@@ -11,14 +11,29 @@
 #      from the deploy repo's prod overlay) via `kubectl set image` — the
 #      e2e namespace is deliberately NOT ArgoCD-managed.
 #   3. Port-forwards the app (:18080) and Mailpit (:18025).
+#      ⚠️ The stack's ROOMLER__APP__FRONTEND_URL must equal the origin the
+#      browser uses here (http://127.0.0.1:18080). Since the session-cookie
+#      migration the /ws upgrade authenticates by COOKIE and refuses an
+#      untrusted Origin with 403 — cookies are ambient and a WS upgrade is
+#      not subject to CORS. With the in-cluster name there instead, every
+#      handshake in the suite is refused, ~7 specs fail for one reason, and
+#      nothing realtime is tested at all. Fixed in the e2e overlay
+#      2026-08-29; if you point this lane at another port, move it too.
 #   4. Runs the suite in the official Playwright container (spec dir copied
 #      to a scratch tree minus e2e/video/ — that spec is bun-only syntax).
 #   5. Diffs the failing specs against scripts/e2e-expected-failures.txt and
 #      writes ~/e2e-nightly/LATEST (one summary line) + a dated full log.
 #      Unexpected failures ⇒ exit 1 (and a GitHub issue, if `gh` is authed).
 #
-# Install (build host):
-#   crontab: 30 3 * * * $HOME/roomler-ai/scripts/e2e-nightly.sh >> $HOME/e2e-nightly/cron.log 2>&1
+# Install (build host) — note BOTH details, each of which silently killed this
+# lane once:
+#   crontab: 30 3 * * * REPO=$HOME/wt-e2e-lane bash $HOME/wt-e2e-lane/scripts/e2e-nightly.sh >> $HOME/e2e-nightly/cron.log 2>&1
+#   * invoked through `bash`, because this file was committed 100644 and the
+#     bare-path form failed `Permission denied` EVERY night from install until
+#     2026-08-29 — into a log nobody reads. The mode bit is fixed too, but the
+#     cron line should not depend on it.
+#   * REPO points at a dedicated worktree, never the shared clone: that clone
+#     is routinely parked on another session's branch.
 set -uo pipefail
 
 REPO="${REPO:-$HOME/roomler-ai}"
@@ -43,7 +58,15 @@ fail_hard() { note "ABORT: $*"; echo "$STAMP INFRA-FAIL: $*" > "$OUT/LATEST"; ex
 
 # ── 1. fresh specs ───────────────────────────────────────────────────
 cd "$REPO" || fail_hard "repo missing"
-git pull -q --ff-only || note "git pull failed — running with the existing checkout"
+# Detach at origin/master rather than `git pull`, for the reason deploy-api.sh
+# already learned: a shared clone gets parked on someone's branch, and
+# `--ff-only` then FAILS and this script cheerfully runs whatever specs happen
+# to be checked out — a nightly that silently tests an unmerged branch is worse
+# than one that does not run. Detaching also works inside a worktree, which is
+# what the cron should point REPO at.
+git fetch origin --quiet || note "git fetch failed — running with the existing checkout"
+git checkout --quiet --detach origin/master || note "could not detach at origin/master — running with the existing checkout"
+note "specs at $(git log --oneline -1)"
 
 # ── 2. sync the e2e stack to the prod image ──────────────────────────
 PRODTAG=$(awk '/newTag:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml")

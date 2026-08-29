@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Per-(caller, device) request limiter for the exec / SSH control planes.
 //!
 //! Both subsystems DOCUMENT a per-minute ceiling (`exec::RATE_LIMIT_PER_MINUTE`,

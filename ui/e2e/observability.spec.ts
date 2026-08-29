@@ -48,7 +48,10 @@ test.describe('Org dashboard — Insights + Network', () => {
     await expect(page.getByText('Insights')).toBeVisible({ timeout: 15000 })
     // The Network card only renders once the org HAS overlay nodes —
     // an empty ring would be noise on a fresh workspace.
-    await expect(page.getByText('Network', { exact: true })).toHaveCount(0)
+    // Anchored to the section HEADING. Plain text matching also catches the
+    // dashboard's "Network" quick-link tile, which is a nav affordance and
+    // says nothing about whether a mesh ring was drawn.
+    await expect(page.getByRole('heading', { name: 'Network', exact: true })).toHaveCount(0)
   })
 })
 
@@ -66,7 +69,9 @@ test.describe('Org analytics', () => {
     await expect(page.getByRole('tab', { name: /calls/i })).toBeVisible()
     await expect(page.getByRole('tab', { name: /tunnels/i })).toBeVisible()
 
-    await page.getByRole('button', { name: '30D', exact: true }).click()
+    // The range buttons are lower-case ('24h' | '7d' | '30d' | '1y' in
+    // components/stats/RangePicker.vue).
+    await page.getByRole('button', { name: '30d', exact: true }).click()
     await expect(page.getByText(/machines online/i).first()).toBeVisible()
 
     await page.getByRole('tab', { name: /calls/i }).click()

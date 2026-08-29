@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `LocalTurnHost` — the corp host's enrolled agent hosts a small UDP TURN
 //! server on loopback + its overlay IP, so the local browser (loopback, never
 //! firewall-blocked) and the remote agent (over the WFP-permitted overlay) can

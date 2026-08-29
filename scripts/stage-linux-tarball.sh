@@ -1,13 +1,16 @@
 #!/usr/bin/env sh
+# RETIRED-NAME-ANCHOR-BEGIN
+# The tarball name names a PUBLISHED release asset. Filenames are fixed by what is already on GitHub Releases (FR-21 D6), and usr/share/doc/roomler-agent is the dpkg doc
+# directory that travels with it.
 # Stage the Linux payload and tar it — the distro-agnostic install path for
 # hosts with no dpkg/apt (Fedora, RHEL, SUSE, Arch …), which otherwise cannot
 # install ANY published artifact and so can never self-update.
 #
-# The tree MUST mirror the `.deb` asset map in agents/roomler-agent/Cargo.toml:
+# The tree MUST mirror the `.deb` asset map in agents/roomlerd/Cargo.toml:
 # same payload, same destinations, so the two formats install identically and
 # `docs/linux-self-update.md`'s installer can be format-agnostic below the
 # extraction. Run from the repo root, AFTER the lane's bundle step has
-# populated agents/roomler-agent/vendor-ffmpeg/.
+# populated agents/roomlerd/vendor-ffmpeg/.
 #
 # Usage: scripts/stage-linux-tarball.sh <version> <target-triple>
 #   e.g. scripts/stage-linux-tarball.sh 0.3.0-rc.371 x86_64-unknown-linux-gnu
@@ -18,7 +21,7 @@ triple="${2:?target triple}"
 name="roomler-agent-${version}-${triple}"
 root="/tmp/${name}"
 
-pkg=agents/roomler-agent
+pkg=agents/roomlerd
 rm -rf "$root"
 
 # Binaries. `roomler-shim` installs UNDER the user-facing name: it re-execs
@@ -32,6 +35,8 @@ install -D -m755 target/release/roomler-shim "$root/usr/bin/roomler"
 libs=0
 for lib in "$pkg"/vendor-ffmpeg/*.so.*; do
     [ -e "$lib" ] || break
+    # RETIRED-NAME-ANCHOR(2): RPATH directory baked into the binary; the
+    # staged tree must match it or the tarball cannot load its own FFmpeg.
     install -D -m644 "$lib" "$root/usr/lib/roomler-agent/$(basename "$lib")"
     libs=$((libs + 1))
 done
@@ -52,3 +57,4 @@ sha256sum "${name}.tar.gz" | awk '{print $1"  "$2}' > "${name}.tar.gz.sha256"
 
 echo "staged ${libs} lib(s); $(du -h "${name}.tar.gz" | cut -f1) -> ${name}.tar.gz"
 tar tzf "${name}.tar.gz" | sed "s|^|  |"
+# RETIRED-NAME-ANCHOR-END

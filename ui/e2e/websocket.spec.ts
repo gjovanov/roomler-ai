@@ -14,15 +14,26 @@ test.describe('WebSocket', () => {
     // Start listening for WebSocket connections before login triggers one
     // Filter for our app's /ws path to avoid catching Vite's HMR WebSocket
     const wsPromise = page.waitForEvent('websocket', {
-      predicate: (ws) => ws.url().includes('/ws?token='),
+      // The app dials `/ws`, optionally `?tid=<tenant>`. The token USED to be
+      // in this URL and deliberately is not any more (#691) — a query string
+      // reaches access logs and `Referer`. Match on the PATH; the assertions
+      // below then lock the new property instead of the retired one.
+      predicate: (ws) => new URL(ws.url()).pathname === '/ws',
       timeout: 15000,
     })
 
     await loginViaUi(page, user.username, user.password)
 
-    // Verify a WebSocket connection was established to /ws
     const ws = await wsPromise
-    expect(ws.url()).toContain('/ws?token=')
+    expect(new URL(ws.url()).pathname).toBe('/ws')
+    // Cookie-only sessions: no credential may appear in the URL.
+    expect(ws.url()).not.toContain('token=')
+    // ⚠️ And it must STAY open. A refused upgrade (403 for an untrusted Origin
+    // on the cookie path) still fires the `websocket` event, so asserting only
+    // that a socket was created would pass against a stack where realtime is
+    // completely broken — which is exactly how this lane went quiet.
+    await page.waitForTimeout(2000)
+    expect(ws.isClosed(), 'the /ws upgrade was refused or dropped').toBe(false)
   })
 
   test('WebSocket connection does not produce console errors', async ({ page }) => {
@@ -54,13 +65,18 @@ test.describe('WebSocket', () => {
     )
 
     const wsPromise = page.waitForEvent('websocket', {
-      predicate: (ws) => ws.url().includes('/ws?token='),
+      // The app dials `/ws`, optionally `?tid=<tenant>`. The token USED to be
+      // in this URL and deliberately is not any more (#691) — a query string
+      // reaches access logs and `Referer`. Match on the PATH; the assertions
+      // below then lock the new property instead of the retired one.
+      predicate: (ws) => new URL(ws.url()).pathname === '/ws',
       timeout: 15000,
     })
     await loginViaUi(page, user.username, user.password)
 
     const ws = await wsPromise
-    expect(ws.url()).toContain('/ws?token=')
+    expect(new URL(ws.url()).pathname).toBe('/ws')
+    expect(ws.url()).not.toContain('token=')
 
     // Register error listener before navigating so we catch all errors
     const wsErrors: string[] = []

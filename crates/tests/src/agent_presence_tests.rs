@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Phase A-1 — cross-pod agent presence truth.
 //!
 //! Two-pod model: `TestApp::spawn_pair` runs two servers over ONE Mongo

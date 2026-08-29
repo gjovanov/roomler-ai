@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Wizard-state persistence for the unified `roomler-setup` app.
 //!
 //! The wizard writes its in-progress state to

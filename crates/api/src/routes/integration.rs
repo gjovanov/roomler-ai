@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use axum::{
     Json,
     extract::{Path, State},
 };
 use bson::oid::ObjectId;
+use roomler_ai_services::quota;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -23,6 +26,19 @@ pub async fn recognize_file(
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+
+    // FR-32 P1a — `ai_recognition` is advertised per plan and was enforced
+    // nowhere. Checked BEFORE the availability probe on purpose: "your plan
+    // does not include this" is the caller's actual situation, and reporting a
+    // server misconfiguration instead would send them chasing the wrong fix.
+    let tenant = state.tenants.base.find_by_id(tid).await?;
+    if let Err(d) = quota::require_feature(
+        tenant.plan.clone(),
+        tenant.settings.plan_enforcement,
+        quota::Limit::AiRecognition,
+    ) {
+        return Err(ApiError::Forbidden(d.message()));
     }
 
     if !state.recognition.is_available() {

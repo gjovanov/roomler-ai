@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::{
@@ -98,6 +100,27 @@ impl MessageDao {
         }
 
         self.base.find_by_id(id).await
+    }
+
+    /// FR-32 — live messages in the tenant, for **reporting only**.
+    ///
+    /// `max_message_history` is deliberately NOT gated. It is a retention
+    /// bound, not a cap on an action, and the three ways to enforce one are all
+    /// bad in P1: deleting destroys customer data irreversibly, refusing writes
+    /// turns a chat product read-only, and bounding reads honestly means
+    /// touching `find_in_room`, `find_pinned`, `find_thread_replies`, both
+    /// export paths and full-text search — miss the exports and the limit is
+    /// theatre, since anyone can dump the full history to PDF.
+    ///
+    /// But P1's question — *who would be denied* — needs no gate to answer.
+    /// This count answers it, so P2 and P3 get their input at the cost of one
+    /// query instead of a six-call-site retention view built on a limit that
+    /// may not survive re-pricing (messages are small documents; this limit has
+    /// almost no cost basis and exists for upgrade pressure).
+    pub async fn count_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<u64> {
+        self.base
+            .count(doc! { "tenant_id": tenant_id, "deleted_at": null })
+            .await
     }
 
     pub async fn find_in_room(

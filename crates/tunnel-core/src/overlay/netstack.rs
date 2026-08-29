@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Userspace TCP/IP stack (netstack) — the overlay's OS-free twin.
 //!
 //! [`SystemTun`](super::tun::SystemTun) hands the overlay's IP packets to the

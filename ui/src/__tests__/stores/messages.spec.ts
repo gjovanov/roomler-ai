@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 
@@ -163,6 +165,41 @@ describe('useMessageStore', () => {
       store.addMessageFromWs(msg as never)
 
       expect(store.messages).toHaveLength(1)
+    })
+
+    // Found in the field 2026-08-29, by the e2e lane the moment it could
+    // deliver WS traffic again: `sendMessage` pushed the POST response
+    // unconditionally while only THIS handler deduplicated, so whenever the
+    // server's broadcast beat the HTTP response back to the sender, their own
+    // message rendered twice and stayed that way until a reload.
+    // ⚠️ The race is not exotic: the room broadcast is published while the
+    // request is still being answered, so the socket frequently wins.
+    it('does not duplicate when the WS echo of your own message arrives first', async () => {
+      const store = useMessageStore()
+      mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
+      await store.fetchMessages('t1', 'r1')
+
+      const sent = makeMessage({ id: 'race-1', room_id: 'r1', content: 'hi' })
+      store.addMessageFromWs(sent as never)
+      mockApi.post.mockResolvedValueOnce(sent)
+      await store.sendMessage('t1', 'r1', 'hi')
+
+      expect(store.messages.map((m) => m.id)).toEqual(['race-1'])
+    })
+
+    it('does not duplicate a THREAD reply when its echo arrives first', async () => {
+      const store = useMessageStore()
+      mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
+      await store.fetchMessages('t1', 'r1')
+      mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
+      await store.fetchThread("t1", "r1", "parent-1")
+
+      const reply = makeMessage({ id: 'race-2', room_id: 'r1', thread_id: 'parent-1' })
+      store.addMessageFromWs(reply as never)
+      mockApi.post.mockResolvedValueOnce(reply)
+      await store.sendMessage('t1', 'r1', 'hi', 'parent-1')
+
+      expect(store.threadMessages.map((m) => m.id)).toEqual(['race-2'])
     })
 
     it('should add thread messages to threadMessages when thread_id is set', () => {

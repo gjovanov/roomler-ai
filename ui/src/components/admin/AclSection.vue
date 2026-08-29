@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <!-- One ACL page, two enforcement planes (2026-08-04). They are separate
        backend systems on purpose — tunnel ACL gates flows an AGENT dials

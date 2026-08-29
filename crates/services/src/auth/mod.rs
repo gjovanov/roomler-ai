@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use argon2::password_hash::rand_core::OsRng;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use bson::oid::ObjectId;
@@ -43,7 +45,7 @@ pub enum TokenType {
     /// operator. Exchanged for a long-lived `TunnelClient` token via
     /// `POST /api/tunnel-client/enroll`.
     TunnelEnrollment,
-    /// Long-lived token carried by an enrolled `roomler-tunnel` client
+    /// Long-lived token carried by an enrolled `roomler` client
     /// on its WebSocket connection (`role=tunnel-client`). Audience
     /// distinct from `Agent` — agents serve forwards, clients open them.
     TunnelClient,
@@ -72,7 +74,7 @@ pub struct AgentClaims {
     pub token_type: TokenType,
 }
 
-/// Claims carried by a `roomler-tunnel` client token. Long-lived,
+/// Claims carried by a `roomler` client token. Long-lived,
 /// one per enrolled laptop. `owner_user_id` lets the WS handler
 /// associate every forward decision with the operating user for
 /// audit + policy evaluation.
@@ -413,7 +415,7 @@ impl AuthService {
         Ok(claims)
     }
 
-    // ─── roomler-tunnel client tokens ─────────────────────────────────
+    // ─── tunnel client tokens ─────────────────────────────────
 
     /// Mint a single-use tunnel-enrollment token. Returned `jti` is
     /// unique; caller may persist for replay protection. Mirrors

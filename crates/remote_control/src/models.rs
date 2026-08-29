@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +77,25 @@ pub struct AgentCaps {
     /// `files:get` / `files:dir`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// FR-17 — video DATA-CHANNEL wire options the agent supports, as
+    /// opposed to which transport it offers (that is `transports`).
+    /// Recognised values:
+    ///
+    /// * `chunk-framing` — every 16 KiB DataChannel message carries an
+    ///   8-byte `[frame_seq | chunk_idx | chunk_count]` prefix, so a
+    ///   receiver can tell WHICH frame a message belongs to and notice a
+    ///   missing one. Without it the stream is only reassemblable because
+    ///   the channel is reliable+ordered, which is the property FR-17
+    ///   exists to give up: on a lossy relay that ordering costs seconds
+    ///   of head-of-line blocking (measured: one frame blocked 10 263 ms).
+    ///
+    /// Empty / unset (older agents) deserialises to `[]` and the browser
+    /// keeps the legacy unframed format. The capability is what makes the
+    /// negotiation race-free: the viewer knows before it connects, so
+    /// there is never a window where the two ends disagree about how to
+    /// parse bytes already in flight.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video: Vec<String>,
     /// P6 — multi-user input capabilities. Recognised values:
     ///
     /// * `arbiter` — the agent runs the InputArbiter (single fenced
@@ -291,6 +312,15 @@ pub enum RpcCap {
     /// things, so matching must stay equality — see
     /// [`AgentCaps::has_rpc`] and the test that locks it.
     ConfigReport,
+    /// FR-19 — this device runs an **org-relay server**: it has bound
+    /// `relay_server_port`, answers probes, and (P2c+) forwards ciphertext
+    /// between bound members. The server never installs a relay session on a
+    /// device that does not advertise this.
+    ///
+    /// ⚠️ Equality-matched like every verb here. There is no `relay` verb
+    /// today, and if one is ever added it must not be matched by prefix
+    /// against this one — the `ssh` / `ssh-consent` trap, locked by test.
+    RelayServer,
 }
 
 impl RpcCap {
@@ -308,17 +338,19 @@ impl RpcCap {
             Self::SshConsent => "ssh-consent",
             Self::Config => "config",
             Self::ConfigReport => "config-report",
+            Self::RelayServer => "relay-server",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 6] = [
+    pub const ALL: [RpcCap; 7] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
         Self::SshConsent,
         Self::Config,
         Self::ConfigReport,
+        Self::RelayServer,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -345,7 +377,13 @@ impl AgentCaps {
 /// server-side per session from the device's [`AccessPolicy::consent_mode`]
 /// (with `Prompt` — attended — as the system default), then carried to the agent
 /// in `ServerMsg::Request` as a directive the agent obeys. Self-control
-/// (`controller == owner_user_id`) short-circuits to `Auto` in the API gate.
+/// (`controller == owner_user_id`) short-circuits to `Auto` in the API gate
+/// unless the device set [`AccessPolicy::prompt_owner`].
+///
+/// ⚠️ The directive is a CEILING, not a floor. A device that set
+/// `auto_grant_session = false` locally always prompts, even under `Auto` —
+/// the agent resolves the two with `consent::strictest_of`. Same rule as
+/// exec's and SSH's gate 4: the device's own refusal survives the server.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentMode {
@@ -360,7 +398,16 @@ pub enum ConsentMode {
     Email,
     /// Push an in-app consent card to the device owner (Phase 4).
     Push,
-    /// Prompt the host first; fall back to email if nobody answers (Phase 4).
+    /// Prompt the host AND email the owner, in parallel — first answer wins.
+    ///
+    /// Not a sequential fallback, despite the name: the server emails the
+    /// approve-link the moment the session is requested, at the same time as
+    /// the agent raises its on-host prompt. What IS sequential is the two
+    /// windows — the host prompt closes after
+    /// [`crate::consent::HOST_PROMPT_TIMEOUT`] while the emailed link stays
+    /// live for the full [`crate::consent::ASYNC_CONSENT_TIMEOUT`], so a host
+    /// nobody answers hands over to the owner instead of ending the session.
+    /// An explicit host *Deny* does end it: the person at the machine said no.
     PromptThenEmail,
 }
 
@@ -373,6 +420,22 @@ pub struct AccessPolicy {
     /// default.)
     #[serde(default)]
     pub consent_mode: Option<ConsentMode>,
+    /// FR-27 — apply [`Self::consent_mode`] to the device's OWNER too.
+    ///
+    /// `None`/`false` (the default, and every pre-FR-27 row) keeps the
+    /// historical shortcut: controlling your own device auto-consents, because
+    /// unattended access to your own headless boxes is the common case and
+    /// prompting them would ask a machine nobody is sitting at.
+    ///
+    /// That shortcut is also why the picker looked broken. It is applied in
+    /// `resolve_session_authz` BEFORE the policy is read, so on a fleet where
+    /// one person owns every device, `consent_mode` had no observable effect
+    /// whatsoever — and nothing on screen said so. `true` here makes the mode
+    /// authoritative for the owner as well, which is both the honest behaviour
+    /// for a shared workstation and the only way to field-test the attended
+    /// modes without a second account.
+    #[serde(default)]
+    pub prompt_owner: Option<bool>,
     #[serde(default)]
     pub allowed_role_ids: Vec<ObjectId>,
     #[serde(default)]
@@ -387,10 +450,23 @@ pub struct AccessPolicy {
 
 impl AccessPolicy {
     /// Effective consent mode for a NON-owner controller: the per-device mode,
-    /// or the system default (`Prompt` = attended) when unset. Self-control is
-    /// resolved to `Auto` by the caller before this is consulted.
+    /// or the system default (`Prompt` = attended) when unset.
     pub fn effective_consent_mode(&self) -> ConsentMode {
         self.consent_mode.unwrap_or(ConsentMode::Prompt)
+    }
+
+    /// FR-27 — the mode for a controller who IS the device owner. `Auto` unless
+    /// the device opted into being asked ([`Self::prompt_owner`]).
+    ///
+    /// Split from [`Self::effective_consent_mode`] rather than folded into it
+    /// so the owner shortcut is a named, greppable decision instead of an
+    /// `if` buried in the API gate — which is how it stayed invisible.
+    pub fn owner_consent_mode(&self) -> ConsentMode {
+        if self.prompt_owner.unwrap_or(false) {
+            self.effective_consent_mode()
+        } else {
+            ConsentMode::Auto
+        }
     }
 }
 
@@ -587,6 +663,21 @@ pub struct Agent {
     pub machine_id: String,
     pub os: OsKind,
     pub agent_version: String,
+    /// FR-27 — the version of the `roomler-desktop` companion INSTALLED on this
+    /// host, reported on the heartbeat. `None` means one of three different
+    /// things and the grid must not flatten them: a pre-FR-27 agent that never
+    /// reports the field, a host with no companion installed, or a probe that
+    /// could not read one.
+    ///
+    /// It exists because the daemon and the companion update through DIFFERENT
+    /// mechanisms on every platform — Windows: the daemon side-loads the EXE
+    /// (`companion::refresh_if_stale`), macOS: the `.pkg` carries
+    /// `/Applications/Roomler.app`, Linux: a separate `roomler-desktop` .deb
+    /// that apt owns — so "Update all" moving the daemon says nothing about the
+    /// companion, and until now nothing on screen could tell you it had been
+    /// left behind. That was the operator's report, not a hypothetical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_version: Option<String>,
     /// P6 — OpenSSH public half of the device's SSH host key, as reported on
     /// its last hello. Published so a caller can verify what it dialled
     /// instead of trusting it on first use.
@@ -640,6 +731,10 @@ pub struct Agent {
     /// deserialises to [`SshMode::Off`].
     #[serde(default)]
     pub ssh_policy: SshPolicy,
+    /// FR-19 gate 3 — org-relay approval for this device. Same closed default
+    /// as the two above: every pre-FR-19 row deserialises to "not approved".
+    #[serde(default)]
+    pub peer_relay_policy: PeerRelayPolicy,
     /// Device config an operator has ASKED for, reconciled by the agent when
     /// it next connects (`docs/remote-config.md` step 2).
     ///
@@ -796,6 +891,16 @@ pub enum SshAccountMode {
 /// set it could raise its own ceiling and the setting would mean nothing. This
 /// list is an allowlist, so leaving it out is sufficient; the trap is a later
 /// change that adds "the rest of the ssh_* surface" for symmetry.
+///
+/// ⚠️ **The whole `relay_*` surface (FR-19) is ABSENT**, and unlike the two
+/// above this is enforced by a test that matches on the PREFIX rather than on
+/// a name. `relay_server_enabled` is gate 4 — the refusal that survives a
+/// compromised server — and `relay_server_port` is just as load-bearing: a
+/// server able to move the port could point the listener somewhere the
+/// operator never opened, or away from one they did. The prefix rule exists
+/// because the feature will grow more keys (`relay_max_sessions`,
+/// `relay_static_endpoints`), and a per-name test would silently fail to cover
+/// the one someone adds later.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct DesiredConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1096,10 +1201,10 @@ pub struct SshGrantSpec {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Tunnel client (roomler-tunnel)
+// Tunnel client (roomler-cli)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// A laptop running `roomler-tunnel`. Mirrors [`Agent`] structurally
+/// A laptop running `roomler`. Mirrors [`Agent`] structurally
 /// (same lifecycle, same `AgentStatus`, same `(tenant_id, machine_id)`
 /// uniqueness for rehydrate-on-re-enroll) but slimmer — tunnel clients
 /// don't capture screens or hold capability lists. The `_role_` is
@@ -1216,7 +1321,7 @@ pub struct DestinationRule {
 /// Lived in `tunnel_core::policy` until P3e lever E moved it HERE, next to
 /// the shapes it matches over (this crate is where `HostPattern` /
 /// `PortRange` / `DestinationRule` are canonical — the doc block above this
-/// section says so). The move lets `roomler-agent-core`'s config-side ACL
+/// section says so). The move lets `roomler-core`'s config-side ACL
 /// evaluate rules without depending on tunnel-core's data plane; tunnel-core
 /// re-exports both fns from `policy` so its callers are unchanged.
 pub fn dst_matches(rule: &DestinationRule, dst_host: &str, dst_port: u16) -> bool {
@@ -1413,6 +1518,312 @@ pub enum OverlayAclMode {
     Enforce,
 }
 
+/// FR-19 gate 1 — the org's switch for peer relays. Same shape and the same
+/// closed default as [`OverlayAclMode`], for the same reason: every
+/// `overlay_networks` row written before FR-19 lacks the field, and the
+/// default must make enabling the feature a no-op for them.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelayMode {
+    /// No sessions are minted. The default.
+    #[default]
+    Off,
+    /// Decide and audit what WOULD be minted, but mint nothing.
+    Warn,
+    /// Mint.
+    On,
+}
+
+/// FR-19 gate 3 — may THIS device serve as an org relay for its tenant?
+/// Per-device and admin-set; the device's own `relay_server_enabled` (gate 4)
+/// is separate and device-local, so approving here does nothing on a device
+/// that has not opted in itself — an offer is not a grant, and a grant is not
+/// an offer.
+///
+/// `PartialEq` so a listing can ask "is this the untouched default?" — the
+/// same question [`ExecPolicy`] answers for the same reason.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct PeerRelayPolicy {
+    /// Approved to serve. Default `false`.
+    #[serde(default)]
+    pub serve: bool,
+    /// Admin-declared `ip:port`s the relay is reachable at — the port-forwarded
+    /// or multi-homed case the node's own srflx/static candidates cannot
+    /// discover. Each entry is SSRF-validated at approval time (a public IP
+    /// literal, never a name) and re-checked at mint time: a server-pushed
+    /// probe target is an oracle-returning port scanner run by every device
+    /// in the tenant as SYSTEM/root, so `169.254.169.254:80` must never get
+    /// through here. Tried AFTER the measured candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_endpoints: Vec<String>,
+}
+
+/// Bounds on FR-19 relay minting. Server-side only — the relay device
+/// re-clamps every session lifetime against its own table
+/// (`orgrelay::session`), so nothing here is trusted by a device.
+pub mod peer_relay_limits {
+    /// Mints per minute per (requesting node, relay node) pair — the key the
+    /// spec prescribes (§4 "Rate limiting"): a mint writes state onto a THIRD
+    /// device, so the pair to bound is requester × relay, not requester × peer.
+    /// The number is the exec precedent (`exec_limits::RATE_LIMIT_PER_MINUTE`)
+    /// so a fleet boot — one requester asking for every unreachable peer
+    /// through the same relay inside a minute — fits under it.
+    pub const MINT_RATE_LIMIT_PER_MINUTE: u32 = 30;
+    /// The relay-server UDP port assumed when a join carries none — the
+    /// value E2E-3 settled (spec §5) and `orgrelay::DEFAULT_RELAY_SERVER_PORT`
+    /// on the device; the two are the same number by contract.
+    pub const DEFAULT_RELAY_PORT: u16 = 3478;
+    /// Seconds a member has to complete its bind at the relay.
+    pub const BIND_SECS: u32 = 30;
+    /// Idle seconds before the relay drops a bound session. Refreshed by
+    /// traffic, so under a WireGuard keepalive it never fires — which is why
+    /// `MAX_LIFETIME_SECS` exists.
+    pub const IDLE_SECS: u32 = 300;
+    /// Absolute session lifetime, independent of traffic. Also the exposure
+    /// window after a server restart loses the session registry: a session
+    /// the server can no longer revoke ends here at the latest.
+    pub const MAX_LIFETIME_SECS: u32 = 3600;
+    /// Live sessions the server will place on one relay — mirrors the
+    /// device's own `orgrelay::session::MAX_SESSIONS`, which refuses beyond it.
+    pub const MAX_SESSIONS_PER_RELAY: usize = 64;
+    /// How long a reachability report counts toward relay ranking.
+    pub const PROBE_TTL_SECS: u64 = 600;
+    /// The STUN magic cookie as a 24-bit VNI — never minted, so a STUN
+    /// packet arriving at the relay port can never alias a session.
+    pub const STUN_COOKIE_VNI: u32 = 0x2112A4;
+    /// The 24-bit Geneve VNI ceiling.
+    pub const VNI_MAX: u32 = 0xFF_FFFF;
+}
+
+/// Why a peer-relay decision — an admin's approval or a session mint — was
+/// refused. The FR-19 twin of [`ExecDenyReason`] / [`SshDenyReason`], kept
+/// separate for the reason those two are: the vocabularies diverge (a mint has
+/// no caller permission, an approval has no relay).
+///
+/// Every arm is auditable. A refusal nobody can query is a refusal nobody will
+/// notice, and the refused rows are what an operator hunting "why is this pair
+/// still on DERP?" actually reads.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelayDenyReason {
+    /// Gate 1 — the org's [`PeerRelayMode`] is `Off`. ⚠️ Deliberately NEVER
+    /// audited: with the feature off there must be zero rows and zero reads
+    /// (acceptance: "`peer_relay_mode=off` ⇒ no `peer_relay_audit` rows").
+    OrgDisabled,
+    /// Approval — the caller lacks `MANAGE_AGENTS`.
+    NotDeviceAdmin,
+    /// Approval — turning `serve` ON additionally requires `EXEC_DEVICE`: you
+    /// cannot grant a power you do not hold (#600/#605), and nominating a
+    /// relay makes a device a chokepoint for the whole tenant's traffic.
+    CannotGrantRelay,
+    /// The requesting node did not advertise `supports_org_relay` on its join
+    /// — a pre-FR-19 build that could not act on a session anyway.
+    RequesterUnsupported,
+    /// The peer the requester wants to reach did not advertise it; a session
+    /// with one deaf end is a session nobody can use.
+    PeerUnsupported,
+    /// The peer is in another tenant.
+    CrossTenant,
+    /// Gate 2 — no overlay policy grants this pair relay use. Evaluated
+    /// regardless of `acl_mode`: an affirmative capability (spec §4).
+    AclDenied,
+    /// Gate 2 could not be evaluated because the policy rows were unreadable.
+    /// The fail-CLOSED arm, distinct from [`Self::AclDenied`] so a Mongo blip
+    /// is never mistaken for a policy decision.
+    PolicyUnreadable,
+    /// No device in the tenant is approved (gate 3), advertising
+    /// `relay-server` (gate 4) and online.
+    NoRelay,
+    /// The chosen relay's endpoint failed the SSRF validator — it would have
+    /// steered members at a loopback / RFC1918 / metadata / overlay address.
+    NonRoutableEndpoint,
+    /// The requester or the relay is a SECONDARY-org row on a multi-org
+    /// device; serving is primary-only (a UDP listener is host-global).
+    SecondaryOrg,
+    /// Per-(requesting node, relay node) ceiling
+    /// ([`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`]).
+    RateLimited,
+}
+
+impl PeerRelayDenyReason {
+    /// One line an operator can act on — names WHICH gate said no.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::OrgDisabled => "peer relays are off for this organization",
+            Self::NotDeviceAdmin => "Missing MANAGE_AGENTS permission",
+            Self::CannotGrantRelay => {
+                "Approving a device as an org relay requires EXEC_DEVICE — it makes the device \
+                 a traffic chokepoint for the whole organization, and you cannot grant a power \
+                 you do not hold"
+            }
+            Self::RequesterUnsupported => "the requesting device does not support org relays",
+            Self::PeerUnsupported => "the peer does not support org relays",
+            Self::CrossTenant => "the peer is not in this organization",
+            Self::AclDenied => "no overlay policy grants this pair the use of a relay",
+            Self::PolicyUnreadable => {
+                "the overlay policies could not be read; refusing rather than guessing"
+            }
+            Self::NoRelay => "no approved, serving, online relay device in this organization",
+            Self::NonRoutableEndpoint => "the relay's endpoint is not a public address",
+            Self::SecondaryOrg => "org relays serve the device's primary organization only",
+            Self::RateLimited => "too many relay requests through this relay; try again shortly",
+        }
+    }
+}
+
+/// Which decision a [`PeerRelayAuditEvent`] records.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelayAuditAction {
+    /// An admin set a device's [`PeerRelayPolicy`] — the privilege-granting
+    /// act, audited because the exit-node precedent auditing nothing is a gap
+    /// not to copy.
+    Approve,
+    /// A node asked for a session to a peer and the server decided.
+    Mint,
+    /// The server tore a session down — org mode off, an ACL edit that no
+    /// longer grants the pair the relay, the relay's approval cleared, or a
+    /// party removed. A push, never an expiry (§7): the idle deadline never
+    /// fires under a WireGuard keepalive.
+    Revoke,
+}
+
+/// One peer-relay decision, granted or refused. TTL-expired after 90 days like
+/// [`ExecAuditEvent`].
+///
+/// One collection for both actions on purpose: the question an incident review
+/// asks — "who made this device a relay, and what has been routed through it
+/// since?" — is ONE query on `agent_id`, which two collections would split.
+/// The optional fields each belong to one action; [`Self::action`] says which.
+///
+/// **A mint row records the DECISION, not the session.** The server pushes a
+/// session to three devices and its involvement ends there; it never sees a
+/// byte of what they exchange. Same discipline as [`SshAuditEvent`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PeerRelayAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub action: PeerRelayAuditAction,
+    /// The device the row is ABOUT: the one being approved, or the relay
+    /// chosen to carry the session (absent on a mint no relay qualified for).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<ObjectId>,
+    /// The admin who asked (`approve`). A mint has no person behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<ObjectId>,
+    /// `mint` — the node that asked, and the peer it asked to reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_node_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_node_id: Option<ObjectId>,
+    /// `mint` — the overlay node chosen as the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_node_id: Option<ObjectId>,
+    /// `approve` — the requested value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<bool>,
+    /// `mint` — the VNI issued. Absent on refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vni: Option<u32>,
+    /// `mint` under [`PeerRelayMode::Warn`]: the decision was taken and
+    /// recorded exactly as `On` would have, and NOTHING was pushed.
+    #[serde(default)]
+    pub warn_only: bool,
+    pub at: DateTime,
+    /// Refusal reason; `None` = approved / minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<PeerRelayDenyReason>,
+    /// `revoke` — which of the four triggers fired (`mode_off` |
+    /// `acl_revoked` | `policy_revoked` | `device_removed` | `device_left`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl PeerRelayAuditEvent {
+    pub const COLLECTION: &'static str = "peer_relay_audit";
+}
+
+#[cfg(test)]
+mod peer_relay_audit_tests {
+    use super::*;
+
+    /// The wire strings are what the audit UI and the integration tests match
+    /// on; a rename here would silently turn a filtered view empty.
+    #[test]
+    fn deny_reason_wire_strings_are_locked() {
+        let all = [
+            (PeerRelayDenyReason::OrgDisabled, "org_disabled"),
+            (PeerRelayDenyReason::NotDeviceAdmin, "not_device_admin"),
+            (PeerRelayDenyReason::CannotGrantRelay, "cannot_grant_relay"),
+            (
+                PeerRelayDenyReason::RequesterUnsupported,
+                "requester_unsupported",
+            ),
+            (PeerRelayDenyReason::PeerUnsupported, "peer_unsupported"),
+            (PeerRelayDenyReason::CrossTenant, "cross_tenant"),
+            (PeerRelayDenyReason::AclDenied, "acl_denied"),
+            (PeerRelayDenyReason::PolicyUnreadable, "policy_unreadable"),
+            (PeerRelayDenyReason::NoRelay, "no_relay"),
+            (
+                PeerRelayDenyReason::NonRoutableEndpoint,
+                "non_routable_endpoint",
+            ),
+            (PeerRelayDenyReason::SecondaryOrg, "secondary_org"),
+            (PeerRelayDenyReason::RateLimited, "rate_limited"),
+        ];
+        for (reason, wire) in all {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::json!(wire)
+            );
+            assert!(!reason.message().is_empty());
+        }
+        assert_eq!(
+            serde_json::to_value(PeerRelayAuditAction::Approve).unwrap(),
+            serde_json::json!("approve")
+        );
+        assert_eq!(
+            serde_json::to_value(PeerRelayAuditAction::Mint).unwrap(),
+            serde_json::json!("mint")
+        );
+        assert_eq!(
+            serde_json::to_value(PeerRelayAuditAction::Revoke).unwrap(),
+            serde_json::json!("revoke")
+        );
+    }
+
+    /// A row must explain itself without a join, and the optional fields are
+    /// skipped when absent so an `approve` row carries no mint noise.
+    #[test]
+    fn approve_row_serialises_without_mint_fields() {
+        let row = PeerRelayAuditEvent {
+            id: None,
+            tenant_id: ObjectId::new(),
+            action: PeerRelayAuditAction::Approve,
+            agent_id: Some(ObjectId::new()),
+            user_id: Some(ObjectId::new()),
+            requester_node_id: None,
+            peer_node_id: None,
+            relay_node_id: None,
+            serve: Some(true),
+            vni: None,
+            warn_only: false,
+            at: DateTime::now(),
+            denied: Some(PeerRelayDenyReason::CannotGrantRelay),
+            reason: None,
+        };
+        let doc = bson::to_document(&row).unwrap();
+        assert!(doc.contains_key("serve"));
+        assert!(!doc.contains_key("vni"));
+        assert!(!doc.contains_key("requester_node_id"));
+        assert_eq!(doc.get_str("denied").unwrap(), "cannot_grant_relay");
+        let back: PeerRelayAuditEvent = bson::from_document(doc).unwrap();
+        assert_eq!(back.action, PeerRelayAuditAction::Approve);
+        assert_eq!(back.denied, Some(PeerRelayDenyReason::CannotGrantRelay));
+    }
+}
+
 /// A tenant-scoped overlay access rule. Default-deny **once the tenant's
 /// [`OverlayAclMode`] is `Enforce`**; `Off` (the default) preserves the
 /// historical "same tenant + same network ⇒ full visibility" behaviour.
@@ -1502,7 +1913,7 @@ pub struct TunnelAuditEvent {
     /// this id. New ObjectId per `tunnel forward` invocation.
     pub tunnel_session_id: ObjectId,
     /// The originating tunnel-CLIENT row, set when a dedicated
-    /// `roomler-tunnel` client opened this session. `None` for an
+    /// `roomler` client opened this session. `None` for an
     /// agent-originated session (P3b-2), where `origin_agent_id` is set
     /// instead. Exactly one of `tunnel_client_id` / `origin_agent_id`
     /// is populated. Optional (not a bare `ObjectId`) since P3b-2 —
@@ -1933,6 +2344,12 @@ pub enum EndReason {
     AgentHangup,
     UserDenied,
     ConsentTimeout,
+    /// FR-27 — the device could raise no consent prompt at all: no desktop
+    /// session, no companion, no native overlay. Distinct from
+    /// [`Self::ConsentTimeout`] because nobody was ever asked, so the useful
+    /// advice is "give that host a prompt surface, or pick email/push", not
+    /// "try again and answer it".
+    NoPromptSurface,
     AgentDisconnect,
     AdminTerminated,
     IdleTimeout,
@@ -2338,6 +2755,12 @@ pub struct OverlayNode {
     /// `false` ⇒ peers probe it with ICMP.
     #[serde(default)]
     pub supports_overlay_echo: bool,
+    /// FR-19 — this node understands `rc:overlay.relay_session` /
+    /// `rc:overlay.relay_revoke` and the `org-relay` verdict (advertised on
+    /// join, echoed per-peer in the netmap). The server never pushes those to a
+    /// node that has not said so. Absent on an older row ⇒ `false`.
+    #[serde(default)]
+    pub supports_org_relay: bool,
     /// Phase 1 — subnet CIDRs this node CLAIMS it can route for peers (from its
     /// `--advertise-routes` config, refreshed on each join). Untrusted until an
     /// admin approves; see `approved_routes`.
@@ -2418,6 +2841,11 @@ pub struct OverlayNetwork {
     /// mesh keeps its current behaviour until an admin opts in.
     #[serde(default)]
     pub acl_mode: OverlayAclMode,
+    /// FR-19 gate 1 — the org's peer-relay switch. `#[serde(default)]` for the
+    /// same reason as `acl_mode`: every pre-FR-19 row lacks it, and the default
+    /// is [`PeerRelayMode::Off`] so nothing is minted until an admin opts in.
+    #[serde(default)]
+    pub peer_relay_mode: PeerRelayMode,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -2671,6 +3099,67 @@ pub fn block_align_slot(after: u32, slots: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-19 — the `relay-server` verb: spelling locked (a rename silently
+    /// un-advertises the feature fleet-wide), and only ever equality-matched —
+    /// a future `relay` verb must not be implied by it, nor it by `relay`.
+    #[test]
+    fn relay_server_verb_is_locked_and_only_equality_matched() {
+        assert_eq!(RpcCap::RelayServer.wire(), "relay-server");
+        assert!(matches!(
+            RpcCap::from_wire("relay-server"),
+            Some(RpcCap::RelayServer)
+        ));
+        assert!(RpcCap::from_wire("relay").is_none());
+        assert!(RpcCap::from_wire("relay-server-x").is_none());
+        assert!(RpcCap::from_wire("relay-serve").is_none());
+        assert!(RpcCap::ALL.iter().any(|c| c.wire() == "relay-server"));
+    }
+
+    /// FR-19 gate 4: **no `relay_*` key may ever be server-pushable.**
+    ///
+    /// Matches on the PREFIX, not on a name, and that is the whole point. A
+    /// per-name assertion would pass forever while covering nothing new, and
+    /// this surface is going to grow (`relay_max_sessions`,
+    /// `relay_static_endpoints`, …).
+    ///
+    /// ⚠️ The struct literal below is spelled out in full **on purpose** — no
+    /// `..Default::default()`. Every field is populated so the serialised form
+    /// cannot pass merely because a value was `None` and got skipped; and,
+    /// more importantly, adding any field to [`DesiredConfig`] makes this test
+    /// stop compiling, which forces whoever adds it to come here and read why
+    /// a `relay_*` key must not be the field they are adding. A tolerant
+    /// literal would let that change land silently.
+    #[test]
+    fn no_relay_key_is_server_pushable_via_desired_config() {
+        let full = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
+            ssh_account_mode: Some("console_user".into()),
+            ssh_port: Some(2222),
+            revision: 7,
+            updated_by: None,
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(
+            !json.contains("relay_"),
+            "a relay_* key reached DesiredConfig -- that is gate 4 becoming \
+             server-settable, which is the one move FR-19's design exists to \
+             prevent: {json}"
+        );
+        // And the round trip cannot smuggle one in either.
+        let back: DesiredConfig = serde_json::from_str(
+            r#"{"exec_enabled":true,"relay_server_enabled":true,"relay_server_port":9,"revision":1}"#,
+        )
+        .expect("unknown keys must be ignored, not fail the frame");
+        assert_eq!(back.exec_enabled, Some(true));
+        assert!(
+            !serde_json::to_string(&back).unwrap().contains("relay_"),
+            "a relay_* key survived a decode/encode round trip"
+        );
+    }
 
     /// WIRE LOCK. These exact strings are what every deployed agent already
     /// sends and what the server gates on; changing one does not fail loudly,

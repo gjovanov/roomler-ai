@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
+// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! Operator-attention notification.
 //!
 //! v1 ships a sentinel file the agent writes when it needs human
@@ -6,10 +10,12 @@
 //! dir, alongside `config.toml`, so:
 //!
 //! - A fleet-management script can scan `%APPDATA%\roomler\
-//!   roomler-agent\config\needs-attention.txt` across machines.
+//!   roomler\config\needs-attention.txt` across machines (a
+//!   pre-rename host keeps `\roomler-agent\` there — see
+//!   `appdirs::app_segment`).
 //! - The future admin UI heartbeat (resilience plan Phase 7) can
 //!   surface "this agent flagged itself as needing attention."
-//! - An interactive operator running `roomler-agent re-enroll`
+//! - An interactive operator running `roomlerd re-enroll`
 //!   sees the file vanish on success.
 //!
 //! Real OS-toast notification (BurntToast on Win, `notify-send` on
@@ -190,10 +196,10 @@ pub fn has_attention() -> bool {
 // P3e lever E: the worker-aware trio (`attention_path_for_worker`,
 // `raise_attention_machine_aware`, `raise_attention_machine_aware_with_reason`)
 // did NOT move here — it probes the process's worker role via
-// `roomler_agent::system_context::worker_role`, which is the one coupling in
+// `roomlerd::system_context::worker_role`, which is the one coupling in
 // this module that genuinely belongs to the daemon (winlogon-token
 // machinery, `system-context` feature). The trio lives on in
-// `roomler-agent/src/notify.rs`, layered over the primitives below
+// `roomlerd/src/notify.rs`, layered over the primitives below
 // (`attention_path`, `raise_attention_at_with_reason`, `ATTENTION_FILENAME`);
 // thin clients (the desktop companion) only ever need the user-context
 // surface in this file. The daemon-side wrappers build on
@@ -246,7 +252,7 @@ mod tests {
     }
 
     // The `attention_path_for_worker` no-panic + resolve-without-writing
-    // tests moved to `roomler-agent/src/notify.rs` with the worker-aware
+    // tests moved to `roomlerd/src/notify.rs` with the worker-aware
     // trio itself (P3e lever E).
 
     #[test]

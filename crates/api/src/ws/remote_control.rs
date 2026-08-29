@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! WebSocket glue for the remote-control subsystem.
 //!
 //! The `roomler-ai-remote-control` crate owns the state machine and the
@@ -571,22 +573,38 @@ pub async fn handle_agent_socket(
                                 sys,
                                 srflx_count,
                                 warm_relay,
+                                companion_version,
                                 ..
                             } = &parsed
                             {
-                                Some((*active_sessions, sys.clone(), *srflx_count, warm_relay.clone()))
+                                Some((
+                                    *active_sessions,
+                                    sys.clone(),
+                                    *srflx_count,
+                                    warm_relay.clone(),
+                                    companion_version.clone(),
+                                ))
                             } else {
                                 None
                             };
                             if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
                                 warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
                             }
-                            if let Some((active_sessions, sys, srflx_count, warm_relay)) =
-                                heartbeat_sessions
+                            if let Some((
+                                active_sessions,
+                                sys,
+                                srflx_count,
+                                warm_relay,
+                                companion_version,
+                            )) = heartbeat_sessions
                             {
                                 if let Err(e) = state
                                     .agents
-                                    .touch_heartbeat(agent_id, warm_relay.as_deref())
+                                    .touch_heartbeat(
+                                        agent_id,
+                                        warm_relay.as_deref(),
+                                        companion_version.as_deref(),
+                                    )
                                     .await
                                 {
                                     warn!(%agent_id, %e, "agent touch_heartbeat failed");
@@ -1606,10 +1624,21 @@ pub async fn resolve_session_authz(
     }
     let tenant_name = tenant.map(|t| t.name);
 
-    // Controlling your OWN device is always allowed AND auto-consents.
+    // Controlling your OWN device is always allowed. Whether it also
+    // auto-consents is now the DEVICE's call (FR-27): `prompt_owner` unset —
+    // every pre-FR-27 row, and the default — keeps the historical shortcut,
+    // because unattended access to your own headless boxes is the common case
+    // and prompting them asks a machine nobody is sitting at.
+    //
+    // ⚠️ This shortcut is why the consent picker looked broken. It short-circuits
+    // BEFORE `effective_consent_mode()` is ever read, so on a fleet where one
+    // person owns every device the setting had no observable effect at all —
+    // and nothing on screen said so. The UI now labels it, and this flag is how
+    // an owner opts into being asked (a shared workstation, or field-testing the
+    // attended modes without a second account).
     if agent.owner_user_id == controller_user_id {
         return Ok(SessionAuthz::allow_with_input(
-            ConsentMode::Auto,
+            agent.access_policy.owner_consent_mode(),
             input_mode,
             tenant_name,
         ));
@@ -1766,7 +1795,9 @@ pub fn apply_rc_ctrl(hub: &roomler_ai_remote_control::Hub, ctrl: &serde_json::Va
             ) else {
                 return;
             };
-            if hub.deliver_consent(sid, granted).is_ok() {
+            // Cross-pod replay of an approve-link decision: a human clicked a
+            // button, so there is no deny REASON to carry (FR-27).
+            if hub.deliver_consent(sid, granted, None).is_ok() {
                 info!(session = %sid, granted, "rc ctrl: consent applied from another pod");
             }
         }

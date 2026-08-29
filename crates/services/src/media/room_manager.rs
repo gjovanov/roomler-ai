@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use mediasoup::prelude::*;
@@ -12,7 +14,7 @@ use std::num::NonZero;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::worker_pool::WorkerPool;
 
@@ -70,6 +72,14 @@ pub struct ConsumerInfo {
     pub producer_id: String,
     pub kind: String,
     pub rtp_parameters: serde_json::Value,
+    /// FR-30 P4 — is the SOURCE producer paused right now?
+    ///
+    /// The pause EVENT only reaches whoever was in the room when it happened.
+    /// Without this, someone who joins a call after you muted sees no badge
+    /// until your next toggle — measured in the field 2026-08-29. The state
+    /// has to travel with the subscription, not only as a transition.
+    #[serde(default)]
+    pub producer_paused: bool,
 }
 
 /// Manages mediasoup rooms and their media state.
@@ -393,6 +403,24 @@ impl RoomManager {
             return Err(anyhow::anyhow!("Cannot consume: incompatible capabilities"));
         }
 
+        // FR-30 P4 — read the source producer's pause state HERE, while only
+        // `room` is held. ⚠️ Not below: `participants.get_mut()` is taken a few
+        // lines down, and iterating the same DashMap while holding a mutable
+        // entry deadlocks it.
+        let producer_paused = room
+            .participants
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .producers
+                    .iter()
+                    .find(|pe| pe.producer.id() == producer_id)
+                    .map(|pe| pe.producer.paused())
+            })
+            .next()
+            .unwrap_or(false);
+
         let mut participant = room
             .participants
             .get_mut(connection_id)
@@ -419,6 +447,7 @@ impl RoomManager {
                 MediaKind::Video => "video".to_string(),
             },
             rtp_parameters: serde_json::to_value(consumer.rtp_parameters())?,
+            producer_paused,
         };
 
         participant.consumers.push(consumer);
@@ -434,6 +463,57 @@ impl RoomManager {
     }
 
     /// Closes a specific producer by ID.
+    /// FR-30 — pause or resume ONE of a participant's producers.
+    ///
+    /// ⚠️ Deliberately NOT a sibling of `close_producer` below, which is sync.
+    /// `Producer::pause()` is async, and holding a DashMap guard across an
+    /// await is how you deadlock the whole room registry — so the handle is
+    /// CLONED out first and every guard dropped before we await. A mediasoup
+    /// `Producer` is a cheap cloneable handle, so this costs nothing.
+    ///
+    /// Pausing server-side is half the point on its own: it stops forwarding
+    /// to every consumer, so a participant with their camera off stops
+    /// shipping black frames to everyone in the room.
+    pub async fn set_producer_paused(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+        producer_id: &ProducerId,
+        paused: bool,
+    ) -> bool {
+        let producer = {
+            let Some(room) = self.rooms.get(room_id) else {
+                return false;
+            };
+            let Some(participant) = room.participants.get(connection_id) else {
+                return false;
+            };
+            participant
+                .producers
+                .iter()
+                .find(|pe| &pe.producer.id() == producer_id)
+                .map(|pe| pe.producer.clone())
+        };
+
+        let Some(producer) = producer else {
+            return false;
+        };
+
+        let result = if paused {
+            producer.pause().await
+        } else {
+            producer.resume().await
+        };
+
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(?room_id, %connection_id, %paused, error = %e, "failed to set producer paused");
+                false
+            }
+        }
+    }
+
     pub fn close_producer(
         &self,
         room_id: &ObjectId,

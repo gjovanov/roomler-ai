@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
@@ -115,10 +117,18 @@ export const useMessageStore = defineStore('messages', () => {
       `/tenant/${tenantId}/room/${roomId}/message`,
       body,
     )
-    if (threadId) {
-      threadMessages.value.push(msg)
-    } else {
-      messages.value.push(msg)
+    // ⚠️ Adopt, never append blindly. The server publishes the room broadcast
+    // while it is still answering this request, so our OWN `message:new` echo
+    // routinely arrives before the response does — and `addMessageFromWs` has
+    // then already inserted it. Pushing unconditionally rendered the sender's
+    // own message twice, and it stayed doubled until a reload.
+    // Found by the e2e lane the moment it could carry WS traffic again
+    // (chat-multi "sending a message does not produce a duplicate"); it was
+    // invisible for as long as the lane's WebSocket handshakes were refused,
+    // because with no echo there is no race.
+    const list = threadId ? threadMessages : messages
+    if (!list.value.some((m) => m.id === msg.id)) {
+      list.value.push(msg)
     }
     return msg
   }

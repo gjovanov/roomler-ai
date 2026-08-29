@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Wire protocol for the `rc:*` WebSocket namespace.
 //!
 //! Both the agent and the controller browser speak the same envelope shape;
@@ -32,7 +34,7 @@ pub enum Role {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Role advertised in `rc:tunnel.hello`. Distinguishes the
-/// `roomler-tunnel` CLI (which initiates forwards) from the agent
+/// `roomler` CLI (which initiates forwards) from the agent
 /// (which serves them). Wire form: `"client"` | `"agent"`.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -280,6 +282,17 @@ pub enum ClientMsg {
         /// agent→server like `srflx_count`, so no capability flag.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warm_relay: Option<String>,
+        /// FR-27 — the version of the `roomler-desktop` companion installed on
+        /// this host, or `None` when none is installed / the probe failed /
+        /// the agent predates the field. Additive agent→server like
+        /// `srflx_count`, so no capability flag.
+        ///
+        /// Reported because the daemon and the companion update by DIFFERENT
+        /// mechanisms on all three platforms, so a fleet-wide "Update all"
+        /// moving `agent_version` says nothing about the companion — which is
+        /// exactly the skew the operator hit on macOS.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        companion_version: Option<String>,
     },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
@@ -478,6 +491,34 @@ pub enum ClientMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         granted: bool,
+        /// FR-27 — why, when `granted` is false. Absent (every pre-FR-27
+        /// agent) means an ordinary deny, which is what a bare `false` has
+        /// always meant. Present values come from
+        /// [`crate::consent::ConsentDenyReason::wire`]; an unrecognised one
+        /// degrades to the same ordinary deny, so a newer agent can name a
+        /// reason this server has never heard of.
+        ///
+        /// This exists because the agent's OWN prompt timeout produced a bare
+        /// `false`, and the hub turned that into `EndReason::UserDenied` — so
+        /// "nobody was at the machine" reached the controller as "a human
+        /// refused you", which is both wrong and un-actionable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// FR-34 — the on-host consent prompt is up, but the host is LOCKED, so
+    /// nobody can see it until the machine is unlocked. Sent once when the
+    /// prompt begins on a locked host so the controller's "awaiting consent"
+    /// wait can explain WHY (walk over, unlock, approve) instead of looking
+    /// like a hang. Advisory + additive: an old server ignores it, and it
+    /// never changes the consent outcome — a locked host is still answered by
+    /// unlocking and clicking the panel (the sound flow), just with 5 minutes
+    /// (FR-34 P4) to get there.
+    #[serde(rename = "rc:consent.pending")]
+    ConsentPending {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        host_locked: bool,
     },
 
     // ─── controller → server ─────────────────────────────────────────
@@ -513,12 +554,22 @@ pub enum ClientMsg {
         /// `"yuv420"` (VP9 profile 0; ~30% lower bandwidth; slight
         /// ClearType softening) and `"yuv444"` (VP9 profile 1; sharpest
         /// text; current default). `None` / unset means "use the
-        /// agent's `ROOMLER_AGENT_VP9_CHROMA` env-var default". Only
+        /// agent's `ROOMLERD_VP9_CHROMA` env-var default". Only
         /// applies when `preferred_transport` is `data-channel-vp9-444`;
         /// ignored otherwise. Forwarded verbatim to the agent in the
         /// matching server-side [`ServerMsg::SessionRequest`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// FR-17 — the controller can parse the framed DataChannel wire
+        /// format (every message prefixed with
+        /// `[frame_seq | chunk_idx | chunk_count]`). Sent only when the
+        /// agent advertised `chunk-framing` in `AgentCaps.video`, so the
+        /// two ends can never disagree about bytes already in flight.
+        /// `None` / unset (older controllers) means the legacy unframed
+        /// format, which is reassemblable only because the channel is
+        /// reliable + ordered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_framing: Option<bool>,
         /// Opt-in system/desktop audio. When `true` the controller wants
         /// the agent to add a WebRTC Opus audio track (the agent must
         /// also advertise `"opus"` in `AgentCaps.audio` and be built with
@@ -578,14 +629,14 @@ pub enum ClientMsg {
     // Plan v2 §"What changed from v1" #1 + #2:
     //   * Wire types fold into the existing `rc:*` namespace, NOT a
     //     separate `rc-tunnel:*` namespace or WS endpoint.
-    //   * Each `roomler-tunnel forward` invocation owns ONE peer; many
+    //   * Each `roomler forward` invocation owns ONE peer; many
     //     TCP flows multiplex onto a fixed DC pool via `flow_id`
     //     framing (see `tunnel-core::mux`). No per-flow DC creation.
     //   * Server is the auth boundary — `TcpForwardRequest` rides the
     //     WS so the server can apply the cross-tenant gate + policy
     //     eval before forwarding to the agent.
     //
-    /// Sent right after WS upgrade by either a `roomler-tunnel` client
+    /// Sent right after WS upgrade by either a `roomler` client
     /// or an agent that wants to advertise tunnel support. Locks in
     /// the wire transport for the rest of the session.
     ///
@@ -618,7 +669,7 @@ pub enum ClientMsg {
         /// carry N concurrent opens: the `roomlerd` daemon (P3b-2)
         /// multiplexes many client sessions over its single agent WS and
         /// demuxes the reply by this nonce (post-open it switches to the
-        /// server-minted `session_id`). The standalone `roomler-tunnel`
+        /// server-minted `session_id`). The standalone `roomler`
         /// CLI has a single in-flight open and sends `None`, matching the
         /// reply positionally. `None` is omitted on the wire, so a
         /// pre-P3b-2 server/client stays byte-identical.
@@ -876,20 +927,20 @@ pub enum ClientMsg {
         #[serde(default)]
         endpoints: Vec<String>,
         /// rc.142 — the node can carry WG over a QUIC-over-TURN relay carrier
-        /// (`ROOMLER_AGENT_OVERLAY_QUIC=1`). The server persists it and echoes it
+        /// (`ROOMLERD_OVERLAY_QUIC=1`). The server persists it and echoes it
         /// per-peer in the netmap so QUIC is only attempted when BOTH ends
         /// advertise it (a QUIC/raw split would silently break the pair).
         #[serde(default)]
         supports_quic: bool,
         /// Phase D — the node can carry WG over the v1 single-relay carrier (ONE
-        /// anchor allocation + a raw dialer, `ROOMLER_NODE_OVERLAY_RELAY_SINGLE=1`).
+        /// anchor allocation + a raw dialer, `ROOMLERD_OVERLAY_RELAY_SINGLE=1`).
         /// Persisted + echoed per-peer like `supports_quic`, so single-relay is
         /// only chosen when BOTH ends advertise it (a mixed pair stays on the
         /// both-allocate relay). Absent from a pre-Phase-D node ⇒ `false`.
         #[serde(default)]
         supports_relay_single: bool,
         /// Phase D (DERP) — the node can carry WG over the pubkey-addressed
-        /// `/derp` WS relay (`ROOMLER_NODE_OVERLAY_DERP=1`), the last-resort
+        /// `/derp` WS relay (`ROOMLERD_OVERLAY_DERP=1`), the last-resort
         /// carrier for two BOTH-UDP-blocked peers. Persisted + echoed per-peer
         /// like `supports_relay_single`, so DERP is only chosen when BOTH ends
         /// advertise it. Absent from a pre-DERP node ⇒ `false`.
@@ -932,6 +983,29 @@ pub enum ClientMsg {
         /// the rest. Absent from an older node ⇒ `false` ⇒ ICMP.
         #[serde(default)]
         supports_overlay_echo: bool,
+        /// FR-19 — this node UNDERSTANDS `rc:overlay.relay_session` /
+        /// `rc:overlay.relay_revoke` and the `org-relay` verdict. The server
+        /// never pushes those to a node that has not said so: an unknown
+        /// `ServerMsg` tag is dropped at `debug!` on the agent, which would make
+        /// a minted session evaporate silently. Absent from an older node ⇒
+        /// `false`. ⚠️ Distinct from the `relay-server` RPC verb, which says
+        /// "I SERVE relays" — this says "I can USE one".
+        #[serde(default)]
+        supports_org_relay: bool,
+        /// FR-19 (P3c) — whether this join comes from the device's PRIMARY
+        /// org. Relay serving and relay use are primary-only: a UDP listener
+        /// is host-global, and a secondary org's admin must not be able to
+        /// mint sessions onto the device owner's listener — the same trust
+        /// line `rc:agent.update` draws. `None` (a build that does not say)
+        /// is treated as NOT primary for every relay decision: fail closed.
+        /// P4 sets it from `OrgCtx`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        org_primary: Option<bool>,
+        /// FR-19 (P3c) — the UDP port this node's org-relay server listens
+        /// on when it serves one; the mint pairs it with the node's public
+        /// addresses. `None` ⇒ `peer_relay_limits::DEFAULT_RELAY_PORT`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_port: Option<u16>,
         /// Phase 1 — subnet CIDRs this node offers to route for peers
         /// (`--advertise-routes` / config). The server stores them as *claimed*
         /// routes; an admin must **approve** each before it's distributed in the
@@ -989,6 +1063,22 @@ pub enum ClientMsg {
     /// pushes a `netmap_delta` removing it from peers.
     #[serde(rename = "rc:overlay.leave")]
     OverlayLeave {},
+
+    /// FR-19 P1 — reachability report: can THIS node reach an offered org
+    /// relay's endpoint? Pairwise (node × relay × endpoint), which is why it is
+    /// its own message and not a `CapVector` field — the vector is one
+    /// process-global slot per node. Unknown to a pre-FR-19 server ⇒
+    /// logged-and-ignored on the agent socket, no capability gate needed.
+    #[serde(rename = "rc:overlay.relay_probe")]
+    OverlayRelayProbe {
+        #[serde(with = "oid_hex")]
+        relay_node_id: ObjectId,
+        /// The `ip:port` probed.
+        endpoint: String,
+        reachable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtt_ms: Option<u32>,
+    },
 
     /// Node asks for short-lived coturn credentials to stand up a relay
     /// leg to a specific peer (used when direct hole-punch to that peer
@@ -1092,9 +1182,15 @@ pub enum ServerMsg {
         /// rc.62 — per-session VP9 chroma override forwarded verbatim
         /// from the controller's [`ClientMsg::SessionRequest::chroma_pref`].
         /// `None` / unset means "use the agent's
-        /// `ROOMLER_AGENT_VP9_CHROMA` env-var default".
+        /// `ROOMLERD_VP9_CHROMA` env-var default".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// FR-17 — forwarded verbatim from the controller's
+        /// [`ClientMsg::SessionRequest::chunk_framing`]. `Some(true)` means
+        /// the controller can parse the framed wire format; anything else
+        /// keeps the legacy unframed one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_framing: Option<bool>,
         /// Opt-in system/desktop audio, forwarded verbatim from the
         /// controller's [`ClientMsg::SessionRequest::audio_enabled`]. When
         /// `true` the agent adds a WebRTC Opus audio track (if built with
@@ -1110,6 +1206,18 @@ pub enum ServerMsg {
         /// `AccessPolicy.consent_mode` (self-control → `Auto`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consent_mode: Option<ConsentMode>,
+        /// FR-27 — how long the ON-HOST prompt should stand, which is not
+        /// always `consent_timeout_secs`.
+        ///
+        /// The two coincide for `prompt`, and diverge for `prompt_then_email`:
+        /// the session waits the full async window for the owner's emailed
+        /// link, but the modal on the host's screen has no business standing
+        /// there for five minutes. Sent by the server rather than derived by
+        /// the agent so there is ONE authority for the split; `None` (older
+        /// server) means "use `consent_timeout_secs`", i.e. exactly the
+        /// pre-FR-27 behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_prompt_timeout_secs: Option<u32>,
         /// P6 — the device's input arbitration mode directive from
         /// `AccessPolicy.input_mode`. `None` (older server / unset policy) →
         /// the agent's arbiter default (free). Only the FIRST session's hint
@@ -1162,6 +1270,17 @@ pub enum ServerMsg {
 
     /// Sent to the controller after the agent has consented and is ready for
     /// the SDP offer. Controller now creates its PeerConnection.
+    /// FR-34 — relayed from the agent's [`ClientMsg::ConsentPending`]: the
+    /// host is locked while a consent prompt is pending, so the operator has
+    /// to unlock the machine before they can see and approve it. Advisory; the
+    /// viewer uses it to turn a bare "awaiting consent" into an instruction.
+    #[serde(rename = "rc:consent.pending")]
+    ConsentPending {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        host_locked: bool,
+    },
+
     #[serde(rename = "rc:ready")]
     Ready {
         #[serde(with = "oid_hex")]
@@ -1759,6 +1878,52 @@ pub enum ServerMsg {
         derp_url: Option<String>,
     },
 
+    /// FR-19 — a minted org-relay session, pushed to each MEMBER of the pair.
+    /// Only ever sent to a node that advertised `supports_org_relay` on join.
+    /// The `bind_secret` is per-(session, member): possession of it is what
+    /// "this is the node the session was minted for" means at the relay.
+    #[serde(rename = "rc:overlay.relay_session")]
+    OverlayRelaySession {
+        /// 24-bit session id, unique per relay node.
+        vni: u32,
+        /// Re-mint counter for this (pair, relay); covered by the bind MAC.
+        generation: u64,
+        #[serde(with = "oid_hex")]
+        peer_node_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        relay_node_id: ObjectId,
+        /// The relay's reachable `ip:port`s, measured + static. Try in order.
+        relay_endpoints: Vec<String>,
+        /// This member's bind secret, base64 (32 bytes).
+        bind_secret: String,
+        /// Seconds the relay allows to complete the bind; the agent re-clamps
+        /// against its own clock (server timestamps only ever shorten).
+        bind_secs: u32,
+        /// Absolute session lifetime in seconds, independent of traffic.
+        max_lifetime_secs: u32,
+    },
+
+    /// FR-19 — the same session, pushed to the RELAY node with BOTH members'
+    /// secrets so it can verify either party's bind. Only ever sent to a node
+    /// whose hello advertised the `relay-server` verb.
+    #[serde(rename = "rc:overlay.relay_serve")]
+    OverlayRelayServe {
+        vni: u32,
+        generation: u64,
+        /// The two members. Exactly two — a relay session is a pair.
+        members: Vec<RelayMemberWire>,
+        bind_secs: u32,
+        idle_secs: u32,
+        max_lifetime_secs: u32,
+    },
+
+    /// FR-19 — revoke a session immediately, on relay AND members. Pushed on
+    /// org mode-off, ACL revoke, policy revoke and device removal. Revocation
+    /// is a push rather than an expiry because a session's idle deadline is
+    /// refreshed by traffic and never fires under a WireGuard keepalive.
+    #[serde(rename = "rc:overlay.relay_revoke")]
+    OverlayRelayRevoke { vni: u32 },
+
     /// Multi-region relay PoPs: the probe-target list the server pushes to a
     /// node that advertised `supports_relay_regions` (hello-gated — the agent's
     /// `ServerMsg` deserializer errors on unknown variants, so this is NEVER
@@ -1808,6 +1973,16 @@ pub struct CapVectorWire {
     /// The central `/derp` WS is up + registered (the floor's health).
     #[serde(default)]
     pub derp_ws_ok: bool,
+}
+
+/// One member of an org-relay session as pushed to the relay in
+/// [`ServerMsg::OverlayRelayServe`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RelayMemberWire {
+    /// base64 WireGuard public key — the member's identity as the mint names it.
+    pub wg_public_key: String,
+    /// base64 32-byte bind secret for THIS member.
+    pub bind_secret: String,
 }
 
 /// One relay region as pushed in [`ServerMsg::RelayRegions`] — the probe
@@ -1874,7 +2049,7 @@ pub struct AgentSysStats {
     /// peer-to-peer data channel, which is why `tunnel_audit.bytes_in`/
     /// `bytes_out` have held a literal 0 on every row ever written. These
     /// two are DEVICE-attributed — a daemon-supervised forward belongs to
-    /// the host, not to a person. A dedicated `roomler-tunnel` client's
+    /// the host, not to a person. A dedicated `roomler` client's
     /// flows are user-owned and still report nothing; that needs the same
     /// counters wired into the CLI's own heartbeat.
     ///
@@ -1977,6 +2152,11 @@ pub struct LocalRelayDescriptor {
 /// back to its local computation, so adding a variant later is
 /// forward-compatible.
 ///
+/// ⚠️ That last sentence is only true because [`NetmapPeer::relay_strategy`]
+/// decodes through [`relay_strategy_lenient`]. The derive alone does **not**
+/// deliver it — see that function for what happens without it. Any *new*
+/// field or message carrying this type must use the same shim.
+///
 /// Anchor/dialer symmetry is the whole reason this is server-computed: the
 /// server holds BOTH ends' pubkeys, so it stamps exactly one end
 /// `SingleRelayAnchor` and the other `SingleRelayDialer` — the client's own
@@ -1993,6 +2173,51 @@ pub enum RelayStrategyWire {
     Derp,
     /// Two coturn allocations (the fall-through).
     BothAllocate,
+    /// FR-19 — ride a tenant-owned org relay. A UNIT variant on purpose: this
+    /// enum derives `Copy` and is serialised as a bare string tag, so the
+    /// session itself travels out-of-band in `rc:overlay.relay_session`.
+    /// Only ever emitted to a peer whose join advertised `supports_org_relay`;
+    /// a pre-FR-19 agent that somehow received it decodes it to `None` via
+    /// `relay_strategy_lenient` (#811) rather than losing the frame.
+    OrgRelay,
+}
+
+/// Lenient decoder for [`NetmapPeer::relay_strategy`]: an **unrecognised**
+/// tag becomes `None` instead of failing the parse.
+///
+/// ⚠️ Without this, [`RelayStrategyWire`]'s own doc comment is a lie with
+/// fleet-wide consequences, and the failure is invisible. The enum is
+/// externally tagged with only unit variants, so it decodes from a bare
+/// string; `#[serde(default)]` on the field covers an **absent** value and
+/// does nothing for an **unknown** one. An unknown tag is therefore a hard
+/// serde error that fails the *whole enclosing `ServerMsg`* — not just this
+/// field, not just this peer — and the agent's parse arm swallows that at
+/// `debug!`. So the first server to add a variant would make every older
+/// agent drop entire netmap frames and stop installing peers, silently.
+///
+/// `#[serde(other)]` cannot express this: serde permits it only on
+/// internally or adjacently tagged enums, and this one is neither.
+///
+/// Unknown ⇒ `None` ⇒ the client computes the tier locally — precisely what
+/// an absent field already means, so every existing consumer handles it with
+/// no new arm. A non-string value degrades the same way rather than
+/// exploding, so a future variant that grows a payload is survivable too.
+fn relay_strategy_lenient<'de, D>(de: D) -> Result<Option<RelayStrategyWire>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(tag) = raw else {
+        return Ok(None);
+    };
+    // Re-parse through the derive so the kebab-case spellings live in exactly
+    // one place; a rename cannot drift away from this shim.
+    Ok(RelayStrategyWire::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(tag.as_str()),
+    )
+    .ok())
 }
 
 /// One peer in a netmap. `node_id` is the peer's `overlay_nodes._id`
@@ -2049,6 +2274,11 @@ pub struct NetmapPeer {
     /// pre-Phase-C server/peer stays "unknown" (attempted, never skipped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srflx_nat: Option<String>,
+    /// FR-19 — echoed from the peer's join so a node knows whether its peer can
+    /// use an org relay (both ends must). Skipped when `false` so a pre-FR-19
+    /// node's netmap shape is byte-identical.
+    #[serde(default, skip_serializing_if = "<&bool as std::ops::Not>::not")]
+    pub supports_org_relay: bool,
     /// Phase B (overlay v3) — this peer's MEASURED capability vector, or
     /// `None` when the peer hasn't measured (pre-B agent) or its vector went
     /// STALE (the server's freshness gate treats >3× cadence as absent — a
@@ -2113,7 +2343,15 @@ pub struct NetmapPeer {
     /// `supports_server_relay_strategy`; `None` otherwise (and for every
     /// pre-U2 server), in which case the client computes the tier locally as
     /// before. Skipped-when-None so a pre-U2 node's wire shape is unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// ⚠️ Decodes through [`relay_strategy_lenient`], NOT the bare derive:
+    /// an unknown tag from a newer server must degrade to `None`, not fail
+    /// the whole `ServerMsg`. Do not "simplify" this back to `#[serde(default)]`.
+    #[serde(
+        default,
+        deserialize_with = "relay_strategy_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub relay_strategy: Option<RelayStrategyWire>,
     /// Data-probe — this peer's overlay engine answers the overlay-native
     /// echo probe inline. The prober uses the engine echo toward such peers
@@ -2551,6 +2789,7 @@ mod tests {
             browser_caps: vec!["h264".into(), "h265".into()],
             preferred_transport: None,
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: false,
             override_reason: None,
             local_relay: None,
@@ -2573,6 +2812,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: Some("data-channel-vp9-444".into()),
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: true,
             override_reason: None,
             local_relay: None,
@@ -2593,6 +2833,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: None,
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: false,
             override_reason: None,
             local_relay: Some(LocalRelayDescriptor {
@@ -2635,6 +2876,7 @@ mod tests {
             sys: None,
             srflx_count: Some(2),
             warm_relay: Some("5.9.157.221:12586".into()),
+            companion_version: Some("0.4.16".into()),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.heartbeat""#));
@@ -2654,6 +2896,7 @@ mod tests {
                 sys,
                 srflx_count,
                 warm_relay,
+                companion_version,
             } => {
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
@@ -2661,9 +2904,11 @@ mod tests {
                 assert!(sys.is_none());
                 assert_eq!(srflx_count, Some(2));
                 assert_eq!(warm_relay.as_deref(), Some("5.9.157.221:12586"));
+                assert_eq!(companion_version.as_deref(), Some("0.4.16"));
             }
             other => panic!("wrong variant: {other:?}"),
         }
+        assert!(s.contains(r#""companion_version":"0.4.16""#));
         // A stage-1 agent omits the field — decodes as None, and a
         // warm-less stage-2 agent's None must not serialize at all.
         let stage1 = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":1}"#;
@@ -2672,6 +2917,16 @@ mod tests {
             back,
             ClientMsg::AgentHeartbeat {
                 warm_relay: None,
+                ..
+            }
+        ));
+        // FR-27 — same rule for the companion version: a pre-FR-27 agent omits
+        // it, and that must decode as "not reported", never as an empty string
+        // the grid would render as a version.
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(stage1).unwrap(),
+            ClientMsg::AgentHeartbeat {
+                companion_version: None,
                 ..
             }
         ));
@@ -2736,6 +2991,10 @@ mod tests {
             // distinguishable on the wire from an agent that doesn't report.
             srflx_count: Some(0),
             warm_relay: None,
+            // No companion on this host — must not serialize at all, so a
+            // server reading it cannot tell it apart from an old agent (both
+            // mean "nothing to show").
+            companion_version: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -2875,7 +3134,7 @@ mod tests {
         // `rc:goodbye` frame, the old agent's `serde_json::from_str`
         // returns `Err` and the existing `Err(e) => debug!(…,
         // "ignoring non-rc:* frame")` arm at
-        // `agents/roomler-agent/src/signaling.rs:333` swallows it
+        // `agents/roomlerd/src/signaling.rs:333` swallows it
         // silently — no panic, no fatal exit.
         //
         // We simulate the rc.52 ServerMsg shape via a stripped local
@@ -3626,6 +3885,9 @@ mod tests {
             supports_derp: true,
             supports_forced_derp: true,
             supports_overlay_echo: false,
+            supports_org_relay: false,
+            org_primary: None,
+            relay_port: None,
             supports_server_relay_strategy: true,
             supports_derp_floor: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
@@ -4163,6 +4425,7 @@ mod tests {
                 supports_derp: true,
                 supports_forced_derp: true,
                 supports_derp_floor: false,
+                supports_org_relay: false,
                 supports_overlay_echo: false,
                 relay_strategy: Some(RelayStrategyWire::SingleRelayDialer),
                 routes: vec!["10.0.0.0/24".into()],
@@ -4290,6 +4553,185 @@ mod tests {
         }"#;
         let p: NetmapPeer = serde_json::from_str(json).unwrap();
         assert!(p.agent_id.is_none());
+    }
+
+    /// FR-19 wire locks: the three relay-session tags, raw-hex ObjectIds, the
+    /// skipped-when-absent `rtt_ms`, and the `org-relay` verdict string. A
+    /// rename here does not fail loudly — it makes every deployed device look
+    /// like it lacks the feature.
+    #[test]
+    fn org_relay_messages_wire_roundtrip_and_tags_are_locked() {
+        let oid = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let m = ServerMsg::OverlayRelaySession {
+            vni: 0x0042_4242,
+            generation: 3,
+            peer_node_id: oid,
+            relay_node_id: oid,
+            relay_endpoints: vec!["62.210.194.66:3478".into()],
+            bind_secret: "AAAA".into(),
+            bind_secs: 30,
+            max_lifetime_secs: 3600,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_session""#), "{s}");
+        assert!(
+            s.contains(r#""peer_node_id":"507f1f77bcf86cd799439011""#),
+            "ObjectIds must be raw hex, not $oid: {s}"
+        );
+        let ServerMsg::OverlayRelaySession {
+            vni, generation, ..
+        } = serde_json::from_str(&s).unwrap()
+        else {
+            panic!("relay_session must round-trip");
+        };
+        assert_eq!((vni, generation), (0x0042_4242, 3));
+
+        let m = ServerMsg::OverlayRelayServe {
+            vni: 7,
+            generation: 1,
+            members: vec![
+                RelayMemberWire {
+                    wg_public_key: "a".into(),
+                    bind_secret: "b".into(),
+                },
+                RelayMemberWire {
+                    wg_public_key: "c".into(),
+                    bind_secret: "d".into(),
+                },
+            ],
+            bind_secs: 30,
+            idle_secs: 300,
+            max_lifetime_secs: 3600,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_serve""#), "{s}");
+        let ServerMsg::OverlayRelayServe { members, .. } = serde_json::from_str(&s).unwrap() else {
+            panic!("relay_serve must round-trip");
+        };
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[1].bind_secret, "d");
+
+        let s = serde_json::to_string(&ServerMsg::OverlayRelayRevoke { vni: 7 }).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_revoke""#), "{s}");
+
+        let m = ClientMsg::OverlayRelayProbe {
+            relay_node_id: oid,
+            endpoint: "62.210.194.66:3478".into(),
+            reachable: true,
+            rtt_ms: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_probe""#), "{s}");
+        assert!(!s.contains("rtt_ms"), "an absent rtt must be skipped: {s}");
+
+        assert_eq!(
+            serde_json::to_string(&RelayStrategyWire::OrgRelay).unwrap(),
+            r#""org-relay""#
+        );
+    }
+
+    /// The join flag and its netmap echo both default to `false`, and the echo
+    /// is SKIPPED when false, so a pre-FR-19 node's netmap shape is unchanged.
+    #[test]
+    fn supports_org_relay_defaults_false_and_is_skipped_in_the_netmap() {
+        let json = r#"{"node_id":"507f1f77bcf86cd799439011","overlay_ip":"100.64.0.4",
+                       "name":"d","wg_public_key":"cGVlcg==","reachable":true}"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert!(!p.supports_org_relay);
+        assert!(
+            !serde_json::to_string(&p)
+                .unwrap()
+                .contains("supports_org_relay"),
+            "false must be skipped, not serialised"
+        );
+    }
+
+    /// The regression this shim exists for, at the level where it actually
+    /// bites: a NEWER server stamps a `relay_strategy` tag this build has
+    /// never heard of, and an OLDER agent must still parse the **whole
+    /// netmap** and install its peers.
+    ///
+    /// Without `relay_strategy_lenient` the unknown tag is a hard serde error
+    /// on the enclosing `ServerMsg` — the frame is lost, not the field — and
+    /// the agent's parse arm swallows it at `debug!`. That is a fleet-wide,
+    /// silent peer-install outage triggered by a server-side deploy, which is
+    /// why this asserts the surviving peer's other fields too: "it parsed" is
+    /// the claim, not merely "the enum was None".
+    #[test]
+    fn unknown_relay_strategy_tag_keeps_the_whole_netmap_parseable() {
+        let json = r#"{
+            "t":"rc:overlay.netmap",
+            "self_ip":"100.64.0.2",
+            "network":{"cidr":"100.64.0.0/10","mtu":1280},
+            "epoch":7,
+            "peers":[{
+                "node_id":"507f1f77bcf86cd799439011",
+                "overlay_ip":"100.64.0.4",
+                "name":"devbox",
+                "wg_public_key":"cGVlcg==",
+                "reachable":true,
+                "relay_strategy":"some-future-relay-kind"
+            }]
+        }"#;
+        let msg: ServerMsg =
+            serde_json::from_str(json).expect("unknown tag must not fail the frame");
+        let ServerMsg::OverlayNetmap { peers, epoch, .. } = msg else {
+            panic!("expected an OverlayNetmap");
+        };
+        assert_eq!(epoch, 7);
+        assert_eq!(peers.len(), 1, "the peer must survive, not be dropped");
+        assert_eq!(peers[0].name, "devbox");
+        assert_eq!(peers[0].overlay_ip, "100.64.0.4");
+        assert!(
+            peers[0].relay_strategy.is_none(),
+            "unknown ⇒ None ⇒ the client derives the tier locally, exactly as for an absent field"
+        );
+    }
+
+    /// Leniency must not swallow the values that DO exist — a shim that
+    /// mapped everything to `None` would pass the test above while silently
+    /// disabling the server verdict fleet-wide.
+    #[test]
+    fn every_known_relay_strategy_tag_still_decodes() {
+        for (tag, want) in [
+            ("single-relay-anchor", RelayStrategyWire::SingleRelayAnchor),
+            ("single-relay-dialer", RelayStrategyWire::SingleRelayDialer),
+            ("derp", RelayStrategyWire::Derp),
+            ("both-allocate", RelayStrategyWire::BothAllocate),
+            ("org-relay", RelayStrategyWire::OrgRelay),
+        ] {
+            let json = format!(
+                r#"{{"node_id":"507f1f77bcf86cd799439011","overlay_ip":"100.64.0.4",
+                     "name":"d","wg_public_key":"cGVlcg==","reachable":true,
+                     "relay_strategy":"{tag}"}}"#
+            );
+            let p: NetmapPeer = serde_json::from_str(&json).unwrap();
+            assert_eq!(p.relay_strategy, Some(want), "tag {tag} must still decode");
+            // …and still serialise back to the same tag.
+            let s = serde_json::to_string(&p).unwrap();
+            assert!(s.contains(&format!(r#""relay_strategy":"{tag}""#)), "{s}");
+        }
+    }
+
+    /// Absent, `null`, and a non-string shape all mean "no verdict". The last
+    /// case matters because a future variant that grows a payload would arrive
+    /// as a map, and an older agent must degrade rather than lose the frame.
+    #[test]
+    fn relay_strategy_absent_null_and_non_string_all_decode_to_none() {
+        let base = r#""node_id":"507f1f77bcf86cd799439011","overlay_ip":"100.64.0.4",
+                      "name":"d","wg_public_key":"cGVlcg==","reachable":true"#;
+        for tail in [
+            String::new(),
+            r#","relay_strategy":null"#.to_string(),
+            r#","relay_strategy":{"org-relay":{"vni":7}}"#.to_string(),
+            r#","relay_strategy":42"#.to_string(),
+        ] {
+            let p: NetmapPeer = serde_json::from_str(&format!("{{{base}{tail}}}")).unwrap();
+            assert!(
+                p.relay_strategy.is_none(),
+                "tail {tail} must decode to None"
+            );
+        }
     }
 
     /// Back-compat both directions for the Phase-A `lan_endpoints` field: a

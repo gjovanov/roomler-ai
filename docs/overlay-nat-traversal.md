@@ -20,11 +20,12 @@ order, and demotes to the next tier if it can't establish:
 
 | Tier | Carrier | When it wins | Flag (default) |
 |---|---|---|---|
-| LAN direct | UDP on the shared interface socket | peer shares one of our /24s | `ROOMLER_NODE_OVERLAY_DIRECT` (**on**) |
-| **A** direct-to-public | UDP via an unbound egress socket | peer's NIC holds a public IP | `ROOMLER_NODE_OVERLAY_PUBLIC_DIRECT` (**off**) |
-| **C** srflx hole-punch | UDP via the **punch socket** | both ends NAT'd (not both symmetric) | `ROOMLER_NODE_OVERLAY_SRFLX` (**on** since rc.200) |
-| **D** single-relay | ONE coturn allocation + a raw dialer, QUIC-over-TURN | nothing direct works **and ≥1 side is UDP-capable** | `ROOMLER_NODE_OVERLAY_RELAY_SINGLE` (**on** since rc.200) |
-| **D″** DERP | `/derp` WSS on `roomler.ai:443`, pubkey-addressed, raw WG | **both** ends UDP-blocked (TCP-only net) | `ROOMLER_NODE_OVERLAY_DERP` (**on** since rc.203) |
+| LAN direct | UDP on the shared interface socket | peer shares one of our /24s | `ROOMLERD_OVERLAY_DIRECT` (**on**) |
+| **A** direct-to-public | UDP via an unbound egress socket | peer's NIC holds a public IP | `ROOMLERD_OVERLAY_PUBLIC_DIRECT` (**off**) |
+| **C** srflx hole-punch | UDP via the **punch socket** | both ends NAT'd (not both symmetric) | `ROOMLERD_OVERLAY_SRFLX` (**on** since rc.200) |
+| **D** single-relay | ONE coturn allocation + a raw dialer, QUIC-over-TURN | nothing direct works **and ≥1 side is UDP-capable** | `ROOMLERD_OVERLAY_RELAY_SINGLE` (**on** since rc.200) |
+| **D″** DERP | `/derp` WSS on `roomler.ai:443`, pubkey-addressed, raw WG | **both** ends UDP-blocked (TCP-only net) | `ROOMLERD_OVERLAY_DERP` (**on** since rc.203) |
+| **D‴** org relay | a tenant-owned `roomlerd` forwarding Geneve-framed WG ciphertext on UDP 3478 (FR-19) | the server **minted a session** for the pair (org switch, ACL grant per member, an approved + serving relay) — a relay *kind* beside TURN/DERP, not a new tier | `ROOMLERD_OVERLAY_ORG_RELAY` (**off**) |
 | **D′** both-allocate relay | two coturn allocations (raw / QUIC) | single-relay off, or a mixed-capability pair | always available (fall-through) |
 
 LAN direct and the relay predate this work (rc.131–rc.135; the relay is the
@@ -133,7 +134,7 @@ filter, so the mismatch is harmless there.)
 
 A UDP NAT mapping expires on an idle node (30 s – 5 min). A gather-once srflx
 goes stale for a peer that joins later. The keepalive task (`run_srflx_keepalive`,
-`ROOMLER_NODE_OVERLAY_SRFLX_KEEPALIVE_SECS`, default 20, `0` = off) re-runs a
+`ROOMLERD_OVERLAY_SRFLX_KEEPALIVE_SECS`, default 20, `0` = off) re-runs a
 STUN Binding on the punch socket every interval — both holding the mapping open
 and detecting a change.
 
@@ -355,7 +356,7 @@ cascade's guarantees while replacing its reactive counters:
   against it, because only the server can flip both ends of a pair
   atomically.
 
-`ROOMLER_NODE_OVERLAY_PATHMON` (default `on`) now governs only telemetry
+`ROOMLERD_OVERLAY_PATHMON` (default `on`) now governs only telemetry
 verbosity (the 10-min decision summaries); selection is always
 monitor-driven — rollback is a release revert, not an env flip.
 
@@ -444,7 +445,7 @@ each behind its own nftables NAT gateway:
   a mid-punch mapping rotation.
 
 Server = prod `roomler.ai` (already wire-capable); test daemons run the branch
-build via `--config` with `ROOMLER_NODE_OVERLAY_SRFLX=1` set only on them. The
+build via `--config` with `ROOMLERD_OVERLAY_SRFLX=1` set only on them. The
 matrix: cone↔cone punches ≤ ~10 s (both `Direct`, zero coturn allocations for
 the pair); cone↔symmetric attempts once then relays; symmetric↔symmetric skips
 up-front to relay; install skew converges via the re-upgrade tick; stale-srflx

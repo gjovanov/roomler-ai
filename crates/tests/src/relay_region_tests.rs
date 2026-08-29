@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Multi-region relay PoPs — integration coverage for the region registry.
 //!
 //! The load-bearing guarantee is the FLAG-OFF one: with

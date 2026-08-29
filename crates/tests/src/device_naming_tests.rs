@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Device naming: admin rename (fleet + overlay/MagicDNS propagation),
 //! display_name, tags — and the rehydrate-clobber rule.
 //!
@@ -271,6 +273,7 @@ async fn rename_propagates_to_live_overlay_node_with_dedup() {
         supports_server_relay_strategy: false,
         supports_derp_floor: false,
         supports_overlay_echo: false,
+        supports_org_relay: false,
         advertised_routes: vec![],
     };
     // A neighbour already OWNS the label the rename will want — forces the

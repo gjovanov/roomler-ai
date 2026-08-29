@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Peer-establishment half of [`OverlayRuntime`] — split out of `runtime.rs`
 //! (rc.284, pure move): the direct-tier LAN context, the netmap
 //! install/evict pipeline, make-before-break upgrade probes, the
@@ -767,7 +769,7 @@ impl OverlayRuntime {
 
     /// rc.131 — bind the shared direct-carrier socket + discover our LAN
     /// endpoint. Only in Relay mode (Direct mode is the loopback test/helper
-    /// path) and when `ROOMLER_AGENT_OVERLAY_DIRECT` isn't disabled. `None` if
+    /// path) and when `ROOMLERD_OVERLAY_DIRECT` isn't disabled. `None` if
     /// disabled, not relay mode, the bind fails, or there's no usable LAN IP
     /// (offline / CGNAT-only) — the node then stays relay-only as before.
     pub(super) async fn setup_direct(&self) -> Option<DirectCtx> {

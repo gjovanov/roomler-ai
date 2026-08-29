@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <div class="conference-root">
     <div class="conference-row">
@@ -90,6 +92,7 @@
               v-bind="layoutProps"
               @toggle-pin="handleTogglePin"
               @request-pip="handlePiP"
+              @spotlight="handleSpotlight"
             />
 
           </div>
@@ -297,6 +300,7 @@ const layoutCtrl = useConferenceLayout(
   activeSpeakerKeyRef,
   getDisplayName,
   localDisplayName,
+  { video: conferenceStore.remoteVideoPaused, audio: conferenceStore.remoteAudioPaused },
 )
 
 const layoutComponent = computed<Component>(() => {
@@ -321,12 +325,15 @@ const layoutProps = computed(() => {
       activeSpeakerKey: speakerKey,
     }
   }
-  // spotlight or sidebar
+  // spotlight or sidebar — `selfViewMode` used to be omitted here, which is
+  // why "in grid (cropped/uncropped)" appeared dead: Auto resolves to one of
+  // these two for screen shares and for any call of two people (FR-25).
   return {
     primary: l.primary,
     secondary: l.secondary,
     selfParticipant: l.selfViewFloating ? selfP : null,
     selfViewFloating: l.selfViewFloating,
+    selfViewMode: layoutCtrl.prefs.value.selfViewMode,
     activeSpeakerKey: speakerKey,
   }
 })
@@ -335,25 +342,37 @@ function handleTogglePin(streamKey: string) {
   layoutCtrl.togglePin(streamKey)
 }
 
-function handlePiP(streamKey: string) {
+function handleSpotlight(streamKey: string) {
+  layoutCtrl.toggleSpotlight(streamKey)
+}
+
+/**
+ * FR-25 — the tile lookup depends on `data-stream-key`, which no layout was
+ * passing, so this silently found nothing and PiP looked broken. The layouts
+ * bind it now; a miss here is worth saying out loud rather than swallowing.
+ */
+async function handlePiP(streamKey: string) {
   const videoEl = document.querySelector(
     `video[data-stream-key="${streamKey}"]`,
   ) as HTMLVideoElement | null
-  if (videoEl) {
-    pip.requestPiP(videoEl)
+  if (!videoEl) {
+    snackbar.showError('That video is not on screen right now')
+    return
   }
+  const failure = await pip.requestPiP(videoEl)
+  if (failure) snackbar.showError(failure)
 }
 
 function togglePiP() {
   if (pip.isPiPActive.value) {
     pip.exitPiP()
-  } else {
-    const speakerKey = conferenceStore.activeSpeakerKey
-    const targetKey = speakerKey || (conferenceStore.remoteStreams.keys().next().value as string | undefined)
-    if (targetKey) {
-      handlePiP(targetKey)
-    }
+    return
   }
+  // Prefer the speaker, then any remote, then yourself — a solo call used
+  // to fall off the end of this and do nothing at all.
+  const speakerKey = conferenceStore.activeSpeakerKey
+  const firstRemote = conferenceStore.remoteStreams.keys().next().value as string | undefined
+  handlePiP(speakerKey || firstRemote || 'local')
 }
 
 const statusColor = computed(() => {

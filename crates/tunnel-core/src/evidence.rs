@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay evidence counters — process-global, always compiled (increment
 //! sites may live behind features/cfgs; a build without them reports honest
 //! zeros). Cumulative since daemon start — consumers DIFF two readings,

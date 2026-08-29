@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use mongodb::{Database, IndexModel, options::IndexOptions};
 use tracing::info;
 
@@ -254,7 +256,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
-    // roomler-tunnel clients — same uniqueness contract as agents
+    // tunnel clients — same uniqueness contract as agents
     // (re-enroll-on-same-machine rehydrates the soft-deleted row in
     // place). `owner_user_id` index speeds the "my tunnel clients"
     // view on the user-facing dashboard.
@@ -429,6 +431,25 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
             index(bson::doc! { "tenant_id": 1, "at": -1 }),
             index(bson::doc! { "agent_id": 1, "at": -1 }),
             index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
+    // FR-19 peer-relay decisions — approvals (who made a device a relay) and
+    // mints (what was routed through it), granted or refused. `agent_id`
+    // answers both halves of the incident-review question in one query,
+    // `requester_node_id` is what a rate-limit forensics pass walks, and the
+    // TTL is the same 90 days as the other decision logs: making a device a
+    // chokepoint for the tenant's traffic is the same class of event as
+    // opening exec on it.
+    create_indexes(
+        db,
+        "peer_relay_audit",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "requester_node_id": 1, "at": -1 }),
             index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
         ],
     )

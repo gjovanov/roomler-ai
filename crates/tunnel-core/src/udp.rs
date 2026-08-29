@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Client-side SOCKS5 UDP ASSOCIATE relay (RFC 1928 §7).
 //!
 //! On a UDP ASSOCIATE the client binds a local UDP relay socket, returns

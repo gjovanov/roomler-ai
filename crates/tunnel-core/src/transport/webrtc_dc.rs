@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `webrtc-dc-v1` transport — WebRTC SCTP DataChannels.
 //!
 //! [`TunnelPeer`] wraps an `RTCPeerConnection` and pre-negotiates a
 //! fixed pool of 8 ordered + reliable DataChannels with deterministic
-//! stream IDs (100, 102, 104, … 114). Each `roomler-tunnel forward`
+//! stream IDs (100, 102, 104, … 114). Each `roomler forward`
 //! invocation owns one `TunnelPeer`; multiple concurrent TCP flows
 //! multiplex onto the pool via [`crate::mux`]'s 4-byte `flow_id`
 //! prefix. Per plan §"What changed from v1" #1 (DC-per-flow was wrong;
@@ -87,7 +89,7 @@ impl TunnelPeer {
         // `0.0.0.0:5353` per agent. Disabling it removes ~2/3 of the sockets
         // an agent holds (see the `Drop` impl for the leak this compounded)
         // and stops us contending for a port the OS resolver already owns on
-        // Windows — the same unreliability `roomler-agent`'s
+        // Windows — the same unreliability `roomlerd`'s
         // `mdns_resolve` module exists to route around.
         setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
 

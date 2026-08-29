@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Reading cookies off a request, in one place.
 //!
 //! There were three hand-rolled parsers before this — in the auth extractor,

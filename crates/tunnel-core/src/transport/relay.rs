@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Phase 3 core: run a quinn QUIC endpoint over an **arbitrary relayed
 //! datagram connection** instead of a real UDP socket.
 //!

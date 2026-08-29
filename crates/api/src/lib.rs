@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 pub mod cluster;
 pub mod cookies;
 pub mod error;
@@ -404,6 +406,13 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{agent_id}/desired-config",
             put(routes::remote_config::set_desired_config),
+        )
+        // FR-19 gate 3 — approve a device as an org relay. MANAGE_AGENTS +
+        // EXEC_DEVICE (there is no free permission bit; routes/peer_relay.rs
+        // says why), audited on both arms.
+        .route(
+            "/{agent_id}/peer-relay-policy",
+            put(routes::peer_relay::set_policy),
         );
 
     // Remote-control session routes (tenant-scoped)
@@ -455,7 +464,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{token}/approve", post(routes::consent::approve_consent))
         .route("/{token}/deny", post(routes::consent::deny_consent));
 
-    // roomler-tunnel routes — same enrollment two-step shape as the
+    // roomler-cli routes — same enrollment two-step shape as the
     // agent, but a distinct audience (`TunnelClient` JWT) so a leaked
     // agent token can't impersonate a client and vice-versa. CRUD +
     // policy + audit endpoints land in T2.
@@ -523,6 +532,14 @@ pub fn build_router(state: AppState) -> Router {
     // tenant-scoped rather than per-device: the switch governs every device,
     // and the log is the org-wide "what ran on my fleet?" view.
     let exec_audit_routes = Router::new().route("/", get(routes::agent_exec::audit));
+    // FR-19 — peer relays: the org switch + approved-relay listing, and the
+    // decision log. Approval itself is on the agent router (gate 3 is per
+    // device).
+    let peer_relay_routes = Router::new().route(
+        "/",
+        get(routes::peer_relay::get_settings).put(routes::peer_relay::set_mode),
+    );
+    let peer_relay_audit_routes = Router::new().route("/", get(routes::peer_relay::audit));
     let ssh_audit_routes = Router::new().route("/", get(routes::agent_ssh::audit));
     let ssh_activity_routes = Router::new().route("/", get(routes::agent_ssh::activity));
     let exec_settings_routes = Router::new().route(
@@ -557,7 +574,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/agents", get(routes::tunnel::list_tenant_agents));
 
     // `/api/tunnel/{latest-release,installer/{platform}}` — public
-    // GitHub-Releases proxy for the roomler-tunnel binary. Same
+    // GitHub-Releases proxy for the roomler CLI binary. Same
     // shape + lifecycle as `/api/agent/{latest-release,installer/...}`
     // but a separate namespace so the two artifact sets don't collide.
     let public_tunnel_release_routes = Router::new()
@@ -663,6 +680,12 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
         .nest("/admin/stats", admin_stats_routes)
+        // FR-32 P1c — "who would break if enforcement were turned on?".
+        // Platform-admin only (404 on miss, like the rest of /admin).
+        .route(
+            "/admin/plan-compliance",
+            get(routes::plan_compliance::admin_plan_compliance),
+        )
         // The block registry is GLOBAL, so reclaiming from it is a platform
         // operation, not a tenant one. Dry-run by default.
         .route(
@@ -702,6 +725,11 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/overlay-block", overlay_block_routes)
         .nest("/tenant/{tenant_id}/stats", tenant_stats_routes)
         .nest("/tenant/{tenant_id}/exec-audit", exec_audit_routes)
+        .nest("/tenant/{tenant_id}/peer-relay", peer_relay_routes)
+        .nest(
+            "/tenant/{tenant_id}/peer-relay-audit",
+            peer_relay_audit_routes,
+        )
         .nest("/tenant/{tenant_id}/ssh-audit", ssh_audit_routes)
         .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity_routes)
         .nest("/tenant/{tenant_id}/exec-settings", exec_settings_routes)

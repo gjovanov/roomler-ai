@@ -87,7 +87,7 @@ Orthogonal to the dials (the P7→P8 "sharp all the time" arc):
 ## Config / env reference
 
 All keys live in the agent config (`roomler config set …`) with
-`ROOMLER_AGENT_*` env twins; restart required.
+`ROOMLERD_*` env twins; restart required.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -98,8 +98,8 @@ All keys live in the agent config (`roomler config set …`) with
 | `constrained_cq_relief` | 4 | CQ softening at a sub-native rung on relay — only reachable via explicit picks / restored rungs |
 | `idle_refine_settle_constrained_ms` | 1200 | Up-flip settle on relay when a rung exists |
 | `gpu_scale` / `scale_threads` | on / 1 | HW-downscale Phase A/B levers (only active when something scales) |
-| `ROOMLER_AGENT_RELAY_MAX_KBPS` | 3000 | The constrained-transport ceiling clamp |
-| `ROOMLER_AGENT_SMOOTH_MAX_EDGE` / `RELAY_MAX_EDGE` | 1024 / 1280 | Rung sizes when `priority_res_cap` is on |
+| `ROOMLERD_RELAY_MAX_KBPS` | 3000 | The constrained-transport ceiling clamp |
+| `ROOMLERD_SMOOTH_MAX_EDGE` / `RELAY_MAX_EDGE` | 1024 / 1280 | Rung sizes when `priority_res_cap` is on |
 
 ## Field history (why it is shaped this way)
 

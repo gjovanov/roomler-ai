@@ -24,7 +24,7 @@ on:
     branches: [master]
     paths:
       - 'crates/**'
-      - 'agents/roomler-agent/**'
+      - 'agents/roomlerd/**'
       - '.github/workflows/integration-tests.yml'
   # ⚠️ On PRs this used to fire ONLY for `crates/tests/**` — i.e. when someone
   # edited the tests, not when they edited what the tests cover. A change to a
@@ -48,6 +48,14 @@ on:
       - 'crates/services/src/dao/**'
       - 'crates/api/src/routes/**'
       - 'crates/api/src/ws/**'
+      # Added 2026-08-28: these two carry the overlay/wire code the suite's
+      # agent + DERP + relay-region tests actually drive, and their absence
+      # was not theoretical — FR-19 P1a (#816) touched `crates/tunnel-core/**`
+      # and this lane did not run on the PR at all, only after the merge. That
+      # is the exact "verified only post-merge" state the comment above says
+      # this filter exists to prevent.
+      - 'crates/tunnel-core/**'
+      - 'crates/remote_control/**'
       - '.github/workflows/integration-tests.yml'
   workflow_dispatch:
     inputs:

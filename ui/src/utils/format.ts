@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 // Shared display formatters for the stats surfaces.
 //
 // `null` is deliberately distinct from `0` throughout: a class whose bytes
