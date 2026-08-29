@@ -321,9 +321,9 @@ mod tests {
     #[test]
     fn kill_switch_refuses_to_open() {
         // SAFETY: single-threaded test process; no other thread reads env here.
-        unsafe { std::env::set_var("ROOMLERD_X11_DAMAGE", "0") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "X11_DAMAGE", "0") };
         assert!(DamageTracker::open().is_none());
-        unsafe { std::env::remove_var("ROOMLERD_X11_DAMAGE") };
+        unsafe { tunnel_core::env::test_env::clear("X11_DAMAGE") };
     }
 
     /// `open()` must never panic and never propagate an error, on any host —
@@ -331,7 +331,7 @@ mod tests {
     /// `None` that costs performance, never a capture backend that won't start.
     #[test]
     fn open_is_infallible_without_a_display() {
-        unsafe { std::env::remove_var("ROOMLERD_X11_DAMAGE") };
+        unsafe { tunnel_core::env::test_env::clear("X11_DAMAGE") };
         unsafe { std::env::set_var("DISPLAY", ":-1-not-a-display") };
         let _ = DamageTracker::open();
         unsafe { std::env::remove_var("DISPLAY") };
