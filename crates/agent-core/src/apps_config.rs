@@ -4,7 +4,7 @@
 //! P3e lever E: ONLY the serde types live here — [`crate::config::AgentConfig`]
 //! embeds [`VirtualDesktopAppsConfig`], so the types must be nameable without
 //! the launch machinery. The window-manager trait, the platform backends, and
-//! the process-global `APPS_CONFIG` install stay in `roomler-agent`'s
+//! the process-global `APPS_CONFIG` install stay in `roomlerd`'s
 //! `apps` module, which re-exports these types under their old paths.
 
 use std::collections::BTreeMap;

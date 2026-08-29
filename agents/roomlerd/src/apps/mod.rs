@@ -118,7 +118,7 @@ pub trait WindowManager: Send + Sync {
 // Config (`[virtual_desktop_apps]` in the agent config.toml)
 // ---------------------------------------------------------------------------
 
-// The serde shapes moved to `roomler-agent-core::apps_config` in P3e lever E
+// The serde shapes moved to `roomler-core::apps_config` in P3e lever E
 // (AgentConfig embeds them, and AgentConfig lives there now); the launch
 // machinery around them stays HERE. Re-exported under the old paths so
 // `crate::apps::VirtualDesktopAppsConfig` remains valid everywhere.

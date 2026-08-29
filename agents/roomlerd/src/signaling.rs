@@ -606,7 +606,7 @@ pub async fn run(
                               The server is rejecting this agent's token. \
                               Either the token expired (default 1 year) or an \
                               admin revoked it. Run:\n\n\
-                              \troomler-agent re-enroll --token <new-jwt>\n\n\
+                              \troomlerd re-enroll --token <new-jwt>\n\n\
                               with a fresh enrollment JWT from the admin UI \
                               to restore service.";
                     match notify::raise_attention_with_reason(notify::REASON_AUTH, msg) {
@@ -652,7 +652,7 @@ pub async fn run(
                     "Roomler agent: server-side close — {reason:?}.\n\n{message}\n\n\
                      The agent will not reconnect. Re-enrol with a fresh enrollment \
                      JWT from the admin UI:\n\n\
-                     \troomler-agent re-enroll --token <new-jwt>\n\n\
+                     \troomlerd re-enroll --token <new-jwt>\n\n\
                      then restart the service (or wait for the supervisor to relaunch)."
                 );
                 match notify::raise_attention_machine_aware_with_reason(
@@ -1114,7 +1114,7 @@ async fn connect_once(
         bson::oid::ObjectId,
         (String, Option<roomler_ai_remote_control::models::InputMode>),
     > = HashMap::new();
-    // T2.10d: one `AgentTunnelPeer` per active `roomler-tunnel`
+    // T2.10d: one `AgentTunnelPeer` per active `roomler`
     // session. Distinct map from `peers` (remote-control sessions)
     // because the namespaces don't overlap and the lifecycles
     // differ — tunnel peers live until `TunnelTerminate` /
