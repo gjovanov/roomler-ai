@@ -124,12 +124,21 @@ pub(super) struct Inner {
 /// today), and a real X session on the same host is unaffected — this reads
 /// the daemon's own configuration, not the display.
 fn display_is_our_own_virtual_desktop() -> bool {
-    // Same accessor shape as `main.rs::virtual_desktop_requested`, kept local
-    // because that one is a bin-crate private and this is the lib.
-    let raw = std::env::var("ROOMLERD_VIRTUAL_DESKTOP")
-        .or_else(|_| std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP"))
-        .unwrap_or_default();
-    raw == "1" || raw.eq_ignore_ascii_case("true")
+    // Must stay byte-identical to `main.rs::virtual_desktop_requested`: the two
+    // answer the SAME question from different crates, and a host where they
+    // disagree gets a virtual desktop that main.rs asked for and this refuses to
+    // recognise as its own.
+    //
+    // They did disagree. This hand-rolled `ROOMLERD_` -> `ROOMLER_AGENT_` pair
+    // skipped `node_env`'s middle arm (`ROOMLER_NODE_`) and, more importantly, its
+    // config fallback — so the knob set through the S2 config surface
+    // (`roomler config`, the way an operator is told to set it) was visible to
+    // main.rs and invisible here. The comment claimed "same accessor shape as
+    // main.rs" while being a different shape, which is the exact class of stale
+    // assertion FR-21 exists to remove.
+    tunnel_core::env::node_env("VIRTUAL_DESKTOP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 impl Inner {
@@ -480,7 +489,16 @@ mod tests {
     /// ⚠️ Serial and self-restoring: these are process-wide env vars.
     #[test]
     fn a_virtual_desktop_host_is_not_a_consent_surface() {
-        const KEYS: [&str; 2] = ["ROOMLERD_VIRTUAL_DESKTOP", "ROOMLER_AGENT_VIRTUAL_DESKTOP"];
+        // RETIRED-NAME-ANCHOR(4): all three arms of `node_env`'s chain, so the
+        // accessor cannot silently drop one. The middle arm is the regression
+        // this array exists to catch: the hand-rolled version this replaced
+        // read only the first and last, so `ROOMLER_NODE_*` — and the config
+        // fallback behind it — were invisible here while `main.rs` saw them.
+        const KEYS: [&str; 3] = [
+            "ROOMLERD_VIRTUAL_DESKTOP",
+            "ROOMLER_NODE_VIRTUAL_DESKTOP",
+            "ROOMLER_AGENT_VIRTUAL_DESKTOP",
+        ];
         let saved: Vec<_> = KEYS.iter().map(|k| (*k, std::env::var(k).ok())).collect();
         // SAFETY (edition 2024): no other test in this crate touches these.
         unsafe {
