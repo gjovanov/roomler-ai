@@ -25,7 +25,7 @@ case "${1:-}" in
   *)       echo "usage: $0 [--check|--strip]" >&2; exit 2 ;;
 esac
 
-applied=0 skipped=0 fixed=0 missing=0
+applied=0 skipped=0 fixed=0 missing=0 unclassified=0
 
 # comment_style <path> -> "line" | "block" | "" (unsupported)
 comment_style() {
@@ -55,7 +55,18 @@ while IFS= read -r file; do
   style="$(comment_style "$file")"
   [ -n "$style" ] || continue
 
-  licence="$(licence_for "$file")" || continue
+  if ! licence="$(licence_for "$file")"; then
+    # ⚠️ Unclassified is an ERROR in --check, never a silent skip. A directory
+    # RENAME is what makes this matter: FR-21 moved agents/roomler-agent ->
+    # agents/roomlerd, and with a skip the whole daemon would have dropped out
+    # of the sweep while the check still reported OK — files shipping with no
+    # licence header at all, and nothing saying so.
+    if [ "$MODE" = check ] && ! is_excluded "$file"; then
+      echo "UNCLASSIFIED (add its directory to scripts/licence-classes.sh): $file"
+      unclassified=$((unclassified + 1))
+    fi
+    continue
+  fi
 
   existing="$(head -3 "$file" | grep -m1 -oE 'SPDX-License-Identifier: [A-Za-z0-9.\-]+' || true)"
   existing="${existing#SPDX-License-Identifier: }"
@@ -111,9 +122,9 @@ done < <(git ls-files)
 
 case "$MODE" in
   check)
-    if [ "$((missing + fixed))" -gt 0 ]; then
+    if [ "$((missing + fixed + unclassified))" -gt 0 ]; then
       echo
-      echo "FAIL: $missing file(s) missing an SPDX header, $fixed with the wrong licence."
+      echo "FAIL: $missing missing an SPDX header, $fixed with the wrong licence, $unclassified unclassified."
       echo "Run: scripts/apply-spdx.sh"
       exit 1
     fi

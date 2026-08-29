@@ -56,6 +56,10 @@ const OVERLAY_ALPN: &[u8] = b"roomler-overlay-wg-v1";
 
 /// Placeholder SNI — the client pins by cert fingerprint, not by name,
 /// so the value only needs to be a syntactically-valid DNS name.
+// RETIRED-NAME-ANCHOR: this value goes out on the wire in the ClientHello. The
+// pin is by cert fingerprint so the name is not semantically load-bearing, which
+// is exactly why changing it buys nothing and risks a middlebox or a future
+// server-side check. Frozen. See docs/fr/FR-21.
 const SNI: &str = "roomler-tunnel";
 
 /// SHA-256 fingerprint of a DER certificate, lowercase hex. This is the
