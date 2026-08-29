@@ -2,11 +2,17 @@
 # e2e sweep. A failing spec containing NONE of these lines is a REGRESSION.
 # Keep this list justified — every entry is a failure we UNDERSTAND:
 #
-# Conference specs need mediasoup RTC UDP ports, which the port-forward
-# topology can't carry (only :80 is forwarded).
-e2e/conference-chat.spec.ts
-e2e/conference-multi.spec.ts
-e2e/conference.spec.ts
+# 2026-08-30 — the conference entries are GONE, and the reason they were here
+# was wrong twice over. They did not need "mediasoup RTC UDP ports the
+# port-forward can't carry": the build host has no route to the pod network at
+# all, so no port would have helped — and underneath THAT, a blank `turn.url`
+# was advertising an ICE server with an empty URL, which made every browser
+# refuse the peer connection outright (#940). Nobody could join a call on any
+# stack configured that way. With the browser moved into the app pod (FR-37)
+# and #940 shipped, the whole family passes: conference 4/4, conference-multi
+# 5/5, conference-chat 2/2, conference-list green — 19/19.
+# ⚠️ An entry here is a claim you understand the failure. These three were a
+# claim nobody had re-tested since July, and they hid a product bug.
 # rc-vp9-444 needs an agent built with the vp9-444 feature lane attached to
 # the stack — not part of the nightly topology.
 e2e/rc-vp9-444.spec.ts
