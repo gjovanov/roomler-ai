@@ -1,6 +1,6 @@
 # FR-19: Peer relays — tenant-owned UDP relay nodes between direct and DERP
 
-Status: **in progress** — P0–P2 and P3a shipped, P3b in PR (2026-08-29); proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
+Status: **in progress** — P0–P2 and P3a shipped, P3b (#893) merging, P3c the mint in PR (2026-08-29); proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
 Reference design: [Tailscale peer relays](https://tailscale.com/docs/features/peer-relay).
 Sibling of FR-18 (#801) and FR-17 (#799) — both are about the *cost* of the relay path;
 this FR is about **replacing that path with a better one** rather than tuning it.
@@ -713,10 +713,11 @@ Verified against `origin/master`, 2026-08-28.
 | change | file:line |
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:152` `RelayKind` |
-| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:268` (`impl RelayConn for DerpConn`) and `derp.rs:420` (`conn_for`) |
+| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:268` (`impl RelayConn for DerpConn`) and `derp.rs:420` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
 | Client cascade branch | `relay_link.rs:1016` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
-| Mint + ACL gate + rate limit | `overlay.rs:693` `handle_overlay_relay_request` (cross-tenant `:705-717`, ACL `:719-743`) |
+| Mint + ACL gate + rate limit | `overlay.rs:693` `handle_overlay_relay_request` (cross-tenant `:705-717`, ACL `:719-743`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
+| **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
 | Netmap shaping | `overlay.rs:1982` `shape_peer` |
 | Wire model | `crates/remote_control/src/signaling.rs:2007` `NetmapPeer`; `:1985` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
@@ -756,7 +757,7 @@ appears in **two** places), and the customer-facing install docs (§12).
 | **P1** | **Bind-only responder** (bind + authenticated challenge, **forwards nothing**, no session table) + `rc:overlay.relay_probe` + `peer_relay_audit` + every counter **with its reader** | `relay_server_enabled=false` |
 | **P2** | Forwarding: Geneve framing, VNI table, full 3-way bind, caps, revocation, `catch_unwind` | `relay_server_enabled=false` |
 | **P3** | Server-side mint + gates + approval (`MANAGE_AGENTS`+`EXEC_DEVICE`, no free bit — §4) / audit behind `VIEW_EXEC_AUDIT` + rate limit + `peer_relay_mode`. Split: **P3a** models + wire (#890) · **P3b** DAO, routes, `peer_relay_audit`, fail-closed `try_load_acl` / `try_overlay_source_of`, limiter · **P3c** the mint | `peer_relay_mode=off` ⇒ zero mints |
-| **P4** | `RelayKind::Org` live in the verdict + `relay_strategy` branch + promote/demote | `overlay_org_relay=false` |
+| **P4** | `RelayKind::Org` live in the verdict + `relay_strategy` branch + promote/demote. Split: **P4a** the client in `tunnel-core` (`orgrelay/client.rs`: bind handshake + `OrgRelayConn`, proven over loopback against the real P2 relay) · **P4b** runtime + agent wiring — `RelayKind::Org`, the `relay_strategy` branch, `OverlayEvent::OrgRelay{Session,Revoke}`, relay-side `relay_serve` install, the probe report, the join flags — behind the config key · **P4c** the first field mint (`warn`, then `on`) | `overlay_org_relay=false` |
 | **P5** | jupiter/zeus provisioning in `~/k8s-cluster-multi` + weekly drift-audit cron | revert host_vars |
 | **P6** | Admin UI: relay approval, org switch, audit section | UI-only |
 
@@ -796,12 +797,24 @@ kill switch. That is what makes E2E-3 executable before P2.
       landed; `load_acl` / `overlay_source_of` keep their open posture as explicit wrappers
       that now LOG what they swallow. Integration test
       `try_load_acl_fails_closed_where_load_acl_fails_open` proves both postures on one
-      unreadable row. The mint's `PolicyUnreadable` arm is P3c.)*
+      unreadable row. **P3c:** the mint's `PolicyUnreadable` arm landed — an unreadable
+      policy set, OR an unreadable member identity, OR an unreadable approved-relay list, is a
+      refusal with that reason; `every_refusal_is_audited_with_its_reason` proves it on a
+      malformed row over a real relay request.)*
 - [ ] Mint refused for a **secondary-org** node; a relay grant arriving on a secondary org's
-      WS is dropped agent-side.
+      WS is dropped agent-side. *(P3c — server half: the join carries `org_primary`
+      (additive, `#[serde(default)]`); the mint requires `Some(true)` on requester, peer AND
+      relay, so an absent flag fails closed — tested for both `false` and absent. The
+      agent-side drop is P4.)*
 - [ ] `mint_refused_for_non_routable_endpoint` — `169.254.169.254`, RFC1918, loopback,
-      `100.64/10`, ULA, v4-mapped.
-- [ ] Mint refused when rate-limited, with the refusal audited.
+      `100.64/10`, ULA, v4-mapped. *(P3c: the approval route refuses a non-public
+      `static_endpoint` with 400, and the mint refuses `non_routable_endpoint` when one is
+      smuggled past it (tested by writing the row directly); the address rule is the push
+      SSRF validator's `is_global_unicast`, shared, not copied.)*
+- [ ] Mint refused when rate-limited, with the refusal audited. *(P3c: `rate_limited`,
+      keyed (requester node, relay node) as §4 prescribes; the test pre-spends the ceiling
+      in process. Deliberately AFTER relay selection so the row can name the relay the
+      requester was hammering.)*
 - [ ] Relay approval requires `MANAGE_AGENTS` **and** `EXEC_DEVICE` (`RELAY_DEVICE` after
       #888), and writes an audit row — on BOTH arms. *(P3b: `decide_approval` is one pure
       function with 7 unit tests; the wiring is locked by the integration test
@@ -816,17 +829,29 @@ kill switch. That is what makes E2E-3 executable before P2.
       peer set the **selected carrier and every `TierWhy` row are unchanged** — diffed from
       `roomler why --json` before and after. *(Now genuinely checkable because §6 adds no
       tier; the first draft asserted "byte-identical" while widening `[TierState; 3]`, so it
-      would have failed its own first criterion.)*
+      would have failed its own first criterion.)* *(P3c: the zero-rows half is proven by
+      `mode_off_writes_nothing_and_warn_audits_without_pushing` — under `off` the mint
+      returns before any read past the cached mode; under `warn` it audits the would-be
+      mint with `warn_only: true` and pushes nothing. The `roomler why --json` diff is the
+      P4 field check.)*
 - [ ] A relay forwards only between the two bound `addr:port`s for a VNI; a packet from an
       unbound source is dropped and counted by `ORG_RELAY_FORWARD_UNBOUND_SRC`.
 - [ ] **Shape disjointness over WG × STUN × disco × Geneve**, all 256 byte-0 values; a frame
       with `Opt Len ≠ 0` is rejected; `VNI = 0x2112A4` is never minted.
 - [ ] A **re-bind under a valid `tag₁` from a new source succeeds** (symmetric-NAT rebind)
-      and **without one fails** — both directions.
+      and **without one fails** — both directions. *(P2c proved both directions on the relay
+      side; **P4a** proves the client's half of the success direction end to end —
+      `a_member_rebinds_from_a_new_source_and_keeps_the_session` re-binds from a fresh socket
+      with the same VNI + secret and the relay forwards to the new source.)*
 - [ ] A session exceeds neither `max_lifetime` nor the relay's own re-clamped deadlines when
       the server supplies longer ones.
 - [ ] `rc:relay.revoke` tears down a **live, traffic-carrying** session from all four
-      triggers: mode-off, ACL revoke, policy revoke, device removal.
+      triggers: mode-off, ACL revoke, policy revoke, device removal. *(P3c — the push half:
+      `all_four_revocation_triggers_push_relay_revoke_to_every_party` mints, then fires each
+      trigger in turn and asserts the revoke reaches the relay AND both members with the
+      session's VNI, with a `revoke` audit row naming the trigger (`mode_off` /
+      `acl_revoked` / `policy_revoked` / `device_removed`; a graceful leave adds
+      `device_left`). "Traffic-carrying" is the P4 field half.)*
 
 **The floor**
 

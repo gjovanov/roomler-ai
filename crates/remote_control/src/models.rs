@@ -1547,6 +1547,15 @@ pub struct PeerRelayPolicy {
     /// Approved to serve. Default `false`.
     #[serde(default)]
     pub serve: bool,
+    /// Admin-declared `ip:port`s the relay is reachable at — the port-forwarded
+    /// or multi-homed case the node's own srflx/static candidates cannot
+    /// discover. Each entry is SSRF-validated at approval time (a public IP
+    /// literal, never a name) and re-checked at mint time: a server-pushed
+    /// probe target is an oracle-returning port scanner run by every device
+    /// in the tenant as SYSTEM/root, so `169.254.169.254:80` must never get
+    /// through here. Tried AFTER the measured candidates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_endpoints: Vec<String>,
 }
 
 /// Bounds on FR-19 relay minting. Server-side only — the relay device
@@ -1560,6 +1569,30 @@ pub mod peer_relay_limits {
     /// so a fleet boot — one requester asking for every unreachable peer
     /// through the same relay inside a minute — fits under it.
     pub const MINT_RATE_LIMIT_PER_MINUTE: u32 = 30;
+    /// The relay-server UDP port assumed when a join carries none — the
+    /// value E2E-3 settled (spec §5) and `orgrelay::DEFAULT_RELAY_SERVER_PORT`
+    /// on the device; the two are the same number by contract.
+    pub const DEFAULT_RELAY_PORT: u16 = 3478;
+    /// Seconds a member has to complete its bind at the relay.
+    pub const BIND_SECS: u32 = 30;
+    /// Idle seconds before the relay drops a bound session. Refreshed by
+    /// traffic, so under a WireGuard keepalive it never fires — which is why
+    /// `MAX_LIFETIME_SECS` exists.
+    pub const IDLE_SECS: u32 = 300;
+    /// Absolute session lifetime, independent of traffic. Also the exposure
+    /// window after a server restart loses the session registry: a session
+    /// the server can no longer revoke ends here at the latest.
+    pub const MAX_LIFETIME_SECS: u32 = 3600;
+    /// Live sessions the server will place on one relay — mirrors the
+    /// device's own `orgrelay::session::MAX_SESSIONS`, which refuses beyond it.
+    pub const MAX_SESSIONS_PER_RELAY: usize = 64;
+    /// How long a reachability report counts toward relay ranking.
+    pub const PROBE_TTL_SECS: u64 = 600;
+    /// The STUN magic cookie as a 24-bit VNI — never minted, so a STUN
+    /// packet arriving at the relay port can never alias a session.
+    pub const STUN_COOKIE_VNI: u32 = 0x2112A4;
+    /// The 24-bit Geneve VNI ceiling.
+    pub const VNI_MAX: u32 = 0xFF_FFFF;
 }
 
 /// Why a peer-relay decision — an admin's approval or a session mint — was
@@ -1648,6 +1681,11 @@ pub enum PeerRelayAuditAction {
     Approve,
     /// A node asked for a session to a peer and the server decided.
     Mint,
+    /// The server tore a session down — org mode off, an ACL edit that no
+    /// longer grants the pair the relay, the relay's approval cleared, or a
+    /// party removed. A push, never an expiry (§7): the idle deadline never
+    /// fires under a WireGuard keepalive.
+    Revoke,
 }
 
 /// One peer-relay decision, granted or refused. TTL-expired after 90 days like
@@ -1696,6 +1734,10 @@ pub struct PeerRelayAuditEvent {
     /// Refusal reason; `None` = approved / minted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied: Option<PeerRelayDenyReason>,
+    /// `revoke` — which of the four triggers fired (`mode_off` |
+    /// `acl_revoked` | `policy_revoked` | `device_removed` | `device_left`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl PeerRelayAuditEvent {
@@ -1745,6 +1787,10 @@ mod peer_relay_audit_tests {
             serde_json::to_value(PeerRelayAuditAction::Mint).unwrap(),
             serde_json::json!("mint")
         );
+        assert_eq!(
+            serde_json::to_value(PeerRelayAuditAction::Revoke).unwrap(),
+            serde_json::json!("revoke")
+        );
     }
 
     /// A row must explain itself without a join, and the optional fields are
@@ -1765,6 +1811,7 @@ mod peer_relay_audit_tests {
             warn_only: false,
             at: DateTime::now(),
             denied: Some(PeerRelayDenyReason::CannotGrantRelay),
+            reason: None,
         };
         let doc = bson::to_document(&row).unwrap();
         assert!(doc.contains_key("serve"));

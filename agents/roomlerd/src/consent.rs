@@ -275,6 +275,28 @@ struct BrokerInner {
     pending: Mutex<std::collections::HashSet<String>>,
 }
 
+/// Clears the `.pending` marker and the in-memory pending entry for one
+/// session on drop, so a prompt whose awaiting future is CANCELLED (the SSH /
+/// RC transport died before a decision) does not leak a phantom the CLI and
+/// tray keep showing. Straight-line cleanup ran only on a normal decision.
+struct PendingGuard<'a> {
+    inner: &'a BrokerInner,
+    session_hex: &'a str,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(
+            self.inner
+                .sentinel_dir
+                .join(format!("{}.pending", self.session_hex)),
+        );
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.remove(self.session_hex);
+        }
+    }
+}
+
 impl ConsentBroker {
     /// Build a new broker. `sentinel_dir` is created if absent. On
     /// Unix the directory is `chmod 700` to match `config.toml`'s
@@ -387,6 +409,17 @@ impl ConsentBroker {
             let mut pending = self.inner.pending.lock().unwrap();
             pending.insert(session_hex.to_string());
         }
+        // FR-27 — clear the `.pending` marker and the in-memory entry on EVERY
+        // exit, including the future being DROPPED before a decision. Field
+        // 2026-08-29: an SSH dial from mars whose transport reset mid-prompt
+        // left `<id>.pending` behind, so `roomlerd consent --list` showed a
+        // phantom prompt that outlived its session (and a late `--approve`
+        // logged "no active prompt"). The old cleanup was straight-line code
+        // after the poll loop, so a cancelled `request_with_mode` skipped it.
+        let _guard = PendingGuard {
+            inner: &self.inner,
+            session_hex,
+        };
         tracing::info!(
             session = session_hex,
             timeout_secs = timeout.as_secs(),
@@ -423,18 +456,12 @@ impl ConsentBroker {
             tokio::time::sleep(POLL_INTERVAL).await;
         };
 
-        // Clean up so a future re-request of the same session id
-        // doesn't see a stale decision.
+        // Clear the decision sentinels so a future re-request of the same id
+        // doesn't see a stale one. The `.pending` marker and the in-memory
+        // entry are the guard's job (above) so they are cleared on cancellation
+        // too.
         let _ = std::fs::remove_file(&approve);
         let _ = std::fs::remove_file(&deny);
-        // Also clear the `.pending` request marker the tray watches, so a
-        // resolved prompt disappears from the tray immediately (best-effort;
-        // absent when the request came without one — e.g. the CLI path).
-        let _ = std::fs::remove_file(self.pending_path(session_hex));
-        {
-            let mut pending = self.inner.pending.lock().unwrap();
-            pending.remove(session_hex);
-        }
         tracing::info!(session = session_hex, ?outcome, "operator consent decision");
         outcome
     }
@@ -841,6 +868,71 @@ mod tests {
         );
         assert_eq!(prompt.await.unwrap(), Decision::Granted);
         assert!(!pending.exists(), ".pending must be cleared once resolved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-27 field 2026-08-29: an SSH dial whose transport reset mid-prompt
+    /// dropped the awaiting future before any decision, and the `.pending`
+    /// marker survived — `roomlerd consent --list` then showed a phantom that
+    /// outlived its session. Cancelling the prompt future must clear the marker.
+    #[tokio::test]
+    async fn a_cancelled_prompt_does_not_leak_its_pending_marker() {
+        let dir = fixture_dir("cancel");
+        let broker = ConsentBroker::new(
+            Mode::Prompt {
+                timeout: Duration::from_secs(30),
+            },
+            dir.clone(),
+        )
+        .unwrap();
+        let session = "6a00000000000000000000ff";
+        broker
+            .write_prompt(
+                session,
+                &PendingPrompt {
+                    kind: PromptKind::Ssh,
+                    asked_by: "tester",
+                    permissions: String::new(),
+                    detail: "run a command".into(),
+                    org: String::new(),
+                    timeout: Duration::from_secs(30),
+                    surface: PromptSurface::Companion,
+                },
+            )
+            .unwrap();
+        let marker = broker.pending_path(session);
+        assert!(marker.exists(), "precondition: the marker was written");
+
+        // Await in a task, let it register as pending and enter the poll loop,
+        // then ABORT it — cancelling the task drops the future, which is exactly
+        // what a dead transport does: nobody polls the prompt again.
+        let b = broker.clone();
+        let sess = session.to_string();
+        let handle = tokio::spawn(async move {
+            b.request_with_mode(
+                &sess,
+                Mode::Prompt {
+                    timeout: Duration::from_secs(30),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        handle.abort();
+        let _ = handle.await; // observe the cancellation + let the drop run
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            !marker.exists(),
+            "a cancelled prompt must not leak its .pending marker"
+        );
+        // In-memory entry cleared too: a decision for it now finds no active
+        // prompt (record_decision gates on the live pending set).
+        assert!(
+            !broker.record_decision(session, true),
+            "a cancelled prompt must clear the in-memory pending entry"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
