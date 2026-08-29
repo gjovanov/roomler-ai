@@ -47,7 +47,7 @@ async fn get_plans_free_plan_has_correct_data() {
     assert_eq!(free["price_cents"], 0);
     assert_eq!(free["limits"]["max_members"], 10);
     assert_eq!(free["limits"]["max_channels"], 5);
-    assert_eq!(free["limits"]["video_max_participants"], 0);
+    assert_eq!(free["limits"]["video_max_participants"], 4);
     assert_eq!(free["limits"]["cloud_integrations"], false);
     assert_eq!(free["limits"]["ai_recognition"], false);
     assert_eq!(free["limits"]["recordings"], false);
