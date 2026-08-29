@@ -948,6 +948,7 @@ mod tests {
             machine_id: "m".into(),
             os: OsKind::Linux,
             agent_version: "0".into(),
+            companion_version: None,
             ssh_host_pubkey: String::new(),
             agent_token_hash: String::new(),
             status,
