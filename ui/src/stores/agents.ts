@@ -153,6 +153,13 @@ export interface Agent {
   machine_id: string
   os: AgentOs
   agent_version: string
+  /** FR-27 — the `roomler-desktop` version installed on the host, reported on
+   *  the heartbeat. Absent means one of three things and the UI must not
+   *  flatten them: a pre-FR-27 agent, no companion installed, or a probe that
+   *  could not read one. The daemon and the companion update by different
+   *  mechanisms on every platform, so `agent_version` moving says nothing
+   *  about this one. */
+  companion_version?: string
   status: AgentStatusValue
   /** Phase A-1 three-state truth: `online` = an rc socket is registered
    *  somewhere (Connect will work); `stale` = heartbeat trail fresh but no

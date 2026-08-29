@@ -1,7 +1,7 @@
 # FR-26 — Remote-desktop viewer: display name, quality-metric toggles, FSR default, settings reorg
 
 **Issue:** [#840](https://github.com/gjovanov/roomler-ai/issues/840)
-**Status:** shipped in #845, live on prod — awaiting the operator's own read
+**Status:** shipped in #845 — **field-verified 2026-08-29, all criteria met**
 
 > **Renumbered from FR-24.** #838 (licensing split) claimed FR-24 in the same
 > hours from a parallel session, and its ledger row lived on an unmerged branch
@@ -92,7 +92,7 @@ sections except the new Metrics pane; FSR stays in **Display**, where it belongs
       legacy flag honoured once (unit-locked)
 - [x] FSR reads ON for a fresh profile
 - [x] Settings dialog is tabbed with no control lost
-- [ ] Field: a renamed device shows its display name; unchecking a metric hides
+- [x] Field: a renamed device shows its display name; unchecking a metric hides
       exactly that pill and survives reload; sharpening is on by default
 
 ## Field-verification log
@@ -106,3 +106,21 @@ sections except the new Metrics pane; FSR stays in **Display**, where it belongs
   build reached prod, and says nothing about whether a renamed device reads
   correctly or a checkbox survives a reload. Those three remain open below and
   need a real session.
+- **2026-08-29 — field-verified in a real browser against prod.** Driven
+  through the operator's own signed-in Chrome, so this is the product as they
+  meet it, not a harness:
+  - **Title**: `/agent/6a6bd070…/remote` renders **CORPLAP-1** with
+    `CORPLAP-1 · windows · 0.4.15` in the subtitle — display name wins, machine
+    name stays visible.
+  - **Tabs**: the dialog opens on `VIDEO · DISPLAY · METRICS · SESSION`.
+  - **Metrics**: all six checkboxes present. `Pipeline diagnostics` read
+    CHECKED, which looked wrong for one beat and is exactly right: stored
+    `roomler-rc-metrics` was **absent** while the legacy
+    `roomler-rc-diag-hud` was `"1"`, so `paint` inherited the hand-set flag as
+    designed. Unchecking `Bitrate` wrote the full object
+    (`{codec,bitrate:false,fps,resolution,age,paint}`) and **survived a full
+    page reload**.
+  - **FSR default**: with `roomler-rc-sharpen` REMOVED — i.e. a fresh profile —
+    Display reads **ON** ("Always sharpen (AMD FSR), even at 1:1"). Proven from
+    a clean slate rather than from a stored choice.
+  - Every preference touched was restored to its original value afterwards.
