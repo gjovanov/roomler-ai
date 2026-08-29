@@ -40,6 +40,10 @@
 #   A marker with no retired name under it is itself an error (`--check`
 #   reports it), because a stale marker silently widens the exemption.
 #
+#   The COLON is part of the marker. `RETIRED-NAME-ANCHOR` written without one
+#   is prose, not a marker — so a comment that merely talks ABOUT the scheme
+#   cannot accidentally exempt the line beneath it.
+#
 # THE GUARD IS A PAIR, NOT A RATCHET
 #
 #   A pure "unclassified == 0" check would be red for the whole program, and a
@@ -49,10 +53,18 @@
 #
 #     1. unclassified <= baseline   — catches new occurrences being ADDED
 #     2. anchors      >= baseline   — catches existing anchors being DELETED
+#     3. anchors      <= baseline   — catches the FLOOR going stale
 #
 #   Together those are sound while the migration is in flight. `--check
 #   --strict` replaces (1) with `unclassified == 0` and is what CI runs from
 #   P5 onward.
+#
+#   (3) exists because a floor only protects at the value it was last written
+#   to, and nothing was forcing it to move with the tree. On 2026-08-29 master
+#   carried 110 anchors against a floor of 83: twenty-seven could have been
+#   deleted with `--check` reporting OK, for weeks, silently. (2) and (3)
+#   together mean the floor now tracks the tree exactly — raising it is the same
+#   one-line `--update-baseline` that lowering it already required.
 #
 # USAGE
 #
@@ -65,7 +77,30 @@
 #
 set -euo pipefail
 
-cd "$(git rev-parse --show-toplevel)"
+# `cd "$(git rev-parse …)"` on its own is not safe: if the rev-parse fails the
+# substitution is empty, `cd ""` SUCCEEDS as a no-op, and the scan then runs in
+# whatever directory the caller happened to be in — finding nothing and
+# reporting `0 occurrences` as though the tree were clean. Observed for real:
+# WSL git cannot resolve a worktree whose `.git` file holds a Windows gitdir
+# path, and the scan silently returned 0 files.
+#
+# A guard that reports success after scanning nothing is the same defect this
+# repo already documents for the integration lane ("a job that silently runs
+# nothing is indistinguishable from a passing one"). Fail loudly instead.
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT" ]; then
+    echo "FAIL  cannot resolve the repository root — refusing to scan nothing." >&2
+    echo "      \`git rev-parse --show-toplevel\` failed in: $(pwd)" >&2
+    exit 2
+fi
+cd "$REPO_ROOT"
+
+# Same reasoning one level down: an empty file list means the scan covered
+# nothing, which must never be reportable as a clean tree.
+if [ "$(git ls-files | wc -l)" -lt 2 ]; then
+    echo "FAIL  the repository lists no tracked files — refusing to scan nothing." >&2
+    exit 2
+fi
 
 BASELINE_FILE="scripts/name-audit-baseline.txt"
 
@@ -145,7 +180,19 @@ scan() {
                     next
                 }
 
-                is_marker = (line ~ /RETIRED-NAME-ANCHOR/)
+                # The COLON is required, so that a line which merely MENTIONS the
+                # marker in prose does not become one. Matching the bare token
+                # anywhere meant a comment reading "...with no RETIRED-NAME-ANCHOR"
+                # silently anchored the line beneath it and the audit went green —
+                # found while writing a regression test whose own comment
+                # exempted the regression. A silent exemption is the exact failure
+                # this script exists to prevent, so it must not be reachable by
+                # writing about the script.
+                #
+                # Safe by inspection, not by hope: all 146 span markers in the tree
+                # use `RETIRED-NAME-ANCHOR:` or `RETIRED-NAME-ANCHOR(N):`, and the
+                # BEGIN/END region markers are consumed above before this runs.
+                is_marker = (line ~ /RETIRED-NAME-ANCHOR(\([0-9]+\))?:/)
                 # Comment syntaxes across the tree: Rust/TS //, shell/YAML/systemd #,
                 # block-comment continuation *, /*, XML <!--, ini ;.
                 is_comment = (bare ~ /^(\/\/|#|\*|\/\*|<!--|;)/)
@@ -319,6 +366,23 @@ EOF
         echo "      A deleted anchor strands pre-rename hosts and fails NO build and NO test."
         echo "      If an anchor is genuinely retired, lower it in $BASELINE_FILE in the same PR"
         echo "      and say in the PR body which field state no longer exists."
+        rc=1
+    fi
+
+    # A floor only protects at the value it was last written to. Anchors were
+    # added in later batches without regenerating the baseline, and on
+    # 2026-08-29 master carried 110 anchors against a floor of 83 — meaning 27
+    # could have been deleted with `--check` reporting OK. That is precisely the
+    # failure the floor exists to prevent, and nothing surfaced it for weeks:
+    # the guard was quieter than the tree it was guarding.
+    #
+    # So the floor must track the tree in BOTH directions. Raising it is a
+    # one-line `--update-baseline` in the same PR that adds the anchor, which is
+    # the same discipline already required for lowering it.
+    if [ "$n_anchored" -gt "$base_anchors" ]; then
+        echo "FAIL  anchors rose $base_anchors -> $n_anchored, so the floor is now STALE."
+        echo "      It would not notice the next $(( n_anchored - base_anchors )) anchor(s) being deleted."
+        echo "      Run: scripts/name-audit.sh --update-baseline   (and commit it in this PR)"
         rc=1
     fi
 
