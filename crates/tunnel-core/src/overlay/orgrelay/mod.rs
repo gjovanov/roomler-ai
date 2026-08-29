@@ -6,6 +6,7 @@
 //!   probes and forwards nothing. There is no session table and no data path
 //!   here; those arrive with P2.
 
+pub mod bind;
 pub mod responder;
 mod wire;
 
