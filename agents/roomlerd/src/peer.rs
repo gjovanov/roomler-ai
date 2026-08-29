@@ -9943,8 +9943,8 @@ mod overlay_tier_tests {
         // where a real daemon happens to be running).
         // SAFETY: no other test touches this var (set_var is unsafe in
         // edition 2024 because of cross-thread env races).
-        unsafe { std::env::set_var("ROOMLERD_OVERLAY_TIER_DETECT", "0") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "OVERLAY_TIER_DETECT", "0") };
         assert!(!overlay_remote_is_relay_tier("100.64.0.29", sid).await);
-        unsafe { std::env::remove_var("ROOMLERD_OVERLAY_TIER_DETECT") };
+        unsafe { tunnel_core::env::test_env::clear("OVERLAY_TIER_DETECT") };
     }
 }

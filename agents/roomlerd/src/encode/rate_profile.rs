@@ -1024,17 +1024,17 @@ mod tests {
 
         // SAFETY: no other test in this crate touches these vars (set_var
         // is unsafe in edition 2024 because of cross-thread env races).
-        unsafe { std::env::set_var("ROOMLERD_RATE_FACTOR_HEVC", "140") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_HEVC", "140") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 140);
         // Clamped to 50–400.
-        unsafe { std::env::set_var("ROOMLERD_RATE_FACTOR_HEVC", "10") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_HEVC", "10") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 50);
-        unsafe { std::env::set_var("ROOMLERD_RATE_FACTOR_HEVC", "9000") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_HEVC", "9000") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 400);
         // Garbage falls back to the built-in.
-        unsafe { std::env::set_var("ROOMLERD_RATE_FACTOR_HEVC", "fast") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_HEVC", "fast") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 125);
-        unsafe { std::env::remove_var("ROOMLERD_RATE_FACTOR_HEVC") };
+        unsafe { tunnel_core::env::test_env::clear("RATE_FACTOR_HEVC") };
         // Other codecs untouched by the HEVC var.
         assert_eq!(codec_rate_factor_pct("H264"), 150);
     }
