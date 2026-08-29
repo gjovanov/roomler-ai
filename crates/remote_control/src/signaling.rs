@@ -977,6 +977,20 @@ pub enum ClientMsg {
         /// "I SERVE relays" — this says "I can USE one".
         #[serde(default)]
         supports_org_relay: bool,
+        /// FR-19 (P3c) — whether this join comes from the device's PRIMARY
+        /// org. Relay serving and relay use are primary-only: a UDP listener
+        /// is host-global, and a secondary org's admin must not be able to
+        /// mint sessions onto the device owner's listener — the same trust
+        /// line `rc:agent.update` draws. `None` (a build that does not say)
+        /// is treated as NOT primary for every relay decision: fail closed.
+        /// P4 sets it from `OrgCtx`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        org_primary: Option<bool>,
+        /// FR-19 (P3c) — the UDP port this node's org-relay server listens
+        /// on when it serves one; the mint pairs it with the node's public
+        /// addresses. `None` ⇒ `peer_relay_limits::DEFAULT_RELAY_PORT`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_port: Option<u16>,
         /// Phase 1 — subnet CIDRs this node offers to route for peers
         /// (`--advertise-routes` / config). The server stores them as *claimed*
         /// routes; an admin must **approve** each before it's distributed in the
@@ -3846,6 +3860,8 @@ mod tests {
             supports_forced_derp: true,
             supports_overlay_echo: false,
             supports_org_relay: false,
+            org_primary: None,
+            relay_port: None,
             supports_server_relay_strategy: true,
             supports_derp_floor: true,
             advertised_routes: vec!["192.168.1.0/24".into()],

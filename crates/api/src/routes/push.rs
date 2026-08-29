@@ -79,7 +79,7 @@ async fn validate_push_endpoint(endpoint: &str) -> Result<(), ApiError> {
 
 /// Conservative "is this a routable public address" test. Deliberately hand
 /// rolled: `IpAddr::is_global` is still unstable.
-fn is_global_unicast(ip: &IpAddr) -> bool {
+pub(crate) fn is_global_unicast(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             !(v4.is_private()
