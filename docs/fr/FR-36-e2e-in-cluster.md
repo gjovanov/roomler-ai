@@ -1,6 +1,6 @@
 # FR-36 — The e2e suite runs outside the cluster, so it cannot test media (and keeps breaking on the seam)
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues)
+**Issue:** [#928](https://github.com/gjovanov/roomler-ai/issues/928)
 **Status:** proposed — diagnosis measured 2026-08-29, no code yet
 
 ## Goal
