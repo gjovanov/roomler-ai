@@ -1,0 +1,127 @@
+[package]
+name = "roomler-desktop"
+license = "MPL-2.0"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "Roomler desktop — tray-resident control surface: overview, devices, tunnels, settings, onboarding, consent."
+
+[[bin]]
+# The tray/desktop companion. P3d Slice B moved the OUTPUT binary to
+# `roomler-desktop`; FR-21 P2a brought the package name into line. CI renames
+# the release artifact to `roomler-desktop-{VERSION}-{TRIPLE}.exe` accordingly.
+name = "roomler-desktop"
+path = "src/main.rs"
+
+[dependencies]
+# P3e lever E: the tray calls `enrollment::enroll`, `config::save`,
+# `machine::derive_machine_id`, the log tail, and the sentinel reader — all of
+# which live in agent-core now. Before the split this was a lib dep on the
+# FULL `roomler-agent`, which pulled the entire data plane (webrtc family,
+# quinn, turn, openh264-sys2, tokio-tungstenite, async_zip, …) into a GUI that
+# never opens a session. One deliberate loss: `win_service::default_log_dir`
+# — replaced by the same one-liner over `appdirs` (see commands.rs).
+roomler-core = { path = "../../crates/agent-core" }
+
+# LocalAPI client (unification P2): the tray reads live node/peer state from
+# the running daemon over the LocalAPI. P3e lever E: the dep is the LEAF
+# protocol crate, NOT tunnel-core — the tray only ever speaks the pipe
+# protocol, and depending on tunnel-core would compile the whole data plane
+# (webrtc, quinn, turn, rustls are non-optional there). The `use` paths below
+# say `roomler_localapi as localapi`, byte-compatible with the wire either way
+# because tunnel-core's own `localapi` is a re-export of this same crate.
+roomler-localapi = { path = "../../crates/localapi" }
+
+# Tauri 2.x runtime + tray + plugins.
+#
+# `custom-protocol` is REQUIRED for plain `cargo build --release` to
+# produce a self-contained binary — without it the runtime loads
+# from `devUrl` (localhost:1430) and the user sees ERR_CONNECTION_
+# REFUSED in the webview. `cargo tauri build` enables it automatically,
+# but our release-agent.yml uses `cargo build --release` for the tray
+# EXE artifact (no Tauri toolchain on the runner), so we opt in here
+# unconditionally. We don't have a Vite/Webpack dev-server for the
+# static `src/front/` HTML, so devUrl isn't load-bearing for any
+# workflow — embedding via custom-protocol is the only mode that
+# makes sense.
+tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
+tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+
+# Async + error handling — shared workspace versions.
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+gethostname = "0.5"
+
+# FR-27 — `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on the two panel
+# windows, so the "Being viewed by …" banner never appears in the video going
+# back to the viewer (the recursive-picture-frame the daemon's native overlay
+# has always avoided). Windows-only, and deliberately the narrowest possible
+# feature set — P3e lever E exists to keep this crate's graph small.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# FR-27 — the Linux companion, as its OWN Debian package.
+#
+# Deliberately NOT folded into the `roomlerd` .deb. That package installs on
+# every headless node in the fleet — k8s workers, build hosts, relays — and
+# adding webkit2gtk + GTK + an app-indicator library to their dependency graph
+# to ship a menu-bar app none of them can display would be a real regression
+# for pillar 2. A separate package means a desktop gets the panel and a server
+# never hears about it. A CI guard asserts the daemon package's `depends`
+# gains no GTK/webkit entry.
+#
+# `roomlerd` is a hard dependency: this app is a thin client over the daemon's
+# LocalAPI and does nothing at all without one.
+#
+# ⚠️ The runtime deps are the SONAME packages, not the `-dev` ones CI installs
+# to build. `libwebkit2gtk-4.1-0` is what Ubuntu 22.04+ ships;
+# `libayatana-appindicator3-1` is what `tray-icon` dlopens for the tray on
+# Linux, and without it the app starts with no tray at all — the exact failure
+# this FR is fixing on Windows, re-created on another platform.
+[package.metadata.deb]
+name = "roomler-desktop"
+maintainer = "G ROX LTD <goran.jovanov@gmail.com>"
+copyright = "2026, G ROX LTD"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Roomler desktop — the menu-bar companion for the Roomler daemon: device \
+status, network peers, tunnel routes, and the on-screen consent prompt and \
+"being viewed" banner for remote-control sessions."""
+depends = "libc6, libwebkit2gtk-4.1-0, libgtk-3-0, libayatana-appindicator3-1, roomlerd"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/roomler-desktop", "usr/bin/", "755"],
+    ["packaging/linux/roomler-desktop.desktop", "usr/share/applications/", "644"],
+    # Autostart, because the companion is the device's consent PROMPT surface:
+    # a device set to "Prompt on host" whose companion is not running has no
+    # way to ask anyone, and the operator finds out by a session mysteriously
+    # timing out. `Hidden=true` in the file is the documented per-user opt-out.
+    [
+        "packaging/linux/roomler-desktop.desktop",
+        "etc/xdg/autostart/roomler-desktop.desktop",
+        "644",
+    ],
+    ["icons/icon.png", "usr/share/icons/hicolor/512x512/apps/roomler-desktop.png", "644"],
+]
+
+# cargo-wix metadata — the tray ships as its own perUser MSI alongside
+# the agent's MSI(s). Operators install both: agent does the work,
+# tray surfaces the onboarding GUI + status.
+[package.metadata.wix]
+upgrade-guid = "C9F3E4A1-7D2B-4C6E-8F3A-1B2C9D4E5F60"
+path-guid = "D8E2F3B0-6C1A-3B5D-7E2A-9A1B8C3D4E5F"
+license = false
+eula = false

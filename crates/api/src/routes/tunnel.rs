@@ -6,7 +6,7 @@
 //! enrollment flow. The tunnel client (a laptop running
 //! `roomler-tunnel`) is enrolled in the same two-step shape as a
 //! remote-control agent: admin issues a single-use `TunnelEnrollment`
-//! token, then the operator runs `roomler-tunnel enroll` which
+//! token, then the operator runs `roomler enroll` which
 //! exchanges it for a long-lived `TunnelClient` token.
 //!
 //! Signalling, forwarding, audit + policy CRUD land in T2.
@@ -47,7 +47,7 @@ pub struct TunnelEnrollmentTokenResponse {
 
 /// POST /api/tenant/{tenant_id}/tunnel-client/enroll-token —
 /// admin/member issues a single-use token the operator pastes into
-/// `roomler-tunnel enroll`. Mirrors `issue_enrollment_token` for
+/// `roomler enroll`. Mirrors `issue_enrollment_token` for
 /// agents.
 pub async fn issue_tunnel_enrollment_token(
     State(state): State<AppState>,
@@ -183,7 +183,7 @@ pub struct TunnelAgentInfo {
 }
 
 /// GET /api/tunnel-client/agents — the tenant's agent roster, so
-/// `roomler-tunnel socks5` (mesh mode) can route a CONNECT by friendly agent
+/// `roomler socks5` (mesh mode) can route a CONNECT by friendly agent
 /// name instead of the raw 24-hex id. Authenticated by the caller's TunnelClient
 /// JWT (`Authorization: Bearer <token>`) and scoped to that token's tenant.
 pub async fn list_tenant_agents(

@@ -35,17 +35,17 @@ SERVER_PATHS=(
   crates/config
   crates/derp-relay
   crates/tests
-  ui/src
+  ui
 )
 
 # CLIENT: everything installed on a machine, PLUS the four crates shared with
 # the server (they must match the weaker side — see the header).
 CLIENT_PATHS=(
-  agents/roomler-agent
-  agents/roomler-agent-tray
+  agents/roomlerd
+  agents/roomler-desktop
   agents/roomler-cli-shim
   agents/roomler-setup
-  agents/roomler-tunnel
+  agents/roomler-cli
   crates/agent-core
   crates/roomler-setup-core
   crates/tunnel-core
@@ -75,12 +75,12 @@ SERVER_CRATES=(
 )
 
 CLIENT_CRATES=(
-  roomler-agent
-  roomler-agent-tray
+  roomlerd
+  roomler-desktop
   roomler-cli-shim
   roomler-setup
-  roomler-tunnel
-  roomler-agent-core
+  roomler-cli
+  roomler-core
   roomler-setup-core
   roomler-ai-tunnel-core
   roomler-ai-remote-control
@@ -92,14 +92,23 @@ CLIENT_CRATES=(
 # SERVER_CRATE appears anywhere in these dependency graphs — that assertion, not
 # the header sweep, is what stops the split from silently rotting.
 SHIPPED_AGENT_CRATES=(
-  roomler-agent
-  roomler-tunnel
+  roomlerd
+  roomler-cli
   roomler-cli-shim
-  roomler-agent-tray
+  roomler-desktop
   roomler-setup
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# is_excluded <path> -> rc 0 if the path is deliberately outside the sweep.
+is_excluded() {
+  local path="$1" p
+  for p in "${EXCLUDE_PATTERNS[@]}"; do
+    case "$path" in *"$p"*) return 0 ;; esac
+  done
+  return 1
+}
 
 # licence_for <path> -> SPDX id on stdout, or empty + rc 1 if unclassified.
 licence_for() {
