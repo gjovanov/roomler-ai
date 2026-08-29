@@ -26,6 +26,7 @@ pub mod room;
 pub mod ssh_activity;
 pub mod ssh_audit;
 pub mod stats;
+pub mod subscriber;
 pub mod tenant;
 pub mod tunnel_audit;
 pub mod tunnel_client;
