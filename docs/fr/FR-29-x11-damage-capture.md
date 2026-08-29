@@ -111,10 +111,14 @@ working diagnostic, so P1 adds a distinct counter and heartbeat field.
 
 ## Open decisions
 
-- **Is root-window damage sufficient under a compositing WM?** With a
-  compositor, clients are redirected offscreen and the compositor paints the
-  root; root damage should cover it, but XFCE-with-compositing, Plasma/KWin and
-  GNOME/Mutter must each be checked — all three are installed on the field host.
+- ~~**Is root-window damage sufficient under a compositing WM?**~~ **SETTLED
+  for XFCE/xfwm4, both directions** (2026-08-29). With `use_compositing=true`:
+  motion still captured at **27.3 fps** (damage is not hidden by the
+  redirection) *and* idle still cost **3.0 %** of a core (a compositor does not
+  flood damage and defeat the skip). Both failure modes were plausible; neither
+  occurs. ⚠️ **Plasma/KWin and GNOME/Mutter remain untested** — both are
+  installed on the field host, so this is cheap to close and should be done
+  before P1 defaults on for hosts running those sessions.
 - Whether P3's partial readback is worth its complexity, or whether P1 alone
   (idle free, active unchanged) already buys the operator experience we want.
 
@@ -134,6 +138,7 @@ working diagnostic, so P1 adds a distinct counter and heartbeat field.
 |---|---|---|
 | 2026-08-29 | 0.4.15 (pre-change baseline) | idle capture 22.2 ms, CPU 45.8 %, 25.2 fps — the numbers P1 must move |
 | 2026-08-29 | P1, source build on the host | **idle CPU 3.4 % (13×)**; motion unchanged (45.0 %, 20.6 ms, 27.6 fps); kill switch back to 50.6 % |
+| 2026-08-29 | P1, xfwm4 **compositing ON** | motion 27.3 fps / 44.2 % / 20.4 ms; **idle 3.0 %** — a compositor neither hides damage nor floods it |
 
 ### What the field test caught that CI never would
 
