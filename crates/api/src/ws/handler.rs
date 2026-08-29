@@ -856,6 +856,9 @@ pub(crate) async fn dispatch_media_local(
         "media:producer_close" => {
             handle_media_producer_close(state, user_id, connection_id, data).await;
         }
+        "media:producer_pause" => {
+            handle_media_producer_pause(state, user_id, connection_id, data).await;
+        }
         "media:leave" => {
             handle_media_leave(state, user_id, connection_id, data).await;
         }
@@ -1303,6 +1306,78 @@ async fn handle_media_consume(
         Err(e) => {
             send_media_error(state, connection_id, &format!("consume failed: {}", e)).await;
         }
+    }
+}
+
+/// FR-30 — relay "my camera/mic just went off (or back on)" to the room.
+///
+/// Without this a peer cannot tell: `producer.pause()` in mediasoup-client is
+/// LOCAL, and a track with `enabled = false` keeps its RTP stream alive with
+/// black frames, so the receiving track stays `live` and UNMUTED. Measured on
+/// prod 2026-08-29 — the far side saw `enabled:true, readyState:"live",
+/// muted:false` after the sender switched their camera off, which is why
+/// "hide participants without video" could never hide anyone.
+///
+/// Shaped exactly like `handle_media_producer_close` below, and additive: an
+/// older client never sends this and ignores the event it would receive.
+async fn handle_media_producer_pause(
+    state: &AppState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    data: Option<&serde_json::Value>,
+) {
+    let Some(data) = data else { return };
+    let Some(room_id_str) = data.get("room_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(producer_id_str) = data.get("producer_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    // Absent means "pause": the only caller that omits it is a client that
+    // predates the resume half, and pausing is the safe reading.
+    let paused = data.get("paused").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let Ok(rid) = ObjectId::parse_str(room_id_str) else {
+        return;
+    };
+    let Ok(producer_id) = producer_id_str.parse::<ProducerId>() else {
+        return;
+    };
+
+    if !state
+        .room_manager
+        .set_producer_paused(&rid, connection_id, &producer_id, paused)
+        .await
+    {
+        // The producer is not ours, or is already gone. Say nothing: fanning
+        // out an unverified claim would let one participant blank another's
+        // tile for everybody.
+        return;
+    }
+
+    let other_conns = state
+        .room_manager
+        .get_other_connection_ids(&rid, connection_id);
+    if other_conns.is_empty() {
+        return;
+    }
+
+    let event = serde_json::json!({
+        "type": "media:producer_paused",
+        "data": {
+            "producer_id": producer_id.to_string(),
+            "user_id": user_id.to_hex(),
+            "paused": paused,
+        }
+    });
+    for conn_id in &other_conns {
+        super::dispatcher::send_to_connection_routed(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            conn_id,
+            &event,
+        )
+        .await;
     }
 }
 
