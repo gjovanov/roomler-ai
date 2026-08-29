@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#809](https://github.com/gjovanov/roomler-ai/issues/809) |
-| **Status** | P0-P7 on master; **field-verified on Linux, Windows and macOS**; the CI guard blocks on `--check --strict` (**0 unclassified**, 732 anchored). |
+| **Status** | P0-P7 on master; **field-verified on Linux, Windows and macOS**; the CI guard blocks on `--check --strict` (**0 unclassified**, 756 anchored). |
 | **Opened** | 2026-08-28 |
 | **Baseline** | master `fa364b12` (0.4.11) — every count and anchor below was measured against it |
 | **Scope** | Windows · Linux · macOS — code, comments, docs, `CLAUDE.md`, file names, folder names, env vars |
@@ -250,7 +250,7 @@ P2 is wrong and stops.
 | **P4** | Residual live paths | fix the §5 staging defect by calling a resolver instead of a constant (expose `machine_global_dir()` over LocalAPI); sweep the remaining hardcoded `roomler-agent` paths | every path keeps a new-then-old fallback, exactly like `appdirs` |
 | **P5** | Ratify + enforce | freeze list reviewed and justified in-tree; `name-audit --check` flips to **blocking**; a deliberately-red run proves it fails | revert the `continue-on-error` removal |
 | **P6** | Field verification | the §9.4 matrix on Windows / Linux / macOS, fresh **and** upgrade-from-0.4.x, including a pre-rename host | n/a — verification, not a change |
-| **P7** ✅ | Drive `unclassified` to zero, flip the guard to `--strict` | 10 reviewed batches; every occurrence migrated or anchored with a stated reason; `ci.yml` runs `--check --strict`; new guard: a shebang must stay on line 1 | revert the `--strict` word in `ci.yml` — the `--check` pair keeps working |
+| **P7** ✅ | Drive `unclassified` to zero, flip the guard to `--strict` | 12 reviewed batches; every occurrence migrated or anchored with a stated reason; `ci.yml` runs `--check --strict`; new guard: a shebang must stay on line 1 | revert the `--strict` word in `ci.yml` — the `--check` pair keeps working |
 
 ### 7a. Resequencing, measured during P1 — P1 was specced too large
 
