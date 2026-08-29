@@ -1,9 +1,9 @@
-//! `roomler-tunnel` library surface.
+//! `roomler` library surface.
 //!
 //! Re-export of `tunnel_core` so consumers of the binary have one
 //! import path, plus the CLI-specific helpers used by [`cli`].
 //! End-to-end tests in `crates/tests/` drive this lib in-process
-//! against a `TestApp`, mirroring how `roomler-agent` is driven from
+//! against a `TestApp`, mirroring how `roomlerd` is driven from
 //! `crates/tests/src/remote_control.rs`.
 
 /// The whole `roomler` command surface (clap definitions + dispatch).

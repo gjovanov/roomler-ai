@@ -1,6 +1,7 @@
 //! Agent-side forward allowlist — the second gate after the
 //! server-side ACL in `api/ws/tunnel.rs`.
 //!
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! Config-driven via `[tunnel]` block in `~/.config/roomler-agent/
 //! config.toml`. Operators on org-controlled hosts narrow what the
 //! server's tenant-wide policies permit (e.g. "this VM only ever

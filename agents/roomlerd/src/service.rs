@@ -4,6 +4,7 @@
 //! automatically on the next interactive login:
 //!
 //!   - **Windows**: Scheduled Task named `Roomler` (pre-P3D-rename hosts
+// RETIRED-NAME-ANCHOR(3): the legacy scheduled-task name install/uninstall must still find.
 //!     have `RoomlerAgent`, which `install()` retires and `uninstall()`
 //!     deletes), ONLOGON trigger, LIMITED run level (matches the agent's
 //!     un-elevated-by-design posture from `packaging/windows/README.txt`).
@@ -422,7 +423,7 @@ mod windows {
     /// fail with "The argument is incorrect" on Win10 22H2.
     fn write_temp_xml(xml_utf8: &str) -> Result<PathBuf> {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("roomler-agent-task-{}.xml", std::process::id()));
+        let path = dir.join(format!("roomlerd-task-{}.xml", std::process::id()));
         let mut buf = Vec::with_capacity(xml_utf8.len() * 2 + 2);
         buf.extend_from_slice(&[0xFF, 0xFE]); // UTF-16-LE BOM
         for c in xml_utf8.encode_utf16() {

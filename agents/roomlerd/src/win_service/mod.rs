@@ -56,6 +56,11 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 pub const NEW_SERVICE_NAME: &str = "Roomler";
 
 /// Pre-rename SCM short name. A host installed before the P3D migration
+// RETIRED-NAME-ANCHOR-BEGIN
+// RoomlerAgentService is the SCM name on a host installed before the rename.
+// install() must find and retire it and uninstall() must remove it, so the
+// string is an input. LEGACY_SERVICE_NAME is asserted against this literal
+// precisely so a rename here fails a test instead of stranding a fleet.
 /// still has a `RoomlerAgentService` entry; the takeover install starts
 /// the new service first, then retires this one.
 // RETIRED-NAME-ANCHOR: without this the takeover install cannot find the running
@@ -471,3 +476,4 @@ mod tests {
         assert_eq!(s.current_state, ServiceState::Running);
     }
 }
+// RETIRED-NAME-ANCHOR-END
