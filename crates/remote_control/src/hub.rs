@@ -22,6 +22,7 @@ use tracing::{info, warn};
 use crate::audit::AuditSink;
 use crate::consent::{
     ASYNC_CONSENT_TIMEOUT, ConsentOutcome, DEFAULT_CONSENT_TIMEOUT, HOST_PROMPT_TIMEOUT,
+    hub_consent_deadline,
 };
 use crate::error::{Error, Result};
 use crate::models::{AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, SessionPhase};
@@ -922,10 +923,17 @@ impl Hub {
             });
         }
 
-        // Spawn the consent watcher.
+        // Spawn the consent watcher. FR-27: it waits GRACE longer than the
+        // window it just announced to the agent, because the agent's verdict
+        // arrives ~130 ms after that window on every non-answer and is the
+        // one carrying a reason (`timeout` vs `no_prompt_surface`). Measured
+        // on mars 2026-08-29: with an equal wait the hub terminated first and
+        // every `no_prompt_surface` reached the controller as "nobody
+        // answered". This timer is the backstop for a dead agent, not a
+        // competitor of a live one — see `consent::CONSENT_VERDICT_GRACE`.
         let hub = self.clone();
         tokio::spawn(async move {
-            let outcome = waiter.wait(timeout).await;
+            let outcome = waiter.wait(hub_consent_deadline(timeout)).await;
             hub.handle_consent_outcome(session_id, outcome);
         });
 
