@@ -307,6 +307,14 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["damage"], optional = true }
 
+# FR-36 P1 — DRM/KMS scanout capture (`drm-capture`). MIT, and its whole tree
+# (drm-ffi / drm-sys / drm-fourcc) is MIT too, so it is clean under FR-24's
+# no-AGPL-in-a-shipped-agent rule. drm-sys builds from `linux-raw-sys` with NO
+# bindgen, so this adds no libclang requirement to any release lane — verified
+# with `cargo tree | grep -c bindgen` = 0 on aarch64 Fedora. bitflags, bytemuck
+# and rustix are already in the lockfile.
+drm = { version = "0.15", optional = true }
+
 # FR-27 — the native macOS consent panel (`viewer-indicator-macos`). All three
 # are already in the lockfile (tauri pulls them for the desktop companion), so
 # this is a target-scoped direct dep rather than new supply-chain surface.
@@ -498,8 +506,20 @@ media = ["scrap-capture", "openh264-encoder"]
 # Windows builds should use this so the open_default cascade can pick
 # MF when available and fall back to openh264 when not.
 media-hw = ["media", "mf-encoder"]
+# FR-36 P1 — DRM/KMS screen capture: read the scanout framebuffer below the
+# compositor. The only backend that can see a WAYLAND desktop, or a LOCKED
+# one — the portal refuses both by design. Linux-only in effect (the dep is
+# scoped to the Linux target, so enabling this elsewhere is a no-op, same as
+# `clipboard`'s `dep:clipboard-win`).
+#
+# ⚠️ Compiling it in does NOT switch any host to it: `ROOMLERD_DRM_CAPTURE`
+# defaults to OFF, because DRM carries no damage information and defaulting it
+# on would undo FR-29's idle-CPU win on every X11 host. Shipped in `full` for
+# the same reason `ssh-server` is — the code is present with its gates closed,
+# so a Wayland host opts in with an env var instead of a custom build.
+drm-capture = ["dep:drm"]
 # Everything needed for a full remote-control session, software only.
-full = ["media", "enigo-input", "clipboard", "audio"]
+full = ["media", "enigo-input", "clipboard", "audio", "drm-capture"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
