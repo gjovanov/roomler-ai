@@ -1,7 +1,7 @@
 # FR-30 — Camera/mic state is never signalled, so peers cannot see who turned their camera off
 
 **Issue:** [#884](https://github.com/gjovanov/roomler-ai/issues/884)
-**Status:** proposed — design anchored against master, no code yet
+**Status:** P1+P2 shipped (#886) and **field-verified 2026-08-29** on prod `v20260829-0d5078f44e42`. P3 (the tile indicator) open.
 
 ## Goal
 
@@ -92,15 +92,15 @@ sends `producer_pause` (so it behaves exactly as today) and ignores an unknown
 
 ## Acceptance criteria
 
-- [ ] With "hide participants without video" on, turning the camera off in tab A
+- [x] With "hide participants without video" on, turning the camera off in tab A
       removes that tile in tab B within ~1 s, **without a reload**; turning it
       back on restores it
 - [ ] A remote tile shows a camera-off indicator (and a mic-off one) driven by
       the signal, not by local state
-- [ ] Consumers stop receiving video while the producer is paused — measured,
+- [x] Consumers stop receiving video while the producer is paused — measured,
       not assumed
 - [ ] An old client in the same call is unaffected (no errors, no missing tiles)
-- [ ] The FR-25 criterion this unblocks is re-ticked in
+- [x] The FR-25 criterion this unblocks is re-ticked in
       `docs/fr/FR-25-call-layout-mentions-pip.md`
 
 ## Open decisions
@@ -119,4 +119,28 @@ sends `producer_pause` (so it behaves exactly as today) and ignores an unknown
 
 ## Field-verification log
 
-- (pending)
+- **2026-08-29 — P1+P2 field-verified**, two browsers in one call on prod
+  `v20260829-0d5078f44e42`, `hideNonVideo` on:
+
+  | action | tiles visible in the OTHER tab |
+  |---|---|
+  | both cameras on | `["bd1627c2…", "local"]` |
+  | tab A camera **off** | `["local"]` — the remote tile went, **no reload** |
+  | tab A camera **on** again | `["bd1627c2…", "local"]`, video flowing at 640px |
+
+  And the bandwidth half, counted with `getVideoPlaybackQuality()` on the
+  receiving tab over 3 s:
+
+  | sender state | frames arriving | the track, as the receiver sees it |
+  |---|---|---|
+  | camera on | **96** (~32 fps) | `enabled:true, live, unmuted` |
+  | camera off | **0** | `enabled:true, live, unmuted` — *identical* |
+
+  🔑 That last column is the whole point of this FR in one measurement: the
+  track looks **exactly the same** either way, so nothing on the receiving side
+  could ever have distinguished them. Only the peer's own signal can, and now
+  it does — while the server-side pause stops the frames at the SFU rather than
+  shipping black ones to everybody.
+
+- Remaining: P3, the camera-off / mic-off indicator on a remote tile. The
+  signal it needs is now delivered; the tile just doesn't draw it yet.
