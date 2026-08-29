@@ -1444,6 +1444,9 @@ async fn connect_once(
                     sys: Some(sys),
                     srflx_count,
                     warm_relay,
+                    // FR-27 — cached for 10 min inside, so this is a map lookup
+                    // on all but one heartbeat in twenty.
+                    companion_version: crate::companion::installed_version(),
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
@@ -1975,7 +1978,7 @@ async fn handle_server_msg(
                     detail: String::new(),
                     // The marker is written EITHER WAY — it is the
                     // machine-readable record that a decision is outstanding,
-                    // and `roomler consent --list` must show a
+                    // and `roomlerd consent --list` must show a
                     // natively-prompted session too. This field is what stops
                     // the companion from ALSO popping a panel and asking the
                     // same question twice.
