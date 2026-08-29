@@ -59,7 +59,7 @@ pub struct ScrapCapture {
     /// command channel is the per-frame hot path and a cap change is rare, so
     /// this keeps the frame path byte-for-byte as it was.
     desired: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// FR-28 — frames the damage tracker proved were unnecessary. Shared with
+    /// FR-29 — frames the damage tracker proved were unnecessary. Shared with
     /// the worker; surfaced through `ScreenCapture::frames_unchanged`.
     unchanged: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -85,7 +85,7 @@ impl ScrapCapture {
         // init failure back to the caller synchronously.
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32)>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<CaptureCmd>();
-        // FR-28 — counted on the worker, read by the pump's heartbeat. Kept
+        // FR-29 — counted on the worker, read by the pump's heartbeat. Kept
         // separate from `frames_empty` so "idle screen, working as intended"
         // never masquerades as "pump starved".
         let unchanged = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -170,7 +170,7 @@ impl ScrapCapture {
                 #[cfg(target_os = "macos")]
                 let mut last_reopen = Instant::now();
 
-                // FR-28 P1 — built HERE, on the capture worker, because an
+                // FR-29 P1 — built HERE, on the capture worker, because an
                 // X11 connection has the same thread affinity the XShm
                 // capturer does. `None` = tracking unavailable or switched
                 // off, in which case every tick captures exactly as before.
@@ -258,7 +258,7 @@ impl ScrapCapture {
                             }
                         }
                     }
-                    // FR-28 P1 — skip the full-screen XShm readback when the
+                    // FR-29 P1 — skip the full-screen XShm readback when the
                     // server says nothing changed. `Ok(None)` is the pump's
                     // existing idle-screen path (it already logs "capture
                     // produced no frame (idle screen)"), so this makes a path
