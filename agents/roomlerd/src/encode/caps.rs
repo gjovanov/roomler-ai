@@ -813,6 +813,15 @@ fn rpc_caps() -> Vec<String> {
         // and isn't.
         caps.push(RpcCap::SshConsent);
     }
+    // FR-19 — advertise the org-relay SERVER only when this device has opted
+    // in (`relay_server_enabled`, gate 4). The server never installs a session
+    // on a device that does not advertise this, so a device that has not opted
+    // in is simply never asked — and a build without the overlay features has
+    // no relay to advertise at all.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    if tunnel_core::overlay::orgrelay::relay_server_enabled() {
+        caps.push(RpcCap::RelayServer);
+    }
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 
