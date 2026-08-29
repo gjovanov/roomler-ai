@@ -1304,6 +1304,7 @@ mod tests {
                 kind: "rc".into(),
                 detail: String::new(),
                 expires_at_ms: 0,
+                surface: String::new(),
                 org: String::new(),
             };
             std::fs::write(

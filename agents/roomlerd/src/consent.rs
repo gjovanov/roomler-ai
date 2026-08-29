@@ -167,6 +167,34 @@ impl PromptKind {
     }
 }
 
+/// FR-27 — WHO is already showing this prompt.
+///
+/// The marker is written even when the daemon's own native panel is up,
+/// because it is also the machine-readable record that a decision is
+/// outstanding — `roomler consent --list` must show a natively-prompted
+/// session, and the LocalAPI is the only honest place to read that from.
+///
+/// Which makes this field load-bearing: without it the desktop companion would
+/// see the marker and pop a SECOND panel asking the same question, and two
+/// Approve buttons for one decision is how someone approves the wrong thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSurface {
+    /// The daemon is drawing it (Windows overlay, X11, AppKit). A UI reading
+    /// the marker should LIST it and not render a panel.
+    Native,
+    /// Nobody is drawing it yet — the companion should.
+    Companion,
+}
+
+impl PromptSurface {
+    pub fn wire(self) -> &'static str {
+        match self {
+            PromptSurface::Native => "native",
+            PromptSurface::Companion => "companion",
+        }
+    }
+}
+
 /// Everything a prompt surface needs to render one decision.
 ///
 /// Built here rather than at each call site so the three subsystems cannot
@@ -188,6 +216,8 @@ pub struct PendingPrompt<'a> {
     /// Asking organization, for a multi-org device. Empty otherwise.
     pub org: String,
     pub timeout: Duration,
+    /// Who is already showing this prompt. See [`PromptSurface`].
+    pub surface: PromptSurface,
 }
 
 impl PendingPrompt<'_> {
@@ -206,6 +236,7 @@ impl PendingPrompt<'_> {
             kind: self.kind.wire().to_string(),
             detail: self.detail.clone(),
             expires_at_ms,
+            surface: self.surface.wire().to_string(),
             org: self.org.clone(),
         };
         // Infallible for this shape; a `{}` body would still parse to a
