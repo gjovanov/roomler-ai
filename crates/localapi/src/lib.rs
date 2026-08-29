@@ -675,11 +675,18 @@ pub struct RouteInfo {
     pub state: RouteState,
 }
 
-/// One remote-control session awaiting an operator consent decision (rc.46).
+/// One request awaiting an operator consent decision (rc.46).
 /// Surfaced by [`Request::ConsentPending`] so the desktop app renders its
 /// Approve/Deny modal over the LocalAPI instead of reading the daemon's private
 /// sentinel dir — which lives in the daemon's profile and is unreachable to the
 /// interactive-user app when the daemon runs as SYSTEM (P2b bug fix).
+///
+/// FR-27 — no longer remote-control only. Fleet-RPC `exec` and Roomler SSH have
+/// always prompted through the same broker, but never wrote a marker, so their
+/// prompts were invisible to every UI and answerable only by someone who greped
+/// the daemon log for a request id inside 30 s. [`Self::kind`] is what lets one
+/// modal serve all three without lying about which is which — "approve this"
+/// means something very different for a screen share and for a root shell.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ConsentRequest {
     pub session_id: String,
@@ -690,6 +697,41 @@ pub struct ConsentRequest {
     pub permissions: String,
     #[serde(default)]
     pub timeout_secs: u64,
+    /// FR-27 — which subsystem is asking: `rc` (screen control), `exec` (a
+    /// command) or `ssh` (a shell). `#[serde(default)]` yields `""` from a
+    /// pre-FR-27 daemon, which a reader should treat as `rc` — the only kind
+    /// that existed then.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// FR-27 — the one line that makes the decision answerable: the redacted
+    /// command for `exec`, the principal + account mode for `ssh`, empty for
+    /// `rc` (where `controller_name` and `permissions` already say everything).
+    ///
+    /// ⚠️ Redacted BY THE DAEMON before it is written. A consent prompt is
+    /// rendered by a GUI process and can be screenshotted, and `exec` payloads
+    /// routinely carry tokens — `exec::redactor()` runs first, as it does for
+    /// exec output leaving the host.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// FR-27 — unix-millis deadline, so a panel can show a real countdown
+    /// instead of restarting one every time it re-reads the list. `0` from a
+    /// pre-FR-27 daemon means "unknown"; fall back to `timeout_secs`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub expires_at_ms: u64,
+    /// FR-27 — who is ALREADY showing this prompt: `native` (the daemon's own
+    /// overlay is up) or `companion` / absent (nobody is; the desktop app
+    /// should).
+    ///
+    /// ⚠️ Load-bearing for the desktop app, not informational. The daemon
+    /// writes a marker even when its native panel is up, because this list is
+    /// also what `roomler consent --list` reads — so without this field the
+    /// companion would pop a SECOND panel asking the same question, and two
+    /// Approve buttons for one decision is how someone approves the wrong
+    /// thing. A UI must LIST a `native` entry and not render a prompt for it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub surface: String,
+    // NOTE: `org` stays LAST; the struct is built field-by-field at three call
+    // sites and keeping the multi-org line at the end matches how it reads.
     /// Multi-org — the organization the request comes from, so the modal can
     /// say WHO is asking. On a device enrolled in two orgs, "Alice wants to
     /// control this machine" is not enough to decide on: Alice may be a
@@ -699,6 +741,36 @@ pub struct ConsentRequest {
     /// (`#[serde(default)]` — the desktop app simply shows no org line).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub org: String,
+}
+
+/// FR-27 — one remote-control session currently LIVE on this device.
+///
+/// The device side of "who is watching my screen". Distinct from
+/// [`ConsentRequest`], which is about sessions not yet allowed to start: this
+/// is what the "Being viewed by …" banner renders, and what its Disconnect
+/// button acts on.
+///
+/// There was no LocalAPI verb for this at all before, which is why the banner
+/// existed only as the Windows-native overlay inside the daemon — no thin
+/// client could see a session, let alone end one.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RcSessionInfo {
+    /// Hex `ObjectId` — the handle [`Request::RcDisconnect`] takes.
+    pub session_id: String,
+    /// Display name of whoever is controlling.
+    #[serde(default)]
+    pub controller_name: String,
+    /// Pipe-separated permission names — what they were actually granted, so
+    /// a view-only watcher is distinguishable from someone typing.
+    #[serde(default)]
+    pub permissions: String,
+    /// Asking organization on a multi-org device; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub org: String,
+    /// Unix millis when the session started, for an "N min" age in the banner.
+    /// `0` = unknown.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub started_at_ms: u64,
 }
 
 /// A LocalAPI request. P1 exposed read-only verbs; P2b adds the (mutating)
@@ -716,6 +788,12 @@ pub enum Request {
     ConsentPending,
     /// Approve (`allow=true`) or deny a pending consent, by session id.
     ConsentDecide { session_id: String, allow: bool },
+    /// FR-27 — remote-control sessions currently LIVE on this device.
+    RcSessions,
+    /// FR-27 — end a live remote-control session from the device side. This is
+    /// the Disconnect the "Being viewed by …" banner offers; mutating, and the
+    /// pipe/socket ACL is the trust boundary, like [`Self::ConsentDecide`].
+    RcDisconnect { session_id: String },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. `timeout_ms` 0 ⇒ the daemon's default.
     Ping {
@@ -898,6 +976,13 @@ pub enum Response {
     ConsentDecided {
         ok: bool,
     },
+    /// FR-27 — live remote-control sessions.
+    RcSessions(Vec<RcSessionInfo>),
+    /// FR-27 — result of [`Request::RcDisconnect`]; `ok` = a session with that
+    /// id was found and asked to stop.
+    RcDisconnected {
+        ok: bool,
+    },
     /// Round-trip result of [`Request::Ping`] — the resolved overlay IP + RTT.
     Pong {
         target: String,
@@ -1074,6 +1159,18 @@ pub trait LocalApiState: Send + Sync {
     fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
         false
     }
+    /// FR-27 — remote-control sessions currently LIVE on this device. Distinct
+    /// from [`Self::consent_pending`], which is about sessions not yet allowed
+    /// to start. Default: none.
+    fn rc_sessions(&self) -> Vec<RcSessionInfo> {
+        Vec::new()
+    }
+    /// FR-27 — tear down a live remote-control session from the device side.
+    /// Returns whether a session with that id was found and asked to stop.
+    /// Default: no-op `false`.
+    fn rc_disconnect(&self, _session_id: &str) -> bool {
+        false
+    }
     /// ICMP-ping an overlay peer by name/IP over the userspace netstack, and
     /// return a [`Response::Pong`] (or [`Response::Error`]). Async — awaited by
     /// [`serve_connection`], not the sync [`handle`]. `prefer_v6` resolves a
@@ -1210,6 +1307,10 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         Request::ConsentPending => Response::ConsentPending(state.consent_pending()),
         Request::ConsentDecide { session_id, allow } => Response::ConsentDecided {
             ok: state.consent_decide(session_id, *allow),
+        },
+        Request::RcSessions => Response::RcSessions(state.rc_sessions()),
+        Request::RcDisconnect { session_id } => Response::RcDisconnected {
+            ok: state.rc_disconnect(session_id),
         },
         Request::KillFlow { id } => Response::FlowKilled {
             ok: state.kill_flow(id),
@@ -1905,6 +2006,27 @@ impl Client {
         }
     }
 
+    /// FR-27 — `Request::RcSessions` → remote-control sessions currently live
+    /// on this device.
+    pub async fn rc_sessions(&mut self) -> std::io::Result<Vec<RcSessionInfo>> {
+        match self.request(&Request::RcSessions).await? {
+            Response::RcSessions(v) => Ok(v),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-27 — `Request::RcDisconnect` → end a live session from the device
+    /// side. `false` = no session with that id (already gone, or never here).
+    pub async fn rc_disconnect(&mut self, session_id: &str) -> std::io::Result<bool> {
+        let req = Request::RcDisconnect {
+            session_id: session_id.to_string(),
+        };
+        match self.request(&req).await? {
+            Response::RcDisconnected { ok } => Ok(ok),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
     /// `Request::ConsentDecide` → approve/deny a pending consent. Returns
     /// whether the daemon recorded the decision.
     pub async fn consent_decide(&mut self, session_id: &str, allow: bool) -> std::io::Result<bool> {
@@ -2202,6 +2324,10 @@ mod tests {
                 controller_name: "alice".into(),
                 permissions: "view|control".into(),
                 timeout_secs: 30,
+                kind: "rc".into(),
+                detail: String::new(),
+                expires_at_ms: 0,
+                surface: String::new(),
                 org: "Acme".into(),
             }]
         }
@@ -2992,6 +3118,10 @@ mod tests {
             controller_name: "Alice".into(),
             permissions: "VIEW_SCREEN".into(),
             timeout_secs: 30,
+            kind: String::new(),
+            detail: String::new(),
+            expires_at_ms: 0,
+            surface: String::new(),
             org: String::new(),
         };
         let json = serde_json::to_string(&single).unwrap();
@@ -3008,5 +3138,107 @@ mod tests {
         let round: ConsentRequest =
             serde_json::from_str(&serde_json::to_string(&multi).unwrap()).unwrap();
         assert_eq!(round.org, "Acme GmbH");
+    }
+
+    /// FR-27 — `kind` / `detail` / `expires_at_ms` are additive in exactly the
+    /// same way, and for the same reason: the desktop app and the daemon do not
+    /// step forward in the same instant.
+    ///
+    /// The empty defaults are load-bearing, not incidental. A pre-FR-27 daemon
+    /// wrote only remote-control prompts, so an absent `kind` MUST read as
+    /// `rc` at the UI — an empty string rendered literally would label a real
+    /// screen-control request with a blank type.
+    #[test]
+    fn consent_request_kind_and_detail_are_additive() {
+        let legacy: ConsentRequest = serde_json::from_str(
+            r#"{"session_id":"abc","controller_name":"Alice","permissions":"VIEW_SCREEN","timeout_secs":30}"#,
+        )
+        .expect("a pre-FR-27 payload must still parse");
+        assert_eq!(legacy.kind, "");
+        assert_eq!(legacy.detail, "");
+        assert_eq!(legacy.expires_at_ms, 0);
+
+        // An rc prompt carries no detail and must not ship empty keys.
+        let rc = ConsentRequest {
+            session_id: "abc".into(),
+            controller_name: "Alice".into(),
+            permissions: "VIEW".into(),
+            timeout_secs: 30,
+            kind: "rc".into(),
+            detail: String::new(),
+            expires_at_ms: 0,
+            surface: String::new(),
+            org: String::new(),
+        };
+        let json = serde_json::to_string(&rc).unwrap();
+        assert!(
+            !json.contains("\"detail\""),
+            "empty detail must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("\"expires_at_ms\""),
+            "an unknown deadline must be omitted, not sent as 0: {json}"
+        );
+
+        // An exec prompt carries the whole point of the change: what is about
+        // to run, and until when.
+        let exec = ConsentRequest {
+            kind: "exec".into(),
+            detail: "systemctl restart roomlerd".into(),
+            expires_at_ms: 1_700_000_000_000,
+            surface: String::new(),
+            ..rc
+        };
+        let round: ConsentRequest =
+            serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
+        assert_eq!(round.kind, "exec");
+        assert_eq!(round.detail, "systemctl restart roomlerd");
+        assert_eq!(round.expires_at_ms, 1_700_000_000_000);
+    }
+
+    /// FR-27 — `surface` decides whether a UI RENDERS a prompt or merely lists
+    /// it. The daemon writes a marker even when its own native panel is up
+    /// (this list is also what `roomler consent --list` reads), so a UI that
+    /// ignored the field would put a SECOND Approve button in front of one
+    /// decision.
+    ///
+    /// The absent case is the load-bearing one: a pre-FR-27 daemon had no
+    /// native panel at all, so "" must mean "nobody is showing it" — i.e. the
+    /// companion should — and never be mistaken for "native".
+    #[test]
+    fn consent_request_surface_defaults_to_the_companion() {
+        let legacy: ConsentRequest = serde_json::from_str(
+            r#"{"session_id":"abc","controller_name":"Alice","permissions":"VIEW","timeout_secs":30}"#,
+        )
+        .expect("a pre-FR-27 payload must still parse");
+        assert_eq!(legacy.surface, "");
+        assert_ne!(legacy.surface, "native", "absent must never read as native");
+
+        let native = ConsentRequest {
+            session_id: "abc".into(),
+            controller_name: "Alice".into(),
+            permissions: "VIEW".into(),
+            timeout_secs: 30,
+            kind: "rc".into(),
+            detail: String::new(),
+            expires_at_ms: 0,
+            surface: "native".into(),
+            org: String::new(),
+        };
+        let round: ConsentRequest =
+            serde_json::from_str(&serde_json::to_string(&native).unwrap()).unwrap();
+        assert_eq!(round.surface, "native");
+
+        // A companion-served prompt omits the key rather than shipping the
+        // default spelling, exactly as `org` does.
+        let companion = ConsentRequest {
+            surface: String::new(),
+            ..native
+        };
+        let json = serde_json::to_string(&companion).unwrap();
+        assert!(
+            !json.contains("\"surface\""),
+            "an empty surface must be omitted: {json}"
+        );
     }
 }

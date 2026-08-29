@@ -287,27 +287,44 @@ enum Command {
         #[arg(long)]
         flavour: Option<String>,
     },
-    /// Approve or deny a pending operator-consent prompt for a remote-
-    /// control session. Used when the agent's `auto_grant_session` is
-    /// `false` (org-controlled fleets). Prefers the running device
-    /// service over its LocalAPI (works regardless of which profile the
-    /// service runs under — incl. SYSTEM/SCM installs); falls back to a
-    /// sentinel file under `<log_dir>/consent/` in THIS profile when no
-    /// service is listening (console-run agent). 30 s timeout from the
-    /// agent's POV, after which the broker auto-denies. Read the
-    /// agent's log line to find the session id awaiting approval.
+    /// List, approve or deny pending operator-consent prompts (remote
+    /// control, `exec`, SSH). Used when the device prompts rather than
+    /// auto-granting. Prefers the running device service over its LocalAPI
+    /// (works regardless of which profile the service runs under — incl.
+    /// SYSTEM/SCM installs); falls back to a sentinel file under
+    /// `<log_dir>/consent/` in THIS profile when no service is listening
+    /// (console-run agent). 30 s from the agent's POV, after which the
+    /// broker auto-denies.
+    ///
+    /// `--list` is FR-27: the id was previously obtainable only by grepping
+    /// the daemon log, inside the same 30 s the operator had to answer in,
+    /// which made the headless path close to unusable.
     Consent {
-        /// Hex `session_id` from the agent's log line
-        /// "operator consent required" — typically a 24-character
+        /// Show every prompt currently awaiting a decision, and exit.
+        #[arg(long, short = 'l', conflicts_with_all = ["approve", "deny"])]
+        list: bool,
+        /// Hex `session_id` (or exec request id) from `--list` or the
+        /// agent's "operator consent required" log line — a 24-character
         /// MongoDB ObjectId hex string.
-        #[arg(long)]
-        session: String,
+        #[arg(long, required_unless_present = "list")]
+        session: Option<String>,
         /// Approve the session.
         #[arg(long, conflicts_with = "deny")]
         approve: bool,
         /// Deny the session.
         #[arg(long, conflicts_with = "approve")]
         deny: bool,
+    },
+    /// FR-27 — list, or end, remote-control sessions currently LIVE on this
+    /// device. The headless twin of the desktop app's "Being viewed by …"
+    /// banner, and the only such view on a host with no GUI at all.
+    ///
+    /// `--disconnect <id>` takes exactly the same teardown path as the
+    /// on-screen Disconnect: the daemon closes the peer and tells the server.
+    Rc {
+        /// End this session (hex id from the plain listing).
+        #[arg(long, value_name = "SESSION")]
+        disconnect: Option<String>,
     },
     /// (internal) Entry point invoked by the Windows Service Control
     /// Manager when `RoomlerAgentService` starts. Hands the process
@@ -650,11 +667,82 @@ fn embedded_cli_args() -> Option<Vec<std::ffi::OsString>> {
     Some(argv)
 }
 
+/// FR-27 — on macOS with the native consent panel, tokio may NOT own the main
+/// thread.
+///
+/// AppKit delivers every event — including the click on an Approve button —
+/// on the main run loop, and `#[tokio::main]` parks the main thread in
+/// `block_on` for the daemon's entire life. Nothing drains the main queue, so
+/// a window can be created and will never respond. That is the whole reason
+/// macOS has had no native overlay: not that nobody wrote one, but that this
+/// process shape makes one inert.
+///
+/// So on that one configuration the roles swap: the runtime is built
+/// explicitly and the daemon future runs on a worker, while the main thread
+/// hands itself to AppKit. Everywhere else `main` is exactly what it was.
+///
+/// ⚠️ `NSApp.run()` never returns. The daemon's own exit paths
+/// (`std::process::exit`, the watchdog's `STALL_EXIT_CODE`) still work — they
+/// terminate the process, not this function — but anything that relied on
+/// `main` RETURNING to end the process would not. Nothing does: the daemon's
+/// clean shutdown is a `process::exit` after its drain.
+#[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
+fn main() -> Result<()> {
+    // The embedded CLI must still short-circuit before any of this — and it
+    // must NOT hand the main thread to AppKit, since a CLI call has to be able
+    // to return an exit code.
+    if let Some(argv) = embedded_cli_args() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(roomler_cli::cli::run_from(
+            argv,
+            roomler_cli::cli::Origin::EmbeddedInDaemon,
+        ));
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    std::thread::Builder::new()
+        .name("roomlerd-main".into())
+        .spawn(move || {
+            if let Err(e) = rt.block_on(daemon_main()) {
+                tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
+                std::process::exit(1);
+            }
+            // The daemon returning normally is a shutdown. The main thread is
+            // inside AppKit and will not notice, so say so explicitly.
+            std::process::exit(0);
+        })
+        .context("spawning the daemon thread")?;
+
+    // Hands the main thread to AppKit, forever. `Accessory` keeps us out of
+    // the Dock and the app switcher — the bundle already sets `LSUIElement`,
+    // and this makes it true for a non-bundled dev run too.
+    //
+    // ⚠️ `roomlerd::`, NOT `crate::`. This file is a SEPARATE crate root from
+    // the lib, so a `cfg`-gated path here that reads like an intra-crate one
+    // compiles nowhere — and, being macOS-only, nowhere is exactly where it
+    // would have been noticed. Same trap as rc.454's `tcc` block; the `--bins`
+    // in the macOS CI job exists for it and caught this on the first push.
+    roomlerd::indicator::mac::run_main_loop();
+}
+
+#[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 #[tokio::main]
 async fn main() -> Result<()> {
+    daemon_main().await
+}
+
+async fn daemon_main() -> Result<()> {
     // P3e lever D — embedded `roomler` CLI. MUST stay the first statement in
     // main(): everything below is daemon-startup setup that a CLI invocation
     // has no business performing. See `embedded_cli_args`.
+    //
+    // ⚠️ The macOS `main` above ALSO checks this, before it hands the main
+    // thread to AppKit. Both are needed: this one covers every other platform,
+    // that one has to run before a run loop it can never return from.
     if let Some(argv) = embedded_cli_args() {
         return roomler_cli::cli::run_from(argv, roomler_cli::cli::Origin::EmbeddedInDaemon).await;
     }
@@ -872,10 +960,20 @@ async fn main() -> Result<()> {
             sweep_old_versions_cmd(dry_run, flavour.as_deref())
         }
         Command::Consent {
+            list,
             session,
             approve,
             deny,
-        } => consent_cmd(&session, approve, deny).await,
+        } => {
+            if list {
+                consent_list_cmd().await
+            } else {
+                // `required_unless_present = "list"` makes this infallible.
+                let session = session.unwrap_or_default();
+                consent_cmd(&session, approve, deny).await
+            }
+        }
+        Command::Rc { disconnect } => rc_cmd(disconnect.as_deref()).await,
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
         Command::EnableSystemContext { no_restart } => enable_system_context_cmd(no_restart),
         Command::DisableSystemContext { no_restart } => disable_system_context_cmd(no_restart),
@@ -1010,6 +1108,114 @@ fn sweep_old_versions_cmd(dry_run: bool, flavour: Option<&str>) -> Result<()> {
 /// The direct filesystem write survives as an explicit FALLBACK for a
 /// console-run agent in THIS profile when no daemon is listening on the
 /// local pipe/socket.
+/// FR-27 — list, or end, the remote-control sessions live on this device.
+///
+/// LocalAPI-only, like [`consent_list_cmd`] and for the same reason: a listing
+/// read from the wrong profile would confidently print "nobody is viewing this
+/// device" while someone was.
+async fn rc_cmd(disconnect: Option<&str>) -> Result<()> {
+    let mut client = tunnel_core::localapi::connect()
+        .await
+        .context("connecting to the device service")?;
+
+    if let Some(session) = disconnect {
+        let ok = client
+            .rc_disconnect(session)
+            .await
+            .context("asking the device service to end the session")?;
+        if !ok {
+            anyhow::bail!(
+                "no live remote-control session {session} on this device \
+                 (or the id is not a 24-char hex ObjectId)"
+            );
+        }
+        println!("asked the device service to end session {session}");
+        return Ok(());
+    }
+
+    let sessions = client
+        .rc_sessions()
+        .await
+        .context("asking the device service for live remote-control sessions")?;
+    if sessions.is_empty() {
+        println!("nobody is viewing this device");
+        return Ok(());
+    }
+    for s in &sessions {
+        let who = if s.controller_name.is_empty() {
+            "(unnamed)"
+        } else {
+            &s.controller_name
+        };
+        // Say what they can DO, not just that they are there: "watching" and
+        // "typing on this machine" are different things to be told about.
+        let grant = if s.permissions.to_uppercase().contains("INPUT") {
+            "keyboard + mouse"
+        } else {
+            "view only"
+        };
+        println!("{}  {}  [{}]", s.session_id, who, grant);
+        if !s.org.is_empty() {
+            println!("    org:        {}", s.org);
+        }
+        if !s.permissions.is_empty() {
+            println!("    granted:    {}", s.permissions);
+        }
+        println!("    disconnect: roomler rc --disconnect {}", s.session_id);
+    }
+    Ok(())
+}
+
+/// FR-27 — list every prompt the daemon is currently waiting on.
+///
+/// Before this the id existed only in a log line, and had to be found inside
+/// the same 30 s window the operator had to answer in. That made the headless
+/// consent path close to unusable, which in turn is part of why every device in
+/// the field is left on `auto`.
+///
+/// Deliberately LocalAPI-only: the sentinel-file fallback in [`consent_cmd`]
+/// exists because a decision written to the wrong profile is silently inert,
+/// but a LISTING read from the wrong profile is worse — it would confidently
+/// print "nothing pending" while the daemon waits.
+async fn consent_list_cmd() -> Result<()> {
+    let mut client = tunnel_core::localapi::connect()
+        .await
+        .context("connecting to the device service")?;
+    let pending = client
+        .consent_pending()
+        .await
+        .context("asking the device service for pending consent prompts")?;
+    if pending.is_empty() {
+        println!("no consent prompt is waiting for a decision");
+        return Ok(());
+    }
+    for p in &pending {
+        // Pre-FR-27 daemons write no `kind`; the only kind that existed then
+        // was remote control.
+        let kind = if p.kind.is_empty() { "rc" } else { &p.kind };
+        println!("{}  [{}]  from {}", p.session_id, kind, p.controller_name);
+        if p.surface == "native" {
+            // Worth saying: the operator is about to be told to run a command
+            // for something that already has a button in front of them.
+            println!("    shown:       on this device's screen already");
+        }
+        if !p.org.is_empty() {
+            println!("    org:         {}", p.org);
+        }
+        if !p.permissions.is_empty() {
+            println!("    permissions: {}", p.permissions);
+        }
+        if !p.detail.is_empty() {
+            println!("    request:     {}", p.detail);
+        }
+        println!(
+            "    approve:     roomler consent --session {} --approve",
+            p.session_id
+        );
+    }
+    Ok(())
+}
+
 async fn consent_cmd(session_hex: &str, approve: bool, deny: bool) -> Result<()> {
     let kind = roomlerd::consent::SentinelKind::from_flags(approve, deny)?;
     let allow = matches!(kind, roomlerd::consent::SentinelKind::Approve);
@@ -2430,6 +2636,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         std::sync::Arc::new(std::sync::Mutex::new(rows))
     };
 
+    // FR-27 — ONE registry for the whole daemon; each signalling loop stores
+    // its own kill channel per session, so a multi-org host routes a Disconnect
+    // to the loop that actually owns that session.
+    let rc_sessions = roomlerd::rc_sessions::RcSessionRegistry::new();
+
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(
             localapi_state::DaemonState::new(
@@ -2452,6 +2663,10 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             // as fast as a pushed one (docs/remote-config.md).
             .with_remote_config(remote_cfg.clone())
             // Multi-org P1 — live per-enrollment rows for `roomler status`.
+            // FR-27 — live remote-control sessions, so the desktop app can
+            // render "Being viewed by ..." and offer a Disconnect. Written by
+            // every signalling loop through its ViewerIndicator.
+            .with_rc_sessions(rc_sessions.clone())
             .with_orgs(org_registry.clone())
             .with_org_views(org_views.clone()),
         );
@@ -2518,6 +2733,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         // One clone per org task: each spawn MOVES its capture, so a shared
         // binding would be consumed by the first iteration.
         let remote_cfg_org = remote_cfg.clone();
+        let rc_sessions_org = rc_sessions.clone();
         let org_cfg = cfg.for_org(&org);
         let (org_view_tx, org_view_rx) =
             tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
@@ -2545,6 +2761,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                     broker,
                     org_hub,
                     remote_cfg_org,
+                    rc_sessions_org,
                 )
                 .await
                 {
@@ -2583,6 +2800,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         // Cloned for the org-join closure: it is an `Fn` (called per join), so
         // it must not consume the captured services.
         let remote_cfg2 = remote_cfg.clone();
+        let rc_sessions2 = rc_sessions.clone();
         roomlerd::org_join::install(roomlerd::org_join::JoinRuntime {
             config_path: config_path.clone(),
             write_lock: cfg_write_lock.clone(),
@@ -2689,6 +2907,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 // Per-spawn clone: the async block below MOVES its capture,
                 // and this closure runs once per join.
                 let remote_cfg_join = remote_cfg2.clone();
+                let rc_sessions_join = rc_sessions2.clone();
                 let span = tracing::info_span!("org", label = %org.label);
                 tokio::spawn(tracing::Instrument::instrument(
                     async move {
@@ -2703,6 +2922,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                             broker,
                             org_hub,
                             remote_cfg_join,
+                            rc_sessions_join,
                         )
                         .await
                         {
@@ -2756,6 +2976,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let connected = localapi_connected.clone();
         let view_tx = overlay_view_tx.clone();
         let sample_slot = rtt_sample_slot.clone();
+        let rc_sessions_primary = rc_sessions.clone();
         async move {
             signaling::run(
                 primary_ctx,
@@ -2768,6 +2989,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 consent_broker,
                 tunnel_hub,
                 remote_cfg,
+                rc_sessions_primary,
             )
             .await
         }
