@@ -188,29 +188,47 @@ is why it is sequenced last, behind its own feature and the probe.
 | 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac |
 | 4 | Linux packaging — a **separate** `roomler-desktop` .deb | absent package = today's behaviour | **implemented** — field pending |
 | 5 | Input arbitration — mode re-seed, visible floor requests, single-viewer rail, deterministic handover | none needed (bug fixes) | **implemented** — field pending |
-| 6 | Field test on the GROX fleet | n/a | not started |
+| 6 | Field test on the GROX fleet | n/a | **partly done, 2026-08-29 on 0.4.16** — the Windows native panel is verified end to end and the field log below lists exactly what is not. The test itself found 3 defects (#877), one of which froze the whole pre-0.4.16 Linux fleet |
+| 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **implemented in #877** — needs an API deploy + 0.4.17 to field-verify |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the field-result half lands with phase 6 |
 
 ## Acceptance criteria
 
-- [ ] With `consent_mode = prompt` and `prompt_owner = true`, controlling an
-      owned device puts a panel on that device's screen and Approve starts the
-      session.
-- [ ] Deny, and "nobody answered", are **distinguishable at the controller**.
+Ticked only where a run is recorded in the field log below.
+
+- [x] With `consent_mode = prompt`, controlling a device puts a panel on that
+      device's screen and Approve starts the session — **Windows**, 0.4.16.
+      ⚠️ The `prompt_owner = true` half is untested: every fleet device is owned
+      by a different user id than the test account, so the toggle never renders.
+- [x] Deny, and "nobody answered", are **distinguishable at the controller**.
 - [ ] A host with no reachable prompt surface reports `no_prompt_surface`; the
       controller is told nobody could be asked, and the audit row says so.
+      ⚠️ No control left in the fleet — every Linux host runs a virtual desktop
+      (see the log). Re-test on 0.4.17.
 - [ ] `auto_grant_session=false` on a device defeats a server `Auto` directive.
 - [ ] All five modes exercised end-to-end on the fleet, each recorded with the
-      surface that served it.
+      surface that served it. `auto`, `prompt` and the host half of
+      `prompt_then_email` are done; `email` / `push` resolve at the **owner**,
+      a different account here.
 - [ ] An `exec` prompt and an `ssh` prompt render on the same surface as an RC one.
+      ⚠️ Blocked on `EXEC_DEVICE` / `SSH_DEVICE`, which are deliberately not in
+      `DEFAULT_ADMIN` — an operator grant, not a code change.
 - [ ] A live session shows "Being viewed by «name»" with a working Disconnect on
-      Windows, macOS and a Linux X11 desktop.
-- [ ] `roomler-desktop` shows exactly one tray icon, with a menu, on all three OSes.
+      Windows, macOS and a Linux X11 desktop. (Windows border confirmed visible +
+      capture-excluded during a session; the reveal-on-hover badge and the other
+      two OSes are untested.)
+- [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
+      measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
 - [ ] macOS "Check for updates" and "Apply update" both work from the companion.
 - [ ] The Devices grid shows the companion version alongside the agent version.
+      (Implemented in #877; needs the server deploy + 0.4.17.)
 - [ ] `free` ↔ `exclusive` verified with two concurrent viewers; the device policy
-      re-applies after every session ends.
-- [ ] The `roomlerd` .deb's `Depends` still contains no GTK/webkit entry.
+      re-applies after every session ends. **Second half done** (re-seed proven on
+      one daemon process, no restart); the two-viewer half is blocked by a
+      same-host media failure and needs a second controller machine.
+- [x] The `roomlerd` .deb's `Depends` still contains no GTK/webkit entry —
+      `libasound2, libc6, libxcb-randr0, libxcb-shm0, libxcb1`, and the guard that
+      asserts it actually runs now (#871).
 
 ## Deviations (accepted, recorded up front)
 
