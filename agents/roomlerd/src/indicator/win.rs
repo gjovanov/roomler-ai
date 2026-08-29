@@ -116,10 +116,58 @@ fn pt_in(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }
 
+// ── FR-27: the native consent panel ────────────────────────────────────────
+//
+// Drawn by the daemon itself, so it needs no second process running, no
+// login-session plumbing and no IPC — and it inherits the property that makes
+// this module worth having: `WDA_EXCLUDEFROMCAPTURE`, so the Approve button is
+// invisible in the video going back to the person asking for access. A prompt
+// the requester can SEE (and, with input granted on another session, click) is
+// not a consent prompt.
+
+/// Panel geometry. Wider and much taller than the badge: this one has to carry
+/// a title, who is asking, which org, what they want to run, and two buttons.
+const CONSENT_W: i32 = 460;
+const CONSENT_H: i32 = 232;
+const CONSENT_PAD: i32 = 14;
+const CONSENT_BTN_W: i32 = 104;
+const CONSENT_BTN_H: i32 = 32;
+/// Green (0x2E9E4F) for Approve. COLORREF is 0x00BBGGRR.
+const APPROVE_RGB: u32 = 0x004F9E2E;
+
+/// Approve / Deny rectangles in panel client coordinates. Fixed, so the
+/// painter and the hit-test agree without stashing state — same reason as
+/// [`button_rect`].
+fn consent_approve_rect() -> RECT {
+    let top = CONSENT_H - CONSENT_PAD - CONSENT_BTN_H;
+    RECT {
+        left: CONSENT_W - CONSENT_PAD - CONSENT_BTN_W,
+        top,
+        right: CONSENT_W - CONSENT_PAD,
+        bottom: top + CONSENT_BTN_H,
+    }
+}
+
+fn consent_deny_rect() -> RECT {
+    let a = consent_approve_rect();
+    RECT {
+        left: a.left - 8 - CONSENT_BTN_W,
+        top: a.top,
+        right: a.left - 8,
+        bottom: a.bottom,
+    }
+}
+
 #[derive(Default)]
 struct State {
     /// Active sessions: `session_id_hex → controller display name`.
     sessions: HashMap<String, String>,
+    /// FR-27 — the consent question currently on screen, if any.
+    ///
+    /// At most ONE: two overlapping Approve/Deny panels is how someone
+    /// approves the wrong thing. A second request while one is up waits for
+    /// the first to resolve, and its own 30 s window is what bounds the wait.
+    prompt: Option<super::PromptView>,
 }
 
 #[derive(Clone)]
@@ -152,10 +200,18 @@ struct PumpState {
     dragging: bool,
     dwell_since: Option<Instant>,
     hide_since: Option<Instant>,
+    // FR-27 — the consent panel.
+    consent_hwnd: HWND,
+    consent_tx: super::ConsentSender,
+    consent_visible: bool,
+    /// Whole seconds left as last PAINTED. The pump ticks at 120 ms; repainting
+    /// the panel eight times a second to redraw the same number is flicker for
+    /// nothing, so the countdown only invalidates when the digit changes.
+    consent_secs_shown: u64,
 }
 
 impl Inner {
-    pub(super) fn new(kill_tx: KillSender) -> Result<Self> {
+    pub(super) fn new(kill_tx: KillSender, consent_tx: super::ConsentSender) -> Result<Self> {
         let state = Arc::new(Mutex::new(State::default()));
         let hwnd_cell: Arc<Mutex<Option<isize>>> = Arc::new(Mutex::new(None));
         let (tx, rx) = std_mpsc::channel::<Cmd>();
@@ -166,16 +222,16 @@ impl Inner {
 
         thread::Builder::new()
             .name("roomler-agent-indicator".into())
-            .spawn(
-                move || match run_pump(state_for_thread, hwnd_for_thread, rx, kill_tx) {
+            .spawn(move || {
+                match run_pump(state_for_thread, hwnd_for_thread, rx, kill_tx, consent_tx) {
                     Ok(()) => {
                         let _ = ready_tx.send(Ok(()));
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                     }
-                },
-            )
+                }
+            })
             .context("spawning viewer-indicator thread")?;
 
         // The pump writes the border HWND into `hwnd_for_thread` before
@@ -231,6 +287,38 @@ impl Inner {
         self.post_redraw();
     }
 
+    /// FR-27 — raise the native consent panel. `false` when one is already up
+    /// (see [`State::prompt`]) or the pump never came up.
+    pub(super) fn prompt(&self, view: super::PromptView) -> bool {
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.prompt.is_some() {
+                return false;
+            }
+            s.prompt = Some(view);
+        }
+        if self.hwnd.lock().unwrap().is_none() {
+            // No pump → nothing will ever draw it. Undo, and let the caller
+            // fall through to the companion instead of waiting on a panel
+            // that does not exist.
+            self.state.lock().unwrap().prompt = None;
+            return false;
+        }
+        self.post_redraw();
+        true
+    }
+
+    pub(super) fn dismiss(&self, session_hex: &str) {
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.prompt.as_ref().map(|p| p.session_hex.as_str()) != Some(session_hex) {
+                return;
+            }
+            s.prompt = None;
+        }
+        self.post_redraw();
+    }
+
     fn post_redraw(&self) {
         let hwnd_isize = match *self.hwnd.lock().unwrap() {
             Some(h) => h,
@@ -267,6 +355,7 @@ fn run_pump(
     hwnd_out: Arc<Mutex<Option<isize>>>,
     _rx: std_mpsc::Receiver<Cmd>,
     kill_tx: KillSender,
+    consent_tx: super::ConsentSender,
 ) -> Result<()> {
     unsafe {
         let hinstance = GetModuleHandleW(None).context("GetModuleHandleW")?;
@@ -312,6 +401,28 @@ fn run_pump(
             }
         }
 
+        // FR-27 — consent-panel class. Opaque and INTERACTIVE (no
+        // `WS_EX_TRANSPARENT`): unlike the border, this one exists to be
+        // clicked.
+        let consent_class = w!("RoomlerConsentWClass");
+        let consent_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(consent_wnd_proc),
+            hInstance: hinstance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH::default(),
+            lpszClassName: consent_class,
+            ..Default::default()
+        };
+        if RegisterClassExW(&consent_wc) == 0 {
+            let err = windows::Win32::Foundation::GetLastError();
+            if err.0 != 1410 {
+                let _ = DeleteObject(HGDIOBJ(magenta_brush.0));
+                return Err(anyhow!("RegisterClassExW(consent) failed: {:?}", err));
+            }
+        }
+
         let screen_w = GetSystemMetrics(SM_CXSCREEN);
         let screen_h = GetSystemMetrics(SM_CYSCREEN);
 
@@ -351,6 +462,26 @@ fn run_pump(
         )
         .context("CreateWindowExW(badge)")?;
 
+        // FR-27 — consent panel, hidden until a prompt arrives. Top-centre,
+        // the place a notification is expected. `WS_EX_NOACTIVATE` so raising
+        // it does not yank focus out of whatever the person is typing in —
+        // clicks still land (the badge's Disconnect already works this way).
+        let consent_hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            consent_class,
+            w!("Roomler consent"),
+            WS_POPUP,
+            (screen_w - CONSENT_W) / 2,
+            48,
+            CONSENT_W,
+            CONSENT_H,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        )
+        .context("CreateWindowExW(consent)")?;
+
         // Colorkey transparency + capture exclusion on the border.
         let _ = SetLayeredWindowAttributes(border_hwnd, COLORREF(COLORKEY_RGB), 0, LWA_COLORKEY);
         let _ = SetWindowDisplayAffinity(border_hwnd, WDA_EXCLUDEFROMCAPTURE);
@@ -358,8 +489,13 @@ fn run_pump(
         // never appear in the RTP stream, and the viewer's injected input
         // can't intentionally target what it can't see.
         let _ = SetWindowDisplayAffinity(badge_hwnd, WDA_EXCLUDEFROMCAPTURE);
+        // FR-27 — and on the consent panel, which matters MORE than the badge:
+        // the person asking for access must not be able to see the Approve
+        // button, let alone (with input already granted on another session)
+        // aim at it.
+        let _ = SetWindowDisplayAffinity(consent_hwnd, WDA_EXCLUDEFROMCAPTURE);
 
-        // Build the shared pump state and hand a raw pointer to BOTH procs.
+        // Build the shared pump state and hand a raw pointer to ALL THREE procs.
         let pump = Box::new(PumpState {
             shared: state,
             kill_tx,
@@ -369,10 +505,15 @@ fn run_pump(
             dragging: false,
             dwell_since: None,
             hide_since: None,
+            consent_hwnd,
+            consent_tx,
+            consent_visible: false,
+            consent_secs_shown: u64::MAX,
         });
         let pump_ptr_val = Box::into_raw(pump) as isize;
         SetWindowLongPtrW(border_hwnd, GWLP_USERDATA, pump_ptr_val);
         SetWindowLongPtrW(badge_hwnd, GWLP_USERDATA, pump_ptr_val);
+        SetWindowLongPtrW(consent_hwnd, GWLP_USERDATA, pump_ptr_val);
 
         *hwnd_out.lock().unwrap() = Some(border_hwnd.0 as isize);
 
@@ -387,6 +528,7 @@ fn run_pump(
 
         // Clean up.
         let _ = KillTimer(border_hwnd, TIMER_ID);
+        let _ = DestroyWindow(consent_hwnd);
         let _ = DestroyWindow(badge_hwnd);
         let _ = DestroyWindow(border_hwnd);
         let _ = DeleteObject(HGDIOBJ(magenta_brush.0));
@@ -455,6 +597,265 @@ unsafe fn kill_current_session(p: *mut PumpState) {
 }
 
 // ---------------------------------------------------------------------------
+// FR-27 — consent panel.
+
+/// Bring the panel in line with `State.prompt`: shown while a question is
+/// outstanding, hidden otherwise. Idempotent, so both the redraw message and
+/// the timer can call it.
+unsafe fn sync_consent(p: *mut PumpState) {
+    unsafe {
+        let want = (*p).shared.lock().unwrap().prompt.is_some();
+        let hwnd = (*p).consent_hwnd;
+        if want && !(*p).consent_visible {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(hwnd, None, true);
+            (*p).consent_visible = true;
+            (*p).consent_secs_shown = u64::MAX;
+        } else if !want && (*p).consent_visible {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            (*p).consent_visible = false;
+        }
+    }
+}
+
+/// Repaint only when the displayed second actually changes. The pump ticks
+/// every 120 ms; redrawing the same digit eight times a second is flicker in
+/// exchange for nothing.
+unsafe fn tick_consent_countdown(p: *mut PumpState) {
+    unsafe {
+        if !(*p).consent_visible {
+            return;
+        }
+        let secs = {
+            let s = (*p).shared.lock().unwrap();
+            match &s.prompt {
+                Some(v) => v
+                    .expires_at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs(),
+                None => return,
+            }
+        };
+        if secs != (*p).consent_secs_shown {
+            (*p).consent_secs_shown = secs;
+            let _ = InvalidateRect((*p).consent_hwnd, None, true);
+        }
+    }
+}
+
+unsafe extern "system" fn consent_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_PAINT => {
+                paint_consent(hwnd);
+                LRESULT(0)
+            }
+            // Decide on button-UP, so a press-then-drag-away cancels — the
+            // same rule the badge's Disconnect uses, and it matters more here.
+            WM_LBUTTONUP => {
+                let p = pump_ptr(hwnd);
+                if p.is_null() {
+                    return LRESULT(0);
+                }
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                let allow = if pt_in(&consent_approve_rect(), x, y) {
+                    true
+                } else if pt_in(&consent_deny_rect(), x, y) {
+                    false
+                } else {
+                    return LRESULT(0);
+                };
+                // Take the session id and CLEAR the prompt in one borrow, so a
+                // double-click cannot answer twice.
+                let session = {
+                    let mut s = (*p).shared.lock().unwrap();
+                    match s.prompt.take() {
+                        Some(v) => v.session_hex,
+                        None => return LRESULT(0),
+                    }
+                };
+                // The panel does not resolve consent — it reports. The
+                // signalling loop feeds this to the broker, which applies the
+                // live-prompt gate every other answer path goes through.
+                let _ = (*p).consent_tx.try_send((session, allow));
+                sync_consent(p);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, _wparam, lparam),
+        }
+    }
+}
+
+unsafe fn paint_consent(hwnd: HWND) {
+    unsafe {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        if hdc.is_invalid() {
+            return;
+        }
+        let view = {
+            let p = pump_ptr(hwnd);
+            if p.is_null() {
+                None
+            } else {
+                (*p).shared.lock().unwrap().prompt.clone()
+            }
+        };
+        let Some(view) = view else {
+            let _ = EndPaint(hwnd, &ps);
+            return;
+        };
+
+        let full = RECT {
+            left: 0,
+            top: 0,
+            right: CONSENT_W,
+            bottom: CONSENT_H,
+        };
+        let bg = CreateSolidBrush(COLORREF(BADGE_BG_RGB));
+        FillRect(hdc, &full, bg);
+        let _ = DeleteObject(HGDIOBJ(bg.0));
+        let red = CreateSolidBrush(COLORREF(BORDER_RGB));
+        FrameRect(hdc, &full, red);
+
+        let line = |top: i32, h: i32| RECT {
+            left: CONSENT_PAD,
+            top,
+            right: CONSENT_W - CONSENT_PAD,
+            bottom: top + h,
+        };
+        let mut y = CONSENT_PAD;
+        draw_text(
+            hdc,
+            &view.title,
+            line(y, 22),
+            -17,
+            FW_BOLD.0 as i32,
+            TEXT_RGB,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        y += 26;
+        draw_text(
+            hdc,
+            &view.lead,
+            line(y, 20),
+            -14,
+            FW_NORMAL.0 as i32,
+            TEXT_RGB,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        y += 22;
+        // Multi-org: WHO is asking is only half the question when the same
+        // person can be a colleague in one org and a contractor in another.
+        if !view.org.is_empty() {
+            draw_text(
+                hdc,
+                &format!("On behalf of {}", view.org),
+                line(y, 18),
+                -12,
+                FW_NORMAL.0 as i32,
+                LABEL_RGB,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            y += 20;
+        }
+        // The command an `exec` prompt would run — the line the decision
+        // actually rests on. Already redacted by the caller.
+        if !view.detail.is_empty() {
+            draw_text(
+                hdc,
+                &view.detail,
+                line(y, 34),
+                -12,
+                FW_NORMAL.0 as i32,
+                TEXT_RGB,
+                DT_LEFT | DT_END_ELLIPSIS,
+            );
+            y += 36;
+        }
+        if !view.permissions.is_empty() {
+            draw_text(
+                hdc,
+                &format!("Permissions: {}", view.permissions),
+                line(y, 18),
+                -12,
+                FW_NORMAL.0 as i32,
+                LABEL_RGB,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
+
+        // Countdown, bottom-left, level with the buttons. This prompt expires;
+        // one that silently stops mattering is how "consent seems not to work"
+        // looks from the other end.
+        let secs = view
+            .expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        let btns = consent_approve_rect();
+        draw_text(
+            hdc,
+            &format!("Expires in {secs}s"),
+            RECT {
+                left: CONSENT_PAD,
+                top: btns.top,
+                right: consent_deny_rect().left - 8,
+                bottom: btns.bottom,
+            },
+            -12,
+            FW_NORMAL.0 as i32,
+            LABEL_RGB,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let deny = consent_deny_rect();
+        let deny_brush = CreateSolidBrush(COLORREF(BORDER_RGB));
+        FillRect(hdc, &deny, deny_brush);
+        let _ = DeleteObject(HGDIOBJ(deny_brush.0));
+        draw_text(
+            hdc,
+            "Deny",
+            deny,
+            -14,
+            FW_BOLD.0 as i32,
+            TEXT_RGB,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let approve_brush = CreateSolidBrush(COLORREF(APPROVE_RGB));
+        FillRect(hdc, &btns, approve_brush);
+        let _ = DeleteObject(HGDIOBJ(approve_brush.0));
+        draw_text(
+            hdc,
+            "Approve",
+            btns,
+            -14,
+            FW_BOLD.0 as i32,
+            TEXT_RGB,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+
+        let _ = DeleteObject(HGDIOBJ(red.0));
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Border window proc: paints the thin frame + drives the reveal timer.
 
 unsafe extern "system" fn border_wnd_proc(
@@ -470,6 +871,11 @@ unsafe extern "system" fn border_wnd_proc(
                 if p.is_null() {
                     return LRESULT(0);
                 }
+                // FR-27 — the consent panel is driven by `State.prompt`, NOT
+                // by session presence: it is what stands between a request and
+                // a session, so gating it on the latter would hide it exactly
+                // when it is needed.
+                sync_consent(p);
                 if has_session(p) {
                     let _ = SetWindowPos(
                         hwnd,
@@ -499,6 +905,9 @@ unsafe extern "system" fn border_wnd_proc(
                 if p.is_null() {
                     return LRESULT(0);
                 }
+                // FR-27 — keep the panel's countdown honest. Cheap: it
+                // repaints only when the whole second changes.
+                tick_consent_countdown(p);
                 if !has_session(p) {
                     if (*p).badge_visible {
                         hide_badge(p);

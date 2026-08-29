@@ -718,6 +718,18 @@ pub struct ConsentRequest {
     /// pre-FR-27 daemon means "unknown"; fall back to `timeout_secs`.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub expires_at_ms: u64,
+    /// FR-27 — who is ALREADY showing this prompt: `native` (the daemon's own
+    /// overlay is up) or `companion` / absent (nobody is; the desktop app
+    /// should).
+    ///
+    /// ⚠️ Load-bearing for the desktop app, not informational. The daemon
+    /// writes a marker even when its native panel is up, because this list is
+    /// also what `roomler consent --list` reads — so without this field the
+    /// companion would pop a SECOND panel asking the same question, and two
+    /// Approve buttons for one decision is how someone approves the wrong
+    /// thing. A UI must LIST a `native` entry and not render a prompt for it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub surface: String,
     // NOTE: `org` stays LAST; the struct is built field-by-field at three call
     // sites and keeping the multi-org line at the end matches how it reads.
     /// Multi-org — the organization the request comes from, so the modal can
@@ -2315,6 +2327,7 @@ mod tests {
                 kind: "rc".into(),
                 detail: String::new(),
                 expires_at_ms: 0,
+                surface: String::new(),
                 org: "Acme".into(),
             }]
         }
@@ -3108,6 +3121,7 @@ mod tests {
             kind: String::new(),
             detail: String::new(),
             expires_at_ms: 0,
+            surface: String::new(),
             org: String::new(),
         };
         let json = serde_json::to_string(&single).unwrap();
@@ -3153,6 +3167,7 @@ mod tests {
             kind: "rc".into(),
             detail: String::new(),
             expires_at_ms: 0,
+            surface: String::new(),
             org: String::new(),
         };
         let json = serde_json::to_string(&rc).unwrap();
@@ -3171,6 +3186,7 @@ mod tests {
             kind: "exec".into(),
             detail: "systemctl restart roomlerd".into(),
             expires_at_ms: 1_700_000_000_000,
+            surface: String::new(),
             ..rc
         };
         let round: ConsentRequest =
@@ -3178,5 +3194,51 @@ mod tests {
         assert_eq!(round.kind, "exec");
         assert_eq!(round.detail, "systemctl restart roomlerd");
         assert_eq!(round.expires_at_ms, 1_700_000_000_000);
+    }
+
+    /// FR-27 — `surface` decides whether a UI RENDERS a prompt or merely lists
+    /// it. The daemon writes a marker even when its own native panel is up
+    /// (this list is also what `roomler consent --list` reads), so a UI that
+    /// ignored the field would put a SECOND Approve button in front of one
+    /// decision.
+    ///
+    /// The absent case is the load-bearing one: a pre-FR-27 daemon had no
+    /// native panel at all, so "" must mean "nobody is showing it" — i.e. the
+    /// companion should — and never be mistaken for "native".
+    #[test]
+    fn consent_request_surface_defaults_to_the_companion() {
+        let legacy: ConsentRequest = serde_json::from_str(
+            r#"{"session_id":"abc","controller_name":"Alice","permissions":"VIEW","timeout_secs":30}"#,
+        )
+        .expect("a pre-FR-27 payload must still parse");
+        assert_eq!(legacy.surface, "");
+        assert_ne!(legacy.surface, "native", "absent must never read as native");
+
+        let native = ConsentRequest {
+            session_id: "abc".into(),
+            controller_name: "Alice".into(),
+            permissions: "VIEW".into(),
+            timeout_secs: 30,
+            kind: "rc".into(),
+            detail: String::new(),
+            expires_at_ms: 0,
+            surface: "native".into(),
+            org: String::new(),
+        };
+        let round: ConsentRequest =
+            serde_json::from_str(&serde_json::to_string(&native).unwrap()).unwrap();
+        assert_eq!(round.surface, "native");
+
+        // A companion-served prompt omits the key rather than shipping the
+        // default spelling, exactly as `org` does.
+        let companion = ConsentRequest {
+            surface: String::new(),
+            ..native
+        };
+        let json = serde_json::to_string(&companion).unwrap();
+        assert!(
+            !json.contains("\"surface\""),
+            "an empty surface must be omitted: {json}"
+        );
     }
 }
