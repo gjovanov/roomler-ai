@@ -767,7 +767,7 @@ pub struct ConsentRequest {
     ///
     /// ⚠️ Load-bearing for the desktop app, not informational. The daemon
     /// writes a marker even when its native panel is up, because this list is
-    /// also what `roomler consent --list` reads — so without this field the
+    /// also what `roomlerd consent --list` reads — so without this field the
     /// companion would pop a SECOND panel asking the same question, and two
     /// Approve buttons for one decision is how someone approves the wrong
     /// thing. A UI must LIST a `native` entry and not render a prompt for it.
@@ -3281,7 +3281,7 @@ mod tests {
 
     /// FR-27 — `surface` decides whether a UI RENDERS a prompt or merely lists
     /// it. The daemon writes a marker even when its own native panel is up
-    /// (this list is also what `roomler consent --list` reads), so a UI that
+    /// (this list is also what `roomlerd consent --list` reads), so a UI that
     /// ignored the field would put a SECOND Approve button in front of one
     /// decision.
     ///
