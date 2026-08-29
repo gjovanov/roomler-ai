@@ -2038,6 +2038,25 @@ async fn handle_server_msg(
                     session = %session_hex, native, have_surface,
                     "consent prompt surface"
                 );
+                // FR-34 — a LOCKED host has the panel on the (currently
+                // invisible) secure desktop, so the operator must UNLOCK the
+                // machine before they can see and approve it. That is the
+                // sound flow (unlock proves presence, then approve; 5-minute
+                // window since P4) — but the controller has no way to know it
+                // is locked, so its "awaiting consent" wait looks like a hang.
+                // Tell it. Advisory + best-effort; `probe_lock_state()` is
+                // Unlocked on every non-Windows host, so this only fires where
+                // a lock screen exists.
+                if crate::lock_state::probe_lock_state() == crate::lock_state::LockState::Locked {
+                    info!(
+                        session = %session_hex,
+                        "consent prompt on a LOCKED host — signalling the controller to unlock + approve"
+                    );
+                    let _ = outbound_tx.try_send(ClientMsg::ConsentPending {
+                        session_id,
+                        host_locked: true,
+                    });
+                }
             }
             if owner_side_consent {
                 info!(
