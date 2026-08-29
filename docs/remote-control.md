@@ -517,6 +517,20 @@ unlock, and only then can they see and approve — 30 s was not enough to arrive
 link is the fallback; plain `prompt` has none, so its one window must be
 generous. The on-host panel shows the remaining time as `m:ss`.
 
+**A locked host (FR-34).** When a device set to `prompt` is LOCKED, the on-host
+panel is on the (currently invisible) secure `Winlogon` desktop, so nobody can
+see it until someone unlocks the machine. That is the intended flow — unlocking
+proves physical presence, then you approve — not a bug, and the 5-min window
+gives the operator time to reach the machine. So the controller does not sit in
+a silent wait: the agent probes lock state at prompt time (`lock_state`) and, if
+locked, sends `rc:consent.pending{host_locked}` over the signalling WS; the hub
+relays it to the controller, whose "awaiting consent" screen becomes *"that
+device is locked — unlock it on the machine, then approve."* Advisory only; it
+never gates the outcome. (Rendering the panel on the secure desktop was
+considered and rejected — modern Win11 restricts windows there, it is
+`WDA_EXCLUDEFROMCAPTURE` so unobservable, and unlock-then-approve is the sounder
+flow anyway.)
+
 `prompt_then_email` is "and", not "then" — the mail goes out at once. What is
 sequential is the two windows: the host modal closes after the attended window
 while the emailed link keeps the full async one, so a host nobody answers hands
