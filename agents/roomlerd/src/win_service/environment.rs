@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! SCM `Environment` registry-value helpers.
 //!
 //! The Service Control Manager passes a service's startup environment

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Direct (LAN) carrier discovery for the overlay (rc.131).
 //!
 //! The overlay was relay-only: every peer connection rode a coturn TURN

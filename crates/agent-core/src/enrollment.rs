@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! One-shot enrollment exchange.
 //!
 //! Flow: admin issues an enrollment token in the Roomler UI and hands it to

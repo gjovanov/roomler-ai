@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! One definition of "an origin this deployment considers its own".
 //!
 //! Two places need it and they must not drift:

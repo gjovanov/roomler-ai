@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! ACL evaluation primitives.
 //!
 //! Data shapes are canonical in `roomler_ai_remote_control::models`
@@ -958,6 +960,7 @@ mod tests {
             access_policy: Default::default(),
             exec_policy: Default::default(),
             ssh_policy: Default::default(),
+            peer_relay_policy: Default::default(),
             desired_config: Default::default(),
             config_report: None,
             routes: Vec::new(),

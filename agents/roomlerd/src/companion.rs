@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! S1a PR-A — keep the `roomler-desktop` companion EXE at the daemon's
 //! version.
 //!

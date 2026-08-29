@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import heroMesh from '@/assets/tutorial/hero-mesh.svg'
 import heroRemoteDesktop from '@/assets/tutorial/remote-desktop.svg'
 import heroPrivateNetwork from '@/assets/tutorial/private-network.svg'

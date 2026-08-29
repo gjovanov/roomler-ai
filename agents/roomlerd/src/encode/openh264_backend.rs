@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Software H.264 encoder built on [OpenH264].
 //!
 //! Pinned to a dedicated OS thread the same way the capture backend is —

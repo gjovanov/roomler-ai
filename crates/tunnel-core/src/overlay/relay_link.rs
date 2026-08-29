@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Coturn-relay carrier coordination for the overlay runtime (Phase 3b).
 //!
 //! **Deterministic worker (rc.127).** The relay-to-relay leg must hairpin on
@@ -1035,12 +1037,21 @@ impl RelayCoordinator {
         if self.server_strategy
             && let Some(w) = peer.relay_strategy
         {
-            return match w {
-                RelayStrategyWire::SingleRelayAnchor => RelayStrategy::SingleRelay(true),
-                RelayStrategyWire::SingleRelayDialer => RelayStrategy::SingleRelay(false),
-                RelayStrategyWire::Derp => RelayStrategy::Derp,
-                RelayStrategyWire::BothAllocate => RelayStrategy::BothAllocate,
-            };
+            match w {
+                RelayStrategyWire::SingleRelayAnchor => return RelayStrategy::SingleRelay(true),
+                RelayStrategyWire::SingleRelayDialer => return RelayStrategy::SingleRelay(false),
+                RelayStrategyWire::Derp => return RelayStrategy::Derp,
+                RelayStrategyWire::BothAllocate => return RelayStrategy::BothAllocate,
+                // FR-19 — an org-relay verdict. This build cannot ride one yet
+                // (the client carrier is P4), so it is treated exactly as an
+                // ABSENT verdict: fall through to the local derivation below.
+                // The server only stamps this for a peer whose join advertised
+                // `supports_org_relay`, which this build never does, so the arm
+                // is reachable only through a server bug — and the right answer
+                // to a server bug is the pre-FR-19 behaviour, never a panic and
+                // never a black hole.
+                RelayStrategyWire::OrgRelay => {}
+            }
         }
         // B3 — MEASURED capability supersedes every derived input, but only
         // when BOTH ends carry a fresh relay-band bit: ours from the local

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Room-level read authorization (`RoomVisibility`).
 //!
 //! Before this there was none: every member of a tenant could read every room

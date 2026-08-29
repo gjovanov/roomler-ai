@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Desktop / system audio capture → Opus for the WebRTC audio track.
 //!
 //! Opt-in per session (`ServerMsg::Request.audio_enabled`, threaded from

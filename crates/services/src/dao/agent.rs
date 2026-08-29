@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use std::collections::HashMap;
 
 use bson::{DateTime, Document, doc, oid::ObjectId};
@@ -62,6 +64,7 @@ impl AgentDao {
             // admin act, never a side effect of enrollment.
             exec_policy: ExecPolicy::default(),
             ssh_policy: SshPolicy::default(),
+            peer_relay_policy: Default::default(),
             // Nothing requested until an operator asks for something
             // (docs/remote-config.md). A freshly enrolled device must not
             // arrive carrying a config intent nobody wrote.

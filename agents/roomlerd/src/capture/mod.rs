@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Screen capture abstraction.
 //!
 //! Trait + concrete backends. `scrap_backend::ScrapCapture` is the default
@@ -125,6 +127,76 @@ impl Damage {
                     .fold(0u64, u64::saturating_add)
                     .min(frame_area);
                 Some(((sum.saturating_mul(1000) / frame_area) as u32).clamp(1, 1000))
+            }
+        }
+    }
+
+    /// UNION of the damaged area in permille — the fraction of the frame a
+    /// perfect per-rect readback would actually have to touch.
+    ///
+    /// ⚠️ This is NOT [`Self::area_permille`]. That one SUMS rect areas, so
+    /// overlapping rectangles over-count and it saturates at 1000 ‰ on any
+    /// busy screen — useful as "is there significant motion", useless for
+    /// "how much would we have to read". FR-29 P3's entire premise is that
+    /// the union is much smaller than the frame; this is the number that
+    /// decides whether that premise holds, so it must not be conflated.
+    ///
+    /// Computed on a coarse grid rather than exactly: a partially covered
+    /// cell counts as fully covered, so the answer is an over-estimate — the
+    /// safe direction, matching every other producer here. That also bounds
+    /// the cost at O(cells) regardless of how the rects overlap.
+    pub fn union_permille(&self, w: u32, h: u32) -> Option<u32> {
+        const GX: u32 = 128;
+        const GY: u32 = 72;
+        const WORDS: usize = ((GX * GY) as usize).div_ceil(64);
+        match self {
+            Damage::Unknown => None,
+            Damage::Tracked(v) if v.is_empty() => Some(0),
+            Damage::Tracked(v) => {
+                if w == 0 || h == 0 {
+                    return Some(0);
+                }
+                let mut grid = [0u64; WORDS];
+                for r in v {
+                    // Round the covered cell range OUTWARD, so a rect that
+                    // clips a cell marks the whole cell dirty.
+                    let cx0 = (r.x * GX / w).min(GX - 1);
+                    let cy0 = (r.y * GY / h).min(GY - 1);
+                    let cx1 = (r.x.saturating_add(r.w).saturating_mul(GX).div_ceil(w)).min(GX);
+                    let cy1 = (r.y.saturating_add(r.h).saturating_mul(GY).div_ceil(h)).min(GY);
+                    for cy in cy0..cy1.max(cy0 + 1) {
+                        for cx in cx0..cx1.max(cx0 + 1) {
+                            let bit = (cy * GX + cx) as usize;
+                            grid[bit / 64] |= 1u64 << (bit % 64);
+                        }
+                    }
+                }
+                let set: u32 = grid.iter().map(|word| word.count_ones()).sum();
+                Some(((u64::from(set) * 1000 / u64::from(GX * GY)) as u32).clamp(1, 1000))
+            }
+        }
+    }
+
+    /// Bounding-box area in permille — what the SIMPLE form of a partial
+    /// readback (one `GetImage` over the enclosing rect) would cost. Read it
+    /// beside [`Self::union_permille`]: if the union is small but the box is
+    /// large, the damage is scattered and a bbox readback buys nothing, which
+    /// is a design input for P3 rather than a detail.
+    pub fn bbox_permille(&self, w: u32, h: u32) -> Option<u32> {
+        match self {
+            Damage::Unknown => None,
+            Damage::Tracked(v) if v.is_empty() => Some(0),
+            Damage::Tracked(v) => {
+                let area = u64::from(w) * u64::from(h);
+                if area == 0 {
+                    return Some(0);
+                }
+                let x0 = v.iter().map(|r| r.x).min().unwrap_or(0);
+                let y0 = v.iter().map(|r| r.y).min().unwrap_or(0);
+                let x1 = v.iter().map(|r| r.x.saturating_add(r.w)).max().unwrap_or(0);
+                let y1 = v.iter().map(|r| r.y.saturating_add(r.h)).max().unwrap_or(0);
+                let bb = u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0));
+                Some(((bb.min(area).saturating_mul(1000) / area) as u32).clamp(1, 1000))
             }
         }
     }
@@ -582,6 +654,72 @@ mod frame_tests {
     }
 
     // ── P8a — Damage::area_permille ────────────────────────────────────
+
+    /// The whole point of `union_permille` is that it does NOT do what
+    /// `area_permille` does. Four identical overlapping rects saturate the
+    /// summed measure to 1000 ‰ while the union is still just that one rect —
+    /// if this ever stops holding, FR-29 P3's viability signal is silently
+    /// reading the wrong thing again.
+    #[test]
+    fn union_permille_does_not_double_count_overlap() {
+        let (w, h) = (1920u32, 1080u32);
+        let half = DirtyRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 540,
+        };
+        let four_copies = Damage::Tracked(vec![half, half, half, half]);
+        assert_eq!(
+            four_copies.area_permille(u64::from(w) * u64::from(h)),
+            Some(1000),
+            "summed measure saturates on overlap"
+        );
+        let u = four_copies.union_permille(w, h).unwrap();
+        assert!(
+            (480..=520).contains(&u),
+            "union of four identical half-screen rects is ~500 permille, got {u}"
+        );
+    }
+
+    /// Scattered damage: a small union but a bounding box covering the whole
+    /// frame. This is the case where a bbox-based partial readback buys
+    /// nothing, so the two numbers must be able to disagree loudly.
+    #[test]
+    fn bbox_and_union_diverge_on_scattered_damage() {
+        let (w, h) = (1920u32, 1080u32);
+        let d = Damage::Tracked(vec![
+            DirtyRect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+            },
+            DirtyRect {
+                x: 1904,
+                y: 1064,
+                w: 16,
+                h: 16,
+            },
+        ]);
+        let u = d.union_permille(w, h).unwrap();
+        let b = d.bbox_permille(w, h).unwrap();
+        assert!(u <= 20, "two tiny corners are a tiny union, got {u}");
+        assert!(
+            b >= 900,
+            "…but their bounding box is the whole frame, got {b}"
+        );
+    }
+
+    /// `Unknown` must stay unmeasurable on both, and provably-unchanged must
+    /// read 0 rather than being confused with it.
+    #[test]
+    fn union_and_bbox_preserve_the_two_empty_states() {
+        assert_eq!(Damage::Unknown.union_permille(100, 100), None);
+        assert_eq!(Damage::Unknown.bbox_permille(100, 100), None);
+        assert_eq!(Damage::Tracked(vec![]).union_permille(100, 100), Some(0));
+        assert_eq!(Damage::Tracked(vec![]).bbox_permille(100, 100), Some(0));
+    }
 
     #[test]
     fn damage_area_permille_semantics() {

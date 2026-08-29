@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use axum::extract::ws::{Message, WebSocket};
 use bson::oid::ObjectId;
 use dashmap::DashMap;

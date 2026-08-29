@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! GDI `BitBlt`-from-desktop-DC capture fallback for the M3 A1
 //! SYSTEM-context worker.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Roomler SSH — the in-daemon SSH surface on this node's overlay address.
 //!
 //! # Where this is

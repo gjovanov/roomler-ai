@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! `PUT /api/tenant/{tenant_id}/agent/{agent_id}/desired-config` — record the
 //! device config an operator wants, for the agent to reconcile when it next
 //! connects. Step 2 of `docs/remote-config.md`.

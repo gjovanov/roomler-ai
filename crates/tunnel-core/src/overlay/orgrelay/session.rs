@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-19 P2b — the relay session table and the forwarding decision.
 //!
 //! One pure function decides what a relay does with an inbound datagram, so
@@ -27,12 +29,20 @@
 //!   is behind symmetric NAT, so a mapping change is normal and must not need
 //!   a control-plane round trip to recover — but an unauthenticated re-bind
 //!   would be a hijack primitive. Both directions are tested.
+//! * **The table has a ceiling and refuses rather than grows.** Sessions are
+//!   minted by the server, so this is a bound on what an org can ask of its
+//!   own relay, not on what an attacker can do — but a relay that could be
+//!   handed unbounded state by its control plane is a relay whose host has no
+//!   say in its own resource use.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use super::bind::{BindOutcome, BindRefusal, BindSecret, BindVerifier, Mac, Nonce};
+
+/// Default ceiling on concurrent sessions per relay. FR-19's `relay_max_sessions`.
+pub const MAX_SESSIONS: usize = 64;
 
 /// One party to a session: its WireGuard public key (identity, as the mint
 /// names it) and the secret proving it is that party.
@@ -90,7 +100,7 @@ pub enum DropReason {
     UnknownVni,
     /// A data packet from a source that is not one of the two bound addresses.
     UnboundSource,
-    /// Both members bound, but this data arrived before that completed.
+    /// Data arrived before both members had bound.
     NotYetBound,
     SessionExpired,
     SessionIdle,
@@ -101,11 +111,11 @@ pub enum DropReason {
 /// What the relay should do with this datagram.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayAction {
-    /// Send these bytes back to the sender (the bind challenge).
-    Reply(Vec<u8>),
+    /// Send this cookie back to the sender as the challenge.
+    Challenge(Mac),
     /// The sender is now bound; nothing to send.
     Bound,
-    /// Forward the payload verbatim to the other party.
+    /// Forward the frame verbatim to the other party.
     Forward {
         to: SocketAddr,
     },
@@ -126,9 +136,14 @@ pub enum Inbound<'a> {
     Data(&'a [u8]),
 }
 
+/// The table refused a new session because it is at [`MAX_SESSIONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapReached;
+
 pub struct SessionTable {
     by_vni: HashMap<u32, Session>,
     verifier: BindVerifier,
+    cap: usize,
 }
 
 impl SessionTable {
@@ -136,13 +151,19 @@ impl SessionTable {
         Self {
             by_vni: HashMap::new(),
             verifier,
+            cap: MAX_SESSIONS,
         }
     }
 
-    /// Install a minted session. Sessions come from the server; nothing an
-    /// inbound packet can do creates one.
-    pub fn insert(&mut self, s: Session) {
+    /// Install a minted session, refusing at the cap rather than growing. A
+    /// re-mint for a VNI already present replaces it (the server's `lamport`
+    /// ordering has already decided that the newer one wins).
+    pub fn insert(&mut self, s: Session) -> Result<(), CapReached> {
+        if !self.by_vni.contains_key(&s.vni) && self.by_vni.len() >= self.cap {
+            return Err(CapReached);
+        }
         self.by_vni.insert(s.vni, s);
+        Ok(())
     }
 
     /// Revoke a session immediately.
@@ -194,7 +215,7 @@ impl SessionTable {
                         self.verifier
                             .on_bind(&m.secret, vni, s.generation, &nonce, &from, &tag1)
                     {
-                        return RelayAction::Reply(c.to_vec());
+                        return RelayAction::Challenge(c);
                     }
                 }
                 RelayAction::Drop(DropReason::Bind(BindRefusal::BadTag1))
@@ -257,11 +278,9 @@ mod tests {
     }
     const N: Nonce = [3u8; 16];
 
-    fn table() -> (SessionTable, Instant) {
-        let now = Instant::now();
-        let mut t = SessionTable::new(BindVerifier::new(CookieKey::from_bytes([1u8; 32]), None));
-        t.insert(Session {
-            vni: 42,
+    fn session(vni: u32, now: Instant) -> Session {
+        Session {
+            vni,
             generation: 1,
             members: [
                 Member {
@@ -277,20 +296,26 @@ mod tests {
             max_lifetime: now + Duration::from_secs(3600),
             idle_deadline: now + IDLE_REFRESH,
             bind_deadline: now + Duration::from_secs(30),
-        });
+        }
+    }
+
+    fn table() -> (SessionTable, Instant) {
+        let now = Instant::now();
+        let mut t = SessionTable::new(BindVerifier::new(CookieKey::from_bytes([1u8; 32]), None));
+        t.insert(session(42, now)).expect("under cap");
         (t, now)
     }
 
-    /// Drive one member all the way to bound.
+    /// Drive one member all the way to bound — as the CLIENT would, knowing
+    /// nothing about its own mapped address.
     fn bind_member(t: &mut SessionTable, key: u8, a: SocketAddr, now: Instant) {
         let s = BindSecret::from_bytes([key; 32]);
-        let t1 = tag1(&s, 42, 1, &N, &a);
-        let RelayAction::Reply(c) = t.decide(42, a, Inbound::Bind { nonce: N, tag1: t1 }, now)
+        let t1 = tag1(&s, 42, 1, &N);
+        let RelayAction::Challenge(cookie) =
+            t.decide(42, a, Inbound::Bind { nonce: N, tag1: t1 }, now)
         else {
             panic!("a valid bind must be challenged");
         };
-        let mut cookie = [0u8; 16];
-        cookie.copy_from_slice(&c);
         let t2 = tag2(&s, &cookie, &N);
         assert_eq!(
             t.decide(
@@ -387,9 +412,10 @@ mod tests {
             "traffic must follow the re-bound address"
         );
 
-        // An attacker with no secret cannot move it.
+        // An attacker with no secret cannot move it: their forged tag1 is
+        // refused outright, so they never even reach a challenge here.
         let evil = addr("192.0.2.66:7000");
-        let bogus = tag1(&BindSecret::from_bytes([0xEE; 32]), 42, 1, &N, &evil);
+        let bogus = tag1(&BindSecret::from_bytes([0xEE; 32]), 42, 1, &N);
         assert_eq!(
             t.decide(
                 42,
@@ -406,6 +432,51 @@ mod tests {
             t.decide(42, b, Inbound::Data(b"x"), now),
             RelayAction::Forward { to: a2 },
             "a refused bind must not have moved anything"
+        );
+    }
+
+    /// A REPLAYED tag1 from an attacker earns a challenge (one frame, to the
+    /// attacker's own address) but cannot be answered, so nothing moves. This
+    /// is the posture the address-at-step-3 design accepts on purpose.
+    #[test]
+    fn a_replayed_tag1_is_challenged_but_cannot_rebind() {
+        let (mut t, now) = table();
+        let a = addr("198.51.100.1:5000");
+        let b = addr("203.0.113.9:6000");
+        bind_member(&mut t, 0xA1, a, now);
+        bind_member(&mut t, 0xB1, b, now);
+
+        let evil = addr("192.0.2.66:7000");
+        let captured = tag1(&BindSecret::from_bytes([0xA1; 32]), 42, 1, &N);
+        let RelayAction::Challenge(cookie) = t.decide(
+            42,
+            evil,
+            Inbound::Bind {
+                nonce: N,
+                tag1: captured,
+            },
+            now,
+        ) else {
+            panic!("a replayed tag1 earns exactly one challenge");
+        };
+        // No secret ⇒ no valid tag2 ⇒ refused, and A's binding is untouched.
+        let forged = tag2(&BindSecret::from_bytes([0xEE; 32]), &cookie, &N);
+        assert_eq!(
+            t.decide(
+                42,
+                evil,
+                Inbound::Answer {
+                    nonce: N,
+                    cookie,
+                    tag2: forged
+                },
+                now
+            ),
+            RelayAction::Drop(DropReason::Bind(BindRefusal::BadTag2))
+        );
+        assert_eq!(
+            t.decide(42, b, Inbound::Data(b"x"), now),
+            RelayAction::Forward { to: a }
         );
     }
 
@@ -512,5 +583,26 @@ mod tests {
             t.decide(42, a2, Inbound::Data(b"x"), now),
             RelayAction::Drop(DropReason::NotYetBound)
         );
+    }
+
+    /// The ceiling refuses rather than grows — and a re-mint of an EXISTING
+    /// VNI is not a new session, so it is admitted at the cap.
+    #[test]
+    fn the_cap_refuses_new_sessions_but_admits_a_remint() {
+        let now = Instant::now();
+        let mut t = SessionTable::new(BindVerifier::new(CookieKey::from_bytes([1u8; 32]), None));
+        for vni in 1..=MAX_SESSIONS as u32 {
+            t.insert(session(vni, now)).expect("under cap");
+        }
+        assert_eq!(t.len(), MAX_SESSIONS);
+        assert_eq!(t.insert(session(9999, now)), Err(CapReached));
+        assert_eq!(
+            t.len(),
+            MAX_SESSIONS,
+            "a refused insert must not grow the table"
+        );
+        // Re-minting VNI 1 replaces, it does not add.
+        assert_eq!(t.insert(session(1, now)), Ok(()));
+        assert_eq!(t.len(), MAX_SESSIONS);
     }
 }

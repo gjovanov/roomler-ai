@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows Filtering Platform (WFP) direct programming for the L3 overlay.
 //!
 //! On a corporate host whose Windows Defender Firewall is locked down by

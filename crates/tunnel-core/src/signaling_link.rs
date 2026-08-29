@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! The **signaling seam** the tunnel-session driver rides.
 //!
 //! [`crate::driver::run_tunnel_session`] speaks the `rc:tunnel.*` control

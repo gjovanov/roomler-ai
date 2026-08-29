@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-1 — the ownership directory: entity → owning-pod records in Redis.
 //!
 //! One record per live entity (`agent`, later `tunnel`/`derp`/`media`),

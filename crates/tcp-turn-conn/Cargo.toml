@@ -5,6 +5,8 @@
 # the single-instance guarantee `turn::client::Client` interop depends on.
 [package]
 name = "tcp-turn-conn"
+license = "MPL-2.0"
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "TURNS-over-TLS-over-TCP util::Conn adapter (STUN/ChannelData de-framing + native-certs-first TLS) for TURN relay clients on UDP-blocked corporate networks."

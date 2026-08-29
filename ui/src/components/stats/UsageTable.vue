@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <div>
     <div class="d-flex align-center flex-wrap mb-2" style="gap: 8px">

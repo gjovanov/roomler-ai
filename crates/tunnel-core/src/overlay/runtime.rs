@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay node runtime (Phase 3b).
 //!
 //! Drives one node's membership in the overlay mesh: announces itself
@@ -1843,6 +1845,10 @@ impl OverlayRuntime {
             // Data-probe — this build's engine answers the overlay-native
             // echo inline (wired in `process_inbound`), so advertise it.
             supports_overlay_echo: true,
+            // FR-19 — `false` until the client side (P4) can actually USE an
+            // org relay. Advertising it earlier would invite the server to push
+            // relay_session frames this build cannot act on.
+            supports_org_relay: false,
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         }
@@ -4273,6 +4279,7 @@ mod tests {
             supports_derp_floor: false,
             caps: None,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             relay_strategy: None,
             routes: vec![],
             agent_id: None,
@@ -4685,6 +4692,7 @@ mod tests {
             supports_forced_derp: false,
             caps: None,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             relay_strategy: None,
             routes: vec![],
             agent_id: None,
@@ -4882,6 +4890,7 @@ mod tests {
                 supports_forced_derp: false,
                 caps: None,
                 supports_overlay_echo: false,
+                supports_org_relay: false,
                 relay_strategy: None,
                 routes: vec![],
                 agent_id: None,
@@ -6644,6 +6653,7 @@ mod tests {
                 supports_derp_floor: false,
                 caps: None,
                 supports_overlay_echo: false,
+                supports_org_relay: false,
                 relay_strategy: None,
                 routes: vec![],
                 agent_id: None,
@@ -6889,6 +6899,7 @@ mod tests {
             supports_derp_floor: false,
             caps: None,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             relay_strategy: None,
             routes: vec![],
             agent_id: None,
@@ -7448,6 +7459,7 @@ mod tests {
             supports_derp_floor: false,
             caps: None,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             relay_strategy: None,
             routes,
             agent_id: None,
@@ -7622,6 +7634,7 @@ mod tests {
             supports_derp_floor: false,
             caps: None,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             relay_strategy: None,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
             agent_id: None,

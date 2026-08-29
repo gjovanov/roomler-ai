@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-4 — media claim-or-route: mediasoup rooms become cluster-safe.
 //!
 //! A conference room is server-materialized state with no client-owned

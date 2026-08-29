@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Integration tests for the remote-control subsystem.
 //!
 //! These exercise the REST flow (enroll → list → delete), the JWT audience

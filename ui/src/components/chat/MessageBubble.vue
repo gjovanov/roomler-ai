@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <div :class="['message-bubble', { 'message-bubble--compact': compact, 'message-bubble--unread': unread }]">
     <div class="d-flex align-start">
