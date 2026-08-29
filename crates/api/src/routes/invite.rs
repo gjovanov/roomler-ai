@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
 };
 use bson::oid::ObjectId;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -185,6 +186,23 @@ pub async fn accept_invite(
         return Err(ApiError::Conflict(
             "Already a member of this tenant".to_string(),
         ));
+    }
+
+    // FR-32 P1b — plan `max_members` cap on the redemption path too. ⚠ Both
+    // paths must gate or neither does: `add_member` is the admin route, this is
+    // the one an invitee walks, and leaving this open would make the cap a
+    // formality any tenant could route around by sending invite links.
+    {
+        let tenant = state.tenants.base.find_by_id(invite.tenant_id).await?;
+        let used = state.tenants.count_members(invite.tenant_id).await?;
+        if let Err(d) = quota::check(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::MaxMembers,
+            used,
+        ) {
+            return Err(ApiError::Forbidden(d.message()));
+        }
     }
 
     // Determine roles to assign (default to "member" role if none specified)
@@ -509,6 +527,23 @@ pub async fn add_member(
     // Check not already a member
     if state.tenants.is_member(tid, user_id).await? {
         return Err(ApiError::Conflict("User is already a member".to_string()));
+    }
+
+    // FR-32 P1b — plan `max_members` cap. Checked AFTER the already-a-member
+    // test, so only a NEW seat consumes one; mirrors the device cap's "only NEW
+    // rows consume a slot". Ships in the tenant's `plan_enforcement` mode,
+    // default `Warn` — recorded, not refused.
+    {
+        let tenant = state.tenants.base.find_by_id(tid).await?;
+        let used = state.tenants.count_members(tid).await?;
+        if let Err(d) = quota::check(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::MaxMembers,
+            used,
+        ) {
+            return Err(ApiError::Forbidden(d.message()));
+        }
     }
 
     let role_ids: Vec<ObjectId> = if body.role_ids.is_empty() {
