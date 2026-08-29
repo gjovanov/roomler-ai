@@ -692,9 +692,9 @@ fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     let mut cmd = std::process::Command::new("ip");
     let dest = dest_ip.to_string();
     if dest_ip.is_ipv6() {
-        cmd.args(["-6", "-o", "route", "get", &dest]);
+        cmd.args(["-6", "-o", "route", "get", dest.as_str()]);
     } else {
-        cmd.args(["-o", "route", "get", &dest]);
+        cmd.args(["-o", "route", "get", dest.as_str()]);
     }
     let out = cmd.output().ok()?;
     let line = String::from_utf8_lossy(&out.stdout);
@@ -720,9 +720,9 @@ fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     let mut cmd = std::process::Command::new("route");
     let dest = dest_ip.to_string();
     if dest_ip.is_ipv6() {
-        cmd.args(["-n", "get", "-inet6", &dest]);
+        cmd.args(["-n", "get", "-inet6", dest.as_str()]);
     } else {
-        cmd.args(["-n", "get", &dest]);
+        cmd.args(["-n", "get", dest.as_str()]);
     }
     let out = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
