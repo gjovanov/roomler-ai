@@ -81,6 +81,9 @@ pub struct ViewerWindow {
     /// constrained QSV session, the FR-10 deferral that keeps a re-open
     /// lump out of the middle of a drag.
     pub age_over: bool,
+    /// FR-35 — the ceiling learner stepped the constrained ceiling up this
+    /// window (for the pump's log line).
+    pub ceiling_grown: Option<super::ceiling_learn::Grow>,
 }
 
 /// Outcome of a heartbeat tier step, emitted only when the
@@ -138,6 +141,15 @@ pub struct RateGovernor {
     /// (`encode::measured_ceiling_enabled` — env/config
     /// `MEASURED_CEILING`). False = observe-and-report only.
     measured_ceiling: bool,
+    /// FR-35 — grows the constrained ceiling above the nominal on delivery
+    /// evidence; inert (returns the plan) when `hi` is 0 or off-relay.
+    learner: super::ceiling_learn::CeilingLearner,
+    /// AIMD decrease count at the last tick — a change means the pipe pushed
+    /// back since, which the learner must hear.
+    last_decreases: u32,
+    /// Send-task byte total at the last viewer window, for the window's
+    /// delivered rate (the learner's "carried" evidence).
+    last_sent_bytes: u64,
 }
 
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
@@ -153,6 +165,8 @@ impl RateGovernor {
         send_depth: usize,
         measured_ceiling: bool,
         age_feedback: bool,
+        ceiling_hi_bps: u32,
+        ceiling_seed_bps: Option<u32>,
         now: Instant,
     ) -> Self {
         Self {
@@ -175,7 +189,32 @@ impl RateGovernor {
             goodput_sink: GoodputSink::new(),
             pace: super::encode_pressure::FpsPace::new(),
             measured_ceiling,
+            learner: super::ceiling_learn::CeilingLearner::new(ceiling_hi_bps, ceiling_seed_bps),
+            last_decreases: 0,
+            last_sent_bytes: 0,
         }
+    }
+
+    /// FR-35 — the ceiling the AIMD runs under: the plan's, lifted by what the
+    /// learner has proven on a constrained session. Also the value the pump
+    /// opens the encoder with, so the opening keyframe is sized by it.
+    pub fn effective_ceiling(&mut self, plan_ceiling_bps: u32, constrained: bool) -> u32 {
+        if constrained {
+            self.learner.effective_ceiling(plan_ceiling_bps)
+        } else {
+            plan_ceiling_bps
+        }
+    }
+
+    /// FR-35 — the learned ceiling (0 = nothing learned or seeded), for the
+    /// heartbeat.
+    pub fn learned_ceiling_bps(&self) -> u32 {
+        self.learner.learned_bps()
+    }
+
+    /// FR-35 P2 — the session's stable rate when it beats the nominal.
+    pub fn stable_bps(&self) -> Option<u32> {
+        self.learner.stable_bps()
     }
 
     /// Hand to the send task at spawn. It reports every frame's
@@ -259,6 +298,12 @@ impl RateGovernor {
         } else {
             ceiling_bps
         };
+        // FR-35 — lift the constrained ceiling by what the learner has proven.
+        let ceiling_bps = if constrained {
+            self.learner.effective_ceiling(ceiling_bps)
+        } else {
+            ceiling_bps
+        };
         let depth = self.send_depth;
         let ctrl = self.aimd.get_or_insert_with(|| {
             AimdController::new(
@@ -276,6 +321,15 @@ impl RateGovernor {
             send_capacity == 0,
             now,
         );
+        // FR-35 — any decrease (full channel, overflow, stall, age) since the
+        // last tick pulls the learned ceiling back to the post-decrease target.
+        let decreases = ctrl.decreases();
+        if decreases != self.last_decreases {
+            self.last_decreases = decreases;
+            if constrained {
+                self.learner.on_decrease(ctrl.desired(), now);
+            }
+        }
         let bps = ctrl.take_pending()?;
         Some(self.record_applied(bps))
     }
@@ -305,9 +359,15 @@ impl RateGovernor {
     /// pump's own `pre_encode_tick` picks this up one frame later and
     /// routes it through the normal apply arms — the same discipline the
     /// FR-15 age loop follows.
-    pub fn note_send_stall(&mut self, now: Instant) {
+    pub fn note_send_stall(&mut self, wait: Duration, now: Instant) {
+        // FR-35 — a send blocked ≥ 1 s is a HARD stall: ×0.5 at once.
+        let hard = self.learner.on_stall(wait, now);
         if let Some(ctrl) = self.aimd.as_mut() {
-            ctrl.note_buffer_overflow(now);
+            if hard {
+                ctrl.apply_hard_md(now);
+            } else {
+                ctrl.note_buffer_overflow(now);
+            }
         }
     }
 
@@ -339,6 +399,7 @@ impl RateGovernor {
     /// consumes the report); `fold_followers` folds the shared
     /// pipeline's follower windows given this pump's own divisor
     /// (the stream paces to the slowest viewer).
+    #[allow(clippy::too_many_arguments)] // one tick = the pump's per-window facts; a struct would only rename the list
     pub fn tick_viewer_window(
         &mut self,
         now: Instant,
@@ -347,11 +408,21 @@ impl RateGovernor {
         take_age: impl FnOnce() -> u64,
         constrained: bool,
         fold_followers: impl FnOnce(u32) -> u32,
+        sent_bytes_total: u64,
     ) -> Option<ViewerWindow> {
-        if now.duration_since(self.viewer_window_at) < VIEWER_WINDOW {
+        let elapsed = now.duration_since(self.viewer_window_at);
+        if elapsed < VIEWER_WINDOW {
             return None;
         }
         self.viewer_window_at = now;
+        // FR-35 — the window's delivered rate, from the send task's running
+        // byte total (bits per second over the actual elapsed window).
+        let sent_bps: u32 = {
+            let bytes = sent_bytes_total.saturating_sub(self.last_sent_bytes);
+            self.last_sent_bytes = sent_bytes_total;
+            let ms = elapsed.as_millis().max(1) as u64;
+            (bytes.saturating_mul(8000) / ms).min(u32::MAX as u64) as u32
+        };
         // Fold the window's blocked-send samples in one byte-weighted
         // aggregate. Deliberately inside the window gate rather than per
         // frame — the send task is a different task, and this is the
@@ -395,6 +466,14 @@ impl RateGovernor {
         if age_over && let Some(ctrl) = self.aimd.as_mut() {
             ctrl.note_buffer_overflow(now);
         }
+        // FR-35 — hand the learner this window's evidence.
+        let ceiling_grown = if constrained {
+            let desired = self.aimd.as_ref().map(|c| c.desired()).unwrap_or(0);
+            self.learner
+                .on_window(desired, sent_bps, self.last_viewer_age, now)
+        } else {
+            None
+        };
         Some(ViewerWindow {
             reported_fps,
             struggling,
@@ -403,6 +482,7 @@ impl RateGovernor {
             changed,
             age_ms,
             age_over,
+            ceiling_grown,
         })
     }
 
@@ -519,7 +599,70 @@ mod tests {
     const CEILING: u32 = 12_000_000;
 
     fn gov(now: Instant) -> RateGovernor {
-        RateGovernor::new(30, DEPTH, true, true, now)
+        RateGovernor::new(30, DEPTH, true, true, 0, None, now)
+    }
+
+    /// FR-35 — on a constrained session the learner lifts the ceiling above
+    /// the nominal only on carried, clean windows, never above hi, and a
+    /// direct session is untouched.
+    #[test]
+    fn ceiling_learner_lifts_the_constrained_ceiling_on_carried_windows() {
+        let start = Instant::now();
+        let mut g = RateGovernor::new(30, DEPTH, false, false, 8_000_000, None, start);
+        let a = g
+            .pre_encode_tick(
+                3_000_000,
+                crate::encode::MIN_BITRATE_BPS,
+                true,
+                DEPTH,
+                start,
+            )
+            .expect("initial apply");
+        assert_eq!(
+            a.bps, 3_000_000,
+            "opens at the nominal with nothing learned"
+        );
+        let mut bytes: u64 = 0;
+        let mut grown = 0;
+        for i in 1..=40u64 {
+            bytes += 3_000_000 / 8; // the window carried 3 Mbps
+            let now = start + Duration::from_secs(i);
+            let w = g
+                .tick_viewer_window(now, 30, || 0, || 0, true, |o| o, bytes)
+                .expect("window due");
+            if w.ceiling_grown.is_some() {
+                grown += 1;
+            }
+            let _ = g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, now);
+        }
+        assert!(grown >= 3, "expected several steps, got {grown}");
+        let lifted = g.effective_ceiling(3_000_000, true);
+        assert!(lifted > 3_000_000 && lifted <= 8_000_000, "lifted={lifted}");
+        assert_eq!(
+            g.effective_ceiling(3_000_000, false),
+            3_000_000,
+            "direct is untouched"
+        );
+        // A quiet session (nothing carried) never lifts.
+        let mut q = RateGovernor::new(30, DEPTH, false, false, 8_000_000, None, start);
+        let _ = q.pre_encode_tick(
+            3_000_000,
+            crate::encode::MIN_BITRATE_BPS,
+            true,
+            DEPTH,
+            start,
+        );
+        for i in 1..=30u64 {
+            let now = start + Duration::from_secs(i);
+            let w = q
+                .tick_viewer_window(now, 30, || 0, || 0, true, |o| o, i * 100_000)
+                .expect("window due");
+            assert!(w.ceiling_grown.is_none());
+        }
+        assert_eq!(q.effective_ceiling(3_000_000, true), 3_000_000);
+        // Learning off (hi = 0): the plan verbatim, seed ignored.
+        let mut off = RateGovernor::new(30, DEPTH, false, false, 0, Some(20_000_000), start);
+        assert_eq!(off.effective_ceiling(3_000_000, true), 3_000_000);
     }
 
     /// Stage 1: a held goodput estimate clamps the nominal ceiling to
@@ -537,7 +680,7 @@ mod tests {
         }
         let t1 = start + Duration::from_secs(2);
         assert!(
-            g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o)
+            g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o, 0)
                 .is_some()
         );
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
@@ -554,13 +697,13 @@ mod tests {
     #[test]
     fn measured_ceiling_disabled_keeps_nominal() {
         let start = Instant::now();
-        let mut g = RateGovernor::new(30, DEPTH, false, true, start);
+        let mut g = RateGovernor::new(30, DEPTH, false, true, 0, None, start);
         let sink = g.goodput_sink();
         for _ in 0..40 {
             sink.record(30_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o);
+        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o, 0);
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
@@ -581,7 +724,7 @@ mod tests {
             sink.record(30_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o);
+        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o, 0);
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t1)
@@ -604,7 +747,7 @@ mod tests {
             sink.record(60_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o);
+        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o, 0);
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
             .expect("initial apply");
@@ -744,6 +887,7 @@ mod tests {
             || 0,
             false,
             |own| own,
+            0,
         );
         assert!(r.is_none());
         assert_eq!(consumed, 0, "report consumed before the window was due");
@@ -757,6 +901,7 @@ mod tests {
             || 0,
             false,
             |own| own,
+            0,
         );
         assert!(r.is_some());
         assert_eq!(consumed, 1);
@@ -769,7 +914,15 @@ mod tests {
         // Fold a follower divisor of 3 in (own report healthy → own
         // divisor 1; the shared stream paces to the slowest viewer).
         let w = g
-            .tick_viewer_window(start + Duration::from_secs(2), 30, || 0, || 0, false, |_| 3)
+            .tick_viewer_window(
+                start + Duration::from_secs(2),
+                30,
+                || 0,
+                || 0,
+                false,
+                |_| 3,
+                0,
+            )
             .expect("window due");
         assert_eq!(w.skip_divisor, 3);
         assert!(w.changed);
@@ -803,6 +956,7 @@ mod tests {
                 || 0,
                 false,
                 |own| own,
+                0,
             );
             let w = w.expect("2 s apart — every window due");
             assert!(
@@ -860,6 +1014,7 @@ mod tests {
                     || viewer_rate::pack_age(avg, min, 100),
                     true,
                     |o| o,
+                    0,
                 )
                 .expect("window due");
             assert_eq!(w.age_ms, Some((avg, min)));
@@ -887,7 +1042,7 @@ mod tests {
             [("direct", false, true), ("kill switch", true, false)]
         {
             let start = Instant::now();
-            let mut g = RateGovernor::new(30, DEPTH, false, feedback, start);
+            let mut g = RateGovernor::new(30, DEPTH, false, feedback, 0, None, start);
             let mut applied = g
                 .pre_encode_tick(
                     ceiling,
@@ -908,6 +1063,7 @@ mod tests {
                         || viewer_rate::pack_age(avg, min, 100),
                         constrained,
                         |o| o,
+                        0,
                     )
                     .expect("window due");
                 assert!(!w.age_over, "{label}: age must not act");
@@ -949,6 +1105,7 @@ mod tests {
                     || 0, // no age slot written this window
                     true,
                     |o| o,
+                    0,
                 )
                 .expect("window due");
             assert_eq!(w.age_ms, None);
