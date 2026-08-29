@@ -168,25 +168,6 @@ async fn report_loop(stats: Arc<RelayStats>) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The default is off, and "off" must mean nothing was created — not a
-    /// relay sitting on a socket with zeroed counters. `stats()` returning
-    /// `None` is how a reader tells those apart.
-    #[test]
-    fn a_device_that_did_not_opt_in_reports_no_relay() {
-        // No env set in this test process, so the gate is closed.
-        assert!(!orgrelay::relay_server_enabled());
-        maybe_start();
-        assert!(
-            stats().is_none() && handle().is_none(),
-            "opting out must leave no relay, not an idle one"
-        );
-    }
-}
-
 /// FR-19 P4b — install a server-minted session into the running relay
 /// (`rc:overlay.relay_serve`). Every lifetime is RE-CLAMPED against this
 /// node's own ceilings and its own clock — server values only ever shorten
@@ -268,5 +249,23 @@ pub fn revoke_from_wire(vni: u32) {
         && h.revoke(vni)
     {
         tracing::info!(vni, "org-relay: session revoked by the server");
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default is off, and "off" must mean nothing was created — not a
+    /// relay sitting on a socket with zeroed counters. `stats()` returning
+    /// `None` is how a reader tells those apart.
+    #[test]
+    fn a_device_that_did_not_opt_in_reports_no_relay() {
+        // No env set in this test process, so the gate is closed.
+        assert!(!orgrelay::relay_server_enabled());
+        maybe_start();
+        assert!(
+            stats().is_none() && handle().is_none(),
+            "opting out must leave no relay, not an idle one"
+        );
     }
 }
