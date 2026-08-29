@@ -832,6 +832,11 @@ fn rpc_caps() -> Vec<String> {
     if tunnel_core::overlay::orgrelay::relay_server_enabled() {
         caps.push(RpcCap::RelayServer);
     }
+    // FR-40 — a build with an overlay surface can retire its overlay key on
+    // order. A property of the BUILD, like `config`: the device may still
+    // refuse (`overlay_key_rotation=false`), and says so in its report.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    caps.push(RpcCap::KeyRotate);
     caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 

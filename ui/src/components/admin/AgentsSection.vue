@@ -168,6 +168,12 @@
                     :disabled="updateBusy === item.id"
                     @click="triggerUpdate(agentFor(item)!)"
                   />
+                  <v-list-item
+                    prepend-icon="mdi-key-change"
+                    title="Rotate overlay key…"
+                    :disabled="rotateKeyBusy === item.id"
+                    @click="openRotateKey(agentFor(item)!)"
+                  />
                   <v-list-subheader>Diagnostics</v-list-subheader>
                   <v-list-item
                     prepend-icon="mdi-alert-circle-outline"
@@ -360,6 +366,17 @@
             >
               {{ remoteConfigChip(agentFor(item)!)!.text }}
             </v-chip>
+            <v-chip
+              v-if="item.kind === 'agent' && agentFor(item) && keyRotationChip(agentFor(item)!)"
+              size="x-small"
+              variant="tonal"
+              class="mt-1"
+              :color="keyRotationChip(agentFor(item)!)!.color"
+              :prepend-icon="keyRotationChip(agentFor(item)!)!.icon"
+              :title="keyRotationChip(agentFor(item)!)!.tooltip"
+            >
+              {{ keyRotationChip(agentFor(item)!)!.text }}
+            </v-chip>
           </template>
           <template #item.os="{ item }">
             <v-chip size="x-small" :prepend-icon="osIcon(item.os as any)" variant="tonal">
@@ -374,6 +391,15 @@
                 :title="deriveOverlayV6(item.overlay_ip) ?? undefined"
               >
                 {{ deriveOverlayV6(item.overlay_ip) }}
+              </div>
+              <!-- FR-40 — the node's public key, so a rotation is visible as a
+                   changed key rather than trusted from a chip. -->
+              <div
+                v-if="item.overlay_public_key"
+                class="text-caption text-medium-emphasis font-mono"
+                :title="`Overlay public key, epoch ${item.overlay_key_epoch ?? 0}: ${item.overlay_public_key}`"
+              >
+                key {{ item.overlay_public_key.slice(0, 10) }}… · e{{ item.overlay_key_epoch ?? 0 }}
               </div>
             </template>
             <span v-else class="text-caption text-medium-emphasis">—</span>
@@ -612,6 +638,17 @@
               >
                 {{ remoteConfigChip(a)!.text }}
               </v-chip>
+              <v-chip
+                v-if="keyRotationChip(a)"
+                size="x-small"
+                variant="tonal"
+                class="ml-1"
+                :color="keyRotationChip(a)!.color"
+                :prepend-icon="keyRotationChip(a)!.icon"
+                :title="keyRotationChip(a)!.tooltip"
+              >
+                {{ keyRotationChip(a)!.text }}
+              </v-chip>
             </div>
             <div class="text-caption text-medium-emphasis mb-2">
               <span :title="`Agent ID: ${a.id}`">id: {{ shortId(a.id) }}</span>
@@ -731,6 +768,12 @@
                     title="Update now"
                     :disabled="updateBusy === a.id"
                     @click="triggerUpdate(a)"
+                  />
+                  <v-list-item
+                    prepend-icon="mdi-key-change"
+                    title="Rotate overlay key…"
+                    :disabled="rotateKeyBusy === a.id"
+                    @click="openRotateKey(a)"
                   />
                   <v-list-subheader>Diagnostics</v-list-subheader>
                   <v-list-item
@@ -1100,6 +1143,37 @@
     :agent="remoteConfigTarget"
     @saved="agentStore.fetchAgents(tenantId); fetchGrid()"
   />
+
+  <!-- FR-40 — rotate-overlay-key confirmation -->
+  <v-dialog v-model="rotateKeyDialogOpen" max-width="520">
+    <v-card>
+      <v-card-title>Rotate the overlay key of {{ rotateKeyTarget?.name }}?</v-card-title>
+      <v-card-text>
+        The device mints a fresh WireGuard key <strong>on the device</strong>, saves it and
+        re-joins the mesh under it. Every peer picks the new key up within seconds and the old
+        key stops working everywhere. The server never sees a private key.
+        <br /><br />
+        Immediate and disruptive by design: every session this device carries in this
+        organization (remote control, SSH over the overlay, tunnels) ends and reconnects.
+        <template v-if="rotateKeyTarget && !rotateKeyTarget.is_online">
+          <br /><br />
+          The device is offline — the order is queued and runs on its next connect.
+        </template>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="rotateKeyDialogOpen = false">Cancel</v-btn>
+        <v-btn
+          color="warning"
+          variant="flat"
+          :loading="rotateKeyBusy !== null"
+          @click="doRotateKey"
+        >
+          Rotate key
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
 
   <!-- S1a — Update-all confirmation -->
   <v-dialog v-model="updateAllDialogOpen" max-width="480">
@@ -1849,6 +1923,108 @@ const updateBusy = ref<string | null>(null)
 const updateNotice = ref<string | null>(null)
 const updateAllDialogOpen = ref(false)
 const updatingAll = ref(false)
+
+// FR-40 — overlay-key rotation (docs/fr/FR-40-overlay-key-rotation.md)
+const rotateKeyDialogOpen = ref(false)
+const rotateKeyTarget = ref<Agent | null>(null)
+const rotateKeyBusy = ref<string | null>(null)
+
+function openRotateKey(a: Agent) {
+  rotateKeyTarget.value = a
+  rotateKeyDialogOpen.value = true
+}
+
+async function doRotateKey() {
+  const a = rotateKeyTarget.value
+  if (!a) return
+  rotateKeyBusy.value = a.id
+  try {
+    const res = await agentStore.rotateOverlayKey(props.tenantId, a.id)
+    updateNotice.value = res.delivered
+      ? `Key rotation ordered on ${a.name} — it mints a new key, re-joins the mesh and reports back within seconds.`
+      : `${a.name} is offline — the key rotation is queued and runs on its next connect.`
+    rotateKeyDialogOpen.value = false
+    await agentStore.fetchAgents(props.tenantId)
+    fetchGrid()
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    rotateKeyBusy.value = null
+  }
+}
+
+/** One chip per resolved state. The states are the SERVER's resolution
+ *  (`key_rotation_view`) — the client only names them. */
+function keyRotationChip(
+  a: Agent,
+): { color: string; icon: string; text: string; tooltip: string } | null {
+  const kr = a.key_rotation
+  if (!kr) return null
+  switch (kr.state) {
+    case 'queued':
+      return {
+        color: 'info',
+        icon: 'mdi-key-chain',
+        text: 'key rotation queued',
+        tooltip: 'Ordered while the device was offline; it rotates on its next connect.',
+      }
+    case 'delivered':
+      return {
+        color: 'info',
+        icon: 'mdi-key-chain',
+        text: 'rotating key…',
+        tooltip: 'The order reached the device; waiting for its answer.',
+      }
+    case 'rotating':
+      return {
+        color: 'info',
+        icon: 'mdi-key-chain',
+        text: 'rotating key…',
+        tooltip: 'The device minted its new key and is re-joining the mesh.',
+      }
+    case 'rotated':
+      return {
+        color: 'success',
+        icon: 'mdi-key-change',
+        text: `key rotated · e${kr.report?.key_epoch ?? '?'}`,
+        tooltip: `Rotated ${kr.report?.reported_at ?? ''} and joined the mesh under the new key.`,
+      }
+    case 'reported_not_joined':
+      return {
+        color: 'error',
+        icon: 'mdi-key-alert',
+        text: 'key not re-joined',
+        tooltip:
+          'The device reported a rotation but has not joined the mesh under the new key — read its log.',
+      }
+    case 'refused':
+      return {
+        color: 'warning',
+        icon: 'mdi-hand-back-left-outline',
+        text: `key rotation refused (${kr.report?.outcome ?? 'refused'})`,
+        tooltip: kr.report?.detail ?? 'The device refused the rotation order.',
+      }
+    case 'failed':
+      return {
+        color: 'error',
+        icon: 'mdi-alert-circle-outline',
+        text: 'key rotation failed',
+        tooltip:
+          kr.report?.detail ??
+          'The device could not mint or save a new key; its identity is unchanged.',
+      }
+    case 'unsupported':
+      return {
+        color: 'grey',
+        icon: 'mdi-update',
+        text: 'agent too old for key rotation',
+        tooltip:
+          "This device's agent predates key rotation (0.4.24+). Update it — the order stays queued.",
+      }
+    default:
+      return null
+  }
+}
 
 async function triggerUpdate(a: Agent) {
   updateBusy.value = a.id

@@ -477,6 +477,28 @@ pub enum ClientMsg {
         detail: Option<String>,
     },
 
+    /// FR-40 — the device's answer to [`ServerMsg::KeyRotate`], sent on the
+    /// session that received the order (that session is about to end: a
+    /// `rotated` device reconnects immediately under its new key).
+    ///
+    /// Sent on EVERY outcome, refusals included — the refusals are what an
+    /// operator can act on. `tenant_id` / `agent_id` come from the
+    /// authenticated WS, never this frame. Keys here are PUBLIC halves only.
+    #[serde(rename = "rc:agent.key_rotated")]
+    KeyRotated {
+        request_id: String,
+        outcome: crate::models::KeyRotationOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        old_public_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_public_key: Option<String>,
+        /// The epoch the device will present on its next join.
+        #[serde(default)]
+        key_epoch: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -1389,6 +1411,33 @@ pub enum ServerMsg {
         revision: u64,
         /// Only the keys under management; absent keys mean "leave alone".
         desired: crate::models::DesiredConfig,
+    },
+
+    /// FR-40 — order the device to retire its overlay (WireGuard) key: mint
+    /// a fresh one LOCALLY, persist it, report back with
+    /// [`ClientMsg::KeyRotated`], then reconnect and re-join under the new
+    /// key (`docs/fr/FR-40-overlay-key-rotation.md`).
+    ///
+    /// An ORDER, never a delivery: this frame carries no key material and a
+    /// test locks that it never grows any. The server never sees a private
+    /// key at any step — which is the property that makes the overlay's
+    /// end-to-end encryption mean something.
+    ///
+    /// Per org, honoured on whichever org's WS it arrives on: a device's
+    /// overlay key is per enrollment (`AgentConfig::for_org` scopes it), so
+    /// org B rotating its own key on a shared host touches nothing of org
+    /// A's. This is the OPPOSITE of [`Self::UpdateNow`] / [`Self::ConfigPush`],
+    /// which drive machine-wide state and are therefore primary-only.
+    ///
+    /// ⚠️ Gate on [`RpcCap::KeyRotate`] — never send it blind (see that
+    /// verb's doc). Disruptive by design: the device ends every session it
+    /// carries on that org and rebuilds its overlay runtime.
+    ///
+    /// [`RpcCap::KeyRotate`]: crate::models::RpcCap::KeyRotate
+    #[serde(rename = "rc:agent.key_rotate")]
+    KeyRotate {
+        /// Echoed in the report so an answer can be matched to THIS order.
+        request_id: String,
     },
 
     /// Multi-org — join an ADDITIONAL org from the admin UI ("Add to another
@@ -4054,6 +4103,82 @@ mod tests {
                 assert_eq!(pin.as_deref(), Some("agent-v0.3.0-rc.260"))
             }
             other => panic!("expected UpdateNow, got {other:?}"),
+        }
+    }
+
+    // ─── FR-40 key-rotation wire locks ───────────────────────────────
+
+    /// The order carries NO key material — and never may. A future field
+    /// named like a key would turn "the server orders a re-mint it never
+    /// sees" into a delivery path, so the frame's whole shape is pinned.
+    #[test]
+    fn key_rotate_order_carries_no_key_shaped_field() {
+        let m = ServerMsg::KeyRotate {
+            request_id: "req-1".to_string(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["t"], "rc:agent.key_rotate");
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["request_id", "t"],
+            "the order is exactly {{t, request_id}}: {v}"
+        );
+        for k in &keys {
+            let k = k.to_ascii_lowercase();
+            assert!(
+                !k.contains("key") && !k.contains("secret") && !k.contains("priv"),
+                "a key-shaped field on the ORDER would make the server a key path: {k}"
+            );
+        }
+        match serde_json::from_str::<ServerMsg>(&serde_json::to_string(&m).unwrap()).unwrap() {
+            ServerMsg::KeyRotate { request_id } => assert_eq!(request_id, "req-1"),
+            other => panic!("expected KeyRotate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_rotated_report_roundtrip_and_public_only() {
+        use crate::models::KeyRotationOutcome;
+        let m = ClientMsg::KeyRotated {
+            request_id: "req-1".to_string(),
+            outcome: KeyRotationOutcome::Rotated,
+            old_public_key: Some("old==".to_string()),
+            new_public_key: Some("new==".to_string()),
+            key_epoch: 3,
+            detail: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:agent.key_rotated""#));
+        assert!(s.contains(r#""outcome":"rotated""#));
+        assert!(!s.contains("detail"), "detail omitted when None: {s}");
+        assert!(!s.contains("secret"), "{s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::KeyRotated {
+                request_id,
+                outcome,
+                new_public_key,
+                key_epoch,
+                ..
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(outcome, KeyRotationOutcome::Rotated);
+                assert_eq!(new_public_key.as_deref(), Some("new=="));
+                assert_eq!(key_epoch, 3);
+            }
+            other => panic!("expected KeyRotated, got {other:?}"),
+        }
+        // A refusal parses with no keys and a detail.
+        let refused = r#"{"t":"rc:agent.key_rotated","request_id":"r","outcome":"disabled","detail":"overlay_key_rotation=false"}"#;
+        match serde_json::from_str::<ClientMsg>(refused).unwrap() {
+            ClientMsg::KeyRotated {
+                outcome, key_epoch, ..
+            } => {
+                assert_eq!(outcome, KeyRotationOutcome::Disabled);
+                assert_eq!(key_epoch, 0);
+            }
+            other => panic!("expected KeyRotated, got {other:?}"),
         }
     }
 
