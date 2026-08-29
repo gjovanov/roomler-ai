@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! `/api/agent/crash` (public, agent-authed) +
 //! `/api/tenant/{tenant_id}/agent/{agent_id}/crash` (protected,
 //! user-authed) — agent crash report ingest + listing.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! mDNS ICE-candidate resolution — the relay-escape root-cause fix.
 //!
 //! # Why this exists

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Fleet RPC — the server side of remote command execution.
 //!
 //! This module is the POLICY DECISION POINT. The agent decides what happens on

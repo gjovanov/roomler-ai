@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows Media Foundation hardware H.264 encoder backend.
 //!
 //! The MFT-backed alternative to [`openh264_backend`]. Wraps

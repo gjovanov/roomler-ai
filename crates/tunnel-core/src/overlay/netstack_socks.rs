@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! SOCKS5 front for the [netstack](super::netstack) — CONNECT + UDP ASSOCIATE.
 //!
 //! The app-facing half of the OS-free path: a localhost SOCKS5 proxy backed by

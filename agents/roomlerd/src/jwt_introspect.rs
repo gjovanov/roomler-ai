@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Inspect a JWT's claims WITHOUT verifying its signature.
 //!
 //! The installer wizard parses the operator-pasted enrollment token to

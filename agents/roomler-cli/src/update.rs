@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler self-update` — check the server's tunnel latest-release,
 //! download the newer binary through the roomler.ai installer proxy (corp-AV-
 //! friendly, same origin as the manifest), verify its SHA-256, and self-replace

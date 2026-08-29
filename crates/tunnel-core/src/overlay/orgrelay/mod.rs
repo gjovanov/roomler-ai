@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-19 — org-relay: framing, and the reachability responder.
 //!
 //! * [`wire`] — Geneve framing and the shape rules (P1a, #816). Re-exported at

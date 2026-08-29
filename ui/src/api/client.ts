@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import router from '@/plugins/router'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { clearSignedIn } from '@/api/session'

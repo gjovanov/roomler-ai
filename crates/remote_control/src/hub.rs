@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `Hub` — process-global registry of online agents and live sessions.
 //!
 //! The Hub is `Clone`-able (it's a thin Arc handle) and is shared across all

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler ssh <device> [args…]` — open an SSH session to another device in
 //! this org over the overlay (P6b).
 //!

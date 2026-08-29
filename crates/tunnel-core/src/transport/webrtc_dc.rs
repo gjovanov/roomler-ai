@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `webrtc-dc-v1` transport — WebRTC SCTP DataChannels.
 //!
 //! [`TunnelPeer`] wraps an `RTCPeerConnection` and pre-negotiates a

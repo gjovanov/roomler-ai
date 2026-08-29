@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows backend for remote app selection & launch: `EnumWindows`
 //! (list), `SetForegroundWindow` (focus), and `std::process::Command`
 //! (launch). No new crate — `windows-sys` is already a dependency.

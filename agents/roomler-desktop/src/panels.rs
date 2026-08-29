@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-27 — the two small always-on-top panels: the consent prompt, and the
 //! "Being viewed by …" session banner.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Phase 8: pre-flight checks at agent startup.
 //!
 //! Three quick probes — DNS resolution, TCP reachability, and clock-skew vs

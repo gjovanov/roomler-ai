@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P5 (multi-org program) — shared-floor encoder for the DC video transports.
 //!
 //! With `rc_max_sessions` ≥ 2 (rc.302), every concurrent viewer used to run

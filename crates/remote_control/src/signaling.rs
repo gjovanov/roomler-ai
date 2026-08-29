@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Wire protocol for the `rc:*` WebSocket namespace.
 //!
 //! Both the agent and the controller browser speak the same envelope shape;

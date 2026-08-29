@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Unified device list — agents + tunnel clients as ONE server-paginated,
 //! server-searched, server-sorted feed for the devices grid, joined to their
 //! overlay nodes (address + MagicDNS label) in memory.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Minimal SOCKS5 server (RFC 1928) — CONNECT only, no authentication.
 //!
 //! This is the tunnel's **userspace mode** (Tailscale's `--socks5-server`
