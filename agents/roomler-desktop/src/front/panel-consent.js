@@ -93,6 +93,12 @@
     } catch (_) {
       return // backend not ready — stay quiet, the window is about to hide
     }
+    // FR-27 — skip anything the DAEMON is already showing natively. The marker
+    // is written either way (it is also what `roomler consent --list` reads),
+    // so without this filter a Windows/X11/macOS host would get two Approve
+    // buttons for one decision — which is how someone approves the wrong
+    // thing. Absent `surface` = a pre-FR-27 daemon, where nothing was native.
+    if (Array.isArray(pending)) pending = pending.filter((p) => p.surface !== 'native')
     if (!Array.isArray(pending) || pending.length === 0) {
       active = null
       expiresAt = 0
