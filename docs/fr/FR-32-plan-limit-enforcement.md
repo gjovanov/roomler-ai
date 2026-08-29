@@ -129,7 +129,8 @@ once the gates are wired. P0 logs; P1 adds the collection if the volume justifie
 |---|---|---|
 | **P0** | `plan_enforcement` mode + `services::quota` helper + `Limit` enum + structured denial logging. **No new gate wired.** Re-point the 3 existing sites through the helper, behaviour byte-for-byte identical. | mode `Off` |
 | **P1** | Build the missing `count_*` DAOs and wire all 11 limits, **shipped in `Warn`**. Nothing is refused. | mode `Off` |
-| **P2** | Read the warn data. Grandfather over-limit tenants (per-tenant override), then flip to `Enforce` tenant by tenant. | per-tenant mode |
+| **P1c** | `GET /api/admin/plan-compliance` — the snapshot that tells an operator who is already over the line, so P2 has an input on deploy day. | read-only |
+| **P2** | Read the compliance report. Grandfather over-limit tenants, then flip to `Enforce` tenant by tenant. | per-tenant mode |
 | **P3** | Resolve the shapes: delete or repurpose `TenantSettings.{max_members,file_upload_limit}`; give `Enterprise` real limits and a price, or remove the variant. | n/a — schema only |
 
 Gates by enforcement point (P1):
@@ -208,6 +209,34 @@ fits, and the add saturates so a pathological delta cannot wrap into "fits".
    exports and it is theatre. It also has almost no cost basis; it exists for upgrade
    pressure. P1's question is answered instead by `MessageDao::count_for_tenant`, a
    **reporting query with no gate**, so P3 can decide whether the limit survives at all.
+
+### P1c: the observe phase wants a snapshot, not an event log
+
+Open decision 4 asked whether denials get their own collection. Answering it revealed the
+question was wrong.
+
+P2 has to know **who is already over a limit** so they can be grandfathered before anyone is
+flipped to `Enforce`. A denial log cannot answer that: it only ever sees tenants who happen to
+call the API during the observe window. A tenant sitting at 40 members on a 10-member plan
+that nobody adds to this month emits **nothing** — and would be flipped straight into a wall.
+It also means waiting weeks for data to accumulate.
+
+A snapshot has neither problem: it is complete, it includes idle tenants, and it answers on
+the day the code deploys. So `GET /api/admin/plan-compliance` (platform-admin, 404 on miss)
+reports every tenant's current usage against its plan, worst first, with a `would_break` flag.
+
+The `tracing::warn!` line stays: it records *frequency* — how often people actually collide
+with a limit — which is a genuine P3 pricing input and a different question from "who is over
+now". A `quota_denials` collection is therefore **not** needed for P2, and P3 can decide
+whether frequency is worth persisting.
+
+⚠ The report reads its limits through `quota::Limit::describe`, the same function the gates
+use. A report that recomputed them independently could call a tenant compliant while the gate
+refuses them — worse than having no report. A unit test pins this.
+
+⚠ `over` in the report is **strictly greater** than the cap, while the *gate* refuses the next
+one *at* the cap. They answer different questions ("are you outside your plan" vs "may you add
+one more"), and conflating them would mark every tenant exactly at its limit as breaking.
 
 ## Acceptance criteria
 
