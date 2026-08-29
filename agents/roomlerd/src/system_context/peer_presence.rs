@@ -241,12 +241,20 @@ pub fn snapshot() -> Snapshot {
 mod tests {
     use super::*;
 
-    // All three tests below operate on the SAME process-wide marker path, and
-    // two of them delete it. Run in parallel, a `signal_disconnected` from one
-    // lands between another's write and its read, and the read panics with
-    // "marker readable after write" — a failure that says nothing about the code
-    // under test. Reproduced on master: green in isolation, red in the full
-    // `--features system-context` suite.
+    // EVERY test below that touches the marker takes this lock — five of them.
+    // They share ONE process-wide path and every one of them deletes it, so run
+    // in parallel a `signal_disconnected` from one lands between another's write
+    // and its read, and the read panics with "marker readable after write" — a
+    // failure that says nothing about the code under test. Reproduced on
+    // master: green in isolation, red in the full `--features system-context`
+    // suite.
+    //
+    // ⚠️ The count is not decoration. The first fix guarded the three obvious
+    // writers and the suite STILL failed roughly 1 run in 5, because two more
+    // tests touch the same path — and a single green run had already
+    // "confirmed" it. Do not drop a guard that looks redundant; verify by
+    // running the FULL lane ten times, never a `system_context` filter, which
+    // is the very isolation that hides this.
     //
     // Same shape as `encode::RELAY_ENV_LOCK`: one lock, held for the whole test.
     // `unwrap_or_else(|e| e.into_inner())` because a panic in one test poisons
