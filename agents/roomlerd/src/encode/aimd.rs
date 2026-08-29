@@ -110,6 +110,9 @@ pub struct AimdController {
     /// Last time the channel was observed full (or a buffer overflow was
     /// noted). AI is blocked until this is `AI_SETTLE` in the past.
     last_full_at: Instant,
+    /// FR-35 — count of applied decreases, so the governor can tell the
+    /// ceiling learner "the pipe pushed back" without reading the target.
+    decreases: u32,
 }
 
 impl AimdController {
@@ -134,6 +137,7 @@ impl AimdController {
             // immediately and the settle window is measured from now.
             last_event_at: now,
             last_full_at: now,
+            decreases: 0,
         }
     }
 
@@ -227,7 +231,27 @@ impl AimdController {
         if next < self.desired_bps {
             self.desired_bps = next;
             self.last_event_at = now;
+            self.decreases += 1;
         }
+    }
+
+    /// FR-35 — a HARD stall (a send blocked ≥ 1 s): cut to ×0.5 at once,
+    /// bypassing the ×0.85 ladder and its 500 ms spacing. The P0 field
+    /// measurement met a 7.9 s stall with three ×0.85 steps over four
+    /// seconds; the pipe had already collapsed by the first one.
+    pub fn apply_hard_md(&mut self, now: Instant) {
+        let next = (self.desired_bps / 2).max(self.floor_bps);
+        self.last_full_at = now;
+        if next < self.desired_bps {
+            self.desired_bps = next;
+            self.last_event_at = now;
+            self.decreases += 1;
+        }
+    }
+
+    /// FR-35 — decreases applied so far (monotonic).
+    pub fn decreases(&self) -> u32 {
+        self.decreases
     }
 
     fn apply_ai(&mut self, now: Instant) {
@@ -399,6 +423,24 @@ mod tests {
     }
 
     // (5) take_pending hysteresis: no change → None; change → Some once.
+    /// FR-35 — a hard stall halves the target at once and counts as a
+    /// decrease; the ordinary ladder still moves ×0.85.
+    #[test]
+    fn hard_md_halves_at_once_and_counts() {
+        let t0 = Instant::now();
+        let mut c = ctrl(12_000_000, 4, t0);
+        assert_eq!(c.take_pending(), Some(12_000_000));
+        assert_eq!(c.decreases(), 0);
+        c.apply_hard_md(t0 + Duration::from_millis(100));
+        assert_eq!(c.desired(), 6_000_000);
+        assert_eq!(c.decreases(), 1);
+        // Never below the floor.
+        let mut f = ctrl(FLOOR + 1, 4, t0);
+        f.take_pending();
+        f.apply_hard_md(t0 + Duration::from_millis(100));
+        assert_eq!(f.desired(), FLOOR);
+    }
+
     #[test]
     fn take_pending_only_on_change() {
         let t0 = Instant::now();
