@@ -13,7 +13,7 @@ use anyhow::Result;
 #[cfg(feature = "scrap-capture")]
 pub mod scrap_backend;
 
-/// FR-28 P1 — the "did anything change?" answer XShm cannot give.
+/// FR-29 P1 — the "did anything change?" answer XShm cannot give.
 /// Linux-only: every other platform's backend already has an equivalent
 /// (DXGI reports `WouldBlock`; WGC reports DirtyRegions).
 #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
@@ -205,7 +205,7 @@ pub trait ScreenCapture: Send {
     /// dim-change encoder rebuild).
     fn set_output_cap(&mut self, _target: Option<(u32, u32)>) {}
 
-    /// FR-28 — cumulative frames the backend declined to produce because it
+    /// FR-29 — cumulative frames the backend declined to produce because it
     /// PROVED the screen was unchanged.
     ///
     /// ⚠️ Deliberately NOT folded into the pump's `frames_empty`. The two
@@ -214,7 +214,7 @@ pub trait ScreenCapture: Send {
     /// "pump is frame-production-bound" symptom — a host in trouble — whereas
     /// a high `frames_unchanged` is a host doing exactly the right thing on an
     /// idle desktop. Merging them would silently retire a working diagnostic.
-    /// Backends that cannot tell (the pre-FR-28 default) report 0.
+    /// Backends that cannot tell (the pre-FR-29 default) report 0.
     fn frames_unchanged(&self) -> u64 {
         0
     }
