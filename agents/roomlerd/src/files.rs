@@ -231,10 +231,10 @@ pub(crate) fn stage_in_programdata() -> bool {
     *STAGE_IN_PROGRAMDATA
 }
 
-/// Windows-only staging root: `%PROGRAMDATA%\roomler\<segment>\staging\`,
-/// where `<segment>` is resolved per host by `appdirs::machine_global_dir()`
 // RETIRED-NAME-ANCHOR(3): names the pre-rename segment because explaining the
 // conditional resolution requires naming both halves. docs/fr/FR-21
+/// Windows-only staging root: `%PROGRAMDATA%\roomler\<segment>\staging\`,
+/// where `<segment>` is resolved per host by `appdirs::machine_global_dir()`
 /// (the `roomler` segment on a fresh install; the pre-rename `roomler-agent`
 /// one only where that tree already exists). Do NOT restate it as a literal —
 /// FR-21 P4 fixed a viewer that did exactly that.
@@ -1459,6 +1459,11 @@ const DIR_LIST_TIMEOUT_SECS: u64 = 3;
 /// sends the token; the agent resolves it.
 ///
 /// FR-21 P4. The viewer used to hardcode
+// RETIRED-NAME-ANCHOR-BEGIN
+// appdirs::app_segment() keeps resolving the pre-rename `roomler-agent`
+// segment while that tree exists, so a host installed before the rename
+// keeps finding its own staging dir and uploads. Every occurrence below is
+// that fallback or a test pinning it — the retired name is the INPUT.
 /// `C:\ProgramData\roomler\roomler-agent\staging`, but `machine_global_dir()`
 /// resolves the `roomler` segment on a fresh install and only falls back to the
 /// pre-rename `roomler-agent` segment when that tree already exists — so the
@@ -2910,7 +2915,7 @@ mod tests {
 
     async fn tempdir_or_skip() -> PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "roomler-agent-files-test-{}",
+            "roomlerd-files-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -3545,3 +3550,4 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }
+// RETIRED-NAME-ANCHOR-END

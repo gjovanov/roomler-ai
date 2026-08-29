@@ -7,6 +7,11 @@ without operator setup.
 
 ## What ships in this chunk (1B)
 
+<!-- RETIRED-NAME-ANCHOR-BEGIN
+     roomler-agent-e2e is a DOCKER IMAGE NAME that is already in the internal
+     registry and referenced by kustomization.yaml and the StatefulSet. All
+     three must agree, and changing them requires a coordinated re-push;
+     until then the standing e2e namespace pulls the existing name. -->
 - **`Dockerfile.agent-e2e`** — multi-stage build of `roomler-agent`
   with `--features synthetic-frame-source,openh264-encoder,clipboard`.
   Runtime is debian:trixie-slim + curl + ca-certificates + libssl3 +
@@ -120,3 +125,4 @@ curl -fsS http://roomler2.roomler-ai-e2e/api/tenant/<tenant_id>/agent \
   so any test that drives mouse/keyboard against the agent will get
   silently dropped. Phase 2 covers input via an alternative image
   (Xvfb sidecar) or a Windows agent.
+<!-- RETIRED-NAME-ANCHOR-END -->

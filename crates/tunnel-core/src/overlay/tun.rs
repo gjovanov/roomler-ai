@@ -1644,6 +1644,8 @@ mod system {
         }
     }
 
+    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours;
+    // an operator with it in a script needs to be able to grep for it.
     /// rc.279 — kill-switch for the stable adapter identity (constant
     /// requested GUID + boot stray-adapter sweep):
     /// `ROOMLERD_OVERLAY_TUN_STABLE_GUID` (legacy `ROOMLER_AGENT_…`
@@ -1656,6 +1658,8 @@ mod system {
         crate::env::flag("OVERLAY_TUN_STABLE_GUID", true)
     }
 
+    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours;
+    // an operator with it in a script needs to be able to grep for it.
     /// rc.279 — kill-switch for the route-war eviction (peer `/32`s since
     /// rc.208, our own `/32` since rc.278): `ROOMLERD_OVERLAY_ROUTE_EVICT`
     /// (legacy `ROOMLER_AGENT_…` honoured; config key `overlay_route_evict`).

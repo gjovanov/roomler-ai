@@ -25,6 +25,10 @@ use std::time::Duration;
 
 use tokio::net::{UdpSocket, lookup_host};
 
+// RETIRED-NAME-ANCHOR(5): the legacy env prefix is spelled out ONCE in this
+// file so an operator with `ROOMLER_AGENT_OVERLAY_*` in a script can still
+// grep for it. The alias is real and read by `env::node_env`; the other
+// gates in this file point at that function rather than restate it. FR-21 D1.
 /// `ROOMLERD_OVERLAY_DIRECT` (legacy `ROOMLER_AGENT_OVERLAY_DIRECT` still
 /// honoured — see [`crate::env::node_env`]) — default **ON**. Set
 /// `0`/`false`/`no`/`off` to disable the direct LAN path and force pure relay
@@ -270,14 +274,13 @@ pub fn first_non_vpn_uplink() -> Option<(Ipv4Addr, Option<u32>)> {
     gather_lan_interfaces().into_iter().next()
 }
 
-/// Net-change poke acceleration — gate for arming forced revalidation pokes
-/// on every established direct carrier when an OS addr/iface event fires
-/// (`ROOMLERD_OVERLAY_NETCHANGE_POKE`; legacy `ROOMLER_AGENT_…` alias
-/// honoured). Default **ON**; set `0`/`false`/`no`/`off` to fall back to the
-/// passive gates (`POKE_SILENCE_AFTER` + rx-stale) if forced pokes ever
-/// misbehave in the field. The mechanism is safe by construction — an
-/// answered poke clears with no side effects — so this exists as an
-/// emergency valve, not a rollout gate.
+/// Net-change poke acceleration — gate for arming forced revalidation pokes on
+/// every established direct carrier when an OS addr/iface event fires
+/// (`ROOMLERD_OVERLAY_NETCHANGE_POKE`). Default **ON**; set
+/// `0`/`false`/`no`/`off` to fall back to the passive gates
+/// (`POKE_SILENCE_AFTER` + rx-stale) if forced pokes ever misbehave in the
+/// field. The mechanism is safe by construction — an answered poke clears with
+/// no side effects — so this exists as an emergency valve, not a rollout gate.
 pub fn netchange_poke_enabled() -> bool {
     match crate::env::node_env("OVERLAY_NETCHANGE_POKE") {
         Some(v) => {
@@ -292,12 +295,11 @@ pub fn netchange_poke_enabled() -> bool {
 }
 
 /// rc.275 hygiene — gate for the LAN-gather virtual-interface filter
-/// (`ROOMLERD_OVERLAY_LAN_IFACE_FILTER`; legacy `ROOMLER_AGENT_…` alias
-/// honoured — see [`crate::env::node_env`]). Default **ON**; set
-/// `0`/`false`/`no`/`off` to restore the unfiltered pre-rc.275 gather if the
-/// deny-list ever misclassifies a real NIC in the field (the failure mode is
-/// benign either way — a skipped interface just isn't advertised, and the
-/// relay path still works).
+/// (`ROOMLERD_OVERLAY_LAN_IFACE_FILTER` — see [`crate::env::node_env`]).
+/// Default **ON**; set `0`/`false`/`no`/`off` to restore the unfiltered
+/// pre-rc.275 gather if the deny-list ever misclassifies a real NIC in the
+/// field (the failure mode is benign either way — a skipped interface just
+/// isn't advertised, and the relay path still works).
 pub fn lan_iface_filter_enabled() -> bool {
     match crate::env::node_env("OVERLAY_LAN_IFACE_FILTER") {
         Some(v) => {
@@ -509,17 +511,17 @@ pub fn force_egress_interface(sock: &tokio::net::UdpSocket, ifindex: u32) {
 pub fn force_egress_interface(_sock: &tokio::net::UdpSocket, _ifindex: u32) {}
 
 /// Gate for **bind-to-interface-by-route** LAN-carrier egress selection
-/// (`ROOMLERD_OVERLAY_BIND_BY_ROUTE`; legacy `ROOMLER_AGENT_…` alias
-/// honoured). **Default OFF** until field-proven, mirroring the QUIC /
-/// `public_direct` arc. When on, a LAN direct carrier's egress interface is
-/// chosen per-destination from the OS route table (the connect()-trick,
-/// [`os_src_ip_for`]) + [`classify_egress`], and the socket is re-pinned to
-/// the CURRENT ifindex — instead of relying on the same-subnet heuristic and a
-/// pin computed once at startup. This is Tailscale's `bindToInterfaceByRoute`
-/// (net/netns) adapted to roomler: an on-link `/24` beats a full-tunnel VPN's
-/// `/1` default, so a genuine same-LAN peer stays on the physical NIC even
-/// under a corporate VPN, and a peer the OS routes elsewhere (VPN-captured)
-/// falls to relay honestly instead of flapping a one-way "direct".
+/// (`ROOMLERD_OVERLAY_BIND_BY_ROUTE`). **Default OFF** until field-proven,
+/// mirroring the QUIC / `public_direct` arc. When on, a LAN direct carrier's
+/// egress interface is chosen per-destination from the OS route table (the
+/// connect-trick, [`os_src_ip_for`]) + [`classify_egress`], and the socket is
+/// re-pinned to the CURRENT ifindex — instead of relying on the same-subnet
+/// heuristic and a pin computed once at startup. This is Tailscale's
+/// `bindToInterfaceByRoute` (net/netns) adapted to roomler: an on-link `/24`
+/// beats a full-tunnel VPN's `/1` default, so a genuine same-LAN peer stays on
+/// the physical NIC even under a corporate VPN, and a peer the OS routes
+/// elsewhere (VPN-captured) falls to relay honestly instead of flapping a
+/// one-way "direct".
 pub fn bind_by_route_enabled() -> bool {
     match crate::env::node_env("OVERLAY_BIND_BY_ROUTE") {
         Some(v) => {
@@ -533,19 +535,19 @@ pub fn bind_by_route_enabled() -> bool {
     }
 }
 
-/// Gate for **VPN-bypass** carrier egress (`ROOMLERD_OVERLAY_VPN_BYPASS`;
-/// legacy `ROOMLER_AGENT_…` alias honoured). **Default OFF** opt-in. When on
-/// (and an uplink ifindex is resolved), EVERY overlay underlay carrier socket
-/// — the `public_sock`, the single-relay dialer, and the coturn TURN underlay —
-/// has its egress pinned (`IP_UNICAST_IF`) to the host's real PHYSICAL uplink,
-/// forcing the overlay's own transport out the physical NIC instead of a
-/// full-tunnel corporate VPN's captured default route. Confirmed on ÖBB
-/// winhost-a (2026-07-30): a Check Point full-tunnel VPN captured ALL egress
-/// (`Find-NetRoute` → every dst via `172.30.x/Ethernet`), so its carriers rode
-/// the VPN one-way; pinning to the physical Wi-Fi bypasses it. This is
-/// Tailscale's `net/netns` "bind to the physical interface, not another VPN's
-/// tunnel" applied to the whole underlay. Mirrors the `public_direct` opt-in
-/// arc; flips default-ON after the winhost-a field-proof.
+/// Gate for **VPN-bypass** carrier egress (`ROOMLERD_OVERLAY_VPN_BYPASS`).
+/// **Default OFF** opt-in. When on (and an uplink ifindex is resolved), EVERY
+/// overlay underlay carrier socket — the `public_sock`, the single-relay
+/// dialer, and the coturn TURN underlay — has its egress pinned
+/// (`IP_UNICAST_IF`) to the host's real PHYSICAL uplink, forcing the overlay's
+/// own transport out the physical NIC instead of a full-tunnel corporate VPN's
+/// captured default route. Confirmed on ÖBB winhost-a (2026-07-30): a Check
+/// Point full-tunnel VPN captured ALL egress (`Find-NetRoute` → every dst via
+/// `172.30.x/Ethernet`), so its carriers rode the VPN one-way; pinning to the
+/// physical Wi-Fi bypasses it. This is Tailscale's `net/netns` "bind to the
+/// physical interface, not another VPN's tunnel" applied to the whole
+/// underlay. Mirrors the `public_direct` opt-in arc; flips default-ON after
+/// the winhost-a field-proof.
 pub fn vpn_bypass_enabled() -> bool {
     match crate::env::node_env("OVERLAY_VPN_BYPASS") {
         Some(v) => {
@@ -670,14 +672,13 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
 }
 
 /// NAT-traversal Phase A — opt-in gate for the **direct-to-public** carrier
-/// tier (`ROOMLERD_OVERLAY_PUBLIC_DIRECT`; legacy `ROOMLER_AGENT_…` alias
-/// honoured — see [`crate::env::node_env`]). **Default OFF** until
-/// field-proven, mirroring the QUIC gate's arc (CC8 in the NAT-traversal
-/// plan). Gates the whole tier: dialing a peer's public endpoint, AND the
-/// accept side (the runtime only wires the inbound-handshake receiver when this
-/// is on). The accept path doubles as a roaming fix for restarted same-LAN
-/// peers, but it rides this flag too so the fleet default stays byte-identical
-/// until the tier is field-proven per-host.
+/// tier (`ROOMLERD_OVERLAY_PUBLIC_DIRECT` — see [`crate::env::node_env`]).
+/// **Default OFF** until field-proven, mirroring the QUIC gate's arc (CC8 in
+/// the NAT-traversal plan). Gates the whole tier: dialing a peer's public
+/// endpoint, AND the accept side (the runtime only wires the inbound-handshake
+/// receiver when this is on). The accept path doubles as a roaming fix for
+/// restarted same-LAN peers, but it rides this flag too so the fleet default
+/// stays byte-identical until the tier is field-proven per-host.
 pub fn public_direct_enabled() -> bool {
     match crate::env::node_env("OVERLAY_PUBLIC_DIRECT") {
         Some(v) => {
@@ -691,15 +692,15 @@ pub fn public_direct_enabled() -> bool {
     }
 }
 
-/// Gate for **make-before-break** carrier upgrades
-/// (`ROOMLERD_OVERLAY_MBB`; legacy `ROOMLER_AGENT_…` alias honoured).
+/// Gate for **make-before-break** carrier upgrades (`ROOMLERD_OVERLAY_MBB`).
 /// **Default ON since rc.210** — field-proven 2026-07-25 on the netns NAT lab
-/// (buildhost↔fleet-host-2, the false-same-/24-LAN-match freeze scenario): MBB=1 held the
-/// relay while a doomed direct upgrade was probed then dropped it ("kept relay
-/// (no stall)"), where MBB=0 tore the relay down ("upgrading relay peer to
-/// direct LAN carrier"). Disable per-host with `ROOMLERD_OVERLAY_MBB=0`
-/// (kill-switch): only an explicit `0`/`false`/`no`/`off` turns it back off;
-/// unset / truthy / anything else keeps the default ON.
+/// (buildhost↔fleet-host-2, the false-same-/24-LAN-match freeze scenario):
+/// MBB=1 held the relay while a doomed direct upgrade was probed then dropped
+/// it ("kept relay (no stall)"), where MBB=0 tore the relay down ("upgrading
+/// relay peer to direct LAN carrier"). Disable per-host with
+/// `ROOMLERD_OVERLAY_MBB=0` (kill-switch): only an explicit
+/// `0`/`false`/`no`/`off` turns it back off; unset / truthy / anything else
+/// keeps the default ON.
 ///
 /// A relay→direct UPGRADE installs the candidate direct carrier as a SHADOW
 /// PROBE (its own `Tunn`, in `WgDevice::probes`) while the working relay keeps
@@ -727,14 +728,14 @@ pub fn make_before_break_enabled() -> bool {
 }
 
 /// NAT-traversal Phase B/C — gate for the **srflx** carrier tier
-/// (`ROOMLERD_OVERLAY_SRFLX`; legacy `ROOMLER_AGENT_…` alias honoured).
-/// **Default ON** since 2026-07-20 (field-proven: a cone↔cone pair hole-punches
-/// to a DIRECT carrier — buildhost↔fleet-host-2 netns lab, 0% loss, ~0.6 ms, half the relay
-/// RTT). Turns on the whole srflx tier: gathering + advertising this node's own
-/// server-reflexive candidates (via STUN), AND dialing a peer's advertised srflx
-/// (a 1:1/cone-NAT node whose NIC IP is private). The tier FALLS THROUGH — a
-/// failed/both-symmetric punch degrades to the relay tier — so default-ON only
-/// adds a direct-connect fast path, never removes reachability. Set the env to
+/// (`ROOMLERD_OVERLAY_SRFLX`). **Default ON** since 2026-07-20 (field-proven:
+/// a cone↔cone pair hole-punches to a DIRECT carrier — buildhost↔fleet-host-2
+/// netns lab, 0% loss, ~0.6 ms, half the relay RTT). Turns on the whole srflx
+/// tier: gathering + advertising this node's own server-reflexive candidates
+/// (via STUN), AND dialing a peer's advertised srflx (a 1:1/cone-NAT node
+/// whose NIC IP is private). The tier FALLS THROUGH — a failed/both-symmetric
+/// punch degrades to the relay tier — so default-ON only adds a direct-connect
+/// fast path, never removes reachability. Set the env to
 /// `0`/`false`/`no`/`off` to disable.
 pub fn srflx_enabled() -> bool {
     match crate::env::node_env("OVERLAY_SRFLX") {
@@ -750,20 +751,19 @@ pub fn srflx_enabled() -> bool {
 }
 
 /// NAT-traversal Phase D — gate for the **single-relay** carrier tier
-/// (`ROOMLERD_OVERLAY_RELAY_SINGLE`; legacy `ROOMLER_AGENT_…` alias
-/// honoured). **Default ON** since 2026-07-20. When on (and both ends advertise
-/// the capability), a relay-tier pair uses ONE coturn allocation — the ANCHOR
-/// (smaller pubkey) allocates + runs the QUIC server + permits the dialer's IP;
-/// the DIALER (larger pubkey) sends raw UDP to the anchor's relayed address as a
-/// plain TURN peer (no allocation). This avoids the both-allocate coturn hairpin
-/// (the open REKEY_TIMEOUT relay bug) and carries symmetric NAT (permissions are
-/// IP-only). Field-proven in the full runtime (sym↔sym buildhost↔fleet-host-2 netns lab,
-/// 2026-07-20: `single_relay=true` → QUIC-over-TURN up both ways → WG 0% loss);
-/// default-ON is net-positive since both-allocate was already broken cross-NAT.
-/// v1 serves BOTH-UDP-OK pairs; a UDP-blocked dialer (raw UDP can't reach
-/// coturn) stays dark on the relay tier — the documented v1 limitation, no worse
-/// than the broken both-allocate it replaces. Set `0`/`false`/`no`/`off` to
-/// disable.
+/// (`ROOMLERD_OVERLAY_RELAY_SINGLE`). **Default ON** since 2026-07-20. When on
+/// (and both ends advertise the capability), a relay-tier pair uses ONE coturn
+/// allocation — the ANCHOR (smaller pubkey) allocates + runs the QUIC server +
+/// permits the dialer's IP; the DIALER (larger pubkey) sends raw UDP to the
+/// anchor's relayed address as a plain TURN peer (no allocation). This avoids
+/// the both-allocate coturn hairpin (the open REKEY_TIMEOUT relay bug) and
+/// carries symmetric NAT (permissions are IP-only). Field-proven in the full
+/// runtime (sym↔sym buildhost↔fleet-host-2 netns lab, 2026-07-20:
+/// `single_relay=true` → QUIC-over-TURN up both ways → WG 0% loss); default-ON
+/// is net-positive since both-allocate was already broken cross-NAT. v1 serves
+/// BOTH-UDP-OK pairs; a UDP-blocked dialer (raw UDP can't reach coturn) stays
+/// dark on the relay tier — the documented v1 limitation, no worse than the
+/// broken both-allocate it replaces. Set `0`/`false`/`no`/`off` to disable.
 pub fn relay_single_enabled() -> bool {
     match crate::env::node_env("OVERLAY_RELAY_SINGLE") {
         Some(v) => {
@@ -778,24 +778,23 @@ pub fn relay_single_enabled() -> bool {
 }
 
 /// rc.276 (B-probe) — force ALL overlay coturn allocations onto the
-/// **TURNS/TCP (TLS) tier** (`ROOMLERD_OVERLAY_RELAY_TLS`; legacy
-/// `ROOMLER_AGENT_…` alias honoured). **Default OFF** opt-in (positive truthy
-/// only), mirroring `public_direct_enabled` — this is the field-diagnostic
-/// twin of remote-control's `ROOMLERD_ICE_RELAY_TCP`: the WebRTC
-/// screen-share survives corp endpoint VPNs via `turns:coturn:443?tcp`
-/// (real TLS + SNI, OS-native trust — indistinguishable from HTTPS), while
-/// the overlay's Tier-2 UDP allocate "succeeds" and then runs silently
-/// one-way, so the TLS tier never engages on its own. Forcing it answers
-/// the gating question for the auto-demotion follow-up: does a WG handshake
-/// complete over a TLS-TURN carrier on the affected host at all? (DERP —
-/// also WG-in-TLS — did NOT survive there, so this is a genuine experiment,
-/// not a foregone conclusion.)
+/// **TURNS/TCP (TLS) tier** (`ROOMLERD_OVERLAY_RELAY_TLS`). **Default OFF**
+/// opt-in (positive truthy only), mirroring `public_direct_enabled` — this is
+/// the field-diagnostic twin of remote-control's `ROOMLERD_ICE_RELAY_TCP`: the
+/// WebRTC screen-share survives corp endpoint VPNs via `turns:coturn:443?tcp`
+/// (real TLS + SNI, OS-native trust — indistinguishable from HTTPS), while the
+/// overlay's Tier-2 UDP allocate "succeeds" and then runs silently one-way, so
+/// the TLS tier never engages on its own. Forcing it answers the gating
+/// question for the auto-demotion follow-up: does a WG handshake complete over
+/// a TLS-TURN carrier on the affected host at all? (DERP — also WG-in-TLS —
+/// did NOT survive there, so this is a genuine experiment, not a foregone
+/// conclusion.)
 ///
 /// Side effect: while forced, the node also advertises
 /// `supports_relay_single=false` and turns its local single-relay flag off —
-/// the raw-UDP DIALER role is exactly the flow shape the affected hosts
-/// can't send, and both ends must compute the same strategy (the peer reads
-/// our capability from the join, so the veto stays pair-symmetric).
+/// the raw-UDP DIALER role is exactly the flow shape the affected hosts can't
+/// send, and both ends must compute the same strategy (the peer reads our
+/// capability from the join, so the veto stays pair-symmetric).
 pub fn relay_tls_forced() -> bool {
     match crate::env::node_env("OVERLAY_RELAY_TLS") {
         Some(v) => {
@@ -810,19 +809,18 @@ pub fn relay_tls_forced() -> bool {
 }
 
 /// Phase D (DERP) — is the pubkey-addressed `/derp` relay carrier ENABLED?
-/// (`ROOMLERD_OVERLAY_DERP`; legacy `ROOMLER_AGENT_…` alias honoured.)
-/// **Default ON** since 2026-07-21 (field-proven). DERP is the last-resort
-/// carrier for two BOTH-UDP-blocked peers (a strict corp firewall that permits
-/// only TCP/TLS-443), which no other tier can serve; both peers dial OUT to the
-/// relay over WSS:443 and WG rides end-to-end. Only CHOSEN when both ends
-/// advertise `supports_derp` AND both are UDP-blocked (the single-relay
-/// `(false,false)` arm), so a UDP-capable pair never touches it — default-ON
-/// just means an overlay node keeps a `/derp` WS available in case a
-/// both-UDP-blocked peer appears. Field-proven 2026-07-21 (buildhost↔fleet-host-2 netns,
-/// both UDP+coturn-TCP-blocked → WG over `/derp` at 0% loss, ~2.7 ms). Set
-/// `0`/`false`/`no`/`off` to disable. (Follow-up: open the `/derp` WS lazily —
-/// only when this node is itself UDP-blocked — so UDP-capable nodes don't hold
-/// an idle WS.)
+/// (`ROOMLERD_OVERLAY_DERP`.) **Default ON** since 2026-07-21 (field-proven).
+/// DERP is the last-resort carrier for two BOTH-UDP-blocked peers (a strict
+/// corp firewall that permits only TCP/TLS-443), which no other tier can
+/// serve; both peers dial OUT to the relay over WSS:443 and WG rides
+/// end-to-end. Only CHOSEN when both ends advertise `supports_derp` AND both
+/// are UDP-blocked (the single-relay `(false,false)` arm), so a UDP-capable
+/// pair never touches it — default-ON just means an overlay node keeps a
+/// `/derp` WS available in case a both-UDP-blocked peer appears. Field-proven
+/// 2026-07-21 (buildhost↔fleet-host-2 netns, both UDP+coturn-TCP-blocked → WG
+/// over `/derp` at 0% loss, ~2.7 ms). Set `0`/`false`/`no`/`off` to disable.
+/// (Follow-up: open the `/derp` WS lazily — only when this node is itself
+/// UDP-blocked — so UDP-capable nodes don't hold an idle WS.)
 pub fn derp_enabled() -> bool {
     match crate::env::node_env("OVERLAY_DERP") {
         Some(v) => {
@@ -1179,9 +1177,9 @@ pub fn disco_probe_enabled() -> bool {
 }
 
 /// C1 — answer out-of-tunnel disco echoes on the carrier socket
-/// (`ROOMLERD_OVERLAY_DISCO_RESPOND`, legacy `ROOMLER_AGENT_…`; default
-/// **ON**). Answering is unconditional and costs a map lookup + one X25519
-/// per verified ping; nothing on this node ASKS yet (the prober is C2).
+/// (`ROOMLERD_OVERLAY_DISCO_RESPOND`; default **ON**). Answering is
+/// unconditional and costs a map lookup + one X25519 per verified ping;
+/// nothing on this node ASKS yet (the prober is C2).
 ///
 /// Default-ON on purpose, and it is the deployment barrier the rc.346
 /// regression paid for: a prober that punishes non-answer must ship at least
@@ -1191,12 +1189,12 @@ pub fn disco_respond_enabled() -> bool {
 }
 
 /// B4 — carrier-plane socket-liveness watchdog
-/// (`ROOMLERD_OVERLAY_PLANE_WATCHDOG`, legacy `ROOMLER_AGENT_…`; default
-/// **ON**): when the plane's punch-socket keepalive fails
-/// [`PLANE_WATCHDOG_FAILS`] consecutive cycles (a reader-less / wedged socket
-/// — the 2026-08-10 class of bug B1 fixed structurally), self-heal by
-/// requesting a debounced plane rebuild that re-binds fresh sockets. The
-/// kill switch reverts to "warn only, never auto-rebuild".
+/// (`ROOMLERD_OVERLAY_PLANE_WATCHDOG`; default **ON**): when the plane's
+/// punch-socket keepalive fails [`PLANE_WATCHDOG_FAILS`] consecutive cycles (a
+/// reader-less / wedged socket — the 2026-08-10 class of bug B1 fixed
+/// structurally), self-heal by requesting a debounced plane rebuild that
+/// re-binds fresh sockets. The kill switch reverts to "warn only, never
+/// auto-rebuild".
 pub fn plane_watchdog_enabled() -> bool {
     crate::env::flag("OVERLAY_PLANE_WATCHDOG", true)
 }
@@ -1207,28 +1205,27 @@ pub fn plane_watchdog_enabled() -> bool {
 /// re-resolve at 3 handles) never trips it, short enough to bound the wedge.
 pub const PLANE_WATCHDOG_FAILS: u32 = 6;
 
-/// A3 — WG-style endpoint roaming (`ROOMLERD_OVERLAY_ROAM`, legacy
-/// `ROOMLER_AGENT_…`; default **ON**): adopt a peer's observed source after an
-/// AUTHENTICATED inbound from it, repointing the carrier in place. The kill
-/// switch reverts to the strict no-roam demux. Off ⇒ a symmetric-NAT peer
-/// whose real per-destination mapping differs from its advert stays on relay,
-/// and a mid-session NAT rebind waits out the rx-staleness rebuild.
+/// A3 — WG-style endpoint roaming (`ROOMLERD_OVERLAY_ROAM`; default **ON**):
+/// adopt a peer's observed source after an AUTHENTICATED inbound from it,
+/// repointing the carrier in place. The kill switch reverts to the strict
+/// no-roam demux. Off ⇒ a symmetric-NAT peer whose real per-destination
+/// mapping differs from its advert stays on relay, and a mid-session NAT
+/// rebind waits out the rx-staleness rebuild.
 pub fn roam_enabled() -> bool {
     crate::env::flag("OVERLAY_ROAM", true)
 }
 
-/// W5 — srflx SEEKING mode (`ROOMLERD_OVERLAY_SRFLX_SEEK`, legacy
-/// `ROOMLER_AGENT_…`; default **ON**): when the plane's srflx gather yields
-/// NO candidate, keep the plane srflx task alive in a query-only state that
-/// periodically re-gathers (backoff 20 s → ×3 → 300 s cap, plus an
-/// immediate poke on interface events). Before this, a NONE gather returned
-/// the STUN sink and NOTHING ever re-queried — `srflx NONE` was sticky for
-/// the daemon's lifetime (field 2026-08-14: winhost-a on the corp VPN stayed
-/// NONE across VPN cycles, which also made it the universal relay ANCHOR).
-/// The B4 watchdog stays INERT in SEEKING (there is no advertised mapping
-/// to defend; on a genuinely UDP-blocked host it would otherwise force a
-/// full plane rebuild every few cycles forever). The kill switch restores
-/// the old return-the-sink behaviour.
+/// W5 — srflx SEEKING mode (`ROOMLERD_OVERLAY_SRFLX_SEEK`; default **ON**):
+/// when the plane's srflx gather yields NO candidate, keep the plane srflx
+/// task alive in a query-only state that periodically re-gathers (backoff 20 s
+/// → ×3 → 300 s cap, plus an immediate poke on interface events). Before this,
+/// a NONE gather returned the STUN sink and NOTHING ever re-queried — `srflx
+/// NONE` was sticky for the daemon's lifetime (field 2026-08-14: winhost-a on
+/// the corp VPN stayed NONE across VPN cycles, which also made it the
+/// universal relay ANCHOR). The B4 watchdog stays INERT in SEEKING (there is
+/// no advertised mapping to defend; on a genuinely UDP-blocked host it would
+/// otherwise force a full plane rebuild every few cycles forever). The kill
+/// switch restores the old return-the-sink behaviour.
 pub fn srflx_seek_enabled() -> bool {
     crate::env::flag("OVERLAY_SRFLX_SEEK", true)
 }
@@ -1269,17 +1266,17 @@ pub fn quic_async_enabled() -> bool {
 }
 
 /// Auth-first type-1 routing on a MULTI-ORG carrier plane
-/// (`ROOMLERD_OVERLAY_INIT_AUTH_FIRST`, legacy `ROOMLER_AGENT_…`; default
-/// **ON**): with more than one engine attached, an inbound handshake
-/// initiation is routed by trial-authentication against each engine's static
-/// (candidates-with-a-session-at-that-source first), never by the
-/// source-keyed shortcut alone. With N orgs sharing ONE socket on both hosts,
-/// both orgs' sessions arrive from the SAME remote `ip:port`, and the
-/// shortcut deterministically delivered the second org's inits into the
-/// first org's `Tunn` — the dual-org direct mutual-exclusion lockout (field
-/// 2026-08-14: buildhost/fleet-host-1/fleet-host-2 direct on exactly one org each, the loser
-/// pinned to relay until a restart swapped the winner). Single-engine planes
-/// keep the shortcut either way. The kill switch restores the legacy
+/// (`ROOMLERD_OVERLAY_INIT_AUTH_FIRST`; default **ON**): with more than one
+/// engine attached, an inbound handshake initiation is routed by
+/// trial-authentication against each engine's static
+/// (candidates-with-a-session-at-that-source first), never by the source-keyed
+/// shortcut alone. With N orgs sharing ONE socket on both hosts, both orgs'
+/// sessions arrive from the SAME remote `ip:port`, and the shortcut
+/// deterministically delivered the second org's inits into the first org's
+/// `Tunn` — the dual-org direct mutual-exclusion lockout (field 2026-08-14:
+/// buildhost/fleet-host-1/fleet-host-2 direct on exactly one org each, the
+/// loser pinned to relay until a restart swapped the winner). Single-engine
+/// planes keep the shortcut either way. The kill switch restores the legacy
 /// shortcut on multi-org planes too. Read once at plane construction.
 pub fn init_auth_first_enabled() -> bool {
     crate::env::flag("OVERLAY_INIT_AUTH_FIRST", true)

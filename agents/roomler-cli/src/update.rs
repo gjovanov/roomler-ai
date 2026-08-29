@@ -5,7 +5,7 @@
 //! friendly, same origin as the manifest), verify its SHA-256, and self-replace
 //! the running executable.
 //!
-//! Mirrors `roomler-agent self-update`, minus the MSI / Windows-service / UAC
+//! Mirrors `roomlerd self-update`, minus the MSI / Windows-service / UAC
 //! machinery — the tunnel ships as a plain binary inside a release `.zip`, so a
 //! self-update is just download → verify → swap the exe. Windows only for now
 //! (the fleet's platform); other OSes are pointed at the manual download.
@@ -58,7 +58,7 @@ struct Release {
 pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
     let base = cfg.server_url.trim_end_matches('/');
     let http = reqwest::Client::builder()
-        .user_agent(concat!("roomler-tunnel/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("roomler-cli/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build http client")?;
 
@@ -80,7 +80,7 @@ pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
         .tag_name
         .trim_start_matches("tunnel-v")
         .trim_start_matches('v');
-    println!("roomler-tunnel: current {CURRENT}, latest {latest_ver}");
+    println!("roomler: current {CURRENT}, latest {latest_ver}");
 
     if !is_newer(latest_ver, CURRENT) {
         println!("Already up to date.");
@@ -133,7 +133,7 @@ pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
     // 5) Extract the binary + self-replace.
     let new_exe = extract_windows_exe(&bytes)?;
     replace_self(&new_exe)?;
-    println!("Updated to {latest_ver}. Restart roomler-tunnel to run the new version.");
+    println!("Updated to {latest_ver}. Restart roomler to run the new version.");
     Ok(())
 }
 
@@ -190,6 +190,10 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
 }
 
 /// Pull the CLI exe out of the release zip. P3d Slice B renamed the OUTPUT
+// RETIRED-NAME-ANCHOR-BEGIN
+// Reads a PUBLISHED archive. The retired entry name is an input this must
+// keep accepting: a fleet host running the previous CLI looks for exactly
+// that name, and dropping the arm strands it on its current version.
 /// binary `roomler-tunnel.exe` -> `roomler.exe`, but the CI ships BOTH names
 /// in the zip and a deployed (pre-rename) fleet self-updater may still be
 /// extracting `roomler-tunnel.exe`, so accept EITHER source entry. The on-disk
@@ -209,6 +213,7 @@ fn extract_windows_exe(zip_bytes: &[u8]) -> Result<Vec<u8>> {
         }
     }
     bail!("neither roomler.exe nor roomler-tunnel.exe found in the release archive");
+    // RETIRED-NAME-ANCHOR-END
 }
 
 /// Replace the running executable with `new_exe` bytes. Windows lets a running

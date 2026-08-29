@@ -528,6 +528,8 @@ mod tests {
         // .deb/.pkg carry no signature for a version to be anchored to, so the
         // binding is reported as absent, not as a failure. See module docs.
         for name in [
+            // RETIRED-NAME-ANCHOR(8): names a PUBLISHED release asset. Filenames are
+            // fixed by what is already on GitHub Releases (FR-21 D6).
             "roomler-agent.deb",
             "roomler-agent.pkg",
             "roomler-agent.tgz",
@@ -557,6 +559,8 @@ mod tests {
         );
     }
 
+    // RETIRED-NAME-ANCHOR(2): names a PUBLISHED release asset. Filenames are fixed by
+    // what is already on GitHub Releases (FR-21 D6) — this is a real downloaded file.
     /// The mapping above is derived from reading `release-agent.yml`, and a
     /// wrong reading of it would not fail loudly — it would make every agent
     /// refuse every update, which looks like nothing happening. So it is
