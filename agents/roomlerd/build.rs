@@ -1,3 +1,4 @@
+// RETIRED-NAME-ANCHOR(3): records the OLD -> NEW mapping, so it must name both sides.
 //! Embeds a Windows VERSIONINFO resource into `roomlerd.exe`.
 //!
 //! Authenticode says *who* signed a binary. VERSIONINFO is what Explorer's
@@ -15,7 +16,6 @@
 //! `cargo:rustc-link-lib=dylib=resource`, and link-lib directives from a
 //! dependency's build script propagate into the final link of every
 //! DOWNSTREAM binary. This crate is a path dependency of BOTH Tauri crates
-// RETIRED-NAME-ANCHOR(3): records the OLD -> NEW mapping, so it must name both sides.
 //! (`roomler-agent-tray` -> `roomler-desktop.exe`, `roomler-setup` ->
 //! `roomler-setup.exe`), and both already embed their own VS_VERSION_INFO
 //! via `tauri_build::build()`. The result would be two RT_VERSION resources

@@ -1133,14 +1133,14 @@ fn probe_service_state() -> (String, bool) {
     ("none".to_string(), false)
 }
 
+// RETIRED-NAME-ANCHOR(4): the fallback targets a binary the field still has; dropping
+// it strands them.
 /// Resolve the agent daemon's executable path. For a packaged install, the
 /// tray and daemon ship in the same dir (per the MSI layout). For dev
 /// builds, fall back to PATH lookup.
 ///
 /// P3d Slice B renamed the daemon OUTPUT binary `roomlerd` -> `roomlerd`.
 /// Resolution prefers a sibling `roomlerd[.exe]` (so a fresh tray spawns the
-// RETIRED-NAME-ANCHOR(4): the fallback targets a binary the field still has; dropping
-// it strands them.
 /// new daemon), then falls back to the legacy `roomler-agent[.exe]` (which the
 /// MSI still ships as the inert `AgentExeAlias`, so a mixed / in-flight install
 /// still resolves), then finally the bare new name relying on PATH.

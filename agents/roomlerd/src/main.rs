@@ -73,10 +73,10 @@ enum Command {
         /// entry duplicating the new primary identity is dropped.
         #[arg(long)]
         replace: bool,
-        /// rc.52: write the enrolled config to the machine-global
         // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree.
         // `machine_global_dir()` still resolves
         // it on a host that has one, so it must stay named here. docs/fr/FR-21
+        /// rc.52: write the enrolled config to the machine-global
         /// path (`%PROGRAMDATA%\roomler\roomler-agent\config.toml`)
         /// instead of the per-user `%APPDATA%` default. Required for
         /// perMachine + SystemContext hosts so the LocalSystem worker
@@ -1007,14 +1007,14 @@ async fn daemon_main() -> Result<()> {
     res
 }
 
+// RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still
+// resolves
+// it on a host that has one, so it must stay named here. docs/fr/FR-21
 /// Record a `SupervisorDetected` crash sidecar when the worker
 /// `Run` subcommand returns Err and main is about to exit non-zero.
 /// Routed through `crash_recorder::record` so:
 ///
 ///   - Under SystemContext (LocalSystem worker), the sidecar lands in
-// RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still
-// resolves
-// it on a host that has one, so it must stay named here. docs/fr/FR-21
 ///     `%PROGRAMDATA%\roomler\roomler-agent\crashes\` where the
 ///     user-context uploader will find it on a later successful start.
 ///   - Under user-context worker, the sidecar lands in the worker's
