@@ -456,11 +456,6 @@ fn test_settings() -> Settings {
         // renumber tests carve explicitly; the block-carve test flips the
         // flag via `spawn_with_settings`.
         overlay: roomler_ai_config::OverlaySettings::default(),
-        claude: roomler_ai_config::ClaudeSettings {
-            api_key: None,
-            model: "claude-sonnet-4-5-20250929".to_string(),
-            max_tokens: 4096,
-        },
         oauth: roomler_ai_config::OAuthSettings {
             base_url: "http://localhost:5001".to_string(),
             google: roomler_ai_config::OAuthProviderSettings {
