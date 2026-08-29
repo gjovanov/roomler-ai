@@ -6322,6 +6322,31 @@ fn attach_control_handler(
                 "rc:control.request" => {
                     crate::input::arbiter::global().request_floor(session_id);
                 }
+                // FR-27 — the courteous half of the floor protocol. A refused
+                // request is now REMEMBERED and broadcast, so the holder can
+                // see it and answer instead of the requester having to keep
+                // clicking until it happens to land in an idle window.
+                //
+                // The arbiter validates both: only the current holder may
+                // grant, and only to the session that actually asked, so a
+                // stale click cannot hand control to whoever asked last.
+                "rc:control.grant" => {
+                    let to = val
+                        .get("session")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| bson::oid::ObjectId::parse_str(s).ok());
+                    match to {
+                        Some(to) => crate::input::arbiter::global().grant_floor(session_id, to),
+                        None => {
+                            debug!(%session_id, "control: rc:control.grant without a valid session — dropped")
+                        }
+                    }
+                }
+                // Sent by the HOLDER to decline, or by the REQUESTER to
+                // withdraw; the arbiter accepts it from either.
+                "rc:control.dismiss" => {
+                    crate::input::arbiter::global().clear_floor_request(session_id);
+                }
                 "rc:control.mode" => {
                     let mode = val
                         .get("mode")

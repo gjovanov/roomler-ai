@@ -111,8 +111,13 @@
       <!-- P6 — multi-user participants rail. Self-gating: pre-P6 agents
            never broadcast rc:control.state, so controlState stays null and
            nothing renders. Shows everyone on the device; the star marks
-           the exclusive-mode floor holder. -->
-      <v-menu v-if="rc.phase.value === 'connected' && multiUserState && multiUserState.participants.length > 1">
+           the exclusive-mode floor holder.
+
+           FR-27 — shown from ONE participant, not two. The rail is also the
+           only place the input MODE is visible or changeable, and a solo
+           viewer arriving on an `exclusive` device could previously neither
+           see that nor do anything about it. -->
+      <v-menu v-if="rc.phase.value === 'connected' && multiUserState && multiUserState.participants.length >= 1">
         <template #activator="{ props: railProps }">
           <v-chip
             v-bind="railProps"
@@ -159,19 +164,48 @@
           />
         </v-list>
       </v-menu>
+      <!-- FR-27 — I HOLD the floor and someone is waiting for it. Until now
+           a refused request was dropped silently, so the holder never learned
+           anyone wanted control and the requester had to keep clicking until
+           one landed in an idle window. Grant hands it over immediately;
+           Ignore clears the chip (they can always ask again). -->
+      <div
+        v-if="rc.phase.value === 'connected' && floorRequester && iHoldTheFloor"
+        class="d-flex align-center mr-2"
+      >
+        <v-chip size="small" color="warning" variant="tonal" prepend-icon="mdi-hand-back-right">
+          {{ floorRequester.name || 'A viewer' }} wants control
+        </v-chip>
+        <v-btn
+          size="small"
+          color="warning"
+          variant="text"
+          class="ml-1"
+          @click="rc.grantControl(floorRequester.session)"
+        >
+          Grant
+        </v-btn>
+        <v-btn size="small" variant="text" @click="rc.dismissControlRequest()">Ignore</v-btn>
+      </div>
       <!-- P6 — exclusive mode + someone else holds the floor: one-click
-           request. Auto-granted when the holder has been idle ≥2 s. -->
+           request. Auto-granted when the holder has been idle ≥2 s.
+           FR-27 — once asked, the button becomes a waiting state with a way
+           to withdraw, instead of looking like it did nothing. -->
       <v-btn
         v-if="rc.phase.value === 'connected' && multiUserState?.mode === 'exclusive' && !iHoldTheFloor"
         size="small"
-        color="warning"
+        :color="iAmWaitingForTheFloor ? undefined : 'warning'"
         variant="tonal"
-        prepend-icon="mdi-hand-back-right"
+        :prepend-icon="iAmWaitingForTheFloor ? 'mdi-timer-sand' : 'mdi-hand-back-right'"
         class="mr-2"
-        title="Request input control (auto-granted when the current holder is idle)"
-        @click="rc.requestControl()"
+        :title="
+          iAmWaitingForTheFloor
+            ? 'Waiting for the current holder — granted automatically once they go idle. Click to withdraw.'
+            : 'Request input control (auto-granted when the current holder is idle)'
+        "
+        @click="iAmWaitingForTheFloor ? rc.dismissControlRequest() : rc.requestControl()"
       >
-        Request control
+        {{ iAmWaitingForTheFloor ? 'Waiting…' : 'Request control' }}
       </v-btn>
       <!-- Live stats (codec · bitrate · fps · resolution). Relocated here
            from over the video (2026-07-21) so it never hides a maximized
@@ -3184,6 +3218,15 @@ const iHoldTheFloor = computed(() => {
   if (!st || st.mode !== 'exclusive') return true
   return st.holder != null && st.holder === rc.sessionId.value
 })
+/** FR-27 — the session waiting for the floor, if any. Null on a pre-FR-27
+ *  agent, which is indistinguishable from "nothing pending" and renders the
+ *  same: the whole block self-hides. */
+const floorRequester = computed(() => rc.controlState.value?.pendingRequest ?? null)
+/** …and whether that waiting session is US, so the request button can become
+ *  a waiting state instead of looking like it did nothing. */
+const iAmWaitingForTheFloor = computed(
+  () => !!floorRequester.value && floorRequester.value.session === rc.sessionId.value,
+)
 /** 1 s ticker so still ghosts fade out (5 s) without a paint loop. */
 const ghostNow = ref(Date.now())
 let ghostTicker: ReturnType<typeof setInterval> | null = null

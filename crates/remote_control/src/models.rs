@@ -364,7 +364,13 @@ impl AgentCaps {
 /// server-side per session from the device's [`AccessPolicy::consent_mode`]
 /// (with `Prompt` — attended — as the system default), then carried to the agent
 /// in `ServerMsg::Request` as a directive the agent obeys. Self-control
-/// (`controller == owner_user_id`) short-circuits to `Auto` in the API gate.
+/// (`controller == owner_user_id`) short-circuits to `Auto` in the API gate
+/// unless the device set [`AccessPolicy::prompt_owner`].
+///
+/// ⚠️ The directive is a CEILING, not a floor. A device that set
+/// `auto_grant_session = false` locally always prompts, even under `Auto` —
+/// the agent resolves the two with `consent::strictest_of`. Same rule as
+/// exec's and SSH's gate 4: the device's own refusal survives the server.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentMode {
@@ -379,7 +385,16 @@ pub enum ConsentMode {
     Email,
     /// Push an in-app consent card to the device owner (Phase 4).
     Push,
-    /// Prompt the host first; fall back to email if nobody answers (Phase 4).
+    /// Prompt the host AND email the owner, in parallel — first answer wins.
+    ///
+    /// Not a sequential fallback, despite the name: the server emails the
+    /// approve-link the moment the session is requested, at the same time as
+    /// the agent raises its on-host prompt. What IS sequential is the two
+    /// windows — the host prompt closes after
+    /// [`crate::consent::HOST_PROMPT_TIMEOUT`] while the emailed link stays
+    /// live for the full [`crate::consent::ASYNC_CONSENT_TIMEOUT`], so a host
+    /// nobody answers hands over to the owner instead of ending the session.
+    /// An explicit host *Deny* does end it: the person at the machine said no.
     PromptThenEmail,
 }
 
@@ -392,6 +407,22 @@ pub struct AccessPolicy {
     /// default.)
     #[serde(default)]
     pub consent_mode: Option<ConsentMode>,
+    /// FR-27 — apply [`Self::consent_mode`] to the device's OWNER too.
+    ///
+    /// `None`/`false` (the default, and every pre-FR-27 row) keeps the
+    /// historical shortcut: controlling your own device auto-consents, because
+    /// unattended access to your own headless boxes is the common case and
+    /// prompting them would ask a machine nobody is sitting at.
+    ///
+    /// That shortcut is also why the picker looked broken. It is applied in
+    /// `resolve_session_authz` BEFORE the policy is read, so on a fleet where
+    /// one person owns every device, `consent_mode` had no observable effect
+    /// whatsoever — and nothing on screen said so. `true` here makes the mode
+    /// authoritative for the owner as well, which is both the honest behaviour
+    /// for a shared workstation and the only way to field-test the attended
+    /// modes without a second account.
+    #[serde(default)]
+    pub prompt_owner: Option<bool>,
     #[serde(default)]
     pub allowed_role_ids: Vec<ObjectId>,
     #[serde(default)]
@@ -406,10 +437,23 @@ pub struct AccessPolicy {
 
 impl AccessPolicy {
     /// Effective consent mode for a NON-owner controller: the per-device mode,
-    /// or the system default (`Prompt` = attended) when unset. Self-control is
-    /// resolved to `Auto` by the caller before this is consulted.
+    /// or the system default (`Prompt` = attended) when unset.
     pub fn effective_consent_mode(&self) -> ConsentMode {
         self.consent_mode.unwrap_or(ConsentMode::Prompt)
+    }
+
+    /// FR-27 — the mode for a controller who IS the device owner. `Auto` unless
+    /// the device opted into being asked ([`Self::prompt_owner`]).
+    ///
+    /// Split from [`Self::effective_consent_mode`] rather than folded into it
+    /// so the owner shortcut is a named, greppable decision instead of an
+    /// `if` buried in the API gate — which is how it stayed invisible.
+    pub fn owner_consent_mode(&self) -> ConsentMode {
+        if self.prompt_owner.unwrap_or(false) {
+            self.effective_consent_mode()
+        } else {
+            ConsentMode::Auto
+        }
     }
 }
 
@@ -1962,6 +2006,12 @@ pub enum EndReason {
     AgentHangup,
     UserDenied,
     ConsentTimeout,
+    /// FR-27 — the device could raise no consent prompt at all: no desktop
+    /// session, no companion, no native overlay. Distinct from
+    /// [`Self::ConsentTimeout`] because nobody was ever asked, so the useful
+    /// advice is "give that host a prompt surface, or pick email/push", not
+    /// "try again and answer it".
+    NoPromptSurface,
     AgentDisconnect,
     AdminTerminated,
     IdleTimeout,

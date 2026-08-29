@@ -498,7 +498,78 @@ export function useRemoteControl(sessionId: string) {
 
 ### 11.2 Consent
 
-Even with full unattended permission granted by org policy, the controlled user can be configured to see a non-blocking toast: *"Goran is requesting control. [Allow] [Deny] (auto-deny in 25s)"*. Default for org members controlling org devices: **prompt every session**. Default for self-controlling-self (e.g., your laptop from your phone): **no prompt**, owner identity proven by JWT.
+Five modes, set per device (`AccessPolicy.consent_mode`, admin-set, default
+`prompt`). The server resolves one per session and sends it to the agent as a
+directive on `ServerMsg::Request`:
+
+| mode | who is asked | window | agent behaviour |
+|---|---|---|---|
+| `auto` | nobody | — | grants immediately |
+| `prompt` | whoever is at the device | 30 s | raises an on-host prompt |
+| `email` | the device OWNER, by approve-link | 5 min | waits; the SERVER resolves |
+| `push` | the device owner, by web-push card | 5 min | waits; the SERVER resolves |
+| `prompt_then_email` | **both, in parallel** | host 30 s / owner 5 min | prompts AND the server emails |
+
+`prompt_then_email` is "and", not "then" — the mail goes out at once. What is
+sequential is the two windows: the host modal closes after the attended window
+while the emailed link keeps the full async one, so a host nobody answers hands
+over to the owner rather than ending the session. An explicit host **Deny** does
+end it — the person at the machine said no.
+
+**The owner shortcut.** Controlling a device you OWN resolves to `auto` before
+the policy is read (`resolve_session_authz`), because unattended access to your
+own headless boxes is the common case. ⚠️ That made the picker look broken on
+any fleet where one person owns every device: the setting had no observable
+effect and nothing on screen said so. `AccessPolicy.prompt_owner` (FR-27,
+default off) opts the owner back in, and the Devices grid now labels the state
+either way.
+
+**The device has the last word.** The directive is a CEILING. A device with
+`auto_grant_session = false` prompts even under an `auto` directive — the agent
+resolves the two through `consent::strictest_of`. Same gate-4 principle as exec
+and SSH: the device's own refusal survives a server that has been talked into
+something. The floor defeats `auto` only; `email`/`push` do not auto-grant, so a
+device that merely refuses to auto-grant has no standing to force a second
+prompt onto the host.
+
+**Prompt surfaces.** A chain, probed per prompt and logged per prompt
+(`native` + `have_surface` on one line):
+
+1. **native** — the daemon draws the panel itself. Windows
+   (`viewer-indicator`, and `WDA_EXCLUDEFROMCAPTURE` so the requester cannot
+   see the Approve button), X11 (`viewer-indicator-x11`, an override-redirect
+   window, no capture exclusion — X has no equivalent), macOS
+   (`viewer-indicator-macos`, AppKit).
+2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
+   starts it if it is not running (`companion::ensure_running`).
+3. **CLI** — `roomler consent --list` / `--approve`, which works everywhere.
+4. **none** — reported as `no_prompt_surface`, not as a deny.
+
+⚠️ The `.pending` marker is written in ALL cases, because it is also what
+`roomler consent --list` reads. `ConsentRequest.surface` is what stops the
+companion from popping a second panel over a native one.
+
+⚠️ **macOS native requires tokio off the main thread.** AppKit delivers events
+on the main run loop and `#[tokio::main]` parks it, so under
+`viewer-indicator-macos` the runtime moves to a worker and `main` hands the
+main thread to `NSApp`. That is why the feature is compiled by CI but not yet
+in the macOS release build.
+⚠️ **The macOS panel appears in the captured stream.** `NSWindowSharingNone` is
+ignored by `CGDisplayStream`, which is what our capture uses. ⚠️ Since FR-27 the marker is written by **all three**
+consent-bearing subsystems — remote control, Fleet-RPC `exec` and Roomler SSH —
+carrying a `kind` so the modal does not describe a root command as "wants to
+control this device". Before that only remote control wrote one, so an `exec` or
+SSH prompt reached no UI at all. The daemon also starts the companion when a
+prompt begins (`companion::ensure_running`), since nothing used to.
+
+**A refusal says which refusal it is.** `rc:consent` carries an optional
+`reason`; an absent one is an ordinary deny, which is what a bare
+`granted: false` has always meant. ⚠️ Until FR-27 the agent's own prompt
+timeout produced exactly that bare `false`, and the hub terminated it as
+`EndReason::UserDenied` — so "nobody was at the machine" reached the controller
+as "a human refused you". The three now end as `UserDenied`,
+`ConsentTimeout` and `NoPromptSurface`, and the viewer renders a sentence per
+case rather than the enum name.
 
 ### 11.3 Recording & audit consent
 
