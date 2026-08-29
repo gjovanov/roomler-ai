@@ -28,6 +28,24 @@
 //! the relay can compute alone cannot prove membership, and a value the member
 //! holds cannot be a stateless return-routability cookie.
 //!
+//! # Where the address is bound — and why not in `tag1`
+//!
+//! `tag1` (step 1) covers `vni ‖ generation ‖ nonce` and **not** the source
+//! address. The first version of this module included the address, and the
+//! loopback test made the mistake obvious within minutes: a client behind NAT
+//! **cannot know its own mapped `addr:port` when it sends its first packet**,
+//! so it could never have computed the value the relay expected. The reference
+//! design binds the address at the *challenge* step for exactly this reason,
+//! and so does this one: the [`cookie`] covers the observed address, `tag2`
+//! covers the cookie, and the relay re-derives the cookie against the observed
+//! source on the answer. The address is therefore bound *by step 3*, which is
+//! the only step that grants anything.
+//!
+//! What that costs: a captured `tag1` can be replayed from elsewhere to obtain
+//! a challenge. A challenge is one 64-byte frame, sent only to the address it
+//! was requested from, rate-limited per source — the same posture as a probe
+//! echo, and it grants nothing.
+//!
 //! # Encoding
 //!
 //! Every MAC input is **fixed-width and domain-separated**. There are no
@@ -122,14 +140,11 @@ fn mac(key: &[u8; 32], parts: &[&[u8]]) -> Mac {
     tag
 }
 
-/// `tag1` — the member's proof, sent with the initial bind.
-pub fn tag1(
-    secret: &BindSecret,
-    vni: u32,
-    generation: u64,
-    nonce: &Nonce,
-    from: &SocketAddr,
-) -> Mac {
+/// `tag1` — the member's proof, sent with the initial bind. Deliberately does
+/// **not** cover the source address (see the module doc): the client cannot
+/// know its NAT-mapped address on its first packet, and the address is bound
+/// at step 3 instead.
+pub fn tag1(secret: &BindSecret, vni: u32, generation: u64, nonce: &Nonce) -> Mac {
     mac(
         &secret.0,
         &[
@@ -137,12 +152,12 @@ pub fn tag1(
             &vni.to_be_bytes(),
             &generation.to_be_bytes(),
             nonce,
-            &addr_bytes(from),
         ],
     )
 }
 
-/// The relay's stateless return-routability cookie.
+/// The relay's stateless return-routability cookie — this is where the
+/// observed source address enters the handshake.
 pub fn cookie(key: &CookieKey, vni: u32, nonce: &Nonce, from: &SocketAddr) -> Mac {
     mac(
         &key.0,
@@ -193,7 +208,8 @@ impl BindVerifier {
         Self { current, previous }
     }
 
-    /// Step 1 → 2. Verify the member's proof and issue a challenge.
+    /// Step 1 → 2. Verify the member's proof and issue a challenge bound to
+    /// the address the bind arrived from.
     pub fn on_bind(
         &self,
         secret: &BindSecret,
@@ -206,7 +222,7 @@ impl BindVerifier {
         // Mutation-verified: deleting this check fails four tests, including
         // `a_valid_cookie_without_the_member_secret_is_refused` — which is the
         // first draft's design, and the reason this module exists.
-        let want = tag1(secret, vni, generation, nonce, from);
+        let want = tag1(secret, vni, generation, nonce);
         if !ct_eq(&want, presented_tag1) {
             return BindOutcome::Refused(BindRefusal::BadTag1);
         }
@@ -276,7 +292,8 @@ mod tests {
         let s = secret(9);
         let a = addr("198.51.100.7:41000");
 
-        let t1 = tag1(&s, 42, 3, &N, &a);
+        // The client computes tag1 knowing nothing about its mapped address.
+        let t1 = tag1(&s, 42, 3, &N);
         let BindOutcome::Challenge(c) = v.on_bind(&s, 42, 3, &N, &a, &t1) else {
             panic!("a valid tag1 must be challenged");
         };
@@ -285,7 +302,8 @@ mod tests {
     }
 
     /// The property the first draft did not have: holding a valid cookie is
-    /// NOT enough. Without the member secret there is no way past step 1.
+    /// NOT enough. Without the member secret there is no way past step 1, and
+    /// even a genuine cookie cannot be answered.
     #[test]
     fn a_valid_cookie_without_the_member_secret_is_refused() {
         let v = verifier();
@@ -293,14 +311,12 @@ mod tests {
         let attacker = secret(0xAA);
         let a = addr("198.51.100.7:41000");
 
-        // The attacker forges tag1 with a key they do not have.
-        let forged = tag1(&attacker, 42, 3, &N, &a);
+        let forged = tag1(&attacker, 42, 3, &N);
         assert_eq!(
             v.on_bind(&real, 42, 3, &N, &a, &forged),
             BindOutcome::Refused(BindRefusal::BadTag1)
         );
 
-        // Even handed a genuine cookie, the answer fails without the secret.
         let genuine = cookie(&ckey(1), 42, &N, &a);
         let bad_t2 = tag2(&attacker, &genuine, &N);
         assert_eq!(
@@ -311,28 +327,39 @@ mod tests {
 
     /// The same-NAT steal, which is the case that matters most: a co-worker
     /// behind the victim's corporate NAT shares its public IP but not its
-    /// port, so every MAC over the address differs and nothing they capture
-    /// helps them.
+    /// port. Replaying the victim's captured `tag1` DOES earn them a challenge
+    /// — one 64-byte frame, to their own address, rate-limited — but the
+    /// cookie is bound to their port, not the victim's, and they cannot answer
+    /// it without the secret. Nothing they capture binds anything.
     #[test]
-    fn a_neighbour_on_the_same_public_ip_cannot_reuse_the_victims_exchange() {
+    fn a_neighbour_on_the_same_public_ip_cannot_bind_with_the_victims_exchange() {
         let v = verifier();
         let s = secret(9);
         let victim = addr("203.0.113.5:41000");
         let neighbour = addr("203.0.113.5:41001"); // same IP, different port
 
-        let t1 = tag1(&s, 42, 3, &N, &victim);
-        // Replaying the victim's own tag1 from the neighbour's port fails.
+        // Replayed tag1 from the neighbour: challenged, and the challenge is
+        // bound to the NEIGHBOUR's address, not the victim's.
+        let t1 = tag1(&s, 42, 3, &N);
+        let BindOutcome::Challenge(c_neigh) = v.on_bind(&s, 42, 3, &N, &neighbour, &t1) else {
+            panic!("a replayed tag1 earns a challenge (and nothing more)");
+        };
+        assert_ne!(c_neigh, cookie(&ckey(1), 42, &N, &victim));
+
+        // The victim's cookie does not validate from the neighbour's port...
+        let c_victim = cookie(&ckey(1), 42, &N, &victim);
+        let t2 = tag2(&s, &c_victim, &N);
         assert_eq!(
-            v.on_bind(&s, 42, 3, &N, &neighbour, &t1),
-            BindOutcome::Refused(BindRefusal::BadTag1)
+            v.on_answer(&s, 42, &N, &neighbour, &c_victim, &t2),
+            BindOutcome::Refused(BindRefusal::BadCookie)
         );
 
-        // And a cookie minted for the victim does not validate for them either.
-        let c = cookie(&ckey(1), 42, &N, &victim);
-        let t2 = tag2(&s, &c, &N);
+        // ...and the neighbour's own challenge cannot be answered without the
+        // secret they do not hold.
+        let forged_t2 = tag2(&secret(0xAA), &c_neigh, &N);
         assert_eq!(
-            v.on_answer(&s, 42, &N, &neighbour, &c, &t2),
-            BindOutcome::Refused(BindRefusal::BadCookie)
+            v.on_answer(&s, 42, &N, &neighbour, &c_neigh, &forged_t2),
+            BindOutcome::Refused(BindRefusal::BadTag2)
         );
     }
 
@@ -392,7 +419,7 @@ mod tests {
     fn the_three_macs_are_domain_separated() {
         let s = secret(9);
         let a = addr("198.51.100.7:41000");
-        let t1 = tag1(&s, 42, 3, &N, &a);
+        let t1 = tag1(&s, 42, 3, &N);
         let c = cookie(&CookieKey::from_bytes([9u8; 32]), 42, &N, &a); // same key bytes
         let t2 = tag2(&s, &[0u8; MAC_LEN], &N);
         assert_ne!(t1, c, "tag1 and cookie must differ even under one key");
@@ -401,29 +428,28 @@ mod tests {
     }
 
     /// Fixed-width encoding: distinct tuples cannot serialise identically.
-    /// Under a naive textual concatenation these two would both render as
-    /// "…42" followed by "3…" vs "4" followed by "23…" — the digit-sliding
-    /// case the encoding exists to make unrepresentable.
+    /// Under a naive textual concatenation `(42, 3)` and `(4, 23)` both render
+    /// as the digits `423` — the sliding case the encoding exists to make
+    /// unrepresentable.
     #[test]
     fn adjacent_fields_cannot_slide_into_each_other() {
         let s = secret(9);
-        let a = addr("198.51.100.7:41000");
         assert_ne!(
-            tag1(&s, 42, 3, &N, &a),
-            tag1(&s, 4, 23, &N, &a),
+            tag1(&s, 42, 3, &N),
+            tag1(&s, 4, 23, &N),
             "(vni=42,gen=3) and (vni=4,gen=23) must be distinct inputs"
         );
     }
 
-    /// An IPv4 address and its IPv6-mapped spelling are ONE address, so they
-    /// must produce one MAC — otherwise a peer that reports the other form is
-    /// refused for no reason a user could diagnose.
+    /// An IPv4 address and its IPv6-mapped spelling are ONE address, so the
+    /// cookie must be one value — otherwise a peer whose socket reports the
+    /// other form is refused for no reason a user could diagnose.
     #[test]
     fn ipv4_and_its_ipv6_mapped_form_are_the_same_address() {
-        let s = secret(9);
+        let k = ckey(1);
         assert_eq!(
-            tag1(&s, 42, 3, &N, &addr("198.51.100.7:41000")),
-            tag1(&s, 42, 3, &N, &addr("[::ffff:198.51.100.7]:41000")),
+            cookie(&k, 42, &N, &addr("198.51.100.7:41000")),
+            cookie(&k, 42, &N, &addr("[::ffff:198.51.100.7]:41000")),
         );
     }
 
@@ -434,7 +460,7 @@ mod tests {
         let v = verifier();
         let a = addr("198.51.100.7:41000");
         let other = secret(0x55);
-        let t1 = tag1(&other, 42, 3, &N, &a);
+        let t1 = tag1(&other, 42, 3, &N);
         assert_eq!(
             v.on_bind(&secret(9), 42, 3, &N, &a, &t1),
             BindOutcome::Refused(BindRefusal::BadTag1)
@@ -448,7 +474,7 @@ mod tests {
         let v = verifier();
         let s = secret(9);
         let a = addr("198.51.100.7:41000");
-        let t1 = tag1(&s, 42, 3, &N, &a);
+        let t1 = tag1(&s, 42, 3, &N);
         assert_eq!(
             v.on_bind(&s, 43, 3, &N, &a, &t1),
             BindOutcome::Refused(BindRefusal::BadTag1),
