@@ -22,7 +22,7 @@
 //!   enrol → enrol again with the same `machine_id` → assert the
 //!   second response carries the same `tunnel_client_id`. Locks the
 //!   `find_by_tenant_and_machine` + `rehydrate` path. Without this
-//!   the operator who re-runs `roomler-tunnel enroll` after a config
+//!   the operator who re-runs `roomler enroll` after a config
 //!   loss would mint a fresh row each time and the listing UI would
 //!   show ghosts.
 //!
@@ -76,10 +76,10 @@
 
 use crate::fixtures::test_app::TestApp;
 use futures::{SinkExt, StreamExt};
-use roomler_agent::config::AgentConfig;
-use roomler_agent::encode::EncoderPreference;
-use roomler_agent::tunnel::client_mgr::TunnelClientHub;
-use roomler_agent::{enrollment, signaling};
+use roomlerd::config::AgentConfig;
+use roomlerd::encode::EncoderPreference;
+use roomlerd::tunnel::client_mgr::TunnelClientHub;
+use roomlerd::{enrollment, signaling};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -764,8 +764,8 @@ fn spawn_origin_signaling(
     tokio::spawn(async move {
         let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
-        let broker = roomler_agent::consent::ConsentBroker::new(
-            roomler_agent::consent::Mode::AutoGrant,
+        let broker = roomlerd::consent::ConsentBroker::new(
+            roomlerd::consent::Mode::AutoGrant,
             std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
         )
         .expect("consent broker init");
@@ -788,12 +788,17 @@ fn spawn_origin_signaling(
             // must still be SEEDED from the config this agent was handed —
             // which is exactly what `main.rs` does. See agent_exec_tests for
             // the failure hardcoding `false` produced.
-            roomler_agent::remote_config::RemoteConfigServices::new(
+            roomlerd::remote_config::RemoteConfigServices::new(
                 std::path::PathBuf::from("unused-in-tests.toml"),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 exec_enabled,
                 remote_config_enabled,
             ),
+            // FR-27 — the live remote-control session registry. Tests never
+            // read it back, but the signalling loop registers into it, so a
+            // fresh one per harness is the honest value (not a shared global
+            // that would leak sessions between tests).
+            roomlerd::rc_sessions::RcSessionRegistry::new(),
         )
         .await;
     })

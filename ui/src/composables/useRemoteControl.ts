@@ -329,6 +329,34 @@ export function friendlyRcError(code: unknown, serverMessage: unknown): string {
   }
 }
 
+/**
+ * FR-27 - user-facing text for a session that ended before it started.
+ *
+ * These used to render as the raw enum name (`user_denied`,
+ * `consent_timeout`), which is unhelpful on its own and was, until FR-27,
+ * frequently WRONG: the agent's own prompt timeout came back as a bare
+ * `granted: false`, so "nobody was at the machine" reached the controller as
+ * "the user denied your request". The agent now says which it was, and the
+ * three outcomes need three different next steps from whoever reads this.
+ *
+ * Returns `null` for a nominal end (hangups, idle timeouts) so the caller can
+ * stay silent - an alert on a normal disconnect is noise.
+ */
+export function friendlyEndReason(reason: unknown): string | null {
+  switch (reason) {
+    case 'user_denied':
+      return 'Someone at that device declined the request.'
+    case 'consent_timeout':
+      return 'Nobody answered the prompt on that device in time. Nothing was declined - try again, or ask the person there to approve it.'
+    case 'no_prompt_surface':
+      return 'That device could not show a prompt to anyone - nobody is signed in at its screen, or the Roomler desktop app is not running there. Start it on the device, or set this device to email/push consent.'
+    case 'error':
+      return 'The session could not be established.'
+    default:
+      return null
+  }
+}
+
 /** Degraded classification Ã¢ÂÂ pure so the priority order is testable. */
 export function classifyDegraded(inp: {
   pcState: string | null
@@ -414,6 +442,16 @@ export interface RcControlState {
   mode: 'free' | 'exclusive'
   holder: string | null
   participants: RcParticipant[]
+  /** FR-27 — who is waiting for the exclusive-mode floor, when a request was
+   *  refused because the holder was active. `null` when nothing is pending,
+   *  and always `null` in free mode.
+   *
+   *  Before this the refusal was dropped silently: the holder never learned
+   *  anyone had asked, and the requester saw nothing, so "Request control"
+   *  only appeared to work if you happened to click during the holder's idle
+   *  window. Absent from pre-FR-27 agents, which is indistinguishable from
+   *  "nothing pending" — the correct degradation. */
+  pendingRequest: { session: string; name: string } | null
 }
 
 /** P6 — a ghost cursor: another session's pointer, rebroadcast by the
@@ -430,7 +468,7 @@ export interface PeerCursor {
 /** rc.NEXT Ã¢ÂÂ remote app selection & launch (virtual-desktop hosts). The
  *  agent enumerates windows on its desktop; the browser can focus one or
  *  launch a new allowlisted app. Rides the control DC (same request/reply
- *  pattern as rc:logs-fetch). See `agents/roomler-agent/src/apps/`. */
+ *  pattern as rc:logs-fetch). See `agents/roomlerd/src/apps/`. */
 export interface RcWindowEntry {
   window_id: string
   title: string
@@ -539,12 +577,21 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         },
       ]
     })
+    const rawPending = obj.pending_request as Record<string, unknown> | null | undefined
+    const pendingRequest =
+      rawPending && typeof rawPending.session === 'string'
+        ? {
+            session: rawPending.session,
+            name: typeof rawPending.name === 'string' ? rawPending.name : '',
+          }
+        : null
     return {
       kind: 'control_state',
       state: {
         mode: obj.mode === 'exclusive' ? 'exclusive' : 'free',
         holder: typeof obj.holder === 'string' ? obj.holder : null,
         participants,
+        pendingRequest,
       },
     }
   }
@@ -1224,6 +1271,72 @@ export function diagHudEnabled(): boolean {
   }
 }
 
+// FR-26 — which quality pills the toolbar readout shows, per user.
+//
+// The readout grew one pill at a time until it was six wide, and the only
+// way to influence it was an undiscoverable `roomler-rc-diag-hud=1`
+// localStorage flag. Now every pill has a checkbox in Viewer settings.
+// Everything is ON by default except `paint`: the per-hop numbers answer a
+// question ("is the fps ceiling paint-, decode- or main-thread-bound?")
+// that only matters while you are chasing it.
+const METRICS_STORAGE_KEY = 'roomler-rc-metrics'
+
+export interface RcMetricToggles {
+  codec: boolean
+  bitrate: boolean
+  fps: boolean
+  resolution: boolean
+  age: boolean
+  paint: boolean
+}
+
+export const DEFAULT_RC_METRICS: RcMetricToggles = {
+  codec: true,
+  bitrate: true,
+  fps: true,
+  resolution: true,
+  age: true,
+  paint: false,
+}
+
+/**
+ * Read the per-pill preference. Anything unreadable, corrupt or partial
+ * falls back **per key**, so a stored object written by an older build
+ * (fewer pills) keeps working and newly added pills appear rather than
+ * silently reading as `false`.
+ *
+ * ⚠️ `paint` additionally inherits the legacy `roomler-rc-diag-hud=1` flag
+ * the first time, so anyone who set it by hand keeps their HUD.
+ */
+export function storedMetricToggles(): RcMetricToggles {
+  let parsed: Partial<RcMetricToggles> = {}
+  try {
+    const raw = globalThis.localStorage?.getItem(METRICS_STORAGE_KEY)
+    const obj = raw ? JSON.parse(raw) : null
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) parsed = obj
+  } catch {
+    /* privacy mode / corrupt JSON — defaults */
+  }
+  const pick = (k: keyof RcMetricToggles): boolean =>
+    typeof parsed[k] === 'boolean' ? (parsed[k] as boolean) : DEFAULT_RC_METRICS[k]
+  return {
+    codec: pick('codec'),
+    bitrate: pick('bitrate'),
+    fps: pick('fps'),
+    resolution: pick('resolution'),
+    age: pick('age'),
+    paint: typeof parsed.paint === 'boolean' ? parsed.paint : diagHudEnabled(),
+  }
+}
+
+export function persistMetricToggles(m: RcMetricToggles): void {
+  try {
+    globalThis.localStorage?.setItem(METRICS_STORAGE_KEY, JSON.stringify(m))
+  } catch {
+    /* non-fatal — the toggles just won't survive this session */
+  }
+}
+
 // P7 (Parsec-class plan) — FSR sharpening knobs (see rc-fsr-render.ts).
 //  - roomler-rc-sharpen: 'auto' | 'on' | 'off'. Default 'auto' — the EASU+
 //    RCAS upscale engages only when the decoded stream is SMALLER than the
@@ -1238,7 +1351,8 @@ export function storedSharpenMode(): SharpenMode {
   try {
     return normalizeSharpenMode(globalThis.localStorage?.getItem(SHARPEN_STORAGE_KEY))
   } catch {
-    return 'auto'
+    // FR-26 - unreadable storage gets the same default a fresh profile does.
+    return 'on'
   }
 }
 
@@ -1774,6 +1888,60 @@ export async function isH264HwDecodeSupported(): Promise<boolean> {
     return false
   }
 }
+
+/**
+ * FR-22 — memoise a capability probe for the lifetime of the page.
+ *
+ * ⚠️ Measured, not assumed. Driving a real session through the browser
+ * caught `probes_ready: +1878 ms` on a reconnect — **45 % of that
+ * connect's entire 4216 ms time-to-first-frame** — while other connects
+ * in the same page showed 7-8 ms for identical work. `connect()` fires
+ * seven of these concurrently on EVERY attempt and nothing cached them,
+ * so every reconnect paid it again.
+ *
+ * Sound to cache because the answers cannot change while the page lives:
+ * they describe this browser's decoders and this machine's GPU. A driver
+ * change needs at minimum a reload, which clears this.
+ *
+ * The PROMISE is memoised, not the value. `connect()` launches these in
+ * a `Promise.all`, so a value-only cache would still let a second caller
+ * start a second probe while the first was in flight — precisely the
+ * case that is slow.
+ *
+ * ⚠️ A rejection is NOT cached: every probe resolves `false` on failure
+ * rather than throwing, so a cached rejection would be a permanent false
+ * negative. Re-probing next call is the safe direction.
+ *
+ * ⚠️ Applied at the CALL SITE, not to the exported probes. The exported
+ * `isXxxSupported` stay pure so they remain individually testable
+ * against a stubbed `VideoDecoder` / `mediaCapabilities` — memoising
+ * those directly made one existing test fail by serving a previous
+ * test's stub, which is the same staleness this would cause for anyone
+ * re-probing after an environment change.
+ */
+export function memoProbe<T>(fn: () => Promise<T>): () => Promise<T> {
+  let inflight: Promise<T> | null = null
+  return () => {
+    if (inflight) return inflight
+    const p = fn().catch((e) => {
+      inflight = null
+      throw e
+    })
+    inflight = p
+    return p
+  }
+}
+
+/** The probe set `connect()` runs on every attempt, cached per page. */
+const probeAv1Hw = memoProbe(isAv1HwDecodeSupported)
+const probeHevcHw = memoProbe(isHevcHwDecodeSupported)
+const probeHevcDec = memoProbe(isHevcDecodeSupported)
+const probeVp9Hw = memoProbe(isVp9HwDecodeSupported)
+const probeVp9_444 = memoProbe(isVp9_444DecodeSupported)
+const probeH264Hw = memoProbe(isH264HwDecodeSupported)
+const probeH264Dc = memoProbe(isH264DcDecodeSupported)
+const probeAv1Dec = memoProbe(isAv1DecodeSupported)
+const probeHevcRext = memoProbe(isHevcRextDecodeSupported)
 
 /** rc.190 Ã¢ÂÂ inputs to the pure transport auto-rank. `agentTransports` /
  *  `agentHwEncoders` come from `Agent.capabilities` (the agent's caps
@@ -2665,7 +2833,54 @@ export function isChromeWithBrokenScriptTransform(): boolean {
  *  worker to wait for the next IDR Ã¢ÂÂ far worse than a few ms of
  *  retransmit latency. */
 export const VP9_444_DC_LABEL = 'video-bytes'
-export const VP9_444_DC_OPTIONS: RTCDataChannelInit = { ordered: true }
+
+/**
+ * FR-17 stage B — how the `video-bytes` channel is opened.
+ *
+ * Historically `{ ordered: true }`, justified as "SCTP is doing the
+ * reassembly anyway, and dropping a P-frame is far worse than a few ms
+ * of retransmit latency". True on a LAN; falsified on a 90-210 ms relay,
+ * where one lost chunk head-of-line-blocks everything behind it and the
+ * backlog has no bound — measured `send_wait_max` 10,263 ms on an agent
+ * whose encoder was idle at 8-12 ms/frame.
+ *
+ * `maxRetransmits: 0` rather than a bounded retransmit is deliberate and
+ * is coupled to the RECEIVER. Stage A's assembler treats a chunk-index
+ * jump as an unrecoverable gap: it drops the frame and asks for an IDR.
+ * That is exactly right when a lost chunk never arrives, and WRONG the
+ * moment retransmits are allowed — a chunk that arrives one RTT late
+ * would be discarded as a gap, converting a recoverable frame into a
+ * lost one plus a keyframe request. Testing 1-2 retransmits (stage C)
+ * therefore requires a reorder buffer in the worker first; it is not a
+ * number that can be turned up on its own.
+ *
+ * ⚠️ Unordered is only legal WITH framing. An unframed stream is a bare
+ * byte sequence whose reassembly depends entirely on arrival order, so
+ * delivering it out of order does not degrade the picture — it produces
+ * garbage the decoder reports as corruption. This function is the single
+ * place that pairing is enforced, so the two can never be set
+ * independently by a caller who has not thought about it.
+ */
+export function videoDcOptions(
+  chunkFraming: boolean,
+  unordered: boolean,
+): RTCDataChannelInit {
+  if (!chunkFraming || !unordered) return { ordered: true }
+  return { ordered: false, maxRetransmits: 0 }
+}
+
+/** Field opt-in for stage B, mirroring `storedDecodePref`'s A/B knob.
+ *  Default OFF: this changes the delivery guarantee of the video path,
+ *  and the FR's own acceptance bar is a measured relay-pair improvement,
+ *  not a plausible argument. Pure + exported for tests. */
+export function storedUnorderedVideo(): boolean {
+  try {
+    return globalThis.localStorage?.getItem('roomler-rc-unordered-video') === '1'
+  } catch {
+    /* privacy mode - default off */
+    return false
+  }
+}
 
 /** Short codec name to pass into `new RTCRtpScriptTransform(worker,
  *  { codec })`. Reads the first negotiated codec off
@@ -2846,6 +3061,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** Last time a STALL snackbar was shown, so a flapping path cannot
    *  bury its own message under repeats. */
   let lastStallSnackAtMs = -Infinity
+  /** FR-22 - has ANY attempt in this connect cycle already painted a
+   *  frame? Distinguishes "the session dropped and came back" from "the
+   *  request was never answered", which the attempt counter alone cannot.
+   *  Cleared by a fresh user-initiated connect, not by a retry. */
+  let sessionEverPainted = false
 
   /** FR-22 - per-attempt connect timing. Null outside an attempt; a
    *  retry replaces it wholesale so the ladder's second attempt cannot
@@ -2871,6 +3091,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const line = formatConnectTiming(snap)
     if (reason === 'first-frame') {
       lastTtffMs.value = snap.marks.first_frame ?? null
+      sessionEverPainted = true
       console.info('[rc] connect', line)
     } else {
       console.warn('[rc] connect', reason, line)
@@ -3293,7 +3514,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** rc.62 Ã¢ÂÂ VP9 chroma preference (per-browser, persisted). When set
    *  to `'yuv420'` or `'yuv444'` the value is sent as `chroma_pref` in
    *  the `rc:session.request` payload; the agent's VP9-444 encoder
-   *  uses it instead of its `ROOMLER_AGENT_VP9_CHROMA` env var. When
+   *  uses it instead of its `ROOMLERD_VP9_CHROMA` env var. When
    *  `'auto'` (default), the field is omitted and the agent uses its
    *  own configured default. */
   const vp9Chroma = ref<Vp9ChromaPref>(readStoredVp9Chroma())
@@ -4555,10 +4776,31 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  reply is the next `rc:control.state` broadcast (granted = we become
    *  the holder; an ACTIVE holder keeps it and state shows who). */
   function requestControl() {
+    sendControl({ t: 'rc:control.request' })
+  }
+
+  /** FR-27 — the holder hands the floor to whoever is waiting, without making
+   *  them wait out the idle timer. The agent validates both ends (only the
+   *  current holder may grant, and only to the session that actually asked),
+   *  so a stale click cannot hand control to whoever asked last. */
+  function grantControl(session: string) {
+    sendControl({ t: 'rc:control.grant', session })
+  }
+
+  /** FR-27 — the holder declines, or the requester withdraws. The agent
+   *  accepts it from either, so one verb clears the chip on both toolbars. */
+  function dismissControlRequest() {
+    sendControl({ t: 'rc:control.dismiss' })
+  }
+
+  /** Fire-and-forget on the control DC. No-op while it is closed — every
+   *  caller here is a UI affordance whose reply is the next
+   *  `rc:control.state` broadcast, so a dropped send self-corrects. */
+  function sendControl(msg: Record<string, unknown>) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
-      ch.send(JSON.stringify({ t: 'rc:control.request' }))
+      ch.send(JSON.stringify(msg))
     } catch {
       /* drop */
     }
@@ -4805,7 +5047,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  next `connect()` Ã¢ÂÂ the choice is baked into the
    *  `rc:session.request.chroma_pref` field. Older agents that don't
    *  understand the field ignore it and fall back to their own
-   *  `ROOMLER_AGENT_VP9_CHROMA` default (= no-op). */
+   *  `ROOMLERD_VP9_CHROMA` default (= no-op). */
   function setVp9Chroma(c: Vp9ChromaPref) {
     vp9Chroma.value = c
     persistVp9Chroma(c)
@@ -5412,7 +5654,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // worker as ArrayBuffer chunks (transferred, not copied).
     let dc: RTCDataChannel
     try {
-      dc = pc.createDataChannel(VP9_444_DC_LABEL, VP9_444_DC_OPTIONS)
+      // FR-17 stage B - unordered ONLY when this session negotiated
+      // framing; `videoDcOptions` enforces that pairing.
+      dc = pc.createDataChannel(
+        VP9_444_DC_LABEL,
+        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
+      )
     } catch (err) {
       console.warn('[rc] vp9-444 DC creation failed', err)
       try { worker.terminate() } catch { /* ignore */ }
@@ -5653,7 +5900,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // agent stays silent if it picked the WebRTC track instead.
     let dc: RTCDataChannel
     try {
-      dc = pc.createDataChannel(VP9_444_DC_LABEL, VP9_444_DC_OPTIONS)
+      // FR-17 stage B - unordered ONLY when this session negotiated
+      // framing; `videoDcOptions` enforces that pairing.
+      dc = pc.createDataChannel(
+        VP9_444_DC_LABEL,
+        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
+      )
     } catch (err) {
       console.warn('[rc] hevc DC creation failed', err)
       try { worker.terminate() } catch { /* ignore */ }
@@ -5963,10 +6215,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       phase.value = 'closed'
       if (msg.reason) {
-        // Reason is informational; UI surfaces it when non-nominal.
-        if (msg.reason === 'error' || msg.reason === 'consent_timeout' || msg.reason === 'user_denied') {
-          error.value = msg.reason
-        }
+        // FR-27 - a non-nominal end gets a sentence, not the enum name. The
+        // mapping returns null for every nominal reason, so the set of
+        // reasons that surface is the set that has something to say.
+        const friendly = friendlyEndReason(msg.reason)
+        if (friendly) error.value = friendly
       }
       teardown()
     })
@@ -6292,6 +6545,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // the right args from the original user click.
     if (!isReconnect) {
       lastConnectArgs = { agentId, permissions, orgId }
+      // New user-initiated connect - a later retry in THIS cycle must not
+      // inherit "the session worked once" from the previous one.
+      sessionEverPainted = false
       // Fresh user-initiated connect Ã¢ÂÂ reset reconnect state.
       cancelReconnect()
     }
@@ -6306,7 +6562,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // it, so a connect that spent its whole wait in the pre-flight
     // reported a small TTFF and was reported as healthy - which is
     // exactly the case that reproduced with no snackbar.
-    connectTiming = beginAttempt(reconnectAttempt.value + 1)
+    connectTiming = beginAttempt(reconnectAttempt.value + 1, sessionEverPainted)
     // Per-ATTEMPT, not per-user-connect: each retry has to earn "media
     // flowed" again, otherwise one good session would excuse every frameless
     // one that followed it.
@@ -6594,7 +6850,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // Declare we want to *receive* video from the agent. Without this line
     // the offer has no m=video section, so the agent's answer can't include
     // one either Ã¢ÂÂ ontrack never fires and hasMedia stays false. See the
-    // peer-side mirror in agents/roomler-agent/src/peer.rs (add_track).
+    // peer-side mirror in agents/roomlerd/src/peer.rs (add_track).
     pc.addTransceiver('video', { direction: 'recvonly' })
 
     // Opt-in host audio: declare a recvonly audio transceiver so the
@@ -7400,13 +7656,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // and pick the best pair; explicit user picks skip this entirely.
       const caps = agent?.value?.capabilities
       const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec] = await Promise.all([
-        isAv1HwDecodeSupported(),
-        isHevcHwDecodeSupported(),
-        isHevcDecodeSupported(),
-        isVp9HwDecodeSupported(),
-        isVp9_444DecodeSupported(),
-        isH264HwDecodeSupported(),
-        isH264DcDecodeSupported(),
+        probeAv1Hw(),
+        probeHevcHw(),
+        probeHevcDec(),
+        probeVp9Hw(),
+        probeVp9_444(),
+        probeH264Hw(),
+        probeH264Dc(),
       ])
       vp9_444Supported.value = vp9Dec
       hevcSupported.value = hevcDec
@@ -7456,11 +7712,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // RTP path silently Ã¢ÂÂ same behaviour as before P2.
       const h264Caps = agent?.value?.capabilities
       const agentHasH264Dc = (h264Caps?.transports ?? []).includes('data-channel-h264')
-      const codec = agentHasH264Dc ? await isH264DcDecodeSupported() : null
+      const codec = agentHasH264Dc ? await probeH264Dc() : null
       if (agentHasH264Dc && codec && !failedDcTransports.has('data-channel-h264')) {
         preferredTransport = 'data-channel-h264'
         h264DcCodec = codec
-        viewerDecodeHw.value = await isH264HwDecodeSupported()
+        viewerDecodeHw.value = await probeH264Hw()
       } else if (failedDcTransports.has('data-channel-h264')) {
         console.info(
           '[rc] data-channel-h264 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to the RTP track.',
@@ -7475,7 +7731,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } else if (videoTransport.value === 'data-channel-av1') {
       // rc.190 Ã¢ÂÂ explicit AV1 pick. Chromium always has dav1d SW decode,
       // so gate only on decodability; the badge surfaces HW vs SW truth.
-      const decodable = av1Supported.value || (await isAv1DecodeSupported())
+      const decodable = av1Supported.value || (await probeAv1Dec())
       av1Supported.value = decodable
       if (decodable && !failedDcTransports.has('data-channel-av1')) {
         preferredTransport = 'data-channel-av1'
@@ -7490,7 +7746,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         )
       }
     } else if (videoTransport.value === 'data-channel-vp9-444') {
-      const supported = vp9_444Supported.value || (await isVp9_444DecodeSupported())
+      const supported = vp9_444Supported.value || (await probeVp9_444())
       vp9_444Supported.value = supported
       if (supported && !failedDcTransports.has('data-channel-vp9-444')) {
         preferredTransport = 'data-channel-vp9-444'
@@ -7514,11 +7770,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // `smooth` + `powerEfficient`. On failure we fall back to VP9 4:2:0
       // (profile 0 = universal fixed-function HW decode) Ã¢ÂÂ NOT VP9-444
       // (profile 1), which is ALSO software-decoded and would hang too.
-      const decodable = hevcSupported.value || (await isHevcDecodeSupported())
+      const decodable = hevcSupported.value || (await probeHevcDec())
       hevcSupported.value = decodable
       const hwSmooth = decodable
         && !failedDcTransports.has('data-channel-hevc')
-        && (await isHevcHwDecodeSupported())
+        && (await probeHevcHw())
       if (hwSmooth) {
         preferredTransport = 'data-channel-hevc'
         viewerDecodeHw.value = true
@@ -7527,7 +7783,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // the agent's advertised hevc_chroma. Either missing → silently run
         // the normal 4:2:0 HEVC session (no chroma_pref sent).
         if (vp9Chroma.value === 'yuv444') {
-          const rext = hevcRextSupported.value || (await isHevcRextDecodeSupported())
+          const rext = hevcRextSupported.value || (await probeHevcRext())
           hevcRextSupported.value = rext
           const agentRext =
             agent?.value?.capabilities?.hevc_chroma?.includes('yuv444') === true
@@ -7542,7 +7798,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           }
         }
       } else {
-        const vp9Ok = vp9_444Supported.value || (await isVp9_444DecodeSupported())
+        const vp9Ok = vp9_444Supported.value || (await probeVp9_444())
         vp9_444Supported.value = vp9Ok
         const fallback = vp9Ok && !failedDcTransports.has('data-channel-vp9-444')
         if (fallback) {
@@ -9648,6 +9904,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     controlState,
     peerCursors,
     requestControl,
+    grantControl,
+    dismissControlRequest,
     setInputMode,
     /**
      * Name of the input desktop the agent is currently bound to,

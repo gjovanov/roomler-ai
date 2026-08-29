@@ -1267,7 +1267,74 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
 /// bulk writes below are belt-and-braces for sockets that don't finish
 /// in time. Agents see a plain socket close (never a Goodbye — those are
 /// fatal client-side) and reconnect with backoff through the LB.
+/// FR-28 kill switch. Default ON: the announcement is strictly more
+/// information than the agent has today, and the discover-by-failed-send
+/// path stays in place for the ungraceful cases (SIGKILL, node loss) that
+/// no announcement can cover.
+fn drain_derp_on_shutdown() -> bool {
+    !matches!(
+        std::env::var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 pub async fn shutdown_cleanup(state: &AppState) {
+    // FR-28 — tell every `/derp` client we are going away BEFORE anything
+    // else, so the announcement races nothing.
+    //
+    // Without this the agent learns the socket is dead only when a send on
+    // it hard-errors, and until then it keeps handing carrier frames to a
+    // corpse. Measured on 2026-08-29: a pod roll produced a **2436 ms**
+    // `video DC delivery gap` and a decode stall on an IDLE remote-control
+    // session, on two hosts in the same second, and DERP churn is otherwise
+    // rare (2-3 events per host per 6 h, ALL correlating with rolls). It is
+    // the one freeze cause reproducible on demand.
+    //
+    // The primitive already existed for the cluster convergence sweep — it
+    // was simply never wired to shutdown.
+    //
+    // ⚠️ This is NOT the pre-close draining the comment in `main.rs`
+    // deliberately rejects. It adds no delay and waits for nothing: a
+    // broadcast on the way out, after which the process stops accepting
+    // exactly when it does today. `maxSurge: 0` means a drained second is
+    // downtime, so buying recovery with rollout time would be the wrong
+    // trade — this buys it with a notification.
+    if drain_derp_on_shutdown() {
+        let cancels: Vec<_> = state
+            .derp_cancels
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        if !cancels.is_empty() {
+            tracing::info!(
+                sockets = cancels.len(),
+                "shutdown: signalling /derp clients to re-home before we stop accepting"
+            );
+            for c in cancels {
+                // ⚠️ `notify_one`, NOT `notify_waiters` — and the first
+                // attempt at this got it backwards, which is why the field
+                // test measured MORE `hard-errored` lines, not fewer.
+                //
+                // The socket loop awaits `cancel.notified()` inside a
+                // `select!` (`ws/derp.rs:439`), so the future is recreated
+                // every iteration and there is NO registered waiter while
+                // the task is forwarding a frame. `notify_waiters` wakes
+                // only waiters registered at that instant and stores
+                // nothing, so exactly the busy sockets — the ones carrying
+                // a live session, the ones this is for — missed the signal.
+                //
+                // `notify_one` stores a permit when nobody is parked, so the
+                // next `notified()` returns immediately. The hazard the
+                // first version worried about (a permit stored for a task
+                // already gone) costs nothing: the `Notify` is dropped with
+                // its registry entry.
+                c.notify_one();
+            }
+        }
+    }
     // C-4/C-6 — release directory records for every locally-owned class
     // FIRST (before the agent sweep's early return): a graceful deploy
     // hands each entity off with a ZERO-length ownerless window instead
@@ -1358,5 +1425,78 @@ pub async fn shutdown_cleanup(state: &AppState) {
                 tracing::debug!(agent = %id, %e, "shutdown: presence release failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fr28_tests {
+    use super::drain_derp_on_shutdown;
+
+    /// FR-28 — the kill switch must be OFF-by-explicit-value only.
+    ///
+    /// ⚠️ Default ON is deliberate and is the whole point: the announcement
+    /// is strictly more information than the agent has today, and the
+    /// discover-by-failed-send path stays for the ungraceful cases
+    /// (SIGKILL, node loss) that no announcement can cover. A default that
+    /// silently disabled it would leave the measured 2436 ms freeze in
+    /// place while the code looked shipped.
+    /// FR-28 — the signal must survive a socket that is NOT parked on
+    /// `notified()` at the instant we fire.
+    ///
+    /// ⚠️ This is the test the first version needed and did not have. It
+    /// only checked the env kill switch, which cannot observe the defect:
+    /// `notify_waiters()` wakes waiters registered AT THAT MOMENT and
+    /// stores nothing, while the real socket loop rebuilds its
+    /// `cancel.notified()` future every `select!` iteration. So exactly
+    /// the busy sockets — the ones carrying a live session — missed it,
+    /// and the field test measured MORE `hard-errored` lines (12) than
+    /// the undrained baseline (8).
+    #[tokio::test]
+    async fn cancel_reaches_a_socket_that_is_not_currently_awaiting() {
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // Fire while nobody is parked — the busy-forwarding case.
+        cancel.notify_one();
+
+        // The loop comes back around and awaits: it must return at once.
+        let woke =
+            tokio::time::timeout(std::time::Duration::from_millis(200), cancel.notified()).await;
+        assert!(
+            woke.is_ok(),
+            "a cancel fired while the socket was busy must still be observed"
+        );
+    }
+
+    /// The same shape with `notify_waiters`, pinned so the difference is
+    /// documented rather than rediscovered: it is LOST when nobody waits.
+    #[tokio::test]
+    async fn notify_waiters_would_lose_it_which_is_why_we_do_not_use_it() {
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        cancel.notify_waiters();
+        let woke =
+            tokio::time::timeout(std::time::Duration::from_millis(100), cancel.notified()).await;
+        assert!(
+            woke.is_err(),
+            "notify_waiters stores no permit — this is the bug"
+        );
+    }
+
+    #[test]
+    fn drain_defaults_on_and_only_explicit_falsey_disables() {
+        // SAFETY: single-threaded test, no other reader of this var.
+        unsafe { std::env::remove_var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN") };
+        assert!(drain_derp_on_shutdown(), "absent must mean ON");
+
+        for off in ["0", "false", "no", "off", "OFF", "False"] {
+            unsafe { std::env::set_var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN", off) };
+            assert!(!drain_derp_on_shutdown(), "{off} must disable");
+        }
+        // Anything else is ON — an operator typo must not silently disable a
+        // freeze fix.
+        for on in ["1", "true", "yes", "on", "", "banana"] {
+            unsafe { std::env::set_var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN", on) };
+            assert!(drain_derp_on_shutdown(), "{on:?} must stay ON");
+        }
+        unsafe { std::env::remove_var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN") };
     }
 }

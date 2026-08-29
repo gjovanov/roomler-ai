@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2117`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomler-agent/src/signaling.rs:1502`).
+(`agents/roomlerd/src/signaling.rs:1502`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -507,6 +507,23 @@ local socket is consulted. `ss -ulnp` showed 3478 free, `HOST_FW_INPUT` showed i
 ACCEPTed, and a bound listener still received nothing. The same chain consumes
 **10000–13000** and **443 on `.74`**. Consequences:
 
+✅ **The relay host is `scw-m2-asahi` (`62.210.194.66`)** — measured 2026-08-28, after mars
+was ruled out below. It is a Scaleway Apple-M2 running Fedora Asahi: a public IP, UDP/3478
+free, **no DNAT on it**, and firewalld the only gate. With 3478 opened, **`clk00017265`
+reached it** — arrival confirmed server-side from its own srflx `192.164.201.1:10400` — as
+did `pc50045`. `pc55331` did not, as expected: it has no UDP anywhere.
+
+⚠️ **The two home-LAN candidates were measured and REJECTED, not assumed.**
+`MacBook-1` (`gorans-macbook-pro-local-daemon`) and `neo16` share one consumer NAT behind
+`37.63.112.129`. With a listener bound on the MacBook's `0.0.0.0:3478` and four datagrams
+sent from mars to that public IP, the listener reported **`NO-INBOUND (timeout)`** — there
+is no port forward, so neither can serve a relay to anyone off that LAN. Two traps caught
+on the way, both of which would have produced a false answer:
+`timeout` does not exist on macOS (the first listener never ran and its "33 bytes received"
+was the shell's own error text), and a first probe was sent from `pc55331`, which has no
+UDP at all and would have failed against a working host. A relay on a roaming laptop behind
+a residential NAT is also the wrong shape regardless of reachability.
+
 - **mars cannot host an org relay on 3478** without displacing coturn — the one port the
   target population can reach is already taken on the fleet's most natural relay host.
   E2E-1 must therefore either pick a host without coturn DNAT or move coturn first.
@@ -675,7 +692,7 @@ Verified against `origin/master`, 2026-08-28.
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:716-717` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
 | Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:133` |
-| CLI surfaces | `agents/roomler-tunnel/src/localclient.rs:1028` (`relay_qualified_label`), `:252` (`print_why`), `:141` (`netcheck`) |
+| CLI surfaces | `agents/roomler-cli/src/localclient.rs:1028` (`relay_qualified_label`), `:252` (`print_why`), `:141` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
@@ -782,7 +799,7 @@ kill switch. That is what makes E2E-3 executable before P2.
 - [ ] Same pair, same day, before/after: RTT, overlay throughput, RC `send_wait_max_ms`.
       Target **≥3× throughput**, **≥50 % lower `send_wait_max_ms`**. ⚠️ `send_wait_max_ms`
       exists only as a tracing field on the agent's video-pump heartbeat
-      (`agents/roomler-agent/src/peer.rs:5650`, emitted `:5723`) — **not** on `NodeStatus` or
+      (`agents/roomlerd/src/peer.rs:5650`, emitted `:5723`) — **not** on `NodeStatus` or
       in `peers --json` — so this needs a **live remote-desktop session** in both runs plus
       log scraping, and `roomler logs --grep` reads a ≤64 KiB tail with literal substring
       matching, so a miss is not an absence.
@@ -805,7 +822,7 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 ### 10a. Unit (no MongoDB)
 
-⚠️ `cargo test -p roomler-agent --lib` **skips** the overlay tests; the lane needs
+⚠️ `cargo test -p roomlerd --lib` **skips** the overlay tests; the lane needs
 `--features overlay-l3`.
 
 | test | asserts |
@@ -842,7 +859,7 @@ content nor existence), `mint_refused_for_secondary_org`, `mint_requires_relay_s
 
 ⚠️ **The data-plane round trip does NOT go here.** The first draft proposed
 `three_node_relay_roundtrip` in this crate with "A and B forced off direct". That is not
-implementable: `crates/tests/Cargo.toml:17` depends on `roomler-agent` with **default
+implementable: `crates/tests/Cargo.toml:17` depends on `roomlerd` with **default
 features**, and `overlay-l3`/`overlay-netstack` are opt-in — **the overlay data plane,
 WireGuard, carriers and `CarrierPlane` are not compiled into the test binary at all**
 (`grep -l 'tunnel_core|overlay::' crates/tests/src/` returns nothing). `connect_agent`
@@ -876,9 +893,18 @@ in the same PR as `peer_relay_tests.rs`.
 
 | host | overlay | role | risk |
 |---|---|---|---|
-| **mars** | 100.65.4.14 | **primary relay** — utility tier, public IP, no prod pods | low |
-| **zeus** | 100.65.4.24 | second relay, drift-audit target | ⚠️ **high** — `k8s-worker-2` serves conference media for a hash-determined subset of **all** tenants (the FR-4 population). A COTURN flush is a media outage for that subset |
-| **jupiter** | 100.65.4.15 | third relay, ranking only | ⚠️ **high** — storage-pinned prod |
+| **scw-m2-asahi** | 100.65.4.32 / `62.210.194.66` | ✅ **primary relay** — measured: 3478 free, no DNAT, and `clk00017265` reaches it | **low** — hosted box, no prod pods, no coturn |
+| **mars** | 100.65.4.14 | ❌ **cannot serve 3478** — `COTURN_DNAT` consumes it on both public IPs. Retained only as the Fleet-RPC driver and probe origin | low |
+| **zeus** | 100.65.4.24 | second relay *only if a second is needed* | ⚠️ **high** — `k8s-worker-2` serves conference media for a hash-determined subset of **all** tenants (the FR-4 population). A COTURN flush is a media outage for that subset, and 3478 is DNAT'd there too |
+| **jupiter** | 100.65.4.15 | third relay, ranking only | ⚠️ **high** — storage-pinned prod; same DNAT |
+| ~~neo16~~, ~~MacBook-1~~ | 100.65.4.2 / .34 | ❌ **rejected by measurement** — one consumer NAT behind `37.63.112.129`, inbound UDP/3478 `NO-INBOUND` | n/a |
+
+⚠️ **This table changed because of measurement, and it changes the plan.** The original
+E2E-1 assumed mars as primary relay; mars cannot serve the only port the target population
+can reach. `scw-m2-asahi` replaces it, which also removes the need to touch either
+prod cluster host to run E2E-1 at all — the multi-relay ranking case is the *only* thing
+that would need zeus or jupiter, and it is worth asking whether that case is worth a
+COTURN flush on a host serving live conference media.
 
 **E2E-1 — relay selection.** All three offered to `clk00017265`; lowest measured RTT wins.
 Then take mars's relay down and assert re-selection to zeus without a DERP round trip.
@@ -1038,12 +1064,12 @@ property to test (E2E-2, E2E-4), not to assert.
   survive; one attempted after will not. Interacts with the C4 warm-relay design — **do not
   solve both here.**
 - **MTU — not a risk, and the first draft overstated it.** The overlay MTU is a fixed 1280
-  (`agents/roomler-agent/src/overlay.rs:41`), so worst case on the wire is
+  (`agents/roomlerd/src/overlay.rs:41`), so worst case on the wire is
   1280 + 32 (WG) + 8 (Geneve) + 8 (UDP) + 20 (IPv4) = **1348**, comfortably under 1500.
   Geneve's 8 bytes is +4 over TURN's ChannelData and costs nothing against DERP (WS over
   TCP). Re-check only if the overlay MTU is ever raised. ⚠️ And do **not** cite
   `roomler diagnose` as the path-MTU instrument — it is
-  `bail!("T3: diagnose not yet wired")` (`agents/roomler-tunnel/src/cli.rs:587`); only its
+  `bail!("T3: diagnose not yet wired")` (`agents/roomler-cli/src/cli.rs:587`); only its
   doc comment describes the probe.
 
 ---
@@ -1092,3 +1118,5 @@ property to test (E2E-2, E2E-4), not to assert.
 | 2026-08-28 | 0.4.10 | **Pre-implementation evidence sweep.** Fleet-wide `netcheck` + `peers` + `why` from mars over Fleet RPC. 3/12 online peers on `relay:derp/tcp`, **all TCP**. `relay band/udp` **BLOCKED** on `clk00017265` (symmetric NAT), jupiter and zeus; `stun/udp: NO MAPPING` on `pc55331` (whose relay-band cell is **derived, not probed**). Live tier ladder captured for `100.65.4.30`. ⇒ cluster-host firewall provisioning promoted to its own phase (P5); default port set to **3478 as a hypothesis**, with E2E-3 to settle it. ⚠️ Also found while specifying: `blocked_by: "peer-relays-instead"` (`path.rs:590`) already uses "peer relay" for nearly the opposite thing — the product keeps the industry term, the wire uses `relay_kind:"org"`. |
 | 2026-08-28 | — | **Independent review, three lenses, before publication.** Three material corrections, each retained inline as a warning rather than silently fixed: (1) **§6 inverted** — a fifth carrier tier was the wrong design; `RelayKind::Org` plus a fourth `RelayConn` impl needs zero changes to `send_ip_packet`/`SendPeer`/`Router`/`CarrierPlane`, and avoids four hazards in `path.rs`/`lifecycle.rs`, three of them silent. The first draft's own "30 points of headroom" blocker was a **misreading** of `weight() = 2×(base − B_RELAY)` and is retracted. (2) **§4 was insecure** — the bind proved return-routability only; it now carries a per-member `bind_secret` delivered over the authenticated control WS, plus nonce, domain separation, constant-time compare and anti-amplification padding. (3) **§2b overread its instrument** — `relay_band_udp` probes coturn's ~10–13k band and never touches 40000, so the port choice is a hypothesis for E2E-3, which must additionally use Geneve-shaped payloads because a STUN ALG on 3478 may pass STUN and drop us. Also corrected: gate 2 is inert (`OverlayAclMode` defaults `Off`), "fail closed" is unreachable through `load_acl`'s `AclCtx` return, VNI scoping was self-contradictory, P1 was not inert, `roomler config set` is not live outside a two-key allowlist, `three_node_relay_roundtrip` was not implementable (overlay isn't compiled into `crates/tests`), and several acceptance criteria named instruments that do not exist. |
 | 2026-08-28 | 0.4.11 | **E2E-3 RUN — open decision #3 CLOSED: the default port is 3478.** Geneve-shaped 64-byte frames (`Opt Len 0`, pinned proto `0x7788`, deliberately not STUN-shaped) from three clients to a non-amplifying responder on mars; arrivals verified server-side, not inferred from client timeouts. **clk00017265 — symmetric NAT, corp-managed, the host this FR exists for — reached 3478 and NOTHING else** (11000 ✗, 41641 ✗); pc50045 reached all three; pc55331 reached none, confirming the DERP floor. ⇒ 3478 confirmed, 41641 dead as a fallback, 443 retained only as a documented alternative. Two corrections fell out: the codebase's *"drops the ~10-13k relay band"* is **narrower than measured** (clk allows *only* 3478, not "all but the band"), and the STUN-ALG risk §5 flagged **did not materialise**. ⚠️ The run's first probe FAILED on 3478 and nearly produced the opposite conclusion — the cause was mars's own `COTURN_DNAT` redirecting udp/3478 on both public IPs in `PREROUTING`, invisible to `ss -ulnp` and downstream of an ACCEPTing `HOST_FW_INPUT`. Isolated by a STUN-shaped control (also blocked ⇒ not payload inspection), then by reading the nat table. **mars therefore cannot host an org relay on 3478 without displacing coturn** — a new open question for E2E-1. Test rig fully torn down and verified: DNAT restored, temp accepts removed, nothing bound, mesh carriers unchanged. |
+| 2026-08-28 | 0.4.11 | **Relay-host question ANSWERED: `scw-m2-asahi` (`62.210.194.66`).** mars was ruled out by its own `COTURN_DNAT`, so three further candidates were measured rather than argued about. **Asahi (Scaleway M2 / Fedora Asahi): public IP, 3478 free, no DNAT, firewalld the only gate — with 3478 opened, `clk00017265` reached it** (arrival confirmed server-side from its srflx `192.164.201.1:10400`), as did `pc50045`; `pc55331` did not, consistent with having no UDP at all. **`MacBook-1` and `neo16` REJECTED**: they share one consumer NAT behind `37.63.112.129`, and a listener on the MacBook's `0.0.0.0:3478` reported `NO-INBOUND (timeout)` against four datagrams from mars ⇒ no port forward, so neither can serve anyone off that LAN. ⚠️ Two traps caught on the way, each of which would have produced a false answer: `timeout` does not exist on macOS, so the first listener never ran and its "33 bytes received" was the shell's own error text; and the first inbound probe was sent from `pc55331`, which has no UDP and would have failed against a *working* host. ⇒ E2E-1 is re-planned around Asahi, which also removes any need to touch a prod cluster host to run it. Rig fully torn down: responder stopped, firewalld port removed (`ports:` empty again), scratch files deleted, service list unchanged. |
+| 2026-08-29 | 0.4.15 | **P1 FIELD-VERIFIED — the real daemon serves probes on `scw-m2-asahi:3478`.** P1a–P1d shipped (#816, #826, #832, #852), deployed to Asahi, `relay_server_enabled=true`, firewalld `3478/udp` permanent. The daemon logs `org-relay probe responder listening … local=Some(0.0.0.0:3478)` and holds the socket. Against the **real responder** (not the Python stand-in): **`clk00017265` PASS ×2** — the corp-managed symmetric-NAT host this FR exists for — and **`pc50045` PASS**; `pc55331` fails, as it must, having no UDP anywhere. ⚠️ **Deploying a non-release build is not possible on a host with an active updater**: a hand-installed 0.4.14 was silently overwritten **90 s later** by the published 0.4.15 (`post-install watcher … expected=agent-v0.4.15`). The first diagnosis — "my rollback timer fired" — was **wrong**; `journalctl -u fr19-rollback.service` said *No entries*, and the agent's own log named the updater. The fix was to stop fighting it rather than disable `auto_update` on a fleet host: master was already 0.4.15 **and** carried P1d while the *released* 0.4.15 tag predated the merge, so a master build reports a version the updater does not consider newer. ⚠️ **A mid-test FAIL on `pc50045` was the CLIENT, not the relay** — its own netcheck flipped to `stun/udp: NO MAPPING` / `nat: untyped` when its Check Point VPN came up, and flipped back to `ok`/`cone` when it dropped, with the probe passing again on the same relay. VPN-up ⇒ fail, VPN-down ⇒ pass, same host: the client's capability vector is what settles "the relay broke", not the server. ⚠️ Observability gap found in use: the Rust responder only aggregates counters every 300 s **and sleeps before its first report**, so there is a 5-minute blind window at startup and no per-datagram arrival evidence — the stand-in logged every packet, which is what made the earlier DNAT confound visible. Worth a `NodeStatus` field before P2. |

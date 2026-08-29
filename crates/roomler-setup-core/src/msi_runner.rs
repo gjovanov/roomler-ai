@@ -4,7 +4,7 @@
 //!
 //! W3 in the rc.28 plan, BLOCKER-3 fix from the architect critique.
 //!
-//! `roomler_agent::updater::spawn_installer_inner` launches msiexec
+//! `roomlerd::updater::spawn_installer_inner` launches msiexec
 //! via `ShellExecuteExW + verb=runas` (perMachine) or
 //! `Command::new("msiexec")` (perUser) and returns the PID. That
 //! function does NOT wait synchronously — its job is to start the
@@ -132,7 +132,7 @@ mod imp {
 
     impl MsiRunner {
         /// Open a MONITORING handle to a PID returned by
-        /// `roomler_agent::updater::spawn_installer_inner`.
+        /// `roomlerd::updater::spawn_installer_inner`.
         ///
         /// Rights are `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`
         /// ONLY — deliberately NOT the full `PROCESS_QUERY_INFORMATION`
