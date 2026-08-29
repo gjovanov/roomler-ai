@@ -1425,7 +1425,11 @@ async fn detect_constrained_transport(
 /// already waited for the nomination, so this normally returns at once.
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 async fn nominated_remote_ip(pc: &Arc<RTCPeerConnection>) -> Option<String> {
-    let ice = pc.sctp().transport().ice_transport();
+    // Bind each hop:  yields a temporary Arc and
+    // borrows it (E0716 in CI when chained).
+    let sctp = pc.sctp();
+    let dtls = sctp.transport();
+    let ice = dtls.ice_transport();
     for _ in 0..30 {
         if let Some(pair) = ice.get_selected_candidate_pair().await {
             return Some(pair.remote().address.clone());
