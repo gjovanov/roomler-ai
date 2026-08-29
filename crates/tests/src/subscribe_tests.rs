@@ -29,6 +29,35 @@ async fn post_subscribe(app: &TestApp, email: &str) -> reqwest::Response {
         .expect("subscribe request failed")
 }
 
+/// Follow a confirm/unsubscribe link WITHOUT chasing the redirect, and return
+/// where it pointed.
+///
+/// ⚠️ Both routes answer a redirect to `app.frontend_url`, which in a test is
+/// the default `http://localhost:5000` — a port nothing is listening on. A
+/// default `reqwest::Client` follows that hop and the test dies with
+/// `ConnectionRefused` against port 5000 while the route under test behaved
+/// perfectly. Stopping at the hop is also the better assertion: it pins *where*
+/// the link sends a human, which following it silently discards.
+async fn visit(app: &TestApp, path: &str) -> (reqwest::StatusCode, String) {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client build failed");
+    let resp = client
+        .get(app.url(path))
+        .send()
+        .await
+        .expect("link request failed");
+    let status = resp.status();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    (status, location)
+}
+
 async fn row(app: &TestApp, email: &str) -> Option<bson::Document> {
     app.db
         .collection::<bson::Document>("subscribers")
@@ -143,15 +172,12 @@ async fn confirming_flips_the_row_and_burns_the_token() {
         .unwrap()
         .to_string();
 
-    let resp = app
-        .client
-        .get(app.url(&format!("/api/subscribe/confirm/{token}")))
-        .send()
-        .await
-        .unwrap();
-    // Redirects to the landing page; reqwest follows it by default, so assert
-    // on the stored state rather than on the hop.
-    assert!(resp.status().is_success() || resp.status().is_redirection());
+    let (status, location) = visit(&app, &format!("/api/subscribe/confirm/{token}")).await;
+    assert!(status.is_redirection(), "expected a redirect, got {status}");
+    assert!(
+        location.contains("subscribe=confirmed"),
+        "the link must send a human somewhere that says it worked; got {location:?}"
+    );
 
     let doc = row(&app, "confirm@example.com").await.unwrap();
     assert!(doc.get_bool("confirmed").unwrap());
@@ -175,14 +201,16 @@ async fn unsubscribing_needs_no_session_and_is_idempotent() {
         .unwrap()
         .to_string();
 
-    for _ in 0..2 {
-        let resp = app
-            .client
-            .get(app.url(&format!("/api/subscribe/unsubscribe/{token}")))
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success() || resp.status().is_redirection());
+    for attempt in 1..=2 {
+        let (status, location) = visit(&app, &format!("/api/subscribe/unsubscribe/{token}")).await;
+        assert!(
+            status.is_redirection(),
+            "attempt {attempt} expected a redirect, got {status}"
+        );
+        assert!(
+            location.contains("subscribe=unsubscribed"),
+            "attempt {attempt}: a prefetched link must still report success, got {location:?}"
+        );
     }
 
     let doc = row(&app, "leaving@example.com").await.unwrap();
@@ -203,16 +231,8 @@ async fn resubscribing_after_a_withdrawal_requires_confirming_again() {
     let confirm = doc.get_str("confirm_token").unwrap().to_string();
     let unsub = doc.get_str("unsubscribe_token").unwrap().to_string();
 
-    app.client
-        .get(app.url(&format!("/api/subscribe/confirm/{confirm}")))
-        .send()
-        .await
-        .unwrap();
-    app.client
-        .get(app.url(&format!("/api/subscribe/unsubscribe/{unsub}")))
-        .send()
-        .await
-        .unwrap();
+    visit(&app, &format!("/api/subscribe/confirm/{confirm}")).await;
+    visit(&app, &format!("/api/subscribe/unsubscribe/{unsub}")).await;
 
     post_subscribe(&app, "again@example.com").await;
 
@@ -238,7 +258,12 @@ async fn an_unknown_token_changes_nothing() {
         "/api/subscribe/confirm/0000000000000000000000000000000000000000000000",
         "/api/subscribe/unsubscribe/0000000000000000000000000000000000000000000000",
     ] {
-        app.client.get(app.url(path)).send().await.unwrap();
+        let (status, location) = visit(&app, path).await;
+        assert!(status.is_redirection(), "{path} should still redirect");
+        assert!(
+            location.contains("subscribe=invalid"),
+            "an unknown token must say so rather than claim success; got {location:?}"
+        );
     }
 
     let doc = row(&app, "untouched@example.com").await.unwrap();
