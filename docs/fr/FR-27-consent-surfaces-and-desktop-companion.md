@@ -37,10 +37,21 @@ Every line below was read on `origin/master` at `861d4557`.
    `agents/roomler-desktop/src/main.rs` (`consent_watch_loop`)
 3. **"Nobody was there" is reported to the controller as "the user denied you".**
    `Decision::Timeout` maps to `granted: false`, and the hub terminates that as
-   `EndReason::UserDenied`. The hub's own `ConsentTimeout` branch exists but
-   loses the race every time, because the agent's prompt window is set to the
-   *same* `consent_timeout_secs` the hub is waiting on.
+   `EndReason::UserDenied`. The hub's own `ConsentTimeout` branch exists, but
+   which of the two fires is a *race*: the agent's prompt window is set from the
+   same `consent_timeout_secs` the hub is waiting on.
    — `agents/roomlerd/src/consent.rs:79`, `crates/remote_control/src/hub.rs:967`
+
+   ⚠️ **Corrected after the 2026-08-29 baseline.** This finding originally said
+   the hub "loses the race every time". Measured on `mars`, it *wins*: the hub
+   terminated at `t+30.000 s` and the agent's `granted=false` arrived 132 ms
+   later, so an equal-window pair already reports `ConsentTimeout` today. The
+   defect is real but narrower than written — it reproduces wherever the two
+   windows differ, which is exactly `prompt_then_email` (agent modal 300 s) and
+   any pair whose RTT lets the agent answer first. The fix is unchanged and is
+   what makes the outcome deterministic instead of timing-dependent: the agent
+   states its reason (`timeout` / `no_prompt_surface`) rather than leaving the
+   server to infer one from a bare `granted: false`.
 4. **`.pending` has exactly one production call site.** Fleet-RPC exec and
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who

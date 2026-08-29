@@ -499,7 +499,10 @@ jobs:
       # invisible until someone watched an `apt upgrade` on a server pull 200 MB
       # of X11. Assert it here, where it is cheap.
       - name: Guard — the daemon .deb stays headless
-        working-directory: agents/roomlerd
+        # No `working-directory`: cargo-deb writes to the WORKSPACE target dir,
+        # not the member's, so this runs from the repo root exactly like the
+        # "Rename + checksum" step below — which has always done so, and is why
+        # only the new step broke.
         run: |
           set -euo pipefail
           deb=$(ls target/debian/roomlerd_*_amd64.deb | head -n1)
