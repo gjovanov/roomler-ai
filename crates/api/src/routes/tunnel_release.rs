@@ -1,3 +1,9 @@
+// RETIRED-NAME-ANCHOR-BEGIN
+// Serves PUBLISHED release assets. The `tunnel-v*` tag and the
+// roomler-tunnel-<version>-<target> asset names are fixed by what is already
+// on GitHub Releases — renaming them here serves 404s to every existing
+// installer. Release asset names are frozen by FR-21 D6; the test fixtures
+// below are copies of real asset lists and must match byte-for-byte.
 //! `/api/tunnel/{latest-release,installer/{platform}}` — cached
 //! GitHub-Releases proxy for the `roomler-tunnel` binary. Mirrors
 //! [`routes::agent_release`] but targets `tunnel-v*` tags and
@@ -377,3 +383,4 @@ mod tests {
         );
     }
 }
+// RETIRED-NAME-ANCHOR-END
