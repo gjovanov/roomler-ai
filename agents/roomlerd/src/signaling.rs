@@ -1444,6 +1444,9 @@ async fn connect_once(
                     sys: Some(sys),
                     srflx_count,
                     warm_relay,
+                    // FR-27 — cached for 10 min inside, so this is a map lookup
+                    // on all but one heartbeat in twenty.
+                    companion_version: crate::companion::installed_version(),
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
