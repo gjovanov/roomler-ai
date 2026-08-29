@@ -7,7 +7,8 @@ name: Release roomler-setup
 #   - Windows x86_64 (msvc + webview2 auto-bootstrap) — SIGNED EXE in a `.zip`
 #
 # The unified wizard superseded the two legacy wizard EXEs, retired
-# RETIRED-NAME-ANCHOR(3): names the two wizards RETIRED in P4c-2. A history line has to name what existed.
+# RETIRED-NAME-ANCHOR(3): names the two wizards RETIRED in P4c-2. A history line has to
+# name what existed.
 # in P4c-2 (roomler-installer = agent/daemon, roomler-tunnel-installer
 # = tunnel CLI). On Windows it offers all roles (daemon perMachine-SCM
 # / perUser-task / perMachine + tunnel-client); on Linux/macOS only

@@ -36,7 +36,8 @@ Environment=RUST_LOG=roomler_agent=info,roomlerd=info,warn
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-# RETIRED-NAME-ANCHOR(10): systemd must whitelist BOTH trees or it denies an upgraded host its own.
+# RETIRED-NAME-ANCHOR(10): systemd must whitelist BOTH trees or it denies an upgraded
+# host its own.
 # P3d Slice B: the appdirs resolver (src/appdirs.rs) uses the NEW `roomler`
 # app segment on fresh installs but keeps the OLD `roomler-agent` tree when a
 # pre-rename host already has one. Whitelist BOTH so neither a fresh install

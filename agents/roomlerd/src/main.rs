@@ -74,7 +74,8 @@ enum Command {
         #[arg(long)]
         replace: bool,
         /// rc.52: write the enrolled config to the machine-global
-        // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still resolves
+        // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree.
+        // `machine_global_dir()` still resolves
         // it on a host that has one, so it must stay named here. docs/fr/FR-21
         /// path (`%PROGRAMDATA%\roomler\roomler-agent\config.toml`)
         /// instead of the per-user `%APPDATA%` default. Required for
@@ -1011,7 +1012,8 @@ async fn daemon_main() -> Result<()> {
 /// Routed through `crash_recorder::record` so:
 ///
 ///   - Under SystemContext (LocalSystem worker), the sidecar lands in
-// RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still resolves
+// RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still
+// resolves
 // it on a host that has one, so it must stay named here. docs/fr/FR-21
 ///     `%PROGRAMDATA%\roomler\roomler-agent\crashes\` where the
 ///     user-context uploader will find it on a later successful start.
@@ -1396,7 +1398,8 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         overlay,
     } = opts;
     // rc.52: --machine-global retargets the write to
-    // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still resolves
+    // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()`
+    // still resolves
     // it on a host that has one, so it must stay named here. docs/fr/FR-21
     // %PROGRAMDATA%\roomler\roomler-agent\config.toml so a perMachine
     // + SystemContext host's LocalSystem worker can load it pre-logon.

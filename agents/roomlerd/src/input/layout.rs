@@ -38,7 +38,8 @@
 //! preamble.
 //!
 //! Kill switch: `ROOMLERD_AUTO_LAYOUT=0` (the older `ROOMLER_NODE_` and
-// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it.
+// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an
+// operator with it in a script needs to be able to grep for it.
 //! `ROOMLER_AGENT_` prefixes are still honoured) disables the per-char
 //! auto-switch without a redeploy;
 //! status reporting + manual set stay active.
