@@ -1,6 +1,6 @@
 # FR-29 — X11 capture reads the whole screen even when nothing changed
 
-**Issue:** #TBD · **Status:** design → P1 · **Owner:** agent / capture
+**Issue:** [#864](https://github.com/gjovanov/roomler-ai/issues/864) · **Status:** design → P1 · **Owner:** agent / capture
 
 ## Goal
 
