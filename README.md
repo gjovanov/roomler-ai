@@ -81,7 +81,12 @@ see [`docs/installation.md`](docs/installation.md).
 
 Not a claim that it beats each of those at its own game — a claim that you stop
 running five things, on one identity, with one agent, and can host the whole lot
-yourself.
+yourself. Head-to-head write-ups, each naming what the other product does
+better: [**vs Tailscale**](docs/compare/vs-tailscale.md) ·
+[vs RustDesk](docs/compare/vs-rustdesk.md) ·
+[vs TeamViewer](docs/compare/vs-teamviewer.md) ·
+[vs MeshCentral](docs/compare/vs-meshcentral.md) ·
+[vs NetBird](docs/compare/vs-netbird.md).
 
 ## Licence, in one line
 
