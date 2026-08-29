@@ -5,6 +5,7 @@ use axum::{
     extract::{Path, Query, State},
 };
 use bson::oid::ObjectId;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
@@ -64,6 +65,19 @@ pub async fn create(
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+
+    // FR-32 P1a — `recordings` is advertised per plan and was enforced nowhere.
+    // Ships in the tenant's `plan_enforcement` mode, which defaults to `Warn`:
+    // this records the denial and lets the call through until an operator
+    // reads the data and flips the tenant to `Enforce`.
+    let tenant = state.tenants.base.find_by_id(tid).await?;
+    if let Err(d) = quota::require_feature(
+        tenant.plan.clone(),
+        tenant.settings.plan_enforcement,
+        quota::Limit::Recordings,
+    ) {
+        return Err(ApiError::Forbidden(d.message()));
+    }
 
     let recording_type = match body.recording_type.as_deref() {
         Some("audio") => roomler_ai_db::models::recording::RecordingType::Audio,

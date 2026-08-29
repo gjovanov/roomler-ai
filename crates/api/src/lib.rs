@@ -680,6 +680,12 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
         .nest("/admin/stats", admin_stats_routes)
+        // FR-32 P1c — "who would break if enforcement were turned on?".
+        // Platform-admin only (404 on miss, like the rest of /admin).
+        .route(
+            "/admin/plan-compliance",
+            get(routes::plan_compliance::admin_plan_compliance),
+        )
         // The block registry is GLOBAL, so reclaiming from it is a platform
         // operation, not a tenant one. Dry-run by default.
         .route(
