@@ -229,10 +229,10 @@ pub(crate) fn stage_in_programdata() -> bool {
     *STAGE_IN_PROGRAMDATA
 }
 
-/// Windows-only staging root: `%PROGRAMDATA%\roomler\<segment>\staging\`,
-/// where `<segment>` is resolved per host by `appdirs::machine_global_dir()`
 // RETIRED-NAME-ANCHOR(3): names the pre-rename segment because explaining the
 // conditional resolution requires naming both halves. docs/fr/FR-21
+/// Windows-only staging root: `%PROGRAMDATA%\roomler\<segment>\staging\`,
+/// where `<segment>` is resolved per host by `appdirs::machine_global_dir()`
 /// (the `roomler` segment on a fresh install; the pre-rename `roomler-agent`
 /// one only where that tree already exists). Do NOT restate it as a literal —
 /// FR-21 P4 fixed a viewer that did exactly that.

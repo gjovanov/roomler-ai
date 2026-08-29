@@ -59,10 +59,10 @@ impl CliTransport {
 #[derive(Debug, Parser)]
 #[command(name = "roomler", version, about, long_about = None)]
 struct Cli {
-    /// Override config file location. Defaults to the platform config dir
     // RETIRED-NAME-ANCHOR(4): the config segment is frozen — it holds the
     // ENROLLED credential on tunnel-only hosts, and renaming it strands
     // every one of them. agents/roomler-cli/src/config.rs
+    /// Override config file location. Defaults to the platform config dir
     /// (`%APPDATA%\roomler\roomler-tunnel\config.toml` on Windows,
     /// `~/.config/roomler-tunnel/config.toml` on Linux, the equivalent on
     /// macOS via the `directories` crate).
