@@ -262,13 +262,12 @@ impl ScrapCapture {
                     // forces a capture periodically, so a missed damage event
                     // costs a stale tile, never a frozen stream.
                     #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
-                    if let Some(d) = damage.as_mut() {
-                        if !d.should_capture() {
-                            unchanged_worker
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let _ = res_tx.send(Ok(None));
-                            continue;
-                        }
+                    if let Some(d) = damage.as_mut()
+                        && !d.should_capture()
+                    {
+                        unchanged_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = res_tx.send(Ok(None));
+                        continue;
                     }
                     let reply =
                         capture_one_blocking(&mut cap, w, h, (native_w, native_h), start, downscale);
