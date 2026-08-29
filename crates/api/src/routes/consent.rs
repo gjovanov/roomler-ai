@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! PUBLIC remote-control consent endpoints (Phase 4).
 //!
 //! A device owner who received an email link / web-push tap lands here to
@@ -70,7 +72,7 @@ async fn resolve(
     // Resolve the in-memory consent slot. Best-effort: the session may have
     // already timed out or closed, in which case there's nothing to grant — the
     // owner still gets a clean 200 (their decision was recorded).
-    if let Err(e) = state.rc_hub.deliver_consent(req.session_id, granted) {
+    if let Err(e) = state.rc_hub.deliver_consent(req.session_id, granted, None) {
         tracing::info!(
             session = %req.session_id, %e,
             "consent slot no longer waiting (session gone / timed out)"

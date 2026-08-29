@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use roomler_ai_api::{build_router, state, state::AppState};
 use roomler_ai_config::Settings;
 use roomler_ai_db::{connect, indexes::ensure_indexes};

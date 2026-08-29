@@ -1,7 +1,9 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! One-shot enrollment exchange.
 //!
 //! Flow: admin issues an enrollment token in the Roomler UI and hands it to
-//! the machine operator. `roomler-agent enroll --token <t>` posts it to
+//! the machine operator. `roomlerd enroll --token <t>` posts it to
 //! `POST /api/agent/enroll` with machine metadata, gets back a long-lived
 //! agent token, and persists everything to the config file.
 
@@ -110,7 +112,10 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_derp: None,
         overlay_server_relay_strategy: None,
         overlay_derp_floor: None,
+        overlay_org_relay: None,
         overlay_netcheck: None,
+        relay_server_enabled: None,
+        relay_server_port: None,
         tunnel_derp_fallback: None,
         tunnel_peers_survive_reattach: None,
         overlay_mbb: None,
@@ -157,7 +162,10 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         idle_refine: None,
         idle_refine_balanced: None,
         gpu_scale: None,
+        overlay_lan_capture_probe: None,
+        relay_ceiling_learn: None,
         idle_refine_max_edge: None,
+        relay_max_hi_kbps: None,
         idle_refine_min_frame_kb: None,
         idle_refine_major_area_permille: None,
         idle_refine_settle_ms: None,
@@ -174,6 +182,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         fps_pace: None,
         relay_idr_thrift: None,
         relay_age_feedback: None,
+        send_stall_ms: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
@@ -345,7 +354,7 @@ fn unique_org_label(
             )
         })?;
         if cfg.find_org(&label).is_some() {
-            bail!("--label {label:?} is already in use (see `roomler-agent org ls`)");
+            bail!("--label {label:?} is already in use (see `roomlerd org ls`)");
         }
         return Ok(label);
     }

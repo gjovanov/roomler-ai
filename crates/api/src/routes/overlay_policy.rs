@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Admin CRUD for the overlay L3 ACL.
 //!
 //! Mirrors the tunnel-policy admin surface (`routes/tunnel.rs`) but drives a
@@ -303,4 +305,6 @@ async fn refan_tenant(state: &AppState, tenant_id: ObjectId) {
         crate::ws::overlay::refan_node(state, n).await;
     }
     crate::ws::derp_acl::rebuild(state, tenant_id, network_id).await;
+    // FR-19 — a policy edit can un-grant a live relay session; revoke those.
+    crate::ws::org_relay::reconcile_acl(state, tenant_id).await;
 }

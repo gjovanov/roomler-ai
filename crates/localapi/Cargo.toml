@@ -1,5 +1,7 @@
 [package]
 name = "roomler-localapi"
+license = "MPL-2.0"
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "Roomler LocalAPI — the daemon's local control-surface protocol (wire types, client, and dispatch)."

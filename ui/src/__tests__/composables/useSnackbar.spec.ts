@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, beforeEach } from 'vitest'
 import { useSnackbar } from '@/composables/useSnackbar'
 

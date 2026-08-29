@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Userspace WireGuard device (boringtun) bridged to a pluggable
 //! carrier.
 //!
@@ -82,7 +84,9 @@ pub const QUIC_UPGRADE_DEADLINE: Duration = Duration::from_secs(90);
 /// [`QUIC_BUILD_TIMEOUT`], so the cycle is ~12 s).
 pub const QUIC_UPGRADE_RETRY_GAP: Duration = Duration::from_secs(4);
 
-/// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLER_NODE_OVERLAY_QUIC`;
+// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an
+// operator with it in a script needs to be able to grep for it.
+/// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLERD_OVERLAY_QUIC`;
 /// legacy `ROOMLER_AGENT_OVERLAY_QUIC` still honoured — see
 /// [`crate::env::node_env`]). **Default OFF** — the raw relay is the proven
 /// path; QUIC is enabled per-host only after field-proving (mirrors the
@@ -2972,6 +2976,7 @@ mod tests {
             supports_derp: false,
             supports_forced_derp: false,
             supports_derp_floor: false,
+            supports_org_relay: false,
             caps: None,
             supports_overlay_echo: false,
             relay_strategy: None,

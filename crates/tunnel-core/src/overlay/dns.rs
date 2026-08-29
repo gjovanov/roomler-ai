@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Phase 2 MagicDNS — a tiny split-DNS resolver.
 //!
 //! Overlay names (`<node>.<magic_domain>`, or a bare `<node>` label the OS sends
@@ -14,7 +16,7 @@
 //!
 //! Dual-stack: an `AAAA` query for a known node answers its **derived** overlay
 //! IPv6 ([`derive_overlay_v6`]) — same map, no v6 state. Default-on;
-//! `ROOMLER_AGENT_DNS_AAAA=0` (read by the runtime into
+//! `ROOMLERD_DNS_AAAA=0` (read by the runtime into
 //! [`DnsConfig::answer_aaaa`]) reverts to A-only, the mixed-fleet escape hatch:
 //! an old peer's OS doesn't own its derived v6, so v6 toward it blackholes —
 //! happy-eyeballs apps fall back to A, strictly-sequential ones may hang.
@@ -47,7 +49,7 @@ pub struct DnsConfig {
     /// name → overlay IP.
     pub names: NameMap,
     /// Answer `AAAA` for known nodes with their derived overlay IPv6. `false`
-    /// (the `ROOMLER_AGENT_DNS_AAAA=0` escape hatch) answers NODATA instead.
+    /// (the `ROOMLERD_DNS_AAAA=0` escape hatch) answers NODATA instead.
     pub answer_aaaa: bool,
 }
 

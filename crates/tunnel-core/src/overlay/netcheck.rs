@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Phase B (overlay v3) — netcheck: the measured capability vector.
 //!
 //! Selection heuristics (srflx-presence-implies-dialer, conviction latches)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Brute-force gate for the credential endpoints.
 //!
 //! The general `/api` limiter is a capacity control: it is keyed on the

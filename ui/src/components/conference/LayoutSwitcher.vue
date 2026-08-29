@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-menu :close-on-content-click="false" location="bottom end">
     <template #activator="{ props: menuProps }">

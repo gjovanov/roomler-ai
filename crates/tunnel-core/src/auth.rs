@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Audience-name pointers for the tunnel JWT types.
 //!
 //! Canonical claim shapes + issue/verify functions live in
 //! `crates/services/src/auth/mod.rs` alongside the existing
 //! `Access` / `Refresh` / `Enrollment` / `Agent` pattern. This module
-//! is intentionally thin — the `roomler-tunnel` CLI stores tokens as
+//! is intentionally thin — the `roomler` CLI stores tokens as
 //! opaque strings and never decodes them, so it doesn't need the
 //! claim structs.
 //!
