@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture: the desktops we cannot see at all
 
-**Issue:** #TBD · **Status:** design · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** design · **Owner:** agent / capture
 
 ## Goal
 
