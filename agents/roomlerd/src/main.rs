@@ -720,8 +720,13 @@ fn main() -> Result<()> {
     // Hands the main thread to AppKit, forever. `Accessory` keeps us out of
     // the Dock and the app switcher — the bundle already sets `LSUIElement`,
     // and this makes it true for a non-bundled dev run too.
-    crate::indicator::mac::run_main_loop();
-    Ok(())
+    //
+    // ⚠️ `roomlerd::`, NOT `crate::`. This file is a SEPARATE crate root from
+    // the lib, so a `cfg`-gated path here that reads like an intra-crate one
+    // compiles nowhere — and, being macOS-only, nowhere is exactly where it
+    // would have been noticed. Same trap as rc.454's `tcc` block; the `--bins`
+    // in the macOS CI job exists for it and caught this on the first push.
+    roomlerd::indicator::mac::run_main_loop();
 }
 
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
