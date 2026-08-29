@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! S2 config surface — the curated, secret-free slice of [`AgentConfig`]
 //! that the LocalAPI `ConfigGet` / `ConfigSet` verbs expose to the
 //! desktop app / CLI.
@@ -12,7 +14,7 @@
 //! `overlay_wg_secret_key`), identity (`machine_id`; `machine_name` has
 //! its own `SetDeviceName` verb), `[[tunnel_routes]]` (the `Route*`
 //! verbs + Routes pane own those), `[[orgs]]` (multi-org P1 — identity +
-//! per-org secrets managed by `roomler-agent enroll` / the `org` CLI
+//! per-org secrets managed by `roomlerd enroll` / the `org` CLI
 //! verbs, same policy as `tunnel_routes`; a future desktop org pane gets
 //! dedicated LocalAPI verbs, not surface keys), and the crash-bookkeeping
 //! fields. Every key is read at daemon startup, so the whole surface is
@@ -163,6 +165,31 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session, advertise the capability, and floor fresh pairs at birth. Built-in default: on since rc.400.",
     ),
     (
+        "overlay_org_relay",
+        "tribool",
+        "FR-19 P4b - ride a tenant-owned ORG RELAY when the server mints a session for a \
+         pair (org switch on, an ACL rule granting each member the relay node, an approved \
+         and serving relay). Advertised on the join as supports_org_relay; the serving half \
+         is relay_server_enabled. Built-in default: OFF.",
+    ),
+    (
+        "relay_server_enabled",
+        "tribool",
+        "FR-19 - offer this node as an ORG RELAY: bind relay_server_port and answer \
+         reachability probes (it forwards nothing until the relay data path ships). \
+         Device-local by design and never server-pushable: this is the refusal that \
+         survives a compromised server. Built-in default: OFF.",
+    ),
+    (
+        "relay_server_port",
+        "number",
+        "FR-19 - UDP port for the org-relay listener (1-65535). Built-in default: 3478, \
+         measured rather than guessed - the corp-managed target host reaches 3478 on an \
+         arbitrary public IP and no other port. A successful bind does NOT prove \
+         reachability: a coturn DNAT can consume the port in PREROUTING while ss shows it \
+         free.",
+    ),
+    (
         "overlay_netcheck",
         "tribool",
         "Overlay v3 Phase B — netcheck: measure egress capabilities (relay-band probe over the dialer path, STUN/NAT, /derp health) every ~20 min and publish the capability vector. Built-in default: on.",
@@ -230,17 +257,17 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_pathmon",
         "string",
-        "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
+        "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLERD_OVERLAY_PATHMON.",
     ),
     (
         "overlay_demote",
         "string",
-        "B2 - score-driven demotion of degraded-but-live direct carriers: shadow (count only - built-in default) | on | off. Env: ROOMLER_AGENT_OVERLAY_DEMOTE.",
+        "B2 - score-driven demotion of degraded-but-live direct carriers: shadow (count only - built-in default) | on | off. Env: ROOMLERD_OVERLAY_DEMOTE.",
     ),
     (
         "overlay_rpf",
         "string",
-        "P4 - ingress filtering of inbound overlay packets: drops a SOURCE address the sending peer does not own, and a DESTINATION outside the subnets this node advertises. warn (count + log, still deliver - built-in default) | enforce | off. Env: ROOMLER_NODE_OVERLAY_RPF.",
+        "P4 - ingress filtering of inbound overlay packets: drops a SOURCE address the sending peer does not own, and a DESTINATION outside the subnets this node advertises. warn (count + log, still deliver - built-in default) | enforce | off. Env: ROOMLERD_OVERLAY_RPF.",
     ),
     (
         "overlay_route_events",
@@ -271,7 +298,7 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Multi-org: the loopback SOCKS5 port serving THIS org's userspace netstack \
          (overlay_mode=\"netstack\"). One TCP listener per org — two orgs configured onto \
          one port means the second joins no mesh. The primary reads \
-         ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS instead; set this on an [[orgs]] entry. \
+         ROOMLERD_OVERLAY_NETSTACK_SOCKS instead; set this on an [[orgs]] entry. \
          Built-in default: unset (OS-TUN mode).",
     ),
     (
@@ -282,12 +309,12 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_direct_port",
         "number",
-        "Stable UDP base port for the overlay direct sockets (per-interface LAN; the public/srflx dialer takes base+256). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. A swallowed base walks an 8-port band, then the same walk at base+512 (Hyper-V/WSL reserve invisible pools that move between boots). 0 = ephemeral ports. Built-in default: DERIVED per machine (43648 + machine-id-hash slot, 43648..43896) so siblings behind one NAT never collide; set 43648 explicitly to pin the old fleet-wide constant. Env: ROOMLER_NODE_OVERLAY_DIRECT_PORT.",
+        "Stable UDP base port for the overlay direct sockets (per-interface LAN; the public/srflx dialer takes base+256). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. A swallowed base walks an 8-port band, then the same walk at base+512 (Hyper-V/WSL reserve invisible pools that move between boots). 0 = ephemeral ports. Built-in default: DERIVED per machine (43648 + machine-id-hash slot, 43648..43896) so siblings behind one NAT never collide; set 43648 explicitly to pin the old fleet-wide constant. Env: ROOMLERD_OVERLAY_DIRECT_PORT.",
     ),
     (
         "overlay_iface_metric",
         "number",
-        "The overlay NIC's IPv4 interface metric (Windows). Windows ranks a route by route metric + INTERFACE metric; corp endpoint managers (Check Point, AnyConnect) mirror overlay prefixes at route metric 1 on an interface also pinned to 1, producing an exact tie that Windows breaks by lower ifIndex — the VPN's — and the per-destination pick is sticky, so peers stay captured across restarts. Unlike metric-0 routes (which those products delete), an interface metric has no route-monitor hook, so 0 wins outright. Raise only to make the overlay deliberately lose against another interface. Built-in default: 0. Env: ROOMLER_NODE_OVERLAY_IFACE_METRIC.",
+        "The overlay NIC's IPv4 interface metric (Windows). Windows ranks a route by route metric + INTERFACE metric; corp endpoint managers (Check Point, AnyConnect) mirror overlay prefixes at route metric 1 on an interface also pinned to 1, producing an exact tie that Windows breaks by lower ifIndex — the VPN's — and the per-destination pick is sticky, so peers stay captured across restarts. Unlike metric-0 routes (which those products delete), an interface metric has no route-monitor hook, so 0 wins outright. Raise only to make the overlay deliberately lose against another interface. Built-in default: 0. Env: ROOMLERD_OVERLAY_IFACE_METRIC.",
     ),
     (
         "shared_encoder",
@@ -382,157 +409,177 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "rate_factor_h264",
         "string",
-        "H.264 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_H264. Empty = built-in 150. Restart required.",
+        "H.264 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_H264. Empty = built-in 150. Restart required.",
     ),
     (
         "rate_factor_hevc",
         "string",
-        "HEVC maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_HEVC. Empty = built-in 125. Restart required.",
+        "HEVC maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_HEVC. Empty = built-in 125. Restart required.",
     ),
     (
         "rate_factor_vp9",
         "string",
-        "VP9 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_VP9. Empty = built-in 125. Restart required.",
+        "VP9 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_VP9. Empty = built-in 125. Restart required.",
     ),
     (
         "rate_factor_av1",
         "string",
-        "AV1 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_AV1. Empty = built-in 100. Restart required.",
+        "AV1 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_AV1. Empty = built-in 100. Restart required.",
     ),
     (
         "lanczos_min_pct",
         "string",
-        "P7 - minimum linear downscale (percent, 0-100) at which the Lanczos-3 text-sharp filter engages; shallower shrinks use box. Empty = built-in 34 (covers the Smoother rungs; 56 restores the pre-P7 gate; 0 = always). Env: ROOMLER_NODE_LANCZOS_MIN_PCT. Restart required.",
+        "P7 - minimum linear downscale (percent, 0-100) at which the Lanczos-3 text-sharp filter engages; shallower shrinks use box. Empty = built-in 34 (covers the Smoother rungs; 56 restores the pre-P7 gate; 0 = always). Env: ROOMLERD_LANCZOS_MIN_PCT. Restart required.",
     ),
     (
         "nvenc_spatial_aq",
         "tribool",
-        "P7 - NVENC spatial AQ. Built-in default: OFF (AQ steals bits from desktop text); true restores it for camera-heavy hosts. Env: ROOMLER_NODE_NVENC_SPATIAL_AQ. Restart required.",
+        "P7 - NVENC spatial AQ. Built-in default: OFF (AQ steals bits from desktop text); true restores it for camera-heavy hosts. Env: ROOMLERD_NVENC_SPATIAL_AQ. Restart required.",
     ),
     (
         "scale_cq_boost",
         "string",
-        "P7 - CQ sharpening steps granted at deep resolution rungs (0-12; spends the maxrate-floor headroom on text). Empty = built-in 4; 0 disables. Env: ROOMLER_NODE_SCALE_CQ_BOOST. Restart required.",
+        "P7 - CQ sharpening steps granted at deep resolution rungs (0-12; spends the maxrate-floor headroom on text). Empty = built-in 4; 0 disables. Env: ROOMLERD_SCALE_CQ_BOOST. Restart required.",
     ),
     (
         "idle_refine",
         "tribool",
-        "P7 - idle native-rung refinement: lift the resolution cap when the scene settles so text is crisp at rest; motion restores it in ~300 ms. Built-in default: on (Smoother scope). Env: ROOMLER_NODE_IDLE_REFINE. Restart required.",
+        "P7 - idle native-rung refinement: lift the resolution cap when the scene settles so text is crisp at rest; motion restores it in ~300 ms. Built-in default: on (Smoother scope). Env: ROOMLERD_IDLE_REFINE. Restart required.",
     ),
     (
         "idle_refine_balanced",
         "tribool",
-        "P7 - idle refinement on Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: on since P7c (field-proven on the winhost-b relay); off restores the un-refined Balanced rung. Env: ROOMLER_NODE_IDLE_REFINE_BALANCED. Restart required.",
+        "P7 - idle refinement on Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: on since P7c (field-proven on the winhost-b relay); off restores the un-refined Balanced rung. Env: ROOMLERD_IDLE_REFINE_BALANCED. Restart required.",
     ),
     (
         "gpu_scale",
         "tribool",
-        "HW-downscale Phase B - GPU scale-before-readback (D3D11 VideoProcessor) on DXGI-direct capture: the Smoother rung is scaled on the GPU and the readback shrinks with it. Built-in default: on; off reverts to the Phase-A CPU resample. Env: ROOMLER_NODE_GPU_SCALE. Restart required.",
+        "HW-downscale Phase B - GPU scale-before-readback (D3D11 VideoProcessor) on DXGI-direct capture: the Smoother rung is scaled on the GPU and the readback shrinks with it. Built-in default: on; off reverts to the Phase-A CPU resample. Env: ROOMLERD_GPU_SCALE. Restart required.",
+    ),
+    (
+        "overlay_lan_capture_probe",
+        "tribool",
+        "FR-33 - probe each LAN prefix for a corp-VPN split-prefix capture (own address on interface A, traffic to the prefix leaves via interface B) and surface it in status / why / the RC pill. Built-in default: on (a read-only route lookup per LAN address per netstate snapshot). Env: ROOMLERD_OVERLAY_LAN_CAPTURE_PROBE. Restart required.",
+    ),
+    (
+        "relay_ceiling_learn",
+        "tribool",
+        "FR-35 - let the constrained (relay) ceiling grow above the nominal 3 Mbps on delivery evidence (AIMD pinned at the ceiling, the window carried >=70% of it, no decrease/stall for 10 s, viewer age within 1.5x floor) and remember the pair's stable rate so the next session opens there. Built-in default: on. Env: ROOMLERD_RELAY_CEILING_LEARN. Restart required.",
+    ),
+    (
+        "relay_max_hi_kbps",
+        "string",
+        "FR-35 - upper bound (kbps, 0-100000) for the learned relay ceiling. Empty = built-in 8000 (one pair measured: sustained 6-9 Mbps, choked at 12.8); 0 = learning off. Env: ROOMLERD_RELAY_MAX_HI_KBPS. Restart required.",
     ),
     (
         "idle_refine_max_edge",
         "string",
-        "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLER_NODE_IDLE_REFINE_MAX_EDGE. Restart required.",
+        "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLERD_IDLE_REFINE_MAX_EDGE. Restart required.",
     ),
     (
         "idle_refine_min_frame_kb",
         "string",
-        "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Defined at the 1024x640 reference rung and scaled by the live encode area (P7c-2 - a fixed floor oscillated across rungs). Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLER_NODE_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
+        "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Defined at the 1024x640 reference rung and scaled by the live encode area (P7c-2 - a fixed floor oscillated across rungs). Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLERD_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
     ),
     (
         "idle_refine_major_area_permille",
         "string",
-        "P8a-2 - MAJOR-motion area floor (permille of the frame, 0-1000) on capture-tracked backends (DXGI-direct/WGC): only damage at/above it restores the resolution cap; smaller damage (typing, popups, windowed terminal scrolls, PiP video) stays at native so text is sharp all the time. Empty = built-in 400 (40%); 0 = any non-empty tracked damage counts (pre-P8a-2 posture). Env: ROOMLER_NODE_IDLE_REFINE_MAJOR_AREA_PERMILLE. Restart required.",
+        "P8a-2 - MAJOR-motion area floor (permille of the frame, 0-1000) on capture-tracked backends (DXGI-direct/WGC): only damage at/above it restores the resolution cap; smaller damage (typing, popups, windowed terminal scrolls, PiP video) stays at native so text is sharp all the time. Empty = built-in 400 (40%); 0 = any non-empty tracked damage counts (pre-P8a-2 posture). Env: ROOMLERD_IDLE_REFINE_MAJOR_AREA_PERMILLE. Restart required.",
     ),
     (
         "idle_refine_settle_ms",
         "string",
-        "P8a-2 - up-flip settle (ms, 100-5000) on capture-tracked backends: the cap lifts this long after the last major-damage frame (damage truth needs no 1s window drain). Empty = built-in 500. Env: ROOMLER_NODE_IDLE_REFINE_SETTLE_MS. Restart required.",
+        "P8a-2 - up-flip settle (ms, 100-5000) on capture-tracked backends: the cap lifts this long after the last major-damage frame (damage truth needs no 1s window drain). Empty = built-in 500. Env: ROOMLERD_IDLE_REFINE_SETTLE_MS. Restart required.",
     ),
     (
         "idle_refine_settle_constrained_ms",
         "string",
-        "Phase B - tracked settle (ms, 100-10000) on CONSTRAINED transports: the cap lifts only after this long without major damage, because the refined IDR itself costs link time and a 500 ms settle fired on ordinary drag pauses (field: freezing/lag). Empty = built-in 1200 (2000 before the constrained HRD trim bounded the IDR). Env: ROOMLER_NODE_IDLE_REFINE_SETTLE_CONSTRAINED_MS. Restart required.",
+        "Phase B - tracked settle (ms, 100-10000) on CONSTRAINED transports: the cap lifts only after this long without major damage, because the refined IDR itself costs link time and a 500 ms settle fired on ordinary drag pauses (field: freezing/lag). Empty = built-in 1200 (2000 before the constrained HRD trim bounded the IDR). Env: ROOMLERD_IDLE_REFINE_SETTLE_CONSTRAINED_MS. Restart required.",
     ),
     (
         "constrained_cq_relief",
         "string",
-        "Constrained-motion CQ relief (softening steps, 0-12) applied at the resolution rung of a RELAY session; the rung exists for motion fluidity and softer frames arrive steadily instead of in lumps (field 2026-08-21: the sharpening bias at the rung was the 9 fps equilibrium). At-rest native quality is untouched; an explicit resolution pick is exempt. Empty = built-in 4; 0 = no relief. Env: ROOMLER_NODE_CONSTRAINED_CQ_RELIEF. Restart required.",
+        "Constrained-motion CQ relief (softening steps, 0-12) applied at the resolution rung of a RELAY session; the rung exists for motion fluidity and softer frames arrive steadily instead of in lumps (field 2026-08-21: the sharpening bias at the rung was the 9 fps equilibrium). At-rest native quality is untouched; an explicit resolution pick is exempt. Empty = built-in 4; 0 = no relief. Env: ROOMLERD_CONSTRAINED_CQ_RELIEF. Restart required.",
     ),
     (
         "constrained_queue_ms",
         "string",
-        "Constrained send-queue byte budget (ms of the relay ceiling, 0-2000): frame production skips while more than this much link time is queued, converting viewer lag into a small fps reduction (field 2026-08-21: the drag-start freeze was ~0.5-1 MB of native motion frames queued on a ~2 Mbps relay). Empty = built-in 450; 0 = unbounded (pre-rc.442). Env: ROOMLER_NODE_CONSTRAINED_QUEUE_MS. Restart required.",
+        "Constrained send-queue byte budget (ms of the relay ceiling, 0-2000): frame production skips while more than this much link time is queued, converting viewer lag into a small fps reduction (field 2026-08-21: the drag-start freeze was ~0.5-1 MB of native motion frames queued on a ~2 Mbps relay). Empty = built-in 450; 0 = unbounded (pre-rc.442). Env: ROOMLERD_CONSTRAINED_QUEUE_MS. Restart required.",
     ),
     (
         "constrained_hrd_pct",
         "string",
-        "HRD/VBV window for CONSTRAINED sessions (percent of maxrate, 25-200). Empty = built-in 200 (the rc.234 2x window; rc.442 defaulted 75 to bound IDR transit and rc.443 reverted it - av1_qsv errors and hangs on a forced IDR that exceeds a sub-1x reservoir). Sub-100 values are per-host experiments only. Env: ROOMLER_NODE_CONSTRAINED_HRD_PCT. Restart required.",
+        "HRD/VBV window for CONSTRAINED sessions (percent of maxrate, 25-200). Empty = built-in 200 (the rc.234 2x window; rc.442 defaulted 75 to bound IDR transit and rc.443 reverted it - av1_qsv errors and hangs on a forced IDR that exceeds a sub-1x reservoir). Sub-100 values are per-host experiments only. Env: ROOMLERD_CONSTRAINED_HRD_PCT. Restart required.",
     ),
     (
         "direct_queue_ms",
         "string",
-        "DIRECT-path send-queue byte budget (ms of the AIMD's live target, 0-2000): frame production skips while more than this much link time is queued, bounding the standing lag a drag burst can build on a direct session (field 2026-08-26: 100-345 KB queued = the sluggish, rubber-band drag). Empty = built-in 150; 0 = unbounded (pre-P1 posture). Env: ROOMLER_NODE_DIRECT_QUEUE_MS. Restart required.",
+        "DIRECT-path send-queue byte budget (ms of the AIMD's live target, 0-2000): frame production skips while more than this much link time is queued, bounding the standing lag a drag burst can build on a direct session (field 2026-08-26: 100-345 KB queued = the sluggish, rubber-band drag). Empty = built-in 150; 0 = unbounded (pre-P1 posture). Env: ROOMLERD_DIRECT_QUEUE_MS. Restart required.",
     ),
     (
         "direct_hrd_pct",
         "string",
-        "HRD/VBV window for DIRECT sessions (percent of maxrate, 25-200). Empty = built-in 100 - half the rc.234 2x window, which legalised drag-start bursts of seconds' worth of bits (the standing-queue lag). av1_* encoders are floored at 200 regardless (rc.443: Intel AV1 VDENC errors on an over-reservoir IDR instead of QP-clamping). Env: ROOMLER_NODE_DIRECT_HRD_PCT. Restart required.",
+        "HRD/VBV window for DIRECT sessions (percent of maxrate, 25-200). Empty = built-in 100 - half the rc.234 2x window, which legalised drag-start bursts of seconds' worth of bits (the standing-queue lag). av1_* encoders are floored at 200 regardless (rc.443: Intel AV1 VDENC errors on an over-reservoir IDR instead of QP-clamping). Env: ROOMLERD_DIRECT_HRD_PCT. Restart required.",
     ),
     (
         "bg_rebuild",
         "tribool",
-        "Background encoder rebuild (2026-08-27, drag-latency P3). Default ON: on encoders with no in-place bitrate reconfigure (QSV/AMF), a bitrate change opens the replacement on a blocking thread while the current encoder keeps producing, then swaps between frames - no mid-drag stall, and rate drops land DURING motion as smaller frames instead of production skips. false = the rc.445 motion-defer (applies held until 1.2s of quiet, then a blocking re-open). Env: ROOMLER_NODE_BG_REBUILD. Restart required.",
+        "Background encoder rebuild (2026-08-27, drag-latency P3). Default ON: on encoders with no in-place bitrate reconfigure (QSV/AMF), a bitrate change opens the replacement on a blocking thread while the current encoder keeps producing, then swaps between frames - no mid-drag stall, and rate drops land DURING motion as smaller frames instead of production skips. false = the rc.445 motion-defer (applies held until 1.2s of quiet, then a blocking re-open). Env: ROOMLERD_BG_REBUILD. Restart required.",
     ),
     (
         "par_convert",
         "tribool",
-        "Parallel colour conversion (2026-08-27, drag-latency P5). Default ON: big frames run the BGRA->NV12/I444 convert in row bands across threads - byte-identical output, roughly halves the convert share of encode time at 2880x1800+. false = single-threaded convert. Env: ROOMLER_NODE_PAR_CONVERT. Restart required.",
+        "Parallel colour conversion (2026-08-27, drag-latency P5). Default ON: big frames run the BGRA->NV12/I444 convert in row bands across threads - byte-identical output, roughly halves the convert share of encode time at 2880x1800+. false = single-threaded convert. Env: ROOMLERD_PAR_CONVERT. Restart required.",
     ),
     (
         "fps_pace",
         "tribool",
-        "fps-first cadence pacing on HW encoders (2026-08-27, drag-latency P5). Default ON: when the encoder cannot hold target fps, frames are consumed on an EVEN grid at the sustainable rate (5 fps steps, floor 15) instead of dropping ~33% at random phases - even cadence beats a jittery higher rate. While engaged the encode-pressure bitrate factor is masked at 1.0 (pixels-bound HW encode time does not respond to bitrate); the resolution tier stays the second lever. false = unpaced pre-P5 behaviour. Env: ROOMLER_NODE_FPS_PACE. Restart required.",
+        "fps-first cadence pacing on HW encoders (2026-08-27, drag-latency P5). Default ON: when the encoder cannot hold target fps, frames are consumed on an EVEN grid at the sustainable rate (5 fps steps, floor 15) instead of dropping ~33% at random phases - even cadence beats a jittery higher rate. While engaged the encode-pressure bitrate factor is masked at 1.0 (pixels-bound HW encode time does not respond to bitrate); the resolution tier stays the second lever. false = unpaced pre-P5 behaviour. Env: ROOMLERD_FPS_PACE. Restart required.",
     ),
     (
         "relay_idr_thrift",
         "tribool",
-        "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CORPLAP-3 bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_IDR_THRIFT. Restart required.",
+        "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CORPLAP-3 bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLERD_RELAY_IDR_THRIFT. Restart required.",
+    ),
+    (
+        "send_stall_ms",
+        "number",
+        "Blocked-send congestion threshold in ms (2026-08-28, FR-15 P2 follow-up). Default 250; 0 disables. A frame that sat longer than this inside the DataChannel send call is unambiguous congestion - the pipe refused to drain - and the pump feeds the AIMD a congestion sample. This is the one congestion signal that needs NO clock sync and NO viewer and works on both transports, which matters on a relay where the measured-rate clamp is direct-only and the age loop rides a probe the congestion itself biases. Acted on for CONSTRAINED sessions only; direct keeps the measured ceiling. Env: ROOMLER_NODE_SEND_STALL_MS. Restart required.",
     ),
     (
         "relay_age_feedback",
         "tribool",
-        "Relay age feedback (2026-08-27, FR-15). Default ON: the viewer reports the true paint AGE of the frames it showed (the FR-1 P7 clock probe) on its rc:decodestat window; the agent learns the session's age FLOOR and treats sustained excess (>=70ms over floor for 2 consecutive windows) on a CONSTRAINED transport as over-rate - capping send-fps and feeding the AIMD a congestion sample, so the decrease lands through the normal (FR-10-deferred) apply path. It exists because a relay backlog sits BELOW every agent counter: the field measured 1000ms of viewer age against a 26KB agent queue. false = open-loop 0.4.7 relay posture. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_AGE_FEEDBACK. Restart required.",
+        "Relay age feedback (2026-08-27, FR-15). Default ON: the viewer reports the true paint AGE of the frames it showed (the FR-1 P7 clock probe) on its rc:decodestat window; the agent learns the session's age FLOOR and treats sustained excess (>=70ms over floor for 2 consecutive windows) on a CONSTRAINED transport as over-rate - capping send-fps and feeding the AIMD a congestion sample, so the decrease lands through the normal (FR-10-deferred) apply path. It exists because a relay backlog sits BELOW every agent counter: the field measured 1000ms of viewer age against a 26KB agent queue. false = open-loop 0.4.7 relay posture. Direct sessions unaffected. Env: ROOMLERD_RELAY_AGE_FEEDBACK. Restart required.",
     ),
     (
         "measured_ceiling",
         "tribool",
-        "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLER_NODE_MEASURED_CEILING. Restart required.",
+        "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLERD_MEASURED_CEILING. Restart required.",
     ),
     (
         "area_min_bitrate",
         "tribool",
-        "Area-scaled AIMD bitrate floor (2026-08-26). Default ON: the flat 1.5 Mbps floor was a 1080p legibility tuning and is unreadable mush at 5+ MPix; the scaled floor is ~3.1 Mbps at 2880x1800, capped 4 Mbps, unconstrained sessions only (a relay's 3 Mbps clamp keeps the flat floor so the MD keeps room). false = flat 1.5 Mbps floor. Env: ROOMLER_NODE_AREA_MIN_BITRATE. Restart required.",
+        "Area-scaled AIMD bitrate floor (2026-08-26). Default ON: the flat 1.5 Mbps floor was a 1080p legibility tuning and is unreadable mush at 5+ MPix; the scaled floor is ~3.1 Mbps at 2880x1800, capped 4 Mbps, unconstrained sessions only (a relay's 3 Mbps clamp keeps the flat floor so the MD keeps room). false = flat 1.5 Mbps floor. Env: ROOMLERD_AREA_MIN_BITRATE. Restart required.",
     ),
     (
         "priority_res_cap",
         "tribool",
-        "rc.445 - restore the pre-rc.445 Priority-dial resolution caps (Smoother 1024 everywhere / Balanced 1280 on relay). Default OFF: every mid-motion rung flip costs a blocking encoder open (0.65-0.87s measured on Iris Xe) and the field verdict was that never flipping beats the rung; the dial's bit-shedding moved to the ceiling factors. Env: ROOMLER_NODE_PRIORITY_RES_CAP. Restart required.",
+        "rc.445 - restore the pre-rc.445 Priority-dial resolution caps (Smoother 1024 everywhere / Balanced 1280 on relay). Default OFF: every mid-motion rung flip costs a blocking encoder open (0.65-0.87s measured on Iris Xe) and the field verdict was that never flipping beats the rung; the dial's bit-shedding moved to the ceiling factors. Env: ROOMLERD_PRIORITY_RES_CAP. Restart required.",
     ),
     (
         "smoother_rate_pct",
         "string",
-        "rc.445 - Smoother's bitrate-ceiling factor (percent, 30-100): a lower ceiling makes the HRD raise QP during motion continuously (smaller frames, steadier fps) with ZERO encoder rebuilds; at-rest quality untouched. Empty = built-in 70. Env: ROOMLER_NODE_SMOOTHER_RATE_PCT. Restart required.",
+        "rc.445 - Smoother's bitrate-ceiling factor (percent, 30-100): a lower ceiling makes the HRD raise QP during motion continuously (smaller frames, steadier fps) with ZERO encoder rebuilds; at-rest quality untouched. Empty = built-in 70. Env: ROOMLERD_SMOOTHER_RATE_PCT. Restart required.",
     ),
     (
         "balanced_rate_pct",
         "string",
-        "rc.445 - Balanced's bitrate-ceiling factor (percent, 30-100). Empty = built-in 85. Env: ROOMLER_NODE_BALANCED_RATE_PCT. Restart required.",
+        "rc.445 - Balanced's bitrate-ceiling factor (percent, 30-100). Empty = built-in 85. Env: ROOMLERD_BALANCED_RATE_PCT. Restart required.",
     ),
     (
         "scale_threads",
         "string",
-        "HW-downscale Phase A - worker threads (1-8) for the CPU resampler's row-banded passes; a lever for weak hosts where the Smoother rung's downscale eats the frame budget. Empty = built-in 1 (inline, no threads). Env: ROOMLER_NODE_SCALE_THREADS. Restart required.",
+        "HW-downscale Phase A - worker threads (1-8) for the CPU resampler's row-banded passes; a lever for weak hosts where the Smoother rung's downscale eats the frame budget. Empty = built-in 1 (inline, no threads). Env: ROOMLERD_SCALE_THREADS. Restart required.",
     ),
     (
         "ice_follow_renomination",
@@ -552,27 +599,27 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_tier_detect",
         "tribool",
-        "Clamp media bitrate when the overlay carrier under a nominated pair is relay-tier. Built-in default: on. Env: ROOMLER_NODE_OVERLAY_TIER_DETECT.",
+        "Clamp media bitrate when the overlay carrier under a nominated pair is relay-tier. Built-in default: on. Env: ROOMLERD_OVERLAY_TIER_DETECT.",
     ),
     (
         "overlay_rtt_q",
         "tribool",
-        "B1 - feed the 15 s overlay RTT probes into the PathMonitor quality plane (Q-only, never eligibility). Built-in default: on. Env: ROOMLER_AGENT_OVERLAY_RTT_Q.",
+        "B1 - feed the 15 s overlay RTT probes into the PathMonitor quality plane (Q-only, never eligibility). Built-in default: on. Env: ROOMLERD_OVERLAY_RTT_Q.",
     ),
     (
         "overlay_upward_probe",
         "tribool",
-        "B3 - probe an eligible higher tier from a healthy srflx/public incumbent every >=120 s (MBB; incumbent held until latch). Built-in default: on. Env: ROOMLER_AGENT_OVERLAY_UPWARD_PROBE.",
+        "B3 - probe an eligible higher tier from a healthy srflx/public incumbent every >=120 s (MBB; incumbent held until latch). Built-in default: on. Env: ROOMLERD_OVERLAY_UPWARD_PROBE.",
     ),
     (
         "relay_probe",
         "tribool",
-        "Multi-region relay PoPs - probe the server-pushed region list (timed STUN per PoP) and report RTTs; the server derives this node's relay_home from them. Built-in default: on. Env: ROOMLER_NODE_RELAY_PROBE.",
+        "Multi-region relay PoPs - probe the server-pushed region list (timed STUN per PoP) and report RTTs; the server derives this node's relay_home from them. Built-in default: on. Env: ROOMLERD_RELAY_PROBE.",
     ),
     (
         "text_mod_neutralize",
         "tribool",
-        "KeyText typing: temporarily release physically-held Shift/Ctrl/Alt the remote layout does not want around each character tap (fixes wrong/dead symbols on non-US layouts). Built-in default: on. Env: ROOMLER_NODE_TEXT_MOD_NEUTRALIZE. Restart required.",
+        "KeyText typing: temporarily release physically-held Shift/Ctrl/Alt the remote layout does not want around each character tap (fixes wrong/dead symbols on non-US layouts). Built-in default: on. Env: ROOMLERD_TEXT_MOD_NEUTRALIZE. Restart required.",
     ),
     (
         "forward_acl",
@@ -645,7 +692,10 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_derp" => cfg.overlay_derp.map(fmt_bool),
         "overlay_server_relay_strategy" => cfg.overlay_server_relay_strategy.map(fmt_bool),
         "overlay_derp_floor" => cfg.overlay_derp_floor.map(fmt_bool),
+        "overlay_org_relay" => cfg.overlay_org_relay.map(fmt_bool),
         "overlay_netcheck" => cfg.overlay_netcheck.map(fmt_bool),
+        "relay_server_enabled" => cfg.relay_server_enabled.map(fmt_bool),
+        "relay_server_port" => cfg.relay_server_port.map(|v| v.to_string()),
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback.map(fmt_bool),
         "tunnel_peers_survive_reattach" => cfg.tunnel_peers_survive_reattach.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
@@ -697,7 +747,10 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "idle_refine" => cfg.idle_refine.map(fmt_bool),
         "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
         "gpu_scale" => cfg.gpu_scale.map(fmt_bool),
+        "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe.map(fmt_bool),
+        "relay_ceiling_learn" => cfg.relay_ceiling_learn.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
+        "relay_max_hi_kbps" => cfg.relay_max_hi_kbps.map(|p| p.to_string()),
         "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
         "idle_refine_major_area_permille" => {
             cfg.idle_refine_major_area_permille.map(|p| p.to_string())
@@ -718,6 +771,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "fps_pace" => cfg.fps_pace.map(fmt_bool),
         "relay_idr_thrift" => cfg.relay_idr_thrift.map(fmt_bool),
         "relay_age_feedback" => cfg.relay_age_feedback.map(fmt_bool),
+        "send_stall_ms" => cfg.send_stall_ms.map(|v| v.to_string()),
         "priority_res_cap" => cfg.priority_res_cap.map(fmt_bool),
         "smoother_rate_pct" => cfg.smoother_rate_pct.map(|p| p.to_string()),
         "balanced_rate_pct" => cfg.balanced_rate_pct.map(|p| p.to_string()),
@@ -871,7 +925,27 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             cfg.overlay_server_relay_strategy = parse_tribool(value)?
         }
         "overlay_derp_floor" => cfg.overlay_derp_floor = parse_tribool(value)?,
+        "overlay_org_relay" => cfg.overlay_org_relay = parse_tribool(value)?,
         "overlay_netcheck" => cfg.overlay_netcheck = parse_tribool(value)?,
+        "relay_server_enabled" => cfg.relay_server_enabled = parse_tribool(value)?,
+        "relay_server_port" => {
+            cfg.relay_server_port = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let n: u32 = v
+                        .parse()
+                        .map_err(|_| format!("relay_server_port must be a number (got {v:?})"))?;
+                    // No 0-means-ephemeral escape hatch here, deliberately: a
+                    // relay peers must be able to FIND is useless on a port the
+                    // operator cannot state, and 3478 is the only port E2E-3
+                    // measured the target population reaching.
+                    if n == 0 || n > 65535 {
+                        return Err(format!("relay_server_port must be 1-65535 (got {n})"));
+                    }
+                    Some(n)
+                }
+            }
+        }
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback = parse_tribool(value)?,
         "tunnel_peers_survive_reattach" => {
             cfg.tunnel_peers_survive_reattach = parse_tribool(value)?
@@ -1049,7 +1123,10 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine" => cfg.idle_refine = parse_tribool(value)?,
         "idle_refine_balanced" => cfg.idle_refine_balanced = parse_tribool(value)?,
         "gpu_scale" => cfg.gpu_scale = parse_tribool(value)?,
+        "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe = parse_tribool(value)?,
+        "relay_ceiling_learn" => cfg.relay_ceiling_learn = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
+        "relay_max_hi_kbps" => cfg.relay_max_hi_kbps = parse_u32_range(key, value, 0, 100_000)?,
         "idle_refine_min_frame_kb" => {
             cfg.idle_refine_min_frame_kb = parse_u32_range(key, value, 0, 256)?
         }
@@ -1074,6 +1151,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "fps_pace" => cfg.fps_pace = parse_tribool(value)?,
         "relay_idr_thrift" => cfg.relay_idr_thrift = parse_tribool(value)?,
         "relay_age_feedback" => cfg.relay_age_feedback = parse_tribool(value)?,
+        "send_stall_ms" => cfg.send_stall_ms = parse_u32_range(key, value, 0, 10_000)?,
         "priority_res_cap" => cfg.priority_res_cap = parse_tribool(value)?,
         "smoother_rate_pct" => cfg.smoother_rate_pct = parse_u32_range(key, value, 30, 100)?,
         "balanced_rate_pct" => cfg.balanced_rate_pct = parse_u32_range(key, value, 30, 100)?,

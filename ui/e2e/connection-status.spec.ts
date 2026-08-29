@@ -69,14 +69,21 @@ test.describe('Connection Status', () => {
   test('WebSocket connects successfully after login', async ({ page }) => {
     // Listen for WebSocket connections
     const wsPromise = page.waitForEvent('websocket', {
-      predicate: (ws) => ws.url().includes('/ws?token='),
+      // The app dials `/ws`, optionally `?tid=<tenant>`. The token USED to be
+      // in this URL and deliberately is not any more (#691) — a query string
+      // reaches access logs and `Referer`. Match on the PATH; the assertions
+      // below then lock the new property instead of the retired one.
+      predicate: (ws) => new URL(ws.url()).pathname === '/ws',
       timeout: 15000,
     })
 
     await loginViaUi(page, user.username, user.password)
 
     const ws = await wsPromise
-    expect(ws.url()).toContain('/ws?token=')
+    expect(new URL(ws.url()).pathname).toBe('/ws')
+    expect(ws.url()).not.toContain('token=')
+    await page.waitForTimeout(2000)
+    expect(ws.isClosed(), 'the /ws upgrade was refused or dropped').toBe(false)
   })
 
   test('no WebSocket console errors during normal operation', async ({ page }) => {

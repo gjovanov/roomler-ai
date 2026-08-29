@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest'
 
 // Pure helpers exported for testing. We can't import the full composable
@@ -41,7 +43,8 @@ import {
   parseNativeClipPayload,
   bytesToBase64,
   VP9_444_DC_LABEL,
-  VP9_444_DC_OPTIONS,
+  videoDcOptions,
+  storedUnorderedVideo,
   readStoredAudioEnabled,
   persistAudioEnabled,
   audioRequestFields,
@@ -57,6 +60,7 @@ import {
   RC_STALL_PROBE_TICKS,
   RC_STALL_FAIL_TICKS,
   isRetryableTerminateReason,
+  friendlyEndReason,
   isRetryableRcErrorCode,
   readyRecoveryAction,
   sessionGateAllows,
@@ -97,6 +101,9 @@ import {
   diagHudEnabled,
   remoteCursorCssFor,
   storedSharpenMode,
+  storedMetricToggles,
+  persistMetricToggles,
+  DEFAULT_RC_METRICS,
   storedSharpness,
   HEVC_REXT_CODEC_STRING,
   translateModifierForHost,
@@ -1348,7 +1355,7 @@ describe('normalizeClipboardText (clipboard v2)', () => {
 describe('clipboard FNV-1a 64 hashes (clipboard v2)', () => {
   it('matches the published FNV-1a 64 vectors the agent locks too', () => {
     // Same vectors as clipboard::tests::fnv1a64_matches_published_vectors
-    // in agents/roomler-agent/src/clipboard.rs — echo suppression
+    // in agents/roomlerd/src/clipboard.rs — echo suppression
     // silently breaks if either side drifts.
     expect(hashClipboardBytes(new Uint8Array(0))).toBe('cbf29ce484222325')
     expect(hashClipboardBytes(new TextEncoder().encode('a'))).toBe('af63dc4c8601ec8c')
@@ -1570,21 +1577,58 @@ describe('buildClipboardImageFrames (clipboard v2)', () => {
   })
 })
 
-describe('VP9_444_DC_LABEL + VP9_444_DC_OPTIONS', () => {
+describe('VP9_444_DC_LABEL + videoDcOptions', () => {
   // The agent's `on_data_channel` arm matches on `"video-bytes"`
-  // exactly (see agents/roomler-agent/src/peer.rs:494). A typo on
+  // exactly (see agents/roomlerd/src/peer.rs:494). A typo on
   // either side silently turns the entire VP9-444 path into a
   // log-only dead end, so lock the value here.
   it('uses the exact label the agent matches on', () => {
     expect(VP9_444_DC_LABEL).toBe('video-bytes')
   })
 
-  // Reliable + ordered: SCTP retransmits dropped chunks (a P-frame
-  // hole would force the decoder to wait for the next IDR), and
-  // libvpx wants frames in encode order. Don't relax these without
-  // also bumping the worker assembler tests.
-  it('uses the reliable + ordered DC profile', () => {
-    expect(VP9_444_DC_OPTIONS).toEqual({ ordered: true })
+  // FR-17 stage B. The historical profile stays the default: reliable +
+  // ordered, because without framing SCTP's arrival order IS the
+  // reassembly and nothing else can recover it.
+  it('defaults to the reliable + ordered profile', () => {
+    expect(videoDcOptions(false, false)).toEqual({ ordered: true })
+    expect(videoDcOptions(true, false)).toEqual({ ordered: true })
+  })
+
+  // ⚠️ The invariant this function exists for. An unframed stream
+  // delivered out of order is not a degraded picture — it is garbage the
+  // decoder reports as corruption, because a bare byte stream has no way
+  // to tell "rest of this frame" from "start of the next". Asking for
+  // unordered without framing must therefore be REFUSED, not honoured.
+  it('refuses to go unordered without framing', () => {
+    expect(videoDcOptions(false, true)).toEqual({ ordered: true })
+  })
+
+  it('goes unordered with no retransmits once framing is negotiated', () => {
+    // maxRetransmits: 0 is coupled to stage A's assembler, which treats a
+    // chunk-index jump as unrecoverable. A retransmitted chunk arriving
+    // an RTT late would be discarded as a gap — so 1-2 retransmits
+    // (stage C) needs a reorder buffer first and is NOT a number that
+    // can be turned up on its own.
+    expect(videoDcOptions(true, true)).toEqual({ ordered: false, maxRetransmits: 0 })
+  })
+})
+
+describe('FR-17 stage B opt-in', () => {
+  beforeEach(() => {
+    globalThis.localStorage?.clear()
+  })
+
+  it('is off unless explicitly enabled', () => {
+    expect(storedUnorderedVideo()).toBe(false)
+    globalThis.localStorage?.setItem('roomler-rc-unordered-video', '0')
+    expect(storedUnorderedVideo()).toBe(false)
+    globalThis.localStorage?.setItem('roomler-rc-unordered-video', 'true')
+    expect(storedUnorderedVideo()).toBe(false)
+  })
+
+  it('turns on for exactly the documented value', () => {
+    globalThis.localStorage?.setItem('roomler-rc-unordered-video', '1')
+    expect(storedUnorderedVideo()).toBe(true)
   })
 })
 
@@ -2005,11 +2049,13 @@ describe('parseControlInbound', () => {
     // Agent's fetch_tail() failed path (e.g. log file rotated mid-
     // read). Browser surfaces the message in a red caption.
     const r = parseControlInbound(
-      '{"t":"rc:logs-fetch.reply","ok":false,"error":"no roomler-agent.log* file"}'
+      // RETIRED-NAME-ANCHOR(6): mirrors the daemon's real message, which names
+      // BOTH prefixes because an upgraded host still has pre-rename log files.
+      '{"t":"rc:logs-fetch.reply","ok":false,"error":"no roomlerd.log* or roomler-agent.log* file"}'
     )
     expect(r).toEqual({
       kind: 'logs_fetch_reply',
-      reply: { ok: false, error: 'no roomler-agent.log* file' },
+      reply: { ok: false, error: 'no roomlerd.log* or roomler-agent.log* file' },
     })
   })
 
@@ -2866,6 +2912,37 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
     }
   })
 
+  it('FR-27: carries a pending floor request, and degrades to null without one', () => {
+    const waiting = parseControlInbound(
+      '{"t":"rc:control.state","mode":"exclusive","holder":"aabbccdd00112233aabbccdd","participants":[],"pending_request":{"session":"ffeeddcc00112233aabbccdd","name":"Ana"}}',
+    )
+    expect(waiting?.kind).toBe('control_state')
+    if (waiting?.kind === 'control_state') {
+      expect(waiting.state.pendingRequest).toEqual({
+        session: 'ffeeddcc00112233aabbccdd',
+        name: 'Ana',
+      })
+    }
+
+    // A pre-FR-27 agent omits the key entirely. That is indistinguishable from
+    // "nothing pending", which is the correct degradation: the whole chip
+    // self-hides rather than rendering an empty one.
+    const older = parseControlInbound(
+      '{"t":"rc:control.state","mode":"exclusive","holder":null,"participants":[]}',
+    )
+    if (older?.kind === 'control_state') expect(older.state.pendingRequest).toBeNull()
+
+    // An explicit null, and a malformed object, must not throw either.
+    for (const raw of [
+      '{"t":"rc:control.state","mode":"free","holder":null,"participants":[],"pending_request":null}',
+      '{"t":"rc:control.state","mode":"free","holder":null,"participants":[],"pending_request":{"name":"no session id"}}',
+    ]) {
+      const p = parseControlInbound(raw)
+      expect(p?.kind).toBe('control_state')
+      if (p?.kind === 'control_state') expect(p.state.pendingRequest).toBeNull()
+    }
+  })
+
   it('defaults native dims to 0 for older agents that omit them (back-compat)', () => {
     const parsed = parseControlInbound(
       '{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct"}',
@@ -3297,6 +3374,10 @@ describe('S3 resilience: isRetryableTerminateReason', () => {
       'agent_hangup',
       'user_denied',
       'consent_timeout',
+      // FR-27 - a device with no prompt surface would answer the retry the
+      // same way, so retrying is pure noise. Terminal by the allowlist's
+      // fail-safe default; asserted here so it stays deliberate.
+      'no_prompt_surface',
       'admin_terminated',
       'idle_timeout',
     ]) {
@@ -3309,6 +3390,31 @@ describe('S3 resilience: isRetryableTerminateReason', () => {
     expect(isRetryableTerminateReason(null)).toBe(false)
     expect(isRetryableTerminateReason('')).toBe(false)
     expect(isRetryableTerminateReason('some_future_reason')).toBe(false)
+  })
+})
+
+describe('FR-27: friendlyEndReason', () => {
+  it('tells the three consent outcomes apart', () => {
+    const denied = friendlyEndReason('user_denied')!
+    const timedOut = friendlyEndReason('consent_timeout')!
+    const noSurface = friendlyEndReason('no_prompt_surface')!
+    expect(new Set([denied, timedOut, noSurface]).size).toBe(3)
+    // The whole point of the wire change: a timeout must not read as a
+    // refusal. It says so out loud, because that IS what it used to say.
+    expect(timedOut).toMatch(/nobody answered/i)
+    expect(timedOut).toMatch(/nothing was declined/i)
+    expect(denied).toMatch(/declined/i)
+    expect(denied).not.toMatch(/nobody answered/i)
+    // And "nobody could be asked" has to name a fix the operator can act on.
+    expect(noSurface).toMatch(/desktop app|email/i)
+  })
+
+  it('stays silent on a nominal ending', () => {
+    for (const r of ['controller_hangup', 'agent_hangup', 'idle_timeout', 'agent_disconnect']) {
+      expect(friendlyEndReason(r)).toBeNull()
+    }
+    expect(friendlyEndReason(undefined)).toBeNull()
+    expect(friendlyEndReason('some_future_reason')).toBeNull()
   })
 })
 
@@ -3632,8 +3738,8 @@ describe('P7 — FSR sharpening sizing policy (computeRenderTarget)', () => {
     expect(normalizeSharpenMode('auto')).toBe('auto')
     expect(normalizeSharpenMode('on')).toBe('on')
     expect(normalizeSharpenMode('off')).toBe('off')
-    expect(normalizeSharpenMode('banana')).toBe('auto')
-    expect(normalizeSharpenMode(null)).toBe('auto')
+    expect(normalizeSharpenMode('banana')).toBe('on') // FR-26: default is now ON
+    expect(normalizeSharpenMode(null)).toBe('on')
     expect(normalizeSharpness('0.25')).toBe(0.25)
     expect(normalizeSharpness(1.5)).toBe(1.5)
     expect(normalizeSharpness('9')).toBe(2)
@@ -3667,14 +3773,69 @@ describe('P7 — FSR localStorage knobs', () => {
     localStorage.removeItem('roomler-rc-fsr-sharpness')
   })
 
-  it('storedSharpenMode defaults to auto and honours on/off', () => {
-    expect(storedSharpenMode()).toBe('auto')
+  // FR-26 flipped the default from 'auto' (sharpen only when upscaling) to
+  // 'on' — the viewer is used for text far more than for video.
+  it('storedSharpenMode defaults to ON and honours auto/off', () => {
+    expect(storedSharpenMode()).toBe('on')
     localStorage.setItem('roomler-rc-sharpen', 'off')
     expect(storedSharpenMode()).toBe('off')
-    localStorage.setItem('roomler-rc-sharpen', 'on')
-    expect(storedSharpenMode()).toBe('on')
-    localStorage.setItem('roomler-rc-sharpen', 'banana')
+    localStorage.setItem('roomler-rc-sharpen', 'auto')
     expect(storedSharpenMode()).toBe('auto')
+    localStorage.setItem('roomler-rc-sharpen', 'banana')
+    expect(storedSharpenMode()).toBe('on')
+  })
+
+  // FR-26 — per-pill toolbar toggles.
+  it('storedMetricToggles: everything on except the pipeline HUD', () => {
+    const m = storedMetricToggles()
+    expect(m).toEqual({
+      codec: true,
+      bitrate: true,
+      fps: true,
+      resolution: true,
+      age: true,
+      paint: false,
+    })
+    expect(m).toEqual(DEFAULT_RC_METRICS)
+  })
+
+  it('storedMetricToggles falls back PER KEY, so a stored older shape still works', () => {
+    // Written by a build that only knew three pills: the keys it never
+    // heard of must read as their defaults, not as false.
+    localStorage.setItem(
+      'roomler-rc-metrics',
+      JSON.stringify({ codec: false, bitrate: true, paint: true }),
+    )
+    expect(storedMetricToggles()).toEqual({
+      codec: false,
+      bitrate: true,
+      fps: true,
+      resolution: true,
+      age: true,
+      paint: true,
+    })
+  })
+
+  it('storedMetricToggles survives corrupt or hostile storage', () => {
+    for (const junk of ['{not json', '[]', 'null', '42', '"nope"']) {
+      localStorage.setItem('roomler-rc-metrics', junk)
+      expect(storedMetricToggles()).toEqual(DEFAULT_RC_METRICS)
+    }
+  })
+
+  it('paint inherits the legacy roomler-rc-diag-hud flag exactly once', () => {
+    // Anyone who set the undiscoverable flag by hand keeps their HUD; once
+    // the checkbox is used, the stored object wins.
+    localStorage.setItem('roomler-rc-diag-hud', '1')
+    expect(storedMetricToggles().paint).toBe(true)
+    persistMetricToggles({ ...DEFAULT_RC_METRICS, paint: false })
+    expect(storedMetricToggles().paint).toBe(false)
+  })
+
+  it('persistMetricToggles round-trips through storage', () => {
+    const wanted = { ...DEFAULT_RC_METRICS, fps: false, age: false, paint: true }
+    persistMetricToggles(wanted)
+    expect(storedMetricToggles()).toEqual(wanted)
   })
 
   it('storedSharpness defaults to 0.25 and clamps overrides', () => {

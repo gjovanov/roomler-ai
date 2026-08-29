@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! ACL evaluation primitives.
 //!
 //! Data shapes are canonical in `roomler_ai_remote_control::models`
@@ -256,7 +258,7 @@ pub fn check_forward_request(
 
 // `dst_matches` / `host_matches` moved to `remote_control::models` in P3e
 // lever E — the matcher now lives next to the shapes it matches over, and
-// `roomler-agent-core`'s ACL can call it without this crate's data plane.
+// `roomler-core`'s ACL can call it without this crate's data plane.
 // Re-exported here so every existing `policy::dst_matches` caller (the
 // forward gate, the agent ACL tests, T2.3's evaluate flow) is unchanged.
 pub use roomler_ai_remote_control::models::{dst_matches, host_matches};
@@ -946,6 +948,7 @@ mod tests {
             machine_id: "m".into(),
             os: OsKind::Linux,
             agent_version: "0".into(),
+            companion_version: None,
             ssh_host_pubkey: String::new(),
             agent_token_hash: String::new(),
             status,
@@ -957,6 +960,7 @@ mod tests {
             access_policy: Default::default(),
             exec_policy: Default::default(),
             ssh_policy: Default::default(),
+            peer_relay_policy: Default::default(),
             desired_config: Default::default(),
             config_report: None,
             routes: Vec::new(),

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::{Plan, Role, Tenant, TenantMember, TenantSettings, role::permissions};
@@ -296,6 +298,17 @@ impl TenantDao {
                 Some(doc! { "name": 1 }),
             )
             .await
+    }
+
+    /// FR-32 — members in the tenant, for the plan `max_members` gate.
+    ///
+    /// `tenant_members` rows are hard-deleted by [`Self::remove_member`], so
+    /// unlike the agent and tunnel-client counts there is no tombstone to
+    /// exclude. Pending members ARE counted: an unaccepted invite already holds
+    /// the seat, and not counting them would let a tenant sit permanently over
+    /// its cap by never having invitees accept.
+    pub async fn count_members(&self, tenant_id: ObjectId) -> DaoResult<u64> {
+        self.members.count(doc! { "tenant_id": tenant_id }).await
     }
 
     pub async fn is_member(&self, tenant_id: ObjectId, user_id: ObjectId) -> DaoResult<bool> {

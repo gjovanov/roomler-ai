@@ -1,10 +1,12 @@
-//! REST surface for the `roomler-tunnel` subsystem.
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//! REST surface for the `roomler` subsystem.
 //!
 //! Mirrors `crates/api/src/routes/remote_control.rs` for the
 //! enrollment flow. The tunnel client (a laptop running
-//! `roomler-tunnel`) is enrolled in the same two-step shape as a
+//! `roomler`) is enrolled in the same two-step shape as a
 //! remote-control agent: admin issues a single-use `TunnelEnrollment`
-//! token, then the operator runs `roomler-tunnel enroll` which
+//! token, then the operator runs `roomler enroll` which
 //! exchanges it for a long-lived `TunnelClient` token.
 //!
 //! Signalling, forwarding, audit + policy CRUD land in T2.
@@ -20,6 +22,7 @@ use roomler_ai_remote_control::models::{
     AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget,
 };
 use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -45,7 +48,7 @@ pub struct TunnelEnrollmentTokenResponse {
 
 /// POST /api/tenant/{tenant_id}/tunnel-client/enroll-token —
 /// admin/member issues a single-use token the operator pastes into
-/// `roomler-tunnel enroll`. Mirrors `issue_enrollment_token` for
+/// `roomler enroll`. Mirrors `issue_enrollment_token` for
 /// agents.
 pub async fn issue_tunnel_enrollment_token(
     State(state): State<AppState>,
@@ -127,13 +130,19 @@ pub async fn enroll_tunnel_client(
             // S5 — plan tunnel-client cap. Mirrors the device cap in
             // `enroll_agent`: only NEW rows consume a slot.
             let tenant = state.tenants.base.find_by_id(tid).await?;
-            let max = tenant.plan.limits().max_tunnel_clients as u64;
             let used = state.tunnel_clients.count_active_for_tenant(tid).await?;
-            if used >= max {
+            // FR-32: decision + record in `quota::check`. `MaxTunnelClients` is
+            // an established limit, so it refuses whatever the mode says.
+            if let Err(d) = quota::check(
+                tenant.plan.clone(),
+                tenant.settings.plan_enforcement,
+                quota::Limit::MaxTunnelClients,
+                used,
+            ) {
                 return Err(ApiError::Forbidden(format!(
-                    "Tunnel-client limit reached for the {:?} plan ({used} of {max} used). \
+                    "Tunnel-client limit reached for the {:?} plan ({} of {} used). \
                      Upgrade the plan or remove a tunnel client first.",
-                    tenant.plan
+                    d.plan, d.used, d.max
                 )));
             }
             state
@@ -181,7 +190,7 @@ pub struct TunnelAgentInfo {
 }
 
 /// GET /api/tunnel-client/agents — the tenant's agent roster, so
-/// `roomler-tunnel socks5` (mesh mode) can route a CONNECT by friendly agent
+/// `roomler socks5` (mesh mode) can route a CONNECT by friendly agent
 /// name instead of the raw 24-hex id. Authenticated by the caller's TunnelClient
 /// JWT (`Authorization: Bearer <token>`) and scoped to that token's tenant.
 pub async fn list_tenant_agents(

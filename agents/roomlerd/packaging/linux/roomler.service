@@ -1,0 +1,50 @@
+[Unit]
+Description=Roomler Daemon — keeps this device on your private Roomler mesh network and available for secure remote control
+Documentation=https://roomler.ai/
+# An interactive user session is required for scrap capture (XShm needs a
+# display) and enigo input injection (both run on the user's X server).
+# This is a systemd *user* unit, not a system unit, for that reason.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# RETIRED-NAME-ANCHOR(3): a "was X" line has to name X.
+# P3d Slice B: the daemon binary is now `roomlerd` (was `roomler-agent`).
+ExecStart=/usr/bin/roomlerd run
+# `always`, not `on-failure`: a self-update exits 0 on purpose (the agent
+# hands off to the installer and shuts down cleanly), and `on-failure`
+# would leave the node stopped until the next login — a successful
+# upgrade would read as the host going offline. Codes come from
+# `watchdog.rs`: 2 = STALL (watchdog forced exit) MUST come back;
+# 7 = AGENT_DELETED (row deleted / quarantined server-side) must NOT —
+# restarting only hammers a server that already said no; 8 = ALREADY_RUNNING
+# (another process holds the single-instance lock) must NOT either — this
+# process is redundant by definition, and without the exception `always`
+# restarts it every 5 s forever. Especially reachable for THIS unit: a
+# per-user agent and the system `roomlerd.service` both target the same
+# config on a desktop that enabled both.
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=7 8
+# RETIRED-NAME-ANCHOR: `roomler_agent` is the pre-FR-21 tracing target. Kept
+# alongside the new one so this unit reads correctly on a daemon from either
+# side of the rename; agent-core::logging mirrors it for units already on disk.
+Environment=RUST_LOG=roomler_agent=info,roomlerd=info,warn
+
+# Sandboxing — conservative defaults appropriate for a user unit.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+# RETIRED-NAME-ANCHOR(10): systemd must whitelist BOTH trees or it denies an upgraded
+# host its own.
+# P3d Slice B: the appdirs resolver (src/appdirs.rs) uses the NEW `roomler`
+# app segment on fresh installs but keeps the OLD `roomler-agent` tree when a
+# pre-rename host already has one. Whitelist BOTH so neither a fresh install
+# nor an upgraded host is blocked by ProtectHome=read-only.
+# RETIRED-NAME-ANCHOR: dropping the legacy pair makes systemd deny the daemon its own
+# pre-rename tree mid-migration, under ProtectHome=read-only. See docs/fr/FR-21.
+ReadWritePaths=%h/.config/roomler %h/.local/share/roomler %h/.config/roomler-agent %h/.local/share/roomler-agent
+
+[Install]
+WantedBy=default.target

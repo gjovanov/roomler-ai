@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! REST surface for the remote-control subsystem.
 //!
 //! Per `docs/remote-control.md` §9.1. Signaling (SDP/ICE) happens over the
@@ -17,6 +19,7 @@ use roomler_ai_remote_control::{
     turn_creds::ice_servers_for,
 };
 use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
@@ -152,13 +155,19 @@ pub async fn enroll_agent(
     // second time, for a new and confusing reason.
     if existing.is_none() {
         let tenant = state.tenants.base.find_by_id(tid).await?;
-        let max = tenant.plan.limits().max_devices as u64;
         let used = state.agents.count_active_for_tenant(tid).await?;
-        if used >= max {
+        // FR-32: decision + record in `quota::check`. `MaxDevices` is an
+        // established limit, so it refuses whatever the tenant's mode says.
+        if let Err(d) = quota::check(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::MaxDevices,
+            used,
+        ) {
             return Err(ApiError::Forbidden(format!(
-                "Device limit reached for the {:?} plan ({used} of {max} devices used). \
+                "Device limit reached for the {:?} plan ({} of {} devices used). \
                  Upgrade the plan or remove a device first.",
-                tenant.plan
+                d.plan, d.used, d.max
             )));
         }
     }
@@ -254,6 +263,12 @@ pub struct AgentResponse {
     pub machine_id: String,
     pub os: OsKind,
     pub agent_version: String,
+    /// FR-27 — the `roomler-desktop` version installed on the host, as the
+    /// device last reported it. Omitted when there is none / it could not be
+    /// read / the agent predates the field: the grid must not turn three
+    /// different situations into one string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub companion_version: Option<String>,
     pub status: AgentStatus,
     /// Three-state truth: `online` | `stale` | `offline` (Phase A-1).
     pub presence: AgentPresence,
@@ -264,7 +279,7 @@ pub struct AgentResponse {
     pub last_seen_at: String,
     pub access_policy: AccessPolicy,
     /// Subnet-router CIDRs this agent advertises for the mesh (Phase 2). The
-    /// `roomler-tunnel socks5` mesh longest-prefix-matches a LAN target IP
+    /// `roomler socks5` mesh longest-prefix-matches a LAN target IP
     /// against these to pick the covering agent, which then dials the real
     /// IP. Admin-managed here; still gated by the tenant's `tunnel_policies`.
     pub routes: Vec<String>,
@@ -1307,6 +1322,7 @@ fn to_agent_response(
         machine_id: a.machine_id,
         os: a.os,
         agent_version: a.agent_version,
+        companion_version: a.companion_version,
         status: a.status,
         is_online,
         last_seen_at: fmt_dt(a.last_seen_at),
@@ -1347,7 +1363,7 @@ fn fmt_dt(dt: DateTime) -> String {
 /// are dropped, and duplicates removed. A bare IP or any unparseable entry
 /// fails the whole request with 400 so the admin UI shows a clear error instead
 /// of silently storing a route the mesh client would skip. Mirrors the
-/// client-side parse in `roomler-tunnel`'s `mesh.rs` (both use `ipnet::IpNet`).
+/// client-side parse in `roomler-cli`'s `mesh.rs` (both use `ipnet::IpNet`).
 fn normalize_routes(raw: Vec<String>) -> Result<Vec<String>, ApiError> {
     use std::str::FromStr;
     const MAX_ROUTES: usize = 64;

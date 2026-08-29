@@ -1,10 +1,14 @@
-import { ref, computed, watch, type Ref } from 'vue'
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+import { ref, computed, watch, onScopeDispose, type Ref } from 'vue'
 
 export type LayoutMode = 'auto' | 'tiled' | 'spotlight' | 'sidebar'
 export type SelfViewMode = 'in-grid-cropped' | 'in-grid-uncropped' | 'floating-uncropped'
 
 export interface LayoutParticipant {
   streamKey: string
+  /** FR-30 — the peer SAID their camera is off. Not derivable from the track. */
+  videoPaused: boolean
   userId: string
   displayName: string
   stream: MediaStream | null
@@ -70,6 +74,47 @@ interface RemoteStream {
   source: string
 }
 
+/**
+ * FR-25 — which layout a mode actually resolves to. Pure so the rules can be
+ * read (and tested) without a call: Auto used to be an inline chain inside a
+ * computed, which is exactly where the "layout controls don't work" reports
+ * came from — nobody could point at the rule that fired.
+ *
+ * Order is deliberate: a screen share is the reason everyone is looking, an
+ * explicit pin is the operator overriding us, a 1:1 wants one big tile, and
+ * everything else is a grid.
+ */
+export function resolveEffectiveMode(
+  mode: LayoutMode,
+  ctx: { hasScreenShare: boolean; pinnedCount: number; participantCount: number },
+): 'tiled' | 'spotlight' | 'sidebar' {
+  if (mode !== 'auto') return mode
+  if (ctx.hasScreenShare) return 'sidebar'
+  if (ctx.pinnedCount > 0) return 'spotlight'
+  if (ctx.participantCount <= 2) return 'spotlight'
+  return 'tiled'
+}
+
+/**
+ * FR-25 — pick the big tile for sidebar/spotlight when nothing is pinned.
+ * NEVER the local tile while a remote exists: "Sidebar" used to take
+ * `sorted[0]`, which is alphabetical, so an operator whose name sorted first
+ * got a full-screen view of themselves.
+ */
+export function pickPrimaryFallback(
+  sorted: LayoutParticipant[],
+  activeSpeakerKey: string | null,
+): LayoutParticipant[] {
+  const speaker = activeSpeakerKey
+    ? sorted.find((p) => p.streamKey === activeSpeakerKey && !p.isLocal)
+    : undefined
+  if (speaker) return [speaker]
+  const firstRemote = sorted.find((p) => !p.isLocal)
+  if (firstRemote) return [firstRemote]
+  // Alone in the call — showing yourself is all there is.
+  return sorted.slice(0, 1)
+}
+
 export function useConferenceLayout(
   localStream: Ref<MediaStream | null>,
   remoteStreams: Map<string, RemoteStream>,
@@ -78,13 +123,74 @@ export function useConferenceLayout(
   activeSpeakerKey: Ref<string | null>,
   getDisplayName: (userId: string) => string,
   localDisplayName: Ref<string>,
+  // FR-30 — what each peer SAYS about their own camera/mic, keyed by
+  // streamKey. Optional so the composable stays usable (and testable) without
+  // a live call store. ⚠️ An options object rather than more positional
+  // arguments: P1 shipped `remoteVideoPaused` here and audio would have made
+  // it nine in a row, at which point a call site gets one wrong silently.
+  remotePaused?: {
+    video?: Map<string, boolean>
+    audio?: Map<string, boolean>
+  },
 ) {
   const prefs = ref<LayoutPreferences>(loadPrefs())
 
   // Persist on change
   watch(prefs, (v) => savePrefs(v), { deep: true })
 
+  // FR-25 — native MediaStream/track state is INVISIBLE to Vue reactivity
+  // (VideoTile learned this the hard way and keeps its own ref). Reading it
+  // straight from a computed meant "hide participants without video" was
+  // decided once and never revisited: a camera switched on after the filter
+  // ran left its owner hidden until something unrelated invalidated the
+  // computed. This counter is the dependency that makes it converge.
+  const videoStateVersion = ref(0)
+  const watchedStreams = new Map<MediaStream, () => void>()
+
+  function watchStream(stream: MediaStream) {
+    if (watchedStreams.has(stream)) return
+    const bump = () => {
+      videoStateVersion.value++
+    }
+    const tracks = stream.getVideoTracks()
+    stream.addEventListener('addtrack', bump)
+    stream.addEventListener('removetrack', bump)
+    for (const t of tracks) {
+      t.addEventListener('ended', bump)
+      t.addEventListener('mute', bump)
+      t.addEventListener('unmute', bump)
+    }
+    watchedStreams.set(stream, () => {
+      stream.removeEventListener('addtrack', bump)
+      stream.removeEventListener('removetrack', bump)
+      for (const t of tracks) {
+        t.removeEventListener('ended', bump)
+        t.removeEventListener('mute', bump)
+        t.removeEventListener('unmute', bump)
+      }
+    })
+    // A track added later needs its own listeners; the addtrack bump
+    // re-enters this via the participants computed.
+    stream.addEventListener('addtrack', () => {
+      const teardown = watchedStreams.get(stream)
+      if (teardown) {
+        teardown()
+        watchedStreams.delete(stream)
+      }
+      watchStream(stream)
+    })
+  }
+
+  function unwatchAll() {
+    for (const teardown of watchedStreams.values()) teardown()
+    watchedStreams.clear()
+  }
+  onScopeDispose(unwatchAll)
+
   function hasLiveVideoTrack(stream: MediaStream | null): boolean {
+    // Touch the counter so every caller inside a computed re-runs on a
+    // track transition. Cheap, and the only honest way to depend on it.
+    void videoStateVersion.value
     if (!stream) return false
     return stream.getVideoTracks().some((t) => t.enabled && t.readyState === 'live')
   }
@@ -94,6 +200,7 @@ export function useConferenceLayout(
 
     // Local participant
     if (localStream.value) {
+      watchStream(localStream.value)
       list.push({
         streamKey: 'local',
         userId: 'local',
@@ -103,12 +210,16 @@ export function useConferenceLayout(
         isLocal: true,
         isScreenShare: false,
         isPinned: prefs.value.pinnedStreamKeys.includes('local'),
+        // Your own camera state is already visible to you locally; the signal
+        // is about what OTHERS cannot otherwise see.
+        videoPaused: false,
         audioLevel: 0,
       })
     }
 
     // Remote participants
     for (const [streamKey, remote] of remoteStreams) {
+      watchStream(remote.stream)
       const isScreen = streamKey.endsWith(':screen') || remote.source === 'screen'
       const name = isScreen
         ? getDisplayName(remote.userId) + ' (Screen)'
@@ -118,10 +229,13 @@ export function useConferenceLayout(
         userId: remote.userId,
         displayName: name,
         stream: remote.stream,
-        isMuted: false,
+        // FR-30 P3 — was hardcoded `false`, so a remote could never show as
+        // muted. Same signal as the camera, different map.
+        isMuted: remotePaused?.audio?.get(streamKey) === true,
         isLocal: false,
         isScreenShare: isScreen,
         isPinned: prefs.value.pinnedStreamKeys.includes(streamKey),
+        videoPaused: remotePaused?.video?.get(streamKey) === true,
         audioLevel: audioLevels.value.get(streamKey) ?? 0,
       })
     }
@@ -140,7 +254,9 @@ export function useConferenceLayout(
   function filterHidden(list: LayoutParticipant[]): LayoutParticipant[] {
     if (!prefs.value.hideNonVideo) return list
     return list.filter(
-      (p) => p.isPinned || p.isLocal || hasLiveVideoTrack(p.stream),
+      // FR-30 — a paused sender's track is still `live` and unmuted here, so
+      // the peer's own signal is the only thing that can answer this.
+      (p) => p.isPinned || p.isLocal || (!p.videoPaused && hasLiveVideoTrack(p.stream)),
     )
   }
 
@@ -163,21 +279,11 @@ export function useConferenceLayout(
     const sorted = sortParticipants(all)
     const selfFloating = prefs.value.selfViewMode === 'floating-uncropped'
 
-    // Determine effective mode
-    let effectiveMode: 'tiled' | 'spotlight' | 'sidebar'
-    if (mode === 'auto') {
-      if (hasScreenShare.value) {
-        effectiveMode = 'sidebar'
-      } else if (pinnedParticipants.value.length > 0) {
-        effectiveMode = 'spotlight'
-      } else if (sorted.length <= 2) {
-        effectiveMode = 'spotlight'
-      } else {
-        effectiveMode = 'tiled'
-      }
-    } else {
-      effectiveMode = mode
-    }
+    const effectiveMode = resolveEffectiveMode(mode, {
+      hasScreenShare: hasScreenShare.value,
+      pinnedCount: pinnedParticipants.value.length,
+      participantCount: sorted.length,
+    })
 
     // Split into primary/secondary based on effective mode
     let primary: LayoutParticipant[] = []
@@ -191,31 +297,27 @@ export function useConferenceLayout(
       primary = gridParticipants.slice(0, prefs.value.tiledMaxTiles)
       secondary = [] // no filmstrip in tiled
     } else if (effectiveMode === 'spotlight') {
-      // Pinned or active speaker in primary, rest in secondary
+      // Pinned wins; otherwise the speaker, then the first remote — never
+      // yourself while someone else is on the call (FR-25).
       const pinned = sorted.filter((p) => p.isPinned)
-      if (pinned.length > 0) {
-        primary = pinned
-      } else if (activeSpeakerKey.value) {
-        const speaker = sorted.find((p) => p.streamKey === activeSpeakerKey.value)
-        primary = speaker ? [speaker] : sorted.slice(0, 1)
-      } else {
-        // No pinned, no active speaker — first non-local participant
-        const nonLocal = sorted.filter((p) => !p.isLocal)
-        primary = nonLocal.length > 0 ? [nonLocal[0]] : sorted.slice(0, 1)
-      }
+      primary = pinned.length > 0 ? pinned : pickPrimaryFallback(sorted, activeSpeakerKey.value)
       const primaryKeys = new Set(primary.map((p) => p.streamKey))
       secondary = sorted.filter((p) => !primaryKeys.has(p.streamKey))
       if (selfFloating) {
         secondary = secondary.filter((p) => !p.isLocal)
       }
     } else {
-      // sidebar: screen share or pinned in primary, rest in sidebar
+      // sidebar: screen share or pinned in primary, rest in the sidebar.
+      // With neither, fall back the same way spotlight does — `sorted[0]`
+      // is alphabetical, which used to hand the big tile to whoever sorted
+      // first, usually yourself (FR-25).
       const screenShares = sorted.filter((p) => p.isScreenShare)
       if (screenShares.length > 0) {
         primary = screenShares
       } else {
         const pinned = sorted.filter((p) => p.isPinned)
-        primary = pinned.length > 0 ? pinned : sorted.slice(0, 1)
+        primary =
+          pinned.length > 0 ? pinned : pickPrimaryFallback(sorted, activeSpeakerKey.value)
       }
       const primaryKeys = new Set(primary.map((p) => p.streamKey))
       secondary = sorted.filter((p) => !primaryKeys.has(p.streamKey))
@@ -254,6 +356,31 @@ export function useConferenceLayout(
     prefs.value.mode = mode
   }
 
+  // FR-25 — double-click spotlights a tile. The mode we came from is
+  // remembered (in memory, not storage: it describes THIS call) so the
+  // second double-click really undoes the first instead of stranding the
+  // operator in spotlight.
+  let modeBeforeSpotlight: LayoutMode | null = null
+
+  /** Returns true if the tile is now spotlit, false if it was released. */
+  function toggleSpotlight(streamKey: string): boolean {
+    const isOnlyPin =
+      prefs.value.pinnedStreamKeys.length === 1 &&
+      prefs.value.pinnedStreamKeys[0] === streamKey
+    if (isOnlyPin && prefs.value.mode === 'spotlight') {
+      prefs.value.pinnedStreamKeys = []
+      prefs.value.mode = modeBeforeSpotlight ?? 'auto'
+      modeBeforeSpotlight = null
+      return false
+    }
+    if (prefs.value.mode !== 'spotlight') modeBeforeSpotlight = prefs.value.mode
+    // Sole pin: spotlighting a second tile replaces the first rather than
+    // silently doing nothing at the MAX_PINS ceiling.
+    prefs.value.pinnedStreamKeys = [streamKey]
+    prefs.value.mode = 'spotlight'
+    return true
+  }
+
   function setMaxTiles(n: number) {
     prefs.value.tiledMaxTiles = Math.max(4, Math.min(49, n))
   }
@@ -272,6 +399,7 @@ export function useConferenceLayout(
     layout,
     selfParticipant,
     togglePin,
+    toggleSpotlight,
     setMode,
     setMaxTiles,
     setSelfViewMode,

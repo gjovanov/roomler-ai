@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { looksSignedIn } from '@/api/session'
@@ -36,6 +38,11 @@ const routes: RouteRecordRaw[] = [
     path: '/terms',
     name: 'terms',
     component: () => import('@/views/legal/TermsView.vue'),
+  },
+  {
+    path: '/imprint',
+    name: 'imprint',
+    component: () => import('@/views/legal/ImprintView.vue'),
   },
   {
     path: '/oauth/callback',

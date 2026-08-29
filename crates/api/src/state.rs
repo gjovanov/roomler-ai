@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use std::collections::HashSet;
 
 use bson::oid::ObjectId;
@@ -21,10 +23,10 @@ use roomler_ai_services::{
         consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
         invite::InviteDao, message::MessageDao, notification::NotificationDao,
         overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
-        overlay_policy::OverlayPolicyDao, push_subscription::PushSubscriptionDao,
-        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
-        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao,
-        ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
+        overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
+        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
+        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
+        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
         tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
         tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
@@ -37,7 +39,7 @@ use std::sync::Arc;
 use crate::ws::redis_pubsub::RedisPubSub;
 use crate::ws::storage::WsStorage;
 
-/// Outbound channel for a connected `roomler-tunnel` client, keyed by
+/// Outbound channel for a connected `roomler` client, keyed by
 /// the `tunnel_session_id` issued on `rc:tunnel.open`. The tunnel WS
 /// handler registers its sender on TunnelOpen success and unregisters
 /// on disconnect / TunnelTerminate; the agent WS handler reads this
@@ -101,6 +103,9 @@ pub struct AppState {
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
+    /// FR-19 peer-relay decisions: approvals (who made a device a relay) and
+    /// mints (what the server routed through it), granted or refused.
+    pub peer_relay_audit: Arc<PeerRelayAuditDao>,
     /// P8 — device-reported session activity. Separate from `ssh_audit`
     /// because one is the server's decision and the other is a claim by the
     /// device; see `SshActivityEvent`.
@@ -167,7 +172,7 @@ pub struct AppState {
     /// Per-pod request/reply bus.
     pub cluster_bus: Option<Arc<crate::cluster::bus::PodBus>>,
 
-    // roomler-tunnel subsystem
+    // tunnel subsystem
     pub tunnel_clients: Arc<TunnelClientDao>,
     pub tunnel_policies: Arc<TunnelPolicyDao>,
     pub tunnel_audit: Arc<TunnelAuditDao>,
@@ -242,6 +247,18 @@ pub struct AppState {
     /// through the same `authorize`, so neither transport is unlimited.
     pub exec_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     pub ssh_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    /// FR-19 — per-(requesting node, relay node) mint ceiling
+    /// (`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`), checked by the mint
+    /// in `ws::overlay` AFTER the identity gates so a refusal is attributable.
+    pub relay_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    /// FR-19 — the org-relay mint's pod-local state: minted sessions (keyed
+    /// by pair), per-relay VNI cursors, the server-wide generation clock,
+    /// join extras (primary-org flag, relay port) and reachability reports.
+    /// Pod-local is correct here for the same reason `relay_pair_churn` is:
+    /// tenant affinity puts a tenant's nodes on ONE pod, and the relay's own
+    /// table is the truth a restart falls back on (sessions then run out
+    /// their `max_lifetime`).
+    pub org_relay: Arc<crate::ws::org_relay::OrgRelayState>,
 
     /// The one GitHub-releases cache, shared by `/api/agent/*`,
     /// `/api/tunnel/*` and `/api/setup/*` — they all read the same
@@ -371,6 +388,7 @@ impl AppState {
         let exec_audit = Arc::new(ExecAuditDao::new(&db));
         let ssh_audit = Arc::new(SshAuditDao::new(&db));
         let config_audit = Arc::new(ConfigAuditDao::new(&db));
+        let peer_relay_audit = Arc::new(PeerRelayAuditDao::new(&db));
         let ssh_activity = Arc::new(SshActivityDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
             &db,
@@ -788,7 +806,7 @@ impl AppState {
             },
         );
 
-        // roomler-tunnel subsystem
+        // tunnel subsystem
         let tunnel_clients = Arc::new(TunnelClientDao::new(&db));
         let tunnel_policies = Arc::new(TunnelPolicyDao::new(&db));
         let tunnel_audit = Arc::new(TunnelAuditDao::new(&db));
@@ -845,6 +863,7 @@ impl AppState {
             exec_audit,
             ssh_audit,
             config_audit,
+            peer_relay_audit,
             ssh_activity,
             agent_crashes,
             agent_logs,
@@ -883,6 +902,8 @@ impl AppState {
             relay_pair_churn: Arc::new(DashMap::new()),
             exec_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             ssh_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
+            relay_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
+            org_relay: Arc::new(crate::ws::org_relay::OrgRelayState::new()),
             releases_cache,
         };
 
@@ -1356,5 +1377,58 @@ pub async fn shutdown_cleanup(state: &AppState) {
                 tracing::debug!(agent = %id, %e, "shutdown: presence release failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod notify_semantics_tests {
+
+    /// A `Notify` signal must survive a task that is NOT parked on
+    /// `notified()` at the instant it is fired.
+    ///
+    /// These two tests outlive FR-28's reverted P0 on purpose. The hazard
+    /// is general: anywhere a `select!`-driven loop is signalled, the
+    /// future is rebuilt each iteration, so there is no registered waiter
+    /// while the loop is doing work. `notify_waiters` drops the signal
+    /// there; `notify_one` stores a permit. FR-28 P0 shipped the wrong one
+    /// and the field measured it (12 `hard-errored` lines vs a baseline of
+    /// 8) — the code is gone, the lesson should not be.
+    ///
+    /// ⚠️ This is the test the first version needed and did not have. It
+    /// only checked the env kill switch, which cannot observe the defect:
+    /// `notify_waiters()` wakes waiters registered AT THAT MOMENT and
+    /// stores nothing, while the real socket loop rebuilds its
+    /// `cancel.notified()` future every `select!` iteration. So exactly
+    /// the busy sockets — the ones carrying a live session — missed it,
+    /// and the field test measured MORE `hard-errored` lines (12) than
+    /// the undrained baseline (8).
+    #[tokio::test]
+    async fn cancel_reaches_a_socket_that_is_not_currently_awaiting() {
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // Fire while nobody is parked — the busy-forwarding case.
+        cancel.notify_one();
+
+        // The loop comes back around and awaits: it must return at once.
+        let woke =
+            tokio::time::timeout(std::time::Duration::from_millis(200), cancel.notified()).await;
+        assert!(
+            woke.is_ok(),
+            "a cancel fired while the socket was busy must still be observed"
+        );
+    }
+
+    /// The same shape with `notify_waiters`, pinned so the difference is
+    /// documented rather than rediscovered: it is LOST when nobody waits.
+    #[tokio::test]
+    async fn notify_waiters_loses_a_signal_when_nobody_is_parked() {
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        cancel.notify_waiters();
+        let woke =
+            tokio::time::timeout(std::time::Duration::from_millis(100), cancel.notified()).await;
+        assert!(
+            woke.is_err(),
+            "notify_waiters stores no permit — this is the bug"
+        );
     }
 }

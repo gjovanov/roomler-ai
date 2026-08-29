@@ -1,7 +1,7 @@
 # Phase 1 Chunk 1B — Linux agent image for the roomler-ai-agent-e2e
 # overlay. Identical pattern to Dockerfile.e2e (multi-stage builder +
 # slim runtime + entrypoint script that touches /results/.done after
-# work completes), but the runtime is `roomler-agent run` driven by a
+# work completes), but the runtime is `roomlerd run` driven by a
 # synthetic frame source instead of Playwright.
 #
 # Feature selection — DELIBERATELY minimal:
@@ -30,7 +30,7 @@ COPY . .
 # Build the agent binary with the e2e-only feature set. `--locked`
 # pins to Cargo.lock so a transient registry change can't shift
 # resolved versions between this build and the workspace.
-RUN cargo build --release -p roomler-agent --locked \
+RUN cargo build --release -p roomlerd --locked \
     --no-default-features \
     --features synthetic-frame-source,openh264-encoder,clipboard
 
@@ -48,9 +48,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 # P3d Slice B: the built binary is now `roomlerd` (the [[bin]] output name).
 # This self-contained e2e image installs it under the legacy in-image path
-# `/usr/local/bin/roomler-agent` (the bootstrap + run scripts below invoke that
+# `/usr/local/bin/roomlerd` (the bootstrap + run scripts below invoke that
 # path); only the COPY SOURCE changes. The e2e image is not the field fleet.
-COPY --from=builder /src/target/release/roomlerd /usr/local/bin/roomler-agent
+COPY --from=builder /src/target/release/roomlerd /usr/local/bin/roomlerd
 
 # Bootstrap script. The Pod's StatefulSet sets `ROOMLER_E2E_SERVER`
 # (the in-cluster API URL) + `ROOMLER_E2E_TENANT_SLUG` + `ROOMLER_E2E_
@@ -66,7 +66,7 @@ COPY --from=builder /src/target/release/roomlerd /usr/local/bin/roomler-agent
 #      let the seed Job handle it; see job-agent-seed.yaml).
 #   3. POST /api/tenant/<tid>/agent/enroll-token to mint a fresh
 #      enrollment JWT.
-#   4. Run `roomler-agent --config /etc/roomler-agent/config.toml
+#   4. Run `roomlerd --config /etc/roomler/config.toml
 #      enroll --server $SERVER --token <jwt> --name <pod-hostname>`.
 #   5. Touch /results/.bootstrap-done so an external orchestrator
 #      can wait on Pod-readiness without scraping logs.
@@ -78,7 +78,7 @@ ADMIN_EMAIL="${ROOMLER_E2E_ADMIN_EMAIL:?seed admin email}"
 ADMIN_PASS="${ROOMLER_E2E_ADMIN_PASSWORD:?seed admin password}"
 TENANT_ID="${ROOMLER_E2E_TENANT_ID:?seed tenant id (ObjectId hex)}"
 AGENT_NAME="${HOSTNAME:-agent-e2e}"
-CONFIG_PATH="${ROOMLER_AGENT_CONFIG_PATH:-/etc/roomler-agent/config.toml}"
+CONFIG_PATH="${ROOMLERD_CONFIG_PATH:-/etc/roomler/config.toml}"
 
 mkdir -p "$(dirname "$CONFIG_PATH")"
 mkdir -p /results
@@ -115,7 +115,7 @@ if [ -z "$ENROLL_JWT" ]; then
 fi
 
 echo "[bootstrap] enrolling agent name=$AGENT_NAME"
-/usr/local/bin/roomler-agent --config "$CONFIG_PATH" \
+/usr/local/bin/roomlerd --config "$CONFIG_PATH" \
   enroll \
   --server "$SERVER" \
   --token "$ENROLL_JWT" \
@@ -128,21 +128,21 @@ RUN chmod +x /usr/local/bin/agent-bootstrap.sh
 
 # Runner script: bootstrap (idempotent — re-enrol on every restart
 # uses a fresh token, which is correct for ephemeral e2e Pods) then
-# exec the agent. ROOMLER_AGENT_SYNTHETIC_FRAMES=1 is set by the
+# exec the agent. ROOMLERD_SYNTHETIC_FRAMES=1 is set by the
 # Deployment env so the capture cascade routes to the synthetic
-# backend; ROOMLER_AGENT_AUTO_UPDATE=0 disables the auto-updater
+# backend; ROOMLERD_AUTO_UPDATE=0 disables the auto-updater
 # (the e2e image carries the version we want to test; an in-Pod
 # update would defeat the point).
 COPY <<'EOF' /usr/local/bin/run-agent-e2e.sh
 #!/bin/sh
 set -eu
 /usr/local/bin/agent-bootstrap.sh
-exec /usr/local/bin/roomler-agent --config "${ROOMLER_AGENT_CONFIG_PATH:-/etc/roomler-agent/config.toml}" run
+exec /usr/local/bin/roomlerd --config "${ROOMLERD_CONFIG_PATH:-/etc/roomler/config.toml}" run
 EOF
 RUN chmod +x /usr/local/bin/run-agent-e2e.sh
 
-ENV ROOMLER_AGENT_SYNTHETIC_FRAMES=1
-ENV ROOMLER_AGENT_AUTO_UPDATE=0
-ENV ROOMLER_AGENT_CONFIG_PATH=/etc/roomler-agent/config.toml
+ENV ROOMLERD_SYNTHETIC_FRAMES=1
+ENV ROOMLERD_AUTO_UPDATE=0
+ENV ROOMLERD_CONFIG_PATH=/etc/roomler/config.toml
 
 ENTRYPOINT ["/usr/local/bin/run-agent-e2e.sh"]

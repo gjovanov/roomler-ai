@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Roomler SSH — the server side.
 //!
 //! This module is the POLICY DECISION POINT, the twin of [`agent_exec`]. The

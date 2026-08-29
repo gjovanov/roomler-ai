@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
@@ -12,6 +14,17 @@ export type ConsentMode = 'auto' | 'prompt' | 'email' | 'push' | 'prompt_then_em
 
 export interface AccessPolicy {
   consent_mode: ConsentMode | null
+  /** FR-27 — apply `consent_mode` to the device's OWNER too.
+   *
+   *  `null`/`false` (the default) keeps the historical shortcut: controlling
+   *  your own device auto-consents, because unattended access to your own
+   *  headless boxes is the common case.
+   *
+   *  That shortcut is applied server-side BEFORE the policy is read, which is
+   *  why the consent picker appeared to do nothing on a fleet where one person
+   *  owns every device. Turning this on makes the mode authoritative for the
+   *  owner as well. */
+  prompt_owner?: boolean | null
   allowed_role_ids: string[]
   allowed_user_ids: string[]
   auto_terminate_idle_minutes: number | null
@@ -42,6 +55,14 @@ export interface AgentCapabilities {
    *  it's optional here; the auto-rank falls back to deriving from
    *  `hw_encoders` for older agent rows. */
   transports?: string[]
+  /** FR-17 — opt-in `video-bytes` wire extensions the agent understands.
+   *  Today the only value is `'chunk-framing'`: every 16 KiB DataChannel
+   *  message carries an 8-byte {frame_seq, chunk_idx, chunk_count}
+   *  prefix so a receiver can tell a gap from a boundary. Absent on
+   *  agents below 0.4.14, which is exactly why the viewer must ASK for
+   *  it rather than assume it — an unframed stream parsed as a framed
+   *  one is garbage, not a degraded picture. */
+  video?: string[]
   has_input_permission: boolean
   /** Host permissions the OS has actually GRANTED (rc.454+):
    *  'screen-capture', 'input'. macOS is the only platform that gates
@@ -134,6 +155,13 @@ export interface Agent {
   machine_id: string
   os: AgentOs
   agent_version: string
+  /** FR-27 — the `roomler-desktop` version installed on the host, reported on
+   *  the heartbeat. Absent means one of three things and the UI must not
+   *  flatten them: a pre-FR-27 agent, no companion installed, or a probe that
+   *  could not read one. The daemon and the companion update by different
+   *  mechanisms on every platform, so `agent_version` moving says nothing
+   *  about this one. */
+  companion_version?: string
   status: AgentStatusValue
   /** Phase A-1 three-state truth: `online` = an rc socket is registered
    *  somewhere (Connect will work); `stale` = heartbeat trail fresh but no
@@ -145,7 +173,7 @@ export interface Agent {
   last_seen_at: string
   access_policy: AccessPolicy
   /** Subnet-router CIDRs this agent advertises for the mesh subnet-router
-   *  (Phase 2). Managed via the Subnet-routes dialog; the `roomler-tunnel`
+   *  (Phase 2). Managed via the Subnet-routes dialog; the `roomler`
    *  mesh longest-prefix-matches a LAN target IP against these to pick the
    *  covering agent. Optional because pre-Phase-2 agents / older API
    *  responses may omit it. */

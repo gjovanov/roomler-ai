@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 pub mod fixtures;
 
 #[cfg(test)]
@@ -61,6 +63,12 @@ mod overlay_tests;
 mod pagination_tests;
 #[cfg(test)]
 mod pdf_export_tests;
+#[cfg(test)]
+mod peer_relay_mint_tests;
+#[cfg(test)]
+mod peer_relay_tests;
+#[cfg(test)]
+mod plan_limit_tests;
 #[cfg(test)]
 mod rate_limit_tests;
 #[cfg(test)]

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 /**
  * Enrollment command templates — ONE source for every "how do I enroll
  * this machine" string the UI renders (unified EnrollmentDialog, S4).
@@ -94,6 +96,8 @@ export function enrollCommands(
   // legacy name (renaming it would void the TCC grants keyed to that binary),
   // and there is no `roomlerd` anywhere on the box — so the generic
   // `roomlerd enroll` this used to print could not work on a Mac.
+  // RETIRED-NAME-ANCHOR: frozen -- the bundle name keys the macOS TCC grants, and this
+  // is the only binary that actually exists on a Mac. FR-21 D5. docs/fr/FR-21
   const macAgentBin = '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent'
 
   const manual = (os: EnrollOs): CommandBlock => ({

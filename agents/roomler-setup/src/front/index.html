@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -68,7 +70,7 @@
             <input type="radio" name="role" value="tunnel-client">
             <div>
               <strong>Reach others only — tunnel client</strong>
-              <p class="muted">Installs the <code>roomler-tunnel</code> CLI and enrolls it,
+              <p class="muted">Installs the <code>roomler</code> CLI and enrolls it,
               so this machine can forward ports through enrolled agents. No daemon.</p>
             </div>
           </label>
@@ -267,12 +269,12 @@
       <div id="done-systemcontext-note" class="info" hidden>
         <strong>SystemContext mode active.</strong>
         <p>The perMachine MSI is installed, the daemon is enrolled, and the SCM
-        service runs with <code>ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1</code> in its
+        service runs with <code>ROOMLERD_ENABLE_SYSTEM_SWAP=1</code> in its
         <code>Environment</code> block. Remote control can now drive the Windows
         lock screen, UAC dialogs, and admin apps when an operator connects from
         the browser.</p>
         <p class="muted">To disable SystemContext mode later, run
-        <code>roomler-agent disable-system-context</code> from an elevated shell,
+        <code>roomlerd disable-system-context</code> from an elevated shell,
         or re-run this wizard and pick the attended-service role.</p>
       </div>
 

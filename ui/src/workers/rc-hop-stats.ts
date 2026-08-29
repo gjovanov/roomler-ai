@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 /**
  * P1 (Parsec-class plan) — shared pure helpers for the decode workers'
  * per-hop instrumentation. The DEVBOX field ceiling (~25-35 fps on an RTX

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! P4 — cross-org realtime device presence (`device:presence` WS events).
 //!
 //! Before this module, agent presence was READ-derived only: the listing

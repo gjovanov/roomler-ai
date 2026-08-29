@@ -21,8 +21,10 @@ every update wiped Screen Recording + Accessibility.
 `installer -target /` needs root; the per-user half isn't. Worse, the exit-to-update dance
 (spawn installer, exit, hope launchd restarts you) raced launchd job replacement.
 Fix: a third launchd unit, **`com.roomler.update`**, installed by the pkg BY DEFAULT
+<!-- RETIRED-NAME-ANCHOR(2): the real macOS daemon config dir, read by the
+     shipped .pkg postinstall. FR-21 D5. -->
 (opt-out marker `/etc/roomler-agent/disable-auto-update`, absence-removes): a root,
-single-shot helper (`roomler-agent update-helper`, hidden subcommand) that owns
+single-shot helper (`roomlerd update-helper`, hidden subcommand) that owns
 check → download → verify → `installer -pkg … -target /`. Agents only touch the wake file
 `/private/var/tmp/roomler-update-check` — **whose content is deliberately ignored** (a pin
 honoured from a sticky world-writable path would hand any local user a
@@ -59,7 +61,7 @@ plists), hands-off only when the job is RUNNING (it is this very install's ances
 The manifest's SHA256 arrives from the same origin as the URL — a transport check, not a
 tamper anchor. Fix: the release signing subkey's ed25519 point (fpr
 `5DB8221F546288DE780C10D3A2C53E5FE6FA485A`) is **compiled into the binary**
-(`agents/roomler-agent/src/pgp_verify.rs`); `download_asset` on Linux/macOS fetches
+(`agents/roomlerd/src/pgp_verify.rs`); `download_asset` on Linux/macOS fetches
 `<asset-url>.asc` and refuses fail-closed. Deliberately not an OpenPGP implementation:
 ~150 lines of RFC 4880 framing for exactly the shape CI emits (one v4 packet, class 0x00,
 EdDSA, SHA-256/512), ring doing the ed25519 (already in the graph — zero new deps).
