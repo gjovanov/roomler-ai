@@ -128,6 +128,10 @@
     } catch (_) {
       return // backend not ready / dir absent — stay quiet
     }
+    // FR-27 — skip anything the daemon already shows natively; see
+    // panel-consent.js. Two Approve buttons for one decision is how someone
+    // approves the wrong thing.
+    if (Array.isArray(pending)) pending = pending.filter((p) => p.surface !== 'native')
     if (Array.isArray(pending) && pending.length > 0) {
       // Keep showing the current one if it's still pending; otherwise show the
       // first outstanding request (an operator may have resolved one elsewhere).
