@@ -667,11 +667,77 @@ fn embedded_cli_args() -> Option<Vec<std::ffi::OsString>> {
     Some(argv)
 }
 
+/// FR-27 — on macOS with the native consent panel, tokio may NOT own the main
+/// thread.
+///
+/// AppKit delivers every event — including the click on an Approve button —
+/// on the main run loop, and `#[tokio::main]` parks the main thread in
+/// `block_on` for the daemon's entire life. Nothing drains the main queue, so
+/// a window can be created and will never respond. That is the whole reason
+/// macOS has had no native overlay: not that nobody wrote one, but that this
+/// process shape makes one inert.
+///
+/// So on that one configuration the roles swap: the runtime is built
+/// explicitly and the daemon future runs on a worker, while the main thread
+/// hands itself to AppKit. Everywhere else `main` is exactly what it was.
+///
+/// ⚠️ `NSApp.run()` never returns. The daemon's own exit paths
+/// (`std::process::exit`, the watchdog's `STALL_EXIT_CODE`) still work — they
+/// terminate the process, not this function — but anything that relied on
+/// `main` RETURNING to end the process would not. Nothing does: the daemon's
+/// clean shutdown is a `process::exit` after its drain.
+#[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
+fn main() -> Result<()> {
+    // The embedded CLI must still short-circuit before any of this — and it
+    // must NOT hand the main thread to AppKit, since a CLI call has to be able
+    // to return an exit code.
+    if let Some(argv) = embedded_cli_args() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        return rt.block_on(roomler_cli::cli::run_from(
+            argv,
+            roomler_cli::cli::Origin::EmbeddedInDaemon,
+        ));
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    std::thread::Builder::new()
+        .name("roomlerd-main".into())
+        .spawn(move || {
+            if let Err(e) = rt.block_on(daemon_main()) {
+                tracing::error!(error = %format!("{e:#}"), "daemon exited with an error");
+                std::process::exit(1);
+            }
+            // The daemon returning normally is a shutdown. The main thread is
+            // inside AppKit and will not notice, so say so explicitly.
+            std::process::exit(0);
+        })
+        .context("spawning the daemon thread")?;
+
+    // Hands the main thread to AppKit, forever. `Accessory` keeps us out of
+    // the Dock and the app switcher — the bundle already sets `LSUIElement`,
+    // and this makes it true for a non-bundled dev run too.
+    crate::indicator::mac::run_main_loop();
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 #[tokio::main]
 async fn main() -> Result<()> {
+    daemon_main().await
+}
+
+async fn daemon_main() -> Result<()> {
     // P3e lever D — embedded `roomler` CLI. MUST stay the first statement in
     // main(): everything below is daemon-startup setup that a CLI invocation
     // has no business performing. See `embedded_cli_args`.
+    //
+    // ⚠️ The macOS `main` above ALSO checks this, before it hands the main
+    // thread to AppKit. Both are needed: this one covers every other platform,
+    // that one has to run before a run loop it can never return from.
     if let Some(argv) = embedded_cli_args() {
         return roomler_cli::cli::run_from(argv, roomler_cli::cli::Origin::EmbeddedInDaemon).await;
     }

@@ -131,6 +131,13 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
 
+      # FR-27 — the native X11 consent panel. Off by default, so the workspace
+      # clippy above never sees it; without this step it would compile in NO
+      # lane until a release tag, which is exactly the "invisible until
+      # <platform> builds it" class the macOS job exists for.
+      - name: Run clippy on the X11 consent panel
+        run: cargo clippy -p roomlerd --lib --features viewer-indicator-x11 -- -D warnings
+
       # The step above is deliberately NOT `--all-targets`, so it never
       # compiles `#[cfg(test)]` bodies — the same blind spot the API-unit-test
       # and integration-type-check steps below exist to cover, but for LINTS
@@ -338,6 +345,14 @@ jobs:
       # this is the only lane that type-checks the fork at all.
       - name: cargo check agent (scrap-capture — the macOS capture surface)
         run: cargo check -p roomlerd --lib --features scrap-capture
+
+      # FR-27 — the native AppKit consent panel. `--bins` as well as `--lib`,
+      # and that is the whole point: this feature ALSO changes `main.rs`, which
+      # is a separate crate root, to move tokio off the main thread so AppKit
+      # can pump. A `--lib` check would compile the panel and miss the swap
+      # entirely — the exact escape rc.454 hit, one feature over.
+      - name: cargo check agent (viewer-indicator-macos — the AppKit panel + the main-thread swap)
+        run: cargo check -p roomlerd --lib --bins --features viewer-indicator-macos
 
       # `--bins`, because `--lib` alone was not enough. main.rs is a SEPARATE
       # crate root: a `#[cfg(target_os = "macos")]` block there referring to a
