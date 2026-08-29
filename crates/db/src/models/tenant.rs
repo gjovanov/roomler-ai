@@ -24,7 +24,7 @@ pub struct Tenant {
     pub deleted_at: Option<DateTime>,
 }
 
-/// FR-31 — how far plan-limit checks are allowed to go for a tenant.
+/// FR-32 — how far plan-limit checks are allowed to go for a tenant.
 ///
 /// Mirrors [`crate::models::OverlayNetwork`]'s `acl_mode` deliberately, and for
 /// the same reason: turning eleven previously-unenforced gates on against a live
@@ -94,12 +94,12 @@ pub struct TenantSettings {
     #[serde(default)]
     pub remote_ssh_enabled: bool,
 
-    /// FR-31 — how far plan-limit checks may go for this tenant. Defaults to
-    /// `Warn`, so a pre-FR-31 tenant document deserialises into observe mode:
+    /// FR-32 — how far plan-limit checks may go for this tenant. Defaults to
+    /// `Warn`, so a pre-FR-32 tenant document deserialises into observe mode:
     /// every newly wired gate is measured and logged, and none of them refuse.
     ///
     /// ⚠ This does NOT apply to the limits that were already enforced before
-    /// FR-31 (`max_devices`, `max_tunnel_clients`) — see
+    /// FR-32 (`max_devices`, `max_tunnel_clients`) — see
     /// `roomler_ai_services::quota::Limit::is_established`. An established
     /// limit always enforces, so setting `Off` can never silently un-enforce
     /// the device cap.
