@@ -477,6 +477,30 @@ async fn handle_overlay_join(
         }
     }
 
+    // FR-40 — stamp what this device PRESENTED, as verified above, onto its
+    // agent row: the server's own record of the device's current overlay
+    // public key, and the half of a rotation the control plane can vouch for
+    // (a `rc:agent.key_rotated` report is a claim; this join is the proof).
+    // Stamped on every join, not only after a rotation, so the dashboard can
+    // always show the key. Best-effort, off the netmap path.
+    if let NodeIdentity::Agent(agent_id) = ident {
+        let identity = roomler_ai_remote_control::models::OverlayIdentity {
+            public_key: self_node.wg_public_key.clone(),
+            key_epoch: self_node.key_epoch,
+            joined_at: bson::DateTime::now(),
+        };
+        let st = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = st
+                .agents
+                .record_overlay_identity(tenant_id, agent_id, &identity)
+                .await
+            {
+                warn!(%tenant_id, %agent_id, %e, "overlay.join: overlay_identity write failed");
+            }
+        });
+    }
+
     // Overlay ACL — refresh the DERP relay allow table off the join path. A
     // join is when a NEW pubkey can enter the network, and the table is keyed by
     // pubkey, so it would otherwise stay stale (fail-open) for that node until

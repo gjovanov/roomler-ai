@@ -21,6 +21,7 @@ pub mod message;
 pub mod notification;
 pub mod oauth;
 pub mod overlay_block;
+pub mod overlay_key;
 pub mod overlay_policy;
 pub mod overlay_route;
 pub mod peer_relay;

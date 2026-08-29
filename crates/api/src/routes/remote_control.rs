@@ -332,6 +332,144 @@ pub struct AgentResponse {
     /// change and a refused one look identical without the answer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_config: Option<RemoteConfigView>,
+    /// FR-40 — the device's overlay (WireGuard) PUBLIC key as it last joined
+    /// with, server-verified. Absent until the device has joined the overlay
+    /// on a server that stamps it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_key_epoch: Option<u32>,
+    /// FR-40 — the standing rotation order and where it stands. Absent when
+    /// no rotation was ever ordered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_rotation: Option<KeyRotationView>,
+}
+
+/// FR-40 — one device's overlay-key rotation as the dashboard reads it:
+/// the order, the device's answer (if any) and ONE server-resolved state.
+#[derive(Debug, Serialize)]
+pub struct KeyRotationView {
+    pub request_id: String,
+    pub requested_at: String,
+    pub requested_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<KeyRotationReportView>,
+    pub state: KeyRotationState,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KeyRotationReportView {
+    pub request_id: String,
+    pub outcome: roomler_ai_remote_control::models::KeyRotationOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_public_key: Option<String>,
+    pub key_epoch: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub reported_at: String,
+}
+
+/// Where a rotation order stands. Resolved ONCE, here, from the order, the
+/// device's report and the key the device has since JOINED with — because
+/// "the device says it rotated" and "the device is on the mesh under the new
+/// key" are different facts, and only the second is one the server verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyRotationState {
+    /// Ordered while the device was offline; it is ordered again on its next
+    /// connect (reconcile-on-connect).
+    Queued,
+    /// Pushed to a live socket; no answer for THIS order yet.
+    Delivered,
+    /// The device reported `rotated` and is expected to re-join within
+    /// seconds; its last verified join still shows the previous key.
+    Rotating,
+    /// The device reported `rotated` AND has since joined under the key it
+    /// reported. Done.
+    Rotated,
+    /// The device reported `rotated` long enough ago that it should have
+    /// re-joined by now, and its last verified join still shows another key —
+    /// read the device log.
+    ReportedNotJoined,
+    /// The device refused — `report.outcome` says which refusal.
+    Refused,
+    /// Mint or persist failed on the device; `report.detail` says why. The
+    /// device's identity is unchanged.
+    Failed,
+    /// Queued for a device whose agent predates `key-rotate`: it will not act
+    /// on the order until it is updated.
+    Unsupported,
+}
+
+/// A `rotated` report older than this with no matching join is a problem,
+/// not a device that is still reconnecting.
+const KEY_ROTATION_REJOIN_GRACE_SECS: i64 = 60;
+
+fn key_rotation_view(
+    request: Option<roomler_ai_remote_control::models::KeyRotationRequest>,
+    report: Option<roomler_ai_remote_control::models::KeyRotationReport>,
+    identity: Option<&roomler_ai_remote_control::models::OverlayIdentity>,
+    caps: &roomler_ai_remote_control::models::AgentCaps,
+) -> Option<KeyRotationView> {
+    use roomler_ai_remote_control::models::{KeyRotationOutcome, RpcCap};
+
+    let req = request?;
+    // Only a report about THIS order counts — an answer to a superseded one
+    // says nothing about it (the remote-config revision rule).
+    let current = report.as_ref().filter(|r| r.request_id == req.request_id);
+    let state = match current.map(|r| r.outcome) {
+        Some(KeyRotationOutcome::Rotated) => {
+            let joined_under_new =
+                match (current.and_then(|r| r.new_public_key.as_deref()), identity) {
+                    (Some(new), Some(id)) => id.public_key == new,
+                    _ => false,
+                };
+            if joined_under_new {
+                KeyRotationState::Rotated
+            } else {
+                let age_secs = current
+                    .map(|r| {
+                        (DateTime::now().timestamp_millis() - r.reported_at.timestamp_millis())
+                            / 1000
+                    })
+                    .unwrap_or(0);
+                if age_secs <= KEY_ROTATION_REJOIN_GRACE_SECS {
+                    KeyRotationState::Rotating
+                } else {
+                    KeyRotationState::ReportedNotJoined
+                }
+            }
+        }
+        Some(KeyRotationOutcome::Failed) => KeyRotationState::Failed,
+        Some(
+            KeyRotationOutcome::Disabled
+            | KeyRotationOutcome::RateLimited
+            | KeyRotationOutcome::Unsupported,
+        ) => KeyRotationState::Refused,
+        None if !caps.has_rpc(RpcCap::KeyRotate) => KeyRotationState::Unsupported,
+        None if req.delivered_at.is_some() => KeyRotationState::Delivered,
+        None => KeyRotationState::Queued,
+    };
+    Some(KeyRotationView {
+        request_id: req.request_id,
+        requested_at: fmt_dt(req.requested_at),
+        requested_by: req.requested_by.to_hex(),
+        delivered_at: req.delivered_at.map(fmt_dt),
+        report: report.map(|r| KeyRotationReportView {
+            request_id: r.request_id,
+            outcome: r.outcome,
+            old_public_key: r.old_public_key,
+            new_public_key: r.new_public_key,
+            key_epoch: r.key_epoch,
+            detail: r.detail,
+            reported_at: fmt_dt(r.reported_at),
+        }),
+        state,
+    })
 }
 
 /// The remote-config state of one device, as the dashboard needs to read it.
@@ -1311,6 +1449,15 @@ fn to_agent_response(
     // Resolved before the struct literal moves `capabilities`: the
     // remote-config state depends on which verbs this device advertises.
     let remote_config = remote_config_view(a.desired_config, a.config_report, &a.capabilities);
+    // FR-40 — same rule: resolved before `capabilities` moves.
+    let key_rotation = key_rotation_view(
+        a.key_rotation,
+        a.key_rotation_report,
+        a.overlay_identity.as_ref(),
+        &a.capabilities,
+    );
+    let overlay_public_key = a.overlay_identity.as_ref().map(|i| i.public_key.clone());
+    let overlay_key_epoch = a.overlay_identity.as_ref().map(|i| i.key_epoch);
     AgentResponse {
         presence,
         id,
@@ -1334,6 +1481,9 @@ fn to_agent_response(
         exec_policy: configured_only(a.exec_policy),
         ssh_policy: configured_only(a.ssh_policy),
         remote_config,
+        overlay_public_key,
+        overlay_key_epoch,
+        key_rotation,
     }
 }
 
