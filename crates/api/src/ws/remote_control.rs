@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! WebSocket glue for the remote-control subsystem.
 //!
 //! The `roomler-ai-remote-control` crate owns the state machine and the

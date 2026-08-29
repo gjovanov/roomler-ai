@@ -1,5 +1,7 @@
 [package]
 name = "roomler-setup"
+license = "MPL-2.0"
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "Unified install + onboarding wizard for the Roomler daemon (Windows MSI flavours) and the roomler tunnel CLI (Win/Linux/macOS)."

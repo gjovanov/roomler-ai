@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use crate::fixtures::test_app::TestApp;
 use jsonwebtoken::{EncodingKey, Header};
 use serde_json::Value;

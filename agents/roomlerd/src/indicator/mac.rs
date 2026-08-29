@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-27 — the native consent panel on macOS (AppKit).
 //!
 //! Like the X11 backend this is the PROMPT only; the "Being viewed by …"

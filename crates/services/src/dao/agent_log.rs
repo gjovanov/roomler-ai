@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! DAO for the `agent_logs` MongoDB collection — rc.58.
 //!
 //! Backs the centralized log-collection feature. Uploaders (agent

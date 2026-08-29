@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler.exe` on daemon hosts — a launcher that re-execs `roomlerd cli`.
 //!
 //! # Why

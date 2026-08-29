@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Worker-process supervisor (Effort 2 M2).
 //!
 //! When the SCM-launched service receives a `Running` state and

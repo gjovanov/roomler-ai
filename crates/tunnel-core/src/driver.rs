@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Tunnel-client **session driver** — the reusable engine behind the CLI's
 //! `forward`/`socks5`/`mesh` and (P3b-2) the daemon's outbound tunnels.
 //!

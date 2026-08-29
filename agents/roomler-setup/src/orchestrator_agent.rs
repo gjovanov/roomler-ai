@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Daemon-role install orchestrator (`cmd_install` with a daemon
 //! [`Role`]) + force-kill plumbing.
 //!

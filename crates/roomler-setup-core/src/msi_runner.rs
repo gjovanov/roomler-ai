@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! MSI execution with synchronous wait + exit-code decoding.
 //!
 //! W3 in the rc.28 plan, BLOCKER-3 fix from the architect critique.

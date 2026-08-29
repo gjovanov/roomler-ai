@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Short-lived TURN credentials following the coturn REST API convention
 //! ("draft-uberti-behave-turn-rest").
 //!
