@@ -208,6 +208,12 @@ impl RateGovernor {
 
     /// FR-35 — the learned ceiling (0 = nothing learned or seeded), for the
     /// heartbeat.
+    /// AIMD decreases so far this session (any cause) — the "evidence" bit the
+    /// rate memory needs before it accepts a LOWER stable rate.
+    pub fn decreases(&self) -> u32 {
+        self.aimd.as_ref().map_or(0, |a| a.decreases())
+    }
+
     pub fn learned_ceiling_bps(&self) -> u32 {
         self.learner.learned_bps()
     }
