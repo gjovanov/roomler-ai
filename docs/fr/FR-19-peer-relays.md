@@ -391,7 +391,7 @@ is 24 bits, so two `u32`s differing above bit 23 would alias to one session.
 |---|---|---|---|
 | 1 | `OverlayNetwork.peer_relay_mode` (`off`\|`warn`\|`on`) | the org | **`off`** ✅ |
 | 2 | overlay ACL `relay` capability, src → relay node | the policy author | ⚠️ **inert today** |
-| 3 | `Agent.peer_relay_policy` + `RELAY_DEVICE` permission | the fleet admin | **deny** ✅ |
+| 3 | `Agent.peer_relay_policy` — approval needs `MANAGE_AGENTS` **and** `EXEC_DEVICE` (see ⚠️ under *Permissions*) | the fleet admin | **deny** ✅ |
 | 4 | agent-local `relay_server_enabled` | the device owner | **off** ✅ |
 
 ⚠️ **Gate 2's default is not "deny" — it is "off, and permits everything."** The first draft
@@ -427,6 +427,23 @@ device a traffic chokepoint and a metadata observation point for the whole tenan
 it belongs in the class `role.rs` already draws a line around — *"an admin should see every
 command the fleet ran without silently gaining the power to run one"*, which is why
 `EXEC_DEVICE` (1<<27) and `SSH_DEVICE` (1<<29) are excluded. Therefore:
+
+⚠️ **Corrected in P3a (2026-08-29): there is no free permission bit, so there is no
+`RELAY_DEVICE`.** The spec and its security review both assumed bits 31 and 32 were
+available. They are not: the UI mirror (`ui/src/utils/permissions.ts`) checks masks with
+JavaScript's **signed 32-bit** bitwise ops — `1 << 31` is negative, `1 << 32` wraps to 1 —
+and its spec pins the ceiling at bit 30 *by design*. A bit defined server-side that the UI
+cannot render is a permission nobody can grant from the product, which is worse than no
+bit. So, until the mask moves to `BigInt` (#888):
+
+- **Relay approval requires `MANAGE_AGENTS` and `EXEC_DEVICE`.** Coherent rather than a
+  hack: an `EXEC_DEVICE` holder can already run `roomler config set relay_server_enabled
+  true` on any exec-enabled device as root, so the coupling grants nothing new. What it
+  cannot express is an org that wants relay approvers who may *not* run root commands —
+  that needs the dedicated bit, which needs #888.
+- **The relay audit reads behind `VIEW_EXEC_AUDIT`**, keeping the exec pairing.
+
+The bullets below describe the design *once #888 lands*:
 
 - **`RELAY_DEVICE`** — approval; **not** in `DEFAULT_ADMIN`; required *in addition to*
   `MANAGE_AGENTS`.
