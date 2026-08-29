@@ -95,6 +95,8 @@ pub async fn relay_overlay_msg_from_node(
             supports_derp_floor,
             supports_overlay_echo,
             supports_org_relay,
+            org_primary,
+            relay_port,
             advertised_routes,
             ..
         } => {
@@ -112,6 +114,8 @@ pub async fn relay_overlay_msg_from_node(
                 supports_derp_floor,
                 supports_overlay_echo,
                 supports_org_relay,
+                org_primary,
+                relay_port,
                 advertised_routes,
             )
             .await;
@@ -158,6 +162,23 @@ pub async fn relay_overlay_msg_from_node(
         }
         ClientMsg::OverlayWarmRelayRequest {} => {
             handle_overlay_warm_relay_request(state, ident).await;
+            None
+        }
+        ClientMsg::OverlayRelayProbe {
+            relay_node_id,
+            endpoint,
+            reachable,
+            rtt_ms,
+        } => {
+            crate::ws::org_relay::handle_relay_probe(
+                state,
+                ident,
+                relay_node_id,
+                endpoint,
+                reachable,
+                rtt_ms,
+            )
+            .await;
             None
         }
         other => Some(other),
@@ -218,6 +239,8 @@ async fn handle_overlay_join(
     supports_derp_floor: bool,
     supports_overlay_echo: bool,
     supports_org_relay: bool,
+    org_primary: Option<bool>,
+    relay_port: Option<u16>,
     advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
@@ -394,6 +417,20 @@ async fn handle_overlay_join(
             return;
         }
     };
+    // FR-19 P3c — what the join said beyond the row, for the mint: whether
+    // this is the device's PRIMARY org and which port its relay server
+    // listens on. Pod-local by design (the mint runs on this pod, by tenant
+    // affinity) and overwritten on every rejoin so nothing stale survives a
+    // build or an org that stopped saying it.
+    if let Some(id) = self_node.id {
+        state.org_relay.note_join(
+            id,
+            crate::ws::org_relay::JoinExtras {
+                org_primary,
+                relay_port,
+            },
+        );
+    }
 
     let all = match state
         .overlay_nodes
@@ -667,6 +704,10 @@ pub async fn handle_overlay_leave(state: &AppState, ident: NodeIdentity) {
         return; // never joined the overlay — nothing to tear down
     };
     let Some(self_id) = self_node.id else { return };
+    // FR-19 — a party that leaves takes its relay sessions with it: the
+    // other member and the relay hear the revoke now rather than at the
+    // session's absolute lifetime.
+    crate::ws::org_relay::revoke_node(state, self_id, "device_left").await;
     let _ = state
         .overlay_nodes
         .mark_status(self_id, AgentStatus::Offline)
@@ -749,6 +790,12 @@ async fn handle_overlay_relay_request(
                 "overlay acl [warn]: would refuse relay_request");
         }
     }
+
+    // FR-19 P3c — offer an org relay for this pair when the org allows one.
+    // Runs alongside the TURN grant below, never instead of it: the client
+    // cascade (P4) prefers Org when a session arrives, and a pair without
+    // one keeps exactly the path it has today.
+    crate::ws::org_relay::maybe_mint(state, &self_node, &peer).await;
 
     let pair_key = pair_key(self_id, peer_node_id);
 
@@ -1234,6 +1281,9 @@ pub(crate) async fn release_overlay_node(
             return None;
         }
     };
+    // FR-19 — trigger 4 of §7: a removed device's relay sessions (as member
+    // or as relay) are torn down by push, not left to expire.
+    crate::ws::org_relay::revoke_node(state, node_id, "device_removed").await;
 
     // 3 — pool the host. Best-effort: a failure leaks, never conflicts.
     let host = state
@@ -1537,7 +1587,7 @@ async fn fan_delta_to(
 /// agent nodes go through the Hub, tunnel-client nodes through the
 /// connection-lifetime registry. Best-effort — an offline node is
 /// simply skipped (it re-syncs on its next join).
-async fn send_to_node(state: &AppState, node: &OverlayNode, msg: ServerMsg) {
+pub(crate) async fn send_to_node(state: &AppState, node: &OverlayNode, msg: ServerMsg) {
     match &node.node_ref {
         NodeRef::Agent { agent_id } => {
             if let Err(e) = state.rc_hub.send_to_agent(*agent_id, msg) {
@@ -1548,6 +1598,32 @@ async fn send_to_node(state: &AppState, node: &OverlayNode, msg: ServerMsg) {
             // Clone the Sender out of the DashMap Ref so the shard guard
             // isn't held across the `.await` (the established pattern in
             // `remote_control::relay_to_client`).
+            let tx = state
+                .overlay_nodes_by_id
+                .get(tunnel_client_id)
+                .map(|e| e.value().clone());
+            match tx {
+                Some(tx) => {
+                    if let Err(e) = tx.send(msg).await {
+                        debug!(%tunnel_client_id, %e, "overlay: client node channel closed; skipped");
+                    }
+                }
+                None => debug!(%tunnel_client_id, "overlay: client node not connected; skipped"),
+            }
+        }
+    }
+}
+
+/// [`send_to_node`] by [`NodeRef`] alone — for callers that hold a session
+/// record rather than a row (FR-19's mint re-push and revoke).
+pub(crate) async fn send_to_node_ref(state: &AppState, node_ref: &NodeRef, msg: ServerMsg) {
+    match node_ref {
+        NodeRef::Agent { agent_id } => {
+            if let Err(e) = state.rc_hub.send_to_agent(*agent_id, msg) {
+                debug!(agent_id = %agent_id, %e, "overlay: agent node unreachable; skipped");
+            }
+        }
+        NodeRef::TunnelClient { tunnel_client_id } => {
             let tx = state
                 .overlay_nodes_by_id
                 .get(tunnel_client_id)
@@ -1949,6 +2025,20 @@ fn server_relay_verdict(
                 .relay_pair_churn
                 .get(&pair_key(a, b))
                 .is_some_and(|pc| forced_active(&pc, Instant::now())));
+    // FR-19 — an ACTIVE org-relay session for this pair outranks every rule
+    // below: the mint already applied the gates, and the client cascade picks
+    // Org over Turn/Derp when a session exists (§6). Gated on BOTH ends'
+    // `supports_org_relay` like every other capability, and on both accepting
+    // server verdicts at all, so a pre-FR-19 end never sees the tag.
+    if recipient.supports_org_relay
+        && peer.supports_org_relay
+        && recipient.supports_server_relay_strategy
+        && peer.supports_server_relay_strategy
+        && let (Some(a), Some(b)) = (recipient.id, peer.id)
+        && state.org_relay.active_session(&pair_key(a, b)).is_some()
+    {
+        return Some(RelayStrategyWire::OrgRelay);
+    }
     verdict_from_nodes(recipient, peer, pinned)
 }
 
@@ -2232,7 +2322,7 @@ fn union_endpoints(lan: &[String], rest: &[String]) -> Vec<String> {
 }
 
 /// Symmetric per-pair key so both ends mint identical coturn creds.
-fn pair_key(a: ObjectId, b: ObjectId) -> String {
+pub(crate) fn pair_key(a: ObjectId, b: ObjectId) -> String {
     let (x, y) = (a.to_hex(), b.to_hex());
     if x <= y {
         format!("{x}:{y}")
