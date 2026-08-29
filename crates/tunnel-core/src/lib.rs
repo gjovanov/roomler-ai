@@ -1,7 +1,7 @@
 //! Roomler AI tunnel core.
 //!
-//! Shared building blocks for the `roomler-tunnel` CLI (controller side)
-//! and the `roomler-agent` tunnel service (target side):
+//! Shared building blocks for the `roomler` CLI (controller side)
+//! and the `roomlerd` tunnel service (target side):
 //!
 //! * [`transport`] — pluggable data-plane (`webrtc-dc-v1` today;
 //!   `wireguard-v1` in v0.5). Capability-negotiated at peer setup.
@@ -30,6 +30,7 @@ pub mod auth;
 /// Tunnel-client session driver — the shared flow vocabulary (P3b-1); the session
 /// orchestration + the `TunnelSignaling` seam fold in at P3b-2.
 pub mod driver;
+// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it.
 /// Node env-var reads with `ROOMLERD_*` → legacy `ROOMLER_AGENT_*` fallback.
 pub mod env;
 pub mod evidence;

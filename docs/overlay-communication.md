@@ -602,6 +602,7 @@ all.
 
 ## 9. Configuration reference
 
+<!-- RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it. -->
 All flags take the `ROOMLERD_OVERLAY_` prefix; the legacy `ROOMLER_AGENT_`
 prefix is still honoured.
 

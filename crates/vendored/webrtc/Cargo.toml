@@ -5,7 +5,7 @@
 #     callers can advertise an SCTP rwnd larger than the upstream
 #     1 MB default (INITIAL_RECV_BUF_SIZE in webrtc-sctp-0.11.0). At
 #     50-100 ms RTT, 1 MB caps single-stream DC throughput at
-#     ~80-167 Mbps; roomler-tunnel needs 8 MB to keep
+#     ~80-167 Mbps; the tunnel CLI needs 8 MB to keep
 #     native-to-native DCs link-bound on home-broadband paths.
 #   - src/sctp_transport/mod.rs:159: pulls the value out of
 #     SettingEngine instead of hardcoding 0 (which falls back to the

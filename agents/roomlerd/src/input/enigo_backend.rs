@@ -35,7 +35,7 @@ impl EnigoInjector {
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
 
         thread::Builder::new()
-            .name("roomler-agent-input".into())
+            .name("roomlerd-input".into())
             .spawn(move || {
                 let settings = Settings::default();
                 let enigo = match Enigo::new(&settings) {

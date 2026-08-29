@@ -2,7 +2,7 @@
 //!
 //! [`crate::driver::run_tunnel_session`] speaks the `rc:tunnel.*` control
 //! protocol over this pair instead of owning a WebSocket, so the SAME driver
-//! serves both the `roomler-tunnel` CLI (which backs it with a tokio-tungstenite
+//! serves both the `roomler` CLI (which backs it with a tokio-tungstenite
 //! WS carrying a `TunnelClient` JWT) and — at P3b-2 — the `roomlerd` daemon
 //! (which backs it with its existing agent-WS multiplexer + a per-session
 //! `ServerMsg` channel). The split into a cloneable **sink** + a single-consumer

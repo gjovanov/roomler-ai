@@ -1,3 +1,7 @@
+<!-- RETIRED-NAME-ANCHOR-BEGIN
+     Every retired name in this runbook names a PUBLISHED release asset. Filenames are fixed by what is already on GitHub Releases (FR-21 D6). The commands here are meant to
+     be pasted against a real downloaded artifact, so the filenames must match
+     what is actually published. -->
 # Code signing
 
 How every published Roomler artifact gets signed, why the pipeline is shaped
@@ -367,3 +371,4 @@ workspace version (the hardcoded `rc.30`/`rc.197` pins are gone).
   --push`.
 - If the Azure *subject* ever changes (rename, re-registration), update
   `AZURE_SIGNING_EXPECT_SUBJECT` **and** do the §9 sweep in the same PR.
+<!-- RETIRED-NAME-ANCHOR-END -->

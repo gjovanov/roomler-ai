@@ -43,7 +43,7 @@ The current stack already gives us 80% of what's needed:
 
 The only genuinely new component is the **native agent** (a separate Rust binary that ships per-OS) and a thin signaling extension on the server.
 
-> **See also — the `roomler-tunnel` subsystem.** A sibling of remote-control that reuses the same agent binary, `rc:*` signaling, and coturn cluster, but for **TCP port-forwarding** (operator's `127.0.0.1:<port>` → agent → an internal service) rather than screen capture + input. Its data plane defaults to **QUIC** (`quic-v1`, quinn) with a WebRTC-data-channel fallback, and crosses corporate NAT / firewalls via the same direct → TURN(UDP) → TURNS/TCP tier walk. The server negotiates `quic-v1` only for agents new enough to speak it (≥ rc.104). Operator guide: [`docs/tunnel-install.md`](./tunnel-install.md).
+> **See also — the `roomler` subsystem.** A sibling of remote-control that reuses the same agent binary, `rc:*` signaling, and coturn cluster, but for **TCP port-forwarding** (operator's `127.0.0.1:<port>` → agent → an internal service) rather than screen capture + input. Its data plane defaults to **QUIC** (`quic-v1`, quinn) with a WebRTC-data-channel fallback, and crosses corporate NAT / firewalls via the same direct → TURN(UDP) → TURNS/TCP tier walk. The server negotiates `quic-v1` only for agents new enough to speak it (≥ rc.104). Operator guide: [`docs/tunnel-install.md`](./tunnel-install.md).
 
 > **See also — the L3 overlay & its Windows firewall override.** The `overlay-l3` feature evolves the tunnel into a Tailscale-style per-tenant WireGuard+DERP mesh (Wintun NIC `roomler`, overlay IPs `100.64.0.0/10`). On a GPO-locked Windows host the corporate Defender Firewall drops unsolicited inbound on the overlay adapter; the agent overrides this by programming the Windows Filtering Platform directly (a LUID-scoped, high-weight hard-permit sublayer) from its LocalSystem service. Design, limits (callout/IPsec), and the `ROOMLERD_WFP_PERMIT` disable: [`docs/overlay-wfp.md`](./overlay-wfp.md).
 
@@ -122,9 +122,9 @@ The application server **never sees raw input or pixels** — those flow over th
 
 ## 4. The agent
 
-A standalone Rust binary, distributed as `roomler-agent` per OS. Two operating modes:
+A standalone Rust binary, distributed as `roomlerd` per OS. Two operating modes:
 
-1. **Attended** — user runs `roomler-agent --pair` from the tray, gets a one-time PIN, types it in the controller UI. PIN is good for 10 minutes, single use.
+1. **Attended** — user runs `roomlerd --pair` from the tray, gets a one-time PIN, types it in the controller UI. PIN is good for 10 minutes, single use.
 2. **Unattended** — agent registers once with an `enrollment_token` (issued by an org Admin via the existing org settings UI), persists a per-machine `agent_token`, and stays connected to the API via WebSocket whenever the user is logged in.
 
 ### 4.1 Why a native binary (and not just `getDisplayMedia` + browser)
@@ -148,7 +148,7 @@ agents/roomlerd/
 ├── Cargo.toml                 # workspace member of the main repo
 ├── src/
 │   ├── main.rs                # tray/CLI entry
-│   ├── config.rs              # ~/.config/roomler-agent/config.toml
+│   ├── config.rs              # ~/.config/roomler/config.toml
 │   ├── enrollment.rs          # one-shot enrollment → agent_token
 │   ├── signaling.rs           # WSS to roomler API, rc:* protocol
 │   ├── peer.rs                # webrtc-rs PeerConnection wrapper
@@ -647,7 +647,7 @@ keyboard component.*
 
 <!-- RETIRED-NAME-ANCHOR-BEGIN: §17-19 are historical appendices. They record what the
      product was called and what operators actually typed at the time (0.1.32 - rc.26),
-     so rewriting `roomler-agent` to `roomlerd` here would falsify the record rather
+     so rewriting `roomlerd` to `roomlerd` here would falsify the record rather
      than update it. The CURRENT encoder reference is docs/encoders.md. docs/fr/FR-21 -->
 
 ## 17. Hardware encoder backends
@@ -1175,7 +1175,7 @@ JWT cache flushes during a deploy used to permanently break every
 agent in the field; now they back off and rejoin within seconds.
 After 3 consecutive 401s, raises `<config-dir>/needs-attention.txt`
 sentinel via `notify::raise_attention` describing the situation +
-recommending `roomler-agent re-enroll --token <jwt>` (new CLI
+recommending `roomlerd re-enroll --token <jwt>` (new CLI
 that preserves `machine_id` + `machine_name` from the existing
 config). Sentinel auto-cleared on auth recovery.
 
@@ -1259,7 +1259,7 @@ document — both are Schema 1.3+ Settings.* children. schtasks /XML
 on Win10/11 correctly rejected the document with
 `(39,7):DisallowStartOnRemoteAppSession: ERROR: The task XML
 contains an unexpected node`. Field impact: anyone who tried
-`roomler-agent service install` after 0.1.50–0.1.52 saw the error
+`roomlerd service install` after 0.1.50–0.1.52 saw the error
 and kept their pre-0.1.50 ONLOGON task. Their *binary* had all the
 in-process resilience features but their *Scheduled Task* still had
 the bad battery defaults.
@@ -1447,7 +1447,7 @@ feature-gated MF / WGC compilation paths.
 `InstallScope='perUser'` (no UAC), but `CreateService` requires admin
 elevation. Auto-registering `RoomlerAgentService` from a perUser MSI
 is impossible. Operators install the MSI normally, then run
-`roomler-agent service install --as-service` from an elevated
+`roomlerd service install --as-service` from an elevated
 PowerShell. Future per-machine MSI flavour can revisit.
 
 ### 19.8.5 Where the cycle ended

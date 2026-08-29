@@ -14,8 +14,8 @@
 //! by an out-of-process operator running:
 //!
 //! ```text
-//! roomler-agent consent --session <hex_id> --approve
-//! roomler-agent consent --session <hex_id> --deny
+//! roomlerd consent --session <hex_id> --approve
+//! roomlerd consent --session <hex_id> --deny
 //! ```
 //!
 //! 30 s timeout → auto-deny. Outcome propagates back through the
@@ -24,7 +24,7 @@
 //! The tray popup (Phase 3) now renders this prompt on attended
 //! sessions: the signaling layer calls [`ConsentBroker::write_pending`]
 //! to drop a `<session>.pending` marker in this same dir, the
-//! `roomler-agent-tray` companion watches for it and shows an
+//! `roomler-desktop` companion watches for it and shows an
 //! Approve/Deny modal, and the operator's choice writes the same
 //! `.approve`/`.deny` sentinel the poll loop below already consumes.
 //! The CLI subcommand remains a headless fallback.
@@ -388,7 +388,7 @@ impl ConsentBroker {
             session = session_hex,
             timeout_secs = timeout.as_secs(),
             sentinel_dir = %self.inner.sentinel_dir.display(),
-            "operator consent required — drop a sentinel via `roomler-agent consent --session {} --approve|--deny`",
+            "operator consent required — drop a sentinel via `roomlerd consent --session {} --approve|--deny`",
             session_hex
         );
 
