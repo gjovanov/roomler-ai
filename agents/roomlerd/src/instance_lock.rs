@@ -7,6 +7,10 @@
 //! server-side WS to drop the other.
 //!
 //! - **Windows**: a pair of per-session named mutexes,
+// RETIRED-NAME-ANCHOR-BEGIN
+// The legacy mutex and lock-file names are held ON PURPOSE: an OLD instance
+// only knows the old name, so dropping it would let two daemons run at once
+// across an upgrade — the exact thing this module exists to prevent.
 //!   `Local\Roomler-<sha>` (post-P3D-rename) AND `Local\RoomlerAgent-<sha>`
 //!   (pre-rename). Acquiring both means an OLD `roomlerd run` and a
 //!   NEW one can't both run during the rename window — either one already
@@ -255,7 +259,7 @@ mod tests {
         // Each test gets its own cfg path so tests in parallel don't
         // collide on the lock_id-derived OS primitive.
         std::env::temp_dir().join(format!(
-            "roomler-agent-test-{}-{}-{}.toml",
+            "roomlerd-test-{}-{}-{}.toml",
             name,
             std::process::id(),
             std::time::SystemTime::now()
@@ -327,3 +331,4 @@ mod tests {
         );
     }
 }
+// RETIRED-NAME-ANCHOR-END

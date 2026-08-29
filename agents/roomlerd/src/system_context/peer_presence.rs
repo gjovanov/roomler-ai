@@ -29,6 +29,11 @@
 //!
 //! ## Path
 //!
+// RETIRED-NAME-ANCHOR-BEGIN
+// This path is a RENDEZVOUS between two processes — the supervisor and the
+// SystemContext worker — which can be different versions during an update.
+// Both ends must agree on the name, and only one of them gets replaced
+// first, so the name is a compatibility surface rather than a label.
 //! `C:\ProgramData\roomler-agent\peer-connected.lock` — under
 //! `%PROGRAMDATA%`. Both the user-context worker (running as the
 //! interactive user) and the SCM service (running as `LocalSystem`)
@@ -369,3 +374,4 @@ mod tests {
         assert!(!is_signaled());
     }
 }
+// RETIRED-NAME-ANCHOR-END

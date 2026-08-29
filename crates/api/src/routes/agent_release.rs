@@ -154,6 +154,11 @@ pub struct InstallerHealth {
     /// Normalised flavour: `"peruser"` or `"permachine"`.
     pub flavour: String,
     /// Canonical asset filename, e.g.
+    // RETIRED-NAME-ANCHOR-BEGIN
+    // Serves PUBLISHED release assets. Their filenames are fixed by what is
+    // already on GitHub Releases; the updater matches on extension + arch +
+    // the -permachine- infix, never the prefix (FR-21 D6). The fixtures below
+    // are copies of real asset lists and must stay byte-for-byte.
     /// `roomler-agent-0.3.0-rc.27-perMachine-x86_64-pc-windows-msvc.msi`.
     pub filename: String,
     /// Asset size in bytes.
@@ -526,3 +531,4 @@ mod tests {
         );
     }
 }
+// RETIRED-NAME-ANCHOR-END
