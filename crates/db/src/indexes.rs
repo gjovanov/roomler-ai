@@ -184,6 +184,23 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Subscribers (FR-39). `email` is unique so a re-submission updates the
+    // existing row rather than creating a second one that the first row's
+    // unsubscribe link could never reach. The two token indexes are unique
+    // because each token is a capability resolved by lookup, and two rows
+    // sharing one would make the resolution ambiguous.
+    create_indexes(
+        db,
+        "subscribers",
+        vec![
+            index_unique(bson::doc! { "email": 1 }),
+            index_unique(bson::doc! { "unsubscribe_token": 1 }),
+            index(bson::doc! { "confirm_token": 1 }),
+            index(bson::doc! { "created_at": -1 }),
+        ],
+    )
+    .await?;
+
     // Custom Emojis
     create_indexes(
         db,

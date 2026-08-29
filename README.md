@@ -1,16 +1,107 @@
-# Roomler AI
+# Roomler
 
-**Every device you own, one secure network.** Roomler puts the desktop of any of
-your machines into a browser tab (TeamViewer / RustDesk class), joins all of your
-devices into a private encrypted network that travels with you (Tailscale class —
-with tunnels, SOCKS5, and exit nodes) — and throws in team chat and video
-conferencing as part of every plan. One server, one identity, one small agent per
-machine. Self-hostable, end-to-end encrypted.
+**Open-source remote desktop and WireGuard mesh in one daemon.**
+
+[![License](https://img.shields.io/badge/license-AGPL--3.0%20server%20%2B%20MPL--2.0%20agent-009688)](LICENSING.md)
+[![Platforms](https://img.shields.io/badge/agent-Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-informational)](#platform-support)
+[![Releases](https://img.shields.io/github/v/release/gjovanov/roomler-ai?filter=agent-*&label=agent)](https://github.com/gjovanov/roomler-ai/releases)
+[![Self-hosted](https://img.shields.io/badge/self--hosted-unlimited%20devices-009688)](docs/self-hosting.md)
+
+Put the desktop of any machine you own into a browser tab, and join all of those
+machines into one private encrypted network that travels with you — so a laptop
+in a hotel, a GPU box at home and a server in a rack behave as if they shared a
+LAN. Chat and video conferencing come with it.
+
+It is one small agent per machine and one server you can run yourself. Traffic
+goes **peer-to-peer** and is end-to-end encrypted: the server introduces the two
+ends and enforces policy, and never sees your pixels, keystrokes, files or
+tunnelled bytes.
 
 <p align="center">
   <img src="docs/assets/hero-mesh.svg" alt="Your devices, one encrypted mesh — a laptop, a GPU workstation, a home server and a cloud cluster connected directly, coordinated by roomler.ai" width="640">
 </p>
 <p align="center"><i>Your devices, one encrypted mesh — coordinated from the cloud, connected directly.<br>The server never sees your screens, keystrokes, files, or traffic.</i></p>
+
+## Run it
+
+**Self-hosted** — unlimited devices, no licence key, no activation, no
+phone-home. Same code as the hosted service; there is no crippled community
+build.
+
+```bash
+git clone https://github.com/gjovanov/roomler-ai.git && cd roomler-ai
+cp .env.selfhost.example .env.selfhost      # fill in 4 values; 2 are `openssl rand -hex 32`
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build
+```
+
+Then open <http://localhost:8080>. The first build compiles Rust and mediasoup
+from source and takes 10–20 minutes; after that, startup is seconds. Full
+walkthrough — TLS, reverse proxy, media ports, backups —
+in **[`docs/self-hosting.md`](docs/self-hosting.md)**.
+
+**Hosted** — create a workspace at [roomler.ai](https://roomler.ai) and skip to
+the next step. Free for 3 devices.
+
+### Add a machine
+
+Mint an enrollment token in the app (**Devices → Enroll device**), then on the
+machine you want to reach:
+
+```bash
+# Linux / macOS
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon --token <enrollment-jwt>
+# Windows (PowerShell, elevated)
+irm https://roomler.ai/api/setup/install.ps1 | iex
+```
+
+The agent connects **outbound only** — nothing is opened on the machine you
+enrol, and no port is forwarded. Then, from anywhere:
+
+```bash
+roomler ssh     gpu-1                                            # a shell — no sshd, no listening port
+roomler forward --agent office-1 --local 127.0.0.1:5432 --remote db.internal:5432
+roomler socks5  --agent berlin-1 --local 127.0.0.1:1080          # see the network as that machine sees it
+```
+
+…or open the machine's desktop from the web app and use it as if you were
+sitting at it.
+
+Prefer a GUI? The **roomler-setup** wizard installs any role on any OS —
+see [`docs/installation.md`](docs/installation.md).
+
+## What it replaces
+
+| If you use… | …for | Roomler does it |
+|---|---|---|
+| **TeamViewer / AnyDesk / RustDesk** | reaching a desktop | browser-based, hardware-encoded, consent-gated, works through corporate firewalls |
+| **Tailscale / ZeroTier / NetBird** | a private network between machines | WireGuard mesh, stable IPs, MagicDNS, subnet routers, exit nodes |
+| **ngrok / Cloudflare Tunnel** | reaching one service behind a NAT | `roomler forward`, SOCKS5, daemon-supervised declared routes |
+| **`sshd` + a jump host** | a shell on a remote box | `roomler ssh` — no daemon to install, no port to open, no bastion |
+| **Slack + Zoom** | the team layer | rooms, threads, files, HD calls on the same server and accounts |
+
+Not a claim that it beats each of those at its own game — a claim that you stop
+running five things, on one identity, with one agent, and can host the whole lot
+yourself. Head-to-head write-ups, each naming what the other product does
+better: [**vs Tailscale**](docs/compare/vs-tailscale.md) ·
+[vs RustDesk](docs/compare/vs-rustdesk.md) ·
+[vs TeamViewer](docs/compare/vs-teamviewer.md) ·
+[vs MeshCentral](docs/compare/vs-meshcentral.md) ·
+[vs NetBird](docs/compare/vs-netbird.md).
+
+## Licence, in one line
+
+The server you would *host* is **AGPL-3.0**; everything you *install on a
+machine* — agent, CLI, desktop and setup apps — is **MPL-2.0**, which imposes
+nothing on the tooling you build around it. MSPs and IT providers: that split
+exists for you. See [`LICENSING.md`](LICENSING.md) and
+[`COMMERCIAL.md`](COMMERCIAL.md).
+
+> **On the name:** the AI in `roomler.ai` is one optional document-recognition
+> feature. This is a networking and remote-access product. Nothing calls home,
+> and self-hosted deployments send us no telemetry at all.
+
+---
+
 
 ## 🖥️ 1 · Desktop sharing & remote control
 
@@ -143,46 +234,30 @@ they cannot read. Full picture: [`docs/architecture.md`](docs/architecture.md).
 | **Auth** | JWT (6 audience-checked token types), Argon2, OAuth 2.0 |
 | **Infrastructure** | Docker multi-stage image (nginx + API), docker-compose dev stack (MongoDB, Redis, MinIO, coturn), Kubernetes-ready |
 
-## Quick start
+## Building from source (development)
 
-Using the hosted service? Create a workspace at [roomler.ai](https://roomler.ai)
-and skip straight to *Add a machine*.
-
-### Run the platform (development)
-
-```bash
-# 1. Infrastructure
-docker compose up -d          # MongoDB :27019, Redis :6379, MinIO :9000, coturn
-
-# 2. Backend
-cargo run --bin roomler-ai-api    # API on :3000
-
-# 3. Frontend
-cd ui && bun install && bun run dev   # SPA on :5000
-```
-
-### Add a machine to your fleet
-
-Mint an enrollment token in the admin UI (**Admin → Agents → Enroll**), then on the
-machine:
+Running it, hosted or self-hosted, is [above](#run-it). This is the loop for
+working *on* it — the dev stack runs the dependencies and you run the API and the
+Vite server yourself, so both hot-reload.
 
 ```bash
-# Linux / macOS — daemon (remote desktop + tunnels + overlay)
-curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon --token <enrollment-jwt>
+# 1. Dependencies only — MongoDB :27019, Redis :6379, MinIO :9000, coturn
+docker compose up -d
 
-# Windows (PowerShell)
-irm https://roomler.ai/api/setup/install.ps1 | iex
+# 2. Backend — API on :3000
+cargo run --bin roomler-ai-api
+
+# 3. Frontend — SPA on :5000, proxying /api and /ws to :5001
+cd ui && bun install && bun run dev
 ```
 
-Prefer a GUI? Download the **roomler-setup** wizard from the admin UI — one installer
-for every role (Windows service / per-user / tunnel-only) on every OS. Details, MSI
-flavours, and service modes: [`docs/installation.md`](docs/installation.md).
+⚠️ `docker-compose.yml` is the **development** stack: dependencies, no
+application. The one-command self-hosted stack is
+[`docker-compose.selfhost.yml`](docker-compose.selfhost.yml) — see
+[`docs/self-hosting.md`](docs/self-hosting.md).
 
-### Reach it
-
-- **Remote desktop**: open the machine from the web app and click *Connect*.
-- **Tunnel**: `roomler forward --agent <name> --local 127.0.0.1:5432 --remote db:5432`
-- **Overlay**: `roomler ping <name>` — every node has a stable IP and MagicDNS name.
+Tests, lint and the agent's feature flags: [`docs/testing.md`](docs/testing.md)
+and [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Platform support
 
@@ -205,6 +280,7 @@ Start with [Use cases](docs/use-cases.md).
 | Start with | |
 |---|---|
 | [Use cases](docs/use-cases.md) | What people do with it — in plain language, scenario by scenario |
+| [Self-hosting](docs/self-hosting.md) | Run the whole thing yourself: one compose file, TLS, media ports, backups |
 | [Agent & Tunnel overview](docs/agent-tunnel-architecture.md) | The remote-access stack in five minutes, for users and operators |
 | [Installation](docs/installation.md) | Every install path on every platform, enrollment, self-update |
 | [Remote control](docs/remote-control.md) | Full remote-desktop design: protocol, security, latency budget |

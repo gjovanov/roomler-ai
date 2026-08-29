@@ -142,6 +142,9 @@
             <h2 class="text-h4 text-md-h3 font-weight-bold mb-4 text-white">Take your devices with you</h2>
             <p class="text-body-1 cta-subtitle mb-6 mb-md-8">Free for up to 3 devices — remote desktop, private mesh, tunnels, chat and calls.</p>
             <v-btn color="white" size="large" :to="{ name: 'register' }" class="px-6 text-primary">Create Your Workspace — Free</v-btn>
+
+            <v-divider class="my-8 cta-divider" />
+            <StayInTouch source="landing" />
           </v-col>
         </v-row>
       </v-container>
@@ -186,9 +189,12 @@
 import { onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
+import StayInTouch from '@/components/landing/StayInTouch.vue'
+import { useSnackbar } from '@/composables/useSnackbar'
 import { enrollCommands } from '@/utils/enrollCommands'
 
 const route = useRoute()
+const { showSnackbar } = useSnackbar()
 
 const capabilities = [
   'Remote desktop',
@@ -307,7 +313,25 @@ const plans = ref<LandingPlan[]>([
   { id: 'business', name: 'Business', price_cents: 1600, features: ['300 devices', 'Everything in Pro', 'Priority support'] },
 ])
 
+// FR-39 — where the confirm / unsubscribe links land. The API redirects here
+// with `?subscribe=<outcome>` rather than rendering its own page, so the
+// message arrives in the product's own voice. The param is stripped afterwards
+// so a reload does not repeat the message and a shared URL carries no state.
+const SUBSCRIBE_MESSAGES: Record<string, { text: string; color: string }> = {
+  confirmed: { text: "You're on the list — thanks.", color: 'success' },
+  unsubscribed: { text: "You've been unsubscribed. No more emails.", color: 'success' },
+  invalid: { text: 'That link is no longer valid — it may already have been used.', color: 'warning' },
+}
+
 onMounted(async () => {
+  const outcome = SUBSCRIBE_MESSAGES[String(route.query.subscribe ?? '')]
+  if (outcome) {
+    showSnackbar(outcome.text, outcome.color, 6000)
+    const url = new URL(window.location.href)
+    url.searchParams.delete('subscribe')
+    window.history.replaceState({}, '', url.toString())
+  }
+
   try {
     const resp = await fetch('/api/stripe/plans')
     if (resp.ok) {
@@ -439,6 +463,14 @@ onMounted(async () => {
 
 .cta-subtitle {
   color: rgba(255, 255, 255, 0.85);
+}
+
+/* Separates the primary CTA from the lower-commitment one below it, without
+   reading as a second section — the email capture is a fallback, not a rival. */
+.cta-divider {
+  border-color: rgba(255, 255, 255, 0.22) !important;
+  max-width: 520px;
+  margin-inline: auto;
 }
 
 .landing-footer {
