@@ -348,10 +348,17 @@ export const useConferenceStore = defineStore('conference', () => {
       rtpParameters: result.rtp_parameters,
     })
 
+    // FR-30 P4 — seed from the subscription. A pause that happened before we
+    // joined has no event for us to hear, so without this the badge only ever
+    // appears after the peer's NEXT toggle.
+    const startsPaused = result.producer_paused === true
+
     consumers.set(consumer.id, consumer)
 
     const streamKey = source === 'screen' ? `${connectionId}:screen` : connectionId
     consumerStreamKey.set(consumer.id, streamKey)
+    if (result.kind === 'video') remoteVideoPaused.set(streamKey, startsPaused)
+    else remoteAudioPaused.set(streamKey, startsPaused)
 
     const existing = remoteStreams.get(streamKey)
     const tracks = existing ? [...existing.stream.getTracks(), consumer.track] : [consumer.track]
