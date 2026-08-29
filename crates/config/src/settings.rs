@@ -12,7 +12,6 @@ pub struct Settings {
     pub s3: S3Settings,
     pub mediasoup: MediasoupSettings,
     pub turn: TurnSettings,
-    pub claude: ClaudeSettings,
     pub oauth: OAuthSettings,
     pub stripe: StripeSettings,
     pub giphy: GiphySettings,
@@ -492,13 +491,6 @@ pub struct TurnSettings {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ClaudeSettings {
-    pub api_key: Option<String>,
-    pub model: String,
-    pub max_tokens: u32,
-}
-
-#[derive(Debug, Deserialize, Clone)]
 pub struct StripeSettings {
     pub secret_key: String,
     pub webhook_secret: String,
@@ -617,8 +609,6 @@ impl Settings {
             .set_default("overlay.blocks_enabled", false)?
             .set_default("overlay.block_prefix", 22)?
             .set_default("overlay.block_version_floor", "0.3.0-rc.301")?
-            .set_default("claude.model", "claude-sonnet-4-5-20250929")?
-            .set_default("claude.max_tokens", 4096)?
             .set_default("oauth.base_url", "http://localhost:5001")?
             .set_default("oauth.google.client_id", "")?
             .set_default("oauth.google.client_secret", "")?

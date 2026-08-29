@@ -49,7 +49,6 @@ async fn get_plans_free_plan_has_correct_data() {
     assert_eq!(free["limits"]["max_channels"], 5);
     assert_eq!(free["limits"]["video_max_participants"], 4);
     assert_eq!(free["limits"]["cloud_integrations"], false);
-    assert_eq!(free["limits"]["ai_recognition"], false);
     assert_eq!(free["limits"]["recordings"], false);
     // S5 pivot — fleet limits lead the matrix.
     assert_eq!(free["limits"]["max_devices"], 3);
@@ -81,7 +80,6 @@ async fn get_plans_pro_plan_has_correct_data() {
     assert_eq!(pro["price_cents"], 800);
     assert_eq!(pro["limits"]["video_max_participants"], 10);
     assert_eq!(pro["limits"]["cloud_integrations"], true);
-    assert_eq!(pro["limits"]["ai_recognition"], false);
     assert_eq!(pro["limits"]["recordings"], false);
     assert_eq!(pro["limits"]["max_devices"], 30);
     assert_eq!(pro["limits"]["max_tunnel_clients"], 30);
@@ -111,7 +109,6 @@ async fn get_plans_business_plan_has_correct_data() {
     assert_eq!(biz["price_cents"], 1600);
     assert_eq!(biz["limits"]["video_max_participants"], 100);
     assert_eq!(biz["limits"]["cloud_integrations"], true);
-    assert_eq!(biz["limits"]["ai_recognition"], true);
     assert_eq!(biz["limits"]["recordings"], true);
     assert_eq!(biz["limits"]["max_devices"], 300);
     assert_eq!(biz["limits"]["max_tunnel_clients"], 300);
