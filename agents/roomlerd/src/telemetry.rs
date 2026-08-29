@@ -251,7 +251,6 @@ mod tests {
             dns: None,
             srflx: None,
             warm_relay: None,
-            lan_captures: None,
             direct_socks: Vec::new(),
             derp_inbound_drops: None,
         };
@@ -289,7 +288,6 @@ mod tests {
             dns: None,
             srflx: None,
             warm_relay: None,
-            lan_captures: None,
             direct_socks: Vec::new(),
             derp_inbound_drops: None,
         };
@@ -327,7 +325,6 @@ mod tests {
             dns: None,
             srflx: None,
             warm_relay: None,
-            lan_captures: None,
             direct_socks: Vec::new(),
             derp_inbound_drops: None,
         };
@@ -369,7 +366,6 @@ mod tests {
             dns: None,
             srflx: None,
             warm_relay: None,
-            lan_captures: None,
             direct_socks: Vec::new(),
             derp_inbound_drops: None,
         };
