@@ -112,6 +112,7 @@ describe('useConferenceLayout', () => {
     local?: FakeStream | null
     remotes?: Array<[string, FakeStream]>
     paused?: Map<string, boolean>
+    audioPaused?: Map<string, boolean>
   } = {}) {
     const scope = effectScope()
     let api!: ReturnType<typeof useConferenceLayout>
@@ -135,7 +136,7 @@ describe('useConferenceLayout', () => {
         ref(null),
         (id: string) => id,
         ref('Me'),
-        opts.paused,
+        { video: opts.paused, audio: opts.audioPaused },
       )
     })
     return { api, scope, remoteStreams, paused: opts.paused }
@@ -258,5 +259,23 @@ describe('useConferenceLayout', () => {
     api.prefs.value.hideNonVideo = true
     paused.set('local', true)
     expect([...api.layout.value.primary, ...api.layout.value.secondary].map((p) => p.streamKey)).toContain('local')
+  })
+
+  // FR-30 P3 — a remote's mute state used to be hardcoded `false`, so the
+  // mic-off badge could only ever appear on your own tile.
+  it('a remote reads as muted when the PEER says their mic is off', () => {
+    const audioPaused = reactive(new Map<string, boolean>())
+    const { api } = mount({
+      local: new FakeStream(true),
+      remotes: [['them', new FakeStream(true)]],
+      audioPaused,
+    })
+    const them = () => api.participants.value.find((p) => p.streamKey === 'them')!
+
+    expect(them().isMuted).toBe(false)
+    audioPaused.set('them', true)
+    expect(them().isMuted).toBe(true)
+    audioPaused.set('them', false)
+    expect(them().isMuted).toBe(false)
   })
 })
