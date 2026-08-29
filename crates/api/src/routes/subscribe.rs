@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! FR-38 — PUBLIC subscribe / confirm / unsubscribe.
+//! FR-39 — PUBLIC subscribe / confirm / unsubscribe.
 //!
 //! No auth extractor anywhere in this module. For `confirm` and `unsubscribe`
 //! the unguessable token IS the capability, the same shape as

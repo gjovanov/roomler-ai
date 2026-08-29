@@ -1294,6 +1294,9 @@ mod tests {
         // The primary name wins when both are set — otherwise a stale alias on
         // a field host would quietly override the value an operator just set.
         clear();
+        // RAW-ENV-DELIBERATE: `test_env::set_as` clears the sibling
+        // spellings, and this assertion needs BOTH set at once so the chain has
+        // something to choose between.
         unsafe { std::env::set_var("ROOMLERD_HW_AUTO", "1") };
         unsafe { std::env::set_var("ROOMLER_AGENT_HW_AUTO", "0") };
         assert!(!hw_auto_disabled(), "ROOMLERD_* must take precedence");
@@ -1325,9 +1328,9 @@ mod tests {
         // Isolate from any operator env override so the defaults are asserted.
         // SAFETY: guarded by RELAY_ENV_LOCK against the known writers.
         unsafe {
-            std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_EDGE");
-            std::env::remove_var("ROOMLER_AGENT_SMOOTH_MAX_EDGE");
-            std::env::remove_var("ROOMLERD_PRIORITY_RES_CAP");
+            tunnel_core::env::test_env::clear("RELAY_MAX_EDGE");
+            tunnel_core::env::test_env::clear("SMOOTH_MAX_EDGE");
+            tunnel_core::env::test_env::clear("PRIORITY_RES_CAP");
         }
         // rc.445 DEFAULT: no dial dims-caps on any path — a mid-motion rung
         // flip costs a blocking encoder open (field-measured 0.65-0.87 s on
@@ -1342,7 +1345,7 @@ mod tests {
             assert_eq!(priority_relay_cap(dial, false), None);
         }
         // The restore switch brings back the rc.443 caps for A/B.
-        unsafe { std::env::set_var("ROOMLERD_PRIORITY_RES_CAP", "1") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "PRIORITY_RES_CAP", "1") };
         assert_eq!(priority_relay_cap(priority::BALANCED, true), Some(1280));
         assert_eq!(priority_relay_cap(priority::BALANCED, false), None);
         assert_eq!(priority_relay_cap(priority::SHARPER, true), None);
@@ -1350,14 +1353,14 @@ mod tests {
         assert_eq!(priority_relay_cap(priority::SMOOTHER, true), Some(1024));
         assert_eq!(priority_relay_cap(priority::SMOOTHER, false), Some(1024));
         assert_eq!(priority_relay_cap(42, true), Some(1280));
-        unsafe { std::env::remove_var("ROOMLERD_PRIORITY_RES_CAP") };
+        unsafe { tunnel_core::env::test_env::clear("PRIORITY_RES_CAP") };
     }
 
     #[test]
     fn dial_rate_factor_defaults_per_dial() {
         unsafe {
-            std::env::remove_var("ROOMLER_AGENT_SMOOTHER_RATE_PCT");
-            std::env::remove_var("ROOMLER_AGENT_BALANCED_RATE_PCT");
+            tunnel_core::env::test_env::clear("SMOOTHER_RATE_PCT");
+            tunnel_core::env::test_env::clear("BALANCED_RATE_PCT");
         }
         assert_eq!(dial_rate_factor_pct(priority::SHARPER), 100);
         assert_eq!(dial_rate_factor_pct(priority::SMOOTHER), 70);
@@ -1374,7 +1377,7 @@ mod tests {
         // SAFETY: same hermetic save/restore contract as the sibling env
         // tests; serialised on RELAY_ENV_LOCK.
         let prior = std::env::var("ROOMLERD_IDLE_REFINE_BALANCED").ok();
-        unsafe { std::env::remove_var("ROOMLERD_IDLE_REFINE_BALANCED") };
+        unsafe { tunnel_core::env::test_env::clear("IDLE_REFINE_BALANCED") };
 
         // Smoother refines on EVERY path (its cap applies on every path).
         assert!(idle_refine_applies(priority::SMOOTHER, true));
@@ -1386,17 +1389,19 @@ mod tests {
         assert!(idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
         // The kill switch restores the un-refined Balanced rung.
-        unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", "0") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", "0") };
         assert!(!idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
         // The old opt-in spelling stays valid.
-        unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", "1") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", "1") };
         assert!(idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
 
         match prior {
-            Some(v) => unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", v) },
-            None => unsafe { std::env::remove_var("ROOMLERD_IDLE_REFINE_BALANCED") },
+            Some(v) => unsafe {
+                tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", v)
+            },
+            None => unsafe { tunnel_core::env::test_env::clear("IDLE_REFINE_BALANCED") },
         }
     }
 
@@ -1410,34 +1415,77 @@ mod tests {
     #[test]
     fn relay_max_bps_reads_env() {
         let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Hermetic: save the prior value, exercise set/unset, then restore.
-        // SAFETY: same reasoning as `hw_auto_disabled_reads_env` — no other
-        // code in this crate touches ROOMLERD_RELAY_MAX_KBPS at test
-        // time, and the tests that do share RELAY_ENV_LOCK.
-        let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
+        // `relay_max_bps` reads through `node_env`, which prefers ROOMLERD_*
+        // and falls back to the retired ROOMLER_AGENT_*. This test used to set
+        // ONLY the retired name, so it proved the third link of that chain and
+        // left the spelling the code and docs actually use covered by nothing —
+        // and, because it cleared only that one name, an inherited
+        // ROOMLERD_RELAY_MAX_KBPS would have decided every assertion below.
+        //
+        // SAFETY: set_var/remove_var are unsafe in Rust 2024 because concurrent
+        // reads can race. Every test that touches these vars holds
+        // RELAY_ENV_LOCK, and `clear` removes BOTH spellings before each read.
+        const NAMES: [&str; 2] = ["ROOMLERD_RELAY_MAX_KBPS", "ROOMLER_AGENT_RELAY_MAX_KBPS"];
+        let prior: Vec<Option<String>> = NAMES.iter().map(|n| std::env::var(n).ok()).collect();
+        let clear = || {
+            for n in NAMES {
+                unsafe { std::env::remove_var(n) };
+            }
+        };
 
-        unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") };
+        clear();
         assert_eq!(
             relay_max_bps(),
             3_000_000,
             "unset defaults to the 3 Mbps relay ceiling"
         );
 
-        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "1500") };
-        assert_eq!(relay_max_bps(), 1_500_000, "kbps env is multiplied by 1000");
+        for name in NAMES {
+            clear();
+            unsafe { std::env::set_var(name, "1500") };
+            assert_eq!(
+                relay_max_bps(),
+                1_500_000,
+                "{name}: kbps is multiplied by 1000"
+            );
 
-        // Whitespace-trimmed + a 0 / garbage value falls back to the default.
-        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "  4200 ") };
-        assert_eq!(relay_max_bps(), 4_200_000, "value is trimmed before parse");
-        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "0") };
-        assert_eq!(relay_max_bps(), 3_000_000, "0 is rejected → default");
-        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "nope") };
-        assert_eq!(relay_max_bps(), 3_000_000, "non-numeric → default");
+            // Whitespace-trimmed; a 0 / garbage value falls back to the default.
+            unsafe { std::env::set_var(name, "  4200 ") };
+            assert_eq!(
+                relay_max_bps(),
+                4_200_000,
+                "{name}: value is trimmed before parse"
+            );
+            unsafe { std::env::set_var(name, "0") };
+            assert_eq!(
+                relay_max_bps(),
+                3_000_000,
+                "{name}: 0 is rejected -> default"
+            );
+            unsafe { std::env::set_var(name, "nope") };
+            assert_eq!(relay_max_bps(), 3_000_000, "{name}: non-numeric -> default");
+        }
+
+        // The current spelling wins when both are set — otherwise a stale alias
+        // on a field host would quietly override the value an operator just set.
+        clear();
+        // RAW-ENV-DELIBERATE: `test_env::set_as` clears the sibling
+        // spellings, and this assertion needs BOTH set at once so the chain has
+        // something to choose between.
+        unsafe { std::env::set_var("ROOMLERD_RELAY_MAX_KBPS", "1500") };
+        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "4200") };
+        assert_eq!(
+            relay_max_bps(),
+            1_500_000,
+            "ROOMLERD_* must take precedence"
+        );
 
         // Restore the pre-test environment.
-        match prior {
-            Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", v) },
-            None => unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") },
+        clear();
+        for (n, v) in NAMES.iter().zip(prior) {
+            if let Some(v) = v {
+                unsafe { std::env::set_var(n, v) };
+            }
         }
     }
 
@@ -1445,17 +1493,22 @@ mod tests {
     fn relay_clamp_caps_vp9_444_target() {
         let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The `x.min(relay_max_bps())` clamp the pump applies must pull a
-        // 0.20-bpp 2560×1600@30 VP9-444 target (12_441_600 bps) down to
-        // the 3 Mbps relay ceiling.
-        let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
-        unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") };
+        // 0.20-bpp 2560x1600@30 VP9-444 target (12_441_600 bps) down to the
+        // 3 Mbps relay ceiling. BOTH spellings are cleared: clearing only one
+        // let the other decide the ceiling this asserts against.
+        const NAMES: [&str; 2] = ["ROOMLERD_RELAY_MAX_KBPS", "ROOMLER_AGENT_RELAY_MAX_KBPS"];
+        let prior: Vec<Option<String>> = NAMES.iter().map(|n| std::env::var(n).ok()).collect();
+        for n in NAMES {
+            unsafe { std::env::remove_var(n) };
+        }
 
         let vp9_444_target: u32 = 12_441_600;
         assert_eq!(vp9_444_target.min(relay_max_bps()), 3_000_000);
 
-        match prior {
-            Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", v) },
-            None => unsafe { std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_KBPS") },
+        for (n, v) in NAMES.iter().zip(prior) {
+            if let Some(v) = v {
+                unsafe { std::env::set_var(n, v) };
+            }
         }
     }
 
