@@ -1,3 +1,12 @@
+# RETIRED-NAME-ANCHOR-BEGIN
+# Every retired name in this workflow is either a PUBLISHED release-asset name
+# (already-released files cannot be renamed, and the updater's picker matches
+# those strings) or a FROZEN install path — the RPATH-bound
+# /usr/lib/roomler-agent, the macOS .app bundle whose name keys the TCC grants,
+# or the inert roomler-agent.exe alias the deployed fleet still resolves.
+# INVARIANT: a retired name here must be a published artifact name or a path a
+# real host has. If you add one that is neither, that is a bug, not a new
+# exemption. docs/fr/FR-21
 name: Release roomler-tunnel
 
 # Builds the `roomler-tunnel` CLI binary for the three desktop targets the
@@ -473,3 +482,4 @@ jobs:
             sleep 10
           done
           echo "::warning::release cache refresh did not confirm on every pod for ${TAG}; the cache TTL will heal it within 15 min"
+# RETIRED-NAME-ANCHOR-END

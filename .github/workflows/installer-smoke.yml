@@ -1,3 +1,10 @@
+# RETIRED-NAME-ANCHOR-BEGIN
+# This lane installs and uninstalls the real installers, so it must assert on
+# the names a host actually has — including the pre-rename ones it is checking
+# are cleaned up: the legacy service and task, the roomler-agent.exe alias, the
+# old install folders and the published MSI names.
+# INVARIANT: a retired name here must be one the installer has to create, find or
+# remove on a real host. docs/fr/FR-21
 # Phase 6 Chunk 6A — install + uninstall smoke for the per-User MSI
 # on windows-latest. Catches the regressions install_detect locks
 # (UpgradeCode registry presence) + the WiX bundle's basic
@@ -1045,3 +1052,4 @@ jobs:
             || { echo "::error::helper not re-loaded after removing the opt-out"; exit 1; }
           echo "  opt-in restores the helper"
 
+# RETIRED-NAME-ANCHOR-END
