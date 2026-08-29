@@ -1420,6 +1420,60 @@ async fn detect_constrained_transport(
     false
 }
 
+/// FR-35 P2 — the nominated pair's REMOTE address (the viewer host), the key
+/// the per-peer rate memory is kept under. `detect_constrained_transport` has
+/// already waited for the nomination, so this normally returns at once.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+async fn nominated_remote_ip(pc: &Arc<RTCPeerConnection>) -> Option<String> {
+    // Bind each hop:  yields a temporary Arc and
+    // borrows it (E0716 in CI when chained).
+    let sctp = pc.sctp();
+    let dtls = sctp.transport();
+    let ice = dtls.ice_transport();
+    for _ in 0..30 {
+        if let Some(pair) = ice.get_selected_candidate_pair().await {
+            return Some(pair.remote().address.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// FR-35 P2 — persists the session's stable rate for its peer when the pump
+/// ends, whichever way it ends. The pump stores the governor's current stable
+/// rate into `stable` once per viewer window; `0` = nothing worth keeping.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+struct RateMemoryGuard {
+    path: Option<std::path::PathBuf>,
+    peer: Option<String>,
+    stable: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+impl Drop for RateMemoryGuard {
+    fn drop(&mut self) {
+        let stable = self.stable.load(std::sync::atomic::Ordering::Relaxed);
+        let (Some(path), Some(peer)) = (self.path.as_ref(), self.peer.as_ref()) else {
+            return;
+        };
+        if stable == 0 {
+            return;
+        }
+        let mut mem = crate::encode::rate_memory::RateMemory::load(path);
+        mem.record(peer, stable, crate::encode::rate_memory::now_unix());
+        match mem.save(path) {
+            Ok(()) => info!(
+                peer,
+                stable_bps = stable,
+                "FR-35 rate memory: stable rate remembered for the pair"
+            ),
+            Err(e) => {
+                warn!(peer, %e, "FR-35 rate memory: could not persist (memory stays off for this pair)")
+            }
+        }
+    }
+}
+
 /// Relay-escape — mid-session re-read of the selected ICE pair. The DC
 /// pumps poll this every [`TRANSPORT_RECHECK_INTERVAL`] so a pair switch
 /// (Chrome renominates relay→direct once the mDNS-resolved host pair
@@ -3221,6 +3275,10 @@ async fn media_pump_vp9_444_dc(
         send_depth,
         crate::encode::measured_ceiling_enabled(),
         crate::encode::relay_age_feedback_enabled(),
+        // FR-35 — the ceiling learner is field-verified on the FFmpeg pump
+        // only; this pump keeps today's fixed ceiling in P1.
+        0,
+        None,
         std::time::Instant::now(),
     );
     {
@@ -3695,6 +3753,7 @@ async fn media_pump_vp9_444_dc(
             || viewer_report.take_age(),
             constrained_transport,
             |own_div| pipeline.step_viewer_windows(own_div, target_fps),
+            bytes_written.load(std::sync::atomic::Ordering::Relaxed),
         ) && (vw.changed || vw.struggling || vw.age_over)
         {
             info!(
@@ -4330,6 +4389,37 @@ async fn media_pump_ffmpeg_dc(
     // and follows a mid-session renomination (see the block at the loop top).
     let mut constrained = detect_constrained_transport(&pc, session_id).await;
     let mut last_transport_check = std::time::Instant::now();
+    // FR-35 P2 — per-peer rate memory: the pair's remembered stable rate
+    // seeds the opening ceiling (85 % of it), so the opening keyframe is
+    // sized by what the pair proved, not by the fleet constant. Keyed by the
+    // nominated pair's remote address (the viewer host).
+    let rate_hi_bps = crate::encode::relay_max_hi_bps();
+    let rate_peer_key = if constrained && rate_hi_bps > 0 {
+        nominated_remote_ip(&pc).await
+    } else {
+        None
+    };
+    let rate_memory_path = crate::encode::rate_memory::default_path();
+    let rate_seed = match (&rate_peer_key, &rate_memory_path) {
+        (Some(peer), Some(path)) => crate::encode::rate_memory::RateMemory::load(path)
+            .seed_for(peer, crate::encode::rate_memory::now_unix()),
+        _ => None,
+    };
+    if let Some(seed) = rate_seed {
+        info!(
+            %session_id,
+            codec_label,
+            peer = rate_peer_key.as_deref().unwrap_or("-"),
+            seed_bps = seed,
+            hi_bps = rate_hi_bps,
+            "FR-35 rate memory: opening ceiling seeded from the pair's remembered stable rate"
+        );
+    }
+    let rate_memory_guard = RateMemoryGuard {
+        path: rate_memory_path,
+        peer: rate_peer_key,
+        stable: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+    };
     // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
     // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
     // encoder AND reopens the capturer at the new profile fps — pre-P3 a
@@ -4568,6 +4658,9 @@ async fn media_pump_ffmpeg_dc(
         ffmpeg_send_depth,
         crate::encode::measured_ceiling_enabled(),
         crate::encode::relay_age_feedback_enabled(),
+        // FR-35 — the constrained ceiling learns the pair (0 = off).
+        rate_hi_bps,
+        rate_seed,
         std::time::Instant::now(),
     );
     // rc.443 — consecutive-encode-error escalation (retry → rebuild →
@@ -5361,7 +5454,9 @@ async fn media_pump_ffmpeg_dc(
                 priority.load(std::sync::atomic::Ordering::Relaxed),
             ),
         );
-        let ceiling = rate.ceiling_bps;
+        // FR-35 — the plan's ceiling, lifted by what the learner has proven
+        // (and by the pair's remembered rate at open).
+        let ceiling = governor.effective_ceiling(rate.ceiling_bps, constrained);
         // 2026-08-26 — feed the direct byte gate's fallback reference and
         // compute the area-scaled AIMD floor from the ACTUAL encode dims
         // (see `encode::area_min_bitrate_bps` — flat 1.5 M on constrained).
@@ -5516,7 +5611,7 @@ async fn media_pump_ffmpeg_dc(
         // SLOWEST viewer: fold every follower's decode report in and take
         // the max divisor. Also steps the spill gate (a sustained large
         // deviation detaches the most deviant follower to its own encoder).
-        if let Some(vw) = governor.tick_viewer_window(
+        let viewer_window = governor.tick_viewer_window(
             std::time::Instant::now(),
             target_fps,
             || viewer_report.take_report(),
@@ -5525,7 +5620,27 @@ async fn media_pump_ffmpeg_dc(
             || viewer_report.take_age(),
             constrained,
             |own_div| pipeline.step_viewer_windows(own_div, target_fps),
-        ) && (vw.changed || vw.struggling || vw.age_over)
+            bytes_written.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if let Some(vw) = viewer_window {
+            // FR-35 — one line per ceiling step, and the session's stable
+            // rate handed to the memory guard for persistence at pump end.
+            if let Some(g) = vw.ceiling_grown {
+                info!(
+                    %session_id,
+                    codec_label,
+                    from_bps = g.from_bps,
+                    to_bps = g.to_bps,
+                    "FR-35 ceiling learner: the pair carried the ceiling — stepping it up"
+                );
+            }
+            rate_memory_guard.stable.store(
+                governor.stable_bps().unwrap_or(0),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        if let Some(vw) = viewer_window
+            && (vw.changed || vw.struggling || vw.age_over)
         {
             info!(
                 %session_id,
@@ -5564,7 +5679,8 @@ async fn media_pump_ffmpeg_dc(
             let stalled_us = send_stall_us.swap(0, std::sync::atomic::Ordering::Relaxed);
             if constrained && stalled_us >= threshold.as_micros() as u64 {
                 send_stalls += 1;
-                governor.note_send_stall(std::time::Instant::now());
+                governor
+                    .note_send_stall(Duration::from_micros(stalled_us), std::time::Instant::now());
             }
         }
 
@@ -6039,6 +6155,7 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_backpressure, frames_empty, settle_kf_suppressed,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 send_wait_avg_ms, send_wait_max_ms,
+                learned_ceiling_bps = governor.learned_ceiling_bps(),
                 send_stalls,
                 // FR-17 - the NEGOTIATED delivery mode of this
                 // session's `video-bytes` channel, so a heartbeat is
