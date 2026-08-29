@@ -610,6 +610,11 @@ pub struct AgentConfig {
     /// reverts to the Phase-A CPU resample (a field A/B in one flip).
     #[serde(default)]
     pub gpu_scale: Option<bool>,
+    /// FR-33 — probe each LAN prefix for a VPN split-prefix capture and
+    /// surface it (`ROOMLERD_OVERLAY_LAN_CAPTURE_PROBE`). Built-in default:
+    /// ON; a read-only route lookup per LAN address per netstate snapshot.
+    #[serde(default)]
+    pub overlay_lan_capture_probe: Option<bool>,
     /// P7 — long-edge cap for the refined rung
     /// (`ROOMLERD_IDLE_REFINE_MAX_EDGE`). Built-in default: 0 = full
     /// native.
@@ -1699,6 +1704,7 @@ pub fn test_fixture() -> AgentConfig {
         idle_refine: None,
         idle_refine_balanced: None,
         gpu_scale: None,
+        overlay_lan_capture_probe: None,
         idle_refine_max_edge: None,
         idle_refine_min_frame_kb: None,
         idle_refine_major_area_permille: None,
@@ -1847,6 +1853,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 56]
         ("IDLE_REFINE", cfg.idle_refine),
         ("IDLE_REFINE_BALANCED", cfg.idle_refine_balanced),
         ("GPU_SCALE", cfg.gpu_scale),
+        ("OVERLAY_LAN_CAPTURE_PROBE", cfg.overlay_lan_capture_probe),
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
         ("OVERLAY_DERP", cfg.overlay_derp),

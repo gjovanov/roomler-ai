@@ -129,6 +129,15 @@ pub struct NodeStatus {
     /// predates the feature or has `overlay_warm_relay` off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_relay: Option<WarmRelayStatus>,
+    /// FR-33 — LAN prefixes this host owns an address in whose traffic the OS
+    /// routes through ANOTHER interface (a corp-VPN split-prefix capture: LAN
+    /// handshakes arrive, our replies leave through the VPN and die, and the
+    /// LAN tier can never latch while it lasts). `None` from a daemon that
+    /// predates the field or has the probe off; `Some(empty)` = probed,
+    /// nothing captured — the two must stay distinguishable, or an old daemon
+    /// would read as "clear".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_captures: Option<Vec<LanCaptureStatus>>,
     /// B4 (overlay v3) — the measured netcheck capability vector + its age
     /// (`roomler netcheck`). `None` from a pre-B4 daemon or before the
     /// first measurement completes (~45 s after start).
@@ -2269,6 +2278,25 @@ fn unexpected_response(resp: Response) -> std::io::Error {
     }
 }
 
+/// FR-33 — one captured LAN prefix, as [`NodeStatus::lan_captures`] reports it.
+/// Detect-and-report only: the daemon never routes around a capture.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct LanCaptureStatus {
+    /// The captured prefix, `a.b.c.d/n`.
+    #[serde(default)]
+    pub prefix: String,
+    /// The interface that owns our address in it (name).
+    #[serde(default)]
+    pub owner: String,
+    /// The interface a packet to a neighbour in the prefix actually leaves by
+    /// (ifindex on Windows, device name on Unix).
+    #[serde(default)]
+    pub via: String,
+    /// That interface's name when the daemon could resolve it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_name: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2330,6 +2358,7 @@ mod tests {
                 dns: None,
                 srflx: None,
                 warm_relay: None,
+                lan_captures: None,
                 orgs: Vec::new(),
                 direct_socks: Vec::new(),
                 direct_bind_walks: None,
