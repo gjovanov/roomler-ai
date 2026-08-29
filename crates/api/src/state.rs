@@ -1312,10 +1312,24 @@ pub async fn shutdown_cleanup(state: &AppState) {
                 "shutdown: signalling /derp clients to re-home before we stop accepting"
             );
             for c in cancels {
-                // `notify_waiters` and not `notify_one`: each socket has its
-                // own Notify, and a permit stored for a task that is already
-                // gone would strand nothing useful.
-                c.notify_waiters();
+                // ⚠️ `notify_one`, NOT `notify_waiters` — and the first
+                // attempt at this got it backwards, which is why the field
+                // test measured MORE `hard-errored` lines, not fewer.
+                //
+                // The socket loop awaits `cancel.notified()` inside a
+                // `select!` (`ws/derp.rs:439`), so the future is recreated
+                // every iteration and there is NO registered waiter while
+                // the task is forwarding a frame. `notify_waiters` wakes
+                // only waiters registered at that instant and stores
+                // nothing, so exactly the busy sockets — the ones carrying
+                // a live session, the ones this is for — missed the signal.
+                //
+                // `notify_one` stores a permit when nobody is parked, so the
+                // next `notified()` returns immediately. The hazard the
+                // first version worried about (a permit stored for a task
+                // already gone) costs nothing: the `Notify` is dropped with
+                // its registry entry.
+                c.notify_one();
             }
         }
     }
@@ -1424,6 +1438,47 @@ mod fr28_tests {
     /// (SIGKILL, node loss) that no announcement can cover. A default that
     /// silently disabled it would leave the measured 2436 ms freeze in
     /// place while the code looked shipped.
+    /// FR-28 — the signal must survive a socket that is NOT parked on
+    /// `notified()` at the instant we fire.
+    ///
+    /// ⚠️ This is the test the first version needed and did not have. It
+    /// only checked the env kill switch, which cannot observe the defect:
+    /// `notify_waiters()` wakes waiters registered AT THAT MOMENT and
+    /// stores nothing, while the real socket loop rebuilds its
+    /// `cancel.notified()` future every `select!` iteration. So exactly
+    /// the busy sockets — the ones carrying a live session — missed it,
+    /// and the field test measured MORE `hard-errored` lines (12) than
+    /// the undrained baseline (8).
+    #[tokio::test]
+    async fn cancel_reaches_a_socket_that_is_not_currently_awaiting() {
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        // Fire while nobody is parked — the busy-forwarding case.
+        cancel.notify_one();
+
+        // The loop comes back around and awaits: it must return at once.
+        let woke =
+            tokio::time::timeout(std::time::Duration::from_millis(200), cancel.notified()).await;
+        assert!(
+            woke.is_ok(),
+            "a cancel fired while the socket was busy must still be observed"
+        );
+    }
+
+    /// The same shape with `notify_waiters`, pinned so the difference is
+    /// documented rather than rediscovered: it is LOST when nobody waits.
+    #[tokio::test]
+    async fn notify_waiters_would_lose_it_which_is_why_we_do_not_use_it() {
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        cancel.notify_waiters();
+        let woke =
+            tokio::time::timeout(std::time::Duration::from_millis(100), cancel.notified()).await;
+        assert!(
+            woke.is_err(),
+            "notify_waiters stores no permit — this is the bug"
+        );
+    }
+
     #[test]
     fn drain_defaults_on_and_only_explicit_falsey_disables() {
         // SAFETY: single-threaded test, no other reader of this var.
