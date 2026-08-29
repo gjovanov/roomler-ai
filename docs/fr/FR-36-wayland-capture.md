@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture, and unattended access
 
-**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** design — **P0 decided: DRM/KMS below the compositor. P1 go/no-go PASSED on real hardware (2026-08-29)** · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **P1 landed behind `ROOMLERD_DRM_CAPTURE` (default OFF) — a Wayland desktop that was uncapturable now delivers frames; 4K rate is the open problem** (2026-08-29) · **Owner:** agent / capture
 
 ## Goal
 
@@ -108,14 +108,22 @@ exists to serve, and is no longer on the critical path for this host.
 
 | Phase | What | Kill switch |
 |---|---|---|
-| **P1** | DRM/KMS capture as a fifth `ScreenCapture` backend: enumerate CRTCs, `drmModeGetFB2` the active scanout, deliver `Frame`s. **`XR24` + `XR30`** (both measured in the field). | `ROOMLERD_DRM_CAPTURE=0` ⇒ today's path exactly |
+| **P1** ✅ | DRM/KMS capture as a fifth `ScreenCapture` backend (`capture/drm_backend.rs`): enumerate CRTCs, `drmModeGetFB2` the active scanout, PRIME-export, mmap, deliver `Frame`s. Handles **`XR24` + `XR30`** (both measured in the field). | **`ROOMLERD_DRM_CAPTURE=1` to opt IN** — see below |
 | **P2** | **Detiling** — EGL import + convert to linear. **NOT needed on Apple Silicon** (plane is LINEAR-only, measured); required for Intel `*_RC_CCS`, Nvidia block-linear. Deferred off the critical path. | same flag ⇒ fall back to portal/X11 |
 | **P3** | **Privilege split.** A minimal helper holding `CAP_SYS_ADMIN`, passing **DMA-BUF fds over `SCM_RIGHTS`**; the daemon never needs the capability itself. | same flag |
 | **P4** | Input on Wayland via **`uinput`** — XTest/enigo does not reach native Wayland clients, so capture without this is a read-only session. | separate flag |
 
-**Backend priority: DRM/KMS → portal/PipeWire → X11.** The portal keeps its
-place as the *attended* path (a logged-in user who consents once); X11 stays the
-default until DRM is field-proven.
+**Backend priority: DRM/KMS → portal/PipeWire → X11**, but DRM is **opt-in**
+(`ROOMLERD_DRM_CAPTURE=1`) rather than the Linux default — the inverse of this
+repo's usual kill-switch shape, and deliberately so.
+
+Measured on one host, one session, back to back at 1080p: scrap delivered **1 of
+30** frames because FR-29's damage tracking proved the other 29 unchanged; DRM
+delivered **30 of 30**, because DRM reports no damage and cannot know. Defaulting
+it on would silently undo the FR-29 win (45.8 % → 2.8 % of a core, idle) on every
+X11 host in the fleet. A Wayland or headless host opts in; everyone else keeps
+the existing cascade byte-for-byte. The portal keeps its place as the *attended*
+path (a logged-in user who consents once).
 
 ### Privilege model — do not simply run capture as root
 
@@ -164,20 +172,30 @@ out of scope becomes in-scope here.
 
 ## Acceptance criteria
 
-- [x] **A GNOME Wayland session on `scw-m2-asahi` yields real pixels** — proven
-      by direct DRM grab (today the agent's X11 backend gets nothing there).
-      ⚠️ Proven at the *frame* level, NOT yet end-to-end through the agent
-- [ ] The agent **streams** that Wayland session (P1 backend wired into the pump)
+- [x] **A GNOME Wayland session on `scw-m2-asahi` yields real pixels.** Proven
+      twice: by direct DRM probe, then through the shipped
+      `capture::open_default` cascade. The **before** state is recorded beside
+      it — the current path logs `scrap capture unavailable → NoopCapture (no
+      primary display: connection refused)` and delivers **zero frames**
+- [x] The P1 backend is **wired into the capture cascade** and delivers
+      `Frame`s through the `ScreenCapture` trait (`roomlerd capture-smoke`)
+- [ ] A **browser-visible remote-control session** against that Wayland
+      desktop — capture is proven, encode/transport end-to-end is not
 - [ ] Streams **while the session is locked**, and **at the login greeter** —
       the cases the portal structurally refuses
 - [ ] Survives a reboot with nobody logged in interactively
-- [x] `avg_capture_ms` **< 10 ms** at **1080p** — measured **1.58 ms** to read
-      the framebuffer (vs the ~20 ms X11 floor). ⚠️ **MISSED at native 4K**:
-      15.2 ms. Report per-resolution, never as one number
-- [ ] Sustained-motion fps **≥ 29** at `target_fps=30`
+- [x] `avg_capture_ms` **< 10 ms** at **1080p** — measured **5.84 ms** for the
+      whole backend (1.58 ms of that is the framebuffer read; the rest is the
+      BGRA repack). Same host/session, scrap measured 5.11 ms
+- [ ] **`avg_capture_ms` at native 4K: 42.9 ms — FAILS the bar by 4×**
+      (52.9 ms with the production `Auto` downscale). ⚠️ Recorded as a failure,
+      not reframed: see the open decision below
+- [ ] Sustained-motion fps **≥ 29** at `target_fps=30`. At 1080p the headroom
+      is there; at 4K the measured ceiling is **~19 fps**
 - [ ] Input reaches native Wayland clients (uinput), not only Xwayland ones
-- [ ] X11/Windows/macOS byte-for-byte unchanged; `ROOMLERD_DRM_CAPTURE=0`
-      restores the current path exactly
+- [x] X11/Windows/macOS unchanged — the backend is Linux-only, feature-gated,
+      AND env-gated off; with the flag unset the same host still selects
+      `backend=scrap` with X11 damage tracking active
 - [x] Field-verified with the **before** state recorded beside the after
 
 ## Open decisions / risks
@@ -187,9 +205,17 @@ out of scope becomes in-scope here.
   `IN_FORMATS` advertises `DRM_FORMAT_MOD_LINEAR` and nothing else, so a tiled
   scanout buffer is not representable on this hardware. Verified live under both
   Xorg and mutter.
-- **Which resolutions we promise.** 4K 10-bit costs 15.2 ms just to *read*.
-  Options: capture at the CRTC's mode and downscale on the GPU, cap the
-  advertised mode, or accept a lower fps at 4K. Needs a decision before P1 lands.
+- ⚠️ **4K is the open problem, and it is memory bandwidth, not the loop.** The
+  whole backend costs **42.9 ms/frame** at 4096×2160 10-bit (~19 fps) against
+  5.84 ms at 1080p. Reading is 15.2 ms of that; the BGRA repack is most of the
+  rest, and `Auto` downscale ADDS 10 ms because it is a second full pass.
+  ⚠️ A vectorisable-loop rewrite (paired `chunks_exact`) was tried and
+  **REFUTED** — 43.8 ms vs 42.4 ms, i.e. no change — so the cost is the ~70 MB/
+  frame of traffic, not instruction count. **The identified fix is to fuse the
+  downscale INTO the repack**: today the `Auto` path is read 35 MB → write
+  35 MB → read 35 MB → write 8.8 MB; fused it becomes read 35 MB → write
+  8.8 MB. Predicted ~2.5×, unmeasured. Alternatives remain: cap the advertised
+  mode, or accept a lower fps at 4K.
 - Vendor `libdrmtap` (MIT, C + meson) vs reimplement the narrow slice in Rust.
   **The P1 probe is ~120 lines of libdrm calls with no detiling**, which shifts
   this decision toward reimplementing: vendoring adds a C build dep to every
@@ -217,4 +243,7 @@ out of scope becomes in-scope here.
 | 2026-08-29 | 0.4.20 (pre-FR baseline) | Wayland: **uncapturable**. X11 baseline same host: `avg_capture_ms` ~20 ms, ~27 fps at 1080p, idle 2.8 % of a core |
 | 2026-08-29 | portal probe | `xdg-desktop-portal` reachable (4 portal names on the session bus) but **exposes neither `ScreenCast` nor `RemoteDesktop`** in an XFCE/**X11** session — those come from a compositor-matching backend. `-gnome` + `-gtk` installed; **`-kde` is NOT**. The agent must therefore *detect* ScreenCast, never assume it |
 | 2026-08-29 | **P1 probe, X11 (XFCE)** | ✅ `card2`/`apple-drm`, `fb 49 1920×1080 XR24 modifier=0x0`. Correct image. Liveness confirmed (new window ⇒ 859,916 differing bytes). Read **1.58 ms** cached / 2.07 ms remap-per-frame |
-| 2026-08-29 | **P1 probe, GNOME Wayland** | ✅ session switched to `gnome-wayland` (mutter 48.8). `fb 51 4096×2160 **XR30** modifier=0x0`, `allocated by = gnome-shell`. First decode was psychedelic — probe assumed 8-bit; with `XR30` unpacking the image is correct. Read **15.2 ms** cached (35.4 MB). Host reverted to XFCE; `roomlerd` PID unchanged across both switches |
+| 2026-08-29 | **P1 probe, GNOME Wayland** | ✅ session switched to `gnome-wayland` (mutter 48.8). `fb 51 4096×2160 **XR30** modifier=0x0`, `allocated by = gnome-shell`. First decode was psychedelic — probe assumed 8-bit; with `XR30` unpacking the image is correct. Read **15.2 ms** cached (35.4 MB). Host reverted to XFCE; `roomlerd` PID unchanged across this switch pair |
+| 2026-08-29 | **P1 backend, X11 (XFCE), 1080p** | ✅ `open_default` picks `backend=drm` under `ROOMLERD_DRM_CAPTURE=1`; correct desktop image. **5.84 ms/frame, 30/30 delivered.** Same host, same session, scrap: **5.11 ms** but **1/30 delivered, 29 proven unchanged** — FR-29 damage tracking working, and the reason DRM must not be the default |
+| 2026-08-29 | **P1 backend, GNOME Wayland, 4K** | ✅ **before:** the shipping path logs `scrap capture unavailable — falling back to NoopCapture (no primary display: connection refused)` — **zero frames**. **after:** `backend=drm`, **30/30 at 4096×2160 XR30**, correct image. ⚠️ **42.9 ms/frame raw, 52.9 ms with `Auto` downscale** ⇒ ~19 fps. Memory-bandwidth bound (~70 MB/frame). A vectorisable-loop rewrite was tried and **REFUTED** (43.8 vs 42.4 ms — no change) |
+| 2026-08-29 | daemon impact | `roomlerd` restarted **once** during the whole session (`NRestarts=1`, 18:04), not coincident with either lightdm restart; ended `active/running`. The FR-19 relay it also hosts stayed reachable throughout (every measurement above arrived over its own control WS) |
