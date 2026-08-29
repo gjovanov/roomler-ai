@@ -52,6 +52,28 @@ fn config_fallback(suffix: &str) -> Option<String> {
     CONFIG_FALLBACKS.get().and_then(|m| m.get(suffix).cloned())
 }
 
+/// The registered config fallbacks as REAL env-var pairs for a child process.
+///
+/// The registry is process-local, so a child this daemon spawns — the caps
+/// probe (`roomlerd caps-probe`, rc.433) — inherits the environment but NOT
+/// the registry, and every `node_env` read inside it falls straight to the
+/// built-in default. Field 2026-08-29 (FR-19 P4c): `relay_server_enabled =
+/// true` in `config.toml` started the relay server in-process, while the
+/// hello's capability list — computed in the probe child — never carried
+/// `relay-server`, so the server could only ever answer `no_relay`.
+///
+/// Each pair is resolved through [`node_env`], i.e. with the full precedence
+/// (an operator env var still wins over config), and spelled with the
+/// current prefix so the child reads it on the first arm of the chain.
+pub fn config_fallbacks_for_child() -> Vec<(String, String)> {
+    let Some(map) = CONFIG_FALLBACKS.get() else {
+        return Vec::new();
+    };
+    map.keys()
+        .filter_map(|suffix| node_env(suffix).map(|v| (format!("ROOMLERD_{suffix}"), v)))
+        .collect()
+}
+
 // RETIRED-NAME-ANCHOR(4): arms 2 and 3 are the reason a rename here costs
 // nothing in the field. Both spellings are set on real hosts today — mars,
 // jupiter and zeus each carry four `ROOMLER_AGENT_*` entries in an
@@ -122,6 +144,42 @@ pub fn node_env_os(suffix: &str) -> Option<std::ffi::OsString> {
 
 #[cfg(test)]
 mod tests {
+    /// The one registration this test binary makes. The registry is a
+    /// process-wide `OnceLock`, so two tests that each register their own map
+    /// are mutually exclusive by construction — whichever runs first wins and
+    /// the other's expectation is dead. Every test that needs the registry
+    /// calls THIS, so the winner is irrelevant: the map is the same superset
+    /// whoever installs it.
+    fn register_test_registry() {
+        let mut m = HashMap::new();
+        m.insert(S_CFG.to_string(), "from-config".to_string());
+        m.insert("CAPSFIX_TEST_ONLY".to_string(), "1".to_string());
+        register_config_fallbacks(m);
+    }
+
+    /// The registry never reaches a child process by itself; the export must
+    /// carry every registered suffix that resolves, spelled with the current
+    /// prefix so the child reads it on the first arm of the precedence chain,
+    /// and nothing that is not registered. Values are asserted only for the
+    /// suffix no other test touches — `S_CFG` is toggled through env by a
+    /// concurrently running test, so its value is deliberately not compared.
+    #[test]
+    fn config_fallbacks_are_exported_to_children_as_prefixed_env_pairs() {
+        register_test_registry();
+        let registry = CONFIG_FALLBACKS.get().expect("registered above");
+        let pairs = config_fallbacks_for_child();
+        assert!(
+            pairs.contains(&("ROOMLERD_CAPSFIX_TEST_ONLY".to_string(), "1".to_string())),
+            "{pairs:?}"
+        );
+        for (k, _) in &pairs {
+            let suffix = k
+                .strip_prefix("ROOMLERD_")
+                .unwrap_or_else(|| panic!("exported name lacks the current prefix: {k}"));
+            assert!(registry.contains_key(suffix), "unregistered export: {k}");
+        }
+    }
+
     // ── FR-21 P3 (D1): ROOMLERD_* wins, and NOTHING in the field stops working ──
 
     const S3: &str = "UNIFY_TEST_P3_PRECEDENCE";
@@ -221,9 +279,7 @@ mod tests {
     fn config_fallback_loses_to_env_and_beats_unset() {
         // Register once for the whole process — includes a suffix no env var
         // will ever set, plus the one this test also sets via env.
-        let mut m = HashMap::new();
-        m.insert(S_CFG.to_string(), "from-config".to_string());
-        register_config_fallbacks(m);
+        register_test_registry();
 
         // No env set → the registered fallback answers.
         assert_eq!(node_env(S_CFG).as_deref(), Some("from-config"));
