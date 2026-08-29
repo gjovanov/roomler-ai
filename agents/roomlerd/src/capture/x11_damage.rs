@@ -18,6 +18,7 @@
 //! it) and is created on the capture worker thread, which is where the whole
 //! backend is already pinned for XShm thread-affinity reasons.
 
+use super::{Damage, DirtyRect};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
@@ -31,6 +32,22 @@ use x11rb::rust_connection::RustConnection;
 /// itself within a second rather than a dead session.
 const DEFAULT_MAX_SKIP: Duration = Duration::from_millis(1000);
 
+/// Cap on accumulated damage rects before collapsing to their bounding box.
+/// Matches the WGC backend's constant and its reasoning: past this the
+/// localisation is worthless, and a bounding box stays motion-TRUE — it
+/// over-reports area, never under, which is the safe direction for every
+/// consumer (ROI hints, `area_permille`, the rate profile's refine flip).
+const MAX_DAMAGE_RECTS: usize = 256;
+
+/// What the tracker decided for one capture tick.
+pub enum Tick {
+    /// Provably nothing changed and the safety valve is not due — the caller
+    /// should report no frame and skip the readback entirely.
+    Skip,
+    /// Capture, and stamp the delivered frame with this damage.
+    Capture(Damage),
+}
+
 /// Tracks whether the X11 root window changed since the last delivered frame.
 ///
 /// Construction is fail-open by design — every error path yields `None` and
@@ -43,9 +60,18 @@ pub struct DamageTracker {
     /// When we last actually let a capture through, for the safety valve.
     last_capture: Instant,
     max_skip: Duration,
-    /// Damage seen but not yet consumed by a capture. Kept across calls
-    /// because the caller may ask more than once per delivered frame.
-    pending: bool,
+    /// Rectangles reported since the last consumed capture. Empty means
+    /// nothing changed. Kept across calls because the caller may ask more
+    /// than once per delivered frame.
+    rects: Vec<DirtyRect>,
+    /// Set when the rect list overflowed `MAX_DAMAGE_RECTS`, or when we lost
+    /// the ability to describe the damage precisely. The accumulated rects
+    /// then collapse to their bounding box.
+    overflowed: bool,
+    /// Set when we know the screen changed but NOT where — a connection
+    /// failure. Distinct from `overflowed`: there we still have a truthful
+    /// bounding box, here we have nothing and must say `Unknown`.
+    blind: bool,
 }
 
 impl DamageTracker {
@@ -89,10 +115,13 @@ impl DamageTracker {
         }
 
         let damage = conn.generate_id().ok()?;
-        // NON_EMPTY: one event when the region goes empty -> non-empty, and
-        // then silence until we subtract. That is exactly "has anything
-        // changed since I last looked", with no per-rectangle event storm.
-        let Ok(cookie) = conn.damage_create(damage, root, ReportLevel::NON_EMPTY) else {
+        // RAW_RECTANGLES rather than NON_EMPTY (P1's level): we want WHERE it
+        // changed, not just whether. One event per damaged rectangle, which we
+        // accumulate between captures and cap at MAX_DAMAGE_RECTS — the storm
+        // risk that argues for NON_EMPTY is bounded by that cap, and we are
+        // polling the queue every tick anyway, so the events cost a drain we
+        // were already doing.
+        let Ok(cookie) = conn.damage_create(damage, root, ReportLevel::RAW_RECTANGLES) else {
             tracing::info!("capture: could not request damage on the root window");
             return None;
         };
@@ -112,38 +141,64 @@ impl DamageTracker {
             // Start due, so the very first tick always captures.
             last_capture: Instant::now() - max_skip,
             max_skip,
-            pending: false,
+            rects: Vec::new(),
+            overflowed: false,
+            blind: false,
         })
     }
 
-    /// Should the caller perform a real capture this tick?
+    /// Decide this capture tick, and hand back the damage to stamp on the
+    /// frame when it says capture.
     ///
-    /// `false` means "provably nothing changed and the safety valve is not
-    /// due" — the caller should report no frame and skip the readback.
-    pub fn should_capture(&mut self) -> bool {
+    /// ⚠️ The valve-forced capture reports `Damage::Unknown`, NOT
+    /// `Tracked(vec![])`. The valve exists precisely because a damage event
+    /// may have been missed, so "we saw no rects" is not evidence that
+    /// nothing changed — claiming `Tracked` there would tell the encoder to
+    /// skip a region that may well have moved.
+    pub fn tick(&mut self) -> Tick {
         self.drain_events();
 
-        if self.last_capture.elapsed() >= self.max_skip {
-            // Safety valve. Re-arm as if we had consumed damage so a genuinely
-            // idle screen keeps ticking at the valve rate rather than every frame.
-            self.consume();
-            return true;
+        let valve_due = self.last_capture.elapsed() >= self.max_skip;
+        if !valve_due && self.rects.is_empty() && !self.blind {
+            return Tick::Skip;
         }
-        if self.pending {
-            self.consume();
-            return true;
-        }
-        false
+
+        let damage = if self.blind || (valve_due && self.rects.is_empty()) {
+            Damage::Unknown
+        } else if self.overflowed {
+            Damage::Tracked(vec![bounding_box(&self.rects)])
+        } else {
+            Damage::Tracked(self.rects.clone())
+        };
+        self.consume();
+        Tick::Capture(damage)
     }
 
-    /// Absorb any queued events, latching whether the root changed.
+    /// Absorb any queued events, accumulating what changed and where.
     ///
-    /// A connection error latches `pending` rather than clearing it: if we
-    /// can no longer tell what changed, the safe answer is "assume it did".
+    /// A connection error sets `blind` rather than clearing state: if we can
+    /// no longer tell what changed, the safe answer is "assume it did, and
+    /// admit we cannot say where".
     fn drain_events(&mut self) {
         loop {
             match self.conn.poll_for_event() {
-                Ok(Some(Event::DamageNotify(_))) => self.pending = true,
+                Ok(Some(Event::DamageNotify(ev))) => {
+                    if self.rects.len() >= MAX_DAMAGE_RECTS {
+                        // Keep draining — the queue must not back up — but stop
+                        // growing the list; `overflowed` collapses it later.
+                        self.overflowed = true;
+                        continue;
+                    }
+                    let a = ev.area;
+                    if a.width > 0 && a.height > 0 {
+                        self.rects.push(DirtyRect {
+                            x: a.x.max(0) as u32,
+                            y: a.y.max(0) as u32,
+                            w: a.width as u32,
+                            h: a.height as u32,
+                        });
+                    }
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => return,
                 Err(e) => {
@@ -151,7 +206,7 @@ impl DamageTracker {
                         %e,
                         "capture: X11 damage connection failed — assuming the screen changed from here on"
                     );
-                    self.pending = true;
+                    self.blind = true;
                     return;
                 }
             }
@@ -167,7 +222,9 @@ impl DamageTracker {
     /// and the screen would silently stop updating until the safety valve
     /// fired. Slow is recoverable; frozen is the bug this must not create.
     fn consume(&mut self) {
-        self.pending = false;
+        self.rects.clear();
+        self.overflowed = false;
+        self.blind = false;
         self.last_capture = Instant::now();
         if let Ok(cookie) = self
             .conn
@@ -179,9 +236,85 @@ impl DamageTracker {
     }
 }
 
+/// Bounding box of a non-empty rect list. Used when the list overflows the
+/// cap: coarse, but motion-TRUE — it over-reports area, never under, which is
+/// the safe direction for every consumer of `Damage`.
+fn bounding_box(rects: &[DirtyRect]) -> DirtyRect {
+    let x0 = rects.iter().map(|r| r.x).min().unwrap_or(0);
+    let y0 = rects.iter().map(|r| r.y).min().unwrap_or(0);
+    let x1 = rects
+        .iter()
+        .map(|r| r.x.saturating_add(r.w))
+        .max()
+        .unwrap_or(0);
+    let y1 = rects
+        .iter()
+        .map(|r| r.y.saturating_add(r.h))
+        .max()
+        .unwrap_or(0);
+    DirtyRect {
+        x: x0,
+        y: y0,
+        w: x1.saturating_sub(x0),
+        h: y1.saturating_sub(y0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overflow collapse must never UNDER-report: the box has to cover
+    /// every rect that went into it, because a consumer that trusts a too-small
+    /// region skips pixels that actually moved.
+    #[test]
+    fn bounding_box_covers_every_rect() {
+        let rects = vec![
+            DirtyRect {
+                x: 10,
+                y: 20,
+                w: 5,
+                h: 5,
+            },
+            DirtyRect {
+                x: 100,
+                y: 4,
+                w: 2,
+                h: 50,
+            },
+            DirtyRect {
+                x: 0,
+                y: 60,
+                w: 1,
+                h: 1,
+            },
+        ];
+        let b = bounding_box(&rects);
+        assert_eq!((b.x, b.y), (0, 4), "origin is the min corner");
+        // Right edge 102 (100+2), bottom edge 61 (60+1).
+        assert_eq!((b.w, b.h), (102, 57));
+        for r in &rects {
+            assert!(r.x >= b.x && r.y >= b.y, "rect starts inside the box");
+            assert!(
+                r.x + r.w <= b.x + b.w && r.y + r.h <= b.y + b.h,
+                "rect ends inside the box"
+            );
+        }
+    }
+
+    /// A single rect must round-trip unchanged — the collapse is only allowed
+    /// to coarsen when there is genuinely more than one region.
+    #[test]
+    fn bounding_box_of_one_rect_is_that_rect() {
+        let r = DirtyRect {
+            x: 7,
+            y: 9,
+            w: 11,
+            h: 13,
+        };
+        let b = bounding_box(std::slice::from_ref(&r));
+        assert_eq!((b.x, b.y, b.w, b.h), (r.x, r.y, r.w, r.h));
+    }
 
     /// The kill switch must win even where an X server is present, because it
     /// is the operator's only lever if damage tracking misbehaves in the field.
