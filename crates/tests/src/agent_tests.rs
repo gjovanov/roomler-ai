@@ -1,4 +1,4 @@
-//! End-to-end tests that drive the `roomler-agent` library crate against a
+//! End-to-end tests that drive the `roomlerd` library crate against a
 //! live `TestApp`. Unlike the REST-only `remote_control_tests`, these
 //! exercise the agent's HTTP enrollment + WSS signaling loop in-process,
 //! so a regression in either side (server rename, protocol drift, WS auth)

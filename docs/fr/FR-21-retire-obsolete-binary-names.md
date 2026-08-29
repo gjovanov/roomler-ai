@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#809](https://github.com/gjovanov/roomler-ai/issues/809) |
-| **Status** | P0–P5 on master; **field-verified on Linux, Windows and macOS**; the `--check` guard blocks. Open: `--strict` (needs the remaining ~1006 occurrences resolved) |
+| **Status** | P0-P7 on master; **field-verified on Linux, Windows and macOS**; the CI guard blocks on `--check --strict` (**0 unclassified**, 732 anchored). |
 | **Opened** | 2026-08-28 |
 | **Baseline** | master `fa364b12` (0.4.11) — every count and anchor below was measured against it |
 | **Scope** | Windows · Linux · macOS — code, comments, docs, `CLAUDE.md`, file names, folder names, env vars |
@@ -250,6 +250,7 @@ P2 is wrong and stops.
 | **P4** | Residual live paths | fix the §5 staging defect by calling a resolver instead of a constant (expose `machine_global_dir()` over LocalAPI); sweep the remaining hardcoded `roomler-agent` paths | every path keeps a new-then-old fallback, exactly like `appdirs` |
 | **P5** | Ratify + enforce | freeze list reviewed and justified in-tree; `name-audit --check` flips to **blocking**; a deliberately-red run proves it fails | revert the `continue-on-error` removal |
 | **P6** | Field verification | the §9.4 matrix on Windows / Linux / macOS, fresh **and** upgrade-from-0.4.x, including a pre-rename host | n/a — verification, not a change |
+| **P7** ✅ | Drive `unclassified` to zero, flip the guard to `--strict` | 10 reviewed batches; every occurrence migrated or anchored with a stated reason; `ci.yml` runs `--check --strict`; new guard: a shebang must stay on line 1 | revert the `--strict` word in `ci.yml` — the `--check` pair keeps working |
 
 ### 7a. Resequencing, measured during P1 — P1 was specced too large
 
@@ -307,12 +308,12 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
 
 ## 8. Acceptance criteria
 
-- [ ] `scripts/name-audit.sh --check` exits 0 on master, and its report shows **0 unclassified
+- [x] `scripts/name-audit.sh --check` exits 0 on master, and its report shows **0 unclassified
       occurrences** (down from 1 765).
-- [ ] Every remaining occurrence is a `RETIRED-NAME-ANCHOR:` site whose comment states why it is
+- [x] Every remaining occurrence is a `RETIRED-NAME-ANCHOR:` site whose comment states why it is
       frozen; the anchor count is asserted by a unit test, so silently deleting one fails a test
       rather than a field host.
-- [ ] CI **fails** a PR that adds a new unclassified occurrence — proven by a deliberate red run
+- [x] CI **fails** a PR that adds a new unclassified occurrence — proven by a deliberate red run
       linked from the issue, not by assertion.
 - [ ] `CLAUDE.md`'s Commands block names binaries that exist (`roomlerd`, `roomler`,
       `roomler-desktop`); copy-pasting any line works on a real host.
@@ -440,6 +441,7 @@ whole of it.
 | date | what | result |
 |---|---|---|
 | 2026-08-28 | **Debian takeover, against real artifacts.** Built `.deb` from `release-agent.yml` run `33150602388`; published `agent-v0.4.11` `.deb` as the upgrade-from side. | **PASS.** `Package: roomlerd`, `Provides: roomler-agent`, `Replaces: roomler-tunnel, roomler-agent`. Upgrade via `dpkg -i` (the self-updater's *fallback*, the stricter path): **exit 0, zero overwrite conflicts**; `/usr/bin/roomlerd` + `/usr/bin/roomler` ownership transferred to `roomlerd`; unit present. Vestigial `ii roomler-agent` remains exactly as designed, and the one-time `--remove roomler-agent` sweep exits 0 with **all files surviving**. Asset filename unchanged (`roomler-agent-0.4.11-…deb`), so the "no artifact name moves" criterion holds. |
+| 2026-08-29 | **P7 — `--strict` reached, and three real defects found on the way.** `unclassified` 1006 -> 0; 732 anchored sites, 0 stale markers. (1) `user_profile::active_user_config_path()` hardcoded the PRE-rename appdirs segment, so on every post-rename install the path could not exist and the caller's `exists()` filter silently dropped the user-config rung — indistinguishable from "no logged-in user", the documented `None` case. It survived because the test asserted `ends_with("\\roomler-agent\\config\\config.toml")`: the test pinned the bug. Now dual-segment, with a pure test on candidate ORDER; mutation-checked red/green. (2) An anchor block had been inserted ABOVE `#!/bin/bash` in the macOS `postinstall`, so `installer` could not execute it and EVERY `.pkg` install failed at `Validating packages`. Red on `installer-smoke` for nine commits, misread as the flakiness master shows on the same job — master fails LATER (`helper job still loaded after opt-out`, after a successful install). One job name, two failures. `--check` now fails any tracked file whose shebang is not line 1 — the anchor system's own failure mode, caught by nothing else. (3) Nine env keys were exercised in tests only through the RETIRED spelling, i.e. the third link of a three-link fallback; the spelling the code and docs use was covered by nothing, and `hw_auto_disabled_reads_env` cleared one name while reading a chain preferring the other. Plus a break this branch itself caused: the e2e image moved to `/etc/roomler` while its StatefulSet still mounted `/etc/roomler-agent`, and its data PVC mounted a directory the daemon never writes to. |
 | 2026-08-28 | Full release lane under the renamed packages (dispatch). | **PASS** — both `.deb`s, `.msi`, `.pkg`, companion EXE all build. |
 | 2026-08-28 | **P6 Linux, on three REAL hosts** — mars, jupiter, zeus, each with `roomler-agent 0.4.11-1` genuinely installed and the daemon running. `.deb` from run `33150602388`, moved to each host over the roomler mesh itself (`100.65.4.2` → node). Primary path `apt-get install ./…deb`, not the fallback. | **PASS.** `Replacing files in old package roomler-agent`, exit 0, no conflict, on all three. `/usr/bin/roomlerd`, `/usr/bin/roomler` and the bundled FFmpeg `.so`s transferred owner; `ldd` 0 not-found; node id + overlay ip UNCHANGED; service active on the new binary; `roomlerd --version` now `roomlerd 0.4.11` (production printed `roomler-agent 0.4.11`). |
 | 2026-08-28 | **The RUST_LOG shim, forced onto the legacy spec** — a `.deb` upgrade replaces the packaged unit, so a plain upgrade tests the FILE, not the fallback. Drop-in pinned `RUST_LOG=roomler_agent=info,warn` on mars, then restart. | **PASS.** INFO 40 → 75: 35 new lines from the renamed lib under a spec naming ONLY the retired target. Without the shim it stays 40 and the daemon goes dark above `warn`. Drop-in removed; the operator's own `virtual-desktop.conf` untouched. |

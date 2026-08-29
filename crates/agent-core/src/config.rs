@@ -2,6 +2,7 @@
 //!
 //! Stored at `<user config dir>/roomler/config.toml`. On Linux that
 //! resolves to `$XDG_CONFIG_HOME/roomler/` or `~/.config/roomler/`. A host
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! installed before the rename keeps its `roomler-agent` tree — see
 //! [`crate::appdirs`], whose `app_segment` picks the old segment only when
 //! that tree already exists.
@@ -1968,6 +1969,7 @@ pub fn default_config_path() -> Result<PathBuf> {
 
 /// rc.52: machine-global config path —
 /// `%PROGRAMDATA%\roomler\roomler\config.toml` (a pre-rename host keeps
+// RETIRED-NAME-ANCHOR(2): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
 /// its `\roomler\roomler-agent\` tree — see `appdirs::app_segment`).
 ///
 /// `default_config_path()` resolves to a per-USER profile

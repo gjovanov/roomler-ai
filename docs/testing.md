@@ -35,7 +35,7 @@ flowchart TB
 
 Each test spawns a **real Axum server** on a random port against a **unique
 UUID-named database** (dropped on teardown). The agent-facing modules drive the
-actual `roomler-agent` library in-process for full `rc:*` round-trips against a
+actual `roomlerd` library in-process for full `rc:*` round-trips against a
 TestApp — enrollment, sessions, tunnels, overlay joins, exec.
 
 Coverage areas: auth · tenant (+archive) · member · role · room/channel · message ·
