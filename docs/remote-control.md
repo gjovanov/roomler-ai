@@ -549,6 +549,21 @@ prompt onto the host.
 `roomlerd consent --list` reads. `ConsentRequest.surface` is what stops the
 companion from popping a second panel over a native one.
 
+⚠️ **A virtual-desktop host declines the native surface, even though its X
+display connects.**
+<!-- RETIRED-NAME-ANCHOR: the LEGACY env spelling FR-21 P3 kept working, and
+     the one every affected host actually carries in its systemd drop-in. -->
+`ROOMLER_AGENT_VIRTUAL_DESKTOP=1` means the daemon started
+the Xvfb itself so a headless box can be remote-controlled — so the display's
+only viewer is a remote controller, which is the worst possible place to ask
+"may this remote controller in?". Field-measured on mars, jupiter and the WSL
+node 2026-08-29: unattended, the panel is drawn where nobody can see it and the
+session dies `timeout` when the truth is `no_prompt_surface`; attended, viewer
+A can click **Approve** on viewer B's request. `indicator/x11.rs` reads the
+daemon's own configuration, not the display, so a real X session on the same
+machine is unaffected and the banner path is untouched. Consequence for such a
+host: use `email`/`push`, or answer with `roomlerd consent`.
+
 ⚠️ **macOS native requires tokio off the main thread.** AppKit delivers events
 on the main run loop and `#[tokio::main]` parks it, so under
 `viewer-indicator-macos` the runtime moves to a worker and `main` hands the
