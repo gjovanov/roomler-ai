@@ -83,8 +83,9 @@ seam for a production-shaped hazard on a node that also runs real workloads.
 
 ## Acceptance criteria
 
-- [ ] A two-participant conference spec passes **in-cluster**, with real RTP —
-      not skipped, not stubbed
+- [x] A two-participant conference spec passes **in-cluster**, with real RTP —
+      not skipped, not stubbed (`conference.spec.ts` 4/4, `conference-multi.spec.ts`
+      5/5 on 2026-08-29)
 - [ ] The suite runs with **zero** `kubectl port-forward` invocations
 - [ ] `ROOMLER__APP__FRONTEND_URL` in the e2e overlay is back to the in-cluster
       service name, and the WS still authenticates
@@ -154,9 +155,9 @@ e2e stack; the stack was left exactly as found.
    value, and `cors_origins` cannot be set from a configmap at all (no
    `list_separator` ⇒ boot crash), so P2 must flip it as it switches lanes.
 
-4. **Still red — a fourth blocker, isolated but not solved.** With media
-   healthy, `conference.spec.ts` + `conference-multi.spec.ts` ran **2 passed /
-   9 failed**, and the server log shows why the tile never appears:
+4. **The fourth blocker was a PRODUCT BUG, and it is fixed (#940).** With
+   media healthy, `conference.spec.ts` + `conference-multi.spec.ts` ran **2
+   passed / 9 failed**, and the server log showed why the tile never appears:
 
    ```
    media:join … room_exists=true
@@ -165,10 +166,34 @@ e2e stack; the stack was left exactly as found.
    participant media closed          ← 15 s later, no connect_transport, no produce
    ```
 
-   The client stops between `transport_created` and `produce`, with **no
-   console error**, healthy `getUserMedia`, and working `enumerateDevices`. So
-   it is not permissions and not device selection — the next look belongs in
-   the client's `device.load()` / send-transport path.
+   The client stopped between `transport_created` and `produce`, with **no
+   console error**, healthy `getUserMedia`, and working `enumerateDevices`.
+
+   🔑 **Found by polling for the snackbar instead of reading the DOM once.**
+   The error was reported — and had already faded before any screenshot:
+
+   ```
+   Failed to join call: Failed to construct 'RTCPeerConnection':
+   '' is not a valid URL.
+   ```
+
+   `turn.url` is an `Option<String>`, and this stack has it as `Some("")`.
+   `expand_turn_url("")` returned `[""]`, so the server advertised an ICE
+   server with an empty URL and the browser refused the whole peer connection.
+   **Nobody could join a call, in any browser.** Fixed in #940 (blank ⇒ no TURN
+   server, at three layers), and re-run against the fixed image:
+
+   | | before #940 | after |
+   |---|---|---|
+   | `conference.spec.ts` | 0/4 | **4/4** |
+   | `conference-multi.spec.ts` | 0/5 | **5/5** |
+   | `conference-chat.spec.ts` | 0/2 | 0/2 — the in-call CHAT panel, a separate issue |
+
+   ⚠️ So `scripts/e2e-expected-failures.txt` has blamed unforwarded RTC ports
+   for months, I blamed missing routes this morning, and the actual cause was a
+   blank config value that made calls unjoinable for **any** deployment that
+   left it empty. Three diagnoses, two of them confidently wrong, and only the
+   one that came from making the failure reproducible was right.
 
 **Stack restored**: probe pod deleted, `frontend_url` back to
 `http://127.0.0.1:18080` so the existing nightly keeps working tonight.
