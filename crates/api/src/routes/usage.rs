@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Wave 3 — per-USER usage accounting (minutes + bytes).
 //!
 //! Every other stats surface is keyed by device, region or org. This one is

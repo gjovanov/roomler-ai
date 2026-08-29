@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P2 — the ONE carrier lifecycle (consolidation invariant I2).
 //!
 //! Every liveness rule that can kill an overlay carrier lives here as a pure,

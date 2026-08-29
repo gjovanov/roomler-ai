@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Roomler Setup — the unified 5-step Tauri 2 wizard.
 //!
 //! ONE downloadable EXE replacing the two legacy wizards retired in

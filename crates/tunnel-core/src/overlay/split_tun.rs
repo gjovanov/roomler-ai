@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Port-intercept TUN shim — lets an in-process service own a TCP port on this
 //! node's overlay address **without binding an OS socket**.
 //!

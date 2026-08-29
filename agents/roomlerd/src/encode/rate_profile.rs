@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P3 (Parsec-class plan) — transport/codec-aware rate-profile helpers for
 //! the DC video pumps. Pure (no ffmpeg/webrtc/tokio types, explicit
 //! `Instant`s), so everything here unit-tests on the default feature build

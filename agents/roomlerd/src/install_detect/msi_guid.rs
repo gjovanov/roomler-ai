@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows Installer "packed" / "compressed" GUID encoder.
 //!
 //! Windows Installer stores `UpgradeCode`-to-`ProductCode` mappings

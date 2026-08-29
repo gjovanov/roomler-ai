@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Fleet RPC — the agent-side execution engine.
 //!
 //! Runs ONE bounded shell command on behalf of a `rc:rpc.exec` frame the

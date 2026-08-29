@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use mongodb::bson::{DateTime, doc, oid::ObjectId};
 use roomler_ai_config::StripeSettings;
 use roomler_ai_db::models::tenant::{BillingInfo, Plan, PlanLimits, SubscriptionStatus, Tenant};

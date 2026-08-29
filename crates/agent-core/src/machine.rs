@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Stable machine fingerprint derivation.
 //!
 //! The server uses `(tenant_id, machine_id)` as a unique key, so `machine_id`

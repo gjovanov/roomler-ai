@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler-agent` — the native remote-control agent for the Roomler AI
 //! platform. Runs on the controlled host, connects out to the Roomler API
 //! over WSS, and (eventually) serves a WebRTC peer to a browser controller.

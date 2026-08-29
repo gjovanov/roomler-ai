@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-5 — DERP directory + registration-driven rehome.
 //!
 //! The DERP relay is pod-local by design: two mesh peers only exchange

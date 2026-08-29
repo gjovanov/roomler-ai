@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 /*
  * Devices view: the network's peers with their live connection type — the
  * Tailscale-style "which of my devices is reachable, and how" table.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'

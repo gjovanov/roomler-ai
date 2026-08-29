@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Thin wrapper around a `webrtc-rs` `RTCPeerConnection`.
 //!
 //! Owns the per-session WebRTC state: codecs, ICE, data channels, and (when

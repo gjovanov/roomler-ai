@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay crypto-routing table.
 //!
 //! boringtun's [`Tunn`](boringtun::noise::Tunn) is **single-peer** — it

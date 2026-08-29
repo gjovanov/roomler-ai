@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Opus encoder for the WebRTC audio track.
 //!
 //! Wraps [`audiopus::coder::Encoder`] configured for the WebRTC Opus

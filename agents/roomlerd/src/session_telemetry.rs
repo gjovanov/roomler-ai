@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Per-session counters for `rc:session.stats` (wave 2).
 //!
 //! `remote_sessions.stats` has been declared-but-never-written since

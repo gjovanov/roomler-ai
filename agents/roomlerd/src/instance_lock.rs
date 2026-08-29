@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Cross-platform single-instance lock for `roomlerd run`.
 //!
 //! Prevents an interactive `roomlerd run` from racing the
