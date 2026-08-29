@@ -98,7 +98,7 @@ pub async fn ensure_running() -> bool {
         Ok(EnsureOutcome::Unsupported) => {
             tracing::info!(
                 "no desktop companion on this host — an on-screen prompt is not possible; \
-                 answer with `roomler consent --list` / `--approve`, or set this device to \
+                 answer with `roomlerd consent --list` / `--approve`, or set this device to \
                  email/push consent"
             );
             false

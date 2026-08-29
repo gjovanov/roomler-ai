@@ -542,11 +542,11 @@ prompt onto the host.
    (`viewer-indicator-macos`, AppKit).
 2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
    starts it if it is not running (`companion::ensure_running`).
-3. **CLI** — `roomler consent --list` / `--approve`, which works everywhere.
+3. **CLI** — `roomlerd consent --list` / `--approve`, which works everywhere.
 4. **none** — reported as `no_prompt_surface`, not as a deny.
 
 ⚠️ The `.pending` marker is written in ALL cases, because it is also what
-`roomler consent --list` reads. `ConsentRequest.surface` is what stops the
+`roomlerd consent --list` reads. `ConsentRequest.surface` is what stops the
 companion from popping a second panel over a native one.
 
 ⚠️ **macOS native requires tokio off the main thread.** AppKit delivers events
