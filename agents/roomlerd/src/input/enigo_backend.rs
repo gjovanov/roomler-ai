@@ -710,11 +710,11 @@ mod tests {
         let (px, py) = map_normalised_to_virtual(0.5, 0.5, 1920, 0, 1920, 1200);
         // Must be inside primary's [1920, 3840) × [0, 1200) rect.
         assert!(
-            px >= 1920 && px < 3840,
+            (1920..3840).contains(&px),
             "centre x should be inside primary's x-range, got {px}"
         );
         assert!(
-            py >= 0 && py < 1200,
+            (0..1200).contains(&py),
             "centre y should be inside primary's y-range, got {py}"
         );
         // Pre-rc.54 would have produced (960, 600) — that's on the
