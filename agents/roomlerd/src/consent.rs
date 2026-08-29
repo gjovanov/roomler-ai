@@ -14,9 +14,9 @@
 //! by an out-of-process operator running:
 //!
 //! ```text
-//! roomler consent --session <hex_id> --approve
-//! roomler consent --session <hex_id> --deny
-//! roomler consent --list          # FR-27: what is outstanding right now
+//! roomlerd consent --session <hex_id> --approve
+//! roomlerd consent --session <hex_id> --deny
+//! roomlerd consent --list          # FR-27: what is outstanding right now
 //! ```
 //!
 //! 30 s timeout → auto-deny. Outcome propagates back through the
@@ -172,7 +172,7 @@ impl PromptKind {
 ///
 /// The marker is written even when the daemon's own native panel is up,
 /// because it is also the machine-readable record that a decision is
-/// outstanding — `roomler consent --list` must show a natively-prompted
+/// outstanding — `roomlerd consent --list` must show a natively-prompted
 /// session, and the LocalAPI is the only honest place to read that from.
 ///
 /// Which makes this field load-bearing: without it the desktop companion would
@@ -395,7 +395,7 @@ impl ConsentBroker {
             // headless operator gets, and naming a binary that no longer
             // exists makes it worse than silence. Field-caught on mars
             // 2026-08-29, still printing the old name at 0.4.16.
-            "operator consent required — answer it with `roomler consent --session {} --approve|--deny` (`roomler consent --list` shows what is outstanding)",
+            "operator consent required — answer it with `roomlerd consent --session {} --approve|--deny` (`roomlerd consent --list` shows what is outstanding)",
             session_hex
         );
 
@@ -942,5 +942,42 @@ mod tests {
         assert_eq!(broker.request("").await, Decision::Denied);
         assert!(start.elapsed() < Duration::from_millis(50));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// RETIRED-NAME-ANCHOR(35): this whole module exists BECAUSE the retired names
+// keep coming back into that log line, so it has to spell them out to assert
+// they are gone. Naming them is the test.
+#[cfg(test)]
+mod cli_name_tests {
+    /// The guidance in [`ConsentBroker::request`]'s log line is, on a headless
+    /// host, the ONLY thing telling an operator how to answer — and it has now
+    /// been wrong twice: FR-21 retired `roomler-agent`, and the first repair
+    /// swapped it for `roomler consent`, which the `roomler` CLI does not have
+    /// (these subcommands live on the DAEMON's clap surface, alongside
+    /// `roomlerd enroll` / `roomlerd run`; `roomler` is the tunnel + fleet CLI
+    /// and its `Commands` enum has no `consent` arm). Caught by actually
+    /// running it: `roomler consent --help` → `unrecognized subcommand`.
+    ///
+    /// Nothing else fails when this string rots, so assert it.
+    #[test]
+    fn the_log_line_names_a_command_that_exists() {
+        // Scan only what precedes THIS module: the prose above quotes the
+        // wrong spellings in order to name them, and a whole-file scan would
+        // fail on its own explanation.
+        let full = include_str!("consent.rs");
+        let src = full.split("mod cli_name_tests").next().unwrap();
+        assert!(
+            !src.contains("`roomler consent"),
+            "the guidance must say `roomlerd consent` — `roomler` has no consent subcommand"
+        );
+        assert!(
+            !src.contains("roomler-agent consent"),
+            "FR-21 retired the `roomler-agent` binary name"
+        );
+        assert!(
+            src.contains("roomlerd consent --session"),
+            "the guidance must still tell the operator the actual command"
+        );
     }
 }

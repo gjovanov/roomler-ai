@@ -137,7 +137,7 @@ daemon start and re-probed when one fails**:
 | 1 | native `mac` | AppKit reachable (see the main-thread note) |
 | 1 | native `x11` | `DISPLAY` set **and** `x11rb::connect` succeeds |
 | 2 | `companion` | `roomler-desktop` over LocalAPI, started on demand |
-| 3 | `cli` | `roomler consent` sentinel (works today) |
+| 3 | `cli` | `roomlerd consent` sentinel (works today) |
 | 4 | none | report `no_prompt_surface` rather than deny silently |
 
 The chosen surface is logged at startup, exposed in LocalAPI `Status` and
@@ -183,7 +183,7 @@ is why it is sequenced last, behind its own feature and the probe.
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
 | 0 | FR + issue + ledger | n/a | **done** — the FR-24 collision was already repaired on master by #850 |
-| 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomler consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | **implemented** — field pending |
+| 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomlerd consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | **implemented** — field pending |
 | 2 | Desktop companion — one tray with an icon, daemon-path resolution, update-output surfacing, version honesty, `ensure_running()` | each item independent; no wire change | **implemented** (version honesty deferred to a follow-up) — field pending |
 | 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac |
 | 4 | Linux packaging — a **separate** `roomler-desktop` .deb | absent package = today's behaviour | **implemented** — field pending |
