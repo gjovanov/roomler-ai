@@ -49,7 +49,7 @@ impossible again.
 | **SERVER** | `api`, `services`, `db`, `config`, `derp-relay`, `tests` | 54 157 |
 | **SERVER (web)** | `ui/src` | 53 717 |
 | **SHARED** | `tunnel-core` 55 593 · `remote_control` 12 883 · `localapi` 3 012 · `tcp-turn-conn` 518 | **72 006** |
-| **CLIENT** | `roomler-agent` 89 737 · `agent-core` · `roomler-tunnel` · `roomler-setup` · `roomler-setup-core` · `roomler-agent-tray` · `roomler-cli-shim` | 110 911 |
+| **CLIENT** | `roomlerd` 89 737 · `roomler-core` · `roomler-cli` · `roomler-setup` · `roomler-setup-core` · `roomler-desktop` · `roomler-cli-shim` | 110 911 |
 | **THIRD-PARTY** | `crates/vendored/*` | untouched |
 
 SHARED is measured, not guessed: `crates/api/Cargo.toml` deps
@@ -65,7 +65,7 @@ side of its own proposal:**
 | Named asset | Lives in | Class | Licence here |
 |---|---|---|---|
 | Mesh carrier cascade | `crates/tunnel-core/src/overlay/` | SHARED | **MPL-2.0** |
-| Encoder cascade | `agents/roomler-agent/src/encode/` | CLIENT | **MPL-2.0** |
+| Encoder cascade | `agents/roomlerd/src/encode/` | CLIENT | **MPL-2.0** |
 
 **AGPL therefore covers ~37% of first-party code and 0% of the code the split
 was argued for.** What it covers is routes, DAOs, Mongo models and the Vue app.
@@ -90,7 +90,7 @@ Chosen with the trade-off measured, not by default.
   rewrite.
 - OSI-approved and SPDX-known. Packagers and enterprise legal accept it without
   argument.
-- **Accepts:** a competitor may take `tunnel-core` and `roomler-agent` into a
+- **Accepts:** a competitor may take `tunnel-core` and `roomlerd` into a
   proprietary product, owing back only changes to our files.
 
 Rejected, recorded so they are not re-litigated:
@@ -263,6 +263,7 @@ a win and needs measuring on its own merits, not as a legal necessity.
 | 2026-08-28 | `cargo deny` failure triaged | two real findings: our own AGPL members were checked as "dependencies", and `tun` 0.8.10 is **WTFPL** (unvetted). The invented `ring` clarify never matched and was removed. |
 | 2026-08-29 | Re-read LGPL-2.1 §6(a) against the actual build | "object code **and/or source code**" ⇒ open-sourcing the agent already discharges the half we thought needed an object archive; P4b closed without shipping one |
 | 2026-08-29 | `gh workflow run lgpl-source-offer.yml --ref fr24-licensing-split` | **HTTP 404** — `workflow_dispatch` resolves only on the default branch; the first run has to wait for the merge |
+<!-- RETIRED-NAME-ANCHOR(2): the row below RECORDS the rename, so it must name both sides. -->
 | 2026-08-29 | Merged master (FR-21 renames + FR-25/26/28/29) into the branch | `agents/roomler-agent`→`roomlerd`, `roomler-tunnel`→`roomler-cli`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→`roomler-core`; classification and crate lists repointed |
 | 2026-08-29 | **The rename exposed a hole in the sweep** | an unclassified path was a silent `continue`, so a renamed directory would have dropped the whole daemon out of the sweep while `--check` still reported OK. Unclassified is now a hard failure; it immediately caught 10 real files (`ui/*.ts`, `ui/index.html`, `ui/public/*`) that `ui/src` never covered ⇒ SERVER_PATHS broadened to `ui` |
 | 2026-08-29 | Post-merge re-verification | SPDX 647/647 · manifest audit exit 0 · graph check `none` × 5 · fmt clean · agent crates check · ui build + **898/898** vitest |
