@@ -200,14 +200,18 @@ pub async fn admin_plan_compliance(
         // ⚠ `video_max_participants` and `ai_recognition` are WIRED gates that
         // the first version of this report omitted — and the omission mattered.
         //
-        // Free's `video_max_participants` is **0**, so flipping a Free tenant to
-        // `Enforce` refuses the very first person to join a call: conferencing
-        // stops entirely. A snapshot cannot see that as "over", because a cap of
-        // zero is only exceeded *while a call is in progress* — so the report
-        // said `would_break: 0` about a change that would have taken video away
-        // from every Free tenant. A report used to authorise a rollout has to
-        // cover every gate that rollout turns on, including the ones whose
-        // breakage is invisible at rest.
+        // Free's video cap was **0** until 2026-08-29 — "Free has no
+        // conferencing" — so flipping a Free tenant to `Enforce` would have
+        // refused the very first person to join a call. A snapshot cannot see
+        // that as "over", because a zero cap is only exceeded *while a call is
+        // in progress*, so the report said `would_break: 0` about a change that
+        // would have taken video away from every Free tenant. A report used to
+        // authorise a rollout has to cover every gate that rollout turns on,
+        // including the ones whose breakage is invisible at rest.
+        //
+        // Free now has a real cap of 4 (operator decision), so video is no
+        // longer a removal for Free. `ai_recognition` still is, and the same
+        // reasoning is what keeps it visible.
         //
         // They are surfaced as **capability rows**: `used` is what the tenant
         // holds today (always 1 — the ability is live while unenforced), `max`
@@ -306,22 +310,32 @@ mod tests {
         assert!(11u64 > max, "one past the cap is over");
     }
 
-    /// Free excludes video entirely (`video_max_participants: 0`), so flipping
-    /// a Free tenant to `Enforce` refuses the first person to join a call.
+    /// A plan that EXCLUDES a capability (a cap of zero) must be reported as
+    /// breaking: enforcing it removes something the tenant can do today, and a
+    /// zero cap is never "over" at rest, so nothing else would surface it.
     ///
-    /// The report's first version omitted this limit, and a cap of zero is
-    /// never "over" at rest — so it reported `would_break: 0` about a change
-    /// that would have removed conferencing from every Free tenant. This test
-    /// exists so that stays visible.
+    /// This is the case the report's first version missed — it said
+    /// `would_break: 0` about a change that would have taken conferencing away
+    /// from every Free tenant, back when `Free.video_max_participants` was 0.
+    ///
+    /// Free now has a real video cap of **4** (operator decision, 2026-08-29),
+    /// so video is no longer a removal for Free; `ai_recognition` still is, and
+    /// carries the property here.
     #[test]
-    fn a_plan_that_excludes_video_is_reported_as_breaking() {
+    fn a_plan_that_excludes_a_capability_is_reported_as_breaking() {
         let free = Plan::Free.limits();
+        // Free HAS video now, bounded — a cap the gate can enforce without
+        // taking a capability away from anyone.
         assert_eq!(
             quota::Limit::VideoMaxParticipants.describe(&free).0,
-            Some(0),
-            "Free excludes video; enforcing it is a capability REMOVAL, not a cap"
+            Some(4),
+            "Free has 4 video participants; 0 would mean enforcing REMOVES conferencing"
         );
-        assert_eq!(quota::Limit::AiRecognition.describe(&free).0, Some(0));
+        assert_eq!(
+            quota::Limit::AiRecognition.describe(&free).0,
+            Some(0),
+            "an excluded capability must read as a zero cap so the report flags it"
+        );
 
         // A plan that includes them must not be flagged.
         let biz = Plan::Business.limits();
