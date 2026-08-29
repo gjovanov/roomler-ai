@@ -22,6 +22,7 @@ use roomler_ai_remote_control::models::{
     AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget,
 };
 use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -129,13 +130,19 @@ pub async fn enroll_tunnel_client(
             // S5 — plan tunnel-client cap. Mirrors the device cap in
             // `enroll_agent`: only NEW rows consume a slot.
             let tenant = state.tenants.base.find_by_id(tid).await?;
-            let max = tenant.plan.limits().max_tunnel_clients as u64;
             let used = state.tunnel_clients.count_active_for_tenant(tid).await?;
-            if used >= max {
+            // FR-32: decision + record in `quota::check`. `MaxTunnelClients` is
+            // an established limit, so it refuses whatever the mode says.
+            if let Err(d) = quota::check(
+                tenant.plan.clone(),
+                tenant.settings.plan_enforcement,
+                quota::Limit::MaxTunnelClients,
+                used,
+            ) {
                 return Err(ApiError::Forbidden(format!(
-                    "Tunnel-client limit reached for the {:?} plan ({used} of {max} used). \
+                    "Tunnel-client limit reached for the {:?} plan ({} of {} used). \
                      Upgrade the plan or remove a tunnel client first.",
-                    tenant.plan
+                    d.plan, d.used, d.max
                 )));
             }
             state
