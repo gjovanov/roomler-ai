@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 export function useValidation() {
   const rules = {
     required: (v: unknown) => !!v || v === 0 || 'This field is required',

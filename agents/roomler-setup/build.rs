@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // Tauri build script — generates the runtime bindings + bundles the
 // `src/front/` assets per `tauri.conf.json`. The macros in `main.rs`
 // depend on what this emits.

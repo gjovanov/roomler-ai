@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { api } from '@/api/client'
 
 function urlBase64ToUint8Array(base64String: string): Uint8Array {

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! HW-downscale Phase A — the CPU resampler, extracted from peer.rs and
 //! de-wasted.
 //!

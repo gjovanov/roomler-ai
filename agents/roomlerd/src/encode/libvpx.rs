@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! VP9 profile 1 (8-bit 4:4:4) software encoder via libvpx.
 //!
 //! This is the encoder side of Phase Y (VP9 4:4:4 over RTCDataChannel),

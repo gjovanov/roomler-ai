@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `flow_id` framing for multiplexing many TCP flows onto a fixed
 //! pool of WebRTC DataChannels.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Cross-platform input injection via [enigo].
 //!
 //! enigo picks the right OS primitive per platform: XTest / uinput on

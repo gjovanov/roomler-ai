@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Roomler AI tunnel core.
 //!
 //! Shared building blocks for the `roomler-tunnel` CLI (controller side)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use mongodb::{Database, IndexModel, options::IndexOptions};
 use tracing::info;
 

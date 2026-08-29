@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! rc.191 — match the remote display mode to the viewer ("display match").
 //!
 //! The field sharpness saga (2026-07-16) proved the only truly crisp remote

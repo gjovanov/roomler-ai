@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-6 — cluster observability: the counters every rehome/fallback path
 //! increments, and the snapshot the `/api/cluster/status` route serves.
 //!
