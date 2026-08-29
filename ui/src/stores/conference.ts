@@ -39,6 +39,10 @@ export const useConferenceStore = defineStore('conference', () => {
   // prod 2026-08-29), which is why "hide participants without video" could
   // never hide anyone.
   const remoteVideoPaused = reactive<Map<string, boolean>>(new Map())
+  // FR-30 P3 — the same signal for audio. A remote's mute state was hardcoded
+  // `false` in the layout, so the mic-off badge could only ever appear on your
+  // own tile; the wire already carries it, kind-agnostic.
+  const remoteAudioPaused = reactive<Map<string, boolean>>(new Map())
   const localStream = shallowRef<MediaStream | null>(null)
   const isMuted = ref(false)
   const isVideoOn = ref(true)
@@ -381,6 +385,8 @@ export const useConferenceStore = defineStore('conference', () => {
     remoteStreams.delete(`${connectionId}:screen`)
     remoteVideoPaused.delete(connectionId)
     remoteVideoPaused.delete(`${connectionId}:screen`)
+    remoteAudioPaused.delete(connectionId)
+    remoteAudioPaused.delete(`${connectionId}:screen`)
     for (const [id, consumer] of consumers) {
       const key = consumerStreamKey.get(id)
       if (key === connectionId || key === `${connectionId}:screen`) {
@@ -414,11 +420,12 @@ export const useConferenceStore = defineStore('conference', () => {
   }) {
     for (const [id, consumer] of consumers) {
       if (consumer.producerId !== data.producer_id) continue
-      // Audio pause is relayed too (same wire), but only video changes who is
-      // shown; the mic indicator reads this map's audio sibling when it lands.
-      if (consumer.kind !== 'video') break
       const key = consumerStreamKey.get(id)
-      if (key) remoteVideoPaused.set(key, data.paused)
+      if (!key) break
+      // Video decides who is SHOWN; audio only decorates the tile. Same wire,
+      // two maps, so a muted-but-visible peer is not confused with a hidden one.
+      if (consumer.kind === 'video') remoteVideoPaused.set(key, data.paused)
+      else remoteAudioPaused.set(key, data.paused)
       break
     }
   }
@@ -541,6 +548,7 @@ export const useConferenceStore = defineStore('conference', () => {
 
     remoteStreams.clear()
     remoteVideoPaused.clear()
+    remoteAudioPaused.clear()
     device.value = null
     consumeChain = Promise.resolve()
 
@@ -685,6 +693,7 @@ export const useConferenceStore = defineStore('conference', () => {
     consumers,
     remoteStreams,
     remoteVideoPaused,
+    remoteAudioPaused,
     localStream,
     isMuted,
     isVideoOn,
