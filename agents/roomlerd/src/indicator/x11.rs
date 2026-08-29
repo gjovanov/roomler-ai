@@ -94,6 +94,11 @@ pub(super) struct Inner {
     alive: Arc<AtomicBool>,
 }
 
+// RETIRED-NAME-ANCHOR(24): `ROOMLER_AGENT_VIRTUAL_DESKTOP` is the LEGACY
+// spelling FR-21 P3 (D1) deliberately kept working — mars, jupiter and the WSL
+// node all carry it verbatim in operator-authored systemd drop-ins that no
+// package upgrade rewrites. Reading only `ROOMLERD_*` here would silently make
+// the guard below a no-op on every host that needs it.
 /// ⚠️ FR-27, field-measured on `mars` + `jupiter` 2026-08-29: a
 /// `ROOMLER_AGENT_VIRTUAL_DESKTOP=1` host is NOT an attended host, even though
 /// it has a perfectly good X display.
@@ -457,6 +462,8 @@ fn paint<C: Connection>(
 mod tests {
     use super::display_is_our_own_virtual_desktop;
 
+    // RETIRED-NAME-ANCHOR(16): the legacy env spelling under test, on purpose
+    // — see the anchor on `display_is_our_own_virtual_desktop`.
     /// The FR-27 field finding, locked. `mars` and `jupiter` both carry
     /// `ROOMLER_AGENT_VIRTUAL_DESKTOP=1` in an operator-authored systemd
     /// drop-in (FR-21 P3 kept the legacy spelling working), and both reported
