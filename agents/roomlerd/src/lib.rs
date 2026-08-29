@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! Library crate for `roomler-agent`. The binary at `src/main.rs` is a thin
+//! Library crate for `roomlerd`. The binary at `src/main.rs` is a thin
 //! CLI shell around these modules; exposing them here lets integration
 //! tests drive the agent in-process against a `TestApp` server.
 
 // P3e lever E: the daemon-free building blocks (appdirs, machine, config,
 // config_surface, enrollment, logging, logs_upload, crash_recorder, the
 // notify primitives, the forward ACL, the apps config shapes) moved to the
-// `roomler-agent-core` crate so the desktop companion can link them without
+// `roomler-core` crate so the desktop companion can link them without
 // this crate's data plane. Re-exported here under their old `crate::` paths —
 // every internal call site is unchanged. `notify` stays a real module (it
 // layers the daemon-only worker-aware wrappers over the core primitives);

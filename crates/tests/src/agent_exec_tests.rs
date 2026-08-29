@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 //! Fleet RPC end-to-end: the browser/API leg driven against a live `TestApp`
-//! with the real `roomler-agent` library on the other end.
+//! with the real `roomlerd` library on the other end.
 //!
 //! What these lock is the thing unit tests can't: that the four gates are
 //! actually wired into the ONE path a command takes, that a refusal is a
