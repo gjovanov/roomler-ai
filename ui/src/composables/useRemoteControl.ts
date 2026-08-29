@@ -2958,6 +2958,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** Last time a STALL snackbar was shown, so a flapping path cannot
    *  bury its own message under repeats. */
   let lastStallSnackAtMs = -Infinity
+  /** FR-22 - has ANY attempt in this connect cycle already painted a
+   *  frame? Distinguishes "the session dropped and came back" from "the
+   *  request was never answered", which the attempt counter alone cannot.
+   *  Cleared by a fresh user-initiated connect, not by a retry. */
+  let sessionEverPainted = false
 
   /** FR-22 - per-attempt connect timing. Null outside an attempt; a
    *  retry replaces it wholesale so the ladder's second attempt cannot
@@ -2983,6 +2988,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const line = formatConnectTiming(snap)
     if (reason === 'first-frame') {
       lastTtffMs.value = snap.marks.first_frame ?? null
+      sessionEverPainted = true
       console.info('[rc] connect', line)
     } else {
       console.warn('[rc] connect', reason, line)
@@ -6414,6 +6420,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // the right args from the original user click.
     if (!isReconnect) {
       lastConnectArgs = { agentId, permissions, orgId }
+      // New user-initiated connect - a later retry in THIS cycle must not
+      // inherit "the session worked once" from the previous one.
+      sessionEverPainted = false
       // Fresh user-initiated connect Ã¢ÂÂ reset reconnect state.
       cancelReconnect()
     }
@@ -6428,7 +6437,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // it, so a connect that spent its whole wait in the pre-flight
     // reported a small TTFF and was reported as healthy - which is
     // exactly the case that reproduced with no snackbar.
-    connectTiming = beginAttempt(reconnectAttempt.value + 1)
+    connectTiming = beginAttempt(reconnectAttempt.value + 1, sessionEverPainted)
     // Per-ATTEMPT, not per-user-connect: each retry has to earn "media
     // flowed" again, otherwise one good session would excuse every frameless
     // one that followed it.
