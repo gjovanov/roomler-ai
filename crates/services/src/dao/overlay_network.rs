@@ -3,7 +3,7 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use mongodb::options::ReturnDocument;
-use roomler_ai_remote_control::models::{OverlayAclMode, OverlayNetwork};
+use roomler_ai_remote_control::models::{OverlayAclMode, OverlayNetwork, PeerRelayMode};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 use super::overlay_block::OverlayBlockDao;
@@ -202,6 +202,26 @@ impl OverlayNetworkDao {
                 doc! { "tenant_id": tenant_id },
                 doc! { "$set": {
                     "acl_mode": bson::to_bson(&mode).unwrap_or(bson::Bson::Null),
+                    "updated_at": DateTime::now(),
+                }},
+            )
+            .await
+    }
+
+    /// FR-19 gate 1 — set the tenant's peer-relay posture (`off` | `warn` |
+    /// `on`). Same shape as [`Self::set_acl_mode`], including creating the
+    /// row, so an admin can stage the posture before the first node joins.
+    pub async fn set_peer_relay_mode(
+        &self,
+        tenant_id: ObjectId,
+        mode: PeerRelayMode,
+    ) -> DaoResult<bool> {
+        self.get_or_create(tenant_id).await?;
+        self.base
+            .update_one(
+                doc! { "tenant_id": tenant_id },
+                doc! { "$set": {
+                    "peer_relay_mode": bson::to_bson(&mode).unwrap_or(bson::Bson::Null),
                     "updated_at": DateTime::now(),
                 }},
             )
