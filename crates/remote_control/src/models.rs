@@ -652,6 +652,21 @@ pub struct Agent {
     pub machine_id: String,
     pub os: OsKind,
     pub agent_version: String,
+    /// FR-27 — the version of the `roomler-desktop` companion INSTALLED on this
+    /// host, reported on the heartbeat. `None` means one of three different
+    /// things and the grid must not flatten them: a pre-FR-27 agent that never
+    /// reports the field, a host with no companion installed, or a probe that
+    /// could not read one.
+    ///
+    /// It exists because the daemon and the companion update through DIFFERENT
+    /// mechanisms on every platform — Windows: the daemon side-loads the EXE
+    /// (`companion::refresh_if_stale`), macOS: the `.pkg` carries
+    /// `/Applications/Roomler.app`, Linux: a separate `roomler-desktop` .deb
+    /// that apt owns — so "Update all" moving the daemon says nothing about the
+    /// companion, and until now nothing on screen could tell you it had been
+    /// left behind. That was the operator's report, not a hypothetical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_version: Option<String>,
     /// P6 — OpenSSH public half of the device's SSH host key, as reported on
     /// its last hello. Published so a caller can verify what it dialled
     /// instead of trusting it on first use.

@@ -256,6 +256,12 @@ pub struct AgentResponse {
     pub machine_id: String,
     pub os: OsKind,
     pub agent_version: String,
+    /// FR-27 — the `roomler-desktop` version installed on the host, as the
+    /// device last reported it. Omitted when there is none / it could not be
+    /// read / the agent predates the field: the grid must not turn three
+    /// different situations into one string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub companion_version: Option<String>,
     pub status: AgentStatus,
     /// Three-state truth: `online` | `stale` | `offline` (Phase A-1).
     pub presence: AgentPresence,
@@ -1309,6 +1315,7 @@ fn to_agent_response(
         machine_id: a.machine_id,
         os: a.os,
         agent_version: a.agent_version,
+        companion_version: a.companion_version,
         status: a.status,
         is_online,
         last_seen_at: fmt_dt(a.last_seen_at),
