@@ -1,3 +1,10 @@
+// RETIRED-NAME-ANCHOR-BEGIN
+// This whole module IS the env-prefix fallback chain. Every occurrence of a
+// retired name in it is a prefix the chain must keep honouring
+// (`ROOMLER_AGENT_`, `ROOMLER_NODE_`), its documentation, or a test that sets one
+// to prove the field keeps working.
+// INVARIANT: if you add a retired name here that is NOT part of that chain, that
+// is a bug, not a new exemption. docs/fr/FR-21
 //! Roomler node env-var reads with legacy-prefix fallback.
 //!
 //! The controlled-host daemon is being renamed `roomler-agent` → `roomlerd`
@@ -349,3 +356,5 @@ mod tests {
         }
     }
 }
+
+// RETIRED-NAME-ANCHOR-END
