@@ -267,15 +267,39 @@ impl ScrapCapture {
                     // forces a capture periodically, so a missed damage event
                     // costs a stale tile, never a frozen stream.
                     #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
-                    if let Some(d) = damage.as_mut()
-                        && !d.should_capture()
-                    {
-                        unchanged_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let _ = res_tx.send(Ok(None));
-                        continue;
+                    // P2 — what the tracker says changed, stamped on the frame
+                    // below. `Unknown` is the honest default for every path
+                    // that is not damage-driven (tracker absent or switched
+                    // off), and matches the pre-FR-29 contract exactly.
+                    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                    let mut frame_damage = Damage::Unknown;
+                    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                    if let Some(d) = damage.as_mut() {
+                        match d.tick() {
+                            super::x11_damage::Tick::Skip => {
+                                unchanged_worker
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let _ = res_tx.send(Ok(None));
+                                continue;
+                            }
+                            super::x11_damage::Tick::Capture(dmg) => frame_damage = dmg,
+                        }
                     }
-                    let reply =
+                    #[allow(unused_mut)]
+                    let mut reply =
                         capture_one_blocking(&mut cap, w, h, (native_w, native_h), start, downscale);
+                    // The tracker reports in ROOT coordinates; a delivered
+                    // frame may have been downscaled on the way out, so the
+                    // rects have to follow it or every consumer would point at
+                    // the wrong pixels.
+                    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                    if let Ok(Some(f)) = reply.as_mut() {
+                        f.damage = if f.width == w && f.height == h {
+                            frame_damage
+                        } else {
+                            super::scale_damage(&frame_damage, w, h, f.width, f.height)
+                        };
+                    }
                     let _ = res_tx.send(reply);
                 }
             })
