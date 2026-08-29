@@ -436,6 +436,25 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // FR-19 peer-relay decisions — approvals (who made a device a relay) and
+    // mints (what was routed through it), granted or refused. `agent_id`
+    // answers both halves of the incident-review question in one query,
+    // `requester_node_id` is what a rate-limit forensics pass walks, and the
+    // TTL is the same 90 days as the other decision logs: making a device a
+    // chokepoint for the tenant's traffic is the same class of event as
+    // opening exec on it.
+    create_indexes(
+        db,
+        "peer_relay_audit",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "requester_node_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Roomler-SSH grant decisions. Same three questions as `exec_audit`, same
     // 90-day TTL — an SSH session is the bigger power of the two, so its log
     // must not be the shorter-lived one.

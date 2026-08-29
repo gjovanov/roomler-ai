@@ -211,7 +211,7 @@ Router::new()
     .with_state(state)
 ```
 
-Route groups: auth (7), user (2), oauth (2), stripe (4), invite (2+4), giphy (2), push (3), notification (5), tenant (3), member (2), role (6), room (16), message (11), recording (3), file (7), task (3), export (2), search (1), health (1), ws (1), agent (4 tenant-scoped + 1 public enroll), session (3), turn (1).
+Route groups: auth (7), user (2), oauth (2), stripe (4), invite (2+4), giphy (2), push (3), notification (5), tenant (3), member (2), role (6), room (16), message (11), recording (3), file (7), task (3), export (2), search (1), health (1), ws (1), agent (4 tenant-scoped + 1 public enroll), session (3), turn (1), peer-relay (3 + 1 per-device policy).
 
 ## DB Model Pattern
 
@@ -219,7 +219,7 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 - 18 collections: tenants, users, tenant_members, roles, rooms, room_members, messages, reactions, recordings, files, invites, background_tasks, audit_logs, notifications, custom_emojis, activation_codes, **agents, remote_sessions, remote_audit**
 - Indexes defined in `crates/db/src/indexes.rs` (unique, TTL, text indexes on email, username, slug, code, content, etc.)
 - Text indexes on messages (content), rooms (name, purpose, tags), users (display_name, username) for full-text search
-- TTL indexes on audit_logs (90 days), activation_codes, background_tasks, **remote_audit (90 days)**, **exec_audit (90 days)**, **ssh_audit (90 days)**, **ssh_activity (90 days)**
+- TTL indexes on audit_logs (90 days), activation_codes, background_tasks, **remote_audit (90 days)**, **exec_audit (90 days)**, **ssh_audit (90 days)**, **ssh_activity (90 days)**, **peer_relay_audit (90 days)**
 - Unique composite index on `agents.{tenant_id, machine_id}` so re-enrolling a known machine reuses its row
 - All queries use BSON documents, no ORM
 
