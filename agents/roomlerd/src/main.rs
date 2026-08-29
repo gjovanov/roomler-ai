@@ -173,6 +173,35 @@ enum Command {
         #[arg(long, default_value = "h264")]
         codec: String,
     },
+    /// Smoke-test the screen-capture cascade on THIS host: run
+    /// `open_default`, pull N frames, and report which backend answered,
+    /// the geometry, and per-frame timing. Optionally dump the last frame
+    /// as a PPM so a human can confirm the pixels are a desktop rather
+    /// than plausible-looking garbage.
+    ///
+    /// Exists because "capture works here" was previously only answerable
+    /// by opening a full remote-control session — which conflates capture,
+    /// encode, transport and the browser. FR-36 needs it to field-verify a
+    /// DRM/KMS backend on a host with no session at all.
+    #[command(hide = true, name = "capture-smoke")]
+    CaptureSmoke {
+        /// How many frames to pull before reporting.
+        #[arg(long, default_value_t = 10)]
+        frames: u32,
+        /// Write the last captured frame here as a binary PPM (P6).
+        /// A wrong-format decode keeps perfect geometry and ruins every
+        /// colour, so looking at the image is the only real check.
+        #[arg(long)]
+        dump: Option<String>,
+        /// Target fps for the capture's own pacing gate.
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// Downscale policy: `never` (default here, so the number is the raw
+        /// capture cost), `auto` (what production uses — halves sources above
+        /// ~3.5 Mpx), or `always`.
+        #[arg(long, default_value = "never")]
+        downscale: String,
+    },
     /// M3 derisking spike: probe Windows.Graphics.Capture init from
     /// the requested desktop. Three modes — `default` (no swap, sanity
     /// baseline; should always pass in a user session), `input`
@@ -948,6 +977,12 @@ async fn daemon_main() -> Result<()> {
             }
         }
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
+        Command::CaptureSmoke {
+            frames,
+            dump,
+            fps,
+            downscale,
+        } => capture_smoke_cmd(frames, dump.as_deref(), fps, &downscale).await,
         Command::SystemCaptureSmoke {
             desktop,
             frames,
@@ -3600,6 +3635,103 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
     println!(
         "encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}"
     );
+    Ok(())
+}
+
+/// `capture-smoke` CLI dispatch — "does screen capture work on this host,
+/// and does it produce a real picture?"
+///
+/// Deliberately goes through `capture::open_default` rather than naming a
+/// backend, so it answers the question an operator actually has (which
+/// backend did this host end up on?) and so the cascade itself is under test.
+///
+/// ⚠️ The `--dump` PPM is not decoration. A capture backend that decodes the
+/// framebuffer with the wrong pixel layout returns a frame of exactly the
+/// right size, at the right rate, with perfect geometry — and completely wrong
+/// colours. Every counter here would be green for that frame. Only looking at
+/// the image catches it, which is how FR-36's 10-bit scanout was found.
+async fn capture_smoke_cmd(
+    frames: u32,
+    dump: Option<&str>,
+    fps: u32,
+    downscale: &str,
+) -> Result<()> {
+    use roomlerd::capture::{self, DownscalePolicy, PixelFormat};
+
+    let policy = match downscale.trim().to_ascii_lowercase().as_str() {
+        "never" => DownscalePolicy::Never,
+        "auto" => DownscalePolicy::Auto,
+        "always" => DownscalePolicy::Always,
+        other => bail!("unknown --downscale {other:?} (never|auto|always)"),
+    };
+    let mut cap = capture::open_default(fps.max(1), policy);
+    let mut delivered = 0u32;
+    let mut empty = 0u32;
+    let mut last: Option<capture::Frame> = None;
+    let mut worst_ms = 0f64;
+    let mut total_ms = 0f64;
+
+    for _ in 0..frames.max(1) {
+        let t0 = std::time::Instant::now();
+        match cap.next_frame().await {
+            Ok(Some(f)) => {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                total_ms += ms;
+                worst_ms = worst_ms.max(ms);
+                delivered += 1;
+                last = Some(f);
+            }
+            // Not a failure: a paced backend legitimately reports "nothing new".
+            Ok(None) => empty += 1,
+            Err(e) => bail!("capture-smoke: next_frame failed: {e:#}"),
+        }
+    }
+
+    let Some(frame) = last else {
+        bail!(
+            "capture-smoke FAILED: {frames} attempts, {empty} empty, ZERO frames delivered \
+             (monitors={})",
+            cap.monitor_count()
+        );
+    };
+
+    println!(
+        "capture-smoke: delivered={delivered} empty={empty} unchanged={} monitors={} \
+         {}x{} stride={} format={:?} source={:?} mean_ms={:.2} worst_ms={:.2}",
+        cap.frames_unchanged(),
+        cap.monitor_count(),
+        frame.width,
+        frame.height,
+        frame.stride,
+        frame.pixel_format,
+        frame.source,
+        total_ms / delivered.max(1) as f64,
+        worst_ms,
+    );
+
+    if let Some(path) = dump {
+        if frame.pixel_format != PixelFormat::Bgra {
+            bail!(
+                "capture-smoke: --dump only understands BGRA frames, got {:?}",
+                frame.pixel_format
+            );
+        }
+        let (w, h) = (frame.width as usize, frame.height as usize);
+        let stride = frame.stride as usize;
+        let mut out = Vec::with_capacity(w * h * 3 + 32);
+        out.extend_from_slice(format!("P6\n{w} {h}\n255\n").as_bytes());
+        for y in 0..h {
+            let row = &frame.data[y * stride..y * stride + w * 4];
+            for x in 0..w {
+                // BGRA in memory -> RGB on the wire.
+                out.push(row[x * 4 + 2]);
+                out.push(row[x * 4 + 1]);
+                out.push(row[x * 4]);
+            }
+        }
+        std::fs::write(path, &out).with_context(|| format!("writing {path}"))?;
+        println!("capture-smoke: wrote {path} ({} bytes)", out.len());
+    }
     Ok(())
 }
 
