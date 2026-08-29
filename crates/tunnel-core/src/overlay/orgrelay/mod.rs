@@ -10,6 +10,7 @@
 
 pub mod bind;
 pub mod client;
+pub mod member;
 pub mod responder;
 pub mod server;
 pub mod session;
