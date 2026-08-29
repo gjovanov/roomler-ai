@@ -9,6 +9,7 @@
 //!   here; those arrive with P2.
 
 pub mod bind;
+pub mod client;
 pub mod responder;
 pub mod server;
 pub mod session;

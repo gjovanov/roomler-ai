@@ -713,7 +713,7 @@ Verified against `origin/master`, 2026-08-28.
 | change | file:line |
 |---|---|
 | Relay sub-kind gains `Org` | `crates/tunnel-core/src/overlay/relay_link.rs:152` `RelayKind` |
-| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:268` (`impl RelayConn for DerpConn`) and `derp.rs:420` (`conn_for`) |
+| **Transport: a 4th `RelayConn` impl + `OrgRelayMux`** | model on `transport/derp.rs:268` (`impl RelayConn for DerpConn`) and `derp.rs:420` (`conn_for`). **P4a:** `crates/tunnel-core/src/overlay/orgrelay/client.rs` — `bind` / `bind_any` (the member's half of §4; a Challenge is the success signal, the wire has no ack) + `OrgRelayConn: RelayConn` (8-byte header on send, only this session's frames from the relay's address on recv, synthetic peer addr, `close()` → dead latch). One socket per session rather than a mux: the relay binds a member by observed source, so each session needs its own source anyway |
 | Client cascade branch | `relay_link.rs:1016` `relay_strategy` |
 | Server verdict | `crates/api/src/ws/overlay.rs:1851` / `:1944` |
 | Mint + ACL gate + rate limit | `overlay.rs:693` `handle_overlay_relay_request` (cross-tenant `:705-717`, ACL `:719-743`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
@@ -757,7 +757,7 @@ appears in **two** places), and the customer-facing install docs (§12).
 | **P1** | **Bind-only responder** (bind + authenticated challenge, **forwards nothing**, no session table) + `rc:overlay.relay_probe` + `peer_relay_audit` + every counter **with its reader** | `relay_server_enabled=false` |
 | **P2** | Forwarding: Geneve framing, VNI table, full 3-way bind, caps, revocation, `catch_unwind` | `relay_server_enabled=false` |
 | **P3** | Server-side mint + gates + approval (`MANAGE_AGENTS`+`EXEC_DEVICE`, no free bit — §4) / audit behind `VIEW_EXEC_AUDIT` + rate limit + `peer_relay_mode`. Split: **P3a** models + wire (#890) · **P3b** DAO, routes, `peer_relay_audit`, fail-closed `try_load_acl` / `try_overlay_source_of`, limiter · **P3c** the mint | `peer_relay_mode=off` ⇒ zero mints |
-| **P4** | `RelayKind::Org` live in the verdict + `relay_strategy` branch + promote/demote | `overlay_org_relay=false` |
+| **P4** | `RelayKind::Org` live in the verdict + `relay_strategy` branch + promote/demote. Split: **P4a** the client in `tunnel-core` (`orgrelay/client.rs`: bind handshake + `OrgRelayConn`, proven over loopback against the real P2 relay) · **P4b** runtime + agent wiring — `RelayKind::Org`, the `relay_strategy` branch, `OverlayEvent::OrgRelay{Session,Revoke}`, relay-side `relay_serve` install, the probe report, the join flags — behind the config key · **P4c** the first field mint (`warn`, then `on`) | `overlay_org_relay=false` |
 | **P5** | jupiter/zeus provisioning in `~/k8s-cluster-multi` + weekly drift-audit cron | revert host_vars |
 | **P6** | Admin UI: relay approval, org switch, audit section | UI-only |
 
@@ -839,7 +839,10 @@ kill switch. That is what makes E2E-3 executable before P2.
 - [ ] **Shape disjointness over WG × STUN × disco × Geneve**, all 256 byte-0 values; a frame
       with `Opt Len ≠ 0` is rejected; `VNI = 0x2112A4` is never minted.
 - [ ] A **re-bind under a valid `tag₁` from a new source succeeds** (symmetric-NAT rebind)
-      and **without one fails** — both directions.
+      and **without one fails** — both directions. *(P2c proved both directions on the relay
+      side; **P4a** proves the client's half of the success direction end to end —
+      `a_member_rebinds_from_a_new_source_and_keeps_the_session` re-binds from a fresh socket
+      with the same VNI + secret and the relay forwards to the new source.)*
 - [ ] A session exceeds neither `max_lifetime` nor the relay's own re-clamped deadlines when
       the server supplies longer ones.
 - [ ] `rc:relay.revoke` tears down a **live, traffic-carrying** session from all four
