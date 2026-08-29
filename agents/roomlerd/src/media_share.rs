@@ -1111,8 +1111,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         // SAFETY: same contract as the sibling env-clearing tests.
         unsafe {
-            std::env::remove_var("ROOMLERD_IDLE_REFINE_BALANCED");
-            std::env::set_var("ROOMLERD_PRIORITY_RES_CAP", "1");
+            tunnel_core::env::test_env::clear("IDLE_REFINE_BALANCED");
+            tunnel_core::env::test_env::set_as("ROOMLERD_", "PRIORITY_RES_CAP", "1");
         }
         use crate::encode::priority::{BALANCED, SHARPER, SMOOTHER};
         let key = PipelineKey::FfmpegDc("TEST-REFINE");
@@ -1142,12 +1142,12 @@ mod tests {
         // is NOT liftable: single-viewer Balanced blocks, and a Smoother
         // owner + Balanced follower blocks on relay; on direct Balanced
         // contributes no cap ⇒ eligible either way.
-        unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", "0") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", "0") };
         follower_prio.store(BALANCED, std::sync::atomic::Ordering::Relaxed);
         assert!(!owner.merged_refine_eligible(SMOOTHER, true));
         assert!(owner.merged_refine_eligible(SMOOTHER, false));
         assert!(!owner.merged_refine_eligible(BALANCED, true));
-        unsafe { std::env::remove_var("ROOMLERD_IDLE_REFINE_BALANCED") };
+        unsafe { tunnel_core::env::test_env::clear("IDLE_REFINE_BALANCED") };
 
         // Default-on: the same mixed pair is eligible on relay too.
         assert!(owner.merged_refine_eligible(SMOOTHER, true));
@@ -1163,7 +1163,7 @@ mod tests {
         drop(owner);
         // rc.445 default (caps off): nothing can block — eligibility is
         // vacuous, matching the caller's capped_below_native=false gate.
-        unsafe { std::env::remove_var("ROOMLERD_PRIORITY_RES_CAP") };
+        unsafe { tunnel_core::env::test_env::clear("PRIORITY_RES_CAP") };
         let owner = Pipeline::register(key, ObjectId::new());
         assert!(owner.merged_refine_eligible(SMOOTHER, true));
         assert!(owner.merged_refine_eligible(BALANCED, true));
