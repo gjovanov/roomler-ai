@@ -6,7 +6,7 @@ use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
     AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy, OsKind,
-    SshPolicy,
+    PeerRelayPolicy, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -444,6 +444,43 @@ impl AgentDao {
             .update_one(
                 doc! { "_id": agent_id, "tenant_id": tenant_id },
                 doc! { "$set": { "ssh_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// FR-19 gate 3 — replace the device's org-relay approval. A
+    /// `MANAGE_AGENTS` + `EXEC_DEVICE` admin action (`routes::peer_relay`),
+    /// kept separate from the exec/SSH setters for the reason they are
+    /// separate from each other: approving one power must never be a side
+    /// effect of approving another.
+    pub async fn update_peer_relay_policy(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        policy: &PeerRelayPolicy,
+    ) -> DaoResult<bool> {
+        let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "peer_relay_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// Every live device the tenant has approved to serve as an org relay.
+    /// Gate 3 only: whether it is also SERVING is gate 4, read off its
+    /// advertised `relay-server` capability, and whether it is online is the
+    /// presence path's answer — neither is this row's to give.
+    pub async fn list_relay_approved(&self, tenant_id: ObjectId) -> DaoResult<Vec<Agent>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "deleted_at": null,
+                    "peer_relay_policy.serve": true,
+                },
+                Some(doc! { "name": 1 }),
             )
             .await
     }
