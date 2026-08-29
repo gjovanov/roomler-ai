@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Cross-platform archive extraction for the tunnel CLI download.
 //!
 //! Two callers, one entry point: [`extract_archive`] sniffs the

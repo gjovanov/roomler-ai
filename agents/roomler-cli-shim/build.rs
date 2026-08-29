@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Embeds a Windows VERSIONINFO resource into `roomler-shim.exe`.
 //!
 //! The shim INSTALLS as `roomler.exe` (the wxs File element renames it) on

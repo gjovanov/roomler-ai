@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows multi-monitor enumeration — diagnostic-only as of rc.48.
 //!
 //! Surfaces the per-monitor virtual-screen layout (origin, size, DPI,

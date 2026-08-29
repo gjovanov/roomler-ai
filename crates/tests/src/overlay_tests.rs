@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Integration tests for overlay IP allocation and RELEASE.
 //!
 //! Removing a device from the fleet returns its host number to the tenant's

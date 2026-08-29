@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Cross-platform screen capture backed by the `scrap` crate.
 //!
 //! `scrap` is a thin wrapper that picks the right kernel primitive per OS:

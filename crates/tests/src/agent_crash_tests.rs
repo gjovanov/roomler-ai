@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Integration tests for the Task 9 crash-log ingest + listing
 //! endpoints. Spawns a real `TestApp` (real Axum server + real
 //! MongoDB) and exercises:

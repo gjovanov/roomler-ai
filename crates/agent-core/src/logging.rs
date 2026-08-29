@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Persistent file logging + panic hook.
 //!
 //! Stdout output is preserved for foreground / interactive runs; a daily-

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Audience-name pointers for the tunnel JWT types.
 //!
 //! Canonical claim shapes + issue/verify functions live in

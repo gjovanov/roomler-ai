@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-19 P2b — the relay session table and the forwarding decision.
 //!
 //! One pure function decides what a relay does with an inbound datagram, so

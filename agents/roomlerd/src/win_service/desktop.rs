@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Win32 desktop wrappers for the M3 SYSTEM-context capture path.
 //!
 //! Background. A Windows session has multiple "desktops" within it.

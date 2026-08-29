@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Cross-session "controller is currently connected" signal between
 //! the user-context worker and the SCM-supervisor.
 //!

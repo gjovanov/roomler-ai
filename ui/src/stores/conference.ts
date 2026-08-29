@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { defineStore } from 'pinia'
 import { shallowRef, ref, reactive } from 'vue'
 import { Device, type types as msTypes } from 'mediasoup-client'

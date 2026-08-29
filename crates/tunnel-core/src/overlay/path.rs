@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P3 — PathMonitor: measured path selection (consolidation invariant I3).
 //!
 //! One probe-and-score model for *which carrier tier to run a peer on*. It

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Multi-org P2b — tenant-block addressing: status + the renumber migration.
 //!
 //! Every tenant shares `100.64.0.0/10` today, each network's host cursor

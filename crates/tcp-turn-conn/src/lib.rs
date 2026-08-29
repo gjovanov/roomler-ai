@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! TURNS-over-TLS-over-TCP `Conn` adapter for relay candidate gathering.
 //!
 //! P5 (consolidation invariant I5) — this crate IS the substance of the

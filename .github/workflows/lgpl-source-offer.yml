@@ -1,0 +1,135 @@
+name: LGPL corresponding source
+
+# FR-24 P4 — make the LGPL written offer in THIRD-PARTY-NOTICES.md real.
+#
+# The Windows agent links FFmpeg STATICALLY (x64-windows-static-md), which puts
+# us under LGPL-2.1 §6: a recipient must be able to relink `roomlerd.exe`
+# against their own build of the library. Discharging that needs the library's
+# complete corresponding source available for at least three years — and an
+# Actions artifact expires in 90 days, so it cannot carry the offer.
+#
+# This job builds the source bundle ONCE per FFmpeg version and uploads it to
+# the same permanent release that already carries the binaries, so
+# THIRD-PARTY-NOTICES.md can point at a URL that will still resolve in 2029.
+#
+# Re-run it (workflow_dispatch) whenever the pinned FFmpeg version changes.
+# ⚠️ It must be re-run BEFORE a release ships a new FFmpeg version, or the offer
+# names a version whose source is not published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: 'Upstream FFmpeg tag (must match the vendored build)'
+        required: true
+        default: 'n8.1.2'
+      release_tag:
+        description: 'Release to attach the bundle to'
+        required: true
+        default: 'vendored-ffmpeg-8.1.2'
+
+permissions:
+  contents: write
+
+jobs:
+  corresponding-source:
+    name: Publish FFmpeg corresponding source + build recipe
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pristine upstream source
+        run: |
+          set -euo pipefail
+          V='${{ inputs.ffmpeg_version }}'
+          mkdir -p bundle
+          curl -fsSL -o "bundle/ffmpeg-$V.tar.gz" \
+            "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/$V.tar.gz"
+          # Archive our OWN copy: an upstream tag can be moved or removed, and a
+          # three-year offer cannot depend on someone else's hosting.
+          echo "source: $(du -h "bundle/ffmpeg-$V.tar.gz" | cut -f1)"
+
+      - name: Emit the exact build recipe
+        run: |
+          set -euo pipefail
+          V='${{ inputs.ffmpeg_version }}'
+          # The vcpkg overlay port is GENERATED at build time by
+          # vendor-ffmpeg-windows.yml rather than committed, so the workflow
+          # files themselves are part of the corresponding source. Ship them.
+          mkdir -p bundle/recipe
+          cp .github/workflows/vendor-ffmpeg-windows.yml bundle/recipe/
+          cp .github/workflows/vendor-ffmpeg-macos.yml   bundle/recipe/
+
+          cat > bundle/recipe/README.md <<RECIPE
+          # FFmpeg $V — corresponding source and build recipe
+
+          This bundle is published to satisfy LGPL-2.1 §6 for the FFmpeg
+          libraries distributed with Roomler. It contains:
+
+          * \`ffmpeg-$V.tar.gz\` — pristine upstream source, unmodified. We apply
+            **no patches** to FFmpeg; the only customisation is the configure
+            flag set below, which selects components rather than changing code.
+          * \`recipe/vendor-ffmpeg-windows.yml\` — the exact workflow that
+            produces the Windows (static, MSVC) and Linux (shared) builds,
+            including the vcpkg overlay port and triplet it generates.
+          * \`recipe/vendor-ffmpeg-macos.yml\` — the macOS build. Note the macOS
+            agent ships **no** FFmpeg since 0.3.x; retained for completeness.
+
+          ## Linking, per platform
+
+          | Platform | Linkage | LGPL clause |
+          |---|---|---|
+          | Windows (\`roomlerd.exe\`) | **static** (\`x64-windows-static-md\`) | §6 — relink capability required |
+          | Linux (\`.deb\`) | shared (\`--enable-shared --disable-static\`) | §6(b) — satisfied by the shared mechanism |
+          | macOS | not shipped | n/a |
+
+          ## Rebuilding
+
+          Both builds run entirely from the workflow files above on
+          stock GitHub-hosted runners. Reproducing them needs no private input:
+
+          \`\`\`
+          gh workflow run vendor-ffmpeg-windows.yml
+          \`\`\`
+
+          ## Relinking the Windows agent
+
+          To exercise your §6 rights on the statically-linked Windows build,
+          request the linkable object files for a specific released version at
+          **legal@roomler.ai**, quoting the version string from
+          \`roomlerd.exe --version\`. See THIRD-PARTY-NOTICES.md in the Roomler
+          repository for the full written offer.
+          RECIPE
+
+      - name: Pack, checksum, publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V='${{ inputs.ffmpeg_version }}'
+          OUT="ffmpeg-$V-corresponding-source.tar.xz"
+          tar -C bundle -cJf "$OUT" .
+          sha256sum "$OUT" > "$OUT.sha256"
+          cat "$OUT.sha256"
+          gh release upload '${{ inputs.release_tag }}' "$OUT" "$OUT.sha256" \
+            --repo "${{ github.repository }}" --clobber
+          echo "published $OUT to ${{ inputs.release_tag }}"
+
+      - name: Assert the offer resolves
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V='${{ inputs.ffmpeg_version }}'
+          # A written offer pointing at a missing asset is worse than no offer:
+          # it claims compliance we do not have. Verify the URL the notice
+          # publishes actually serves bytes.
+          names=$(gh release view '${{ inputs.release_tag }}' \
+            --repo "${{ github.repository }}" --json assets --jq '.assets[].name')
+          for want in "ffmpeg-$V-corresponding-source.tar.xz" \
+                      "ffmpeg-$V-corresponding-source.tar.xz.sha256"; do
+            printf '%s\n' "$names" | grep -qx "$want" \
+              || { echo "::error::$want missing from the release"; exit 1; }
+          done
+          echo "OK: corresponding-source bundle is live on ${{ inputs.release_tag }}."

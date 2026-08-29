@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Shared install-wizard machinery for the unified `roomler-setup`
 //! app. (Through P4a-P4c-1 it also served the two legacy wizard
 //! crates via path-compatible shims, keeping their behaviour

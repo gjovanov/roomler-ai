@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Resolve the active-session user's profile directory from a
 //! SystemContext worker.
 //!

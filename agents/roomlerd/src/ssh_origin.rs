@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! The **originating** side of Roomler SSH — this device asking the server for
 //! a session on another one (`roomler ssh <device>`).
 //!

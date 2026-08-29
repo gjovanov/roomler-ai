@@ -1,5 +1,7 @@
 [package]
 name = "roomler-setup-core"
+license = "MPL-2.0"
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "Shared install-wizard machinery for the unified roomler-setup app (and, until P4c retires them, the two legacy wizard crates)."

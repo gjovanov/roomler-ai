@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Multi-org — join an additional org from the admin UI
 //! (`rc:agent.join_org`), without touching the machine.
 //!

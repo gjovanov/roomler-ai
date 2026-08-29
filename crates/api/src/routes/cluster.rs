@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-6 — `GET /api/cluster/status`: this pod's identity, cluster health
 //! and the rehome/fallback counters + live gauges (see
 //! `cluster::metrics`). Auth-gated (any valid access token) — it exposes

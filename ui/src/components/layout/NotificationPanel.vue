@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-list density="compact" max-width="400" class="notification-panel">
     <v-list-subheader class="d-flex align-center">

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows DPI awareness.
 //!
 //! The agent captures pixels via WGC / DXGI / scrap (always physical-

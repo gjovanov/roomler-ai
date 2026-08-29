@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Screen capture abstraction.
 //!
 //! Trait + concrete backends. `scrap_backend::ScrapCapture` is the default

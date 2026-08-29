@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <div class="uptime-wrap">
     <div v-if="!rows.length" class="uptime-empty text-medium-emphasis text-body-2">

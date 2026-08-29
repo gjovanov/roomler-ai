@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Agent on-disk configuration.
 //!
 //! Stored at `<user config dir>/roomler-agent/config.toml`. On Linux that

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 pub mod background_task;
 pub mod custom_emoji;
 pub mod file;

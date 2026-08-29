@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Liveness watchdog for the agent's main pumps.
 //!
 //! Each pump (signaling, encoder, capture) ticks the watchdog after

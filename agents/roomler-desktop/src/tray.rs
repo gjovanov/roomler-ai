@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! System-tray icon + right-click menu. Built atop Tauri 2's
 //! `TrayIcon` API (which wraps the `tray-icon` crate on the OS
 //! layer).

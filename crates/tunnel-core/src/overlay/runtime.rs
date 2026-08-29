@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay node runtime (Phase 3b).
 //!
 //! Drives one node's membership in the overlay mesh: announces itself

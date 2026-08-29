@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Library crate for `roomler-agent`. The binary at `src/main.rs` is a thin
 //! CLI shell around these modules; exposing them here lets integration
 //! tests drive the agent in-process against a `TestApp` server.

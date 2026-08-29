@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Feature-shaped bridge from the tunnel layer to `netstate` (R1, 2026-08-25).
 //!
 //! The tunnel flow supervisor and the route reconciler both want ONE thing
