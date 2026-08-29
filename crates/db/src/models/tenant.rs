@@ -235,7 +235,13 @@ impl Plan {
                 max_channels: 5,
                 max_message_history: 5_000,
                 storage_bytes: 100 * 1024 * 1024,
-                video_max_participants: 0,
+                // FR-32 — Free gets 4 video participants (operator decision,
+                // 2026-08-29). It was 0, i.e. "Free has no conferencing at
+                // all", which was never enforced — so Free tenants have always
+                // been able to hold calls, and enforcing 0 would have taken
+                // that away rather than held a line. 4 is a real cap that the
+                // gate can enforce without removing a capability people use.
+                video_max_participants: 4,
                 cloud_integrations: false,
                 ai_recognition: false,
                 recordings: false,

@@ -26,6 +26,14 @@ pub static BUS_DEADLINE_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static MEDIA_FOLD_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// DERP sockets closed for cluster convergence (C-5).
 pub static DERP_REHOME_CLOSE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// FR-19 — total bytes this pod has relayed over `/derp` (peer-to-peer WG
+/// carrier that crossed the control plane). This is the quantity a peer relay
+/// takes OFF the pod: when a tenant moves a pair onto `relay:org/udp`, that
+/// pair's carrier no longer traverses `/derp`, so this counter's growth rate
+/// falls for the moved traffic. ⚠️ `derp_registrations` must NOT fall with it —
+/// the DERP floor is never torn down (§7); a falling registration count is a
+/// regression, a falling BYTE rate is the win.
+pub static DERP_BYTES_RELAYED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Split-evidence observations (rc hub-miss with fresh foreign record,
 /// tunnel relay drop with foreign session record) (A2b).
 pub static SPLIT_EVIDENCE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +114,7 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "media_belt_fallback_total":
                 crate::ws::media_cluster::MEDIA_BELT_FALLBACK_TOTAL.load(Ordering::Relaxed),
             "derp_rehome_close_total": DERP_REHOME_CLOSE_TOTAL.load(Ordering::Relaxed),
+            "derp_bytes_relayed_total": DERP_BYTES_RELAYED_TOTAL.load(Ordering::Relaxed),
             "derp_rehome_stuck_total":
                 crate::ws::derp_cluster::DERP_REHOME_STUCK_TOTAL.load(Ordering::Relaxed),
             "split_evidence_total": SPLIT_EVIDENCE_TOTAL.load(Ordering::Relaxed),
