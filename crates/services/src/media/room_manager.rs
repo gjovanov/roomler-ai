@@ -72,6 +72,14 @@ pub struct ConsumerInfo {
     pub producer_id: String,
     pub kind: String,
     pub rtp_parameters: serde_json::Value,
+    /// FR-30 P4 — is the SOURCE producer paused right now?
+    ///
+    /// The pause EVENT only reaches whoever was in the room when it happened.
+    /// Without this, someone who joins a call after you muted sees no badge
+    /// until your next toggle — measured in the field 2026-08-29. The state
+    /// has to travel with the subscription, not only as a transition.
+    #[serde(default)]
+    pub producer_paused: bool,
 }
 
 /// Manages mediasoup rooms and their media state.
@@ -395,6 +403,24 @@ impl RoomManager {
             return Err(anyhow::anyhow!("Cannot consume: incompatible capabilities"));
         }
 
+        // FR-30 P4 — read the source producer's pause state HERE, while only
+        // `room` is held. ⚠️ Not below: `participants.get_mut()` is taken a few
+        // lines down, and iterating the same DashMap while holding a mutable
+        // entry deadlocks it.
+        let producer_paused = room
+            .participants
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .producers
+                    .iter()
+                    .find(|pe| pe.producer.id() == producer_id)
+                    .map(|pe| pe.producer.paused())
+            })
+            .next()
+            .unwrap_or(false);
+
         let mut participant = room
             .participants
             .get_mut(connection_id)
@@ -421,6 +447,7 @@ impl RoomManager {
                 MediaKind::Video => "video".to_string(),
             },
             rtp_parameters: serde_json::to_value(consumer.rtp_parameters())?,
+            producer_paused,
         };
 
         participant.consumers.push(consumer);
