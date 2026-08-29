@@ -45,6 +45,10 @@ pub mod install_cleanup;
 pub mod install_detect;
 pub mod instance_lock;
 pub mod jwt_introspect;
+/// FR-40 — the overlay-key mint behind `rc:agent.key_rotate`. Ungated: it
+/// carries the overlay feature split inside so the handler compiles the same
+/// in every build (see the module doc for the rustc ICE that forced this).
+pub mod key_rotation;
 pub mod localapi_state;
 pub mod lock_overlay;
 pub mod lock_state;

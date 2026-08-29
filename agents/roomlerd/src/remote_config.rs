@@ -188,6 +188,49 @@ impl RemoteConfigServices {
         .await
         .unwrap_or_else(|e| Err(format!("config apply task join: {e}")))
     }
+
+    /// FR-40 — persist a freshly minted overlay key for ONE enrollment and
+    /// bump its epoch, under the daemon-wide write lock, through the same
+    /// atomic `config::save` as everything else (fsync + `.prev` + 0600/ACL).
+    ///
+    /// `is_primary` selects the config's scalar identity; otherwise the
+    /// `[[orgs]]` entry whose `tenant_id` matches. Returns the new epoch.
+    /// The caller adopts the key in memory ONLY after this succeeds — a key
+    /// that is not written down would be lost at the next restart, and the
+    /// device would come back as the identity it just retired.
+    pub async fn rotate_overlay_key(
+        &self,
+        is_primary: bool,
+        tenant_id: &str,
+        new_secret: String,
+    ) -> Result<u32, String> {
+        let _guard = self.lock.lock().await;
+        let path = self.path.clone();
+        let tenant_id = tenant_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let mut cfg =
+                crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
+            let epoch = if is_primary {
+                cfg.overlay_wg_secret_key = Some(new_secret);
+                cfg.overlay_wg_key_epoch = cfg.overlay_wg_key_epoch.wrapping_add(1);
+                cfg.overlay_wg_key_epoch
+            } else {
+                let org = cfg
+                    .orgs
+                    .iter_mut()
+                    .find(|o| o.tenant_id == tenant_id)
+                    .ok_or_else(|| format!("no [[orgs]] entry for tenant {tenant_id}"))?;
+                org.overlay_wg_secret_key = Some(new_secret);
+                org.overlay_wg_key_epoch = org.overlay_wg_key_epoch.wrapping_add(1);
+                org.overlay_wg_key_epoch
+            };
+            crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+            Ok(epoch)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("key rotation task join: {e}")))
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +248,82 @@ mod tests {
             exec,
             opted_in,
         )
+    }
+
+    /// FR-40 — a rotation writes ONE enrollment's key + epoch through the
+    /// atomic save and leaves the other identity on disk untouched; an
+    /// unknown org is refused with nothing written.
+    #[tokio::test]
+    async fn rotate_overlay_key_moves_one_identity_and_bumps_its_epoch() {
+        let dir = std::env::temp_dir().join(format!("fr40-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut cfg = crate::config::test_fixture();
+        cfg.overlay_wg_secret_key = Some("PRIMARY-OLD".into());
+        cfg.overlay_wg_key_epoch = 4;
+        cfg.orgs.push(crate::config::OrgEntry {
+            label: "beta".into(),
+            server_url: cfg.server_url.clone(),
+            ws_url: None,
+            agent_token: "tok-beta".into(),
+            agent_id: "aid-beta".into(),
+            tenant_id: "tid-beta".into(),
+            enabled: true,
+            overlay_mode: crate::config::OrgOverlayMode::Off,
+            overlay_wg_secret_key: Some("BETA-OLD".into()),
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        });
+        crate::config::save(&path, &cfg).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+
+        // A secondary org: only its entry moves.
+        let epoch = svc
+            .rotate_overlay_key(false, "tid-beta", "BETA-NEW".into())
+            .await
+            .unwrap();
+        assert_eq!(epoch, 1);
+        let back = crate::config::load(&path).unwrap();
+        assert_eq!(
+            back.orgs[0].overlay_wg_secret_key.as_deref(),
+            Some("BETA-NEW")
+        );
+        assert_eq!(back.orgs[0].overlay_wg_key_epoch, 1);
+        assert_eq!(back.overlay_wg_secret_key.as_deref(), Some("PRIMARY-OLD"));
+        assert_eq!(back.overlay_wg_key_epoch, 4);
+
+        // The primary: the scalar moves, the org stays.
+        let epoch = svc
+            .rotate_overlay_key(true, "tid-primary", "PRIMARY-NEW".into())
+            .await
+            .unwrap();
+        assert_eq!(epoch, 5);
+        let back = crate::config::load(&path).unwrap();
+        assert_eq!(back.overlay_wg_secret_key.as_deref(), Some("PRIMARY-NEW"));
+        assert_eq!(back.overlay_wg_key_epoch, 5);
+        assert_eq!(
+            back.orgs[0].overlay_wg_secret_key.as_deref(),
+            Some("BETA-NEW")
+        );
+
+        // An org this device is not enrolled in: refused, nothing written.
+        assert!(
+            svc.rotate_overlay_key(false, "tid-nope", "X".into())
+                .await
+                .is_err()
+        );
+        let back = crate::config::load(&path).unwrap();
+        assert_eq!(back.overlay_wg_key_epoch, 5);
+        assert_eq!(back.orgs[0].overlay_wg_key_epoch, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -72,6 +72,9 @@ impl AgentDao {
             // The device has never spoken, so it has said nothing. Distinct
             // from "it said nothing happened" — see `Agent::config_report`.
             config_report: None,
+            key_rotation: None,
+            key_rotation_report: None,
+            overlay_identity: None,
             routes: Vec::new(),
             advertised_routes: Vec::new(),
             relay_home: None,
@@ -508,6 +511,84 @@ impl AgentDao {
             .update_one(
                 doc! { "_id": agent_id, "tenant_id": tenant_id },
                 doc! { "$set": { "config_report": report_bson } },
+            )
+            .await
+    }
+
+    /// FR-40 — record an operator's standing rotation order on the row (the
+    /// desired state the connect-time reconcile reads). Replaces any earlier
+    /// order: a rotation is idempotent in intent, and the report is matched by
+    /// `request_id`, so an answer to the superseded order cannot be mistaken
+    /// for an answer to this one.
+    pub async fn record_key_rotation_request(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        request: &roomler_ai_remote_control::models::KeyRotationRequest,
+    ) -> DaoResult<bool> {
+        let bson = bson::to_bson(request).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "key_rotation": bson } },
+            )
+            .await
+    }
+
+    /// FR-40 — stamp the moment an order reached a live socket. Guarded on
+    /// the `request_id` so a late delivery of a superseded order cannot mark
+    /// the current one as delivered.
+    pub async fn mark_key_rotation_delivered(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        request_id: &str,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": agent_id,
+                    "tenant_id": tenant_id,
+                    "key_rotation.request_id": request_id,
+                },
+                doc! { "$set": { "key_rotation.delivered_at": bson::DateTime::now() } },
+            )
+            .await
+    }
+
+    /// FR-40 — the DEVICE's answer (same discipline as
+    /// [`Self::record_config_report`]: one field, written by the device,
+    /// meaning "this is what the host claims"; `key_rotation_audit` holds the
+    /// server's own record of what was ordered).
+    pub async fn record_key_rotation_report(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        report: &roomler_ai_remote_control::models::KeyRotationReport,
+    ) -> DaoResult<bool> {
+        let bson = bson::to_bson(report).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "key_rotation_report": bson } },
+            )
+            .await
+    }
+
+    /// FR-40 — what the device presented at its overlay join, as `ws::overlay`
+    /// verified it. Stamped on EVERY join (not only after a rotation), so the
+    /// row always carries the device's current overlay public key.
+    pub async fn record_overlay_identity(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        identity: &roomler_ai_remote_control::models::OverlayIdentity,
+    ) -> DaoResult<bool> {
+        let bson = bson::to_bson(identity).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "overlay_identity": bson } },
             )
             .await
     }

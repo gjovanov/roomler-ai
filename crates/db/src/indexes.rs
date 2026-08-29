@@ -453,6 +453,19 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // FR-40 overlay-key rotation orders — who ordered which device to retire
+    // its key, dispatched or refused. Same 90-day TTL as the other audit logs.
+    create_indexes(
+        db,
+        "key_rotation_audit",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index(bson::doc! { "agent_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // FR-19 peer-relay decisions — approvals (who made a device a relay) and
     // mints (what was routed through it), granted or refused. `agent_id`
     // answers both halves of the incident-review question in one query,

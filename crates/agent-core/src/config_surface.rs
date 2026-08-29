@@ -467,6 +467,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "FR-35 - let the constrained (relay) ceiling grow above the nominal 3 Mbps on delivery evidence (AIMD pinned at the ceiling, the window carried >=70% of it, no decrease/stall for 10 s, viewer age within 1.5x floor) and remember the pair's stable rate so the next session opens there. Built-in default: on. Env: ROOMLERD_RELAY_CEILING_LEARN. Restart required.",
     ),
     (
+        "overlay_key_rotation",
+        "tribool",
+        "FR-40 - honour rc:agent.key_rotate: an admin retiring this device's overlay (WireGuard) key from the dashboard. The device mints the new key locally, persists it and re-joins the mesh under it; the server never sees a private key. Built-in default: on (a kill switch, not a gate - the order leaks nothing). Env: ROOMLERD_OVERLAY_KEY_ROTATION. Restart required.",
+    ),
+    (
         "relay_max_hi_kbps",
         "string",
         "FR-35 - upper bound (kbps, 0-100000) for the learned relay ceiling. Empty = built-in 8000 (one pair measured: sustained 6-9 Mbps, choked at 12.8); 0 = learning off. Env: ROOMLERD_RELAY_MAX_HI_KBPS. Restart required.",
@@ -749,6 +754,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "gpu_scale" => cfg.gpu_scale.map(fmt_bool),
         "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe.map(fmt_bool),
         "relay_ceiling_learn" => cfg.relay_ceiling_learn.map(fmt_bool),
+        "overlay_key_rotation" => cfg.overlay_key_rotation.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
         "relay_max_hi_kbps" => cfg.relay_max_hi_kbps.map(|p| p.to_string()),
         "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
@@ -1125,6 +1131,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "gpu_scale" => cfg.gpu_scale = parse_tribool(value)?,
         "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe = parse_tribool(value)?,
         "relay_ceiling_learn" => cfg.relay_ceiling_learn = parse_tribool(value)?,
+        "overlay_key_rotation" => cfg.overlay_key_rotation = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
         "relay_max_hi_kbps" => cfg.relay_max_hi_kbps = parse_u32_range(key, value, 0, 100_000)?,
         "idle_refine_min_frame_kb" => {
