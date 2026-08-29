@@ -173,6 +173,38 @@ pub fn check(
     limit: Limit,
     used: u64,
 ) -> Result<(), QuotaDenial> {
+    // "May I add one more?" is the delta form with delta = 1.
+    check_delta(plan, mode, limit, used, 1)
+}
+
+/// Check whether `delta` more units fit under the limit.
+///
+/// ⚠ The counted limits add ONE thing at a time, so `used >= max` is the right
+/// test for them. `storage_bytes` does not: a tenant at 99 MB of 100 MB must be
+/// refused a 10 MB upload and ALLOWED a 100 KB one, which `used >= max` cannot
+/// express — it would accept both, right up until the quota was already blown,
+/// and then reject a 1-byte file. The size is only knowable after the multipart
+/// body is read, so the check is inherently "current + incoming", not "current".
+///
+/// Refuses when `current + delta > max`, so a file that exactly fills the quota
+/// still fits.
+pub fn check_delta(
+    plan: Plan,
+    mode: PlanEnforcement,
+    limit: Limit,
+    current: u64,
+    delta: u64,
+) -> Result<(), QuotaDenial> {
+    check_inner(plan, mode, limit, current, delta)
+}
+
+fn check_inner(
+    plan: Plan,
+    mode: PlanEnforcement,
+    limit: Limit,
+    used: u64,
+    delta: u64,
+) -> Result<(), QuotaDenial> {
     // `Off` means no check runs — but never for a limit that was already
     // enforced before FR-32, which the mode was never meant to reach.
     if matches!(mode, PlanEnforcement::Off) && !limit.is_established() {
@@ -184,7 +216,8 @@ pub fn check(
         return Ok(()); // uncapped for this plan
     };
 
-    if used < max {
+    // Saturating, so a pathological delta cannot wrap into "fits".
+    if used.saturating_add(delta) <= max {
         return Ok(());
     }
 
@@ -332,6 +365,99 @@ mod tests {
         );
         // ...and Warn never refuses, even for a feature the plan lacks.
         assert!(require_feature(Plan::Free, PlanEnforcement::Warn, Limit::Recordings).is_ok());
+    }
+
+    /// The bug the delta form exists to prevent: a tenant near its storage
+    /// quota must be judged on the SIZE of what they are uploading, not merely
+    /// on whether they are already at the cap.
+    #[test]
+    fn storage_is_judged_on_the_incoming_size() {
+        const MB: u64 = 1024 * 1024;
+        // Free.storage_bytes is 100 MB; sit the tenant 1 MB under it.
+        let used = 99 * MB;
+
+        // A 100 KB file still fits...
+        assert!(
+            check_delta(
+                Plan::Free,
+                PlanEnforcement::Enforce,
+                Limit::StorageBytes,
+                used,
+                100 * 1024
+            )
+            .is_ok()
+        );
+        // ...a 10 MB file does not.
+        assert!(
+            check_delta(
+                Plan::Free,
+                PlanEnforcement::Enforce,
+                Limit::StorageBytes,
+                used,
+                10 * MB
+            )
+            .is_err()
+        );
+        // A file that EXACTLY fills the remaining quota is allowed — `>` not `>=`.
+        assert!(
+            check_delta(
+                Plan::Free,
+                PlanEnforcement::Enforce,
+                Limit::StorageBytes,
+                used,
+                MB
+            )
+            .is_ok()
+        );
+        // One byte more is not.
+        assert!(
+            check_delta(
+                Plan::Free,
+                PlanEnforcement::Enforce,
+                Limit::StorageBytes,
+                used,
+                MB + 1
+            )
+            .is_err()
+        );
+    }
+
+    /// A pathological delta must not wrap into "fits".
+    #[test]
+    fn a_saturating_delta_cannot_overflow_into_success() {
+        assert!(
+            check_delta(
+                Plan::Free,
+                PlanEnforcement::Enforce,
+                Limit::StorageBytes,
+                u64::MAX,
+                1
+            )
+            .is_err()
+        );
+    }
+
+    /// `check` is the delta form with delta = 1, so the two must agree.
+    #[test]
+    fn check_is_delta_of_one() {
+        for used in [0u64, 5, 9, 10, 11] {
+            let a = check(
+                Plan::Free,
+                PlanEnforcement::Enforce,
+                Limit::MaxMembers,
+                used,
+            )
+            .is_err();
+            let b = check_delta(
+                Plan::Free,
+                PlanEnforcement::Enforce,
+                Limit::MaxMembers,
+                used,
+                1,
+            )
+            .is_err();
+            assert_eq!(a, b, "disagreement at used={used}");
+        }
     }
 
     #[test]
