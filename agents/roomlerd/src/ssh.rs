@@ -80,6 +80,14 @@ pub struct SessionServices {
     /// The operator-consent broker — the same instance the tray and the
     /// LocalAPI decide through, so an SSH prompt resolves from any of them.
     pub consent: crate::consent::ConsentBroker,
+    /// FR-27 — the native prompt surface, threaded here for the same reason
+    /// the broker is: an SSH server is built inside the overlay's TUN
+    /// factory, far from `signaling::run`, and "the prompt reached no screen"
+    /// must not be a state a server can be constructed into. Field-measured
+    /// 2026-08-29 on NEO16: with only the companion path an SSH prompt from
+    /// mars timed out on a desktop whose native panel had just served three
+    /// exec prompts in a row.
+    pub indicator: crate::indicator::ViewerIndicator,
     /// Where P8 activity reports go: this WS session's outbound queue.
     ///
     /// Scoped to the connection on purpose — a report belongs to the org
@@ -874,10 +882,12 @@ mod sshd {
             let caller = policy.caller.clone();
             let consent = policy.consent_sentinel.clone();
             let broker = self.ctx.services.consent.clone();
+            let indicator = self.ctx.services.indicator.clone();
 
             if let Some(sentinel) = consent
                 && let Err(why) = await_consent(
                     &broker,
+                    &indicator,
                     &handle,
                     channel,
                     &caller,
@@ -1034,10 +1044,12 @@ mod sshd {
             let caller = policy.caller.clone();
             let consent = policy.consent_sentinel.clone();
             let broker = self.ctx.services.consent.clone();
+            let indicator = self.ctx.services.indicator.clone();
 
             if let Some(sentinel) = consent
                 && let Err(why) = await_consent(
                     &broker,
+                    &indicator,
                     &handle,
                     channel,
                     &caller,
@@ -1375,6 +1387,7 @@ mod sshd {
             let caller = policy.caller.clone();
             let consent = policy.consent_sentinel.clone();
             let broker = self.ctx.services.consent.clone();
+            let indicator = self.ctx.services.indicator.clone();
             // Captured here, where the policy is still borrowed, and reported
             // from inside the task once the exit code exists.
             let activity = self
@@ -1385,7 +1398,7 @@ mod sshd {
                 .map(|s| (s, policy.grant_id.clone()));
             tokio::spawn(async move {
                 run_exec(
-                    handle, channel, command, caller, run_as, consent, broker, activity,
+                    handle, channel, command, caller, run_as, consent, broker, indicator, activity,
                 )
                 .await;
             });
@@ -1634,6 +1647,7 @@ mod sshd {
     /// a root shell on my machine right now" are not the same question.
     async fn await_consent(
         broker: &crate::consent::ConsentBroker,
+        indicator: &crate::indicator::ViewerIndicator,
         handle: &russh::server::Handle,
         channel: ChannelId,
         caller: &str,
@@ -1653,10 +1667,23 @@ mod sshd {
             )
             .await;
 
-        // FR-27 — SSH has prompted through this broker since P5d and never
-        // written a marker, so the prompt reached no UI at all: the only way to
-        // answer was to find the sentinel id in the daemon log and run the CLI
-        // inside 30 s. Best-effort — the CLI path is unchanged if this fails.
+        // FR-27 — the same surface chain as a screen-control or exec prompt:
+        // the daemon's own panel first, the desktop companion (started if it
+        // is not running) second, the CLI sentinel always. SSH used to write
+        // the companion marker only, which on a host with the companion closed
+        // meant no screen at all — while the native panel on the same desktop
+        // was answering exec prompts a minute earlier. `what` is the lead,
+        // because "grant SSH" and "open an interactive shell as SYSTEM" are not
+        // the same question.
+        let native = indicator.show_prompt(crate::indicator::PromptView {
+            session_hex: sentinel.to_string(),
+            title: "SSH session request".into(),
+            lead: format!("{caller} wants to {what} on this device."),
+            detail: String::new(),
+            permissions: String::new(),
+            org: String::new(),
+            expires_at: std::time::Instant::now() + timeout,
+        });
         let prompt = crate::consent::PendingPrompt {
             kind: crate::consent::PromptKind::Ssh,
             asked_by: caller,
@@ -1664,27 +1691,57 @@ mod sshd {
             detail: what.to_string(),
             org: String::new(),
             timeout,
-            // Companion, not native: the SSH server is constructed inside the
-            // overlay's TUN factory and has no `ViewerIndicator` handle. It
-            // would have to ride `SessionServices` the way the broker does —
-            // worth doing, and deliberately not smuggled in here, where it
-            // would be a second unreviewed plumbing change inside a security
-            // path.
-            surface: crate::consent::PromptSurface::Companion,
+            // Written either way — `roomlerd consent --list` must show a
+            // natively-prompted session too; the field is what stops the
+            // companion from asking the same question twice.
+            surface: if native {
+                crate::consent::PromptSurface::Native
+            } else {
+                crate::consent::PromptSurface::Companion
+            },
         };
+        let mut have_surface = native;
         if let Err(e) = broker.write_prompt(sentinel, &prompt) {
-            warn!(%caller, %sentinel, %e, "ssh: could not write the .pending consent marker — no on-screen prompt is possible for this session");
+            if !native {
+                have_surface = false;
+            }
+            warn!(%caller, %sentinel, %e, native, "ssh: could not write the .pending consent marker");
         }
+        if !native {
+            // Awaited, not spawned, and bounded: its verdict is what lets the
+            // refusal below say "nobody could be asked" instead of "nobody
+            // answered" — different fixes, and the caller cannot tell them
+            // apart afterwards.
+            let companion_up = tokio::time::timeout(
+                crate::signaling::COMPANION_START_BUDGET,
+                crate::companion::ensure_running(),
+            )
+            .await
+            .unwrap_or(false);
+            if !companion_up {
+                have_surface = false;
+            }
+        }
+        info!(%caller, %sentinel, native, have_surface, "consent prompt surface (ssh)");
 
         let decision = broker
             .request_with_mode(sentinel, crate::consent::Mode::Prompt { timeout })
             .await;
+        // The single convergence point: answered, timed out, or resolved from
+        // the CLI — the panel comes down here regardless of who decided.
+        indicator.hide_prompt(sentinel);
         if decision.granted() {
             info!(%caller, %sentinel, "ssh: operator approved the session");
             return Ok(());
         }
-        warn!(%caller, %sentinel, ?decision, "ssh: operator did not approve the session");
+        warn!(%caller, %sentinel, ?decision, have_surface, "ssh: operator did not approve the session");
         Err(match decision {
+            crate::consent::Decision::Timeout if !have_surface => {
+                "nobody could be asked at this device — it has no prompt surface (no one at its \
+                 screen and the Roomler desktop app is not running); answer with `roomlerd \
+                 consent` there, start the desktop app, or set this device's SSH policy to auto"
+                    .to_string()
+            }
             crate::consent::Decision::Timeout => format!(
                 "nobody approved this session at the device within {}s",
                 timeout.as_secs()
@@ -1719,6 +1776,7 @@ mod sshd {
         run_as: crate::exec::RunAs,
         consent: Option<String>,
         broker: crate::consent::ConsentBroker,
+        indicator: crate::indicator::ViewerIndicator,
         activity: Option<(ActivitySink, Option<String>)>,
     ) {
         use roomler_ai_remote_control::models::exec_limits;
@@ -1730,6 +1788,7 @@ mod sshd {
         if let Some(sentinel) = consent
             && let Err(why) = await_consent(
                 &broker,
+                &indicator,
                 &handle,
                 channel,
                 &caller,
@@ -2116,6 +2175,7 @@ mod tests {
         super::SessionServices {
             consent: crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
                 .expect("a temp sentinel dir"),
+            indicator: crate::indicator::ViewerIndicator::disabled(),
             // Reporting off in tests unless a case opts in — the default a
             // device ships with.
             activity: None,

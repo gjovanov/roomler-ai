@@ -88,6 +88,7 @@ pub struct RelayDeviceView {
     /// with `relay_server_enabled`. An approved device that is not serving is
     /// the most common "why is nothing relayed?" answer, so it is on screen.
     pub serving: bool,
+    pub static_endpoints: Vec<String>,
 }
 
 impl From<Agent> for RelayDeviceView {
@@ -97,6 +98,7 @@ impl From<Agent> for RelayDeviceView {
             name: a.name,
             status: a.status,
             serving: a.capabilities.has_rpc(RpcCap::RelayServer),
+            static_endpoints: a.peer_relay_policy.static_endpoints,
         }
     }
 }
@@ -158,6 +160,14 @@ pub async fn set_mode(
         .overlay_networks
         .set_peer_relay_mode(tid, body.mode)
         .await?;
+    state.org_relay.invalidate_mode(tid);
+    if body.mode == PeerRelayMode::Off {
+        // §7 trigger 1 — off means off NOW, not at the next expiry.
+        let n = crate::ws::org_relay::revoke_tenant(&state, tid, "mode_off").await;
+        if n > 0 {
+            warn!(tenant = %tenant_id, revoked = n, "peer-relay: live sessions revoked by the org switch");
+        }
+    }
     warn!(
         tenant = %tenant_id, admin = %auth.user_id, mode = ?body.mode,
         "peer-relay: org switch changed"
@@ -189,6 +199,19 @@ pub async fn set_policy(
     // Tenant-scoped, so an agent id from another org is a 404 rather than a
     // cross-tenant read.
     let agent = state.agents.base.find_by_id_in_tenant(tid, aid).await?;
+    // Static endpoints are server-pushed probe targets that every device in
+    // the tenant will dial as SYSTEM/root: public `ip:port` literals only
+    // (spec §5, SSRF). Checked before the decision so a refused body never
+    // leaves a granted-looking audit row behind.
+    if let Some(bad) = requested
+        .static_endpoints
+        .iter()
+        .find(|e| !crate::ws::org_relay::valid_static_endpoint(e))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "static endpoint {bad} is not a public ip:port"
+        )));
+    }
 
     let verdict = decide_approval(perms, &agent.peer_relay_policy, &requested);
     let event = PeerRelayAuditEvent {
@@ -205,6 +228,7 @@ pub async fn set_policy(
         warn_only: false,
         at: DateTime::now(),
         denied: verdict.err(),
+        reason: None,
     };
     if let Err(e) = state.peer_relay_audit.record(event).await {
         // Best-effort, like the other decision logs: an audit insert must
@@ -219,6 +243,14 @@ pub async fn set_policy(
         .agents
         .update_peer_relay_policy(tid, aid, &requested)
         .await?;
+    if !requested.serve {
+        // §7 trigger 3 — clearing the approval tears down what it carried.
+        let n = crate::ws::org_relay::revoke_relay_agent(&state, tid, aid, "policy_revoked").await;
+        if n > 0 {
+            warn!(tenant = %tenant_id, agent = %agent_id, revoked = n,
+                "peer-relay: live sessions revoked with the approval");
+        }
+    }
     warn!(
         tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
         serve = requested.serve, "peer-relay: device approval changed"
@@ -273,6 +305,8 @@ pub struct PeerRelayAuditRow {
     pub at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub denied: Option<PeerRelayDenyReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl From<PeerRelayAuditEvent> for PeerRelayAuditRow {
@@ -292,6 +326,7 @@ impl From<PeerRelayAuditEvent> for PeerRelayAuditRow {
             warn_only: e.warn_only,
             at: e.at.try_to_rfc3339_string().unwrap_or_default(),
             denied: e.denied,
+            reason: e.reason,
         }
     }
 }
@@ -347,7 +382,10 @@ mod tests {
     use permissions::*;
 
     fn p(serve: bool) -> PeerRelayPolicy {
-        PeerRelayPolicy { serve }
+        PeerRelayPolicy {
+            serve,
+            static_endpoints: Vec::new(),
+        }
     }
 
     /// The whole point: `DEFAULT_ADMIN` carries MANAGE_AGENTS but not
