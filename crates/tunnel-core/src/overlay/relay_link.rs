@@ -35,6 +35,12 @@
 //!    `Carrier::relay` dialing it.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+
+use super::orgrelay::{
+    client::OrgRelayConn,
+    member::{OrgBindJob, OrgSession, per_endpoint_budget},
+};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,6 +162,8 @@ pub enum RelayKind {
     Turn,
     /// The DERP `/derp` WS relay (both-UDP-blocked pair).
     Derp,
+    /// FR-19 — a tenant-owned org relay (`orgrelay`), reached over UDP.
+    Org,
 }
 
 impl RelayKind {
@@ -165,6 +173,7 @@ impl RelayKind {
         match self {
             RelayKind::Turn => "turn",
             RelayKind::Derp => "derp",
+            RelayKind::Org => "org",
         }
     }
 }
@@ -181,6 +190,9 @@ enum RelayStrategy {
     Derp,
     /// The both-allocate fall-through (two coturn allocations).
     BothAllocate,
+    /// FR-19 P4b — the server minted an org-relay session for this pair and
+    /// it is live: bind at the tenant relay. No alloc, no creds.
+    OrgRelay,
 }
 
 /// A peer link whose carrier is ready to install.
@@ -383,6 +395,23 @@ pub struct RelayCoordinator {
     /// lazy (checked on read); after it, the normal strategy resumes on the
     /// next establishment cycle.
     forced_derp_until: HashMap<ObjectId, Instant>,
+    /// FR-19 P4b — org-relay sessions the server minted for this node, by
+    /// PEER. A live entry makes `relay_strategy` answer `OrgRelay` for that
+    /// peer regardless of the netmap stamp: both ends were pushed the same
+    /// session, so the decision is symmetric without the wire, and the stamp
+    /// (which only changes on the next netmap event) cannot lag behind it.
+    org_sessions: HashMap<ObjectId, OrgSession>,
+    /// The peer config captured when the org bind was requested — what the
+    /// `ReadyLink` is built from at commit time (refreshed by `maybe_complete`).
+    org_peers: HashMap<ObjectId, PeerConfig>,
+    /// Peers whose org bind the runtime is running off-loop; `is_tracking`
+    /// dedups on it exactly as on `pending`.
+    org_binding: HashSet<ObjectId>,
+    /// Binds `request` decided on but the runtime has not spawned yet —
+    /// drained by `take_org_jobs` on the runtime's next pass.
+    org_jobs: Vec<OrgBindJob>,
+    /// `overlay_org_relay` — the client half of FR-19, default OFF.
+    org_relay: bool,
     /// Multi-region DERP — lazily-opened muxes for REGIONAL relays, keyed by
     /// their `derp_url`. A pair force-pinned with a `derp_url` builds its
     /// [`DerpConn`] off that region's mux; everything else keeps the central
@@ -549,6 +578,11 @@ impl RelayCoordinator {
             derp_mux,
             roles: HashMap::new(),
             forced_derp_until: HashMap::new(),
+            org_sessions: HashMap::new(),
+            org_peers: HashMap::new(),
+            org_binding: HashSet::new(),
+            org_jobs: Vec::new(),
+            org_relay: super::direct::org_relay_enabled(),
             regional_muxes: HashMap::new(),
             event_sink: None,
             forced_urls: HashMap::new(),
@@ -1026,6 +1060,21 @@ impl RelayCoordinator {
         {
             return RelayStrategy::Derp;
         }
+        // FR-19 P4b — a live org-relay session for this pair is the answer,
+        // ahead of the server's netmap stamp: both ends hold the same session,
+        // so this is symmetric without the wire, and the stamp only changes on
+        // the next netmap event. Gated on the local flag so a build with
+        // `overlay_org_relay` off ignores any session it is pushed (it never
+        // advertised `supports_org_relay`, so it is pushed none — belt and
+        // braces against a server bug, never a black hole).
+        if self.org_relay
+            && self
+                .org_sessions
+                .get(node_id)
+                .is_some_and(|s| s.is_live(Instant::now()))
+        {
+            return RelayStrategy::OrgRelay;
+        }
         // U2 — a server-computed verdict is authoritative, taken verbatim.
         // Checked AFTER the local force-DERP pin (a live `OverlayForceDerp`
         // push the server may still send during a mixed transition wins over
@@ -1283,6 +1332,7 @@ impl RelayCoordinator {
             || self.allocated.contains_key(node_id)
             || self.dialing.contains_key(node_id)
             || self.derping.contains_key(node_id)
+            || self.org_binding.contains(node_id)
     }
 
     /// Kick off a relay link. The strategy decides the mechanics:
@@ -1334,6 +1384,12 @@ impl RelayCoordinator {
                 self.derping.insert(node_id, peer);
                 return;
             }
+            RelayStrategy::OrgRelay => {
+                debug!(peer = %node_id,
+                    "overlay relay: org-relay session minted — binding at the tenant relay (no alloc, no creds)");
+                self.org_request_bind(node_id, peer);
+                return;
+            }
             RelayStrategy::SingleRelay(true) | RelayStrategy::BothAllocate => {}
         }
         // U1 — attach the refresh evidence + the sticky mux-failure flag.
@@ -1343,6 +1399,7 @@ impl RelayCoordinator {
                     match k {
                         RelayKind::Turn => "turn",
                         RelayKind::Derp => "derp",
+                        RelayKind::Org => "org",
                     }
                     .to_string()
                 }),
@@ -1517,6 +1574,10 @@ impl RelayCoordinator {
         if let Some(slot) = self.dialing.get_mut(&node_id) {
             *slot = peer.clone();
             return self.try_build_dialer(&node_id);
+        }
+        // FR-19 P4b — keep the config the org link will be built from fresh.
+        if let Some(p) = self.org_peers.get_mut(&node_id) {
+            *p = peer.clone();
         }
         if let Some(a) = self.allocated.get_mut(&node_id) {
             a.peer = peer.clone();
@@ -1805,6 +1866,148 @@ impl RelayCoordinator {
         Some(link)
     }
 
+    // ─── FR-19 P4b — org-relay sessions, the member's side ─────────────────
+
+    /// The server minted (or re-pushed) an org-relay session for `peer`.
+    /// Replaces any prior session for that peer — a re-mint after a revoke
+    /// carries a new VNI, and a re-push of the SAME session (the server's
+    /// idempotent re-request path) is harmless to overwrite. A previous
+    /// carrier is closed so the runtime rebuilds onto the new session.
+    pub fn org_session_accept(&mut self, peer: ObjectId, session: OrgSession) {
+        if let Some(old) = self.org_sessions.insert(peer, session)
+            && let Some(conn) = old.conn
+        {
+            conn.close();
+        }
+        self.org_binding.remove(&peer);
+        self.org_jobs.retain(|j| j.node_id != peer);
+    }
+
+    /// `rc:overlay.relay_revoke` — drop the session with this VNI, closing its
+    /// carrier so the dead latch fires and the sweep re-coordinates the pair
+    /// onto TURN/DERP (the strategy no longer answers `OrgRelay`). Returns
+    /// the peer it belonged to.
+    pub fn org_session_revoke(&mut self, vni: u32) -> Option<ObjectId> {
+        let peer = *self.org_sessions.iter().find(|(_, s)| s.vni == vni)?.0;
+        self.drop_org_session(&peer);
+        Some(peer)
+    }
+
+    /// The off-loop bind for `peer` failed on every endpoint: the session is
+    /// unusable from here. Drop it and forget the pair, so the next request
+    /// takes the TURN/DERP path; the server re-mints on a later
+    /// `relay_request` if it still wants to.
+    pub fn org_bind_failed(&mut self, peer: &ObjectId) {
+        self.drop_org_session(peer);
+    }
+
+    /// Expire sessions past their absolute lifetime (the member's own clock,
+    /// from receipt), closing their carriers. Returns the peers affected.
+    pub fn reap_org_sessions(&mut self, now: Instant) -> Vec<ObjectId> {
+        let dead: Vec<ObjectId> = self
+            .org_sessions
+            .iter()
+            .filter(|(_, s)| !s.is_live(now))
+            .map(|(p, _)| *p)
+            .collect();
+        for p in &dead {
+            self.drop_org_session(p);
+        }
+        dead
+    }
+
+    fn drop_org_session(&mut self, peer: &ObjectId) {
+        if let Some(s) = self.org_sessions.remove(peer)
+            && let Some(conn) = s.conn
+        {
+            conn.close();
+        }
+        self.org_binding.remove(peer);
+        self.org_peers.remove(peer);
+        self.org_jobs.retain(|j| j.node_id != *peer);
+        if self.roles.get(peer) == Some(&RelayStrategy::OrgRelay) {
+            self.forget(peer);
+        }
+    }
+
+    /// Test hook — the production value comes from `OVERLAY_ORG_RELAY`.
+    #[cfg(test)]
+    pub(crate) fn set_org_relay(&mut self, on: bool) {
+        self.org_relay = on;
+    }
+
+    /// Binds decided by `request` that the runtime has not spawned yet.
+    pub fn take_org_jobs(&mut self) -> Vec<OrgBindJob> {
+        std::mem::take(&mut self.org_jobs)
+    }
+
+    /// Queue the bind for `peer` — idempotent while one is in flight or a
+    /// carrier is already bound on the current session.
+    pub fn org_request_bind(&mut self, peer: ObjectId, peer_cfg: PeerConfig) {
+        let Some(s) = self.org_sessions.get(&peer) else {
+            return;
+        };
+        if self.org_binding.contains(&peer) || s.conn.is_some() {
+            return;
+        }
+        let job = OrgBindJob {
+            node_id: peer,
+            relay_node_id: s.relay_node_id,
+            vni: s.vni,
+            generation: s.generation,
+            endpoints: s.endpoints.clone(),
+            secret: s.secret.clone(),
+            per_endpoint: per_endpoint_budget(s.bind_budget, s.endpoints.len()),
+        };
+        self.org_binding.insert(peer);
+        self.org_peers.insert(peer, peer_cfg);
+        self.roles.insert(peer, RelayStrategy::OrgRelay);
+        self.org_jobs.push(job);
+    }
+
+    /// Commit a finished off-loop bind (on-loop, µs): wrap the bound conn as a
+    /// RAW relay carrier — symmetric, no anchor/dialer role, no QUIC — and
+    /// hand it to `install_ready`. `None` if the session was revoked or
+    /// superseded while the bind ran (the conn is then closed here).
+    pub fn commit_org_bind(
+        &mut self,
+        peer: ObjectId,
+        conn: Arc<OrgRelayConn>,
+    ) -> Option<ReadyLink> {
+        self.org_binding.remove(&peer);
+        let Some(s) = self.org_sessions.get_mut(&peer) else {
+            conn.close();
+            return None;
+        };
+        if s.vni != conn.vni() {
+            conn.close();
+            return None;
+        }
+        let Some(peer_cfg) = self.org_peers.get(&peer).cloned() else {
+            conn.close();
+            return None;
+        };
+        s.conn = Some(conn.clone());
+        let dst = conn.synth_peer();
+        let conn_dyn: Arc<dyn RelayConn> = conn;
+        let carrier = Carrier::relay(conn_dyn.clone(), dst);
+        self.roles.insert(peer, RelayStrategy::OrgRelay);
+        info!(peer = %peer, vni = s.vni, relay = %s.relay_node_id,
+            "overlay relay: org-relay link ready (raw WG through a tenant relay)");
+        Some(ReadyLink {
+            node_id: peer,
+            public_key: peer_cfg.public_key,
+            overlay_ip: peer_cfg.overlay_ip,
+            carrier,
+            relay_parts: Some((conn_dyn, dst)),
+            extra_permission_targets: Vec::new(),
+            supports_quic: false,
+            single_relay: None,
+            relay_kind: RelayKind::Org,
+            subnets: peer_cfg.subnets.clone(),
+        })
+    }
+
     /// Phase A2 (overlay v3) — build the DERP FLOOR for a fresh pair: an
     /// immediately-installable derp carrier so "reachable but carrier-less"
     /// can't exist wherever wss:/derp works, while the better-tier
@@ -1994,6 +2197,8 @@ impl RelayCoordinator {
         self.derping.remove(node_id);
         self.floored.remove(node_id);
         self.roles.remove(node_id);
+        self.org_binding.remove(node_id);
+        self.org_jobs.retain(|j| j.node_id != *node_id);
         // C4 stage 2 (PR-B) — release the single-pair warm commit. If the leg
         // itself is still alive (its probes decide that, not this pair's
         // fate), the very next `request` for this — or any — anchor pair
@@ -2187,6 +2392,111 @@ fn extra_srflx_permission_targets(srflx: &[String], primary: IpAddr) -> Vec<Sock
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    // ─── FR-19 P4b — org-relay sessions, the member's side ─────────────────
+
+    fn org_session(vni: u32, secs: u64) -> OrgSession {
+        OrgSession {
+            vni,
+            generation: 1,
+            relay_node_id: ObjectId::new(),
+            endpoints: vec!["8.8.8.8:3478".parse().unwrap()],
+            secret: crate::overlay::orgrelay::bind::BindSecret::from_bytes([1; 32]),
+            bind_budget: Duration::from_secs(30),
+            expires_at: Instant::now() + Duration::from_secs(secs),
+            conn: None,
+        }
+    }
+
+    /// A live session decides the strategy only with the flag on; `request`
+    /// then queues an off-loop bind instead of asking for creds, and a revoke
+    /// by VNI drops both the decision and the tracking.
+    #[tokio::test]
+    async fn a_live_org_session_decides_the_strategy_only_with_the_flag_on() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
+        let node = ObjectId::new();
+        let peer = base_peer();
+        coord.org_session_accept(node, org_session(7, 60));
+        assert_ne!(
+            coord.relay_strategy(&node, &peer),
+            RelayStrategy::OrgRelay,
+            "flag off ⇒ a pushed session is ignored"
+        );
+        coord.set_org_relay(true);
+        assert_eq!(coord.relay_strategy(&node, &peer), RelayStrategy::OrgRelay);
+
+        coord.request(node, peer.clone()).await;
+        assert!(
+            coord.is_tracking(&node),
+            "an org bind in flight is tracking"
+        );
+        let jobs = coord.take_org_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].vni, 7);
+        assert_eq!(jobs[0].node_id, node);
+        assert!(coord.take_org_jobs().is_empty(), "drained once");
+        coord.request(node, peer.clone()).await;
+        assert!(
+            coord.take_org_jobs().is_empty(),
+            "a second request while binding queues nothing"
+        );
+
+        assert_eq!(coord.org_session_revoke(7), Some(node));
+        assert_ne!(coord.relay_strategy(&node, &peer), RelayStrategy::OrgRelay);
+        assert!(!coord.is_tracking(&node), "revoke clears the tracking too");
+        assert_eq!(coord.org_session_revoke(7), None, "already gone");
+    }
+
+    /// Expiry reaps on the member's own clock; a bind that completes for a
+    /// session that was replaced meanwhile is refused and its conn closed; the
+    /// current session commits an `Org` link, and revoking it closes the
+    /// carrier so the dead latch fires.
+    #[tokio::test]
+    async fn expired_sessions_are_reaped_and_a_stale_bind_is_refused() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
+        coord.set_org_relay(true);
+        let node = ObjectId::new();
+
+        coord.org_session_accept(node, org_session(9, 0));
+        assert_ne!(
+            coord.relay_strategy(&node, &base_peer()),
+            RelayStrategy::OrgRelay,
+            "an expired session decides nothing"
+        );
+        assert_eq!(coord.reap_org_sessions(Instant::now()), vec![node]);
+
+        coord.org_session_accept(node, org_session(11, 60));
+        coord.org_request_bind(node, base_peer());
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let stale = Arc::new(OrgRelayConn::new(sock.clone(), relay, 10, "r".into()));
+        assert!(
+            coord.commit_org_bind(node, stale.clone()).is_none(),
+            "a bind for another VNI never commits"
+        );
+        assert!(!stale.is_alive(), "a refused conn is closed");
+
+        let fresh = Arc::new(OrgRelayConn::new(sock, relay, 11, "r".into()));
+        let link = coord
+            .commit_org_bind(node, fresh.clone())
+            .expect("the current session commits");
+        assert_eq!(link.relay_kind, RelayKind::Org);
+        assert!(
+            link.single_relay.is_none(),
+            "symmetric — no anchor/dialer role"
+        );
+        assert!(!link.supports_quic, "raw WG only");
+        assert!(!coord.is_tracking(&node), "bound ⇒ no longer coordinating");
+        assert!(fresh.is_alive());
+
+        coord.org_session_revoke(11);
+        assert!(
+            !fresh.is_alive(),
+            "revoking a bound session closes its carrier"
+        );
+    }
 
     /// W6 phase-2 — the anchor permits every DISTINCT public srflx IP the
     /// dialer advertises, beyond the primary: same-IP re-adverts collapse,

@@ -165,6 +165,14 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session, advertise the capability, and floor fresh pairs at birth. Built-in default: on since rc.400.",
     ),
     (
+        "overlay_org_relay",
+        "tribool",
+        "FR-19 P4b - ride a tenant-owned ORG RELAY when the server mints a session for a \
+         pair (org switch on, an ACL rule granting each member the relay node, an approved \
+         and serving relay). Advertised on the join as supports_org_relay; the serving half \
+         is relay_server_enabled. Built-in default: OFF.",
+    ),
+    (
         "relay_server_enabled",
         "tribool",
         "FR-19 - offer this node as an ORG RELAY: bind relay_server_port and answer \
@@ -669,6 +677,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_derp" => cfg.overlay_derp.map(fmt_bool),
         "overlay_server_relay_strategy" => cfg.overlay_server_relay_strategy.map(fmt_bool),
         "overlay_derp_floor" => cfg.overlay_derp_floor.map(fmt_bool),
+        "overlay_org_relay" => cfg.overlay_org_relay.map(fmt_bool),
         "overlay_netcheck" => cfg.overlay_netcheck.map(fmt_bool),
         "relay_server_enabled" => cfg.relay_server_enabled.map(fmt_bool),
         "relay_server_port" => cfg.relay_server_port.map(|v| v.to_string()),
@@ -898,6 +907,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             cfg.overlay_server_relay_strategy = parse_tribool(value)?
         }
         "overlay_derp_floor" => cfg.overlay_derp_floor = parse_tribool(value)?,
+        "overlay_org_relay" => cfg.overlay_org_relay = parse_tribool(value)?,
         "overlay_netcheck" => cfg.overlay_netcheck = parse_tribool(value)?,
         "relay_server_enabled" => cfg.relay_server_enabled = parse_tribool(value)?,
         "relay_server_port" => {
