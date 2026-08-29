@@ -55,8 +55,11 @@ pub const GROW_INTERVAL: Duration = Duration::from_secs(5);
 pub const PINNED_PCT: u64 = 90;
 /// The window's delivered rate must reach this fraction of the ceiling.
 pub const CARRIED_PCT: u64 = 70;
-/// Viewer age bound relative to its learned floor.
-pub const AGE_FLOOR_FACTOR_PCT: u64 = 150;
+/// Viewer age bound relative to its learned floor. 2× (was 1.5×): on the
+/// first field run the pair painted at 66–80 ms over a 43 ms floor during a
+/// window drag it carried at 2.1–2.8 Mbps with no age events — 1.5× vetoed
+/// exactly the windows that were the evidence.
+pub const AGE_FLOOR_FACTOR_PCT: u64 = 200;
 /// A blocked send at least this long is a HARD stall (×0.5, not ×0.85).
 pub const HARD_STALL: Duration = Duration::from_secs(1);
 /// A target must hold this long without a decrease to be the stable rate.
@@ -346,7 +349,7 @@ mod tests {
         // The pump calls effective_ceiling() every tick BEFORE any window,
         // so the learner always knows the nominal; mirror that order.
         let _ = l.effective_ceiling(NOMINAL);
-        // age 200 ms on a 60 ms floor: over 1.5× — no step.
+        // age 200 ms on a 60 ms floor: over 2× — no step.
         assert!(
             l.on_window(NOMINAL, NOMINAL, Some((200, 60)), t(base, 1))
                 .is_none()
