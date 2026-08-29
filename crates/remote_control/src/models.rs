@@ -1169,10 +1169,10 @@ pub struct SshGrantSpec {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Tunnel client (roomler-tunnel)
+// Tunnel client (roomler-cli)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// A laptop running `roomler-tunnel`. Mirrors [`Agent`] structurally
+/// A laptop running `roomler`. Mirrors [`Agent`] structurally
 /// (same lifecycle, same `AgentStatus`, same `(tenant_id, machine_id)`
 /// uniqueness for rehydrate-on-re-enroll) but slimmer — tunnel clients
 /// don't capture screens or hold capability lists. The `_role_` is
@@ -1289,7 +1289,7 @@ pub struct DestinationRule {
 /// Lived in `tunnel_core::policy` until P3e lever E moved it HERE, next to
 /// the shapes it matches over (this crate is where `HostPattern` /
 /// `PortRange` / `DestinationRule` are canonical — the doc block above this
-/// section says so). The move lets `roomler-agent-core`'s config-side ACL
+/// section says so). The move lets `roomler-core`'s config-side ACL
 /// evaluate rules without depending on tunnel-core's data plane; tunnel-core
 /// re-exports both fns from `policy` so its callers are unchanged.
 pub fn dst_matches(rule: &DestinationRule, dst_host: &str, dst_port: u16) -> bool {
@@ -1575,7 +1575,7 @@ pub struct TunnelAuditEvent {
     /// this id. New ObjectId per `tunnel forward` invocation.
     pub tunnel_session_id: ObjectId,
     /// The originating tunnel-CLIENT row, set when a dedicated
-    /// `roomler-tunnel` client opened this session. `None` for an
+    /// `roomler` client opened this session. `None` for an
     /// agent-originated session (P3b-2), where `origin_agent_id` is set
     /// instead. Exactly one of `tunnel_client_id` / `origin_agent_id`
     /// is populated. Optional (not a bare `ObjectId`) since P3b-2 —
