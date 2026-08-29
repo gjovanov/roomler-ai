@@ -191,8 +191,12 @@ jobs:
       - name: Install libvpx (cached apt)
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
-          packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev
-          version: ci-vpx-v1
+          # libasound2-dev is for the `audio` half of `full` in the capture
+          # clippy lane below — without it alsa-sys fails its build script and
+          # the lane dies before linting anything. Bump `version:` whenever
+          # this list changes, or the action serves the previously cached set.
+          packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
+          version: ci-vpx-v2
 
       # Pair `vp9-444` with `vp9-444-bindgen` on Linux so env-libvpx-sys
       # regenerates its FFI bindings via bindgen against the installed
