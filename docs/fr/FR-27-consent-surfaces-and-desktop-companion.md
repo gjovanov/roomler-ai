@@ -239,4 +239,43 @@ is why it is sequenced last, behind its own feature and the probe.
 
 ## Field-verification log
 
-*(empty — entries land per phase, each showing the pre-change failure first)*
+### 2026-08-29 — 0.4.15 baseline, then 0.4.16
+
+Full write-up on the issue ([baseline](https://github.com/gjovanov/roomler-ai/issues/854#issuecomment-5462090974) ·
+[result](https://github.com/gjovanov/roomler-ai/issues/854#issuecomment-5462384972)). Server
+`v20260829-673a1686220f`; controller is an ADMINISTRATOR who is **not** the devices' owner,
+so `resolve_session_authz` takes the admin-without-override arm and the device's mode applies.
+
+| # | finding | 0.4.15 | 0.4.16 |
+|---|---|---|---|
+| 2 | on-screen prompt (Windows) | no consent window exists at all — only the two pre-existing indicator windows, both `vis=False`, for the whole 30 s | `RoomlerConsentWClass` `vis=True`, `460x232` at `(1050,48)`, `GetWindowDisplayAffinity = 0x11` **while shown** |
+| 3.0 | which surface served it | nothing logged | `consent prompt surface … native=true have_surface=true` |
+| — | Approve | — | human clicked at t+14.7 s → `allow=true` → `outcome=Granted`, session started |
+| 3 | Deny vs timeout | — | `outcome=Denied` → *"Someone at that device declined the request."*; `reason="timeout"` → *"Nobody answered the prompt on that device in time."* |
+| 5 (1d) | `prompt_then_email` host window | agent modal ran 300 s and its timeout killed the emailed link | panel up **exactly 30 s** (`timeout_secs=30`), then hidden — and the session was still `awaiting_consent` at t+59 s, i.e. the hub kept the owner's window open |
+| 6 | tray icons | **two** `tray_icon_app` windows | **one** |
+| 12 (5a) | in-session mode outlives the session | exclusive → last viewer leaves → reconnect ⇒ still `exclusive` | same sequence, no daemon restart ⇒ back to the device policy's `free` |
+| 14 (5c) | rail at one viewer | hidden | *"Viewers · input free"* + the holder + **Switch to exclusive input** |
+
+⚠️ **Three defects the field test found**, all fixed in #877 — see the issue comment. The
+worst was self-inflicted: publishing a second Linux `.deb` in the agent release froze every
+pre-0.4.16 Linux agent, because their picker takes the FIRST `.deb` for their arch and
+`/api/agent/latest-release` forwards GitHub's order. The other two are that a
+`ROOMLER_AGENT_VIRTUAL_DESKTOP=1` host wrongly counted as a consent surface, and that the one
+line a headless operator gets still named the FR-21-retired `roomler-agent`.
+
+⚠️ **Not verified, and why**
+
+- `prompt_owner` — **not exercisable from this account**: every Grox device is owned by a
+  different user id, so the toggle never renders. Server side is covered by the
+  `resolve_session_authz` tests; the UI half needs one run signed in as the owner.
+- `no_prompt_surface` — there is **no clean negative control left in the fleet**: mars,
+  jupiter and the WSL node all run a virtual desktop, and it took the #877 fix to make any of
+  them decline. Re-test on 0.4.17.
+- **two concurrent viewers** — a second viewer from the SAME browser to the same device
+  never gets media (*"No video from this device after 3 attempts"*), reproduced against both
+  NEO16 and mars. Same-host artifact rather than a P6 defect on the evidence available, but
+  it means `free` ↔ `exclusive` with two live viewers is still unproven; it needs a second
+  controller machine.
+- `email` / `push` — both resolve at the **owner**, who is a different account here.
+- macOS and Linux-X11 panels, exec + ssh prompts, macOS Check-for-updates.
