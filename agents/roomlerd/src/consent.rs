@@ -14,8 +14,9 @@
 //! by an out-of-process operator running:
 //!
 //! ```text
-//! roomler-agent consent --session <hex_id> --approve
-//! roomler-agent consent --session <hex_id> --deny
+//! roomler consent --session <hex_id> --approve
+//! roomler consent --session <hex_id> --deny
+//! roomler consent --list          # FR-27: what is outstanding right now
 //! ```
 //!
 //! 30 s timeout → auto-deny. Outcome propagates back through the
@@ -388,7 +389,11 @@ impl ConsentBroker {
             session = session_hex,
             timeout_secs = timeout.as_secs(),
             sentinel_dir = %self.inner.sentinel_dir.display(),
-            "operator consent required — drop a sentinel via `roomler-agent consent --session {} --approve|--deny`",
+            // FR-21 retired `roomler-agent`; this line is the ONLY guidance a
+            // headless operator gets, and naming a binary that no longer
+            // exists makes it worse than silence. Field-caught on mars
+            // 2026-08-29, still printing the old name at 0.4.16.
+            "operator consent required — answer it with `roomler consent --session {} --approve|--deny` (`roomler consent --list` shows what is outstanding)",
             session_hex
         );
 
