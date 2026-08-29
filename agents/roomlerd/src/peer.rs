@@ -2017,6 +2017,13 @@ async fn media_pump(
     // the preceding ~30-frame window, not the entire session.
     let mut heartbeat_frames_base: u64 = 0;
     let mut heartbeat_capture_us_base: u64 = 0;
+    // FR-29 P2 — windowed like every other average in this heartbeat. A
+    // CUMULATIVE damage average is worse than none: it is dominated by
+    // whatever the screen was doing minutes ago, which is exactly how a
+    // busy-period 1000permille reading survived into an idle window and
+    // made a precise tracker look saturated.
+    let mut heartbeat_damage_frames_base: u64 = 0;
+    let mut heartbeat_damage_permille_base: u64 = 0;
     let mut heartbeat_encode_us_base: u64 = 0;
 
     // Last applied quality preference. Initialised to a sentinel
@@ -2543,8 +2550,12 @@ async fn media_pump(
             // backend that reports Damage::Unknown it stays 0 no matter how
             // busy the screen is, so a non-zero value is proof the tracker is
             // producing real rects rather than the field merely existing.
-            let avg_damage_permille = if damage_tracked_frames > 0 {
-                damage_permille_sum / damage_tracked_frames
+            let damage_frames_window =
+                damage_tracked_frames.saturating_sub(heartbeat_damage_frames_base);
+            let damage_permille_window =
+                damage_permille_sum.saturating_sub(heartbeat_damage_permille_base);
+            let avg_damage_permille = if damage_frames_window > 0 {
+                damage_permille_window / damage_frames_window
             } else {
                 0
             };
@@ -2552,13 +2563,15 @@ async fn media_pump(
                 %session_id,
                 backend,
                 frames_captured, frames_empty, frames_unchanged, frames_encoded, frames_keepalive,
-                damage_tracked_frames, avg_damage_permille,
+                damage_tracked_frames = damage_frames_window, avg_damage_permille,
                 bytes_written, write_errors,
                 avg_capture_ms, avg_encode_ms,
                 "media pump heartbeat (≈1s window)"
             );
             heartbeat_frames_base = frames_encoded;
             heartbeat_capture_us_base = capture_time_us;
+            heartbeat_damage_frames_base = damage_tracked_frames;
+            heartbeat_damage_permille_base = damage_permille_sum;
             heartbeat_encode_us_base = encode_time_us;
         }
     }
