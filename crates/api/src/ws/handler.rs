@@ -1375,7 +1375,7 @@ async fn handle_media_producer_pause(
             &state.ws_storage,
             &state.redis_pubsub,
             conn_id,
-            event.clone(),
+            &event,
         )
         .await;
     }
