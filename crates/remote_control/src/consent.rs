@@ -99,9 +99,20 @@ pub fn outcome_of(granted: bool, reason: Option<&str>) -> ConsentOutcome {
     }
 }
 
-/// The attended window: how long an on-host prompt stands, and how long the
-/// hub waits for it.
-pub const DEFAULT_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The attended window: how long a plain-`prompt` on-host prompt stands, and how
+/// long the hub waits for it.
+///
+/// 5 minutes. Field pc50045, 2026-08-29: a device set to
+/// plain `prompt` may be LOCKED when the session starts — the operator has to
+/// walk to the machine, unlock it, and only then can they see and approve the
+/// prompt. 30 s was not enough to do that, so the controller timed out before
+/// the human arrived. Plain `prompt` has no remote fallback, so this window is
+/// the only chance to answer and must be generous.
+///
+/// ⚠️ `prompt_then_email` does NOT use this — its host half is
+/// [`HOST_PROMPT_TIMEOUT`] (short), because its emailed link is the real
+/// fallback and a five-minute modal on someone's screen is an obstruction.
+pub const DEFAULT_CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The window for a mode whose approval reaches a HUMAN somewhere else — email
 /// link, push card. Minutes rather than seconds, because the owner has to be
@@ -110,13 +121,14 @@ pub const ASYNC_CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// FR-27 — how long the ON-HOST half of `prompt_then_email` stands.
 ///
-/// Deliberately NOT [`ASYNC_CONSENT_TIMEOUT`], which is what the agent used to
-/// be handed: a modal that sits on someone's screen for five minutes is not a
-/// prompt, it is an obstruction, and the host is not the party that needs the
-/// long window. The host gets the attended window; the emailed link keeps the
-/// full async one. A host timeout therefore hands over to the owner rather than
-/// ending the session — see `Hub::deliver_consent`.
-pub const HOST_PROMPT_TIMEOUT: Duration = DEFAULT_CONSENT_TIMEOUT;
+/// Deliberately SHORT (30 s), and deliberately NOT [`DEFAULT_CONSENT_TIMEOUT`]
+/// (now 5 min) nor [`ASYNC_CONSENT_TIMEOUT`]: a modal that sits on someone's
+/// screen for minutes is an obstruction, and here — unlike plain `prompt` — the
+/// emailed link IS the fallback, so the host half need only catch someone
+/// already sitting there and then hand over. A host timeout hands over to the
+/// owner rather than ending the session — see `Hub::deliver_consent`. (Plain
+/// `prompt` waits the full 5 min precisely because it has no email to hand to.)
+pub const HOST_PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// FR-27 — how much LONGER than the window it announced the hub waits for the
 /// agent's own verdict before falling back to a bare `ConsentTimeout`.
@@ -322,12 +334,16 @@ mod tests {
         }
     }
 
-    /// The host half of `prompt_then_email` must be the ATTENDED window, not
-    /// the async one — a five-minute modal is an obstruction, and it is the
-    /// owner, not the host, who needs the long window.
+    /// `prompt_then_email`'s host half is SHORT — shorter than both the plain
+    /// attended window (which is long, 5 min, so a human can reach a locked
+    /// machine) and the async window — because its emailed link is the fallback,
+    /// so the host modal need not linger. A five-minute modal is an obstruction;
+    /// the owner, reached remotely, is who gets the long window.
     #[test]
-    fn the_host_prompt_window_is_not_the_async_one() {
-        assert_eq!(HOST_PROMPT_TIMEOUT, DEFAULT_CONSENT_TIMEOUT);
+    fn the_prompt_then_email_host_window_is_short() {
+        assert!(HOST_PROMPT_TIMEOUT < DEFAULT_CONSENT_TIMEOUT);
         assert!(HOST_PROMPT_TIMEOUT < ASYNC_CONSENT_TIMEOUT);
+        // Plain prompt has no remote fallback, so it waits the full async span.
+        assert_eq!(DEFAULT_CONSENT_TIMEOUT, ASYNC_CONSENT_TIMEOUT);
     }
 }

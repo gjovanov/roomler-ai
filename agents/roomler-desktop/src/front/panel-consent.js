@@ -71,7 +71,10 @@
       return
     }
     const left = Math.max(0, Math.round((expiresAt - Date.now()) / 1000))
-    el.textContent = left > 0 ? `Expires in ${left}s` : 'Expired'
+    // m:ss above a minute — the plain-prompt window is 5 min (FR-34), and
+    // "Expires in 287s" reads worse than "Expires in 4:47".
+    const pretty = left >= 60 ? `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}` : `${left}s`
+    el.textContent = left > 0 ? `Expires in ${pretty}` : 'Expired'
   }
 
   async function decide(approve) {
