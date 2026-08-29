@@ -209,7 +209,7 @@ pub async fn join_org(
     if !already {
         let tenant = state.tenants.base.find_by_id(target).await?;
         let used = state.agents.count_active_for_tenant(target).await?;
-        // FR-31: the decision and its record live in `quota::check`; the
+        // FR-32: the decision and its record live in `quota::check`; the
         // wording stays here because it is contextual ("in the target
         // organization"). `MaxDevices` is an established limit, so this
         // refuses regardless of the tenant's `plan_enforcement` mode.
