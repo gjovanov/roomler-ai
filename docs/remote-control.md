@@ -586,6 +586,15 @@ as "a human refused you". The three now end as `UserDenied`,
 `ConsentTimeout` and `NoPromptSurface`, and the viewer renders a sentence per
 case rather than the enum name.
 
+⚠️ **The hub waits longer than the window it announces**
+(`consent::CONSENT_VERDICT_GRACE`, 5 s). The agent's prompt window and the
+hub's own fallback are set from the same `consent_timeout_secs`, so on every
+non-answer they expire together and the hub's used to fire ~130 ms first —
+measured on mars twice — throwing away the agent's reason and reporting every
+`no_prompt_surface` as "nobody answered". The hub's timer is a backstop for a
+dead agent, not a peer of a live one; the number on the wire is unchanged, so
+the on-host prompt still stands for exactly the announced window.
+
 ### 11.3 Recording & audit consent
 
 If recording is enabled for the session, the controlled side gets a persistent banner (cannot be dismissed) and a red dot in the tray icon. Mirrors macOS's screen-recording indicator behavior; users have learned to look for it.
