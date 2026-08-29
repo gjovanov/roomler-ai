@@ -92,7 +92,29 @@ rows, so recording them cannot be per-call-site* (`decide` returns
 field to `PlanLimits` fails to compile until someone decides whether it is a gate — the same
 structural trick as `RpcCap::wire()`.
 
-### 3. Denials are data
+### 3. The mode must not be able to weaken what was already enforced
+
+Found while building P0. Re-pointing the three live sites through the helper, with the
+mode defaulting to `Warn`, **would have stopped enforcing the device cap fleet-wide the
+moment P0 shipped** — a billing regression arriving inside a change that reads as a tidy-up,
+and one no reviewer would likely catch, because the diff looks like pure extraction.
+
+So `Limit::is_established()` marks `MaxDevices` and `MaxTunnelClients`, and an established
+limit **ignores the mode entirely**. `PlanEnforcement` stages *new* enforcement; it is not a
+switch that turns billing off. A unit test asserts both established limits refuse under all
+three modes, so the property cannot be quietly deleted.
+
+### 4. `u32::MAX` is the "unlimited" sentinel, not a number
+
+`PlanLimits` spells unlimited as `u32::MAX` (`Pro.max_members`, `Pro.max_channels`,
+`Business.max_concurrent_sessions`) and `-1` for `max_message_history` — not as `Option`.
+The first draft of the helper compared against it as a real cap. That is wrong twice: it
+would refuse a tenant the published matrix calls unlimited, and it would file denial records
+with a `max` of 4 294 967 295 — **poisoning the exact dataset P2 and P3 exist to read**.
+
+Caught by a unit test written before the bug was suspected; the test now pins the sentinel.
+
+### 5. Denials are data
 
 Every check in `Warn` or `Enforce` emits a structured record: tenant, limit, `used`, `max`,
 plan, mode, outcome. This is what P2 and P3 read to reshape tiers — "how many Free tenants
@@ -150,6 +172,9 @@ Gates by enforcement point (P1):
    charges Business money for Business limits under a different name.
 4. Do denials get their own collection with a TTL (like `exec_audit`), or is structured
    logging enough until P2 needs to query them?
+5. **`TenantSettings.max_members` defaults to 100 while Free's `PlanLimits.max_members` is
+   10** — the two dead sources of truth disagree by 10×, so whichever is wired changes who
+   is over the line. Found during P0; feeds decision 2.
 
 ## Out of scope
 

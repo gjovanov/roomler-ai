@@ -24,6 +24,25 @@ pub struct Tenant {
     pub deleted_at: Option<DateTime>,
 }
 
+/// FR-31 — how far plan-limit checks are allowed to go for a tenant.
+///
+/// Mirrors [`crate::models::OverlayNetwork`]'s `acl_mode` deliberately, and for
+/// the same reason: turning eleven previously-unenforced gates on against a live
+/// fleet would lock out tenants that *we* let over the line. `Warn` is the
+/// default rather than `Off` because a mode that does nothing produces no data,
+/// and learning who *would* be denied is the entire point of the observe phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEnforcement {
+    /// No check runs at all.
+    Off,
+    /// The check runs and the denial is recorded, but the request succeeds.
+    #[default]
+    Warn,
+    /// The denial is returned to the caller.
+    Enforce,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Plan {
@@ -74,6 +93,18 @@ pub struct TenantSettings {
     /// is enabled.
     #[serde(default)]
     pub remote_ssh_enabled: bool,
+
+    /// FR-31 — how far plan-limit checks may go for this tenant. Defaults to
+    /// `Warn`, so a pre-FR-31 tenant document deserialises into observe mode:
+    /// every newly wired gate is measured and logged, and none of them refuse.
+    ///
+    /// ⚠ This does NOT apply to the limits that were already enforced before
+    /// FR-31 (`max_devices`, `max_tunnel_clients`) — see
+    /// `roomler_ai_services::quota::Limit::is_established`. An established
+    /// limit always enforces, so setting `Off` can never silently un-enforce
+    /// the device cap.
+    #[serde(default)]
+    pub plan_enforcement: PlanEnforcement,
 }
 
 impl Default for TenantSettings {
@@ -89,6 +120,7 @@ impl Default for TenantSettings {
             magic_dns_nameservers: Vec::new(),
             remote_exec_enabled: false,
             remote_ssh_enabled: false,
+            plan_enforcement: PlanEnforcement::default(),
         }
     }
 }
