@@ -1,3 +1,10 @@
+// RETIRED-NAME-ANCHOR-BEGIN
+// This whole module IS the legacy-segment fallback. Every occurrence of a
+// retired name in it is the OLD half of a dual-read — the module doc explaining
+// the new-then-old resolution, `OLD_APP`, `migrate_legacy_trees`, and the tests
+// that build a legacy tree in order to migrate it.
+// INVARIANT: if you add a retired name here that is NOT the old half of a
+// dual-read, that is a bug, not a new exemption. docs/fr/FR-21
 //! Roomler node application directories with a legacy-segment fallback.
 //!
 //! The controlled-host daemon is being renamed `roomler-agent` -> `roomlerd`
@@ -565,3 +572,5 @@ mod tests {
         );
     }
 }
+
+// RETIRED-NAME-ANCHOR-END
