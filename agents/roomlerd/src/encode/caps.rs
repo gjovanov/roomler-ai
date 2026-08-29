@@ -88,6 +88,10 @@ mod child {
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("caps-probe")
             .env(CHILD_ENV, "1")
+            // S2 config fallbacks are process-local: hand them to the child as
+            // real env vars, or every knob it reads falls to its built-in
+            // default (FR-19 P4c: `relay-server` was never advertised).
+            .envs(tunnel_core::env::config_fallbacks_for_child())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             // Inherited on purpose: the child's own probe logging is the
@@ -230,7 +234,13 @@ const PROBE_HEIGHT: u32 = 270;
 pub fn detect() -> AgentCaps {
     CACHED_CAPS
         .get_or_init(|| match child::probe() {
-            Some(caps) => caps,
+            Some(mut caps) => {
+                // The RPC verbs are config-derived, not driver-probed: compute
+                // them HERE, where the config fallbacks are registered,
+                // whatever the child saw.
+                caps.rpc = rpc_caps();
+                caps
+            }
             None => {
                 // The child died, hung, or could not be launched. "Codec
                 // unavailable" is the only honest reading: we have no
