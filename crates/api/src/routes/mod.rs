@@ -36,6 +36,7 @@ pub mod room;
 pub mod setup_release;
 pub mod stats;
 pub mod stripe;
+pub mod subscribe;
 pub mod tenant;
 pub mod tunnel;
 pub mod tunnel_release;
