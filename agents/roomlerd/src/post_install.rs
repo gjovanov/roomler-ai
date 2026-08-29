@@ -284,6 +284,8 @@ fn install_flavour(origin: Option<&std::path::Path>) -> crate::updater::WindowsI
 /// new binary's `--version`. Through rc.194 the watcher's own
 /// current_exe path was ALSO the path the installer wrote to (msiexec
 /// replaced the file in place while we were running; our memory map
+/// RETIRED-NAME-ANCHOR(4): names the folder hosts installed BEFORE P4b; the
+/// migration reads it, so the old name is the input, not a leftover.
 /// stayed valid). P4b renamed the install folder (`roomler-agent` →
 /// `Roomler`), so on the rename hop the watcher — spawned from the OLD
 /// directory — only ever sees the stale pending-delete binary at its
@@ -502,6 +504,8 @@ fn ensure_service_running(
 /// install directory for this flavour
 /// (`…\Roomler\roomlerd.exe`) when the own-path probe couldn't
 /// verify the expected version. On the rename-hop upgrade the
+/// RETIRED-NAME-ANCHOR(4): same pre-P4b folder — the watcher must run from
+/// the directory being vacated, which still carries the retired name.
 /// watcher runs from the vacated `roomler-agent\` directory, so its
 /// own path never sees the freshly-installed binary. Record-only,
 /// like the rest of the watcher: a version match here upgrades the
@@ -549,7 +553,7 @@ fn renamed_daemon_candidate(flavour: crate::updater::WindowsInstallFlavour) -> O
         .map(|dir| dir.join("roomlerd.exe"))
 }
 
-/// Whether a `--version` line (e.g. "roomler-agent 0.1.50") contains
+/// Whether a `--version` line (e.g. "roomlerd 0.1.50") contains
 /// the version triple from `expected_tag` (e.g. "agent-v0.1.50").
 /// Tolerant on the prefix so we don't have to track release-tool
 /// formatting changes.
@@ -741,19 +745,19 @@ mod tests {
 
     #[test]
     fn version_matches_when_output_contains_triple() {
+        assert!(version_matches("roomlerd 0.1.50", "agent-v0.1.50"));
+        assert!(version_matches("roomlerd 0.1.50", "0.1.50"));
+        assert!(version_matches("roomlerd 0.1.50", "v0.1.50"));
+        assert!(version_matches("roomlerd 1.2.3 (some-build-id)", "v1.2.3"));
+        // RETIRED-NAME-ANCHOR(2): a ROLLBACK re-runs the previous binary, which
+        // still prints the pre-FR-21 name. Prefix tolerance is the contract.
         assert!(version_matches("roomler-agent 0.1.50", "agent-v0.1.50"));
-        assert!(version_matches("roomler-agent 0.1.50", "0.1.50"));
-        assert!(version_matches("roomler-agent 0.1.50", "v0.1.50"));
-        assert!(version_matches(
-            "roomler-agent 1.2.3 (some-build-id)",
-            "v1.2.3"
-        ));
     }
 
     #[test]
     fn version_does_not_match_different_triple() {
-        assert!(!version_matches("roomler-agent 0.1.49", "agent-v0.1.50"));
-        assert!(!version_matches("roomler-agent 1.0.0", "agent-v0.0.1"));
+        assert!(!version_matches("roomlerd 0.1.49", "agent-v0.1.50"));
+        assert!(!version_matches("roomlerd 1.0.0", "agent-v0.0.1"));
         assert!(!version_matches(
             "totally unrelated string",
             "agent-v0.1.50"
@@ -765,8 +769,8 @@ mod tests {
         // We refuse to match against malformed tags so a
         // server-side typo can't smuggle a "successful" verdict
         // through.
-        assert!(!version_matches("roomler-agent 0.1.50", "not-a-version"));
-        assert!(!version_matches("roomler-agent 0.1.50", ""));
+        assert!(!version_matches("roomlerd 0.1.50", "not-a-version"));
+        assert!(!version_matches("roomlerd 0.1.50", ""));
     }
 
     #[test]
@@ -779,7 +783,7 @@ mod tests {
             finished_unix: Some(200),
             installer_exit_code: Some(0),
             new_binary_path: Some("C:/agent.exe".into()),
-            new_binary_version: Some("roomler-agent 0.1.50".into()),
+            new_binary_version: Some("roomlerd 0.1.50".into()),
             status: InstallStatus::SucceededVerified,
             note: "ok".into(),
         };
