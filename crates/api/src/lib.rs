@@ -696,7 +696,7 @@ pub fn build_router(state: AppState) -> Router {
         // normalised server-side). User-scoped, not tenant-scoped: a
         // user navigates across orgs within one session.
         .route("/stats/pageview", post(routes::stats::page_view))
-        // FR-38 — the public updates list. No auth extractor: `subscribe` is an
+        // FR-39 — the public updates list. No auth extractor: `subscribe` is an
         // open form, and for the other two the unguessable token IS the
         // capability (same shape as `public_consent_routes` above). Flat rather
         // than nested so the POST target and its two token paths read together.

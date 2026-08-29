@@ -313,7 +313,7 @@ const plans = ref<LandingPlan[]>([
   { id: 'business', name: 'Business', price_cents: 1600, features: ['300 devices', 'Everything in Pro', 'Priority support'] },
 ])
 
-// FR-38 — where the confirm / unsubscribe links land. The API redirects here
+// FR-39 — where the confirm / unsubscribe links land. The API redirects here
 // with `?subscribe=<outcome>` rather than rendering its own page, so the
 // message arrives in the product's own voice. The param is stripped afterwards
 // so a reload does not repeat the message and a shared URL carries no state.

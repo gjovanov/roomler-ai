@@ -61,7 +61,7 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --b
 
 > **The first build takes 10–20 minutes** — it compiles the Rust server and
 > mediasoup from source. Subsequent starts are seconds. A prebuilt image is
-> tracked in [FR-38](fr/FR-38-launch-readiness.md); until it ships, `--build` is
+> tracked in [FR-39](fr/FR-39-launch-readiness.md); until it ships, `--build` is
 > the only path.
 
 Watch it come up:
@@ -221,7 +221,7 @@ re-enroll.
 ## Known limitations, stated plainly
 
 - **No prebuilt image yet.** First run compiles from source. Tracked in
-  [FR-38](fr/FR-38-launch-readiness.md).
+  [FR-39](fr/FR-39-launch-readiness.md).
 - **Single node.** The compose stack is one API instance. Multi-pod scale-out is
   supported by the code (Redis fan-out, leader-gated startup) but is a
   Kubernetes topology, not this file — see

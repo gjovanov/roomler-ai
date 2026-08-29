@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 G ROX EOOD -->
 <!--
-  FR-38 — the fallback for a visitor who is interested but not ready to create
+  FR-39 — the fallback for a visitor who is interested but not ready to create
   an account. Without it, everyone who does not convert on the spot is
   unreachable forever, and every burst of traffic is a spike rather than an
   audience.
