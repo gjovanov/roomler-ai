@@ -25,9 +25,13 @@
         :data-stream-key="streamKey"
       />
 
-      <!-- Avatar overlay when video is off (positioned on top of video) -->
+      <!-- Avatar overlay when video is off (positioned on top of video).
+           FR-30 P3 — `videoPaused` is the PEER's own word for it. Without it a
+           camera-off participant showed their last frame, frozen, forever:
+           the track keeps reading live+unmuted on this side, so `hasVideoTrack`
+           cannot tell. A frozen face is worse than an avatar — it looks live. -->
       <div
-        v-if="!hasVideoTrack"
+        v-if="!hasVideoTrack || videoPaused"
         class="d-flex align-center justify-center w-100 h-100 bg-grey-darken-4"
         style="position: absolute; top: 0; left: 0; z-index: 1"
       >
@@ -44,6 +48,16 @@
         size="18"
       >
         mdi-pin
+      </v-icon>
+
+      <!-- Camera-off indicator (FR-30 P3) -->
+      <v-icon
+        v-if="videoPaused"
+        class="camera-indicator"
+        color="error"
+        size="20"
+      >
+        mdi-video-off
       </v-icon>
 
       <!-- Muted indicator -->
@@ -121,6 +135,9 @@ const props = withDefaults(defineProps<{
   compact?: boolean
   showActions?: boolean
   streamKey?: string
+  /** FR-30 P3 — the peer said their camera is off. Not derivable here: their
+      track reads live+unmuted on this side either way. */
+  videoPaused?: boolean
 }>(), {
   isPinned: false,
   isActiveSpeaker: false,
@@ -128,6 +145,7 @@ const props = withDefaults(defineProps<{
   compact: false,
   showActions: false,
   streamKey: '',
+  videoPaused: false,
 })
 
 defineEmits<{
@@ -324,6 +342,17 @@ defineExpose({ videoRef })
   border-radius: 50%;
   padding: 2px;
   z-index: 2;
+}
+
+.camera-indicator {
+  position: absolute;
+  bottom: 8px;
+  /* Left of the mic badge: camera-off and mic-off happen together often
+     enough that they must not sit on top of each other. */
+  right: 40px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 50%;
+  padding: 4px;
 }
 
 .mute-indicator {

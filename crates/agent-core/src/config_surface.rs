@@ -457,6 +457,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "HW-downscale Phase B - GPU scale-before-readback (D3D11 VideoProcessor) on DXGI-direct capture: the Smoother rung is scaled on the GPU and the readback shrinks with it. Built-in default: on; off reverts to the Phase-A CPU resample. Env: ROOMLERD_GPU_SCALE. Restart required.",
     ),
     (
+        "overlay_lan_capture_probe",
+        "tribool",
+        "FR-33 - probe each LAN prefix for a corp-VPN split-prefix capture (own address on interface A, traffic to the prefix leaves via interface B) and surface it in status / why / the RC pill. Built-in default: on (a read-only route lookup per LAN address per netstate snapshot). Env: ROOMLERD_OVERLAY_LAN_CAPTURE_PROBE. Restart required.",
+    ),
+    (
         "idle_refine_max_edge",
         "string",
         "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLERD_IDLE_REFINE_MAX_EDGE. Restart required.",
@@ -732,6 +737,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "idle_refine" => cfg.idle_refine.map(fmt_bool),
         "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
         "gpu_scale" => cfg.gpu_scale.map(fmt_bool),
+        "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
         "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
         "idle_refine_major_area_permille" => {
@@ -1105,6 +1111,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine" => cfg.idle_refine = parse_tribool(value)?,
         "idle_refine_balanced" => cfg.idle_refine_balanced = parse_tribool(value)?,
         "gpu_scale" => cfg.gpu_scale = parse_tribool(value)?,
+        "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
         "idle_refine_min_frame_kb" => {
             cfg.idle_refine_min_frame_kb = parse_u32_range(key, value, 0, 256)?
