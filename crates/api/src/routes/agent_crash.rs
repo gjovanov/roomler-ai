@@ -34,7 +34,7 @@ use crate::{
 };
 
 /// Maximum `log_tail` byte length accepted by the ingest endpoint.
-/// Matches `roomler_agent::crash_recorder::MAX_PAYLOAD_BYTES` so a
+/// Matches `roomlerd::crash_recorder::MAX_PAYLOAD_BYTES` so a
 /// drift on either side surfaces as a 422 (server) or a serialise-
 /// time failure (agent), not silent data loss.
 const MAX_LOG_TAIL_BYTES: usize = 64 * 1024;

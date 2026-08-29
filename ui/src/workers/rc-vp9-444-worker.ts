@@ -14,7 +14,7 @@
  * worker is independent of the broken-in-Chrome 131 RTP transform
  * path.
  *
- * Wire format (matches `agents/roomler-agent/src/encode/libvpx.rs`):
+ * Wire format (matches `agents/roomlerd/src/encode/libvpx.rs`):
  *
  *   struct Frame {
  *     u32  size_le;          // payload length, little-endian
@@ -293,6 +293,15 @@ function maybeEmitStats(): void {
     bytesReceivedTotal: statsBytesTotal,
     decodeQueueSize: decoder?.decodeQueueSize ?? 0,
     framesDroppedBacklog,
+    // FR-17 - the framing counters, surfaced rather than left
+    // internal: a rising `chunkStragglers` with steady fps is the
+    // unordered transport WORKING (late chunks discarded without
+    // harming the frames after them), while a rising `chunkGaps`
+    // is real loss costing an IDR each. Told apart only if both
+    // are readable - FR-18 shipped a counter nothing read and its
+    // acceptance criterion became unmeasurable.
+    chunkGaps: framingState.gaps,
+    chunkStragglers: framingState.stragglers,
     paint: paintStats.snapshotAndReset(),
     // FR-1 P7 — end-to-end frame age; null until the clock probe lands.
     age: clockOffsetUs !== null ? ageStats.snapshotAndReset() : null,

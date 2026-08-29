@@ -33,7 +33,7 @@
 //! understand the integration coverage matrix.
 
 use crate::fixtures::test_app::TestApp;
-use roomler_agent::{config::AgentConfig, encode::EncoderPreference, enrollment, signaling};
+use roomlerd::{config::AgentConfig, encode::EncoderPreference, enrollment, signaling};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -48,8 +48,8 @@ fn spawn_agent_signaling(
     tokio::spawn(async move {
         let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
-        let broker = roomler_agent::consent::ConsentBroker::new(
-            roomler_agent::consent::Mode::AutoGrant,
+        let broker = roomlerd::consent::ConsentBroker::new(
+            roomlerd::consent::Mode::AutoGrant,
             std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
         )
         .expect("consent broker init");
@@ -67,17 +67,22 @@ fn spawn_agent_signaling(
             // an empty slot is the correct value, not a stub.
             Default::default(),
             broker,
-            roomler_agent::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            roomlerd::tunnel::client_mgr::TunnelClientHub::new("test".into()),
             // Remote config: tests never PUSH one, but the live `exec_enabled`
             // must still be SEEDED from the config this agent was handed —
             // which is exactly what `main.rs` does. See agent_exec_tests for
             // the failure hardcoding `false` produced.
-            roomler_agent::remote_config::RemoteConfigServices::new(
+            roomlerd::remote_config::RemoteConfigServices::new(
                 std::path::PathBuf::from("unused-in-tests.toml"),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 exec_enabled,
                 remote_config_enabled,
             ),
+            // FR-27 — the live remote-control session registry. Tests never
+            // read it back, but the signalling loop registers into it, so a
+            // fresh one per harness is the honest value (not a shared global
+            // that would leak sessions between tests).
+            roomlerd::rc_sessions::RcSessionRegistry::new(),
         )
         .await;
     })

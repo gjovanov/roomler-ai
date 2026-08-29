@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Name=Roomler
+GenericName=Remote access companion
+Comment=Device status, network peers, tunnel routes, and remote-control consent prompts
+Exec=/usr/bin/roomler-desktop
+Icon=roomler-desktop
+Terminal=false
+Categories=Network;RemoteAccess;Utility;
+Keywords=roomler;remote;mesh;vpn;tunnel;
+
+# The same file is installed twice — once in /usr/share/applications (the
+# launcher entry) and once in /etc/xdg/autostart (start it at login). That is
+# deliberate: this app is the device's consent PROMPT surface, and a device set
+# to "Prompt on host" whose companion is not running cannot ask anybody. The
+# operator finds out by a session timing out for no stated reason.
+#
+# To opt out per user, without touching the package:
+#   mkdir -p ~/.config/autostart
+#   cp /etc/xdg/autostart/roomler-desktop.desktop ~/.config/autostart/
+#   echo 'Hidden=true' >> ~/.config/autostart/roomler-desktop.desktop
+#
+# Wait for a tray to exist before starting: on GNOME/KDE the app-indicator host
+# comes up after the session bus, and a companion that raced it lands with no
+# tray icon at all.
+X-GNOME-Autostart-Phase=Applications
+X-GNOME-Autostart-Delay=5

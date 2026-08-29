@@ -1,5 +1,5 @@
 [package]
-name = "roomler-agent-core"
+name = "roomler-core"
 license = "MPL-2.0"
 publish = false
 version.workspace = true
@@ -7,7 +7,7 @@ edition.workspace = true
 description = "Daemon-free agent building blocks: config, enrollment, machine id, logging, sentinels — shared by roomlerd and the desktop companion."
 
 [lib]
-name = "roomler_agent_core"
+name = "roomler_core"
 path = "src/lib.rs"
 
 # P3e lever E. These modules moved OUT of `roomler-agent` verbatim because the

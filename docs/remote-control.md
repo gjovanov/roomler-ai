@@ -45,7 +45,7 @@ The only genuinely new component is the **native agent** (a separate Rust binary
 
 > **See also — the `roomler-tunnel` subsystem.** A sibling of remote-control that reuses the same agent binary, `rc:*` signaling, and coturn cluster, but for **TCP port-forwarding** (operator's `127.0.0.1:<port>` → agent → an internal service) rather than screen capture + input. Its data plane defaults to **QUIC** (`quic-v1`, quinn) with a WebRTC-data-channel fallback, and crosses corporate NAT / firewalls via the same direct → TURN(UDP) → TURNS/TCP tier walk. The server negotiates `quic-v1` only for agents new enough to speak it (≥ rc.104). Operator guide: [`docs/tunnel-install.md`](./tunnel-install.md).
 
-> **See also — the L3 overlay & its Windows firewall override.** The `overlay-l3` feature evolves the tunnel into a Tailscale-style per-tenant WireGuard+DERP mesh (Wintun NIC `roomler`, overlay IPs `100.64.0.0/10`). On a GPO-locked Windows host the corporate Defender Firewall drops unsolicited inbound on the overlay adapter; the agent overrides this by programming the Windows Filtering Platform directly (a LUID-scoped, high-weight hard-permit sublayer) from its LocalSystem service. Design, limits (callout/IPsec), and the `ROOMLER_AGENT_WFP_PERMIT` disable: [`docs/overlay-wfp.md`](./overlay-wfp.md).
+> **See also — the L3 overlay & its Windows firewall override.** The `overlay-l3` feature evolves the tunnel into a Tailscale-style per-tenant WireGuard+DERP mesh (Wintun NIC `roomler`, overlay IPs `100.64.0.0/10`). On a GPO-locked Windows host the corporate Defender Firewall drops unsolicited inbound on the overlay adapter; the agent overrides this by programming the Windows Filtering Platform directly (a LUID-scoped, high-weight hard-permit sublayer) from its LocalSystem service. Design, limits (callout/IPsec), and the `ROOMLERD_WFP_PERMIT` disable: [`docs/overlay-wfp.md`](./overlay-wfp.md).
 
 ## 3. High-level topology
 
@@ -144,7 +144,7 @@ So: native agent for the *host*, browser for the *controller*. This is the same 
 ### 4.2 Agent crate layout
 
 ```
-agents/roomler-agent/
+agents/roomlerd/
 ├── Cargo.toml                 # workspace member of the main repo
 ├── src/
 │   ├── main.rs                # tray/CLI entry
@@ -498,7 +498,78 @@ export function useRemoteControl(sessionId: string) {
 
 ### 11.2 Consent
 
-Even with full unattended permission granted by org policy, the controlled user can be configured to see a non-blocking toast: *"Goran is requesting control. [Allow] [Deny] (auto-deny in 25s)"*. Default for org members controlling org devices: **prompt every session**. Default for self-controlling-self (e.g., your laptop from your phone): **no prompt**, owner identity proven by JWT.
+Five modes, set per device (`AccessPolicy.consent_mode`, admin-set, default
+`prompt`). The server resolves one per session and sends it to the agent as a
+directive on `ServerMsg::Request`:
+
+| mode | who is asked | window | agent behaviour |
+|---|---|---|---|
+| `auto` | nobody | — | grants immediately |
+| `prompt` | whoever is at the device | 30 s | raises an on-host prompt |
+| `email` | the device OWNER, by approve-link | 5 min | waits; the SERVER resolves |
+| `push` | the device owner, by web-push card | 5 min | waits; the SERVER resolves |
+| `prompt_then_email` | **both, in parallel** | host 30 s / owner 5 min | prompts AND the server emails |
+
+`prompt_then_email` is "and", not "then" — the mail goes out at once. What is
+sequential is the two windows: the host modal closes after the attended window
+while the emailed link keeps the full async one, so a host nobody answers hands
+over to the owner rather than ending the session. An explicit host **Deny** does
+end it — the person at the machine said no.
+
+**The owner shortcut.** Controlling a device you OWN resolves to `auto` before
+the policy is read (`resolve_session_authz`), because unattended access to your
+own headless boxes is the common case. ⚠️ That made the picker look broken on
+any fleet where one person owns every device: the setting had no observable
+effect and nothing on screen said so. `AccessPolicy.prompt_owner` (FR-27,
+default off) opts the owner back in, and the Devices grid now labels the state
+either way.
+
+**The device has the last word.** The directive is a CEILING. A device with
+`auto_grant_session = false` prompts even under an `auto` directive — the agent
+resolves the two through `consent::strictest_of`. Same gate-4 principle as exec
+and SSH: the device's own refusal survives a server that has been talked into
+something. The floor defeats `auto` only; `email`/`push` do not auto-grant, so a
+device that merely refuses to auto-grant has no standing to force a second
+prompt onto the host.
+
+**Prompt surfaces.** A chain, probed per prompt and logged per prompt
+(`native` + `have_surface` on one line):
+
+1. **native** — the daemon draws the panel itself. Windows
+   (`viewer-indicator`, and `WDA_EXCLUDEFROMCAPTURE` so the requester cannot
+   see the Approve button), X11 (`viewer-indicator-x11`, an override-redirect
+   window, no capture exclusion — X has no equivalent), macOS
+   (`viewer-indicator-macos`, AppKit).
+2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
+   starts it if it is not running (`companion::ensure_running`).
+3. **CLI** — `roomler consent --list` / `--approve`, which works everywhere.
+4. **none** — reported as `no_prompt_surface`, not as a deny.
+
+⚠️ The `.pending` marker is written in ALL cases, because it is also what
+`roomler consent --list` reads. `ConsentRequest.surface` is what stops the
+companion from popping a second panel over a native one.
+
+⚠️ **macOS native requires tokio off the main thread.** AppKit delivers events
+on the main run loop and `#[tokio::main]` parks it, so under
+`viewer-indicator-macos` the runtime moves to a worker and `main` hands the
+main thread to `NSApp`. That is why the feature is compiled by CI but not yet
+in the macOS release build.
+⚠️ **The macOS panel appears in the captured stream.** `NSWindowSharingNone` is
+ignored by `CGDisplayStream`, which is what our capture uses. ⚠️ Since FR-27 the marker is written by **all three**
+consent-bearing subsystems — remote control, Fleet-RPC `exec` and Roomler SSH —
+carrying a `kind` so the modal does not describe a root command as "wants to
+control this device". Before that only remote control wrote one, so an `exec` or
+SSH prompt reached no UI at all. The daemon also starts the companion when a
+prompt begins (`companion::ensure_running`), since nothing used to.
+
+**A refusal says which refusal it is.** `rc:consent` carries an optional
+`reason`; an absent one is an ordinary deny, which is what a bare
+`granted: false` has always meant. ⚠️ Until FR-27 the agent's own prompt
+timeout produced exactly that bare `false`, and the hub terminated it as
+`EndReason::UserDenied` — so "nobody was at the machine" reached the controller
+as "a human refused you". The three now end as `UserDenied`,
+`ConsentTimeout` and `NoPromptSurface`, and the viewer renders a sentence per
+case rather than the enum name.
 
 ### 11.3 Recording & audit consent
 
@@ -573,6 +644,11 @@ keyboard component.*
 2. Should an in-progress remote control session be **shareable into a roomler call** as a screen share automatically? The plumbing supports it; it's a UX call.
 3. **Recording storage**: piggyback on the existing MinIO setup, or push to S3-compatible per-org bucket? Existing MinIO is fine for v1.
 4. **Mobile controller** keyboard UX is genuinely hard (no physical keys, lots of host-OS shortcuts to send). v1 should be view + tap-to-click only on mobile, full input on desktop browsers.
+
+<!-- RETIRED-NAME-ANCHOR-BEGIN: §17-19 are historical appendices. They record what the
+     product was called and what operators actually typed at the time (0.1.32 - rc.26),
+     so rewriting `roomler-agent` to `roomlerd` here would falsify the record rather
+     than update it. The CURRENT encoder reference is docs/encoders.md. docs/fr/FR-21 -->
 
 ## 17. Hardware encoder backends
 
@@ -664,7 +740,7 @@ keyframe comes out or the cascade bottoms at `NoopEncoder`.
 
 To reproduce locally:
 
-    cargo build -p roomler-agent --release --features full-hw
+    cargo build -p roomlerd --release --features full-hw
     target\release\roomler-agent.exe encoder-smoke --encoder hardware
 
 With the `full-hw` build, the MF backend code is present but only
@@ -1029,7 +1105,7 @@ P0 cut.
 
 The five P0 phases that made the agent stop dying silently.
 
-**Persistent file logging + panic hook** (`agents/roomler-agent/src/
+**Persistent file logging + panic hook** (`agents/roomlerd/src/
 logging.rs`): daily-rolling appender via `tracing-appender` at the
 platform data-local dir (`%LOCALAPPDATA%\roomler\roomler-agent\
 data\logs\` on Win; `~/.local/share/roomler-agent/logs/` on Linux;
@@ -1042,7 +1118,7 @@ output BEFORE delegating to the previous hook — the sync write
 is the belt-and-braces against the non-blocking appender's worker
 not draining the queue before the OS reaps a panicking process.
 
-**Windows Scheduled Task XML rewrite** (`agents/roomler-agent/src/
+**Windows Scheduled Task XML rewrite** (`agents/roomlerd/src/
 service.rs::render_task_xml`): replaced `schtasks /Create /SC
 ONLOGON ...` with `schtasks /Create /XML <utf-16-le-bom-tempfile>`.
 Schema 1.2 (broadest universally-supported version, Win 7+).
@@ -1062,7 +1138,7 @@ Brings Windows to parity with systemd `Restart=on-failure` (already
 in `packaging/linux/roomler-agent.service`) and macOS launchd
 `KeepAlive` (already in `packaging/macos/com.roomler.agent.plist`).
 
-**Single-instance lock** (`agents/roomler-agent/src/instance_lock.rs`):
+**Single-instance lock** (`agents/roomlerd/src/instance_lock.rs`):
 prevents an interactive `roomler-agent run` from racing the
 Scheduled-Task / systemd-launched copy in the same user session.
 Win: `CreateMutexW` named `Local\RoomlerAgent-<sha-prefix12-of-
@@ -1075,7 +1151,7 @@ after `kill -9`. Only `run` gates on the lock — `enroll`,
 `service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
 `self-update` stay runnable alongside a live agent.
 
-**Internal liveness watchdog** (`agents/roomler-agent/src/watchdog.
+**Internal liveness watchdog** (`agents/roomlerd/src/watchdog.
 rs`): process-singleton via `OnceLock<Arc<Watchdog>>`; pumps tick
 via global `watchdog::tick("name")` free helpers (no parameter
 threading). Per-pump thresholds — signaling: 90s (keepalive cadence
@@ -1092,7 +1168,7 @@ wakes every 30s, force-exits if the async watchdog hasn't bumped
 its `AtomicU64` heartbeat in 60s — catches a fully-deadlocked
 tokio runtime.
 
-**Token revocation grace** (`agents/roomler-agent/src/signaling.rs`):
+**Token revocation grace** (`agents/roomlerd/src/signaling.rs`):
 replaced the `AuthRejected → hard exit` branch with a backoff ladder
 (`auth_backoff_for`): 30s → 60s → 5min → 1h capped. Server-side
 JWT cache flushes during a deploy used to permanently break every
@@ -1111,7 +1187,7 @@ Pure resolver `resolve_check_interval_with(env_value, cfg_value)`
 extracted so tests don't race on process env. Defaults to the
 existing 24 h built-in.
 
-**Post-install watcher** (`agents/roomler-agent/src/post_install.rs`):
+**Post-install watcher** (`agents/roomlerd/src/post_install.rs`):
 new hidden CLI subcommand `roomler-agent post-install-watch
 --installer-pid <pid> --installer-path <path> --expected-version
 <tag>`. Spawned by `updater::spawn_installer_with_watch` as a
@@ -1195,7 +1271,7 @@ so a future "let me bump these back in" diff fails CI.
 
 ### 19.5 MSI auto-registers Scheduled Task (0.1.54)
 
-WiX custom actions in `agents/roomler-agent/wix/main.wxs`:
+WiX custom actions in `agents/roomlerd/wix/main.wxs`:
 
 - `RegisterAutostart`: `FileKey='roomler_agent_exe'
   ExeCommand='service install' Execute='deferred' Impersonate='yes'
@@ -1289,7 +1365,7 @@ dropping the WS. With this in place, "agent online" can be defined as
 `last_seen_at > now − 90 s` (3× cadence tolerance for one missed
 tick).
 
-Agent (`agents/roomler-agent/src/signaling.rs`) adds a 30 s
+Agent (`agents/roomlerd/src/signaling.rs`) adds a 30 s
 `tokio::time::interval` arm to the connect_once `select!`. v1 sends
 `rss_mb=0`, `cpu_pct=0.0` (process-self metrics deferred to a follow-
 up that adds the `sysinfo` crate); `active_sessions = peers.len()`
@@ -1320,7 +1396,7 @@ Optional opt-in alternative to the Scheduled Task auto-start, for
 fleet / unattended deployments. Two milestones landed; M3 + M4 + M5
 are deferred (see §19.8.5).
 
-**M1 — service host skeleton** (`agents/roomler-agent/src/win_service/
+**M1 — service host skeleton** (`agents/roomlerd/src/win_service/
 mod.rs`):
 
   - `install(exe_path)` registers `RoomlerAgentService` with the SCM
@@ -1381,3 +1457,5 @@ SystemContext capture (rc.1–rc.7, hardened through rc.26 behind
 `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP`), M5 field verification, and the perMachine
 MSI flavour (`wix-perMachine/`). The operator-facing verification procedure lives
 in [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md).
+
+<!-- RETIRED-NAME-ANCHOR-END: end of the historical appendices (§17-19). -->

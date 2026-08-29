@@ -72,7 +72,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import sys, struct, pathlib
-          icons = pathlib.Path("agents/roomler-agent-tray/icons")
+          icons = pathlib.Path("agents/roomler-desktop/icons")
           bad = []
           for name in ("tray.png", "icon.png"):
               p = icons / name
@@ -130,6 +130,13 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
+
+      # FR-27 — the native X11 consent panel. Off by default, so the workspace
+      # clippy above never sees it; without this step it would compile in NO
+      # lane until a release tag, which is exactly the "invisible until
+      # <platform> builds it" class the macOS job exists for.
+      - name: Run clippy on the X11 consent panel
+        run: cargo clippy -p roomlerd --lib --features viewer-indicator-x11 -- -D warnings
 
       # The step above is deliberately NOT `--all-targets`, so it never
       # compiles `#[cfg(test)]` bodies — the same blind spot the API-unit-test
@@ -197,7 +204,7 @@ jobs:
       # feature not used." `libclang-dev` (installed above) is the
       # bindgen runtime requirement.
       - name: Check agent --features vp9-444
-        run: cargo check -p roomler-agent --features vp9-444,vp9-444-bindgen
+        run: cargo check -p roomlerd --features vp9-444,vp9-444-bindgen
 
       - name: Test agent under vp9-444
         # Runs the full `--features vp9-444` lib test suite:
@@ -221,13 +228,13 @@ jobs:
         #     Rust on Linux (X11 headers already installed above).
         #   - roomler SSH (`ssh-server`, which implies `overlay-netstack`):
         #     same trap the clipboard note above describes, and it had already
-        #     sprung — `agents/roomler-agent/src/ssh.rs`'s suite (host key,
+        #     sprung — `agents/roomlerd/src/ssh.rs`'s suite (host key,
         #     auth accept/deny, grant redemption, single-use, expiry) is
         #     `#[cfg(feature = "ssh-server")]` and was in NO CI lane, so none
         #     of it ran here. It also puts the Unix half of the privilege drop
         #     under test on a real Linux host, which a Windows dev box cannot
         #     exercise at all. russh is pure Rust; the cost is compile time.
-        run: cargo test -p roomler-agent --features vp9-444,vp9-444-bindgen,clipboard,ssh-server --lib
+        run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server --lib
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
@@ -261,7 +268,7 @@ jobs:
         # Phase 3b: the agent's overlay glue (overlay.rs + the main /
         # signaling hooks) only compiles under the opt-in feature, so the
         # default --workspace clippy never sees it. Lint it explicitly.
-        run: cargo clippy -p roomler-agent --features overlay-l3 -- -D warnings
+        run: cargo clippy -p roomlerd --features overlay-l3 -- -D warnings
 
       - name: Multi-org shared TUN against real kernel networking
         # The mux's bookkeeping is unit-tested against a fake device; the half
@@ -281,8 +288,8 @@ jobs:
           # Build FIRST with human diagnostics. The json pass below would
           # otherwise swallow a compile error into records jq drops, leaving
           # only an empty $BIN and "sudo: : command not found".
-          cargo test -p roomler-agent --features overlay-l3 --lib --no-run
-          BIN=$(cargo test -p roomler-agent --features overlay-l3 --lib \
+          cargo test -p roomlerd --features overlay-l3 --lib --no-run
+          BIN=$(cargo test -p roomlerd --features overlay-l3 --lib \
                   --no-run --message-format=json \
                 | jq -r 'select(.profile.test == true) | .executable' | head -1)
           echo "test binary: $BIN"
@@ -328,7 +335,7 @@ jobs:
       # (`src/pty.rs`, `exec.rs`'s privilege drop); check-only, so it costs a
       # compile and not a link.
       - name: cargo check agent (ssh-server — the raw-libc surface)
-        run: cargo check -p roomler-agent --lib --features ssh-server
+        run: cargo check -p roomlerd --lib --features ssh-server
 
       # The capture path is the OTHER macOS-only surface, and until rc.454 it
       # compiled nowhere but a release tag either. It now calls
@@ -337,24 +344,32 @@ jobs:
       # target. `scrap-capture` also pulls in the quartz backend itself, so
       # this is the only lane that type-checks the fork at all.
       - name: cargo check agent (scrap-capture — the macOS capture surface)
-        run: cargo check -p roomler-agent --lib --features scrap-capture
+        run: cargo check -p roomlerd --lib --features scrap-capture
+
+      # FR-27 — the native AppKit consent panel. `--bins` as well as `--lib`,
+      # and that is the whole point: this feature ALSO changes `main.rs`, which
+      # is a separate crate root, to move tokio off the main thread so AppKit
+      # can pump. A `--lib` check would compile the panel and miss the swap
+      # entirely — the exact escape rc.454 hit, one feature over.
+      - name: cargo check agent (viewer-indicator-macos — the AppKit panel + the main-thread swap)
+        run: cargo check -p roomlerd --lib --bins --features viewer-indicator-macos
 
       # `--bins`, because `--lib` alone was not enough. main.rs is a SEPARATE
       # crate root: a `#[cfg(target_os = "macos")]` block there referring to a
-      # lib module needs `roomler_agent::`, and a bare path compiles nowhere —
+      # lib module needs `roomlerd::`, and a bare path compiles nowhere —
       # but nothing on this lane ever built the binary, so rc.454's startup
       # permission preflight passed every check and then failed on master.
       # Same "invisible until a Mac compiles it" class this whole job exists
       # for, one crate root over.
       - name: cargo check agent BINARY (macOS cfg arms in main.rs)
-        run: cargo check -p roomler-agent --bins --features scrap-capture
+        run: cargo check -p roomlerd --bins --features scrap-capture
 
       # The desktop companion ships on macOS from rc.455 and owns the
       # permissions panel — the one surface that tells an operator why their
       # remote screen is blank. Its macOS arms (the TCC probes, `open` for the
       # Settings pane) exist on exactly this target.
       - name: cargo check the desktop companion
-        run: cargo check -p roomler-agent-tray
+        run: cargo check -p roomler-desktop
 
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
@@ -362,10 +377,10 @@ jobs:
         # Both checks are free here.
         run: |
           set -euo pipefail
-          for p in agents/roomler-agent/packaging/macos/*.plist; do
+          for p in agents/roomlerd/packaging/macos/*.plist; do
             plutil -lint "$p"
           done
-          bash -n agents/roomler-agent/packaging/macos/postinstall
+          bash -n agents/roomlerd/packaging/macos/postinstall
           # The daemon plist must point at a path the .pkg actually creates,
           # and must NOT reuse the LaunchAgent's Label — launchctl would
           # refuse the second bootstrap and the failure reads as "already
@@ -377,7 +392,7 @@ jobs:
           # Globbed on `com.roomler.*` — the launchd jobs — rather than every
           # .plist in the directory, which also holds entitlements.plist (a
           # codesign input with no Label at all).
-          labels=$(for p in agents/roomler-agent/packaging/macos/com.roomler.*.plist; do
+          labels=$(for p in agents/roomlerd/packaging/macos/com.roomler.*.plist; do
                      plutil -extract Label raw "$p" \
                        || { echo "::error::$p has no Label"; exit 1; }
                    done)
@@ -388,8 +403,10 @@ jobs:
           [ "$count" -ge 3 ] || { echo "::error::expected >=3 launchd jobs, found $count"; exit 1; }
           dupes=$(echo "$labels" | sort | uniq -d)
           [ -z "$dupes" ] || { echo "::error::duplicate launchd Label(s): $dupes"; exit 1; }
+          # RETIRED-NAME-ANCHOR(2): asserts the frozen bundle path. Its name keys the
+          # macOS TCC grants; FR-21 D5 freezes it. docs/fr/FR-21
           grep -q '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent' \
-            agents/roomler-agent/packaging/macos/com.roomler.daemon.plist
+            agents/roomlerd/packaging/macos/com.roomler.daemon.plist
 
       - name: macOS overlay against a real utun
         # The macOS arms of add_address_sync / add_peer_route /
@@ -447,7 +464,7 @@ jobs:
       # helpers reachable, and dropping it turns pre-existing dead-code warnings
       # into errors that have nothing to do with the change under test.
       - name: Clippy roomler-agent (overlay-l3 + ssh-server, incl. tests)
-        run: cargo clippy -p roomler-agent --features overlay-l3,ssh-server --tests -- -D warnings
+        run: cargo clippy -p roomlerd --features overlay-l3,ssh-server --tests -- -D warnings
 
   ffmpeg-encoder-check:
     # `ffmpeg-encoder` compiled in NO pull-request lane. It needs a vendored
@@ -544,7 +561,7 @@ jobs:
         # real build. Keep this set a subset of what release-agent.yml builds.
         #
         # `--all-targets` so test-only lints fire, matching the repo rule.
-        run: cargo clippy -p roomler-agent --features ffmpeg-encoder,vp9-444,vp9-444-bindgen --all-targets -- -D warnings
+        run: cargo clippy -p roomlerd --features ffmpeg-encoder,vp9-444,vp9-444-bindgen --all-targets -- -D warnings
 
       - name: Test agent --features ffmpeg-encoder
         # Test, not merely check. The ten encoder names the cascade dispatches
@@ -553,7 +570,43 @@ jobs:
         # vendored build and the dispatch table from drifting apart — a drift
         # that is invisible until a device silently falls back to software.
         # They need the library present, not a GPU.
-        run: cargo test -p roomler-agent --features ffmpeg-encoder --lib
+        run: cargo test -p roomlerd --features ffmpeg-encoder --lib
+
+  name-audit:
+    name: Retired-name audit (FR-21)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # FR-21 (#809). Two assertions, and the PAIR is what makes it sound while the
+    # migration is still in flight:
+    #
+    #   1. unclassified must not RISE   -> nobody adds a fresh retired name
+    #   2. anchors must not FALL        -> nobody deletes a dual-read fallback
+    #
+    # (2) is the half a plain ratchet misses, and it is the half that matters:
+    # deleting an anchor fails no build and no test, it just strands every
+    # pre-rename host at its next update. The macOS `.app` anchor is the worst
+    # case -- its name keys the TCC grants.
+    #
+    # P5: this job now BLOCKS. It was `continue-on-error` while P1-P4 were in
+    # flight, because a job that is red for a whole program trains people to
+    # ignore it — but an advisory guard nobody ever flips is a guard that does
+    # nothing, so the flip is the phase.
+    #
+    # It blocks on `--check`, NOT on `--check --strict`. My own spec conflated
+    # those two, and they are different steps: `--strict` demands
+    # "unclassified == 0" and master sits at ~1006, so enabling it today would
+    # make this job red on every PR for work that has not happened yet. The
+    # pair below is enforceable NOW and is what actually protects the field:
+    # nobody may add a retired name, and nobody may delete a dual-read fallback.
+    # `--strict` becomes reachable when the remaining occurrences are resolved,
+    # and flipping to it is a one-word change here.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit retired product names
+        run: bash scripts/name-audit.sh --check
+      - name: Report (always, so a red run shows WHAT moved)
+        if: always()
+        run: bash scripts/name-audit.sh --summary
 
   frontend:
     name: Frontend checks

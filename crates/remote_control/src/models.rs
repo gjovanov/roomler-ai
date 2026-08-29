@@ -366,7 +366,13 @@ impl AgentCaps {
 /// server-side per session from the device's [`AccessPolicy::consent_mode`]
 /// (with `Prompt` — attended — as the system default), then carried to the agent
 /// in `ServerMsg::Request` as a directive the agent obeys. Self-control
-/// (`controller == owner_user_id`) short-circuits to `Auto` in the API gate.
+/// (`controller == owner_user_id`) short-circuits to `Auto` in the API gate
+/// unless the device set [`AccessPolicy::prompt_owner`].
+///
+/// ⚠️ The directive is a CEILING, not a floor. A device that set
+/// `auto_grant_session = false` locally always prompts, even under `Auto` —
+/// the agent resolves the two with `consent::strictest_of`. Same rule as
+/// exec's and SSH's gate 4: the device's own refusal survives the server.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentMode {
@@ -381,7 +387,16 @@ pub enum ConsentMode {
     Email,
     /// Push an in-app consent card to the device owner (Phase 4).
     Push,
-    /// Prompt the host first; fall back to email if nobody answers (Phase 4).
+    /// Prompt the host AND email the owner, in parallel — first answer wins.
+    ///
+    /// Not a sequential fallback, despite the name: the server emails the
+    /// approve-link the moment the session is requested, at the same time as
+    /// the agent raises its on-host prompt. What IS sequential is the two
+    /// windows — the host prompt closes after
+    /// [`crate::consent::HOST_PROMPT_TIMEOUT`] while the emailed link stays
+    /// live for the full [`crate::consent::ASYNC_CONSENT_TIMEOUT`], so a host
+    /// nobody answers hands over to the owner instead of ending the session.
+    /// An explicit host *Deny* does end it: the person at the machine said no.
     PromptThenEmail,
 }
 
@@ -394,6 +409,22 @@ pub struct AccessPolicy {
     /// default.)
     #[serde(default)]
     pub consent_mode: Option<ConsentMode>,
+    /// FR-27 — apply [`Self::consent_mode`] to the device's OWNER too.
+    ///
+    /// `None`/`false` (the default, and every pre-FR-27 row) keeps the
+    /// historical shortcut: controlling your own device auto-consents, because
+    /// unattended access to your own headless boxes is the common case and
+    /// prompting them would ask a machine nobody is sitting at.
+    ///
+    /// That shortcut is also why the picker looked broken. It is applied in
+    /// `resolve_session_authz` BEFORE the policy is read, so on a fleet where
+    /// one person owns every device, `consent_mode` had no observable effect
+    /// whatsoever — and nothing on screen said so. `true` here makes the mode
+    /// authoritative for the owner as well, which is both the honest behaviour
+    /// for a shared workstation and the only way to field-test the attended
+    /// modes without a second account.
+    #[serde(default)]
+    pub prompt_owner: Option<bool>,
     #[serde(default)]
     pub allowed_role_ids: Vec<ObjectId>,
     #[serde(default)]
@@ -408,10 +439,23 @@ pub struct AccessPolicy {
 
 impl AccessPolicy {
     /// Effective consent mode for a NON-owner controller: the per-device mode,
-    /// or the system default (`Prompt` = attended) when unset. Self-control is
-    /// resolved to `Auto` by the caller before this is consulted.
+    /// or the system default (`Prompt` = attended) when unset.
     pub fn effective_consent_mode(&self) -> ConsentMode {
         self.consent_mode.unwrap_or(ConsentMode::Prompt)
+    }
+
+    /// FR-27 — the mode for a controller who IS the device owner. `Auto` unless
+    /// the device opted into being asked ([`Self::prompt_owner`]).
+    ///
+    /// Split from [`Self::effective_consent_mode`] rather than folded into it
+    /// so the owner shortcut is a named, greppable decision instead of an
+    /// `if` buried in the API gate — which is how it stayed invisible.
+    pub fn owner_consent_mode(&self) -> ConsentMode {
+        if self.prompt_owner.unwrap_or(false) {
+            self.effective_consent_mode()
+        } else {
+            ConsentMode::Auto
+        }
     }
 }
 
@@ -817,6 +861,16 @@ pub enum SshAccountMode {
 /// set it could raise its own ceiling and the setting would mean nothing. This
 /// list is an allowlist, so leaving it out is sufficient; the trap is a later
 /// change that adds "the rest of the ssh_* surface" for symmetry.
+///
+/// ⚠️ **The whole `relay_*` surface (FR-19) is ABSENT**, and unlike the two
+/// above this is enforced by a test that matches on the PREFIX rather than on
+/// a name. `relay_server_enabled` is gate 4 — the refusal that survives a
+/// compromised server — and `relay_server_port` is just as load-bearing: a
+/// server able to move the port could point the listener somewhere the
+/// operator never opened, or away from one they did. The prefix rule exists
+/// because the feature will grow more keys (`relay_max_sessions`,
+/// `relay_static_endpoints`), and a per-name test would silently fail to cover
+/// the one someone adds later.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct DesiredConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1954,6 +2008,12 @@ pub enum EndReason {
     AgentHangup,
     UserDenied,
     ConsentTimeout,
+    /// FR-27 — the device could raise no consent prompt at all: no desktop
+    /// session, no companion, no native overlay. Distinct from
+    /// [`Self::ConsentTimeout`] because nobody was ever asked, so the useful
+    /// advice is "give that host a prompt surface, or pick email/push", not
+    /// "try again and answer it".
+    NoPromptSurface,
     AgentDisconnect,
     AdminTerminated,
     IdleTimeout,
@@ -2692,6 +2752,51 @@ pub fn block_align_slot(after: u32, slots: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-19 gate 4: **no `relay_*` key may ever be server-pushable.**
+    ///
+    /// Matches on the PREFIX, not on a name, and that is the whole point. A
+    /// per-name assertion would pass forever while covering nothing new, and
+    /// this surface is going to grow (`relay_max_sessions`,
+    /// `relay_static_endpoints`, …).
+    ///
+    /// ⚠️ The struct literal below is spelled out in full **on purpose** — no
+    /// `..Default::default()`. Every field is populated so the serialised form
+    /// cannot pass merely because a value was `None` and got skipped; and,
+    /// more importantly, adding any field to [`DesiredConfig`] makes this test
+    /// stop compiling, which forces whoever adds it to come here and read why
+    /// a `relay_*` key must not be the field they are adding. A tolerant
+    /// literal would let that change land silently.
+    #[test]
+    fn no_relay_key_is_server_pushable_via_desired_config() {
+        let full = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
+            ssh_account_mode: Some("console_user".into()),
+            ssh_port: Some(2222),
+            revision: 7,
+            updated_by: None,
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(
+            !json.contains("relay_"),
+            "a relay_* key reached DesiredConfig -- that is gate 4 becoming \
+             server-settable, which is the one move FR-19's design exists to \
+             prevent: {json}"
+        );
+        // And the round trip cannot smuggle one in either.
+        let back: DesiredConfig = serde_json::from_str(
+            r#"{"exec_enabled":true,"relay_server_enabled":true,"relay_server_port":9,"revision":1}"#,
+        )
+        .expect("unknown keys must be ignored, not fail the frame");
+        assert_eq!(back.exec_enabled, Some(true));
+        assert!(
+            !serde_json::to_string(&back).unwrap().contains("relay_"),
+            "a relay_* key survived a decode/encode round trip"
+        );
+    }
 
     /// WIRE LOCK. These exact strings are what every deployed agent already
     /// sends and what the server gates on; changing one does not fail loudly,

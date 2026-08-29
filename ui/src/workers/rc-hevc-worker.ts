@@ -13,7 +13,7 @@
  * field SystemContext host captures 1920×1200, which exceeds L3.1's
  * ~1280×720 ceiling and rendered black (see DEFAULT_HEVC_CODEC note).
  *
- * Source agent: `agents/roomler-agent/src/encode/ffmpeg/encoder.rs`
+ * Source agent: `agents/roomlerd/src/encode/ffmpeg/encoder.rs`
  * via `peer.rs::media_pump_hevc_dc`. Cascade: hevc_nvenc → hevc_qsv
  * → hevc_amf. Gate 0 smoke (2026-05-29) validated both NVENC on RTX
  * 5090 Blackwell AND QSV on Iris Xe Tiger Lake — the two MF-broken
@@ -310,6 +310,15 @@ function maybeEmitStats(): void {
     bytesReceivedTotal: statsBytesTotal,
     decodeQueueSize: decoder?.decodeQueueSize ?? 0,
     framesDroppedBacklog,
+    // FR-17 - the framing counters, surfaced rather than left
+    // internal: a rising `chunkStragglers` with steady fps is the
+    // unordered transport WORKING (late chunks discarded without
+    // harming the frames after them), while a rising `chunkGaps`
+    // is real loss costing an IDR each. Told apart only if both
+    // are readable - FR-18 shipped a counter nothing read and its
+    // acceptance criterion became unmeasurable.
+    chunkGaps: framingState.gaps,
+    chunkStragglers: framingState.stragglers,
     paint: paintStats.snapshotAndReset(),
     fwd: fwdStats.snapshotAndReset(),
     decode: decodeStats.snapshotAndReset(),

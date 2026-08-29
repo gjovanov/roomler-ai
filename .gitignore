@@ -39,3 +39,10 @@ scripts/signing/gpg/*
 *.p12
 *.key
 *.p8
+
+# Tauri writes one ACL schema per HOST platform into `gen/schemas/`. The repo
+# tracks the ones the release lanes actually build (desktop / windows); a
+# `linux-schema.json` only appears when someone compiles the companion on
+# Linux — as the WSL backend lane does — and committing it would put a local
+# build artifact in every such session's diff. FR-27.
+agents/*/gen/schemas/linux-schema.json

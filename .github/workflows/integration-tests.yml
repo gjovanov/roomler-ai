@@ -24,7 +24,7 @@ on:
     branches: [master]
     paths:
       - 'crates/**'
-      - 'agents/roomler-agent/**'
+      - 'agents/roomlerd/**'
       - '.github/workflows/integration-tests.yml'
   # ⚠️ On PRs this used to fire ONLY for `crates/tests/**` — i.e. when someone
   # edited the tests, not when they edited what the tests cover. A change to a

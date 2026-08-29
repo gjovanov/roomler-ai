@@ -85,13 +85,13 @@ use super::lifecycle::{DeathReason, DirectTier};
 // Mode
 // ---------------------------------------------------------------------------
 
-/// `ROOMLER_NODE_OVERLAY_PATHMON` — how far the monitor is engaged.
+/// `ROOMLERD_OVERLAY_PATHMON` — how far the monitor is engaged.
 /// Parsed by [`PathMonMode::parse`]; the env READ lives with the caller
 /// (`runtime.rs`) so this module stays env-free.
 /// PR-E — the legacy selection machinery is DELETED: the monitor is the one
 /// and only path selector, unconditionally. This enum now gates TELEMETRY
 /// only (the 10-min summaries + divergence-style execution logs); it is kept
-/// so `ROOMLER_NODE_OVERLAY_PATHMON=shadow|off` set on a pre-PR-E host keeps
+/// so `ROOMLERD_OVERLAY_PATHMON=shadow|off` set on a pre-PR-E host keeps
 /// parsing — the runtime warns once at startup that those values no longer
 /// change selection (rollback to legacy = deploy a pre-PR-E rc).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -133,7 +133,7 @@ impl PathMonMode {
 }
 
 /// B2 — score-driven demotion engagement (`overlay_demote` config /
-/// `ROOMLER_AGENT_OVERLAY_DEMOTE`): `off` | `shadow` (compute + count
+/// `ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute + count
 /// would-be demotions, never act — the rc.296 first-ship default) |
 /// `on` (voluntary demotions execute as MBB probes — the default since
 /// B3/rc.303: the ~43 h fleet shadow read was spotless, ZERO would-be
@@ -2571,7 +2571,7 @@ mod tests {
     /// promotion into a flap — without costing the pair its hearing.
     #[test]
     fn a_followed_peer_is_still_answered_when_accepting_costs_nothing() {
-        let key = "ROOMLER_NODE_OVERLAY_ANSWER_WHILE_FOLLOWED";
+        let key = "ROOMLERD_OVERLAY_ANSWER_WHILE_FOLLOWED";
         let restore = std::env::var(key).ok();
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(1);

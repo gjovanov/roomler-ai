@@ -3,7 +3,7 @@
 //! One-shot enrollment exchange.
 //!
 //! Flow: admin issues an enrollment token in the Roomler UI and hands it to
-//! the machine operator. `roomler-agent enroll --token <t>` posts it to
+//! the machine operator. `roomlerd enroll --token <t>` posts it to
 //! `POST /api/agent/enroll` with machine metadata, gets back a long-lived
 //! agent token, and persists everything to the config file.
 
@@ -113,6 +113,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_server_relay_strategy: None,
         overlay_derp_floor: None,
         overlay_netcheck: None,
+        relay_server_enabled: None,
+        relay_server_port: None,
         tunnel_derp_fallback: None,
         tunnel_peers_survive_reattach: None,
         overlay_mbb: None,
@@ -348,7 +350,7 @@ fn unique_org_label(
             )
         })?;
         if cfg.find_org(&label).is_some() {
-            bail!("--label {label:?} is already in use (see `roomler-agent org ls`)");
+            bail!("--label {label:?} is already in use (see `roomlerd org ls`)");
         }
         return Ok(label);
     }

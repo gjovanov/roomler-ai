@@ -36,6 +36,9 @@ const ORG: &str = "roomler";
 /// New app segment (post-rename, fresh installs).
 const NEW_APP: &str = "roomler";
 /// Legacy app segment (pre-rename installs already in the field).
+// RETIRED-NAME-ANCHOR: a pre-rename host resolves its ENROLLED config through this
+// segment. Renaming it orphans that config -- the device drops off the mesh and
+// re-enrolls as a stranger. See docs/fr/FR-21.
 const OLD_APP: &str = "roomler-agent";
 
 /// True if a NEW-segment `ProjectDirs` tree is present on disk.

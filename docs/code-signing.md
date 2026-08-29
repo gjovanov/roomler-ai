@@ -305,7 +305,7 @@ gh release download agent-v<version> --repo gjovanov/roomler-ai \
   --pattern '*perMachine*.msi' --dir /tmp
 ROOMLER_TEST_MSI=/tmp/roomler-agent-<version>-perMachine-x86_64-pc-windows-msvc.msi \
 ROOMLER_TEST_MSI_TAG=agent-v<version> \
-  cargo test -p roomler-agent --lib -- --ignored real_published_msi
+  cargo test -p roomlerd --lib -- --ignored real_published_msi
 ```
 
 The same freeze risk applies to the signing gate: a release that ships an
@@ -330,9 +330,9 @@ The cert subject and every packaging surface must agree, or Windows shows one
 name in the UAC prompt and another in Add/Remove Programs. Current sweep
 (all `G ROX LTD`):
 
-- `agents/roomler-agent/wix/main.wxs` + `wix-perMachine/main.wxs` — `Manufacturer` (2× each)
-- `agents/roomler-agent/build.rs` + `agents/roomler-tunnel/build.rs` — `CompanyName`, `LegalCopyright`
-- `agents/roomler-agent-tray/tauri.conf.json` + `agents/roomler-setup/tauri.conf.json` — `bundle.publisher`, `bundle.copyright`
+- `agents/roomlerd/wix/main.wxs` + `wix-perMachine/main.wxs` — `Manufacturer` (2× each)
+- `agents/roomlerd/build.rs` + `agents/roomler-cli/build.rs` — `CompanyName`, `LegalCopyright`
+- `agents/roomler-desktop/tauri.conf.json` + `agents/roomler-setup/tauri.conf.json` — `bundle.publisher`, `bundle.copyright`
 - both `[package.metadata.deb]` blocks — `maintainer`, `copyright`
 
 The `AZURE_SIGNING_EXPECT_SUBJECT` variable enforces the cert side: if the

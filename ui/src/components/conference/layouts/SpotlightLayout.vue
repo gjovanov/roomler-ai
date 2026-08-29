@@ -15,8 +15,10 @@
         :is-active-speaker="p.streamKey === activeSpeakerKey"
         object-fit="contain"
         :show-actions="true"
+        :stream-key="p.streamKey"
         @toggle-pin="$emit('toggle-pin', p.streamKey)"
         @request-pip="$emit('request-pip', p.streamKey)"
+        @spotlight="$emit('spotlight', p.streamKey)"
       />
     </div>
 
@@ -33,8 +35,11 @@
         :is-active-speaker="p.streamKey === activeSpeakerKey"
         :compact="true"
         :show-actions="true"
+        :stream-key="p.streamKey"
+        :object-fit="p.isLocal && selfViewMode === 'in-grid-uncropped' ? 'contain' : 'cover'"
         @toggle-pin="$emit('toggle-pin', p.streamKey)"
         @request-pip="$emit('request-pip', p.streamKey)"
+        @spotlight="$emit('spotlight', p.streamKey)"
       />
     </div>
 
@@ -44,12 +49,14 @@
       class="floating-self-view"
     >
       <VideoTile
+        :stream-key="selfParticipant.streamKey"
         :stream="selfParticipant.stream"
         :display-name="selfParticipant.displayName"
         :is-muted="selfParticipant.isMuted"
         :is-local="true"
         :compact="true"
         object-fit="contain"
+        @spotlight="$emit('spotlight', $event)"
       />
     </div>
   </div>
@@ -58,19 +65,24 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import VideoTile from '@/components/conference/VideoTile.vue'
-import type { LayoutParticipant } from '@/composables/useConferenceLayout'
+import type { LayoutParticipant, SelfViewMode } from '@/composables/useConferenceLayout'
 
 const props = defineProps<{
   primary: LayoutParticipant[]
   secondary: LayoutParticipant[]
   selfParticipant: LayoutParticipant | null
   selfViewFloating: boolean
+  // FR-25 - the self-view crop choice reaches EVERY layout now; it used to
+  // be passed only to the tiled one, so "in grid (uncropped)" silently did
+  // nothing in the two layouts Auto picks most often.
+  selfViewMode: SelfViewMode
   activeSpeakerKey: string | null
 }>()
 
 defineEmits<{
   'toggle-pin': [streamKey: string]
   'request-pip': [streamKey: string]
+  spotlight: [streamKey: string]
 }>()
 
 const primaryGridStyle = computed(() => {
