@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // Clippy's `doc_lazy_continuation` / `doc_list_item_indent` lints flag
 // rustdoc indentation we wrote for prose continuation lines (slash-
 // separated menu items, signatures). The intent is plain English

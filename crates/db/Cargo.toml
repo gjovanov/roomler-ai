@@ -1,5 +1,7 @@
 [package]
 name = "roomler-ai-db"
+license = "AGPL-3.0-only"
+publish = false
 version.workspace = true
 edition.workspace = true
 

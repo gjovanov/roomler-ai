@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use mongodb::options::ReturnDocument;
@@ -79,6 +81,7 @@ impl OverlayNetworkDao {
             // New networks start permissive too — the ACL is opt-in per tenant
             // so that turning the feature on can never black-hole a live mesh.
             acl_mode: OverlayAclMode::default(),
+            peer_relay_mode: Default::default(),
             created_at: now,
             updated_at: now,
         };

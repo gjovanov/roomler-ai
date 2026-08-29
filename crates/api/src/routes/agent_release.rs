@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! `/api/agent/latest-release` — cached proxy of the GitHub releases
 //! list for the agent's auto-updater.
 //!

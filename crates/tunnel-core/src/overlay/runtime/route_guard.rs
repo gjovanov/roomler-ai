@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Route ownership + defense — split out of `runtime.rs` (rc.284, pure move):
 //! the 2 s route-guard cadence, the peer `/32` drop helper, subnet-route
 //! install, and the P5 exit-node split-default state machine (reconcile /

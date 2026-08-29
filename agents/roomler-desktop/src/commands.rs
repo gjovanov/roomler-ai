@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Tauri `invoke` command handlers — thin glue between the SPA's
 //! JavaScript and the agent's library / CLI.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows multimedia timer resolution.
 //!
 //! By default a Windows process runs at the *system* timer resolution,

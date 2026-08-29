@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::{Document, doc, oid::ObjectId};
 use mongodb::{Collection, Database};
 use serde::{Deserialize, Serialize};

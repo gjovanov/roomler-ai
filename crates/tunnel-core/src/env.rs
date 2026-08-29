@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR-BEGIN
 // This whole module IS the env-prefix fallback chain. Every occurrence of a
 // retired name in it is a prefix the chain must keep honouring

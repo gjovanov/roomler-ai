@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! On-disk config for `roomler`.
 //!
 //! Mirrors `roomlerd`'s pattern: TOML file at the platform-specific

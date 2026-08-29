@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Thin wrapper around a `webrtc-rs` `RTCPeerConnection`.
 //!
 //! Owns the per-session WebRTC state: codecs, ICE, data channels, and (when
@@ -1998,6 +2000,17 @@ async fn media_pump(
     // stall in capture or encode is indistinguishable from a working pump.
     let mut frames_captured: u64 = 0;
     let mut frames_empty: u64 = 0;
+    // FR-29 P2 — damage observability. Without these the backend can report
+    // perfect dirty rects and nothing on the host can tell: both would-be
+    // consumers (`set_roi_hints`, `note_real_frame_area`) are inert today, so
+    // the heartbeat is the ONLY place the tracked/unknown split becomes
+    // visible. P1's lesson was that an optimisation you cannot observe is one
+    // you cannot trust.
+    let mut damage_tracked_frames: u64 = 0;
+    let mut damage_permille_sum: u64 = 0;
+    let mut damage_union_sum: u64 = 0;
+    let mut damage_bbox_sum: u64 = 0;
+    let mut damage_rects_sum: u64 = 0;
     let mut frames_encoded: u64 = 0;
     let mut frames_keepalive: u64 = 0;
     let mut bytes_written: u64 = 0;
@@ -2013,6 +2026,16 @@ async fn media_pump(
     // the preceding ~30-frame window, not the entire session.
     let mut heartbeat_frames_base: u64 = 0;
     let mut heartbeat_capture_us_base: u64 = 0;
+    // FR-29 P2 — windowed like every other average in this heartbeat. A
+    // CUMULATIVE damage average is worse than none: it is dominated by
+    // whatever the screen was doing minutes ago, which is exactly how a
+    // busy-period 1000permille reading survived into an idle window and
+    // made a precise tracker look saturated.
+    let mut heartbeat_damage_frames_base: u64 = 0;
+    let mut heartbeat_damage_permille_base: u64 = 0;
+    let mut heartbeat_damage_union_base: u64 = 0;
+    let mut heartbeat_damage_bbox_base: u64 = 0;
+    let mut heartbeat_damage_rects_base: u64 = 0;
     let mut heartbeat_encode_us_base: u64 = 0;
 
     // Last applied quality preference. Initialised to a sentinel
@@ -2397,6 +2420,34 @@ async fn media_pump(
         if !frame.damage.rects().is_empty() {
             enc.set_roi_hints(frame.damage.rects(), (frame.width, frame.height));
         }
+        // FR-29 P2 — record what the backend claimed to know about this frame.
+        if let Some(pm) = frame
+            .damage
+            .area_permille(u64::from(frame.width) * u64::from(frame.height))
+        {
+            damage_tracked_frames += 1;
+            damage_permille_sum += u64::from(pm);
+            // FR-29 — the two numbers that decide whether P3 is worth building.
+            // `area_permille` sums overlapping rects and saturates, so it can
+            // never answer "how much would a partial readback have to read".
+            // The union answers it for a perfect per-rect readback; the bbox
+            // answers it for the simple one-GetImage form.
+            damage_union_sum += u64::from(
+                frame
+                    .damage
+                    .union_permille(frame.width, frame.height)
+                    .unwrap_or(0),
+            );
+            damage_bbox_sum += u64::from(
+                frame
+                    .damage
+                    .bbox_permille(frame.width, frame.height)
+                    .unwrap_or(0),
+            );
+            // FR-29 — few huge rects or many small ones? union==bbox==1000 is
+            // consistent with BOTH, and they imply opposite things about P3.
+            damage_rects_sum += frame.damage.rects().len() as u64;
+        }
 
         // Adaptive bitrate: combine quality preference (controller
         // intent) with REMB (network capacity) and apply on change
@@ -2527,16 +2578,53 @@ async fn media_pump(
             // the backend proved a capture was unnecessary. Reporting one as
             // the other would turn a healthy idle host into a false alarm.
             let frames_unchanged = capturer.frames_unchanged();
+            // FR-29 P2 — `damage_tracked_frames` is the falsifiable bit: on a
+            // backend that reports Damage::Unknown it stays 0 no matter how
+            // busy the screen is, so a non-zero value is proof the tracker is
+            // producing real rects rather than the field merely existing.
+            let damage_frames_window =
+                damage_tracked_frames.saturating_sub(heartbeat_damage_frames_base);
+            let damage_permille_window =
+                damage_permille_sum.saturating_sub(heartbeat_damage_permille_base);
+            let avg_damage_permille = damage_permille_window
+                .checked_div(damage_frames_window)
+                .unwrap_or(0);
+            // FR-29 P3 viability, measured rather than assumed: `union` is what
+            // a perfect per-rect readback would touch, `bbox` what the simple
+            // one-GetImage form would. If both sit near 1000 there is nothing
+            // for a partial readback to win and P3 should not be built.
+            let avg_damage_union_permille = damage_union_sum
+                .saturating_sub(heartbeat_damage_union_base)
+                .checked_div(damage_frames_window)
+                .unwrap_or(0);
+            let avg_damage_bbox_permille = damage_bbox_sum
+                .saturating_sub(heartbeat_damage_bbox_base)
+                .checked_div(damage_frames_window)
+                .unwrap_or(0);
+            let avg_damage_rects = damage_rects_sum
+                .saturating_sub(heartbeat_damage_rects_base)
+                .checked_div(damage_frames_window)
+                .unwrap_or(0);
             info!(
                 %session_id,
                 backend,
                 frames_captured, frames_empty, frames_unchanged, frames_encoded, frames_keepalive,
+                damage_tracked_frames = damage_frames_window,
+                avg_damage_permille,
+                avg_damage_union_permille,
+                avg_damage_bbox_permille,
+                avg_damage_rects,
                 bytes_written, write_errors,
                 avg_capture_ms, avg_encode_ms,
                 "media pump heartbeat (≈1s window)"
             );
             heartbeat_frames_base = frames_encoded;
             heartbeat_capture_us_base = capture_time_us;
+            heartbeat_damage_frames_base = damage_tracked_frames;
+            heartbeat_damage_permille_base = damage_permille_sum;
+            heartbeat_damage_union_base = damage_union_sum;
+            heartbeat_damage_bbox_base = damage_bbox_sum;
+            heartbeat_damage_rects_base = damage_rects_sum;
             heartbeat_encode_us_base = encode_time_us;
         }
     }

@@ -1,5 +1,7 @@
 [package]
 name = "roomler-cli-shim"
+license = "MPL-2.0"
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "Tiny launcher installed as roomler.exe on daemon hosts — re-execs `roomlerd cli`."

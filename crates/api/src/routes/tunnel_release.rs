@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR-BEGIN
 // Serves PUBLISHED release assets. The `tunnel-v*` tag and the
 // roomler-tunnel-<version>-<target> asset names are fixed by what is already
