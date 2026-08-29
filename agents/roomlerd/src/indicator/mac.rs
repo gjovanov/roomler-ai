@@ -405,8 +405,10 @@ impl Panel {
         }
         self.secs_shown.set(secs);
         unsafe {
-            self.countdown
-                .setStringValue(&NSString::from_str(&format!("Expires in {secs}s")));
+            self.countdown.setStringValue(&NSString::from_str(&format!(
+                "Expires in {}",
+                super::format_countdown(secs)
+            )));
         }
     }
 
