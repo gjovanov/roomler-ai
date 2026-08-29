@@ -40,7 +40,7 @@ tunnel traffic, flows direct vs relayed).
 
 ### The gap
 
-**`stats_relay` is keyed `{region, ts}`** (`crates/db/src/indexes.rs:500`). It
+**`stats_relay` is keyed `{region, ts}`** (`crates/db/src/indexes.rs:523`). It
 records CPU, memory, rx/tx rate, DERP registrations and coturn allocations *per
 PoP* — fleet health, not consumption. There is no per-tenant relay byte anywhere
 in the system, so the question *"what did org X cost me last month?"* has no
@@ -56,9 +56,9 @@ Verified in code, not assumed:
 
 | Tier | Tenant known? | Byte count available? |
 |---|---|---|
-| API-pod DERP (`crates/api/src/ws/derp.rs`) | **yes** — `verify_agent_token` + authoritative DB lookup (`derp.rs:264-284`); a forged tenant claim cannot widen scope | **yes** — `frame.len()` already computed on that path for `tunnel_budget_permits` (`derp.rs:508`) |
+| API-pod DERP (`crates/api/src/ws/derp.rs`) | **yes** — `verify_agent_token` + authoritative DB lookup (`derp.rs:236`); a forged tenant claim cannot widen scope | **yes** — `frame.len()` already computed on that path for `tunnel_budget_permits` (`derp.rs:508`) |
 | PoP DERP (`crates/derp-relay`) | via the ticket's `network` → `overlay_networks` → tenant | in-process; the binary is deliberately **DB-free** |
-| coturn TURN | username is `{expiry}:{user_id}` (`turn_creds.rs:61`) — user, **not** tenant | `coturn_prometheus()` already scrapes; reads only `turn_total_allocations` / `turn_total_sessions` today |
+| coturn TURN | username is `{expiry}:{user_id}` (`crates/remote_control/src/turn_creds.rs:63`) — user, **not** tenant | `coturn_prometheus()` already scrapes; reads only `turn_total_allocations` / `turn_total_sessions` today |
 
 ## Key design
 
@@ -203,6 +203,6 @@ must not be logged out of everything (`stats.rs:45-47`).
 | date | what | result |
 |---|---|---|
 | 2026-08-28 | Audit of the shipped stats subsystem | 10 collections + 2 populated UIs already exist; the gap is attribution, not measurement |
-| 2026-08-28 | `stats_relay` key inspection (`indexes.rs:500`) | `{region, ts}` — fleet health, **no tenant dimension** |
+| 2026-08-28 | `stats_relay` key inspection (`indexes.rs:523`) | `{region, ts}` — fleet health, **no tenant dimension** |
 | 2026-08-28 | Attribution reachability at all three relay tiers | API-pod DERP: tenant + length both already in hand; PoP: ticket carries `network`; coturn: needs the grant map |
 | 2026-08-28 | `tunnel_audit` byte provenance (`usage.rs:14-19`) | client-reported on flow close ⇒ **not billable**, analytics only |
