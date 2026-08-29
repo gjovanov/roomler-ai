@@ -56,7 +56,6 @@ impl FileDao {
             external_source: None,
             scan_status: ScanStatus::Pending,
             visibility: Visibility::Private,
-            recognized_content: None,
             created_at: now,
             updated_at: now,
             deleted_at: None,

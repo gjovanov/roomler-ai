@@ -74,7 +74,6 @@
             <v-list-item title="Channels" :subtitle="plan.limits.max_channels >= 4294967295 ? 'Unlimited' : String(plan.limits.max_channels)" prepend-icon="mdi-pound" />
             <v-list-item title="Video Participants" :subtitle="plan.limits.video_max_participants === 0 ? 'None' : String(plan.limits.video_max_participants)" prepend-icon="mdi-video" />
             <v-list-item title="Cloud Integrations" :subtitle="plan.limits.cloud_integrations ? 'Yes' : 'No'" :prepend-icon="plan.limits.cloud_integrations ? 'mdi-check-circle' : 'mdi-close-circle'" />
-            <v-list-item title="AI Recognition" :subtitle="plan.limits.ai_recognition ? 'Yes' : 'No'" :prepend-icon="plan.limits.ai_recognition ? 'mdi-check-circle' : 'mdi-close-circle'" />
             <v-list-item title="Recordings" :subtitle="plan.limits.recordings ? 'Yes' : 'No'" :prepend-icon="plan.limits.recordings ? 'mdi-check-circle' : 'mdi-close-circle'" />
           </v-list>
           <v-btn
@@ -133,7 +132,6 @@ interface PlanInfo {
     storage_bytes: number
     video_max_participants: number
     cloud_integrations: boolean
-    ai_recognition: boolean
     recordings: boolean
   }
 }

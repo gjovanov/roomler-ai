@@ -197,8 +197,8 @@ pub async fn admin_plan_compliance(
             reported_only: false,
         });
 
-        // ⚠ `video_max_participants` and `ai_recognition` are WIRED gates that
-        // the first version of this report omitted — and the omission mattered.
+        // ⚠ `video_max_participants` is a WIRED gate that the first version of
+        // this report omitted — and the omission mattered.
         //
         // Free's video cap was **0** until 2026-08-29 — "Free has no
         // conferencing" — so flipping a Free tenant to `Enforce` would have
@@ -209,31 +209,24 @@ pub async fn admin_plan_compliance(
         // authorise a rollout has to cover every gate that rollout turns on,
         // including the ones whose breakage is invisible at rest.
         //
-        // Free now has a real cap of 4 (operator decision), so video is no
-        // longer a removal for Free. `ai_recognition` still is, and the same
-        // reasoning is what keeps it visible.
-        //
-        // They are surfaced as **capability rows**: `used` is what the tenant
-        // holds today (always 1 — the ability is live while unenforced), `max`
-        // is 0 when the plan excludes it, and `over` therefore means "enforcing
-        // would REMOVE something this tenant can do right now".
-        for (limit, label) in [
-            (quota::Limit::VideoMaxParticipants, "VideoMaxParticipants"),
-            (quota::Limit::AiRecognition, "AiRecognition"),
-        ] {
-            let max = limit.describe(&limits).0;
-            let excluded = max == Some(0);
-            if excluded {
-                would_break = true;
-            }
-            out.push(LimitRow {
-                limit: label.into(),
-                used: 1,
-                max,
-                over: excluded,
-                reported_only: false,
-            });
+        // Surfaced as a **capability row**: `used` is what the tenant holds
+        // today (always 1 — the ability is live while unenforced), `max` is 0
+        // when the plan excludes it, so `over` means "enforcing would REMOVE
+        // something this tenant can do right now" rather than "they exceeded a
+        // quota". Free now has a real cap of 4, so no current plan excludes
+        // video — but the row stays, because the next plan change could.
+        let video_max = quota::Limit::VideoMaxParticipants.describe(&limits).0;
+        let video_excluded = video_max == Some(0);
+        if video_excluded {
+            would_break = true;
         }
+        out.push(LimitRow {
+            limit: "VideoMaxParticipants".into(),
+            used: 1,
+            max: video_max,
+            over: video_excluded,
+            reported_only: false,
+        });
 
         // `max_message_history` is measured and NEVER gated — see the FR-32
         // spec. It is here so P3 can decide whether the limit survives
@@ -319,8 +312,9 @@ mod tests {
     /// from every Free tenant, back when `Free.video_max_participants` was 0.
     ///
     /// Free now has a real video cap of **4** (operator decision, 2026-08-29),
-    /// so video is no longer a removal for Free; `ai_recognition` still is, and
-    /// carries the property here.
+    /// so video is no longer a removal for Free. `recordings` (still excluded
+    /// on Free) carries the property here — the guard keeps a live example
+    /// rather than being deleted along with the value it used to pin.
     #[test]
     fn a_plan_that_excludes_a_capability_is_reported_as_breaking() {
         let free = Plan::Free.limits();
@@ -331,11 +325,15 @@ mod tests {
             Some(4),
             "Free has 4 video participants; 0 would mean enforcing REMOVES conferencing"
         );
+        // `recordings` carries the excluded-capability property now that
+        // `ai_recognition` is gone: excluded ⇒ a zero cap ⇒ the report flags a
+        // tenant that holds any, because enforcing would take them away.
         assert_eq!(
-            quota::Limit::AiRecognition.describe(&free).0,
+            quota::Limit::Recordings.describe(&free).0,
             Some(0),
             "an excluded capability must read as a zero cap so the report flags it"
         );
+        assert_eq!(quota::Limit::ExitNodes.describe(&free).0, Some(0));
 
         // A plan that includes them must not be flagged.
         let biz = Plan::Business.limits();
@@ -343,7 +341,7 @@ mod tests {
             quota::Limit::VideoMaxParticipants.describe(&biz).0,
             Some(100)
         );
-        assert_eq!(quota::Limit::AiRecognition.describe(&biz).0, None);
+        assert_eq!(quota::Limit::Recordings.describe(&biz).0, None);
     }
 
     #[test]
