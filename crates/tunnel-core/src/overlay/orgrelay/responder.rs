@@ -101,7 +101,7 @@ impl ResponderStats {
         }
     }
 
-    fn record(&self, v: &ProbeVerdict) {
+    pub(crate) fn record(&self, v: &ProbeVerdict) {
         let c = match v {
             ProbeVerdict::Answer(_) => &self.answered,
             ProbeVerdict::RefusedNotShaped => &self.refused_not_shaped,
@@ -153,7 +153,12 @@ impl ProbeGate {
         ProbeVerdict::Answer(pkt.to_vec())
     }
 
-    fn admit(&mut self, src: SocketAddr, now: Instant) -> bool {
+    /// The per-source budget, shared by EVERY unauthenticated control frame —
+    /// probe, bind and answer draw from the same allowance, because to a
+    /// flooder they are all just "a packet that makes the relay do work".
+    /// Public so the relay server can gate binds through the same table
+    /// rather than keeping a second one an attacker could fill separately.
+    pub fn admit(&mut self, src: SocketAddr, now: Instant) -> bool {
         if self.recent.len() >= MAX_SOURCES {
             self.recent
                 .retain(|_, (t, _)| now.duration_since(*t) < WINDOW);
@@ -185,7 +190,12 @@ impl ProbeGate {
     }
 }
 
-/// The socket-owning shell. Holds no session state of its own.
+/// The socket-owning shell for a **probe-only** node. Holds no session state.
+///
+/// Superseded on a serving relay by [`super::server::RelayServer`], which
+/// answers probes through the same [`ProbeGate`] and additionally binds and
+/// forwards. Retained as the minimal P1 surface and for its socket-loop tests,
+/// which are the regression tests for the oversized-datagram DoS.
 pub struct ProbeResponder {
     gate: ProbeGate,
     stats: Arc<ResponderStats>,
