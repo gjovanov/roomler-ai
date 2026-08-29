@@ -1,6 +1,6 @@
 # FR-38: The product is unfindable — repository metadata, README, comparison docs, and a way for a visitor to stay in touch
 
-Status: **P0 in progress** (2026-08-29). Tracking issue: `FR-38` (#951).
+Status: **P1–P6 implemented; field-verification pending** (2026-08-29). Tracking issue: `FR-38` (#951).
 Spec on master up front; the work is known and mostly mechanical.
 
 ## The measurement that motivates it
@@ -100,18 +100,25 @@ account** — so that interest which does not convert immediately is not lost pe
 
 ## Acceptance criteria
 
-- [ ] `gh repo view --json description,repositoryTopics` names remote desktop and mesh
-      networking, and carries at least eight discovery topics
-- [ ] the repository's social preview renders the product name and one-liner in a link card
-- [ ] the README's first screen carries the one-liner, a demo, and a quickstart that was
-      run from scratch on a clean machine
-- [ ] `docs/compare/` holds five documents, each naming at least one thing the other
-      product does better
-- [ ] `POST /api/subscribe` stores a subscriber and returns **202 for a fresh address and
-      202 for an address already on the list**, indistinguishably
-- [ ] the unsubscribe link in the stored record works with no session and no account
-- [ ] the Privacy Policy describes the subscriber collection, and every sentence of that
-      description is true of the code that ships with it
+- [x] `gh repo view --json description,repositoryTopics` names remote desktop and mesh
+      networking, and carries at least eight discovery topics — **done**, 20 topics live
+- [~] the repository's social preview renders the product name and one-liner in a link card
+      — asset generated (`docs/assets/social-preview.png`); **GitHub exposes no API, so the
+      upload is an operator step** (Settings → General → Social preview)
+- [~] the README's first screen carries the one-liner, a demo, and a quickstart that was
+      run from scratch on a clean machine — one-liner and quickstart **done**; the demo is
+      the operator step below, and the clean-machine run is unverified
+- [x] `docs/compare/` holds five documents, each naming at least one thing the other
+      product does better — **done** (Tailscale, RustDesk, TeamViewer, MeshCentral, NetBird)
+- [~] `POST /api/subscribe` stores a subscriber and returns **202 for a fresh address and
+      202 for an address already on the list**, indistinguishably — implemented and locked by
+      `crates/tests/src/subscribe_tests.rs`, which **has not been run**: Docker was not
+      available on the dev box, so the lane runs in CI (this PR touches `crates/tests/**`)
+- [~] the unsubscribe link in the stored record works with no session and no account —
+      same status as above: asserted, not yet run
+- [x] the Privacy Policy describes the subscriber collection, and every sentence of that
+      description is true of the code that ships with it — **done** (§2.14 + retention),
+      written from the implementation rather than from a template
 - [ ] `docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build` brings up a working instance on a clean machine, and `/health` answers 200 **(operator — needs a clean box and a 10–20 min build)**
 - [ ] a 60–90 s demo (enroll → browser desktop → `roomler ssh` → `roomler forward`) exists
       and is embedded in the README **(operator — needs a real capture session)**
@@ -138,3 +145,13 @@ account** — so that interest which does not convert immediately is not lost pe
 | date | what was checked | result |
 |---|---|---|
 | 2026-08-29 | baseline: description, topics, stars, landing capture, directory presence | recorded above |
+| 2026-08-29 | **P1** repo description + 20 topics | live; `gh repo view` confirms |
+| 2026-08-29 | self-host compose renders, and fails fast without a secret | `docker compose config` exit 0 with secrets, exit 1 + the generation hint without |
+| 2026-08-29 | config keys the compose sets actually exist | `auth.auto_verify`, `s3.enabled` in `settings.rs`; the production JWT refusal at `crates/api/src/main.rs:32` |
+| 2026-08-29 | two draft claims checked against code and **corrected** | registering creates no organization (`auth.rs:140` — the web form sends no `tenant_name`); agents update from upstream GitHub releases, not a self-hoster's builds (`agent_release.rs`) |
+| 2026-08-29 | UI typecheck + unit tests | `vue-tsc --noEmit` clean; **901 tests / 39 files pass** |
+| 2026-08-29 | `cargo check -p roomler-ai-api` (WSL) | clean |
+| | `crates/tests/src/subscribe_tests.rs` | **not run locally** — no Docker on the dev box; runs in CI |
+| | one-command self-host on a clean machine | **operator** — needs a clean box and a 10-20 min build |
+| | 60-90 s demo recorded and embedded | **operator** — needs a real capture session |
+| | social preview uploaded | **operator** — no GitHub API for it |
