@@ -168,7 +168,7 @@ async fn consent_watch_loop(app: tauri::AppHandle) {
                     .into_iter()
                     // FR-27 — ignore anything the DAEMON is already showing
                     // natively. It still writes a marker for those (that list
-                    // is also what `roomler consent --list` reads), so without
+                    // is also what `roomlerd consent --list` reads), so without
                     // this filter a host with a native overlay would get two
                     // Approve buttons for one decision.
                     .filter(|p| p.surface != "native")

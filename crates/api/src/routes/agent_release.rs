@@ -111,7 +111,41 @@ pub(crate) fn filter_component_releases(
     // relative order (`sort_by_key` is stable), so a hand-made tag is still
     // reachable by explicit version — it just never wins "latest".
     out.sort_by_key(|r| std::cmp::Reverse(super::remote_control::release_ord(&r.tag_name)));
+    for r in &mut out {
+        order_assets_daemon_first(&mut r.assets);
+    }
     out
+}
+
+// RETIRED-NAME-ANCHOR(60): `roomler-agent-*` is the published RELEASE-ASSET
+// name, which release-agent.yml freezes deliberately ("a published, immutable
+// surface that every prior release already carries"). The updater's picker
+// keys on it, so the doc and the test below must quote it exactly.
+/// Push the desktop-companion artifacts to the END of every release's asset
+/// list, so a client scanning for "the first `.deb` for my arch" cannot pick
+/// one up.
+///
+/// ⚠️ This is a fix for the INSTALLED BASE, not for current agents. Every
+/// released Linux updater up to 0.4.15 selects with
+/// `assets.iter().find(|a| name.ends_with(".deb") && name.contains(arch))`,
+/// which is only correct while the list happens to be ordered favourably —
+/// and this proxy's order is GitHub's, which is neither documented nor by
+/// name. FR-27 added `roomler-desktop-<v>-x86_64-unknown-linux-gnu.deb` to
+/// `agent-v0.4.16`, it came back FIRST, and on 2026-08-29 both `mars` and
+/// `jupiter` apt-installed the companion **as their own daemon update**: the
+/// install "succeeded", the version never moved, and jupiter pulled 34
+/// packages of webkit/GTK onto a headless cluster node. Silent update freeze,
+/// no error anywhere. 0.4.16+ refuses by name (`updater::is_daemon_asset`),
+/// but no agent-side fix can reach an agent that cannot update — only this
+/// can, because every one of them reads THIS endpoint.
+///
+/// Ordering rather than filtering: `scripts/install.sh --desktop` and the
+/// Windows `companion::refresh_if_stale` both resolve their artifact out of
+/// this same payload, so the assets must stay present.
+///
+/// Stable sort ⇒ everything else keeps GitHub's relative order.
+fn order_assets_daemon_first(assets: &mut [AgentReleaseAsset]) {
+    assets.sort_by_key(|a| a.name.to_lowercase().starts_with("roomler-desktop-"));
 }
 
 // ─── installer download proxy ─────────────────────────────────────────────────
@@ -344,6 +378,69 @@ mod tests {
             published_at: None,
             assets: asset_names.iter().map(|n| asset(n)).collect(),
         }
+    }
+
+    // RETIRED-NAME-ANCHOR(55): the asset names below are the PUBLISHED
+    // release-asset spellings, frozen on purpose by release-agent.yml, and
+    // the point of this test is that a pre-0.4.16 picker matching them wins
+    // over the companion. Renaming them here would make it assert nothing.
+    /// FR-27 / 2026-08-29 field incident. Every Linux updater up to 0.4.15
+    /// takes the FIRST `.deb` matching its arch, and GitHub handed this proxy
+    /// the companion first — so `mars` and `jupiter` apt-installed
+    /// `roomler-desktop` as their own daemon update and froze at 0.4.15 with
+    /// no error. The fix has to live here because a frozen agent is exactly
+    /// the one that cannot receive an agent-side fix.
+    #[test]
+    fn the_daemon_deb_precedes_the_companion_deb_for_a_find_first_client() {
+        let releases = filter_component_releases(
+            vec![release(
+                "agent-v0.4.16",
+                false,
+                &[
+                    "roomler-desktop-0.4.16-x86_64-unknown-linux-gnu.deb",
+                    "roomler-agent-0.4.16-aarch64-unknown-linux-gnu.deb",
+                    "roomler-agent-0.4.16-x86_64-unknown-linux-gnu.deb",
+                    "roomler-desktop-0.4.16-x86_64-pc-windows-msvc.exe",
+                ],
+            )],
+            "agent-v",
+        );
+        let a = &releases[0].assets;
+        // Replay the pre-0.4.16 picker verbatim.
+        let picked = a
+            .iter()
+            .find(|x| {
+                let n = x.name.to_lowercase();
+                n.ends_with(".deb") && n.contains("x86_64")
+            })
+            .unwrap();
+        assert_eq!(
+            picked.name,
+            "roomler-agent-0.4.16-x86_64-unknown-linux-gnu.deb"
+        );
+        // Ordering, NOT filtering: install.sh --desktop and the Windows
+        // companion refresher both resolve their artifact from this payload.
+        assert!(
+            a.iter()
+                .any(|x| x.name == "roomler-desktop-0.4.16-x86_64-unknown-linux-gnu.deb")
+        );
+        assert!(
+            a.iter()
+                .any(|x| x.name == "roomler-desktop-0.4.16-x86_64-pc-windows-msvc.exe")
+        );
+        // Non-companion assets keep GitHub's relative order (stable sort).
+        let daemon: Vec<&str> = a
+            .iter()
+            .map(|x| x.name.as_str())
+            .filter(|n| n.starts_with("roomler-agent-"))
+            .collect();
+        assert_eq!(
+            daemon,
+            [
+                "roomler-agent-0.4.16-aarch64-unknown-linux-gnu.deb",
+                "roomler-agent-0.4.16-x86_64-unknown-linux-gnu.deb",
+            ]
+        );
     }
 
     #[test]
