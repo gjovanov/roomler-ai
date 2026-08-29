@@ -327,6 +327,34 @@ export function friendlyRcError(code: unknown, serverMessage: unknown): string {
   }
 }
 
+/**
+ * FR-27 - user-facing text for a session that ended before it started.
+ *
+ * These used to render as the raw enum name (`user_denied`,
+ * `consent_timeout`), which is unhelpful on its own and was, until FR-27,
+ * frequently WRONG: the agent's own prompt timeout came back as a bare
+ * `granted: false`, so "nobody was at the machine" reached the controller as
+ * "the user denied your request". The agent now says which it was, and the
+ * three outcomes need three different next steps from whoever reads this.
+ *
+ * Returns `null` for a nominal end (hangups, idle timeouts) so the caller can
+ * stay silent - an alert on a normal disconnect is noise.
+ */
+export function friendlyEndReason(reason: unknown): string | null {
+  switch (reason) {
+    case 'user_denied':
+      return 'Someone at that device declined the request.'
+    case 'consent_timeout':
+      return 'Nobody answered the prompt on that device in time. Nothing was declined - try again, or ask the person there to approve it.'
+    case 'no_prompt_surface':
+      return 'That device could not show a prompt to anyone - nobody is signed in at its screen, or the Roomler desktop app is not running there. Start it on the device, or set this device to email/push consent.'
+    case 'error':
+      return 'The session could not be established.'
+    default:
+      return null
+  }
+}
+
 /** Degraded classification Ã¢ÂÂ pure so the priority order is testable. */
 export function classifyDegraded(inp: {
   pcState: string | null
@@ -412,6 +440,16 @@ export interface RcControlState {
   mode: 'free' | 'exclusive'
   holder: string | null
   participants: RcParticipant[]
+  /** FR-27 — who is waiting for the exclusive-mode floor, when a request was
+   *  refused because the holder was active. `null` when nothing is pending,
+   *  and always `null` in free mode.
+   *
+   *  Before this the refusal was dropped silently: the holder never learned
+   *  anyone had asked, and the requester saw nothing, so "Request control"
+   *  only appeared to work if you happened to click during the holder's idle
+   *  window. Absent from pre-FR-27 agents, which is indistinguishable from
+   *  "nothing pending" — the correct degradation. */
+  pendingRequest: { session: string; name: string } | null
 }
 
 /** P6 — a ghost cursor: another session's pointer, rebroadcast by the
@@ -537,12 +575,21 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         },
       ]
     })
+    const rawPending = obj.pending_request as Record<string, unknown> | null | undefined
+    const pendingRequest =
+      rawPending && typeof rawPending.session === 'string'
+        ? {
+            session: rawPending.session,
+            name: typeof rawPending.name === 'string' ? rawPending.name : '',
+          }
+        : null
     return {
       kind: 'control_state',
       state: {
         mode: obj.mode === 'exclusive' ? 'exclusive' : 'free',
         holder: typeof obj.holder === 'string' ? obj.holder : null,
         participants,
+        pendingRequest,
       },
     }
   }
@@ -4673,10 +4720,31 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  reply is the next `rc:control.state` broadcast (granted = we become
    *  the holder; an ACTIVE holder keeps it and state shows who). */
   function requestControl() {
+    sendControl({ t: 'rc:control.request' })
+  }
+
+  /** FR-27 — the holder hands the floor to whoever is waiting, without making
+   *  them wait out the idle timer. The agent validates both ends (only the
+   *  current holder may grant, and only to the session that actually asked),
+   *  so a stale click cannot hand control to whoever asked last. */
+  function grantControl(session: string) {
+    sendControl({ t: 'rc:control.grant', session })
+  }
+
+  /** FR-27 — the holder declines, or the requester withdraws. The agent
+   *  accepts it from either, so one verb clears the chip on both toolbars. */
+  function dismissControlRequest() {
+    sendControl({ t: 'rc:control.dismiss' })
+  }
+
+  /** Fire-and-forget on the control DC. No-op while it is closed — every
+   *  caller here is a UI affordance whose reply is the next
+   *  `rc:control.state` broadcast, so a dropped send self-corrects. */
+  function sendControl(msg: Record<string, unknown>) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
-      ch.send(JSON.stringify({ t: 'rc:control.request' }))
+      ch.send(JSON.stringify(msg))
     } catch {
       /* drop */
     }
@@ -6091,10 +6159,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       phase.value = 'closed'
       if (msg.reason) {
-        // Reason is informational; UI surfaces it when non-nominal.
-        if (msg.reason === 'error' || msg.reason === 'consent_timeout' || msg.reason === 'user_denied') {
-          error.value = msg.reason
-        }
+        // FR-27 - a non-nominal end gets a sentence, not the enum name. The
+        // mapping returns null for every nominal reason, so the set of
+        // reasons that surface is the set that has something to say.
+        const friendly = friendlyEndReason(msg.reason)
+        if (friendly) error.value = friendly
       }
       teardown()
     })
@@ -9779,6 +9848,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     controlState,
     peerCursors,
     requestControl,
+    grantControl,
+    dismissControlRequest,
     setInputMode,
     /**
      * Name of the input desktop the agent is currently bound to,
