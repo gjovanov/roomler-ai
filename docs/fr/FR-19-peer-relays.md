@@ -773,6 +773,9 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 ⚠️ Where an instrument does not exist it is named as prerequisite work **in the same row**.
 
+> **Test coverage map (2026-08-29).** The wire/mint hardening boxes ticked below are each backed by a named, non-vacuous test on master, not a field run:
+> `tag₁`-refusal & same-egress third node → `orgrelay::bind::a_valid_cookie_without_the_member_secret_is_refused`; replay → `a_captured_exchange_does_not_replay_under_a_different_nonce`; amplification bound → `wire::probe_is_fixed_length_so_a_reply_can_never_amplify` + `every_control_kind_roundtrips_at_one_fixed_size`; bind flood → `server::a_bind_flood_is_rate_limited_before_it_can_cost_a_mac`; `policy_unreadable` & `rate_limited` mint refusals → `peer_relay_mint_tests::every_refusal_is_audited_with_its_reason`; fuzz/no-panic → `wire::control_and_data_decoders_never_panic_on_arbitrary_bytes`; shape disjointness over all 256 byte-0 values → `wire::shape_is_disjoint_from_wg_stun_and_disco_across_every_first_byte`; `relay_max_sessions` cap → `server::the_handle_cannot_push_the_table_past_its_cap`. Non-routable endpoint + approval authz were additionally field-verified (log below). **Still open** (no confirmable coverage from HEAD): the pre-FR-19 forward-compat box (needs the old `NetmapPeer` shape), and the field-instrument boxes (bytes-through-pod, port-audit scoping, 24 h socket census, kill-every-relay demote).
+
 **P0 — wire compatibility (gates everything else)**
 
 - [ ] A **pre-FR-19** agent receiving a netmap containing an unknown `relay_strategy` tag
@@ -782,16 +785,16 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 **Security (§4 — the half the first draft got wrong)**
 
-- [ ] A bind carrying a **valid cookie but no valid `tag₁`** is refused. *(This is the
+- [x] A bind carrying a **valid cookie but no valid `tag₁`** is refused. *(This is the
       criterion the first draft could not have had: its handshake made any cookie-echoing
       party a legitimate binder.)*
-- [ ] A third node **on the same egress `addr:port` as a legitimate member** cannot bind or
+- [x] A third node **on the same egress `addr:port` as a legitimate member** cannot bind or
       displace it — the same-NAT steal, i.e. the `clk00017265` population.
-- [ ] A captured `Bind`/`Answer` pair **does not replay** in the next rotation window.
-- [ ] **`len(response) ≤ len(request)` on every bind-path reply**, asserted byte-for-byte.
-- [ ] A bind flood from N sources does not degrade the relay's **own** carriers, and the
+- [x] A captured `Bind`/`Answer` pair **does not replay** in the next rotation window.
+- [x] **`len(response) ≤ len(request)` on every bind-path reply**, asserted byte-for-byte.
+- [x] A bind flood from N sources does not degrade the relay's **own** carriers, and the
       per-source limiter counts refusals by reason.
-- [ ] With `overlay_policies` **unreadable**, the mint is refused and audited with a distinct
+- [x] With `overlay_policies` **unreadable**, the mint is refused and audited with a distinct
       reason — the fail-closed property, which needs `try_load_acl` to be expressible at all.
       *(P3b: `try_load_acl(…, PolicyLoad::Always) -> Result` + `try_overlay_source_of`
       landed; `load_acl` / `overlay_source_of` keep their open posture as explicit wrappers
@@ -811,7 +814,7 @@ kill switch. That is what makes E2E-3 executable before P2.
       `static_endpoint` with 400, and the mint refuses `non_routable_endpoint` when one is
       smuggled past it (tested by writing the row directly); the address rule is the push
       SSRF validator's `is_global_unicast`, shared, not copied.)*
-- [ ] Mint refused when rate-limited, with the refusal audited. *(P3c: `rate_limited`,
+- [x] Mint refused when rate-limited, with the refusal audited. *(P3c: `rate_limited`,
       keyed (requester node, relay node) as §4 prescribes; the test pre-spends the ceiling
       in process. Deliberately AFTER relay selection so the row can name the relay the
       requester was hammering.)*
@@ -821,7 +824,7 @@ kill switch. That is what makes E2E-3 executable before P2.
       `approval_needs_manage_agents_and_exec_device_and_audits_both_arms` — six attempts,
       six rows. Clearing an approval needs only `MANAGE_AGENTS`: revocation is not a grant.
       Field check against prod after the deploy.)*
-- [ ] The bind/Geneve parser survives **fuzzing over arbitrary byte strings** without panic.
+- [x] The bind/Geneve parser survives **fuzzing over arbitrary byte strings** without panic.
 
 **Correctness**
 
@@ -836,7 +839,7 @@ kill switch. That is what makes E2E-3 executable before P2.
       P4 field check.)*
 - [ ] A relay forwards only between the two bound `addr:port`s for a VNI; a packet from an
       unbound source is dropped and counted by `ORG_RELAY_FORWARD_UNBOUND_SRC`.
-- [ ] **Shape disjointness over WG × STUN × disco × Geneve**, all 256 byte-0 values; a frame
+- [x] **Shape disjointness over WG × STUN × disco × Geneve**, all 256 byte-0 values; a frame
       with `Opt Len ≠ 0` is rejected; `VNI = 0x2112A4` is never minted.
 - [ ] A **re-bind under a valid `tag₁` from a new source succeeds** (symmetric-NAT rebind)
       and **without one fails** — both directions. *(P2c proved both directions on the relay
@@ -882,7 +885,7 @@ kill switch. That is what makes E2E-3 executable before P2.
 - [ ] `peer-relay-port-audit.sh check` fails on a host whose UDP port is closed, and the
       weekly cron files an issue — proven by removing the rule on zeus and watching it fire.
 - [ ] The port rule is **scoped**, not merely present.
-- [ ] A relay at `relay_max_sessions` refuses with a distinct reason; the pair falls back.
+- [x] A relay at `relay_max_sessions` refuses with a distinct reason; the pair falls back.
 - [ ] Relay-node UDP socket census flat over 24 h (F6).
 
 ---
