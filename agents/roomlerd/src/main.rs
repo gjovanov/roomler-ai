@@ -1123,6 +1123,11 @@ async fn consent_list_cmd() -> Result<()> {
         // was remote control.
         let kind = if p.kind.is_empty() { "rc" } else { &p.kind };
         println!("{}  [{}]  from {}", p.session_id, kind, p.controller_name);
+        if p.surface == "native" {
+            // Worth saying: the operator is about to be told to run a command
+            // for something that already has a button in front of them.
+            println!("    shown:       on this device's screen already");
+        }
         if !p.org.is_empty() {
             println!("    org:         {}", p.org);
         }
