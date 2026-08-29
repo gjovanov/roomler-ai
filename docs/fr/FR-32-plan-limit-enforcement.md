@@ -2,7 +2,7 @@
 # FR-32 — Eleven of fourteen plan limits are advertised and enforced nowhere
 
 **Issue:** [#898](https://github.com/gjovanov/roomler-ai/issues/898) ·
-**Status:** design ·
+**Status:** P0+P1a+P1b+P1c shipped & field-verified on `v20260829-0da90b766dc0`; P2 pending ·
 **Parent arc:** pricing (P1 of the sequence agreed under [FR-24](FR-24-licensing-split.md))
 
 ## Goal
@@ -276,7 +276,48 @@ one more"), and conflating them would mark every tenant exactly at its limit as 
 
 ## Field-verification log
 
-_(empty — nothing shipped yet)_
+### 2026-08-29 — P0 + P1a + P1b + P1c live on prod `v20260829-0da90b766dc0` (#904 → `e95907ff`)
+
+**Falsifiable check, with a control.** The report route was measured **before** the roll and
+after, plus a never-existing path to prove the discriminator:
+
+| Path | Before | After |
+|---|---|---|
+| `/api/admin/plan-compliance` | **404** (absent) | **401** (present, auth required) |
+| `/api/admin/stats/orgs` (control, unchanged) | 401 | 401 |
+| `/api/nonexistent-control` | 404 | 404 |
+| `/health` | 200 | 200 |
+
+A 404→401 transition while a known-missing path still 404s is the route shipping, not a
+coincidence of gateway behaviour.
+
+**The report returns real data** (fetched as a platform admin in the operator's own browser):
+65 tenants, and fleet-wide non-zero usage across every aggregation — `MaxMembers` 111,
+`MaxChannels` 67, `MaxDevices` 27, `MaxTunnelClients` 11, `StorageBytes` 26 112 358,
+`MagicDns` 2, `MaxMessageHistory` 97. ⚠ This check is the load-bearing one: an all-zero report
+is indistinguishable from "everyone is compliant", so the totals had to be shown non-zero
+before `would_break: 0` could mean anything.
+
+**Result: `would_break = 0` of 65 tenants.** Nobody is over a gated limit, and nobody is even
+*at* one — the closest is `Conf Org [Free] MaxChannels 1/5`, at 20 %. So **P2's grandfathering
+step is a no-op**: tenants can be flipped to `Enforce` without any of them being refused.
+
+**Every tenant deserialised to `Warn`** (65/65), confirming the `#[serde(default)]` on
+`plan_enforcement` lands pre-FR-32 documents in observe mode as designed.
+
+**No regression:** zero panics, zero `5xx`, zero `compliance query failed`, and zero
+`plan limit exceeded` lines in 12 minutes across both pods.
+
+#### Two pricing findings the report surfaced
+
+1. **`Enterprise` is not just a phantom tier, it is the ONLY paid tier in use.** Plan
+   distribution is **63 Free · 2 Enterprise · 0 Pro · 0 Business**, and both Enterprise
+   tenants are internal (`Grox`, `Jovanov`). The two tiers Stripe actually sells have **zero
+   adoption**, while the only non-Free tenants sit on a tier `get_plans()` never returns.
+   That reframes open decision 3: it is a P3 pricing input, not a tidy-up.
+2. **The gates are inert against real data, by measurement rather than by assertion.** Free's
+   caps (10 members, 5 channels, 100 MB) are far above what any Free tenant on this
+   deployment actually uses, which is itself worth knowing before P3 re-prices them.
 
 ---
 
