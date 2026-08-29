@@ -63,10 +63,21 @@ pub struct TenantSettings {
     pub mfa_required: bool,
     #[serde(default)]
     pub allow_guest_access: bool,
-    #[serde(default = "default_max_members")]
-    pub max_members: u32,
-    #[serde(default = "default_file_upload_limit")]
-    pub file_upload_limit: u64,
+    // FR-32 — `max_members` and `file_upload_limit` lived here and were REMOVED.
+    // They shadowed `PlanLimits::{max_members, storage_bytes}` and had zero
+    // readers in the entire workspace — not two enforcers disagreeing, two dead
+    // fields shadowing two dead fields. They also disagreed with the plan they
+    // shadowed by 10x (this defaulted to 100; Free's PlanLimits says 10), so
+    // wiring the wrong one would have changed who is over the line.
+    //
+    // `PlanLimits` is the single source of truth: it is what
+    // `GET /api/stripe/plans` publishes, what `BillingView.vue` renders, and
+    // what the billing test asserts. Serde ignores the leftover key in existing
+    // tenant documents, so no migration is needed.
+    //
+    // A per-tenant override may well be wanted for bespoke Enterprise deals —
+    // the same problem as the phantom `Enterprise` tier. Add it deliberately
+    // then, with stated semantics, rather than inheriting one from an accident.
     /// Phase 2 MagicDNS — the tenant's overlay DNS suffix (e.g.
     /// `"myorg.roomler.net"`). When set, overlay nodes run a local split-DNS
     /// resolver that answers `<node-name>.<domain>` with the peer's overlay IP.
@@ -114,8 +125,6 @@ impl Default for TenantSettings {
             default_message_notifications: NotificationLevel::default(),
             mfa_required: false,
             allow_guest_access: false,
-            max_members: default_max_members(),
-            file_upload_limit: default_file_upload_limit(),
             magic_dns_domain: None,
             magic_dns_nameservers: Vec::new(),
             remote_exec_enabled: false,
@@ -127,14 +136,6 @@ impl Default for TenantSettings {
 
 fn default_locale() -> String {
     "en-US".to_string()
-}
-
-fn default_max_members() -> u32 {
-    100
-}
-
-fn default_file_upload_limit() -> u64 {
-    10 * 1024 * 1024 // 10 MB
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
