@@ -76,20 +76,30 @@ impl DamageTracker {
         let root = conn.setup().roots.get(screen_num)?.root;
 
         // The extension must be present AND negotiated before any damage
-        // request is legal.
-        conn.damage_query_version(1, 1)
-            .and_then(|c| c.reply().map_err(Into::into))
-            .map_err(|e| tracing::info!(%e, "capture: X server has no DAMAGE extension"))
-            .ok()?;
+        // request is legal. Stepwise rather than chained: the request and the
+        // reply fail with DIFFERENT error types (`ConnectionError` vs
+        // `ReplyError`) and there is no `From` between them.
+        let Ok(cookie) = conn.damage_query_version(1, 1) else {
+            tracing::info!("capture: X server did not accept a DAMAGE version request");
+            return None;
+        };
+        if let Err(e) = cookie.reply() {
+            tracing::info!(%e, "capture: X server has no usable DAMAGE extension");
+            return None;
+        }
 
         let damage = conn.generate_id().ok()?;
         // NON_EMPTY: one event when the region goes empty -> non-empty, and
         // then silence until we subtract. That is exactly "has anything
         // changed since I last looked", with no per-rectangle event storm.
-        conn.damage_create(damage, root, ReportLevel::NON_EMPTY)
-            .and_then(|c| c.check().map_err(Into::into))
-            .map_err(|e| tracing::info!(%e, "capture: could not watch the root window for damage"))
-            .ok()?;
+        let Ok(cookie) = conn.damage_create(damage, root, ReportLevel::NON_EMPTY) else {
+            tracing::info!("capture: could not request damage on the root window");
+            return None;
+        };
+        if let Err(e) = cookie.check() {
+            tracing::info!(%e, "capture: the X server refused to watch the root window for damage");
+            return None;
+        }
         let _ = conn.flush();
 
         tracing::info!(
