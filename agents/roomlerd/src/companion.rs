@@ -98,7 +98,7 @@ pub async fn ensure_running() -> bool {
         Ok(EnsureOutcome::Unsupported) => {
             tracing::info!(
                 "no desktop companion on this host — an on-screen prompt is not possible; \
-                 answer with `roomler consent --list` / `--approve`, or set this device to \
+                 answer with `roomlerd consent --list` / `--approve`, or set this device to \
                  email/push consent"
             );
             false
@@ -117,6 +117,131 @@ pub async fn ensure_running() -> bool {
 
 /// One attempt per this interval, process-wide.
 const ENSURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// FR-27 — the version of the companion INSTALLED on this host, for the
+/// heartbeat, or `None` when there is none / it cannot be read.
+///
+/// This exists because the daemon and the companion update through different
+/// mechanisms on all three platforms (see [`refresh_if_stale`]), so a fleet
+/// "Update all" moving `agent_version` says nothing about the companion. The
+/// operator's report was exactly that: the daemon went forward and the desktop
+/// stayed behind, with nothing on screen to say so.
+///
+/// ⚠️ Deliberately does NOT run the companion binary. `--version` on a GUI
+/// binary is a process spawn on every heartbeat and, on Linux, a GTK-linked
+/// executable started by a root daemon with no display; both are worse than a
+/// file read. Every arm reads metadata the installer already wrote.
+///
+/// Cached for [`VERSION_TTL`]: the answer only changes when a package manager
+/// runs, and the heartbeat is every 30 s.
+pub fn installed_version() -> Option<String> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+
+    if let Some((at, ref v)) = *CACHE.lock().unwrap()
+        && at.elapsed() < VERSION_TTL
+    {
+        return v.clone();
+    }
+    let v = installed_version_inner();
+    *CACHE.lock().unwrap() = Some((Instant::now(), v.clone()));
+    v
+}
+
+const VERSION_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Windows: the sidecar marker [`refresh_if_stale`] writes on every swap. A
+/// wizard-placed EXE with no marker reads as `None`, which is honest — the
+/// daemon genuinely does not know what version it is until it swaps it once.
+#[cfg(target_os = "windows")]
+fn installed_version_inner() -> Option<String> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    if !dir.join(DESKTOP_EXE).exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(dir.join(VERSION_MARKER)).ok()?;
+    sanitize_version(&raw)
+}
+
+/// macOS: `CFBundleShortVersionString` out of the app bundle's `Info.plist`.
+/// Scanned as text rather than parsed: the plist is one we generate ourselves
+/// (`release-agent.yml`), in the XML form, and a plist crate for one string
+/// would be a dependency the thin-client work (P3e lever E) just spent effort
+/// removing.
+#[cfg(target_os = "macos")]
+fn installed_version_inner() -> Option<String> {
+    const PLIST: &str = "/Applications/Roomler.app/Contents/Info.plist";
+    let text = std::fs::read_to_string(PLIST).ok()?;
+    let after = text.split("<key>CFBundleShortVersionString</key>").nth(1)?;
+    let open = after.find("<string>")? + "<string>".len();
+    let close = after[open..].find("</string>")? + open;
+    sanitize_version(&after[open..close])
+}
+
+/// Linux: ask dpkg, which OWNS the companion here (its own `roomler-desktop`
+/// .deb). Reading the package database is the one answer that stays true when
+/// apt upgrades the companion without the daemon noticing.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn installed_version_inner() -> Option<String> {
+    let out = std::process::Command::new("dpkg-query")
+        .args(["-W", "-f=${Version}", "roomler-desktop"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        // Not installed, or no dpkg at all (the Fedora/Asahi host). Both are
+        // "no companion we can name", not an error worth logging every 10 min.
+        return None;
+    }
+    // cargo-deb appends a Debian revision (`0.4.16-1`); report the upstream
+    // half so the grid can compare it against `agent_version` directly.
+    let raw = String::from_utf8_lossy(&out.stdout);
+    sanitize_version(raw.split('-').next().unwrap_or(""))
+}
+
+/// A version string is about to be persisted on the device row and rendered in
+/// the grid, and every arm above reads it off the host — so bound it. Empty
+/// stays `None` (absent and blank must not look different downstream).
+fn sanitize_version(raw: &str) -> Option<String> {
+    let v: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+        .take(32)
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::sanitize_version;
+
+    #[test]
+    fn blank_and_whitespace_are_absent_not_empty() {
+        assert_eq!(sanitize_version(""), None);
+        assert_eq!(sanitize_version("   \n"), None);
+    }
+
+    #[test]
+    fn ordinary_versions_survive_intact() {
+        assert_eq!(sanitize_version("0.4.16\n"), Some("0.4.16".into()));
+        assert_eq!(
+            sanitize_version("0.3.0-rc.483"),
+            Some("0.3.0-rc.483".into())
+        );
+    }
+
+    #[test]
+    fn host_supplied_junk_cannot_reach_the_grid() {
+        // The Windows arm reads a file anyone able to write next to the daemon
+        // could edit; the value ends up in a Vue table.
+        assert_eq!(
+            sanitize_version("<script>alert(1)</script>"),
+            Some("scriptalert1script".into())
+        );
+        assert_eq!(sanitize_version(&"9".repeat(200)).unwrap().len(), 32);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnsureOutcome {
