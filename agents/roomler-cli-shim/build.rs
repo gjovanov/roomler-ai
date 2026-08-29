@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Embeds a Windows VERSIONINFO resource into `roomler-shim.exe`.
 //!
 //! The shim INSTALLS as `roomler.exe` (the wxs File element renames it) on
 //! every Windows daemon host, so this is one of the two first-party binaries
 //! AV consoles, Task Manager and AppLocker actually look at there. Same
 //! rationale and same embed-resource-vs-winresource reasoning as
-//! `agents/roomler-agent/build.rs` -- see that file.
+//! `agents/roomlerd/build.rs` -- see that file.
 //!
 //! No-op on every non-Windows host.
 

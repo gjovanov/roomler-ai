@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler-ai-remote-control` — TeamViewer-style remote desktop subsystem for Roomler AI.
 //!
 //! This crate is signaling and state-management only. It never touches video

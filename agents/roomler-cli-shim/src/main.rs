@@ -1,17 +1,19 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler.exe` on daemon hosts — a launcher that re-execs `roomlerd cli`.
 //!
 //! # Why
 //!
 //! Both MSI flavours used to bundle the full standalone tunnel CLI next to the
 //! daemon (P4b). Measured on rc.361 that was 22.1 MiB of which only ~1.2 MiB
-//! was CLI-specific code: `cargo bloat` puts `roomler_tunnel` + its bin at
+//! was CLI-specific code: `cargo bloat` puts `roomler_cli` + its bin at
 //! 1.16 MiB of a 15.0 MiB `.text`, and everything else (std, the webrtc
 //! family, tunnel_core, tokio, rustls, reqwest, quinn, clap) is a second copy
 //! of crates `roomlerd.exe` already links. It also cost the Windows MSI job a
-//! serial 143 s `cargo build -p roomler-tunnel` with a different feature set.
+//! serial 143 s `cargo build -p roomler-cli` with a different feature set.
 //!
 //! So the daemon now owns that command surface (`roomlerd cli <args>` →
-//! `roomler_tunnel::cli::run_from`), and this ~150 KB launcher keeps the
+//! `roomler_cli::cli::run_from`), and this ~150 KB launcher keeps the
 //! user-facing `roomler` command, its PATH entry, and the installer-smoke
 //! payload assertions exactly where they were. Tunnel-ONLY hosts are
 //! unaffected — they still install the real standalone binary from
@@ -159,9 +161,13 @@ const DAEMON_FILE_NAME: &str = "roomlerd.exe";
 #[cfg(not(target_os = "windows"))]
 const DAEMON_FILE_NAME: &str = "roomlerd";
 
+// RETIRED-NAME-ANCHOR(8): the macOS bundle executable is FROZEN (D5) — it keys the host
+// TCC grants.
 /// The macOS bundle's executable. Named `roomler-agent`, not `roomlerd`:
 /// `CFBundleExecutable` conventionally matches the bundle, CI asserts the two
 /// plists point here, and renaming it would invalidate the TCC grants keyed to
 /// this binary.
 #[cfg(target_os = "macos")]
+// RETIRED-NAME-ANCHOR(2): the macOS .app bundle name is FROZEN (FR-21 D5) —
+// it keys the host's Screen Recording and Accessibility TCC grants.
 const MACOS_BUNDLE_DAEMON: &str = "/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent";

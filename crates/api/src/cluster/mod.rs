@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-1 — multi-pod cluster foundation (see `docs/multi-pod-scale-out.md`).
 //!
 //! Three pieces, all fail-soft when Redis is absent:

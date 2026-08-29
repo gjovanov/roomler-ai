@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay crypto-routing table.
 //!
 //! boringtun's [`Tunn`](boringtun::noise::Tunn) is **single-peer** — it
@@ -76,7 +78,7 @@ pub fn embedded_v4_of_overlay_v6(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 }
 
 /// P4 — reverse-path filtering mode (`overlay_rpf` config /
-/// `ROOMLER_NODE_OVERLAY_RPF`): `off` (deliver everything — the pre-P4
+/// `ROOMLERD_OVERLAY_RPF`): `off` (deliver everything — the pre-P4
 /// behaviour) | `warn` (evaluate + count + throttled-log, still deliver — the
 /// built-in default) | `enforce` (drop).
 ///

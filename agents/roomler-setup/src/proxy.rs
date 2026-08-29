@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Proxy-base resolution for the unified wizard — the identity half
 //! the legacy wrappers kept per-crate, re-owned by this app.
 //!
@@ -22,7 +24,7 @@ pub const USER_AGENT: &str = concat!("roomler-setup/", env!("CARGO_PKG_VERSION")
 const DEFAULT_AGENT_BASE: &str = "https://roomler.ai/api/agent/installer";
 
 /// Default proxy base for the tunnel-CLI archive endpoint family.
-/// NB: `/api/tunnel/installer` serves the `roomler-tunnel` CLI
+/// NB: `/api/tunnel/installer` serves the `roomler` CLI
 /// tarball; the (P4c-2-retired) `/api/tunnel-wizard` family served
 /// the wizard EXE itself — pointing here at the latter made the
 /// wizard install ITSELF (rc.60 bug, fixed rc.61).

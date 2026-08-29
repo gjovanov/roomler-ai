@@ -22,8 +22,8 @@ flowchart TB
 |---|---|---|
 | Backend integration | `cargo test -p roomler-ai-tests` | MongoDB `localhost:27019`, Redis `6379` |
 | Remote-control crate | `cargo test -p roomler-ai-remote-control --lib` | nothing (wire-format locks, Hub, consent) |
-| Agent library | `cargo test -p roomler-agent --lib` | nothing (default features) |
-| Agent w/ media+input | `cargo test -p roomler-agent --lib --features full` | libxcb*-dev on Linux |
+| Agent library | `cargo test -p roomlerd --lib` | nothing (default features) |
+| Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
@@ -35,7 +35,7 @@ flowchart TB
 
 Each test spawns a **real Axum server** on a random port against a **unique
 UUID-named database** (dropped on teardown). The agent-facing modules drive the
-actual `roomler-agent` library in-process for full `rc:*` round-trips against a
+actual `roomlerd` library in-process for full `rc:*` round-trips against a
 TestApp — enrollment, sessions, tunnels, overlay joins, exec.
 
 Coverage areas: auth · tenant (+archive) · member · role · room/channel · message ·

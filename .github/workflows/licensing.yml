@@ -1,0 +1,100 @@
+name: Licensing
+
+# FR-24 — the mechanism that stops the AGPL/MPL split from rotting.
+#
+# Three independent checks, in increasing order of what they'd catch:
+#   1. every workspace member declares an explicit `license`
+#   2. every first-party source file carries the right SPDX header
+#   3. NO server crate appears in a shipped agent binary's dependency graph
+#
+# (3) is the load-bearing one. (1) and (2) catch a forgotten file; (3) catches
+# the change that would actually break the promise in LICENSING.md — an
+# AGPL-licensed crate reaching a binary customers install on their own machines.
+
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'scripts/licence-classes.sh'
+      - 'scripts/apply-spdx.sh'
+      - '.github/workflows/licensing.yml'
+      - 'crates/**'
+      - 'agents/**'
+      - 'ui/src/**'
+      - 'LICENSE*'
+      - 'LICENSING.md'
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: licensing-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  licensing:
+    name: Licence split integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every workspace member declares an explicit `license`
+        run: |
+          set -euo pipefail
+          source scripts/licence-classes.sh
+          fail=0
+          for f in crates/*/Cargo.toml agents/*/Cargo.toml; do
+            pkg=$(grep -m1 '^name = ' "$f" | sed 's/name = //;s/"//g')
+            # Only the [package] section counts — [package.metadata.wix] also
+            # has a `license` key, and it means something entirely different.
+            got=$(awk '/^\[/{n++} n>1{exit} /^license = /{print $3}' "$f" | tr -d '"')
+            want=$(licence_for_crate "$pkg") || {
+              echo "::error file=$f::$pkg is not classified in scripts/licence-classes.sh"
+              fail=1; continue
+            }
+            if [ "$got" != "$want" ]; then
+              echo "::error file=$f::$pkg declares '${got:-<none>}', expected '$want'"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] && echo "OK: all workspace members declare the expected licence."
+          exit $fail
+
+      - name: Every first-party source file carries the right SPDX header
+        run: bash scripts/apply-spdx.sh --check
+
+      # ── The one that matters ────────────────────────────────────────────────
+      # An AGPL crate inside roomlerd would make the agent effectively AGPL,
+      # which is a procurement blocker at most enterprises and would falsify the
+      # MSP paragraph in LICENSING.md. Nothing else in this workflow would catch
+      # it: the new edge would be a one-line Cargo.toml change that compiles.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: No AGPL crate reaches a shipped agent binary
+        run: |
+          set -euo pipefail
+          source scripts/licence-classes.sh
+          fail=0
+          for agent in "${SHIPPED_AGENT_CRATES[@]}"; do
+            # -e normal drops dev-dependencies: a test-only edge cannot reach a
+            # shipped binary, and treating it as a violation would be a false
+            # positive that trains people to disable this check.
+            graph=$(cargo tree -p "$agent" -e normal --prefix none --no-dedupe 2>/dev/null | awk '{print $1}' | sort -u)
+            for server in "${SERVER_CRATES[@]}"; do
+              if printf '%s\n' "$graph" | grep -qx "$server"; then
+                echo "::error::$agent (MPL-2.0, shipped to customer machines) depends on $server ($SERVER_LICENCE)."
+                echo "         This would make the agent effectively $SERVER_LICENCE. See LICENSING.md."
+                cargo tree -p "$agent" -e normal --invert "$server" 2>/dev/null | head -20
+                fail=1
+              fi
+            done
+          done
+          [ "$fail" = 0 ] && echo "OK: no $SERVER_LICENCE crate reaches any shipped agent binary."
+          exit $fail
+
+      - name: Dependency licences are on the allowlist
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

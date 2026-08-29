@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Tauri invoke handlers for the unified setup wizard.
 //!
 //! 11 handlers — the union of the two legacy wizards' surfaces
@@ -71,7 +73,7 @@ pub struct TunnelDetect {
 /// compile-time platform check.
 #[tauri::command]
 pub fn cmd_detect_install() -> Result<DetectResult, String> {
-    use roomler_agent::install_detect::{ExistingInstall, detect_existing_install};
+    use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
     let agent = match detect_existing_install() {
         ExistingInstall::Clean => AgentDetect {
             supported: cfg!(target_os = "windows"),
@@ -115,7 +117,7 @@ pub fn cmd_detect_install() -> Result<DetectResult, String> {
 /// the platform-default path, read + TOML-parse best-effort for the
 /// machine_name.
 fn probe_tunnel_install() -> TunnelDetect {
-    let Ok(path) = roomler_tunnel::config::default_config_path() else {
+    let Ok(path) = roomler_cli::config::default_config_path() else {
         return TunnelDetect {
             installed: false,
             machine_name: None,
@@ -131,7 +133,7 @@ fn probe_tunnel_install() -> TunnelDetect {
     }
     let machine_name = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|s| toml::from_str::<roomler_tunnel::config::TunnelConfig>(&s).ok())
+        .and_then(|s| toml::from_str::<roomler_cli::config::TunnelConfig>(&s).ok())
         .map(|c| c.machine_name);
     TunnelDetect {
         installed: true,
@@ -195,7 +197,7 @@ pub struct TokenValidation {
 /// `cmd_install` for the field repro that motivates the attribute).
 #[tauri::command(rename_all = "camelCase")]
 pub fn cmd_validate_token(token: String, role: Option<Role>) -> Result<TokenValidation, String> {
-    use roomler_agent::jwt_introspect::{is_likely_expired, parse_unverified};
+    use roomlerd::jwt_introspect::{is_likely_expired, parse_unverified};
     let view = parse_unverified(&token).map_err(|e| e.to_string())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -429,6 +431,8 @@ mod tests {
             tag: "tunnel-v0.3.0-rc.194".to_string(),
             role: Role::TunnelClient,
             flavour: None,
+            // RETIRED-NAME-ANCHOR(4): fixtures of the INSTALLED layout on hosts that
+            // predate the rename.
             binary_path: Some("/usr/local/bin/roomler-tunnel".to_string()),
             config_path: Some("/home/foo/.config/roomler-tunnel/config.toml".to_string()),
             path_updated: Some(true),

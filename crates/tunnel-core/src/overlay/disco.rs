@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Disco — the out-of-tunnel carrier echo (C1: responder only).
 //!
 //! # Why this exists, and why it is NOT the rc.346 data-probe

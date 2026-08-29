@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 pub mod agent_crash;
 pub mod agent_exec;
 pub mod agent_log;
@@ -21,6 +23,8 @@ pub mod oauth;
 pub mod overlay_block;
 pub mod overlay_policy;
 pub mod overlay_route;
+pub mod peer_relay;
+pub mod plan_compliance;
 pub mod push;
 pub mod reaction;
 pub mod recording;

@@ -31,8 +31,11 @@
 #   --no-enroll       install without enrolling (no token needed); prints the
 #                     enroll command to run later.
 #
-# The desktop companion (roomler-desktop) ships for Windows only today — this
-# script notes that and moves on.
+# The desktop companion (roomler-desktop) rides IN the macOS .pkg. On Linux it
+# is a SEPARATE .deb (FR-27) — installed automatically when this box has a
+# graphical session, since the companion is the device's consent PROMPT
+# surface and a device set to "Prompt on host" without one cannot ask anybody.
+#   --desktop / --no-desktop   force that decision either way.
 #
 # Conventions: POSIX sh (no bashisms), curl -fsSL, /tmp staging, sudo only
 # where the target dir demands it. The enrollment token is single-use and is
@@ -52,6 +55,9 @@ SYSTEM=0
 # in the wrong tree entirely. Must match roomlerd.service's ROOMLERD_CONFIG.
 SYSTEM_CONFIG="/etc/roomler/config.toml"
 # macOS's privileged half has its OWN path, and it is NOT $SYSTEM_CONFIG above:
+# RETIRED-NAME-ANCHOR(3): /etc/roomler-agent is the REAL macOS daemon config
+# dir — the shipped com.roomler.daemon.plist passes it as --config and the
+# .pkg postinstall creates it. Renaming it here alone strands the daemon.
 # com.roomler.daemon.plist passes `--config /etc/roomler-agent/config.toml`
 # explicitly, and the agent's root-aware config ladder is Linux-only. Reusing
 # one variable for both would enroll into a file nothing reads.
@@ -59,11 +65,20 @@ MACOS_DAEMON_CONFIG="/etc/roomler-agent/config.toml"
 MACOS_DAEMON_MARKER="/etc/roomler-agent/enable-daemon"
 DAEMON_TOKEN=""
 NO_ENROLL=0
+# FR-27 — the Linux desktop companion. Empty = decide by probing for a
+# graphical session; --desktop / --no-desktop force it either way.
+DESKTOP=""
 
 usage() {
     sed -n '2,30p' "$0" 2>/dev/null || true
     echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME]"
     echo "                  [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
+    echo "                  [--desktop|--no-desktop]"
+    echo
+    echo "  --desktop       Linux only. Force the roomler-desktop companion on or off."
+    echo "                  Default: installed when a graphical session is detected. It is"
+    echo "                  the device's on-screen consent prompt, so a host set to"
+    echo "                  'Prompt on host' without it cannot ask anybody."
     echo
     echo "  --daemon-token  macOS only. Installs the privileged half as well (overlay/mesh)."
     echo "                  macOS needs TWO processes: a per-user LaunchAgent for screen"
@@ -86,6 +101,8 @@ while [ $# -gt 0 ]; do
         --system) SYSTEM=1; shift ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
         --no-enroll) NO_ENROLL=1; shift ;;
+        --desktop) DESKTOP=1; shift ;;
+        --no-desktop) DESKTOP=0; shift ;;
         -h|--help) usage ;;
         *) echo "unknown flag: $1" >&2; usage ;;
     esac
@@ -229,7 +246,7 @@ install_daemon_linux() {
         digest="$(asset_field_for "$releases" "$pattern" digest)"
     fi
     [ -n "$url" ] || { echo "error: no linux/${arch} .${fmt} asset in the latest agent release" >&2; exit 1; }
-    deb="$STAGE/roomler-agent.${fmt}"
+    deb="$STAGE/roomlerd.${fmt}"
     download "$url" "$deb"
     verify_sha256 "$deb" "$digest"
 
@@ -255,6 +272,8 @@ install_daemon_linux() {
     else
         say "installing the roomlerd daemon (tarball — sudo required)"
         # --strip-components=1 drops the versioned prefix dir so the payload
+# RETIRED-NAME-ANCHOR: usr/lib/roomler-agent is baked into the binary as an
+# RPATH — the directory name cannot move without a relink.
         # lands at /usr/bin, /usr/lib/roomler-agent, /usr/lib/systemd/…
         # (identical to what the .deb installs). On a FIRST install there are
         # no operator-edited units to protect, so unpacking wholesale is fine;
@@ -288,11 +307,14 @@ install_daemon_macos() {
     url="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' browser_download_url)"
     digest="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' digest)"
     [ -n "$url" ] || { echo "error: no macOS .pkg asset in the latest agent release" >&2; exit 1; }
-    pkg="$STAGE/roomler-agent.pkg"
+    pkg="$STAGE/roomlerd.pkg"
     download "$url" "$pkg"
     verify_sha256 "$pkg" "$digest"
 
     # The .app kept its legacy internal name through the roomlerd rename —
+# RETIRED-NAME-ANCHOR(5): the macOS .app bundle name is FROZEN (FR-21 D5) —
+# it keys the host's Screen Recording and Accessibility TCC grants, which a
+# rename would silently void, leaving a black screen with no error.
     # CFBundleExecutable is `roomler-agent`, and CI asserts it, because
     # renaming would change the binary's TCC identity and force every existing
     # Mac to re-grant Screen Recording and Accessibility. The old probe led
@@ -384,6 +406,8 @@ install_macos_privileged_half() {
 macos_permissions_notice() {
     say ""
     say "ONE MANUAL STEP REMAINS — macOS will not grant these without you:"
+# RETIRED-NAME-ANCHOR(2): this is the string macOS SHOWS in the privacy pane;
+# it comes from the frozen bundle, so it must match what the user will see.
     say "  System Settings → Privacy & Security → Screen Recording  → enable 'roomler-agent'"
     say "  System Settings → Privacy & Security → Accessibility     → enable 'roomler-agent'"
     say ""
@@ -422,7 +446,7 @@ enroll_daemon() {
 
 install_tunnel_linux() {
     if command -v dpkg >/dev/null 2>&1; then
-        deb="$STAGE/roomler-tunnel.deb"
+        deb="$STAGE/roomler-cli.deb"
         say "downloading the roomler CLI (.deb) via the proxy"
         download "$SERVER/api/tunnel/installer/linux-deb?version=latest" "$deb"
         if [ "$DOWNLOAD_ONLY" = 1 ]; then
@@ -431,7 +455,7 @@ install_tunnel_linux() {
         fi
         sudo dpkg -i "$deb" || sudo apt-get -f install -y
     else
-        tarball="$STAGE/roomler-tunnel.tar.gz"
+        tarball="$STAGE/roomler-cli.tar.gz"
         say "downloading the roomler CLI (tarball) via the proxy"
         download "$SERVER/api/tunnel/installer/linux-x86_64?version=latest" "$tarball"
         if [ "$DOWNLOAD_ONLY" = 1 ]; then
@@ -444,7 +468,7 @@ install_tunnel_linux() {
 }
 
 install_tunnel_macos() {
-    tarball="$STAGE/roomler-tunnel.tar.gz"
+    tarball="$STAGE/roomler-cli.tar.gz"
     say "downloading the roomler CLI (universal tarball) via the proxy"
     download "$SERVER/api/tunnel/installer/macos?version=latest" "$tarball"
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
@@ -462,6 +486,10 @@ install_tunnel_tarball() {
     tar -xzf "$tarball" -C "$xdir"
     # Archives ship BOTH names since the P3d rename; prefer `roomler`.
     bin=""
+# RETIRED-NAME-ANCHOR-BEGIN
+# The tunnel CLI is installed on hosts that predate the rename, so the archive
+# may carry either name and an existing `roomler-tunnel` on PATH must keep
+# working. The symlink below is that compatibility promise, not a leftover.
     for name in roomler roomler-tunnel; do
         found="$(find "$xdir" -maxdepth 2 -type f -name "$name" | head -n 1)"
         [ -n "$found" ] && { bin="$found"; break; }
@@ -475,6 +503,7 @@ install_tunnel_tarball() {
 
 enroll_tunnel() {
     cli="$(command -v roomler || command -v roomler-tunnel || true)"
+# RETIRED-NAME-ANCHOR-END
     [ -n "$cli" ] || cli=/usr/local/bin/roomler
     if [ "$NO_ENROLL" = 1 ] || [ -z "$TOKEN" ]; then
         [ "$NO_ENROLL" = 1 ] || warn "no --token given — skipping enrollment"
@@ -485,17 +514,78 @@ enroll_tunnel() {
     "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
 }
 
+# FR-27 — the Linux desktop companion, from its OWN .deb.
+#
+# A SEPARATE package on purpose: the daemon .deb installs on headless nodes
+# across the fleet, and folding webkit2gtk + GTK into it to ship a menu-bar app
+# they cannot display would be a real regression for them.
+#
+# Installed by default when this box has a graphical session, because the
+# companion IS the consent prompt surface — a device set to "Prompt on host"
+# without one cannot ask anybody, and the operator only finds out when a
+# session times out for no stated reason.
+#
+# Never fatal. A daemon with no companion is still a working daemon; it just
+# has no on-screen way to answer a prompt, which this says out loud.
+#
+# Reads `arch` and `releases` from install_daemon_linux, which always runs
+# first (the case dispatch below calls them in that order).
+install_desktop_linux() {
+    if [ "$DESKTOP" = 0 ]; then
+        say "skipping the desktop companion (--no-desktop)"
+        return 0
+    fi
+    if [ -z "$DESKTOP" ]; then
+        # Probe, don't ask. A display or a login session is the honest signal
+        # that someone could SEE a prompt on this box.
+        if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] &&
+            ! { command -v loginctl >/dev/null 2>&1 &&
+                loginctl list-sessions --no-legend 2>/dev/null | grep -q .; }; then
+            say "no graphical session detected — skipping the desktop companion (--desktop forces it)"
+            return 0
+        fi
+    fi
+    if ! command -v dpkg >/dev/null 2>&1; then
+        say "no dpkg here — the desktop companion ships as a .deb only; skipping"
+        return 0
+    fi
+
+    desktop_pattern="roomler-desktop-.*${arch}-unknown-linux-gnu\\.deb"
+    desktop_url="$(asset_field_for "$releases" "$desktop_pattern" browser_download_url)"
+    if [ -z "$desktop_url" ]; then
+        say "no roomler-desktop .deb for ${arch} in this release — skipping the companion"
+        return 0
+    fi
+    desktop_digest="$(asset_field_for "$releases" "$desktop_pattern" digest)"
+    desktop_pkg="$STAGE/roomler-desktop.deb"
+    download "$desktop_url" "$desktop_pkg"
+    verify_sha256 "$desktop_pkg" "$desktop_digest"
+
+    if [ "$DOWNLOAD_ONLY" = 1 ]; then
+        say "download-only: would run: sudo dpkg -i $desktop_pkg"
+        return 0
+    fi
+    say "installing the roomler-desktop companion (.deb — sudo required)"
+    # `apt-get -f install` pulls webkit2gtk / GTK / appindicator when dpkg
+    # reports them missing, which on a fresh desktop it usually will.
+    if sudo dpkg -i "$desktop_pkg" || sudo apt-get -f install -y; then
+        say "desktop companion installed — starts at your next login, or now: roomler-desktop &"
+    else
+        warn "the desktop companion did not install; the daemon is unaffected."
+        warn "  Without it this device has no on-screen consent prompt — use"
+        warn "  'roomler consent --list' / '--approve', or set it to email/push consent."
+    fi
+}
+
 # ─── main ───────────────────────────────────────────────────────────────────
 
 say "roomler install.sh — role=$ROLE os=$OS server=$SERVER"
-# The companion rides IN the macOS .pkg (and the Windows MSI); only Linux has
-# none, and there it is the daemon + CLI without a desktop surface.
-if [ "$ROLE" = daemon ] && [ "$OS" = Linux ]; then
-    say "note: the roomler-desktop companion is not available on Linux — not installed here"
-fi
 
 case "$ROLE/$OS" in
-    daemon/Linux)  install_daemon_linux ;;
+    # FR-27 — the companion AFTER the daemon: it depends on `roomlerd` (the
+    # package literally Depends on it), and it reuses the release listing the
+    # daemon step already fetched.
+    daemon/Linux)  install_daemon_linux; install_desktop_linux ;;
     daemon/Darwin) install_daemon_macos ;;
     tunnel/Linux)  install_tunnel_linux ;;
     tunnel/Darwin) install_tunnel_macos ;;

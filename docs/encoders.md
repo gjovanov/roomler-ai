@@ -2,7 +2,7 @@
 
 Everything between the remote host's framebuffer and the viewer's canvas: capture
 backends, the encoder cascade, codecs per platform, rate control, and the browser
-decode paths. Agent side lives in `agents/roomler-agent/src/{capture,encode}/`;
+decode paths. Agent side lives in `agents/roomlerd/src/{capture,encode}/`;
 viewer side in `ui/src/composables/useRemoteControl.ts` + `ui/src/workers/`.
 *As of 0.3.0-rc.381.*
 
@@ -62,8 +62,8 @@ Linux/macOS hardware paths exist only where FFmpeg's NVENC/QSV names resolve.
 
 ## Selection cascade
 
-Preference resolution: **CLI `--encoder` > env (`ROOMLER_NODE_ENCODER` /
-`ROOMLER_AGENT_ENCODER`) > `encoder_preference` in config.toml > `auto`**. Values:
+Preference resolution: **CLI `--encoder` > env (`ROOMLERD_ENCODER` /
+`ROOMLERD_ENCODER`) > `encoder_preference` in config.toml > `auto`**. Values:
 `auto` | `hardware` (`hw`/`mf`) | `software` (`sw`/`openh264`).
 
 ```mermaid
@@ -93,7 +93,7 @@ Key properties:
 - **Fail closed**: once a session's track is bound to `video/HEVC` or `video/AV1`,
   an encoder failure yields a null encoder rather than silently switching
   bitstreams.
-- **Escape hatch**: `ROOMLER_AGENT_HW_AUTO=0` reverts `auto` to software-first
+- **Escape hatch**: `ROOMLERD_HW_AUTO=0` reverts `auto` to software-first
   without a rebuild.
 - Advertised labels look like `mf-h264-hw`, `ffmpeg-hevc_nvenc`, `openh264-sw`,
   `libvpx-vp9-444-sw`; transports like `data-channel-hevc`, `data-channel-h264`.
@@ -139,13 +139,13 @@ clean dlopen-failed branch, which is why this stayed latent: the probe only
 runs at startup, so a long-lived agent never re-enters it and the crash appears
 at the next restart, looking like whatever shipped most recently.
 
-⚠️ `ROOMLER_AGENT_HW_AUTO=0` and `ROOMLER_AGENT_ENCODER=software` do **not**
+⚠️ `ROOMLERD_HW_AUTO=0` and `ROOMLERD_ENCODER=software` do **not**
 skip the probe. Those select an encoder; the probe enumerates what to
 *advertise* and always runs.
 
 Implementation notes worth keeping:
 
-- The child sets `ROOMLER_AGENT_CAPS_CHILD=1`; `detect()` seeing that computes
+- The child sets `ROOMLERD_CAPS_CHILD=1`; `detect()` seeing that computes
   in-process, so nothing can recurse into an endless spawn.
 - stdout is **marker-parsed, not last-line-parsed** — the daemon logs to stdout,
   so "the last line" would have been a log line on the very first run.
