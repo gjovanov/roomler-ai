@@ -78,18 +78,21 @@ seam for a production-shaped hazard on a node that also runs real workloads.
 | # | phase | kill switch |
 |---|---|---|
 | P1 | Job manifest + initContainer clone; prove one conference spec passes in-cluster | the existing host-side path stays until this is green |
-| P2 | Point `scripts/e2e-nightly.sh` at the Job; delete the port-forward supervisor and revert the `frontend_url` override | revert the script; the overlay change is one line |
-| P3 | Re-triage `scripts/e2e-expected-failures.txt` — the conference entries exist only because of this, and must not silently stay | — |
+| P2 | ✅ done differently: a **sidecar in the app pod**, not a Job — a Job cannot share the app's network namespace, and that namespace is the whole point | revert the script; the overlay change is two files |
+| P3 | ✅ done — the conference entries are gone | — |
+| P4 | **New**: the in-pod run is much slower (44/170 in ~20 min, vs 170 in 17.8 min on the host). The sidecar shares the pod's CPU budget with the app | raise the sidecar's limits, or shard workers |
 
 ## Acceptance criteria
 
 - [x] A two-participant conference spec passes **in-cluster**, with real RTP —
       not skipped, not stubbed (`conference.spec.ts` 4/4, `conference-multi.spec.ts`
       5/5 on 2026-08-29)
-- [ ] The suite runs with **zero** `kubectl port-forward` invocations
-- [ ] `ROOMLER__APP__FRONTEND_URL` in the e2e overlay is back to the in-cluster
-      service name, and the WS still authenticates
-- [ ] `e2e-expected-failures.txt` loses the conference entries; anything still
+- [x] The suite runs with **zero** `kubectl port-forward` invocations
+- [x] `ROOMLER__APP__FRONTEND_URL` matches the browser's real origin
+      (`http://127.0.0.1`, the sidecar's view) and the WS authenticates.
+      ⚠️ NOT the service name, as this criterion originally assumed — the
+      browser is in the pod, so the app is localhost to it
+- [x] `e2e-expected-failures.txt` loses the conference entries; anything still
       failing is either fixed or re-justified in writing
 - [ ] The nightly writes its usual `LATEST` line from the new path
 
@@ -194,6 +197,32 @@ e2e stack; the stack was left exactly as found.
    blank config value that made calls unjoinable for **any** deployment that
    left it empty. Three diagnoses, two of them confidently wrong, and only the
    one that came from making the failure reproducible was right.
+
+**2026-08-30 — P2 + P3 done.** The browser is now the `pwrunner` sidecar in the
+app pod (deploy repo `af89db7`), and `scripts/e2e-nightly.sh` execs into it.
+
+| spec | 2026-08-29 morning | now |
+|---|---|---|
+| `conference.spec.ts` | 0/4 | **4/4** |
+| `conference-multi.spec.ts` | 0/5 | **5/5** |
+| `conference-chat.spec.ts` | 0/2 | **2/2** |
+| `conference-list.spec.ts` | — | green |
+
+**19/19.** `conference-chat` needed its own locator fix: `getByText('Chat')`
+matched FOUR elements, because the fixture's own org and room are named
+"Chat Org" and "Chat Meeting" — the same over-broad-locator class as the
+morning's batch.
+
+⚠️ **P4 (new): the in-pod run is much slower** — 44/170 in ~20 min, against
+170 in 17.8 min on the host. The sidecar shares the pod's CPU budget with the
+app it is testing. The nightly has all night, so this is not urgent, but it is
+a real regression in wall-clock and should not be discovered later as a
+mystery.
+
+⚠️ The design note above said "run it as a Job". A Job cannot share the app's
+**network namespace**, and that namespace is the entire mechanism — so it is a
+sidecar instead. Recorded because the spec argued for the wrong container
+shape and only the probe showed why.
 
 **Stack restored**: probe pod deleted, `frontend_url` back to
 `http://127.0.0.1:18080` so the existing nightly keeps working tonight.
