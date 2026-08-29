@@ -532,10 +532,30 @@ something. The floor defeats `auto` only; `email`/`push` do not auto-grant, so a
 device that merely refuses to auto-grant has no standing to force a second
 prompt onto the host.
 
-**Prompt surfaces.** The agent writes a `.pending` marker in its sentinel dir;
-the `roomler-desktop` companion polls the daemon's LocalAPI (`ConsentPending`)
-and renders the Approve/Deny modal, and `roomler consent --list` / `--approve`
-is the headless path. ⚠️ Since FR-27 the marker is written by **all three**
+**Prompt surfaces.** A chain, probed per prompt and logged per prompt
+(`native` + `have_surface` on one line):
+
+1. **native** — the daemon draws the panel itself. Windows
+   (`viewer-indicator`, and `WDA_EXCLUDEFROMCAPTURE` so the requester cannot
+   see the Approve button), X11 (`viewer-indicator-x11`, an override-redirect
+   window, no capture exclusion — X has no equivalent), macOS
+   (`viewer-indicator-macos`, AppKit).
+2. **companion** — `roomler-desktop`'s always-on-top consent window. The daemon
+   starts it if it is not running (`companion::ensure_running`).
+3. **CLI** — `roomler consent --list` / `--approve`, which works everywhere.
+4. **none** — reported as `no_prompt_surface`, not as a deny.
+
+⚠️ The `.pending` marker is written in ALL cases, because it is also what
+`roomler consent --list` reads. `ConsentRequest.surface` is what stops the
+companion from popping a second panel over a native one.
+
+⚠️ **macOS native requires tokio off the main thread.** AppKit delivers events
+on the main run loop and `#[tokio::main]` parks it, so under
+`viewer-indicator-macos` the runtime moves to a worker and `main` hands the
+main thread to `NSApp`. That is why the feature is compiled by CI but not yet
+in the macOS release build.
+⚠️ **The macOS panel appears in the captured stream.** `NSWindowSharingNone` is
+ignored by `CGDisplayStream`, which is what our capture uses. ⚠️ Since FR-27 the marker is written by **all three**
 consent-bearing subsystems — remote control, Fleet-RPC `exec` and Roomler SSH —
 carrying a `kind` so the modal does not describe a root command as "wants to
 control this device". Before that only remote control wrote one, so an `exec` or
