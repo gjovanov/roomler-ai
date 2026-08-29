@@ -1356,7 +1356,7 @@ fn fmt_dt(dt: DateTime) -> String {
 /// are dropped, and duplicates removed. A bare IP or any unparseable entry
 /// fails the whole request with 400 so the admin UI shows a clear error instead
 /// of silently storing a route the mesh client would skip. Mirrors the
-/// client-side parse in `roomler-tunnel`'s `mesh.rs` (both use `ipnet::IpNet`).
+/// client-side parse in `roomler-cli`'s `mesh.rs` (both use `ipnet::IpNet`).
 fn normalize_routes(raw: Vec<String>) -> Result<Vec<String>, ApiError> {
     use std::str::FromStr;
     const MAX_ROUTES: usize = 64;

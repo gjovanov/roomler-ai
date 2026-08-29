@@ -700,8 +700,9 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
 /// non-admin local user could otherwise read the long-lived agent
 /// token and impersonate the host to the Roomler server.
 ///
-/// `config_path` is `…\roomler\roomler-agent\config.toml`; we harden
-/// its grandparent `…\roomler\` so `roomler-agent\`, `crashes\`, and
+/// `config_path` is `…\roomler\<segment>\config.toml` (the
+/// segment is whatever `appdirs::app_segment` picked); we harden its
+/// grandparent `…\roomler\` so that segment, `crashes\`, and
 /// every future child inherit the ACL — the directory-inheritance
 /// pattern (one `icacls` at install time) rather than a per-file ACL
 /// that has a create→ACL TOCTOU and gets re-widened by every later
@@ -715,7 +716,9 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
 /// Administrators.
 fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
     let roomler_dir = config_path
-        .parent() // …\roomler\roomler-agent
+        // RETIRED-NAME-ANCHOR(2): names the PRE-RENAME appdirs segment a host installed
+        // before P4b still has; appdirs::app_segment resolves it, so it is an input.
+        .parent() // …\roomler\<segment>
         .and_then(|p| p.parent()) // …\roomler
         .ok_or_else(|| {
             format!(

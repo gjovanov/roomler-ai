@@ -2049,11 +2049,13 @@ describe('parseControlInbound', () => {
     // Agent's fetch_tail() failed path (e.g. log file rotated mid-
     // read). Browser surfaces the message in a red caption.
     const r = parseControlInbound(
-      '{"t":"rc:logs-fetch.reply","ok":false,"error":"no roomler-agent.log* file"}'
+      // RETIRED-NAME-ANCHOR(6): mirrors the daemon's real message, which names
+      // BOTH prefixes because an upgraded host still has pre-rename log files.
+      '{"t":"rc:logs-fetch.reply","ok":false,"error":"no roomlerd.log* or roomler-agent.log* file"}'
     )
     expect(r).toEqual({
       kind: 'logs_fetch_reply',
-      reply: { ok: false, error: 'no roomler-agent.log* file' },
+      reply: { ok: false, error: 'no roomlerd.log* or roomler-agent.log* file' },
     })
   })
 

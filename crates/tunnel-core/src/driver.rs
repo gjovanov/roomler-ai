@@ -5,7 +5,7 @@
 //!
 //! P3b-1 landed the shared **flow vocabulary** here — the per-flow
 //! reply-correlation types + the open-timeout. P3b-1b folds in the session
-//! orchestration itself (moved from `roomler-tunnel::forward`) behind the
+//! orchestration itself (moved from `roomler::forward`) behind the
 //! [`crate::signaling_link`] seam: [`run_tunnel_session`] speaks the
 //! `rc:tunnel.*` control protocol over a cloneable
 //! [`TunnelSignalingSink`](crate::signaling_link::TunnelSignalingSink) + a

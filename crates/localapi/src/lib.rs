@@ -1475,7 +1475,7 @@ where
 // ---------------------------------------------------------------------------
 // Platform listener (unification P1-cont)
 //
-// The daemon (`roomlerd` / today's `roomler-agent`) calls [`serve`] once at
+// The daemon (`roomlerd` / today's `roomlerd`) calls [`serve`] once at
 // startup. It binds the local-only control endpoint — a named pipe on Windows,
 // a unix socket elsewhere — restricts it to trusted local principals via the
 // pipe/socket ACL (no token: the OS enforces WHO can connect), and serves each

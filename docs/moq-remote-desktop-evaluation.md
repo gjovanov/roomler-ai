@@ -4,7 +4,7 @@
 
 ## Context
 
-The team shipped a QUIC (quinn) transport for the **roomler-tunnel** (native-to-native TCP forwarder). The follow-on question: should the **remote-desktop** subsystem (TeamViewer-style screen + input control) also adopt **MoQ (Media over QUIC)**?
+The team shipped a QUIC (quinn) transport for the **roomler** CLI (native-to-native TCP forwarder). The follow-on question: should the **remote-desktop** subsystem (TeamViewer-style screen + input control) also adopt **MoQ (Media over QUIC)**?
 
 This doc is the answer ("research + evaluate MoQ + weigh pros/cons + decide if it benefits remote desktop + give an implementation plan"). It is grounded in (a) a full code map of the current data plane, (b) the IETF/library/browser state of MoQ as of June 2026, (c) a peer-reviewed QUIC-vs-WebRTC remote-rendering benchmark, and (d) an adversarial stress-test of the conclusion.
 
@@ -43,7 +43,7 @@ Everything is **feature-flagged** (`--features moq-broadcast` + `ROOMLERD_MOQ=1`
 
 ### Phase 0 — hard-gate spike (the only thing worth doing first; cheap, reversible, throwaway)
 **Build (minimal):**
-- **Agent probe** (`roomler-agent moq-probe`, behind the feature): reuse `capture::open_default` + `encode::open_for_codec` (`encode/mod.rs:339`); wrap each frame with the **existing** `frame_video_bytes` 13-byte header verbatim (`peer.rs:1605`); publish via the kixelated **`moq-lite`** + **`web-transport`** Rust crates (native QUIC) — map one keyframe-led GOP = one MoQ *group*, each frame = one *object*.
+- **Agent probe** (`roomlerd moq-probe`, behind the feature): reuse `capture::open_default` + `encode::open_for_codec` (`encode/mod.rs:339`); wrap each frame with the **existing** `frame_video_bytes` 13-byte header verbatim (`peer.rs:1605`); publish via the kixelated **`moq-lite`** + **`web-transport`** Rust crates (native QUIC) — map one keyframe-led GOP = one MoQ *group*, each frame = one *object*.
 - **Relay**: run kixelated **`moq-relay` as one container on an existing coturn host** (we already operate + monitor these). No new cloud account.
 - **Throwaway browser subscriber** (a static page / hidden route, *not* wired into `RemoteControl.vue`): open a `WebTransport` to the relay, subscribe, and `postMessage({type:'chunk', bytes})` to the **unmodified** `rc-vp9-444-worker.ts` / `rc-hevc-worker.ts` (the existing transport-agnostic handoff in `useRemoteControl.ts:~1850`). If frames paint, subscriber-reuse is proven.
 
@@ -92,7 +92,7 @@ Everything is **feature-flagged** (`--features moq-broadcast` + `ROOMLERD_MOQ=1`
 - New deps (Phase 0): `moq-lite`, `web-transport` (Rust, kixelated/moq-dev); `moq-relay` container. New build feature `moq-broadcast`.
 
 ## Verification (Phase 0)
-Run `roomler-agent moq-probe` on a field box, `moq-relay` on a coturn host, open the throwaway subscriber page in 1 + K browser tabs. Confirm frames paint via the unmodified worker (subscriber-reuse), then collect the five measurements above and check them against the GO/NO-GO bars. Everything is behind the `moq-broadcast` feature + `ROOMLERD_MOQ=1`; deleting the feature is a clean revert. No change to the WebRTC control path is shipped at any point in Phase 0.
+Run `roomlerd moq-probe` on a field box, `moq-relay` on a coturn host, open the throwaway subscriber page in 1 + K browser tabs. Confirm frames paint via the unmodified worker (subscriber-reuse), then collect the five measurements above and check them against the GO/NO-GO bars. Everything is behind the `moq-broadcast` feature + `ROOMLERD_MOQ=1`; deleting the feature is a clean revert. No change to the WebRTC control path is shipped at any point in Phase 0.
 
 ## Out of scope
 - Replacing the 1:1 WebRTC control transport (rejected — see Evaluation).

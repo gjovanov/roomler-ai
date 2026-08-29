@@ -35,7 +35,7 @@ exclude = [
     "crates/vendored/webrtc-ice",
     # Vendored upstream with a SettingEngine setter that exposes the
     # SCTP `a_rwnd` (was hardcoded to 0 = 1 MiB upstream default).
-    # Needed for roomler-tunnel native-to-native peers to advertise
+    # Needed for roomler native-to-native peers to advertise
     # 8 MiB so DC throughput stays link-bound at high BDP.
     "crates/vendored/webrtc",
     # Vendored upstream minus the on-drop NetworkList registry deletion —
@@ -59,7 +59,7 @@ exclude = [
 # to a `log::warn!("Unable to handle URL")` and return without creating
 # a candidate. Upstream issue webrtc-rs/webrtc#690 closed NOT_PLANNED
 # 2026-01-31. Our vendored copy adds a TURNS-over-TLS-over-TCP branch
-# so the roomler-agent can establish relay candidates from corporate
+# so the daemon can establish relay candidates from corporate
 # networks that block UDP entirely. See agent_gather.rs and the new
 # tcp_turn_conn.rs module for the patch notes.
 #
@@ -67,7 +67,7 @@ exclude = [
 # `max_receive_buffer_size` — `RTCSctpTransport::start` hardcodes 0
 # which falls back to the 1 MiB INITIAL_RECV_BUF_SIZE constant in
 # webrtc-sctp-0.11.0. At 50-100 ms RTT this caps single-stream DC
-# throughput at ~80-167 Mbps. roomler-tunnel native-to-native peers
+# throughput at ~80-167 Mbps. roomler native-to-native peers
 # need 8 MiB rwnd to stay link-bound on home-broadband paths. Our
 # vendored copy adds set_sctp_max_receive_buffer_size to
 # SettingEngine and threads it through the SCTP `Config` constructor.

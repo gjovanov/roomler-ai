@@ -55,6 +55,9 @@ SYSTEM=0
 # in the wrong tree entirely. Must match roomlerd.service's ROOMLERD_CONFIG.
 SYSTEM_CONFIG="/etc/roomler/config.toml"
 # macOS's privileged half has its OWN path, and it is NOT $SYSTEM_CONFIG above:
+# RETIRED-NAME-ANCHOR(3): /etc/roomler-agent is the REAL macOS daemon config
+# dir — the shipped com.roomler.daemon.plist passes it as --config and the
+# .pkg postinstall creates it. Renaming it here alone strands the daemon.
 # com.roomler.daemon.plist passes `--config /etc/roomler-agent/config.toml`
 # explicitly, and the agent's root-aware config ladder is Linux-only. Reusing
 # one variable for both would enroll into a file nothing reads.
@@ -243,7 +246,7 @@ install_daemon_linux() {
         digest="$(asset_field_for "$releases" "$pattern" digest)"
     fi
     [ -n "$url" ] || { echo "error: no linux/${arch} .${fmt} asset in the latest agent release" >&2; exit 1; }
-    deb="$STAGE/roomler-agent.${fmt}"
+    deb="$STAGE/roomlerd.${fmt}"
     download "$url" "$deb"
     verify_sha256 "$deb" "$digest"
 
@@ -269,6 +272,8 @@ install_daemon_linux() {
     else
         say "installing the roomlerd daemon (tarball — sudo required)"
         # --strip-components=1 drops the versioned prefix dir so the payload
+# RETIRED-NAME-ANCHOR: usr/lib/roomler-agent is baked into the binary as an
+# RPATH — the directory name cannot move without a relink.
         # lands at /usr/bin, /usr/lib/roomler-agent, /usr/lib/systemd/…
         # (identical to what the .deb installs). On a FIRST install there are
         # no operator-edited units to protect, so unpacking wholesale is fine;
@@ -302,11 +307,14 @@ install_daemon_macos() {
     url="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' browser_download_url)"
     digest="$(asset_field_for "$releases" 'aarch64-apple-darwin[^"]*\.pkg' digest)"
     [ -n "$url" ] || { echo "error: no macOS .pkg asset in the latest agent release" >&2; exit 1; }
-    pkg="$STAGE/roomler-agent.pkg"
+    pkg="$STAGE/roomlerd.pkg"
     download "$url" "$pkg"
     verify_sha256 "$pkg" "$digest"
 
     # The .app kept its legacy internal name through the roomlerd rename —
+# RETIRED-NAME-ANCHOR(5): the macOS .app bundle name is FROZEN (FR-21 D5) —
+# it keys the host's Screen Recording and Accessibility TCC grants, which a
+# rename would silently void, leaving a black screen with no error.
     # CFBundleExecutable is `roomler-agent`, and CI asserts it, because
     # renaming would change the binary's TCC identity and force every existing
     # Mac to re-grant Screen Recording and Accessibility. The old probe led
@@ -398,6 +406,8 @@ install_macos_privileged_half() {
 macos_permissions_notice() {
     say ""
     say "ONE MANUAL STEP REMAINS — macOS will not grant these without you:"
+# RETIRED-NAME-ANCHOR(2): this is the string macOS SHOWS in the privacy pane;
+# it comes from the frozen bundle, so it must match what the user will see.
     say "  System Settings → Privacy & Security → Screen Recording  → enable 'roomler-agent'"
     say "  System Settings → Privacy & Security → Accessibility     → enable 'roomler-agent'"
     say ""
@@ -436,7 +446,7 @@ enroll_daemon() {
 
 install_tunnel_linux() {
     if command -v dpkg >/dev/null 2>&1; then
-        deb="$STAGE/roomler-tunnel.deb"
+        deb="$STAGE/roomler-cli.deb"
         say "downloading the roomler CLI (.deb) via the proxy"
         download "$SERVER/api/tunnel/installer/linux-deb?version=latest" "$deb"
         if [ "$DOWNLOAD_ONLY" = 1 ]; then
@@ -445,7 +455,7 @@ install_tunnel_linux() {
         fi
         sudo dpkg -i "$deb" || sudo apt-get -f install -y
     else
-        tarball="$STAGE/roomler-tunnel.tar.gz"
+        tarball="$STAGE/roomler-cli.tar.gz"
         say "downloading the roomler CLI (tarball) via the proxy"
         download "$SERVER/api/tunnel/installer/linux-x86_64?version=latest" "$tarball"
         if [ "$DOWNLOAD_ONLY" = 1 ]; then
@@ -458,7 +468,7 @@ install_tunnel_linux() {
 }
 
 install_tunnel_macos() {
-    tarball="$STAGE/roomler-tunnel.tar.gz"
+    tarball="$STAGE/roomler-cli.tar.gz"
     say "downloading the roomler CLI (universal tarball) via the proxy"
     download "$SERVER/api/tunnel/installer/macos?version=latest" "$tarball"
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
@@ -476,6 +486,10 @@ install_tunnel_tarball() {
     tar -xzf "$tarball" -C "$xdir"
     # Archives ship BOTH names since the P3d rename; prefer `roomler`.
     bin=""
+# RETIRED-NAME-ANCHOR-BEGIN
+# The tunnel CLI is installed on hosts that predate the rename, so the archive
+# may carry either name and an existing `roomler-tunnel` on PATH must keep
+# working. The symlink below is that compatibility promise, not a leftover.
     for name in roomler roomler-tunnel; do
         found="$(find "$xdir" -maxdepth 2 -type f -name "$name" | head -n 1)"
         [ -n "$found" ] && { bin="$found"; break; }
@@ -489,6 +503,7 @@ install_tunnel_tarball() {
 
 enroll_tunnel() {
     cli="$(command -v roomler || command -v roomler-tunnel || true)"
+# RETIRED-NAME-ANCHOR-END
     [ -n "$cli" ] || cli=/usr/local/bin/roomler
     if [ "$NO_ENROLL" = 1 ] || [ -z "$TOKEN" ]; then
         [ "$NO_ENROLL" = 1 ] || warn "no --token given — skipping enrollment"

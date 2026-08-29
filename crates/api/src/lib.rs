@@ -464,7 +464,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{token}/approve", post(routes::consent::approve_consent))
         .route("/{token}/deny", post(routes::consent::deny_consent));
 
-    // roomler-tunnel routes — same enrollment two-step shape as the
+    // roomler-cli routes — same enrollment two-step shape as the
     // agent, but a distinct audience (`TunnelClient` JWT) so a leaked
     // agent token can't impersonate a client and vice-versa. CRUD +
     // policy + audit endpoints land in T2.
@@ -574,7 +574,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/agents", get(routes::tunnel::list_tenant_agents));
 
     // `/api/tunnel/{latest-release,installer/{platform}}` — public
-    // GitHub-Releases proxy for the roomler-tunnel binary. Same
+    // GitHub-Releases proxy for the roomler CLI binary. Same
     // shape + lifecycle as `/api/agent/{latest-release,installer/...}`
     // but a separate namespace so the two artifact sets don't collide.
     let public_tunnel_release_routes = Router::new()

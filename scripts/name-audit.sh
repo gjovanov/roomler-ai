@@ -199,6 +199,12 @@ scan() {
                 for (m in marker_line)
                     if (!marker_used[m])
                         print "STALEMARKER\t" file "\t" m "\tmarker covers no retired name"
+                # A BEGIN with no END silently swallows the REST OF THE FILE —
+                # the widest possible exemption, and the one least likely to be
+                # noticed, because everything it hides simply stops being
+                # reported. Caught here rather than trusted to review.
+                if (in_region)
+                    print "STALEMARKER\t" file "\t" region_line "\tBEGIN with no matching END — it exempts the rest of the file"
             }
         ' "$f"
     done
@@ -274,10 +280,32 @@ update)
     echo "baseline written: unclassified=$n_unclassified anchors=$n_anchored paths=$n_paths"
     ;;
 check)
+    rc=0
+    # An anchor block inserted at the top of a script pushes the shebang off
+    # line 1, where it stops being a shebang and becomes an ordinary comment.
+    # That is not hypothetical: it shipped on this branch and broke the macOS
+    # .pkg — `installer` failed at "Validating packages" because it could not
+    # execute postinstall at all. Nothing else catches it; the file still
+    # parses, still lints, and reads fine in review.
+    displaced=""
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        head -c 2 "$f" 2>/dev/null | grep -q '^#!' && continue
+        head -30 "$f" 2>/dev/null | grep -q '^#!/' || continue
+        displaced="$displaced $f"
+    done <<EOF
+$(git ls-files 2>/dev/null)
+EOF
+    if [ -n "$displaced" ]; then
+        echo "FAIL  a shebang is not on line 1:"
+        for f in $displaced; do echo "        $f"; done
+        echo "      A shebang only works as line 1. Put the anchor block BELOW it."
+        rc=1
+    fi
+
     base_unclassified=$(read_baseline unclassified 999999)
     base_anchors=$(read_baseline anchors 0)
     base_paths=$(read_baseline paths 999999)
-    rc=0
 
     if [ "$n_stale" -gt 0 ]; then
         echo "FAIL  $n_stale stale RETIRED-NAME-ANCHOR marker(s) cover no retired name."

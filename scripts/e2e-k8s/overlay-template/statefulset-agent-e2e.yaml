@@ -37,6 +37,8 @@ spec:
       # the agent's startup wait window.
       containers:
         - name: agent
+          # RETIRED-NAME-ANCHOR(3): docker image name already in the registry;
+          # see scripts/e2e-k8s/AGENT-E2E.md. Renaming needs a coordinated re-push.
           image: gjovanov/roomler-agent-e2e:latest # rewritten by kustomization images:
           imagePullPolicy: IfNotPresent
           env:
@@ -69,9 +71,9 @@ spec:
               value: "1"
           volumeMounts:
             - name: config
-              mountPath: /etc/roomler-agent
+              mountPath: /etc/roomler
             - name: data
-              mountPath: /root/.local/share/roomler/roomler-agent
+              mountPath: /root/.local/share/roomler
           resources:
             requests:
               cpu: 100m

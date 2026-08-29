@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR-BEGIN
+// Every retired name in this module is the legacy half of a dual-read: the
+// `roomler-agent.log*` rolling-file prefix that upgraded hosts still carry (read
+// and pruned alongside `roomlerd.log*`), and the `roomler_agent` tracing target
+// that `mirror_legacy_log_target` keeps honouring for units already on disk in
+// the field — plus the tests that set exactly those to prove the field keeps
+// working.
+// INVARIANT: a retired name here must be one the daemon must still READ. If you
+// add one that is not, that is a bug, not a new exemption. docs/fr/FR-21
 //! Persistent file logging + panic hook.
 //!
 //! Stdout output is preserved for foreground / interactive runs; a daily-
@@ -119,8 +128,8 @@ fn log_basename() -> &'static str {
 /// `roomlerd` is left alone. Directives for other targets, and the bare global level,
 /// pass through untouched.
 ///
-/// RETIRED-NAME-ANCHOR(2): `roomler_agent` is the retired target this exists to keep
-/// working. Deleting it re-creates the blackout described above.
+// RETIRED-NAME-ANCHOR(2): `roomler_agent` is the retired target this exists to keep
+// working. Deleting it re-creates the blackout described above.
 fn mirror_legacy_log_target(spec: &str) -> String {
     const LEGACY: &str = "roomler_agent";
     const CURRENT: &str = "roomlerd";
@@ -762,3 +771,4 @@ mod tests {
         prune_old_logs_at(&bogus, SystemTime::now());
     }
 }
+// RETIRED-NAME-ANCHOR-END

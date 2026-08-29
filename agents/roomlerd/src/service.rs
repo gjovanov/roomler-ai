@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR(3): the legacy scheduled-task name install/uninstall must still
+// find.
 //! Cross-platform auto-start-on-boot / login plumbing.
 //!
 //! `roomlerd service install` registers the agent so it launches
@@ -10,8 +12,8 @@
 //!     deletes), ONLOGON trigger, LIMITED run level (matches the agent's
 //!     un-elevated-by-design posture from `packaging/windows/README.txt`).
 //!   - **Linux**: systemd user unit. The .deb already drops the unit
-//!     file at `/usr/lib/systemd/user/roomler-agent.service`; install
-//!     here means `systemctl --user enable --now roomler-agent.service`.
+//!     file at `/usr/lib/systemd/user/roomler.service`; install
+//!     here means `systemctl --user enable --now roomler.service`.
 //!   - **macOS**: `launchctl load -w` the LaunchAgent plist. The .pkg
 //!     postinstall drops it at `~/Library/LaunchAgents/com.roomler.agent.plist`;
 //!     install here only needs to (re-)load it.
@@ -424,7 +426,7 @@ mod windows {
     /// fail with "The argument is incorrect" on Win10 22H2.
     fn write_temp_xml(xml_utf8: &str) -> Result<PathBuf> {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("roomler-agent-task-{}.xml", std::process::id()));
+        let path = dir.join(format!("roomlerd-task-{}.xml", std::process::id()));
         let mut buf = Vec::with_capacity(xml_utf8.len() * 2 + 2);
         buf.extend_from_slice(&[0xFF, 0xFE]); // UTF-16-LE BOM
         for c in xml_utf8.encode_utf16() {
@@ -530,6 +532,9 @@ mod linux {
     /// `service install` ended up with TWO enabled units (double-start).
     pub const UNIT: &str = "roomler.service";
     /// Legacy unit name written by pre-S1b `service install` runs.
+    // RETIRED-NAME-ANCHOR(2): the unit name on hosts installed before P3d
+    // Slice B. Install/uninstall must still find it or an upgraded host ends
+    // up with two enabled units and a silent restart storm.
     const LEGACY_UNIT: &str = "roomler-agent.service";
 
     /// Which unit name is in force on this host: the canonical name when its
@@ -637,6 +642,9 @@ mod linux {
              ExecStart={exe_str} run\n\
              Restart=on-failure\n\
              RestartSec=5\n\
+            // RETIRED-NAME-ANCHOR(2): renaming a lib renames its TRACING TARGET.
+            // Units already on disk in the field carry the old target, so the
+            // spec names BOTH — dropping either silences a fleet, with no error.
              Environment=RUST_LOG=roomler_agent=info,roomlerd=info,tunnel_core=info,warn\n\
              \n\
              [Install]\n\
@@ -732,6 +740,8 @@ mod macos {
              \t<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
              \t<key>ProcessType</key><string>Interactive</string>\n\
              \t<key>EnvironmentVariables</key>\n\
+            // RETIRED-NAME-ANCHOR(2): same dual tracing target as the systemd
+            // unit above, for the macOS LaunchAgent plist.
              \t<dict><key>RUST_LOG</key><string>roomler_agent=info,roomlerd=info,tunnel_core=info,warn</string></dict>\n\
              </dict>\n\
              </plist>\n"

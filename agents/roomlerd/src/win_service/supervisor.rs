@@ -4,7 +4,7 @@
 //!
 //! When the SCM-launched service receives a `Running` state and
 //! a console session is active, this module spawns the agent's own
-//! `roomler-agent.exe run` as the active user via
+//! `roomlerd.exe run` as the active user via
 //! `WTSQueryUserToken` + `CreateProcessAsUserW`, then watches it.
 //! The worker exiting non-zero triggers a respawn with exponential
 //! backoff (parity with the Scheduled Task `RestartOnFailure` PT1M
@@ -1539,6 +1539,9 @@ pub fn run(
             //
             // Runtime trigger as of 0.3.0: `keep_stream_alive` comes
             // from `peer_presence_is_signaled()` which reads the
+            // RETIRED-NAME-ANCHOR(3): names the PRE-RENAME appdirs segment a host
+            // installed before P4b still has; appdirs::app_segment resolves it, so it
+            // is an input.
             // `%PROGRAMDATA%\roomler-agent\peer-connected.lock`
             // marker file. The user-context worker writes to that
             // file every 5 s while its WebRTC peer is in `Connected`

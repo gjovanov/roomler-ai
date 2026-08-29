@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
+// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! Resolve the active-session user's profile directory from a
 //! SystemContext worker.
 //!
@@ -30,10 +32,18 @@
 //!    up the username for that session. Returns "Administrator"
 //!    or whatever; empty string if no user is logged in.
 //! 3. Build `C:\Users\<username>\AppData\Roaming\roomler\
-//!    roomler-agent\config\config.toml`. Uses the standard Win11
+//!    roomler\config\config.toml` (a host installed before the
+//!    rename keeps `roomler-agent` there, so both are tried — see
+//!    `config_candidates_under`). Uses the standard Win11
 //!    profile location; fails gracefully (returns `None`) if the
 //!    profile isn't there.
 //!
+//!
+// RETIRED-NAME-ANCHOR-BEGIN
+// From here down, `roomler-agent` names the PRE-RENAME appdirs segment that
+// a host installed before P4b still has. The resolver returns both segments
+// and the tests pin the order; dropping the retired one is what removed the
+// user-config rung from every post-rename install in the first place.
 //! ## Limitations
 //!
 //! * Assumes the user's profile directory is at `C:\Users\<name>`.
@@ -50,7 +60,7 @@
 
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::RemoteDesktop::{
@@ -74,22 +84,53 @@ pub fn active_user_profile_root() -> Option<PathBuf> {
     Some(PathBuf::from(format!("C:\\Users\\{username}")))
 }
 
-/// Resolve the active-session user's roomler-agent config file path.
+/// Per-user config candidates under `root`, most-current first.
+///
+/// The segment under `%APPDATA%\roomler\` is the appdirs *application*
+/// name, which P4b renamed `roomler-agent` -> `roomler`. A host installed
+/// before that rename still has the old tree, so both are candidates.
+///
+/// This cannot just call `appdirs`: a SystemContext worker runs as
+/// LocalSystem, so `ProjectDirs` would resolve the LocalSystem profile —
+/// the whole reason this module exists is to reach the INTERACTIVE user's
+/// profile instead. The segment list is therefore duplicated here on
+/// purpose, and `appdirs`'s own constants are the thing to keep it in step
+/// with.
+fn config_candidates_under(root: &Path) -> [PathBuf; 2] {
+    let base = root.join("AppData").join("Roaming").join("roomler");
+    [
+        base.join("roomler").join("config").join("config.toml"),
+        base.join("roomler-agent")
+            .join("config")
+            .join("config.toml"),
+    ]
+}
+
+/// Resolve the active-session user's config file path.
 /// Returns `None` if any of the discovery steps fail (no logged-in
 /// user, FFI failure, profile not at standard location).
 ///
 /// Caller (typically main.rs's config_path resolution) uses this as
 /// a fallback when the default `ProjectDirs::config_dir()` lookup
-/// returns a path that doesn't exist.
+/// returns a path that doesn't exist. That caller then filters on
+/// `exists()`, so returning only ONE segment silently drops the rung
+/// whenever the host is on the other one — which is what happened to
+/// every post-rename install until FR-21: the hardcoded segment was the
+/// pre-rename one, so a freshly installed host had no user-config rung
+/// at all, with nothing logged.
+///
+/// Returns the first candidate that exists; if neither does, the current
+/// one, so the logged path names where the config SHOULD go.
 pub fn active_user_config_path() -> Option<PathBuf> {
-    let path = active_user_profile_root()?
-        .join("AppData")
-        .join("Roaming")
-        .join("roomler")
-        .join("roomler-agent")
-        .join("config")
-        .join("config.toml");
-    Some(path)
+    let root = active_user_profile_root()?;
+    let candidates = config_candidates_under(&root);
+    Some(
+        candidates
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+            .unwrap_or_else(|| candidates[0].clone()),
+    )
 }
 
 /// Resolve the active-session user's Downloads folder path.
@@ -206,11 +247,10 @@ mod tests {
 
     #[test]
     fn active_user_config_path_under_test_runner_resolves() {
-        // Under cargo test we're a logged-in user; this should
-        // resolve to OUR profile's roomler-agent config path. The
-        // file may not exist (developer runs cargo test without
-        // ever enrolling) — that's fine; the function only
-        // resolves the path, doesn't check existence.
+        // Under cargo test we're a logged-in user, so this resolves to OUR
+        // profile. Which SEGMENT it lands on depends on what exists on this
+        // box, so assert the shape, not one spelling — pinning a single
+        // segment is what let the pre-rename one survive here unnoticed.
         let path = active_user_config_path();
         assert!(path.is_some(), "should resolve under user context");
         let p = path.unwrap();
@@ -220,11 +260,31 @@ mod tests {
             "path should be under C:\\Users: {p:?}"
         );
         assert!(
-            s.ends_with("\\roomler-agent\\config\\config.toml"),
-            "path should end with roomler-agent config: {p:?}"
+            s.ends_with("\\roomler\\config\\config.toml")
+                || s.ends_with("\\roomler-agent\\config\\config.toml"),
+            "path should end with a known config segment: {p:?}"
         );
     }
 
+    #[test]
+    fn config_candidates_put_the_current_segment_first() {
+        // The bug this replaced: only the PRE-RENAME segment was ever
+        // returned, so on a freshly installed host the caller's exists()
+        // filter dropped the user-config rung entirely — silently, because
+        // a missing candidate is indistinguishable from no logged-in user.
+        let root = Path::new("C:\\Users\\someone");
+        let got = config_candidates_under(root);
+        let a = got[0].to_string_lossy().to_lowercase();
+        let b = got[1].to_string_lossy().to_lowercase();
+        assert!(
+            a.ends_with("\\roomler\\roomler\\config\\config.toml"),
+            "current segment must come first: {a}"
+        );
+        assert!(
+            b.ends_with("\\roomler\\roomler-agent\\config\\config.toml"),
+            "pre-rename segment must still be offered: {b}"
+        );
+    }
     #[test]
     fn active_user_profile_root_under_test_runner_resolves() {
         let root = active_user_profile_root();
@@ -284,3 +344,4 @@ mod tests {
         assert!(result.is_none());
     }
 }
+// RETIRED-NAME-ANCHOR-END

@@ -256,7 +256,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
-    // roomler-tunnel clients — same uniqueness contract as agents
+    // tunnel clients — same uniqueness contract as agents
     // (re-enroll-on-same-machine rehydrates the soft-deleted row in
     // place). `owner_user_id` index speeds the "my tunnel clients"
     // view on the user-facing dashboard.

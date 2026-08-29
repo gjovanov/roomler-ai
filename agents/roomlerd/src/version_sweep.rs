@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! Sweep obsolete same-flavour roomler-agent MSI products.
+//! Sweep obsolete same-flavour roomlerd MSI products.
 //!
 //! ## Why this exists
 //!
@@ -23,7 +23,7 @@
 //!
 //! ## What it does
 //!
-//! Enumerates every installed roomler-agent MSI product of the running
+//! Enumerates every installed roomlerd MSI product of the running
 //! agent's flavour ([`crate::install_detect::enumerate_installed_products`]),
 //! then `msiexec /x`-uninstalls each one **strictly older** than the
 //! running version. It never touches:
