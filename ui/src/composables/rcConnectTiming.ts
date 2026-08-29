@@ -72,12 +72,25 @@ const MARK_ORDER: RcConnectMark[] = [
 export interface RcConnectTiming {
   /** 1-based attempt number within one user-initiated connect. */
   attempt: number
+  /** True when an EARLIER attempt in this connect cycle already painted a
+   *  frame — i.e. the session worked and then dropped, rather than the
+   *  request never being answered.
+   *
+   *  ⚠️ Field-found. Without this, `attempt > 1` was reported as "the
+   *  first request went unanswered", which is one cause among several and
+   *  was FALSE in the first session this was tested on: attempt 1 painted
+   *  at 1734 ms, the agent's DERP control WS then dropped, and the ladder
+   *  reconnected on attempt 6. The message named a cause the data did not
+   *  establish — the same "confidently wrong rather than absent" failure
+   *  the consent rule below exists to prevent. */
+  afterDrop: boolean
   /** ms since the attempt began, per mark. Missing = never reached. */
   marks: Partial<Record<RcConnectMark, number>>
 }
 
 export interface RcConnectRecorder {
   attempt: number
+  afterDrop: boolean
   mark(name: RcConnectMark): void
   /** Elapsed ms since the attempt began. */
   elapsed(): number
@@ -91,11 +104,12 @@ function now(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now()
 }
 
-export function beginAttempt(attempt: number): RcConnectRecorder {
+export function beginAttempt(attempt: number, afterDrop = false): RcConnectRecorder {
   const t0 = now()
   const marks: Partial<Record<RcConnectMark, number>> = {}
   return {
     attempt,
+    afterDrop,
     mark(name) {
       // First writer wins. A duplicate `rc:ready` or a renegotiation must
       // not restate a wait that already completed.
@@ -105,7 +119,7 @@ export function beginAttempt(attempt: number): RcConnectRecorder {
       return Math.round(now() - t0)
     },
     snapshot() {
-      return { attempt, marks: { ...marks } }
+      return { attempt, afterDrop, marks: { ...marks } }
     },
     done() {
       return marks.first_frame !== undefined
@@ -255,10 +269,18 @@ export function describeConnectTiming(t: RcConnectTiming): RcConnectVerdict {
   // the two cases - one slow connect, and a lost one plus a fast retry -
   // are indistinguishable to everyone except someone reading devtools.
   if (t.attempt > 1) {
+    const n = t.attempt - 1
+    const tries = `${n} failed attempt${n > 1 ? 's' : ''}`
+    // ⚠️ State only what the marks establish. A retry has (at least) two
+    // causes that look identical in the attempt counter: a request that
+    // was never answered, and a session that WORKED and then dropped.
+    // `afterDrop` is the only thing that can tell them apart, and naming
+    // the wrong one sends the reader after the wrong bug.
     return {
-      text: `Connected in ${secs(total)} after ${t.attempt - 1} failed `
-        + `attempt${t.attempt > 2 ? 's' : ''}. The first request went `
-        + `unanswered and was retried automatically.`,
+      text: t.afterDrop
+        ? `Reconnected in ${secs(total)} after ${tries}. The session `
+          + `dropped and was restored automatically.`
+        : `Connected in ${secs(total)} after ${tries}.`,
       color: 'warning',
       notable: true,
     }
