@@ -287,6 +287,37 @@ cpal = { version = "0.15", optional = true }
 # Used for `flock` in the single-instance lock. Tiny crate, ubiquitous.
 libc = "0.2"
 
+# FR-27 — the native X11 consent panel (`viewer-indicator-x11`). Already in the
+# lockfile via enigo/arboard, so this adds no new dependency tree. Default
+# features only: the panel is CLICKABLE, so it needs none of the `shape`
+# extension the click-through border would.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", optional = true }
+
+# FR-27 — the native macOS consent panel (`viewer-indicator-macos`). All three
+# are already in the lockfile (tauri pulls them for the desktop companion), so
+# this is a target-scoped direct dep rather than new supply-chain surface.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, features = [
+    "NSApplication",
+    "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSGraphics",
+    "NSResponder",
+    "NSScreen",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSGeometry",
+    "NSString",
+    "NSThread",
+] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # Effort 2 (Windows Service deployment mode). Optional opt-in alternative
 # to the Scheduled Task default. windows-service 0.7 owns the SCM lifecycle
@@ -413,6 +444,25 @@ clipboard = ["dep:arboard", "dep:png", "dep:clipboard-win"]
 # is watching". Excluded from screen capture via SetWindowDisplayAffinity
 # so it never makes it into the RTP stream. No-op on non-Windows.
 viewer-indicator = ["dep:windows"]
+# FR-27 — the NATIVE consent panel on X11: an override-redirect window the
+# daemon draws itself, so a Linux desktop can answer a "Prompt on host" device
+# with nothing else installed. Prompt only; the "being viewed" banner on Linux
+# stays with the desktop companion.
+#
+# `x11rb` is already in the lockfile (enigo, arboard) so this adds no new
+# dependency tree, and `dep:x11rb` is target-scoped below — enabling the
+# feature on Windows or macOS is a no-op, same pattern as `clipboard`.
+#
+# ⚠️ Unlike the Windows panel there is NO capture exclusion: X has no
+# equivalent of `WDA_EXCLUDEFROMCAPTURE`. See the module docs.
+viewer-indicator-x11 = ["dep:x11rb"]
+# FR-27 — the NATIVE consent panel on macOS (AppKit). Prompt only, same split
+# as X11.
+#
+# ⚠️ Requires the daemon's tokio runtime to be OFF the main thread: AppKit
+# delivers events on the main run loop, and `#[tokio::main]` parks it forever.
+# `main.rs` does that swap under this same feature.
+viewer-indicator-macos = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 # System / desktop audio → WebRTC Opus track (opt-in per session via
 # `ServerMsg::Request.audio_enabled`). Pulls in the Opus encoder
 # (audiopus, bundled libopus from C source) and the cpal capture backend
