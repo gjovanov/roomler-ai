@@ -388,6 +388,9 @@ pub async fn maybe_start(
         };
 
     let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU)
+        // FR-40 — the epoch persisted next to the key, bumped per rotation;
+        // sent as `key_epoch` on the join.
+        .with_key_epoch(cfg.overlay_wg_key_epoch)
         // Phase 1 — advertise this node's subnet routes (admin-gated server-side).
         // P5 — plus `0.0.0.0/0` when this node is configured as an exit node.
         .with_advertised_routes(cfg.effective_overlay_advertised_routes())

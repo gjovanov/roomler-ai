@@ -444,7 +444,10 @@ pub async fn run(
     // for the config's scalar identity; `run_cmd` synthesizes a per-org
     // `AgentConfig` via `AgentConfig::for_org` for secondaries).
     ctx: OrgCtx,
-    cfg: AgentConfig,
+    // `mut` for exactly one reason: FR-40 key rotation swaps the overlay
+    // secret in this snapshot between two connections (see
+    // `ConnectError::KeyRotated`). Nothing else writes it after start.
+    mut cfg: AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     // Unification P1 — LocalAPI live handles (stable across reconnects, owned by
@@ -682,6 +685,31 @@ pub async fn run(
                 crate::purge_exit_routes();
                 std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
             }
+            Err(ConnectError::KeyRotated {
+                secret_base64,
+                key_epoch,
+            }) => {
+                // FR-40 — the handler already persisted the new key (persist
+                // FIRST, or a restart would bring the retired key back). Adopt
+                // it here, in the one snapshot `connect_once` reads, and go
+                // straight back: this is one device re-joining, not a fleet
+                // event, so no stagger. `overlay::maybe_start` sees the
+                // fingerprint change (it includes the public key) and rebuilds
+                // the runtime; the join carries the new key + epoch.
+                cfg.overlay_wg_secret_key = Some(secret_base64);
+                cfg.overlay_wg_key_epoch = key_epoch;
+                info!(
+                    org = %ctx.label,
+                    key_epoch,
+                    "overlay key rotated — reconnecting under the new identity"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { return Ok(()); }
+                    },
+                }
+            }
             Err(ConnectError::ReplacedByNewer { message }) => {
                 let now = std::time::Instant::now();
                 // Drop events older than the rolling window BEFORE pushing
@@ -873,6 +901,18 @@ enum ConnectError {
     /// within a 5 min rolling window.
     #[error("replaced by newer connection: {message}")]
     ReplacedByNewer { message: String },
+    /// FR-40 — the `rc:agent.key_rotate` handler minted + PERSISTED a new
+    /// overlay key for this org. The outer `run()` loop adopts it in its
+    /// config snapshot (the only copy `connect_once` ever reads) and
+    /// reconnects at once: the overlay runtime's fingerprint includes the
+    /// public key, so the reconnect rebuilds it and joins under the new
+    /// identity. Carries the secret in-process only — it never crosses a
+    /// socket.
+    #[error("overlay key rotated (epoch {key_epoch}); reconnecting under the new identity")]
+    KeyRotated {
+        secret_base64: String,
+        key_epoch: u32,
+    },
     #[error(transparent)]
     Transient(#[from] anyhow::Error),
 }
@@ -1731,6 +1771,65 @@ fn report_config_status(
     if outbound_tx.try_send(msg).is_err() {
         debug!("rc:agent.config_status dropped (outbound queue full or closed)");
     }
+}
+
+/// FR-40 — the device's answer to `rc:agent.key_rotate`, on every outcome.
+/// Same fire-and-forget rule as [`report_config_status`]; `detail` is
+/// redacted and capped before it leaves the host. Only PUBLIC keys are ever
+/// passed here — the frame has no field for anything else, by construction.
+fn report_key_rotated(
+    outbound_tx: &mpsc::Sender<ClientMsg>,
+    request_id: &str,
+    outcome: roomler_ai_remote_control::models::KeyRotationOutcome,
+    old_public_key: Option<&str>,
+    new_public_key: Option<&str>,
+    key_epoch: u32,
+    detail: Option<&str>,
+) {
+    use roomler_ai_remote_control::models::KeyRotationReport;
+
+    let detail = detail.map(|d| {
+        let mut s = crate::exec::redactor().apply(d);
+        if s.chars().count() > KeyRotationReport::MAX_DETAIL {
+            s = s.chars().take(KeyRotationReport::MAX_DETAIL).collect();
+            s.push('…');
+        }
+        s
+    });
+    let msg = ClientMsg::KeyRotated {
+        request_id: request_id.to_string(),
+        outcome,
+        old_public_key: old_public_key.map(str::to_string),
+        new_public_key: new_public_key.map(str::to_string),
+        key_epoch,
+        detail,
+    };
+    if outbound_tx.try_send(msg).is_err() {
+        debug!("rc:agent.key_rotated dropped (outbound queue full or closed)");
+    }
+}
+
+/// FR-40 — the device's own floor between two rotations of ONE org's key.
+/// The server enforces the same ceiling; this one survives a server that
+/// does not.
+const KEY_ROTATION_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// `true` (and stamps now) when no rotation for `tenant_id` ran inside
+/// [`KEY_ROTATION_MIN_INTERVAL`]. Process-wide, keyed per org, since every
+/// org loop lives in this one daemon.
+fn key_rotation_ceiling_ok(tenant_id: &str) -> bool {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    let m = LAST.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut last = m.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if let Some(prev) = last.get(tenant_id)
+        && now.duration_since(*prev) < KEY_ROTATION_MIN_INTERVAL
+    {
+        return false;
+    }
+    last.insert(tenant_id.to_string(), now);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3189,6 +3288,147 @@ async fn handle_server_msg(
             );
             if !delivered {
                 debug!(%request_id, "rc:rpc.response for an unknown request — caller gave up");
+            }
+        }
+
+        // FR-40 — retire THIS org's overlay key: mint → persist → report →
+        // reconnect under the new identity
+        // (`docs/fr/FR-40-overlay-key-rotation.md`).
+        //
+        // Deliberately NOT primary-only: the key is per enrollment
+        // (`AgentConfig::for_org` scopes it), so org B's admin rotating org B's
+        // key on a shared host touches nothing of org A's — the opposite of
+        // `rc:agent.update` / `rc:agent.config`, which drive machine-wide
+        // state. Every branch reports, refusals included: the operator is
+        // looking at a security action "in flight" and each refusal has a
+        // different fix.
+        ServerMsg::KeyRotate { request_id } => {
+            use roomler_ai_remote_control::models::KeyRotationOutcome;
+
+            if agent_cfg.overlay_key_rotation == Some(false) {
+                warn!(
+                    %request_id,
+                    "rc:agent.key_rotate refused — overlay_key_rotation=false on this device"
+                );
+                report_key_rotated(
+                    outbound_tx,
+                    &request_id,
+                    KeyRotationOutcome::Disabled,
+                    None,
+                    None,
+                    agent_cfg.overlay_wg_key_epoch,
+                    Some("overlay_key_rotation=false on the device"),
+                );
+                return Ok(());
+            }
+            // The device's OWN ceiling. The server has one too, but a bound
+            // that exists only on the ordering side is not a bound.
+            if !key_rotation_ceiling_ok(tenant_id) {
+                warn!(
+                    %request_id,
+                    "rc:agent.key_rotate refused — a rotation ran less than a minute ago"
+                );
+                report_key_rotated(
+                    outbound_tx,
+                    &request_id,
+                    KeyRotationOutcome::RateLimited,
+                    None,
+                    None,
+                    agent_cfg.overlay_wg_key_epoch,
+                    Some("rotated less than 60 s ago"),
+                );
+                return Ok(());
+            }
+            // A build with no overlay surface has nothing to rotate. The mint
+            // lives in `crate::key_rotation`, which carries the feature split,
+            // so this arm — and `ConnectError::KeyRotated` — compiles the same
+            // in every feature set (see that module's doc for why that is not
+            // merely tidy).
+            let Some((new_secret, new_public)) = crate::key_rotation::mint_wg_identity() else {
+                warn!(
+                    %request_id,
+                    "rc:agent.key_rotate refused — this build has no overlay surface"
+                );
+                report_key_rotated(
+                    outbound_tx,
+                    &request_id,
+                    KeyRotationOutcome::Unsupported,
+                    None,
+                    None,
+                    0,
+                    Some("no overlay surface in this build"),
+                );
+                return Ok(());
+            };
+            {
+                let old_public = agent_cfg
+                    .overlay_wg_secret_key
+                    .as_deref()
+                    .and_then(crate::key_rotation::wg_public_of);
+                // Persist FIRST. If this fails the identity stays and the
+                // device says so: a key that is not written down would be
+                // lost at the next restart, and the device would come back as
+                // the key it just retired.
+                let key_epoch = match remote_cfg
+                    .rotate_overlay_key(ctx.is_primary, tenant_id, new_secret.clone())
+                    .await
+                {
+                    Ok(epoch) => epoch,
+                    Err(e) => {
+                        warn!(
+                            %request_id,
+                            error = %e,
+                            "rc:agent.key_rotate failed — identity unchanged"
+                        );
+                        report_key_rotated(
+                            outbound_tx,
+                            &request_id,
+                            KeyRotationOutcome::Failed,
+                            old_public.as_deref(),
+                            None,
+                            agent_cfg.overlay_wg_key_epoch,
+                            Some(&e),
+                        );
+                        return Ok(());
+                    }
+                };
+                info!(
+                    org = %ctx.label,
+                    %request_id,
+                    old_public_key = old_public.as_deref().unwrap_or("-"),
+                    new_public_key = %new_public,
+                    key_epoch,
+                    "rc:agent.key_rotate — new overlay key persisted; reconnecting under it"
+                );
+                report_key_rotated(
+                    outbound_tx,
+                    &request_id,
+                    KeyRotationOutcome::Rotated,
+                    old_public.as_deref(),
+                    Some(&new_public),
+                    key_epoch,
+                    None,
+                );
+                // Let the report leave on this session before it ends — the
+                // pump drains the outbound queue concurrently. Even if it is
+                // lost, the join under the new key is what the server verifies.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                // Same teardown as `Goodbye`: the `?`-propagated Err below
+                // would otherwise skip it and leave peers to a 10–30 s
+                // silence-detect instead of a clean close.
+                close_all_peers(peers, indicator).await;
+                close_all_tunnel_peers(tunnel_peers).await;
+                close_all_tunnel_quic_peers(tunnel_quic_peers).await;
+                pending_codecs.clear();
+                pending_transports.clear();
+                pending_chroma.clear();
+                pending_chunk_framing.clear();
+                pending_audio.clear();
+                pending_permissions.clear();
+                return Err(ConnectError::KeyRotated {
+                    secret_base64: new_secret,
+                    key_epoch,
+                });
             }
         }
 
