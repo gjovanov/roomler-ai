@@ -1549,6 +1549,234 @@ pub struct PeerRelayPolicy {
     pub serve: bool,
 }
 
+/// Bounds on FR-19 relay minting. Server-side only — the relay device
+/// re-clamps every session lifetime against its own table
+/// (`orgrelay::session`), so nothing here is trusted by a device.
+pub mod peer_relay_limits {
+    /// Mints per minute per (requesting node, relay node) pair — the key the
+    /// spec prescribes (§4 "Rate limiting"): a mint writes state onto a THIRD
+    /// device, so the pair to bound is requester × relay, not requester × peer.
+    /// The number is the exec precedent (`exec_limits::RATE_LIMIT_PER_MINUTE`)
+    /// so a fleet boot — one requester asking for every unreachable peer
+    /// through the same relay inside a minute — fits under it.
+    pub const MINT_RATE_LIMIT_PER_MINUTE: u32 = 30;
+}
+
+/// Why a peer-relay decision — an admin's approval or a session mint — was
+/// refused. The FR-19 twin of [`ExecDenyReason`] / [`SshDenyReason`], kept
+/// separate for the reason those two are: the vocabularies diverge (a mint has
+/// no caller permission, an approval has no relay).
+///
+/// Every arm is auditable. A refusal nobody can query is a refusal nobody will
+/// notice, and the refused rows are what an operator hunting "why is this pair
+/// still on DERP?" actually reads.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelayDenyReason {
+    /// Gate 1 — the org's [`PeerRelayMode`] is `Off`. ⚠️ Deliberately NEVER
+    /// audited: with the feature off there must be zero rows and zero reads
+    /// (acceptance: "`peer_relay_mode=off` ⇒ no `peer_relay_audit` rows").
+    OrgDisabled,
+    /// Approval — the caller lacks `MANAGE_AGENTS`.
+    NotDeviceAdmin,
+    /// Approval — turning `serve` ON additionally requires `EXEC_DEVICE`: you
+    /// cannot grant a power you do not hold (#600/#605), and nominating a
+    /// relay makes a device a chokepoint for the whole tenant's traffic.
+    CannotGrantRelay,
+    /// The requesting node did not advertise `supports_org_relay` on its join
+    /// — a pre-FR-19 build that could not act on a session anyway.
+    RequesterUnsupported,
+    /// The peer the requester wants to reach did not advertise it; a session
+    /// with one deaf end is a session nobody can use.
+    PeerUnsupported,
+    /// The peer is in another tenant.
+    CrossTenant,
+    /// Gate 2 — no overlay policy grants this pair relay use. Evaluated
+    /// regardless of `acl_mode`: an affirmative capability (spec §4).
+    AclDenied,
+    /// Gate 2 could not be evaluated because the policy rows were unreadable.
+    /// The fail-CLOSED arm, distinct from [`Self::AclDenied`] so a Mongo blip
+    /// is never mistaken for a policy decision.
+    PolicyUnreadable,
+    /// No device in the tenant is approved (gate 3), advertising
+    /// `relay-server` (gate 4) and online.
+    NoRelay,
+    /// The chosen relay's endpoint failed the SSRF validator — it would have
+    /// steered members at a loopback / RFC1918 / metadata / overlay address.
+    NonRoutableEndpoint,
+    /// The requester or the relay is a SECONDARY-org row on a multi-org
+    /// device; serving is primary-only (a UDP listener is host-global).
+    SecondaryOrg,
+    /// Per-(requesting node, relay node) ceiling
+    /// ([`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`]).
+    RateLimited,
+}
+
+impl PeerRelayDenyReason {
+    /// One line an operator can act on — names WHICH gate said no.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::OrgDisabled => "peer relays are off for this organization",
+            Self::NotDeviceAdmin => "Missing MANAGE_AGENTS permission",
+            Self::CannotGrantRelay => {
+                "Approving a device as an org relay requires EXEC_DEVICE — it makes the device \
+                 a traffic chokepoint for the whole organization, and you cannot grant a power \
+                 you do not hold"
+            }
+            Self::RequesterUnsupported => "the requesting device does not support org relays",
+            Self::PeerUnsupported => "the peer does not support org relays",
+            Self::CrossTenant => "the peer is not in this organization",
+            Self::AclDenied => "no overlay policy grants this pair the use of a relay",
+            Self::PolicyUnreadable => {
+                "the overlay policies could not be read; refusing rather than guessing"
+            }
+            Self::NoRelay => "no approved, serving, online relay device in this organization",
+            Self::NonRoutableEndpoint => "the relay's endpoint is not a public address",
+            Self::SecondaryOrg => "org relays serve the device's primary organization only",
+            Self::RateLimited => "too many relay requests through this relay; try again shortly",
+        }
+    }
+}
+
+/// Which decision a [`PeerRelayAuditEvent`] records.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelayAuditAction {
+    /// An admin set a device's [`PeerRelayPolicy`] — the privilege-granting
+    /// act, audited because the exit-node precedent auditing nothing is a gap
+    /// not to copy.
+    Approve,
+    /// A node asked for a session to a peer and the server decided.
+    Mint,
+}
+
+/// One peer-relay decision, granted or refused. TTL-expired after 90 days like
+/// [`ExecAuditEvent`].
+///
+/// One collection for both actions on purpose: the question an incident review
+/// asks — "who made this device a relay, and what has been routed through it
+/// since?" — is ONE query on `agent_id`, which two collections would split.
+/// The optional fields each belong to one action; [`Self::action`] says which.
+///
+/// **A mint row records the DECISION, not the session.** The server pushes a
+/// session to three devices and its involvement ends there; it never sees a
+/// byte of what they exchange. Same discipline as [`SshAuditEvent`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PeerRelayAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub action: PeerRelayAuditAction,
+    /// The device the row is ABOUT: the one being approved, or the relay
+    /// chosen to carry the session (absent on a mint no relay qualified for).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<ObjectId>,
+    /// The admin who asked (`approve`). A mint has no person behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<ObjectId>,
+    /// `mint` — the node that asked, and the peer it asked to reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_node_id: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_node_id: Option<ObjectId>,
+    /// `mint` — the overlay node chosen as the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_node_id: Option<ObjectId>,
+    /// `approve` — the requested value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<bool>,
+    /// `mint` — the VNI issued. Absent on refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vni: Option<u32>,
+    /// `mint` under [`PeerRelayMode::Warn`]: the decision was taken and
+    /// recorded exactly as `On` would have, and NOTHING was pushed.
+    #[serde(default)]
+    pub warn_only: bool,
+    pub at: DateTime,
+    /// Refusal reason; `None` = approved / minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<PeerRelayDenyReason>,
+}
+
+impl PeerRelayAuditEvent {
+    pub const COLLECTION: &'static str = "peer_relay_audit";
+}
+
+#[cfg(test)]
+mod peer_relay_audit_tests {
+    use super::*;
+
+    /// The wire strings are what the audit UI and the integration tests match
+    /// on; a rename here would silently turn a filtered view empty.
+    #[test]
+    fn deny_reason_wire_strings_are_locked() {
+        let all = [
+            (PeerRelayDenyReason::OrgDisabled, "org_disabled"),
+            (PeerRelayDenyReason::NotDeviceAdmin, "not_device_admin"),
+            (PeerRelayDenyReason::CannotGrantRelay, "cannot_grant_relay"),
+            (
+                PeerRelayDenyReason::RequesterUnsupported,
+                "requester_unsupported",
+            ),
+            (PeerRelayDenyReason::PeerUnsupported, "peer_unsupported"),
+            (PeerRelayDenyReason::CrossTenant, "cross_tenant"),
+            (PeerRelayDenyReason::AclDenied, "acl_denied"),
+            (PeerRelayDenyReason::PolicyUnreadable, "policy_unreadable"),
+            (PeerRelayDenyReason::NoRelay, "no_relay"),
+            (
+                PeerRelayDenyReason::NonRoutableEndpoint,
+                "non_routable_endpoint",
+            ),
+            (PeerRelayDenyReason::SecondaryOrg, "secondary_org"),
+            (PeerRelayDenyReason::RateLimited, "rate_limited"),
+        ];
+        for (reason, wire) in all {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::json!(wire)
+            );
+            assert!(!reason.message().is_empty());
+        }
+        assert_eq!(
+            serde_json::to_value(PeerRelayAuditAction::Approve).unwrap(),
+            serde_json::json!("approve")
+        );
+        assert_eq!(
+            serde_json::to_value(PeerRelayAuditAction::Mint).unwrap(),
+            serde_json::json!("mint")
+        );
+    }
+
+    /// A row must explain itself without a join, and the optional fields are
+    /// skipped when absent so an `approve` row carries no mint noise.
+    #[test]
+    fn approve_row_serialises_without_mint_fields() {
+        let row = PeerRelayAuditEvent {
+            id: None,
+            tenant_id: ObjectId::new(),
+            action: PeerRelayAuditAction::Approve,
+            agent_id: Some(ObjectId::new()),
+            user_id: Some(ObjectId::new()),
+            requester_node_id: None,
+            peer_node_id: None,
+            relay_node_id: None,
+            serve: Some(true),
+            vni: None,
+            warn_only: false,
+            at: DateTime::now(),
+            denied: Some(PeerRelayDenyReason::CannotGrantRelay),
+        };
+        let doc = bson::to_document(&row).unwrap();
+        assert!(doc.contains_key("serve"));
+        assert!(!doc.contains_key("vni"));
+        assert!(!doc.contains_key("requester_node_id"));
+        assert_eq!(doc.get_str("denied").unwrap(), "cannot_grant_relay");
+        let back: PeerRelayAuditEvent = bson::from_document(doc).unwrap();
+        assert_eq!(back.action, PeerRelayAuditAction::Approve);
+        assert_eq!(back.denied, Some(PeerRelayDenyReason::CannotGrantRelay));
+    }
+}
+
 /// A tenant-scoped overlay access rule. Default-deny **once the tenant's
 /// [`OverlayAclMode`] is `Enforce`**; `Off` (the default) preserves the
 /// historical "same tenant + same network ⇒ full visibility" behaviour.

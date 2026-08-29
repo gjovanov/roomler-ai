@@ -212,10 +212,10 @@ Ticked only where a run is recorded in the field log below.
       ⚠️ The `prompt_owner = true` half is untested: every fleet device is owned
       by a different user id than the test account, so the toggle never renders.
 - [x] Deny, and "nobody answered", are **distinguishable at the controller**.
-- [ ] A host with no reachable prompt surface reports `no_prompt_surface`; the
-      controller is told nobody could be asked, and the audit row says so.
-      ⚠️ No control left in the fleet — every Linux host runs a virtual desktop
-      (see the log). Re-test on 0.4.17.
+- [x] A host with no reachable prompt surface reports `no_prompt_surface`; the
+      controller is told nobody could be asked, and the audit row says so —
+      **mars, 0.4.18 + API `v20260829-507d7b33990a`** (it took both halves: the
+      agent's virtual-desktop guard AND the hub's verdict grace; see the log).
 - [ ] `auto_grant_session=false` on a device defeats a server `Auto` directive.
 - [ ] All five modes exercised end-to-end on the fleet, each recorded with the
       surface that served it. `auto`, `prompt` and the host half of
@@ -327,7 +327,24 @@ line a headless operator gets still named the FR-21-retired `roomler-agent`.
 
 So the agent is right and the controller is still told the wrong thing: the hub's
 fallback timer and the agent's window were the same number. Fixed server-side
-(`CONSENT_VERDICT_GRACE`, this FR's last PR); re-test on the next API deploy.
+(`CONSENT_VERDICT_GRACE`, #892).
+
+### 2026-08-29 — API `v20260829-507d7b33990a` (#892): the negative control, whole
+
+Same host, same policy, same click — with the hub now waiting 5 s past the window:
+
+```
+14:47:13.494  consent prompt surface … native=false have_surface=false
+14:47:43.630  consent decision → sending rc:consent … granted=false reason="no_prompt_surface"
+14:47:43.631  session terminated by server … reason=NoPromptSurface          ← 1 ms AFTER the verdict
+```
+
+Controller, at t+30.3 s: *"That device could not show a prompt to anyone — nobody
+is signed in at its screen, or the Roomler desktop app is not running there. Start
+it on the device, or set this device to email/push consent."* Before #892 the
+terminate line read `reason=ConsentTimeout` and came 138 ms BEFORE the verdict.
+
+Every device policy touched during the run is restored (mars back to unset).
 
 Also on 0.4.18: `companion_version` is live end to end — NEO16 reports `0.4.18`
 (the sidecar the daemon's own refresh wrote), mars reports *absent* (no

@@ -1,6 +1,6 @@
 # FR-19: Peer relays — tenant-owned UDP relay nodes between direct and DERP
 
-Status: **proposed** (2026-08-28). Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
+Status: **in progress** — P0–P2 and P3a shipped, P3b in PR (2026-08-29); proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
 Reference design: [Tailscale peer relays](https://tailscale.com/docs/features/peer-relay).
 Sibling of FR-18 (#801) and FR-17 (#799) — both are about the *cost* of the relay path;
 this FR is about **replacing that path with a better one** rather than tuning it.
@@ -475,7 +475,10 @@ enforce one, deliberately after the identity gates so refusals are attributable:
 `rc:rpc.request` / `rc:ssh.request` WS legs, so those had no ceiling at all."* A mint is
 another device-originated WS leg and is **more** expensive, because it writes state onto a
 *third* device. Add a `(requesting node, relay node)` limiter with a `RateLimited` deny
-reason.
+reason. **P3b:** `AppState::relay_rate_limiter` + `peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`
+= 30 (the exec precedent, so a fleet boot — one requester asking for every unreachable peer
+through the same relay inside a minute — fits under it); the check site lands with the mint
+in P3c, after the identity gates, so a refusal is attributable and audited.
 
 **Multi-org: relay serving is PRIMARY-ORG ONLY, enforced.** ⚠️ The first draft said a device
 *"may serve N tenants"* and, two sentences later, that it *"should follow"* the primary-only
@@ -491,7 +494,8 @@ exactly this shape: *"the reason both features are still off nearly everywhere: 
 gate is the one nobody can reach."* An HQ relay is precisely a box an admin may not have
 hands on. Decision: `relay_server_enabled` **stays device-local and unpushable**, and §12's
 operator checklist carries the local-enable step. If that friction proves fatal in the
-field, routing it through remote config requires `MANAGE_AGENTS` **and** `RELAY_DEVICE` —
+field, routing it through remote config requires `MANAGE_AGENTS` **and** `EXEC_DEVICE`
+(`RELAY_DEVICE` once #888 lands) —
 and the "survives a compromised server" claim for gate 4 must then be dropped rather than
 kept as a property the delivery mechanism contradicts.
 
@@ -694,7 +698,7 @@ the counter was added without a reader"*. Still true: `stale_drops()`
 | `roomler netcheck` | relay node: `relay server: listening :3478, N sessions` |
 | relay node | per-session `packets_rx`/`bytes_rx`, **one labelled counter per refusal reason** — bad MAC, unknown VNI, wrong tenant, at-capacity, expired, unbound-source — each with a `NodeStatus` reader. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood |
 | process-global | `ORG_RELAY_SESSIONS_OPENED_TOTAL` / `_CLOSED_TOTAL` only. ⚠️ **Not a gauge**: `evidence.rs:1-4` is *"cumulative since daemon start — consumers DIFF two readings, never judge absolutes"*. The live session count is a `NodeStatus` field |
-| server | `peer_relay_audit` (90 d TTL) — every **approval**, mint and refusal, reason enumerated, written in one place via `decide() -> Result<Granted, DenyReason>`, read behind `VIEW_RELAY_AUDIT` |
+| server | `peer_relay_audit` (90 d TTL) — every **approval**, mint and refusal, reason enumerated, written in one place via `decide() -> Result<Granted, DenyReason>`, read behind `VIEW_EXEC_AUDIT` (`VIEW_RELAY_AUDIT` after #888). **P3b:** `GET …/peer-relay-audit` (`?agent_id=`), one row shape for both actions (`action: approve \| mint`) so "who made this device a relay, and what went through it?" is one query on `agent_id`; `PeerRelayDenyReason` is the enumerated vocabulary (12 arms, wire-locked) |
 
 ⚠️ An empty `relay_via` is not evidence of "no relay available" — it may mean the node never
 measured (`signaling.rs:1795`).
@@ -751,7 +755,7 @@ appears in **two** places), and the customer-facing install docs (§12).
 | **P0** | **Wire forward-compatibility, rolled to the fleet before anything else** — `supports_org_relay` hello bit, `#[serde(other)]` on `RelayStrategyWire`, out-of-band session push (§3b). Nothing else lands until the fleet carries it. | decoder only |
 | **P1** | **Bind-only responder** (bind + authenticated challenge, **forwards nothing**, no session table) + `rc:overlay.relay_probe` + `peer_relay_audit` + every counter **with its reader** | `relay_server_enabled=false` |
 | **P2** | Forwarding: Geneve framing, VNI table, full 3-way bind, caps, revocation, `catch_unwind` | `relay_server_enabled=false` |
-| **P3** | Server-side mint + gates + `RELAY_DEVICE` / `VIEW_RELAY_AUDIT` + rate limit + `peer_relay_mode` | `peer_relay_mode=off` ⇒ zero mints |
+| **P3** | Server-side mint + gates + approval (`MANAGE_AGENTS`+`EXEC_DEVICE`, no free bit — §4) / audit behind `VIEW_EXEC_AUDIT` + rate limit + `peer_relay_mode`. Split: **P3a** models + wire (#890) · **P3b** DAO, routes, `peer_relay_audit`, fail-closed `try_load_acl` / `try_overlay_source_of`, limiter · **P3c** the mint | `peer_relay_mode=off` ⇒ zero mints |
 | **P4** | `RelayKind::Org` live in the verdict + `relay_strategy` branch + promote/demote | `overlay_org_relay=false` |
 | **P5** | jupiter/zeus provisioning in `~/k8s-cluster-multi` + weekly drift-audit cron | revert host_vars |
 | **P6** | Admin UI: relay approval, org switch, audit section | UI-only |
@@ -788,12 +792,22 @@ kill switch. That is what makes E2E-3 executable before P2.
       per-source limiter counts refusals by reason.
 - [ ] With `overlay_policies` **unreadable**, the mint is refused and audited with a distinct
       reason — the fail-closed property, which needs `try_load_acl` to be expressible at all.
+      *(P3b: `try_load_acl(…, PolicyLoad::Always) -> Result` + `try_overlay_source_of`
+      landed; `load_acl` / `overlay_source_of` keep their open posture as explicit wrappers
+      that now LOG what they swallow. Integration test
+      `try_load_acl_fails_closed_where_load_acl_fails_open` proves both postures on one
+      unreadable row. The mint's `PolicyUnreadable` arm is P3c.)*
 - [ ] Mint refused for a **secondary-org** node; a relay grant arriving on a secondary org's
       WS is dropped agent-side.
 - [ ] `mint_refused_for_non_routable_endpoint` — `169.254.169.254`, RFC1918, loopback,
       `100.64/10`, ULA, v4-mapped.
 - [ ] Mint refused when rate-limited, with the refusal audited.
-- [ ] Relay approval requires `MANAGE_AGENTS` **and** `RELAY_DEVICE`, and writes an audit row.
+- [ ] Relay approval requires `MANAGE_AGENTS` **and** `EXEC_DEVICE` (`RELAY_DEVICE` after
+      #888), and writes an audit row — on BOTH arms. *(P3b: `decide_approval` is one pure
+      function with 7 unit tests; the wiring is locked by the integration test
+      `approval_needs_manage_agents_and_exec_device_and_audits_both_arms` — six attempts,
+      six rows. Clearing an approval needs only `MANAGE_AGENTS`: revocation is not a grant.
+      Field check against prod after the deploy.)*
 - [ ] The bind/Geneve parser survives **fuzzing over arbitrary byte strings** without panic.
 
 **Correctness**
@@ -1069,7 +1083,7 @@ Consequences taken here:
 - This table goes in the customer-facing docs, not just here.
 
 **Operational checklist:** a reachable UDP port (§5), a static endpoint if behind NAT
-(SSRF-validated), `RELAY_DEVICE` approval, an ACL grant naming permitted sources, and —
+(SSRF-validated), `MANAGE_AGENTS`+`EXEC_DEVICE` approval (`RELAY_DEVICE` after #888), an ACL grant naming permitted sources, and —
 ⚠️ because gate 4 is deliberately unpushable (§2) — **someone with local access to set
 `relay_server_enabled` on the box itself.**
 
