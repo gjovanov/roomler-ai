@@ -1,3 +1,13 @@
+# RETIRED-NAME-ANCHOR-BEGIN
+# Every retired name left in this file is ACCURATE and must stay:
+#   * "Roomler Agent" IS the MSI ARP DisplayName (wix/main.wxs Name=)
+#   * roomler-agent-<version>-…msi ARE the published asset filenames
+#   * roomler-agent.exe IS the compatibility alias the MSI installs
+# The service name, task name and config paths in here were NOT accurate and
+# were corrected; this file ships to operators, so a wrong instruction here is
+# a support ticket.
+# INVARIANT: a retired name here must be one a user can actually see on their
+# machine. docs/fr/FR-21
 Roomler Agent — README
 ======================
 
@@ -20,7 +30,7 @@ The install directory is appended to your user PATH, so `roomler`
 and `roomlerd` work from any NEW terminal. No admin rights were
 required (per-user install, no UAC).
 
-Configuration is stored under `%APPDATA%\roomler-agent\` once you run
+Configuration is stored under `%APPDATA%\roomler\roomler\` once you run
 the enroll step below.
 
 First-time setup
@@ -56,11 +66,11 @@ Autostart on logon (registered automatically since 0.1.54)
 ----------------------------------------------------------
 The MSI registers the auto-start hook automatically on install + on
 every upgrade. After running the MSI you should already have a
-Scheduled Task called `RoomlerAgent` with the resilience XML
+Scheduled Task called `Roomler` with the resilience XML
 (restart-on-failure, battery-defeat, single-instance belt). Confirm
 with:
 
-    schtasks /Query /TN RoomlerAgent
+    schtasks /Query /TN Roomler
 
 If you ever need to manage the hook manually (e.g. after restoring a
 backup or recovering from the rare Win11 ACL-locked-task scenario):
@@ -77,7 +87,7 @@ Win11 quirk), the MSI's RegisterAutostart custom action will silently
 skip (Return="ignore" so install completes), and the operator can
 delete the locked task from an elevated PowerShell once with:
 
-    schtasks /Delete /TN RoomlerAgent /F
+    schtasks /Delete /TN Roomler /F
 
 then re-run `service install` from a normal shell.
 
@@ -103,7 +113,7 @@ For fleet / unattended deployments where the host needs to be reachable
 *before* anyone logs in (e.g. driving the lock screen for remote
 login), the agent ships an opt-in alternative to the per-user
 Scheduled Task: it can register itself with the Service Control
-Manager as `RoomlerAgentService`, running under LocalSystem with
+Manager as `Roomler`, running under LocalSystem with
 AutoStart at boot.
 
 Two ways to get there:
@@ -146,8 +156,8 @@ the same agent, uninstall the Scheduled Task first:
 Inspect / manage:
 
     & $agent service status --as-service      # NotInstalled / Stopped / Running
-    Get-Service RoomlerAgentService           # PowerShell native
-    sc.exe stop RoomlerAgentService           # explicit stop
+    Get-Service Roomler           # PowerShell native
+    sc.exe stop Roomler           # explicit stop
 
 Pre-logon SYSTEM-context capture (the agent itself running capture +
 input under SYSTEM when no user is logged in) is planned for a future
@@ -193,7 +203,7 @@ Logs
 ----
 The agent writes to stderr. To capture a log file for troubleshooting:
 
-    & $agent run 2>&1 | Tee-Object -FilePath "$env:TEMP\roomler-agent.log"
+    & $agent run 2>&1 | Tee-Object -FilePath "$env:TEMP\roomlerd.log"
 
 Set `RUST_LOG=roomlerd=debug,webrtc=debug` for verbose output.
 
@@ -201,3 +211,4 @@ Support
 -------
 Project:  https://roomler.ai/
 Source:   https://github.com/gjovanov/roomler-ai
+# RETIRED-NAME-ANCHOR-END
