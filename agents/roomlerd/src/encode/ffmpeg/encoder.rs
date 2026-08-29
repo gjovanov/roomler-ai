@@ -1919,7 +1919,7 @@ mod tests {
         // future test that does must share AQ_ENV_LOCK.
         let prior = std::env::var("ROOMLERD_NVENC_SPATIAL_AQ").ok();
 
-        unsafe { std::env::remove_var("ROOMLERD_NVENC_SPATIAL_AQ") };
+        unsafe { tunnel_core::env::test_env::clear("NVENC_SPATIAL_AQ") };
         let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(
             !summary.contains("spatial-aq"),
@@ -1929,7 +1929,7 @@ mod tests {
         assert!(summary.contains("forced-idr=1"), "got: {summary}");
         assert!(summary.contains("rc=vbr"), "got: {summary}");
 
-        unsafe { std::env::set_var("ROOMLERD_NVENC_SPATIAL_AQ", "1") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "NVENC_SPATIAL_AQ", "1") };
         let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(
             summary.contains("spatial-aq=1"),
@@ -1937,13 +1937,15 @@ mod tests {
         );
 
         // Any non-"1" value keeps it off (explicit-opt-in semantics).
-        unsafe { std::env::set_var("ROOMLERD_NVENC_SPATIAL_AQ", "0") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "NVENC_SPATIAL_AQ", "0") };
         let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(!summary.contains("spatial-aq"), "got: {summary}");
 
         match prior {
-            Some(v) => unsafe { std::env::set_var("ROOMLERD_NVENC_SPATIAL_AQ", v) },
-            None => unsafe { std::env::remove_var("ROOMLERD_NVENC_SPATIAL_AQ") },
+            Some(v) => unsafe {
+                tunnel_core::env::test_env::set_as("ROOMLERD_", "NVENC_SPATIAL_AQ", v)
+            },
+            None => unsafe { tunnel_core::env::test_env::clear("NVENC_SPATIAL_AQ") },
         }
     }
 }

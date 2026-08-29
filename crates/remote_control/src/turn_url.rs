@@ -128,6 +128,19 @@ fn fmt_host(host: &str) -> String {
 /// `stun:`, or a transport-suffixed URL — passes through as `[base]`, exactly
 /// the legacy gate.
 pub fn expand_turn_url(base: &str, caps: &VariantCaps) -> Vec<String> {
+    // A blank URL expands to NOTHING, not to one blank URL.
+    //
+    // `turn.url` is an Option, so `Some("")` reads as "configured" at every
+    // call site while meaning "not configured" to a human. Returning [""] from
+    // here put an empty string into the ICE server list, and a browser rejects
+    // the whole thing:
+    //   Failed to construct 'RTCPeerConnection': '' is not a valid URL
+    // — which makes EVERY call unjoinable, with the failure surfacing only as
+    // a snackbar that fades. Field-diagnosed 2026-08-29 on the e2e stack,
+    // where it had been the real cause of "conference specs fail" for months.
+    if base.trim().is_empty() {
+        return Vec::new();
+    }
     let mut urls = vec![base.to_string()];
     if !base.starts_with("turn:") || base.contains("?transport=") {
         return urls;
@@ -157,6 +170,27 @@ pub fn expand_turn_url(base: &str, caps: &VariantCaps) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blank URL expands to NOTHING.
+    ///
+    /// `turn.url` is an `Option<String>`, so `Some("")` looks configured to
+    /// every call site and means "unset" to the operator who left it empty.
+    /// Returning `[""]` here put an empty string in the ICE server list and a
+    /// browser rejects the whole peer connection —
+    /// `Failed to construct 'RTCPeerConnection': '' is not a valid URL` —
+    /// so NOBODY can join a call. Field-diagnosed 2026-08-29 on the e2e stack,
+    /// where it had quietly been the real cause of "the conference specs fail"
+    /// for months while we blamed the network.
+    #[test]
+    fn blank_url_expands_to_nothing() {
+        for blank in ["", "   ", "\t", "\n"] {
+            assert!(
+                expand_turn_url(blank, &VariantCaps::default()).is_empty(),
+                "blank TURN url {blank:?} must expand to no urls at all"
+            );
+            assert!(expand_turn_url(blank, &VariantCaps::media()).is_empty());
+        }
+    }
 
     /// The exact six-variant list the legacy string-replace expansion emitted
     /// for the deployed base shape — byte-identical, order included. This is
