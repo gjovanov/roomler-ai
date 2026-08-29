@@ -97,6 +97,13 @@ pub struct DeviceRow {
     /// MagicDNS domain configured or the device has no overlay node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub magic_dns_fqdn: Option<String>,
+    /// FR-40 — the node's overlay (WireGuard) PUBLIC key and its epoch, from
+    /// the node row. Shown so an operator can SEE a rotation land instead of
+    /// trusting a chip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlay_key_epoch: Option<u32>,
 }
 
 /// GET /api/tenant/{tenant_id}/device — membership-gated like every other
@@ -288,6 +295,8 @@ fn agent_row(
         overlay_node_id,
         magic_dns_name,
         magic_dns_fqdn,
+        overlay_public_key: node.map(|n| n.wg_public_key.clone()),
+        overlay_key_epoch: node.map(|n| n.key_epoch),
     }
 }
 
@@ -321,6 +330,8 @@ fn client_row(
         overlay_node_id,
         magic_dns_name,
         magic_dns_fqdn,
+        overlay_public_key: node.map(|n| n.wg_public_key.clone()),
+        overlay_key_epoch: node.map(|n| n.key_epoch),
     }
 }
 
