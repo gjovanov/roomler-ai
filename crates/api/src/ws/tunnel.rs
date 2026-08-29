@@ -1,4 +1,4 @@
-//! WebSocket handler for `roomler-tunnel` clients (`role=tunnel-client`).
+//! WebSocket handler for `roomler` clients (`role=tunnel-client`).
 //!
 //! T2.5 wires the server-side ACL gate. Lifecycle:
 //!
@@ -446,7 +446,7 @@ pub(crate) struct TunnelSession {
 
 /// Identity + reply channel of whoever originated a tunnel-CLIENT session
 /// on this server. Two principals drive the identical handlers:
-///   * `Principal::TunnelClient` — a dedicated `roomler-tunnel` WS
+///   * `Principal::TunnelClient` — a dedicated `roomler` WS
 ///     (`handle_tunnel_client_socket`).
 ///   * `Principal::Agent` — an enrolled agent driving the tunnel-client
 ///     role over its own agent WS (P3b-2,

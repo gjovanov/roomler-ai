@@ -3,7 +3,7 @@
 //! friendly, same origin as the manifest), verify its SHA-256, and self-replace
 //! the running executable.
 //!
-//! Mirrors `roomler-agent self-update`, minus the MSI / Windows-service / UAC
+//! Mirrors `roomlerd self-update`, minus the MSI / Windows-service / UAC
 //! machinery — the tunnel ships as a plain binary inside a release `.zip`, so a
 //! self-update is just download → verify → swap the exe. Windows only for now
 //! (the fleet's platform); other OSes are pointed at the manual download.
@@ -56,7 +56,7 @@ struct Release {
 pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
     let base = cfg.server_url.trim_end_matches('/');
     let http = reqwest::Client::builder()
-        .user_agent(concat!("roomler-tunnel/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("roomler-cli/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build http client")?;
 
@@ -78,7 +78,7 @@ pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
         .tag_name
         .trim_start_matches("tunnel-v")
         .trim_start_matches('v');
-    println!("roomler-tunnel: current {CURRENT}, latest {latest_ver}");
+    println!("roomler: current {CURRENT}, latest {latest_ver}");
 
     if !is_newer(latest_ver, CURRENT) {
         println!("Already up to date.");
@@ -131,7 +131,7 @@ pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
     // 5) Extract the binary + self-replace.
     let new_exe = extract_windows_exe(&bytes)?;
     replace_self(&new_exe)?;
-    println!("Updated to {latest_ver}. Restart roomler-tunnel to run the new version.");
+    println!("Updated to {latest_ver}. Restart roomler to run the new version.");
     Ok(())
 }
 

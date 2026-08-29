@@ -46,7 +46,7 @@
 //!
 //! D3D11 device/context + the duplication object have thread affinity at
 //! runtime. The capture pump owns one of these on its dedicated
-//! `roomler-agent-system-capture` thread and drives it synchronously;
+//! `roomlerd-system-capture` thread and drives it synchronously;
 //! nobody else touches it. We never send it across threads.
 //!
 //! ## Feature gating

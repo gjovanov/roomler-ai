@@ -1,8 +1,8 @@
-//! REST surface for the `roomler-tunnel` subsystem.
+//! REST surface for the `roomler` subsystem.
 //!
 //! Mirrors `crates/api/src/routes/remote_control.rs` for the
 //! enrollment flow. The tunnel client (a laptop running
-//! `roomler-tunnel`) is enrolled in the same two-step shape as a
+//! `roomler`) is enrolled in the same two-step shape as a
 //! remote-control agent: admin issues a single-use `TunnelEnrollment`
 //! token, then the operator runs `roomler enroll` which
 //! exchanges it for a long-lived `TunnelClient` token.

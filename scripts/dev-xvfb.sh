@@ -88,7 +88,7 @@ fi
 # windows to a user's live session they're reusing.
 if (( started_xvfb )); then
     xterm -geometry 80x24+0+0 \
-        -e "echo 'roomler-agent dev-xvfb canvas'; sleep 1d" >/dev/null 2>&1 &
+        -e "echo 'roomlerd dev-xvfb canvas'; sleep 1d" >/dev/null 2>&1 &
     pids+=($!)
     # Give the (WM-less) server a moment to map the window.
     sleep 0.3
@@ -110,7 +110,7 @@ fi
 # foreground instead so `cleanup()` tears them down when the command exits.
 case "$1" in
     run)
-        echo "→ running roomler-agent (--features ${AGENT_FEATURES})"
+        echo "→ running roomlerd (--features ${AGENT_FEATURES})"
         cargo run -p roomlerd --features "$AGENT_FEATURES" -- run
         ;;
     shell)

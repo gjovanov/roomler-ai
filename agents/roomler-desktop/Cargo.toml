@@ -15,7 +15,7 @@ path = "src/main.rs"
 # P3e lever E: the tray calls `enrollment::enroll`, `config::save`,
 # `machine::derive_machine_id`, the log tail, and the sentinel reader — all of
 # which live in agent-core now. Before the split this was a lib dep on the
-# FULL `roomler-agent`, which pulled the entire data plane (webrtc family,
+# FULL `roomlerd`, which pulled the entire data plane (webrtc family,
 # quinn, turn, openh264-sys2, tokio-tungstenite, async_zip, …) into a GUI that
 # never opens a session. One deliberate loss: `win_service::default_log_dir`
 # — replaced by the same one-liner over `appdirs` (see commands.rs).

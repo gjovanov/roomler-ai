@@ -157,7 +157,7 @@ pub async fn drain_and_upload(cfg: &AgentConfig) {
 fn build_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(concat!(
-            "roomler-agent-crash-uploader/",
+            "roomlerd-crash-uploader/",
             env!("CARGO_PKG_VERSION")
         ))
         .timeout(POST_TIMEOUT)

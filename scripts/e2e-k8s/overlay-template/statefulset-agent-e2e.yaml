@@ -73,7 +73,7 @@ spec:
             - name: config
               mountPath: /etc/roomler
             - name: data
-              mountPath: /root/.local/share/roomler/roomler-agent
+              mountPath: /root/.local/share/roomler
           resources:
             requests:
               cpu: 100m

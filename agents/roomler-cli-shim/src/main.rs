@@ -159,6 +159,7 @@ const DAEMON_FILE_NAME: &str = "roomlerd.exe";
 #[cfg(not(target_os = "windows"))]
 const DAEMON_FILE_NAME: &str = "roomlerd";
 
+// RETIRED-NAME-ANCHOR(8): the macOS bundle executable is FROZEN (D5) — it keys the host TCC grants.
 /// The macOS bundle's executable. Named `roomler-agent`, not `roomlerd`:
 /// `CFBundleExecutable` conventionally matches the bundle, CI asserts the two
 /// plists point here, and renaming it would invalidate the TCC grants keyed to

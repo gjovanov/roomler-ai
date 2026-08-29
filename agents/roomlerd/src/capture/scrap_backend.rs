@@ -87,7 +87,7 @@ impl ScrapCapture {
         let desired_worker = desired.clone();
 
         thread::Builder::new()
-            .name("roomler-agent-capture".into())
+            .name("roomlerd-capture".into())
             .spawn(move || {
                 let mut attempt: u32 = 0;
                 let init_outcome = loop {

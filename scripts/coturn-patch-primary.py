@@ -2,7 +2,7 @@
 on the primary coturn host so UDP/443 routes to coturn:3478 (plain TURN)
 instead of :5349 (DTLS/TLS). webrtc-rs does NOT implement DTLS-over-UDP
 (upstream issue webrtc-rs/webrtc#690, closed NOT_PLANNED), so the existing
-UDP/443 -> :5349 rule produces zero usable candidates for the roomler-agent.
+UDP/443 -> :5349 rule produces zero usable candidates for the daemon.
 Plain TURN/UDP
 on :443 is the corporate-firewall bypass.
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env sh
+# RETIRED-NAME-ANCHOR-BEGIN
+# The tarball name names a PUBLISHED release asset. Filenames are fixed by what is already on GitHub Releases (FR-21 D6), and usr/share/doc/roomler-agent is the dpkg doc
+# directory that travels with it.
 # Stage the Linux payload and tar it — the distro-agnostic install path for
 # hosts with no dpkg/apt (Fedora, RHEL, SUSE, Arch …), which otherwise cannot
 # install ANY published artifact and so can never self-update.
@@ -54,3 +57,4 @@ sha256sum "${name}.tar.gz" | awk '{print $1"  "$2}' > "${name}.tar.gz.sha256"
 
 echo "staged ${libs} lib(s); $(du -h "${name}.tar.gz" | cut -f1) -> ${name}.tar.gz"
 tar tzf "${name}.tar.gz" | sed "s|^|  |"
+# RETIRED-NAME-ANCHOR-END
