@@ -774,13 +774,13 @@ kill switch. That is what makes E2E-3 executable before P2.
 ⚠️ Where an instrument does not exist it is named as prerequisite work **in the same row**.
 
 > **Test coverage map (2026-08-29).** The wire/mint hardening boxes ticked below are each backed by a named, non-vacuous test on master, not a field run:
-> `tag₁`-refusal & same-egress third node → `orgrelay::bind::a_valid_cookie_without_the_member_secret_is_refused`; replay → `a_captured_exchange_does_not_replay_under_a_different_nonce`; amplification bound → `wire::probe_is_fixed_length_so_a_reply_can_never_amplify` + `every_control_kind_roundtrips_at_one_fixed_size`; bind flood → `server::a_bind_flood_is_rate_limited_before_it_can_cost_a_mac`; `policy_unreadable` & `rate_limited` mint refusals → `peer_relay_mint_tests::every_refusal_is_audited_with_its_reason`; fuzz/no-panic → `wire::control_and_data_decoders_never_panic_on_arbitrary_bytes`; shape disjointness over all 256 byte-0 values → `wire::shape_is_disjoint_from_wg_stun_and_disco_across_every_first_byte`; `relay_max_sessions` cap → `server::the_handle_cannot_push_the_table_past_its_cap`. Non-routable endpoint + approval authz were additionally field-verified (log below). **Still open** (no confirmable coverage from HEAD): the pre-FR-19 forward-compat box (needs the old `NetmapPeer` shape), and the field-instrument boxes (bytes-through-pod, port-audit scoping, 24 h socket census, kill-every-relay demote).
+> `tag₁`-refusal & same-egress third node → `orgrelay::bind::a_valid_cookie_without_the_member_secret_is_refused`; replay → `a_captured_exchange_does_not_replay_under_a_different_nonce`; amplification bound → `wire::probe_is_fixed_length_so_a_reply_can_never_amplify` + `every_control_kind_roundtrips_at_one_fixed_size`; bind flood → `server::a_bind_flood_is_rate_limited_before_it_can_cost_a_mac`; `policy_unreadable` & `rate_limited` mint refusals → `peer_relay_mint_tests::every_refusal_is_audited_with_its_reason`; fuzz/no-panic → `wire::control_and_data_decoders_never_panic_on_arbitrary_bytes`; shape disjointness over all 256 byte-0 values → `wire::shape_is_disjoint_from_wg_stun_and_disco_across_every_first_byte`; `relay_max_sessions` cap → `server::the_handle_cannot_push_the_table_past_its_cap`. Forward-only / drop-unbound-source → `server::three_sockets_relay_ciphertext_between_bound_members_and_nobody_else`; symmetric-NAT rebind → `session::an_authenticated_rebind_moves_the_address_and_an_unauthenticated_one_does_not`; lifetime/deadline bounds → `session::a_busy_session_still_ends_at_max_lifetime` + `an_idle_session_expires_and_is_reaped` + `a_session_nobody_binds_dies_at_the_bind_deadline`. Non-routable endpoint + approval authz were additionally field-verified (log below). **Still open** (no confirmable coverage from HEAD): the pre-FR-19 forward-compat box (needs the old `NetmapPeer` shape), and the field-instrument boxes (bytes-through-pod, port-audit scoping, 24 h socket census, kill-every-relay demote).
 
 **P0 — wire compatibility (gates everything else)**
 
 - [ ] A **pre-FR-19** agent receiving a netmap containing an unknown `relay_strategy` tag
       parses the frame and installs its peers. Asserted against the **old** `NetmapPeer`
-      shape.
+      shape. *(Exposure closed at the source: the field-verified box “server never emits the new tag … lacks `supports_org_relay`” means a pre-FR-19 agent never receives it; the byte-level parser tolerance itself is unasserted — `RelayStrategyWire` has no `#[serde(other)]` — so this belt-and-suspenders box stays open, the exposure does not.)*
 - [x] The server never emits the new tag to an agent whose hello lacks `supports_org_relay`. *(field 0.4.20: non-opted peers got `requester_unsupported`/`peer_unsupported`.)*
 
 **Security (§4 — the half the first draft got wrong)**
@@ -837,16 +837,16 @@ kill switch. That is what makes E2E-3 executable before P2.
       returns before any read past the cached mode; under `warn` it audits the would-be
       mint with `warn_only: true` and pushes nothing. The `roomler why --json` diff is the
       P4 field check.)*
-- [ ] A relay forwards only between the two bound `addr:port`s for a VNI; a packet from an
+- [x] A relay forwards only between the two bound `addr:port`s for a VNI; a packet from an
       unbound source is dropped and counted by `ORG_RELAY_FORWARD_UNBOUND_SRC`.
 - [x] **Shape disjointness over WG × STUN × disco × Geneve**, all 256 byte-0 values; a frame
       with `Opt Len ≠ 0` is rejected; `VNI = 0x2112A4` is never minted.
-- [ ] A **re-bind under a valid `tag₁` from a new source succeeds** (symmetric-NAT rebind)
+- [x] A **re-bind under a valid `tag₁` from a new source succeeds** (symmetric-NAT rebind)
       and **without one fails** — both directions. *(P2c proved both directions on the relay
       side; **P4a** proves the client's half of the success direction end to end —
       `a_member_rebinds_from_a_new_source_and_keeps_the_session` re-binds from a fresh socket
       with the same VNI + secret and the relay forwards to the new source.)*
-- [ ] A session exceeds neither `max_lifetime` nor the relay's own re-clamped deadlines when
+- [x] A session exceeds neither `max_lifetime` nor the relay's own re-clamped deadlines when
       the server supplies longer ones.
 - [x] `rc:relay.revoke` tears down a **live, traffic-carrying** session from all four
       triggers: mode-off, ACL revoke, policy revoke, device removal. *(P3c — the push half:
