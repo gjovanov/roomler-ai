@@ -334,7 +334,15 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
       perMachine host — the SPA and `machine_global_dir()` now agree by construction.
 - [x] `cargo test -p roomler-ai-tests` green (floor: the current ~294 across 34 modules, 2 skips).
 - [x] `cd ui && bun run test:unit` green, including the `enrollCommands` retired-name lock.
-- [ ] `cd ui && bun run e2e` — no new failures against `scripts/e2e-expected-failures.txt`.
+- [x] `cd ui && bun run e2e` — no new failures against `scripts/e2e-expected-failures.txt`.
+      Run via the **nightly lane**, 2026-08-29 11:34Z on tag `v20260829-673a1686220f`:
+      `OK (13 failed, 3 skipped, 154 passed)` — `OK` is the script's own verdict, meaning
+      all 13 failures matched the 20-entry expected-failures list (the documented
+      environmental set: conference specs, `rc-vp9-444`, email flows, the oauth-callback
+      case). The lane's working tree carries the rename (`agents/roomlerd` present), so it
+      is a post-rename run. ⚠️ It predates #895 / #924 / #941 — the audit script, anchor
+      comments and one Linux-only X11 accessor, none of which touch the web UI or the
+      server behaviour this suite exercises.
 - [x] **macOS TCC grants survive the upgrade**: Screen Recording and Accessibility are *not*
       re-prompted, and remote control works with no human action.
 - [ ] A pre-rename host (legacy `%PROGRAMDATA%\roomler\roomler-agent` tree present) keeps its
@@ -356,15 +364,18 @@ Evidence for the ticked boxes, and what the unticked ones are still waiting on
 | ui unit tests | CI **Frontend checks** green, running `bun run test:unit` + `vue-tsc` |
 | macOS TCC | P6 macOS row below — `Screen Recording + Accessibility both granted`, 30 s after the 0.4.15 release |
 | field sweep, three OSes | P6 Linux / Windows / macOS rows below |
+| e2e, no new failures | nightly lane `scripts/e2e-nightly.sh`, 2026-08-29 11:34Z on `v20260829-673a1686220f`: `OK (13 failed, 3 skipped, 154 passed)`. `OK` is the script's verdict that every failure matched `scripts/e2e-expected-failures.txt`. Post-rename tree. ⚠️ Predates #895/#924/#941, none of which touch the UI or server behaviour it exercises |
 | no artifact name changed | `gh release view` asset lists for `agent-v0.4.14` vs `agent-v0.4.23`, version-normalised and diffed: nothing removed, nothing renamed. Real published artifacts, not a rehearsal build |
 | nothing bypasses the env chain | `PREFIXES` is now the single list both readers and `env::test_env` use; all 44 env manipulations in the agent go through it, and `name-audit.sh --check` fails any new raw one. The deprecation warning is `legacy_use_is_new`, mutation-checked: disabling the dedupe fails `legacy_reads_warn_once_per_variable_and_current_reads_never_do` |
 | §5 staging path, both host shapes | `appdirs::resolve_machine_global` split out of the `OnceLock`-cached `machine_global_dir()` and pinned by 4 tests (pre-rename only / fresh only / both present / neither). `files.rs` derives the staging dir as `machine_global_dir().join("staging")`, so this is the decision the criterion turns on. Mutation-checked: dropping the pre-rename branch fails `machine_global_keeps_a_pre_rename_tree` |
 
-**Still open, and why — not forgotten:**
+**Still open, and why — not forgotten.** **12 of 13 ticked; one genuinely blocked.**
+Issue #809 is closed (its own result comment reads "11/11", counting only the boxes ticked
+at that moment). The one below is not bookkeeping — it names a host state that does not
+exist in the fleet, and inventing partial credit for it would defeat the point of the list.
 
-- **`cd ui && bun run e2e`** — not run. The Playwright lane needs the standing e2e stack pinned to a build carrying these changes; nothing here touches UI behaviour, but that is an argument for low risk, not evidence.
 - **§5 staging path on a PRE-RENAME host** — the fresh side is confirmed twice (`CORPLAP-1`, and a second host independently). No host with a surviving `%PROGRAMDATA%\roomler\roomler-agent` tree has been driven through it.
-- **A pre-rename host keeps its enrolled IDENTITY across an upgrade** — narrowed, not closed. The PATH half is now pinned by test: `resolve_machine_global` keeps a legacy `%PROGRAMDATA%\roomler\roomler-agent` tree, so an upgraded host still resolves its own `config.toml` and `staging\`. What is still unproven is the end-to-end claim the criterion actually makes — that a real device comes through an upgrade with the SAME `agent_id` and overlay address. That needs a host that has such a tree, and every fleet Windows host is post-rename.
+- **A pre-rename host keeps its enrolled IDENTITY across an upgrade** — narrowed twice, still open on the shape the box names. **The property itself is field-proven on Linux**: mars, jupiter and zeus were real `roomler-agent` installs upgraded through the `apt-get install` primary path, and came out with **node id and overlay IP unchanged**. What is unproven is the WINDOWS shape the criterion actually names — a host where `%PROGRAMDATA%\roomler\roomler-agent` exists and `%PROGRAMDATA%\roomler\roomler` does not, which is the only input that selects the other branch of the resolver. That branch is pinned by test (`resolve_machine_global`, 4 cases, mutation-checked) and is the same one `appdirs` has used since P4b for the per-user tree — but no device has been driven through it: every fleet Windows host is post-rename (`CORPLAP-1` verified twice), and this dev box has a live enrolled daemon, so producing that state means deliberately orphaning a real enrollment. It needs a **staged throwaway Windows VM** — legacy tree planted, no new one. A real task, not a five-minute check.
 
 ---
 
