@@ -59,6 +59,9 @@ pub struct ScrapCapture {
     /// command channel is the per-frame hot path and a cap change is rare, so
     /// this keeps the frame path byte-for-byte as it was.
     desired: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// FR-29 — frames the damage tracker proved were unnecessary. Shared with
+    /// the worker; surfaced through `ScreenCapture::frames_unchanged`.
+    unchanged: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ScrapCapture {
@@ -82,6 +85,12 @@ impl ScrapCapture {
         // init failure back to the caller synchronously.
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32)>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<CaptureCmd>();
+        // FR-29 — counted on the worker, read by the pump's heartbeat. Kept
+        // separate from `frames_empty` so "idle screen, working as intended"
+        // never masquerades as "pump starved".
+        let unchanged = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let unchanged_worker = unchanged.clone();
         let desired = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(target_os = "macos")]
         let desired_worker = desired.clone();
@@ -151,10 +160,22 @@ impl ScrapCapture {
                 // every frame (capped frame ⇒ "no cap needed" ⇒ reopen native
                 // ⇒ native frame ⇒ "cap!" ⇒ reopen capped ⇒ …), ~30 rebuilds/s,
                 // no codec able to stream — field 2026-08-26 on the MacBook.
+                // Reassigned only by the macOS stream-rebuild block below, so
+                // every other target sees an unused `mut`. Scoped allow rather
+                // than dropping `mut`, which would break the macOS build.
+                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                 let mut native_w = w;
+                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                 let mut native_h = h;
                 #[cfg(target_os = "macos")]
                 let mut last_reopen = Instant::now();
+
+                // FR-29 P1 — built HERE, on the capture worker, because an
+                // X11 connection has the same thread affinity the XShm
+                // capturer does. `None` = tracking unavailable or switched
+                // off, in which case every tick captures exactly as before.
+                #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                let mut damage = super::x11_damage::DamageTracker::open();
 
                 // Wait for capture requests.
                 while let Ok(res_tx) = cmd_rx.recv() {
@@ -237,6 +258,22 @@ impl ScrapCapture {
                             }
                         }
                     }
+                    // FR-29 P1 — skip the full-screen XShm readback when the
+                    // server says nothing changed. `Ok(None)` is the pump's
+                    // existing idle-screen path (it already logs "capture
+                    // produced no frame (idle screen)"), so this makes a path
+                    // that always existed reachable on Linux rather than
+                    // inventing a new one. The tracker's own safety valve
+                    // forces a capture periodically, so a missed damage event
+                    // costs a stale tile, never a frozen stream.
+                    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+                    if let Some(d) = damage.as_mut()
+                        && !d.should_capture()
+                    {
+                        unchanged_worker.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = res_tx.send(Ok(None));
+                        continue;
+                    }
                     let reply =
                         capture_one_blocking(&mut cap, w, h, (native_w, native_h), start, downscale);
                     let _ = res_tx.send(reply);
@@ -256,6 +293,7 @@ impl ScrapCapture {
             target_frame_period: Duration::from_millis(1000 / target_fps.max(1) as u64),
             last_frame_at: None,
             desired,
+            unchanged,
         })
     }
 
@@ -414,6 +452,10 @@ fn downscale_bgra_2x(src: &[u8], src_w: u32, src_h: u32, src_stride: u32) -> (Ve
 
 #[async_trait::async_trait]
 impl ScreenCapture for ScrapCapture {
+    fn frames_unchanged(&self) -> u64 {
+        self.unchanged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Phase B — honour the pump's encode box by re-opening the capture
     /// stream at that size, so CoreGraphics scales on the GPU instead of the
     /// pump resampling on the CPU.
