@@ -11,6 +11,7 @@ pub mod giphy;
 pub mod media;
 pub mod oauth;
 pub mod push;
+pub mod quota;
 pub mod stripe;
 
 pub use auth::AuthService;
