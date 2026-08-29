@@ -31,6 +31,8 @@
 //! config > built-in default. Debug/media dials stay env-only.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
 /// S2 — config-backed fallback values (suffix → env-equivalent string),
@@ -74,6 +76,97 @@ pub fn config_fallbacks_for_child() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Test-only helpers for the env chain. Compiled unconditionally because the
+/// tests that need them live in OTHER crates — `roomlerd`'s lib AND its bin —
+/// and `#[cfg(test)]` does not cross a crate boundary.
+///
+/// Why this exists rather than each test hand-rolling `remove_var`: [`node_env`]
+/// reads THREE prefixes, so clearing one and asserting a default is not
+/// hermetic. That was not hypothetical — it was true of every env test in the
+/// agent (14 suffixes across 8 files), in both directions: some cleared only
+/// the retired name and so proved nothing about the current one, others cleared
+/// only the current name and would have read a stale alias.
+#[doc(hidden)]
+pub mod test_env {
+    use super::PREFIXES;
+
+    /// Remove EVERY spelling of `suffix` from the environment.
+    ///
+    /// # Safety
+    /// `remove_var` is unsafe in Rust 2024: a concurrent read in another thread
+    /// races it. Callers must serialise tests touching the same suffix.
+    pub unsafe fn clear(suffix: &str) {
+        for p in PREFIXES {
+            unsafe { std::env::remove_var(format!("{p}{suffix}")) };
+        }
+    }
+
+    /// Set `suffix` under `prefix` ONLY, clearing the other spellings first, so
+    /// the value under test is the only one the chain can see.
+    ///
+    /// # Safety
+    /// See [`clear`].
+    pub unsafe fn set_as(prefix: &str, suffix: &str, value: impl AsRef<str>) {
+        assert!(
+            PREFIXES.contains(&prefix),
+            "{prefix} is not one of the node_env prefixes"
+        );
+        unsafe { clear(suffix) };
+        unsafe { std::env::set_var(format!("{prefix}{suffix}"), value.as_ref()) };
+    }
+
+    /// Set `suffix` under the CURRENT prefix, clearing the others.
+    ///
+    /// # Safety
+    /// See [`clear`].
+    pub unsafe fn set(suffix: &str, value: impl AsRef<str>) {
+        unsafe { set_as(PREFIXES[0], suffix, value) };
+    }
+
+    /// Snapshots every spelling of `suffix` and restores them on drop, so a
+    /// test cannot leak env state into whatever runs next — including when it
+    /// fails, which a hand-written restore at the end of the body never covers.
+    pub struct Saved {
+        suffix: String,
+        prior: Vec<(String, Option<String>)>,
+    }
+
+    impl Saved {
+        /// Snapshot, then clear — the hermetic starting point.
+        pub fn cleared(suffix: &str) -> Self {
+            let prior = PREFIXES
+                .iter()
+                .map(|p| {
+                    let name = format!("{p}{suffix}");
+                    let v = std::env::var(&name).ok();
+                    (name, v)
+                })
+                .collect();
+            unsafe { clear(suffix) };
+            Self {
+                suffix: suffix.to_string(),
+                prior,
+            }
+        }
+
+        /// The suffix this guard restores.
+        pub fn suffix(&self) -> &str {
+            &self.suffix
+        }
+    }
+
+    impl Drop for Saved {
+        fn drop(&mut self) {
+            for (name, v) in &self.prior {
+                match v {
+                    Some(v) => unsafe { std::env::set_var(name, v) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        }
+    }
+}
+
 // RETIRED-NAME-ANCHOR(4): arms 2 and 3 are the reason a rename here costs
 // nothing in the field. Both spellings are set on real hosts today — mars,
 // jupiter and zeus each carry four `ROOMLER_AGENT_*` entries in an
@@ -94,11 +187,23 @@ pub fn config_fallbacks_for_child() -> Vec<(String, String)> {
 /// an edit at 166 call sites.
 ///
 /// See docs/fr/FR-21.
+/// The env-var prefixes [`node_env`] reads, MOST CURRENT FIRST.
+///
+/// One list, because three things must agree about it: both readers below and
+/// every test that clears a variable. A test that clears one spelling and
+/// asserts a default is not hermetic — an inherited value under either other
+/// spelling silently decides the assertion — so `test_env` clears them from
+/// this same list. Adding a fourth prefix is one edit.
+pub const PREFIXES: [&str; 3] = ["ROOMLERD_", "ROOMLER_NODE_", "ROOMLER_AGENT_"];
+
 pub fn node_env(suffix: &str) -> Option<String> {
-    std::env::var(format!("ROOMLERD_{suffix}"))
-        .or_else(|_| std::env::var(format!("ROOMLER_NODE_{suffix}")))
-        .or_else(|_| std::env::var(format!("ROOMLER_AGENT_{suffix}")))
-        .ok()
+    PREFIXES
+        .iter()
+        .find_map(|p| {
+            let v = std::env::var(format!("{p}{suffix}")).ok()?;
+            note_legacy_use(p, suffix);
+            Some(v)
+        })
         .or_else(|| config_fallback(suffix))
 }
 
@@ -136,10 +241,56 @@ pub fn flag(suffix: &str, default: bool) -> bool {
 ///
 // RETIRED-NAME-ANCHOR(5): the legacy arms, as in [`node_env`]. See docs/fr/FR-21.
 pub fn node_env_os(suffix: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(format!("ROOMLERD_{suffix}"))
-        .or_else(|| std::env::var_os(format!("ROOMLER_NODE_{suffix}")))
-        .or_else(|| std::env::var_os(format!("ROOMLER_AGENT_{suffix}")))
+    PREFIXES
+        .iter()
+        .find_map(|p| {
+            let v = std::env::var_os(format!("{p}{suffix}"))?;
+            note_legacy_use(p, suffix);
+            Some(v)
+        })
         .or_else(|| config_fallback(suffix).map(std::ffi::OsString::from))
+}
+
+/// Warn ONCE per (prefix, suffix) per process when a value was resolved through
+/// a retired spelling.
+///
+/// Why it is worth the code: the aliases are a compatibility promise, and
+/// nothing currently says which hosts still rely on them. Without this, the
+/// only way to know whether a spelling is safe to drop is to grep the fleet's
+/// unit files by hand — so the aliases would be kept forever out of caution.
+/// A host that logs nothing here is a host the alias could be removed from.
+///
+/// The hot path is unaffected: `relay_max_bps` and friends re-read per frame,
+/// and a hit on the CURRENT prefix returns before any lock is taken. Only a
+/// legacy hit — rare, and only on hosts that still set one — reaches the set.
+fn note_legacy_use(prefix: &str, suffix: &str) {
+    if legacy_use_is_new(prefix, suffix) {
+        tracing::warn!(
+            var = %format!("{prefix}{suffix}"),
+            current = %format!("{}{}", PREFIXES[0], suffix),
+            "env: value read through a RETIRED variable name; set the current one instead"
+        );
+    }
+}
+
+/// Record `(prefix, suffix)` and report whether it had NOT been seen before.
+///
+/// Split out so the once-per-variable rule is testable without capturing
+/// tracing output — that would test the subscriber, not this decision.
+fn legacy_use_is_new(prefix: &str, suffix: &str) -> bool {
+    if prefix == PREFIXES[0] {
+        // The current spelling is not a legacy use, and returning here keeps
+        // the hot path lock-free: `relay_max_bps` and friends re-read per frame.
+        return false;
+    }
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut set) = seen.lock() else {
+        // A poisoned set must never take the daemon down over a warning, and
+        // must not spam either: treat it as already-seen.
+        return false;
+    };
+    set.insert(format!("{prefix}{suffix}"))
 }
 
 #[cfg(test)]
@@ -412,6 +563,40 @@ mod tests {
             std::env::remove_var(nk_os());
             std::env::remove_var(ak_os());
         }
+    }
+
+    // ── FR-21: the retired-spelling deprecation warning ─────────────────────
+
+    #[test]
+    fn legacy_reads_warn_once_per_variable_and_current_reads_never_do() {
+        const S: &str = "FR21_DEPRECATION_PROBE";
+        // `note_legacy_use` dedupes on the FULL variable name, so each retired
+        // spelling gets its own single warning while the current one gets none.
+        assert!(!warned(PREFIXES[0], S), "current spelling must never warn");
+        assert!(
+            !warned(PREFIXES[0], S),
+            "...and must stay silent when re-read"
+        );
+
+        for legacy in &PREFIXES[1..] {
+            assert!(warned(legacy, S), "{legacy}: first read must warn");
+            assert!(
+                !warned(legacy, S),
+                "{legacy}: second read must NOT warn again"
+            );
+        }
+
+        // A DIFFERENT suffix under the same retired prefix is a different
+        // variable, so it warns on its own — otherwise one noisy host would
+        // mask every other legacy setting it has.
+        assert!(warned(PREFIXES[1], "FR21_DEPRECATION_PROBE_TWO"));
+    }
+
+    /// Did `note_legacy_use` emit for this (prefix, suffix)? Reads the dedupe
+    /// set's decision directly: capturing tracing output would test the
+    /// subscriber, not the once-per-variable rule this asserts.
+    fn warned(prefix: &str, suffix: &str) -> bool {
+        super::legacy_use_is_new(prefix, suffix)
     }
 }
 
