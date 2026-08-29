@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Viewer-indicator overlay.
 //!
 //! When a remote-control session is active, the controlled host should

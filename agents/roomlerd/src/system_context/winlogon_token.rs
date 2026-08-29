@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Winlogon-token spawn — produces a worker process running as
 //! `S-1-5-18` (LocalSystem) but in a non-zero interactive session.
 //!

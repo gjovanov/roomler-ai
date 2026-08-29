@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR-BEGIN
 // Every retired name in this module is the legacy half of a dual-read: the
 // `roomler-agent.log*` rolling-file prefix that upgraded hosts still carry (read

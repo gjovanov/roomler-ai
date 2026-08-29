@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Transport-agnostic AIMD bitrate controller shared by the DataChannel
 //! video pumps (VP9-444 libvpx + FFmpeg HEVC/vp9_qsv).
 //!

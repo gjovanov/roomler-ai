@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! End-to-end tests that drive the `roomlerd` library crate against a
 //! live `TestApp`. Unlike the REST-only `remote_control_tests`, these
 //! exercise the agent's HTTP enrollment + WSS signaling loop in-process,

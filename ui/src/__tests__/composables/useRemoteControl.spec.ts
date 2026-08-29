@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest'
 
 // Pure helpers exported for testing. We can't import the full composable

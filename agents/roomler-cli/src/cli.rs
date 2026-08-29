@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler` — TeamViewer-style native tunnel client.
 //!
 //! Forwards a local TCP port over a WebRTC P2P data channel to an

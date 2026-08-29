@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
@@ -310,6 +312,15 @@ pub enum RpcCap {
     /// things, so matching must stay equality — see
     /// [`AgentCaps::has_rpc`] and the test that locks it.
     ConfigReport,
+    /// FR-19 — this device runs an **org-relay server**: it has bound
+    /// `relay_server_port`, answers probes, and (P2c+) forwards ciphertext
+    /// between bound members. The server never installs a relay session on a
+    /// device that does not advertise this.
+    ///
+    /// ⚠️ Equality-matched like every verb here. There is no `relay` verb
+    /// today, and if one is ever added it must not be matched by prefix
+    /// against this one — the `ssh` / `ssh-consent` trap, locked by test.
+    RelayServer,
 }
 
 impl RpcCap {
@@ -327,17 +338,19 @@ impl RpcCap {
             Self::SshConsent => "ssh-consent",
             Self::Config => "config",
             Self::ConfigReport => "config-report",
+            Self::RelayServer => "relay-server",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 6] = [
+    pub const ALL: [RpcCap; 7] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
         Self::SshConsent,
         Self::Config,
         Self::ConfigReport,
+        Self::RelayServer,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -718,6 +731,10 @@ pub struct Agent {
     /// deserialises to [`SshMode::Off`].
     #[serde(default)]
     pub ssh_policy: SshPolicy,
+    /// FR-19 gate 3 — org-relay approval for this device. Same closed default
+    /// as the two above: every pre-FR-19 row deserialises to "not approved".
+    #[serde(default)]
+    pub peer_relay_policy: PeerRelayPolicy,
     /// Device config an operator has ASKED for, reconciled by the agent when
     /// it next connects (`docs/remote-config.md` step 2).
     ///
@@ -1499,6 +1516,37 @@ pub enum OverlayAclMode {
     Warn,
     /// Evaluate and enforce.
     Enforce,
+}
+
+/// FR-19 gate 1 — the org's switch for peer relays. Same shape and the same
+/// closed default as [`OverlayAclMode`], for the same reason: every
+/// `overlay_networks` row written before FR-19 lacks the field, and the
+/// default must make enabling the feature a no-op for them.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelayMode {
+    /// No sessions are minted. The default.
+    #[default]
+    Off,
+    /// Decide and audit what WOULD be minted, but mint nothing.
+    Warn,
+    /// Mint.
+    On,
+}
+
+/// FR-19 gate 3 — may THIS device serve as an org relay for its tenant?
+/// Per-device and admin-set; the device's own `relay_server_enabled` (gate 4)
+/// is separate and device-local, so approving here does nothing on a device
+/// that has not opted in itself — an offer is not a grant, and a grant is not
+/// an offer.
+///
+/// `PartialEq` so a listing can ask "is this the untouched default?" — the
+/// same question [`ExecPolicy`] answers for the same reason.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct PeerRelayPolicy {
+    /// Approved to serve. Default `false`.
+    #[serde(default)]
+    pub serve: bool,
 }
 
 /// A tenant-scoped overlay access rule. Default-deny **once the tenant's
@@ -2432,6 +2480,12 @@ pub struct OverlayNode {
     /// `false` ⇒ peers probe it with ICMP.
     #[serde(default)]
     pub supports_overlay_echo: bool,
+    /// FR-19 — this node understands `rc:overlay.relay_session` /
+    /// `rc:overlay.relay_revoke` and the `org-relay` verdict (advertised on
+    /// join, echoed per-peer in the netmap). The server never pushes those to a
+    /// node that has not said so. Absent on an older row ⇒ `false`.
+    #[serde(default)]
+    pub supports_org_relay: bool,
     /// Phase 1 — subnet CIDRs this node CLAIMS it can route for peers (from its
     /// `--advertise-routes` config, refreshed on each join). Untrusted until an
     /// admin approves; see `approved_routes`.
@@ -2512,6 +2566,11 @@ pub struct OverlayNetwork {
     /// mesh keeps its current behaviour until an admin opts in.
     #[serde(default)]
     pub acl_mode: OverlayAclMode,
+    /// FR-19 gate 1 — the org's peer-relay switch. `#[serde(default)]` for the
+    /// same reason as `acl_mode`: every pre-FR-19 row lacks it, and the default
+    /// is [`PeerRelayMode::Off`] so nothing is minted until an admin opts in.
+    #[serde(default)]
+    pub peer_relay_mode: PeerRelayMode,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -2765,6 +2824,22 @@ pub fn block_align_slot(after: u32, slots: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-19 — the `relay-server` verb: spelling locked (a rename silently
+    /// un-advertises the feature fleet-wide), and only ever equality-matched —
+    /// a future `relay` verb must not be implied by it, nor it by `relay`.
+    #[test]
+    fn relay_server_verb_is_locked_and_only_equality_matched() {
+        assert_eq!(RpcCap::RelayServer.wire(), "relay-server");
+        assert!(matches!(
+            RpcCap::from_wire("relay-server"),
+            Some(RpcCap::RelayServer)
+        ));
+        assert!(RpcCap::from_wire("relay").is_none());
+        assert!(RpcCap::from_wire("relay-server-x").is_none());
+        assert!(RpcCap::from_wire("relay-serve").is_none());
+        assert!(RpcCap::ALL.iter().any(|c| c.wire() == "relay-server"));
+    }
 
     /// FR-19 gate 4: **no `relay_*` key may ever be server-pushable.**
     ///

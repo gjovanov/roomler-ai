@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Host display enumeration for `rc:agent.hello`.
 //!
 //! Reports each attached monitor's index + pixel dimensions so the

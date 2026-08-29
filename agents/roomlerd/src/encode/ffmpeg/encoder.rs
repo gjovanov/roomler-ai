@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FFmpeg encoder backend wrapping `ffmpeg-next`.
 //!
 //! rc.72 scope: BGRA→NV12 CPU path + encoder dispatch

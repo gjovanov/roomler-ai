@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Phase 1 subnet-router forwarding + NAT.
 //!
 //! When a node advertises subnet routes, it must **forward** overlay→LAN traffic

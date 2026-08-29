@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Netmap → routable peer config.
 //!
 //! Converts a wire [`NetmapPeer`] (base64 pubkey + dotted overlay IP)
@@ -161,6 +163,7 @@ mod tests {
             supports_derp: false,
             supports_forced_derp: false,
             supports_derp_floor: false,
+            supports_org_relay: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],

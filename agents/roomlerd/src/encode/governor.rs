@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P8c — the rate governor: ONE owner for the four rate controllers
 //! the DC pumps previously threaded by hand.
 //!

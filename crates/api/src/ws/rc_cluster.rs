@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! PR-1 rehome: direction-aware cross-pod convergence for rc + tunnel.
 //!
 //! A cross-pod miss (controller/tunnel-client on pod A, agent's presence

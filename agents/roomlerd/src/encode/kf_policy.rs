@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P8b stage 2 — the keyframe-force policy machine.
 //!
 //! The pending-force lifecycle used to live as five loose locals in

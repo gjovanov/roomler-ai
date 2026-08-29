@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Fleet RPC end-to-end: the browser/API leg driven against a live `TestApp`
 //! with the real `roomlerd` library on the other end.
 //!

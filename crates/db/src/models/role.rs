@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +89,15 @@ pub mod permissions {
     /// and an org may well want one reviewer for bounded commands and another
     /// for interactive sessions.
     pub const VIEW_SSH_AUDIT: u64 = 1 << 30;
+    // ⚠️ Bit 30 is the LAST bit the UI can represent. Its mirror
+    // (`ui/src/utils/permissions.ts`) checks masks with JS int32 bitwise ops,
+    // under which `1 << 31` is negative and `1 << 32` wraps to 1, and its spec
+    // pins the ceiling at bit 30 by design. A bit defined here that the UI
+    // cannot render is a permission nobody can grant from the product.
+    // FR-19's relay approval therefore rides MANAGE_AGENTS + EXEC_DEVICE (an
+    // EXEC_DEVICE holder can already enable a relay on any exec-enabled
+    // device as root, so the coupling grants nothing new) until the mask
+    // moves to BigInt — tracked in #888.
 
     /// Default member permissions
     pub const DEFAULT_MEMBER: u64 = VIEW_CHANNELS

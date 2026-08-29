@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Synchronous Media Foundation H.264 encoder pipeline.
 //!
 //! Owns the MFT, the D3D11 device + DXGI manager, and all input/output

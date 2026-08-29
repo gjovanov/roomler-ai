@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Stats PR-5 — heartbeat telemetry sampler.
 //!
 //! Fills the [`AgentSysStats`] block on `rc:agent.heartbeat`: agent-process

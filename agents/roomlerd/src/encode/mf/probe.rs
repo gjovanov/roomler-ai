@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Single-frame probe for MF H.264 pipelines.
 //!
 //! Activated MFTs report OK on `ActivateObject` but can fail on first
