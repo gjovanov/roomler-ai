@@ -478,6 +478,19 @@ pub enum ClientMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         granted: bool,
+        /// FR-27 — why, when `granted` is false. Absent (every pre-FR-27
+        /// agent) means an ordinary deny, which is what a bare `false` has
+        /// always meant. Present values come from
+        /// [`crate::consent::ConsentDenyReason::wire`]; an unrecognised one
+        /// degrades to the same ordinary deny, so a newer agent can name a
+        /// reason this server has never heard of.
+        ///
+        /// This exists because the agent's OWN prompt timeout produced a bare
+        /// `false`, and the hub turned that into `EndReason::UserDenied` — so
+        /// "nobody was at the machine" reached the controller as "a human
+        /// refused you", which is both wrong and un-actionable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     // ─── controller → server ─────────────────────────────────────────
@@ -1126,6 +1139,18 @@ pub enum ServerMsg {
         /// `AccessPolicy.consent_mode` (self-control → `Auto`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consent_mode: Option<ConsentMode>,
+        /// FR-27 — how long the ON-HOST prompt should stand, which is not
+        /// always `consent_timeout_secs`.
+        ///
+        /// The two coincide for `prompt`, and diverge for `prompt_then_email`:
+        /// the session waits the full async window for the owner's emailed
+        /// link, but the modal on the host's screen has no business standing
+        /// there for five minutes. Sent by the server rather than derived by
+        /// the agent so there is ONE authority for the split; `None` (older
+        /// server) means "use `consent_timeout_secs`", i.e. exactly the
+        /// pre-FR-27 behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_prompt_timeout_secs: Option<u32>,
         /// P6 — the device's input arbitration mode directive from
         /// `AccessPolicy.input_mode`. `None` (older server / unset policy) →
         /// the agent's arbiter default (free). Only the FIRST session's hint

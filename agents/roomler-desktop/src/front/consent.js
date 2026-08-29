@@ -24,13 +24,18 @@
       '<div class="consent-backdrop"></div>',
       '<div class="consent-card" role="dialog" aria-modal="true" aria-labelledby="consent-title">',
       '  <h2 id="consent-title">Remote control request</h2>',
-      '  <p class="consent-lead"><strong id="consent-who"></strong> is requesting to control this device.</p>',
+      '  <p class="consent-lead"><strong id="consent-who"></strong> <span id="consent-verb">is requesting to control this device</span>.</p>',
       // Multi-org: on a device enrolled in more than one organization, WHO is
       // asking is only half the question — the same person can be a colleague
       // in one org and an outside contractor in another. Hidden entirely when
       // the daemon sends no org (single-org device, or an older daemon).
       '  <p class="consent-org" id="consent-org-row" hidden>On behalf of <strong id="consent-org"></strong></p>',
-      '  <p class="consent-perms">Permissions: <span id="consent-perms" class="mono"></span></p>',
+      // FR-27 — WHAT is being asked for, when that is not implied by the
+      // request type: the command an `exec` would run, the activity an SSH
+      // session wants. Rendered with textContent (never innerHTML): this
+      // string originates off-device and is redacted, not sanitised.
+      '  <p class="consent-detail" id="consent-detail-row" hidden><span id="consent-detail" class="mono"></span></p>',
+      '  <p class="consent-perms" id="consent-perms-row">Permissions: <span id="consent-perms" class="mono"></span></p>',
       '  <div class="consent-actions">',
       '    <button type="button" id="consent-deny" class="consent-btn consent-deny">Deny</button>',
       '    <button type="button" id="consent-approve" class="consent-btn consent-approve">Approve</button>',
@@ -59,9 +64,34 @@
     }
   }
 
+  // FR-27 - the modal now serves THREE subsystems, and they are not the same
+  // question. An `exec` prompt rendered as "wants to control this device"
+  // would be a plain lie about a command that runs as SYSTEM/root, so the
+  // title and the verb are driven by `kind`.
+  //
+  // An ABSENT kind means a pre-FR-27 daemon, which only ever wrote remote
+  // control prompts - so the fallback is `rc`, not "unknown".
+  const KINDS = {
+    rc: {
+      title: 'Remote control request',
+      verb: 'is requesting to control this device',
+    },
+    exec: {
+      title: 'Command execution request',
+      verb: 'wants to run a command on this device',
+    },
+    ssh: {
+      title: 'SSH session request',
+      verb: 'wants to open an SSH session on this device',
+    },
+  }
+
   function show(pc) {
     const el = ensureModal()
     activeSession = pc.session_id
+    const kind = KINDS[pc.kind] || KINDS.rc
+    document.getElementById('consent-title').textContent = kind.title
+    document.getElementById('consent-verb').textContent = kind.verb
     document.getElementById('consent-who').textContent = pc.controller_name || 'A remote operator'
     const orgRow = document.getElementById('consent-org-row')
     if (orgRow) {
@@ -69,6 +99,17 @@
       document.getElementById('consent-org').textContent = org
       orgRow.hidden = org === ''
     }
+    const detailRow = document.getElementById('consent-detail-row')
+    if (detailRow) {
+      const detail = (pc.detail || '').trim()
+      document.getElementById('consent-detail').textContent = detail
+      detailRow.hidden = detail === ''
+    }
+    // Only remote control carries a permission set; showing "Permissions: -"
+    // above an exec prompt reads as "no permissions needed", which is the
+    // opposite of true for a command running as the daemon identity.
+    const permsRow = document.getElementById('consent-perms-row')
+    if (permsRow) permsRow.hidden = !pc.permissions
     document.getElementById('consent-perms').textContent = pc.permissions || '—'
     document.getElementById('consent-hint').textContent = ''
     el.hidden = false
@@ -87,6 +128,10 @@
     } catch (_) {
       return // backend not ready / dir absent — stay quiet
     }
+    // FR-27 — skip anything the daemon already shows natively; see
+    // panel-consent.js. Two Approve buttons for one decision is how someone
+    // approves the wrong thing.
+    if (Array.isArray(pending)) pending = pending.filter((p) => p.surface !== 'native')
     if (Array.isArray(pending) && pending.length > 0) {
       // Keep showing the current one if it's still pending; otherwise show the
       // first outstanding request (an operator may have resolved one elsewhere).

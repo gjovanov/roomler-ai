@@ -215,9 +215,14 @@
     });
 
     $('btn-apply-update').addEventListener('click', async () => {
-      pushOutput('Spawning installer. The service will restart briefly while the update applies.');
+      pushOutput('Applying update…');
       try {
-        await invoke('cmd_apply_update');
+        // FR-27 — the daemon now tells us what it actually did, and on macOS
+        // that is the whole answer: a non-root invocation queues the ROOT
+        // update helper and says where to watch. Discarding it made the
+        // button look inert on the platform where it worked correctly.
+        const out = await invoke('cmd_apply_update');
+        pushOutput(out || 'Update started.');
       } catch (e) {
         pushOutput('Error: ' + e);
       }
