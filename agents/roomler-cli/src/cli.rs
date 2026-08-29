@@ -1,7 +1,7 @@
-//! `roomler-tunnel` — TeamViewer-style native tunnel client.
+//! `roomler` — TeamViewer-style native tunnel client.
 //!
 //! Forwards a local TCP port over a WebRTC P2P data channel to an
-//! enrolled `roomler-agent`, which dials the corresponding intranet
+//! enrolled `roomlerd`, which dials the corresponding intranet
 //! destination. The Roomler API is signalling-only — payload never
 //! touches the server.
 //!
@@ -9,11 +9,11 @@
 //!
 //!   roomler enroll --server <url> --token <enrollment-jwt> --name <label>
 //!   roomler forward --agent <agent_id> --local <port> --remote <host:port>
-//!   roomler-tunnel run [--config <path>]
-//!   roomler-tunnel diagnose [--agent <agent_id>]
+//!   roomler run [--config <path>]
+//!   roomler diagnose [--agent <agent_id>]
 //!   roomler status [--json]     # local daemon's node state (LocalAPI)
 //!   roomler peers  [--json]     # peers + connection types (LocalAPI)
-//!   roomler-tunnel flows  [--json]     # active forwards / SOCKS5 (LocalAPI)
+//!   roomler flows  [--json]     # active forwards / SOCKS5 (LocalAPI)
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -60,6 +60,9 @@ impl CliTransport {
 #[command(name = "roomler", version, about, long_about = None)]
 struct Cli {
     /// Override config file location. Defaults to the platform config dir
+    // RETIRED-NAME-ANCHOR(4): the config segment is frozen — it holds the
+    // ENROLLED credential on tunnel-only hosts, and renaming it strands
+    // every one of them. agents/roomler-cli/src/config.rs
     /// (`%APPDATA%\roomler\roomler-tunnel\config.toml` on Windows,
     /// `~/.config/roomler-tunnel/config.toml` on Linux, the equivalent on
     /// macOS via the `directories` crate).
@@ -166,8 +169,8 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// Check for a newer roomler-tunnel release and self-replace the running
-    /// binary (Windows). Mirrors `roomler-agent self-update`.
+    /// Check for a newer roomler CLI release and self-replace the running
+    /// binary (Windows). Mirrors `roomlerd self-update`.
     SelfUpdate {
         /// Only check + report whether an update is available; don't install.
         #[arg(long)]
