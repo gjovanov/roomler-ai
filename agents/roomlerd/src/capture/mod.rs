@@ -653,7 +653,6 @@ mod frame_tests {
 
     // ── P8a — Damage::area_permille ────────────────────────────────────
 
-    #[test]
     /// The whole point of `union_permille` is that it does NOT do what
     /// `area_permille` does. Four identical overlapping rects saturate the
     /// summed measure to 1000 ‰ while the union is still just that one rect —
