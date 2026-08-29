@@ -126,8 +126,8 @@ fn log_basename() -> &'static str {
 /// `roomlerd` is left alone. Directives for other targets, and the bare global level,
 /// pass through untouched.
 ///
-/// RETIRED-NAME-ANCHOR(2): `roomler_agent` is the retired target this exists to keep
-/// working. Deleting it re-creates the blackout described above.
+// RETIRED-NAME-ANCHOR(2): `roomler_agent` is the retired target this exists to keep
+// working. Deleting it re-creates the blackout described above.
 fn mirror_legacy_log_target(spec: &str) -> String {
     const LEGACY: &str = "roomler_agent";
     const CURRENT: &str = "roomlerd";

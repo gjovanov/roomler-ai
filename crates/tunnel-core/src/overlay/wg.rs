@@ -83,6 +83,7 @@ pub const QUIC_UPGRADE_DEADLINE: Duration = Duration::from_secs(90);
 pub const QUIC_UPGRADE_RETRY_GAP: Duration = Duration::from_secs(4);
 
 /// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLERD_OVERLAY_QUIC`;
+// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it.
 /// legacy `ROOMLER_AGENT_OVERLAY_QUIC` still honoured — see
 /// [`crate::env::node_env`]). **Default OFF** — the raw relay is the proven
 /// path; QUIC is enabled per-host only after field-proving (mirrors the

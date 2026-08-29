@@ -728,6 +728,7 @@ impl AgentPeer {
         // PC state → logs + fatal Terminate on Failed + cross-process
         // peer-presence marker for the M3 A1 supervisor.
         //
+        // RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
         // The marker file (`%PROGRAMDATA%\roomler-agent\
         // peer-connected.lock`) is the supervisor's signal for
         // "swap user-context worker for SystemContext worker
@@ -1541,6 +1542,7 @@ async fn current_pair_is_relay(
 async fn overlay_remote_is_relay_tier(remote_addr: &str, session_id: bson::oid::ObjectId) -> bool {
     use tunnel_core::localapi::ConnectionType;
 
+    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it.
     // node_env: accepts ROOMLERD_/ROOMLER_NODE_/ROOMLER_AGENT_ prefixes + the
     // `overlay_tier_detect` config key via the S2 fallback map.
     if tunnel_core::env::node_env("OVERLAY_TIER_DETECT").as_deref() == Some("0") {

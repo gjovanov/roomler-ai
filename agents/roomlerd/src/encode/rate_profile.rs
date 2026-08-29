@@ -120,6 +120,7 @@ impl FlipTracker {
 /// encode times were fine for both).
 ///
 /// Operator override per codec: `ROOMLERD_RATE_FACTOR_<LABEL>` (legacy
+// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it.
 /// `ROOMLER_AGENT_` prefix + the `rate_factor_*` config keys accepted via
 /// [`tunnel_core::env::node_env`]). Clamped to 50–400; garbage falls back
 /// to the built-in. The pump re-reads per frame, so a REAL env var applies

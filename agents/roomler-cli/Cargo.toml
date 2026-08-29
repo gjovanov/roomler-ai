@@ -2,7 +2,7 @@
 name = "roomler-cli"
 version.workspace = true
 edition.workspace = true
-description = "Roomler AI tunnel client — TeamViewer-style native CLI that forwards local TCP ports to a roomler-agent's intranet via the existing Roomler WebRTC plane."
+description = "Roomler AI tunnel client — TeamViewer-style native CLI that forwards local TCP ports to a roomlerd's intranet via the existing Roomler WebRTC plane."
 
 [lib]
 name = "roomler_cli"

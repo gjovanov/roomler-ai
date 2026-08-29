@@ -164,7 +164,7 @@ export interface Agent {
   last_seen_at: string
   access_policy: AccessPolicy
   /** Subnet-router CIDRs this agent advertises for the mesh subnet-router
-   *  (Phase 2). Managed via the Subnet-routes dialog; the `roomler-tunnel`
+   *  (Phase 2). Managed via the Subnet-routes dialog; the `roomler`
    *  mesh longest-prefix-matches a LAN target IP against these to pick the
    *  covering agent. Optional because pre-Phase-2 agents / older API
    *  responses may omit it. */

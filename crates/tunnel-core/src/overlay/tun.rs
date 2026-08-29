@@ -1644,6 +1644,7 @@ mod system {
 
     /// rc.279 — kill-switch for the stable adapter identity (constant
     /// requested GUID + boot stray-adapter sweep):
+    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it.
     /// `ROOMLERD_OVERLAY_TUN_STABLE_GUID` (legacy `ROOMLER_AGENT_…`
     /// honoured; config key `overlay_tun_stable_guid`). Default **ON**;
     /// `0`/`false`/`no`/`off` reverts to the pre-rc.279 random-GUID
@@ -1656,6 +1657,7 @@ mod system {
 
     /// rc.279 — kill-switch for the route-war eviction (peer `/32`s since
     /// rc.208, our own `/32` since rc.278): `ROOMLERD_OVERLAY_ROUTE_EVICT`
+    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it.
     /// (legacy `ROOMLER_AGENT_…` honoured; config key `overlay_route_evict`).
     /// Default **ON** — without it the overlay is unusable under a hostile
     /// full-tunnel VPN — but managed sites whose security tooling alarms on

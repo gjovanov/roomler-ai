@@ -1,5 +1,5 @@
-roomler-agent for Debian/Ubuntu
-===============================
+roomlerd for Debian/Ubuntu
+==========================
 
 The daemon binary is /usr/bin/roomlerd.
 

@@ -1,7 +1,7 @@
 //! Needs-attention sentinel — daemon-side surface.
 //!
 //! P3e lever E: the sentinel machinery (paths, raise/read/clear, reasons)
-//! lives in `roomler-agent-core::notify` so thin clients (the desktop
+//! lives in `roomler-core::notify` so thin clients (the desktop
 //! companion) can read it without linking this crate. Everything is
 //! re-exported here under the old paths. What could NOT move is the rc.53
 //! worker-aware trio below: it probes the process's worker role via
@@ -22,6 +22,7 @@ use std::path::PathBuf;
 /// `C:\Windows\System32\config\systemprofile\AppData\Roaming\…`
 /// — invisible to a human operator and missed by every fleet-mgmt
 /// scanner that greps user profiles. Prefer
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
 /// `%PROGRAMDATA%\roomler\roomler-agent\needs-attention.txt` in that
 /// case so the file is findable by both a logged-in operator
 /// (`dir %PROGRAMDATA%`) AND a fleet scanner.

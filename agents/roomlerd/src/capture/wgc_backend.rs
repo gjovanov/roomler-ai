@@ -198,7 +198,7 @@ impl WgcCapture {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<SizeInt32>>();
 
         let worker = thread::Builder::new()
-            .name("roomler-agent-wgc-capture".into())
+            .name("roomlerd-wgc-capture".into())
             .spawn(move || {
                 let hmon = HMONITOR(hmon_value as *mut _);
                 if let Err(e) = worker_main(

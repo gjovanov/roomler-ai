@@ -7,6 +7,7 @@
 //!
 //! - A fleet-management script can scan `%APPDATA%\roomler\
 //!   roomler\config\needs-attention.txt` across machines (a
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
 //!   pre-rename host keeps `\roomler-agent\` there — see
 //!   `appdirs::app_segment`).
 //! - The future admin UI heartbeat (resilience plan Phase 7) can

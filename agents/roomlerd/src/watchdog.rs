@@ -344,7 +344,7 @@ pub(crate) async fn run_with_intervals(
 /// tokio runtime itself is deadlocked.
 pub fn spawn_thread_watchdog(wd: Arc<Watchdog>) {
     let _ = std::thread::Builder::new()
-        .name("roomler-agent-watchdog-of-watchdog".into())
+        .name("roomlerd-watchdog-of-watchdog".into())
         .spawn(move || {
             let mut prev_count = wd.own_heartbeat();
             let mut prev_at = Instant::now();

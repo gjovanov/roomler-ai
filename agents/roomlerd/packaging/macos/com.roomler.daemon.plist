@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- RETIRED-NAME-ANCHOR-BEGIN
+     /etc/roomler-agent is this daemon's REAL config directory. This file
+     is what passes it, and the .pkg postinstall is what creates it, so the
+     path is not a stale name: it is the contract between the two. FR-21 D5.
+-->
 <!--
   LaunchDAEMON for roomlerd — the privileged half.
 
@@ -25,11 +30,6 @@
   `--config` is explicit: a root daemon and a user agent must NOT share the
   per-user config path, or they would fight over one enrollment identity —
   the hub keys on agent_id and the second connection displaces the first.
--->
-<!-- RETIRED-NAME-ANCHOR-BEGIN
-     /etc/roomler-agent is this daemon's REAL config directory. This file
-     is what passes it, and the .pkg postinstall is what creates it, so the
-     path is not a stale name: it is the contract between the two. FR-21 D5.
 -->
 <plist version="1.0">
 <dict>

@@ -38,6 +38,7 @@
 //! preamble.
 //!
 //! Kill switch: `ROOMLERD_AUTO_LAYOUT=0` (the older `ROOMLER_NODE_` and
+// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an operator with it in a script needs to be able to grep for it.
 //! `ROOMLER_AGENT_` prefixes are still honoured) disables the per-char
 //! auto-switch without a redeploy;
 //! status reporting + manual set stay active.
@@ -331,7 +332,7 @@ fn publish_snapshot(active: HKL) {
 /// unchanged state snaps the viewer's select back on failure).
 pub fn request_set_layout(hkl_hex: String) {
     let spawned = std::thread::Builder::new()
-        .name("roomler-agent-layout-set".into())
+        .name("roomlerd-layout-set".into())
         .spawn(move || {
             // SYSTEM-context worker: bind this fresh thread to the
             // interactive desktop first (same preamble as the

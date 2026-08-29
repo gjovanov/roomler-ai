@@ -133,7 +133,7 @@ impl SystemContextCapture {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<CaptureCmd>();
 
         thread::Builder::new()
-            .name("roomler-agent-system-capture".into())
+            .name("roomlerd-system-capture".into())
             .spawn(move || {
                 worker_main(ready_tx, cmd_rx);
             })
@@ -684,7 +684,7 @@ fn capture_one_blocking(
             // ~25×/s forever with no recovery — video never rendered AND
             // the spam buried the throughput lines in the log upload
             // (field: WINHOST-E). `SetThreadDesktop` is per-thread and this
-            // always runs on `roomler-agent-system-capture`, so the
+            // always runs on `roomlerd-system-capture`, so the
             // rebind sticks for the BitBlt that follows. `try_change_desktop`
             // dedupes (only SetThreadDesktop when the desktop actually
             // changed), so steady-state cost is one OpenInputDesktop

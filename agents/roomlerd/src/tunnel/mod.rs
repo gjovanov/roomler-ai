@@ -1,4 +1,4 @@
-//! Agent-side `roomler-tunnel` plumbing.
+//! Agent-side `roomler` plumbing.
 //!
 //! The server-side ACL gate in `crates/api/src/ws/tunnel.rs` is the
 //! authoritative auth boundary (plan §"Multi-tenancy gotcha" +
@@ -25,7 +25,7 @@
 
 pub mod acceptor;
 // P3e lever E: the agent-side forward allowlist moved to
-// `roomler-agent-core::acl` (AgentConfig embeds its types, and AgentConfig
+// `roomler-core::acl` (AgentConfig embeds its types, and AgentConfig
 // lives there now). Re-exported so `crate::tunnel::acl::…` stays valid.
 pub use roomler_core::acl;
 pub mod client_mgr;

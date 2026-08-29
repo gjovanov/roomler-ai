@@ -1,6 +1,6 @@
-//! On-disk config for `roomler-tunnel`.
+//! On-disk config for `roomler`.
 //!
-//! Mirrors `roomler-agent`'s pattern: TOML file at the platform-specific
+//! Mirrors `roomlerd`'s pattern: TOML file at the platform-specific
 //! per-user config dir, populated by `roomler enroll` and read
 //! by `forward` / `run` / `diagnose`. Env vars `ROOMLER_TUNNEL_SERVER`
 //! and `ROOMLER_TUNNEL_TOKEN` override the file when both are set, so
@@ -29,6 +29,7 @@ pub struct TunnelConfig {
 }
 
 /// Resolve the default per-user config path. On Windows this lands at
+// RETIRED-NAME-ANCHOR(4): ProjectDirs segment holding the ENROLLED credential on tunnel-only hosts.
 /// `%APPDATA%\roomler\roomler-tunnel\config.toml`; on Linux/macOS the
 /// `directories` crate's `ProjectDirs::config_dir()` is honoured.
 pub fn default_config_path() -> Result<PathBuf> {
