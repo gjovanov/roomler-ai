@@ -21,6 +21,8 @@ every update wiped Screen Recording + Accessibility.
 `installer -target /` needs root; the per-user half isn't. Worse, the exit-to-update dance
 (spawn installer, exit, hope launchd restarts you) raced launchd job replacement.
 Fix: a third launchd unit, **`com.roomler.update`**, installed by the pkg BY DEFAULT
+<!-- RETIRED-NAME-ANCHOR(2): the real macOS daemon config dir, read by the
+     shipped .pkg postinstall. FR-21 D5. -->
 (opt-out marker `/etc/roomler-agent/disable-auto-update`, absence-removes): a root,
 single-shot helper (`roomlerd update-helper`, hidden subcommand) that owns
 check → download → verify → `installer -pkg … -target /`. Agents only touch the wake file
