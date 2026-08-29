@@ -217,7 +217,6 @@ pub struct PlanLimits {
     pub storage_bytes: u64,
     pub video_max_participants: u32,
     pub cloud_integrations: bool,
-    pub ai_recognition: bool,
     pub recordings: bool,
 }
 
@@ -243,7 +242,6 @@ impl Plan {
                 // gate can enforce without removing a capability people use.
                 video_max_participants: 4,
                 cloud_integrations: false,
-                ai_recognition: false,
                 recordings: false,
             },
             Plan::Pro => PlanLimits {
@@ -259,7 +257,6 @@ impl Plan {
                 storage_bytes: 10 * 1024 * 1024 * 1024,
                 video_max_participants: 10,
                 cloud_integrations: true,
-                ai_recognition: false,
                 recordings: false,
             },
             Plan::Business | Plan::Enterprise => PlanLimits {
@@ -275,7 +272,6 @@ impl Plan {
                 storage_bytes: 100 * 1024 * 1024 * 1024,
                 video_max_participants: 100,
                 cloud_integrations: true,
-                ai_recognition: true,
                 recordings: true,
             },
         }
