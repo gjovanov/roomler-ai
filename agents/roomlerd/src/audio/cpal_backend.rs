@@ -236,27 +236,27 @@ fn pick_device(host: &cpal::Host) -> Result<(cpal::Device, bool)> {
     {
         use tunnel_core::env::node_env;
         // 1. Explicit override via env.
-        if let Some(name) = node_env("AUDIO_SOURCE") {
-            if !name.trim().is_empty() {
-                if let Some(dev) = find_input_by_name(host, &name) {
-                    tracing::info!(source = %name, "audio: using ROOMLERD_AUDIO_SOURCE monitor");
-                    return Ok((dev, false));
-                }
-                tracing::warn!(
-                    source = %name,
-                    "audio: ROOMLERD_AUDIO_SOURCE not found among input devices — falling through to auto-detect"
-                );
+        if let Some(name) = node_env("AUDIO_SOURCE")
+            && !name.trim().is_empty()
+        {
+            if let Some(dev) = find_input_by_name(host, &name) {
+                tracing::info!(source = %name, "audio: using ROOMLERD_AUDIO_SOURCE monitor");
+                return Ok((dev, false));
             }
+            tracing::warn!(
+                source = %name,
+                "audio: ROOMLERD_AUDIO_SOURCE not found among input devices — falling through to auto-detect"
+            );
         }
         // 2. Auto: first input device whose name ends in `.monitor`
         //    (Pulse exposes every sink's loopback that way).
         if let Ok(inputs) = host.input_devices() {
             for dev in inputs {
-                if let Ok(n) = dev.name() {
-                    if n.ends_with(".monitor") {
-                        tracing::info!(source = %n, "audio: auto-selected PulseAudio monitor source");
-                        return Ok((dev, false));
-                    }
+                if let Ok(n) = dev.name()
+                    && n.ends_with(".monitor")
+                {
+                    tracing::info!(source = %n, "audio: auto-selected PulseAudio monitor source");
+                    return Ok((dev, false));
                 }
             }
         }
@@ -283,10 +283,10 @@ fn pick_device(host: &cpal::Host) -> Result<(cpal::Device, bool)> {
 fn find_input_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
     let inputs = host.input_devices().ok()?;
     for dev in inputs {
-        if let Ok(n) = dev.name() {
-            if n == name {
-                return Some(dev);
-            }
+        if let Ok(n) = dev.name()
+            && n == name
+        {
+            return Some(dev);
         }
     }
     None
