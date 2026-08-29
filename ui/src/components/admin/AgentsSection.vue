@@ -316,6 +316,20 @@
               <span class="mx-1">·</span>
               <span :title="`machine_id: ${item.machine_id}`">{{ shortId(item.machine_id) }}</span>
               <span v-if="item.version"> · v{{ item.version }}</span>
+              <!-- FR-27 — the companion's own version, and only when it
+                   DISAGREES with the daemon's. Shown at all because the two
+                   update by different mechanisms on every platform, so
+                   "Update all" moving the daemon says nothing about the
+                   desktop; hidden when they match because a second identical
+                   number on every row is noise, and the whole point of the
+                   field is the disagreement. -->
+              <span
+                v-if="companionSkew(item)"
+                class="companion-skew ml-1"
+                :title="`roomler-desktop is on v${companionSkew(item)} while the daemon is on v${item.version} — the companion updates separately (its own .deb on Linux, the .pkg on macOS, a daemon-side swap on Windows)`"
+              >
+                · desktop v{{ companionSkew(item) }}
+              </span>
             </div>
           </template>
           <template #item.kind="{ item }">
@@ -616,6 +630,19 @@
                 variant="tonal"
               >
                 v{{ a.agent_version }}
+              </v-chip>
+              <!-- FR-27 — same rule as the grid caption: only when the
+                   companion disagrees with the daemon. Warning-coloured
+                   because a skew here means the desktop is running code the
+                   daemon has moved past, which is what the operator hit. -->
+              <v-chip
+                v-if="a.companion_version && a.companion_version !== a.agent_version"
+                size="x-small"
+                color="warning"
+                variant="tonal"
+                :title="`roomler-desktop is on v${a.companion_version} while the daemon is on v${a.agent_version} — the companion updates separately`"
+              >
+                desktop v{{ a.companion_version }}
               </v-chip>
               <v-chip
                 v-for="codec in codecChips(a)"
@@ -1529,6 +1556,20 @@ const agentById = computed(() => {
 function agentFor(row: DeviceRow): Agent | undefined {
   return row.kind === 'agent' ? agentById.value.get(row.id) : undefined
 }
+
+/** FR-27 — the companion version to display, or `''` when there is nothing
+ *  worth saying.
+ *
+ *  Returns a value ONLY when the companion disagrees with the daemon, because
+ *  agreement is the expected state and rendering it on every row would bury
+ *  the one case an operator needs to see. Absent (`undefined`) is deliberately
+ *  silent rather than rendered as "unknown": it covers a pre-FR-27 agent, a
+ *  host with no companion, and a failed probe alike, and guessing between them
+ *  in a table cell would be worse than saying nothing. */
+function companionSkew(row: DeviceRow): string {
+  const cv = agentFor(row)?.companion_version
+  return cv && cv !== row.version ? cv : ''
+}
 const clientById = computed(() => {
   const m = new Map<string, TunnelClient>()
   for (const c of tunnelClientStore.clients) m.set(c.id, c)
@@ -2383,5 +2424,12 @@ watch(() => props.tenantId, (tid) => {
    their labels on one line each instead of clipping. */
 .agents-table :deep(.consent-select) {
   min-width: 170px;
+}
+
+/* FR-27 — the companion-version skew note. Warning-toned so it reads as
+   "something here is behind", not as a second neutral fact next to the
+   daemon version. */
+.companion-skew {
+  color: rgb(var(--v-theme-warning));
 }
 </style>
