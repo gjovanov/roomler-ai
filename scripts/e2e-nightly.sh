@@ -11,6 +11,14 @@
 #      from the deploy repo's prod overlay) via `kubectl set image` — the
 #      e2e namespace is deliberately NOT ArgoCD-managed.
 #   3. Port-forwards the app (:18080) and Mailpit (:18025).
+#      ⚠️ The stack's ROOMLER__APP__FRONTEND_URL must equal the origin the
+#      browser uses here (http://127.0.0.1:18080). Since the session-cookie
+#      migration the /ws upgrade authenticates by COOKIE and refuses an
+#      untrusted Origin with 403 — cookies are ambient and a WS upgrade is
+#      not subject to CORS. With the in-cluster name there instead, every
+#      handshake in the suite is refused, ~7 specs fail for one reason, and
+#      nothing realtime is tested at all. Fixed in the e2e overlay
+#      2026-08-29; if you point this lane at another port, move it too.
 #   4. Runs the suite in the official Playwright container (spec dir copied
 #      to a scratch tree minus e2e/video/ — that spec is bun-only syntax).
 #   5. Diffs the failing specs against scripts/e2e-expected-failures.txt and
