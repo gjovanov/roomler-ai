@@ -15,6 +15,12 @@
 //! path escapes the dest root, with a clear error so the wizard can
 //! surface "tampered archive — please retry".
 //!
+// RETIRED-NAME-ANCHOR-BEGIN
+// This module exists to extract archives the project ALREADY PUBLISHED, so
+// every retired name below is an input it must keep accepting, not a name it
+// chooses. The probe tries the current name first and the retired one second;
+// the tests pin both. Removing the retired arm breaks upgrades from any
+// tunnel release older than FR-21. docs/fr/FR-21 D6
 //! The archives produced by `release-tunnel.yml` carry a single
 //! top-level directory (`roomler-tunnel-<version>-<target>/`); the
 //! caller (orchestrator) walks one level deep to find the `roomler-
@@ -490,3 +496,4 @@ mod tests {
         assert_eq!(found.file_name().unwrap(), new_name);
     }
 }
+// RETIRED-NAME-ANCHOR-END
