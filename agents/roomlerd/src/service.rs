@@ -1,11 +1,11 @@
+// RETIRED-NAME-ANCHOR(3): the legacy scheduled-task name install/uninstall must still
+// find.
 //! Cross-platform auto-start-on-boot / login plumbing.
 //!
 //! `roomlerd service install` registers the agent so it launches
 //! automatically on the next interactive login:
 //!
 //!   - **Windows**: Scheduled Task named `Roomler` (pre-P3D-rename hosts
-// RETIRED-NAME-ANCHOR(3): the legacy scheduled-task name install/uninstall must still
-// find.
 //!     have `RoomlerAgent`, which `install()` retires and `uninstall()`
 //!     deletes), ONLOGON trigger, LIMITED run level (matches the agent's
 //!     un-elevated-by-design posture from `packaging/windows/README.txt`).

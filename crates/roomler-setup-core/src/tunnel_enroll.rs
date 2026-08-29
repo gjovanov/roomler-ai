@@ -74,13 +74,13 @@ fn os_discriminant() -> Option<&'static str> {
     }
 }
 
+// RETIRED-NAME-ANCHOR(4): a UA string that ALREADY WENT OVER THE WIRE; the server has
+// these rows.
 /// POST the enrollment exchange and return the parsed result. Does
 /// NOT touch the filesystem; the caller pairs this with its
 /// `write_config` after surfacing `EnrollOk` to the SPA.
 ///
 /// `user_agent` is caller-supplied so each wizard keeps its
-// RETIRED-NAME-ANCHOR(4): a UA string that ALREADY WENT OVER THE WIRE; the server has
-// these rows.
 /// historical wire-visible UA (`roomler-tunnel-installer/<v>` for the
 /// legacy shim) and the unified app sends its own.
 pub async fn enroll(
