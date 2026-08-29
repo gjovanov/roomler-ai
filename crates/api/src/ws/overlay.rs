@@ -94,6 +94,7 @@ pub async fn relay_overlay_msg_from_node(
             supports_server_relay_strategy,
             supports_derp_floor,
             supports_overlay_echo,
+            supports_org_relay,
             advertised_routes,
             ..
         } => {
@@ -110,6 +111,7 @@ pub async fn relay_overlay_msg_from_node(
                 supports_server_relay_strategy,
                 supports_derp_floor,
                 supports_overlay_echo,
+                supports_org_relay,
                 advertised_routes,
             )
             .await;
@@ -215,6 +217,7 @@ async fn handle_overlay_join(
     supports_server_relay_strategy: bool,
     supports_derp_floor: bool,
     supports_overlay_echo: bool,
+    supports_org_relay: bool,
     advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
@@ -301,6 +304,7 @@ async fn handle_overlay_join(
                     supports_server_relay_strategy,
                     supports_derp_floor,
                     supports_overlay_echo,
+                    supports_org_relay,
                     &advertised_routes,
                 )
                 .await
@@ -361,6 +365,7 @@ async fn handle_overlay_join(
                         supports_server_relay_strategy,
                         supports_derp_floor,
                         supports_overlay_echo,
+                        supports_org_relay,
                         advertised_routes: advertised_routes.clone(),
                     })
                     .await
@@ -2098,6 +2103,7 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // Data-probe — echo the peer's overlay-native-echo capability so
         // probers pick the engine echo over ICMP for capable peers.
         supports_overlay_echo: node.supports_overlay_echo,
+        supports_org_relay: node.supports_org_relay,
         // Only the admin-APPROVED routes reach peers — and, once the tenant's
         // overlay ACL is enforcing, only the subset THIS recipient may install
         // (see `shape_peer`). `to_netmap_peer` keeps the permissive default so
@@ -2442,6 +2448,7 @@ mod tests {
             supports_server_relay_strategy: false,
             supports_derp_floor: false,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             advertised_routes: vec![],
             approved_routes: vec![],
             is_exit_node: false,

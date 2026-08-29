@@ -968,6 +968,15 @@ pub enum ClientMsg {
         /// the rest. Absent from an older node ⇒ `false` ⇒ ICMP.
         #[serde(default)]
         supports_overlay_echo: bool,
+        /// FR-19 — this node UNDERSTANDS `rc:overlay.relay_session` /
+        /// `rc:overlay.relay_revoke` and the `org-relay` verdict. The server
+        /// never pushes those to a node that has not said so: an unknown
+        /// `ServerMsg` tag is dropped at `debug!` on the agent, which would make
+        /// a minted session evaporate silently. Absent from an older node ⇒
+        /// `false`. ⚠️ Distinct from the `relay-server` RPC verb, which says
+        /// "I SERVE relays" — this says "I can USE one".
+        #[serde(default)]
+        supports_org_relay: bool,
         /// Phase 1 — subnet CIDRs this node offers to route for peers
         /// (`--advertise-routes` / config). The server stores them as *claimed*
         /// routes; an admin must **approve** each before it's distributed in the
@@ -1025,6 +1034,22 @@ pub enum ClientMsg {
     /// pushes a `netmap_delta` removing it from peers.
     #[serde(rename = "rc:overlay.leave")]
     OverlayLeave {},
+
+    /// FR-19 P1 — reachability report: can THIS node reach an offered org
+    /// relay's endpoint? Pairwise (node × relay × endpoint), which is why it is
+    /// its own message and not a `CapVector` field — the vector is one
+    /// process-global slot per node. Unknown to a pre-FR-19 server ⇒
+    /// logged-and-ignored on the agent socket, no capability gate needed.
+    #[serde(rename = "rc:overlay.relay_probe")]
+    OverlayRelayProbe {
+        #[serde(with = "oid_hex")]
+        relay_node_id: ObjectId,
+        /// The `ip:port` probed.
+        endpoint: String,
+        reachable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtt_ms: Option<u32>,
+    },
 
     /// Node asks for short-lived coturn credentials to stand up a relay
     /// leg to a specific peer (used when direct hole-punch to that peer
@@ -1813,6 +1838,52 @@ pub enum ServerMsg {
         derp_url: Option<String>,
     },
 
+    /// FR-19 — a minted org-relay session, pushed to each MEMBER of the pair.
+    /// Only ever sent to a node that advertised `supports_org_relay` on join.
+    /// The `bind_secret` is per-(session, member): possession of it is what
+    /// "this is the node the session was minted for" means at the relay.
+    #[serde(rename = "rc:overlay.relay_session")]
+    OverlayRelaySession {
+        /// 24-bit session id, unique per relay node.
+        vni: u32,
+        /// Re-mint counter for this (pair, relay); covered by the bind MAC.
+        generation: u64,
+        #[serde(with = "oid_hex")]
+        peer_node_id: ObjectId,
+        #[serde(with = "oid_hex")]
+        relay_node_id: ObjectId,
+        /// The relay's reachable `ip:port`s, measured + static. Try in order.
+        relay_endpoints: Vec<String>,
+        /// This member's bind secret, base64 (32 bytes).
+        bind_secret: String,
+        /// Seconds the relay allows to complete the bind; the agent re-clamps
+        /// against its own clock (server timestamps only ever shorten).
+        bind_secs: u32,
+        /// Absolute session lifetime in seconds, independent of traffic.
+        max_lifetime_secs: u32,
+    },
+
+    /// FR-19 — the same session, pushed to the RELAY node with BOTH members'
+    /// secrets so it can verify either party's bind. Only ever sent to a node
+    /// whose hello advertised the `relay-server` verb.
+    #[serde(rename = "rc:overlay.relay_serve")]
+    OverlayRelayServe {
+        vni: u32,
+        generation: u64,
+        /// The two members. Exactly two — a relay session is a pair.
+        members: Vec<RelayMemberWire>,
+        bind_secs: u32,
+        idle_secs: u32,
+        max_lifetime_secs: u32,
+    },
+
+    /// FR-19 — revoke a session immediately, on relay AND members. Pushed on
+    /// org mode-off, ACL revoke, policy revoke and device removal. Revocation
+    /// is a push rather than an expiry because a session's idle deadline is
+    /// refreshed by traffic and never fires under a WireGuard keepalive.
+    #[serde(rename = "rc:overlay.relay_revoke")]
+    OverlayRelayRevoke { vni: u32 },
+
     /// Multi-region relay PoPs: the probe-target list the server pushes to a
     /// node that advertised `supports_relay_regions` (hello-gated — the agent's
     /// `ServerMsg` deserializer errors on unknown variants, so this is NEVER
@@ -1862,6 +1933,16 @@ pub struct CapVectorWire {
     /// The central `/derp` WS is up + registered (the floor's health).
     #[serde(default)]
     pub derp_ws_ok: bool,
+}
+
+/// One member of an org-relay session as pushed to the relay in
+/// [`ServerMsg::OverlayRelayServe`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RelayMemberWire {
+    /// base64 WireGuard public key — the member's identity as the mint names it.
+    pub wg_public_key: String,
+    /// base64 32-byte bind secret for THIS member.
+    pub bind_secret: String,
 }
 
 /// One relay region as pushed in [`ServerMsg::RelayRegions`] — the probe
@@ -2052,6 +2133,13 @@ pub enum RelayStrategyWire {
     Derp,
     /// Two coturn allocations (the fall-through).
     BothAllocate,
+    /// FR-19 — ride a tenant-owned org relay. A UNIT variant on purpose: this
+    /// enum derives `Copy` and is serialised as a bare string tag, so the
+    /// session itself travels out-of-band in `rc:overlay.relay_session`.
+    /// Only ever emitted to a peer whose join advertised `supports_org_relay`;
+    /// a pre-FR-19 agent that somehow received it decodes it to `None` via
+    /// `relay_strategy_lenient` (#811) rather than losing the frame.
+    OrgRelay,
 }
 
 /// Lenient decoder for [`NetmapPeer::relay_strategy`]: an **unrecognised**
@@ -2146,6 +2234,11 @@ pub struct NetmapPeer {
     /// pre-Phase-C server/peer stays "unknown" (attempted, never skipped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srflx_nat: Option<String>,
+    /// FR-19 — echoed from the peer's join so a node knows whether its peer can
+    /// use an org relay (both ends must). Skipped when `false` so a pre-FR-19
+    /// node's netmap shape is byte-identical.
+    #[serde(default, skip_serializing_if = "<&bool as std::ops::Not>::not")]
+    pub supports_org_relay: bool,
     /// Phase B (overlay v3) — this peer's MEASURED capability vector, or
     /// `None` when the peer hasn't measured (pre-B agent) or its vector went
     /// STALE (the server's freshness gate treats >3× cadence as absent — a
@@ -3752,6 +3845,7 @@ mod tests {
             supports_derp: true,
             supports_forced_derp: true,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             supports_server_relay_strategy: true,
             supports_derp_floor: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
@@ -4289,6 +4383,7 @@ mod tests {
                 supports_derp: true,
                 supports_forced_derp: true,
                 supports_derp_floor: false,
+                supports_org_relay: false,
                 supports_overlay_echo: false,
                 relay_strategy: Some(RelayStrategyWire::SingleRelayDialer),
                 routes: vec!["10.0.0.0/24".into()],
@@ -4418,6 +4513,97 @@ mod tests {
         assert!(p.agent_id.is_none());
     }
 
+    /// FR-19 wire locks: the three relay-session tags, raw-hex ObjectIds, the
+    /// skipped-when-absent `rtt_ms`, and the `org-relay` verdict string. A
+    /// rename here does not fail loudly — it makes every deployed device look
+    /// like it lacks the feature.
+    #[test]
+    fn org_relay_messages_wire_roundtrip_and_tags_are_locked() {
+        let oid = ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+        let m = ServerMsg::OverlayRelaySession {
+            vni: 0x0042_4242,
+            generation: 3,
+            peer_node_id: oid,
+            relay_node_id: oid,
+            relay_endpoints: vec!["62.210.194.66:3478".into()],
+            bind_secret: "AAAA".into(),
+            bind_secs: 30,
+            max_lifetime_secs: 3600,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_session""#), "{s}");
+        assert!(
+            s.contains(r#""peer_node_id":"507f1f77bcf86cd799439011""#),
+            "ObjectIds must be raw hex, not $oid: {s}"
+        );
+        let ServerMsg::OverlayRelaySession {
+            vni, generation, ..
+        } = serde_json::from_str(&s).unwrap()
+        else {
+            panic!("relay_session must round-trip");
+        };
+        assert_eq!((vni, generation), (0x0042_4242, 3));
+
+        let m = ServerMsg::OverlayRelayServe {
+            vni: 7,
+            generation: 1,
+            members: vec![
+                RelayMemberWire {
+                    wg_public_key: "a".into(),
+                    bind_secret: "b".into(),
+                },
+                RelayMemberWire {
+                    wg_public_key: "c".into(),
+                    bind_secret: "d".into(),
+                },
+            ],
+            bind_secs: 30,
+            idle_secs: 300,
+            max_lifetime_secs: 3600,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_serve""#), "{s}");
+        let ServerMsg::OverlayRelayServe { members, .. } = serde_json::from_str(&s).unwrap() else {
+            panic!("relay_serve must round-trip");
+        };
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[1].bind_secret, "d");
+
+        let s = serde_json::to_string(&ServerMsg::OverlayRelayRevoke { vni: 7 }).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_revoke""#), "{s}");
+
+        let m = ClientMsg::OverlayRelayProbe {
+            relay_node_id: oid,
+            endpoint: "62.210.194.66:3478".into(),
+            reachable: true,
+            rtt_ms: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.relay_probe""#), "{s}");
+        assert!(!s.contains("rtt_ms"), "an absent rtt must be skipped: {s}");
+
+        assert_eq!(
+            serde_json::to_string(&RelayStrategyWire::OrgRelay).unwrap(),
+            r#""org-relay""#
+        );
+    }
+
+    /// The join flag and its netmap echo both default to `false`, and the echo
+    /// is SKIPPED when false, so a pre-FR-19 node's netmap shape is unchanged.
+    #[test]
+    fn supports_org_relay_defaults_false_and_is_skipped_in_the_netmap() {
+        let json = r#"{"node_id":"507f1f77bcf86cd799439011","overlay_ip":"100.64.0.4",
+                       "name":"d","wg_public_key":"cGVlcg==","reachable":true}"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert!(!p.supports_org_relay);
+        assert!(
+            !serde_json::to_string(&p)
+                .unwrap()
+                .contains("supports_org_relay"),
+            "false must be skipped, not serialised"
+        );
+    }
+
     /// The regression this shim exists for, at the level where it actually
     /// bites: a NEWER server stamps a `relay_strategy` tag this build has
     /// never heard of, and an OLDER agent must still parse the **whole
@@ -4442,7 +4628,7 @@ mod tests {
                 "name":"devbox",
                 "wg_public_key":"cGVlcg==",
                 "reachable":true,
-                "relay_strategy":"org-relay"
+                "relay_strategy":"some-future-relay-kind"
             }]
         }"#;
         let msg: ServerMsg =
@@ -4470,6 +4656,7 @@ mod tests {
             ("single-relay-dialer", RelayStrategyWire::SingleRelayDialer),
             ("derp", RelayStrategyWire::Derp),
             ("both-allocate", RelayStrategyWire::BothAllocate),
+            ("org-relay", RelayStrategyWire::OrgRelay),
         ] {
             let json = format!(
                 r#"{{"node_id":"507f1f77bcf86cd799439011","overlay_ip":"100.64.0.4",
