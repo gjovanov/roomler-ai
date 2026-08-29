@@ -183,8 +183,7 @@ mod tests {
     /// for months while we blamed the network.
     #[test]
     fn blank_url_expands_to_nothing() {
-        for blank in ["", "   ", "	", "
-"] {
+        for blank in ["", "   ", "\t", "\n"] {
             assert!(
                 expand_turn_url(blank, &VariantCaps::default()).is_empty(),
                 "blank TURN url {blank:?} must expand to no urls at all"
