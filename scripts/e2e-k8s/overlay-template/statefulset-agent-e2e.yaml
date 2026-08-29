@@ -69,7 +69,7 @@ spec:
               value: "1"
           volumeMounts:
             - name: config
-              mountPath: /etc/roomler-agent
+              mountPath: /etc/roomler
             - name: data
               mountPath: /root/.local/share/roomler/roomler-agent
           resources:

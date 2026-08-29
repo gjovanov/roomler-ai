@@ -164,4 +164,6 @@ const DAEMON_FILE_NAME: &str = "roomlerd";
 /// plists point here, and renaming it would invalidate the TCC grants keyed to
 /// this binary.
 #[cfg(target_os = "macos")]
+// RETIRED-NAME-ANCHOR(2): the macOS .app bundle name is FROZEN (FR-21 D5) —
+// it keys the host's Screen Recording and Accessibility TCC grants.
 const MACOS_BUNDLE_DAEMON: &str = "/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent";
