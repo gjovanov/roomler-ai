@@ -2047,7 +2047,22 @@ async fn handle_server_msg(
                 // Tell it. Advisory + best-effort; `probe_lock_state()` is
                 // Unlocked on every non-Windows host, so this only fires where
                 // a lock screen exists.
-                if crate::lock_state::probe_lock_state() == crate::lock_state::LockState::Locked {
+                // FR-34 P3b — detect the lock from the SERVICE context.
+                // This consent code runs on the SCM service window
+                // station (the daemon only switches to WinSta0
+                // per-session, when input is wired, AFTER consent), so
+                // the `OpenInputDesktop`-based `probe_lock_state()` reads
+                // the service station's own `Default` and ALWAYS reports
+                // Unlocked here — the emit could never fire on a
+                // perMachine/SYSTEM host (field-confirmed on pc50045,
+                // 0.4.22). `probe_lock_state_service()` asks WTS about the
+                // console session directly, from any station; fall back to
+                // the desktop probe (correct for a perUser/attended daemon
+                // already on WinSta0) when WTS is unavailable / UNKNOWN.
+                let host_locked = crate::lock_state::probe_lock_state_service()
+                    .unwrap_or_else(crate::lock_state::probe_lock_state)
+                    == crate::lock_state::LockState::Locked;
+                if host_locked {
                     info!(
                         session = %session_hex,
                         "consent prompt on a LOCKED host — signalling the controller to unlock + approve"
