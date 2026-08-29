@@ -181,7 +181,7 @@ async fn approval_needs_manage_agents_and_exec_device_and_audits_both_arms() {
     let (s, body) = put(&app, &policy, member, json!({ "serve": true })).await;
     assert_eq!(s, 403);
     assert!(
-        body["error"]
+        body["message"]
             .as_str()
             .unwrap_or_default()
             .contains("EXEC_DEVICE"),
