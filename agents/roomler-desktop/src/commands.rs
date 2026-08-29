@@ -1139,7 +1139,8 @@ fn probe_service_state() -> (String, bool) {
 ///
 /// P3d Slice B renamed the daemon OUTPUT binary `roomlerd` -> `roomlerd`.
 /// Resolution prefers a sibling `roomlerd[.exe]` (so a fresh tray spawns the
-// RETIRED-NAME-ANCHOR(4): the fallback targets a binary the field still has; dropping it strands them.
+// RETIRED-NAME-ANCHOR(4): the fallback targets a binary the field still has; dropping
+// it strands them.
 /// new daemon), then falls back to the legacy `roomler-agent[.exe]` (which the
 /// MSI still ships as the inert `AgentExeAlias`, so a mixed / in-flight install
 /// still resolves), then finally the bare new name relying on PATH.
@@ -1209,7 +1210,10 @@ fn installed_daemon_candidates() -> Vec<PathBuf> {
             // plist and TCC grant keys on the bundle path it points at.
             PathBuf::from("/usr/local/bin/roomlerd"),
             // The bundle itself, if the symlink is missing.
-            // RETIRED-NAME-ANCHOR: the macOS .app bundle name KEYS THE TCC GRANTS — renaming it silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it; this is the path that bundle really has. docs/fr/FR-21
+            // RETIRED-NAME-ANCHOR: the macOS .app bundle name KEYS THE TCC GRANTS —
+            // renaming it silently drops Screen Recording + Accessibility on every Mac.
+            // FR-21 D5 freezes it; this is the path that bundle really has.
+            // docs/fr/FR-21
             PathBuf::from("/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent"),
         ]
     }

@@ -22,7 +22,8 @@ use std::path::PathBuf;
 /// `C:\Windows\System32\config\systemprofile\AppData\Roaming\…`
 /// — invisible to a human operator and missed by every fleet-mgmt
 /// scanner that greps user profiles. Prefer
-// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
+// P4b still has; appdirs::app_segment resolves it, so it is an input.
 /// `%PROGRAMDATA%\roomler\roomler-agent\needs-attention.txt` in that
 /// case so the file is findable by both a logged-in operator
 /// (`dir %PROGRAMDATA%`) AND a fleet scanner.

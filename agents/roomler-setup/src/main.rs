@@ -1,7 +1,8 @@
 //! Roomler Setup — the unified 5-step Tauri 2 wizard.
 //!
 //! ONE downloadable EXE replacing the two legacy wizards retired in
-// RETIRED-NAME-ANCHOR(4): names the two wizards retired in P4c-2 — history, not a live path.
+// RETIRED-NAME-ANCHOR(4): names the two wizards retired in P4c-2 — history, not a live
+// path.
 //! P4c-2 (`roomler-installer` drove the daemon MSIs,
 //! `roomler-tunnel-installer` the tunnel CLI). The operator picks a
 //! role on the Welcome step
