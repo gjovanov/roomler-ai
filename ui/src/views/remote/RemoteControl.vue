@@ -3326,7 +3326,9 @@ const degradedLabel = computed(() => {
 const phaseLabel = computed(() => {
   switch (rc.phase.value) {
     case 'requesting': return 'Requesting session…'
-    case 'awaiting_consent': return 'Waiting for the agent to allow the connection…'
+    case 'awaiting_consent': return rc.hostLocked.value
+      ? 'That device is locked. Someone needs to unlock it on the machine, then approve the request there — you have 5 minutes.'
+      : 'Waiting for the agent to allow the connection…'
     case 'negotiating': return 'Negotiating the peer connection…'
     default: return ''
   }
