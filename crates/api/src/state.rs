@@ -16,8 +16,7 @@ use roomler_ai_remote_control::{
     turn_url::{VariantCaps, expand_turn_url},
 };
 use roomler_ai_services::{
-    AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
-    TaskService,
+    AuthService, EmailService, GiphyService, OAuthService, PushService, TaskService,
     dao::{
         activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
         consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
@@ -73,7 +72,6 @@ pub struct AppState {
     pub tasks: Arc<TaskService>,
     pub room_manager: Arc<RoomManager>,
     pub ws_storage: Arc<WsStorage>,
-    pub recognition: RecognitionService,
     pub oauth: Option<Arc<OAuthService>>,
     pub giphy: Option<Arc<GiphyService>>,
     pub email: Option<Arc<EmailService>>,
@@ -298,13 +296,7 @@ impl AppState {
 
         let worker_pool = Arc::new(WorkerPool::new(&settings.mediasoup).await?);
         let room_manager = Arc::new(RoomManager::new(worker_pool, &settings.mediasoup));
-
         let ws_storage = Arc::new(WsStorage::new());
-        let recognition = RecognitionService::new(
-            settings.claude.api_key.clone(),
-            settings.claude.model.clone(),
-            settings.claude.max_tokens,
-        );
 
         let oauth = if !settings.oauth.google.client_id.is_empty()
             || !settings.oauth.facebook.client_id.is_empty()
@@ -851,7 +843,6 @@ impl AppState {
             tasks,
             room_manager,
             ws_storage,
-            recognition,
             oauth,
             giphy,
             email,
