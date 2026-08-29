@@ -2037,7 +2037,11 @@ async fn media_pump(
 
     loop {
         let capture_started = std::time::Instant::now();
-        let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
+        // Bound to a local first so the mutable borrow of `capturer` ends
+        // here — the idle arm below reads `capturer.frames_unchanged()`, and
+        // a temporary living to the end of the `match` would keep the borrow.
+        let next_frame = capturer.next_frame().await;
+        let frame: std::sync::Arc<crate::capture::Frame> = match next_frame {
             Ok(Some(f)) => {
                 capture_time_us =
                     capture_time_us.saturating_add(capture_started.elapsed().as_micros() as u64);
@@ -2053,7 +2057,21 @@ async fn media_pump(
                 // visible without flooding. DXGI only fires on screen change,
                 // so this can spike briefly then settle.
                 if frames_empty.is_multiple_of(150) {
-                    info!(%session_id, frames_empty, "capture produced no frame (idle screen)");
+                    // FR-29 — this log is now the ONLY periodic signal an idle
+                    // Linux host emits. The media heartbeat fires per 30
+                    // ENCODED frames, and once the damage tracker starts
+                    // proving captures unnecessary nothing is encoded, so the
+                    // heartbeat goes quiet exactly when the optimisation is
+                    // working. Carry the counters here so a healthy idle host
+                    // stays legible instead of looking hung.
+                    info!(
+                        %session_id,
+                        frames_empty,
+                        frames_unchanged = capturer.frames_unchanged(),
+                        frames_captured,
+                        frames_encoded,
+                        "capture produced no frame (idle screen)"
+                    );
                 }
                 // If the screen has been idle for IDLE_KEEPALIVE and we
                 // have a cached frame, re-encode it. openh264 will emit
@@ -2503,10 +2521,16 @@ async fn media_pump(
             let encode_us_window = encode_time_us.saturating_sub(heartbeat_encode_us_base);
             let avg_capture_ms = capture_us_window / (1_000 * frames_in_window);
             let avg_encode_ms = encode_us_window / (1_000 * frames_in_window);
+            // FR-29 — read from the backend, NOT derived from frames_empty.
+            // The two are different conditions that both surface as Ok(None):
+            // frames_empty means the pump was starved, frames_unchanged means
+            // the backend proved a capture was unnecessary. Reporting one as
+            // the other would turn a healthy idle host into a false alarm.
+            let frames_unchanged = capturer.frames_unchanged();
             info!(
                 %session_id,
                 backend,
-                frames_captured, frames_empty, frames_encoded, frames_keepalive,
+                frames_captured, frames_empty, frames_unchanged, frames_encoded, frames_keepalive,
                 bytes_written, write_errors,
                 avg_capture_ms, avg_encode_ms,
                 "media pump heartbeat (≈1s window)"

@@ -294,8 +294,16 @@ libc = "0.2"
 # lockfile via enigo/arboard, so this adds no new dependency tree. Default
 # features only: the panel is CLICKABLE, so it needs none of the `shape`
 # extension the click-through border would.
+#
+# FR-29 additionally needs the `damage` protocol module, to answer "did
+# anything change?" — the question XShm cannot answer and DXGI answers for
+# free with WouldBlock. ONE declaration for both consumers: two
+# `[target.'cfg(target_os = "linux")'.dependencies]` tables is a duplicate-key
+# error, not a merge. Enabled by `viewer-indicator-x11` (FR-27) and by
+# `scrap-capture` (FR-29) independently; the crate itself is already in the
+# lockfile via enigo/arboard, so this buys a feature, not a dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", optional = true }
+x11rb = { version = "0.13", features = ["damage"], optional = true }
 
 # FR-27 — the native macOS consent panel (`viewer-indicator-macos`). All three
 # are already in the lockfile (tauri pulls them for the desktop companion), so
@@ -414,7 +422,7 @@ features = [
 [features]
 default = []
 # Enables the scrap-backed screen capture on Linux/Windows/macOS.
-scrap-capture = ["dep:scrap"]
+scrap-capture = ["dep:scrap", "dep:x11rb"]
 # Enables the OpenH264 software video encoder.
 openh264-encoder = ["dep:openh264", "dep:openh264-sys2"]
 # Enables the Windows Media Foundation hardware H.264 encoder. Windows-

@@ -94,8 +94,51 @@ pub(super) struct Inner {
     alive: Arc<AtomicBool>,
 }
 
+// RETIRED-NAME-ANCHOR(24): `ROOMLER_AGENT_VIRTUAL_DESKTOP` is the LEGACY
+// spelling FR-21 P3 (D1) deliberately kept working — mars, jupiter and the WSL
+// node all carry it verbatim in operator-authored systemd drop-ins that no
+// package upgrade rewrites. Reading only `ROOMLERD_*` here would silently make
+// the guard below a no-op on every host that needs it.
+/// ⚠️ FR-27, field-measured on `mars` + `jupiter` 2026-08-29: a
+/// `ROOMLER_AGENT_VIRTUAL_DESKTOP=1` host is NOT an attended host, even though
+/// it has a perfectly good X display.
+///
+/// The daemon starts that Xvfb itself so a headless server can be
+/// remote-controlled, so the display's ONLY viewer is a remote controller —
+/// which makes it the worst possible place to ask "may this remote controller
+/// in?". Two concrete failures, both observed:
+///
+///   * With nobody attached, the panel is drawn where no human can see it, and
+///     the agent reports `native=true have_surface=true`. The session then dies
+///     `timeout` — "nobody answered" — when the truthful answer is
+///     `no_prompt_surface`, "there was nobody to ask". Those have different
+///     fixes, and telling them apart is the whole point of finding 3.
+///   * With somebody attached, it is worse than useless: viewer A, already in
+///     a session, sees and can click **Approve** on viewer B's prompt. The
+///     party being asked for permission is the party asking.
+///
+/// So the virtual desktop is declined as a PROMPT surface. It stays a fine
+/// place for the "being viewed" banner (the companion owns that on Linux
+/// today), and a real X session on the same host is unaffected — this reads
+/// the daemon's own configuration, not the display.
+fn display_is_our_own_virtual_desktop() -> bool {
+    // Same accessor shape as `main.rs::virtual_desktop_requested`, kept local
+    // because that one is a bin-crate private and this is the lib.
+    let raw = std::env::var("ROOMLERD_VIRTUAL_DESKTOP")
+        .or_else(|_| std::env::var("ROOMLER_AGENT_VIRTUAL_DESKTOP"))
+        .unwrap_or_default();
+    raw == "1" || raw.eq_ignore_ascii_case("true")
+}
+
 impl Inner {
     pub(super) fn new(consent_tx: ConsentSender) -> Result<Self> {
+        if display_is_our_own_virtual_desktop() {
+            anyhow::bail!(
+                "this host's X display is the daemon's own virtual desktop — \
+                 its only viewer is a remote controller, so it is not a place \
+                 to ask for consent"
+            );
+        }
         // Probe by CONNECTING. `DISPLAY` being set proves nothing (a stale
         // value in a service environment is common) and its absence is the
         // normal state for the root daemon, where falling back is right.
@@ -413,4 +456,55 @@ fn paint<C: Connection>(
     fill(APPROVE, ax, ay, aw, ah)?;
     text(TEXT, ax + 24, ay + 20, "Approve")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_is_our_own_virtual_desktop;
+
+    // RETIRED-NAME-ANCHOR(16): the legacy env spelling under test, on purpose
+    // — see the anchor on `display_is_our_own_virtual_desktop`.
+    /// The FR-27 field finding, locked. `mars` and `jupiter` both carry
+    /// `ROOMLER_AGENT_VIRTUAL_DESKTOP=1` in an operator-authored systemd
+    /// drop-in (FR-21 P3 kept the legacy spelling working), and both reported
+    /// `native=true have_surface=true` for a prompt drawn where nobody could
+    /// see it. Both spellings must decline.
+    ///
+    /// ⚠️ Serial and self-restoring: these are process-wide env vars.
+    #[test]
+    fn a_virtual_desktop_host_is_not_a_consent_surface() {
+        const KEYS: [&str; 2] = ["ROOMLERD_VIRTUAL_DESKTOP", "ROOMLER_AGENT_VIRTUAL_DESKTOP"];
+        let saved: Vec<_> = KEYS.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        // SAFETY (edition 2024): no other test in this crate touches these.
+        unsafe {
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
+            assert!(
+                !display_is_our_own_virtual_desktop(),
+                "unset must not suppress the panel — an ordinary Linux desktop"
+            );
+            for k in KEYS {
+                std::env::set_var(k, "1");
+                assert!(display_is_our_own_virtual_desktop(), "{k}=1 must decline");
+                std::env::set_var(k, "true");
+                assert!(
+                    display_is_our_own_virtual_desktop(),
+                    "{k}=true must decline"
+                );
+                std::env::set_var(k, "0");
+                assert!(
+                    !display_is_our_own_virtual_desktop(),
+                    "{k}=0 is off, not on"
+                );
+                std::env::remove_var(k);
+            }
+            for (k, v) in saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
 }
