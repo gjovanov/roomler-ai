@@ -389,6 +389,8 @@ impl ConsentBroker {
             session = session_hex,
             timeout_secs = timeout.as_secs(),
             sentinel_dir = %self.inner.sentinel_dir.display(),
+            // RETIRED-NAME-ANCHOR: naming the retired binary is the POINT —
+            // this comment records which spelling was wrong and why.
             // FR-21 retired `roomler-agent`; this line is the ONLY guidance a
             // headless operator gets, and naming a binary that no longer
             // exists makes it worse than silence. Field-caught on mars
