@@ -28,9 +28,9 @@ pub struct TunnelConfig {
     pub machine_name: String,
 }
 
-/// Resolve the default per-user config path. On Windows this lands at
 // RETIRED-NAME-ANCHOR(4): ProjectDirs segment holding the ENROLLED credential on
 // tunnel-only hosts.
+/// Resolve the default per-user config path. On Windows this lands at
 /// `%APPDATA%\roomler\roomler-tunnel\config.toml`; on Linux/macOS the
 /// `directories` crate's `ProjectDirs::config_dir()` is honoured.
 pub fn default_config_path() -> Result<PathBuf> {

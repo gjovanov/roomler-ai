@@ -280,12 +280,12 @@ fn install_flavour(origin: Option<&std::path::Path>) -> crate::updater::WindowsI
     }
 }
 
+// RETIRED-NAME-ANCHOR(4): names the folder hosts installed BEFORE P4b; the
+// migration reads it, so the old name is the input, not a leftover.
 /// Installer exited 0 — give the FS a moment to settle, then run the
 /// new binary's `--version`. Through rc.194 the watcher's own
 /// current_exe path was ALSO the path the installer wrote to (msiexec
 /// replaced the file in place while we were running; our memory map
-// RETIRED-NAME-ANCHOR(4): names the folder hosts installed BEFORE P4b; the
-// migration reads it, so the old name is the input, not a leftover.
 /// stayed valid). P4b renamed the install folder (`roomler-agent` →
 /// `Roomler`), so on the rename hop the watcher — spawned from the OLD
 /// directory — only ever sees the stale pending-delete binary at its
@@ -500,12 +500,12 @@ fn ensure_service_running(
     }
 }
 
+// RETIRED-NAME-ANCHOR(4): same pre-P4b folder — the watcher must run from
+// the directory being vacated, which still carries the retired name.
 /// P4b folder-rename fallback: probe the daemon at the RENAMED
 /// install directory for this flavour
 /// (`…\Roomler\roomlerd.exe`) when the own-path probe couldn't
 /// verify the expected version. On the rename-hop upgrade the
-// RETIRED-NAME-ANCHOR(4): same pre-P4b folder — the watcher must run from
-// the directory being vacated, which still carries the retired name.
 /// watcher runs from the vacated `roomler-agent\` directory, so its
 /// own path never sees the freshly-installed binary. Record-only,
 /// like the rest of the watcher: a version match here upgrades the

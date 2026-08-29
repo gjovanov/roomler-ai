@@ -65,6 +65,8 @@ pub const LOW_WATER_MARK_BYTES: usize = 1024 * 1024;
 /// never filled a whole chunk worked fine. Was `64 * 1024` (= 65536).
 pub const CHUNK_BYTES: usize = u16::MAX as usize;
 
+// RETIRED-NAME-ANCHOR(24): a field observation, recorded under the name the
+// binary had when it was measured. Rewriting it would misreport history.
 /// Per-flow inbound mailbox capacity (in messages, not bytes). When
 /// the receiver is slow, the [`FlowDemux::on_message`] handler awaits
 /// `send` — cascading backpressure into the DC read loop and (via
@@ -73,8 +75,6 @@ pub const CHUNK_BYTES: usize = u16::MAX as usize;
 /// rc.66 bump: 256 → 4096. Field-test 2026-05-27 with TDS bulk read
 /// stalled at ~50 KB/s effective throughput while SCTP was happily
 /// acknowledging at 1-2 MB/s; arwnd closed monotonically and
-// RETIRED-NAME-ANCHOR(24): a field observation, recorded under the name the
-// binary had when it was measured. Rewriting it would misreport history.
 /// `roomler-tunnel.exe` was at 0% CPU (so not busy-loop, not lock
 /// contention — purely I/O-bound waiting for the local app to
 /// drain). With 4096 × ~64 KiB chunks the per-flow buffer ceiling

@@ -1,3 +1,5 @@
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
+// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! Resolve the active-session user's profile directory from a
 //! SystemContext worker.
 //!
@@ -29,8 +31,6 @@
 //!    or whatever; empty string if no user is logged in.
 //! 3. Build `C:\Users\<username>\AppData\Roaming\roomler\
 //!    roomler\config\config.toml` (a host installed before the
-// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
-// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //!    rename keeps `roomler-agent` there, so both are tried — see
 //!    `config_candidates_under`). Uses the standard Win11
 //!    profile location; fails gracefully (returns `None`) if the
