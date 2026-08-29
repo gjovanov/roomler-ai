@@ -856,6 +856,17 @@ pub fn server_relay_strategy_enabled() -> bool {
     crate::env::flag("OVERLAY_SERVER_RELAY_STRATEGY", true)
 }
 
+/// FR-19 P4b — ride a tenant-owned org relay when the server mints a session
+/// for a pair (`docs/fr/FR-19-peer-relays.md`). Advertised on the join as
+/// `supports_org_relay`, so a build with this off is never pushed a session.
+///
+/// **Opt-in**: only `1|true|yes|on` enables it. The client half of a new
+/// carrier kind ships dark and is switched on per host during the field
+/// program, exactly as `relay_server_enabled` (its serving half) does.
+pub fn org_relay_enabled() -> bool {
+    crate::env::flag("OVERLAY_ORG_RELAY", false)
+}
+
 /// Phase A (overlay v3) — DERP always-on floor: open this node's central
 /// `/derp` mux at startup UNCONDITIONALLY (not just when the srflx gather
 /// came up empty), advertise `supports_derp_floor`, and (A2) install the
