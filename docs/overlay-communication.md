@@ -251,6 +251,7 @@ flowchart TD
 | 3 | srflx hole-punch | UDP, punch socket | both NAT'd, not both symmetric | `SRFLX` (**on**, rc.200) |
 | 4 | single-relay | 1 coturn alloc + raw dialer, QUIC | ≥1 side UDP-capable | `RELAY_SINGLE` (**on**, rc.200) |
 | 5 | **DERP** | `/derp` WSS, pubkey-addressed | **both** UDP-blocked | `DERP` (**on**, rc.203) |
+| 5′ | **org relay** (FR-19) | a tenant-owned `roomlerd` forwarding WG ciphertext on UDP 3478, Geneve-framed | the server **minted a session** for the pair — org switch on, an ACL rule granting each member the relay node, an approved + serving relay. A relay *kind* beside TURN/DERP on the relay tier, not a new tier | `ORG_RELAY` (off) |
 | — | both-allocate | 2 coturn allocations | mixed capability / fall-through | always available |
 
 Every gate accepts `0`/`false`/`no`/`off` to disable. Each direct tier carries
@@ -408,6 +409,24 @@ falls back to two coturn allocations. This path is cross-NAT fragile: it needs
 both allocations on the **same** coturn worker, and a worker-co-location failure
 was the root cause of the historic `REKEY_TIMEOUT`. Tiers 4 and 5 exist largely
 to avoid it.
+
+### UC-7 · Org relay (FR-19)
+
+A pair that would otherwise sit on TURN or DERP can be routed through a node the
+**org itself** owns — an HQ box with a public address — so relayed traffic never
+crosses the API pod. The server decides (`docs/fr/FR-19-peer-relays.md` §1–§7):
+on a `relay_request` it checks the org switch, the ACL grant for **each** member
+to the relay node, an approved relay that is online and advertising
+`relay-server`, and the per-(requester, relay) ceiling; then it pushes
+`relay_serve` to the relay (both members' bind secrets) and `relay_session` to
+each member (its own secret, the relay's endpoints). Each member binds with a
+3-way authenticated handshake (`tag₁` covers no address — a NAT'd member cannot
+know its mapping on its first packet; the cookie binds it at the challenge) and
+installs an `OrgRelayConn` as a raw relay carrier: `relay:org/udp` in `roomler
+peers`. Revocation is a **push** (org off, an ACL edit, approval cleared, a
+party gone), because the idle deadline never fires under a WireGuard keepalive.
+Sessions are 24-bit VNIs unique **per relay node**, capped at 64 per relay, 1 h
+absolute lifetime. The floor is untouched: a node with no UDP stays on DERP.
 
 ---
 
@@ -613,6 +632,7 @@ prefix is still honoured.
 | `…_SRFLX_KEEPALIVE_SECS` | 20 | STUN keepalive holding the mapping open |
 | `…_RELAY_SINGLE` | on | single-relay tier |
 | `…_DERP` | **on** since rc.203 | DERP tier |
+| `…_ORG_RELAY` | off | ride a tenant-owned org relay when the server mints a session for a pair (FR-19 P4b); serving is `RELAY_SERVER_ENABLED` |
 | `…_PATHMON` | **on** | path-monitor telemetry (`on`/`shadow`/`off`). Selection is always monitor-driven since rc.282 — non-`on` values only silence the 10-min decision summaries |
 | `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts; off = 2 s blind tick only |
 | `…_ROUTE_TICK_SECS` | 30 | route-guard heartbeat seconds while the subscription is live (2–300; `2` = pre-demotion cadence). Ignored — always 2 s — without a live subscription |
