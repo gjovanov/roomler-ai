@@ -1,74 +1,160 @@
-# Contributor Licence Agreement
+# Roomler Individual Contributor Licence Agreement
 
-> ⚠️ **Draft — not yet in force.** This text has not been reviewed by a lawyer.
-> Do not activate the CLA bot against it, and do not treat a signature on this
-> version as binding. Tracked in FR-24 P3.
+**Version 1.0**
 
-By contributing to Roomler you agree to the terms below. It is deliberately
-short, and it is modelled on the widely-used Apache ICLA rather than being
-invented here.
+> **Status: awaiting legal review.** The terms below are adapted from the
+> **Apache Software Foundation Individual CLA v2.0**, which is widely used and
+> has been lawyer-drafted; the changes are limited to naming G ROX EOOD as the
+> recipient and §2's relicensing grant, which the Apache original does not need
+> and this project does. It has **not** been reviewed by a lawyer for Bulgarian
+> law. Do not enable the CLA bot against this version — see
+> `.github/workflows/cla.yml`, which is deliberately disabled.
 
-## Why this exists
+Thank you for your interest in Roomler, a project of **G ROX EOOD** ("we" or
+"us").
 
-Roomler is split-licensed (AGPL server, MPL client) and sells exceptions to the
-AGPL — see [COMMERCIAL.md](../COMMERCIAL.md). Selling an exception requires the
-right to license the whole work under other terms.
+This agreement clarifies the intellectual-property licence granted with
+Contributions from any person or entity. It is for your protection as much as
+ours: it does **not** change your rights to use your own Contributions for any
+other purpose.
 
-Today that is trivially satisfied: the project has exactly one contributor. It
-stops being satisfied the moment the **first** outside contribution lands
-without a CLA — at which point dual licensing becomes impossible without going
-back and asking every contributor individually, which is precisely the trap this
-document exists to avoid. That is why it is being put in place while it costs
-nothing.
+You accept and agree to the following terms for Your present and future
+Contributions submitted to us. Except for the licences granted here, You reserve
+all right, title and interest in and to Your Contributions.
 
-## Terms
+## 1. Definitions
 
-**1. Definitions.** "You" means the copyright owner making a Contribution.
-"Contribution" means any work of authorship you intentionally submit to this
-project.
+**"You"** (or **"Your"**) means the copyright owner, or the legal entity
+authorised by the copyright owner, that is entering into this Agreement. For
+legal entities, the entity making a Contribution and all other entities that
+control, are controlled by, or are under common control with that entity are
+considered a single Contributor. "Control" means (i) the power, direct or
+indirect, to cause the direction or management of such entity, whether by
+contract or otherwise, or (ii) ownership of fifty percent (50%) or more of the
+outstanding shares, or (iii) beneficial ownership of such entity.
 
-**2. Copyright licence.** You grant G ROX EOOD a perpetual, worldwide,
-non-exclusive, royalty-free, irrevocable copyright licence to reproduce,
-prepare derivative works of, publicly display and perform, sublicense and
-distribute your Contribution and such derivative works, **under any licence
-terms, including proprietary terms**.
+**"Contribution"** means any original work of authorship, including any
+modifications or additions to an existing work, that is intentionally submitted
+by You to us for inclusion in, or documentation of, any of the products we own
+or manage (the "Work"). "Submitted" means any form of electronic, verbal or
+written communication sent to us or our representatives, including but not
+limited to communication on electronic mailing lists, source-code control
+systems and issue-tracking systems that are managed by, or on behalf of, us for
+the purpose of discussing and improving the Work — but excluding communication
+that is conspicuously marked, or otherwise designated in writing by You, as
+**"Not a Contribution."**
 
-**3. Patent licence.** You grant G ROX EOOD and recipients of the software a
-perpetual, worldwide, non-exclusive, royalty-free, irrevocable patent licence to
-make, use, sell, offer to sell, import and otherwise transfer your Contribution,
-limited to those patent claims necessarily infringed by your Contribution alone
-or by its combination with this project.
+## 2. Grant of Copyright Licence
 
-If you institute patent litigation alleging that this project or a Contribution
-constitutes patent infringement, any patent licences granted to you under this
-agreement terminate as of the date such litigation is filed.
+Subject to the terms of this Agreement, You hereby grant to G ROX EOOD and to
+recipients of software distributed by us a perpetual, worldwide, non-exclusive,
+no-charge, royalty-free, irrevocable copyright licence to reproduce, prepare
+derivative works of, publicly display, publicly perform, sublicense and
+distribute Your Contributions and such derivative works.
 
-**4. You retain your rights.** You keep all right, title and interest in your
-Contribution. This agreement is a licence, **not an assignment** — you may use
-your own Contribution however you like, including in other projects.
+**You further grant G ROX EOOD the right to license Your Contributions under
+terms of our choosing, including licences that differ from the licence the
+Contribution was submitted under and including proprietary terms.**
 
-**5. Your representations.** You represent that each Contribution is your
-original creation, and that you are legally entitled to grant the above
-licences. If your employer has rights to work you create, you represent that you
-have permission to contribute, or that your employer has waived those rights.
+> *Why §2 has a second paragraph.* Roomler is split-licensed — AGPL-3.0-only on
+> the control plane, MPL-2.0 on everything installed on a machine — and sells
+> exceptions to the AGPL (see [COMMERCIAL.md](../COMMERCIAL.md)). Selling an
+> exception requires the right to license the whole work under other terms. This
+> paragraph, and only this paragraph, is what makes that possible. Without it,
+> dual licensing becomes impossible the moment the first outside contribution
+> lands, and re-obtaining it means tracking down every contributor individually.
+> Nothing here lets us take away *your* rights: §5 keeps them.
 
-You may submit work that is not your original creation only if it is clearly
-identified as such, together with its source and licence.
+## 3. Grant of Patent Licence
 
-**6. No warranty.** Contributions are provided "as is", without warranty of any
-kind, express or implied.
+Subject to the terms of this Agreement, You hereby grant to G ROX EOOD and to
+recipients of software distributed by us a perpetual, worldwide, non-exclusive,
+no-charge, royalty-free, **irrevocable** (except as stated in this section)
+patent licence to make, have made, use, offer to sell, sell, import and
+otherwise transfer the Work.
 
-**7. Notify us of changes.** If any representation above becomes inaccurate, you
-agree to tell us.
+This licence applies only to those patent claims licensable by You that are
+necessarily infringed by Your Contribution alone, or by combination of Your
+Contribution with the Work to which it was submitted.
 
-## Signing
+If any entity institutes patent litigation against You or any other entity —
+including a cross-claim or counterclaim in a lawsuit — alleging that Your
+Contribution, or the Work to which You have contributed, constitutes direct or
+contributory patent infringement, then any patent licences granted to that
+entity under this Agreement for that Contribution or Work shall terminate as of
+the date such litigation is filed.
 
-The CLA assistant will comment on your first pull request with a link. Signing
-is a one-time action that covers all your future contributions.
+## 4. You are legally entitled to grant this
 
-Questions: **legal@roomler.ai**
+You represent that You are legally entitled to grant the above licences. If Your
+employer has rights to intellectual property that You create — including Your
+Contributions — You represent that You have received permission to make
+Contributions on behalf of that employer, that Your employer has waived such
+rights for Your Contributions, or that Your employer has executed a separate
+Corporate CLA with us.
+
+## 5. Your Contributions are Your own work
+
+You represent that each of Your Contributions is Your original creation (see §7
+for submissions on behalf of others), and that Your Contribution submissions
+include complete details of any third-party licence or other restriction —
+including related patents, trademarks and licence agreements — of which You are
+personally aware and which are associated with any part of Your Contributions.
+
+**You retain all right, title and interest in Your Contributions.** This
+Agreement is a **licence, not an assignment**: You may continue to use Your own
+Contributions for any purpose, including in other projects, under any terms You
+choose.
+
+## 6. No warranty
+
+You are not expected to provide support for Your Contributions, except to the
+extent You desire to provide support. You may provide support for free, for a
+fee, or not at all. Unless required by applicable law or agreed to in writing,
+You provide Your Contributions on an **"AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND**, either express or implied, including, without
+limitation, any warranties or conditions of TITLE, NON-INFRINGEMENT,
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+## 7. Work that is not Your original creation
+
+Should You wish to submit work that is not Your original creation, You may
+submit it to us separately from any Contribution, identifying the complete
+details of its source and of any licence or other restriction — including
+related patents, trademarks and licence agreements — of which You are personally
+aware, and conspicuously marking the work as **"Submitted on behalf of a
+third-party: [named here]"**.
+
+## 8. Notify us of changes
+
+You agree to notify us of any facts or circumstances of which You become aware
+that would make these representations inaccurate in any respect.
+
+## 9. Governing law
+
+This Agreement is governed by the laws of the **Republic of Bulgaria**, without
+regard to its conflict-of-law provisions. *(⚠️ Choice of forum and any consumer
+protections that cannot be waived are among the points needing legal review.)*
 
 ---
 
+## How to sign
+
+The CLA assistant comments on your first pull request with a link. Signing is a
+one-time action covering all your future contributions.
+
+## Contributing on behalf of a company
+
+If you are contributing as part of your employment and your employer holds
+rights to your work, we need a **Corporate CLA** instead — write to
+**legal@roomler.ai** and we will send one.
+
+---
+
+Questions: **legal@roomler.ai**
+
 G ROX EOOD · Plovdivska 110, 4400 Pazardzhik, Bulgaria · UIC 205174895 ·
 VAT BG205174895 · represented by Goran Jovanov, Manager
+
+*Adapted from the Apache Software Foundation Individual Contributor Licence
+Agreement v2.0, used under the Apache License 2.0.*
