@@ -2554,11 +2554,9 @@ async fn media_pump(
                 damage_tracked_frames.saturating_sub(heartbeat_damage_frames_base);
             let damage_permille_window =
                 damage_permille_sum.saturating_sub(heartbeat_damage_permille_base);
-            let avg_damage_permille = if damage_frames_window > 0 {
-                damage_permille_window / damage_frames_window
-            } else {
-                0
-            };
+            let avg_damage_permille = damage_permille_window
+                .checked_div(damage_frames_window)
+                .unwrap_or(0);
             info!(
                 %session_id,
                 backend,
