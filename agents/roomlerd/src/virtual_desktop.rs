@@ -80,15 +80,7 @@ pub fn start(cfg: &Config) -> Result<VirtualDesktop> {
     let mut children = Vec::new();
 
     let xvfb = Command::new("Xvfb")
-        .args([
-            dpy.as_str(),
-            "-screen",
-            "0",
-            &format!("{w}x{h}x24"),
-            "-ac",
-            "-nolisten",
-            "tcp",
-        ])
+        .args(xvfb_args(&dpy, w, h))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -135,6 +127,40 @@ pub fn start(cfg: &Config) -> Result<VirtualDesktop> {
         display: dpy,
         children,
     })
+}
+
+/// The Xvfb command line for one virtual desktop.
+///
+/// Extracted from `start` so the flags are assertable — the screen-saver
+/// disable below is invisible at runtime until it has already cost someone a
+/// black screen, which is not a thing to leave un-locked.
+fn xvfb_args(display: &str, w: u32, h: u32) -> Vec<String> {
+    vec![
+        display.to_string(),
+        "-screen".into(),
+        "0".into(),
+        format!("{w}x{h}x24"),
+        // No access control: the agent may run as root while the desktop is
+        // owned by another user, and this is a loopback-only server.
+        "-ac".into(),
+        "-nolisten".into(),
+        "tcp".into(),
+        // A remote-desktop host must never blank itself. X's BUILT-IN screen
+        // saver defaults to ~10 minutes and there is no local keyboard here to
+        // wake it, so without this the operator eventually connects to a black
+        // screen — and capture reports it faithfully, which reads as a broken
+        // stream rather than a blanked one. `-s 0` disables that timeout.
+        //
+        // Deliberately NOT `-dpms`: Xvfb has no DPMS extension at all
+        // (`Xlib: extension "DPMS" missing` on the display it serves), so the
+        // flag would be inert noise. And this reaches the X SERVER only — a
+        // full DE started through VIRTUAL_DESKTOP_WM/_STARTUP brings its own
+        // screensaver (xfce4-screensaver blanked and then LOCKED a field host
+        // on 2026-08-29, costing a measurement round), which is that DE's
+        // setting to turn off and not something a server flag can reach.
+        "-s".into(),
+        "0".into(),
+    ]
 }
 
 /// Confirm the required binaries exist, else bail with the apt line.
@@ -218,6 +244,34 @@ fn wait_display_ready(display: &str, timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// The screen-saver disable is the whole point of this argv and is
+    /// invisible at runtime until it has already blanked someone's session,
+    /// so assert it as a pair rather than trusting the flag survived an edit.
+    #[test]
+    fn xvfb_args_disable_the_builtin_screen_saver() {
+        let a = xvfb_args(":99", 1920, 1080);
+        let i = a
+            .iter()
+            .position(|s| s == "-s")
+            .expect("Xvfb must be told to disable the screen saver");
+        assert_eq!(
+            a.get(i + 1).map(String::as_str),
+            Some("0"),
+            "-s must be 0 (disabled); any other value is a TIMEOUT, not a disable"
+        );
+        // -dpms would be inert here: Xvfb ships no DPMS extension.
+        assert!(!a.iter().any(|s| s == "-dpms"));
+    }
+
+    #[test]
+    fn xvfb_args_carry_the_display_and_geometry() {
+        let a = xvfb_args(":7", 1280, 720);
+        assert_eq!(a.first().map(String::as_str), Some(":7"));
+        assert!(a.iter().any(|s| s == "1280x720x24"), "got {a:?}");
+        assert!(a.iter().any(|s| s == "-ac"));
+    }
 
     #[test]
     fn parse_resolution_parses_and_falls_back() {
