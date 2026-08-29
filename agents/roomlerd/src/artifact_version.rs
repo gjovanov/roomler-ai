@@ -557,6 +557,8 @@ mod tests {
         );
     }
 
+    // RETIRED-NAME-ANCHOR(2): names a PUBLISHED release asset. Filenames are fixed by
+    // what is already on GitHub Releases (FR-21 D6) — this is a real downloaded file.
     /// The mapping above is derived from reading `release-agent.yml`, and a
     /// wrong reading of it would not fail loudly — it would make every agent
     /// refuse every update, which looks like nothing happening. So it is
@@ -568,8 +570,6 @@ mod tests {
     /// ```text
     /// gh release download agent-v0.3.0-rc.458 --repo gjovanov/roomler-ai \
     ///   --pattern '*perMachine*.msi' --dir /tmp
-    // RETIRED-NAME-ANCHOR(2): names a PUBLISHED release asset. Filenames are fixed by
-    // what is already on GitHub Releases (FR-21 D6) — this is a real downloaded file.
     /// ROOMLER_TEST_MSI=/tmp/roomler-agent-0.3.0-rc.458-perMachine-x86_64-pc-windows-msvc.msi \
     /// ROOMLER_TEST_MSI_TAG=agent-v0.3.0-rc.458 \
     ///   cargo test -p roomlerd --lib -- --ignored real_published_msi
