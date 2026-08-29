@@ -22,6 +22,7 @@ pub mod device_presence;
 pub mod dispatcher;
 pub mod handler;
 pub mod media_cluster;
+pub mod org_relay;
 pub mod overlay;
 pub mod rc_cluster;
 pub mod rc_relay;
