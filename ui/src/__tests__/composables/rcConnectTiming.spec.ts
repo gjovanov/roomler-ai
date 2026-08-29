@@ -7,7 +7,7 @@ import {
   STALL_SNACK_MIN_GAP_MS,
   type RcConnectTiming,
 } from '@/composables/rcConnectTiming'
-import { signalingTimeoutFor, RC_REQUEST_TIMEOUT_MS, RC_SIGNALING_TIMEOUT_MS }
+import { signalingTimeoutFor, RC_REQUEST_TIMEOUT_MS, RC_SIGNALING_TIMEOUT_MS, memoProbe }
   from '@/composables/useRemoteControl'
 
 describe('FR-22 signalling timeout table', () => {
@@ -302,5 +302,35 @@ describe('FR-22 pre-flight is inside the measured window', () => {
     const v = describeConnectTiming({ attempt: 1, afterDrop: false, marks: {} })
     expect(v.text).toContain('connecting to the signalling server')
     expect(v.text).toContain('stalled at ws_ready')
+  })
+})
+
+describe('FR-22 probe memoisation', () => {
+  it('runs the underlying probe once, even for concurrent callers', async () => {
+    // ⚠️ Measured, not assumed: a reconnect showed `probes_ready: +1878 ms`
+    // — 45% of that connect's 4216 ms TTFF — while other connects in the
+    // same page showed 7-8 ms for identical work. connect() fires seven
+    // of these on EVERY attempt and nothing cached them.
+    let calls = 0
+    const slow = memoProbe(async () => { calls++; await new Promise(r=>setTimeout(r,5)); return 'v' })
+    // Concurrent is the case that matters: connect() uses Promise.all, so
+    // a value-only cache would still start a second probe while the first
+    // was in flight — exactly the situation that is slow.
+    const [a, b] = await Promise.all([slow(), slow()])
+    expect([a, b]).toEqual(['v', 'v'])
+    expect(calls).toBe(1)
+    expect(await slow()).toBe('v')
+    expect(calls).toBe(1)
+  })
+
+  it('does not cache a rejection', async () => {
+    // Every real probe resolves false rather than throwing, so a cached
+    // rejection would be a permanent false negative. Re-probing is the
+    // safe direction if one ever does throw.
+    let n = 0
+    const flaky = memoProbe(async () => { n++; if (n === 1) throw new Error('boom'); return 'ok' })
+    await expect(flaky()).rejects.toThrow('boom')
+    expect(await flaky()).toBe('ok')
+    expect(n).toBe(2)
   })
 })
