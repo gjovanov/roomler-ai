@@ -69,10 +69,12 @@ exactly the hole the row closes.
 
 ## Registry
 
-<!-- RETIRED-NAME-ANCHOR-BEGIN
-     An FR title has to name what the FR is about, and FR-21 is about retiring
-     product names. A region rather than a per-row marker because a comment
-     BETWEEN two rows terminates the table in GFM. -->
+<!-- RETIRED-NAME-ANCHOR(22): the FR-21 row names what FR-21 retired; an FR title
+     has to say what the FR is about. Scoped to that row rather than the whole
+     table: a region ending after the LAST row put its END marker on the file's
+     final line, so every appended FR row conflicted with it — for every session,
+     not just this one. FR-21 sits at a fixed offset from the header because new
+     numbers are only ever appended below it. -->
 | FR | Issue | Title | Status |
 |---|---|---|---|
 | [FR-1](FR-1-remote-desktop-drag-smoothness.md) | [#767](https://github.com/gjovanov/roomler-ai/issues/767) | RustDesk-parity remote-desktop drag smoothness | in progress — P1–P5 shipped + field-verified (0.4.4 "Rozalina works nicely"), P6 + P7-HUD open |
@@ -106,4 +108,3 @@ exactly the hole the row closes.
 | [FR-29](FR-29-x11-damage-capture.md) | [#864](https://github.com/gjovanov/roomler-ai/issues/864) | X11 capture reads the whole screen even when nothing changed — the ~27 fps Linux ceiling | P1 field-verified — idle CPU **45.8 %→3.4 %** on `scw-m2-asahi`; motion deliberately unchanged (that is P3). ⚠️ **Renumbered from FR-28**: #865 landed its ledger row on master first, and the claim protocol makes the ledger the arbiter — "the rebase shows the number is taken before anything is published" |
 | [FR-30](FR-30-camera-state-signalling.md) | [#884](https://github.com/gjovanov/roomler-ai/issues/884) | Camera/mic state is never signalled — peers cannot see who turned their camera off | **P1+P2 shipped (#886) + field-verified 2026-08-29**: `media:producer_pause` / `producer_paused`, server pauses the mediasoup producer. Two browsers — the remote tile now goes on camera-off and returns on camera-on with no reload, and frames arriving drop **96 → 0 per 3 s** while the receiver's track stays `enabled:true/live/unmuted` **either way** (which is exactly why no client-side predicate could ever work). Unblocks the FR-25 criterion. P3 (tile indicator) open |
 | [FR-31](FR-31-opening-keyframe-budget.md) | (issue pending) | The opening keyframe of an NVENC session gets one frame's budget — ffmpeg zeroes the VBV in `cq` mode, so the constrained-profile first frame is a 5.6 KB max-QP smear that inter frames repair over ~1.2 s | P0 measured on `neo16 → PC55331` (relayed): frame 1 = 5 616 B key, frame 3 = 117 KB inter; first-light sharpness 47 % of steady state, ×2.1 at +1.00 s. P1 (post-open `rc_buffer_size` write, knob `nvenc_open_vbv_pct`, `0` = off) designed; default from an A/B on the relay stand-in |
-<!-- RETIRED-NAME-ANCHOR-END -->
