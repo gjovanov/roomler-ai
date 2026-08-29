@@ -305,4 +305,6 @@ async fn refan_tenant(state: &AppState, tenant_id: ObjectId) {
         crate::ws::overlay::refan_node(state, n).await;
     }
     crate::ws::derp_acl::rebuild(state, tenant_id, network_id).await;
+    // FR-19 — a policy edit can un-grant a live relay session; revoke those.
+    crate::ws::org_relay::reconcile_acl(state, tenant_id).await;
 }
