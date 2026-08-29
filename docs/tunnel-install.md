@@ -1,11 +1,11 @@
-# Roomler Tunnel — install, setup, and test (corporate environment)
+# Roomler tunnels — install, setup, and test (corporate environment)
 
-A `roomler-tunnel` connection has three sides:
+A Roomler tunnel connection has three sides:
 
 | Side | What it does | Where it runs |
 |---|---|---|
-| **Tunnel-client** (`roomler-tunnel`) | Listens on a local TCP port on the operator's machine. Each incoming connection rides a **QUIC** stream to the agent by default (transparently falling back to a WebRTC data channel if QUIC setup fails). | Operator's laptop (Win11 / Linux / macOS) |
-| **Agent** (`roomler-agent`) | Receives the forward request, dials the destination from inside the corp network, and pumps bytes back. | A host inside the corp network with route to the destination |
+| **Tunnel-client** (`roomler`) | Listens on a local TCP port on the operator's machine. Each incoming connection rides a **QUIC** stream to the agent by default (transparently falling back to a WebRTC data channel if QUIC setup fails). | Operator's laptop (Win11 / Linux / macOS) |
+| **Agent** (`roomlerd`) | Receives the forward request, dials the destination from inside the corp network, and pumps bytes back. | A host inside the corp network with route to the destination |
 | **Server** (`roomler.ai`) | Issues JWTs, enforces the tenant ACL policy, relays SDP / ICE between the two peers (it never sees the payload). | Roomler-managed |
 
 This guide walks through the Win11-on-both-sides flavour. Linux and macOS commands are inline where they diverge.
@@ -21,7 +21,7 @@ This guide walks through the Win11-on-both-sides flavour. Linux and macOS comman
 
 ## Transport: QUIC by default, WebRTC fallback
 
-Since `roomler-tunnel` / `roomler-agent` **0.3.0-rc.118**, the data plane defaults to **QUIC** (`quic-v1`, via [quinn](https://github.com/quinn-rs/quinn)) and falls back to the original **WebRTC data channel** (`webrtc-dc-v1`) only if QUIC can't be set up. Tuned QUIC is faster than WebRTC on a relayed path and reaches the same hard networks. Choose explicitly with `--transport`:
+Since `roomler` / `roomlerd` **0.3.0-rc.118**, the data plane defaults to **QUIC** (`quic-v1`, via [quinn](https://github.com/quinn-rs/quinn)) and falls back to the original **WebRTC data channel** (`webrtc-dc-v1`) only if QUIC can't be set up. Tuned QUIC is faster than WebRTC on a relayed path and reaches the same hard networks. Choose explicitly with `--transport`:
 
 | `--transport` | Behaviour |
 |---|---|
@@ -56,7 +56,7 @@ The same machine can play both roles for smoke-testing — see §8.
 
 ## 1. Install the agent on `AGENT-CORP`
 
-The agent is the existing `roomler-agent` MSI. Download from your Roomler server (proxied through `roomler.ai` so corp AV trusts it — no `github.com` fetch in the user's network path):
+The agent is the existing `roomlerd` MSI. Download from your Roomler server (proxied through `roomler.ai` so corp AV trusts it — no `github.com` fetch in the user's network path):
 
 **Win11 (PowerShell as Administrator only if you choose perMachine):**
 
@@ -64,8 +64,8 @@ The agent is the existing `roomler-agent` MSI. Download from your Roomler server
 # perUser flavour — installs to %LOCALAPPDATA%, no UAC prompt
 Invoke-WebRequest `
   "https://roomler.ai/api/agent/installer/peruser?version=latest" `
-  -OutFile "$env:USERPROFILE\Downloads\roomler-agent.msi"
-msiexec /i "$env:USERPROFILE\Downloads\roomler-agent.msi"
+  -OutFile "$env:USERPROFILE\Downloads\roomlerd.msi"
+msiexec /i "$env:USERPROFILE\Downloads\roomlerd.msi"
 ```
 
 For unattended / fleet installs (boot-time, runs as `LocalSystem`):
@@ -73,25 +73,25 @@ For unattended / fleet installs (boot-time, runs as `LocalSystem`):
 ```powershell
 Invoke-WebRequest `
   "https://roomler.ai/api/agent/installer/permachine?version=latest" `
-  -OutFile "$env:USERPROFILE\Downloads\roomler-agent-permachine.msi"
+  -OutFile "$env:USERPROFILE\Downloads\roomlerd-permachine.msi"
 # Run elevated:
-msiexec /i "$env:USERPROFILE\Downloads\roomler-agent-permachine.msi"
+msiexec /i "$env:USERPROFILE\Downloads\roomlerd-permachine.msi"
 ```
 
 **Linux (.deb):**
 
 ```bash
-curl -fsSL -o /tmp/roomler-agent.deb \
+curl -fsSL -o /tmp/roomlerd.deb \
   "https://roomler.ai/api/agent/installer/peruser?version=latest&os=linux"
-sudo dpkg -i /tmp/roomler-agent.deb
+sudo dpkg -i /tmp/roomlerd.deb
 ```
 
 **macOS (.pkg):**
 
 ```bash
-curl -fsSL -o /tmp/roomler-agent.pkg \
+curl -fsSL -o /tmp/roomlerd.pkg \
   "https://roomler.ai/api/agent/installer/peruser?version=latest&os=macos"
-sudo installer -pkg /tmp/roomler-agent.pkg -target /
+sudo installer -pkg /tmp/roomlerd.pkg -target /
 ```
 
 ---
@@ -136,13 +136,16 @@ Verify in **Admin → Tenant → Agents** that the row turned green (`status: on
 ```powershell
 Invoke-WebRequest `
   "https://roomler.ai/api/tunnel/installer/windows-x86_64?version=latest" `
-  -OutFile "$env:USERPROFILE\Downloads\roomler-tunnel.zip"
-Expand-Archive "$env:USERPROFILE\Downloads\roomler-tunnel.zip" `
-  -DestinationPath "$env:LOCALAPPDATA\roomler-tunnel"
+  -OutFile "$env:USERPROFILE\Downloads\roomler-cli.zip"
+Expand-Archive "$env:USERPROFILE\Downloads\roomler-cli.zip" `
+  -DestinationPath "$env:LOCALAPPDATA\roomler-cli"
+# RETIRED-NAME-ANCHOR(4): the ARCHIVE directory keeps the roomler-tunnel
+# prefix by contract (release-tunnel.yml). Only the binary inside it was
+# renamed to `roomler`.
 # Optional — add to PATH:
 [Environment]::SetEnvironmentVariable(
   "Path",
-  "$env:Path;$env:LOCALAPPDATA\roomler-tunnel\roomler-tunnel-0.3.0-rc.46-x86_64-pc-windows-msvc",
+  "$env:Path;$env:LOCALAPPDATA\roomler-cli\roomler-tunnel-0.3.0-rc.46-x86_64-pc-windows-msvc",
   "User"
 )
 ```
@@ -150,34 +153,36 @@ Expand-Archive "$env:USERPROFILE\Downloads\roomler-tunnel.zip" `
 **Linux (.deb):**
 
 ```bash
-curl -fsSL -o /tmp/roomler-tunnel.deb \
+curl -fsSL -o /tmp/roomler-cli.deb \
   "https://roomler.ai/api/tunnel/installer/linux-deb?version=latest"
-sudo dpkg -i /tmp/roomler-tunnel.deb
-# `roomler-tunnel` is now on $PATH at /usr/bin/roomler-tunnel
+sudo dpkg -i /tmp/roomler-cli.deb
+# `roomler` is now on $PATH at /usr/bin/roomler
 ```
 
 **Linux (plain tarball):**
 
 ```bash
-curl -fsSL -o /tmp/roomler-tunnel.tar.gz \
+curl -fsSL -o /tmp/roomler-cli.tar.gz \
   "https://roomler.ai/api/tunnel/installer/linux-x86_64?version=latest"
-mkdir -p ~/.local/opt && tar -C ~/.local/opt -xzf /tmp/roomler-tunnel.tar.gz
-ln -sf ~/.local/opt/roomler-tunnel-*-x86_64-unknown-linux-gnu/roomler-tunnel ~/.local/bin/
+# RETIRED-NAME-ANCHOR(2): archive directory name, frozen (see above).
+mkdir -p ~/.local/opt && tar -C ~/.local/opt -xzf /tmp/roomler-cli.tar.gz
+ln -sf ~/.local/opt/roomler-tunnel-*-x86_64-unknown-linux-gnu/roomler ~/.local/bin/
 ```
 
 **macOS (universal tarball):**
 
 ```bash
-curl -fsSL -o /tmp/roomler-tunnel.tar.gz \
+curl -fsSL -o /tmp/roomler-cli.tar.gz \
   "https://roomler.ai/api/tunnel/installer/macos?version=latest"
-mkdir -p ~/.local/opt && tar -C ~/.local/opt -xzf /tmp/roomler-tunnel.tar.gz
-ln -sf ~/.local/opt/roomler-tunnel-*-universal-apple-darwin/roomler-tunnel ~/.local/bin/
+# RETIRED-NAME-ANCHOR(2): archive directory name, frozen (see above).
+mkdir -p ~/.local/opt && tar -C ~/.local/opt -xzf /tmp/roomler-cli.tar.gz
+ln -sf ~/.local/opt/roomler-tunnel-*-universal-apple-darwin/roomler ~/.local/bin/
 ```
 
 Verify:
 
 ```powershell
-roomler-tunnel --version   # → roomler-tunnel 0.3.0-rc.46
+roomler --version   # → roomler 0.4.16
 ```
 
 ---
@@ -197,6 +202,10 @@ roomler enroll `
   --name "Operator laptop"
 ```
 
+<!-- RETIRED-NAME-ANCHOR(5): the CLI resolves its config through
+     ProjectDirs::from("ai", "roomler", "roomler-tunnel"). That segment is
+     frozen: it holds the ENROLLED credential on tunnel only hosts, and
+     renaming it strands every one of them. agents/roomler-cli/src/config.rs -->
 This writes the long-lived `TunnelClient` JWT to:
 
 - Windows: `%APPDATA%\roomler\roomler-tunnel\config.toml`
@@ -332,6 +341,8 @@ Point a browser, `curl --socks5-hostname`, or any SOCKS-capable app at it. Every
 flow shows up in the same audit trail as forwards. Concepts (UDP ASSOCIATE,
 longest-prefix LAN routing, transports): [tunnels.md](tunnels.md).
 
+<!-- RETIRED-NAME-ANCHOR(4): this note EXISTS to explain the retired name, so
+     the name has to appear in it. FR-21 D6. -->
 > Naming note: the standalone binary is `roomler` (a `roomler-tunnel` alias is
 > still shipped); on daemon hosts `roomler` is a shim into `roomlerd cli` —
 > same commands either way.
@@ -345,14 +356,16 @@ longest-prefix LAN routing, transports): [tunnels.md](tunnels.md).
 **Per-flow debug logs on the tunnel-client:**
 
 ```powershell
+# RETIRED-NAME-ANCHOR: names the tracing target of pre-FR-21 builds. Renaming
+# a lib renames its target, so an operator on an older CLI needs the old one.
 $env:RUST_LOG = "roomler_cli=debug,tunnel_core=info"   # pre-FR-21 builds: roomler_tunnel=debug
 roomler forward --agent … --local 5432 --remote db.intranet:5432
 ```
 
 **Per-flow debug logs on the agent**: tail the existing log file:
 
-- Windows: `%LOCALAPPDATA%\roomler\roomler-agent\logs\roomler-agent.log`
-- Linux: `~/.cache/roomler-agent/logs/roomler-agent.log`
+- Windows: `%LOCALAPPDATA%\roomler\roomler\data\logs\roomlerd.log.<date>`
+- Linux: `~/.local/share/roomler/logs/roomlerd.log.<date>` (root daemon: `/root/.local/share/roomler/logs/`; `journalctl -u roomler` works too)
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
