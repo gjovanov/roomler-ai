@@ -1230,6 +1230,25 @@ fn print_status(s: &NodeStatus) {
         );
     }
 
+    // FR-33 — a captured LAN prefix is the other single most useful answer to
+    // "why is this LAN pair on relay?": the peer's handshakes arrive, ours
+    // leave through the VPN. Absent field = a daemon without the probe, and
+    // then NOTHING is printed (an old daemon must not read as "clear").
+    if let Some(caps) = &s.lan_captures {
+        if caps.is_empty() {
+            println!("  lan         clear (own prefixes route on-link)");
+        }
+        for c in caps {
+            let via = match &c.via_name {
+                Some(n) => format!("\"{n}\""),
+                None => format!("ifref {}", c.via),
+            };
+            println!(
+                "  lan         CAPTURED — {} leaves via {via} (owned by {}); direct on the LAN is impossible while it does",
+                c.prefix, c.owner
+            );
+        }
+    }
     // NAT-traversal — the srflx line exists because an empty srflx tier is the
     // single most useful answer to "why is every peer on relay?", and it used
     // to be invisible: both failure paths logged at debug! only.
