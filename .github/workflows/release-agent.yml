@@ -1,6 +1,15 @@
-name: Release roomler-agent
+# RETIRED-NAME-ANCHOR-BEGIN
+# Every retired name in this workflow is either a PUBLISHED release-asset name
+# (already-released files cannot be renamed, and the updater's picker matches
+# those strings) or a FROZEN install path — the RPATH-bound
+# /usr/lib/roomler-agent, the macOS .app bundle whose name keys the TCC grants,
+# or the inert roomler-agent.exe alias the deployed fleet still resolves.
+# INVARIANT: a retired name here must be a published artifact name or a path a
+# real host has. If you add one that is neither, that is a bug, not a new
+# exemption. docs/fr/FR-21
+name: Release roomlerd
 
-# Builds per-OS installers for the roomler-agent binary (MSI on Windows,
+# Builds per-OS installers for the roomlerd binary (MSI on Windows,
 # notarised .pkg on macOS, .deb on Linux). Triggered either by pushing a
 # tag matching `agent-v*` (publishes a GitHub Release) or manually via
 # workflow_dispatch (uploads workflow artifacts for 30-day retention).
@@ -201,8 +210,8 @@ jobs:
           # agents/roomlerd/src/version_sweep.rs::own_msi_version
           # (coexisting-MSI sweep — a divergence there makes an agent rank
           # its OWN install as older and uninstall itself), and the three
-          # build.rs VERSIONINFO embeds (roomler-agent, roomler-cli-shim,
-          # roomler-tunnel — `file_version`): those stamp the EXE
+          # build.rs VERSIONINFO embeds (roomlerd, roomler-cli-shim,
+          # roomler-cli — `file_version`): those stamp the EXE
           # FILEVERSION shown by Explorer/EDR inventory; a divergence there
           # is cosmetic-but-confusing (EXE claims a different version than
           # the MSI), nothing asserts it at build time.
@@ -369,7 +378,7 @@ jobs:
         # extra system dep on Linux (/dev/net/tun is in-kernel; smoltcp needs
         # nothing). Default-OFF: an agent only joins the mesh when its config
         # sets `overlay_enabled`, and netstack mode additionally needs
-        # `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>` — so shipping both
+        # `ROOMLERD_OVERLAY_NETSTACK_SOCKS=<port>` — so shipping both
         # everywhere is inert until an operator opts a host in.
         # `ffmpeg-encoder` adds the FFmpeg HEVC backend (hevc_nvenc / qsv / amf
         # / vaapi / vulkan) via the vendored FFmpeg 8.1.2 fetched above — the
@@ -1184,7 +1193,7 @@ jobs:
       - name: Encoder smoke test (FFmpeg link check + MF cascade → openh264 fallback)
         shell: pwsh
         env:
-          RUST_LOG: roomler_agent=debug,info
+          RUST_LOG: roomlerd=debug,info
         run: |
           # Probe the hardware encoder path. On windows-latest the runner
           # exposes a WARP software D3D11 device; the MS H264 Encoder MFT
@@ -1632,7 +1641,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # 2b. Windows companion — the roomler-desktop EXE, built in PARALLEL with
-  #     the MSI job. The crate deps on roomler-agent with DEFAULT features
+  #     the MSI job. The crate deps on roomlerd with DEFAULT features
   #     (`default = []`, signalling-only), so this job needs no vcpkg /
   #     FFmpeg / libvpx / LLVM — Tauri 2 + the agent-default graph build on
   #     a bare windows-latest. The MSIs never contained this EXE (it ships
@@ -1704,7 +1713,7 @@ jobs:
         shell: pwsh
         run: |
           # P3d Slice B: the tray/desktop-companion OUTPUT binary is now
-          # `roomler-desktop.exe` (package roomler-agent-tray unchanged). The
+          # `roomler-desktop.exe` (and since FR-21 P2a the package matches). The
           # released artifact is renamed to match.
           $exe = "target/release/roomler-desktop.exe"
           if (-not (Test-Path $exe)) { throw "roomler-desktop EXE not produced" }
@@ -2872,3 +2881,4 @@ jobs:
             sleep 10
           done
           echo "::warning::release cache refresh did not confirm on every pod for ${TAG}; the cache TTL will heal it within 15 min"
+# RETIRED-NAME-ANCHOR-END
