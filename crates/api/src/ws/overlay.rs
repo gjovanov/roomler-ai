@@ -1742,13 +1742,13 @@ fn is_reachable(reach: &HashMap<ObjectId, bool>, node: &OverlayNode) -> bool {
 /// Cheap to build and short-lived on purpose: netmap events are joins, leaves,
 /// endpoint trickles and admin edits — orders of magnitude rarer than the
 /// per-flow tunnel gate, so there is nothing to cache yet.
-pub(crate) struct AclCtx {
-    mode: OverlayAclMode,
-    pub(crate) policies: Vec<OverlayPolicy>,
+pub struct AclCtx {
+    pub mode: OverlayAclMode,
+    pub policies: Vec<OverlayPolicy>,
 }
 
 impl AclCtx {
-    fn off() -> Self {
+    pub fn off() -> Self {
         Self {
             mode: OverlayAclMode::Off,
             policies: Vec::new(),
@@ -1765,67 +1765,147 @@ impl AclCtx {
     }
 }
 
-/// Load the tenant's ACL posture and rules.
+/// Whether [`try_load_acl`] reads the policy rows when the tenant's mode is
+/// `Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyLoad {
+    /// Netmap shaping: under `Off` the rules are never consulted, so the read
+    /// is skipped — the pre-FR-19 read profile, byte for byte.
+    WhenGating,
+    /// FR-19 relay grants are an affirmative capability evaluated regardless
+    /// of `acl_mode` (spec §4), so the rows are needed under `Off` too.
+    Always,
+}
+
+/// Load the tenant's ACL posture and rules, surfacing a read failure to the
+/// caller instead of deciding for it.
+///
+/// This exists because "fail closed" was not expressible through
+/// [`load_acl`]: its error path returns [`AclCtx::off`], byte-identical to a
+/// tenant that genuinely has ACLs disabled, so a caller shaped like the relay
+/// gate would take the "no ACL configured" branch on a Mongo blip and GRANT
+/// while its author believed it refused (FR-19 §4). The relay mint uses this
+/// and answers `PolicyUnreadable`; the netmap path keeps its open posture via
+/// the wrapper below.
+pub async fn try_load_acl(
+    state: &AppState,
+    tenant_id: ObjectId,
+    load: PolicyLoad,
+) -> Result<AclCtx, DaoError> {
+    let mode = state
+        .overlay_networks
+        .get_or_create(tenant_id)
+        .await?
+        .acl_mode;
+    if load == PolicyLoad::WhenGating && matches!(mode, OverlayAclMode::Off) {
+        return Ok(AclCtx::off());
+    }
+    let policies = state
+        .overlay_policies
+        .list_active_for_tenant(tenant_id)
+        .await?;
+    Ok(AclCtx { mode, policies })
+}
+
+/// Load the tenant's ACL posture and rules for NETMAP shaping.
 ///
 /// **Fails OPEN, deliberately.** The tunnel gate defaults to deny because a
 /// denied flow is one broken connection; here a spurious deny would withhold
 /// every peer and tear down the tenant's whole mesh on a transient Mongo blip.
 /// The same reasoning already governs `reachability()` above ("failing open").
-/// A load failure is logged at ERROR so it is never silent.
-pub(crate) async fn load_acl(state: &AppState, tenant_id: ObjectId) -> AclCtx {
-    let mode = match state.overlay_networks.get_or_create(tenant_id).await {
-        Ok(n) => n.acl_mode,
-        Err(e) => {
-            tracing::error!(%tenant_id, %e, "overlay acl: network read failed; failing OPEN");
-            return AclCtx::off();
-        }
-    };
-    if matches!(mode, OverlayAclMode::Off) {
-        return AclCtx::off();
-    }
-    match state
-        .overlay_policies
-        .list_active_for_tenant(tenant_id)
+/// A load failure is logged at ERROR so it is never silent — and the posture
+/// is an explicit `unwrap_or_else` at the one call site that decides it, not a
+/// hidden branch inside the loader, so a reader can see which callers fail
+/// open (this one) and which do not (the relay mint).
+pub async fn load_acl(state: &AppState, tenant_id: ObjectId) -> AclCtx {
+    try_load_acl(state, tenant_id, PolicyLoad::WhenGating)
         .await
-    {
-        Ok(policies) => AclCtx { mode, policies },
-        Err(e) => {
-            tracing::error!(%tenant_id, %e, "overlay acl: policy read failed; failing OPEN");
+        .unwrap_or_else(|e| {
+            tracing::error!(%tenant_id, %e, "overlay acl: read failed; failing OPEN (netmap shaping)");
             AclCtx::off()
-        }
-    }
+        })
 }
 
-/// Resolve the identity a netmap is being built FOR: the node itself, plus the
-/// owner + roles of its backing agent / tunnel client so `UserId` / `RoleId`
-/// selectors can match.
-pub(crate) async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> OverlaySource {
+/// Resolve the identity a decision is being made FOR: the node itself, plus
+/// the owner + roles of its backing agent / tunnel client so `UserId` /
+/// `RoleId` selectors can match — or the read error, when the backing row or
+/// the membership could not be read.
+///
+/// The strict form. A `UserId`/`RoleId`-scoped grant cannot be evaluated for
+/// a node whose owner is unknown, and a caller deciding an affirmative
+/// capability (the FR-19 relay grant) must refuse rather than fall through to
+/// "matches only `AllNodes`". Netmap shaping keeps its degrading posture via
+/// [`overlay_source_of`].
+pub async fn try_overlay_source_of(
+    state: &AppState,
+    node: &OverlayNode,
+) -> Result<OverlaySource, DaoError> {
     let owner_user_id = match &node.node_ref {
+        NodeRef::Agent { agent_id } => state.agents.base.find_by_id(*agent_id).await?.owner_user_id,
+        NodeRef::TunnelClient { tunnel_client_id } => {
+            state
+                .tunnel_clients
+                .base
+                .find_by_id(*tunnel_client_id)
+                .await?
+                .owner_user_id
+        }
+    };
+    let role_ids = state
+        .tenants
+        .member_role_ids(node.tenant_id, owner_user_id)
+        .await?;
+    Ok(OverlaySource {
+        node_id: node.id.unwrap_or_default(),
+        owner_user_id: Some(owner_user_id),
+        role_ids,
+    })
+}
+
+/// [`try_overlay_source_of`] for NETMAP shaping: degrades instead of failing —
+/// an unknown owner matches only `AllNodes` / `NodeId` rules and unreadable
+/// roles match none — because a spurious error here would withhold peers.
+///
+/// Each swallowed error is LOGGED. Before FR-19 this was `.ok()` and
+/// `unwrap_or_default()`: a scoped rule silently failing to match, with no
+/// trace to explain a peer that vanished from a netmap.
+pub(crate) async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> OverlaySource {
+    let node_id = node.id.unwrap_or_default();
+    let owner = match &node.node_ref {
         NodeRef::Agent { agent_id } => state
             .agents
             .base
             .find_by_id(*agent_id)
             .await
-            .ok()
             .map(|a| a.owner_user_id),
         NodeRef::TunnelClient { tunnel_client_id } => state
             .tunnel_clients
             .base
             .find_by_id(*tunnel_client_id)
             .await
-            .ok()
             .map(|c| c.owner_user_id),
     };
+    let owner_user_id = match owner {
+        Ok(uid) => Some(uid),
+        Err(e) => {
+            warn!(%node_id, %e,
+                "overlay acl: backing row unreadable; owner-scoped rules will not match this node");
+            None
+        }
+    };
     let role_ids = match owner_user_id {
-        Some(uid) => state
-            .tenants
-            .member_role_ids(node.tenant_id, uid)
-            .await
-            .unwrap_or_default(),
+        Some(uid) => match state.tenants.member_role_ids(node.tenant_id, uid).await {
+            Ok(roles) => roles,
+            Err(e) => {
+                warn!(%node_id, %e,
+                    "overlay acl: roles unreadable; role-scoped rules will not match this node");
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     };
     OverlaySource {
-        node_id: node.id.unwrap_or_default(),
+        node_id,
         owner_user_id,
         role_ids,
     }
