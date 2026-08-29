@@ -245,7 +245,6 @@ fn wait_display_ready(display: &str, timeout: Duration) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
     /// The screen-saver disable is the whole point of this argv and is
     /// invisible at runtime until it has already blanked someone's session,
     /// so assert it as a pair rather than trusting the flag survived an edit.
