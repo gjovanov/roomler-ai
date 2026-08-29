@@ -31,6 +31,12 @@ export const useConferenceStore = defineStore('conference', () => {
   const producers = reactive<Map<string, msTypes.Producer>>(new Map())
   const consumers = reactive<Map<string, msTypes.Consumer>>(new Map())
   const remoteStreams = reactive<Map<string, RemoteStream>>(new Map())
+  // FR-30 — streamKey -> "their camera is off right now", from the peer's own
+  // `media:producer_paused`. It cannot be derived from the received track: a
+  // paused sender's track stays `live` and UNMUTED on this side (measured on
+  // prod 2026-08-29), which is why "hide participants without video" could
+  // never hide anyone.
+  const remoteVideoPaused = reactive<Map<string, boolean>>(new Map())
   const localStream = shallowRef<MediaStream | null>(null)
   const isMuted = ref(false)
   const isVideoOn = ref(true)
@@ -107,6 +113,7 @@ export const useConferenceStore = defineStore('conference', () => {
     })
     ws.onMediaMessage('media:peer_left', handlePeerLeft)
     ws.onMediaMessage('media:producer_closed', handleProducerClosed)
+    ws.onMediaMessage('media:producer_paused', handleProducerPaused)
 
     let capabilitiesPromise = ws.waitForMessage('media:router_capabilities')
     let transportPromise = ws.waitForMessage('media:transport_created')
@@ -370,6 +377,8 @@ export const useConferenceStore = defineStore('conference', () => {
     const connectionId = data.connection_id || data.user_id
     remoteStreams.delete(connectionId)
     remoteStreams.delete(`${connectionId}:screen`)
+    remoteVideoPaused.delete(connectionId)
+    remoteVideoPaused.delete(`${connectionId}:screen`)
     for (const [id, consumer] of consumers) {
       const key = consumerStreamKey.get(id)
       if (key === connectionId || key === `${connectionId}:screen`) {
@@ -395,6 +404,35 @@ export const useConferenceStore = defineStore('conference', () => {
     }
   }
 
+  /** FR-30 — a peer told us their camera/mic went off (or came back). */
+  function handleProducerPaused(data: {
+    producer_id: string
+    user_id: string
+    paused: boolean
+  }) {
+    for (const [id, consumer] of consumers) {
+      if (consumer.producerId !== data.producer_id) continue
+      // Audio pause is relayed too (same wire), but only video changes who is
+      // shown; the mic indicator reads this map's audio sibling when it lands.
+      if (consumer.kind !== 'video') break
+      const key = consumerStreamKey.get(id)
+      if (key) remoteVideoPaused.set(key, data.paused)
+      break
+    }
+  }
+
+  /** FR-30 — tell the room, so peers can hide/annotate our tile. */
+  function signalProducerPaused(kind: 'audio' | 'video', paused: boolean) {
+    const producer = producers.get(kind)
+    if (!producer || !roomId.value) return
+    const ws = useWsStore()
+    ws.send('media:producer_pause', {
+      room_id: roomId.value,
+      producer_id: producer.id,
+      paused,
+    })
+  }
+
   function toggleMute() {
     isMuted.value = !isMuted.value
     const audioProducer = producers.get('audio')
@@ -407,6 +445,7 @@ export const useConferenceStore = defineStore('conference', () => {
         t.enabled = !isMuted.value
       })
     }
+    signalProducerPaused('audio', isMuted.value)
   }
 
   function toggleVideo() {
@@ -421,6 +460,7 @@ export const useConferenceStore = defineStore('conference', () => {
         t.enabled = isVideoOn.value
       })
     }
+    signalProducerPaused('video', !isVideoOn.value)
   }
 
   async function startScreenShare() {
@@ -498,6 +538,7 @@ export const useConferenceStore = defineStore('conference', () => {
     }
 
     remoteStreams.clear()
+    remoteVideoPaused.clear()
     device.value = null
     consumeChain = Promise.resolve()
 
@@ -505,6 +546,7 @@ export const useConferenceStore = defineStore('conference', () => {
     ws.offMediaMessage('media:new_producer')
     ws.offMediaMessage('media:peer_left')
     ws.offMediaMessage('media:producer_closed')
+    ws.offMediaMessage('media:producer_paused')
 
     // Reset state
     isInCall.value = false
@@ -640,6 +682,7 @@ export const useConferenceStore = defineStore('conference', () => {
     producers,
     consumers,
     remoteStreams,
+    remoteVideoPaused,
     localStream,
     isMuted,
     isVideoOn,
