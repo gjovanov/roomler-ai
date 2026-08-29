@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <div class="conference-root">
     <div class="conference-row">
@@ -298,6 +300,7 @@ const layoutCtrl = useConferenceLayout(
   activeSpeakerKeyRef,
   getDisplayName,
   localDisplayName,
+  conferenceStore.remoteVideoPaused,
 )
 
 const layoutComponent = computed<Component>(() => {

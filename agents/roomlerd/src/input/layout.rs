@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an
 // operator with it in a script needs to be able to grep for it.
 //! Windows keyboard-layout awareness + auto-switch (rc.227).

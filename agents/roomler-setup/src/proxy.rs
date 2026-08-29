@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Proxy-base resolution for the unified wizard — the identity half
 //! the legacy wrappers kept per-crate, re-owned by this app.
 //!

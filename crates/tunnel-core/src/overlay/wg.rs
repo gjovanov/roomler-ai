@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Userspace WireGuard device (boringtun) bridged to a pluggable
 //! carrier.
 //!
@@ -2974,6 +2976,7 @@ mod tests {
             supports_derp: false,
             supports_forced_derp: false,
             supports_derp_floor: false,
+            supports_org_relay: false,
             caps: None,
             supports_overlay_echo: false,
             relay_strategy: None,

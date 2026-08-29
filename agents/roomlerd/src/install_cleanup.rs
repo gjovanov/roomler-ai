@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR-BEGIN
 // This whole module EXISTS to clean up pre-rename installs. Every retired
 // name in it is something it must still recognise on a host that has one: the

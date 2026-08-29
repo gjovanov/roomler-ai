@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Serde helpers to pin ObjectId fields on the `rc:*` wire format to raw
 //! 24-character hex strings — matching the REST responses and what the
 //! browser/agent code can reasonably produce.

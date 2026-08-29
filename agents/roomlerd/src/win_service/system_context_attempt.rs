@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Telemetry sink for the rc.44 SystemContext automation slice.
 //!
 //! When the WiX `EnableSystemContext` / `DisableSystemContext` /
