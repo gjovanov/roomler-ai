@@ -381,7 +381,7 @@ jobs:
           # cmake_minimum_required(VERSION < 3.5); CMake 3.31+ errors without
           # this policy shim.
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server"
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server,viewer-indicator-x11"
 
       # P3e Phase 2: the .deb's `roomler` is now the CLI SHIM (re-execs
       # `roomlerd cli`) — the Linux twin of the rc.365 MSI change. It must
@@ -490,6 +490,26 @@ jobs:
         working-directory: agents/roomlerd
         run: cargo deb --no-build --no-strip
 
+      # FR-27 — the headless fleet must not grow a desktop stack.
+      #
+      # The companion ships as its OWN .deb (below) precisely so that k8s
+      # workers, build hosts and relays never pull webkit2gtk/GTK to run a
+      # menu-bar app they cannot display. That separation is one careless
+      # `depends` edit away from being undone, and the regression would be
+      # invisible until someone watched an `apt upgrade` on a server pull 200 MB
+      # of X11. Assert it here, where it is cheap.
+      - name: Guard — the daemon .deb stays headless
+        working-directory: agents/roomlerd
+        run: |
+          set -euo pipefail
+          deb=$(ls target/debian/roomlerd_*_amd64.deb | head -n1)
+          depends=$(dpkg-deb -f "$deb" Depends)
+          echo "roomlerd Depends: $depends"
+          if echo "$depends" | grep -qiE 'webkit|gtk|appindicator|libx11|wayland'; then
+            echo "::error::the roomlerd .deb grew a desktop dependency — the companion belongs in its own package (FR-27)"
+            exit 1
+          fi
+
       - name: Rename + checksum
         id: pack
         shell: bash
@@ -504,6 +524,46 @@ jobs:
           # Renaming it is a separate decision with its own blast radius.
           src=$(ls target/debian/roomlerd_*_amd64.deb | head -n1)
           dst="roomler-agent-${version}-x86_64-unknown-linux-gnu.deb"
+          mv "$src" "$dst"
+          sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
+          echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
+
+      # FR-27 — the Linux desktop companion, as a SEPARATE package.
+      #
+      # Until now `roomler-desktop` shipped for Windows and macOS only
+      # (`install.sh` said so out loud), which meant a Linux desktop had no
+      # consent prompt and no "being viewed" indicator at all — the daemon's
+      # native overlay is Windows-only. It already COMPILED on Linux (workspace
+      # clippy in ci.yml walks it with webkit2gtk installed); only packaging
+      # was missing.
+      - name: Install desktop build deps (companion only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev
+
+      - name: Build the desktop companion
+        run: cargo build -p roomler-desktop --release
+
+      - name: Build the companion .deb
+        working-directory: agents/roomler-desktop
+        run: cargo deb --no-build --no-strip
+
+      - name: Rename + checksum (companion .deb)
+        id: pack_desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          # cargo-deb writes to the WORKSPACE target dir, but pin that with a
+          # find rather than a guess: a wrong path here fails the whole release
+          # job at its last step.
+          src=$(find . -path ./node_modules -prune -o \
+                       -name 'roomler-desktop_*_amd64.deb' -print | head -n1)
+          [ -n "$src" ] || { echo "::error::cargo deb produced no companion .deb"; exit 1; }
+          dst="roomler-desktop-${version}-x86_64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
@@ -526,6 +586,8 @@ jobs:
           path: |
             ${{ steps.pack.outputs.artifact }}
             ${{ steps.pack.outputs.artifact }}.sha256
+            ${{ steps.pack_desktop.outputs.artifact }}
+            ${{ steps.pack_desktop.outputs.artifact }}.sha256
             ${{ steps.tar.outputs.artifact }}
             ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
@@ -618,7 +680,7 @@ jobs:
       - name: Build agent (release, full + vp9-444, no ffmpeg-encoder)
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server"
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,viewer-indicator-x11"
 
       - name: Build the roomler CLI shim (shipped in the .deb alongside roomlerd)
         run: |
@@ -1917,6 +1979,23 @@ jobs:
         # Neither needs a staging line: the bundling step below walks
         # `otool -L` recursively and copies whatever the binary actually
         # links, which is why adding a library here required no change there.
+        #
+        # ⚠️ FR-27 — `viewer-indicator-macos` is deliberately NOT in this set
+        # yet, and turning it on is a decision, not a cleanup.
+        #
+        # The feature does not merely add a window: it moves tokio OFF the main
+        # thread in `main.rs`, because AppKit will not deliver a click to an
+        # Approve button while `#[tokio::main]` parks the main run loop. That
+        # is a change to how every macOS agent STARTS, and macOS updates are
+        # owned by the root helper — a daemon that fails to start cannot pull
+        # its own fix, so recovery is a manual reinstall per Mac.
+        #
+        # It compiles in CI (`macOS overlay compile check` builds
+        # `--lib --bins --features viewer-indicator-macos`), so the code is not
+        # rotting. To enable: build a `workflow_dispatch` artifact with the
+        # feature, run it on a real Mac, confirm the daemon starts AND a prompt
+        # both appears and answers — then add it here. Until then macOS prompts
+        # go to the desktop companion, which works.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder" --target aarch64-apple-darwin

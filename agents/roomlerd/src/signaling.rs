@@ -91,6 +91,17 @@ const SESSION_STATS_BUDGET: Duration = Duration::from_secs(3);
 /// unreachable anyway.
 const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// FR-27 — how long to wait for `companion::ensure_running` before deciding
+/// this host has no on-screen prompt surface.
+///
+/// Bounded because the probe shells out (`launchctl`, `loginctl`,
+/// `systemd-run`, `tasklist`) and the attended prompt is already counting down
+/// against a 30 s window the controller shares: spending a large slice of it
+/// waiting on a wedged helper would turn a slow answer into no answer. A
+/// timeout is treated as "no surface", which is the same thing the operator
+/// experiences.
+const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
+
 /// Pong-RTT degradation bound for the control WS. Field winhost-a 2026-08-15
 /// ~20:00Z: a WS that SURVIVED a corp-VPN route capture kept "working"
 /// with application round-trips over 60 s — every send completed into the
@@ -453,6 +464,11 @@ pub async fn run(
     // write lock and the LIVE `exec_enabled` as one value. Machine-wide, so the
     // SAME instance is shared by every org loop; only the primary ever applies.
     remote_cfg: crate::remote_config::RemoteConfigServices,
+    // FR-27 — the daemon-wide live-session registry, so a thin client can see
+    // "Being viewed by …" and end a session. Each loop registers its OWN kill
+    // channel per session, which is what makes a Disconnect on a multi-org
+    // daemon reach the loop that actually owns that session.
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) -> Result<()> {
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
@@ -471,13 +487,28 @@ pub async fn run(
     // One overlay handle, reused across reconnects. Failing to bring up
     // the indicator is non-fatal — the session still works, the user
     // just doesn't get the visual "you're being watched" cue.
-    let indicator = match ViewerIndicator::new(kill_tx.clone()) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(%e, "viewer-indicator init failed; continuing without overlay");
-            ViewerIndicator::disabled()
-        }
-    };
+    // FR-27 — where a NATIVE consent panel's Approve/Deny comes back. The
+    // backend never resolves consent itself: the answer lands here, the loop
+    // below feeds it to the broker, and the broker applies the gate it already
+    // has. One decision point for the native panel, the companion and the CLI
+    // — three would be three chances to disagree about whether a session was
+    // approved. A retained sender keeps the receiver from closing (same reason
+    // as `kill_tx`), so the `select!` cannot busy-spin where no panel exists.
+    let (consent_tx, mut consent_rx) = mpsc::channel::<(String, bool)>(4);
+    let indicator =
+        match ViewerIndicator::new(kill_tx.clone(), rc_sessions.clone(), consent_tx.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(%e, "viewer-indicator init failed; continuing without overlay");
+                // FR-27 — an overlay that could not start must NOT also cost the
+                // device its session registry: `disabled()` carries a private one,
+                // so rebuild the real handle around it. This is the ordinary case
+                // on macOS and Linux, where there is no native overlay at all and
+                // the companion's banner is the only one.
+                ViewerIndicator::disabled().with_registry(kill_tx.clone(), rc_sessions.clone())
+            }
+        };
+    let _consent_keepalive = consent_tx;
     // Keep the sender alive for the loop's lifetime (see above).
     let _kill_keepalive = kill_tx;
     // Operator-consent broker: created in `run_cmd` and passed in (P2b), so the
@@ -535,6 +566,7 @@ pub async fn run(
             tunnel_hub.clone(),
             &mut slowness_cycles,
             &mut kill_rx,
+            &mut consent_rx,
         )
         .await
         {
@@ -868,6 +900,8 @@ async fn connect_once(
     // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
     // (not owned) so the same receiver survives across reconnects.
     kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
+    // FR-27 — Approve/Deny from a NATIVE consent panel.
+    consent_rx: &mut mpsc::Receiver<(String, bool)>,
 ) -> Result<(), ConnectError> {
     // S6 — `tid` is the tenant-affinity key the server-front LB hashes
     // on, co-locating this agent's WS with its tenant's controllers on
@@ -1474,6 +1508,23 @@ async fn connect_once(
                 }
                 watchdog::tick(ctx.pump);
             }
+            Some((session_hex, allow)) = consent_rx.recv() => {
+                // FR-27 — an Approve/Deny from the NATIVE panel. Routed
+                // through the broker, not applied here, so it passes the same
+                // live-prompt gate as a LocalAPI or CLI decision: an answer
+                // only counts for a question the broker is actively asking,
+                // which is what makes pre-approval unrepresentable.
+                let recorded = consent_broker.record_decision(&session_hex, allow);
+                info!(
+                    session = %session_hex, allow, recorded,
+                    "native consent panel decision"
+                );
+                // Take the panel down either way. If the broker refused it,
+                // the prompt it belonged to is already over, and a panel left
+                // on screen for a resolved session is its own bug.
+                indicator.hide_prompt(&session_hex);
+                watchdog::tick(ctx.pump);
+            }
             Some(sid) = kill_rx.recv() => {
                 // Viewee clicked "Disconnect" in the on-screen overlay.
                 // Close the local peer and tell the server, which notifies
@@ -1730,6 +1781,7 @@ async fn handle_server_msg(
             chunk_framing,
             audio_enabled,
             consent_mode,
+            host_prompt_timeout_secs,
             input_mode,
             tenant_name,
         } => {
@@ -1825,7 +1877,16 @@ async fn handle_server_msg(
             // grant) so an in-prompt operator sees the visual cue
             // alongside the prompt — defence-in-depth against a sneaky
             // unattended grant.
-            indicator.show_session(session_id.to_hex(), controller_name.clone());
+            // FR-27 — the same call also publishes the session to the LocalAPI
+            // registry, so the companion's "Being viewed by …" banner and its
+            // Disconnect exist on every platform, not just the one with a
+            // native overlay.
+            indicator.show_session_full(
+                session_id,
+                controller_name.clone(),
+                permissions.wire_names(),
+                asking_org.clone().unwrap_or_default(),
+            );
             // Spawn a task to run the broker decision in the
             // background; auto-grant resolves <1ms, prompt mode can
             // take up to 30s — we MUST NOT block the WS read loop.
@@ -1833,6 +1894,17 @@ async fn handle_server_msg(
             // Phase 2 — obey the server's per-session consent directive when
             // present; fall back to the broker's startup mode (local
             // `auto_grant_session`) for an older server that sends none.
+            //
+            // FR-27 — the ON-HOST window is `host_prompt_timeout_secs`, not
+            // `consent_timeout_secs`. They coincide for a plain attended
+            // prompt and diverge for `prompt_then_email`, whose session waits
+            // minutes for the owner's emailed link while the modal on this
+            // screen has no business standing there that long. An older server
+            // sends no split, and then the two are the same thing — the
+            // pre-FR-27 behaviour, byte for byte.
+            let host_window = std::time::Duration::from_secs(
+                host_prompt_timeout_secs.unwrap_or(consent_timeout_secs) as u64,
+            );
             let directed_mode: Option<crate::consent::Mode> = consent_mode.map(|m| match m {
                 roomler_ai_remote_control::models::ConsentMode::Auto => {
                     crate::consent::Mode::AutoGrant
@@ -1841,14 +1913,17 @@ async fn handle_server_msg(
                 // PromptThenEmail) all resolve to an on-host prompt at the
                 // agent: the server drives the owner channels itself (Phase 4)
                 // and asks the agent to prompt as the on-console path/fallback.
-                // Bound the wait by the server-sent timeout.
                 _ => crate::consent::Mode::Prompt {
-                    timeout: std::time::Duration::from_secs(consent_timeout_secs as u64),
+                    timeout: host_window,
                 },
             });
-            // Resolve to a concrete mode (directive, else the broker's startup
-            // mode) so the .pending write and the request use the same decision.
-            let effective_mode = directed_mode.unwrap_or_else(|| consent_broker.mode());
+            // FR-27 — resolve directive AGAINST the local setting, taking the
+            // stricter. This used to be `directed_mode.unwrap_or(local)`, i.e.
+            // the directive simply won — so a device that had set
+            // `auto_grant_session = false` was silently overridden by a server
+            // `Auto`, inverting the gate-4 property exec and SSH are built on.
+            let effective_mode =
+                crate::consent::strictest_of(directed_mode, consent_broker.mode(), host_window);
             let session_hex = session_id.to_hex();
             // Phase 4 — Email/Push are OWNER-side modes: the SERVER obtains
             // consent from the device owner (email link / push), so the agent
@@ -1866,24 +1941,96 @@ async fn handle_server_msg(
             // (the agent→tray signal). Auto grants + owner-side modes write
             // nothing. The broker's poll loop removes it when the decision
             // resolves. Best-effort; a failure falls back to the CLI path.
-            if !owner_side_consent && matches!(effective_mode, crate::consent::Mode::Prompt { .. })
-            {
-                let body = serde_json::json!({
-                    "session_id": session_hex,
-                    "controller_name": controller_name,
-                    "permissions": permissions,
-                    "timeout_secs": consent_timeout_secs,
-                    // Multi-org — the tray/desktop modal renders this so the
+            //
+            // FR-27 — whether the marker landed is REMEMBERED. It is the only
+            // prompt surface this daemon has besides the CLI, so a failure to
+            // write it means no human can ever be asked, and that has to reach
+            // the controller as "nobody could be asked" rather than as a deny.
+            let will_prompt = !owner_side_consent
+                && matches!(effective_mode, crate::consent::Mode::Prompt { .. });
+            let mut have_surface = true;
+            if will_prompt {
+                // FR-27 — NATIVE surface first, companion as the fallback.
+                //
+                // The native panel is drawn by the daemon itself, so it needs
+                // no second process running, no login-session plumbing and no
+                // IPC. It exists on Windows (capture-excluded), on X11, and on
+                // macOS; it does NOT exist on a headless host, under GNOME/KDE
+                // Wayland (neither exposes `wlr-layer-shell` to arbitrary
+                // clients), or in a build without the per-OS feature — and
+                // `show_prompt` says which by returning false.
+                let native = indicator.show_prompt(crate::indicator::PromptView {
+                    session_hex: session_hex.clone(),
+                    title: "Remote control request".into(),
+                    lead: format!("{controller_name} is requesting to control this device."),
+                    detail: String::new(),
+                    permissions: permissions.wire_names(),
+                    org: asking_org.clone().unwrap_or_default(),
+                    expires_at: std::time::Instant::now() + host_window,
+                });
+                let prompt = crate::consent::PendingPrompt {
+                    kind: crate::consent::PromptKind::RemoteControl,
+                    asked_by: &controller_name,
+                    permissions: permissions.wire_names(),
+                    detail: String::new(),
+                    // The marker is written EITHER WAY — it is the
+                    // machine-readable record that a decision is outstanding,
+                    // and `roomler consent --list` must show a
+                    // natively-prompted session too. This field is what stops
+                    // the companion from ALSO popping a panel and asking the
+                    // same question twice.
+                    surface: if native {
+                        crate::consent::PromptSurface::Native
+                    } else {
+                        crate::consent::PromptSurface::Companion
+                    },
+                    // Multi-org — the desktop modal renders this so the
                     // operator can tell WHICH organization is asking. On a
                     // device enrolled in two orgs, "Alice wants to control
                     // this machine" is not enough to decide on. Absent for a
                     // single-org device (nothing useful to add).
-                    "org": asking_org,
-                })
-                .to_string();
-                if let Err(e) = consent_broker.write_pending(&session_hex, &body) {
-                    tracing::warn!(session = %session_hex, %e, "could not write .pending consent marker for tray");
+                    org: asking_org.clone().unwrap_or_default(),
+                    timeout: host_window,
+                };
+
+                if let Err(e) = consent_broker.write_prompt(&session_hex, &prompt) {
+                    // Only fatal to the SURFACE when the companion was the
+                    // plan: with a native panel already up, a human can still
+                    // answer — the marker's loss costs the CLI listing, not
+                    // the prompt.
+                    if !native {
+                        have_surface = false;
+                    }
+                    tracing::warn!(session = %session_hex, %e, native, "could not write the .pending consent marker");
                 }
+
+                if !native {
+                    // FR-27 — the marker only helps if something is READING it.
+                    // Nothing used to start the companion, so a device set to
+                    // "Prompt on host" whose operator had quit the menu-bar app
+                    // showed nothing, waited out its window, and reported a deny.
+                    //
+                    // AWAITED, not spawned: its verdict is what separates
+                    // "nobody answered" from "there is nobody to ask, and there
+                    // never was" — two outcomes with different fixes, and the
+                    // caller cannot tell them apart afterwards. Bounded so a
+                    // wedged `launchctl` / `systemd-run` cannot eat the prompt
+                    // window; a timeout means we could not confirm a surface,
+                    // which is the same answer as not having one.
+                    let companion_up = tokio::time::timeout(
+                        COMPANION_START_BUDGET,
+                        crate::companion::ensure_running(),
+                    )
+                    .await
+                    .unwrap_or(false);
+                    if !companion_up {
+                        have_surface = false;
+                    }
+                }
+                info!(
+                    session = %session_hex, native, have_surface,
+                    "consent prompt surface"
+                );
             }
             if owner_side_consent {
                 info!(
@@ -1893,20 +2040,45 @@ async fn handle_server_msg(
             } else {
                 let broker = consent_broker.clone();
                 let outbound = outbound_tx.clone();
+                let ind = indicator.clone();
                 tokio::spawn(async move {
                     let decision = broker.request_with_mode(&session_hex, effective_mode).await;
+                    // FR-27 — take the native panel down however the question
+                    // was answered: the click here, the CLI, the companion, or
+                    // the window simply expiring. This is the ONE place every
+                    // one of those paths converges, so it is the only place
+                    // that cannot miss one — a panel still on screen for a
+                    // resolved session is its own bug, and a stale Approve
+                    // button is a dangerous one.
+                    ind.hide_prompt(&session_hex);
                     let granted = decision.granted();
+                    // FR-27 — say WHY, when the answer is no. A bare `false`
+                    // reaches the controller as "the user denied your request",
+                    // which is a lie whenever the truth is that the prompt
+                    // stood unanswered, or that nothing could raise one.
+                    let reason = match decision {
+                        crate::consent::Decision::Granted => None,
+                        crate::consent::Decision::Denied => None,
+                        crate::consent::Decision::Timeout if !have_surface => Some(
+                            roomler_ai_remote_control::consent::ConsentDenyReason::NoPromptSurface,
+                        ),
+                        crate::consent::Decision::Timeout => {
+                            Some(roomler_ai_remote_control::consent::ConsentDenyReason::HostTimeout)
+                        }
+                    };
                     tracing::info!(
                         session = %session_hex,
                         ?decision,
                         ?effective_mode,
                         granted,
+                        reason = reason.map(|r| r.wire()),
                         "consent decision → sending rc:consent"
                     );
                     if let Err(e) = outbound
                         .send(ClientMsg::Consent {
                             session_id,
                             granted,
+                            reason: reason.map(|r| r.wire().to_string()),
                         })
                         .await
                     {
@@ -2729,13 +2901,77 @@ async fn handle_server_msg(
                 consent_mode,
                 Some(roomler_ai_remote_control::models::ConsentMode::Auto)
             );
-            let consent_mode = if auto {
+            let directive = if auto {
                 crate::consent::Mode::AutoGrant
             } else {
                 crate::consent::Mode::Prompt {
                     timeout: crate::consent::DEFAULT_PROMPT_TIMEOUT,
                 }
             };
+            // FR-27 — same floor as the RC path: a device that set
+            // `auto_grant_session = false` is not overridden into auto-granting
+            // a command that runs as SYSTEM/root.
+            let consent_mode = crate::consent::strictest_of(
+                Some(directive),
+                consent_broker.mode(),
+                crate::consent::DEFAULT_PROMPT_TIMEOUT,
+            );
+
+            // FR-27 — exec has ALWAYS prompted through this broker and NEVER
+            // written a marker, so its prompt reached no UI: the only way to
+            // answer one was to find the request id in the daemon log and run
+            // the CLI inside 30 s. In practice that made a non-`auto`
+            // `exec_policy` unusable rather than strict.
+            //
+            // ⚠️ The command is redacted BEFORE it goes anywhere near a marker
+            // file that a GUI will render — same redactor that scrubs exec
+            // output leaving the host, for the same reason.
+            if matches!(consent_mode, crate::consent::Mode::Prompt { .. }) {
+                let shown = crate::exec::redactor().apply(&command);
+                let detail: String = shown.chars().take(512).collect();
+                // Same multi-org rule as the RC prompt: name the asking org
+                // only on a device that serves more than one, since on a
+                // single-org device there is nothing to disambiguate.
+                // `rc:rpc.exec` carries no tenant display name, so this
+                // loop's own label is the best available.
+                let org = if !ctx.is_primary || !agent_cfg.orgs.is_empty() {
+                    ctx.label.clone()
+                } else {
+                    String::new()
+                };
+                // Native panel first, exactly as for a screen-control request
+                // — and with the command in front of whoever is deciding,
+                // because "approve SSH-ish access" and "approve `rm -rf`
+                // running as SYSTEM" are not the same question.
+                let native = indicator.show_prompt(crate::indicator::PromptView {
+                    session_hex: request_id.clone(),
+                    title: "Command execution request".into(),
+                    lead: format!("{caller} wants to run a command on this device."),
+                    detail: detail.clone(),
+                    permissions: String::new(),
+                    org: org.clone(),
+                    expires_at: std::time::Instant::now() + crate::consent::DEFAULT_PROMPT_TIMEOUT,
+                });
+                let prompt = crate::consent::PendingPrompt {
+                    kind: crate::consent::PromptKind::Exec,
+                    asked_by: &caller,
+                    permissions: String::new(),
+                    detail,
+                    org,
+                    timeout: crate::consent::DEFAULT_PROMPT_TIMEOUT,
+                    surface: if native {
+                        crate::consent::PromptSurface::Native
+                    } else {
+                        crate::consent::PromptSurface::Companion
+                    },
+                };
+                if let Err(e) = consent_broker.write_prompt(&request_id, &prompt) {
+                    tracing::warn!(%request_id, %e, native, "could not write the .pending consent marker for this command");
+                }
+                if !native {
+                    tokio::spawn(crate::companion::ensure_running());
+                }
+            }
 
             let broker = consent_broker.clone();
             let outbound = outbound_tx.clone();
@@ -2752,8 +2988,12 @@ async fn handle_server_msg(
                 // always run as the daemon and continues to.
                 run_as: crate::exec::RunAs::Daemon,
             };
+            let ind = indicator.clone();
             tokio::spawn(async move {
                 let decision = broker.request_with_mode(&request_id, consent_mode).await;
+                // FR-27 — same convergence point as the RC path: take the
+                // native panel down however the question was answered.
+                ind.hide_prompt(&request_id);
                 let outcome = if decision.granted() {
                     crate::exec::shared()
                         .run(req, &crate::exec::redactor())
