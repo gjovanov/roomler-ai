@@ -59,7 +59,7 @@ sequenceDiagram
 
     C->>S: rc:session.request {agent_id}
     S->>A: rc:request (permissions, controller)
-    A->>A: consent — auto-grant, tray prompt, or 30 s deny
+    A->>A: consent — auto-grant, tray prompt, or 5-min deny
     A->>S: rc:ready
     S->>C: rc:session.created
     C->>S: rc:sdp.offer
@@ -420,7 +420,7 @@ crates/
 ### 9.2 Hub state machine
 
 ```
-                      consent.timeout (30s)
+                      consent.timeout (5 min)
         ┌─────────────────────────────────────┐
         ▼                                     │
   ┌──────────┐  request   ┌────────────────┐  │  granted   ┌─────────┐
@@ -505,10 +505,17 @@ directive on `ServerMsg::Request`:
 | mode | who is asked | window | agent behaviour |
 |---|---|---|---|
 | `auto` | nobody | — | grants immediately |
-| `prompt` | whoever is at the device | 30 s | raises an on-host prompt |
+| `prompt` | whoever is at the device | **5 min** | raises an on-host prompt |
 | `email` | the device OWNER, by approve-link | 5 min | waits; the SERVER resolves |
 | `push` | the device owner, by web-push card | 5 min | waits; the SERVER resolves |
 | `prompt_then_email` | **both, in parallel** | host 30 s / owner 5 min | prompts AND the server emails |
+
+Plain `prompt` waits **5 minutes** (FR-34, field CORPLAP-1): a device set to it may
+be LOCKED when a session starts, and the operator has to walk to the machine,
+unlock, and only then can they see and approve — 30 s was not enough to arrive.
+`prompt_then_email` keeps a SHORT (30 s) host half precisely because its emailed
+link is the fallback; plain `prompt` has none, so its one window must be
+generous. The on-host panel shows the remaining time as `m:ss`.
 
 `prompt_then_email` is "and", not "then" — the mail goes out at once. What is
 sequential is the two windows: the host modal closes after the attended window
