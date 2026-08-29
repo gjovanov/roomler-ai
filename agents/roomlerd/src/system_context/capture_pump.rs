@@ -64,6 +64,7 @@ use super::gdi_backend::{GdiBackend, GdiFrame};
 /// `video_service.rs:851-856`); we mirror that — gives one frame of
 /// "is this a real failure?" hysteresis without leaving the operator
 /// staring at empty frames for long.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
 const HARD_ERROR_FALLBACK_THRESHOLD: u32 = 3;
 
 /// After this many consecutive `BackendBail::AccessLost` returns we
@@ -76,6 +77,7 @@ const HARD_ERROR_FALLBACK_THRESHOLD: u32 = 3;
 /// 8 consecutive AccessLost ≈ 400 ms — enough to be sure it's not a
 /// single transient blip but fast enough that the operator doesn't
 /// stare at black frames for long.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
 const ACCESS_LOST_FALLBACK_THRESHOLD: u32 = 8;
 
 /// FR-34 — how long a backend may run WITHOUT delivering a single frame before
@@ -550,16 +552,26 @@ fn backend_name(b: &ActiveBackend) -> &'static str {
 ///   HardError — `media_pump`'s idle-keepalive path covers the gap.
 /// * `Err(e)` on terminal failure (SessionGone or GDI also failing) —
 ///   `media_pump` will rebuild the pump.
+// Nine parameters, and they are the loop state this single capture iteration
+// both reads and advances (three counters, two timers, a delivered flag). A
+// struct would only move the same fields behind one name while the caller
+// still threads every one of them through `media_pump`, so the allow buys
+// clarity nothing. Never surfaced before because the module is behind
+// `system-context` and that lane could not compile at all.
+#[allow(clippy::too_many_arguments)]
 fn capture_one_blocking(
     backend: &mut ActiveBackend,
     consecutive_hard: &mut u32,
+    #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))]
     consecutive_access_lost: &mut u32,
     consecutive_empty: &mut u64,
     // rc.108 — re-climb timer for the non-permanent GDI fallback. Read +
     // written only on the GDI path (under `scrap-capture`); an unused
     // parameter on the GDI-only build, which Rust does not warn on.
+    #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))]
     last_dxgi_reclimb: &mut Instant,
     // FR-34 — see the two fields' declarations in worker_main.
+    #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))]
     backend_built_at: &mut Instant,
     delivered_since_build: &mut bool,
     start: Instant,
