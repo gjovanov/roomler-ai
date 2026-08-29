@@ -10,17 +10,16 @@
 #   2. Points the e2e stack's roomler2 at the CURRENT PROD image tag (read
 #      from the deploy repo's prod overlay) via `kubectl set image` — the
 #      e2e namespace is deliberately NOT ArgoCD-managed.
-#   3. Port-forwards the app (:18080) and Mailpit (:18025).
+#   3. Runs the browser as the `pwrunner` sidecar INSIDE the app pod.
 #      ⚠️ The stack's ROOMLER__APP__FRONTEND_URL must equal the origin the
-#      browser uses here (http://127.0.0.1:18080). Since the session-cookie
-#      migration the /ws upgrade authenticates by COOKIE and refuses an
-#      untrusted Origin with 403 — cookies are ambient and a WS upgrade is
-#      not subject to CORS. With the in-cluster name there instead, every
-#      handshake in the suite is refused, ~7 specs fail for one reason, and
-#      nothing realtime is tested at all. Fixed in the e2e overlay
-#      2026-08-29; if you point this lane at another port, move it too.
-#   4. Runs the suite in the official Playwright container (spec dir copied
-#      to a scratch tree minus e2e/video/ — that spec is bun-only syntax).
+#      browser uses — here http://127.0.0.1, and a PORT is part of an Origin.
+#      Since the session-cookie migration the /ws upgrade authenticates by
+#      COOKIE and refuses an untrusted Origin with 403 (cookies are ambient
+#      and a WS upgrade is not subject to CORS), which silently disarmed every
+#      realtime spec for a week. Both live in the deploy repo's e2e overlay,
+#      so they move together.
+#   4. Copies the spec tree into that sidecar and runs the suite there (minus
+#      e2e/video/ — that spec is bun-only syntax).
 #   5. Diffs the failing specs against scripts/e2e-expected-failures.txt and
 #      writes ~/e2e-nightly/LATEST (one summary line) + a dated full log.
 #      Unexpected failures ⇒ exit 1 (and a GitHub issue, if `gh` is authed).
@@ -40,15 +39,9 @@ REPO="${REPO:-$HOME/roomler-ai}"
 DEPLOY_REPO="${DEPLOY_REPO:-$HOME/roomler-ai-deploy}"
 OUT="${OUT:-$HOME/e2e-nightly}"
 NS=roomler-ai-e2e
-# Derive the Playwright container from the version pinned in package.json —
-# the browser binary path is version-locked, so a hardcoded tag silently
-# breaks the whole run on every @playwright/test bump ("Executable doesn't
-# exist… update docker image as well"). Falls back if the parse fails.
-PW_VER="$(grep -oE '"@playwright/test":[[:space:]]*"[^"]+"' "$REPO/ui/package.json" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-PW_IMG="${PW_IMG:-mcr.microsoft.com/playwright:v${PW_VER:-1.62.0}-jammy}"
-APP_PORT=18080
-MAIL_PORT=18025
-
+# ⚠️ The runner image is pinned in the deploy repo's e2e overlay (the
+# `pwrunner` sidecar), NOT here: browser binaries are version-locked to the
+# image, so bumping @playwright/test means bumping that manifest too.
 STAMP=$(date -u +%Y%m%d-%H%M)
 LOG="$OUT/$STAMP.log"
 mkdir -p "$OUT"
@@ -75,85 +68,44 @@ kubectl -n "$NS" set image deploy/roomler2 "roomler2=registry.roomler.ai/roomler
 kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >> "$LOG" 2>&1 || fail_hard "e2e stack failed to roll to $PRODTAG"
 note "e2e stack on $PRODTAG"
 
-# ── 3. SELF-HEALING port-forwards ────────────────────────────────────
-# A bare `kubectl port-forward` fails two ways under a full ~40-min run:
-# (a) it exits on connection-reset after sustained churn, and (b) worse,
-# it stays ALIVE with the local port still bound but silently stops
-# forwarding (zombie) — a naive respawn then hits "address already in
-# use" and never recovers. The first dry run cascaded into a 269/160
-# retry storm on exactly this. So each supervisor ACTIVELY health-checks
-# its own forward and kills+reclaims the port when forwarding dies,
-# covering both modes. Playwright's 2× retry absorbs the ~seconds of
-# downtime around a respawn. Supervisors are torn down by kill_pf + trap.
-PF_PIDS=()
-supervise_pf() { # $1 = svc:localport:remoteport:healthpath
-  local spec="$1" svc lp rp hp
-  IFS=: read -r svc lp rp hp <<< "$spec"
-  (
-    while true; do
-      # Reclaim the port from any stale/zombie holder before binding.
-      fuser -k "${lp}/tcp" 2>/dev/null
-      sleep 1
-      kubectl -n "$NS" port-forward --address 127.0.0.1 "svc/$svc" "$lp:$rp" >> "$OUT/pf-$svc.log" 2>&1 &
-      local kpid=$!
-      # Active liveness: while kubectl lives, poll the forward; if it
-      # stops answering for 2 consecutive checks, kill it → outer loop
-      # reclaims + respawns. Grace period lets it establish first.
-      sleep 4
-      local misses=0
-      while kill -0 "$kpid" 2>/dev/null; do
-        if curl -sf -o /dev/null --max-time 4 "http://127.0.0.1:${lp}${hp}"; then
-          misses=0
-        else
-          misses=$((misses + 1))
-          if [ "$misses" -ge 2 ]; then
-            echo "[pf $svc] health lost — recycling ($(date -u +%H:%M:%SZ))" >> "$OUT/pf-$svc.log"
-            kill "$kpid" 2>/dev/null
-            break
-          fi
-        fi
-        sleep 4
-      done
-      echo "[pf $svc] restarting ($(date -u +%H:%M:%SZ))" >> "$OUT/pf-$svc.log"
-    done
-  ) &
-  PF_PIDS+=("$!")
-}
-kill_pf() {
-  for p in "${PF_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
-  pkill -f "kubectl.*port-forward.*$NS" 2>/dev/null
-  fuser -k "${APP_PORT}/tcp" "${MAIL_PORT}/tcp" 2>/dev/null
-}
-trap 'kill_pf' EXIT
-
-# Clear anything left from a prior crashed run before we start.
-pkill -f "kubectl.*port-forward.*$NS" 2>/dev/null
-fuser -k "${APP_PORT}/tcp" "${MAIL_PORT}/tcp" 2>/dev/null
-sleep 1
-supervise_pf "roomler2:$APP_PORT:80:/health"
-supervise_pf "mailpit:$MAIL_PORT:8025:/api/v1/info"
-# Wait for both to come up (a fresh roll may need a respawn cycle).
-for _ in $(seq 1 30); do
-  curl -sf -o /dev/null "http://127.0.0.1:$APP_PORT/health" \
-    && curl -sf -o /dev/null "http://127.0.0.1:$MAIL_PORT/api/v1/info" \
-    && break
-  sleep 2
-done
-curl -sf -o /dev/null "http://127.0.0.1:$APP_PORT/health" || fail_hard "app port-forward never came up"
-curl -sf -o /dev/null "http://127.0.0.1:$MAIL_PORT/api/v1/info" || fail_hard "mailpit port-forward never came up"
+# ── 3. the browser is IN the pod ─────────────────────────────────────
+# FR-37. There are no port-forwards any more, and that is the point.
+#
+# The old lane ran a browser on THIS host and reached the stack through
+# `kubectl port-forward`, which forwards one TCP port and no media — and this
+# host has no route to the pod network anyway (`ip route get <podIP>` leaves
+# via the default route), so no RTP was ever going to arrive. Every conference
+# spec failed for months and the baseline blamed unforwarded RTC ports.
+#
+# The browser now runs as the `pwrunner` sidecar inside the app pod, so:
+#   * the app is `http://127.0.0.1`, which is a SECURE CONTEXT — a Service URL
+#     is not, and `navigator.mediaDevices` is simply UNDEFINED there;
+#   * mediasoup announces 127.0.0.1, so media has nowhere to get lost;
+#   * the Origin matches `frontend_url`, so the cookie-authenticated /ws
+#     upgrade is not refused (that 403 silently disarmed every realtime spec
+#     for a week);
+#   * the ~60 lines of self-healing port-forward supervisor this replaces are
+#     gone, along with the failure mode where a forward stays alive while
+#     forwarding nothing.
+POD=$(kubectl -n "$NS" get pod -l app=roomler2 -o jsonpath='{.items[0].metadata.name}')
+[ -n "$POD" ] || fail_hard "no roomler2 pod in $NS"
+kubectl -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[*].name}' | tr ' ' '
+' | grep -qx pwrunner   || fail_hard "pod $POD has no pwrunner sidecar — apply k8s/overlays/e2e in the deploy repo"
+note "runner: $POD/pwrunner"
+curl_in_pod() { kubectl -n "$NS" exec "$POD" -c pwrunner -- curl -sf -o /dev/null -m 8 "$1"; }
+curl_in_pod http://127.0.0.1/health || fail_hard "the app is not answering inside its own pod"
 
 # ── 4. run the suite ─────────────────────────────────────────────────
 WORK="$OUT/ui-work"
-rsync -a --delete --exclude node_modules --exclude dist --exclude test-results \
-  --exclude playwright-report --exclude e2e/video "$REPO/ui/" "$WORK/"
-docker run --rm --network host -v "$WORK:/work" -w /work \
-  -e CI=1 \
-  -e "E2E_BASE_URL=http://127.0.0.1:$APP_PORT" \
-  -e "E2E_API_URL=http://127.0.0.1:$APP_PORT" \
-  -e "E2E_MAILPIT_URL=http://127.0.0.1:$MAIL_PORT" \
-  "$PW_IMG" bash -lc "npm i --no-audit --no-fund --loglevel=error && npx playwright test --reporter=line --timeout=60000 --retries=3" >> "$LOG" 2>&1
+rsync -a --delete --exclude node_modules --exclude dist --exclude test-results   --exclude playwright-report --exclude e2e/video "$REPO/ui/" "$WORK/"
+# The sidecar keeps nothing between runs, so ship the tree and install there.
+kubectl -n "$NS" exec "$POD" -c pwrunner -- rm -rf /work
+kubectl -n "$NS" cp "$WORK" "$POD":/work -c pwrunner >/dev/null 2>&1   || fail_hard "could not copy the spec tree into the runner"
+kubectl -n "$NS" exec "$POD" -c pwrunner -- bash -lc "
+  cd /work && npm i --no-audit --no-fund --loglevel=error >/dev/null 2>&1 &&
+  CI=1 E2E_BASE_URL=http://127.0.0.1 E2E_API_URL=http://127.0.0.1   E2E_MAILPIT_URL=http://mailpit:8025   npx playwright test --reporter=line --timeout=60000 --retries=3" >> "$LOG" 2>&1
 RC=$?
-kill_pf  # stop the supervisors (the EXIT trap also covers abnormal exits)
+
 
 # ── 5. triage against the expected-failures baseline ─────────────────
 CLEAN=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG" | tr '\r' '\n')
@@ -177,25 +129,19 @@ if [ -n "$FAILED" ]; then
 fi
 
 # ── 6. VERIFY unexpected failures in isolation ───────────────────────
-# A real regression fails deterministically; a spec caught in a
-# transient port-forward blip during the loaded main run recovers when
-# re-run alone. Re-run exactly the unexpected specs (fresh forwards, no
-# concurrent load) and keep only the ones that STILL fail — that's the
-# blip-vs-real discriminator, so the lane doesn't cry wolf on infra hiccups.
+# A real regression fails deterministically; a spec caught in a blip during the
+# loaded main run recovers when re-run alone. Re-run exactly the unexpected
+# specs, with no concurrent load, and keep only the ones that STILL fail —
+# that's the blip-vs-real discriminator, so the lane doesn't cry wolf.
 if [ -n "$UNEXPECTED" ]; then
   note "UNEXPECTED (pre-verify):"; echo "$UNEXPECTED" | tee -a "$LOG"
   VSPECS=$(echo "$UNEXPECTED" | grep -oE 'e2e/[^ :]+\.spec\.ts' | sort -u | tr '\n' ' ')
   VLOG="$OUT/$STAMP-verify.log"
-  # Restart forwards for the isolated re-run (main-run supervisors were stopped).
-  supervise_pf "roomler2:$APP_PORT:80:/health"
-  supervise_pf "mailpit:$MAIL_PORT:8025:/api/v1/info"
-  for _ in $(seq 1 30); do curl -sf -o /dev/null "http://127.0.0.1:$APP_PORT/health" && break; sleep 2; done
-  docker run --rm --network host -v "$WORK:/work" -w /work \
-    -e CI=1 -e "E2E_BASE_URL=http://127.0.0.1:$APP_PORT" \
-    -e "E2E_API_URL=http://127.0.0.1:$APP_PORT" \
-    -e "E2E_MAILPIT_URL=http://127.0.0.1:$MAIL_PORT" \
-    "$PW_IMG" bash -lc "npx playwright test $VSPECS --reporter=line --timeout=60000 --retries=3" > "$VLOG" 2>&1
-  kill_pf
+  kubectl -n "$NS" exec "$POD" -c pwrunner -- bash -lc "
+    cd /work &&
+    CI=1 E2E_BASE_URL=http://127.0.0.1 E2E_API_URL=http://127.0.0.1 \
+    E2E_MAILPIT_URL=http://mailpit:8025 \
+    npx playwright test $VSPECS --reporter=line --timeout=60000 --retries=3" > "$VLOG" 2>&1
   VCLEAN=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$VLOG" | tr '\r' '\n')
   VFAILED=$(echo "$VCLEAN" \
     | awk '/^  [0-9]+ failed/{f=1;next} /^  [0-9]+ (flaky|skipped|passed|interrupted|did not run)/{f=0} f' \
