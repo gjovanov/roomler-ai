@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! `/api/setup/*` — cached GitHub-Releases proxy for the unified
 //! `roomler-setup` wizard (tag `setup-v*`, asset prefix
 //! `roomler-setup-`) plus the terminal installers

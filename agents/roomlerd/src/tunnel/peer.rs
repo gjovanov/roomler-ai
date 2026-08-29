@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Agent-side answerer for the `roomler` WebRTC handshake.
 //!
 //! Mirror of `roomler-cli`'s offerer-side [`TunnelPeer`] usage —

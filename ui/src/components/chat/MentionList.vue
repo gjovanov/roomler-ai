@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <!-- v-show (not v-if) so the root element ALWAYS exists at the first
        synchronous render. TipTap's VueRenderer captures the popup content

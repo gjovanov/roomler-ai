@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Roomler Setup — lib surface of the unified wizard.
 //!
 //! The wizard's binary entry point lives in `src/main.rs`; everything

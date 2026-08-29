@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `POST /api/tunnel-client/enroll` wrapper.
 //!
 //! Exchanges an admin-issued enrollment JWT for a long-lived

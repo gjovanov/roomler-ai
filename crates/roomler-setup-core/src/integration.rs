@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Per-platform integration after the CLI archive is extracted.
 //!
 //! Three jobs, each `#[cfg]`-gated to its OS:

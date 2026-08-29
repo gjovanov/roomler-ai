@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Token-probe at worker startup — picks the User-mode or
 //! SystemContext-mode plumbing tree.
 //!
