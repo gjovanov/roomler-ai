@@ -241,6 +241,27 @@ pub fn snapshot() -> Snapshot {
 mod tests {
     use super::*;
 
+    // EVERY test below that touches the marker takes this lock — five of them.
+    // They share ONE process-wide path and every one of them deletes it, so run
+    // in parallel a `signal_disconnected` from one lands between another's write
+    // and its read, and the read panics with "marker readable after write" — a
+    // failure that says nothing about the code under test. Reproduced on
+    // master: green in isolation, red in the full `--features system-context`
+    // suite.
+    //
+    // ⚠️ The count is not decoration. The first fix guarded the three obvious
+    // writers and the suite STILL failed roughly 1 run in 5, because two more
+    // tests touch the same path — and a single green run had already
+    // "confirmed" it. Do not drop a guard that looks redundant; verify by
+    // running the FULL lane ten times, never a `system_context` filter, which
+    // is the very isolation that hides this.
+    //
+    // Same shape as `encode::RELAY_ENV_LOCK`: one lock, held for the whole test.
+    // `unwrap_or_else(|e| e.into_inner())` because a panic in one test poisons
+    // the mutex, and the next test failing on the poison instead of its own
+    // assertion hides which one actually broke.
+    static MARKER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn marker_path_is_absolute_under_programdata_or_tmp() {
         let p = marker_path();
@@ -263,6 +284,7 @@ mod tests {
 
     #[test]
     fn signal_disconnected_when_missing_is_ok() {
+        let _marker_guard = MARKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Idempotent contract: removing a non-existent marker is
         // not an error. The first signal_disconnected call after
         // worker startup typically hits this path because the
@@ -275,6 +297,7 @@ mod tests {
 
     #[test]
     fn signal_connected_writes_non_empty_body() {
+        let _marker_guard = MARKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Regression test for the rc.1/rc.2 bug. Empty-body writes
         // get short-circuited by NTFS so LastWriteTime never advances
         // past the first creation; the supervisor's mtime-based
@@ -314,6 +337,7 @@ mod tests {
 
     #[test]
     fn signal_connected_advances_mtime_across_calls() {
+        let _marker_guard = MARKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Direct regression for the field bug: two consecutive
         // signal_connected calls 100ms apart must produce strictly
         // increasing (or at least non-decreasing) mtimes. The
@@ -353,6 +377,7 @@ mod tests {
 
     #[test]
     fn round_trip_signal_connected_then_is_signaled() {
+        let _marker_guard = MARKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // On the test runner we can write to ProgramData (developer
         // workstation) or /tmp (Linux CI); fall back to skipping
         // gracefully if the directory create fails (locked-down CI
@@ -368,6 +393,7 @@ mod tests {
 
     #[test]
     fn stale_marker_returns_false() {
+        let _marker_guard = MARKER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Drop a marker, then artificially backdate via filetimes if
         // available. Without the filetimes crate we approximate by
         // checking the contract directly: is_signaled returns false
