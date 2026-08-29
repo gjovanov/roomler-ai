@@ -1,7 +1,7 @@
 # FR-30 — Camera/mic state is never signalled, so peers cannot see who turned their camera off
 
 **Issue:** [#884](https://github.com/gjovanov/roomler-ai/issues/884)
-**Status:** P1+P2 shipped (#886) and **field-verified 2026-08-29** on prod `v20260829-0d5078f44e42`. P3 (the tile indicator) open.
+**Status:** **complete** — P1–P4 shipped (#886, #913, #918) and field-verified 2026-08-29 on prod `v20260829-4e22ba66a099`
 
 ## Goal
 
@@ -88,6 +88,7 @@ sends `producer_pause` (so it behaves exactly as today) and ignores an unknown
 | P1 | Wire: `media:producer_pause` → server pauses the producer → `media:producer_paused` to other peers | client simply doesn't send; server handler is inert without it |
 | P2 | Client honours it: per-participant `videoPaused`/`audioPaused`; `hasLiveVideoTrack` consults it so hide-non-video converges | `hideNonVideo` remains a user preference, default unchanged |
 | P3 | Camera-off / mic-off indicator on remote tiles | purely additive UI |
+| P4 | Carry the state on the SUBSCRIPTION too, not only as an event | `#[serde(default)]` — absent reads as "not paused", i.e. the old behaviour |
 | P4 | Field-verify with two browsers, and measure the bandwidth drop while paused | — |
 
 ## Acceptance criteria
@@ -95,11 +96,13 @@ sends `producer_pause` (so it behaves exactly as today) and ignores an unknown
 - [x] With "hide participants without video" on, turning the camera off in tab A
       removes that tile in tab B within ~1 s, **without a reload**; turning it
       back on restores it
-- [ ] A remote tile shows a camera-off indicator (and a mic-off one) driven by
+- [x] A remote tile shows a camera-off indicator (and a mic-off one) driven by
       the signal, not by local state
 - [x] Consumers stop receiving video while the producer is paused — measured,
       not assumed
-- [ ] An old client in the same call is unaffected (no errors, no missing tiles)
+- [x] An old client in the same call is unaffected — additive by construction:
+      the message is never sent by an older client, the event is ignored by one,
+      and `producer_paused` is `#[serde(default)]` in both directions
 - [x] The FR-25 criterion this unblocks is re-ticked in
       `docs/fr/FR-25-call-layout-mentions-pip.md`
 
@@ -142,5 +145,20 @@ sends `producer_pause` (so it behaves exactly as today) and ignores an unknown
   it does — while the server-side pause stops the frames at the SFU rather than
   shipping black ones to everybody.
 
-- Remaining: P3, the camera-off / mic-off indicator on a remote tile. The
-  signal it needs is now delivered; the tile just doesn't draw it yet.
+- **2026-08-29 — P3 (indicators) verified**, prod `v20260829-739aa730b8a1`.
+  With the sender toggling live, the receiving tab's remote tile read
+  `micOff: true, camOff: true, avatar: true` — the avatar covering what was
+  otherwise the sender's last frame, frozen. ⚠️ A frozen face is worse than an
+  avatar precisely because it looks live.
+
+- **2026-08-29 — P4 was found BY that same test, and fixed.** Muting *before*
+  the other tab joined left the newcomer with `micOff: false, camOff: false`:
+  the pause EVENT only reaches whoever was already in the room. A transition is
+  not a state. `ConsumerInfo.producer_paused` now rides the subscription, and
+  the re-test on `v20260829-4e22ba66a099` — mute + camera off FIRST, join
+  SECOND — shows `micOff: true, camOff: true, avatar: true` on the newcomer's
+  very first render.
+
+  🔑 Worth keeping: P1's own field test could not have caught this, because it
+  had both tabs join before anything was toggled. The order of the steps was
+  the whole test.
