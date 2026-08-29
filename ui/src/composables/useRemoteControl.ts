@@ -6109,11 +6109,29 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         )
       }
       markConnect('session_created')
+      // FR-34 — a fresh attempt starts un-locked-known; the agent tells us
+      // via rc:consent.pending if the host is locked.
+      hostLocked.value = false
       phase.value = 'awaiting_consent'
       // Consent is human-paced on Prompt-mode devices; the SERVER owns
       // that timeout (consent_timeout). Ours only covers requesting/
       // negotiating.
       clearSignalingTimeout()
+    })
+    // FR-34 — the agent reports the host is LOCKED while this prompt is
+    // pending, so the on-host panel is on the invisible secure desktop and
+    // someone must unlock the machine to see + approve it. Advisory: it
+    // never gates the flow (unlock + approve resolves it, 5-min window),
+    // it only turns the wait into an instruction. Reuses `hostLocked` (the
+    // same flag the connected session sets from rc:host_locked).
+    on('rc:consent.pending', (msg) => {
+      if (
+        phase.value === 'awaiting_consent' &&
+        msg.session_id === sessionId.value &&
+        msg.host_locked === true
+      ) {
+        hostLocked.value = true
+      }
     })
     on('rc:ready', async (msg) => {
       // (2026-08-05 winhost-a wedge) NEVER drop rc:ready silently: the server
