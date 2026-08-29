@@ -1265,7 +1265,60 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
 /// bulk writes below are belt-and-braces for sockets that don't finish
 /// in time. Agents see a plain socket close (never a Goodbye — those are
 /// fatal client-side) and reconnect with backoff through the LB.
+/// FR-28 kill switch. Default ON: the announcement is strictly more
+/// information than the agent has today, and the discover-by-failed-send
+/// path stays in place for the ungraceful cases (SIGKILL, node loss) that
+/// no announcement can cover.
+fn drain_derp_on_shutdown() -> bool {
+    !matches!(
+        std::env::var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 pub async fn shutdown_cleanup(state: &AppState) {
+    // FR-28 — tell every `/derp` client we are going away BEFORE anything
+    // else, so the announcement races nothing.
+    //
+    // Without this the agent learns the socket is dead only when a send on
+    // it hard-errors, and until then it keeps handing carrier frames to a
+    // corpse. Measured on 2026-08-29: a pod roll produced a **2436 ms**
+    // `video DC delivery gap` and a decode stall on an IDLE remote-control
+    // session, on two hosts in the same second, and DERP churn is otherwise
+    // rare (2-3 events per host per 6 h, ALL correlating with rolls). It is
+    // the one freeze cause reproducible on demand.
+    //
+    // The primitive already existed for the cluster convergence sweep — it
+    // was simply never wired to shutdown.
+    //
+    // ⚠️ This is NOT the pre-close draining the comment in `main.rs`
+    // deliberately rejects. It adds no delay and waits for nothing: a
+    // broadcast on the way out, after which the process stops accepting
+    // exactly when it does today. `maxSurge: 0` means a drained second is
+    // downtime, so buying recovery with rollout time would be the wrong
+    // trade — this buys it with a notification.
+    if drain_derp_on_shutdown() {
+        let cancels: Vec<_> = state
+            .derp_cancels
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        if !cancels.is_empty() {
+            tracing::info!(
+                sockets = cancels.len(),
+                "shutdown: signalling /derp clients to re-home before we stop accepting"
+            );
+            for c in cancels {
+                // `notify_waiters` and not `notify_one`: each socket has its
+                // own Notify, and a permit stored for a task that is already
+                // gone would strand nothing useful.
+                c.notify_waiters();
+            }
+        }
+    }
     // C-4/C-6 — release directory records for every locally-owned class
     // FIRST (before the agent sweep's early return): a graceful deploy
     // hands each entity off with a ZERO-length ownerless window instead
@@ -1356,5 +1409,37 @@ pub async fn shutdown_cleanup(state: &AppState) {
                 tracing::debug!(agent = %id, %e, "shutdown: presence release failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fr28_tests {
+    use super::drain_derp_on_shutdown;
+
+    /// FR-28 — the kill switch must be OFF-by-explicit-value only.
+    ///
+    /// ⚠️ Default ON is deliberate and is the whole point: the announcement
+    /// is strictly more information than the agent has today, and the
+    /// discover-by-failed-send path stays for the ungraceful cases
+    /// (SIGKILL, node loss) that no announcement can cover. A default that
+    /// silently disabled it would leave the measured 2436 ms freeze in
+    /// place while the code looked shipped.
+    #[test]
+    fn drain_defaults_on_and_only_explicit_falsey_disables() {
+        // SAFETY: single-threaded test, no other reader of this var.
+        unsafe { std::env::remove_var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN") };
+        assert!(drain_derp_on_shutdown(), "absent must mean ON");
+
+        for off in ["0", "false", "no", "off", "OFF", "False"] {
+            unsafe { std::env::set_var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN", off) };
+            assert!(!drain_derp_on_shutdown(), "{off} must disable");
+        }
+        // Anything else is ON — an operator typo must not silently disable a
+        // freeze fix.
+        for on in ["1", "true", "yes", "on", "", "banana"] {
+            unsafe { std::env::set_var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN", on) };
+            assert!(drain_derp_on_shutdown(), "{on:?} must stay ON");
+        }
+        unsafe { std::env::remove_var("ROOMLER__DERP__DRAIN_ON_SHUTDOWN") };
     }
 }
