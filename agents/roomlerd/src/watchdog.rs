@@ -79,6 +79,8 @@ pub const STALL_EXIT_CODE: i32 = 2;
 ///     the host without a manual service restart).
 pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 
+// RETIRED-NAME-ANCHOR(2): names the legacy unit deliberately — the hazard
+// being described is precisely that BOTH can be enabled at once.
 /// rc.439: sentinel for "another process already holds this config's
 /// single-instance lock, so this one is redundant — do NOT respawn it."
 ///
@@ -344,7 +346,7 @@ pub(crate) async fn run_with_intervals(
 /// tokio runtime itself is deadlocked.
 pub fn spawn_thread_watchdog(wd: Arc<Watchdog>) {
     let _ = std::thread::Builder::new()
-        .name("roomler-agent-watchdog-of-watchdog".into())
+        .name("roomlerd-watchdog-of-watchdog".into())
         .spawn(move || {
             let mut prev_count = wd.own_heartbeat();
             let mut prev_at = Instant::now();

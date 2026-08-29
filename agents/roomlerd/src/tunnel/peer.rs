@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! Agent-side answerer for the `roomler-tunnel` WebRTC handshake.
+//! Agent-side answerer for the `roomler` WebRTC handshake.
 //!
-//! Mirror of `roomler-tunnel`'s offerer-side [`TunnelPeer`] usage —
+//! Mirror of `roomler-cli`'s offerer-side [`TunnelPeer`] usage —
 //! same crate type, just the answerer half of the handshake. One
 //! `AgentTunnelPeer` per active tunnel session (server-issued
 //! `tunnel_session_id`).

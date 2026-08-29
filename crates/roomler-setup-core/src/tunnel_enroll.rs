@@ -12,7 +12,7 @@
 //! half lives with the dep holders (the setup app's tunnel
 //! orchestrator) — this crate stays free of the tunnel dep.
 //! Original rationale for not calling
-//! `roomler-tunnel`'s private `enroll_cmd`:
+//! `roomler-cli`'s private `enroll_cmd`:
 //!   - `enroll_cmd` is private to the CLI binary and prints to stdout
 //!     with `println!` — bad for a wizard-driven flow that needs
 //!     structured ProgressEvents on a channel.
@@ -76,6 +76,8 @@ fn os_discriminant() -> Option<&'static str> {
     }
 }
 
+// RETIRED-NAME-ANCHOR(4): a UA string that ALREADY WENT OVER THE WIRE; the server has
+// these rows.
 /// POST the enrollment exchange and return the parsed result. Does
 /// NOT touch the filesystem; the caller pairs this with its
 /// `write_config` after surfacing `EnrollOk` to the SPA.

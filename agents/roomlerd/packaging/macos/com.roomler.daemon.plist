@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- RETIRED-NAME-ANCHOR-BEGIN
+     /etc/roomler-agent is this daemon's REAL config directory. This file
+     is what passes it, and the .pkg postinstall is what creates it, so the
+     path is not a stale name: it is the contract between the two. FR-21 D5.
+-->
 <!--
   LaunchDAEMON for roomlerd — the privileged half.
 
@@ -33,7 +38,9 @@
 
     <key>ProgramArguments</key>
     <array>
-    <!-- RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS; renaming it silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it. docs/fr/FR-21 -->
+    <!-- RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS; renaming
+         it silently drops Screen Recording + Accessibility on every Mac. FR-21 D5
+         freezes it. docs/fr/FR-21 -->
         <string>/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent</string>
         <string>--config</string>
         <string>/etc/roomler-agent/config.toml</string>
@@ -64,4 +71,5 @@
         <string>info</string>
     </dict>
 </dict>
+  <!-- RETIRED-NAME-ANCHOR-END -->
 </plist>

@@ -59,7 +59,7 @@ roles:
 
 | Wizard role | What it installs | Runs as |
 |---|---|---|
-| **Daemon — system** | perMachine MSI + SystemContext enabled | SCM service `RoomlerAgentService` (LocalSystem) — controls lock screen, UAC, pre-logon |
+| **Daemon — system** | perMachine MSI + SystemContext enabled | SCM service `Roomler` (LocalSystem) — controls lock screen, UAC, pre-logon |
 | **Daemon — per user** | perUser MSI | Scheduled Task `Roomler` at logon (limited) |
 | **Daemon — machine (attended)** | perMachine MSI | SCM service, no SystemContext |
 | **Tunnel client** | CLI archive + PATH entry | on demand |
@@ -97,6 +97,10 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
 
+<!-- RETIRED-NAME-ANCHOR(5): /etc/roomler-agent is the REAL macOS daemon
+     config dir. The shipped com.roomler.daemon.plist passes it as its
+     config and the .pkg postinstall reads its opt out markers, so the
+     path is an input to code already on user machines. FR-21 D5. -->
 | Half | Runs as | Does | Why it cannot do the other's job |
 |------|---------|------|----------------------------------|
 | LaunchAgent `com.roomler.agent` | you, inside your GUI login session | screen capture, input, clipboard | a root LaunchDaemon in session 0 has no WindowServer — capture and `CGEvent` injection do not work there |
@@ -133,6 +137,13 @@ macOS gates capture and input, and **it never reports an error when a grant is
 missing**: the screen streams as wallpaper only, and injected keys and clicks
 are silently dropped.
 
+<!-- RETIRED-NAME-ANCHOR-BEGIN
+     The whole macOS layout is FROZEN by FR-21 D5. The .app bundle name and
+     path key the Screen Recording and Accessibility TCC grants; renaming
+     either silently voids them, and the failure is a black screen with no
+     error. /etc/roomler-agent is what the shipped LaunchDaemon plist passes
+     as its config, and the published .deb asset name is matched by the
+     updater. Everything below names something a user can see today. -->
 - System Settings → Privacy & Security → **Screen Recording** → enable `roomler-agent`
 - System Settings → Privacy & Security → **Accessibility** → enable `roomler-agent`
 
@@ -224,6 +235,7 @@ provenance**:
 ```bash
 gh attestation verify roomler-agent-<v>-x86_64-unknown-linux-gnu.deb --repo gjovanov/roomler-ai
 ```
+<!-- RETIRED-NAME-ANCHOR-END -->
 
 Windows binaries are Authenticode-signed; macOS artifacts are Developer-ID signed
 and notarized where the format allows. [code-signing.md](code-signing.md) covers
@@ -237,7 +249,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 - **Windows**: uninstall the MSI (per-user or per-machine) from Apps; the agent's
   version sweep also removes older same-flavour MSIs after upgrades.
   `roomlerd service uninstall` removes a manually-installed service/task.
-- **Linux**: `apt remove roomler-agent` (or delete the tarball install) and
+- **Linux**: `apt remove roomlerd` (or delete the tarball install) and
   `systemctl --user disable --now roomler.service`.
 - **macOS**: see [Uninstall](#uninstall) above — there may be TWO halves to
   remove (the per-user LaunchAgent and, if installed, the root LaunchDaemon).
@@ -246,6 +258,6 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 The agent's `config.toml` (server URL, tokens, per-node settings like
 `encoder_preference`, `overlay_*`, `tunnel_routes`) lives under
-`%APPDATA%\roomler\roomler-agent\` / `%PROGRAMDATA%\roomler\roomler-agent\`
-(machine-global) / `~/.config/roomler-agent/` — remove it to fully forget an
+`%APPDATA%\roomler\roomler\` / `%PROGRAMDATA%\roomler\roomler\`
+(machine-global) / `/etc/roomler/` (root) or `~/.config/roomler/` — remove it to fully forget an
 enrollment.

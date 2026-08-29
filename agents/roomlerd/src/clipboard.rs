@@ -159,7 +159,7 @@ impl Clipboard {
         let (tx, rx) = std_mpsc::channel::<ClipboardCmd>();
 
         thread::Builder::new()
-            .name("roomler-agent-clipboard".into())
+            .name("roomlerd-clipboard".into())
             .spawn(move || {
                 let mut cb = match arboard::Clipboard::new() {
                     Ok(c) => {
