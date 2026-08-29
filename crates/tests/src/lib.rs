@@ -52,6 +52,8 @@ mod device_naming_tests;
 #[cfg(test)]
 mod invite_tests;
 #[cfg(test)]
+mod key_rotation_tests;
+#[cfg(test)]
 mod member_tests;
 #[cfg(test)]
 mod notification_tests;

@@ -164,6 +164,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         gpu_scale: None,
         overlay_lan_capture_probe: None,
         relay_ceiling_learn: None,
+        overlay_key_rotation: None,
         idle_refine_max_edge: None,
         relay_max_hi_kbps: None,
         idle_refine_min_frame_kb: None,
@@ -219,6 +220,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         netstack_socks_port: None,
         derived_org: false,
         overlay_wg_secret_key: None,
+        overlay_wg_key_epoch: 0,
         // Phase 1: no advertised subnet routes until the operator configures them.
         overlay_advertised_routes: Vec::new(),
         // P5: not an exit node until the operator opts in.
@@ -319,6 +321,7 @@ pub fn apply_enrollment(
         enabled: true,
         overlay_mode: crate::config::OrgOverlayMode::Off,
         overlay_wg_secret_key: None,
+        overlay_wg_key_epoch: 0,
         overlay_advertised_routes: Vec::new(),
         overlay_exit_node_enabled: false,
         advertise_routes: Vec::new(),
@@ -623,6 +626,7 @@ mod tests {
             enabled: true,
             overlay_mode: crate::config::OrgOverlayMode::Off,
             overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
             overlay_advertised_routes: Vec::new(),
             overlay_exit_node_enabled: false,
             advertise_routes: Vec::new(),

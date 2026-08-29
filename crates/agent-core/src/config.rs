@@ -625,6 +625,12 @@ pub struct AgentConfig {
     /// (`ROOMLERD_RELAY_CEILING_LEARN`). Built-in default: ON.
     #[serde(default)]
     pub relay_ceiling_learn: Option<bool>,
+    /// FR-40 — honour `rc:agent.key_rotate` (an admin retiring this device's
+    /// overlay key from the dashboard; `ROOMLERD_OVERLAY_KEY_ROTATION`).
+    /// Built-in default: ON. A kill switch for a defective implementation,
+    /// not a gate — the order mints locally and leaks nothing.
+    #[serde(default)]
+    pub overlay_key_rotation: Option<bool>,
     /// P7 — long-edge cap for the refined rung
     /// (`ROOMLERD_IDLE_REFINE_MAX_EDGE`). Built-in default: 0 = full
     /// native.
@@ -1006,6 +1012,12 @@ pub struct AgentConfig {
     /// the public key is what the netmap distributes. `None` until then.
     #[serde(default)]
     pub overlay_wg_secret_key: Option<String>,
+    /// FR-40 — bumped on every rotation of `overlay_wg_secret_key` and sent
+    /// as `key_epoch` on the overlay join. `0` = the key minted at first
+    /// start (or a config that predates rotation). Persisted NEXT to the key
+    /// so the two can never disagree on disk.
+    #[serde(default)]
+    pub overlay_wg_key_epoch: u32,
 
     /// Phase 1 subnet router — CIDRs this node offers to route for overlay peers
     /// (e.g. `["192.168.1.0/24"]`). Sent on join as `advertised_routes`; each is
@@ -1130,6 +1142,9 @@ pub struct OrgEntry {
     /// (or on this org's first overlay-enabled start, P2).
     #[serde(default)]
     pub overlay_wg_secret_key: Option<String>,
+    /// FR-40 — this org's key epoch (see `AgentConfig::overlay_wg_key_epoch`).
+    #[serde(default)]
+    pub overlay_wg_key_epoch: u32,
     /// Org-scoped twin of `overlay_advertised_routes` (P2).
     #[serde(default)]
     pub overlay_advertised_routes: Vec<String>,
@@ -1231,6 +1246,7 @@ impl AgentConfig {
             && org.server_url == self.server_url
             && org.overlay_wg_secret_key.is_some();
         c.overlay_wg_secret_key = org.overlay_wg_secret_key.clone();
+        c.overlay_wg_key_epoch = org.overlay_wg_key_epoch;
         c.overlay_advertised_routes = org.overlay_advertised_routes.clone();
         c.overlay_exit_node_enabled = false;
         c.overlay_exit_node = None;
@@ -1329,6 +1345,7 @@ pub fn promote_org_to_primary(cfg: &mut AgentConfig, label: &str) -> Result<()> 
         enabled: true,
         overlay_mode: OrgOverlayMode::Off,
         overlay_wg_secret_key: cfg.overlay_wg_secret_key.clone(),
+        overlay_wg_key_epoch: cfg.overlay_wg_key_epoch,
         overlay_advertised_routes: cfg.overlay_advertised_routes.clone(),
         overlay_exit_node_enabled: cfg.overlay_exit_node_enabled,
         advertise_routes: cfg.advertise_routes.clone(),
@@ -1340,6 +1357,7 @@ pub fn promote_org_to_primary(cfg: &mut AgentConfig, label: &str) -> Result<()> 
     cfg.agent_id = entry.agent_id;
     cfg.tenant_id = entry.tenant_id;
     cfg.overlay_wg_secret_key = entry.overlay_wg_secret_key;
+    cfg.overlay_wg_key_epoch = entry.overlay_wg_key_epoch;
     cfg.overlay_advertised_routes = entry.overlay_advertised_routes;
     cfg.overlay_exit_node_enabled = entry.overlay_exit_node_enabled;
     cfg.overlay_exit_node = None;
@@ -1721,6 +1739,7 @@ pub fn test_fixture() -> AgentConfig {
         gpu_scale: None,
         overlay_lan_capture_probe: None,
         relay_ceiling_learn: None,
+        overlay_key_rotation: None,
         idle_refine_max_edge: None,
         relay_max_hi_kbps: None,
         idle_refine_min_frame_kb: None,
@@ -1769,6 +1788,7 @@ pub fn test_fixture() -> AgentConfig {
         netstack_socks_port: None,
         derived_org: false,
         overlay_wg_secret_key: None,
+        overlay_wg_key_epoch: 0,
         overlay_advertised_routes: Vec::new(),
         overlay_exit_node_enabled: false,
         overlay_exit_node: None,
@@ -1855,7 +1875,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 58] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 59] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1872,6 +1892,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 58]
         ("GPU_SCALE", cfg.gpu_scale),
         ("OVERLAY_LAN_CAPTURE_PROBE", cfg.overlay_lan_capture_probe),
         ("RELAY_CEILING_LEARN", cfg.relay_ceiling_learn),
+        ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
         ("OVERLAY_DERP", cfg.overlay_derp),
@@ -2374,6 +2395,7 @@ machine_name = "devbox"
             enabled: true,
             overlay_mode: OrgOverlayMode::Off,
             overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
             overlay_advertised_routes: Vec::new(),
             overlay_exit_node_enabled: false,
             advertise_routes: Vec::new(),

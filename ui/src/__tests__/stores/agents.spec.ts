@@ -113,6 +113,26 @@ describe('useAgentStore', () => {
     expect(delivered).toBe(true)
   })
 
+  it('rotateOverlayKey POSTs the overlay-key rotate path and returns the dispatch', async () => {
+    const store = useAgentStore()
+    mockApi.post.mockResolvedValueOnce({
+      agent_id: 'a1',
+      request_id: 'r1',
+      dispatch: 'queued',
+      delivered: false,
+    })
+
+    const res = await store.rotateOverlayKey(TENANT_ID, 'a1')
+
+    expect(mockApi.post).toHaveBeenCalledWith(
+      `/tenant/${TENANT_ID}/agent/a1/overlay-key/rotate`,
+      {},
+    )
+    expect(res.request_id).toBe('r1')
+    expect(res.dispatch).toBe('queued')
+    expect(res.delivered).toBe(false)
+  })
+
   it('triggerUpdateAll POSTs the bulk update path and returns counts', async () => {
     const store = useAgentStore()
     mockApi.post.mockResolvedValueOnce({ requested: 3, delivered: 2, results: [] })
