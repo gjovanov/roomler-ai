@@ -36,7 +36,6 @@ pub struct File {
     pub scan_status: ScanStatus,
     #[serde(default)]
     pub visibility: Visibility,
-    pub recognized_content: Option<RecognizedContent>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,
@@ -108,15 +107,6 @@ pub enum ScanStatus {
     Clean,
     Malware,
     Skipped,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecognizedContent {
-    pub raw_text: String,
-    pub structured_data: Option<serde_json::Value>,
-    pub document_type: Option<String>,
-    pub confidence: f64,
-    pub processed_at: DateTime,
 }
 
 fn default_version() -> u32 {
