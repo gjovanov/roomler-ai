@@ -90,7 +90,10 @@ test.describe('Rooms', () => {
   test('explore page loads with search', async ({ page }) => {
     await page.goto(`/tenant/${tenantId}/explore`)
     await expect(page.getByText(/explore/i).first()).toBeVisible()
-    const searchInput = page.locator('input').first()
-    await expect(searchInput).toBeVisible()
+    // Anchored to THIS page's field by its label. `locator('input').first()`
+    // silently started resolving to the nav's collapsed "Search devices" box
+    // when the devices-first nav landed, and a hidden element is not a
+    // meaningful assertion about the explore page.
+    await expect(page.getByLabel('Search', { exact: true })).toBeVisible()
   })
 })
