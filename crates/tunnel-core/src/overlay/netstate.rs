@@ -130,11 +130,37 @@ pub struct DefaultRoute {
     pub gateway: Option<IpAddr>,
 }
 
+/// FR-33 — a LAN prefix this host owns an address in, whose traffic the OS
+/// routes through a DIFFERENT interface than the one that owns the address.
+/// That is the corp-VPN split-prefix capture (Check Point installs
+/// `192.168.68.0/25` + `.128/25` via its adapter at metric 1; AnyConnect
+/// re-routes the whole prefix): LAN handshakes still ARRIVE on the owning
+/// socket, our replies leave through the VPN and die, and every surface used
+/// to say only `upgrading` / `relay` / `penalty`. Detected by a route
+/// LOOKUP of a neighbour address inside the prefix — the same instrument as
+/// [`DefaultRoute`], for the same reason (a capture rarely touches the
+/// prefix's own route entry). Detect and report only: routing around it is
+/// VPN policy evasion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanCapture {
+    /// The captured prefix, `a.b.c.d/n`.
+    pub prefix: String,
+    /// The interface that owns the address (name).
+    pub owner: String,
+    /// The interface the lookup selected: ifindex on Windows, device name on
+    /// Unix — the same identity space as [`DefaultRoute::ifref`].
+    pub via_ifref: String,
+    /// The selected interface's name when the identity maps to one.
+    pub via_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetSnapshot {
     pub ifaces: BTreeMap<String, IfaceSnap>,
     pub default_v4: Option<DefaultRoute>,
     pub default_v6: Option<DefaultRoute>,
+    /// FR-33 — captured LAN prefixes, empty when none (or the probe is off).
+    pub lan_captures: Vec<LanCapture>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +209,11 @@ pub(crate) fn diff(
 ) -> Option<NetDelta> {
     let default_route_moved =
         prev.default_v4 != next.default_v4 || prev.default_v6 != next.default_v6;
+    // FR-33 — a capture appearing or clearing is MATERIAL (it decides whether
+    // the LAN tier can ever work) but keys no socket, so it never lifts the
+    // severity on its own; it is named in the summary either way, which is
+    // the one onset / one clear line the operator gets.
+    let captures_changed = prev.lan_captures != next.lan_captures;
     let count =
         |s: &NetSnapshot| -> usize { s.ifaces.values().map(|i| i.v4.len() + i.v6_count).sum() };
     let (mut added, mut removed) = (0usize, 0usize);
@@ -202,7 +233,7 @@ pub(crate) fn diff(
             removed += pi.v4.len() + pi.v6_count;
         }
     }
-    if !default_route_moved && added == 0 && removed == 0 {
+    if !default_route_moved && added == 0 && removed == 0 && !captures_changed {
         return None;
     }
     let severity = if default_route_moved || removed > 0 {
@@ -211,8 +242,20 @@ pub(crate) fn diff(
         Severity::Minor
     };
     let material = true;
+    let capture_note = if captures_changed {
+        match next.lan_captures.first() {
+            Some(c) => format!(
+                " lan_capture={} via {}",
+                c.prefix,
+                c.via_name.as_deref().unwrap_or(c.via_ifref.as_str())
+            ),
+            None => " lan_capture=clear".to_string(),
+        }
+    } else {
+        String::new()
+    };
     let summary = format!(
-        "default_moved={default_route_moved} v4_default={} addrs +{added}/-{removed} ifaces={} (was {}, addrs {}→{})",
+        "default_moved={default_route_moved} v4_default={} addrs +{added}/-{removed} ifaces={} (was {}, addrs {}→{}){capture_note}",
         next.default_v4
             .as_ref()
             .map(|d| d.ifref.as_str())
@@ -437,6 +480,9 @@ async fn monitor(
 /// effective default routes via a route lookup per family.
 pub fn sample_snapshot() -> NetSnapshot {
     let mut ifaces: BTreeMap<String, IfaceSnap> = BTreeMap::new();
+    // FR-33 — (name, ifindex, address, prefix length) per LAN v4 address, for
+    // the capture probe below.
+    let mut lan_v4: Vec<(String, Option<u32>, std::net::Ipv4Addr, u8)> = Vec::new();
     if let Ok(addrs) = if_addrs::get_if_addrs() {
         for a in addrs {
             let slot = ifaces.entry(a.name.clone()).or_default();
@@ -445,6 +491,7 @@ pub fn sample_snapshot() -> NetSnapshot {
                 if_addrs::IfAddr::V4(v4) => {
                     if !v4.ip.is_loopback() {
                         slot.v4.push(v4.ip);
+                        lan_v4.push((a.name.clone(), a.index, v4.ip, v4.prefixlen));
                     }
                 }
                 if_addrs::IfAddr::V6(v6) => {
@@ -458,32 +505,152 @@ pub fn sample_snapshot() -> NetSnapshot {
             s.v4.sort_unstable();
         }
     }
+    let lan_captures = if crate::env::flag("OVERLAY_LAN_CAPTURE_PROBE", true) {
+        detect_lan_captures(&lan_v4, &ifaces)
+    } else {
+        Vec::new()
+    };
     NetSnapshot {
         ifaces,
         default_v4: default_route(false),
         default_v6: default_route(true),
+        lan_captures,
     }
 }
 
+/// FR-33 — one route lookup per LAN v4 address: does a packet to a neighbour
+/// inside our own prefix leave through the interface that owns the address?
+/// Link-local, loopback, point-to-point (/31, /32) and name-classified VPN
+/// adapters are skipped: none of them is a LAN a peer could be on.
+fn detect_lan_captures(
+    lan_v4: &[(String, Option<u32>, std::net::Ipv4Addr, u8)],
+    ifaces: &BTreeMap<String, IfaceSnap>,
+) -> Vec<LanCapture> {
+    let mut out: Vec<LanCapture> = Vec::new();
+    for (name, index, ip, plen) in lan_v4 {
+        if *plen == 0 || *plen >= 31 || ip.is_link_local() || ip.is_loopback() {
+            continue;
+        }
+        if ifaces.get(name).is_some_and(|i| i.vpn_class) {
+            continue;
+        }
+        let Some(hit) = route_lookup(IpAddr::V4(neighbour_in_prefix(*ip, *plen))) else {
+            continue;
+        };
+        let owner_ref = owner_ifref(name, *index);
+        if hit.ifref == owner_ref {
+            continue;
+        }
+        let prefix = format!("{}/{}", network_of(*ip, *plen), plen);
+        if out.iter().any(|c| c.prefix == prefix && &c.owner == name) {
+            continue;
+        }
+        let via_name = name_for_ifref(&hit.ifref, lan_v4);
+        out.push(LanCapture {
+            prefix,
+            owner: name.clone(),
+            via_ifref: hit.ifref,
+            via_name,
+        });
+    }
+    out
+}
+
+/// The identity [`route_lookup`] reports for an interface: ifindex on Windows
+/// (falling back to the name when `if_addrs` has none), the name elsewhere.
 #[cfg(windows)]
+fn owner_ifref(name: &str, index: Option<u32>) -> String {
+    index
+        .map(|i| i.to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+#[cfg(not(windows))]
+fn owner_ifref(name: &str, _index: Option<u32>) -> String {
+    name.to_string()
+}
+
+/// Map a lookup's `ifref` back to an interface name where the identity is an
+/// index (Windows); on Unix the ref already IS the name.
+#[cfg(windows)]
+fn name_for_ifref(
+    ifref: &str,
+    lan_v4: &[(String, Option<u32>, std::net::Ipv4Addr, u8)],
+) -> Option<String> {
+    let idx: u32 = ifref.parse().ok()?;
+    lan_v4
+        .iter()
+        .find(|(_, i, _, _)| *i == Some(idx))
+        .map(|(n, _, _, _)| n.clone())
+}
+#[cfg(not(windows))]
+fn name_for_ifref(
+    ifref: &str,
+    _lan_v4: &[(String, Option<u32>, std::net::Ipv4Addr, u8)],
+) -> Option<String> {
+    Some(ifref.to_string())
+}
+
+/// The network address of `ip/plen`.
+fn network_of(ip: std::net::Ipv4Addr, plen: u8) -> std::net::Ipv4Addr {
+    let mask: u32 = if plen == 0 {
+        0
+    } else {
+        u32::MAX << (32 - plen as u32)
+    };
+    std::net::Ipv4Addr::from(u32::from(ip) & mask)
+}
+
+/// A host address inside our own prefix that is neither us, the network nor
+/// the broadcast: flip the lowest bit, and if that lands on the network or
+/// broadcast address, flip the second bit instead. A fixed target inside the
+/// prefix is what makes the lookup answer "where would a LAN peer's packet
+/// go" without depending on any peer actually existing.
+fn neighbour_in_prefix(ip: std::net::Ipv4Addr, plen: u8) -> std::net::Ipv4Addr {
+    let net = u32::from(network_of(ip, plen));
+    let bcast = net | (u32::MAX >> plen as u32);
+    let a = u32::from(ip) ^ 1;
+    let pick = if a == net || a == bcast {
+        u32::from(ip) ^ 2
+    } else {
+        a
+    };
+    std::net::Ipv4Addr::from(pick)
+}
+
+/// The fixed public destination the default-route sample looks up.
+fn far_destination(v6: bool) -> IpAddr {
+    if v6 {
+        IpAddr::V6("2001:4860:4860::8888".parse().expect("literal"))
+    } else {
+        IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))
+    }
+}
+
 fn default_route(v6: bool) -> Option<DefaultRoute> {
+    route_lookup(far_destination(v6))
+}
+
+/// Where a packet to `dest` would leave: a route LOOKUP (never a send), the
+/// instrument behind both the default-route sample and the FR-33 capture probe.
+#[cfg(windows)]
+fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     use windows_sys::Win32::Foundation::NO_ERROR;
     use windows_sys::Win32::NetworkManagement::IpHelper::{GetBestRoute2, MIB_IPFORWARD_ROW2};
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
     // SAFETY: zeroed in/out structs + the documented GetBestRoute2 call
-    // shape; the row is only read on NO_ERROR. Destinations are fixed public
-    // anycast addresses — the lookup never sends a packet.
+    // shape; the row is only read on NO_ERROR. The lookup never sends a
+    // packet.
     unsafe {
         let mut dest: SOCKADDR_INET = core::mem::zeroed();
-        if v6 {
-            dest.Ipv6.sin6_family = AF_INET6;
-            dest.Ipv6.sin6_addr.u.Byte = "2001:4860:4860::8888"
-                .parse::<std::net::Ipv6Addr>()
-                .ok()?
-                .octets();
-        } else {
-            dest.Ipv4.sin_family = AF_INET;
-            dest.Ipv4.sin_addr.S_un.S_addr = u32::from(std::net::Ipv4Addr::new(8, 8, 8, 8)).to_be();
+        match dest_ip {
+            IpAddr::V6(v6) => {
+                dest.Ipv6.sin6_family = AF_INET6;
+                dest.Ipv6.sin6_addr.u.Byte = v6.octets();
+            }
+            IpAddr::V4(v4) => {
+                dest.Ipv4.sin_family = AF_INET;
+                dest.Ipv4.sin_addr.S_un.S_addr = u32::from(v4).to_be();
+            }
         }
         let mut row: MIB_IPFORWARD_ROW2 = core::mem::zeroed();
         let mut src: SOCKADDR_INET = core::mem::zeroed();
@@ -519,14 +686,15 @@ fn default_route(v6: bool) -> Option<DefaultRoute> {
 }
 
 #[cfg(target_os = "linux")]
-fn default_route(v6: bool) -> Option<DefaultRoute> {
+fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     // One-shot lookup, matching the existing shelled-`ip` style: cheap,
     // dependency-free, and correct through policy routing.
     let mut cmd = std::process::Command::new("ip");
-    if v6 {
-        cmd.args(["-6", "-o", "route", "get", "2001:4860:4860::8888"]);
+    let dest = dest_ip.to_string();
+    if dest_ip.is_ipv6() {
+        cmd.args(["-6", "-o", "route", "get", dest.as_str()]);
     } else {
-        cmd.args(["-o", "route", "get", "8.8.8.8"]);
+        cmd.args(["-o", "route", "get", dest.as_str()]);
     }
     let out = cmd.output().ok()?;
     let line = String::from_utf8_lossy(&out.stdout);
@@ -546,14 +714,15 @@ fn default_route(v6: bool) -> Option<DefaultRoute> {
 }
 
 #[cfg(target_os = "macos")]
-fn default_route(v6: bool) -> Option<DefaultRoute> {
+fn route_lookup(dest_ip: IpAddr) -> Option<DefaultRoute> {
     // `route -n get` — the BSD twin of `ip route get`; multi-line
     // `key: value` output ("interface: en0" / "gateway: 192.168.68.1").
     let mut cmd = std::process::Command::new("route");
-    if v6 {
-        cmd.args(["-n", "get", "-inet6", "2001:4860:4860::8888"]);
+    let dest = dest_ip.to_string();
+    if dest_ip.is_ipv6() {
+        cmd.args(["-n", "get", "-inet6", dest.as_str()]);
     } else {
-        cmd.args(["-n", "get", "8.8.8.8"]);
+        cmd.args(["-n", "get", dest.as_str()]);
     }
     let out = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -573,7 +742,7 @@ fn default_route(v6: bool) -> Option<DefaultRoute> {
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn default_route(_v6: bool) -> Option<DefaultRoute> {
+fn route_lookup(_dest_ip: IpAddr) -> Option<DefaultRoute> {
     None
 }
 
@@ -841,7 +1010,60 @@ mod tests {
                 gateway: Some("192.168.68.1".parse().unwrap()),
             }),
             default_v6: None,
+            lan_captures: vec![],
         }
+    }
+
+    /// FR-33 — a capture appearing or clearing is a material delta on its
+    /// own (nothing else moved), stays Minor (no socket keys on it), and the
+    /// summary names it both ways — the one onset / one clear line.
+    #[test]
+    fn lan_capture_change_is_material_minor_and_named() {
+        let home = snap(&[("Wi-Fi", &["192.168.68.132"])], Some("Wi-Fi"));
+        let mut captured = home.clone();
+        captured.lan_captures.push(LanCapture {
+            prefix: "192.168.68.128/25".into(),
+            owner: "Wi-Fi".into(),
+            via_ifref: "27".into(),
+            via_name: Some("Ethernet 3".into()),
+        });
+        let d = diff(&home, &captured, false, false).expect("onset is material");
+        assert!(d.material);
+        assert_eq!(d.severity, Severity::Minor, "a capture keys no socket");
+        assert!(!d.default_route_moved);
+        assert!(
+            d.summary
+                .contains("lan_capture=192.168.68.128/25 via Ethernet 3"),
+            "summary names the capture: {}",
+            d.summary
+        );
+        let d = diff(&captured, &home, false, false).expect("clear is material");
+        assert!(d.summary.contains("lan_capture=clear"), "{}", d.summary);
+        assert!(
+            diff(&captured, &captured, false, false).is_none(),
+            "unchanged = no delta"
+        );
+    }
+
+    /// FR-33 — the probe target is a host inside our own prefix that is
+    /// neither us, the network nor the broadcast address.
+    #[test]
+    fn neighbour_in_prefix_stays_inside_and_off_the_edges() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(
+            neighbour_in_prefix(ip("192.168.68.126"), 24),
+            ip("192.168.68.127")
+        );
+        assert_eq!(
+            neighbour_in_prefix(ip("192.168.68.132"), 25),
+            ip("192.168.68.133")
+        );
+        // ^1 would land on the broadcast → the second bit is flipped instead.
+        assert_eq!(neighbour_in_prefix(ip("10.0.0.254"), 24), ip("10.0.0.252"));
+        // ^1 would land on the network address.
+        assert_eq!(neighbour_in_prefix(ip("10.0.0.1"), 24), ip("10.0.0.3"));
+        assert_eq!(network_of(ip("192.168.68.132"), 25), ip("192.168.68.128"));
+        assert_eq!(network_of(ip("10.20.30.40"), 8), ip("10.0.0.0"));
     }
 
     /// Flap damping — one material Major per cooldown window; inside it the
