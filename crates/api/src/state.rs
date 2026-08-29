@@ -23,10 +23,10 @@ use roomler_ai_services::{
         consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
         invite::InviteDao, message::MessageDao, notification::NotificationDao,
         overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
-        overlay_policy::OverlayPolicyDao, push_subscription::PushSubscriptionDao,
-        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
-        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao,
-        ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
+        overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
+        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
+        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
+        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
         tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
         tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
@@ -103,6 +103,9 @@ pub struct AppState {
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
+    /// FR-19 peer-relay decisions: approvals (who made a device a relay) and
+    /// mints (what the server routed through it), granted or refused.
+    pub peer_relay_audit: Arc<PeerRelayAuditDao>,
     /// P8 — device-reported session activity. Separate from `ssh_audit`
     /// because one is the server's decision and the other is a claim by the
     /// device; see `SshActivityEvent`.
@@ -244,6 +247,10 @@ pub struct AppState {
     /// through the same `authorize`, so neither transport is unlimited.
     pub exec_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     pub ssh_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    /// FR-19 — per-(requesting node, relay node) mint ceiling
+    /// (`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`), checked by the mint
+    /// in `ws::overlay` AFTER the identity gates so a refusal is attributable.
+    pub relay_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 
     /// The one GitHub-releases cache, shared by `/api/agent/*`,
     /// `/api/tunnel/*` and `/api/setup/*` — they all read the same
@@ -373,6 +380,7 @@ impl AppState {
         let exec_audit = Arc::new(ExecAuditDao::new(&db));
         let ssh_audit = Arc::new(SshAuditDao::new(&db));
         let config_audit = Arc::new(ConfigAuditDao::new(&db));
+        let peer_relay_audit = Arc::new(PeerRelayAuditDao::new(&db));
         let ssh_activity = Arc::new(SshActivityDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
             &db,
@@ -847,6 +855,7 @@ impl AppState {
             exec_audit,
             ssh_audit,
             config_audit,
+            peer_relay_audit,
             ssh_activity,
             agent_crashes,
             agent_logs,
@@ -885,6 +894,7 @@ impl AppState {
             relay_pair_churn: Arc::new(DashMap::new()),
             exec_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             ssh_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
+            relay_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             releases_cache,
         };
 

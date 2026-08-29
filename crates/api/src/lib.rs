@@ -406,6 +406,13 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{agent_id}/desired-config",
             put(routes::remote_config::set_desired_config),
+        )
+        // FR-19 gate 3 — approve a device as an org relay. MANAGE_AGENTS +
+        // EXEC_DEVICE (there is no free permission bit; routes/peer_relay.rs
+        // says why), audited on both arms.
+        .route(
+            "/{agent_id}/peer-relay-policy",
+            put(routes::peer_relay::set_policy),
         );
 
     // Remote-control session routes (tenant-scoped)
@@ -525,6 +532,14 @@ pub fn build_router(state: AppState) -> Router {
     // tenant-scoped rather than per-device: the switch governs every device,
     // and the log is the org-wide "what ran on my fleet?" view.
     let exec_audit_routes = Router::new().route("/", get(routes::agent_exec::audit));
+    // FR-19 — peer relays: the org switch + approved-relay listing, and the
+    // decision log. Approval itself is on the agent router (gate 3 is per
+    // device).
+    let peer_relay_routes = Router::new().route(
+        "/",
+        get(routes::peer_relay::get_settings).put(routes::peer_relay::set_mode),
+    );
+    let peer_relay_audit_routes = Router::new().route("/", get(routes::peer_relay::audit));
     let ssh_audit_routes = Router::new().route("/", get(routes::agent_ssh::audit));
     let ssh_activity_routes = Router::new().route("/", get(routes::agent_ssh::activity));
     let exec_settings_routes = Router::new().route(
@@ -704,6 +719,11 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/overlay-block", overlay_block_routes)
         .nest("/tenant/{tenant_id}/stats", tenant_stats_routes)
         .nest("/tenant/{tenant_id}/exec-audit", exec_audit_routes)
+        .nest("/tenant/{tenant_id}/peer-relay", peer_relay_routes)
+        .nest(
+            "/tenant/{tenant_id}/peer-relay-audit",
+            peer_relay_audit_routes,
+        )
         .nest("/tenant/{tenant_id}/ssh-audit", ssh_audit_routes)
         .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity_routes)
         .nest("/tenant/{tenant_id}/exec-settings", exec_settings_routes)
