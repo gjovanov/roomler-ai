@@ -20,6 +20,26 @@ RUN bun run build
 
 # --- Stage 3: Runtime (nginx + Rust binary) ---
 FROM debian:trixie-slim AS runtime
+
+# ── OCI image metadata (FR-24) ──────────────────────────────────────────────
+# Renders on GHCR / Docker Hub listing pages and is what `docker inspect`
+# reports. `licenses` is AGPL-3.0-only because THIS IMAGE is the control
+# plane (roomler-ai-api + derp-relay + the Vue bundle) — the MPL-2.0 half of
+# the split ships as native agent binaries, never in this image. It must be
+# updated in lockstep with LICENSE/LICENSING.md; a stale value here
+# advertises the wrong terms to every registry that lists us.
+ARG VERSION=dev
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.title="Roomler" \
+      org.opencontainers.image.description="Remote desktop in a browser tab + WireGuard mesh VPN. Self-hosted, end-to-end encrypted." \
+      org.opencontainers.image.url="https://roomler.ai" \
+      org.opencontainers.image.source="https://github.com/gjovanov/roomler-ai" \
+      org.opencontainers.image.documentation="https://github.com/gjovanov/roomler-ai/blob/master/docs/README.md" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.vendor="G ROX EOOD" \
+      org.opencontainers.image.authors="legal@roomler.ai" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}"
 RUN apt-get update && apt-get install -y ca-certificates nginx && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/roomler-ai-api /usr/local/bin/
 COPY --from=builder /app/target/release/derp-relay /usr/local/bin/

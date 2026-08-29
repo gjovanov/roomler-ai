@@ -177,16 +177,36 @@ not have, so the verification step is part of the job, not a nicety.
 |---|---|---|
 | **P1** | Licence files, `LICENSING.md`, `COMMERCIAL.md`, README | ✅ shipped |
 | **P2** | `license` on all 17 manifests, `ui/package.json`, 625 SPDX headers, `REUSE.toml` | ✅ shipped |
-| **P3** | `CONTRIBUTING.md`, `SECURITY.md`, `security.txt`, `docs/CLA.md` | ⚠️ CLA is a **draft**; needs legal review + bot activation |
-| **P4a** | `THIRD-PARTY-NOTICES.md` + written offer + `lgpl-source-offer.yml` | ✅ shipped; workflow needs its first dispatch |
-| **P4b** | Close the §6 relink gap structurally | open — see below |
+| **P3** | `CONTRIBUTING.md`, `SECURITY.md`, `security.txt`, `docs/CLA.md` (Apache-ICLA-derived), disabled `cla.yml` | ✅ shipped; ⚠️ CLA still needs legal review before the bot is enabled |
+| **P4a** | `THIRD-PARTY-NOTICES.md` + written offer + `lgpl-source-offer.yml` | ✅ shipped; workflow needs its first dispatch (blocked until this merges — `workflow_dispatch` only resolves on the default branch) |
+| **P4b** | Close the §6 relink gap | ✅ **resolved by publication** — see below; `docs/lgpl-relink.md` |
 | **P5** | *(optional)* `server` feature on `tunnel-core` so AGPL reaches further | not planned |
+| **P6** | OCI image labels on the runtime stage + build-args in the deploy recipe | ✅ shipped |
 
-**P4b options**, in preference order: switch the Windows build to **shared**
-FFmpeg (§6(b) removes the obligation entirely, at a measured cost against the
-13.13 MB MSI the P3e program fought for), or publish the relink object archive
-automatically per release. Serving it on request is §6(c)-valid but depends on a
-human answering mail.
+### P4b — the relink gap was smaller than it looked
+
+The first pass assumed §6 obliged us to ship **object files**, and recorded
+two structural fixes (shared FFmpeg on Windows, or a per-release object
+archive). Re-reading the clause closed it without either.
+
+§6(a) asks for the "work that uses the Library" **"as object code and/or
+source code"**. Roomler's agent is MPL-2.0, every crate it links is in this
+repository, and the Windows build is a public `cargo build` that finds FFmpeg
+through `pkg-config` — so a recipient can modify FFmpeg, rebuild, point
+`PKG_CONFIG_PATH` at their tree and relink, using nothing we have not already
+published. **Being open source discharges the half we thought we owed.**
+
+`docs/lgpl-relink.md` makes that exercisable rather than merely arguable:
+the exact per-platform feature lists, the `.pc` layout the build requires, and
+`encoder-smoke --codec hevc` as the check that the relinked binary really uses
+the new library. ⚠️ It also states plainly that a relinked binary is unsigned
+and our updater will refuse it — a security control, not a §6 restriction.
+
+Shared-FFmpeg-on-Windows is therefore no longer a compliance item. It remains
+available as a simplification, but it would **add** to the install (the Linux
+minimal shared tree is ~2.5 MB of libraries, against a measured 0.29 MiB true
+closure for the ten HW encoders when statically linked), so it is not obviously
+a win and needs measuring on its own merits, not as a legal necessity.
 
 ## Acceptance criteria
 
@@ -200,10 +220,12 @@ human answering mail.
 - [x] `SECURITY.md` + `/.well-known/security.txt` published and present in the built bundle
 - [x] FFmpeg build flags documented; openh264 grant gap and HEVC exposure recorded
 - [x] `cargo check` green on both lanes; `ui` build + 858 unit tests green
-- [ ] `cargo deny check licenses` passes in CI *(first run lands with this PR)*
-- [ ] `lgpl-source-offer.yml` dispatched; corresponding-source asset live
-- [ ] CLA reviewed by a lawyer and the bot activated
-- [ ] OCI `licenses` label set (must land with this FR, never ahead of it)
+- [x] `cargo deny check licenses` passes in CI — three real findings triaged (WTFPL `tun`, MIT-0 `dcv-color-primitives`, and our own AGPL members, fixed with `publish = false` + `private.ignore` rather than allowlisting AGPL)
+- [ ] `lgpl-source-offer.yml` dispatched; corresponding-source asset live *(blocked: `workflow_dispatch` resolves only on the default branch, so it runs the moment this merges)*
+- [x] CLA rewritten on the Apache ICLA 2.0 skeleton; `cla.yml` present but `if: false`
+- [ ] CLA reviewed by a lawyer and the bot enabled *(the only thing still gating P3)*
+- [x] OCI `licenses` label set on the runtime stage, landing WITH this FR — plus title/description/url/source/documentation/vendor, and `VERSION`/`GIT_SHA` build-args wired into the deploy recipe
+- [x] LGPL §6 relink right is **exercisable and documented** (`docs/lgpl-relink.md`), not merely offered by mail
 
 ## Open decisions
 
@@ -239,3 +261,5 @@ human answering mail.
 | 2026-08-28 | `dist/.well-known/security.txt` after build | present |
 | 2026-08-28 | First CI run of `licensing.yml` | manifest audit ✓ · SPDX check ✓ · **AGPL-in-agent graph check ✓** · `cargo deny` ✗ |
 | 2026-08-28 | `cargo deny` failure triaged | two real findings: our own AGPL members were checked as "dependencies", and `tun` 0.8.10 is **WTFPL** (unvetted). The invented `ring` clarify never matched and was removed. |
+| 2026-08-29 | Re-read LGPL-2.1 §6(a) against the actual build | "object code **and/or source code**" ⇒ open-sourcing the agent already discharges the half we thought needed an object archive; P4b closed without shipping one |
+| 2026-08-29 | `gh workflow run lgpl-source-offer.yml --ref fr24-licensing-split` | **HTTP 404** — `workflow_dispatch` resolves only on the default branch; the first run has to wait for the merge |
