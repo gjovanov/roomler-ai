@@ -532,8 +532,11 @@ async fn mode_off_writes_nothing_and_warn_audits_without_pushing() {
     rig.request().await;
     rig.assert_nothing_pushed_to_a().await;
     assert!(
-        audit_rows(&rig.app, &rig.seeded).await.is_empty(),
-        "off ⇒ zero rows"
+        audit_rows(&rig.app, &rig.seeded)
+            .await
+            .iter()
+            .all(|r| r["action"] != json!("mint")),
+        "off ⇒ zero MINT rows (the approval writes its own row, legitimately)"
     );
 
     // warn: the decision is recorded as a would-be mint, nothing is pushed.
