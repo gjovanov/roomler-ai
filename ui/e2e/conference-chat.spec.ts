@@ -43,7 +43,11 @@ test.describe('Room Call Chat', () => {
     await page.getByRole('button', { name: /join/i }).click()
 
     // After joining, chat panel should be visible (auto-opens)
-    await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
+    // The panel IS its editor: assert on that, not on the word "Chat".
+    // `getByText('Chat')` matched four elements — this fixture's own org and
+    // room are named "Chat Org" and "Chat Meeting" — so the assertion died on
+    // a strict-mode violation, which reads like a product failure and is not.
+    await expect(page.locator('.tiptap').first()).toBeVisible({ timeout: 15000 })
 
     // Click the chat toggle to hide
     await page.locator('button:has(.mdi-message-text)').first().click()
@@ -60,7 +64,11 @@ test.describe('Room Call Chat', () => {
 
     // Join the call
     await page.getByRole('button', { name: /join/i }).click()
-    await expect(page.getByText('Chat')).toBeVisible({ timeout: 15000 })
+    // The panel IS its editor: assert on that, not on the word "Chat".
+    // `getByText('Chat')` matched four elements — this fixture's own org and
+    // room are named "Chat Org" and "Chat Meeting" — so the assertion died on
+    // a strict-mode violation, which reads like a product failure and is not.
+    await expect(page.locator('.tiptap').first()).toBeVisible({ timeout: 15000 })
 
     // Type into the TipTap editor (unified chat uses MessageEditor with TipTap)
     const editor = page.locator('.tiptap').first()
