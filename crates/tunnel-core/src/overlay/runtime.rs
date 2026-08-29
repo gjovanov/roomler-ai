@@ -692,6 +692,82 @@ struct AllocDone {
 /// allocate is in flight the peer stays in `pending`, so `is_tracking` keeps
 /// deduping re-requests exactly as before.
 type RelayAllocQueue = EpochQueue<AllocDone>;
+
+/// FR-19 P4b — a finished OFF-LOOP org-relay bind (see [`OrgBindQueue`]).
+/// `conn: None` = no endpoint challenged → the commit arm drops the session
+/// so the pair takes the TURN/DERP path on its next request.
+struct OrgBindDone {
+    epoch: u64,
+    node_id: ObjectId,
+    relay_node_id: ObjectId,
+    conn: Option<Arc<crate::overlay::orgrelay::client::OrgRelayConn>>,
+    outcomes: Vec<crate::overlay::orgrelay::client::EndpointOutcome>,
+}
+
+/// FR-19 P4b — OFF-LOOP org-relay binds: the `RelayAllocQueue` discipline
+/// applied to the bind handshake, because a network round trip per endpoint
+/// must never run on the data-plane loop. Same epoch-token ABA guard — a
+/// stale completion drops on epoch mismatch, and `commit_org_bind` requiring
+/// the SAME session (by VNI) drops a bind that a re-mint superseded mid-flight.
+type OrgBindQueue = EpochQueue<OrgBindDone>;
+
+/// Run one org-relay bind off-loop and hand the result to the commit arm.
+/// The socket is fresh per session: the relay binds a member by its observed
+/// source, so every session needs its own.
+fn spawn_org_bind(
+    job: crate::overlay::orgrelay::member::OrgBindJob,
+    relay_label: String,
+    epoch: u64,
+    tx: mpsc::Sender<OrgBindDone>,
+) {
+    use crate::overlay::orgrelay::client::{OrgRelayConn, bind_any};
+    tokio::spawn(async move {
+        let bind_addr = match job.endpoints.first() {
+            Some(std::net::SocketAddr::V6(_)) => "[::]:0",
+            _ => "0.0.0.0:0",
+        };
+        let (conn, outcomes) = match tokio::net::UdpSocket::bind(bind_addr).await {
+            Ok(sock) => match bind_any(
+                &sock,
+                &job.endpoints,
+                job.vni,
+                job.generation,
+                &job.secret,
+                job.per_endpoint,
+            )
+            .await
+            {
+                Ok((relay, outcomes)) => (
+                    Some(Arc::new(OrgRelayConn::new(
+                        Arc::new(sock),
+                        relay,
+                        job.vni,
+                        relay_label,
+                    ))),
+                    outcomes,
+                ),
+                Err((e, outcomes)) => {
+                    debug!(peer = %job.node_id, vni = job.vni, %e,
+                        "overlay relay: org-relay bind failed on every endpoint");
+                    (None, outcomes)
+                }
+            },
+            Err(e) => {
+                warn!(%e, "overlay relay: could not open a socket for the org-relay bind");
+                (None, Vec::new())
+            }
+        };
+        let _ = tx
+            .send(OrgBindDone {
+                epoch,
+                node_id: job.node_id,
+                relay_node_id: job.relay_node_id,
+                conn,
+                outcomes,
+            })
+            .await;
+    });
+}
 /// Phase B — per-socket STUN attempt timeout when gathering srflx candidates at
 /// startup. `srflx_query` retries a few times, so worst-case per socket is a
 /// small multiple of this; the whole gather is additionally bounded by
@@ -755,6 +831,21 @@ pub enum OverlayEvent {
     /// PathMonitor's Q for the peer's incumbent tier; never affects
     /// eligibility. Gated by `OVERLAY_RTT_Q` (default on).
     RttSample { node_id: ObjectId, rtt_ms: u32 },
+    /// FR-19 P4b — the server minted an org-relay session for us and
+    /// `peer_node_id` (`rc:overlay.relay_session`).
+    OrgRelaySession {
+        vni: u32,
+        generation: u64,
+        peer_node_id: ObjectId,
+        relay_node_id: ObjectId,
+        relay_endpoints: Vec<String>,
+        bind_secret: String,
+        bind_secs: u32,
+        max_lifetime_secs: u32,
+    },
+    /// FR-19 P4b — the server tore a session down (`rc:overlay.relay_revoke`:
+    /// org mode off, an ACL edit, the relay's approval cleared, a party gone).
+    OrgRelayRevoke { vni: u32 },
     /// R3/R4 — the embedder observed a LAN-address-set change on a
     /// control-WS reconnect (the `RuntimeFingerprint` lan_ips mismatch that
     /// used to spawn a WHOLE NEW runtime beside this one — which was never
@@ -1150,6 +1241,8 @@ pub struct OverlayRuntime {
     mode: CarrierMode,
     tun_factory: TunFactory,
     mtu: u16,
+    /// FR-19 P4b — see [`Self::with_org_primary`].
+    org_primary: bool,
     /// Phase 1 — subnet CIDRs this node advertises as a router (from config).
     /// Sent in the join; the server gates them behind admin approval.
     advertised_routes: Vec<String>,
@@ -1399,6 +1492,7 @@ impl OverlayRuntime {
             mtu,
             advertised_routes: Vec::new(),
             peer_view: None,
+            org_primary: false,
             exit_node: None,
             exit_server_ips: Vec::new(),
             derp_mux_factory: None,
@@ -1429,6 +1523,7 @@ impl OverlayRuntime {
             mtu,
             advertised_routes: Vec::new(),
             peer_view: None,
+            org_primary: false,
             exit_node: None,
             exit_server_ips: Vec::new(),
             derp_mux_factory: None,
@@ -1511,6 +1606,16 @@ impl OverlayRuntime {
     /// runtime publishes nothing.
     pub fn with_peer_view(mut self, tx: watch::Sender<OverlayView>) -> Self {
         self.peer_view = Some(tx);
+        self
+    }
+
+    /// FR-19 P4b — whether this runtime serves the device's PRIMARY org.
+    /// Carried on the join as `org_primary`: the server refuses every
+    /// org-relay decision for a node that does not say `true`, and the agent
+    /// drops relay frames on a secondary org's WS, so a secondary runtime is
+    /// never handed a session.
+    pub fn with_org_primary(mut self, primary: bool) -> Self {
+        self.org_primary = primary;
         self
     }
 
@@ -1845,16 +1950,16 @@ impl OverlayRuntime {
             // Data-probe — this build's engine answers the overlay-native
             // echo inline (wired in `process_inbound`), so advertise it.
             supports_overlay_echo: true,
-            // FR-19 — `false` until the client side (P4) can actually USE an
-            // org relay. Advertising it earlier would invite the server to push
-            // relay_session frames this build cannot act on.
-            supports_org_relay: false,
-            // FR-19 P3c — the server refuses every relay decision for a node
-            // that does not say it is PRIMARY, and pairs this port with the
-            // node's public addresses when it serves. Both stay `None` until
-            // P4 wires the client side (`OrgCtx`, `relay_server_port`).
-            org_primary: None,
-            relay_port: None,
+            // FR-19 P4b — advertised only with `overlay_org_relay` on: the
+            // server pushes `relay_session` frames only to a node that says it
+            // can act on them, and a session on a build that cannot is a black
+            // hole. `org_primary` gates every relay decision server-side
+            // (absent = refused), and `relay_port` is what the mint pairs with
+            // this node's public addresses when it serves.
+            supports_org_relay: super::direct::org_relay_enabled(),
+            org_primary: Some(self.org_primary),
+            relay_port: super::orgrelay::relay_server_enabled()
+                .then(super::orgrelay::relay_server_port),
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         }
@@ -1923,6 +2028,8 @@ impl OverlayRuntime {
                 Some(OverlayEvent::WarmRelayGrant { .. }) => continue, // pre-netmap; ignore
                 Some(OverlayEvent::ForceDerp { .. }) => continue,   // pre-netmap; ignore
                 Some(OverlayEvent::RttSample { .. }) => continue,   // pre-netmap; ignore
+                Some(OverlayEvent::OrgRelaySession { .. }) => continue, // pre-netmap; ignore
+                Some(OverlayEvent::OrgRelayRevoke { .. }) => continue, // pre-netmap; ignore
                 Some(OverlayEvent::RebuildDirect) => continue,      // pre-netmap; no plane yet
                 None => return,
             }
@@ -2379,6 +2486,14 @@ impl OverlayRuntime {
             tx: built_tx,
         };
         // rc.218 — off-loop relay ALLOCATES (see `RelayAllocQueue`).
+        // FR-19 P4b — off-loop org-relay binds, the same shape as the TURN
+        // allocate queue right below.
+        let (org_tx, mut org_rx) = mpsc::channel::<OrgBindDone>(16);
+        let mut org_q = OrgBindQueue {
+            in_flight: HashMap::new(),
+            epoch: 0,
+            tx: org_tx,
+        };
         let (alloc_tx, mut alloc_rx) = mpsc::channel::<AllocDone>(16);
         let mut alloc_q = RelayAllocQueue {
             in_flight: HashMap::new(),
@@ -2650,6 +2765,50 @@ impl OverlayRuntime {
                         warn_if_slow("arm:relay_alloc_commit", t_arm);
                     }
                 },
+                // FR-19 P4b — an off-loop org-relay bind finished: report what
+                // was measured, then commit the carrier (µs) or drop the session.
+                done = org_rx.recv() => {
+                    if let Some(done) = done {
+                        let t_arm = Instant::now();
+                        // Every endpoint tried is reported — the server ranks
+                        // relays for the NEXT mint on these, and accepts them
+                        // only about (relay, endpoint) pairs it minted for us.
+                        for o in &done.outcomes {
+                            let _ = self
+                                .outbound
+                                .send(ClientMsg::OverlayRelayProbe {
+                                    relay_node_id: done.relay_node_id,
+                                    endpoint: o.endpoint.to_string(),
+                                    reachable: o.reachable,
+                                    rtt_ms: o.rtt.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+                                })
+                                .await;
+                        }
+                        if org_q.take_if_current(&done.node_id, done.epoch) {
+                            if let Some(r) = relay.as_mut() {
+                                match done.conn {
+                                    Some(conn) => {
+                                        if let Some(link) = r.commit_org_bind(done.node_id, conn) {
+                                            let t0 = Instant::now();
+                                            self.install_ready(&mut wg, &mut by_node, &tun, link, &mut relay_bq).await;
+                                            warn_if_slow("install_ready(org-relay)", t0);
+                                            self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
+                                        }
+                                    }
+                                    None => {
+                                        warn!(peer = %done.node_id,
+                                            "overlay relay: org-relay bind failed — dropping the session (TURN/DERP on the next request)");
+                                        r.org_bind_failed(&done.node_id);
+                                    }
+                                }
+                            }
+                        } else {
+                            debug!(peer = %done.node_id, "overlay: dropping a stale org-relay bind (peer superseded mid-bind)");
+                        }
+                        warn_if_slow("arm:org_bind_commit", t_arm);
+                    }
+                },
                 // rc.136 — direct→relay fallback sweep. A DIRECT carrier whose
                 // handshake never completes (or dies mid-session) means the LAN
                 // path only LOOKED viable (same subnet) but isn't actually
@@ -2659,6 +2818,20 @@ impl OverlayRuntime {
                 // doesn't immediately re-upgrade it to direct).
                 _ = fallback.tick() => {
                     let t_arm = Instant::now();
+                    // FR-19 P4b — expire org-relay sessions past their lifetime
+                    // and spawn the binds `request` decided on since the last
+                    // pass (a bind is a network round trip: never on-loop).
+                    if let Some(r) = relay.as_mut() {
+                        for p in r.reap_org_sessions(Instant::now()) {
+                            org_q.invalidate(&p);
+                            debug!(peer = %p, "overlay relay: org-relay session expired (absolute lifetime)");
+                        }
+                        for job in r.take_org_jobs() {
+                            let label = current_peers.get(&job.relay_node_id).map(|p| p.name.clone()).unwrap_or_else(|| job.relay_node_id.to_hex());
+                            let epoch = org_q.stamp(job.node_id);
+                            spawn_org_bind(job, label, epoch, org_q.tx.clone());
+                        }
+                    }
                     // P8 — resume-from-suspend: wall-vs-monotonic skew across
                     // the tick means the host slept. Every installed carrier is
                     // dead (NAT/pinhole state expired; peers tore their ends
@@ -3743,6 +3916,48 @@ impl OverlayRuntime {
                                 }
                                 None => warn!("overlay warm relay: grant carried no turn creds; skipping"),
                             }
+                        }
+                    }
+                    // FR-19 P4b — the server minted an org-relay session for a pair.
+                    Some(OverlayEvent::OrgRelaySession { vni, generation, peer_node_id, relay_node_id, relay_endpoints, bind_secret, bind_secs, max_lifetime_secs }) => {
+                        let t_arm = Instant::now();
+                        if let Some(r) = relay.as_mut() {
+                            match crate::overlay::orgrelay::member::OrgSession::from_wire(vni, generation, relay_node_id, &relay_endpoints, &bind_secret, bind_secs, max_lifetime_secs) {
+                                Some(session) => {
+                                    r.org_session_accept(peer_node_id, session);
+                                    // Bind now when the pair NEEDS a relay: TURN
+                                    // coordination in flight, or installed on a
+                                    // non-direct carrier. A DIRECT pair keeps its
+                                    // path — never ratchet — and the session waits
+                                    // for the next relay request.
+                                    let needs_relay = r.is_tracking(&peer_node_id)
+                                        || by_node.get(&peer_node_id).is_some_and(|e| !e.is_direct);
+                                    if needs_relay
+                                        && let Some(np) = current_peers.get(&peer_node_id)
+                                        && let Some(pc) = crate::overlay::netmap::peer_config_from_netmap(np)
+                                    {
+                                        alloc_q.invalidate(&peer_node_id);
+                                        r.forget(&peer_node_id);
+                                        r.org_request_bind(peer_node_id, pc);
+                                    }
+                                    for job in r.take_org_jobs() {
+                                        let label = current_peers.get(&job.relay_node_id).map(|p| p.name.clone()).unwrap_or_else(|| job.relay_node_id.to_hex());
+                                        let epoch = org_q.stamp(job.node_id);
+                                        spawn_org_bind(job, label, epoch, org_q.tx.clone());
+                                    }
+                                }
+                                None => warn!(peer = %peer_node_id, vni,
+                                    "overlay relay: malformed org-relay session (secret or endpoints); ignored"),
+                            }
+                        }
+                        warn_if_slow("arm:org_relay_session", t_arm);
+                    }
+                    Some(OverlayEvent::OrgRelayRevoke { vni }) => {
+                        if let Some(r) = relay.as_mut()
+                            && let Some(peer) = r.org_session_revoke(vni)
+                        {
+                            org_q.invalidate(&peer);
+                            info!(%peer, vni, "overlay relay: org-relay session revoked by the server — the sweep re-coordinates the pair");
                         }
                     }
                     Some(OverlayEvent::ForceDerp { peer_node_id, ttl_ms, derp_url }) => {
