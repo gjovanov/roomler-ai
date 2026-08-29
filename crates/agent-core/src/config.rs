@@ -63,7 +63,7 @@ pub struct AgentConfig {
     /// match historical self-host behaviour (`docs/remote-control.md`
     /// §11.2 + signaling.rs's pre-Plan-3 auto-grant). Org-controlled
     /// fleets set this to `false` so every session start waits for
-    /// an explicit operator decision via the `roomler-agent consent
+    /// an explicit operator decision via the `roomler consent
     /// --session <hex> --approve|--deny` CLI fallback (or, in a
     /// future version, a tray prompt). 30 s timeout → auto-deny.
     /// Has NO effect on the file-DC path — uploads/downloads/dir

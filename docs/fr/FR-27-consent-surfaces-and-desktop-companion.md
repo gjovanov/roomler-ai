@@ -189,7 +189,7 @@ is why it is sequenced last, behind its own feature and the probe.
 | 4 | Linux packaging — a **separate** `roomler-desktop` .deb | absent package = today's behaviour | **implemented** — field pending |
 | 5 | Input arbitration — mode re-seed, visible floor requests, single-viewer rail, deterministic handover | none needed (bug fixes) | **implemented** — field pending |
 | 6 | Field test on the GROX fleet | n/a | not started |
-| 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | not started |
+| 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the field-result half lands with phase 6 |
 
 ## Acceptance criteria
 
