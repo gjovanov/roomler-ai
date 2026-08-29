@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#809](https://github.com/gjovanov/roomler-ai/issues/809) |
-| **Status** | P0-P7 on master; **field-verified on Linux, Windows and macOS**; the CI guard blocks on `--check --strict` (**0 unclassified**, 756 anchored). |
+| **Status** | **CLOSED 2026-08-29** — all 11 acceptance criteria met and field-verified on Linux, Windows and macOS. 1 849 → **0** unclassified, 743 anchored, guard BLOCKING on `--check --strict`. |
 | **Opened** | 2026-08-28 |
 | **Baseline** | master `fa364b12` (0.4.11) — every count and anchor below was measured against it |
 | **Scope** | Windows · Linux · macOS — code, comments, docs, `CLAUDE.md`, file names, folder names, env vars |
