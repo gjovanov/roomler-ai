@@ -1,6 +1,6 @@
 # FR-35: The constrained ceiling learns the pair — grow the relay cap on delivery evidence, remember it per peer
 
-Status: **P0 measured; P1/P2 designed, not yet implemented** (2026-08-29). Tracking issue: `FR-35` (#922).
+Status: **P0 measured; P1 + P2 implemented, not yet field-verified** (2026-08-29). Tracking issue: `FR-35` (#922).
 Child of the RC-quality program. Follows FR-31 (every opening and repair number on an NVENC relay
 session is proportional to `maxrate`, and nothing ffmpeg exposes changes that) and the parked
 measured-rate line (#678: a sender cannot see capacity it is not using). Operator's directive
