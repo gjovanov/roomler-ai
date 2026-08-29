@@ -1,0 +1,1003 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! `roomler` — TeamViewer-style native tunnel client.
+//!
+//! Forwards a local TCP port over a WebRTC P2P data channel to an
+//! enrolled `roomlerd`, which dials the corresponding intranet
+//! destination. The Roomler API is signalling-only — payload never
+//! touches the server.
+//!
+//! CLI surface:
+//!
+//!   roomler enroll --server <url> --token <enrollment-jwt> --name <label>
+//!   roomler forward --agent <agent_id> --local <port> --remote <host:port>
+//!   roomler run [--config <path>]
+//!   roomler diagnose [--agent <agent_id>]
+//!   roomler status [--json]     # local daemon's node state (LocalAPI)
+//!   roomler peers  [--json]     # peers + connection types (LocalAPI)
+//!   roomler flows  [--json]     # active forwards / SOCKS5 (LocalAPI)
+
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
+
+use crate::{config, forward, localclient, mesh, update};
+
+/// CLI transport shim — the parsed `--transport` value. The real preference
+/// enum (`tunnel_core::driver::TransportPref`) is clap-free (so the driver
+/// crate needn't depend on clap); this mirrors its variants for the CLI and
+/// converts into it at dispatch. Wire values are lowercase (`auto`/`quic`/
+/// `webrtc`), matching the pre-refactor `#[value(rename_all = "lowercase")]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum CliTransport {
+    #[default]
+    Auto,
+    Quic,
+    Webrtc,
+}
+
+impl From<CliTransport> for forward::TransportPref {
+    fn from(t: CliTransport) -> Self {
+        match t {
+            CliTransport::Auto => forward::TransportPref::Auto,
+            CliTransport::Quic => forward::TransportPref::Quic,
+            CliTransport::Webrtc => forward::TransportPref::Webrtc,
+        }
+    }
+}
+
+impl CliTransport {
+    /// The lowercase wire word the daemon's LocalAPI `create_*` verbs expect.
+    fn as_word(self) -> &'static str {
+        match self {
+            CliTransport::Auto => "auto",
+            CliTransport::Quic => "quic",
+            CliTransport::Webrtc => "webrtc",
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "roomler", version, about, long_about = None)]
+struct Cli {
+    // RETIRED-NAME-ANCHOR(4): the config segment is frozen — it holds the
+    // ENROLLED credential on tunnel-only hosts, and renaming it strands
+    // every one of them. agents/roomler-cli/src/config.rs
+    /// Override config file location. Defaults to the platform config dir
+    /// (`%APPDATA%\roomler\roomler-tunnel\config.toml` on Windows,
+    /// `~/.config/roomler-tunnel/config.toml` on Linux, the equivalent on
+    /// macOS via the `directories` crate).
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Enroll this laptop against a Roomler server using an admin-issued
+    /// tunnel-enrollment token. Writes the long-lived `TunnelClient` JWT
+    /// to the config file. Mirrors `roomlerd enroll`.
+    Enroll {
+        /// Base URL of the Roomler API (e.g. https://roomler.ai).
+        #[arg(long)]
+        server: String,
+        /// Tunnel-enrollment token, as printed by the admin UI.
+        #[arg(long)]
+        token: String,
+        /// Friendly name shown in the admin tunnel-clients list.
+        #[arg(long)]
+        name: String,
+    },
+    /// Open one TCP forward: listen on `--local`, accept TCP connections,
+    /// dial `--remote` from the named agent's host. Stays in the
+    /// foreground; Ctrl-C tears down.
+    Forward {
+        /// Hex `agent_id` of the target agent (visible in the admin UI).
+        #[arg(long)]
+        agent: String,
+        /// Local TCP port to listen on (bound to 127.0.0.1).
+        #[arg(long)]
+        local: u16,
+        /// Remote destination `host:port` that the agent dials. Subject
+        /// to the agent's allowlist + the tenant's tunnel_policies.
+        #[arg(long)]
+        remote: String,
+        /// Data-plane transport. `auto` (default) prefers QUIC and
+        /// transparently falls back to WebRTC if QUIC setup fails;
+        /// `quic` forces QUIC (no fallback); `webrtc` forces the proven
+        /// WebRTC DataChannel path. Server-side QUIC negotiation is
+        /// deployed and gates on the agent's reported version, so `auto`
+        /// only attempts QUIC against agents that actually support it.
+        #[arg(long, value_enum, default_value = "auto")]
+        transport: CliTransport,
+        /// Hand the forward to the LOCAL daemon over the LocalAPI instead of
+        /// running it in this process: the daemon opens it over its own agent
+        /// WS (no tunnel-client token needed) + supervises it, and this command
+        /// returns immediately. The flow survives this CLI's exit — manage it
+        /// with `flows` / `kill`. (Becomes the default at the P3d rename.)
+        #[arg(long)]
+        daemon: bool,
+    },
+    /// Run a local SOCKS5 proxy ("userspace mode"): apps point at
+    /// `127.0.0.1:<local>` and each connection's SOCKS5 CONNECT target is dialed
+    /// by the named agent over the tunnel. Needs NO OS routing, so it works on
+    /// strict full-tunnel corporate VPNs (Check Point, etc.) where the L3 overlay
+    /// can't win the routing table. Same server policy + agent allowlist as
+    /// `forward`. Stays in the foreground; Ctrl-C tears down. TCP CONNECT only.
+    Socks5 {
+        /// Hex `agent_id` of the target agent. OMIT for **mesh mode**: one proxy
+        /// reaches the whole tenant, addressing an agent by its 24-hex id as the
+        /// SOCKS hostname (`--socks5-hostname <agent-id>:<port>`).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Local TCP port for the SOCKS5 listener (bound to 127.0.0.1).
+        #[arg(long)]
+        local: u16,
+        /// Data-plane transport — same semantics as `forward` (`auto` prefers
+        /// QUIC with WebRTC-DC fallback).
+        #[arg(long, value_enum, default_value = "auto")]
+        transport: CliTransport,
+        /// Hand the listener to the LOCAL daemon over the LocalAPI (see
+        /// `forward --daemon`). Requires `--agent` (daemon mesh mode is a later
+        /// slice); returns immediately, manage with `flows` / `kill`.
+        #[arg(long)]
+        daemon: bool,
+    },
+    /// Stop a daemon-run forward / SOCKS5 listener by its flow id (from
+    /// `flows`). Talks to the LOCAL daemon over the LocalAPI — no config/token.
+    Kill {
+        /// Flow id to stop (as shown in the `flows` `ID` column).
+        id: String,
+    },
+    /// Manage DECLARED routes — daemon-supervised forwards / SOCKS5
+    /// listeners persisted in the daemon's config: they come back on
+    /// every daemon start (and reboot) until removed. The persistent
+    /// counterpart of the ephemeral `forward --daemon` flow (P6).
+    Route {
+        #[command(subcommand)]
+        action: RouteAction,
+    },
+    /// Read a multi-forward config from disk and run all forwards as
+    /// persistent listeners. Superseded by daemon-supervised declared
+    /// routes — use `route add` instead; never wired.
+    Run {},
+    /// Probe path-MTU, ICE candidate reachability, and TURN-relay status
+    /// against the named agent. Prints a structured diagnostic dump.
+    /// T3 implementation.
+    Diagnose {
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Check for a newer roomler CLI release and self-replace the running
+    /// binary (Windows). Mirrors `roomlerd self-update`.
+    SelfUpdate {
+        /// Only check + report whether an update is available; don't install.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Show the local daemon's node state (id, version, mode, overlay IP,
+    /// server connection) over the LocalAPI. Read-only; needs no config/token —
+    /// the OS pipe/socket ACL is the trust boundary.
+    Status {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Tail a daemon log, resolved BY the daemon — the path differs per process
+    /// and per platform, and two of the candidates on a Windows host are decoys.
+    /// Pairs with Fleet RPC: `roomler exec <host> -- roomler logs --grep ICE`.
+    Logs {
+        /// Which log: `daemon` (this process's rolling log — the one with the
+        /// overlay/media events), `service` (the SCM host log), or `panic`
+        /// (the newest panic dump).
+        #[arg(long, default_value = "daemon")]
+        source: String,
+        /// Tail size in bytes; the daemon clamps it (≤64 KiB).
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        /// Case-insensitive substring filter applied to the returned tail.
+        #[arg(long)]
+        grep: Option<String>,
+        /// Keep only the last N lines (applied after `--grep`; the transport
+        /// stays byte-bounded, so N is capped by `--max-bytes` worth of log).
+        #[arg(short = 'n', long)]
+        lines: Option<usize>,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// List the peers the local daemon currently sees, with each peer's live
+    /// connection type (direct / relay / tunnel / blocked / offline).
+    Peers {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Explain why ONE peer rides the carrier it rides: the tier ladder with
+    /// each tier's eligibility and score, and any hold-down that is
+    /// overriding the raw ranking (a demote-follow window, a server DERP pin,
+    /// a probe in flight).
+    ///
+    /// Accepts a device name (or a unique part of one), an overlay IP, or a
+    /// node id — whatever you can read out of `roomler peers`.
+    Why {
+        /// Peer to explain: name / name fragment / overlay IP / node id.
+        peer: String,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Show this node's measured network capability vector (overlay v3
+    /// netcheck): STUN reachability, the raw relay-band verdict the dialer
+    /// role keys on, `/derp` floor health, NAT class, and the measurement's
+    /// age. `None`/absent until the first probe completes (~45 s after the
+    /// daemon starts).
+    Netcheck {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// List the local daemon's active forwards / SOCKS5 listeners + throughput.
+    /// (Empty until the tunnel data plane folds into the daemon — P3b.)
+    Flows {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Rename this device via the running daemon: the daemon persists the new
+    /// name to its OWN config (profile-correct even under a SYSTEM service —
+    /// no elevation needed) and announces it on the next server reconnect.
+    Rename {
+        /// The new device name (trimmed; max 64 characters).
+        name: String,
+    },
+    /// Read / edit this device's advanced configuration via the running
+    /// daemon (S2 config surface): overlay knobs, subnet routes, update
+    /// policy, encoder preference. The daemon validates per key and
+    /// persists to its OWN config (profile-correct even under a SYSTEM
+    /// service). Changes take effect on the next daemon restart.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
+    /// the OS-free reachability probe. Only meaningful when the local daemon runs
+    /// in netstack mode (a locked-down host with no OS route to the mesh).
+    Ping {
+        /// Overlay peer to ping — a name (e.g. `devbox`) or an overlay IP
+        /// (either family; `fd72:6f6f:6d6c::<v4>` is the derived overlay IPv6).
+        target: String,
+        /// Round-trip timeout in milliseconds.
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+        /// Ping the peer's derived overlay IPv6 instead of its IPv4 (name
+        /// targets only; a literal IP already picks its own family).
+        #[arg(short = '6', long = "ipv6")]
+        prefer_v6: bool,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Run a command on another device in this organization (Fleet RPC).
+    ///
+    /// The local daemon relays it over its own server connection, so no
+    /// separate login is needed — but the SERVER decides, not this CLI:
+    /// the org kill-switch, your EXEC_DEVICE permission, the target's
+    /// policy, and the target's own `exec_enabled` key must all allow it,
+    /// and this device must be marked as permitted to originate.
+    ///
+    /// Commands run as the target daemon's identity (SYSTEM on Windows,
+    /// root under systemd) and every attempt is audited.
+    Exec {
+        /// Target device — a name (e.g. `winhost-a`) or a hex agent id.
+        device: String,
+        /// `pwsh` | `powershell` | `cmd` | `bash` | `sh`. Default: the
+        /// target host's own default shell.
+        #[arg(long, default_value = "")]
+        shell: String,
+        /// Command timeout in seconds on the target (max 300).
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        #[command(flatten)]
+        fmt: OutputFmt,
+        /// The command. Put it after `--` so its own flags aren't parsed
+        /// by roomler: `roomler exec winhost-a -- Get-NetRoute -AddressFamily IPv4`
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Open an SSH session to another device in this org, over the overlay.
+    ///
+    /// No `sshd` and no open port on the target: the roomler daemon there
+    /// intercepts the connection below the OS. The session itself runs through
+    /// your system `ssh` — roomler supplies a single-use identity, the address,
+    /// and the target's host key, then gets out of the way.
+    ///
+    /// The host key is VERIFIED, never trusted on first use. If the server has
+    /// no key for the device, this refuses to connect.
+    ///
+    ///   roomler ssh winhost-a
+    ///   roomler ssh winhost-a -- uptime
+    Ssh {
+        /// Target device — a name (e.g. `winhost-a`) or a hex agent id.
+        device: String,
+        /// Session lifetime in seconds. 0 = the server's ceiling.
+        #[arg(long, default_value_t = 0)]
+        session_secs: u64,
+        /// Anything after `--` is passed to `ssh` verbatim — a remote command,
+        /// or extra client options: `roomler ssh box -- -v uptime`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// stdio↔TCP pipe for OpenSSH's `ProxyCommand`, so stock `ssh`, `scp`,
+    /// `rsync` and `git` can reach mesh devices BY NAME.
+    ///
+    ///   # ~/.ssh/config
+    ///   Host *.roomler
+    ///     ProxyCommand roomler proxy %h %p
+    ///
+    ///   scp report.pdf corplap-3.roomler:/tmp/
+    ///
+    /// Transport and name resolution only: `ProxyCommand` cannot supply an
+    /// identity or a host key, so this uses keys YOU manage. For a
+    /// grant-issued session with the account resolved by policy and the host
+    /// key verified for you, use `roomler ssh` instead.
+    Proxy {
+        /// Device name or overlay address (OpenSSH passes `%h`).
+        host: String,
+        /// Port (OpenSSH passes `%p`).
+        port: u16,
+    },
+    /// Collect a standard diagnostic bundle from one or two devices and
+    /// print it side by side.
+    ///
+    /// Distinct from `diagnose`, which probes MTU/ICE from THIS host. This
+    /// one runs a canned, OS-appropriate evidence set ON the target devices
+    /// via Fleet RPC — adapters, routes, firewall posture, overlay carrier
+    /// state, recent overlay warnings — which is the evidence set a
+    /// "why is this pair on relay?" question actually needs.
+    Diag {
+        #[command(subcommand)]
+        action: DiagAction,
+    },
+}
+
+/// `roomler diag …` — remote evidence bundles over Fleet RPC.
+#[derive(Debug, Subcommand)]
+enum DiagAction {
+    /// Bundle from one device.
+    Host {
+        device: String,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Bundle from BOTH ends of a pair — the shape of the question
+    /// "why can't these two reach each other directly?".
+    Pair {
+        a: String,
+        b: String,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+}
+
+/// Shared output flag for the read-only LocalAPI verbs (`status`/`peers`/
+/// `flows`). `--json` emits the raw wire structs for scripting; omitted, a
+/// human table is printed. Meaningless on `enroll`/`forward`, so it's flattened
+/// only onto the three read verbs rather than made global.
+#[derive(Debug, Args)]
+struct OutputFmt {
+    /// Emit raw JSON instead of a human-readable table.
+    #[arg(long)]
+    json: bool,
+}
+
+/// `roomler config …` — the S2 editable config surface. All verbs talk
+/// to the LOCAL daemon over the LocalAPI; secrets are excluded by
+/// construction and every change is restart-to-apply.
+#[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// List every editable key with its current value and type.
+    Ls {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Set one key. Value formats: `true`/`false` for switches,
+    /// comma-separated CIDRs for route lists, a JSON document for the
+    /// structured keys (`forward_acl`, `virtual_desktop_apps`).
+    Set {
+        /// Config key (as shown by `config ls`).
+        key: String,
+        /// The new value.
+        value: String,
+    },
+    /// Clear one key back to its built-in default.
+    Clear {
+        /// Config key (as shown by `config ls`).
+        key: String,
+    },
+}
+
+/// `roomler route …` — declared-route management (P6). All verbs talk to
+/// the LOCAL daemon over the LocalAPI; the daemon persists changes into
+/// its own config and reconciles them into live flows.
+#[derive(Debug, Subcommand)]
+enum RouteAction {
+    /// Declare a supervised route. With `--remote` it's a static forward;
+    /// without, a SOCKS5 listener toward the node.
+    Add {
+        /// Target agent id (24-hex) to reach.
+        #[arg(long)]
+        agent: String,
+        /// Local loopback port to listen on.
+        #[arg(long)]
+        local: u16,
+        /// Forward target `host:port` (as reachable FROM the agent).
+        /// Omit for a SOCKS5 route.
+        #[arg(long)]
+        remote: Option<String>,
+        /// Transport preference: auto (default) | quic | webrtc.
+        #[arg(long, value_enum, default_value_t = CliTransport::Auto)]
+        transport: CliTransport,
+        /// Route id (slug shown in `route ls`); generated when omitted.
+        #[arg(long)]
+        id: Option<String>,
+        /// Declare disabled (enable later with `route enable`).
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Remove a declared route (kills its live flow, deletes it from the
+    /// daemon config).
+    Rm {
+        /// Route id (from `route ls`).
+        id: String,
+    },
+    /// List declared routes with their live state
+    /// (pending / active / backoff / failed / disabled).
+    Ls {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Enable a declared route (also clears a terminal `failed` state).
+    Enable {
+        /// Route id (from `route ls`).
+        id: String,
+    },
+    /// Disable a declared route without deleting it (kills its live flow).
+    Disable {
+        /// Route id (from `route ls`).
+        id: String,
+    },
+}
+
+/// Which binary is hosting this command surface.
+///
+/// Only `self-update` branches on it today (see that arm), but it is the
+/// honest place to hang any future "the daemon owns this concern" divergence
+/// rather than sniffing argv[0] or an env var.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The standalone `roomler` binary on a tunnel-only host.
+    Standalone,
+    /// Dispatched from `roomlerd cli` on a daemon host.
+    EmbeddedInDaemon,
+}
+
+/// Entry point for the standalone `roomler` binary — parses the process's
+/// own argv.
+pub async fn run() -> Result<()> {
+    run_from(std::env::args_os(), Origin::Standalone).await
+}
+
+/// Entry point for an EMBEDDED caller (P3e lever D): `roomlerd cli -- <args>`
+/// dispatches here so a daemon host ships ONE copy of this CLI's code instead
+/// of a second 22 MiB binary that is ~92 % the same crates. `args` follows the
+/// usual convention — element 0 is the program name.
+///
+/// Logging init is `try_init` (not `init`) precisely because of that embedded
+/// caller: `roomlerd` has already installed a global subscriber by the time it
+/// reaches this dispatch, and `init()` PANICS on a second install. Ignoring an
+/// `Err` here means "someone else already set logging up", which is exactly
+/// right for both callers.
+pub async fn run_from<I, T>(args: I, origin: Origin) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    // Rust starts with SIGPIPE ignored, so `roomler peers | head` PANICS with
+    // "failed printing to stdout: Broken pipe" the moment `head` closes the
+    // pipe (field-hit on buildhost, rc.368, via `roomlerd cli`). Restore the
+    // normal Unix CLI contract — die quietly on EPIPE — for BOTH callers:
+    // this entry is only ever a CLI invocation (the daemon's `run` path never
+    // comes through here), so the process-wide reset is exactly scoped.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
+    let cli = Cli::parse_from(args);
+    match cli.command {
+        Command::Enroll {
+            server,
+            token,
+            name,
+        } => enroll_cmd(cli.config, server, token, name).await,
+        Command::Forward {
+            agent,
+            local,
+            remote,
+            transport,
+            daemon,
+        } => {
+            if daemon {
+                // Thin-client path: hand it to the local daemon over the
+                // LocalAPI (no config/token — the pipe ACL is the boundary).
+                localclient::create_forward(&agent, local, &remote, transport.as_word()).await
+            } else {
+                let cfg = config::load(cli.config).context("loading tunnel config")?;
+                forward::run(cfg, &agent, local, &remote, transport.into()).await
+            }
+        }
+        Command::Socks5 {
+            agent,
+            local,
+            transport,
+            daemon,
+        } => {
+            if daemon {
+                let node = agent.context(
+                    "--daemon socks5 requires --agent (daemon mesh mode is a later slice)",
+                )?;
+                localclient::create_socks5(&node, local, transport.as_word()).await
+            } else {
+                let cfg = config::load(cli.config).context("loading tunnel config")?;
+                let transport = transport.into();
+                match agent {
+                    Some(agent) => forward::run_socks5(cfg, &agent, local, transport).await,
+                    None => mesh::run_mesh(cfg, local, transport).await,
+                }
+            }
+        }
+        Command::Kill { id } => localclient::kill(&id).await,
+        Command::Route { action } => match action {
+            RouteAction::Add {
+                agent,
+                local,
+                remote,
+                transport,
+                id,
+                disabled,
+            } => {
+                localclient::route_add(
+                    id.unwrap_or_default(),
+                    &agent,
+                    local,
+                    remote,
+                    transport.as_word(),
+                    !disabled,
+                )
+                .await
+            }
+            RouteAction::Rm { id } => localclient::route_rm(&id).await,
+            RouteAction::Ls { fmt } => localclient::route_ls(fmt.json).await,
+            RouteAction::Enable { id } => localclient::route_set_enabled(&id, true).await,
+            RouteAction::Disable { id } => localclient::route_set_enabled(&id, false).await,
+        },
+        Command::Run {} => bail!(
+            "`run` was superseded by daemon-supervised declared routes — use `route add` \
+             (persisted in the daemon config, restarts with the daemon)"
+        ),
+        Command::Diagnose { agent } => {
+            bail!("T3: diagnose not yet wired (agent={:?})", agent);
+        }
+        Command::SelfUpdate { check } => {
+            // "One updater per role" (see CLAUDE.md, P4c-2): tunnel-ONLY hosts
+            // self-update this binary; daemon hosts get the whole node stack
+            // refreshed by the MSI. Before P3e lever D that distinction was
+            // only a convention — a daemon host running `roomler self-update`
+            // would happily overwrite the MSI-owned roomler.exe out from under
+            // the installer. Now it would ALSO swap the 150 KB shim for a
+            // 22 MiB standalone CLI, silently undoing the lever. Refuse, and
+            // name the right updater instead.
+            if origin == Origin::EmbeddedInDaemon {
+                bail!(
+                    "`self-update` is not available on a daemon host — this `roomler` is a shim \
+                     over the installed daemon, and the MSI updates the whole node stack \
+                     (daemon + CLI + desktop companion) as a unit.\n\
+                     Update with:  roomlerd self-update"
+                );
+            }
+            let cfg = config::load(cli.config).context("loading tunnel config")?;
+            update::self_update(&cfg, check).await
+        }
+        // Read-only LocalAPI verbs: no config/token — talk straight to the
+        // local daemon over its ACL-gated pipe/socket.
+        Command::Status { fmt } => localclient::status(fmt.json).await,
+        Command::Logs {
+            source,
+            max_bytes,
+            grep,
+            lines,
+            fmt,
+        } => localclient::logs(source, max_bytes, grep, lines, fmt.json).await,
+        Command::Peers { fmt } => localclient::peers(fmt.json).await,
+        Command::Why { peer, fmt } => localclient::why(&peer, fmt.json).await,
+        Command::Netcheck { fmt } => localclient::netcheck(fmt.json).await,
+        Command::Flows { fmt } => localclient::flows(fmt.json).await,
+        Command::Rename { name } => localclient::rename(&name).await,
+        Command::Config { action } => match action {
+            ConfigAction::Ls { fmt } => localclient::config_ls(fmt.json).await,
+            ConfigAction::Set { key, value } => localclient::config_set(&key, Some(&value)).await,
+            ConfigAction::Clear { key } => localclient::config_set(&key, None).await,
+        },
+        Command::Ping {
+            target,
+            timeout_ms,
+            prefer_v6,
+            fmt,
+        } => localclient::ping(&target, timeout_ms, prefer_v6, fmt.json).await,
+        Command::Exec {
+            device,
+            shell,
+            timeout,
+            fmt,
+            command,
+        } => {
+            localclient::exec(
+                &device,
+                &shell,
+                &command.join(" "),
+                timeout.saturating_mul(1000),
+                fmt.json,
+            )
+            .await
+        }
+        Command::Ssh {
+            device,
+            session_secs,
+            args,
+        } => {
+            // Mirror ssh's own exit status, the same way `exec` mirrors the
+            // remote command's — so `roomler ssh box -- false` composes in a
+            // script instead of always looking successful.
+            match crate::sshcmd::run(&device, session_secs, &args).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Proxy { host, port } => crate::sshcmd::proxy(&host, port).await,
+        Command::Diag { action } => match action {
+            DiagAction::Host { device, fmt } => localclient::diag_bundle(&[device], fmt.json).await,
+            DiagAction::Pair { a, b, fmt } => localclient::diag_bundle(&[a, b], fmt.json).await,
+        },
+    }
+}
+
+/// `roomler enroll` — exchange a tunnel-enrollment JWT for a
+/// long-lived `TunnelClient` JWT via the server, then persist server
+/// URL + token to the local config file.
+async fn enroll_cmd(
+    cfg_path: Option<PathBuf>,
+    server_url: String,
+    enrollment_token: String,
+    machine_name: String,
+) -> Result<()> {
+    let enroll_url = format!(
+        "{}/api/tunnel-client/enroll",
+        server_url.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "enrollment_token": enrollment_token,
+        "machine_name": machine_name,
+        "machine_id": derive_machine_id(&machine_name),
+        // The server's TunnelEnrollRequest requires `os` (OsKind,
+        // snake_case) + `client_version`. `std::env::consts::OS` already
+        // yields the exact wire values ("windows" / "linux" / "macos").
+        // Without these the enroll fails with HTTP 422 "missing field".
+        "os": std::env::consts::OS,
+        "client_version": env!("CARGO_PKG_VERSION"),
+    });
+    let resp = reqwest::Client::new()
+        .post(&enroll_url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {enroll_url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("enrollment failed (HTTP {status}): {body}");
+    }
+    #[derive(serde::Deserialize)]
+    struct EnrollResponse {
+        tunnel_client_token: String,
+    }
+    let parsed: EnrollResponse = resp.json().await.context("parsing enrollment response")?;
+
+    let cfg = config::TunnelConfig {
+        server_url,
+        tunnel_client_token: parsed.tunnel_client_token,
+        machine_name,
+    };
+    let path = config::save(&cfg, cfg_path.as_deref()).context("saving tunnel config")?;
+    println!("Enrolled. Config written to {}", path.display());
+    Ok(())
+}
+
+/// Hash `machine_name` + the hostname to a hex-encoded blob the server
+/// uses to dedupe re-enrollments from the same host. Mirrors the
+/// agent's `derive_machine_id` shape (lowercase 16-hex of the SHA-256).
+fn derive_machine_id(machine_name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hostname = hostname_lossy();
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let mut h = Sha256::new();
+    h.update(machine_name.as_bytes());
+    h.update(b"\0");
+    h.update(hostname.as_bytes());
+    h.update(b"\0");
+    h.update(os.as_bytes());
+    h.update(b"\0");
+    h.update(arch.as_bytes());
+    let digest = h.finalize();
+    hex::encode(&digest[..16])
+}
+
+fn hostname_lossy() -> String {
+    #[cfg(unix)]
+    {
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        "unknown".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_forward() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Forward {
+                agent,
+                local,
+                remote,
+                transport,
+                daemon,
+            } => {
+                assert_eq!(agent, "507f1f77bcf86cd799439011");
+                assert_eq!(local, 5432);
+                assert_eq!(remote, "10.0.0.5:5432");
+                // No --transport given → default is auto (prefer QUIC,
+                // fall back to WebRTC on setup failure).
+                assert_eq!(transport, CliTransport::Auto);
+                // No --daemon → in-process standalone (the current default).
+                assert!(!daemon);
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_forward_transport_quic() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+            "--transport",
+            "quic",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Forward { transport, .. } => {
+                assert_eq!(transport, CliTransport::Quic);
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_forward_transport_auto() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+            "--transport",
+            "auto",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Forward { transport, .. } => {
+                assert_eq!(transport, CliTransport::Auto);
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_socks5() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "socks5",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "1080",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Socks5 {
+                agent,
+                local,
+                transport,
+                daemon,
+            } => {
+                assert_eq!(agent.as_deref(), Some("507f1f77bcf86cd799439011"));
+                assert_eq!(local, 1080);
+                assert_eq!(transport, CliTransport::Auto);
+                assert!(!daemon);
+            }
+            other => panic!("expected Socks5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_socks5_mesh_without_agent() {
+        let cli = Cli::try_parse_from(["roomler", "socks5", "--local", "1080"]).unwrap();
+        match cli.command {
+            Command::Socks5 { agent, local, .. } => {
+                assert_eq!(agent, None); // mesh mode
+                assert_eq!(local, 1080);
+            }
+            other => panic!("expected Socks5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_forward_daemon_flag() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+            "--daemon",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Forward { daemon, .. } => assert!(daemon),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_kill_verb() {
+        let cli = Cli::try_parse_from(["roomler", "kill", "fl-7"]).unwrap();
+        match cli.command {
+            Command::Kill { id } => assert_eq!(id, "fl-7"),
+            other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_as_word_matches_localapi_wire() {
+        assert_eq!(CliTransport::Auto.as_word(), "auto");
+        assert_eq!(CliTransport::Quic.as_word(), "quic");
+        assert_eq!(CliTransport::Webrtc.as_word(), "webrtc");
+    }
+
+    #[test]
+    fn parses_enroll() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "enroll",
+            "--server",
+            "https://roomler.ai",
+            "--token",
+            "eyJhbGciOiJIUzI1NiJ9.payload.sig",
+            "--name",
+            "example-laptop",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Enroll {
+                server,
+                token,
+                name,
+            } => {
+                assert_eq!(server, "https://roomler.ai");
+                assert_eq!(token, "eyJhbGciOiJIUzI1NiJ9.payload.sig");
+                assert_eq!(name, "example-laptop");
+            }
+            other => panic!("expected Enroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_machine_id_is_deterministic() {
+        let a = derive_machine_id("test-name");
+        let b = derive_machine_id("test-name");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32); // 16 bytes hex-encoded
+    }
+
+    #[test]
+    fn derive_machine_id_changes_with_name() {
+        assert_ne!(derive_machine_id("a"), derive_machine_id("b"));
+    }
+
+    #[test]
+    fn parses_status_peers_flows() {
+        for verb in ["status", "peers", "flows"] {
+            let cli = Cli::try_parse_from(["roomler", verb]).unwrap();
+            match (verb, cli.command) {
+                ("status", Command::Status { fmt }) => assert!(!fmt.json),
+                ("peers", Command::Peers { fmt }) => assert!(!fmt.json),
+                ("flows", Command::Flows { fmt }) => assert!(!fmt.json),
+                (v, other) => panic!("verb {v} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parses_status_json_flag() {
+        let cli = Cli::try_parse_from(["roomler", "status", "--json"]).unwrap();
+        match cli.command {
+            Command::Status { fmt } => assert!(fmt.json),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_flag_is_not_global() {
+        // A fully-valid `forward` + `--json` must fail: `--json` belongs only to
+        // the read verbs (flattened there), not globally.
+        let r = Cli::try_parse_from([
+            "roomler",
+            "forward",
+            "--agent",
+            "507f1f77bcf86cd799439011",
+            "--local",
+            "5432",
+            "--remote",
+            "10.0.0.5:5432",
+            "--json",
+        ]);
+        assert!(r.is_err(), "--json must not be accepted on `forward`");
+    }
+}

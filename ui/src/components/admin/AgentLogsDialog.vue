@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-dialog v-model="open" max-width="1100" scrollable>
     <v-card>
@@ -254,7 +256,7 @@ function fmtFields(fields: Record<string, unknown> | undefined): string {
 }
 
 /** Strip the leading module path so the target column stays narrow —
- *  e.g. `tunnel_core::forward` → `forward`, `roomler_agent::tunnel::
+ *  e.g. `tunnel_core::forward` → `forward`, `roomlerd::tunnel::
  *  acceptor` → `acceptor`. Full target is still searchable via the
  *  filter box (which matches the un-shortened string). */
 function shortTarget(target: string): string {

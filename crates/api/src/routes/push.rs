@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -77,7 +79,7 @@ async fn validate_push_endpoint(endpoint: &str) -> Result<(), ApiError> {
 
 /// Conservative "is this a routable public address" test. Deliberately hand
 /// rolled: `IpAddr::is_global` is still unstable.
-fn is_global_unicast(ip: &IpAddr) -> bool {
+pub(crate) fn is_global_unicast(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             !(v4.is_private()

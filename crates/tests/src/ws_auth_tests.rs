@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! `/ws` authentication — the session-cookie path and the origin guard that
 //! has to come with it.
 //!

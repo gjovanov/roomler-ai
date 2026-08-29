@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay L3 data plane — userspace WireGuard mesh (Phase 2+).
 //!
 //! Feature-gated behind `overlay`. Pulls in `boringtun` for the Noise
@@ -49,6 +51,10 @@ pub mod netstack_socks;
 /// subscription, typed snapshots/deltas, non-blocking fan-out). Public: the
 /// agent's signaling loop subscribes for its probe-then-cycle arm.
 pub mod netstate;
+/// FR-19 P1 — org-relay wire framing (Geneve `Opt Len 0`, pinned protocol,
+/// 24-bit VNI). Framing and shape rules only: nothing here forwards, binds or
+/// holds session state.
+pub mod orgrelay;
 pub(crate) mod path;
 pub mod relay_link;
 pub mod router;

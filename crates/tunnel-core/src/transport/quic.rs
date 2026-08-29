@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `quic-v1` transport — opportunistic QUIC P2P data plane (quinn).
 //!
 //! This is the Phase-1a *core*: a [`QuicPeer`] that builds a quinn
@@ -45,6 +47,8 @@ use super::{Capabilities, TRANSPORT_QUIC_V1, Transport};
 
 /// ALPN id for the tunnel's QUIC connections. Both ends must match or
 /// the TLS handshake fails (a cheap version/role guard).
+// RETIRED-NAME-ANCHOR(2): WIRE VALUE — the ALPN travels in the TLS ClientHello and both
+// ends must agree, so renaming it breaks every deployed peer.
 const ALPN: &[u8] = b"roomler-tunnel-quic-v1";
 
 /// ALPN id for the overlay's WG-over-QUIC **datagram** carrier. Distinct from
@@ -54,6 +58,10 @@ const OVERLAY_ALPN: &[u8] = b"roomler-overlay-wg-v1";
 
 /// Placeholder SNI — the client pins by cert fingerprint, not by name,
 /// so the value only needs to be a syntactically-valid DNS name.
+// RETIRED-NAME-ANCHOR: this value goes out on the wire in the ClientHello. The
+// pin is by cert fingerprint so the name is not semantically load-bearing, which
+// is exactly why changing it buys nothing and risks a middlebox or a future
+// server-side check. Frozen. See docs/fr/FR-21.
 const SNI: &str = "roomler-tunnel";
 
 /// SHA-256 fingerprint of a DER certificate, lowercase hex. This is the

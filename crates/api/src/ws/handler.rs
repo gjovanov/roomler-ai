@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use axum::{
     extract::{
         Query, State, WebSocketUpgrade,
@@ -856,6 +858,9 @@ pub(crate) async fn dispatch_media_local(
         "media:producer_close" => {
             handle_media_producer_close(state, user_id, connection_id, data).await;
         }
+        "media:producer_pause" => {
+            handle_media_producer_pause(state, user_id, connection_id, data).await;
+        }
         "media:leave" => {
             handle_media_leave(state, user_id, connection_id, data).await;
         }
@@ -932,6 +937,31 @@ async fn handle_media_join(
         return;
     }
 
+    // FR-32 P1b — plan `video_max_participants`. Counted from the pod-local
+    // room registry rather than Mongo, because that is where a live call
+    // actually exists; the tenant-affinity LB co-locates a tenant's conference
+    // on ONE pod, so the local count is the whole call. ⚠ Distinct USERS, not
+    // connections: one person on laptop and phone is one participant.
+    //
+    // A rejoining participant is already in the map, so `>=` would refuse them
+    // their own seat — hence the membership test before the count.
+    if let Ok(room) = state.rooms.base.find_by_id(rid).await
+        && let Ok(tenant) = state.tenants.base.find_by_id(room.tenant_id).await
+    {
+        let present = state.room_manager.get_participant_user_ids(&rid);
+        if !present.contains(user_id)
+            && let Err(d) = roomler_ai_services::quota::check(
+                tenant.plan.clone(),
+                tenant.settings.plan_enforcement,
+                roomler_ai_services::quota::Limit::VideoMaxParticipants,
+                present.len() as u64,
+            )
+        {
+            send_media_error(state, connection_id, &d.message()).await;
+            return;
+        }
+    }
+
     let transport_pair = match state
         .room_manager
         .create_transports(rid, *user_id, connection_id.to_string())
@@ -964,7 +994,17 @@ async fn handle_media_join(
         .await;
     }
 
-    let ice_servers: Vec<serde_json::Value> = if let Some(ref url) = state.settings.turn.url {
+    // ⚠️ `Some("")` is "configured" to the type system and "not configured" to
+    // everyone else. Treat a blank URL as absent, or we advertise an ICE server
+    // the browser refuses outright and no one can join a call at all.
+    let turn_url_configured = state
+        .settings
+        .turn
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+    let ice_servers: Vec<serde_json::Value> = if let Some(url) = turn_url_configured {
         let (turn_username, turn_credential) =
             if let Some(ref secret) = state.settings.turn.shared_secret {
                 let expiry = SystemTime::now()
@@ -1290,6 +1330,11 @@ async fn handle_media_consume(
                     "producer_id": consumer_info.producer_id,
                     "kind": consumer_info.kind,
                     "rtp_parameters": consumer_info.rtp_parameters,
+                    // FR-30 P4 — the pause EVENT only reaches whoever was
+                    // already in the room, so the state has to ride the
+                    // subscription too. Without it, joining after someone
+                    // muted shows no badge until their next toggle.
+                    "producer_paused": consumer_info.producer_paused,
                 }
             });
             super::dispatcher::send_to_connection_routed(
@@ -1303,6 +1348,78 @@ async fn handle_media_consume(
         Err(e) => {
             send_media_error(state, connection_id, &format!("consume failed: {}", e)).await;
         }
+    }
+}
+
+/// FR-30 — relay "my camera/mic just went off (or back on)" to the room.
+///
+/// Without this a peer cannot tell: `producer.pause()` in mediasoup-client is
+/// LOCAL, and a track with `enabled = false` keeps its RTP stream alive with
+/// black frames, so the receiving track stays `live` and UNMUTED. Measured on
+/// prod 2026-08-29 — the far side saw `enabled:true, readyState:"live",
+/// muted:false` after the sender switched their camera off, which is why
+/// "hide participants without video" could never hide anyone.
+///
+/// Shaped exactly like `handle_media_producer_close` below, and additive: an
+/// older client never sends this and ignores the event it would receive.
+async fn handle_media_producer_pause(
+    state: &AppState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    data: Option<&serde_json::Value>,
+) {
+    let Some(data) = data else { return };
+    let Some(room_id_str) = data.get("room_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(producer_id_str) = data.get("producer_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    // Absent means "pause": the only caller that omits it is a client that
+    // predates the resume half, and pausing is the safe reading.
+    let paused = data.get("paused").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let Ok(rid) = ObjectId::parse_str(room_id_str) else {
+        return;
+    };
+    let Ok(producer_id) = producer_id_str.parse::<ProducerId>() else {
+        return;
+    };
+
+    if !state
+        .room_manager
+        .set_producer_paused(&rid, connection_id, &producer_id, paused)
+        .await
+    {
+        // The producer is not ours, or is already gone. Say nothing: fanning
+        // out an unverified claim would let one participant blank another's
+        // tile for everybody.
+        return;
+    }
+
+    let other_conns = state
+        .room_manager
+        .get_other_connection_ids(&rid, connection_id);
+    if other_conns.is_empty() {
+        return;
+    }
+
+    let event = serde_json::json!({
+        "type": "media:producer_paused",
+        "data": {
+            "producer_id": producer_id.to_string(),
+            "user_id": user_id.to_hex(),
+            "paused": paused,
+        }
+    });
+    for conn_id in &other_conns {
+        super::dispatcher::send_to_connection_routed(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            conn_id,
+            &event,
+        )
+        .await;
     }
 }
 

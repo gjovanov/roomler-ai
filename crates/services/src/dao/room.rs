@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use rand::Rng;
@@ -115,6 +117,15 @@ impl RoomDao {
         self.join(tenant_id, room_id, creator_id).await?;
 
         self.base.find_by_id(room_id).await
+    }
+
+    /// FR-32 — live channels in the tenant, for the plan `max_channels` gate.
+    /// Soft-deleted rooms are excluded: an archived channel is not occupying a
+    /// seat the customer is paying for.
+    pub async fn count_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<u64> {
+        self.base
+            .count(doc! { "tenant_id": tenant_id, "deleted_at": null })
+            .await
     }
 
     pub async fn find_by_tenant(&self, tenant_id: ObjectId) -> DaoResult<Vec<Room>> {

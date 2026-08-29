@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `POST /api/tunnel-client/enroll` wrapper.
 //!
 //! Exchanges an admin-issued enrollment JWT for a long-lived
@@ -6,11 +8,11 @@
 //! CLI binary finds its config on first run.
 //!
 //! Moved here (P4a) from the legacy tunnel wizard's enroll.rs (crate
-//! retired in P4c-2). The `roomler_tunnel`-coupled `write_config`
+//! retired in P4c-2). The `roomler_cli`-coupled `write_config`
 //! half lives with the dep holders (the setup app's tunnel
 //! orchestrator) — this crate stays free of the tunnel dep.
 //! Original rationale for not calling
-//! `roomler-tunnel`'s private `enroll_cmd`:
+//! `roomler-cli`'s private `enroll_cmd`:
 //!   - `enroll_cmd` is private to the CLI binary and prints to stdout
 //!     with `println!` — bad for a wizard-driven flow that needs
 //!     structured ProgressEvents on a channel.
@@ -43,7 +45,7 @@ pub struct EnrollResult {
     /// into `config.toml` by the caller's `write_config`. NEVER
     /// logged or echoed in error messages.
     pub tunnel_client_token: String,
-    /// Echoed back into config.toml so `roomler-tunnel forward …`
+    /// Echoed back into config.toml so `roomler forward …`
     /// derives the same WS URL on first run.
     pub server_url: String,
     /// Echoed back into config.toml. Server-side `tunnel_clients`
@@ -74,6 +76,8 @@ fn os_discriminant() -> Option<&'static str> {
     }
 }
 
+// RETIRED-NAME-ANCHOR(4): a UA string that ALREADY WENT OVER THE WIRE; the server has
+// these rows.
 /// POST the enrollment exchange and return the parsed result. Does
 /// NOT touch the filesystem; the caller pairs this with its
 /// `write_config` after surfacing `EnrollOk` to the SPA.
@@ -141,7 +145,7 @@ pub async fn enroll(
 
 /// Derive a stable opaque `machine_id` from `machine_name` + the host's
 /// `OS::HOSTNAME` env + OS/arch. Mirrors
-/// `agents/roomler-tunnel/src/main.rs::derive_machine_id` exactly so
+/// `agents/roomler-cli/src/main.rs::derive_machine_id` exactly so
 /// re-enrollments from the same wizard land on the same row in the
 /// server's `tunnel_clients` collection (unique index on
 /// `{tenant_id, machine_id}`).

@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use axum::{
     Json,
     extract::{Path, Query, State},
 };
 use bson::oid::ObjectId;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
@@ -132,6 +135,21 @@ pub async fn create(
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+
+    // FR-32 P1b — plan `max_channels` cap. Counts live rooms only, so an
+    // archived channel does not hold a seat the customer is paying for.
+    {
+        let tenant = state.tenants.base.find_by_id(tid).await?;
+        let used = state.rooms.count_for_tenant(tid).await?;
+        if let Err(d) = quota::check(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::MaxChannels,
+            used,
+        ) {
+            return Err(ApiError::Forbidden(d.message()));
+        }
     }
 
     let parent_id = body

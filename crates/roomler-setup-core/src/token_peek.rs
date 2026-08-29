@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Unverified JWT payload peek.
 //!
 //! Decodes a JWT's middle segment WITHOUT signature verification to

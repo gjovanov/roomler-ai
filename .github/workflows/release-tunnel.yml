@@ -1,3 +1,12 @@
+# RETIRED-NAME-ANCHOR-BEGIN
+# Every retired name in this workflow is either a PUBLISHED release-asset name
+# (already-released files cannot be renamed, and the updater's picker matches
+# those strings) or a FROZEN install path — the RPATH-bound
+# /usr/lib/roomler-agent, the macOS .app bundle whose name keys the TCC grants,
+# or the inert roomler-agent.exe alias the deployed fleet still resolves.
+# INVARIANT: a retired name here must be a published artifact name or a path a
+# real host has. If you add one that is neither, that is a bug, not a new
+# exemption. docs/fr/FR-21
 name: Release roomler-tunnel
 
 # Builds the `roomler-tunnel` CLI binary for the three desktop targets the
@@ -142,7 +151,7 @@ jobs:
         # agent release died on exactly this).
         run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
       - name: Build roomler-tunnel (release)
-        run: cargo build -p roomler-tunnel --release
+        run: cargo build -p roomler-cli --release
       - name: Strip binary
         # P3d Slice B: CLI OUTPUT binary is now `roomler` (was `roomler-tunnel`).
         run: strip target/release/roomler
@@ -165,7 +174,7 @@ jobs:
           mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
           echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
       - name: Build .deb
-        working-directory: agents/roomler-tunnel
+        working-directory: agents/roomler-cli
         run: cargo deb --no-build --no-strip
       - name: Rename .deb + checksum
         id: deb
@@ -173,7 +182,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
-          src=$(ls target/debian/roomler-tunnel_*_amd64.deb | head -n1)
+          # FR-21 P2b: cargo-deb emits `<package>_…`, and the package is
+          # `roomler-cli` now. The DESTINATION asset name deliberately stays
+          # `roomler-tunnel-…` — a published, immutable surface that every prior
+          # release carries, and the updater matches on extension + arch, not
+          # the prefix.
+          src=$(ls target/debian/roomler-cli_*_amd64.deb | head -n1)
           dst="roomler-tunnel-${version}-x86_64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
@@ -214,9 +228,9 @@ jobs:
           # non-tag runs (dispatch rehearsals on master) save.
           save-if: ${{ github.ref_type != 'tag' }}
       - name: Build roomler-tunnel x86_64
-        run: cargo build -p roomler-tunnel --release --target x86_64-apple-darwin
+        run: cargo build -p roomler-cli --release --target x86_64-apple-darwin
       - name: Build roomler-tunnel aarch64
-        run: cargo build -p roomler-tunnel --release --target aarch64-apple-darwin
+        run: cargo build -p roomler-cli --release --target aarch64-apple-darwin
       - name: Lipo into universal
         run: |
           # P3d Slice B: per-target CLI binary is now `roomler` (was
@@ -310,7 +324,7 @@ jobs:
         # sits beside the MSI's app-local CRT DLLs.
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build -p roomler-tunnel --release
+        run: cargo build -p roomler-cli --release
       # Sign before zipping so the EXE the operator extracts is signed. A zip
       # cannot itself carry an Authenticode signature, so the binary inside is
       # the only thing that can vouch for the download.
@@ -426,9 +440,9 @@ jobs:
             **First-use:**
             1. Extract the archive.
             2. From the Roomler admin UI → Tenant → Tunnels, click "Issue enrollment token".
-            3. Run the copied `roomler-tunnel enroll …` command.
+            3. Run the copied `roomler enroll …` command.
             4. From Admin → Tunnel ACL, create at least one policy authorising your subject + agent + destination.
-            5. Run `roomler-tunnel forward --agent <hex> --local <port> --remote <host:port>`.
+            5. Run `roomler forward --agent <hex> --local <port> --remote <host:port>`.
           files: release/*
 
   # ---------------------------------------------------------------------------
@@ -468,3 +482,4 @@ jobs:
             sleep 10
           done
           echo "::warning::release cache refresh did not confirm on every pod for ${TAG}; the cache TTL will heal it within 15 min"
+# RETIRED-NAME-ANCHOR-END
