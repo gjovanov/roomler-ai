@@ -160,7 +160,7 @@ test.describe('Billing & Subscription', () => {
     expect(free.price_cents).toBe(0)
     expect(free.limits.max_members).toBe(10)
     expect(free.limits.max_channels).toBe(5)
-    expect(free.limits.video_max_participants).toBe(0)
+    expect(free.limits.video_max_participants).toBe(4)
     expect(free.limits.cloud_integrations).toBe(false)
     expect(free.limits.ai_recognition).toBe(false)
     expect(free.limits.recordings).toBe(false)
