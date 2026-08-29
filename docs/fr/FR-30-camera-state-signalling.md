@@ -1,6 +1,6 @@
 # FR-30 — Camera/mic state is never signalled, so peers cannot see who turned their camera off
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues)
+**Issue:** [#884](https://github.com/gjovanov/roomler-ai/issues/884)
 **Status:** proposed — design anchored against master, no code yet
 
 ## Goal
