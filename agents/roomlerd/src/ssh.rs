@@ -1768,7 +1768,6 @@ mod sshd {
     // would only move the same fields behind a name that hides which of them
     // a reader must check.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn run_exec(
         handle: russh::server::Handle,
         channel: ChannelId,
