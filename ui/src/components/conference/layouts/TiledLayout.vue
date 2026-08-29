@@ -8,6 +8,7 @@
       :stream="p.stream"
       :display-name="p.displayName"
       :is-muted="p.isMuted"
+        :video-paused="p.videoPaused"
       :is-local="p.isLocal"
       :is-pinned="p.isPinned"
       :is-active-speaker="p.streamKey === activeSpeakerKey"

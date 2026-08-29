@@ -191,8 +191,12 @@ jobs:
       - name: Install libvpx (cached apt)
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
-          packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev
-          version: ci-vpx-v1
+          # libasound2-dev is for the `audio` half of `full` in the capture
+          # clippy lane below — without it alsa-sys fails its build script and
+          # the lane dies before linting anything. Bump `version:` whenever
+          # this list changes, or the action serves the previously cached set.
+          packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
+          version: ci-vpx-v2
 
       # Pair `vp9-444` with `vp9-444-bindgen` on Linux so env-libvpx-sys
       # regenerates its FFI bindings via bindgen against the installed
@@ -203,6 +207,24 @@ jobs:
       # generated/vpx-ffi-1.14.0.rs not found but 'generate' cargo
       # feature not used." `libclang-dev` (installed above) is the
       # bindgen runtime requirement.
+      # The capture path is linted by NO other lane. `--workspace` clippy
+      # compiles roomlerd with DEFAULT features, and its default is `[]`, so
+      # `capture/scrap_backend.rs` — the screen-capture backend on every OS —
+      # is never even compiled there. The two agent feature lanes miss it too:
+      # `vp9-444` does not enable `scrap-capture`, and `cargo check` does not
+      # fail on warnings anyway. Same trap this file already documents for
+      # `clipboard` and `ssh-server`, and it had already sprung: an
+      # `unused_mut` in scrap_backend.rs survived indefinitely, and FR-29's
+      # `capture/x11_damage.rs` landed with no lint coverage at all.
+      #
+      # `dead_code` is allowed deliberately. This feature set legitimately
+      # leaves the ffmpeg-encoder paths unconstructed (`RatePlan`, `FfmpegDc`,
+      # …), and enabling `ffmpeg-encoder` here would need the vendored FFmpeg
+      # tree — a large cost to silence findings that are not defects. Every
+      # other class still bites.
+      - name: Clippy agent --features full (the capture + encode + input path)
+        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server --all-targets -- -D warnings -A dead_code
+
       - name: Check agent --features vp9-444
         run: cargo check -p roomlerd --features vp9-444,vp9-444-bindgen
 

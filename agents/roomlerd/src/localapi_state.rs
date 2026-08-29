@@ -369,6 +369,24 @@ impl LocalApiState for DaemonState {
             // NAT-traversal — the srflx gather outcome. Empty candidates means
             // this node can't hole-punch and reads as UDP-blocked to every peer.
             srflx: self.overlay.borrow().srflx.clone(),
+            // FR-33 — captured LAN prefixes, from the process-wide netstate
+            // snapshot (a HOST property, like netcheck). `None` when the
+            // monitor is not running.
+            #[cfg(feature = "overlay-l3")]
+            lan_captures: tunnel_core::overlay::netstate::handle().map(|h| {
+                h.snapshot()
+                    .lan_captures
+                    .iter()
+                    .map(|c| tunnel_core::localapi::LanCaptureStatus {
+                        prefix: c.prefix.clone(),
+                        owner: c.owner.clone(),
+                        via: c.via_ifref.clone(),
+                        via_name: c.via_name.clone(),
+                    })
+                    .collect()
+            }),
+            #[cfg(not(feature = "overlay-l3"))]
+            lan_captures: None,
             // C4 stage 1 — the warm TURN/UDP allocation's state.
             warm_relay: self.overlay.borrow().warm_relay.clone(),
             // B4 — the measured capability vector, read straight from the
