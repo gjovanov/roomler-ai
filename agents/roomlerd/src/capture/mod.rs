@@ -281,6 +281,15 @@ pub enum DownscalePolicy {
 /// Lives here rather than in a backend because FR-36's DRM backend applies
 /// the SAME policy: a host must not get a different picture size purely
 /// because it switched capture backend.
+///
+/// ⚠️ Gated on its two consumers. This used to live INSIDE `scrap_backend`, so
+/// the module's own feature gate covered it implicitly; moving it here to share
+/// it with the DRM backend removed that cover and made it dead code in every
+/// feature set that has neither backend. CI caught it on three lanes.
+#[cfg(any(
+    feature = "scrap-capture",
+    all(target_os = "linux", feature = "drm-capture")
+))]
 pub(crate) const DOWNSCALE_TRIGGER_PIXELS: u64 = 3_500_000;
 
 /// 2×2 box downsample over BGRA. Output dimensions are floor(w/2), floor(h/2).
@@ -289,6 +298,15 @@ pub(crate) const DOWNSCALE_TRIGGER_PIXELS: u64 = 3_500_000;
 /// mode on a desktop CPU, well under the ~30 ms budget per frame at 30 fps
 /// and comfortably less than openh264 would have spent encoding the full
 /// 4K frame it replaces.
+///
+/// ⚠️ Gated on its two consumers. This used to live INSIDE `scrap_backend`, so
+/// the module's own feature gate covered it implicitly; moving it here to share
+/// it with the DRM backend removed that cover and made it dead code in every
+/// feature set that has neither backend. CI caught it on three lanes.
+#[cfg(any(
+    feature = "scrap-capture",
+    all(target_os = "linux", feature = "drm-capture")
+))]
 pub(crate) fn downscale_bgra_2x(
     src: &[u8],
     src_w: u32,
