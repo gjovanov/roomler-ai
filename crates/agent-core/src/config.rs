@@ -292,6 +292,9 @@ pub struct AgentConfig {
     /// is the per-host off-switch.
     #[serde(default)]
     pub overlay_derp_floor: Option<bool>,
+    /// FR-19 P4b — ride tenant-owned org relays (tunnel-core
+    /// `OVERLAY_ORG_RELAY`). Opt-in; `None` = off.
+    pub overlay_org_relay: Option<bool>,
     /// Phase B (overlay v3) — netcheck: measure egress capabilities (relay-band
     /// probe, STUN/NAT, /derp health) every ~20 min and publish the CapVector
     /// (`ROOMLERD_OVERLAY_NETCHECK`). Built-in default: on.
@@ -1645,6 +1648,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_derp: None,
         overlay_server_relay_strategy: None,
         overlay_derp_floor: None,
+        overlay_org_relay: None,
         overlay_netcheck: None,
         relay_server_enabled: None,
         relay_server_port: None,
@@ -1828,7 +1832,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 55] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 56] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1851,6 +1855,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 55]
             cfg.overlay_server_relay_strategy,
         ),
         ("OVERLAY_DERP_FLOOR", cfg.overlay_derp_floor),
+        ("OVERLAY_ORG_RELAY", cfg.overlay_org_relay),
         ("OVERLAY_NETCHECK", cfg.overlay_netcheck),
         ("RELAY_SERVER_ENABLED", cfg.relay_server_enabled),
         ("TUNNEL_DERP_FALLBACK", cfg.tunnel_derp_fallback),
