@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-1 — the inter-pod control bus: per-pod Redis channels + a thin
 //! request/reply layer.
 //!

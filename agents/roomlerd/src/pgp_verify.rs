@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Pinned-key verification of the release `.asc` sidecars.
 //!
 //! Windows updates are anchored by Authenticode + a signer-name check

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Unified install-progress events for the `roomler-setup` app.
 //!
 //! P4a DESIGN NOTE: this is the ONE wire shape the unified wizard's

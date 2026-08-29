@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! M3 A1 — SYSTEM-context capture + input on the secure desktop.
 //!
 //! Mounted only when the `system-context` Cargo feature is enabled, and

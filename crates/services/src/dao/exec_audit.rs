@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Fleet-RPC audit log (`exec_audit`).
 //!
 //! Every exec ATTEMPT lands here — allowed or denied. A refused command is the

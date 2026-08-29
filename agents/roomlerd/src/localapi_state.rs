@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! The agent daemon's [`LocalApiState`] — the live data the LocalAPI serves.
 //!
 //! Thin adapter (unification P1): turns the agent's enrolled identity + a

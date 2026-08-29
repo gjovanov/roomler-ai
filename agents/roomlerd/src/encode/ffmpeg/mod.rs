@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FFmpeg-based encoder backend (rc.72 onwards).
 //!
 //! Wraps `ffmpeg-next` to dispatch HEVC + H.264 + VP9 to vendor HW

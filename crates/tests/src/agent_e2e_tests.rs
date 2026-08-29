@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Phase 1 Chunk 1C — agent end-to-end integration tests.
 //!
 //! Complements `agent_tests.rs` (which locks the basic enroll →

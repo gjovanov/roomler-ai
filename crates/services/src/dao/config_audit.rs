@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Remote-config audit log (`config_audit`).
 //!
 //! Every desired-config write lands here — granted or refused. The refused

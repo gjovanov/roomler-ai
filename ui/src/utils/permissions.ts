@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 /**
  * The tenant permission catalog — a TS mirror of the server's bitfield in
  * `crates/db/src/models/role.rs::permissions`.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Operator-consent broker (Plan 3 of the file-DC v2 follow-on
 //! cycle).
 //!

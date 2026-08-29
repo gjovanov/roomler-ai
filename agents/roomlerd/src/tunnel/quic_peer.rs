@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Agent-side QUIC session peer (`quic-v1` transport).
 //!
 //! The QUIC analogue of [`crate::tunnel::peer::AgentTunnelPeer`]: one
