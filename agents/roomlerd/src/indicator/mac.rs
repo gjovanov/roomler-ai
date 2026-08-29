@@ -17,10 +17,10 @@
 //!
 //! Every `NSWindow` / `NSView` call must happen on the main thread. The
 //! signalling loop is on a tokio worker, so [`Inner::prompt`] does NOT touch
-//! AppKit: it parks the request in shared state and asks the main thread to
-//! pick it up (`performSelectorOnMainThread`-equivalent, via a repeating main-
-//! thread timer). Everything that touches a window lives in [`pump`], which
-//! only ever runs on the main thread.
+//! AppKit at all: it parks the request in shared state, and the main thread
+//! picks it up on its next pass. Everything that touches a window lives in
+//! [`pump`], which takes a `MainThreadMarker` — so the rule is enforced by the
+//! type system rather than by remembering it.
 //!
 //! ⚠️ **The panel WILL appear in the captured stream.** `NSWindowSharingNone`
 //! is honoured by ScreenCaptureKit and `CGWindowListCreateImage`, but NOT by
@@ -33,18 +33,19 @@
 #![cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
+use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2::{MainThreadMarker, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSScreen,
-    NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel, NSWindowSharingType,
-    NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezelStyle, NSButton,
+    NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSEventMask, NSFont,
+    NSScreen, NSScreenSaverWindowLevel, NSTextField, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowSharingType, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString};
 
 use super::{ConsentSender, PromptView};
 
@@ -135,24 +136,33 @@ pub fn run_main_loop() -> ! {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     PUMPING.store(true, Ordering::SeqCst);
 
-    // AppKit has no "call me back from another thread" primitive that does not
-    // involve defining an Objective-C class, so the panel is driven by polling
-    // shared state from the main thread instead. 120 ms matches the Windows
-    // pump: fast enough that a prompt appears instantly to a human, cheap
-    // enough to run for the daemon's whole life.
+    // `NSApp.run()` would never give control back, so this is the manual pump
+    // it wraps: block for one event or 120 ms, dispatch it, then step our own
+    // state. 120 ms matches the Windows pump — instant to a human, negligible
+    // to run for the daemon's whole life.
     //
-    // Deliberately NOT a `Timer`/`NSTimer` with a Rust closure: that needs a
-    // target object, i.e. a custom class, i.e. `define_class!` and a second
-    // unsafe surface. A manual `runUntilDate:` loop does the same job with
-    // less machinery, and keeps every AppKit call on this one thread by
-    // construction.
+    // Deliberately NOT an `NSTimer` with a Rust callback: a timer needs a
+    // TARGET object, i.e. a custom Objective-C class, i.e. `define_class!` and
+    // a second unsafe surface with its own `Retained` lifetime story — to
+    // arrange a wake-up a bounded `nextEventMatchingMask:` already gives.
+    //
+    // ⚠️ `finishLaunching` is what `run()` would have called. Skipping it
+    // leaves NSApplication half-initialised and windows behave erratically.
+    app.finishLaunching();
+
     let mut panel: Option<Panel> = None;
     loop {
         pump(mtm, &mut panel);
         unsafe {
-            let until: Retained<objc2_foundation::NSDate> =
-                objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.12);
-            let _: () = msg_send![&*app, runUntilDate: &*until];
+            let until = NSDate::dateWithTimeIntervalSinceNow(0.12);
+            if let Some(ev) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&until),
+                NSDefaultRunLoopMode,
+                true,
+            ) {
+                app.sendEvent(&ev);
+            }
         }
     }
 }
@@ -208,8 +218,8 @@ fn pump(mtm: MainThreadMarker, panel: &mut Option<Panel>) {
 struct Panel {
     window: Retained<NSWindow>,
     countdown: Retained<NSTextField>,
-    approve: Retained<objc2_app_kit::NSButton>,
-    deny: Retained<objc2_app_kit::NSButton>,
+    approve: Retained<NSButton>,
+    deny: Retained<NSButton>,
     secs_shown: std::cell::Cell<u64>,
 }
 
@@ -236,9 +246,7 @@ impl Panel {
                 NSBackingStoreType::Buffered,
                 false,
             );
-            window.setLevel(NSWindowLevel(
-                objc2_app_kit::NSScreenSaverWindowLevel as isize,
-            ));
+            window.setLevel(NSScreenSaverWindowLevel);
             // Visible on every Space and over a fullscreen app: a prompt that
             // only exists on the desktop someone happens to be looking at is
             // not a prompt.
@@ -416,12 +424,12 @@ impl Panel {
     /// is well inside human reaction time.
     fn take_click(&self) -> Option<bool> {
         unsafe {
-            if self.approve.state() == objc2_app_kit::NSControlStateValueOn {
-                self.approve.setState(objc2_app_kit::NSControlStateValueOff);
+            if self.approve.state() == NSControlStateValueOn {
+                self.approve.setState(NSControlStateValueOff);
                 return Some(true);
             }
-            if self.deny.state() == objc2_app_kit::NSControlStateValueOn {
-                self.deny.setState(objc2_app_kit::NSControlStateValueOff);
+            if self.deny.state() == NSControlStateValueOn {
+                self.deny.setState(NSControlStateValueOff);
                 return Some(false);
             }
         }
@@ -466,8 +474,9 @@ unsafe fn add_label(
         )));
         // Wrap rather than clip: the `detail` line carries the command an
         // `exec` prompt would run, and a command truncated at the card edge is
-        // one somebody approves without having read it.
-        label.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByWordWrapping);
+        // one somebody approves without having read it. `0` = no limit, which
+        // the caller bounds by the frame height it passes.
+        label.setMaximumNumberOfLines(0);
         parent.addSubview(&label);
         label
     }
@@ -480,21 +489,17 @@ unsafe fn add_button(
     x: f64,
     y: f64,
     tag: isize,
-) -> Retained<objc2_app_kit::NSButton> {
+) -> Retained<NSButton> {
     unsafe {
-        let b = objc2_app_kit::NSButton::buttonWithTitle_target_action(
-            &NSString::from_str(title),
-            None,
-            None,
-            mtm,
-        );
+        let b =
+            NSButton::buttonWithTitle_target_action(&NSString::from_str(title), None, None, mtm);
         b.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(BTN_W, BTN_H)));
-        b.setBezelStyle(objc2_app_kit::NSBezelStyle::Rounded);
+        b.setBezelStyle(NSBezelStyle::Rounded);
         b.setTag(tag);
         // A PUSH-ON-PUSH-OFF button so its `state` records the press for the
         // poller to find; `take_click` clears it. A momentary button would
         // have nothing to read after the click returns.
-        b.setButtonType(objc2_app_kit::NSButtonType::PushOnPushOff);
+        b.setButtonType(NSButtonType::PushOnPushOff);
         parent.addSubview(&b);
         b
     }

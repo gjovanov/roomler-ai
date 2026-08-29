@@ -302,8 +302,14 @@ objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSApplication",
     "NSButton",
+    # `NSControlStateValue` + the line-cap setter live here.
+    "NSCell",
     "NSColor",
     "NSControl",
+    # The manual event pump: `nextEventMatchingMask:untilDate:inMode:dequeue:`
+    # is gated on this, and without it AppKit would need `NSApp.run()`, which
+    # never returns control to us.
+    "NSEvent",
     "NSFont",
     "NSGraphics",
     "NSResponder",
@@ -313,7 +319,10 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSWindow",
 ] }
 objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSDate",
     "NSGeometry",
+    # `NSDefaultRunLoopMode`, the mode the pump runs events in.
+    "NSRunLoop",
     "NSString",
     "NSThread",
 ] }
