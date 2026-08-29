@@ -95,6 +95,39 @@ impl FileDao {
         }
     }
 
+    /// FR-32 — bytes currently stored by the tenant, for the plan
+    /// `storage_bytes` gate.
+    ///
+    /// The only one of the counted limits that is a SUM rather than a count, so
+    /// it needs an aggregation rather than `count`. Soft-deleted files are
+    /// excluded, which matches what the customer sees in the files list — a
+    /// quota that counted invisible rows would be unactionable, because there
+    /// would be nothing they could delete to get back under it.
+    ///
+    /// ⚠ Returns 0 for a tenant with no files: `$group` emits no document at
+    /// all for an empty match, so the `None` case is "nothing stored", not an
+    /// error.
+    pub async fn sum_storage_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<u64> {
+        let pipeline = vec![
+            doc! { "$match": { "tenant_id": tenant_id, "deleted_at": null } },
+            doc! { "$group": { "_id": null, "total": { "$sum": "$size" } } },
+        ];
+        let mut cursor = self.base.collection().aggregate(pipeline).await?;
+        use futures::TryStreamExt;
+        if let Some(d) = cursor.try_next().await? {
+            // `$sum` widens to i64/f64 depending on the stored BSON types, so
+            // read defensively rather than assuming one of them.
+            let total = d
+                .get_i64("total")
+                .map(|v| v.max(0) as u64)
+                .or_else(|_| d.get_i32("total").map(|v| v.max(0) as u64))
+                .or_else(|_| d.get_f64("total").map(|v| v.max(0.0) as u64))
+                .unwrap_or(0);
+            return Ok(total);
+        }
+        Ok(0)
+    }
+
     pub async fn find_by_room(
         &self,
         tenant_id: ObjectId,

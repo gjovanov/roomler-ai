@@ -168,6 +168,47 @@ Gating the disable path too would mean a plan downgrade could leave a tenant hol
 node or a DNS zone they are not allowed to turn off — strictly worse than the feature having
 been free. Same rule for any future toggle.
 
+### Found in P1b: `max_concurrent_sessions` has no table to count
+
+`RemoteSessionDao::create` has **zero callers workspace-wide**. Nothing ever writes a
+`remote_sessions` row — live sessions exist only in the Hub's in-memory `DashMap`, and the
+per-agent `active_sessions` / `max_sessions` pair there is a *different*, unrelated cap.
+
+A Mongo-backed gate would therefore count an empty collection forever: it could never fire,
+while reading in review exactly like a working control. Withheld for the same reason as
+`cloud_integrations`. Wiring it means either persisting sessions or counting the Hub (pod-local,
+which is *correct* under tenant-affinity routing but is a real coupling to state, not a query).
+
+⚠ Related and worth its own look: `routes/usage.rs` reports remote-desktop usage by reading
+that same never-written collection.
+
+### Found in P1b: a byte quota cannot be a `used >= max` test
+
+The other counted limits add one thing at a time. `storage_bytes` does not — a tenant at
+99 MB of 100 MB must be refused a 10 MB upload and **allowed** a 100 KB one. A bare
+"are you at the cap" test accepts both, right up until the quota is already blown, and then
+rejects a 1-byte file.
+
+Hence `check_delta(current, delta)`, with `check` defined as `delta = 1` so the two forms
+cannot drift. Refuses on `current + delta > max`, so a file that exactly fills the quota still
+fits, and the add saturates so a pathological delta cannot wrap into "fits".
+
+### Decisions taken (operator, 2026-08-29)
+
+1. **`PlanLimits` is the single source of truth.** `TenantSettings::{max_members,
+   file_upload_limit}` are **deleted** — zero readers, no API exposure, no UI, and serde
+   ignores the leftover key in existing documents. The earlier "plan-as-ceiling +
+   settings-as-lower-override" idea was dropped: it was justified as giving P2 grandfathering
+   for free, and it does not — grandfathering needs a *higher* override, and the
+   `plan_enforcement` mode already provides it. A per-tenant override belongs with a real
+   `Enterprise` tier, added deliberately.
+2. **`max_message_history` is not gated.** Only bound-reads is defensible (delete destroys
+   data; refuse-writes makes a chat product read-only), but doing it honestly means
+   `find_in_room` + `find_pinned` + `find_thread_replies` + both exports + search — miss the
+   exports and it is theatre. It also has almost no cost basis; it exists for upgrade
+   pressure. P1's question is answered instead by `MessageDao::count_for_tenant`, a
+   **reporting query with no gate**, so P3 can decide whether the limit survives at all.
+
 ## Acceptance criteria
 
 - [ ] `grep -rn '\.limits()' crates/` shows **no** hand-rolled comparison outside `services::quota`.
