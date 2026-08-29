@@ -227,6 +227,19 @@ a win and needs measuring on its own merits, not as a legal necessity.
 - [x] OCI `licenses` label set on the runtime stage, landing WITH this FR — plus title/description/url/source/documentation/vendor, and `VERSION`/`GIT_SHA` build-args wired into the deploy recipe
 - [x] LGPL §6 relink right is **exercisable and documented** (`docs/lgpl-relink.md`), not merely offered by mail
 
+### Known friction, accepted deliberately
+
+Once this is on master, **any PR that adds a source file fails `Licence split
+integrity` until its author runs `scripts/apply-spdx.sh`**. That is intended —
+a file shipping with no licence header is a real defect, and the failure names
+the one command that fixes it — but it is new friction on every contributor,
+so it is recorded rather than discovered.
+
+⚠️ It also means **master itself can go red** when a PR merges that was opened
+before this landed. `pull_request` CI checks out the branch MERGED WITH master,
+so such a PR is caught before merge; a PR merged in the window between its last
+CI run and this landing is not. The fix is the same one command.
+
 ## Open decisions
 
 1. **P4b**: shared FFmpeg on Windows vs. per-release object archive. Needs the

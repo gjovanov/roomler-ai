@@ -68,3 +68,20 @@ claiming the same number. The protocol and its history are in that file.
 ## Reporting security issues
 
 Not here — see [SECURITY.md](SECURITY.md).
+
+## If `Licence split integrity` fails on your PR
+
+Almost always this: you added a source file and it has no SPDX header. Run
+
+```bash
+scripts/apply-spdx.sh
+```
+
+and commit the result. It is idempotent — it only touches files that need it, and
+it derives the licence from the directory, so you do not have to know which one
+applies.
+
+If it reports **UNCLASSIFIED**, your file is somewhere the split does not describe
+yet. Add its directory to `scripts/licence-classes.sh` rather than working around
+the check: an unclassified path used to be a silent skip, which meant a directory
+rename could drop a whole binary out of the sweep while the check still said OK.
