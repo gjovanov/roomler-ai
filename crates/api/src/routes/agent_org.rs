@@ -32,6 +32,7 @@ use axum::{
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::signaling::ServerMsg;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -207,13 +208,21 @@ pub async fn join_org(
     // 2026-08-05: a Free-plan cap silently stopped a join.)
     if !already {
         let tenant = state.tenants.base.find_by_id(target).await?;
-        let max = tenant.plan.limits().max_devices as u64;
         let used = state.agents.count_active_for_tenant(target).await?;
-        if used >= max {
+        // FR-31: the decision and its record live in `quota::check`; the
+        // wording stays here because it is contextual ("in the target
+        // organization"). `MaxDevices` is an established limit, so this
+        // refuses regardless of the tenant's `plan_enforcement` mode.
+        if let Err(d) = quota::check(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::MaxDevices,
+            used,
+        ) {
             return Err(ApiError::Forbidden(format!(
                 "Device limit reached for the {:?} plan in the target organization \
-                 ({used} of {max} devices used). Upgrade the plan or remove a device first.",
-                tenant.plan
+                 ({} of {} devices used). Upgrade the plan or remove a device first.",
+                d.plan, d.used, d.max
             )));
         }
     }
