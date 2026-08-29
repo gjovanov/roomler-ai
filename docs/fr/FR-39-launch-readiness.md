@@ -1,6 +1,6 @@
-# FR-38: The product is unfindable — repository metadata, README, comparison docs, and a way for a visitor to stay in touch
+# FR-39: The product is unfindable — repository metadata, README, comparison docs, and a way for a visitor to stay in touch
 
-Status: **P1–P6 implemented; field-verification pending** (2026-08-29). Tracking issue: `FR-38` (#951).
+Status: **P1–P6 implemented; field-verification pending** (2026-08-29). Tracking issue: `FR-39` (#951).
 Spec on master up front; the work is known and mostly mechanical.
 
 ## The measurement that motivates it
