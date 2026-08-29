@@ -376,6 +376,10 @@ mod tests {
     #[test]
     fn pick_setup_asset_requires_setup_prefix_and_matches_triples() {
         let assets = vec![
+            // RETIRED-NAME-ANCHOR(26): roomler-tunnel-installer is a PUBLISHED
+            // release asset (FR-21 D6). It appears twice in this test on
+            // purpose: once in the candidate list and once alone, to prove the
+            // legacy wizard asset can NEVER satisfy the setup pick.
             asset("roomler-tunnel-installer-0.3.0-x86_64-pc-windows-msvc.zip"),
             asset("roomler-setup-0.3.0-x86_64-pc-windows-msvc.zip"),
             asset("roomler-setup-0.3.0-x86_64-pc-windows-msvc.zip.sha256"),

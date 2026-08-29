@@ -70,7 +70,7 @@ impl Openh264Encoder {
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
 
         thread::Builder::new()
-            .name("roomler-agent-encoder".into())
+            .name("roomlerd-encoder".into())
             .spawn(move || {
                 let bitrate_bps = initial_bitrate_for(width, height);
                 let init = || -> Result<Encoder> {

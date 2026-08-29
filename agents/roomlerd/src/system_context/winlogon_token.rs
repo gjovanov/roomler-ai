@@ -23,7 +23,7 @@
 //!
 //! The supervisor calls this when [`crate::win_service::supervisor::
 //! decide_spawn`] returns the SystemContext variant (carrying the
-//! target session id). The spawned child runs the same `roomler-agent
+//! target session id). The spawned child runs the same `roomlerd
 //! run` binary; its [`super::worker_role::probe_self`] returns
 //! `WorkerRole::SystemContext` and downstream construction sites pick
 //! the M3 A1 plumbing.
@@ -566,10 +566,10 @@ mod tests {
 
     #[test]
     fn build_cmdline_no_args_quotes_exe() {
-        let exe = PathBuf::from(r"C:\Program Files\roomler-agent\roomler-agent.exe");
+        let exe = PathBuf::from(r"C:\Program Files\Roomler\roomlerd.exe");
         let empty: [&str; 0] = [];
         let cmd = build_cmdline(&exe, &empty);
-        assert_eq!(cmd, r#""C:\Program Files\roomler-agent\roomler-agent.exe""#);
+        assert_eq!(cmd, r#""C:\Program Files\Roomler\roomlerd.exe""#);
     }
 
     #[test]

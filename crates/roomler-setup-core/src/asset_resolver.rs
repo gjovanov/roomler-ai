@@ -43,6 +43,8 @@ pub struct ArtifactHealth {
     /// `"windows-x86_64"`, …).
     #[serde(alias = "flavour", alias = "platform")]
     pub target: String,
+    // RETIRED-NAME-ANCHOR(8): names a PUBLISHED release asset. Filenames are fixed by
+    // what is already on GitHub Releases (FR-21 D6).
     /// Canonical asset filename, e.g.
     /// `roomler-agent-0.3.0-rc.28-perMachine-x86_64-pc-windows-msvc.msi`.
     pub filename: String,
@@ -185,7 +187,7 @@ pub struct ReleaseAsset {
 }
 
 // Deser-only mirrors of the `/api/*/latest-release` JSON. Local to
-// core (NO roomler-agent dep — D8 dep hygiene; core never links the
+// core (NO roomlerd dep — D8 dep hygiene; core never links the
 // agent/tunnel crates).
 #[derive(Deserialize)]
 struct RelListEntry {
@@ -414,6 +416,10 @@ mod tests {
         // Agent endpoint shape (agent_release.rs): `flavour`.
         let h: ArtifactHealth = serde_json::from_str(
             r#"{"tag":"agent-v0.3.0-rc.28","flavour":"permachine",
+                // RETIRED-NAME-ANCHOR(20): names a PUBLISHED release asset. Filenames
+                // are fixed by what is already on GitHub Releases (FR-21 D6); these
+                // fixtures are
+                // copies of real GitHub asset lists.
                 "filename":"roomler-agent-0.3.0-rc.28-perMachine-x86_64-pc-windows-msvc.msi",
                 "size":123,"digest":null,
                 "uri":"/api/agent/installer/permachine?version=latest"}"#,

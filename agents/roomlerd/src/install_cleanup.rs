@@ -1,5 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR-BEGIN
+// This whole module EXISTS to clean up pre-rename installs. Every retired
+// name in it is something it must still recognise on a host that has one: the
+// legacy SCM service `RoomlerAgentService`, the legacy Scheduled Task
+// `RoomlerAgent`, the pre-P4b `roomler-agent` install folders, the
+// `roomler-agent` app segment, the inert `roomler-agent.exe` alias and the
+// `roomler_agent_exe` MSI FileKey.
+// INVARIANT: a retired name here must be one this cleanup has to FIND. If you add
+// one that is not, that is a bug, not a new exemption. docs/fr/FR-21
 //! Cross-flavour install cleanup (Plan rc.18 P2).
 //!
 //! Removes stale artifacts left behind when an operator switches
@@ -683,3 +692,4 @@ mod tests {
         assert!(!same_dir(&a, &b));
     }
 }
+// RETIRED-NAME-ANCHOR-END

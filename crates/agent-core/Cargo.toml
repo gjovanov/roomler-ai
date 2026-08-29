@@ -10,13 +10,13 @@ description = "Daemon-free agent building blocks: config, enrollment, machine id
 name = "roomler_core"
 path = "src/lib.rs"
 
-# P3e lever E. These modules moved OUT of `roomler-agent` verbatim because the
-# desktop companion (roomler-agent-tray) needs exactly them — config
+# P3e lever E. These modules moved OUT of `roomlerd` verbatim because the
+# desktop companion (roomler-desktop) needs exactly them — config
 # load/save, enrollment, machine-id, log tailing, the needs-attention
 # sentinel — and depending on the full agent lib compiled the entire data
 # plane behind it: tunnel-core's webrtc/quinn/turn/rustls are non-optional,
 # so the tray's 470-crate graph carried ~90 transport crates it never called.
-# `roomler-agent` re-exports every module here under its old `crate::` path,
+# `roomlerd` re-exports every module here under its old `crate::` path,
 # so agent-internal call sites are unchanged.
 #
 # Keep this crate daemon-free: no capture, no encode, no input, no transport.
@@ -53,9 +53,9 @@ libc = "0.2"
 [features]
 # Exposes `config::test_fixture` to DOWNSTREAM test builds (a foreign crate's
 # `cargo test` compiles this crate in normal mode, so `#[cfg(test)]` alone
-# hides it). Enabled from roomler-agent's [dev-dependencies] only.
+# hides it). Enabled from roomlerd's [dev-dependencies] only.
 test-fixtures = []
-# Passthrough twins of roomler-agent's overlay features, for ONE call site:
+# Passthrough twins of roomlerd's overlay features, for ONE call site:
 # enrollment's org-append mints the org's own WG identity when an overlay
 # surface is compiled in (`WgKeypair::generate`). Builds without the features
 # leave the key None and the daemon mints lazily at its first overlay-enabled

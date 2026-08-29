@@ -94,7 +94,7 @@ pub async fn run_mesh(cfg: TunnelConfig, local: u16, transport: TransportPref) -
     info!(
         local = %listener.local_addr()?,
         ?transport,
-        "roomler-tunnel SOCKS5 mesh listening (address an agent by its name or 24-hex id as the SOCKS hostname)"
+        "roomler SOCKS5 mesh listening (address an agent by its name or 24-hex id as the SOCKS hostname)"
     );
     let ports: ProxyPorts = Arc::new(Mutex::new(HashMap::new()));
 

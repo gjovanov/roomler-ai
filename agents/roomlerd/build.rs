@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR(3): records the OLD -> NEW mapping, so it must name both sides.
 //! Embeds a Windows VERSIONINFO resource into `roomlerd.exe`.
 //!
 //! Authenticode says *who* signed a binary. VERSIONINFO is what Explorer's

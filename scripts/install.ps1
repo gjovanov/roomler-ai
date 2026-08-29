@@ -37,6 +37,11 @@
 #                   touch nothing else (safe on any box).
 #   -NoEnroll       install without enrolling (no token needed).
 #   -SkipDesktop    daemon roles: don't fetch roomler-desktop.exe.
+# RETIRED-NAME-ANCHOR-BEGIN
+# 'Roomler Agent' IS the MSI ARP DisplayName, so the uninstall lookups below
+# must match it exactly or they find nothing and silently do nothing. The
+# roomler-tunnel paths and probes are the install layout on hosts that predate
+# the rename; the script has to keep finding what is actually there.
 #   -Uninstall      remove Roomler from this box: every 'Roomler Agent' MSI
 #                   product registered for this user (HKCU) or machine-wide
 #                   (HKLM; needs elevation), plus the tunnel-client archive
@@ -426,3 +431,4 @@ try {
 } finally {
     Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 }
+# RETIRED-NAME-ANCHOR-END

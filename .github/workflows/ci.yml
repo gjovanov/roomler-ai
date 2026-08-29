@@ -157,7 +157,7 @@ jobs:
       # `crates/api` unit tests ran in NO lane until now: the clippy step above
       # is `--workspace` WITHOUT `--all-targets`, so it does not even compile
       # `#[cfg(test)]` code, and the `cargo test` steps further down name
-      # `roomler-agent` / `roomler-ai-tunnel-core` explicitly. Every policy test
+      # `roomlerd` / `roomler-ai-tunnel-core` explicitly. Every policy test
       # under `routes/` — who may open a session, what a refusal records — was
       # therefore decorative: a green PR did not mean they had run.
       #
@@ -286,7 +286,7 @@ jobs:
         # individually fast (<1s), so the whole step stays well under a minute.
         run: cargo test -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --lib -- --test-threads=1
 
-      - name: Clippy roomler-agent --features overlay-l3
+      - name: Clippy roomlerd --features overlay-l3
         # Phase 3b: the agent's overlay glue (overlay.rs + the main /
         # signaling hooks) only compiles under the opt-in feature, so the
         # default --workspace clippy never sees it. Lint it explicitly.
@@ -343,7 +343,7 @@ jobs:
       - name: cargo check tunnel-core (overlay-l3 + overlay-netstack)
         run: cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack
 
-      # This job checked tunnel-core ONLY, so `roomler-agent`'s `cfg(unix)` code
+      # This job checked tunnel-core ONLY, so `roomlerd`'s `cfg(unix)` code
       # was never compiled for macOS anywhere except a release-tag build — and
       # that has now broken a release three times, always the same way: a libc
       # declaration that differs between Linux and macOS.
@@ -485,7 +485,7 @@ jobs:
       # stays in the same invocation deliberately: it is what makes tunnel-core's
       # helpers reachable, and dropping it turns pre-existing dead-code warnings
       # into errors that have nothing to do with the change under test.
-      - name: Clippy roomler-agent (overlay-l3 + ssh-server, incl. tests)
+      - name: Clippy roomlerd (overlay-l3 + ssh-server, incl. tests)
         run: cargo clippy -p roomlerd --features overlay-l3,ssh-server --tests -- -D warnings
 
   ffmpeg-encoder-check:
@@ -614,18 +614,29 @@ jobs:
     # ignore it — but an advisory guard nobody ever flips is a guard that does
     # nothing, so the flip is the phase.
     #
-    # It blocks on `--check`, NOT on `--check --strict`. My own spec conflated
-    # those two, and they are different steps: `--strict` demands
-    # "unclassified == 0" and master sits at ~1006, so enabling it today would
-    # make this job red on every PR for work that has not happened yet. The
-    # pair below is enforceable NOW and is what actually protects the field:
-    # nobody may add a retired name, and nobody may delete a dual-read fallback.
-    # `--strict` becomes reachable when the remaining occurrences are resolved,
-    # and flipping to it is a one-word change here.
+    # P7: now `--check --strict`. Every remaining occurrence was resolved one
+    # at a time, so `unclassified == 0` and the third assertion is live:
+    #
+    #   3. unclassified must be ZERO -> every retired name left in the tree is
+    #      marked, and the marker says WHY the name is still real
+    #
+    # That is the assertion worth having. (1) only says the number stopped
+    # growing; (3) says a reader can no longer meet a retired name without an
+    # explanation next to it, and the ~730 anchored sites are the map of what
+    # the field still depends on — RPATHs, published asset names, legacy service
+    # and task names, the macOS bundle whose name keys the TCC grants, the QUIC
+    # ALPN, and the pre-rename appdirs tree.
+    #
+    # (1) and (2) stay: strict alone would accept deleting an anchor and its
+    # dual-read fallback together, which is exactly the change that strands a
+    # fleet while every build and test stays green.
+    #
+    # The job also fails on a shebang that is not on line 1 — the anchor
+    # system's own failure mode, which broke the macOS .pkg on this branch.
     steps:
       - uses: actions/checkout@v4
       - name: Audit retired product names
-        run: bash scripts/name-audit.sh --check
+        run: bash scripts/name-audit.sh --check --strict
       - name: Report (always, so a red run shows WHAT moved)
         if: always()
         run: bash scripts/name-audit.sh --summary

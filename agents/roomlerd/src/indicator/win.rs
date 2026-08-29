@@ -223,7 +223,7 @@ impl Inner {
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
 
         thread::Builder::new()
-            .name("roomler-agent-indicator".into())
+            .name("roomlerd-indicator".into())
             .spawn(move || {
                 match run_pump(state_for_thread, hwnd_for_thread, rx, kill_tx, consent_tx) {
                     Ok(()) => {

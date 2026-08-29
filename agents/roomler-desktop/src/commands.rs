@@ -314,7 +314,7 @@ pub async fn cmd_ping(
     Ok(PingResult { overlay_ip, rtt_ms })
 }
 
-/// First-time enrollment flow. Args mirror the CLI's `roomler-agent
+/// First-time enrollment flow. Args mirror the CLI's `roomlerd
 /// enroll --server --token --name`. On success writes config.toml +
 /// returns a redacted `StatusReport` (no agent_token).
 #[tauri::command]
@@ -1086,7 +1086,7 @@ fn load_optional_config(is_scm: bool) -> Option<AgentConfig> {
 
 /// A `Command` that never flashes a console window on Windows. The tray is a GUI
 /// app (`windows_subsystem = "windows"`), so a plain `std::process::Command`
-/// spawning the console-mode `roomler-agent` pops a console each time — and
+/// spawning the console-mode `roomlerd` pops a console each time — and
 /// `cmd_status` polls the service state every 10 s, so without this the tray
 /// flashes a terminal every 10 s. No-op on non-Windows.
 fn no_window_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -1135,11 +1135,13 @@ fn probe_service_state() -> (String, bool) {
     ("none".to_string(), false)
 }
 
+// RETIRED-NAME-ANCHOR(4): the fallback targets a binary the field still has; dropping
+// it strands them.
 /// Resolve the agent daemon's executable path. For a packaged install, the
 /// tray and daemon ship in the same dir (per the MSI layout). For dev
 /// builds, fall back to PATH lookup.
 ///
-/// P3d Slice B renamed the daemon OUTPUT binary `roomler-agent` -> `roomlerd`.
+/// P3d Slice B renamed the daemon OUTPUT binary `roomlerd` -> `roomlerd`.
 /// Resolution prefers a sibling `roomlerd[.exe]` (so a fresh tray spawns the
 /// new daemon), then falls back to the legacy `roomler-agent[.exe]` (which the
 /// MSI still ships as the inert `AgentExeAlias`, so a mixed / in-flight install
@@ -1210,7 +1212,10 @@ fn installed_daemon_candidates() -> Vec<PathBuf> {
             // plist and TCC grant keys on the bundle path it points at.
             PathBuf::from("/usr/local/bin/roomlerd"),
             // The bundle itself, if the symlink is missing.
-            // RETIRED-NAME-ANCHOR: the macOS .app bundle name KEYS THE TCC GRANTS — renaming it silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it; this is the path that bundle really has. docs/fr/FR-21
+            // RETIRED-NAME-ANCHOR: the macOS .app bundle name KEYS THE TCC GRANTS —
+            // renaming it silently drops Screen Recording + Accessibility on every Mac.
+            // FR-21 D5 freezes it; this is the path that bundle really has.
+            // docs/fr/FR-21
             PathBuf::from("/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent"),
         ]
     }

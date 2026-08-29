@@ -413,6 +413,8 @@ pub fn pick_asset_for_platform(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     }
 }
 
+// RETIRED-NAME-ANCHOR(2): PUBLISHED asset names. Already-released files cannot be
+// renamed and the picker matches them, so they stay verbatim. docs/fr/FR-21
 /// Pure Windows asset picker. Filters by the `-perMachine-` infix in
 /// the asset filename (cargo-wix names them
 /// `roomler-agent-<v>-perMachine-x86_64-…msi`; the perUser MSI uses
@@ -505,6 +507,7 @@ fn host_has_debian_tooling() -> bool {
     })
 }
 
+// RETIRED-NAME-ANCHOR: published asset names, as above. docs/fr/FR-21
 /// Is this release asset the DAEMON's own package, as opposed to something
 /// else in the same release that happens to be a `.deb` for the same arch?
 ///
@@ -526,7 +529,11 @@ fn host_has_debian_tooling() -> bool {
 /// Gated like its only caller: a Windows build has no Linux picker to call it.
 #[cfg(any(not(target_os = "windows"), test))]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-// RETIRED-NAME-ANCHOR(2): every published release asset is named `roomler-agent-…` and always will be — release-agent.yml keeps that destination name deliberately, because it is an immutable surface prior releases already carry and the picker keys on it. Dropping the prefix here makes every Linux agent stop finding its own update. docs/fr/FR-21
+// RETIRED-NAME-ANCHOR(2): every published release asset is named `roomler-agent-…` and
+// always will be — release-agent.yml keeps that destination name deliberately, because
+// it is an immutable surface prior releases already carry and the picker keys on it.
+// Dropping the prefix here makes every Linux agent stop finding its own update.
+// docs/fr/FR-21
 fn is_daemon_asset(lower_name: &str) -> bool {
     lower_name.starts_with("roomler-agent") || lower_name.starts_with("roomlerd")
 }
@@ -617,7 +624,7 @@ async fn fetch_latest_release() -> Result<GithubRelease> {
 
 async fn fetch_releases_from(url: &str) -> Result<GithubRelease> {
     let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("building reqwest client")?;
@@ -700,7 +707,7 @@ pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRel
 /// [`crate::artifact_version`] for the downgrade this closes.
 pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -> Result<PathBuf> {
     let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(600))
         .build()
         .context("building download client")?;
@@ -738,7 +745,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
             "no digest field on asset; falling through to size floor only"
         );
     }
-    let dir = std::env::temp_dir().join("roomler-agent-update");
+    let dir = std::env::temp_dir().join("roomlerd-update");
     std::fs::create_dir_all(&dir).context("creating temp update dir")?;
     let path = dir.join(&asset.name);
     std::fs::write(&path, &bytes).context("writing installer to disk")?;
@@ -902,7 +909,7 @@ pub(crate) fn verify_sha256(bytes: &[u8], digest: &str) -> Result<()> {
 pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
     let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}");
     let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("roomlerd/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("building reqwest client")?;
@@ -1159,6 +1166,8 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     }
 }
 
+// RETIRED-NAME-ANCHOR: the pre-rename machine-global path this cleanup exists to
+// find. docs/fr/FR-21
 /// Windows auto-update spawn for a caller that already KNOWS the
 /// flavour of the install being replaced. [`spawn_installer_inner`]
 /// delegates here with the running EXE's classification; the
@@ -1427,6 +1436,8 @@ const TARBALL_REQUIRED: &[&str] = &["usr/bin/roomlerd", "usr/bin/roomler"];
 const TARBALL_INSTALL_IF_ABSENT: &[&str] = &[
     "usr/lib/systemd/system/roomlerd.service",
     "usr/lib/systemd/user/roomler.service",
+    // RETIRED-NAME-ANCHOR: a path INSIDE the shipped .deb; moving it needs the
+    // package layout to move with it. docs/fr/FR-21
     "usr/share/doc/roomler-agent/README.Debian",
 ];
 
@@ -1531,12 +1542,17 @@ fn install_tarball_linux(euid: u32, tarball: &std::path::Path) -> Result<u32> {
     // Bundled libs are discovered, not enumerated: the set differs per arch
     // (FFmpeg + libvpx on x86_64, libvpx alone on aarch64) and shrinks as
     // linkage is trimmed.
+    // RETIRED-NAME-ANCHOR: RPATH-bound — the binary resolves its bundled FFmpeg from
+    // this directory, so the name cannot move without relinking. docs/fr/FR-21
     let libdir = prefix.join("usr/lib/roomler-agent");
     if libdir.is_dir() {
         for entry in std::fs::read_dir(&libdir).context("reading the bundled libs")? {
             let entry = entry?;
             if entry.path().is_file() {
                 let rel = format!(
+                    // RETIRED-NAME-ANCHOR(2): the bundled-library directory is
+                    // baked into the binary as an RPATH. It cannot move without
+                    // a relink, so the updater must stage into the same name.
                     "usr/lib/roomler-agent/{}",
                     entry.file_name().to_string_lossy()
                 );
@@ -1645,6 +1661,11 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
         // that cannot update. On a two-half install the ROOT daemon updates
         // the shared bundle, so the host still moves forward.
         let euid = unsafe { libc::geteuid() };
+        // RETIRED-NAME-ANCHOR(16): the bail! message names
+        // /var/log/roomler-agent/update.log — the macOS log path fixed by the launchd
+        // plists, which are pinned to the frozen .app bundle name (D5). The marker
+        // cannot sit on that line: it would land inside the string literal.
+        // docs/fr/FR-21
         if euid != 0 {
             bail!(
                 "refusing to self-update: `installer -target /` requires root, but this \
@@ -1658,6 +1679,8 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
 
         // `-target /`, NOT `CurrentUserHomeDirectory`.
         //
+        // RETIRED-NAME-ANCHOR(3): the PRE-P4b /Applications bundle, swept on upgrade.
+        // Without the old name the vacated .app is orphaned forever. docs/fr/FR-21
         // The pkg's payload is absolute: /Applications/roomler-agent.app plus
         // /usr/local/bin/roomler, and BOTH launchd plists name the bundle path
         // literally. A home-directory install relocates the payload under
@@ -2204,6 +2227,10 @@ async fn macos_forward_triggers(
                          the latest release; pinned installs are manual (sudo installer -pkg …)"
                     );
                 }
+                // RETIRED-NAME-ANCHOR(18): both arms name real macOS paths from inside
+                // string literals — /var/log/roomler-agent/update.log and the
+                // /etc/roomler-agent/disable-auto-update opt-out marker — so the anchor
+                // sits on the statement. docs/fr/FR-21
                 match macos_queue_update_check() {
                     Ok(()) => tracing::info!(
                         trigger = MACOS_UPDATE_TRIGGER,
@@ -2253,6 +2280,8 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
     // marker is set, but a loaded job can linger until reboot (it must not
     // bootout its own ancestor mid-install) — so the helper honours the
     // marker itself, making the lingering job harmless.
+    // RETIRED-NAME-ANCHOR(2): the opt-out marker, read here. Its path is part of the
+    // documented macOS contract and exists on hosts today. docs/fr/FR-21
     if std::path::Path::new("/etc/roomler-agent/disable-auto-update").exists() {
         tracing::info!("auto-update opted out (/etc/roomler-agent/disable-auto-update) — exiting");
         return Ok(());
@@ -2315,6 +2344,12 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
     }
 }
 
+// RETIRED-NAME-ANCHOR-BEGIN
+// The fixtures below are REAL published release-asset names. Rewriting them would
+// make these tests assert against files that never existed, and the picker they
+// exercise matches on exactly those strings.
+// INVARIANT: a retired name here must be one that was actually shipped.
+// docs/fr/FR-21
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2884,7 +2919,9 @@ mod tests {
 
         // The companion listed FIRST — asset order is GitHub's, not ours, so
         // "the daemon's happens to come first" is not a property we may rely on.
-        // RETIRED-NAME-ANCHOR(8): these are real PUBLISHED asset names, frozen by release-agent.yml as an immutable surface. Renaming them here would make the test pass against names no release actually carries. docs/fr/FR-21
+        // RETIRED-NAME-ANCHOR(8): these are real PUBLISHED asset names, frozen by
+        // release-agent.yml as an immutable surface. Renaming them here would make the
+        // test pass against names no release actually carries. docs/fr/FR-21
         let release = vec![
             mk("roomler-desktop-0.4.15-x86_64-unknown-linux-gnu.deb"),
             mk("roomler-agent-0.4.15-x86_64-unknown-linux-gnu.deb"),
@@ -3428,3 +3465,4 @@ mod tests {
         assert!(MAX_CONSECUTIVE_DEFERS >= 3 && MAX_CONSECUTIVE_DEFERS <= 24);
     }
 }
+// RETIRED-NAME-ANCHOR-END

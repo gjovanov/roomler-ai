@@ -4,7 +4,7 @@ license = "MPL-2.0"
 publish = false
 version.workspace = true
 edition.workspace = true
-description = "Roomler AI tunnel core — shared transport, signalling, ACL, and forwarding pump for the roomler-tunnel client and the agent's tunnel service."
+description = "Roomler AI tunnel core — shared transport, signalling, ACL, and forwarding pump for the roomler CLI client and the agent's tunnel service."
 
 [lib]
 name = "tunnel_core"

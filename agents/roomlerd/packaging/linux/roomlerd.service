@@ -61,6 +61,9 @@ Environment=RUST_LOG=roomler_agent=info,roomlerd=info,warn
 # single-instance lock) must NOT either — this process is redundant by
 # definition, and without the exception `always` restarts it every 5 s
 # forever. That is not hypothetical: on 2026-08-21 buildhost, fleet-host-2 and fleet-host-1 each
+# RETIRED-NAME-ANCHOR(3): names the LEGACY unit that may still be enabled on
+# an upgraded host. The whole point of the note is that both can be enabled
+# at once, so it has to name the other one.
 # had TWO units enabled (this one plus a legacy `roomler-agent.service`), and
 # the loser of the lock race had burned 1500+ restarts while the winner served
 # normally — `systemctl is-active` read green the whole time.

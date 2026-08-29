@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR(2): this line EXISTS to explain the retired spelling, so it must
+// contain it.
 //! `roomler status | peers | flows` — the thin-client read verbs.
 //!
 //! These connect to the **local** daemon's LocalAPI (the ACL-gated named pipe /

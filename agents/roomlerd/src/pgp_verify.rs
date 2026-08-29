@@ -463,6 +463,8 @@ hV/0cAHGFizJ3Gl+qz5YZ4IEbnnXtgs=\n\
         );
     }
 
+    // RETIRED-NAME-ANCHOR(8): names a PUBLISHED release asset. Filenames are fixed by
+    // what is already on GitHub Releases (FR-21 D6).
     /// Verifies a REAL published artifact against the real pin. `#[ignore]`
     /// because it needs release files this repo does not carry:
     ///

@@ -17,7 +17,7 @@
 //!   works on the operator's box without `AdjustTokenPrivileges`
 //!   gymnastics.
 //!
-//!   Run via: `psexec -s -i 1 ...\roomler-agent.exe system-context-probe winlogon-token`
+//!   Run via: `psexec -s -i 1 ...\roomlerd.exe system-context-probe winlogon-token`
 //!
 //! - **`winsta-attach`** (Pre-flight #3): the SCM service starts in
 //!   the `Service-0x0-3e7$\Default` window station. Before it can open
@@ -28,7 +28,7 @@
 //!   `attach_to_winsta0()` step in the eventual SYSTEM-context worker
 //!   bootstrap.
 //!
-//!   Run via: `psexec -s -i 0 ...\roomler-agent.exe system-context-probe winsta-attach`
+//!   Run via: `psexec -s -i 0 ...\roomlerd.exe system-context-probe winsta-attach`
 //!
 //! - **`dxgi-cadence`** (Pre-flight #5): instrument `scrap::Capturer`
 //!   on the primary display for 30 s on a static desktop. Reports the
@@ -38,13 +38,13 @@
 //!   "emit-on-change" with a 1 fps idle keepalive) — the M3 A1 worker
 //!   needs equivalent compensation.
 //!
-//!   Run via: `...\roomler-agent.exe system-context-probe dxgi-cadence`
+//!   Run via: `...\roomlerd.exe system-context-probe dxgi-cadence`
 //!   (no SYSTEM context needed; user-context is fine for cadence
 //!   measurement.)
 //!
 //! All three exit non-zero on hard failure, write a structured one-line
 //! summary to stdout that the operator can paste into a chat, and write
-//! a more verbose JSON report to `%TEMP%\roomler-agent-probe-{mode}.json`
+//! a more verbose JSON report to `%TEMP%\roomlerd-probe-{mode}.json`
 //! for the implementer to consume offline.
 
 #![cfg(target_os = "windows")]
@@ -162,7 +162,7 @@ fn run_winlogon_token() -> Result<()> {
 
     // Step 5: spawn `cmd.exe /c whoami /all > %TEMP%\winlogon-token-probe.txt`
     // using the primary token via CreateProcessAsUserW.
-    let probe_out = std::env::temp_dir().join("roomler-agent-probe-winlogon-token.txt");
+    let probe_out = std::env::temp_dir().join("roomlerd-probe-winlogon-token.txt");
     let _ = std::fs::remove_file(&probe_out); // best-effort wipe stale data
     let cmdline = format!(
         "cmd.exe /c \"whoami /user >\"{}\" 2>&1 && whoami /priv >>\"{}\" 2>&1\"",
