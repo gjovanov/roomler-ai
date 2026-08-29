@@ -186,3 +186,87 @@ mod tests {
         );
     }
 }
+
+/// FR-19 P4b — install a server-minted session into the running relay
+/// (`rc:overlay.relay_serve`). Every lifetime is RE-CLAMPED against this
+/// node's own ceilings and its own clock — server values only ever shorten
+/// (the Roomler SSH rule). A malformed member (bad base64, wrong length)
+/// drops the whole frame: a session with one unverifiable member is a
+/// session nobody can bind to safely. A node that is not serving ignores it
+/// with a warning: the server mints only onto nodes advertising
+/// `relay-server`, so reaching here without a listener means a stale
+/// capability, not a fault worth more than a log line.
+pub fn install_from_wire(
+    vni: u32,
+    generation: u64,
+    members: &[roomler_ai_remote_control::signaling::RelayMemberWire],
+    bind_secs: u32,
+    idle_secs: u32,
+    max_lifetime_secs: u32,
+) {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use tunnel_core::overlay::orgrelay::{
+        bind::BindSecret,
+        member::{MAX_BIND_BUDGET, MAX_LIFETIME},
+        session::{IDLE_REFRESH, Member, Session},
+    };
+    let Some(h) = handle() else {
+        tracing::warn!(
+            vni,
+            "org-relay: relay_serve received but this node is not serving; ignored"
+        );
+        return;
+    };
+    if members.len() != 2 {
+        tracing::warn!(
+            vni,
+            n = members.len(),
+            "org-relay: relay_serve must name exactly two members; ignored"
+        );
+        return;
+    }
+    let parse = |m: &roomler_ai_remote_control::signaling::RelayMemberWire| -> Option<Member> {
+        let pk = BASE64.decode(&m.wg_public_key).ok()?;
+        let sk = BASE64.decode(&m.bind_secret).ok()?;
+        Some(Member {
+            wg_public: <[u8; 32]>::try_from(pk.as_slice()).ok()?,
+            secret: BindSecret::from_bytes(<[u8; 32]>::try_from(sk.as_slice()).ok()?),
+        })
+    };
+    let (Some(a), Some(b)) = (parse(&members[0]), parse(&members[1])) else {
+        tracing::warn!(
+            vni,
+            "org-relay: relay_serve carried a malformed member; ignored"
+        );
+        return;
+    };
+    let now = std::time::Instant::now();
+    let secs = |s: u32| std::time::Duration::from_secs(u64::from(s));
+    let session = Session {
+        vni,
+        generation,
+        members: [a, b],
+        bound: [None, None],
+        max_lifetime: now + secs(max_lifetime_secs).min(MAX_LIFETIME),
+        idle_deadline: now + secs(idle_secs).min(IDLE_REFRESH),
+        bind_deadline: now + secs(bind_secs).min(MAX_BIND_BUDGET),
+    };
+    if h.install(session) {
+        tracing::info!(vni, generation, "org-relay: session installed");
+    } else {
+        tracing::warn!(
+            vni,
+            "org-relay: session refused (table at capacity, or the relay stopped)"
+        );
+    }
+}
+
+/// FR-19 P4b — drop a session on `rc:overlay.relay_revoke`, if this node
+/// holds it. Silent when it does not: the same frame reaches members too.
+pub fn revoke_from_wire(vni: u32) {
+    if let Some(h) = handle()
+        && h.revoke(vni)
+    {
+        tracing::info!(vni, "org-relay: session revoked by the server");
+    }
+}
