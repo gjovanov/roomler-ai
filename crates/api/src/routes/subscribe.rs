@@ -16,6 +16,12 @@
 //! 2. **Resends are on a cooldown** (`SubscriberDao`). An open form that mails
 //!    whoever is named in the body is a mail bomb pointed at that person,
 //!    posted from our own domain.
+//!
+//! A third follows from the first and is easy to undo by accident: the
+//! confirmation mail is **sent from a detached task**, so the response time does
+//! not depend on whether one was sent. Awaiting it inline would leak the same
+//! membership fact through latency that the status code refuses to leak
+//! directly.
 
 use axum::{
     Json,
@@ -106,7 +112,19 @@ pub async fn subscribe(
     match state.subscribers.subscribe(&email, &source).await {
         Ok((outcome, token)) => {
             if let Some(token) = token {
-                send_confirmation(&state, &email, &token).await;
+                // Detached on purpose, and this is part of the same control as
+                // the uniform 202 rather than a throughput optimisation.
+                // Awaiting the send here would make the response time depend on
+                // the outcome — a fresh address pays for an SMTP round trip, an
+                // address already on the list returns immediately — which is a
+                // timing oracle for exactly the membership the status code is
+                // careful not to reveal. Detaching makes both paths do the same
+                // work before answering.
+                let state = state.clone();
+                let email = email.clone();
+                tokio::spawn(async move {
+                    send_confirmation(&state, &email, &token).await;
+                });
             }
             info!(source = %source, outcome = ?outcome, "subscribe request handled");
             if outcome == SubscribeOutcome::AlreadyConfirmed {
