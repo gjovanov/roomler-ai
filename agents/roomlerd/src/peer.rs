@@ -1994,6 +1994,14 @@ async fn media_pump(
     // stall in capture or encode is indistinguishable from a working pump.
     let mut frames_captured: u64 = 0;
     let mut frames_empty: u64 = 0;
+    // FR-29 P2 — damage observability. Without these the backend can report
+    // perfect dirty rects and nothing on the host can tell: both would-be
+    // consumers (`set_roi_hints`, `note_real_frame_area`) are inert today, so
+    // the heartbeat is the ONLY place the tracked/unknown split becomes
+    // visible. P1's lesson was that an optimisation you cannot observe is one
+    // you cannot trust.
+    let mut damage_tracked_frames: u64 = 0;
+    let mut damage_permille_sum: u64 = 0;
     let mut frames_encoded: u64 = 0;
     let mut frames_keepalive: u64 = 0;
     let mut bytes_written: u64 = 0;
@@ -2393,6 +2401,14 @@ async fn media_pump(
         if !frame.damage.rects().is_empty() {
             enc.set_roi_hints(frame.damage.rects(), (frame.width, frame.height));
         }
+        // FR-29 P2 — record what the backend claimed to know about this frame.
+        if let Some(pm) = frame
+            .damage
+            .area_permille(u64::from(frame.width) * u64::from(frame.height))
+        {
+            damage_tracked_frames += 1;
+            damage_permille_sum += u64::from(pm);
+        }
 
         // Adaptive bitrate: combine quality preference (controller
         // intent) with REMB (network capacity) and apply on change
@@ -2523,10 +2539,20 @@ async fn media_pump(
             // the backend proved a capture was unnecessary. Reporting one as
             // the other would turn a healthy idle host into a false alarm.
             let frames_unchanged = capturer.frames_unchanged();
+            // FR-29 P2 — `damage_tracked_frames` is the falsifiable bit: on a
+            // backend that reports Damage::Unknown it stays 0 no matter how
+            // busy the screen is, so a non-zero value is proof the tracker is
+            // producing real rects rather than the field merely existing.
+            let avg_damage_permille = if damage_tracked_frames > 0 {
+                damage_permille_sum / damage_tracked_frames
+            } else {
+                0
+            };
             info!(
                 %session_id,
                 backend,
                 frames_captured, frames_empty, frames_unchanged, frames_encoded, frames_keepalive,
+                damage_tracked_frames, avg_damage_permille,
                 bytes_written, write_errors,
                 avg_capture_ms, avg_encode_ms,
                 "media pump heartbeat (≈1s window)"
