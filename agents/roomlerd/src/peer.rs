@@ -2002,6 +2002,8 @@ async fn media_pump(
     // you cannot trust.
     let mut damage_tracked_frames: u64 = 0;
     let mut damage_permille_sum: u64 = 0;
+    let mut damage_union_sum: u64 = 0;
+    let mut damage_bbox_sum: u64 = 0;
     let mut frames_encoded: u64 = 0;
     let mut frames_keepalive: u64 = 0;
     let mut bytes_written: u64 = 0;
@@ -2024,6 +2026,8 @@ async fn media_pump(
     // made a precise tracker look saturated.
     let mut heartbeat_damage_frames_base: u64 = 0;
     let mut heartbeat_damage_permille_base: u64 = 0;
+    let mut heartbeat_damage_union_base: u64 = 0;
+    let mut heartbeat_damage_bbox_base: u64 = 0;
     let mut heartbeat_encode_us_base: u64 = 0;
 
     // Last applied quality preference. Initialised to a sentinel
@@ -2415,6 +2419,23 @@ async fn media_pump(
         {
             damage_tracked_frames += 1;
             damage_permille_sum += u64::from(pm);
+            // FR-29 — the two numbers that decide whether P3 is worth building.
+            // `area_permille` sums overlapping rects and saturates, so it can
+            // never answer "how much would a partial readback have to read".
+            // The union answers it for a perfect per-rect readback; the bbox
+            // answers it for the simple one-GetImage form.
+            damage_union_sum += u64::from(
+                frame
+                    .damage
+                    .union_permille(frame.width, frame.height)
+                    .unwrap_or(0),
+            );
+            damage_bbox_sum += u64::from(
+                frame
+                    .damage
+                    .bbox_permille(frame.width, frame.height)
+                    .unwrap_or(0),
+            );
         }
 
         // Adaptive bitrate: combine quality preference (controller
@@ -2557,11 +2578,26 @@ async fn media_pump(
             let avg_damage_permille = damage_permille_window
                 .checked_div(damage_frames_window)
                 .unwrap_or(0);
+            // FR-29 P3 viability, measured rather than assumed: `union` is what
+            // a perfect per-rect readback would touch, `bbox` what the simple
+            // one-GetImage form would. If both sit near 1000 there is nothing
+            // for a partial readback to win and P3 should not be built.
+            let avg_damage_union_permille = damage_union_sum
+                .saturating_sub(heartbeat_damage_union_base)
+                .checked_div(damage_frames_window)
+                .unwrap_or(0);
+            let avg_damage_bbox_permille = damage_bbox_sum
+                .saturating_sub(heartbeat_damage_bbox_base)
+                .checked_div(damage_frames_window)
+                .unwrap_or(0);
             info!(
                 %session_id,
                 backend,
                 frames_captured, frames_empty, frames_unchanged, frames_encoded, frames_keepalive,
-                damage_tracked_frames = damage_frames_window, avg_damage_permille,
+                damage_tracked_frames = damage_frames_window,
+                avg_damage_permille,
+                avg_damage_union_permille,
+                avg_damage_bbox_permille,
                 bytes_written, write_errors,
                 avg_capture_ms, avg_encode_ms,
                 "media pump heartbeat (≈1s window)"
@@ -2570,6 +2606,8 @@ async fn media_pump(
             heartbeat_capture_us_base = capture_time_us;
             heartbeat_damage_frames_base = damage_tracked_frames;
             heartbeat_damage_permille_base = damage_permille_sum;
+            heartbeat_damage_union_base = damage_union_sum;
+            heartbeat_damage_bbox_base = damage_bbox_sum;
             heartbeat_encode_us_base = encode_time_us;
         }
     }
