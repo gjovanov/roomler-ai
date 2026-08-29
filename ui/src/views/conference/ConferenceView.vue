@@ -300,7 +300,7 @@ const layoutCtrl = useConferenceLayout(
   activeSpeakerKeyRef,
   getDisplayName,
   localDisplayName,
-  conferenceStore.remoteVideoPaused,
+  { video: conferenceStore.remoteVideoPaused, audio: conferenceStore.remoteAudioPaused },
 )
 
 const layoutComponent = computed<Component>(() => {
