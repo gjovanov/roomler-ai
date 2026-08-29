@@ -58,6 +58,7 @@ import {
   RC_STALL_PROBE_TICKS,
   RC_STALL_FAIL_TICKS,
   isRetryableTerminateReason,
+  friendlyEndReason,
   isRetryableRcErrorCode,
   readyRecoveryAction,
   sessionGateAllows,
@@ -2907,6 +2908,37 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
     }
   })
 
+  it('FR-27: carries a pending floor request, and degrades to null without one', () => {
+    const waiting = parseControlInbound(
+      '{"t":"rc:control.state","mode":"exclusive","holder":"aabbccdd00112233aabbccdd","participants":[],"pending_request":{"session":"ffeeddcc00112233aabbccdd","name":"Ana"}}',
+    )
+    expect(waiting?.kind).toBe('control_state')
+    if (waiting?.kind === 'control_state') {
+      expect(waiting.state.pendingRequest).toEqual({
+        session: 'ffeeddcc00112233aabbccdd',
+        name: 'Ana',
+      })
+    }
+
+    // A pre-FR-27 agent omits the key entirely. That is indistinguishable from
+    // "nothing pending", which is the correct degradation: the whole chip
+    // self-hides rather than rendering an empty one.
+    const older = parseControlInbound(
+      '{"t":"rc:control.state","mode":"exclusive","holder":null,"participants":[]}',
+    )
+    if (older?.kind === 'control_state') expect(older.state.pendingRequest).toBeNull()
+
+    // An explicit null, and a malformed object, must not throw either.
+    for (const raw of [
+      '{"t":"rc:control.state","mode":"free","holder":null,"participants":[],"pending_request":null}',
+      '{"t":"rc:control.state","mode":"free","holder":null,"participants":[],"pending_request":{"name":"no session id"}}',
+    ]) {
+      const p = parseControlInbound(raw)
+      expect(p?.kind).toBe('control_state')
+      if (p?.kind === 'control_state') expect(p.state.pendingRequest).toBeNull()
+    }
+  })
+
   it('defaults native dims to 0 for older agents that omit them (back-compat)', () => {
     const parsed = parseControlInbound(
       '{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct"}',
@@ -3338,6 +3370,10 @@ describe('S3 resilience: isRetryableTerminateReason', () => {
       'agent_hangup',
       'user_denied',
       'consent_timeout',
+      // FR-27 - a device with no prompt surface would answer the retry the
+      // same way, so retrying is pure noise. Terminal by the allowlist's
+      // fail-safe default; asserted here so it stays deliberate.
+      'no_prompt_surface',
       'admin_terminated',
       'idle_timeout',
     ]) {
@@ -3350,6 +3386,31 @@ describe('S3 resilience: isRetryableTerminateReason', () => {
     expect(isRetryableTerminateReason(null)).toBe(false)
     expect(isRetryableTerminateReason('')).toBe(false)
     expect(isRetryableTerminateReason('some_future_reason')).toBe(false)
+  })
+})
+
+describe('FR-27: friendlyEndReason', () => {
+  it('tells the three consent outcomes apart', () => {
+    const denied = friendlyEndReason('user_denied')!
+    const timedOut = friendlyEndReason('consent_timeout')!
+    const noSurface = friendlyEndReason('no_prompt_surface')!
+    expect(new Set([denied, timedOut, noSurface]).size).toBe(3)
+    // The whole point of the wire change: a timeout must not read as a
+    // refusal. It says so out loud, because that IS what it used to say.
+    expect(timedOut).toMatch(/nobody answered/i)
+    expect(timedOut).toMatch(/nothing was declined/i)
+    expect(denied).toMatch(/declined/i)
+    expect(denied).not.toMatch(/nobody answered/i)
+    // And "nobody could be asked" has to name a fix the operator can act on.
+    expect(noSurface).toMatch(/desktop app|email/i)
+  })
+
+  it('stays silent on a nominal ending', () => {
+    for (const r of ['controller_hangup', 'agent_hangup', 'idle_timeout', 'agent_disconnect']) {
+      expect(friendlyEndReason(r)).toBeNull()
+    }
+    expect(friendlyEndReason(undefined)).toBeNull()
+    expect(friendlyEndReason('some_future_reason')).toBeNull()
   })
 })
 

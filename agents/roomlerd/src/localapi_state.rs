@@ -141,6 +141,10 @@ pub struct DaemonState {
     /// the broker's own sentinel dir, rather than a throwaway broker over a
     /// re-resolved path.
     consent: crate::consent::ConsentBroker,
+    /// FR-27 — live remote-control sessions, written by every signalling
+    /// loop through its `ViewerIndicator`. `None` in tests and in any daemon
+    /// shape that never runs signalling.
+    rc_sessions: Option<crate::rc_sessions::RcSessionRegistry>,
     /// The netstack ICMP backend for the `ping` verb. `None` on a node not
     /// running the userspace stack (OS-TUN or non-overlay build).
     pinger: Option<Arc<dyn NetstackPinger>>,
@@ -231,6 +235,7 @@ impl DaemonState {
             connected,
             overlay,
             consent,
+            rc_sessions: None,
             pinger,
             tunnel_hub,
             rtt_cache,
@@ -240,6 +245,15 @@ impl DaemonState {
             org_views: None,
             remote_config: None,
         }
+    }
+
+    /// FR-27 — attach the live remote-control session registry, so a thin
+    /// client can render "Being viewed by …" and offer a Disconnect. Absent
+    /// (tests, and any daemon shape that never runs signalling) ⇒ an empty
+    /// list and a `false` disconnect, which is the honest answer there.
+    pub fn with_rc_sessions(mut self, sessions: crate::rc_sessions::RcSessionRegistry) -> Self {
+        self.rc_sessions = Some(sessions);
+        self
     }
 
     /// Attach the multi-org status registry so `NodeStatus.orgs` is live.
@@ -532,6 +546,34 @@ impl LocalApiState for DaemonState {
         // being prompted (no pre-approval / confused-deputy — the decision is an
         // answer to a question the broker is currently asking).
         self.consent.record_decision(session_id, allow)
+    }
+
+    fn rc_sessions(&self) -> Vec<tunnel_core::localapi::RcSessionInfo> {
+        self.rc_sessions
+            .as_ref()
+            .map(|r| r.list())
+            .unwrap_or_default()
+    }
+
+    fn rc_disconnect(&self, session_id: &str) -> bool {
+        // Same guard as `consent_decide`, and for the same reason: the id
+        // reaches a lookup keyed by `ObjectId`, and refusing a malformed one up
+        // front keeps the failure legible instead of an opaque "no such
+        // session". The pipe SDDL already limits WHO may call this.
+        if !is_hex_object_id(session_id) {
+            tracing::warn!(
+                session = %session_id,
+                "localapi: rejecting rc disconnect — session id is not a 24-char hex ObjectId"
+            );
+            return false;
+        }
+        let Ok(oid) = bson::oid::ObjectId::parse_str(session_id) else {
+            return false;
+        };
+        match &self.rc_sessions {
+            Some(reg) => reg.disconnect(&oid),
+            None => false,
+        }
     }
 
     async fn ping(&self, target: &str, timeout_ms: u64, prefer_v6: bool) -> Response {
@@ -1259,6 +1301,10 @@ mod tests {
                 controller_name: "x".into(),
                 permissions: "VIEW_SCREEN".into(),
                 timeout_secs: 30,
+                kind: "rc".into(),
+                detail: String::new(),
+                expires_at_ms: 0,
+                surface: String::new(),
                 org: String::new(),
             };
             std::fs::write(
