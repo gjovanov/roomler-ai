@@ -1221,7 +1221,7 @@ async fn consent_list_cmd() -> Result<()> {
             println!("    request:     {}", p.detail);
         }
         println!(
-            "    approve:     roomler consent --session {} --approve",
+            "    approve:     roomlerd consent --session {} --approve",
             p.session_id
         );
     }

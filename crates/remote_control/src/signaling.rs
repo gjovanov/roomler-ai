@@ -280,6 +280,17 @@ pub enum ClientMsg {
         /// agent→server like `srflx_count`, so no capability flag.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warm_relay: Option<String>,
+        /// FR-27 — the version of the `roomler-desktop` companion installed on
+        /// this host, or `None` when none is installed / the probe failed /
+        /// the agent predates the field. Additive agent→server like
+        /// `srflx_count`, so no capability flag.
+        ///
+        /// Reported because the daemon and the companion update by DIFFERENT
+        /// mechanisms on all three platforms, so a fleet-wide "Update all"
+        /// moving `agent_version` says nothing about the companion — which is
+        /// exactly the skew the operator hit on macOS.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        companion_version: Option<String>,
     },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
@@ -2730,6 +2741,7 @@ mod tests {
             sys: None,
             srflx_count: Some(2),
             warm_relay: Some("5.9.157.221:12586".into()),
+            companion_version: Some("0.4.16".into()),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.heartbeat""#));
@@ -2749,6 +2761,7 @@ mod tests {
                 sys,
                 srflx_count,
                 warm_relay,
+                companion_version,
             } => {
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
@@ -2756,9 +2769,11 @@ mod tests {
                 assert!(sys.is_none());
                 assert_eq!(srflx_count, Some(2));
                 assert_eq!(warm_relay.as_deref(), Some("5.9.157.221:12586"));
+                assert_eq!(companion_version.as_deref(), Some("0.4.16"));
             }
             other => panic!("wrong variant: {other:?}"),
         }
+        assert!(s.contains(r#""companion_version":"0.4.16""#));
         // A stage-1 agent omits the field — decodes as None, and a
         // warm-less stage-2 agent's None must not serialize at all.
         let stage1 = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":1}"#;
@@ -2767,6 +2782,16 @@ mod tests {
             back,
             ClientMsg::AgentHeartbeat {
                 warm_relay: None,
+                ..
+            }
+        ));
+        // FR-27 — same rule for the companion version: a pre-FR-27 agent omits
+        // it, and that must decode as "not reported", never as an empty string
+        // the grid would render as a version.
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(stage1).unwrap(),
+            ClientMsg::AgentHeartbeat {
+                companion_version: None,
                 ..
             }
         ));
@@ -2831,6 +2856,10 @@ mod tests {
             // distinguishable on the wire from an agent that doesn't report.
             srflx_count: Some(0),
             warm_relay: None,
+            // No companion on this host — must not serialize at all, so a
+            // server reading it cannot tell it apart from an old agent (both
+            // mean "nothing to show").
+            companion_version: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(

@@ -28,11 +28,30 @@ use tunnel_core::overlay::orgrelay::responder::{ProbeResponder, ResponderCounts,
 /// Set only when the responder actually started, so `None` distinguishes
 /// "not running" from "running and idle" — the distinction FR-19 insists on
 /// for every counter it ships.
-static STATS: OnceLock<Arc<ResponderStats>> = OnceLock::new();
+/// Set **only after a successful bind**, so its presence means "this node is
+/// actually serving", never merely "someone asked it to".
+///
+/// ⚠️ An earlier version set this before binding, which would have reported a
+/// live relay on a node whose bind had failed — the precise confusion the
+/// `Option` exists to prevent. A failed bind leaves this `None` and says so at
+/// `error!`.
+static RUNNING: OnceLock<(String, Arc<ResponderStats>)> = OnceLock::new();
 
-/// Live counters, or `None` when no responder is running on this node.
+/// Guards against a second start. Separate from [`RUNNING`] because that is
+/// only populated once the socket exists, and the guard has to hold from the
+/// moment the first call is made.
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Live counters, or `None` when this node is not serving probes.
 pub fn stats() -> Option<ResponderCounts> {
-    STATS.get().map(|s| s.snapshot())
+    RUNNING.get().map(|(_, s)| s.snapshot())
+}
+
+/// The bound address and live counters, or `None` when not serving. Feeds
+/// `NodeStatus::org_relay`, so `roomler status` answers "is it working?"
+/// immediately instead of waiting out the report loop's 300 s window.
+pub fn status() -> Option<(String, ResponderCounts)> {
+    RUNNING.get().map(|(addr, s)| (addr.clone(), s.snapshot()))
 }
 
 /// How often the counters are summarised into the log. This IS the reader for
@@ -46,8 +65,7 @@ pub fn maybe_start() {
         return;
     }
     let port = orgrelay::relay_server_port();
-    let stats = Arc::new(ResponderStats::default());
-    if STATS.set(stats.clone()).is_err() {
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         tracing::warn!("org-relay responder already started; ignoring second start");
         return;
     }
@@ -56,7 +74,8 @@ pub fn maybe_start() {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 // Loud and specific. A relay that cannot bind must not look
-                // like a relay that is merely quiet.
+                // like a relay that is merely quiet -- and RUNNING stays None,
+                // so `roomler status` shows no relay rather than a phantom one.
                 tracing::error!(
                     port,
                     error = %e,
@@ -67,6 +86,12 @@ pub fn maybe_start() {
                 return;
             }
         };
+        let local = sock
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| format!("0.0.0.0:{port}"));
+        let stats = Arc::new(ResponderStats::default());
+        let _ = RUNNING.set((local, stats.clone()));
         tokio::spawn(report_loop(stats.clone()));
         ProbeResponder::new(stats).serve(sock).await;
     });
