@@ -89,12 +89,24 @@ the controller is black until something moves. The output-suppression on
 |---|---|---|---|
 | 1 | **Stuck-duplication recovery** | In `capture_pump`, track `frames_delivered` (reset on every backend (re)build). When `frames_delivered == 0` and `consecutive_empty` crosses `STUCK_EMPTY_THRESHOLD`, `try_change_desktop()` + rebuild DXGI; if a second streak follows the rebuild, fall to the always-delivers GDI BitBlt path (as the `AccessLost` arm already does at its threshold). **Gated on `frames_delivered == 0`, so a session that has ever shown a frame is byte-for-byte unaffected** — the worst case for the change is a came-up-black session that stays black, i.e. no regression over today. | env `ROOMLERD_STUCK_CAPTURE_RECOVERY=0` |
 | 2 | **First-frame guarantee** | Never let the empty/unchanged path suppress output before the controller has received one frame — force an initial keyframe. Largely subsumed by phase 1 (recovery delivers the frame) + the GDI backstop; this is the belt-and-suspenders for a truly static screen. | — |
-| 3 | **Consent panel on the secure desktop** | Render the FR-27 consent panel on the `Winlogon` secure desktop when the host is locked, via the SystemContext worker that already owns the secure-desktop video overlay (M3), so a locked host can show and answer the prompt without unlocking. Larger; sequenced last. | feature-gated; absent = today's behaviour (unlock to answer) |
+| 3 | **Tell the controller the host is locked** | Unlock-then-approve is the SOUND flow — you unlock (proving you are at the machine), then approve — and with P1+P4 it works. The gap is that the controller has no way to know it is locked, so its "awaiting consent" wait looks like a hang. The agent probes lock state at prompt time and, if locked, sends `rc:consent.pending{host_locked}` over the WS; the hub relays it; the viewer turns the wait into an instruction ("unlock the device and approve, 5-min window"). | advisory + additive; absent = generic wait |
 | 4 | **A 5-minute attended window** | Plain `prompt` gave the operator 30 s — not enough to reach a LOCKED machine, unlock, and approve. Extend `DEFAULT_CONSENT_TIMEOUT` to 5 min (`prompt_then_email`'s host half stays 30 s — its emailed link is the fallback), and show the countdown as `m:ss`. | — |
 
 Phase 1 is the functional fix (black → live without a refresh) and is safe to
-ship on its own by the `frames_delivered == 0` gate. Phase 3 removes the trigger
-but is the hardest (secure-desktop window ownership) and does not block phase 1.
+ship on its own by the `frames_delivered == 0` gate.
+
+⚠️ **Rejected: rendering the consent panel on the secure desktop.** The original
+P3 was to draw the FR-27 panel on the `Winlogon` desktop so a locked host could
+be answered WITHOUT unlocking. Dropped after the field test resolved the design
+question: the operator confirmed unlock-then-approve is fine ("can't we allow the
+user to do a sys unlock and then show the consent prompt — or is this a design
+flaw?"), and it is not a flaw — unlocking proves physical presence, which is
+exactly what a consent gate wants. On top of that the secure-desktop approach is
+high-risk and un-verifiable remotely: modern Win11 heavily restricts third-party
+windows on the locked secure desktop, the panel is `WDA_EXCLUDEFROMCAPTURE` so it
+can never be observed even through an RC session streaming the lock screen, and
+the daemon cannot lock its own controlling host to test. So P3 became the much
+smaller, fully-verifiable "tell the controller it is locked" above.
 
 ## Acceptance criteria
 
@@ -105,10 +117,10 @@ but is the hardest (secure-desktop window ownership) and does not block phase 1.
 - [ ] A session that has ever delivered a frame is unaffected (no extra
       rebuilds, idle optimisation intact).
 - [ ] Connecting to a genuinely static screen shows an initial frame, not black.
-- [ ] On a **locked** perMachine host, the operator can see and answer the
-      consent prompt without unlocking (phase 3). ⚠️ Field-confirmed STILL OPEN
-      2026-08-29: while locked, no consent window appears — the operator had to
-      unlock on the machine itself.
+- [ ] The controller is TOLD the host is locked while a consent prompt is
+      pending, so its wait reads as "unlock the device and approve" rather than
+      a hang (phase 3). ⚠️ Rendering the panel on the secure desktop is
+      REJECTED (see above) — unlocking to approve is the intended flow.
 - [x] Field-verified on **CORPLAP-1** (2026-08-29): lock → session → unlock →
       approve → the screen comes up live, **no refresh** (the black-until-refresh
       is fixed). The prompt is still not visible *while* locked — that is P3.
@@ -133,7 +145,10 @@ but is the hardest (secure-desktop window ownership) and does not block phase 1.
   a live screen with **no refresh** — the black-until-refresh from the original
   report is gone. (Contrast: the incident session sat black for 13 s and only a
   reconnect recovered it.)
-- **P3 (consent on the secure desktop): confirmed still needed.** The prompt is
-  invisible while locked; the operator unlocked at the machine to see it.
+- **P3 reframed.** The operator asked "can't we unlock then show the prompt — or
+  is this a design flaw?" It is NOT a flaw: unlock-then-approve is the sound flow
+  (unlocking proves presence). So rendering on the secure desktop was rejected;
+  P3 became "tell the controller the host is locked" so its wait reads as an
+  instruction instead of a hang.
 - **P4 (window length):** 30 s was too short to walk to a locked machine — raised
   to 5 min.
