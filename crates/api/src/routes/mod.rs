@@ -24,6 +24,7 @@ pub mod overlay_block;
 pub mod overlay_policy;
 pub mod overlay_route;
 pub mod peer_relay;
+pub mod plan_compliance;
 pub mod push;
 pub mod reaction;
 pub mod recording;
