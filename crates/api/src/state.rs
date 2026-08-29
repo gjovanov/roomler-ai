@@ -20,14 +20,15 @@ use roomler_ai_services::{
     dao::{
         activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
         consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
-        invite::InviteDao, message::MessageDao, notification::NotificationDao,
-        overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
-        overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
-        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
-        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
-        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao,
-        subscriber::SubscriberDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
-        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
+        invite::InviteDao, key_rotation_audit::KeyRotationAuditDao, message::MessageDao,
+        notification::NotificationDao, overlay_network::OverlayNetworkDao,
+        overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
+        peer_relay_audit::PeerRelayAuditDao, push_subscription::PushSubscriptionDao,
+        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
+        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao,
+        ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, subscriber::SubscriberDao,
+        tenant::TenantDao, tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
+        tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -104,6 +105,8 @@ pub struct AppState {
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
+    /// FR-40 — overlay-key rotation orders, dispatched or refused.
+    pub key_rotation_audit: Arc<KeyRotationAuditDao>,
     /// FR-19 peer-relay decisions: approvals (who made a device a relay) and
     /// mints (what the server routed through it), granted or refused.
     pub peer_relay_audit: Arc<PeerRelayAuditDao>,
@@ -252,6 +255,10 @@ pub struct AppState {
     /// (`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`), checked by the mint
     /// in `ws::overlay` AFTER the identity gates so a refusal is attributable.
     pub relay_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    /// FR-40 — one rotation order per device per minute. Keyed on the DEVICE
+    /// (the limiter's `caller` slot carries the device id too): a second
+    /// admin clicking inside the window is the same storm, not a new budget.
+    pub key_rotation_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     /// FR-19 — the org-relay mint's pod-local state: minted sessions (keyed
     /// by pair), per-relay VNI cursors, the server-wide generation clock,
     /// join extras (primary-org flag, relay port) and reachability reports.
@@ -384,6 +391,7 @@ impl AppState {
         let exec_audit = Arc::new(ExecAuditDao::new(&db));
         let ssh_audit = Arc::new(SshAuditDao::new(&db));
         let config_audit = Arc::new(ConfigAuditDao::new(&db));
+        let key_rotation_audit = Arc::new(KeyRotationAuditDao::new(&db));
         let peer_relay_audit = Arc::new(PeerRelayAuditDao::new(&db));
         let ssh_activity = Arc::new(SshActivityDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
@@ -859,6 +867,7 @@ impl AppState {
             exec_audit,
             ssh_audit,
             config_audit,
+            key_rotation_audit,
             peer_relay_audit,
             ssh_activity,
             agent_crashes,
@@ -899,6 +908,7 @@ impl AppState {
             exec_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             ssh_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             relay_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
+            key_rotation_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             org_relay: Arc::new(crate::ws::org_relay::OrgRelayState::new()),
             releases_cache,
         };
