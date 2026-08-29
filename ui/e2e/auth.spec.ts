@@ -56,25 +56,30 @@ test.describe('Authentication', () => {
     await expect(page).toHaveURL(/\/login/)
   })
 
-  test('expired token redirects to login page', async ({ page }) => {
+  test('an invalid session cookie redirects to login page', async ({ page, context }) => {
     const user = uniqueUser()
-    const creds = await registerUserViaApi(user)
+    await registerUserViaApi(user)
 
-    // Set the valid token so the router guard lets us in
-    await page.goto('/login')
-    await page.evaluate((token) => {
-      localStorage.setItem('access_token', token)
-    }, creds.access_token)
+    // ⚠️ Rewritten for cookie-only sessions. The original set
+    // `localStorage.access_token` and then tampered it — neither step
+    // describes anything any more: the session cookie is HttpOnly since
+    // #690/#691 precisely so that page script cannot read or forge it, which
+    // is the property that made an XSS unable to walk off with 30 days of
+    // re-mintable access. Tampering therefore has to happen through the
+    // browser CONTEXT, which is also a truer model of a stolen-or-stale
+    // cookie than a localStorage write ever was.
+    await loginViaUi(page, user.username, user.password)
 
-    // Now tamper the token to make it invalid
-    await page.evaluate(() => {
-      localStorage.setItem('access_token', 'expired.invalid.token')
-    })
+    const session = (await context.cookies()).find((c) => c.name === 'access_token')
+    expect(session, 'login set no access_token cookie').toBeTruthy()
 
-    // Navigate to an authenticated route — the API call will 401
-    // and the interceptor should redirect to /login
+    await context.clearCookies()
+    await context.addCookies([{ ...session!, value: 'expired.invalid.token' }])
+
+    // Navigate to an authenticated route — the API call 401s and the
+    // interceptor must land us on /login rather than on a half-rendered app.
     await page.goto('/')
-    await expect(page).toHaveURL(/\/login/, { timeout: 5000 })
+    await expect(page).toHaveURL(/\/login/, { timeout: 10000 })
   })
 
   test('nav menu hides profile/logout when unauthenticated', async ({ page }) => {
