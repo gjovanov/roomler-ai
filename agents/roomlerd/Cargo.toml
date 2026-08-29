@@ -9,6 +9,9 @@ name = "roomlerd"
 path = "src/lib.rs"
 
 [[bin]]
+# RETIRED-NAME-ANCHOR: names the compatibility ALIAS the MSI installs.
+# Renaming it here would not rename the alias; it would only make this
+# comment describe a file that does not exist. FR-21 D6.
 # The daemon. P3d Slice B moved the OUTPUT binary to `roomlerd`; FR-21 P2a
 # then brought the package and lib names into line, so all three now agree.
 # CI still stages a `roomler-agent.exe` alias copy next to it — the installed
@@ -615,6 +618,18 @@ extended-description = """\
 Roomler Daemon — keeps this device on your private Roomler mesh network \
 and available for secure remote control. Media and input flow directly \
 peer-to-peer; the server never sees raw pixels or keystrokes."""
+# RETIRED-NAME-ANCHOR-BEGIN
+# Frozen zone. Every retired name from here to the wix block is LOAD-BEARING:
+#   * usr/lib/roomler-agent is baked into the binary as an RPATH; renaming the
+#     directory without relinking makes the .deb fail to load its own FFmpeg.
+#   * usr/share/doc/roomler-agent is dpkg-visible and moves with the doc dir,
+#     not with the package name.
+#   * provides/replaces name the REAL predecessor packages — a rename here is
+#     a silently broken takeover, not a typo.
+#   * the .msi filename is a PUBLISHED release asset (updater matches on the
+#     -permachine- infix, never the prefix).
+# INVARIANT: a name in this zone must match something dpkg, the linker or a
+# release URL already refers to. docs/fr/FR-21
 # The agent binary is built on ubuntu-22.04 (glibc 2.34) and links libvpx.so.7.
 # The CI "Bundle FFmpeg" step ships FFmpeg 8.1.2's libav* AND libvpx.so.7 inside
 # usr/lib/roomler-agent (binary RPATH + $ORIGIN), so the .deb is self-contained
@@ -715,6 +730,7 @@ assets = [
 # cargo-wix (Windows .msi)
 #   cargo wix -p roomlerd --nocapture
 # Produces target/wix/roomler-agent-<version>-x86_64.msi
+# RETIRED-NAME-ANCHOR-END
 # Source lives at agents/roomlerd/wix/main.wxs.
 [package.metadata.wix]
 upgrade-guid = "1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91"
