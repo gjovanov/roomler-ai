@@ -937,6 +937,31 @@ async fn handle_media_join(
         return;
     }
 
+    // FR-32 P1b — plan `video_max_participants`. Counted from the pod-local
+    // room registry rather than Mongo, because that is where a live call
+    // actually exists; the tenant-affinity LB co-locates a tenant's conference
+    // on ONE pod, so the local count is the whole call. ⚠ Distinct USERS, not
+    // connections: one person on laptop and phone is one participant.
+    //
+    // A rejoining participant is already in the map, so `>=` would refuse them
+    // their own seat — hence the membership test before the count.
+    if let Ok(room) = state.rooms.base.find_by_id(rid).await
+        && let Ok(tenant) = state.tenants.base.find_by_id(room.tenant_id).await
+    {
+        let present = state.room_manager.get_participant_user_ids(&rid);
+        if !present.contains(user_id)
+            && let Err(d) = roomler_ai_services::quota::check(
+                tenant.plan.clone(),
+                tenant.settings.plan_enforcement,
+                roomler_ai_services::quota::Limit::VideoMaxParticipants,
+                present.len() as u64,
+            )
+        {
+            send_media_error(state, connection_id, &d.message()).await;
+            return;
+        }
+    }
+
     let transport_pair = match state
         .room_manager
         .create_transports(rid, *user_id, connection_id.to_string())
