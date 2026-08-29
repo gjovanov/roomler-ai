@@ -24,7 +24,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use super::{Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
+use super::{
+    DOWNSCALE_TRIGGER_PIXELS, Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture,
+    downscale_bgra_2x,
+};
 
 pub const DEFAULT_TARGET_FPS: u32 = 30;
 
@@ -331,17 +334,6 @@ impl ScrapCapture {
     }
 }
 
-/// Downsample 2× when the source has more pixels than this threshold.
-/// Software openh264 at 4K SW encode caps out around 6–12 fps on a
-/// typical desktop CPU; halving each dimension cuts pixel work by 4×
-/// and typically brings us back to 25–30 fps, which matters far more
-/// for perceived smoothness than the extra detail.
-///
-/// Measured in pixels (not width) so QHD 2560×1440 panels (3.7 Mpx)
-/// trigger the downscale as well — an earlier width-only threshold
-/// missed them because QHD width=2560 fell under the 2561 cutoff.
-const DOWNSCALE_TRIGGER_PIXELS: u64 = 3_500_000;
-
 /// Bytes between the starts of two consecutive rows in a captured frame.
 ///
 /// Deliberately NOT `buf.len() / height` everywhere. That division is exact on
@@ -445,35 +437,6 @@ fn capture_one_blocking(
             Err(e) => return Err(anyhow!("scrap frame error: {e}")),
         }
     }
-}
-
-/// 2×2 box downsample over BGRA. Output dimensions are floor(w/2), floor(h/2).
-/// Averages each 2×2 block per channel with a +2/4 round. Naive scalar
-/// loop — at 4K (8.3 Mpx in, 2.1 Mpx out) this runs in ~15 ms in release
-/// mode on a desktop CPU, well under the ~30 ms budget per frame at 30 fps
-/// and comfortably less than openh264 would have spent encoding the full
-/// 4K frame it replaces.
-fn downscale_bgra_2x(src: &[u8], src_w: u32, src_h: u32, src_stride: u32) -> (Vec<u8>, u32, u32) {
-    let dw = src_w / 2;
-    let dh = src_h / 2;
-    let sw = src_stride as usize;
-    let mut dst = vec![0u8; (dw * dh * 4) as usize];
-    for y in 0..dh as usize {
-        let row0 = 2 * y * sw;
-        let row1 = (2 * y + 1) * sw;
-        for x in 0..dw as usize {
-            let sx = 2 * x * 4;
-            let dx = (y * dw as usize + x) * 4;
-            for c in 0..4 {
-                let p00 = src[row0 + sx + c] as u32;
-                let p10 = src[row0 + sx + 4 + c] as u32;
-                let p01 = src[row1 + sx + c] as u32;
-                let p11 = src[row1 + sx + 4 + c] as u32;
-                dst[dx + c] = ((p00 + p10 + p01 + p11 + 2) / 4) as u8;
-            }
-        }
-    }
-    (dst, dw, dh)
 }
 
 #[async_trait::async_trait]
