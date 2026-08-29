@@ -1301,7 +1301,7 @@ mod tests {
         unsafe {
             std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_EDGE");
             std::env::remove_var("ROOMLER_AGENT_SMOOTH_MAX_EDGE");
-            std::env::remove_var("ROOMLER_AGENT_PRIORITY_RES_CAP");
+            std::env::remove_var("ROOMLERD_PRIORITY_RES_CAP");
         }
         // rc.445 DEFAULT: no dial dims-caps on any path — a mid-motion rung
         // flip costs a blocking encoder open (field-measured 0.65-0.87 s on
@@ -1316,7 +1316,7 @@ mod tests {
             assert_eq!(priority_relay_cap(dial, false), None);
         }
         // The restore switch brings back the rc.443 caps for A/B.
-        unsafe { std::env::set_var("ROOMLER_AGENT_PRIORITY_RES_CAP", "1") };
+        unsafe { std::env::set_var("ROOMLERD_PRIORITY_RES_CAP", "1") };
         assert_eq!(priority_relay_cap(priority::BALANCED, true), Some(1280));
         assert_eq!(priority_relay_cap(priority::BALANCED, false), None);
         assert_eq!(priority_relay_cap(priority::SHARPER, true), None);
@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(priority_relay_cap(priority::SMOOTHER, true), Some(1024));
         assert_eq!(priority_relay_cap(priority::SMOOTHER, false), Some(1024));
         assert_eq!(priority_relay_cap(42, true), Some(1280));
-        unsafe { std::env::remove_var("ROOMLER_AGENT_PRIORITY_RES_CAP") };
+        unsafe { std::env::remove_var("ROOMLERD_PRIORITY_RES_CAP") };
     }
 
     #[test]
@@ -1347,8 +1347,8 @@ mod tests {
         let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: same hermetic save/restore contract as the sibling env
         // tests; serialised on RELAY_ENV_LOCK.
-        let prior = std::env::var("ROOMLER_AGENT_IDLE_REFINE_BALANCED").ok();
-        unsafe { std::env::remove_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED") };
+        let prior = std::env::var("ROOMLERD_IDLE_REFINE_BALANCED").ok();
+        unsafe { std::env::remove_var("ROOMLERD_IDLE_REFINE_BALANCED") };
 
         // Smoother refines on EVERY path (its cap applies on every path).
         assert!(idle_refine_applies(priority::SMOOTHER, true));
@@ -1360,17 +1360,17 @@ mod tests {
         assert!(idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
         // The kill switch restores the un-refined Balanced rung.
-        unsafe { std::env::set_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED", "0") };
+        unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", "0") };
         assert!(!idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
         // The old opt-in spelling stays valid.
-        unsafe { std::env::set_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED", "1") };
+        unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", "1") };
         assert!(idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
 
         match prior {
-            Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED", v) },
-            None => unsafe { std::env::remove_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED") },
+            Some(v) => unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", v) },
+            None => unsafe { std::env::remove_var("ROOMLERD_IDLE_REFINE_BALANCED") },
         }
     }
 
