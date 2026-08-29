@@ -102,7 +102,7 @@ const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 /// waiting on a wedged helper would turn a slow answer into no answer. A
 /// timeout is treated as "no surface", which is the same thing the operator
 /// experiences.
-const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
+pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 
 /// Pong-RTT degradation bound for the control WS. Field winhost-a 2026-08-15
 /// ~20:00Z: a WS that SURVIVED a corp-VPN route capture kept "working"
@@ -1032,6 +1032,7 @@ async fn connect_once(
         derp_ticket_slot.clone(),
         crate::ssh::SessionServices {
             consent: consent_broker.clone(),
+            indicator: indicator.clone(),
             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
         },
     )
@@ -1229,6 +1230,7 @@ async fn connect_once(
                         derp_ticket_slot.clone(),
                         crate::ssh::SessionServices {
                             consent: consent_broker.clone(),
+                            indicator: indicator.clone(),
                             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
                         },
                     )
