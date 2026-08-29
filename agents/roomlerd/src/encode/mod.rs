@@ -1225,31 +1225,53 @@ mod tests {
 
     #[test]
     fn hw_auto_disabled_reads_env() {
-        // Race-free: set → read → unset. Tests share the process env,
-        // so avoid overlapping with other tests that touch the same
-        // var (none today).
+        // Both spellings must work: `node_env` prefers ROOMLERD_* and falls
+        // back to the retired ROOMLER_AGENT_* alias, and hosts in the field
+        // still carry the alias in service units and wrapper scripts. Driving
+        // the loop over both proves the PRIMARY name — which nothing covered
+        // before FR-21 — and the fallback in one pass.
+        //
         // SAFETY: set_var/remove_var are unsafe in Rust 2024 because
-        // concurrent reads from other threads can race. Our test suite
-        // is single-threaded in practice (cargo test default is
-        // parallel but this module has one test) and no other code in
-        // this crate touches ROOMLERD_HW_AUTO at test time.
-        unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
+        // concurrent reads from other threads can race. This module has one
+        // test that touches these vars, and it clears BOTH before each read.
+        // Clearing only one would let an inherited value of the other decide
+        // every assertion below, silently — which is what it did before.
+        const NAMES: [&str; 2] = ["ROOMLERD_HW_AUTO", "ROOMLER_AGENT_HW_AUTO"];
+        let clear = || {
+            for n in NAMES {
+                unsafe { std::env::remove_var(n) };
+            }
+        };
+
+        clear();
         assert!(!hw_auto_disabled(), "unset defaults to MF-first");
-        for truthy in ["0", "false", "FALSE", "No", "off"] {
-            unsafe { std::env::set_var("ROOMLER_AGENT_HW_AUTO", truthy) };
-            assert!(
-                hw_auto_disabled(),
-                "value {truthy:?} should disable the MF-first branch"
-            );
+
+        for name in NAMES {
+            for truthy in ["0", "false", "FALSE", "No", "off"] {
+                clear();
+                unsafe { std::env::set_var(name, truthy) };
+                assert!(
+                    hw_auto_disabled(),
+                    "{name}={truthy:?} should disable the MF-first branch"
+                );
+            }
+            for enabled in ["1", "true", "yes", "on", ""] {
+                clear();
+                unsafe { std::env::set_var(name, enabled) };
+                assert!(
+                    !hw_auto_disabled(),
+                    "{name}={enabled:?} should leave MF-first active"
+                );
+            }
         }
-        for enabled in ["1", "true", "yes", "on", ""] {
-            unsafe { std::env::set_var("ROOMLER_AGENT_HW_AUTO", enabled) };
-            assert!(
-                !hw_auto_disabled(),
-                "value {enabled:?} should leave MF-first active"
-            );
-        }
-        unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
+
+        // The primary name wins when both are set — otherwise a stale alias on
+        // a field host would quietly override the value an operator just set.
+        clear();
+        unsafe { std::env::set_var("ROOMLERD_HW_AUTO", "1") };
+        unsafe { std::env::set_var("ROOMLER_AGENT_HW_AUTO", "0") };
+        assert!(!hw_auto_disabled(), "ROOMLERD_* must take precedence");
+        clear();
     }
 
     #[test]
