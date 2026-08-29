@@ -63,12 +63,12 @@ fn config_fallback(suffix: &str) -> Option<String> {
 /// full name, so adding a preferred prefix is one arm in this chain rather than
 /// an edit at 166 call sites.
 ///
-/// RETIRED-NAME-ANCHOR(4): arms 2 and 3 are the reason a rename here costs
-/// nothing in the field. Both spellings are set on real hosts today — mars,
-/// jupiter and zeus each carry four `ROOMLER_AGENT_*` entries in an
-/// operator-authored `/etc/systemd/system/roomlerd.service.d/` drop-in, which a
-/// package upgrade never rewrites. Dropping either arm silently un-configures
-/// those hosts: the daemon starts fine and simply ignores what it was told.
+// RETIRED-NAME-ANCHOR(4): arms 2 and 3 are the reason a rename here costs
+// nothing in the field. Both spellings are set on real hosts today — mars,
+// jupiter and zeus each carry four `ROOMLER_AGENT_*` entries in an
+// operator-authored `/etc/systemd/system/roomlerd.service.d/` drop-in, which a
+// package upgrade never rewrites. Dropping either arm silently un-configures
+// those hosts: the daemon starts fine and simply ignores what it was told.
 /// See docs/fr/FR-21.
 pub fn node_env(suffix: &str) -> Option<String> {
     std::env::var(format!("ROOMLERD_{suffix}"))
@@ -110,7 +110,7 @@ pub fn flag(suffix: &str, default: bool) -> bool {
 /// same: two readers of one knob that disagree about which prefix wins is a
 /// bug nobody would think to look for.
 ///
-/// RETIRED-NAME-ANCHOR(5): the legacy arms, as in [`node_env`]. See docs/fr/FR-21.
+// RETIRED-NAME-ANCHOR(5): the legacy arms, as in [`node_env`]. See docs/fr/FR-21.
 pub fn node_env_os(suffix: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(format!("ROOMLERD_{suffix}"))
         .or_else(|| std::env::var_os(format!("ROOMLER_NODE_{suffix}")))
