@@ -19,6 +19,7 @@ use roomler_ai_remote_control::{
     turn_creds::ice_servers_for,
 };
 use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
@@ -154,13 +155,19 @@ pub async fn enroll_agent(
     // second time, for a new and confusing reason.
     if existing.is_none() {
         let tenant = state.tenants.base.find_by_id(tid).await?;
-        let max = tenant.plan.limits().max_devices as u64;
         let used = state.agents.count_active_for_tenant(tid).await?;
-        if used >= max {
+        // FR-31: decision + record in `quota::check`. `MaxDevices` is an
+        // established limit, so it refuses whatever the tenant's mode says.
+        if let Err(d) = quota::check(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::MaxDevices,
+            used,
+        ) {
             return Err(ApiError::Forbidden(format!(
-                "Device limit reached for the {:?} plan ({used} of {max} devices used). \
+                "Device limit reached for the {:?} plan ({} of {} devices used). \
                  Upgrade the plan or remove a device first.",
-                tenant.plan
+                d.plan, d.used, d.max
             )));
         }
     }
