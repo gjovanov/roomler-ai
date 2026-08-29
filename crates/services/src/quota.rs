@@ -36,7 +36,6 @@ pub enum Limit {
     ExitNodes,
     MagicDns,
     Recordings,
-    AiRecognition,
     CloudIntegrations,
 }
 
@@ -78,7 +77,6 @@ impl Limit {
             Limit::ExitNodes => (bool_cap(limits.exit_nodes), "exit nodes"),
             Limit::MagicDns => (bool_cap(limits.magic_dns), "MagicDNS"),
             Limit::Recordings => (bool_cap(limits.recordings), "recordings"),
-            Limit::AiRecognition => (bool_cap(limits.ai_recognition), "AI recognition"),
             Limit::CloudIntegrations => (bool_cap(limits.cloud_integrations), "cloud integrations"),
         }
     }

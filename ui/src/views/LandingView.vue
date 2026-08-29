@@ -275,7 +275,7 @@ const pillars = [
       {
         icon: 'mdi-file-document-outline',
         title: 'Files, cloud & AI',
-        description: 'File sharing with cloud-storage sync and AI-powered document recognition.',
+        description: 'File sharing with versioned uploads, per-room libraries and search.',
         color: '#009688',
       },
     ],
