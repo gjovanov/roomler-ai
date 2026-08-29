@@ -315,7 +315,7 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
       rather than a field host.
 - [x] CI **fails** a PR that adds a new unclassified occurrence — proven by a deliberate red run
       linked from the issue, not by assertion.
-- [ ] `CLAUDE.md`'s Commands block names binaries that exist (`roomlerd`, `roomler`,
+- [x] `CLAUDE.md`'s Commands block names binaries that exist (`roomlerd`, `roomler`,
       `roomler-desktop`); copy-pasting any line works on a real host.
 - [ ] **P2 changed no artifact name**: the asset list for a dispatch build is byte-identical to
       the previous tag's, modulo version.
@@ -323,15 +323,38 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
       spelling, and the daemon logs the deprecation exactly once per variable per start.
 - [ ] The §5 staging path resolves correctly on **both** a fresh perMachine host and a pre-rename
       perMachine host — the SPA and `machine_global_dir()` now agree by construction.
-- [ ] `cargo test -p roomler-ai-tests` green (floor: the current ~294 across 34 modules, 2 skips).
-- [ ] `cd ui && bun run test:unit` green, including the `enrollCommands` retired-name lock.
+- [x] `cargo test -p roomler-ai-tests` green (floor: the current ~294 across 34 modules, 2 skips).
+- [x] `cd ui && bun run test:unit` green, including the `enrollCommands` retired-name lock.
 - [ ] `cd ui && bun run e2e` — no new failures against `scripts/e2e-expected-failures.txt`.
-- [ ] **macOS TCC grants survive the upgrade**: Screen Recording and Accessibility are *not*
+- [x] **macOS TCC grants survive the upgrade**: Screen Recording and Accessibility are *not*
       re-prompted, and remote control works with no human action.
 - [ ] A pre-rename host (legacy `%PROGRAMDATA%\roomler\roomler-agent` tree present) keeps its
       enrolled identity — same `agent_id`, same overlay address — across the upgrade.
-- [ ] Field: post-roll `roomler exec` sweep across the fleet on all three OSes; every host reports
+- [x] Field: post-roll `roomler exec` sweep across the fleet on all three OSes; every host reports
       the expected binary, service/unit/launchd label, config path and log path.
+
+---
+
+Evidence for the ticked boxes, and what the unticked ones are still waiting on
+(recorded here so a reader does not have to reconstruct it):
+
+| criterion | evidence |
+|---|---|
+| audit 0 unclassified | CI on `2568ecd1`: `OK unclassified=0 (<= 0) anchors=756 (>= 756) paths=0 (<= 0)`, job **Retired-name audit (FR-21): success** |
+| CI fails a new occurrence | mutation-checked: appending one unanchored mention gives `FAIL 1 unclassified occurrence(s); strict mode requires 0` |
+| Commands block names real binaries | every `-p`/`--bin` in the block resolved against `cargo metadata`: `roomler-ai-api`, `roomlerd`, `roomler`, `roomler-shim`, `roomler-desktop`, `roomler-ai-tests` all exist |
+| integration tests | CI `integration-tests` on `2568ecd1`: **338 passed, 0 failed** (floor ~294) |
+| ui unit tests | CI **Frontend checks** green, running `bun run test:unit` + `vue-tsc` |
+| macOS TCC | P6 macOS row below — `Screen Recording + Accessibility both granted`, 30 s after the 0.4.15 release |
+| field sweep, three OSes | P6 Linux / Windows / macOS rows below |
+
+**Still open, and why — not forgotten:**
+
+- **`cd ui && bun run e2e`** — not run. The Playwright lane needs the standing e2e stack pinned to a build carrying these changes; nothing here touches UI behaviour, but that is an argument for low risk, not evidence.
+- **§5 staging path on a PRE-RENAME host** — the fresh side is confirmed twice (`CORPLAP-1`, and a second host independently). No host with a surviving `%PROGRAMDATA%\roomler\roomler-agent` tree has been driven through it.
+- **A pre-rename host keeps its tree** — same gap, same reason: every fleet Windows host is post-rename. Needs one deliberately staged legacy tree.
+- **All 107 `ROOMLER_AGENT_*` on a legacy-only host** — the MECHANISM is proven (`env::node_env`'s chain is unit-tested across all three prefixes, and the RUST_LOG shim was forced onto the legacy spec on `mars` and passed). Enumerating all 107 on a host that sets only the old names has not been done.
+- **"P2 changed no artifact name", byte-identical asset list** — the Debian takeover was verified against real artifacts, and release asset names are frozen by D6 and anchored, but no dispatch-build asset list has been diffed byte-for-byte.
 
 ---
 
