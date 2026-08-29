@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Observability sample sinks (stats PR-1).
 //!
 //! All sample collections use deterministic string `_id`s

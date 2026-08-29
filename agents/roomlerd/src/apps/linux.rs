@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Linux virtual-desktop backend: `wmctrl` (list/focus) + `tmux` (bash
 //! sessions) + `xterm`. Shell-out only — no new crate — consistent with
 //! how [`crate::virtual_desktop`] already spawns Xvfb/WM/apps.

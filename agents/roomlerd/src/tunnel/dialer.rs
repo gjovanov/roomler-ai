@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! TCP dialer for the agent-side tunnel acceptor.
 //!
 //! `dial_dst` connects to `(host, port)` with a bounded total timeout

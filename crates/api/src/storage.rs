@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! File-storage backend — local disk (dev/test default) or S3/MinIO (prod).
 //!
 //! Until S0 every upload and export artifact was written straight to

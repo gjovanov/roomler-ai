@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Daemon-originated tunnel-**client** flows (unification P3b-2 PR-C).
 //!
 //! Lets the roomler daemon act as a tunnel *client* — `roomler forward` /

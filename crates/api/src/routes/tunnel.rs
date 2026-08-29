@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! REST surface for the `roomler-tunnel` subsystem.
 //!
 //! Mirrors `crates/api/src/routes/remote_control.rs` for the

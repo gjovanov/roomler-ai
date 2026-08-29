@@ -1,21 +1,37 @@
-MIT License
+Roomler is distributed under a split licence. This file explains which licence
+applies to which part; it is not itself a licence grant.
 
-Copyright (c) 2026 Goran Jovanov
+Copyright (C) 2026 G ROX EOOD
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+  ┌──────────────────────────────────────────────┬──────────────────┐
+  │ Control plane — the server you would host    │ AGPL-3.0-only    │
+  │   crates/api, crates/services, crates/db,    │                  │
+  │   crates/config, crates/derp-relay,          │ LICENSE-AGPL-3.0 │
+  │   crates/tests, ui/                          │                  │
+  ├──────────────────────────────────────────────┼──────────────────┤
+  │ Everything you install on your own machines  │ MPL-2.0          │
+  │   agents/*, crates/agent-core,               │                  │
+  │   crates/roomler-setup-core,                 │ LICENSE-MPL-2.0  │
+  │   crates/tunnel-core, crates/remote_control, │                  │
+  │   crates/localapi, crates/tcp-turn-conn      │                  │
+  ├──────────────────────────────────────────────┼──────────────────┤
+  │ Documentation — docs/                        │ CC-BY-4.0        │
+  ├──────────────────────────────────────────────┼──────────────────┤
+  │ Vendored third-party — crates/vendored/*     │ upstream terms,  │
+  │                                              │ see each subtree │
+  └──────────────────────────────────────────────┴──────────────────┘
 
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
+Every first-party source file carries an SPDX-License-Identifier header naming
+its licence. That header, not this table, is authoritative for a given file.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+You can self-host the whole thing, for free, on unlimited devices, forever.
+The agent you install on your own or your clients' machines is MPL-2.0 and
+imposes no copyleft on anything you build around it.
+
+  Plain-language explanation and FAQ ......... LICENSING.md
+  Buying an exception to the AGPL ............ COMMERCIAL.md
+  Third-party components and written offers .. THIRD-PARTY-NOTICES.md
+
+HISTORY: releases up to and including the commit that introduced this file were
+published under the MIT licence, retained verbatim in LICENSE-MIT. That grant is
+irrevocable — anything published under it stays available under it.

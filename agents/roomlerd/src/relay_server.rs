@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-19 P1d — start the org-relay reachability responder, if this device
 //! opted in.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Roomler node application directories with a legacy-segment fallback.
 //!
 //! The controlled-host daemon is being renamed `roomler-agent` -> `roomlerd`

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P8b — the encode-policy module (item 2 of the P8 capture-truth
 //! program): ONE place that decides the encode rung and the rate
 //! ceiling, so the media pumps become executors.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Deterministic synthetic frame source for headless CI / Linux Pods.
 //!
 //! Emits a 320×240 BGRA frame at the requested fps cap with a slow

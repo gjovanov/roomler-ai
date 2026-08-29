@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Operator-attention notification.
 //!
 //! v1 ships a sentinel file the agent writes when it needs human

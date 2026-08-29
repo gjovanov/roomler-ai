@@ -1,5 +1,7 @@
 [package]
 name = "roomler-core"
+license = "MPL-2.0"
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "Daemon-free agent building blocks: config, enrollment, machine id, logging, sentinels — shared by roomlerd and the desktop companion."

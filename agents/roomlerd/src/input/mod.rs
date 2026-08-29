@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! OS input injection abstraction.
 //!
 //! The browser controller emits `InputMsg` values (mouse move / click /

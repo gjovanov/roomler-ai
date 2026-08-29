@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 /*
  * Settings view: device rename, background-service management, split-config
  * cleanup and file locations (re-enrollment moved to Onboarding in S1b).

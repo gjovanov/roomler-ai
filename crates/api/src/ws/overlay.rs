@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay-network broker — the control plane for the Tailscale-style
 //! L3 mesh (Phase 1 + 2).
 //!
