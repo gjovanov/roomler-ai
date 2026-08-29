@@ -106,20 +106,20 @@ pub mod test_env {
     ///
     /// # Safety
     /// See [`clear`].
-    pub unsafe fn set_as(prefix: &str, suffix: &str, value: &str) {
+    pub unsafe fn set_as(prefix: &str, suffix: &str, value: impl AsRef<str>) {
         assert!(
             PREFIXES.contains(&prefix),
             "{prefix} is not one of the node_env prefixes"
         );
         unsafe { clear(suffix) };
-        unsafe { std::env::set_var(format!("{prefix}{suffix}"), value) };
+        unsafe { std::env::set_var(format!("{prefix}{suffix}"), value.as_ref()) };
     }
 
     /// Set `suffix` under the CURRENT prefix, clearing the others.
     ///
     /// # Safety
     /// See [`clear`].
-    pub unsafe fn set(suffix: &str, value: &str) {
+    pub unsafe fn set(suffix: &str, value: impl AsRef<str>) {
         unsafe { set_as(PREFIXES[0], suffix, value) };
     }
 

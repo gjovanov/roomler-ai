@@ -1375,7 +1375,7 @@ mod tests {
 
         match prior {
             Some(v) => unsafe {
-                tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", &v)
+                tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", v)
             },
             None => unsafe { tunnel_core::env::test_env::clear("IDLE_REFINE_BALANCED") },
         }
