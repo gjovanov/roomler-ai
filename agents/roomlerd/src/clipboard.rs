@@ -956,6 +956,11 @@ fn watch_tick(cb: &mut arboard::Clipboard, w: &mut WatcherState, marks: &SelfMar
             // Forwarder task gone — an Unwatch is on its way; stay quiet.
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
+        // Load-bearing on Windows, where the `#[cfg(windows)]` image block
+        // below follows; redundant everywhere else, where it is the last
+        // statement of the function. Scoped rather than removed — deleting it
+        // would fall through into the image path on Windows.
+        #[cfg_attr(not(windows), allow(clippy::needless_return))]
         return;
     }
     // Empty text — maybe an image. Windows-only: the seq gate above
