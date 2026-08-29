@@ -206,6 +206,14 @@ export interface Agent {
    *
    *  Absent = nothing has ever been requested for this device. */
   remote_config?: RemoteConfig
+  /** FR-40 — the device's overlay (WireGuard) PUBLIC key as it last joined
+   *  with, server-verified. Absent until it has joined on a server that
+   *  stamps it. */
+  overlay_public_key?: string
+  overlay_key_epoch?: number
+  /** FR-40 — the standing rotation order and where it stands. Absent = a
+   *  rotation was never ordered for this device. */
+  key_rotation?: KeyRotation
   /** Multi-region relay PoPs: the agent's nearest relay region id (derived
    *  server-side from its STUN probe reports), e.g. "us-east". Absent/null =
    *  never probed or all probes timed out — the default region serves it. */
@@ -342,6 +350,51 @@ export interface RemoteConfig {
   desired: DesiredConfig
   report?: ConfigReport
   state: RemoteConfigState
+}
+
+/** FR-40 — where a device's overlay-key rotation stands. Resolved ONCE on the
+ *  server (`key_rotation_view`) from the order, the device's report and the key
+ *  the device has since JOINED with — "the device says it rotated" and "the
+ *  device is on the mesh under the new key" are different facts. */
+export type KeyRotationState =
+  /** Ordered while the device was offline; it rotates on its next connect. */
+  | 'queued'
+  /** The order reached a live socket; no answer yet. */
+  | 'delivered'
+  /** The device reported `rotated` and is re-joining (seconds). */
+  | 'rotating'
+  /** Reported AND joined under the reported key. Done. */
+  | 'rotated'
+  /** Reported long ago, but the last verified join still shows another key. */
+  | 'reported_not_joined'
+  /** The device refused — `report.outcome` says which refusal. */
+  | 'refused'
+  /** Mint or save failed on the device; its identity is unchanged. */
+  | 'failed'
+  /** Queued for an agent that predates `key-rotate`; it acts once updated. */
+  | 'unsupported'
+
+export type KeyRotationOutcome = 'rotated' | 'disabled' | 'rate_limited' | 'unsupported' | 'failed'
+
+/** The device's own account of a rotation order — a claim, like `ConfigReport`.
+ *  Keys are PUBLIC halves only. */
+export interface KeyRotationReport {
+  request_id: string
+  outcome: KeyRotationOutcome
+  old_public_key?: string
+  new_public_key?: string
+  key_epoch: number
+  detail?: string
+  reported_at: string
+}
+
+export interface KeyRotation {
+  request_id: string
+  requested_at: string
+  requested_by: string
+  delivered_at?: string
+  report?: KeyRotationReport
+  state: KeyRotationState
 }
 
 /** One remote command's result. `exit_code: null` together with a non-null
@@ -683,6 +736,22 @@ export const useAgentStore = defineStore('agents', () => {
     return resp.delivered
   }
 
+  /** FR-40 — order a device to retire its overlay (WireGuard) key
+   *  (`rc:agent.key_rotate`). The device mints the new key ITSELF and re-joins
+   *  the mesh under it; the server never sees a private key. `delivered` = a
+   *  live socket took the order; otherwise it is queued for the device's next
+   *  connect. Refusals (`rate_limited`, `agent_unsupported`) come back as a
+   *  409 whose message names the reason. MANAGE_AGENTS. */
+  async function rotateOverlayKey(
+    tenantId: string,
+    agentId: string,
+  ): Promise<{ request_id: string; dispatch: 'pushed' | 'queued'; delivered: boolean }> {
+    return api.post<{ request_id: string; dispatch: 'pushed' | 'queued'; delivered: boolean }>(
+      `/tenant/${tenantId}/agent/${agentId}/overlay-key/rotate`,
+      {},
+    )
+  }
+
   /** S1a — push an immediate self-update to every agent in the tenant
    *  (or a selected subset via `agent_ids`). MANAGE_AGENTS. */
   async function triggerUpdateAll(
@@ -1003,6 +1072,7 @@ export const useAgentStore = defineStore('agents', () => {
     fetchTenantMembers,
     triggerUpdate,
     triggerUpdateAll,
+    rotateOverlayKey,
     fetchJoinTargets,
     joinOrg,
     deleteAgent,

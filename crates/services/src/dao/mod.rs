@@ -9,6 +9,7 @@ pub mod consent_request;
 pub mod exec_audit;
 pub mod file;
 pub mod invite;
+pub mod key_rotation_audit;
 pub mod message;
 pub mod notification;
 pub mod overlay_block;

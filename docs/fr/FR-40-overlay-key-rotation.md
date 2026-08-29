@@ -1,6 +1,6 @@
 # FR-40: Rotate a device's overlay key from the dashboard — the server orders a re-mint it never sees
 
-Status: **P0 — spec; P1 in implementation** (2026-08-30). Tracking issue: `FR-40` (#962).
+Status: **P0 shipped; P1 implemented (PR #963), awaiting release 0.4.24 + field verification on CORPLAP-3** (2026-08-30). Tracking issue: `FR-40` (#962).
 Sibling of the remote-configuration work (`docs/remote-config.md`) — same push / report-back /
 reconcile-on-connect shape — and of `rc:agent.update`, which is the operator's mental model for
 it ("update now", but for the key).
@@ -95,7 +95,7 @@ bit is involved). The route:
 2. records the request on the agent row: `key_rotation = { request_id, requested_at, requested_by }`
    (the *desired state*, so the offline case has somewhere to live);
 3. if the device is online **and** advertises `key-rotate`: pushes → `delivered: true`;
-   online without the verb → `refused: agent_unsupported` (412 — the old-agent frame would
+   online without the verb → `refused: agent_unsupported` (409 — the old-agent frame would
    evaporate silently, the failure `RpcCap::Config`'s doc was written about); offline → `queued`;
 4. writes ONE audit row for either arm (`key_rotation_audit`, 90 d TTL; `decide()` returns
    `Result<Pushed|Queued, DenyReason>` and a single call site records both, the `agent_ssh::dispatch`
@@ -191,7 +191,7 @@ and permission-gated; a defective push is stopped by the device switch.
 | phase | what | kill switch | status |
 |---|---|---|---|
 | P0 | spec + issue + ledger claim | — | this |
-| P1 | verb + order + device mint/persist/report/reconnect + route + audit + ceiling + reconcile-on-connect + UI action/state/pubkey column; release | `overlay_key_rotation` | in implementation |
+| P1 | verb + order + device mint/persist/report/reconnect + route + audit + ceiling + reconcile-on-connect + UI action/state/pubkey column; release | `overlay_key_rotation` | implemented — PR #963 (server + agent + UI, unit + integration tests); release + field verification pending |
 | P2 | retired keys: refuse at join + DERP, self-heal order, pubkey index | none needed (refusal is fail-closed) | open |
 | P3 | `roomler overlay rotate-key [--org]` over LocalAPI (break-glass when the control plane is the compromised thing); tunnel-only clients (`roomler` standalone) | — | open |
 
