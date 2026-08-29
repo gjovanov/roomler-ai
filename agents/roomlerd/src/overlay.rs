@@ -404,7 +404,8 @@ pub async fn maybe_start(
         .with_carrier_plane(shared_carrier_plane())
         // Unification P1 — publish the live mesh view for the LocalAPI so
         // `roomler status` / `peers` see per-device connection types.
-        .with_peer_view(peer_view);
+        .with_peer_view(peer_view)
+        .with_org_primary(!cfg.derived_org);
     // FIELD: endpoints are advertised lazily — the relay coordinator
     // trickles each relayed address post-allocation — so join carries none.
     tokio::spawn(rt.run(evt_rx, Vec::new()));
@@ -892,7 +893,11 @@ pub(crate) fn netmask_to_prefix(nm: std::net::Ipv4Addr) -> u8 {
 /// Forward an `rc:overlay.*` `ServerMsg` to the runtime. Returns the
 /// message untouched if it isn't an overlay message, so the caller's
 /// normal dispatch handles everything else.
-pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<ServerMsg> {
+pub fn intercept(
+    evt_tx: &mpsc::Sender<OverlayEvent>,
+    msg: ServerMsg,
+    is_primary: bool,
+) -> Option<ServerMsg> {
     let evt = match msg {
         ServerMsg::OverlayNetmap {
             self_ip,
@@ -931,6 +936,64 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
             ttl_ms,
             derp_url,
         },
+        // FR-19 P4b — org-relay frames. PRIMARY org only: serving and use are
+        // host-global, and a secondary org's WS must not be able to install a
+        // session onto the device owner's listener — the `rc:agent.update`
+        // trust line. The server refuses these for a secondary-org node
+        // already; this is the device's own half of that rule.
+        ServerMsg::OverlayRelaySession { .. }
+        | ServerMsg::OverlayRelayServe { .. }
+        | ServerMsg::OverlayRelayRevoke { .. }
+            if !is_primary =>
+        {
+            warn!("overlay: org-relay frame on a secondary org's WS; dropped");
+            return None;
+        }
+        ServerMsg::OverlayRelaySession {
+            vni,
+            generation,
+            peer_node_id,
+            relay_node_id,
+            relay_endpoints,
+            bind_secret,
+            bind_secs,
+            max_lifetime_secs,
+        } => OverlayEvent::OrgRelaySession {
+            vni,
+            generation,
+            peer_node_id,
+            relay_node_id,
+            relay_endpoints,
+            bind_secret,
+            bind_secs,
+            max_lifetime_secs,
+        },
+        // The RELAY's copy: install into this node's relay server, if it is
+        // serving. Never reaches the member runtime.
+        ServerMsg::OverlayRelayServe {
+            vni,
+            generation,
+            members,
+            bind_secs,
+            idle_secs,
+            max_lifetime_secs,
+        } => {
+            crate::relay_server::install_from_wire(
+                vni,
+                generation,
+                &members,
+                bind_secs,
+                idle_secs,
+                max_lifetime_secs,
+            );
+            return None;
+        }
+        // A revoke reaches BOTH halves: the relay server drops the session if
+        // it holds it, and the member runtime tears its carrier down.
+        ServerMsg::OverlayRelayRevoke { vni } => {
+            crate::relay_server::revoke_from_wire(vni);
+            OverlayEvent::OrgRelayRevoke { vni }
+        }
         other => return Some(other),
     };
     if evt_tx.try_send(evt).is_err() {
