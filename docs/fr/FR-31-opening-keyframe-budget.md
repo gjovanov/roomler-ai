@@ -1,6 +1,6 @@
 # FR-31: The opening keyframe of an NVENC session gets one frame's budget — ffmpeg discards the HRD in `cq` mode
 
-Status: **P0 measured (NVENC); P1 designed, not yet shipped** (2026-08-29). Tracking issue: `FR-31` (#897).
+Status: **P0 measured; P1 (post-open VBV) REFUTED by the A/B — the opening keyframe is ~1.3 × `maxrate/fps` regardless of VBV size or tuning; P1b (`ldkfs`) under A/B** (2026-08-29). Tracking issue: `FR-31` (#897).
 Child of the RC-quality program; sibling of FR-10 (relay IDR thrift), FR-17 (relay transport),
 FR-22 (time-to-first-frame). Spec ships with the implementation PR (the default is decided by
 an A/B, see "Open decisions").
@@ -90,6 +90,16 @@ transit time before first light (a crisp ~300 KB IDR ≈ 1 s) versus today's ins
 takes ~1.2 s to repair. Total bits to crisp are the same either way; what changes is what the
 operator sees meanwhile.
 
+**P0 result (2026-08-29, on #897):** `pct=100` was handed to the driver (log field + `nvenc.c`
+reinit confirmed) and the opening keyframe stayed at 11–16 KB; `tune=hq` likewise; **`maxrate`
+×10 gave a 132–140 KB keyframe and 99–100 % first-light sharpness** — the driver sizes the
+opening IDR as ~1.3 frame-slices of `maxrate`, full stop. `maxrate` itself is not shippable
+(ffmpeg's reconfigure forces a fresh — starved — IDR on any rate change), so **P1b** adds the
+parameter NVENC provides for exactly this ratio, `lowDelayKeyFrameScale` (`ldkfs`), as a second
+knob (`nvenc_ldkfs`, default unset) in the rejection-tolerant `lowlat` tier. P1's knob stays,
+default 0 (inert). If the driver honours `ldkfs` only under CBR, the remaining path is a
+vendored-ffmpeg patch mapping `rc_initial_buffer_occupancy` → `vbvInitialDelay`.
+
 **P0 — the A/B, on this box's own daemon** (self-view over `ROOMLERD_ICE_RELAY_TCP=1`, which
 forces both a relay-class ICE path and the constrained profile — `peer.rs:1376`; the mirror
 recursion only affects inter-frame dynamics, the opening IDR captures a static screen). Legs:
@@ -150,3 +160,4 @@ on the relay stand-in and then on the real pair `neo16 → CORPLAP-2`, N ≥ 5 e
 |---|---|---|
 | 2026-08-29 | agent 0.4.15/0.4.17 (CORPLAP-2), web `v20260829-40e8fc071129` | P0: the table above; 5/5 runs; sharpening on/off identical; `dc_unopen_drops` uncorrelated. ffmpeg n8.1 `nvenc.c` read: `cq` zeroes the VBV after `-bufsize` is mapped; `vbvInitialDelay` never set; reconfigure honours `rc_buffer_size`. |
 | 2026-08-29 | agent 0.4.17 (CORPLAP-3, `av1_qsv`, relayed) | P2: frame 1 = 161 B key, frame 2 = 131 581 B inter at +300 ms, ~25 KB over the next 14 frames — converges in one frame; QSV needs nothing. |
+| 2026-08-29 | branch build (neo16 self-view, `ROOMLERD_ICE_RELAY_TCP=1`) | P0 A/B: kill switch = baseline (13–16 KB); `pct=100` 11.4 KB ×3; `tune=hq` 11.8–14.2 KB; `maxrate` ×10 → 132–140 KB, first light 99–100 %. P1 refuted; `ldkfs` next. |
