@@ -7892,6 +7892,7 @@ dependencies = [
  "mongodb",
  "nanoid",
  "object_store",
+ "rand 0.9.4",
  "redis",
  "reqwest 0.12.28",
  "roomler-ai-config",
