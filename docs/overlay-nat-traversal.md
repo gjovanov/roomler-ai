@@ -25,6 +25,7 @@ order, and demotes to the next tier if it can't establish:
 | **C** srflx hole-punch | UDP via the **punch socket** | both ends NAT'd (not both symmetric) | `ROOMLERD_OVERLAY_SRFLX` (**on** since rc.200) |
 | **D** single-relay | ONE coturn allocation + a raw dialer, QUIC-over-TURN | nothing direct works **and ≥1 side is UDP-capable** | `ROOMLERD_OVERLAY_RELAY_SINGLE` (**on** since rc.200) |
 | **D″** DERP | `/derp` WSS on `roomler.ai:443`, pubkey-addressed, raw WG | **both** ends UDP-blocked (TCP-only net) | `ROOMLERD_OVERLAY_DERP` (**on** since rc.203) |
+| **D‴** org relay | a tenant-owned `roomlerd` forwarding Geneve-framed WG ciphertext on UDP 3478 (FR-19) | the server **minted a session** for the pair (org switch, ACL grant per member, an approved + serving relay) — a relay *kind* beside TURN/DERP, not a new tier | `ROOMLERD_OVERLAY_ORG_RELAY` (**off**) |
 | **D′** both-allocate relay | two coturn allocations (raw / QUIC) | single-relay off, or a mixed-capability pair | always available (fall-through) |
 
 LAN direct and the relay predate this work (rc.131–rc.135; the relay is the
