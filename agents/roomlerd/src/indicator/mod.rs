@@ -209,29 +209,119 @@ mod win;
 #[cfg(all(target_os = "windows", feature = "viewer-indicator"))]
 use win::Inner;
 
-#[cfg(not(all(target_os = "windows", feature = "viewer-indicator")))]
-#[derive(Clone, Default)]
-struct Inner;
+/// FR-27 — the X11 consent panel. PROMPT ONLY: the "being viewed" banner on
+/// Linux stays with the desktop companion, which already provides it.
+#[cfg(all(target_os = "linux", feature = "viewer-indicator-x11"))]
+mod x11;
 
-#[cfg(not(all(target_os = "windows", feature = "viewer-indicator")))]
-impl Inner {
-    fn new(_kill_tx: KillSender, _consent_tx: ConsentSender) -> Result<Self> {
-        // Drop the senders: `run()` retains its own clones to keep the
-        // channels open, so the signaling `select!` never busy-spins on a
-        // fully-closed receiver even without a real overlay here.
-        Ok(Self)
+/// FR-27 — the macOS consent panel. Prompt only, same split as X11.
+///
+/// `pub` because `main.rs` calls [`mac::run_main_loop`]: the main thread has
+/// to be handed to AppKit before the daemon starts, and that decision belongs
+/// at the process entry point, not buried in an overlay module.
+#[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
+pub mod mac;
+
+/// Non-Windows fallback. Delegates the PROMPT to a per-OS backend where one is
+/// built in and can start; everything else is a no-op, because the banner on
+/// those platforms is the companion's.
+///
+/// `Option`, not a bool: "this build has an X11 backend" and "that backend
+/// actually connected to a display" are different questions, and only the
+/// second one decides whether a human can be shown anything. A root systemd
+/// daemon has the code compiled in and no display to use it on.
+/// The native panel for THIS build. Exactly one of the three aliases below is
+/// live, so `Inner`'s own methods carry no `cfg` at all — the platform choice
+/// is made once, here, instead of being re-derived at every call site.
+#[cfg(all(target_os = "linux", feature = "viewer-indicator-x11"))]
+type NativePanel = x11::Inner;
+#[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
+type NativePanel = mac::Inner;
+#[cfg(not(any(
+    all(target_os = "windows", feature = "viewer-indicator"),
+    all(target_os = "linux", feature = "viewer-indicator-x11"),
+    all(target_os = "macos", feature = "viewer-indicator-macos")
+)))]
+type NativePanel = NoPanel;
+
+/// "This build has no native panel" — a backend that declines to construct.
+///
+/// Declining rather than existing-and-doing-nothing is the point: `Inner`
+/// stores `Option<NativePanel>`, so a refusal here is indistinguishable from
+/// an X11 backend that found no display, and both route the caller to the
+/// companion by the same path. One code shape, no special case.
+#[cfg(not(any(
+    all(target_os = "windows", feature = "viewer-indicator"),
+    all(target_os = "linux", feature = "viewer-indicator-x11"),
+    all(target_os = "macos", feature = "viewer-indicator-macos")
+)))]
+#[derive(Clone)]
+struct NoPanel;
+
+#[cfg(not(any(
+    all(target_os = "windows", feature = "viewer-indicator"),
+    all(target_os = "linux", feature = "viewer-indicator-x11"),
+    all(target_os = "macos", feature = "viewer-indicator-macos")
+)))]
+impl NoPanel {
+    fn new(_consent_tx: ConsentSender) -> Result<Self> {
+        Err(anyhow::anyhow!(
+            "this build has no native consent panel for the current platform"
+        ))
     }
-    fn disabled() -> Self {
-        Self
-    }
-    fn show(&self, _session_id: String, _controller_name: String) {}
-    fn hide(&self, _session_id: String) {}
-    /// No native surface here — say so, rather than swallowing the prompt.
-    /// `false` is what routes the caller to the companion.
     fn prompt(&self, _view: PromptView) -> bool {
         false
     }
     fn dismiss(&self, _session_hex: &str) {}
+}
+
+#[cfg(not(all(target_os = "windows", feature = "viewer-indicator")))]
+#[derive(Clone, Default)]
+struct Inner {
+    /// `None` = no native panel on this host. NOT the same as "this build has
+    /// none": an X11 backend that found no display lands here too, and both
+    /// mean the same thing to the caller.
+    native: Option<NativePanel>,
+}
+
+#[cfg(not(all(target_os = "windows", feature = "viewer-indicator")))]
+impl Inner {
+    fn new(_kill_tx: KillSender, consent_tx: ConsentSender) -> Result<Self> {
+        // The kill sender is dropped where there is no native banner: `run()`
+        // retains its own clone to keep the channel open, so the signaling
+        // `select!` never busy-spins on a fully-closed receiver.
+        let native = match NativePanel::new(consent_tx) {
+            Ok(v) => Some(v),
+            // Never propagated. No display is the NORMAL state for a root
+            // daemon and for every headless node, and failing construction
+            // here would take the session registry down with it. Log at INFO —
+            // an operator debugging "the prompt never appeared" needs this
+            // line — and let the caller fall back to the companion.
+            Err(e) => {
+                tracing::info!(
+                    error = %format!("{e:#}"),
+                    "no native consent panel on this host — prompts go to the desktop companion"
+                );
+                None
+            }
+        };
+        Ok(Self { native })
+    }
+    fn disabled() -> Self {
+        Self::default()
+    }
+    fn show(&self, _session_id: String, _controller_name: String) {}
+    fn hide(&self, _session_id: String) {}
+    /// `false` here is what routes the caller to the companion — never a
+    /// swallowed prompt.
+    fn prompt(&self, view: PromptView) -> bool {
+        self.native.as_ref().is_some_and(|n| n.prompt(view))
+    }
+    fn dismiss(&self, session_hex: &str) {
+        if let Some(n) = self.native.as_ref() {
+            n.dismiss(session_hex);
+        }
+    }
 }
 
 /// Compute a 1–2 character initials label from a controller's display
