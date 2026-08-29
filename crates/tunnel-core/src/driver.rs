@@ -594,7 +594,7 @@ async fn run_webrtc_session(
         // P0 throughput fix (rc.64, field-repro 2026-05-26): disable
         // Nagle on the local listener's accepted TCP socket. The agent
         // side already sets TCP_NODELAY on its outbound (corp-side)
-        // dialer (see agents/roomler-agent/src/tunnel/dialer.rs); the
+        // dialer (see agents/roomlerd/src/tunnel/dialer.rs); the
         // asymmetry meant TDS row tokens flowing FROM the server,
         // through the DC, OUT to the local SSMS/psql/JDBC client got
         // Nagle-coalesced on this socket. Under MSSQL TDS the small

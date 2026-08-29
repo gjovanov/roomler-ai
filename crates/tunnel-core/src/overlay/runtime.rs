@@ -115,7 +115,7 @@ const SHADOW_HARM_WINDOW: Duration = Duration::from_secs(60);
 const SHADOW_SUMMARY_EVERY: Duration = Duration::from_secs(600);
 
 /// B1 — RTT→Q ingestion gate (config `overlay_rtt_q`, env
-/// `ROOMLER_AGENT_OVERLAY_RTT_Q`). Default ON; a kill switch only —
+/// `ROOMLERD_OVERLAY_RTT_Q`). Default ON; a kill switch only —
 /// samples are Q-plane-only either way, never eligibility.
 fn rtt_q_enabled() -> bool {
     crate::env::flag("OVERLAY_RTT_Q", true)
@@ -2159,7 +2159,7 @@ impl OverlayRuntime {
                     magic_domain: magic_domain.clone(),
                     upstream: dns_upstream,
                     names: names.clone(),
-                    // AAAA (derived overlay v6) default-on; ROOMLER_AGENT_DNS_AAAA=0
+                    // AAAA (derived overlay v6) default-on; ROOMLERD_DNS_AAAA=0
                     // reverts to A-only without a rebuild — the mixed-fleet escape
                     // hatch (an old peer's OS doesn't own its derived v6, so v6 to
                     // it blackholes; happy-eyeballs apps fall back, sequential apps
@@ -5785,7 +5785,7 @@ mod tests {
         let mut relay: Option<RelayCoordinator> = None;
 
         // Serialize env mutation (the CI overlay-l3 suite runs --test-threads=1).
-        let key = "ROOMLER_NODE_OVERLAY_MBB";
+        let key = "ROOMLERD_OVERLAY_MBB";
         let restore = std::env::var(key).ok();
 
         // ── MBB ON: accept as a probe, hold the relay ──
@@ -6144,8 +6144,8 @@ mod tests {
     /// returned — exercising the OS-routed selection path end to end.
     #[tokio::test(flavor = "multi_thread")]
     async fn lan_egress_socket_gate_off_then_on_selects_socket() {
-        let n = "ROOMLER_NODE_OVERLAY_BIND_BY_ROUTE";
-        let a = "ROOMLER_AGENT_OVERLAY_BIND_BY_ROUTE";
+        let n = "ROOMLERD_OVERLAY_BIND_BY_ROUTE";
+        let a = "ROOMLERD_OVERLAY_BIND_BY_ROUTE";
         let (rn, ra) = (std::env::var(n).ok(), std::env::var(a).ok());
         let lo = Ipv4Addr::LOCALHOST;
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

@@ -31,7 +31,7 @@
 //! See `docs/overlay-wfp.md`. This pattern reads as "WFP tampering" to
 //! some EDRs — it is **additive permit only**, LUID-scoped to `roomler`,
 //! never shields-up, and break-glass-disable-able via
-//! `ROOMLER_AGENT_WFP_PERMIT=0`.
+//! `ROOMLERD_WFP_PERMIT=0`.
 #![cfg(all(feature = "overlay-l3", windows))]
 
 use windows_sys::Win32::Foundation::{FWP_E_ALREADY_EXISTS, HANDLE};
@@ -97,7 +97,7 @@ const LAYERS: [GUID; 4] = [
 /// have caught the 2026-08-12 outage in seconds (4 filters, 2 adapters).
 pub const FILTERS_PER_ADAPTER: usize = LAYERS.len();
 
-/// `ROOMLER_AGENT_WFP_PERMIT` — default **ON** for `overlay-l3`. Set to
+/// `ROOMLERD_WFP_PERMIT` — default **ON** for `overlay-l3`. Set to
 /// `0`/`false`/`no`/`off` (case-insensitive) to skip WFP programming, e.g.
 /// on a host where IT installed a managed exception, or to silence an
 /// AV "firewall tampering" alert. Matches the agent's truthy convention.
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn wfp_enabled_parses_truthy_table() {
         // Serialize env mutation across the table.
-        let key = "ROOMLER_AGENT_WFP_PERMIT";
+        let key = "ROOMLERD_WFP_PERMIT";
         let restore = std::env::var(key).ok();
 
         unsafe { std::env::remove_var(key) };

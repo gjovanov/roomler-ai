@@ -34,7 +34,7 @@ pub struct AgentConfig {
     /// User-friendly name shown in the admin UI.
     pub machine_name: String,
     /// Encoder preference: `auto` (default), `hardware`, or `software`.
-    /// Can be overridden at launch by `ROOMLER_AGENT_ENCODER` env var or
+    /// Can be overridden at launch by `ROOMLERD_ENCODER` env var or
     /// `--encoder` CLI flag.
     #[serde(default)]
     pub encoder_preference: EncoderPreferenceChoice,
@@ -42,7 +42,7 @@ pub struct AgentConfig {
     /// How often (hours) the auto-updater polls GitHub Releases.
     /// `None` keeps the built-in default (24 h, see
     /// `updater::CHECK_INTERVAL`). Override at launch via the
-    /// `ROOMLER_AGENT_UPDATE_INTERVAL_H` env var. Setting this to a
+    /// `ROOMLERD_UPDATE_INTERVAL_H` env var. Setting this to a
     /// large value (e.g. 168 = weekly) is the recommended way to
     /// dampen update load on bandwidth-constrained fleets.
     #[serde(default)]
@@ -265,21 +265,21 @@ pub struct AgentConfig {
     // (precedence: env — either prefix — > this config key > built-in
     // default). `None` keeps the default. All are applied at daemon
     // startup, so changes take effect on the next service restart.
-    /// QUIC-over-TURN overlay carrier (`ROOMLER_NODE_OVERLAY_QUIC`).
+    /// QUIC-over-TURN overlay carrier (`ROOMLERD_OVERLAY_QUIC`).
     /// Built-in default: off.
     #[serde(default)]
     pub overlay_quic: Option<bool>,
     /// Direct (LAN / hole-punched) overlay carriers
-    /// (`ROOMLER_NODE_OVERLAY_DIRECT`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_DIRECT`). Built-in default: on.
     #[serde(default)]
     pub overlay_direct: Option<bool>,
-    /// DERP (WS-relay) overlay fallback tier (`ROOMLER_NODE_OVERLAY_DERP`).
+    /// DERP (WS-relay) overlay fallback tier (`ROOMLERD_OVERLAY_DERP`).
     /// Built-in default: on.
     #[serde(default)]
     pub overlay_derp: Option<bool>,
     /// U2 — accept the server's computed relay-tier verdict in place of the
     /// local `relay_strategy()` derivation
-    /// (`ROOMLER_NODE_OVERLAY_SERVER_RELAY_STRATEGY`). Built-in default: **on**
+    /// (`ROOMLERD_OVERLAY_SERVER_RELAY_STRATEGY`). Built-in default: **on**
     /// since D1 (overlay v3); `false` is the per-host off-switch — the server
     /// withholds stamps unless BOTH ends advertise, so opting out cleanly
     /// reverts that host's pairs to the client-authoritative path.
@@ -287,84 +287,106 @@ pub struct AgentConfig {
     pub overlay_server_relay_strategy: Option<bool>,
     /// Phase A (overlay v3) — DERP always-on floor: open the central `/derp`
     /// mux at startup unconditionally, advertise `supports_derp_floor`, and
-    /// floor fresh pairs at birth (`ROOMLER_NODE_OVERLAY_DERP_FLOOR`).
+    /// floor fresh pairs at birth (`ROOMLERD_OVERLAY_DERP_FLOOR`).
     /// Built-in default: **on** since rc.400 (soak-proven); explicit `false`
     /// is the per-host off-switch.
     #[serde(default)]
     pub overlay_derp_floor: Option<bool>,
     /// Phase B (overlay v3) — netcheck: measure egress capabilities (relay-band
     /// probe, STUN/NAT, /derp health) every ~20 min and publish the CapVector
-    /// (`ROOMLER_NODE_OVERLAY_NETCHECK`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_NETCHECK`). Built-in default: on.
     #[serde(default)]
     pub overlay_netcheck: Option<bool>,
+    /// FR-19 — offer this node as an **org relay**: bind `relay_server_port`
+    /// and answer reachability probes. Opt-IN, default **off**
+    /// (`ROOMLER_NODE_RELAY_SERVER_ENABLED`).
+    ///
+    /// ⚠️ This is FR-19's gate 4 — the refusal that survives a compromised
+    /// server — so it is deliberately device-local and must **never** become
+    /// server-pushable: it is structurally absent from `DesiredConfig`, and a
+    /// test asserts no `relay_*` key ever appears in one.
+    #[serde(default)]
+    pub relay_server_enabled: Option<bool>,
+    /// FR-19 — UDP port for the org-relay listener. Built-in default **3478**,
+    /// which is not a guess: E2E-3 measured the corp-managed target host
+    /// reaching 3478 on an arbitrary public IP and **no other port** (11000 and
+    /// 41641 both failed), so any other default is unreachable by the
+    /// population the feature exists for.
+    ///
+    /// ⚠️ A successful bind does NOT prove reachability. On a host with a
+    /// coturn DNAT the port can be fully consumed in `PREROUTING` while
+    /// `ss -ulnp` shows it free and the listener receives nothing — measured on
+    /// mars, where this exact confound nearly inverted E2E-3's result.
+    #[serde(default)]
+    pub relay_server_port: Option<u32>,
     /// R4 — tunnel `quic-derp-v1` fallback: after repeated quick tunnel
     /// session deaths (a corp capture window killing fresh TURN/TLS legs),
     /// lead the next attempt with QUIC over the ESTABLISHED `/derp` WS
-    /// (`ROOMLER_NODE_TUNNEL_DERP_FALLBACK`). Built-in default: off while the
+    /// (`ROOMLERD_TUNNEL_DERP_FALLBACK`). Built-in default: off while the
     /// leg is field-proven. Client-side only (the flow supervisor reads it).
     #[serde(default)]
     pub tunnel_derp_fallback: Option<bool>,
     /// R3 — keep established tunnel QUIC peers ALIVE across a control-WS
     /// reattach instead of tearing them down on every transient WS drop
-    /// (`ROOMLER_NODE_TUNNEL_PEERS_SURVIVE_REATTACH`). QUIC flows self-signal
+    /// (`ROOMLERD_TUNNEL_PEERS_SURVIVE_REATTACH`). QUIC flows self-signal
     /// over their own streams (no welded control-WS sender), so a QUIC/derp
     /// data plane survives a corp-VPN control-WS blip. Needs the server-side
     /// grace (`ROOMLER__RC__TUNNEL_GRACE_SECS`) to be useful. Built-in
     /// default: off while field-proven. Agent (target) side.
     #[serde(default)]
     pub tunnel_peers_survive_reattach: Option<bool>,
-    /// Make-before-break carrier upgrades (`ROOMLER_NODE_OVERLAY_MBB`).
+    /// Make-before-break carrier upgrades (`ROOMLERD_OVERLAY_MBB`).
     /// Built-in default: on.
     #[serde(default)]
     pub overlay_mbb: Option<bool>,
     /// LAN-gather virtual-interface filter — drop WSL/Hyper-V/other-VPN
     /// adapters from advertised LAN endpoints
-    /// (`ROOMLER_NODE_OVERLAY_LAN_IFACE_FILTER`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_LAN_IFACE_FILTER`). Built-in default: on.
     #[serde(default)]
     pub overlay_lan_iface_filter: Option<bool>,
     /// WSL2 mirrored-networking guard — a mirrored guest shares the Windows
     /// host's adapters, so its visible LAN addresses are the HOST's; binding
     /// them starves the host agent's own sockets
-    /// (`ROOMLER_NODE_OVERLAY_WSL_MIRRORED_GUARD`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_WSL_MIRRORED_GUARD`). Built-in default: on.
     #[serde(default)]
     pub overlay_wsl_mirrored_guard: Option<bool>,
     /// Auth-first type-1 routing on a multi-org carrier plane — an inbound
     /// handshake initiation is routed by trial-authentication, never by the
     /// source-keyed shortcut that fed the sibling org's inits to whichever
     /// org held a session at that source first (the dual-org direct lockout)
-    /// (`ROOMLER_NODE_OVERLAY_INIT_AUTH_FIRST`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_INIT_AUTH_FIRST`). Built-in default: on.
     #[serde(default)]
     pub overlay_init_auth_first: Option<bool>,
     /// srflx SEEKING mode — when the shared gather finds NO public candidate,
     /// keep re-gathering with backoff (20 s → ×3 → 300 s cap) plus an
     /// immediate retry on interface events, instead of the pre-W5 sticky
     /// "srflx NONE for the daemon lifetime"
-    /// (`ROOMLER_NODE_OVERLAY_SRFLX_SEEK`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_SRFLX_SEEK`). Built-in default: on.
     #[serde(default)]
     pub overlay_srflx_seek: Option<bool>,
     /// W4(d) — restore the LEGACY ReplacedByNewer escalation (3 displacements
     /// in the window ⇒ sentinel + process exit). Built-in default: OFF —
     /// displacement storms on TLS-inspected paths are zombie half-open
     /// WSes, and exiting tore down the whole overlay for an event that
-    /// needed none of it (`ROOMLER_AGENT_WS_REPLACED_EXIT`).
+    /// needed none of it (`ROOMLERD_WS_REPLACED_EXIT`).
     #[serde(default)]
     pub ws_replaced_exit: Option<bool>,
     /// C4 stage 1 — the standing warm TURN/UDP allocation, established
     /// while UDP works and kept alive so corp-VPN flow-grandfathering
     /// preserves a UDP relay leg across a VPN connect. Measurement-only
-    /// in stage 1 (`ROOMLER_AGENT_OVERLAY_WARM_RELAY`). Built-in default: off.
+    /// in stage 1 (`ROOMLERD_OVERLAY_WARM_RELAY`). Built-in default: off.
     #[serde(default)]
     pub overlay_warm_relay: Option<bool>,
     /// W6 phase 3 — raw-first QUIC-over-TURN upgrade: commit the raw relay
     /// immediately, rendezvous in the background (90 s window) and swap in
-    /// on success (`ROOMLER_NODE_OVERLAY_QUIC_ASYNC`). Built-in default: on.
+    /// on success (`ROOMLERD_OVERLAY_QUIC_ASYNC`). Built-in default: on.
     #[serde(default)]
     pub overlay_quic_async: Option<bool>,
     /// R2 — srflx gather falls back to the wildcard public-dial socket when
     /// every LAN-bound vantage is dead (full-tunnel VPN rescue: AnyConnect-
     /// class clients filter the physical NICs while the tunnel passes UDP;
     /// field corplap-3 2026-08-15). Built-in default: on
-    /// (`ROOMLER_NODE_OVERLAY_VPN_VANTAGE`).
+    /// (`ROOMLERD_OVERLAY_VPN_VANTAGE`).
     #[serde(default)]
     pub overlay_vpn_vantage: Option<bool>,
     /// Track A stage 1 — spawn the session-independent network daemon
@@ -374,7 +396,7 @@ pub struct AgentConfig {
     /// start (change needs a service restart). Built-in default: off.
     #[serde(default)]
     pub overlay_netd: Option<bool>,
-    /// Overlay PathMonitor engagement (`ROOMLER_NODE_OVERLAY_PATHMON`):
+    /// Overlay PathMonitor engagement (`ROOMLERD_OVERLAY_PATHMON`):
     /// `on` (authoritative — the built-in default since PR-D's two green
     /// soaks) | `shadow` (fed + compared, legacy decides — the per-host
     /// revert rail) | `off`. Multi-state, so a string key, not a tribool.
@@ -382,11 +404,11 @@ pub struct AgentConfig {
     pub overlay_pathmon: Option<String>,
     /// P4 — event-driven route guard (OS route-table change subscription:
     /// NotifyRouteChange2 / `ip monitor route`)
-    /// (`ROOMLER_NODE_OVERLAY_ROUTE_EVENTS`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_ROUTE_EVENTS`). Built-in default: on.
     #[serde(default)]
     pub overlay_route_events: Option<bool>,
     /// P4 demotion — route-guard blind-tick seconds while the route-event
-    /// subscription is live (`ROOMLER_NODE_OVERLAY_ROUTE_TICK_SECS`, 2–300).
+    /// subscription is live (`ROOMLERD_OVERLAY_ROUTE_TICK_SECS`, 2–300).
     /// Built-in default: 30 (the demoted heartbeat); `2` = the pre-demotion
     /// war cadence (operator revert). Without a live subscription the tick
     /// is always 2 s regardless of this key.
@@ -394,22 +416,22 @@ pub struct AgentConfig {
     pub overlay_route_tick_secs: Option<u32>,
     /// netstate — the process-wide network monitor (ONE OS change
     /// subscription, typed snapshots/deltas, non-blocking fan-out)
-    /// (`ROOMLER_NODE_OVERLAY_NETMON`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_NETMON`). Built-in default: on.
     #[serde(default)]
     pub overlay_netmon: Option<bool>,
     /// netstate — debounce window in ms for coalescing OS signal bursts
-    /// into one delta (`ROOMLER_NODE_OVERLAY_NETMON_DEBOUNCE_MS`, 100–5000).
+    /// into one delta (`ROOMLERD_OVERLAY_NETMON_DEBOUNCE_MS`, 100–5000).
     /// Built-in default: 750.
     #[serde(default)]
     pub overlay_netmon_debounce_ms: Option<u32>,
     /// Force overlay coturn allocations onto the TURNS/TCP (TLS) tier —
-    /// the corp-VPN field probe (`ROOMLER_NODE_OVERLAY_RELAY_TLS`).
+    /// the corp-VPN field probe (`ROOMLERD_OVERLAY_RELAY_TLS`).
     /// Built-in default: off.
     #[serde(default)]
     pub overlay_relay_tls: Option<bool>,
     /// Multi-org v2 shared carrier plane — ONE process-wide direct-socket
     /// set shared by every org's engine, inbound demultiplexed by WireGuard
-    /// receiver index (`ROOMLER_NODE_OVERLAY_SHARED_CARRIER`). Retires the
+    /// receiver index (`ROOMLERD_OVERLAY_SHARED_CARRIER`). Retires the
     /// per-org stable-port band race (which org holds the base port stops
     /// being spawn-order timing). Built-in default: on since rc.339
     /// (explicit `false` is the kill switch).
@@ -417,7 +439,7 @@ pub struct AgentConfig {
     pub overlay_shared_carrier: Option<bool>,
     /// A3 — WG-style endpoint roaming: adopt a peer's observed source after an
     /// AUTHENTICATED inbound from it, repointing the carrier in place
-    /// (`ROOMLER_NODE_OVERLAY_ROAM`). Completes a punch from a symmetric-NAT
+    /// (`ROOMLERD_OVERLAY_ROAM`). Completes a punch from a symmetric-NAT
     /// peer whose real per-destination mapping differs from its advert, and
     /// heals a mid-session NAT rebind without waiting out rx-staleness.
     /// Built-in default: on (explicit `false` restores the strict no-roam
@@ -427,12 +449,12 @@ pub struct AgentConfig {
     /// B4 — carrier-plane socket-liveness watchdog: when the shared plane's
     /// punch-socket keepalive fails N consecutive cycles (reader-less /
     /// wedged socket), self-heal by forcing a debounced plane rebuild
-    /// (`ROOMLER_NODE_OVERLAY_PLANE_WATCHDOG`). Built-in default: on
+    /// (`ROOMLERD_OVERLAY_PLANE_WATCHDOG`). Built-in default: on
     /// (explicit `false` = warn-only, never auto-rebuild).
     #[serde(default)]
     pub overlay_plane_watchdog: Option<bool>,
     /// Diagnostic — per-session plane-demux + carrier-health traces
-    /// (`ROOMLER_NODE_OVERLAY_SESSION_TRACE`). Verbose; enable briefly on an
+    /// (`ROOMLERD_OVERLAY_SESSION_TRACE`). Verbose; enable briefly on an
     /// affected host to field-diagnose a specific peer's carrier. Built-in
     /// default: off.
     #[serde(default)]
@@ -445,19 +467,19 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_data_probe: Option<bool>,
     /// C1 — answer out-of-tunnel disco echoes on the carrier socket
-    /// (`ROOMLER_NODE_OVERLAY_DISCO_RESPOND`). Answering only; nothing on this
+    /// (`ROOMLERD_OVERLAY_DISCO_RESPOND`). Answering only; nothing on this
     /// node probes yet. Built-in default: ON.
     #[serde(default)]
     pub overlay_disco_respond: Option<bool>,
     /// C2 — PROBE peers with disco echoes and record per-path loss + RTT
-    /// (`ROOMLER_NODE_OVERLAY_DISCO_PROBE`). Measurement only; nothing acts
+    /// (`ROOMLERD_OVERLAY_DISCO_PROBE`). Measurement only; nothing acts
     /// on the table. Built-in default: OFF (enable only where every peer is
     /// already running the C1 responder).
     #[serde(default)]
     pub overlay_disco_probe: Option<bool>,
     /// #33 — answer a peer's direct handshake initiation even while that tier
     /// is suppressed, when accepting cannot cost us the relay
-    /// (`ROOMLER_NODE_OVERLAY_ANSWER_WHILE_FOLLOWED`). The demote-follow
+    /// (`ROOMLERD_OVERLAY_ANSWER_WHILE_FOLLOWED`). The demote-follow
     /// hold-down otherwise makes this node stop ANSWERING for up to 15 min, so
     /// two followed ends go mutually deaf and a perfectly good LAN pair sits on
     /// relay. Built-in default: ON since 0.4.2 — set `false` as the kill switch.
@@ -465,37 +487,37 @@ pub struct AgentConfig {
     pub overlay_answer_while_followed: Option<bool>,
     /// Stable Wintun adapter identity — constant requested GUID + boot
     /// stray-adapter sweep, Windows only
-    /// (`ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_TUN_STABLE_GUID`). Built-in default: on.
     #[serde(default)]
     pub overlay_tun_stable_guid: Option<bool>,
     /// Route-war eviction — delete competing VPN-installed routes for
     /// overlay prefixes (peer + own `/32`s), Windows only
-    /// (`ROOMLER_NODE_OVERLAY_ROUTE_EVICT`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_ROUTE_EVICT`). Built-in default: on.
     #[serde(default)]
     pub overlay_route_evict: Option<bool>,
     /// Route-war stolen-path reclaim — repoint destinations whose OS
     /// forwarding cache a corp VPN captured at an equal-metric tie
     /// (targeted evict + immediate cache pin), and debounce the in-block
     /// eviction to evict-on-change, Windows only
-    /// (`ROOMLER_NODE_OVERLAY_ROUTE_RECLAIM`). Built-in default: on; off
+    /// (`ROOMLERD_OVERLAY_ROUTE_RECLAIM`). Built-in default: on; off
     /// restores the pre-rc.409 blind per-wave eviction.
     #[serde(default)]
     pub overlay_route_reclaim: Option<bool>,
     /// Keep the overlay TUN device alive across signaling reconnects
     /// (process-lifetime cache in the agent's TUN factory)
-    /// (`ROOMLER_NODE_OVERLAY_TUN_PERSIST`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_TUN_PERSIST`). Built-in default: on.
     #[serde(default)]
     pub overlay_tun_persist: Option<bool>,
     /// Install defended peer `/32`s (and the ULA `/96` + connected `/10`) at
     /// route metric 0 so they outrank a corp VPN's metric-1 mirror routes,
-    /// Windows only (`ROOMLER_NODE_OVERLAY_ROUTE_METRIC0`). Built-in
+    /// Windows only (`ROOMLERD_OVERLAY_ROUTE_METRIC0`). Built-in
     /// default: **off** — AnyConnect's route monitor deletes routes that
     /// would out-rank its own, which leaves the prefix unrouted (rc.289);
     /// opt-in experiment, auto-yields to metric 1 when it doesn't stick.
     #[serde(default)]
     pub overlay_route_metric0: Option<bool>,
     /// Stable UDP port for the overlay's direct sockets
-    /// (`ROOMLER_NODE_OVERLAY_DIRECT_PORT`). Built-in default: **derived
+    /// (`ROOMLERD_OVERLAY_DIRECT_PORT`). Built-in default: **derived
     /// per machine** — `43648 + (fnv1a(machine_id) % 16) × 8` (see
     /// [`derived_default_direct_port`]) — so two nodes behind ONE NAT pick
     /// distinct stable ports by construction (2026-08-15: both household
@@ -516,7 +538,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_direct_port: Option<u32>,
     /// The overlay NIC's IPv4 interface metric, Windows only
-    /// (`ROOMLER_NODE_OVERLAY_IFACE_METRIC`). Built-in default: **0** — the
+    /// (`ROOMLERD_OVERLAY_IFACE_METRIC`). Built-in default: **0** — the
     /// route war's decisive lever. Windows ranks routes by route metric +
     /// INTERFACE metric, and corp endpoint managers mirror overlay prefixes
     /// at route metric 1 on an interface also pinned to 1, so the historical
@@ -527,25 +549,25 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_iface_metric: Option<u32>,
     /// Loopback-TURN corp-relay for co-located controllers
-    /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
+    /// (`ROOMLERD_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
     pub local_turn: Option<bool>,
     /// MagicDNS AAAA answers for derived overlay v6
-    /// (`ROOMLER_AGENT_DNS_AAAA`). Built-in default: on.
+    /// (`ROOMLERD_DNS_AAAA`). Built-in default: on.
     #[serde(default)]
     pub dns_aaaa: Option<bool>,
-    /// The periodic self-updater (`ROOMLER_AGENT_AUTO_UPDATE`).
+    /// The periodic self-updater (`ROOMLERD_AUTO_UPDATE`).
     /// Built-in default: on. Disabling also ignores web-pushed
     /// forced updates.
     #[serde(default)]
     pub auto_update: Option<bool>,
     /// Disable the centralized log uploader
-    /// (`ROOMLER_AGENT_LOGS_UPLOAD_DISABLED`). `Some(true)` = uploads
+    /// (`ROOMLERD_LOGS_UPLOAD_DISABLED`). `Some(true)` = uploads
     /// OFF. Built-in default: uploads on.
     #[serde(default)]
     pub logs_upload_disabled: Option<bool>,
     /// Per-codec maxrate ceiling factor overrides, percent (50–400).
-    /// (`ROOMLER_NODE_RATE_FACTOR_H264` etc.) Built-ins: H264 150,
+    /// (`ROOMLERD_RATE_FACTOR_H264` etc.) Built-ins: H264 150,
     /// HEVC 125, VP9 100, AV1 100.
     #[serde(default)]
     pub rate_factor_h264: Option<u32>,
@@ -557,42 +579,42 @@ pub struct AgentConfig {
     pub rate_factor_av1: Option<u32>,
     /// P7 — minimum linear downscale (percent) at which the Lanczos-3
     /// filter engages; shallower shrinks fall back to box
-    /// (`ROOMLER_NODE_LANCZOS_MIN_PCT`). Built-in default: 34 — covers the
+    /// (`ROOMLERD_LANCZOS_MIN_PCT`). Built-in default: 34 — covers the
     /// Smoother rungs; 56 restores the pre-P7 gate; 0 = Lanczos always.
     #[serde(default)]
     pub lanczos_min_pct: Option<u32>,
-    /// P7 — NVENC spatial AQ (`ROOMLER_NODE_NVENC_SPATIAL_AQ`).
+    /// P7 — NVENC spatial AQ (`ROOMLERD_NVENC_SPATIAL_AQ`).
     /// Built-in default: OFF (AQ softens desktop text); `Some(true)`
     /// restores it for camera-heavy hosts.
     #[serde(default)]
     pub nvenc_spatial_aq: Option<bool>,
     /// P7 — CQ sharpening steps granted at deep resolution rungs
-    /// (`ROOMLER_NODE_SCALE_CQ_BOOST`). Built-in default: 4; 0 disables.
+    /// (`ROOMLERD_SCALE_CQ_BOOST`). Built-in default: 4; 0 disables.
     #[serde(default)]
     pub scale_cq_boost: Option<u32>,
     /// P7 — idle native-rung refinement: lift the resolution cap when the
     /// scene settles so text is crisp at rest
-    /// (`ROOMLER_NODE_IDLE_REFINE`). Built-in default: on (Smoother scope).
+    /// (`ROOMLERD_IDLE_REFINE`). Built-in default: on (Smoother scope).
     #[serde(default)]
     pub idle_refine: Option<bool>,
     /// P7 — idle refinement on Balanced+relay sessions (lifts the B1
-    /// physics cap at idle) (`ROOMLER_NODE_IDLE_REFINE_BALANCED`).
+    /// physics cap at idle) (`ROOMLERD_IDLE_REFINE_BALANCED`).
     /// Built-in default: ON since P7c (was opt-in at v1).
     #[serde(default)]
     pub idle_refine_balanced: Option<bool>,
     /// HW-downscale Phase B — GPU scale-before-readback on D3D11 capture
-    /// backends (`ROOMLER_NODE_GPU_SCALE`). Built-in default: ON; off
+    /// backends (`ROOMLERD_GPU_SCALE`). Built-in default: ON; off
     /// reverts to the Phase-A CPU resample (a field A/B in one flip).
     #[serde(default)]
     pub gpu_scale: Option<bool>,
     /// P7 — long-edge cap for the refined rung
-    /// (`ROOMLER_NODE_IDLE_REFINE_MAX_EDGE`). Built-in default: 0 = full
+    /// (`ROOMLERD_IDLE_REFINE_MAX_EDGE`). Built-in default: 0 = full
     /// native.
     #[serde(default)]
     pub idle_refine_max_edge: Option<u32>,
     /// P7c — encoded-size floor (KiB) for a frame to count as motion in
     /// the idle-refine machine; smaller deltas (caret, keystrokes) are
-    /// invisible to it (`ROOMLER_NODE_IDLE_REFINE_MIN_FRAME_KB`).
+    /// invisible to it (`ROOMLERD_IDLE_REFINE_MIN_FRAME_KB`).
     /// Built-in default: 12; 0 = every real frame counts.
     #[serde(default)]
     pub idle_refine_min_frame_kb: Option<u32>,
@@ -600,18 +622,18 @@ pub struct AgentConfig {
     /// tracked-damage backends: only damage at/above it can restore the
     /// resolution cap; smaller damage (typing, popups, windowed
     /// terminal scrolls) stays at native
-    /// (`ROOMLER_NODE_IDLE_REFINE_MAJOR_AREA_PERMILLE`). Built-in
+    /// (`ROOMLERD_IDLE_REFINE_MAJOR_AREA_PERMILLE`). Built-in
     /// default: 400 (40 %); 0 = any non-empty tracked damage counts.
     #[serde(default)]
     pub idle_refine_major_area_permille: Option<u32>,
     /// P8a-2 — up-flip settle (ms) on tracked-damage backends: the cap
     /// lifts this long after the last major-damage frame
-    /// (`ROOMLER_NODE_IDLE_REFINE_SETTLE_MS`). Built-in default: 500;
+    /// (`ROOMLERD_IDLE_REFINE_SETTLE_MS`). Built-in default: 500;
     /// clamped 100-5000.
     #[serde(default)]
     pub idle_refine_settle_ms: Option<u32>,
     /// Phase B — the tracked settle on CONSTRAINED transports
-    /// (`ROOMLER_NODE_IDLE_REFINE_SETTLE_CONSTRAINED_MS`). Built-in
+    /// (`ROOMLERD_IDLE_REFINE_SETTLE_CONSTRAINED_MS`). Built-in
     /// default: 1200 (2000 before the constrained HRD trim bounded the
     /// refine IDR); clamped 100-10000. The Up must outlast its own
     /// refined IDR's transmission time on the link it rides.
@@ -619,7 +641,7 @@ pub struct AgentConfig {
     pub idle_refine_settle_constrained_ms: Option<u32>,
     /// Constrained-motion CQ relief (softening steps applied at the
     /// resolution rung of a RELAY session —
-    /// `ROOMLER_NODE_CONSTRAINED_CQ_RELIEF`). Built-in default: 4;
+    /// `ROOMLERD_CONSTRAINED_CQ_RELIEF`). Built-in default: 4;
     /// 0 = no relief; clamped 0-12. Field 2026-08-21: the P7 sharpening
     /// bias at the constrained rung produced frames too big for the
     /// clamped pipe to drain per frame interval — the "9 fps during
@@ -627,13 +649,13 @@ pub struct AgentConfig {
     #[serde(default)]
     pub constrained_cq_relief: Option<u32>,
     /// Constrained send-queue byte budget, in milliseconds of the relay
-    /// ceiling (`ROOMLER_NODE_CONSTRAINED_QUEUE_MS`). Built-in default:
+    /// ceiling (`ROOMLERD_CONSTRAINED_QUEUE_MS`). Built-in default:
     /// 450; 0 = unbounded (pre-rc.442 posture); clamped 0-2000. Bounds
     /// the viewer lag a relay session can accumulate in queued frames.
     #[serde(default)]
     pub constrained_queue_ms: Option<u32>,
     /// HRD/VBV window for constrained sessions, percent of maxrate
-    /// (`ROOMLER_NODE_CONSTRAINED_HRD_PCT`). Built-in default: 200 (the
+    /// (`ROOMLERD_CONSTRAINED_HRD_PCT`). Built-in default: 200 (the
     /// rc.234 window — rc.442's 75 % default was reverted in rc.443
     /// after av1_qsv died on an over-budget forced IDR); clamped 25-200.
     /// Sub-100 values are per-host experiments only.
@@ -641,14 +663,14 @@ pub struct AgentConfig {
     pub constrained_hrd_pct: Option<u32>,
     /// 2026-08-26 drag-latency P1 — DIRECT-path send-queue byte budget,
     /// in milliseconds of the AIMD's live target
-    /// (`ROOMLER_NODE_DIRECT_QUEUE_MS`). Built-in default: 150; 0 =
+    /// (`ROOMLERD_DIRECT_QUEUE_MS`). Built-in default: 150; 0 =
     /// unbounded (the pre-P1 posture); clamped 0-2000. Bounds the
     /// standing queue a drag burst can build on a direct session — the
     /// field "sluggish, bulky" lag.
     #[serde(default)]
     pub direct_queue_ms: Option<u32>,
     /// 2026-08-26 drag-latency P4 — HRD/VBV window for DIRECT sessions,
-    /// percent of maxrate (`ROOMLER_NODE_DIRECT_HRD_PCT`). Built-in
+    /// percent of maxrate (`ROOMLERD_DIRECT_HRD_PCT`). Built-in
     /// default: 100 (half the rc.234 2× window — the 2× reservoir
     /// legalised the drag-start burst that became the standing queue);
     /// clamped 25-200. `av1_*` encoders are floored at 200 regardless
@@ -656,14 +678,14 @@ pub struct AgentConfig {
     #[serde(default)]
     pub direct_hrd_pct: Option<u32>,
     /// 2026-08-26 drag-latency P4 — area-scaled AIMD bitrate floor
-    /// (`ROOMLER_NODE_AREA_MIN_BITRATE`). Default ON: the flat 1.5 Mbps
+    /// (`ROOMLERD_AREA_MIN_BITRATE`). Default ON: the flat 1.5 Mbps
     /// floor was a 1080p legibility tuning and is mush at 5+ MPix; the
     /// scaled floor is ~3.1 M at 2880×1800, capped 4 M, direct-only.
     /// `false` restores the flat floor.
     #[serde(default)]
     pub area_min_bitrate: Option<bool>,
     /// 2026-08-27 drag-latency P2 — measured-rate stage 1
-    /// (`ROOMLER_NODE_MEASURED_CEILING`). Default ON: the bitrate
+    /// (`ROOMLERD_MEASURED_CEILING`). Default ON: the bitrate
     /// ceiling is clamped to 85 % of the session's MEASURED drain rate
     /// while an estimate holds, so the encoder converges just under the
     /// pipe instead of congesting the send queue on every burst (the
@@ -673,7 +695,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub measured_ceiling: Option<bool>,
     /// 2026-08-27 drag-latency P3 — background encoder rebuild
-    /// (`ROOMLER_NODE_BG_REBUILD`). Default ON: on encoders with no
+    /// (`ROOMLERD_BG_REBUILD`). Default ON: on encoders with no
     /// in-place bitrate reconfigure (QSV/AMF), a bitrate change opens
     /// the replacement on a blocking thread while the current encoder
     /// keeps producing, then swaps between frames — no mid-drag stall,
@@ -683,7 +705,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub bg_rebuild: Option<bool>,
     /// 2026-08-27 drag-latency P5 — parallel colour conversion
-    /// (`ROOMLER_NODE_PAR_CONVERT`). Default ON: big frames run the
+    /// (`ROOMLERD_PAR_CONVERT`). Default ON: big frames run the
     /// BGRA→NV12/I444 convert in row bands across threads
     /// (byte-identical output, roughly halves the convert share of the
     /// encode time at 2880×1800+). `false` restores the single-threaded
@@ -691,7 +713,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub par_convert: Option<bool>,
     /// 2026-08-27 drag-latency P5 — fps-first cadence pacing on HW
-    /// encoders (`ROOMLER_NODE_FPS_PACE`). Default ON: when the encoder
+    /// encoders (`ROOMLERD_FPS_PACE`). Default ON: when the encoder
     /// can't hold target fps, the pump consumes frames on an even grid
     /// at the sustainable rate (quantized to 5 fps, floor 15) instead of
     /// letting the capture layer drop ~33 % at random phases — even
@@ -703,7 +725,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub fps_pace: Option<bool>,
     /// 2026-08-27 FR-10 — relay IDR thrift
-    /// (`ROOMLER_NODE_RELAY_IDR_THRIFT`). Default ON: constrained (relay)
+    /// (`ROOMLERD_RELAY_IDR_THRIFT`). Default ON: constrained (relay)
     /// sessions suppress the idle-settle keyframe (a quality refresh, not
     /// a correctness need on a reliable DC — the request-driven resync
     /// stays) and space deferred bitrate re-opens to ≥15 s unless the
@@ -720,7 +742,7 @@ pub struct AgentConfig {
     /// field 2026-08-27 measured 1000 ms of viewer age against a 26 KB
     /// agent queue.  = the open-loop 0.4.7 relay posture. Direct
     /// sessions are unaffected (they have the measured ceiling + byte
-    /// gate). Env: ROOMLER_NODE_RELAY_AGE_FEEDBACK. Restart required.
+    /// gate). Env: ROOMLERD_RELAY_AGE_FEEDBACK. Restart required.
     #[serde(default)]
     pub relay_age_feedback: Option<bool>,
     /// How long ONE frame may sit inside the DataChannel send call before
@@ -735,7 +757,7 @@ pub struct AgentConfig {
     pub send_stall_ms: Option<u32>,
     /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
     /// (Smoother 1024 everywhere / Balanced 1280 on relay;
-    /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
+    /// `ROOMLERD_PRIORITY_RES_CAP`). Default OFF: every mid-motion
     /// rung flip costs a blocking encoder open (0.65-0.87 s measured on
     /// Iris Xe) and the field verdict was "never flipping beats the
     /// rung"; the dial's bit-shedding moved to the rebuild-free ceiling
@@ -743,19 +765,19 @@ pub struct AgentConfig {
     #[serde(default)]
     pub priority_res_cap: Option<bool>,
     /// rc.445 — Smoother's bitrate-ceiling factor, percent
-    /// (`ROOMLER_NODE_SMOOTHER_RATE_PCT`). Built-in default: 70; clamped
+    /// (`ROOMLERD_SMOOTHER_RATE_PCT`). Built-in default: 70; clamped
     /// 30-100. A lower ceiling makes the HRD raise QP during motion
     /// continuously (smaller frames, steadier fps) with zero rebuilds;
     /// at-rest quality is untouched.
     #[serde(default)]
     pub smoother_rate_pct: Option<u32>,
     /// rc.445 — Balanced's bitrate-ceiling factor, percent
-    /// (`ROOMLER_NODE_BALANCED_RATE_PCT`). Built-in default: 85; clamped
+    /// (`ROOMLERD_BALANCED_RATE_PCT`). Built-in default: 85; clamped
     /// 30-100.
     #[serde(default)]
     pub balanced_rate_pct: Option<u32>,
     /// HW-downscale Phase A — worker threads for the CPU resampler's
-    /// row-banded passes (`ROOMLER_NODE_SCALE_THREADS`). Built-in
+    /// row-banded passes (`ROOMLERD_SCALE_THREADS`). Built-in
     /// default: 1 (inline, no threads spawned); clamped 1-8. A lever for
     /// weak hosts where the Smoother rung's downscale eats the frame
     /// budget; HW-encode hosts have idle cores during motion.
@@ -781,40 +803,40 @@ pub struct AgentConfig {
     #[serde(default)]
     pub ice_overlay_host_deprioritize: Option<bool>,
     /// Overlay-carrier-aware constrained detection in the media pumps
-    /// (`ROOMLER_AGENT_OVERLAY_TIER_DETECT`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_TIER_DETECT`). Built-in default: on.
     #[serde(default)]
     pub overlay_tier_detect: Option<bool>,
     /// B1 — feed the 15 s overlay RTT probes into the PathMonitor's
-    /// quality plane (`ROOMLER_AGENT_OVERLAY_RTT_Q`). Q-only — never
+    /// quality plane (`ROOMLERD_OVERLAY_RTT_Q`). Q-only — never
     /// eligibility. Built-in default: on (kill switch).
     #[serde(default)]
     pub overlay_rtt_q: Option<bool>,
     /// Multi-region relay PoPs — probe the server-pushed region list (timed
     /// STUN binding per PoP) and report RTTs so the server derives this
-    /// node's `relay_home` (`ROOMLER_NODE_RELAY_PROBE`). Built-in default:
+    /// node's `relay_home` (`ROOMLERD_RELAY_PROBE`). Built-in default:
     /// on (kill switch).
     #[serde(default)]
     pub relay_probe: Option<bool>,
     /// 2026-08-04 - KeyText modifier neutralization: temporarily release
     /// physically-held Shift/Ctrl/Alt that the remote layout does NOT
     /// want around a scancode tap (fixes '+'->'*' / dead '|' on non-US
-    /// hosts), restoring them after (`ROOMLER_AGENT_TEXT_MOD_NEUTRALIZE`).
+    /// hosts), restoring them after (`ROOMLERD_TEXT_MOD_NEUTRALIZE`).
     /// Built-in default: on (kill switch).
     #[serde(default)]
     pub text_mod_neutralize: Option<bool>,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
-    /// (`ROOMLER_AGENT_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
+    /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
     /// demotions execute). Multi-state, so a string key, not a tribool.
     #[serde(default)]
     pub overlay_demote: Option<String>,
     /// B3 — mid-tier upward probing: srflx/public incumbents probe an
     /// eligible HIGHER tier every ≥120 s via the MBB machinery
-    /// (`ROOMLER_AGENT_OVERLAY_UPWARD_PROBE`). Built-in default: on.
+    /// (`ROOMLERD_OVERLAY_UPWARD_PROBE`). Built-in default: on.
     #[serde(default)]
     pub overlay_upward_probe: Option<bool>,
     /// Multi-user P3 — concurrent remote-control sessions this agent
-    /// advertises (`ROOMLER_AGENT_RC_MAX_SESSIONS`, 1–8). Built-in
+    /// advertises (`ROOMLERD_RC_MAX_SESSIONS`, 1–8). Built-in
     /// default: 2. With the P5 shared encoder (default on) same-profile
     /// DC viewers share one capture + encoder; distinct profiles still
     /// run their own — weak-GPU hosts may prefer 1. The server keeps
@@ -822,13 +844,13 @@ pub struct AgentConfig {
     #[serde(default)]
     pub rc_max_sessions: Option<u32>,
     /// Multi-user P5 — shared-floor encoder for concurrent DC viewers
-    /// (`ROOMLER_AGENT_SHARED_ENCODER`): same-profile sessions share ONE
+    /// (`ROOMLERD_SHARED_ENCODER`): same-profile sessions share ONE
     /// capture + encoder with floor-merged rate/dials; `off` reverts to
     /// the rc.302 pump-per-session behaviour. Built-in default: on.
     #[serde(default)]
     pub shared_encoder: Option<bool>,
     /// P4 — ingress filtering of INBOUND overlay packets
-    /// (`ROOMLER_NODE_OVERLAY_RPF`): `off` | `warn` (count + log, still
+    /// (`ROOMLERD_OVERLAY_RPF`): `off` | `warn` (count + log, still
     /// deliver — the built-in default) | `enforce` (drop). Two checks share
     /// the mode: a packet whose SOURCE the sending peer does not own
     /// (forgery), and one whose DESTINATION lies outside the subnets this
@@ -895,7 +917,7 @@ pub struct AgentConfig {
     /// Operators on org-controlled hosts narrow further by populating
     /// `forward_acl.allowlist` in the TOML or disable forwards
     /// entirely with `forward_acl.enabled = false`. See
-    /// `agents/roomler-agent/src/tunnel/acl.rs` for the matching
+    /// `agents/roomlerd/src/tunnel/acl.rs` for the matching
     /// semantics.
     #[serde(default)]
     pub forward_acl: AgentForwardAcl,
@@ -904,7 +926,7 @@ pub struct AgentConfig {
     /// enabled with a seeded bash/tmux entry so a headless VD host offers
     /// "New bash session" out of the box. Operators add htop/mc/… per host
     /// in the TOML. The browser only ever sends an allowlist KEY, never a
-    /// command line. See `agents/roomler-agent/src/apps/`.
+    /// command line. See `agents/roomlerd/src/apps/`.
     #[serde(default)]
     pub virtual_desktop_apps: crate::apps_config::VirtualDesktopAppsConfig,
 
@@ -923,7 +945,7 @@ pub struct AgentConfig {
     /// `/10` can coexist with carved-block orgs, but TWO un-migrated
     /// tenants on one host are refused at TUN registration (renumber one —
     /// `docs/multi-org.md` §4.3). Mutually exclusive with netstack mode
-    /// (`ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`): when this is on, the OS
+    /// (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`): when this is on, the OS
     /// TUN path is used regardless.
     #[serde(default)]
     pub overlay_multi_org: bool,
@@ -931,7 +953,7 @@ pub struct AgentConfig {
     /// Loopback SOCKS5 port for THIS org's userspace netstack.
     ///
     /// Netstack mode used to be a process-wide singleton keyed off
-    /// `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`: one stack, one port, one
+    /// `ROOMLERD_OVERLAY_NETSTACK_SOCKS`: one stack, one port, one
     /// `roomler ping` backend, none of it org-scoped. A second org did not
     /// join twice — it replaced the first org's stack under a SOCKS front
     /// still answering on the same port, so a caller dialing for org A was
@@ -1037,8 +1059,8 @@ pub struct AgentConfig {
     /// machine-scoped and shared by every org (the server dedupes per tenant
     /// via the `agents.{tenant_id, machine_id}` unique index).
     ///
-    /// Managed by `roomler-agent enroll` (appends when the enrollment
-    /// resolves to a NEW (server, tenant) pair) and the `roomler-agent org`
+    /// Managed by `roomlerd enroll` (appends when the enrollment
+    /// resolves to a NEW (server, tenant) pair) and the `roomlerd org`
     /// verbs. Deliberately NOT on the S2 config surface — same policy as
     /// `[[tunnel_routes]]`: identity + secrets live behind dedicated verbs.
     ///
@@ -1271,7 +1293,7 @@ impl AgentConfig {
 /// `OrgOverlayMode::Off` until P2's per-org overlay lands.
 pub fn promote_org_to_primary(cfg: &mut AgentConfig, label: &str) -> Result<()> {
     let Some(idx) = cfg.orgs.iter().position(|o| o.label == label) else {
-        anyhow::bail!("no org labelled {label:?} — see `roomler-agent org ls`");
+        anyhow::bail!("no org labelled {label:?} — see `roomlerd org ls`");
     };
     let entry = cfg.orgs.remove(idx);
     let demoted = OrgEntry {
@@ -1624,6 +1646,8 @@ pub fn test_fixture() -> AgentConfig {
         overlay_server_relay_strategy: None,
         overlay_derp_floor: None,
         overlay_netcheck: None,
+        relay_server_enabled: None,
+        relay_server_port: None,
         tunnel_derp_fallback: None,
         tunnel_peers_survive_reattach: None,
         overlay_mbb: None,
@@ -1735,7 +1759,7 @@ pub fn test_fixture() -> AgentConfig {
 /// it against the editable key list. Before this the list was a literal in
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
-/// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
+/// Suffixes are the `ROOMLERD_…` env suffixes (uppercase surface key).
 /// Sibling-safe derived default for `overlay_direct_port` — constants
 /// mirror tunnel-core's `direct.rs` layout (locked by an agent-crate test;
 /// agent-core's tunnel-core dependency is optional, so no direct import):
@@ -1804,7 +1828,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 54] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 55] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1828,6 +1852,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 54]
         ),
         ("OVERLAY_DERP_FLOOR", cfg.overlay_derp_floor),
         ("OVERLAY_NETCHECK", cfg.overlay_netcheck),
+        ("RELAY_SERVER_ENABLED", cfg.relay_server_enabled),
         ("TUNNEL_DERP_FALLBACK", cfg.tunnel_derp_fallback),
         (
             "TUNNEL_PEERS_SURVIVE_REATTACH",
@@ -1874,7 +1899,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 54]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 23] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 24] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1905,6 +1930,7 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
+        ("RELAY_SERVER_PORT", cfg.relay_server_port),
     ]
 }
 
