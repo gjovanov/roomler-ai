@@ -175,7 +175,10 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
     const LABEL: &str = "com.roomler.desktop";
 
     if !std::path::Path::new(BUNDLE).exists() {
-        anyhow::bail!("{BUNDLE} is not installed");
+        // Not an error, for the same reason as the Windows arm: a daemon-only
+        // install is a supported shape, and the caller reports
+        // `no_prompt_surface` either way. Saying WHICH keeps the log honest.
+        return Ok(EnsureOutcome::Unsupported);
     }
     if pgrep_running("roomler-desktop") {
         return Ok(EnsureOutcome::AlreadyRunning);
