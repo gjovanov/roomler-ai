@@ -37,8 +37,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use objc2::MainThreadMarker;
 use objc2::rc::Retained;
+// `MainThreadOnly` is what provides `NSWindow::alloc` — an inherent-looking
+// call that is actually a trait method, so the import is load-bearing.
+use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezelStyle, NSButton,
     NSButtonType, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSEventMask, NSFont,
