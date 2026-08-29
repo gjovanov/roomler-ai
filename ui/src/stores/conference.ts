@@ -166,14 +166,22 @@ export const useConferenceStore = defineStore('conference', () => {
     device.value = dev
 
     const forceRelay = !!transportMsg.force_relay
+    // ⚠️ Drop entries with no usable URL before they reach RTCPeerConnection.
+    // A server configured with a BLANK turn url used to advertise `urls: [""]`,
+    // and the constructor rejects the whole thing —
+    //   Failed to construct 'RTCPeerConnection': '' is not a valid URL
+    // — so the call could not be joined at all, reported only by a snackbar
+    // that fades. Fixed server-side too; this keeps an older server harmless.
     const iceServers = transportMsg.ice_servers?.length
-      ? transportMsg.ice_servers.map(
-          (s: { urls: string[]; username: string; credential: string }) => ({
-            urls: s.urls,
+      ? transportMsg.ice_servers
+          .map((s: { urls: string[] | string; username: string; credential: string }) => ({
+            urls: (Array.isArray(s.urls) ? s.urls : [s.urls]).filter(
+              (u) => typeof u === 'string' && u.trim().length > 0,
+            ),
             username: s.username,
             credential: s.credential,
-          }),
-        )
+          }))
+          .filter((s: { urls: string[] }) => s.urls.length > 0)
       : undefined
     const iceTransportPolicy = forceRelay ? 'relay' : 'all'
     console.log('[conference] ICE config:', { iceServers, iceTransportPolicy, forceRelay })
