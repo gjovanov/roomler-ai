@@ -188,6 +188,10 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
 }
 
 /// Pull the CLI exe out of the release zip. P3d Slice B renamed the OUTPUT
+// RETIRED-NAME-ANCHOR-BEGIN
+// Reads a PUBLISHED archive. The retired entry name is an input this must
+// keep accepting: a fleet host running the previous CLI looks for exactly
+// that name, and dropping the arm strands it on its current version.
 /// binary `roomler-tunnel.exe` -> `roomler.exe`, but the CI ships BOTH names
 /// in the zip and a deployed (pre-rename) fleet self-updater may still be
 /// extracting `roomler-tunnel.exe`, so accept EITHER source entry. The on-disk
@@ -207,6 +211,7 @@ fn extract_windows_exe(zip_bytes: &[u8]) -> Result<Vec<u8>> {
         }
     }
     bail!("neither roomler.exe nor roomler-tunnel.exe found in the release archive");
+    // RETIRED-NAME-ANCHOR-END
 }
 
 /// Replace the running executable with `new_exe` bytes. Windows lets a running
