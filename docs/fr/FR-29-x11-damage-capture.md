@@ -66,7 +66,7 @@ window and drains events before each grab.
 |---|---|---|
 | **P1** | Damage-gated grab: no damage since the last delivered frame ⇒ return `Ok(None)` and skip the XShm readback entirely, reusing the existing idle-screen path. | `ROOMLERD_X11_DAMAGE=0` ⇒ today's behaviour byte-for-byte |
 | **P2 — SHIPPED (groundwork)** | Emit `Damage::Tracked(rects)` instead of `Damage::Unknown`. ⚠️ Delivers **no user-visible change today**: both would-be consumers are inert (see below). Its value is as P3’s input and as parity with the Windows WGC backend. | same flag; `Unknown` is the fallback, never a wrong rect list |
-| **P3** | Partial readback — `GetImage` only the damaged bounding box into a persistent backbuffer, instead of the full screen. This is where the residual ~20 ms on *active* frames goes. | same flag; falls back to full-frame grab |
+| **P3 — NOT VIABLE on this driver (measured)** | Partial readback — `GetImage` only the damaged bounding box into a persistent backbuffer, instead of the full screen. This is where the residual ~20 ms on *active* frames goes. | same flag; falls back to full-frame grab |
 
 ### The safety valve is load-bearing
 
@@ -196,3 +196,38 @@ the number that matters, and it is not what this field reports.
 per 30 *encoded* frames, so any heartbeat you can read necessarily describes a busy
 second. Two "idle" damage samples that looked alarming were simply busy windows.
 Diagnose idle from the `idle screen` log line, never from the heartbeat.
+
+## P3 VERDICT — measured, and it does not pay off (2026-08-29)
+
+P3's premise was that the damaged region is much smaller than the frame, so a
+partial readback would read far fewer bytes. **Measured on `scw-m2-asahi`
+(Xorg `modesetting` + glamor), that premise is false:**
+
+| workload | `avg_damage_rects` | union ‰ | bbox ‰ |
+|---|---|---|---|
+| window drag | **1** | 1000 | 1000 |
+| scrolling terminal | 17–19 | 1000 | 1000 |
+
+A *window drag* produces **one rectangle covering the whole screen**. The X
+server does not localise root-window damage on this driver at all — it reports
+"everything changed". Verified with xfwm4 compositing both **on and off**, so it
+is the server/driver, not the compositor.
+
+**Consequence: P3 is not worth building on this path.** A partial readback keyed
+on this damage would read the entire frame anyway; the ~20 ms capture cost that
+caps the host near 27 fps is untouchable from here. Lifting the motion ceiling
+needs a different source of "what changed" — not a smarter reader of this one.
+
+This also explains P1 in hindsight, and vindicates its design: `NON_EMPTY` gave
+a *boolean* ("something changed"), which is exactly and only what the idle skip
+needs, and that boolean is reliable even though the rectangles are worthless.
+
+⚠️ Scope of the result: **one server + driver**. Other fleet hosts may report
+fine-grained damage, which is why the measurement ships rather than just the
+conclusion — `avg_damage_rects` / `avg_damage_union_permille` make this a
+per-host question anyone can answer from a heartbeat, instead of a guess.
+
+⚠️ Do not read `union == bbox == 1000` alone as "many small rects tiling the
+screen". Union and bbox are identical in both worlds; only the **count**
+separates a single full-screen rect (P3 dead) from hundreds of small ones
+(P3 plausible). That ambiguity is why the count is reported.
