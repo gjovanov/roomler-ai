@@ -52,9 +52,14 @@ test.describe('OAuth Login', () => {
     expect(request.url()).toContain('client_id=')
   })
 
-  test('OAuth callback page without token shows error', async ({ page }) => {
+  test('OAuth callback page without a session shows error', async ({ page }) => {
+    // Since cookie-only sessions the callback ignores any token in the URL and
+    // asks the API who it is; with no session that fails, and the page must say
+    // so rather than silently landing you somewhere. The old copy ("No token
+    // received from OAuth provider") described the retired query-token flow and
+    // no longer exists in the view.
     await page.goto('/oauth/callback')
-    await expect(page.getByText('No token received from OAuth provider')).toBeVisible({ timeout: 5000 })
+    await expect(page.getByText('Failed to complete OAuth login')).toBeVisible({ timeout: 10000 })
   })
 
   test('OAuth callback page with invalid token shows error', async ({ page }) => {
