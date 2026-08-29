@@ -135,3 +135,55 @@ frame to an agent too old to understand it must be a no-op.
 |---|---|---|
 | 2026-08-29 | 0.4.15 | Measured: 2436 ms delivery gap + decode stall on an idle session; chain confirmed on 2 hosts against a 69 s-old pod; ~4 s SIGTERM→reattach in an earlier instance. FR filed. |
 | 2026-08-29 | 0.4.17 | **P0 DISPROVEN over three deliberate rolls** (8 / 12 / 10 `hard-errored`; recovery no better). Premise wrong: the agent was never late to notice, it was carrier-less either way. P0 reverted rather than left default-ON looking like a fix. The two notify-semantics tests are KEPT — `notify_waiters` losing a signal when nobody is parked is a general hazard wherever a `select!` loop is signalled. |
+
+## P1 — concrete design (scoped, NOT implemented)
+
+The structure is favourable. `DerpMux` already outlives its socket: *"the outbound
+receiver lives for the mux's whole life (across reconnects), so a reconnect never severs
+the `DerpConn`→WS path"* (`transport/derp.rs:325-330`). Carriers hang off the mux, not
+off the socket, so a socket swap need not be visible to them at all.
+
+What makes today's reconnect visible is `mark_down()` — the agent's WS loop
+(`agents/roomlerd/src/derp.rs:200-240`) is shaped
+`loop { connect; register; mark_up; inner select; mark_down; backoff }`, and every
+iteration owns one `tx`/`rx` pair. `mark_down` is what withholds carrier builds and
+ultimately drives the freeze.
+
+**The change**: on a "going away" signal, dial and register a SECOND socket, swap `tx`,
+retire the old `rx` — **without ever calling `mark_down`**. The mux stays up, carriers
+never notice, and the visible outage is the swap itself (one dial, sub-second) rather
+than a full down→backoff→up→walk cycle.
+
+Server half is small: emit the frame in the existing SIGTERM hook, then behave exactly as
+today. Agent half is the work: the loop must hold two sockets briefly and move the write
+half across.
+
+### ⚠️ Why this needs its own cycle, not a bolt-on
+
+`derp.rs` IS the connectivity floor — *"with every UDP path blocked, DERP over TLS :443
+still carries the mesh"* is commitment #2 in CLAUDE.md. A defect in this loop does not
+degrade the mesh, it removes the floor, and on exactly the corp-VPN hosts that have no
+other carrier. That earns a design pass, review, and a staged rollout of its own.
+
+Specific hazards to design against, all visible in the current loop:
+
+- **A failed second dial must not cost the first socket.** The old `tx` has to keep
+  carrying until the new one is registered, so the swap is commit-on-success. Getting
+  this backwards converts a graceful roll into a hard outage — strictly worse than today.
+- **The registration frame is the first frame on a socket** (`derp.rs:217`). The new
+  socket is not usable until that lands, so "registered" is the swap point, not
+  "connected".
+- **Both sockets are registered under the same pubkey for an instant.** The server's
+  registry is last-writer-wins (`ws/derp.rs:448-451` deregisters only `if` still ours),
+  so the overlap is safe by construction — but that property is load-bearing and should
+  be asserted, not assumed.
+- **Ungraceful death still exists.** SIGKILL and node loss cannot be announced, so the
+  discover-by-failed-send path and the #28 recovery walk both stay. P1 removes the cost
+  of the *graceful* case only.
+
+### Value, stated honestly
+
+This is worth doing, but it is not the largest RC-quality lever: it affects only sessions
+live during a deploy. The measured win of this whole arc so far is the FR-22 probe cache
+(#861, up to 1.9 s off a reconnect, shipped). P1 should be picked up deliberately, not
+because it is the last thing left open.
