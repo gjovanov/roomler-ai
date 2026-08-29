@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-container fluid class="pa-0 remote-control-wrapper">
     <!-- ============================================================
@@ -21,11 +23,17 @@
         <v-icon :color="statusColor" size="small" class="mr-2 flex-shrink-0">
           mdi-circle
         </v-icon>
-        <span class="text-truncate">{{ agent?.name || 'Agent' }}</span>
+        <!-- FR-26 — the admin-set display name wins, as it does on /devices
+             and the dashboard mesh; the machine name rides the subtitle so
+             the mapping stays visible. -->
+        <span class="text-truncate">{{ agent?.display_name || agent?.name || 'Agent' }}</span>
         <!-- OS + version subtitle hidden on phone-sized viewports;
              they're useful context on a desktop but on mobile they
              push Connect/Disconnect off the right edge. -->
         <span v-if="agent" class="text-caption text-medium-emphasis ml-2 d-none d-sm-inline">
+          <template v-if="agent.display_name && agent.display_name !== agent.name">
+            {{ agent.name }} ·
+          </template>
           {{ agent.os }} · {{ agent.agent_version || '—' }}
         </span>
       </v-toolbar-title>
@@ -105,8 +113,13 @@
       <!-- P6 — multi-user participants rail. Self-gating: pre-P6 agents
            never broadcast rc:control.state, so controlState stays null and
            nothing renders. Shows everyone on the device; the star marks
-           the exclusive-mode floor holder. -->
-      <v-menu v-if="rc.phase.value === 'connected' && multiUserState && multiUserState.participants.length > 1">
+           the exclusive-mode floor holder.
+
+           FR-27 — shown from ONE participant, not two. The rail is also the
+           only place the input MODE is visible or changeable, and a solo
+           viewer arriving on an `exclusive` device could previously neither
+           see that nor do anything about it. -->
+      <v-menu v-if="rc.phase.value === 'connected' && multiUserState && multiUserState.participants.length >= 1">
         <template #activator="{ props: railProps }">
           <v-chip
             v-bind="railProps"
@@ -153,19 +166,48 @@
           />
         </v-list>
       </v-menu>
+      <!-- FR-27 — I HOLD the floor and someone is waiting for it. Until now
+           a refused request was dropped silently, so the holder never learned
+           anyone wanted control and the requester had to keep clicking until
+           one landed in an idle window. Grant hands it over immediately;
+           Ignore clears the chip (they can always ask again). -->
+      <div
+        v-if="rc.phase.value === 'connected' && floorRequester && iHoldTheFloor"
+        class="d-flex align-center mr-2"
+      >
+        <v-chip size="small" color="warning" variant="tonal" prepend-icon="mdi-hand-back-right">
+          {{ floorRequester.name || 'A viewer' }} wants control
+        </v-chip>
+        <v-btn
+          size="small"
+          color="warning"
+          variant="text"
+          class="ml-1"
+          @click="rc.grantControl(floorRequester.session)"
+        >
+          Grant
+        </v-btn>
+        <v-btn size="small" variant="text" @click="rc.dismissControlRequest()">Ignore</v-btn>
+      </div>
       <!-- P6 — exclusive mode + someone else holds the floor: one-click
-           request. Auto-granted when the holder has been idle ≥2 s. -->
+           request. Auto-granted when the holder has been idle ≥2 s.
+           FR-27 — once asked, the button becomes a waiting state with a way
+           to withdraw, instead of looking like it did nothing. -->
       <v-btn
         v-if="rc.phase.value === 'connected' && multiUserState?.mode === 'exclusive' && !iHoldTheFloor"
         size="small"
-        color="warning"
+        :color="iAmWaitingForTheFloor ? undefined : 'warning'"
         variant="tonal"
-        prepend-icon="mdi-hand-back-right"
+        :prepend-icon="iAmWaitingForTheFloor ? 'mdi-timer-sand' : 'mdi-hand-back-right'"
         class="mr-2"
-        title="Request input control (auto-granted when the current holder is idle)"
-        @click="rc.requestControl()"
+        :title="
+          iAmWaitingForTheFloor
+            ? 'Waiting for the current holder — granted automatically once they go idle. Click to withdraw.'
+            : 'Request input control (auto-granted when the current holder is idle)'
+        "
+        @click="iAmWaitingForTheFloor ? rc.dismissControlRequest() : rc.requestControl()"
       >
-        Request control
+        {{ iAmWaitingForTheFloor ? 'Waiting…' : 'Request control' }}
       </v-btn>
       <!-- Live stats (codec · bitrate · fps · resolution). Relocated here
            from over the video (2026-07-21) so it never hides a maximized
@@ -178,14 +220,14 @@
         role="status"
         aria-live="polite"
       >
-        <span class="stats-pill">{{ statsCodecLabel }}</span>
-        <span class="stats-pill">{{ statsBitrateLabel }}</span>
-        <span class="stats-pill">{{ statsFpsLabel }}</span>
-        <span v-if="statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
+        <span v-if="metrics.codec" class="stats-pill">{{ statsCodecLabel }}</span>
+        <span v-if="metrics.bitrate" class="stats-pill">{{ statsBitrateLabel }}</span>
+        <span v-if="metrics.fps" class="stats-pill">{{ statsFpsLabel }}</span>
+        <span v-if="metrics.resolution && statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
         <!-- FR-1 P7 — end-to-end frame age (agent framing → canvas paint),
              the RustDesk-"Delay" analogue. Appears once the rc:clock probe
              locks; absent on old agents and the classic video-tag path. -->
-        <span v-if="statsAgeLabel" class="stats-pill">{{ statsAgeLabel }}</span>
+        <span v-if="metrics.age && statsAgeLabel" class="stats-pill">{{ statsAgeLabel }}</span>
         <!-- P1 — per-hop pipeline diagnostics (paint / fwd / decode ms,
              output gap, queue, drops, main-thread long tasks). Opt-in via
              localStorage roomler-rc-diag-hud=1; the numbers that decide
@@ -856,7 +898,19 @@
             <v-icon>mdi-close</v-icon>
           </v-btn>
         </v-toolbar>
+        <!-- FR-26 — four tabs instead of one long scroll. The dialog is
+             fullscreen on a phone, where ~8 stacked buttons plus three
+             sections meant the Session tools were below two screenfuls. -->
+        <v-tabs v-model="settingsTab" density="comfortable" color="primary" grow>
+          <v-tab value="video" prepend-icon="mdi-video-outline">Video</v-tab>
+          <v-tab value="display" prepend-icon="mdi-monitor-screenshot">Display</v-tab>
+          <v-tab value="metrics" prepend-icon="mdi-speedometer">Metrics</v-tab>
+          <v-tab value="session" prepend-icon="mdi-tools">Session</v-tab>
+        </v-tabs>
+        <v-divider />
         <v-card-text class="pa-3 pa-md-4">
+          <v-tabs-window v-model="settingsTab">
+          <v-tabs-window-item value="video">
           <!-- A. VIDEO — host-side capture/encode; applies on next Connect -->
           <div class="d-flex align-center ga-2 mb-3">
             <v-icon size="small" color="primary">mdi-video-outline</v-icon>
@@ -903,9 +957,10 @@
           </v-btn-toggle>
           <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ priorityHint }}</div>
 
-          <v-divider class="my-4" />
+          </v-tabs-window-item>
 
-          <!-- B. DISPLAY — viewer-side scaling; live -->
+          <v-tabs-window-item value="display">
+          <!-- B. DISPLAY — viewer-side scaling + sharpening; live -->
           <div class="d-flex align-center ga-2 mb-3">
             <v-icon size="small" color="primary">mdi-fit-to-screen-outline</v-icon>
             <span class="text-subtitle-2 font-weight-medium">Display</span>
@@ -962,8 +1017,64 @@
           </v-btn-toggle>
           <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ sharpenHint }}</div>
 
-          <v-divider class="my-4" />
+          </v-tabs-window-item>
 
+          <v-tabs-window-item value="metrics">
+          <!-- FR-26 — one checkbox per pill in the toolbar readout. All on
+               except `paint`: the per-hop numbers answer a question you only
+               ask while chasing an fps ceiling. -->
+          <div class="d-flex align-center ga-2 mb-1">
+            <v-icon size="small" color="primary">mdi-speedometer</v-icon>
+            <span class="text-subtitle-2 font-weight-medium">Quality metrics</span>
+          </div>
+          <div class="text-caption text-medium-emphasis mb-2 ml-1">
+            Shown in the toolbar while a session is connected.
+          </div>
+          <v-checkbox
+            v-model="metrics.codec"
+            density="compact"
+            hide-details
+            label="Codec, transport and decoder"
+            :messages="statsCodecLabel || 'e.g. AV1 4:2:0 HW (av1_qsv) · direct · dec HW · FSR'"
+          />
+          <v-checkbox
+            v-model="metrics.bitrate"
+            density="compact"
+            hide-details
+            label="Bitrate"
+            :messages="statsBitrateLabel || 'e.g. 1.8 Mbps'"
+          />
+          <v-checkbox
+            v-model="metrics.fps"
+            density="compact"
+            hide-details
+            label="Frame rate"
+            :messages="statsFpsLabel || 'e.g. 13 fps'"
+          />
+          <v-checkbox
+            v-model="metrics.resolution"
+            density="compact"
+            hide-details
+            label="Resolution"
+            :messages="statsResolutionLabel || 'e.g. 2880×1800'"
+          />
+          <v-checkbox
+            v-model="metrics.age"
+            density="compact"
+            hide-details
+            label="Frame age (end to end)"
+            :messages="statsAgeLabel || 'e.g. ~4 ms — needs agent 0.4.9+'"
+          />
+          <v-checkbox
+            v-model="metrics.paint"
+            density="compact"
+            hide-details
+            label="Pipeline diagnostics"
+            messages="paint / forward / decode milliseconds — for chasing an fps ceiling"
+          />
+          </v-tabs-window-item>
+
+          <v-tabs-window-item value="session">
           <!-- C. SESSION — host audio + connected-only tools -->
           <div class="d-flex align-center ga-2 mb-3">
             <v-icon size="small" color="primary">mdi-cog-outline</v-icon>
@@ -1099,6 +1210,8 @@
               Agent logs
             </v-btn>
           </template>
+          </v-tabs-window-item>
+          </v-tabs-window>
         </v-card-text>
       </v-card>
     </v-dialog>
@@ -1412,6 +1525,8 @@ import {
   nextDirPath,
   isKeyboardLockSupported,
   diagHudEnabled,
+  storedMetricToggles,
+  persistMetricToggles,
   remoteCursorCssFor,
   type RcScaleMode,
   type RcResolutionSetting,
@@ -1659,18 +1774,24 @@ async function onFilePicked(ev: Event) {
   }
 }
 
-// --- rc.23 hotfix #6: staging quick-access path ---
+// --- staging quick-access ---
 //
-// rc.22 always-PROGRAMDATA staging puts in-flight upload partials
-// under this fixed path on every Windows agent. Defining the path
-// as a JS string here (rather than inlining in the @click handler)
-// avoids the Vue-template / HTML-attribute / JS-string escaping
-// stack that produced double-backslashes in the literal sent to
-// the agent ("canonicalising C:\\ProgramData\\..." error). The
-// string below contains exactly one backslash per separator after
-// JS string-literal evaluation; the agent's path resolver handles
-// it natively.
-const STAGING_PATH = 'C:\\ProgramData\\roomler\\roomler-agent\\staging'
+// A SENTINEL, not a path. The agent resolves it against its own layout
+// (`files::STAGING_SENTINEL` -> `machine_global_dir().join("staging")`,
+// falling back to the machine-global root while no update is in flight).
+//
+// FR-21 P4: this was a hardcoded
+// RETIRED-NAME-ANCHOR: quotes the defective literal this fix removed; the old
+// spelling is the evidence, not a stale reference. docs/fr/FR-21
+// `C:\ProgramData\roomler\roomler-agent\staging`, which was right only on
+// hosts carrying the pre-rename tree — `machine_global_dir()` resolves the
+// `roomler` segment on a fresh install. Confirmed broken on a real
+// SYSTEM-mode Windows host, where that parent directory does not exist.
+//
+// Sending a token instead of a path also retires the Vue-template /
+// HTML-attribute / JS-string escaping stack that produced the doubled
+// backslashes behind the old "canonicalising C:..." error.
+const STAGING_PATH = '<staging>'
 
 // --- rc.23 agent log viewer state ---
 //
@@ -2447,7 +2568,12 @@ const isHevcRender = computed<boolean>(() => rc.hevcActive.value)
 // P1 — per-hop diagnostics pill (opt-in localStorage roomler-rc-diag-hud=1).
 // Read once at mount: flipping the flag is a reload-scoped A/B, matching the
 // other roomler-rc-* diagnosis knobs.
-const showDiagHud = diagHudEnabled()
+// FR-26 - per-pill visibility, persisted per user. `paint` inherits the
+// legacy roomler-rc-diag-hud flag on first read (see storedMetricToggles).
+const settingsTab = ref<'video' | 'display' | 'metrics' | 'session'>('video')
+const metrics = ref(storedMetricToggles())
+watch(metrics, (m) => persistMetricToggles(m), { deep: true })
+const showDiagHud = computed(() => metrics.value.paint)
 const diagLabel = computed(() => {
   const d = rc.decodeDiag.value
   if (!d) return ''
@@ -3094,6 +3220,15 @@ const iHoldTheFloor = computed(() => {
   if (!st || st.mode !== 'exclusive') return true
   return st.holder != null && st.holder === rc.sessionId.value
 })
+/** FR-27 — the session waiting for the floor, if any. Null on a pre-FR-27
+ *  agent, which is indistinguishable from "nothing pending" and renders the
+ *  same: the whole block self-hides. */
+const floorRequester = computed(() => rc.controlState.value?.pendingRequest ?? null)
+/** …and whether that waiting session is US, so the request button can become
+ *  a waiting state instead of looking like it did nothing. */
+const iAmWaitingForTheFloor = computed(
+  () => !!floorRequester.value && floorRequester.value.session === rc.sessionId.value,
+)
 /** 1 s ticker so still ghosts fade out (5 s) without a paint loop. */
 const ghostNow = ref(Date.now())
 let ghostTicker: ReturnType<typeof setInterval> | null = null
@@ -3191,7 +3326,9 @@ const degradedLabel = computed(() => {
 const phaseLabel = computed(() => {
   switch (rc.phase.value) {
     case 'requesting': return 'Requesting session…'
-    case 'awaiting_consent': return 'Waiting for the agent to allow the connection…'
+    case 'awaiting_consent': return rc.hostLocked.value
+      ? 'That device is locked. Someone needs to unlock it on the machine, then approve the request there — you have 5 minutes.'
+      : 'Waiting for the agent to allow the connection…'
     case 'negotiating': return 'Negotiating the peer connection…'
     default: return ''
   }

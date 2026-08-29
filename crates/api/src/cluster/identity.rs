@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-1 — stable pod identity + process epoch.
 //!
 //! `pod_id` must be STABLE across process restarts (it names the pod's

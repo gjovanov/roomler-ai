@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Route ownership + defense — split out of `runtime.rs` (rc.284, pure move):
 //! the 2 s route-guard cadence, the peer `/32` drop helper, subnet-route
 //! install, and the P5 exit-node split-default state machine (reconcile /
@@ -31,7 +33,7 @@ pub(super) const ROUTE_GUARD_HEARTBEAT: Duration = Duration::from_secs(30);
 /// Effective route-guard cadence. No live subscription (env-disabled,
 /// platform-unavailable, or died) ⇒ [`ROUTE_GUARD_TICK`] — pre-P4 behaviour
 /// exactly. With one ⇒ [`ROUTE_GUARD_HEARTBEAT`], overridable via
-/// `ROOMLER_NODE_OVERLAY_ROUTE_TICK_SECS` (2–300 s; `2` is the operator
+/// `ROOMLERD_OVERLAY_ROUTE_TICK_SECS` (2–300 s; `2` is the operator
 /// revert to the old cadence; garbage/out-of-range falls back to the
 /// default so a typo can never disable the guard).
 pub(super) fn route_guard_cadence(watch_live: bool, env: Option<String>) -> Duration {

@@ -32,6 +32,10 @@ Debian-family hosts so `apt`/`dpkg` stay the source of truth there.
 RHEL, openSUSE, Arch, Alpine-with-glibc and anything else, where an `.rpm`
 covers only the RPM family and would make it three formats × two arches. The
 payload is already self-contained — the `.deb` bundles FFmpeg + libvpx into
+<!-- RETIRED-NAME-ANCHOR-BEGIN
+     usr/lib/roomler-agent is baked into the binary as an RPATH. The whole
+     section is about why the bundled libraries live there, so the
+     directory name is the subject, not a leftover. -->
 `/usr/lib/roomler-agent` with an RPATH precisely so it does not depend on the
 distro's libraries — so the package manager is buying us very little beyond its
 own bookkeeping. An `.rpm` lane stays available later for hosts where the
@@ -51,7 +55,7 @@ roomler-agent-<version>-<arch>-unknown-linux-gnu.tar.gz.sha256
 ```
 
 Tarball layout — a prefix dir so extraction is never a surprise, mirroring the
-`.deb` asset map in `agents/roomler-agent/Cargo.toml`:
+`.deb` asset map in `agents/roomlerd/Cargo.toml`:
 
 ```
 roomler-agent-<version>-<arch>-unknown-linux-gnu/
@@ -94,7 +98,7 @@ privilege ladder (root direct; otherwise `sudo -n`, then `pkexec`).
 4. Same for `/usr/bin/roomler` and each `/usr/lib/roomler-agent/*.so.*`.
 5. **Systemd units: write only if absent.** An update must never clobber a unit
    the operator edited — the field-test host carries a hand-written unit with
-   `ROOMLER_AGENT_VIRTUAL_DESKTOP=1`, and silently reverting that on upgrade
+   `ROOMLERD_VIRTUAL_DESKTOP=1`, and silently reverting that on upgrade
    would be a data-loss-class bug. First install places them; upgrades leave
    them alone.
 6. Exit and let the service manager restart, exactly as the `.deb` path does.
@@ -145,3 +149,4 @@ axes:
 - **arm64 FFmpeg** — the aarch64 build ships without `ffmpeg-encoder` (no
   linux-arm64 vendored FFmpeg exists, and its encoders dispatch to
   nvenc/qsv/amf, none of which exist on these hosts). Unrelated to install.
+<!-- RETIRED-NAME-ANCHOR-END -->

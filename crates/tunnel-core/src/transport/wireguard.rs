@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `wireguard-v1` transport — the L3 overlay data plane.
 //!
 //! This file carries the always-compiled [`Transport`] descriptor so

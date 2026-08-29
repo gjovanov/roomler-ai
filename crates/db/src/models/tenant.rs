@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +24,25 @@ pub struct Tenant {
     pub deleted_at: Option<DateTime>,
 }
 
+/// FR-32 — how far plan-limit checks are allowed to go for a tenant.
+///
+/// Mirrors [`crate::models::OverlayNetwork`]'s `acl_mode` deliberately, and for
+/// the same reason: turning eleven previously-unenforced gates on against a live
+/// fleet would lock out tenants that *we* let over the line. `Warn` is the
+/// default rather than `Off` because a mode that does nothing produces no data,
+/// and learning who *would* be denied is the entire point of the observe phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanEnforcement {
+    /// No check runs at all.
+    Off,
+    /// The check runs and the denial is recorded, but the request succeeds.
+    #[default]
+    Warn,
+    /// The denial is returned to the caller.
+    Enforce,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Plan {
@@ -42,10 +63,21 @@ pub struct TenantSettings {
     pub mfa_required: bool,
     #[serde(default)]
     pub allow_guest_access: bool,
-    #[serde(default = "default_max_members")]
-    pub max_members: u32,
-    #[serde(default = "default_file_upload_limit")]
-    pub file_upload_limit: u64,
+    // FR-32 — `max_members` and `file_upload_limit` lived here and were REMOVED.
+    // They shadowed `PlanLimits::{max_members, storage_bytes}` and had zero
+    // readers in the entire workspace — not two enforcers disagreeing, two dead
+    // fields shadowing two dead fields. They also disagreed with the plan they
+    // shadowed by 10x (this defaulted to 100; Free's PlanLimits says 10), so
+    // wiring the wrong one would have changed who is over the line.
+    //
+    // `PlanLimits` is the single source of truth: it is what
+    // `GET /api/stripe/plans` publishes, what `BillingView.vue` renders, and
+    // what the billing test asserts. Serde ignores the leftover key in existing
+    // tenant documents, so no migration is needed.
+    //
+    // A per-tenant override may well be wanted for bespoke Enterprise deals —
+    // the same problem as the phantom `Enterprise` tier. Add it deliberately
+    // then, with stated semantics, rather than inheriting one from an accident.
     /// Phase 2 MagicDNS — the tenant's overlay DNS suffix (e.g.
     /// `"myorg.roomler.net"`). When set, overlay nodes run a local split-DNS
     /// resolver that answers `<node-name>.<domain>` with the peer's overlay IP.
@@ -72,6 +104,18 @@ pub struct TenantSettings {
     /// is enabled.
     #[serde(default)]
     pub remote_ssh_enabled: bool,
+
+    /// FR-32 — how far plan-limit checks may go for this tenant. Defaults to
+    /// `Warn`, so a pre-FR-32 tenant document deserialises into observe mode:
+    /// every newly wired gate is measured and logged, and none of them refuse.
+    ///
+    /// ⚠ This does NOT apply to the limits that were already enforced before
+    /// FR-32 (`max_devices`, `max_tunnel_clients`) — see
+    /// `roomler_ai_services::quota::Limit::is_established`. An established
+    /// limit always enforces, so setting `Off` can never silently un-enforce
+    /// the device cap.
+    #[serde(default)]
+    pub plan_enforcement: PlanEnforcement,
 }
 
 impl Default for TenantSettings {
@@ -81,26 +125,17 @@ impl Default for TenantSettings {
             default_message_notifications: NotificationLevel::default(),
             mfa_required: false,
             allow_guest_access: false,
-            max_members: default_max_members(),
-            file_upload_limit: default_file_upload_limit(),
             magic_dns_domain: None,
             magic_dns_nameservers: Vec::new(),
             remote_exec_enabled: false,
             remote_ssh_enabled: false,
+            plan_enforcement: PlanEnforcement::default(),
         }
     }
 }
 
 fn default_locale() -> String {
     "en-US".to_string()
-}
-
-fn default_max_members() -> u32 {
-    100
-}
-
-fn default_file_upload_limit() -> u64 {
-    10 * 1024 * 1024 // 10 MB
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Tests for the global per-IP `tower_governor` limiter.
 //!
 //! ⚠️ Both tests here used to hit `/health`, which the governor **deliberately

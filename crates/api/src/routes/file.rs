@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use axum::{
     Json,
     body::Body,
@@ -5,6 +7,7 @@ use axum::{
     response::Response,
 };
 use bson::oid::ObjectId;
+use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -295,6 +298,24 @@ pub async fn upload(
     }
 
     let data = file_data.ok_or_else(|| ApiError::BadRequest("Missing 'file' field".to_string()))?;
+
+    // FR-32 P1b — plan `storage_bytes` cap. Uses the DELTA form: a tenant at
+    // 99 MB of 100 MB must be refused a 10 MB file and ALLOWED a 100 KB one,
+    // which a bare "are you at the cap" test cannot express. The size is only
+    // knowable here, after the multipart body has been read.
+    {
+        let tenant = state.tenants.base.find_by_id(tid).await?;
+        let current = state.files.sum_storage_for_tenant(tid).await?;
+        if let Err(d) = quota::check_delta(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::StorageBytes,
+            current,
+            data.2.len() as u64,
+        ) {
+            return Err(ApiError::Forbidden(d.message()));
+        }
+    }
     let room_id_val =
         room_id_str.ok_or_else(|| ApiError::BadRequest("Missing 'room_id' field".to_string()))?;
     let rid = ObjectId::parse_str(&room_id_val)
@@ -480,6 +501,24 @@ pub async fn upload_room(
     }
 
     let data = file_data.ok_or_else(|| ApiError::BadRequest("Missing 'file' field".to_string()))?;
+
+    // FR-32 P1b — plan `storage_bytes` cap. Uses the DELTA form: a tenant at
+    // 99 MB of 100 MB must be refused a 10 MB file and ALLOWED a 100 KB one,
+    // which a bare "are you at the cap" test cannot express. The size is only
+    // knowable here, after the multipart body has been read.
+    {
+        let tenant = state.tenants.base.find_by_id(tid).await?;
+        let current = state.files.sum_storage_for_tenant(tid).await?;
+        if let Err(d) = quota::check_delta(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::StorageBytes,
+            current,
+            data.2.len() as u64,
+        ) {
+            return Err(ApiError::Forbidden(d.message()));
+        }
+    }
 
     let resp = do_upload(&state, tid, rid, auth.user_id, data).await?;
     Ok(Json(resp))

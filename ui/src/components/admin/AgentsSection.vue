@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-card>
     <!-- No title text: the hosting view's h1 already says "Devices"
@@ -316,6 +318,20 @@
               <span class="mx-1">·</span>
               <span :title="`machine_id: ${item.machine_id}`">{{ shortId(item.machine_id) }}</span>
               <span v-if="item.version"> · v{{ item.version }}</span>
+              <!-- FR-27 — the companion's own version, and only when it
+                   DISAGREES with the daemon's. Shown at all because the two
+                   update by different mechanisms on every platform, so
+                   "Update all" moving the daemon says nothing about the
+                   desktop; hidden when they match because a second identical
+                   number on every row is noise, and the whole point of the
+                   field is the disagreement. -->
+              <span
+                v-if="companionSkew(item)"
+                class="companion-skew ml-1"
+                :title="`roomler-desktop is on v${companionSkew(item)} while the daemon is on v${item.version} — the companion updates separately (its own .deb on Linux, the .pkg on macOS, a daemon-side swap on Windows)`"
+              >
+                · desktop v{{ companionSkew(item) }}
+              </span>
             </div>
           </template>
           <template #item.kind="{ item }">
@@ -408,6 +424,23 @@
                 class="consent-select"
                 :aria-label="`Consent mode for ${item.name}`"
                 @update:model-value="(m) => onConsentModeChange(agentFor(item)!, m as ConsentMode)"
+              />
+              <!-- FR-27 — the owner shortcut, made visible. Controlling your
+                   OWN device auto-consents server-side BEFORE this mode is
+                   read, so on a fleet where one person owns everything the
+                   select above had no observable effect and nothing said so.
+                   Shown only on devices YOU own; for everyone else the mode
+                   already applies and the row would be noise. -->
+              <v-checkbox
+                v-if="isOwnedByMe(agentFor(item)!)"
+                :model-value="agentFor(item)!.access_policy.prompt_owner ?? false"
+                density="compact"
+                hide-details
+                :disabled="consentBusy === item.id"
+                :label="ownerPromptLabel(agentFor(item)!)"
+                :aria-label="`Apply the consent mode to me, the owner of ${item.name}`"
+                class="consent-owner-toggle"
+                @update:model-value="(v) => onPromptOwnerChange(agentFor(item)!, v === true)"
               />
               <!-- P6 — multi-user input mode (free-for-all | exclusive). -->
               <v-select
@@ -600,6 +633,19 @@
               >
                 v{{ a.agent_version }}
               </v-chip>
+              <!-- FR-27 — same rule as the grid caption: only when the
+                   companion disagrees with the daemon. Warning-coloured
+                   because a skew here means the desktop is running code the
+                   daemon has moved past, which is what the operator hit. -->
+              <v-chip
+                v-if="a.companion_version && a.companion_version !== a.agent_version"
+                size="x-small"
+                color="warning"
+                variant="tonal"
+                :title="`roomler-desktop is on v${a.companion_version} while the daemon is on v${a.agent_version} — the companion updates separately`"
+              >
+                desktop v{{ a.companion_version }}
+              </v-chip>
               <v-chip
                 v-for="codec in codecChips(a)"
                 :key="codec.label"
@@ -626,6 +672,19 @@
               class="mb-2"
               :aria-label="`Consent mode for ${a.name}`"
               @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
+            />
+            <!-- FR-27 — see the desktop table above: the owner shortcut is
+                 applied before the mode is read, so it has to be visible. -->
+            <v-checkbox
+              v-if="isOwnedByMe(a)"
+              :model-value="a.access_policy.prompt_owner ?? false"
+              density="compact"
+              hide-details
+              :disabled="consentBusy === a.id"
+              :label="ownerPromptLabel(a)"
+              :aria-label="`Apply the consent mode to me, the owner of ${a.name}`"
+              class="mb-2"
+              @update:model-value="(v) => onPromptOwnerChange(a, v === true)"
             />
             <!-- P6 — multi-user input mode. -->
             <v-select
@@ -1239,7 +1298,7 @@
       <v-card-text>
         <p class="text-body-2 mb-3">
           CIDRs that <strong>{{ routesTarget?.name }}</strong> advertises for the
-          mesh (<code>roomler-tunnel socks5</code>). A LAN target IP matching one of
+          mesh (<code>roomler socks5</code>). A LAN target IP matching one of
           these routes is dialed by this agent, so the mesh can reach non-agent
           devices behind it (a NAS, a printer, a database host). Access is still
           gated by your <strong>Tunnel ACL</strong> — a route steers the dial, it
@@ -1499,6 +1558,20 @@ const agentById = computed(() => {
 function agentFor(row: DeviceRow): Agent | undefined {
   return row.kind === 'agent' ? agentById.value.get(row.id) : undefined
 }
+
+/** FR-27 — the companion version to display, or `''` when there is nothing
+ *  worth saying.
+ *
+ *  Returns a value ONLY when the companion disagrees with the daemon, because
+ *  agreement is the expected state and rendering it on every row would bury
+ *  the one case an operator needs to see. Absent (`undefined`) is deliberately
+ *  silent rather than rendered as "unknown": it covers a pre-FR-27 agent, a
+ *  host with no companion, and a failed probe alike, and guessing between them
+ *  in a table cell would be worse than saying nothing. */
+function companionSkew(row: DeviceRow): string {
+  const cv = agentFor(row)?.companion_version
+  return cv && cv !== row.version ? cv : ''
+}
 const clientById = computed(() => {
   const m = new Map<string, TunnelClient>()
   for (const c of tunnelClientStore.clients) m.set(c.id, c)
@@ -1660,8 +1733,10 @@ async function performTunnelDelete() {
 }
 
 // Per-device consent mode. Email/Push route the request to the device OWNER
-// (approve-link) for unattended hosts; PromptThenEmail (host-then-email hybrid)
-// is not offered yet — it still behaves as host-prompt server-side.
+// (approve-link) for unattended hosts. `prompt_then_email` runs BOTH legs in
+// parallel — first answer wins — with the on-host modal bounded to the attended
+// window while the emailed link keeps the full async one; a host that goes
+// unanswered hands over to the owner rather than ending the session.
 const CONSENT_MODE_ITEMS: { title: string; value: ConsentMode }[] = [
   { title: 'Prompt on host (attended)', value: 'prompt' },
   { title: 'Auto-grant (unattended)', value: 'auto' },
@@ -1678,6 +1753,45 @@ async function onConsentModeChange(a: Agent, mode: ConsentMode) {
     await agentStore.updateAccessPolicy(props.tenantId, a.id, {
       ...a.access_policy,
       consent_mode: mode,
+    })
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    consentBusy.value = null
+  }
+}
+
+/** FR-27 — do I own this device? Controlling your own device skips consent
+ *  server-side, so the mode select above is inert for these rows unless
+ *  `prompt_owner` is on. Only the owner sees the toggle: for anyone else the
+ *  mode already applies, and an always-visible row explaining someone else's
+ *  exemption would be noise. */
+function isOwnedByMe(a: Agent): boolean {
+  return !!auth.user?.id && a.owner_user_id === auth.user.id
+}
+
+/** The label says what is TRUE right now, not what the checkbox is called —
+ *  "you own this device, so consent is currently skipped" is the fact an
+ *  operator needs; "Ask me too" alone would leave them guessing what the
+ *  unchecked state means. */
+function ownerPromptLabel(a: Agent): string {
+  const mode = a.access_policy.consent_mode ?? 'prompt'
+  return a.access_policy.prompt_owner
+    ? `Ask me too (you own this device; "${consentModeTitle(mode)}" applies to you)`
+    : 'Ask me too (you own this device, so consent is skipped for you)'
+}
+
+function consentModeTitle(mode: ConsentMode): string {
+  return CONSENT_MODE_ITEMS.find((i) => i.value === mode)?.title ?? mode
+}
+
+async function onPromptOwnerChange(a: Agent, prompt_owner: boolean) {
+  if ((a.access_policy.prompt_owner ?? false) === prompt_owner) return
+  consentBusy.value = a.id
+  try {
+    await agentStore.updateAccessPolicy(props.tenantId, a.id, {
+      ...a.access_policy,
+      prompt_owner,
     })
   } catch (e) {
     agentStore.error = (e as Error).message
@@ -1993,7 +2107,7 @@ function closeEnrollDialog() {
 
 /**
  * Copy an agent's hex ObjectId to the clipboard so the operator can
- * paste it into `roomler-tunnel forward --agent <hex>` (or any other
+ * paste it into `roomler forward --agent <hex>` (or any other
  * CLI / API call that needs the agent identifier).
  *
  * Surfaces transient success state via [`copiedAgentId`] for 2 s —
@@ -2312,5 +2426,12 @@ watch(() => props.tenantId, (tid) => {
    their labels on one line each instead of clipping. */
 .agents-table :deep(.consent-select) {
   min-width: 170px;
+}
+
+/* FR-27 — the companion-version skew note. Warning-toned so it reads as
+   "something here is behind", not as a second neutral fact next to the
+   daemon version. */
+.companion-skew {
+  color: rgb(var(--v-theme-warning));
 }
 </style>

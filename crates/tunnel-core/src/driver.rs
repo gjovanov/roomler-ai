@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Tunnel-client **session driver** — the reusable engine behind the CLI's
 //! `forward`/`socks5`/`mesh` and (P3b-2) the daemon's outbound tunnels.
 //!
 //! P3b-1 landed the shared **flow vocabulary** here — the per-flow
 //! reply-correlation types + the open-timeout. P3b-1b folds in the session
-//! orchestration itself (moved from `roomler-tunnel::forward`) behind the
+//! orchestration itself (moved from `roomler::forward`) behind the
 //! [`crate::signaling_link`] seam: [`run_tunnel_session`] speaks the
 //! `rc:tunnel.*` control protocol over a cloneable
 //! [`TunnelSignalingSink`](crate::signaling_link::TunnelSignalingSink) + a
@@ -592,7 +594,7 @@ async fn run_webrtc_session(
         // P0 throughput fix (rc.64, field-repro 2026-05-26): disable
         // Nagle on the local listener's accepted TCP socket. The agent
         // side already sets TCP_NODELAY on its outbound (corp-side)
-        // dialer (see agents/roomler-agent/src/tunnel/dialer.rs); the
+        // dialer (see agents/roomlerd/src/tunnel/dialer.rs); the
         // asymmetry meant TDS row tokens flowing FROM the server,
         // through the DC, OUT to the local SSMS/psql/JDBC client got
         // Nagle-coalesced on this socket. Under MSSQL TDS the small
