@@ -103,9 +103,31 @@ pub fn classify(access_ok: bool, desktop_name: &str) -> LockState {
     }
 }
 
+/// Pure: classify a WTS `SessionFlags` value (from
+/// `WTSINFOEX_LEVEL1_W`) into a `LockState`. Split out from the FFI so
+/// the decision logic is trivially testable.
+///
+/// Modern Windows (8 / Server 2012 and later) reports
+/// `WTS_SESSIONSTATE_LOCK = 0` and `WTS_SESSIONSTATE_UNLOCK = 1`.
+/// `WTS_SESSIONSTATE_UNKNOWN` (-1) and any unexpected value return
+/// `None` so the caller can fall back to another probe rather than
+/// guessing — this probe is advisory, and a false "locked" is worse
+/// than deferring to the desktop probe.
+///
+/// ⚠️ On **Windows 7 / Server 2008 R2** the LOCK/UNLOCK meanings are
+/// REVERSED (a documented Microsoft defect). The fleet is Win10/11; if
+/// that ever changes, gate this on the OS build before trusting it.
+pub fn classify_session_flags(flags: i32) -> Option<LockState> {
+    match flags {
+        0 => Some(LockState::Locked),   // WTS_SESSIONSTATE_LOCK
+        1 => Some(LockState::Unlocked), // WTS_SESSIONSTATE_UNLOCK
+        _ => None,                      // WTS_SESSIONSTATE_UNKNOWN (-1) / unexpected
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod win {
-    use super::{LockState, classify};
+    use super::{LockState, classify, classify_session_flags};
     use crate::win_service::desktop;
 
     /// Probe the lock state from the user-context worker. Returns
@@ -190,6 +212,79 @@ mod win {
     pub fn probe_lock_state() -> LockState {
         probe_lock_state_detailed().0
     }
+
+    /// Probe the lock state via **WTS**, independent of the caller's
+    /// window station. Returns `None` when there is no active console
+    /// session, the query fails, or the OS reports
+    /// `WTS_SESSIONSTATE_UNKNOWN`, so the caller can fall back.
+    ///
+    /// **FR-34 P3b — why this exists.** [`probe_lock_state`] classifies
+    /// via `OpenInputDesktop`, whose result is the input desktop of the
+    /// **calling process's window station**. That is correct from the
+    /// user-context capture worker / a session that has already run
+    /// `attach_to_winsta0()`. But the CONSENT path runs on the SCM
+    /// **service** window station (`Service-0x0-…`) — the daemon only
+    /// switches to `WinSta0` per-session, when input is wired, *after*
+    /// consent — and the service station has its OWN `Default` desktop,
+    /// so `OpenInputDesktop` there classifies `Unlocked` no matter what
+    /// the interactive session is doing. On a perMachine/SYSTEM host the
+    /// old consent probe therefore could NEVER report Locked. WTS asks
+    /// the OS about the console session directly, from any station.
+    pub fn probe_lock_state_service() -> Option<LockState> {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::RemoteDesktop::{
+            WTS_CURRENT_SERVER_HANDLE, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSINFOEXW,
+            WTSQuerySessionInformationW, WTSSessionInfoEx,
+        };
+
+        // 0xFFFFFFFF = no session currently attached to the console
+        // (headless / pre-login) — nothing to report a lock for.
+        let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+        if session_id == u32::MAX {
+            return None;
+        }
+
+        let mut buffer: *mut u16 = std::ptr::null_mut();
+        let mut bytes: u32 = 0;
+        // SAFETY: WTS_CURRENT_SERVER_HANDLE is the documented "this
+        // server" sentinel; session_id is a u32; WTSSessionInfoEx is a
+        // documented info class; `&mut buffer` / `&mut bytes` are stack
+        // ptrs the API writes into. On success `buffer` is OS-allocated
+        // and released via WTSFreeMemory below.
+        let ok = unsafe {
+            WTSQuerySessionInformationW(
+                WTS_CURRENT_SERVER_HANDLE as HANDLE,
+                session_id,
+                WTSSessionInfoEx,
+                &mut buffer,
+                &mut bytes,
+            )
+        };
+        if ok == 0 || buffer.is_null() {
+            return None;
+        }
+
+        // For WTSSessionInfoEx the buffer is a `WTSINFOEXW`, not a
+        // string — guard the returned size before reading it as one.
+        let result = if (bytes as usize) >= std::mem::size_of::<WTSINFOEXW>() {
+            // SAFETY: verified size ≥ WTSINFOEXW and the info class is
+            // WTSSessionInfoEx, so the buffer is a valid WTSINFOEXW.
+            let info = unsafe { &*(buffer as *const WTSINFOEXW) };
+            if info.Level == 1 {
+                // SAFETY: Level == 1 selects the Level1 union member.
+                let flags = unsafe { info.Data.WTSInfoExLevel1.SessionFlags };
+                classify_session_flags(flags)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // SAFETY: pair Free with the successful Query above.
+        unsafe { WTSFreeMemory(buffer as *mut core::ffi::c_void) };
+        result
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -203,12 +298,17 @@ mod nowin {
     pub fn probe_lock_state_detailed() -> (LockState, String) {
         (LockState::Unlocked, "Default".to_string())
     }
+    /// No WTS session-lock concept off Windows — let the caller fall
+    /// back to [`probe_lock_state`] (which is `Unlocked` here).
+    pub fn probe_lock_state_service() -> Option<LockState> {
+        None
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub use nowin::{probe_lock_state, probe_lock_state_detailed};
+pub use nowin::{probe_lock_state, probe_lock_state_detailed, probe_lock_state_service};
 #[cfg(target_os = "windows")]
-pub use win::{probe_lock_state, probe_lock_state_detailed};
+pub use win::{probe_lock_state, probe_lock_state_detailed, probe_lock_state_service};
 
 /// Spawn a tokio task that polls `probe_lock_state` every
 /// `POLL_INTERVAL` and emits transitions on the returned
@@ -286,6 +386,18 @@ mod tests {
         // Winlogon and the user-context probe got ACCESS_DENIED.
         assert_eq!(classify(false, ""), LockState::Locked);
         assert_eq!(classify(false, "Default"), LockState::Locked);
+    }
+
+    #[test]
+    fn session_flags_lock_unlock_unknown() {
+        // Modern Windows: 0 = LOCK, 1 = UNLOCK. FR-34 P3b consent probe.
+        assert_eq!(classify_session_flags(0), Some(LockState::Locked));
+        assert_eq!(classify_session_flags(1), Some(LockState::Unlocked));
+        // WTS_SESSIONSTATE_UNKNOWN (-1) and any unexpected value must
+        // return None so the emit path falls back rather than guessing
+        // — a false "locked" indication is worse than deferring.
+        assert_eq!(classify_session_flags(-1), None);
+        assert_eq!(classify_session_flags(2), None);
     }
 
     #[test]
