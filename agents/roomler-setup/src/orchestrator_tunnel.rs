@@ -329,6 +329,11 @@ fn detect_existing_install_label() -> String {
 }
 
 /// Resolve the per-user install dir. Windows:
+// RETIRED-NAME-ANCHOR-BEGIN
+// The install directory and the ProjectDirs segment below are the layout
+// that ALREADY EXISTS on installed hosts, and the segment holds the enrolled
+// credential on tunnel-only ones. Moving either is a migration, not a
+// rename — see roomler-setup-core::integration, tracked as an FR-21 followup.
 /// `%LOCALAPPDATA%\roomler\roomler-tunnel\Programs\roomler-tunnel`.
 /// Linux: `~/.local/opt/roomler-tunnel`. macOS:
 /// `~/Applications/RoomlerTunnel`.
@@ -443,3 +448,4 @@ mod tests {
         );
     }
 }
+// RETIRED-NAME-ANCHOR-END
