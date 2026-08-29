@@ -143,10 +143,30 @@ Gates by enforcement point (P1):
 | `exit_nodes` | `overlay_route::set_exit_node:312` |
 | `magic_dns` | `overlay_route::set_magic_dns:471` |
 | `ai_recognition` | `integration::recognize_file:16` |
-| `cloud_integrations` | cloud-storage provider selection |
+| `cloud_integrations` | **no enforcement point — the feature has no call path** (see below) |
 | `video_max_participants` | call join (`crates/services/src/media/`) |
 | `max_concurrent_sessions` | remote-session start |
 | `max_message_history` | message read path — **a retention bound, not a gate** (see Open decisions) |
+
+### Found in P1a: `cloud_integrations` is sold but not implemented
+
+`crates/services/src/cloud_storage/` (dropbox, google_drive, onedrive) is declared in
+`services/src/lib.rs` and **referenced by nothing else in the workspace** — no route, no
+`AppState` wiring, no UI. The `StorageProvider::{GoogleDrive,OneDrive,Dropbox}` enum variants
+and the `TenantSettings` OAuth credential fields exist, but no code path ever constructs a
+client.
+
+So this is not an unenforced limit — it is an **advertised feature with no implementation to
+gate**. Deliberately left unwired rather than given a gate at an invented call site: a check
+in front of nothing would read like coverage and assert nothing. The gate goes in when the
+feature does, in the same change.
+
+### Found in P1a: only *enabling* may be gated
+
+`exit_nodes` and `magic_dns` are toggles, and the gate is on the **enable** path only.
+Gating the disable path too would mean a plan downgrade could leave a tenant holding an exit
+node or a DNS zone they are not allowed to turn off — strictly worse than the feature having
+been free. Same rule for any future toggle.
 
 ## Acceptance criteria
 

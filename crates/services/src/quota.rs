@@ -114,9 +114,30 @@ pub struct QuotaDenial {
 }
 
 impl QuotaDenial {
+    /// Is this a disabled *feature* rather than an exhausted *count*?
+    ///
+    /// A boolean feature that the plan does not include caps at zero, so the
+    /// counting wording ("0 of 0 recordings used") would be nonsense. The two
+    /// cases need different sentences, and the distinction is `max == 0`.
+    pub fn is_feature_gate(&self) -> bool {
+        self.max == 0
+    }
+
     /// The message shown to the caller. Deliberately the same shape the three
     /// pre-FR-32 sites already used, so P0 is observable-behaviour-neutral.
     pub fn message(&self) -> String {
+        if self.is_feature_gate() {
+            return format!(
+                "{} {} not available on the {:?} plan. Upgrade to enable.",
+                capitalise(self.noun),
+                if self.noun.ends_with('s') {
+                    "are"
+                } else {
+                    "is"
+                },
+                self.plan,
+            );
+        }
         format!(
             "{} limit reached for the {:?} plan ({} of {} {} used). \
              Upgrade the plan or remove one first.",
@@ -193,6 +214,16 @@ pub fn check(
     if enforcing { Err(denial) } else { Ok(()) }
 }
 
+/// Gate a boolean plan feature.
+///
+/// The counted form of [`check`] already models this — a feature the plan does
+/// not include caps at zero, so `used = 0` trips it — but spelling that at each
+/// call site would mean writing a bare `0` whose meaning is not local. This
+/// names it instead.
+pub fn require_feature(plan: Plan, mode: PlanEnforcement, limit: Limit) -> Result<(), QuotaDenial> {
+    check(plan, mode, limit, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +281,57 @@ mod tests {
                 "max_tunnel_clients must refuse under {mode:?} — it was enforced before FR-32"
             );
         }
+    }
+
+    /// A disabled feature must not be described with counting words. "0 of 0
+    /// recordings used. Upgrade the plan or remove one first" tells a customer
+    /// to remove something that does not exist.
+    #[test]
+    fn a_feature_gate_reads_as_a_feature_not_a_count() {
+        let d = require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::Recordings)
+            .expect_err("Free does not include recordings");
+        assert!(d.is_feature_gate());
+        let m = d.message();
+        assert_eq!(
+            m,
+            "Recordings are not available on the Free plan. Upgrade to enable."
+        );
+        assert!(
+            !m.contains("0 of 0"),
+            "feature gates must not use counting words: {m}"
+        );
+
+        // Singular noun agreement — "MagicDNS is", not "MagicDNS are".
+        let d = require_feature(Plan::Free, PlanEnforcement::Enforce, Limit::MagicDns)
+            .expect_err("Free does not include MagicDNS");
+        assert_eq!(
+            d.message(),
+            "MagicDNS is not available on the Free plan. Upgrade to enable."
+        );
+    }
+
+    /// A count that runs out is still described by counting.
+    #[test]
+    fn a_count_gate_keeps_the_counting_message() {
+        let d = check(Plan::Free, PlanEnforcement::Enforce, Limit::MaxMembers, 10).unwrap_err();
+        assert!(!d.is_feature_gate());
+        assert!(
+            d.message().contains("10 of 10 members used"),
+            "{}",
+            d.message()
+        );
+    }
+
+    /// `require_feature` passes when the plan includes the feature.
+    #[test]
+    fn require_feature_passes_when_the_plan_includes_it() {
+        assert!(require_feature(Plan::Pro, PlanEnforcement::Enforce, Limit::MagicDns).is_ok());
+        assert!(require_feature(Plan::Pro, PlanEnforcement::Enforce, Limit::ExitNodes).is_ok());
+        assert!(
+            require_feature(Plan::Business, PlanEnforcement::Enforce, Limit::Recordings).is_ok()
+        );
+        // ...and Warn never refuses, even for a feature the plan lacks.
+        assert!(require_feature(Plan::Free, PlanEnforcement::Warn, Limit::Recordings).is_ok());
     }
 
     #[test]
