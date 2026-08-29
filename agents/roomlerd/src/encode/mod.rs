@@ -127,6 +127,13 @@ pub(crate) mod resample;
 /// cargo's parallel runner interleaved them once the test count grew
 /// (rc.191 field flake). Module-scoped (not tests-mod-private) since P8b
 /// so `policy::tests` can take the same lock.
+// RETIRED-NAME-ANCHOR-BEGIN
+// Every retired name below is a test deliberately setting the LEGACY
+// `ROOMLER_AGENT_*` env spelling. That coverage is the thing proving hosts in the
+// field keep working after FR-21 P3 made `ROOMLERD_*` the documented prefix —
+// rewriting these would delete the proof while leaving the tests green.
+// INVARIANT: a retired name here must be one a real host can still have set.
+// docs/fr/FR-21
 #[cfg(test)]
 pub(crate) static RELAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1424,3 +1431,4 @@ mod tests {
         assert!(!relay_addr_is_fast_local("garbage"));
     }
 }
+// RETIRED-NAME-ANCHOR-END
