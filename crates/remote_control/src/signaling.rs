@@ -506,6 +506,21 @@ pub enum ClientMsg {
         reason: Option<String>,
     },
 
+    /// FR-34 — the on-host consent prompt is up, but the host is LOCKED, so
+    /// nobody can see it until the machine is unlocked. Sent once when the
+    /// prompt begins on a locked host so the controller's "awaiting consent"
+    /// wait can explain WHY (walk over, unlock, approve) instead of looking
+    /// like a hang. Advisory + additive: an old server ignores it, and it
+    /// never changes the consent outcome — a locked host is still answered by
+    /// unlocking and clicking the panel (the sound flow), just with 5 minutes
+    /// (FR-34 P4) to get there.
+    #[serde(rename = "rc:consent.pending")]
+    ConsentPending {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        host_locked: bool,
+    },
+
     // ─── controller → server ─────────────────────────────────────────
     /// Controller initiates a session. Server creates the RemoteSession,
     /// notifies the agent, and waits for consent.
@@ -1255,6 +1270,17 @@ pub enum ServerMsg {
 
     /// Sent to the controller after the agent has consented and is ready for
     /// the SDP offer. Controller now creates its PeerConnection.
+    /// FR-34 — relayed from the agent's [`ClientMsg::ConsentPending`]: the
+    /// host is locked while a consent prompt is pending, so the operator has
+    /// to unlock the machine before they can see and approve it. Advisory; the
+    /// viewer uses it to turn a bare "awaiting consent" into an instruction.
+    #[serde(rename = "rc:consent.pending")]
+    ConsentPending {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        host_locked: bool,
+    },
+
     #[serde(rename = "rc:ready")]
     Ready {
         #[serde(with = "oid_hex")]
