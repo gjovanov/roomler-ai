@@ -1264,7 +1264,6 @@ mod tests {
             derp_inbound_drops: None,
             srflx: None,
             warm_relay: None,
-            lan_captures: None,
             direct_socks: Vec::new(),
         }
     }
