@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! The single GitHub-releases cache behind every release-serving route,
 //! plus `POST /api/releases/refresh` — the cache-bust the release
 //! workflows call the moment a tag is published.

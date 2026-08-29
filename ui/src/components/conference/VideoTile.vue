@@ -1,5 +1,8 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-card
+    ref="tileRef"
     class="video-tile"
     :class="{
       'active-speaker-border': isActiveSpeaker,
@@ -7,6 +10,7 @@
     }"
     color="grey-darken-3"
     elevation="2"
+    @dblclick="$emit('spotlight', streamKey)"
   >
     <div class="video-container" style="aspect-ratio: 16/9; position: relative; overflow: hidden">
       <!-- Video element — always in DOM and visible so Chrome autoplay works.
@@ -21,9 +25,13 @@
         :data-stream-key="streamKey"
       />
 
-      <!-- Avatar overlay when video is off (positioned on top of video) -->
+      <!-- Avatar overlay when video is off (positioned on top of video).
+           FR-30 P3 — `videoPaused` is the PEER's own word for it. Without it a
+           camera-off participant showed their last frame, frozen, forever:
+           the track keeps reading live+unmuted on this side, so `hasVideoTrack`
+           cannot tell. A frozen face is worse than an avatar — it looks live. -->
       <div
-        v-if="!hasVideoTrack"
+        v-if="!hasVideoTrack || videoPaused"
         class="d-flex align-center justify-center w-100 h-100 bg-grey-darken-4"
         style="position: absolute; top: 0; left: 0; z-index: 1"
       >
@@ -40,6 +48,16 @@
         size="18"
       >
         mdi-pin
+      </v-icon>
+
+      <!-- Camera-off indicator (FR-30 P3) -->
+      <v-icon
+        v-if="videoPaused"
+        class="camera-indicator"
+        color="error"
+        size="20"
+      >
+        mdi-video-off
       </v-icon>
 
       <!-- Muted indicator -->
@@ -71,9 +89,24 @@
           size="small"
           variant="flat"
           color="rgba(0,0,0,0.6)"
+          :title="isPiP ? 'Leave picture-in-picture' : 'Picture-in-picture'"
           @click.stop="$emit('request-pip', streamKey)"
         >
           <v-icon size="18">mdi-picture-in-picture-bottom-right</v-icon>
+        </v-btn>
+        <!-- FR-25 — per-tile fullscreen. Hidden where the browser has no
+             element fullscreen (iOS Safari) rather than shipping a dead
+             control that silently does nothing. -->
+        <v-btn
+          v-if="fullscreenSupported"
+          icon
+          size="small"
+          variant="flat"
+          color="rgba(0,0,0,0.6)"
+          :title="isFullscreen ? 'Exit fullscreen' : 'Fullscreen'"
+          @click.stop="toggleFullscreen"
+        >
+          <v-icon size="18">{{ isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen' }}</v-icon>
         </v-btn>
       </div>
     </div>
@@ -102,6 +135,9 @@ const props = withDefaults(defineProps<{
   compact?: boolean
   showActions?: boolean
   streamKey?: string
+  /** FR-30 P3 — the peer said their camera is off. Not derivable here: their
+      track reads live+unmuted on this side either way. */
+  videoPaused?: boolean
 }>(), {
   isPinned: false,
   isActiveSpeaker: false,
@@ -109,14 +145,47 @@ const props = withDefaults(defineProps<{
   compact: false,
   showActions: false,
   streamKey: '',
+  videoPaused: false,
 })
 
 defineEmits<{
   'toggle-pin': [streamKey: string]
   'request-pip': [streamKey: string]
+  /** FR-25 — double-click: make this tile the spotlight (toggles). */
+  spotlight: [streamKey: string]
 }>()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
+
+// FR-25 — per-tile fullscreen. `$el` because v-card is a component; the
+// document-level listener keeps the icon honest when the user leaves
+// fullscreen with Esc rather than the button.
+const tileRef = ref<{ $el?: HTMLElement } | null>(null)
+const fullscreenSupported = typeof document !== 'undefined' && !!document.fullscreenEnabled
+const isFullscreen = ref(false)
+const isPiP = computed(() =>
+  typeof document !== 'undefined' && document.pictureInPictureElement === videoRef.value,
+)
+
+function onFullscreenChange() {
+  const el = tileRef.value?.$el
+  isFullscreen.value = !!el && document.fullscreenElement === el
+}
+
+async function toggleFullscreen() {
+  const el = tileRef.value?.$el
+  if (!el) return
+  try {
+    if (document.fullscreenElement === el) {
+      await document.exitFullscreen()
+    } else {
+      await el.requestFullscreen()
+    }
+  } catch {
+    // Denied (permissions policy / not user-activated) — the icon state
+    // is driven by fullscreenchange, so nothing to unwind here.
+  }
+}
 let recheckTimer: ReturnType<typeof setTimeout> | null = null
 
 const initial = computed(() =>
@@ -215,6 +284,7 @@ watch(hasVideoTrack, (val) => {
 
 onMounted(() => {
   attachStream()
+  if (fullscreenSupported) document.addEventListener('fullscreenchange', onFullscreenChange)
   // Also listen for track changes if stream is already set
   if (props.stream) {
     props.stream.onaddtrack = () => {
@@ -226,6 +296,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  if (fullscreenSupported) document.removeEventListener('fullscreenchange', onFullscreenChange)
   if (recheckTimer) {
     clearTimeout(recheckTimer)
     recheckTimer = null
@@ -271,6 +342,17 @@ defineExpose({ videoRef })
   border-radius: 50%;
   padding: 2px;
   z-index: 2;
+}
+
+.camera-indicator {
+  position: absolute;
+  bottom: 8px;
+  /* Left of the mic badge: camera-off and mic-off happen together often
+     enough that they must not sit on top of each other. */
+  right: 40px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 50%;
+  padding: 4px;
 }
 
 .mute-indicator {

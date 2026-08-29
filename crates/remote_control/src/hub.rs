@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `Hub` — process-global registry of online agents and live sessions.
 //!
 //! The Hub is `Clone`-able (it's a thin Arc handle) and is shared across all
@@ -18,7 +20,10 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::audit::AuditSink;
-use crate::consent::{ConsentOutcome, DEFAULT_CONSENT_TIMEOUT};
+use crate::consent::{
+    ASYNC_CONSENT_TIMEOUT, ConsentOutcome, DEFAULT_CONSENT_TIMEOUT, HOST_PROMPT_TIMEOUT,
+    hub_consent_deadline,
+};
 use crate::error::{Error, Result};
 use crate::models::{AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, SessionPhase};
 use crate::permissions::Permissions;
@@ -32,10 +37,10 @@ use crate::turn_creds::{
 
 const SERVER_TX_CAPACITY: usize = 64;
 
-/// Consent window for owner-side channels (Email/Push) — the owner has to read a
-/// mail / tap a push, so it's far longer than the 30 s on-host prompt
-/// ([`DEFAULT_CONSENT_TIMEOUT`]). Also bounds the `ConsentRequest` link TTL.
-const ASYNC_CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+// The consent windows (`DEFAULT_CONSENT_TIMEOUT`, `ASYNC_CONSENT_TIMEOUT`,
+// `HOST_PROMPT_TIMEOUT`) live in `crate::consent` — FR-27 moved
+// `ASYNC_CONSENT_TIMEOUT` there from here, because the on-host and owner-side
+// windows now differ within a single mode and the split needs one home.
 
 /// How long a session may sit in `Negotiating` (consent granted, `Ready`
 /// pushed) without the controller's SDP offer before the Hub terminates it.
@@ -668,6 +673,7 @@ impl Hub {
         browser_caps: Vec<String>,
         preferred_transport: Option<String>,
         chroma_pref: Option<String>,
+        chunk_framing: Option<bool>,
         audio_enabled: bool,
         consent_mode: ConsentMode,
         override_reason: Option<String>,
@@ -780,6 +786,9 @@ impl Hub {
         // agent TURN descriptor so `forward_offer` can hand the REMOTE agent a
         // relay it reaches over the overlay. Validated at use, not here.
         live.local_relay = local_relay;
+        // FR-27 — `deliver_consent` needs the mode to know whether a host-side
+        // timeout ends the session or hands over to the owner's emailed link.
+        live.consent_mode = consent_mode;
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -819,6 +828,16 @@ impl Hub {
             }
             _ => DEFAULT_CONSENT_TIMEOUT,
         };
+        // FR-27 — the ON-HOST half of that window. Same as the session window
+        // for a plain attended prompt; the attended window (not the async one)
+        // for `PromptThenEmail`, whose host modal has no business standing on
+        // someone's screen for five minutes while the owner reads their mail.
+        // A host timeout under that mode does NOT end the session — see
+        // `deliver_consent`.
+        let host_prompt_timeout = match consent_mode {
+            ConsentMode::PromptThenEmail => HOST_PROMPT_TIMEOUT,
+            _ => timeout,
+        };
 
         // Move to AwaitingConsent and tell the agent. The agent always gets the
         // Request (it needs the codec / transport context) + the mode directive;
@@ -832,11 +851,13 @@ impl Hub {
             browser_caps,
             preferred_transport,
             chroma_pref,
+            chunk_framing,
             audio_enabled,
             // Server-authoritative directive: the agent obeys this rather than
             // its local `auto_grant_session`. `Auto` → immediate grant;
             // `Prompt` → on-host prompt; `Email`/`Push` → wait (owner resolves).
             consent_mode: Some(consent_mode),
+            host_prompt_timeout_secs: Some(host_prompt_timeout.as_secs() as u32),
             // P6 — the device policy's arbitration mode for the agent's
             // InputArbiter (first session seeds; toggles win afterwards).
             input_mode,
@@ -902,10 +923,17 @@ impl Hub {
             });
         }
 
-        // Spawn the consent watcher.
+        // Spawn the consent watcher. FR-27: it waits GRACE longer than the
+        // window it just announced to the agent, because the agent's verdict
+        // arrives ~130 ms after that window on every non-answer and is the
+        // one carrying a reason (`timeout` vs `no_prompt_surface`). Measured
+        // on mars 2026-08-29: with an equal wait the hub terminated first and
+        // every `no_prompt_surface` reached the controller as "nobody
+        // answered". This timer is the backstop for a dead agent, not a
+        // competitor of a live one — see `consent::CONSENT_VERDICT_GRACE`.
         let hub = self.clone();
         tokio::spawn(async move {
-            let outcome = waiter.wait(timeout).await;
+            let outcome = waiter.wait(hub_consent_deadline(timeout)).await;
             hub.handle_consent_outcome(session_id, outcome);
         });
 
@@ -970,6 +998,14 @@ impl Hub {
                 self.audit(session_id, agent_id, tenant_id, AuditKind::ConsentTimedOut);
                 let _ = self.terminate(session_id, EndReason::ConsentTimeout);
             }
+            // FR-27 — audited as a timeout (nobody answered is what happened)
+            // but terminated distinctly, because the controller's next move is
+            // different: nobody CAN answer on that host until it gets a prompt
+            // surface, or the device moves to email/push.
+            ConsentOutcome::NoPromptSurface => {
+                self.audit(session_id, agent_id, tenant_id, AuditKind::ConsentTimedOut);
+                let _ = self.terminate(session_id, EndReason::NoPromptSurface);
+            }
         }
     }
 
@@ -998,12 +1034,50 @@ impl Hub {
     }
 
     /// Caller: WS dispatcher when it sees `rc:consent` from agent.
-    pub fn deliver_consent(&self, session_id: ObjectId, granted: bool) -> Result<()> {
+    /// Resolve a session's consent slot from an agent reply or an approve-link.
+    ///
+    /// `reason` is FR-27's `rc:consent.reason` — absent (or unrecognised) means
+    /// an ordinary deny, which is what a bare `granted: false` has always meant.
+    /// The approve-link route passes `None`: a human clicked a button there.
+    pub fn deliver_consent(
+        &self,
+        session_id: ObjectId,
+        granted: bool,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let outcome = crate::consent::outcome_of(granted, reason);
         let arc = self
             .inner
             .sessions
             .get(&session_id)
             .ok_or_else(|| Error::SessionNotFound(session_id.to_hex()))?;
+
+        // FR-27 — `prompt_then_email` runs BOTH legs. The host modal closes
+        // after the attended window while the emailed link stays live for the
+        // full async one, so a host-side non-answer is a handover, not a
+        // verdict: leave the slot armed and let the owner (or our own waiter)
+        // decide. An explicit host Deny is a verdict and does resolve — the
+        // person at the machine said no.
+        let handover = {
+            let s = arc.value().lock();
+            s.consent_mode == ConsentMode::PromptThenEmail
+                && matches!(
+                    outcome,
+                    ConsentOutcome::Timeout | ConsentOutcome::NoPromptSurface
+                )
+        };
+        if handover {
+            info!(
+                session = %session_id.to_hex(), ?outcome,
+                "host prompt went unanswered under prompt_then_email — session stays open \
+                 for the owner's approve-link"
+            );
+            // The agent HAS the Request and has already acted on it; a
+            // reconnect must not replay the modal.
+            arc.value().lock().pending_request = None;
+            return Ok(());
+        }
+
         let slot = {
             let mut s = arc.value().lock();
             // Consent is in flight — the agent evidently has the Request, so
@@ -1012,7 +1086,7 @@ impl Hub {
             s.consent_slot.take()
         };
         slot.ok_or_else(|| Error::BadMessage("consent already delivered"))?
-            .resolve(granted)
+            .resolve(outcome)
     }
 
     // ─── SDP / ICE forwarding ────────────────────────────────────────
@@ -1186,7 +1260,7 @@ impl Hub {
     /// `SendFailed` if the channel is full (rare — the agent rx pump
     /// reads as fast as it can serialise + write to the socket).
     ///
-    /// Used by the `roomler-tunnel` relay path in
+    /// Used by the `roomler` relay path in
     /// `crates/api/src/ws/tunnel.rs` to forward
     /// `ServerMsg::TcpForwardForward` / `TcpHalfClose` /
     /// `TcpClosed` / `TunnelTerminate` to the agent on behalf of a
@@ -1491,6 +1565,7 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    chunk_framing,
                     audio_enabled,
                     // Ignored here — the Hub can't validate admin; the API gate
                     // validates the wire field and re-supplies it via `ctx`.
@@ -1521,6 +1596,7 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    chunk_framing,
                     audio_enabled,
                     ctx.consent_mode,
                     ctx.override_reason.clone(),
@@ -1543,10 +1619,34 @@ impl Hub {
                 ClientMsg::Consent {
                     session_id,
                     granted,
+                    ref reason,
                 },
             ) => {
                 self.check_session_party(ctx, session_id)?;
-                self.deliver_consent(session_id, granted)
+                self.deliver_consent(session_id, granted, reason.as_deref())
+            }
+            (
+                Role::Agent,
+                ClientMsg::ConsentPending {
+                    session_id,
+                    host_locked,
+                },
+            ) => {
+                self.check_session_party(ctx, session_id)?;
+                // FR-34 — relay the locked-host hint to the controller so its
+                // "awaiting consent" wait can explain the delay. Advisory only:
+                // a missing session or a dropped controller_tx is a no-op, not
+                // an error — the consent outcome is entirely unaffected.
+                if let Some(arc) = self.inner.sessions.get(&session_id) {
+                    let tx = arc.value().lock().controller_tx.clone();
+                    if let Some(tx) = tx {
+                        let _ = tx.try_send(ServerMsg::ConsentPending {
+                            session_id,
+                            host_locked,
+                        });
+                    }
+                }
+                Ok(())
             }
             (
                 role,
@@ -1641,6 +1741,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1649,7 +1750,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        hub.deliver_consent(sid_a, true).unwrap();
+        hub.deliver_consent(sid_a, true, None).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         hub.with_session(sid_a, |s| s.transition(SessionPhase::Active))
             .unwrap();
@@ -1666,6 +1767,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1724,6 +1826,7 @@ mod tests {
             Vec::new(),
             None,
             None,  // chroma_pref
+            None,  // chunk_framing
             false, // audio_enabled
             ConsentMode::Prompt,
             None, // override_reason
@@ -1758,6 +1861,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,  // chroma_pref
+                None,  // chunk_framing
                 false, // audio_enabled
                 ConsentMode::Prompt,
                 None, // override_reason
@@ -1772,7 +1876,7 @@ mod tests {
         assert!(matches!(m, ServerMsg::SessionCreated { .. }));
 
         // Deliver consent.
-        hub.deliver_consent(sid, true).unwrap();
+        hub.deliver_consent(sid, true, None).unwrap();
 
         // Give the consent task a tick to fire.
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1805,6 +1909,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1829,7 +1934,7 @@ mod tests {
 
         // Consent lands → the pending Request is cleared; a further
         // reconnect must NOT see it replayed.
-        hub.deliver_consent(sid, true).unwrap();
+        hub.deliver_consent(sid, true, None).unwrap();
         let (_tx3, _cancel3, mut rx3) =
             hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
         assert!(
@@ -1867,6 +1972,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1876,7 +1982,7 @@ mod tests {
             )
             .unwrap();
         let _created = ctl_rx.recv().await.unwrap();
-        hub.deliver_consent(sid, true).unwrap();
+        hub.deliver_consent(sid, true, None).unwrap();
         let m = ctl_rx.recv().await.unwrap();
         assert!(matches!(m, ServerMsg::Ready { .. }));
 
@@ -1916,6 +2022,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1925,7 +2032,7 @@ mod tests {
             )
             .unwrap();
         let _created = ctl_rx.recv().await.unwrap();
-        hub.deliver_consent(sid, true).unwrap();
+        hub.deliver_consent(sid, true, None).unwrap();
         let _ready = ctl_rx.recv().await.unwrap();
         // Drain the agent's Request so the offer forward has room.
         let _req = agent_rx.recv().await.unwrap();
@@ -1968,6 +2075,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2023,6 +2131,7 @@ mod tests {
             ClientMsg::Consent {
                 session_id: sid,
                 granted: true,
+                reason: None,
             },
             ClientMsg::Ice {
                 session_id: sid,
@@ -2046,6 +2155,7 @@ mod tests {
             ClientMsg::Consent {
                 session_id: sid,
                 granted: true,
+                reason: None,
             },
         )
         .unwrap();
@@ -2107,6 +2217,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2181,6 +2292,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2246,6 +2358,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2264,6 +2377,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2320,6 +2434,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2342,6 +2457,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None, // chunk_framing
             false,
             ConsentMode::Prompt,
             None,
@@ -2384,6 +2500,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None, // chunk_framing
             false,
             ConsentMode::Prompt,
             None,
@@ -2426,6 +2543,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2487,6 +2605,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,

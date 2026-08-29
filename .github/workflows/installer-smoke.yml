@@ -1,3 +1,10 @@
+# RETIRED-NAME-ANCHOR-BEGIN
+# This lane installs and uninstalls the real installers, so it must assert on
+# the names a host actually has — including the pre-rename ones it is checking
+# are cleaned up: the legacy service and task, the roomler-agent.exe alias, the
+# old install folders and the published MSI names.
+# INVARIANT: a retired name here must be one the installer has to create, find or
+# remove on a real host. docs/fr/FR-21
 # Phase 6 Chunk 6A — install + uninstall smoke for the per-User MSI
 # on windows-latest. Catches the regressions install_detect locks
 # (UpgradeCode registry presence) + the WiX bundle's basic
@@ -30,7 +37,7 @@ on:
   push:
     branches: [master]
     paths:
-      - 'agents/roomler-agent/**'
+      - 'agents/roomlerd/**'
       - '.github/workflows/installer-smoke.yml'
   # Also on PRs — but only those touching the INSTALLER surface, not the whole
   # agent. Until now this job ran on push-to-master and dispatch only, so its
@@ -42,7 +49,7 @@ on:
   # windows-latest job, and Windows runner contention in this repo is real —
   # rc.424's MSI job sat QUEUED for 70 minutes behind a release burst. Measured
   # over the last 90 days, these paths carry 29 commits against 316 for
-  # `agents/roomler-agent/**`, so this fires on roughly one agent PR in ten:
+  # `agents/roomlerd/**`, so this fires on roughly one agent PR in ten:
   # the ones where the installer itself changed.
   #
   # ⚠️ If you change what the MSI SHIPS (a new native dependency, a wxs
@@ -50,16 +57,16 @@ on:
   # audit silently stops covering the change that needed it most.
   pull_request:
     paths:
-      - 'agents/roomler-agent/wix/**'
-      - 'agents/roomler-agent/wix-perMachine/**'
-      - 'agents/roomler-agent/packaging/windows/**'
+      - 'agents/roomlerd/wix/**'
+      - 'agents/roomlerd/wix-perMachine/**'
+      - 'agents/roomlerd/packaging/windows/**'
       # The macOS packaging was missing here, so the postinstall — the script
       # that decides whether the root daemon lives or is DELETED — could change
       # without this job ever running on the PR. That is the hole the warning
       # above describes, and it cost a real regression: an rc.458 -> rc.460
       # self-update silently removed the daemon on a field MacBook.
-      - 'agents/roomler-agent/packaging/macos/**'
-      - 'agents/roomler-agent/build.rs'
+      - 'agents/roomlerd/packaging/macos/**'
+      - 'agents/roomlerd/build.rs'
       - '.github/workflows/installer-smoke.yml'
   workflow_dispatch: {}
 
@@ -132,7 +139,7 @@ jobs:
         # runtime behaviour only.
         shell: pwsh
         run: |
-          cargo build -p roomler-agent --release `
+          cargo build -p roomlerd --release `
             --features "mf-encoder,scrap-capture,openh264-encoder,enigo-input,clipboard,viewer-indicator,system-context"
 
       - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
@@ -240,7 +247,7 @@ jobs:
           # who finds it on a machine knows it's a smoke artifact.
           SMOKE_VERSION: 0.0.0-smoke.1
         run: |
-          cargo wix -p roomler-agent --nocapture --no-build --install-version $env:SMOKE_VERSION
+          cargo wix -p roomlerd --nocapture --no-build --install-version $env:SMOKE_VERSION
           $msi = Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1
           if (-not $msi) { throw 'MSI not produced by cargo-wix' }
           'MSI_PATH=' + $msi.FullName | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -273,7 +280,7 @@ jobs:
           # where <packed> is the Windows-Installer-compressed encoding
           # of the UpgradeCode GUID. The MSI we just built carries
           # UpgradeCode `1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91` (see
-          # `agents/roomler-agent/Cargo.toml::package.metadata.wix`).
+          # `agents/roomlerd/Cargo.toml::package.metadata.wix`).
           #
           # First attempt used `Get-Package -Provider msi` but the
           # PackageManagement `msi` provider isn't available on
@@ -588,12 +595,12 @@ jobs:
           # above, so clobbering is fine but a stale file would make
           # the produced-MSI assert vacuous.
           Remove-Item target\wix\*.msi -Force -ErrorAction SilentlyContinue
-          $wixDir = "agents\roomler-agent\wix"
-          $pmSrc  = "agents\roomler-agent\wix-perMachine\main.wxs"
+          $wixDir = "agents\roomlerd\wix"
+          $pmSrc  = "agents\roomlerd\wix-perMachine\main.wxs"
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item $pmSrc "$wixDir\main.wxs" -Force
           try {
-            cargo wix -p roomler-agent --nocapture --no-build --install-version $env:SMOKE_VERSION
+            cargo wix -p roomlerd --nocapture --no-build --install-version $env:SMOKE_VERSION
           } finally {
             Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
           }
@@ -649,11 +656,11 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           set -euo pipefail
-          cargo build -p roomler-agent --release \
+          cargo build -p roomlerd --release \
             --features "media,vp9-444,vp9-444-bindgen,overlay-l3" \
             --target aarch64-apple-darwin
           cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
-          cargo build -p roomler-agent-tray --release --target aarch64-apple-darwin
+          cargo build -p roomler-desktop --release --target aarch64-apple-darwin
 
       - name: Stage + build the pkg
         run: |
@@ -690,10 +697,10 @@ jobs:
           find "$APP" -type f \( -name '*.dylib' -o -name 'roomler-agent' \) \
             -exec codesign --force --sign - {} \;
 
-          cp agents/roomler-agent/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
-          cp agents/roomler-agent/packaging/macos/com.roomler.daemon.plist "$APP/Contents/Resources/"
-          cp agents/roomler-agent/packaging/macos/com.roomler.desktop.plist "$APP/Contents/Resources/"
-          cp agents/roomler-agent/packaging/macos/com.roomler.update.plist "$APP/Contents/Resources/"
+          cp agents/roomlerd/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
+          cp agents/roomlerd/packaging/macos/com.roomler.daemon.plist "$APP/Contents/Resources/"
+          cp agents/roomlerd/packaging/macos/com.roomler.desktop.plist "$APP/Contents/Resources/"
+          cp agents/roomlerd/packaging/macos/com.roomler.update.plist "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -740,7 +747,7 @@ jobs:
           chmod 755 payload/usr/local/bin/roomler
           ln -s /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent \
             payload/usr/local/bin/roomlerd
-          cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
+          cp agents/roomlerd/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
           # pkgbuild THEN productbuild — the same two steps release-agent.yml
           # runs, and not an optimisation to skip.
@@ -1045,3 +1052,4 @@ jobs:
             || { echo "::error::helper not re-loaded after removing the opt-out"; exit 1; }
           echo "  opt-in restores the helper"
 
+# RETIRED-NAME-ANCHOR-END

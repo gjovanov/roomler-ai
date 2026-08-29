@@ -1,10 +1,12 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use std::collections::HashMap;
 
-use bson::{DateTime, doc, oid::ObjectId};
+use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
     AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy, OsKind,
-    SshPolicy,
+    PeerRelayPolicy, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -44,6 +46,9 @@ impl AgentDao {
             machine_id,
             os,
             agent_version,
+            // FR-27 — unknown until the device's first heartbeat, for the same
+            // reason as the host key below: enrolment never reaches the machine.
+            companion_version: None,
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
@@ -59,6 +64,7 @@ impl AgentDao {
             // admin act, never a side effect of enrollment.
             exec_policy: ExecPolicy::default(),
             ssh_policy: SshPolicy::default(),
+            peer_relay_policy: Default::default(),
             // Nothing requested until an operator asks for something
             // (docs/remote-config.md). A freshly enrolled device must not
             // arrive carrying a config intent nobody wrote.
@@ -240,6 +246,7 @@ impl AgentDao {
         &self,
         agent_id: ObjectId,
         warm_relay: Option<&str>,
+        companion_version: Option<&str>,
     ) -> DaoResult<bool> {
         // C4 stage 2 — the standing warm allocation's relayed address rides
         // the same per-heartbeat write: stored pair-less so a peer can be
@@ -250,12 +257,36 @@ impl AgentDao {
             "last_seen_at": DateTime::now(),
             "status": bson::to_bson(&AgentStatus::Online).unwrap(),
         };
-        let update = match warm_relay {
+        let mut unset = Document::new();
+        match warm_relay {
             Some(ep) => {
                 set.insert("warm_relay_endpoint", ep);
-                doc! { "$set": set }
             }
-            None => doc! { "$set": set, "$unset": { "warm_relay_endpoint": "" } },
+            None => {
+                unset.insert("warm_relay_endpoint", "");
+            }
+        }
+        // FR-27 — the companion version follows the same present/absent rule
+        // as the warm leg, and for the same reason: a stale value is worse
+        // than none. An agent that stops finding a companion (uninstalled, or
+        // a probe that started failing) must clear the field rather than leave
+        // the grid asserting a version that is no longer on the host.
+        //
+        // ⚠️ A PRE-FR-27 agent sends no field at all, which arrives here as
+        // `None` and therefore `$unset` — correct, because such an agent also
+        // never set it, so there is nothing to erase.
+        match companion_version {
+            Some(v) => {
+                set.insert("companion_version", v);
+            }
+            None => {
+                unset.insert("companion_version", "");
+            }
+        }
+        let update = if unset.is_empty() {
+            doc! { "$set": set }
+        } else {
+            doc! { "$set": set, "$unset": unset }
         };
         self.base.update_by_id(agent_id, update).await
     }
@@ -413,6 +444,43 @@ impl AgentDao {
             .update_one(
                 doc! { "_id": agent_id, "tenant_id": tenant_id },
                 doc! { "$set": { "ssh_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// FR-19 gate 3 — replace the device's org-relay approval. A
+    /// `MANAGE_AGENTS` + `EXEC_DEVICE` admin action (`routes::peer_relay`),
+    /// kept separate from the exec/SSH setters for the reason they are
+    /// separate from each other: approving one power must never be a side
+    /// effect of approving another.
+    pub async fn update_peer_relay_policy(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        policy: &PeerRelayPolicy,
+    ) -> DaoResult<bool> {
+        let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "peer_relay_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// Every live device the tenant has approved to serve as an org relay.
+    /// Gate 3 only: whether it is also SERVING is gate 4, read off its
+    /// advertised `relay-server` capability, and whether it is online is the
+    /// presence path's answer — neither is this row's to give.
+    pub async fn list_relay_approved(&self, tenant_id: ObjectId) -> DaoResult<Vec<Agent>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "deleted_at": null,
+                    "peer_relay_policy.serve": true,
+                },
+                Some(doc! { "name": 1 }),
             )
             .await
     }

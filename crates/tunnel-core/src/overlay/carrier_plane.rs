@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Multi-org v2 — the process-wide shared direct-carrier plane.
 //!
 //! Today every org runtime binds its own direct sockets off the SAME

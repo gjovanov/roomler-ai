@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::{doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::RemoteAuditEvent;

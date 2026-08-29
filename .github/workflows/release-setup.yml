@@ -7,6 +7,8 @@ name: Release roomler-setup
 #   - Windows x86_64 (msvc + webview2 auto-bootstrap) — SIGNED EXE in a `.zip`
 #
 # The unified wizard superseded the two legacy wizard EXEs, retired
+# RETIRED-NAME-ANCHOR(3): names the two wizards RETIRED in P4c-2. A history line has to
+# name what existed.
 # in P4c-2 (roomler-installer = agent/daemon, roomler-tunnel-installer
 # = tunnel CLI). On Windows it offers all roles (daemon perMachine-SCM
 # / perUser-task / perMachine + tunnel-client); on Linux/macOS only
@@ -148,7 +150,7 @@ jobs:
       - name: Install Tauri Linux system deps
         # webkit2gtk + libsoup + ayatana; librsvg2 for icon decode. Same
         # set as the legacy tunnel wizard (roomler-setup pulls the same
-        # Tauri Linux runtime). roomler-agent comes in with DEFAULT
+        # Tauri Linux runtime). roomlerd comes in with DEFAULT
         # features (signalling-only) — no vcpkg/FFmpeg/libvpx needed.
         run: |
           sudo apt-get update

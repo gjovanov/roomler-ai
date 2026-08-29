@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Integration tests for the Task 9 crash-log ingest + listing
 //! endpoints. Spawns a real `TestApp` (real Axum server + real
 //! MongoDB) and exercises:
@@ -12,8 +14,8 @@
 //! the dev Windows machine, so the full backend can't compile there.
 
 use crate::fixtures::test_app::TestApp;
-use roomler_agent::crash_recorder::{Payload as AgentCrashPayload, Reason as CrashReason};
-use roomler_agent::{config::AgentConfig, enrollment};
+use roomlerd::crash_recorder::{Payload as AgentCrashPayload, Reason as CrashReason};
+use roomlerd::{config::AgentConfig, enrollment};
 use serde_json::Value;
 
 /// Enrol a fresh agent. Returns the `AgentConfig` (carries

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! PR-2 — cross-pod rc signalling relay: `rc.cmd` / `rc.conn_closed` /
 //! `rc.conn_alive`.
 //!

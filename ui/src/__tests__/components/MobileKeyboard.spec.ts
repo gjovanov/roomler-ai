@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, beforeAll, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'

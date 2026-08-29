@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! The unified wizard's role picker vocabulary.
 //!
 //! One `Role` = one thing the operator wants this machine to be:

@@ -1,5 +1,7 @@
 [package]
 name = "roomler-ai-api"
+license = "AGPL-3.0-only"
+publish = false
 version.workspace = true
 edition.workspace = true
 
@@ -39,6 +41,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 jsonwebtoken.workspace = true
 dashmap.workspace = true
+rand.workspace = true
 # Optional GeoIP country lookup (platform user analytics). The database
 # itself is operator-supplied via ROOMLER__STATS__GEOIP_MMDB — nothing
 # licensed is vendored, and an absent file degrades to "unknown".

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR(24): names the PRE-RENAME appdirs segment a host installed before
+// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! Persist agent crash reports to disk for later upload.
 //!
 //! Three callers feed in (panic hook in `logging.rs`, watchdog stall
@@ -94,6 +98,8 @@ pub enum WriterContext {
     /// User-context worker process. Writes under
     /// `logging::log_dir()/crashes/`.
     Worker,
+    // RETIRED-NAME-ANCHOR(3): the PRE-RENAME tree appdirs still resolves on an upgraded
+    // host.
     /// LocalSystem SCM supervisor. Writes under
     /// `%PROGRAMDATA%\roomler\roomler-agent\crashes\` on Windows,
     /// falls back to the Worker dir on non-Windows (no separate

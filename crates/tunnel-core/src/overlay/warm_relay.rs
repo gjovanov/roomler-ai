@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! C4 — the warm TURN allocation: loop-side state + pure helpers.
 //! Stage 1 made the leg's survival across a VPN transition READABLE
 //! (probes over the grandfathered flow). Stage 2 PR-A adds the flavor
