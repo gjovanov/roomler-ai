@@ -251,6 +251,14 @@ pub struct AppState {
     /// (`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`), checked by the mint
     /// in `ws::overlay` AFTER the identity gates so a refusal is attributable.
     pub relay_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    /// FR-19 — the org-relay mint's pod-local state: minted sessions (keyed
+    /// by pair), per-relay VNI cursors, the server-wide generation clock,
+    /// join extras (primary-org flag, relay port) and reachability reports.
+    /// Pod-local is correct here for the same reason `relay_pair_churn` is:
+    /// tenant affinity puts a tenant's nodes on ONE pod, and the relay's own
+    /// table is the truth a restart falls back on (sessions then run out
+    /// their `max_lifetime`).
+    pub org_relay: Arc<crate::ws::org_relay::OrgRelayState>,
 
     /// The one GitHub-releases cache, shared by `/api/agent/*`,
     /// `/api/tunnel/*` and `/api/setup/*` — they all read the same
@@ -895,6 +903,7 @@ impl AppState {
             exec_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             ssh_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             relay_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
+            org_relay: Arc::new(crate::ws::org_relay::OrgRelayState::new()),
             releases_cache,
         };
 
