@@ -10,6 +10,7 @@
 
 pub mod bind;
 pub mod responder;
+pub mod session;
 mod wire;
 
 pub use wire::*;

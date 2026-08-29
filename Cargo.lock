@@ -8066,6 +8066,7 @@ dependencies = [
  "sha2 0.10.9",
  "smoltcp",
  "socket2 0.5.10",
+ "subtle",
  "tcp-turn-conn",
  "thiserror 2.0.18",
  "tokio",

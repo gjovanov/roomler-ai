@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 use std::collections::HashMap;
 
-use bson::{DateTime, doc, oid::ObjectId};
+use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
     AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy, OsKind,
@@ -46,6 +46,9 @@ impl AgentDao {
             machine_id,
             os,
             agent_version,
+            // FR-27 — unknown until the device's first heartbeat, for the same
+            // reason as the host key below: enrolment never reaches the machine.
+            companion_version: None,
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
@@ -242,6 +245,7 @@ impl AgentDao {
         &self,
         agent_id: ObjectId,
         warm_relay: Option<&str>,
+        companion_version: Option<&str>,
     ) -> DaoResult<bool> {
         // C4 stage 2 — the standing warm allocation's relayed address rides
         // the same per-heartbeat write: stored pair-less so a peer can be
@@ -252,12 +256,36 @@ impl AgentDao {
             "last_seen_at": DateTime::now(),
             "status": bson::to_bson(&AgentStatus::Online).unwrap(),
         };
-        let update = match warm_relay {
+        let mut unset = Document::new();
+        match warm_relay {
             Some(ep) => {
                 set.insert("warm_relay_endpoint", ep);
-                doc! { "$set": set }
             }
-            None => doc! { "$set": set, "$unset": { "warm_relay_endpoint": "" } },
+            None => {
+                unset.insert("warm_relay_endpoint", "");
+            }
+        }
+        // FR-27 — the companion version follows the same present/absent rule
+        // as the warm leg, and for the same reason: a stale value is worse
+        // than none. An agent that stops finding a companion (uninstalled, or
+        // a probe that started failing) must clear the field rather than leave
+        // the grid asserting a version that is no longer on the host.
+        //
+        // ⚠️ A PRE-FR-27 agent sends no field at all, which arrives here as
+        // `None` and therefore `$unset` — correct, because such an agent also
+        // never set it, so there is nothing to erase.
+        match companion_version {
+            Some(v) => {
+                set.insert("companion_version", v);
+            }
+            None => {
+                unset.insert("companion_version", "");
+            }
+        }
+        let update = if unset.is_empty() {
+            doc! { "$set": set }
+        } else {
+            doc! { "$set": set, "$unset": unset }
         };
         self.base.update_by_id(agent_id, update).await
     }
