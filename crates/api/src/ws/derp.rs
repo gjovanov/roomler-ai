@@ -546,6 +546,7 @@ fn forward_frame(
     let mut out = Vec::with_capacity(32 + payload.len());
     out.extend_from_slice(src_pubkey);
     out.extend_from_slice(payload);
+    let out_len = out.len() as u64;
     // Bounded, non-blocking: drop on overflow (loss-tolerant carrier).
     if sender.try_send(out).is_err() {
         let total = DERP_FULL_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -558,6 +559,11 @@ fn forward_frame(
                 "derp: dropped a frame on a full destination queue (slow or half-open consumer)"
             );
         }
+    } else {
+        // FR-19 — the pod actually relayed `out_len` bytes for this pair over
+        // the control plane. Counted only on a SUCCESSFUL enqueue: a dropped
+        // frame is not carried, so it must not inflate the offload baseline.
+        crate::cluster::metrics::DERP_BYTES_RELAYED_TOTAL.fetch_add(out_len, Ordering::Relaxed);
     }
 }
 
