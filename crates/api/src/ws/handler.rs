@@ -994,7 +994,17 @@ async fn handle_media_join(
         .await;
     }
 
-    let ice_servers: Vec<serde_json::Value> = if let Some(ref url) = state.settings.turn.url {
+    // ⚠️ `Some("")` is "configured" to the type system and "not configured" to
+    // everyone else. Treat a blank URL as absent, or we advertise an ICE server
+    // the browser refuses outright and no one can join a call at all.
+    let turn_url_configured = state
+        .settings
+        .turn
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+    let ice_servers: Vec<serde_json::Value> = if let Some(url) = turn_url_configured {
         let (turn_username, turn_credential) =
             if let Some(ref secret) = state.settings.turn.shared_secret {
                 let expiry = SystemTime::now()
