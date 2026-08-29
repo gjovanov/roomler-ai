@@ -330,6 +330,26 @@ impl Inner {
 /// name for the overlay badge. "Goran Jovanov" → "GJ", "gjovanov" →
 /// "GJ", "alice" → "AL", "" → "?". Splits on whitespace + common
 /// separators, takes the first letter of the first two tokens (or the
+/// The consent countdown, human-readable. `"30s"` under a minute, `"4:47"`
+/// above it — because the plain-`prompt` window is now 5 min (a locked host,
+/// FR-34 #917), and "Expires in 287s" reads far worse than "Expires in 4:47".
+/// Pure + platform-agnostic, shared by all three native panels (win/x11/mac).
+#[cfg_attr(
+    not(any(
+        all(target_os = "windows", feature = "viewer-indicator"),
+        all(target_os = "linux", feature = "viewer-indicator-x11"),
+        all(target_os = "macos", feature = "viewer-indicator-macos"),
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn format_countdown(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// first two letters of a single token), uppercased. Pure + platform-
 /// agnostic so it's unit-tested in the default CI.
 #[cfg_attr(
@@ -366,6 +386,17 @@ pub(crate) fn initials_of(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn format_countdown_reads_as_mmss_above_a_minute() {
+        use super::format_countdown;
+        assert_eq!(format_countdown(30), "30s");
+        assert_eq!(format_countdown(59), "59s");
+        assert_eq!(format_countdown(60), "1:00");
+        assert_eq!(format_countdown(287), "4:47");
+        assert_eq!(format_countdown(300), "5:00");
+        assert_eq!(format_countdown(0), "0s");
+    }
+
     use super::initials_of;
 
     #[test]
