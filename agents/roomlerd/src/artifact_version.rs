@@ -526,7 +526,8 @@ mod tests {
         // .deb/.pkg carry no signature for a version to be anchored to, so the
         // binding is reported as absent, not as a failure. See module docs.
         for name in [
-            // RETIRED-NAME-ANCHOR(8): names a PUBLISHED release asset. Filenames are fixed by what is already on GitHub Releases (FR-21 D6).
+            // RETIRED-NAME-ANCHOR(8): names a PUBLISHED release asset. Filenames are
+            // fixed by what is already on GitHub Releases (FR-21 D6).
             "roomler-agent.deb",
             "roomler-agent.pkg",
             "roomler-agent.tgz",
@@ -567,7 +568,8 @@ mod tests {
     /// ```text
     /// gh release download agent-v0.3.0-rc.458 --repo gjovanov/roomler-ai \
     ///   --pattern '*perMachine*.msi' --dir /tmp
-    // RETIRED-NAME-ANCHOR(2): names a PUBLISHED release asset. Filenames are fixed by what is already on GitHub Releases (FR-21 D6) — this is a real downloaded file.
+    // RETIRED-NAME-ANCHOR(2): names a PUBLISHED release asset. Filenames are fixed by
+    // what is already on GitHub Releases (FR-21 D6) — this is a real downloaded file.
     /// ROOMLER_TEST_MSI=/tmp/roomler-agent-0.3.0-rc.458-perMachine-x86_64-pc-windows-msvc.msi \
     /// ROOMLER_TEST_MSI_TAG=agent-v0.3.0-rc.458 \
     ///   cargo test -p roomlerd --lib -- --ignored real_published_msi

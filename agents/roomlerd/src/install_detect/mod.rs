@@ -4,7 +4,8 @@
 //! to decide whether the operator is doing a clean install, a
 //! same-flavour upgrade (preserves enrollment), or a cross-flavour
 //! switch (wipes `%APPDATA%\roomler\roomler\config.toml`, or the
-// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
+// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
+// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! pre-rename `\roomler-agent\` tree on a host that still has one —
 //! operator needs a fresh enrollment token).
 //!

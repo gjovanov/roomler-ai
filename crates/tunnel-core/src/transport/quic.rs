@@ -45,7 +45,8 @@ use super::{Capabilities, TRANSPORT_QUIC_V1, Transport};
 
 /// ALPN id for the tunnel's QUIC connections. Both ends must match or
 /// the TLS handshake fails (a cheap version/role guard).
-// RETIRED-NAME-ANCHOR(2): WIRE VALUE — the ALPN travels in the TLS ClientHello and both ends must agree, so renaming it breaks every deployed peer.
+// RETIRED-NAME-ANCHOR(2): WIRE VALUE — the ALPN travels in the TLS ClientHello and both
+// ends must agree, so renaming it breaks every deployed peer.
 const ALPN: &[u8] = b"roomler-tunnel-quic-v1";
 
 /// ALPN id for the overlay's WG-over-QUIC **datagram** carrier. Distinct from

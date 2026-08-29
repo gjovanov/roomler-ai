@@ -527,7 +527,11 @@ fn host_has_debian_tooling() -> bool {
 /// Gated like its only caller: a Windows build has no Linux picker to call it.
 #[cfg(any(not(target_os = "windows"), test))]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-// RETIRED-NAME-ANCHOR(2): every published release asset is named `roomler-agent-…` and always will be — release-agent.yml keeps that destination name deliberately, because it is an immutable surface prior releases already carry and the picker keys on it. Dropping the prefix here makes every Linux agent stop finding its own update. docs/fr/FR-21
+// RETIRED-NAME-ANCHOR(2): every published release asset is named `roomler-agent-…` and
+// always will be — release-agent.yml keeps that destination name deliberately, because
+// it is an immutable surface prior releases already carry and the picker keys on it.
+// Dropping the prefix here makes every Linux agent stop finding its own update.
+// docs/fr/FR-21
 fn is_daemon_asset(lower_name: &str) -> bool {
     lower_name.starts_with("roomler-agent") || lower_name.starts_with("roomlerd")
 }
@@ -2913,7 +2917,9 @@ mod tests {
 
         // The companion listed FIRST — asset order is GitHub's, not ours, so
         // "the daemon's happens to come first" is not a property we may rely on.
-        // RETIRED-NAME-ANCHOR(8): these are real PUBLISHED asset names, frozen by release-agent.yml as an immutable surface. Renaming them here would make the test pass against names no release actually carries. docs/fr/FR-21
+        // RETIRED-NAME-ANCHOR(8): these are real PUBLISHED asset names, frozen by
+        // release-agent.yml as an immutable surface. Renaming them here would make the
+        // test pass against names no release actually carries. docs/fr/FR-21
         let release = vec![
             mk("roomler-desktop-0.4.15-x86_64-unknown-linux-gnu.deb"),
             mk("roomler-agent-0.4.15-x86_64-unknown-linux-gnu.deb"),

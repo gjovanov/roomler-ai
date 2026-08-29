@@ -466,9 +466,11 @@ hV/0cAHGFizJ3Gl+qz5YZ4IEbnnXtgs=\n\
     ///
     /// ```text
     /// gh release download agent-v0.3.0-rc.475 --repo gjovanov/roomler-ai \
-    // RETIRED-NAME-ANCHOR(8): names a PUBLISHED release asset. Filenames are fixed by what is already on GitHub Releases (FR-21 D6).
+    // RETIRED-NAME-ANCHOR(8): names a PUBLISHED release asset. Filenames are fixed by
+    // what is already on GitHub Releases (FR-21 D6).
     ///   --pattern 'roomler-agent-*aarch64-apple-darwin.pkg*' --dir /tmp/rel
-    // RETIRED-NAME-ANCHOR(2): names a PUBLISHED release asset. Filenames are fixed by what is already on GitHub Releases (FR-21 D6).
+    // RETIRED-NAME-ANCHOR(2): names a PUBLISHED release asset. Filenames are fixed by
+    // what is already on GitHub Releases (FR-21 D6).
     /// ROOMLER_TEST_ARTIFACT=/tmp/rel/roomler-agent-0.3.0-rc.475-aarch64-apple-darwin.pkg \
     ///   cargo test -p roomlerd --lib -- --ignored real_published_asc
     /// ```
