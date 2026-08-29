@@ -1978,7 +1978,7 @@ async fn handle_server_msg(
                     detail: String::new(),
                     // The marker is written EITHER WAY — it is the
                     // machine-readable record that a decision is outstanding,
-                    // and `roomler consent --list` must show a
+                    // and `roomlerd consent --list` must show a
                     // natively-prompted session too. This field is what stops
                     // the companion from ALSO popping a panel and asking the
                     // same question twice.
