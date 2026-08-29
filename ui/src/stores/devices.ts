@@ -36,6 +36,10 @@ export interface DeviceRow {
   overlay_node_id?: string
   magic_dns_name?: string
   magic_dns_fqdn?: string
+  /** FR-40 — the node's overlay (WireGuard) PUBLIC key + epoch, so an operator
+   *  can SEE a rotation land. */
+  overlay_public_key?: string
+  overlay_key_epoch?: number
 }
 
 interface DeviceListResponse {

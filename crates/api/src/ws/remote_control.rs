@@ -143,7 +143,19 @@ pub async fn handle_agent_socket(
     let mut device_name = machine_name.clone();
     // Remote config — read off the row we are already fetching, pushed below.
     let mut desired_config = None;
+    // FR-40 — a standing rotation order with no answer yet is re-ordered on
+    // connect (the offline case, through the same path as the online one).
+    let mut pending_key_rotation: Option<String> = None;
     if let Ok(row) = state.agents.find_in_tenant(tenant_id, agent_id).await {
+        if let Some(req) = row.key_rotation.as_ref() {
+            let answered = row
+                .key_rotation_report
+                .as_ref()
+                .is_some_and(|r| r.request_id == req.request_id);
+            if !answered {
+                pending_key_rotation = Some(req.request_id.clone());
+            }
+        }
         // Prefs = the persisted probe table ordered by RTT (nearest first) —
         // the load-aware fallback ladder until a fresh report replaces it.
         let prefs = prefs_from_rtt(row.relay_rtt.as_deref().unwrap_or(&[]));
@@ -190,6 +202,36 @@ pub async fn handle_agent_socket(
                 %agent_id, %device_name, revision = desired.revision,
                 "desired config not pushed — this device's agent predates \
                  rc:agent.config; update it or apply the config locally"
+            );
+        }
+    }
+
+    // FR-40 — reconcile-on-connect for a rotation order the device has not
+    // answered. Cap-gated for the same reason as the config push: a
+    // pre-feature agent would drop the frame silently while the dashboard
+    // showed a rotation in flight — and this one is a security action.
+    if let Some(request_id) = pending_key_rotation {
+        if caps.has_rpc(RpcCap::KeyRotate) {
+            if registered_tx
+                .try_send(ServerMsg::KeyRotate {
+                    request_id: request_id.clone(),
+                })
+                .is_ok()
+            {
+                info!(%agent_id, %device_name, %request_id, "overlay-key rotation order delivered on connect");
+                if let Err(e) = state
+                    .agents
+                    .mark_key_rotation_delivered(tenant_id, agent_id, &request_id)
+                    .await
+                {
+                    warn!(%agent_id, %e, "key_rotation delivered_at write failed");
+                }
+            }
+        } else {
+            info!(
+                %agent_id, %device_name, %request_id,
+                "overlay-key rotation not ordered — this device's agent predates \
+                 rc:agent.key_rotate; update it first"
             );
         }
     }
@@ -550,6 +592,35 @@ pub async fn handle_agent_socket(
                                             outcome,
                                             live,
                                             needs_restart,
+                                            detail,
+                                        )
+                                        .await;
+                                    });
+                                    continue;
+                                }
+                                // FR-40 — the device's answer to a rotation
+                                // order. A CLAIM, stored on the row like the
+                                // config report; the join that follows is what
+                                // the server can verify (`overlay_identity`).
+                                ClientMsg::KeyRotated {
+                                    request_id,
+                                    outcome,
+                                    old_public_key,
+                                    new_public_key,
+                                    key_epoch,
+                                    detail,
+                                } => {
+                                    let state = state.clone();
+                                    tokio::spawn(async move {
+                                        record_key_rotation_report(
+                                            &state,
+                                            tenant_id,
+                                            agent_id,
+                                            request_id,
+                                            outcome,
+                                            old_public_key,
+                                            new_public_key,
+                                            key_epoch,
                                             detail,
                                         )
                                         .await;
@@ -983,6 +1054,57 @@ async fn record_config_report(
         .await
     {
         warn!(%agent_id, %e, "config report write failed");
+    }
+}
+
+/// FR-40 — persist a device's [`ClientMsg::KeyRotated`] onto its agent row.
+/// Same rules as [`record_config_report`]: last report wins, `reported_at`
+/// is stamped here, `detail` is re-clamped on receipt. Public keys only —
+/// the frame has no field for anything else, by construction.
+#[allow(clippy::too_many_arguments)]
+async fn record_key_rotation_report(
+    state: &AppState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    request_id: String,
+    outcome: roomler_ai_remote_control::models::KeyRotationOutcome,
+    old_public_key: Option<String>,
+    new_public_key: Option<String>,
+    key_epoch: u32,
+    detail: Option<String>,
+) {
+    use roomler_ai_remote_control::models::KeyRotationReport;
+
+    let clamp = |s: String, max: usize| -> String {
+        if s.chars().count() > max {
+            let mut t: String = s.chars().take(max).collect();
+            t.push('…');
+            t
+        } else {
+            s
+        }
+    };
+    // A WireGuard public key is 44 base64 chars; anything longer is not one.
+    const MAX_KEY: usize = 64;
+    let report = KeyRotationReport {
+        request_id: clamp(request_id, 64),
+        outcome,
+        old_public_key: old_public_key.map(|k| clamp(k, MAX_KEY)),
+        new_public_key: new_public_key.map(|k| clamp(k, MAX_KEY)),
+        key_epoch,
+        detail: detail.map(|d| clamp(d, KeyRotationReport::MAX_DETAIL)),
+        reported_at: bson::DateTime::now(),
+    };
+    info!(
+        %agent_id, request_id = %report.request_id, outcome = ?report.outcome,
+        key_epoch, "overlay-key rotation reported by the device"
+    );
+    if let Err(e) = state
+        .agents
+        .record_key_rotation_report(tenant_id, agent_id, &report)
+        .await
+    {
+        warn!(%agent_id, %e, "key rotation report write failed");
     }
 }
 

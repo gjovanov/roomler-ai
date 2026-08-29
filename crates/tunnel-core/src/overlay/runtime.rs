@@ -1241,6 +1241,10 @@ pub struct OverlayRuntime {
     mode: CarrierMode,
     tun_factory: TunFactory,
     mtu: u16,
+    /// FR-40 — the key epoch this node presents on its join (bumped by the
+    /// agent on every rotation, persisted next to the key). `0` = never
+    /// rotated. See [`Self::with_key_epoch`].
+    key_epoch: u32,
     /// FR-19 P4b — see [`Self::with_org_primary`].
     org_primary: bool,
     /// Phase 1 — subnet CIDRs this node advertises as a router (from config).
@@ -1476,6 +1480,16 @@ fn derived_v6_of(overlay_ip: &str) -> Option<String> {
 }
 
 impl OverlayRuntime {
+    /// FR-40 — the key epoch to present on the join. The agent persists it
+    /// next to the key and bumps it on every rotation; the server stores it
+    /// on the node row alongside the public key.
+    pub fn with_key_epoch(mut self, key_epoch: u32) -> Self {
+        self.key_epoch = key_epoch;
+        self
+    }
+}
+
+impl OverlayRuntime {
     /// Direct/test runtime: carriers come from `links`.
     pub fn new(
         keypair: WgKeypair,
@@ -1490,6 +1504,7 @@ impl OverlayRuntime {
             mode: CarrierMode::Direct(links),
             tun_factory,
             mtu,
+            key_epoch: 0,
             advertised_routes: Vec::new(),
             peer_view: None,
             org_primary: false,
@@ -1521,6 +1536,7 @@ impl OverlayRuntime {
             mode: CarrierMode::Relay,
             tun_factory,
             mtu,
+            key_epoch: 0,
             advertised_routes: Vec::new(),
             peer_view: None,
             org_primary: false,
@@ -1918,7 +1934,7 @@ impl OverlayRuntime {
         ClientMsg::OverlayJoin {
             network_hint: None,
             wg_public_key: self.keypair.public_base64(),
-            key_epoch: 0,
+            key_epoch: self.key_epoch,
             supported: vec!["wireguard-v1".to_string()],
             mtu: self.mtu,
             endpoints,
