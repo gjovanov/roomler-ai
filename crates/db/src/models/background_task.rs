@@ -35,7 +35,6 @@ pub enum TaskCategory {
     Recording,
     Export,
     Import,
-    Recognition,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
