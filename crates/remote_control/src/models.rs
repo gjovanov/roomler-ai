@@ -321,6 +321,19 @@ pub enum RpcCap {
     /// today, and if one is ever added it must not be matched by prefix
     /// against this one — the `ssh` / `ssh-consent` trap, locked by test.
     RelayServer,
+    /// FR-40 — `rc:agent.key_rotate`: the agent will mint a fresh overlay
+    /// (WireGuard) key on order, persist it, report back and re-join under
+    /// it (`docs/fr/FR-40-overlay-key-rotation.md`).
+    ///
+    /// ⚠️ Unlike `rc:agent.update`, the order must NOT be sent blind. The
+    /// dashboard shows an operator a rotation in flight, so a pre-feature
+    /// agent dropping the unknown tag in its `debug!` branch would be a lie
+    /// on a screen — and a lie about a SECURITY action, which is worse than
+    /// the config case this verb copies. Gate on it and say "device too old".
+    ///
+    /// Only advertised by builds with an overlay surface (`overlay-l3` /
+    /// `overlay-netstack`): a build with no key has nothing to rotate.
+    KeyRotate,
 }
 
 impl RpcCap {
@@ -339,11 +352,12 @@ impl RpcCap {
             Self::Config => "config",
             Self::ConfigReport => "config-report",
             Self::RelayServer => "relay-server",
+            Self::KeyRotate => "key-rotate",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 7] = [
+    pub const ALL: [RpcCap; 8] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -351,6 +365,7 @@ impl RpcCap {
         Self::Config,
         Self::ConfigReport,
         Self::RelayServer,
+        Self::KeyRotate,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -763,6 +778,23 @@ pub struct Agent {
     /// that refused unless the two numbers are compared.
     #[serde(default)]
     pub config_report: Option<ConfigReport>,
+    /// FR-40 — the standing request that this device retire its overlay key.
+    /// Desired state, exactly like [`Self::desired_config`]: it lives on the
+    /// row so a device that is offline rotates on its next connect through
+    /// the same reconcile path as one that was online when the admin clicked.
+    #[serde(default)]
+    pub key_rotation: Option<KeyRotationRequest>,
+    /// What the DEVICE last said it did with a rotation order. A claim by the
+    /// device, in the [`Self::config_report`] sense — read it against
+    /// [`Self::key_rotation`] by `request_id`, never alone.
+    #[serde(default)]
+    pub key_rotation_report: Option<KeyRotationReport>,
+    /// FR-40 — what the device last PRESENTED at its overlay join, stamped by
+    /// the server from the join frame it verified. This is the half of a
+    /// rotation the control plane can actually vouch for: a report says
+    /// "I rotated", the identity says "and here is the key it joined with".
+    #[serde(default)]
+    pub overlay_identity: Option<OverlayIdentity>,
     /// Subnet-router CIDRs this agent is a gateway for (Phase 2). The SOCKS
     /// mesh longest-prefix-matches a LAN-IP target against these to pick the
     /// covering agent, which then dials the real IP (still gated by the
@@ -1065,6 +1097,99 @@ impl ConfigReport {
     /// Bound on `detail`, applied on the device AND re-clamped on receipt — a
     /// limit that exists only on the reporting side is not a limit.
     pub const MAX_DETAIL: usize = 400;
+}
+
+/// FR-40 — an operator's standing request that a device retire its overlay
+/// (WireGuard) key and mint a fresh one (`docs/fr/FR-40-overlay-key-rotation.md`).
+///
+/// Desired state on the agent row, so the offline case has somewhere to
+/// live: the device is ordered on connect if this is present and unanswered.
+/// ⚠️ Carries NO key material in either direction — the server orders a
+/// re-mint it never sees; the only key that ever crosses the wire is the
+/// PUBLIC half in the device's report. A test asserts the order frame has
+/// no key-shaped field at all.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct KeyRotationRequest {
+    /// Fresh per request. The device echoes it in its report, which is what
+    /// lets a report about an EARLIER order be told apart from the answer to
+    /// this one — compare ids, never outcomes alone.
+    pub request_id: String,
+    pub requested_by: ObjectId,
+    pub requested_at: DateTime,
+    /// When the order was actually pushed to a live socket. Absent = queued
+    /// for the device's next connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<DateTime>,
+}
+
+/// How a device answered a rotation order. Every arm but [`Self::Rotated`] is
+/// a refusal, and — as with [`ConfigOutcome`] — the refusals are the reason
+/// the type exists: each has a different fix, and without them a device that
+/// declined and one that never heard are the same thing on a screen.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyRotationOutcome {
+    /// Minted, persisted, and the device is reconnecting under the new key.
+    /// The join that follows is what proves it — see [`OverlayIdentity`].
+    Rotated,
+    /// The device's `overlay_key_rotation` kill switch is off.
+    Disabled,
+    /// A second order arrived inside the device's own 60 s ceiling.
+    RateLimited,
+    /// This build has no overlay surface, so it has no key to rotate.
+    Unsupported,
+    /// Mint or persist failed — see `detail`. The identity is UNCHANGED: a key
+    /// that cannot be written down is not adopted, or the next restart would
+    /// bring the retired one back.
+    Failed,
+}
+
+impl KeyRotationOutcome {
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Rotated)
+    }
+}
+
+/// The DEVICE's account of a rotation order — a claim, in the
+/// [`ConfigReport`] sense, never the server's own record.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct KeyRotationReport {
+    /// Echoed from the order.
+    pub request_id: String,
+    pub outcome: KeyRotationOutcome,
+    /// Base64 WireGuard PUBLIC keys. Public by construction — the device
+    /// never has a reason to send the secret half, and the server never
+    /// stores one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_public_key: Option<String>,
+    /// The epoch the device will present on its next join (bumped per
+    /// rotation, persisted next to the key).
+    #[serde(default)]
+    pub key_epoch: u32,
+    /// Why, for the refusals. Redacted and capped by the device; re-clamped
+    /// on receipt (see [`Self::MAX_DETAIL`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Server-stamped, never taken off the wire.
+    pub reported_at: DateTime,
+}
+
+impl KeyRotationReport {
+    pub const MAX_DETAIL: usize = 400;
+}
+
+/// What a device last presented at its overlay join, as the server verified
+/// it (`ws::overlay`). Stamped on every join, so it is also simply "this
+/// device's current overlay public key" for the dashboard.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct OverlayIdentity {
+    /// Base64 WireGuard public key.
+    pub public_key: String,
+    #[serde(default)]
+    pub key_epoch: u32,
+    pub joined_at: DateTime,
 }
 
 /// Per-device roomler-SSH policy — gate 3 of four, the exact shape of
@@ -2240,6 +2365,35 @@ impl ConfigAuditEvent {
     pub const COLLECTION: &'static str = "config_audit";
 }
 
+/// FR-40 — a key-rotation order, dispatched or refused. The SERVER's own
+/// decision (authoritative), as opposed to the device's
+/// [`KeyRotationReport`] (a claim). Same discipline as [`ConfigAuditEvent`]:
+/// both arms land here from ONE call site, so a new refusal cannot forget to
+/// audit itself, and a row records what was ORDERED, never what the device
+/// did with it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KeyRotationAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    /// Who asked.
+    pub user_id: ObjectId,
+    pub at: DateTime,
+    pub request_id: String,
+    /// `pushed` (a live socket took it) or `queued` (the device was offline
+    /// and will be ordered on connect). `None` on a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<String>,
+    /// The refusal's wire string; `None` when the order went out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
+}
+
+impl KeyRotationAuditEvent {
+    pub const COLLECTION: &'static str = "key_rotation_audit";
+}
+
 /// What a device reported doing inside an SSH session (P8).
 ///
 /// Deliberately coarse. Recording session CONTENT — a pty byte stream — would
@@ -3174,6 +3328,7 @@ mod tests {
         assert_eq!(RpcCap::SshConsent.wire(), "ssh-consent");
         assert_eq!(RpcCap::Config.wire(), "config");
         assert_eq!(RpcCap::ConfigReport.wire(), "config-report");
+        assert_eq!(RpcCap::KeyRotate.wire(), "key-rotate");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.

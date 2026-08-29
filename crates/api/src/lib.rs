@@ -347,6 +347,12 @@ pub fn build_router(state: AppState) -> Router {
             "/{agent_id}/update",
             post(routes::remote_control::trigger_agent_update),
         )
+        // FR-40 — order the device to retire its overlay key (MANAGE_AGENTS;
+        // cap-gated, audited, queued for an offline device).
+        .route(
+            "/{agent_id}/overlay-key/rotate",
+            post(routes::overlay_key::rotate_overlay_key),
+        )
         // Multi-org — add an already-enrolled device to a SECOND org from the
         // UI (MANAGE_AGENTS in both). `join-targets` is the picker's source
         // of truth so the dialog can never offer a choice that 403s.
