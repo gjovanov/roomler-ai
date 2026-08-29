@@ -2881,4 +2881,42 @@ jobs:
             sleep 10
           done
           echo "::warning::release cache refresh did not confirm on every pod for ${TAG}; the cache TTL will heal it within 15 min"
+
+      # FR-27 — assert what actually broke, against the endpoint that broke it.
+      #
+      # Every Linux updater up to 0.4.15 picks its own package with
+      #   assets.iter().find(|a| name.ends_with(".deb") && name.contains(arch))
+      # and reads THIS feed. On 2026-08-29 the newly-added
+      # `roomler-desktop-*.deb` came back first, so mars and jupiter
+      # apt-installed the companion as their own daemon update: "package
+      # installed", version unchanged, no error, 34 packages of webkit onto a
+      # headless cluster node. `agent_release::order_assets_daemon_first` fixes
+      # it server-side (the only place that can reach an already-frozen agent),
+      # and this replays the broken picker against the live payload so a
+      # regression in that ordering is caught by the release that would ship it
+      # rather than by a fleet that stops updating in silence.
+      #
+      # A warning, not a failure: by this point the release is published and
+      # the assets are immutable, so failing the job would signal nothing a
+      # human could act on differently — but the line has to be loud.
+      - name: Guard — the daemon .deb still wins the pre-0.4.16 picker
+        run: |
+          set -uo pipefail
+          feed=$(curl -sS -m 60 https://roomler.ai/api/agent/latest-release) || {
+            echo "::warning::could not read the release feed; ordering unverified"; exit 0; }
+          for arch in x86_64 aarch64; do
+            # `endswith`/`contains`, not a regex — the picker being replayed
+            # does exactly that, and it keeps backslashes out of a shell string
+            # inside a YAML block scalar (three quoting layers, one of which
+            # silently ate the escape the first time this was written).
+            first=$(jq -r --arg a "$arch" '
+              [ .[0].assets[]?.name
+                | select(endswith(".deb"))
+                | select(contains($a)) ] | first // ""' <<<"$feed")
+            echo "$arch -> ${first:-<no .deb>}"
+            case "$first" in
+              ""|roomler-agent-*) ;;
+              *) echo "::warning::a pre-0.4.16 $arch agent would install '$first' as its daemon update — the companion must sort AFTER the daemon in /api/agent/latest-release (agent_release::order_assets_daemon_first)" ;;
+            esac
+          done
 # RETIRED-NAME-ANCHOR-END

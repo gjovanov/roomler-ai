@@ -427,6 +427,25 @@ impl LocalApiState for DaemonState {
             ),
             roam_adoptions: Some(tunnel_core::evidence::ROAM_ADOPTIONS.load(Ordering::Relaxed)),
             disco_answered: Some(tunnel_core::evidence::DISCO_ANSWERED.load(Ordering::Relaxed)),
+            // FR-19 — present ONLY when the responder actually bound, so a
+            // failed bind reads as "no relay here" rather than a phantom one.
+            //
+            // Gated to match `relay_server` itself: a build without the overlay
+            // features has no responder to report, and this file DOES compile
+            // in those lanes (ffmpeg-encoder, vp9-444), which a local check run
+            // only with `--features overlay-l3` will not reveal.
+            #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+            org_relay: crate::relay_server::status().map(|(listening, c)| {
+                tunnel_core::localapi::OrgRelayStatus {
+                    listening,
+                    answered: c.answered,
+                    refused_not_shaped: c.refused_not_shaped,
+                    refused_not_probe: c.refused_not_probe,
+                    refused_rate_limited: c.refused_rate_limited,
+                }
+            }),
+            #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+            org_relay: None,
         }
     }
 
