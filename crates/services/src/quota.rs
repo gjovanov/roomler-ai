@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! FR-31 — the single decision point for plan-limit checks.
+//! FR-32 — the single decision point for plan-limit checks.
 //!
 //! `Plan::limits()` publishes fourteen numbers through `GET /api/stripe/plans`
-//! and we take money against them. Before FR-31 exactly three were read back:
+//! and we take money against them. Before FR-32 exactly three were read back:
 //! `max_devices` (twice) and `max_tunnel_clients` (once), each as a hand-rolled
 //! count-compare-format block. The other eleven were advertised and enforced
 //! nowhere.
@@ -24,10 +24,10 @@ use roomler_ai_db::models::{Plan, PlanEnforcement, PlanLimits};
 /// that review would otherwise have to remember to ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
-    // ── Established before FR-31: always enforced ───────────────────
+    // ── Established before FR-32: always enforced ───────────────────
     MaxDevices,
     MaxTunnelClients,
-    // ── Wired by FR-31: subject to `PlanEnforcement` ────────────────
+    // ── Wired by FR-32: subject to `PlanEnforcement` ────────────────
     MaxMembers,
     MaxChannels,
     StorageBytes,
@@ -41,7 +41,7 @@ pub enum Limit {
 }
 
 impl Limit {
-    /// Was this limit already enforced before FR-31?
+    /// Was this limit already enforced before FR-32?
     ///
     /// ⚠ **Load-bearing.** `PlanEnforcement` exists to stage *new* enforcement
     /// safely, not to hand anyone a switch that turns the device cap off. An
@@ -115,7 +115,7 @@ pub struct QuotaDenial {
 
 impl QuotaDenial {
     /// The message shown to the caller. Deliberately the same shape the three
-    /// pre-FR-31 sites already used, so P0 is observable-behaviour-neutral.
+    /// pre-FR-32 sites already used, so P0 is observable-behaviour-neutral.
     pub fn message(&self) -> String {
         format!(
             "{} limit reached for the {:?} plan ({} of {} {} used). \
@@ -140,7 +140,7 @@ fn capitalise(s: &str) -> String {
 /// Check one limit for a tenant.
 ///
 /// `used` is the count *before* the operation the caller is about to perform,
-/// so the comparison is `used >= max` — matching the three pre-FR-31 sites,
+/// so the comparison is `used >= max` — matching the three pre-FR-32 sites,
 /// where a tenant at exactly its cap is refused the next one.
 ///
 /// Returns `Ok(())` when the operation may proceed. That includes the
@@ -153,7 +153,7 @@ pub fn check(
     used: u64,
 ) -> Result<(), QuotaDenial> {
     // `Off` means no check runs — but never for a limit that was already
-    // enforced before FR-31, which the mode was never meant to reach.
+    // enforced before FR-32, which the mode was never meant to reach.
     if matches!(mode, PlanEnforcement::Off) && !limit.is_established() {
         return Ok(());
     }
@@ -243,11 +243,11 @@ mod tests {
         ] {
             assert!(
                 check(Plan::Free, mode, Limit::MaxDevices, 3).is_err(),
-                "max_devices must refuse under {mode:?} — it was enforced before FR-31"
+                "max_devices must refuse under {mode:?} — it was enforced before FR-32"
             );
             assert!(
                 check(Plan::Free, mode, Limit::MaxTunnelClients, 3).is_err(),
-                "max_tunnel_clients must refuse under {mode:?} — it was enforced before FR-31"
+                "max_tunnel_clients must refuse under {mode:?} — it was enforced before FR-32"
             );
         }
     }

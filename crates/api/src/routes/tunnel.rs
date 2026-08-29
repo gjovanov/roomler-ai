@@ -131,7 +131,7 @@ pub async fn enroll_tunnel_client(
             // `enroll_agent`: only NEW rows consume a slot.
             let tenant = state.tenants.base.find_by_id(tid).await?;
             let used = state.tunnel_clients.count_active_for_tenant(tid).await?;
-            // FR-31: decision + record in `quota::check`. `MaxTunnelClients` is
+            // FR-32: decision + record in `quota::check`. `MaxTunnelClients` is
             // an established limit, so it refuses whatever the mode says.
             if let Err(d) = quota::check(
                 tenant.plan.clone(),
