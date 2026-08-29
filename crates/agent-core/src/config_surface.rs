@@ -462,6 +462,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "FR-33 - probe each LAN prefix for a corp-VPN split-prefix capture (own address on interface A, traffic to the prefix leaves via interface B) and surface it in status / why / the RC pill. Built-in default: on (a read-only route lookup per LAN address per netstate snapshot). Env: ROOMLERD_OVERLAY_LAN_CAPTURE_PROBE. Restart required.",
     ),
     (
+        "relay_ceiling_learn",
+        "tribool",
+        "FR-35 - let the constrained (relay) ceiling grow above the nominal 3 Mbps on delivery evidence (AIMD pinned at the ceiling, the window carried >=70% of it, no decrease/stall for 10 s, viewer age within 1.5x floor) and remember the pair's stable rate so the next session opens there. Built-in default: on. Env: ROOMLERD_RELAY_CEILING_LEARN. Restart required.",
+    ),
+    (
+        "relay_max_hi_kbps",
+        "string",
+        "FR-35 - upper bound (kbps, 0-100000) for the learned relay ceiling. Empty = built-in 8000 (one pair measured: sustained 6-9 Mbps, choked at 12.8); 0 = learning off. Env: ROOMLERD_RELAY_MAX_HI_KBPS. Restart required.",
+    ),
+    (
         "idle_refine_max_edge",
         "string",
         "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLERD_IDLE_REFINE_MAX_EDGE. Restart required.",
@@ -738,7 +748,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
         "gpu_scale" => cfg.gpu_scale.map(fmt_bool),
         "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe.map(fmt_bool),
+        "relay_ceiling_learn" => cfg.relay_ceiling_learn.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
+        "relay_max_hi_kbps" => cfg.relay_max_hi_kbps.map(|p| p.to_string()),
         "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
         "idle_refine_major_area_permille" => {
             cfg.idle_refine_major_area_permille.map(|p| p.to_string())
@@ -1112,7 +1124,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine_balanced" => cfg.idle_refine_balanced = parse_tribool(value)?,
         "gpu_scale" => cfg.gpu_scale = parse_tribool(value)?,
         "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe = parse_tribool(value)?,
+        "relay_ceiling_learn" => cfg.relay_ceiling_learn = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
+        "relay_max_hi_kbps" => cfg.relay_max_hi_kbps = parse_u32_range(key, value, 0, 100_000)?,
         "idle_refine_min_frame_kb" => {
             cfg.idle_refine_min_frame_kb = parse_u32_range(key, value, 0, 256)?
         }
