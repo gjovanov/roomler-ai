@@ -452,7 +452,12 @@ fn paint<C: Connection>(
 
     let (dx, dy, dw, dh) = deny_rect();
     let (ax, ay, aw, ah) = approve_rect();
-    text(MUTED, PAD, ay + 20, &format!("Expires in {secs}s"))?;
+    text(
+        MUTED,
+        PAD,
+        ay + 20,
+        &format!("Expires in {}", super::format_countdown(secs)),
+    )?;
     fill(DENY, dx, dy, dw, dh)?;
     text(TEXT, dx + 34, dy + 20, "Deny")?;
     fill(APPROVE, ax, ay, aw, ah)?;
