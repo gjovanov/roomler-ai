@@ -13,6 +13,12 @@ use anyhow::Result;
 #[cfg(feature = "scrap-capture")]
 pub mod scrap_backend;
 
+/// FR-29 P1 — the "did anything change?" answer XShm cannot give.
+/// Linux-only: every other platform's backend already has an equivalent
+/// (DXGI reports `WouldBlock`; WGC reports DirtyRegions).
+#[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+pub mod x11_damage;
+
 #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
 pub mod wgc_backend;
 
@@ -198,6 +204,20 @@ pub trait ScreenCapture: Send {
     /// Applies from the NEXT frame (one-frame lag, same-in-kind as the
     /// dim-change encoder rebuild).
     fn set_output_cap(&mut self, _target: Option<(u32, u32)>) {}
+
+    /// FR-29 — cumulative frames the backend declined to produce because it
+    /// PROVED the screen was unchanged.
+    ///
+    /// ⚠️ Deliberately NOT folded into the pump's `frames_empty`. The two
+    /// look identical at the call site (both are `Ok(None)`) and mean opposite
+    /// things: `frames_empty` ≫ `frames_encoded` is the documented
+    /// "pump is frame-production-bound" symptom — a host in trouble — whereas
+    /// a high `frames_unchanged` is a host doing exactly the right thing on an
+    /// idle desktop. Merging them would silently retire a working diagnostic.
+    /// Backends that cannot tell (the pre-FR-29 default) report 0.
+    fn frames_unchanged(&self) -> u64 {
+        0
+    }
 }
 
 /// P8a — re-project tracked damage through a downscale. Per-EDGE
