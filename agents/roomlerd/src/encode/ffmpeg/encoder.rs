@@ -1915,9 +1915,9 @@ mod tests {
         // SAFETY: same reasoning as encode/mod.rs::relay_max_bps_reads_env —
         // nothing else in the crate touches this var at test time, and any
         // future test that does must share AQ_ENV_LOCK.
-        let prior = std::env::var("ROOMLER_AGENT_NVENC_SPATIAL_AQ").ok();
+        let prior = std::env::var("ROOMLERD_NVENC_SPATIAL_AQ").ok();
 
-        unsafe { std::env::remove_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ") };
+        unsafe { std::env::remove_var("ROOMLERD_NVENC_SPATIAL_AQ") };
         let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(
             !summary.contains("spatial-aq"),
@@ -1927,7 +1927,7 @@ mod tests {
         assert!(summary.contains("forced-idr=1"), "got: {summary}");
         assert!(summary.contains("rc=vbr"), "got: {summary}");
 
-        unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "1") };
+        unsafe { std::env::set_var("ROOMLERD_NVENC_SPATIAL_AQ", "1") };
         let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(
             summary.contains("spatial-aq=1"),
@@ -1935,13 +1935,13 @@ mod tests {
         );
 
         // Any non-"1" value keeps it off (explicit-opt-in semantics).
-        unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "0") };
+        unsafe { std::env::set_var("ROOMLERD_NVENC_SPATIAL_AQ", "0") };
         let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(!summary.contains("spatial-aq"), "got: {summary}");
 
         match prior {
-            Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", v) },
-            None => unsafe { std::env::remove_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ") },
+            Some(v) => unsafe { std::env::set_var("ROOMLERD_NVENC_SPATIAL_AQ", v) },
+            None => unsafe { std::env::remove_var("ROOMLERD_NVENC_SPATIAL_AQ") },
         }
     }
 }

@@ -551,7 +551,7 @@ pub const REFINE_SPARSE_MAX: u32 = 2;
 /// deltas, hover highlights — invisible to the state machine. Terminal
 /// text compresses hard, so a few scrolled lines at the LOW rung can duck
 /// under this — harmless: the stream just refines sooner. Env
-/// `ROOMLER_AGENT_IDLE_REFINE_MIN_FRAME_KB` (0 = legacy: every real frame
+/// `ROOMLERD_IDLE_REFINE_MIN_FRAME_KB` (0 = legacy: every real frame
 /// counts).
 ///
 /// P7c-2 — the threshold is defined AT the reference rung below and
@@ -1019,17 +1019,17 @@ mod tests {
 
         // SAFETY: no other test in this crate touches these vars (set_var
         // is unsafe in edition 2024 because of cross-thread env races).
-        unsafe { std::env::set_var("ROOMLER_AGENT_RATE_FACTOR_HEVC", "140") };
+        unsafe { std::env::set_var("ROOMLERD_RATE_FACTOR_HEVC", "140") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 140);
         // Clamped to 50–400.
-        unsafe { std::env::set_var("ROOMLER_AGENT_RATE_FACTOR_HEVC", "10") };
+        unsafe { std::env::set_var("ROOMLERD_RATE_FACTOR_HEVC", "10") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 50);
-        unsafe { std::env::set_var("ROOMLER_AGENT_RATE_FACTOR_HEVC", "9000") };
+        unsafe { std::env::set_var("ROOMLERD_RATE_FACTOR_HEVC", "9000") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 400);
         // Garbage falls back to the built-in.
-        unsafe { std::env::set_var("ROOMLER_AGENT_RATE_FACTOR_HEVC", "fast") };
+        unsafe { std::env::set_var("ROOMLERD_RATE_FACTOR_HEVC", "fast") };
         assert_eq!(codec_rate_factor_pct("HEVC"), 125);
-        unsafe { std::env::remove_var("ROOMLER_AGENT_RATE_FACTOR_HEVC") };
+        unsafe { std::env::remove_var("ROOMLERD_RATE_FACTOR_HEVC") };
         // Other codecs untouched by the HEVC var.
         assert_eq!(codec_rate_factor_pct("H264"), 150);
     }
