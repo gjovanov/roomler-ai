@@ -1270,6 +1270,9 @@ mod tests {
         // The primary name wins when both are set — otherwise a stale alias on
         // a field host would quietly override the value an operator just set.
         clear();
+        // RAW-ENV-DELIBERATE: `test_env::set_as` clears the sibling
+        // spellings, and this assertion needs BOTH set at once so the chain has
+        // something to choose between.
         unsafe { std::env::set_var("ROOMLERD_HW_AUTO", "1") };
         unsafe { std::env::set_var("ROOMLER_AGENT_HW_AUTO", "0") };
         assert!(!hw_auto_disabled(), "ROOMLERD_* must take precedence");
@@ -1301,9 +1304,9 @@ mod tests {
         // Isolate from any operator env override so the defaults are asserted.
         // SAFETY: guarded by RELAY_ENV_LOCK against the known writers.
         unsafe {
-            std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_EDGE");
-            std::env::remove_var("ROOMLER_AGENT_SMOOTH_MAX_EDGE");
-            std::env::remove_var("ROOMLERD_PRIORITY_RES_CAP");
+            tunnel_core::env::test_env::clear("RELAY_MAX_EDGE");
+            tunnel_core::env::test_env::clear("SMOOTH_MAX_EDGE");
+            tunnel_core::env::test_env::clear("PRIORITY_RES_CAP");
         }
         // rc.445 DEFAULT: no dial dims-caps on any path — a mid-motion rung
         // flip costs a blocking encoder open (field-measured 0.65-0.87 s on
@@ -1318,7 +1321,7 @@ mod tests {
             assert_eq!(priority_relay_cap(dial, false), None);
         }
         // The restore switch brings back the rc.443 caps for A/B.
-        unsafe { std::env::set_var("ROOMLERD_PRIORITY_RES_CAP", "1") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "PRIORITY_RES_CAP", "1") };
         assert_eq!(priority_relay_cap(priority::BALANCED, true), Some(1280));
         assert_eq!(priority_relay_cap(priority::BALANCED, false), None);
         assert_eq!(priority_relay_cap(priority::SHARPER, true), None);
@@ -1326,14 +1329,14 @@ mod tests {
         assert_eq!(priority_relay_cap(priority::SMOOTHER, true), Some(1024));
         assert_eq!(priority_relay_cap(priority::SMOOTHER, false), Some(1024));
         assert_eq!(priority_relay_cap(42, true), Some(1280));
-        unsafe { std::env::remove_var("ROOMLERD_PRIORITY_RES_CAP") };
+        unsafe { tunnel_core::env::test_env::clear("PRIORITY_RES_CAP") };
     }
 
     #[test]
     fn dial_rate_factor_defaults_per_dial() {
         unsafe {
-            std::env::remove_var("ROOMLER_AGENT_SMOOTHER_RATE_PCT");
-            std::env::remove_var("ROOMLER_AGENT_BALANCED_RATE_PCT");
+            tunnel_core::env::test_env::clear("SMOOTHER_RATE_PCT");
+            tunnel_core::env::test_env::clear("BALANCED_RATE_PCT");
         }
         assert_eq!(dial_rate_factor_pct(priority::SHARPER), 100);
         assert_eq!(dial_rate_factor_pct(priority::SMOOTHER), 70);
@@ -1350,7 +1353,7 @@ mod tests {
         // SAFETY: same hermetic save/restore contract as the sibling env
         // tests; serialised on RELAY_ENV_LOCK.
         let prior = std::env::var("ROOMLERD_IDLE_REFINE_BALANCED").ok();
-        unsafe { std::env::remove_var("ROOMLERD_IDLE_REFINE_BALANCED") };
+        unsafe { tunnel_core::env::test_env::clear("IDLE_REFINE_BALANCED") };
 
         // Smoother refines on EVERY path (its cap applies on every path).
         assert!(idle_refine_applies(priority::SMOOTHER, true));
@@ -1362,17 +1365,19 @@ mod tests {
         assert!(idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
         // The kill switch restores the un-refined Balanced rung.
-        unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", "0") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", "0") };
         assert!(!idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
         // The old opt-in spelling stays valid.
-        unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", "1") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", "1") };
         assert!(idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
 
         match prior {
-            Some(v) => unsafe { std::env::set_var("ROOMLERD_IDLE_REFINE_BALANCED", v) },
-            None => unsafe { std::env::remove_var("ROOMLERD_IDLE_REFINE_BALANCED") },
+            Some(v) => unsafe {
+                tunnel_core::env::test_env::set_as("ROOMLERD_", "IDLE_REFINE_BALANCED", &v)
+            },
+            None => unsafe { tunnel_core::env::test_env::clear("IDLE_REFINE_BALANCED") },
         }
     }
 
@@ -1440,6 +1445,9 @@ mod tests {
         // The current spelling wins when both are set — otherwise a stale alias
         // on a field host would quietly override the value an operator just set.
         clear();
+        // RAW-ENV-DELIBERATE: `test_env::set_as` clears the sibling
+        // spellings, and this assertion needs BOTH set at once so the chain has
+        // something to choose between.
         unsafe { std::env::set_var("ROOMLERD_RELAY_MAX_KBPS", "1500") };
         unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "4200") };
         assert_eq!(
