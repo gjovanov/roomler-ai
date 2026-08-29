@@ -1662,6 +1662,13 @@ mod sshd {
             detail: what.to_string(),
             org: String::new(),
             timeout,
+            // Companion, not native: the SSH server is constructed inside the
+            // overlay's TUN factory and has no `ViewerIndicator` handle. It
+            // would have to ride `SessionServices` the way the broker does —
+            // worth doing, and deliberately not smuggled in here, where it
+            // would be a second unreviewed plumbing change inside a security
+            // path.
+            surface: crate::consent::PromptSurface::Companion,
         };
         if let Err(e) = broker.write_prompt(sentinel, &prompt) {
             warn!(%caller, %sentinel, %e, "ssh: could not write the .pending consent marker — no on-screen prompt is possible for this session");

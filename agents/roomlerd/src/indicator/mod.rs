@@ -35,6 +35,41 @@ use anyhow::Result;
 /// select!) even when the overlay is disabled.
 pub type KillSender = tokio::sync::mpsc::Sender<bson::oid::ObjectId>;
 
+/// FR-27 — where an operator's Approve/Deny click on a NATIVE prompt comes
+/// back: `(session hex, allowed)`.
+///
+/// The backend does not resolve consent itself. It hands the answer here, the
+/// signalling loop feeds it to `ConsentBroker::record_decision`, and the broker
+/// applies the gate it already has — a decision counts only as an answer to a
+/// question it is actively asking. One resolution point for the native panel,
+/// the companion and the CLI alike; three would be three chances to disagree
+/// about whether a session was approved.
+pub type ConsentSender = tokio::sync::mpsc::Sender<(String, bool)>;
+
+/// FR-27 — one consent question, as a native surface needs to draw it.
+///
+/// Deliberately pre-rendered strings rather than the wire types: a window
+/// procedure running on a Win32 pump thread (or an X11 event loop, or the
+/// AppKit main thread) should be laying out text, not reasoning about
+/// `Permissions` bitflags or which subsystem asked.
+#[derive(Clone, Debug)]
+pub struct PromptView {
+    pub session_hex: String,
+    /// "Remote control request" / "Command execution request" / …
+    pub title: String,
+    /// "Alice is requesting to control this device."
+    pub lead: String,
+    /// The redacted command for `exec`, the activity for `ssh`; empty for rc.
+    pub detail: String,
+    /// Pipe-separated permission names; empty for exec/ssh.
+    pub permissions: String,
+    /// Asking organization on a multi-org device; empty otherwise.
+    pub org: String,
+    /// When the prompt stops mattering — so the panel can count down against
+    /// the real deadline rather than one it started itself.
+    pub expires_at: std::time::Instant,
+}
+
 /// A handle to the viewer-indicator worker. Cheap to clone; multiple
 /// sessions sharing one handle is the common case (one worker, many
 /// concurrent sessions → one combined label).
@@ -65,9 +100,10 @@ impl ViewerIndicator {
     pub fn new(
         kill_tx: KillSender,
         registry: crate::rc_sessions::RcSessionRegistry,
+        consent_tx: ConsentSender,
     ) -> Result<Self> {
         Ok(Self {
-            inner: Inner::new(kill_tx.clone())?,
+            inner: Inner::new(kill_tx.clone(), consent_tx)?,
             registry,
             kill_tx: Some(kill_tx),
         })
@@ -131,6 +167,27 @@ impl ViewerIndicator {
         }
     }
 
+    /// FR-27 — put a consent question on this device's screen, natively.
+    ///
+    /// Returns `false` when this build/platform/session has no native surface
+    /// — which is the ordinary answer on a headless host, on Wayland under
+    /// GNOME or KDE (neither exposes `wlr-layer-shell` to arbitrary clients),
+    /// and in a build without the per-OS feature. The caller then falls back
+    /// to the desktop companion, and only reports `no_prompt_surface` when
+    /// that fails too.
+    ///
+    /// Answers arrive on the `ConsentSender` given at construction, never by
+    /// resolving consent here: the broker stays the single decision point.
+    pub fn show_prompt(&self, view: PromptView) -> bool {
+        self.inner.prompt(view)
+    }
+
+    /// Take a consent prompt down — it was answered, timed out, or resolved
+    /// somewhere else (the CLI, the companion, an emailed link). Idempotent.
+    pub fn hide_prompt(&self, session_hex: &str) {
+        self.inner.dismiss(session_hex);
+    }
+
     /// Announce that a session has ended. When the last session drops,
     /// the overlay is hidden.
     pub fn hide_session(&self, session_id: String) {
@@ -158,9 +215,9 @@ struct Inner;
 
 #[cfg(not(all(target_os = "windows", feature = "viewer-indicator")))]
 impl Inner {
-    fn new(_kill_tx: KillSender) -> Result<Self> {
-        // Drop the sender: `run()` retains its own clone to keep the
-        // channel open, so the signaling `select!` never busy-spins on a
+    fn new(_kill_tx: KillSender, _consent_tx: ConsentSender) -> Result<Self> {
+        // Drop the senders: `run()` retains its own clones to keep the
+        // channels open, so the signaling `select!` never busy-spins on a
         // fully-closed receiver even without a real overlay here.
         Ok(Self)
     }
@@ -169,6 +226,12 @@ impl Inner {
     }
     fn show(&self, _session_id: String, _controller_name: String) {}
     fn hide(&self, _session_id: String) {}
+    /// No native surface here — say so, rather than swallowing the prompt.
+    /// `false` is what routes the caller to the companion.
+    fn prompt(&self, _view: PromptView) -> bool {
+        false
+    }
+    fn dismiss(&self, _session_hex: &str) {}
 }
 
 /// Compute a 1–2 character initials label from a controller's display
