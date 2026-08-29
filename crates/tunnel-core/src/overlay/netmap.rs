@@ -163,6 +163,7 @@ mod tests {
             supports_derp: false,
             supports_forced_derp: false,
             supports_derp_floor: false,
+            supports_org_relay: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],
