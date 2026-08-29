@@ -1840,6 +1840,60 @@ export async function isH264HwDecodeSupported(): Promise<boolean> {
   }
 }
 
+/**
+ * FR-22 — memoise a capability probe for the lifetime of the page.
+ *
+ * ⚠️ Measured, not assumed. Driving a real session through the browser
+ * caught `probes_ready: +1878 ms` on a reconnect — **45 % of that
+ * connect's entire 4216 ms time-to-first-frame** — while other connects
+ * in the same page showed 7-8 ms for identical work. `connect()` fires
+ * seven of these concurrently on EVERY attempt and nothing cached them,
+ * so every reconnect paid it again.
+ *
+ * Sound to cache because the answers cannot change while the page lives:
+ * they describe this browser's decoders and this machine's GPU. A driver
+ * change needs at minimum a reload, which clears this.
+ *
+ * The PROMISE is memoised, not the value. `connect()` launches these in
+ * a `Promise.all`, so a value-only cache would still let a second caller
+ * start a second probe while the first was in flight — precisely the
+ * case that is slow.
+ *
+ * ⚠️ A rejection is NOT cached: every probe resolves `false` on failure
+ * rather than throwing, so a cached rejection would be a permanent false
+ * negative. Re-probing next call is the safe direction.
+ *
+ * ⚠️ Applied at the CALL SITE, not to the exported probes. The exported
+ * `isXxxSupported` stay pure so they remain individually testable
+ * against a stubbed `VideoDecoder` / `mediaCapabilities` — memoising
+ * those directly made one existing test fail by serving a previous
+ * test's stub, which is the same staleness this would cause for anyone
+ * re-probing after an environment change.
+ */
+export function memoProbe<T>(fn: () => Promise<T>): () => Promise<T> {
+  let inflight: Promise<T> | null = null
+  return () => {
+    if (inflight) return inflight
+    const p = fn().catch((e) => {
+      inflight = null
+      throw e
+    })
+    inflight = p
+    return p
+  }
+}
+
+/** The probe set `connect()` runs on every attempt, cached per page. */
+const probeAv1Hw = memoProbe(isAv1HwDecodeSupported)
+const probeHevcHw = memoProbe(isHevcHwDecodeSupported)
+const probeHevcDec = memoProbe(isHevcDecodeSupported)
+const probeVp9Hw = memoProbe(isVp9HwDecodeSupported)
+const probeVp9_444 = memoProbe(isVp9_444DecodeSupported)
+const probeH264Hw = memoProbe(isH264HwDecodeSupported)
+const probeH264Dc = memoProbe(isH264DcDecodeSupported)
+const probeAv1Dec = memoProbe(isAv1DecodeSupported)
+const probeHevcRext = memoProbe(isHevcRextDecodeSupported)
+
 /** rc.190 Ã¢ÂÂ inputs to the pure transport auto-rank. `agentTransports` /
  *  `agentHwEncoders` come from `Agent.capabilities` (the agent's caps
  *  probe truth); the `viewer*` bits are this browser's MediaCapabilities
@@ -7531,13 +7585,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // and pick the best pair; explicit user picks skip this entirely.
       const caps = agent?.value?.capabilities
       const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec] = await Promise.all([
-        isAv1HwDecodeSupported(),
-        isHevcHwDecodeSupported(),
-        isHevcDecodeSupported(),
-        isVp9HwDecodeSupported(),
-        isVp9_444DecodeSupported(),
-        isH264HwDecodeSupported(),
-        isH264DcDecodeSupported(),
+        probeAv1Hw(),
+        probeHevcHw(),
+        probeHevcDec(),
+        probeVp9Hw(),
+        probeVp9_444(),
+        probeH264Hw(),
+        probeH264Dc(),
       ])
       vp9_444Supported.value = vp9Dec
       hevcSupported.value = hevcDec
@@ -7587,11 +7641,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // RTP path silently Ã¢ÂÂ same behaviour as before P2.
       const h264Caps = agent?.value?.capabilities
       const agentHasH264Dc = (h264Caps?.transports ?? []).includes('data-channel-h264')
-      const codec = agentHasH264Dc ? await isH264DcDecodeSupported() : null
+      const codec = agentHasH264Dc ? await probeH264Dc() : null
       if (agentHasH264Dc && codec && !failedDcTransports.has('data-channel-h264')) {
         preferredTransport = 'data-channel-h264'
         h264DcCodec = codec
-        viewerDecodeHw.value = await isH264HwDecodeSupported()
+        viewerDecodeHw.value = await probeH264Hw()
       } else if (failedDcTransports.has('data-channel-h264')) {
         console.info(
           '[rc] data-channel-h264 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to the RTP track.',
@@ -7606,7 +7660,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } else if (videoTransport.value === 'data-channel-av1') {
       // rc.190 Ã¢ÂÂ explicit AV1 pick. Chromium always has dav1d SW decode,
       // so gate only on decodability; the badge surfaces HW vs SW truth.
-      const decodable = av1Supported.value || (await isAv1DecodeSupported())
+      const decodable = av1Supported.value || (await probeAv1Dec())
       av1Supported.value = decodable
       if (decodable && !failedDcTransports.has('data-channel-av1')) {
         preferredTransport = 'data-channel-av1'
@@ -7621,7 +7675,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         )
       }
     } else if (videoTransport.value === 'data-channel-vp9-444') {
-      const supported = vp9_444Supported.value || (await isVp9_444DecodeSupported())
+      const supported = vp9_444Supported.value || (await probeVp9_444())
       vp9_444Supported.value = supported
       if (supported && !failedDcTransports.has('data-channel-vp9-444')) {
         preferredTransport = 'data-channel-vp9-444'
@@ -7645,11 +7699,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // `smooth` + `powerEfficient`. On failure we fall back to VP9 4:2:0
       // (profile 0 = universal fixed-function HW decode) Ã¢ÂÂ NOT VP9-444
       // (profile 1), which is ALSO software-decoded and would hang too.
-      const decodable = hevcSupported.value || (await isHevcDecodeSupported())
+      const decodable = hevcSupported.value || (await probeHevcDec())
       hevcSupported.value = decodable
       const hwSmooth = decodable
         && !failedDcTransports.has('data-channel-hevc')
-        && (await isHevcHwDecodeSupported())
+        && (await probeHevcHw())
       if (hwSmooth) {
         preferredTransport = 'data-channel-hevc'
         viewerDecodeHw.value = true
@@ -7658,7 +7712,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // the agent's advertised hevc_chroma. Either missing → silently run
         // the normal 4:2:0 HEVC session (no chroma_pref sent).
         if (vp9Chroma.value === 'yuv444') {
-          const rext = hevcRextSupported.value || (await isHevcRextDecodeSupported())
+          const rext = hevcRextSupported.value || (await probeHevcRext())
           hevcRextSupported.value = rext
           const agentRext =
             agent?.value?.capabilities?.hevc_chroma?.includes('yuv444') === true
@@ -7673,7 +7727,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           }
         }
       } else {
-        const vp9Ok = vp9_444Supported.value || (await isVp9_444DecodeSupported())
+        const vp9Ok = vp9_444Supported.value || (await probeVp9_444())
         vp9_444Supported.value = vp9Ok
         const fallback = vp9Ok && !failedDcTransports.has('data-channel-vp9-444')
         if (fallback) {
