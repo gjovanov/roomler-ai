@@ -47,6 +47,14 @@ impl RemoteSessionDao {
         Ok(session)
     }
 
+    // FR-32 P1b — a `count_active_for_tenant` was written here for the plan's
+    // `max_concurrent_sessions` gate and then REMOVED, because it would have
+    // counted an empty collection forever: `RemoteSessionDao::create` has zero
+    // callers workspace-wide, and live sessions exist only in the Hub's
+    // in-memory `DashMap`. A gate reading a table nothing writes can never
+    // fire, while reading in review as though it does — the same trap the
+    // `cloud_integrations` gate was withheld for. See the FR-32 spec.
+
     pub async fn find_in_tenant(
         &self,
         tenant_id: ObjectId,
