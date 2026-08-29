@@ -57,6 +57,32 @@ impl RateMemory {
         );
     }
 
+    /// Record a SESSION's stable rate. An idle session's "stable rate" is
+    /// just the seed it opened at (85 % of what was remembered), so writing it
+    /// back would decay the memory by 15 % per idle session until it sits at
+    /// the nominal — measured on the first field run (3.60 → 3.06 Mbps after a
+    /// 14-s idle session). The rule: a LOWER value is only accepted when the
+    /// session saw a decrease (real evidence the pair could not carry the old
+    /// memory); otherwise the old value is kept and its timestamp refreshed.
+    /// Returns the value now on record.
+    pub fn record_session(
+        &mut self,
+        peer: &str,
+        stable_bps: u32,
+        had_decrease: bool,
+        now_unix: u64,
+    ) -> u32 {
+        if !had_decrease
+            && let Some(old) = self.seed_for(peer, now_unix)
+            && old > stable_bps
+        {
+            self.record(peer, old, now_unix);
+            return old;
+        }
+        self.record(peer, stable_bps, now_unix);
+        stable_bps
+    }
+
     /// Missing or unreadable ⇒ empty (logged at debug by the caller if it
     /// cares); a cache must never fail a session.
     pub fn load(path: &Path) -> Self {
@@ -130,6 +156,24 @@ mod tests {
         std::fs::write(&path, b"{not json").unwrap();
         assert_eq!(RateMemory::load(&path), RateMemory::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_idle_session_never_lowers_the_memory_but_a_decrease_does() {
+        let now = 1_788_000_000u64;
+        let mut m = RateMemory::default();
+        assert_eq!(m.record_session("p", 3_598_387, false, now), 3_598_387);
+        // Idle session opened at 85 % and held it: no evidence, keep the old.
+        assert_eq!(m.record_session("p", 3_058_628, false, now + 60), 3_598_387);
+        assert_eq!(m.entries["p"].at_unix, now + 60, "timestamp refreshed");
+        // A session that saw a decrease may lower it.
+        assert_eq!(m.record_session("p", 3_058_628, true, now + 120), 3_058_628);
+        // A higher value always replaces, decrease or not.
+        assert_eq!(
+            m.record_session("p", 4_000_000, false, now + 180),
+            4_000_000
+        );
+        assert_eq!(m.record_session("p", 4_100_000, true, now + 240), 4_100_000);
     }
 
     #[test]
