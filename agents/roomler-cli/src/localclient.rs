@@ -1304,6 +1304,25 @@ fn print_status(s: &NodeStatus) {
         }
     }
 
+    // FR-19 — the org-relay probe responder. Absent means this node is not
+    // serving; it never means "serving but idle", which is why `answered` is
+    // printed even when zero.
+    if let Some(r) = &s.org_relay {
+        // `bound` is not `reachable`: a DNAT can eat the port upstream of the
+        // socket (measured on mars). `answered > 0` is the only line here that
+        // is evidence someone actually got through.
+        let reach = if r.answered > 0 {
+            "reachable (probes answered)"
+        } else {
+            "bound — NOT yet proven reachable"
+        };
+        println!("  org relay   {} — {reach}", r.listening);
+        println!(
+            "              answered={} refused: shape={} not-probe={} rate={}",
+            r.answered, r.refused_not_shaped, r.refused_not_probe, r.refused_rate_limited
+        );
+    }
+
     // PR-B1 — per-bound-direct-socket receive liveness: a socket with rx=0 /
     // a growing last_rx age while its endpoint is advertised is a dead reader
     // (the 2026-08-10 wedge: bound, advertised, Recv-Q pegged, never read).
