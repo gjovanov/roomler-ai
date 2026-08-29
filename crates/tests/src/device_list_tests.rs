@@ -128,6 +128,7 @@ async fn seed_node(
             supports_server_relay_strategy: false,
             supports_derp_floor: false,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             advertised_routes: vec![],
         })
         .await
