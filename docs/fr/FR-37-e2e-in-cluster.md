@@ -80,7 +80,7 @@ seam for a production-shaped hazard on a node that also runs real workloads.
 | P1 | Job manifest + initContainer clone; prove one conference spec passes in-cluster | the existing host-side path stays until this is green |
 | P2 | ✅ done differently: a **sidecar in the app pod**, not a Job — a Job cannot share the app's network namespace, and that namespace is the whole point | revert the script; the overlay change is two files |
 | P3 | ✅ done — the conference entries are gone | — |
-| P4 | **New**: the in-pod run is much slower (44/170 in ~20 min, vs 170 in 17.8 min on the host). The sidecar shares the pod's CPU budget with the app | raise the sidecar's limits, or shard workers |
+| ~~P4~~ | ~~the in-pod run is much slower~~ — **retracted, it is nearly 3× FASTER**: the full sweep takes **6.5 min** against 17.8 min on the host. The mid-run sample that suggested otherwise was measuring `npm i` | — |
 
 ## Acceptance criteria
 
@@ -213,11 +213,22 @@ matched FOUR elements, because the fixture's own org and room are named
 "Chat Org" and "Chat Meeting" — the same over-broad-locator class as the
 morning's batch.
 
-⚠️ **P4 (new): the in-pod run is much slower** — 44/170 in ~20 min, against
-170 in 17.8 min on the host. The sidecar shares the pod's CPU budget with the
-app it is testing. The nightly has all night, so this is not urgent, but it is
-a real regression in wall-clock and should not be discovered later as a
-mystery.
+⚠️ **P4 was wrong and is retracted.** Mid-run I read 44/170 in ~20 min and
+recorded a wall-clock regression. The finished sweep says the opposite:
+
+```
+20260829-2259 OK (2failed 3skipped 165passed(6.5m)) tag=v20260830-078ebef47b2a
+```
+
+**6.5 minutes against 17.8**, and 165 passed against 154. The sample I
+extrapolated from was mostly `npm i` inside a fresh sidecar, which happens once
+and before any test runs. 🔑 A rate read from the first minutes of a run that
+begins with a fixed setup cost is not a rate.
+
+**Final state of the lane**: the only failures left are the two `rc-vp9-444`
+specs, which need an agent built with that feature lane and are legitimately
+baselined. Even the Google-OAuth redirect case — baselined since July because
+containerised Chromium intercepted `accounts.google.com` — now passes.
 
 ⚠️ The design note above said "run it as a Job". A Job cannot share the app's
 **network namespace**, and that namespace is the entire mechanism — so it is a
