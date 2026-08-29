@@ -620,11 +620,21 @@ pub struct AgentConfig {
     /// ON; a read-only route lookup per LAN address per netstate snapshot.
     #[serde(default)]
     pub overlay_lan_capture_probe: Option<bool>,
+    /// FR-35 — let the constrained (relay) ceiling grow above the nominal on
+    /// delivery evidence and remember the pair's stable rate
+    /// (`ROOMLERD_RELAY_CEILING_LEARN`). Built-in default: ON.
+    #[serde(default)]
+    pub relay_ceiling_learn: Option<bool>,
     /// P7 — long-edge cap for the refined rung
     /// (`ROOMLERD_IDLE_REFINE_MAX_EDGE`). Built-in default: 0 = full
     /// native.
     #[serde(default)]
     pub idle_refine_max_edge: Option<u32>,
+    /// FR-35 — upper bound (kbps) for the learned relay ceiling
+    /// (`ROOMLERD_RELAY_MAX_HI_KBPS`). Built-in default: 8000; 0 = learning
+    /// off.
+    #[serde(default)]
+    pub relay_max_hi_kbps: Option<u32>,
     /// P7c — encoded-size floor (KiB) for a frame to count as motion in
     /// the idle-refine machine; smaller deltas (caret, keystrokes) are
     /// invisible to it (`ROOMLERD_IDLE_REFINE_MIN_FRAME_KB`).
@@ -1710,7 +1720,9 @@ pub fn test_fixture() -> AgentConfig {
         idle_refine_balanced: None,
         gpu_scale: None,
         overlay_lan_capture_probe: None,
+        relay_ceiling_learn: None,
         idle_refine_max_edge: None,
+        relay_max_hi_kbps: None,
         idle_refine_min_frame_kb: None,
         idle_refine_major_area_permille: None,
         idle_refine_settle_ms: None,
@@ -1843,7 +1855,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 57] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 58] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1859,6 +1871,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 57]
         ("IDLE_REFINE_BALANCED", cfg.idle_refine_balanced),
         ("GPU_SCALE", cfg.gpu_scale),
         ("OVERLAY_LAN_CAPTURE_PROBE", cfg.overlay_lan_capture_probe),
+        ("RELAY_CEILING_LEARN", cfg.relay_ceiling_learn),
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
         ("OVERLAY_DERP", cfg.overlay_derp),
@@ -1916,7 +1929,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 57]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 24] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 25] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1926,6 +1939,7 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("LANCZOS_MIN_PCT", cfg.lanczos_min_pct),
         ("SCALE_CQ_BOOST", cfg.scale_cq_boost),
         ("IDLE_REFINE_MAX_EDGE", cfg.idle_refine_max_edge),
+        ("RELAY_MAX_HI_KBPS", cfg.relay_max_hi_kbps),
         ("IDLE_REFINE_MIN_FRAME_KB", cfg.idle_refine_min_frame_kb),
         (
             "IDLE_REFINE_MAJOR_AREA_PERMILLE",
