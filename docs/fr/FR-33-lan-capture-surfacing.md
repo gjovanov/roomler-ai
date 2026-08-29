@@ -1,6 +1,6 @@
 # FR-33: A VPN that captures the LAN prefix should say so — surface LAN capture in `status`, `why` and the RC path pill
 
-Status: **designed, not implemented** (2026-08-29). Tracking issue: `FR-33` (#905).
+Status: **P1 implemented, not yet field-verified** (2026-08-29). Tracking issue: `FR-33` (#905).
 Sibling of FR-9 (LAN relay diagnosis) and FR-31 (opening keyframe). Spec on master up front; the
 design is known.
 
@@ -33,8 +33,9 @@ stays out of scope (operator's standing rule).
 
 1. **Detection (netstate, all three OSes).** For every LAN interface address in
    `NetSnapshot.ifaces` (`netstate.rs:134`), look up the route to another address inside the
-   same prefix — a known peer LAN endpoint from the netmap when one exists, else the prefix's
-   broadcast address. If the selected interface ≠ the owning interface, record
+   same prefix — a fixed neighbour address (our own address with its lowest bit flipped, off
+   the network/broadcast edges), so the answer never depends on a peer existing. If the
+   selected interface ≠ the owning interface, record
    `LanCapture { prefix, owner_ifref, via_ifref, via_name }`. Sampled where the default-route
    lookup already runs (`sample_snapshot`, `netstate.rs:438`): one lookup per LAN interface per
    snapshot. Onset and clear each produce ONE `NetDelta` with a one-line `summary`
