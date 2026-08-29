@@ -21,6 +21,12 @@ pub mod scrap_backend;
 #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
 pub mod x11_damage;
 
+/// FR-36 P1 — DRM/KMS capture, below the compositor. Linux-only by
+/// construction: this reads the kernel's scanout plane, which has no analogue
+/// on Windows or macOS. The only backend that can see a Wayland desktop.
+#[cfg(all(target_os = "linux", feature = "drm-capture"))]
+pub mod drm_backend;
+
 #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
 pub mod wgc_backend;
 
@@ -260,6 +266,73 @@ pub enum DownscalePolicy {
     Auto,
     Always,
     Never,
+}
+
+/// Downsample 2× when the source has more pixels than this threshold.
+/// Software openh264 at 4K SW encode caps out around 6–12 fps on a
+/// typical desktop CPU; halving each dimension cuts pixel work by 4×
+/// and typically brings us back to 25–30 fps, which matters far more
+/// for perceived smoothness than the extra detail.
+///
+/// Measured in pixels (not width) so QHD 2560×1440 panels (3.7 Mpx)
+/// trigger the downscale as well — an earlier width-only threshold
+/// missed them because QHD width=2560 fell under the 2561 cutoff.
+///
+/// Lives here rather than in a backend because FR-36's DRM backend applies
+/// the SAME policy: a host must not get a different picture size purely
+/// because it switched capture backend.
+///
+/// ⚠️ Gated on its two consumers. This used to live INSIDE `scrap_backend`, so
+/// the module's own feature gate covered it implicitly; moving it here to share
+/// it with the DRM backend removed that cover and made it dead code in every
+/// feature set that has neither backend. CI caught it on three lanes.
+#[cfg(any(
+    feature = "scrap-capture",
+    all(target_os = "linux", feature = "drm-capture")
+))]
+pub(crate) const DOWNSCALE_TRIGGER_PIXELS: u64 = 3_500_000;
+
+/// 2×2 box downsample over BGRA. Output dimensions are floor(w/2), floor(h/2).
+/// Averages each 2×2 block per channel with a +2/4 round. Naive scalar
+/// loop — at 4K (8.3 Mpx in, 2.1 Mpx out) this runs in ~15 ms in release
+/// mode on a desktop CPU, well under the ~30 ms budget per frame at 30 fps
+/// and comfortably less than openh264 would have spent encoding the full
+/// 4K frame it replaces.
+///
+/// ⚠️ Gated on its two consumers. This used to live INSIDE `scrap_backend`, so
+/// the module's own feature gate covered it implicitly; moving it here to share
+/// it with the DRM backend removed that cover and made it dead code in every
+/// feature set that has neither backend. CI caught it on three lanes.
+#[cfg(any(
+    feature = "scrap-capture",
+    all(target_os = "linux", feature = "drm-capture")
+))]
+pub(crate) fn downscale_bgra_2x(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+) -> (Vec<u8>, u32, u32) {
+    let dw = src_w / 2;
+    let dh = src_h / 2;
+    let sw = src_stride as usize;
+    let mut dst = vec![0u8; (dw * dh * 4) as usize];
+    for y in 0..dh as usize {
+        let row0 = 2 * y * sw;
+        let row1 = (2 * y + 1) * sw;
+        for x in 0..dw as usize {
+            let sx = 2 * x * 4;
+            let dx = (y * dw as usize + x) * 4;
+            for c in 0..4 {
+                let p00 = src[row0 + sx + c] as u32;
+                let p10 = src[row0 + sx + 4 + c] as u32;
+                let p01 = src[row1 + sx + c] as u32;
+                let p11 = src[row1 + sx + 4 + c] as u32;
+                dst[dx + c] = ((p00 + p10 + p01 + p11 + 2) / 4) as u8;
+            }
+        }
+    }
+    (dst, dw, dh)
 }
 
 #[async_trait::async_trait]
@@ -504,6 +577,41 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
             tracing::info!("ROOMLERD_CAPTURE=scrap — skipping WGC, using DXGI via scrap");
         }
     }
+    // FR-36 — DRM/KMS: read the scanout plane below the compositor. This is
+    // the ONLY backend that can see a Wayland desktop (XShm needs an X root
+    // window) or a locked one (the portal refuses both).
+    //
+    // ⚠️ OPT-IN, not the Linux default, and the inverse of this repo's usual
+    // kill-switch shape. DRM reports no damage at all, so defaulting it on
+    // would silently undo FR-29 — which took a Linux host's idle capture from
+    // 45.8 % of a core to 2.8 % precisely BY not grabbing an unchanged screen.
+    // A Wayland or headless host sets `ROOMLERD_DRM_CAPTURE=1`; everyone else
+    // keeps the existing cascade byte-for-byte.
+    #[cfg(all(target_os = "linux", feature = "drm-capture"))]
+    {
+        if drm_backend::env_enabled() {
+            match drm_backend::DrmCapture::primary(_target_fps, _downscale) {
+                Ok(c) => {
+                    tracing::info!(
+                        width = c.width(),
+                        height = c.height(),
+                        "capture: backend=drm (ROOMLERD_DRM_CAPTURE=1, scanout below the compositor)"
+                    );
+                    return Box::new(c);
+                }
+                Err(e) => {
+                    // Deliberately loud: the operator asked for DRM explicitly,
+                    // so silently serving them X11 would look like the feature
+                    // simply not working.
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "ROOMLERD_DRM_CAPTURE=1 but DRM capture could not open — falling through to the standard cascade"
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "scrap-capture")]
     {
         match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
