@@ -115,6 +115,10 @@ pub(crate) fn filter_component_releases(
     out
 }
 
+// RETIRED-NAME-ANCHOR(60): `roomler-agent-*` is the published RELEASE-ASSET
+// name, which release-agent.yml freezes deliberately ("a published, immutable
+// surface that every prior release already carries"). The updater's picker
+// keys on it, so the doc and the test below must quote it exactly.
 /// Push the desktop-companion artifacts to the END of every release's asset
 /// list, so a client scanning for "the first `.deb` for my arch" cannot pick
 /// one up.
@@ -374,6 +378,10 @@ mod tests {
         }
     }
 
+    // RETIRED-NAME-ANCHOR(55): the asset names below are the PUBLISHED
+    // release-asset spellings, frozen on purpose by release-agent.yml, and
+    // the point of this test is that a pre-0.4.16 picker matching them wins
+    // over the companion. Renaming them here would make it assert nothing.
     /// FR-27 / 2026-08-29 field incident. Every Linux updater up to 0.4.15
     /// takes the FIRST `.deb` matching its arch, and GitHub handed this proxy
     /// the companion first — so `mars` and `jupiter` apt-installed
