@@ -1,11 +1,11 @@
-# Roomler Agent & Tunnel — High-Level Architecture
+# Roomler daemon & tunnel CLI — High-Level Architecture
 
 *Audience: end users and operators. For the deep technical design see
 [`remote-control.md`](remote-control.md) (remote desktop) and
 [`tunnel-install.md`](tunnel-install.md) (tunnel setup).*
 
-Roomler's remote-access stack has two user-facing pieces: **`roomler-agent`**, a small
-daemon installed on every machine you want to reach, and **`roomler-tunnel`**, a CLI run
+Roomler's remote-access stack has two user-facing pieces: **`roomlerd`**, a small
+daemon installed on every machine you want to reach, and **`roomler`**, a CLI run
 on the machine you are sitting at. The **roomler.ai** service introduces the two sides to
 each other and enforces policy — but your screen, keystrokes, and tunneled data never pass
 through it in readable form.
@@ -22,7 +22,7 @@ The same picture with every flow labelled:
 flowchart LR
     subgraph you["🧑 You"]
         B["Browser<br/>(roomler.ai web app)"]
-        T["roomler-tunnel CLI<br/>(laptop · script · CI runner)"]
+        T["roomler CLI<br/>(laptop · script · CI runner)"]
     end
 
     subgraph cloud["☁️ roomler.ai — coordination only"]
@@ -30,7 +30,7 @@ flowchart LR
         R["coturn TURN relay<br/>(fallback path — carries<br/>only encrypted bytes)"]
     end
 
-    subgraph fleet["🖥️ Your machines — each runs the roomler-agent daemon"]
+    subgraph fleet["🖥️ Your machines — each runs the roomlerd daemon"]
         A1["Office / home PC<br/>(full desktop)"]
         A2["Headless cloud server<br/>(virtual desktop)"]
         A3["GPU workstation<br/>(AI workloads)"]
@@ -58,7 +58,7 @@ encrypted relay used only when no direct path can be punched.
 
 ## The pieces
 
-### `roomler-agent` — the daemon on your machines
+### `roomlerd` — the daemon on your machines
 
 - One small native binary per machine (Windows service, Linux systemd unit, macOS pkg).
   Starts at boot, survives logout, keeps itself up to date.
@@ -75,7 +75,7 @@ encrypted relay used only when no direct path can be punched.
 - Enrolled once with a 10-minute single-use token from the admin UI; from then on it holds
   only a tenant-scoped credential.
 
-### `roomler-tunnel` — the connectivity CLI
+### `roomler` — the connectivity CLI
 
 - `forward` — a port on your laptop (`127.0.0.1:5432`) becomes any `host:port` the chosen
   agent can reach ("the DB behind the office firewall").
