@@ -156,7 +156,7 @@ pub async fn enroll_agent(
     if existing.is_none() {
         let tenant = state.tenants.base.find_by_id(tid).await?;
         let used = state.agents.count_active_for_tenant(tid).await?;
-        // FR-31: decision + record in `quota::check`. `MaxDevices` is an
+        // FR-32: decision + record in `quota::check`. `MaxDevices` is an
         // established limit, so it refuses whatever the tenant's mode says.
         if let Err(d) = quota::check(
             tenant.plan.clone(),
