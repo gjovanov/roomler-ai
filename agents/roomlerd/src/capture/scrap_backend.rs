@@ -160,7 +160,12 @@ impl ScrapCapture {
                 // every frame (capped frame ⇒ "no cap needed" ⇒ reopen native
                 // ⇒ native frame ⇒ "cap!" ⇒ reopen capped ⇒ …), ~30 rebuilds/s,
                 // no codec able to stream — field 2026-08-26 on the MacBook.
+                // Reassigned only by the macOS stream-rebuild block below, so
+                // every other target sees an unused `mut`. Scoped allow rather
+                // than dropping `mut`, which would break the macOS build.
+                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                 let mut native_w = w;
+                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                 let mut native_h = h;
                 #[cfg(target_os = "macos")]
                 let mut last_reopen = Instant::now();
