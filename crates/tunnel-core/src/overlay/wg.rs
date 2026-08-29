@@ -84,7 +84,7 @@ pub const QUIC_UPGRADE_DEADLINE: Duration = Duration::from_secs(90);
 /// [`QUIC_BUILD_TIMEOUT`], so the cycle is ~12 s).
 pub const QUIC_UPGRADE_RETRY_GAP: Duration = Duration::from_secs(4);
 
-/// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLER_NODE_OVERLAY_QUIC`;
+/// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLERD_OVERLAY_QUIC`;
 /// legacy `ROOMLER_AGENT_OVERLAY_QUIC` still honoured — see
 /// [`crate::env::node_env`]). **Default OFF** — the raw relay is the proven
 /// path; QUIC is enabled per-host only after field-proving (mirrors the

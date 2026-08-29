@@ -32,7 +32,7 @@ pub mod auth;
 /// Tunnel-client session driver — the shared flow vocabulary (P3b-1); the session
 /// orchestration + the `TunnelSignaling` seam fold in at P3b-2.
 pub mod driver;
-/// Node env-var reads with `ROOMLER_NODE_*` → legacy `ROOMLER_AGENT_*` fallback.
+/// Node env-var reads with `ROOMLERD_*` → legacy `ROOMLER_AGENT_*` fallback.
 pub mod env;
 pub mod evidence;
 pub mod forward;

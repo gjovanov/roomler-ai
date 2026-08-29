@@ -255,6 +255,8 @@ pub fn find_tunnel_binary(extracted_root: &Path) -> Result<PathBuf> {
     let candidate_names: [&str; 2] = if cfg!(target_os = "windows") {
         ["roomler.exe", "roomler-tunnel.exe"]
     } else {
+        // RETIRED-NAME-ANCHOR: member names inside ALREADY-PUBLISHED tarballs.
+        // The extractor must keep accepting them. docs/fr/FR-21
         ["roomler", "roomler-tunnel"]
     };
 

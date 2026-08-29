@@ -480,6 +480,19 @@ pub enum ClientMsg {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         granted: bool,
+        /// FR-27 — why, when `granted` is false. Absent (every pre-FR-27
+        /// agent) means an ordinary deny, which is what a bare `false` has
+        /// always meant. Present values come from
+        /// [`crate::consent::ConsentDenyReason::wire`]; an unrecognised one
+        /// degrades to the same ordinary deny, so a newer agent can name a
+        /// reason this server has never heard of.
+        ///
+        /// This exists because the agent's OWN prompt timeout produced a bare
+        /// `false`, and the hub turned that into `EndReason::UserDenied` — so
+        /// "nobody was at the machine" reached the controller as "a human
+        /// refused you", which is both wrong and un-actionable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     // ─── controller → server ─────────────────────────────────────────
@@ -515,7 +528,7 @@ pub enum ClientMsg {
         /// `"yuv420"` (VP9 profile 0; ~30% lower bandwidth; slight
         /// ClearType softening) and `"yuv444"` (VP9 profile 1; sharpest
         /// text; current default). `None` / unset means "use the
-        /// agent's `ROOMLER_AGENT_VP9_CHROMA` env-var default". Only
+        /// agent's `ROOMLERD_VP9_CHROMA` env-var default". Only
         /// applies when `preferred_transport` is `data-channel-vp9-444`;
         /// ignored otherwise. Forwarded verbatim to the agent in the
         /// matching server-side [`ServerMsg::SessionRequest`].
@@ -590,7 +603,7 @@ pub enum ClientMsg {
     // Plan v2 §"What changed from v1" #1 + #2:
     //   * Wire types fold into the existing `rc:*` namespace, NOT a
     //     separate `rc-tunnel:*` namespace or WS endpoint.
-    //   * Each `roomler-tunnel forward` invocation owns ONE peer; many
+    //   * Each `roomler forward` invocation owns ONE peer; many
     //     TCP flows multiplex onto a fixed DC pool via `flow_id`
     //     framing (see `tunnel-core::mux`). No per-flow DC creation.
     //   * Server is the auth boundary — `TcpForwardRequest` rides the
@@ -888,20 +901,20 @@ pub enum ClientMsg {
         #[serde(default)]
         endpoints: Vec<String>,
         /// rc.142 — the node can carry WG over a QUIC-over-TURN relay carrier
-        /// (`ROOMLER_AGENT_OVERLAY_QUIC=1`). The server persists it and echoes it
+        /// (`ROOMLERD_OVERLAY_QUIC=1`). The server persists it and echoes it
         /// per-peer in the netmap so QUIC is only attempted when BOTH ends
         /// advertise it (a QUIC/raw split would silently break the pair).
         #[serde(default)]
         supports_quic: bool,
         /// Phase D — the node can carry WG over the v1 single-relay carrier (ONE
-        /// anchor allocation + a raw dialer, `ROOMLER_NODE_OVERLAY_RELAY_SINGLE=1`).
+        /// anchor allocation + a raw dialer, `ROOMLERD_OVERLAY_RELAY_SINGLE=1`).
         /// Persisted + echoed per-peer like `supports_quic`, so single-relay is
         /// only chosen when BOTH ends advertise it (a mixed pair stays on the
         /// both-allocate relay). Absent from a pre-Phase-D node ⇒ `false`.
         #[serde(default)]
         supports_relay_single: bool,
         /// Phase D (DERP) — the node can carry WG over the pubkey-addressed
-        /// `/derp` WS relay (`ROOMLER_NODE_OVERLAY_DERP=1`), the last-resort
+        /// `/derp` WS relay (`ROOMLERD_OVERLAY_DERP=1`), the last-resort
         /// carrier for two BOTH-UDP-blocked peers. Persisted + echoed per-peer
         /// like `supports_relay_single`, so DERP is only chosen when BOTH ends
         /// advertise it. Absent from a pre-DERP node ⇒ `false`.
@@ -1104,7 +1117,7 @@ pub enum ServerMsg {
         /// rc.62 — per-session VP9 chroma override forwarded verbatim
         /// from the controller's [`ClientMsg::SessionRequest::chroma_pref`].
         /// `None` / unset means "use the agent's
-        /// `ROOMLER_AGENT_VP9_CHROMA` env-var default".
+        /// `ROOMLERD_VP9_CHROMA` env-var default".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
         /// FR-17 — forwarded verbatim from the controller's
@@ -1128,6 +1141,18 @@ pub enum ServerMsg {
         /// `AccessPolicy.consent_mode` (self-control → `Auto`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consent_mode: Option<ConsentMode>,
+        /// FR-27 — how long the ON-HOST prompt should stand, which is not
+        /// always `consent_timeout_secs`.
+        ///
+        /// The two coincide for `prompt`, and diverge for `prompt_then_email`:
+        /// the session waits the full async window for the owner's emailed
+        /// link, but the modal on the host's screen has no business standing
+        /// there for five minutes. Sent by the server rather than derived by
+        /// the agent so there is ONE authority for the split; `None` (older
+        /// server) means "use `consent_timeout_secs`", i.e. exactly the
+        /// pre-FR-27 behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_prompt_timeout_secs: Option<u32>,
         /// P6 — the device's input arbitration mode directive from
         /// `AccessPolicy.input_mode`. `None` (older server / unset policy) →
         /// the agent's arbiter default (free). Only the FIRST session's hint
@@ -2947,7 +2972,7 @@ mod tests {
         // `rc:goodbye` frame, the old agent's `serde_json::from_str`
         // returns `Err` and the existing `Err(e) => debug!(…,
         // "ignoring non-rc:* frame")` arm at
-        // `agents/roomler-agent/src/signaling.rs:333` swallows it
+        // `agents/roomlerd/src/signaling.rs:333` swallows it
         // silently — no panic, no fatal exit.
         //
         // We simulate the rc.52 ServerMsg shape via a stripped local

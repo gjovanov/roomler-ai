@@ -58,6 +58,14 @@ export interface ChunkFramingState {
   gaps: number
   /** Cumulative count of messages discarded while resyncing. */
   discarded: number
+  /** `frame_seq` of the most recently STARTED frame, kept after that
+   *  frame completes so a late chunk of it can be recognised as a
+   *  straggler rather than mistaken for a break in the next one. */
+  lastSeq: number | null
+  /** Cumulative count of late chunks belonging to a frame already moved
+   *  past. Under an unordered channel these are expected; a rising count
+   *  with steady fps is the transport working, not failing. */
+  stragglers: number
 }
 
 export function createChunkFraming(): ChunkFramingState {
@@ -68,6 +76,8 @@ export function createChunkFraming(): ChunkFramingState {
     resyncing: false,
     gaps: 0,
     discarded: 0,
+    lastSeq: null,
+    stragglers: 0,
   }
 }
 
@@ -89,6 +99,29 @@ export interface ChunkFramingResult {
  * Returns the payload to append to the byte assembler, or `null` when the
  * message is a fragment of a frame that can no longer be completed.
  */
+/** How far back a `frame_seq` may be and still count as a late chunk of a
+ *  frame we have moved past, rather than the start of a new stream.
+ *
+ *  ⚠️ Bounded on purpose. "Older than what we have" is the natural rule,
+ *  but an UNBOUNDED version deadlocks the moment the sender's counter
+ *  restarts (a fresh send task begins again at 1): every subsequent frame
+ *  would look ancient, be straggled, and the picture would stop for good
+ *  with no gap reported and nothing in the logs. A window turns that
+ *  failure into a single resync. 64 frames is ~1 s of video at 60 fps —
+ *  far beyond any plausible reordering, far below a counter restart. */
+const STRAGGLER_WINDOW = 64
+
+/** Wrap-safe "`seq` belongs to a frame we have already moved past, and
+ *  recently enough that reordering explains it". The agent advances
+ *  `frame_seq` with `wrapping_add`, so 0 legitimately follows
+ *  0xffffffff — a plain `<` would read that wrap as a jump backwards and
+ *  mis-classify every chunk of the frame after it. */
+function isStraggler(seq: number, lastSeq: number | null): boolean {
+  if (lastSeq === null) return false
+  const back = (lastSeq - seq) >>> 0
+  return back > 0 && back <= STRAGGLER_WINDOW
+}
+
 export function stripChunkPrefix(
   st: ChunkFramingState,
   bytes: Uint8Array,
@@ -111,6 +144,23 @@ export function stripChunkPrefix(
     return breakStream(st)
   }
 
+  // ⚠️ A STRAGGLER: a chunk of a frame we have already moved past.
+  //
+  // Under stage A's ordered channel this cannot happen. Under stage B's
+  // unordered one it is routine — chunk 3 of frame N can arrive after
+  // chunk 0 of frame N+1. Treating it as a gap would let a late chunk of
+  // an already-lost frame destroy the HEALTHY frame after it, and that
+  // cascades: every dropped frame costs an IDR, and each IDR is the
+  // largest frame on the thinnest pipe.
+  //
+  // Checked BEFORE the chunk-0 branch, because a late chunk 0 is just as
+  // able to restart assembly on a dead frame as a late chunk 3 is to
+  // break a live one.
+  if (isStraggler(seq, st.lastSeq)) {
+    st.stragglers++
+    return { payload: null, gap: false }
+  }
+
   if (idx === 0) {
     // A fresh frame always resynchronises us, INCLUDING out of a resync —
     // that is the whole point of a frame boundary. If we were mid-frame,
@@ -119,6 +169,7 @@ export function stripChunkPrefix(
     // lost chunk into two lost frames.
     const truncated = !st.resyncing && st.expectSeq !== null
     st.expectSeq = seq
+    st.lastSeq = seq
     st.expectIdx = 1
     st.expectCount = count
     st.resyncing = false
@@ -141,9 +192,23 @@ export function stripChunkPrefix(
     return { payload: null, gap: false }
   }
 
-  // Mid-frame chunk that isn't the one we expect: either a lost chunk or a
-  // reordered one. Stage A's channel is ordered so neither should occur;
-  // stage B's is not, and both then mean the same thing for this frame.
+  if (st.expectSeq === null) {
+    // Between frames. A chunk of the frame we JUST finished is a late
+    // duplicate — harmless, and not covered by `isStraggler`, whose
+    // "back > 0" is what keeps the normal mid-frame case (seq === lastSeq)
+    // from being straggled.
+    if (seq === st.lastSeq) {
+      st.stragglers++
+      return { payload: null, gap: false }
+    }
+    // Otherwise a NEWER frame whose chunk 0 never arrived. Its opening
+    // bytes carry the size the byte assembler needs, so there is nothing
+    // to salvage.
+    return breakStream(st)
+  }
+
+  // Mid-frame chunk that isn't the one we expect: a lost chunk, or a
+  // newer frame whose chunk 0 we missed. Both end this frame.
   if (seq !== st.expectSeq || idx !== st.expectIdx || count !== st.expectCount) {
     return breakStream(st)
   }

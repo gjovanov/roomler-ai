@@ -3,11 +3,11 @@
 # hosts with no dpkg/apt (Fedora, RHEL, SUSE, Arch …), which otherwise cannot
 # install ANY published artifact and so can never self-update.
 #
-# The tree MUST mirror the `.deb` asset map in agents/roomler-agent/Cargo.toml:
+# The tree MUST mirror the `.deb` asset map in agents/roomlerd/Cargo.toml:
 # same payload, same destinations, so the two formats install identically and
 # `docs/linux-self-update.md`'s installer can be format-agnostic below the
 # extraction. Run from the repo root, AFTER the lane's bundle step has
-# populated agents/roomler-agent/vendor-ffmpeg/.
+# populated agents/roomlerd/vendor-ffmpeg/.
 #
 # Usage: scripts/stage-linux-tarball.sh <version> <target-triple>
 #   e.g. scripts/stage-linux-tarball.sh 0.3.0-rc.371 x86_64-unknown-linux-gnu
@@ -18,7 +18,7 @@ triple="${2:?target triple}"
 name="roomler-agent-${version}-${triple}"
 root="/tmp/${name}"
 
-pkg=agents/roomler-agent
+pkg=agents/roomlerd
 rm -rf "$root"
 
 # Binaries. `roomler-shim` installs UNDER the user-facing name: it re-execs

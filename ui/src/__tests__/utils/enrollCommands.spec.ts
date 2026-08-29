@@ -8,6 +8,8 @@ import { enrollCommands } from '@/utils/enrollCommands'
  * contracts. If a binary name, flag, role vocabulary, or proxy route
  * changes, this spec fails instead of the admin UI shipping stale copy
  * (the pre-S4 dialogs hardcoded the prod URL and the retired
+ * RETIRED-NAME-ANCHOR: names the retired forms on purpose; this suite exists to keep
+ * them retired. FR-21.
  * `roomler-agent --enroll` / `roomler-tunnel enroll` forms).
  */
 describe('enrollCommands', () => {
@@ -52,6 +54,7 @@ describe('enrollCommands', () => {
     expect(linux!.blocks[2]!.command).toContain(`--server ${ORIGIN}`)
     // NOT `roomlerd`: on macOS the daemon lives inside the .app bundle and no
     // binary by that name exists anywhere on the machine.
+    // RETIRED-NAME-ANCHOR: frozen bundle name (macOS TCC grants). FR-21 D5.
     expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomler-agent\.app\S* enroll /)
   })
 
@@ -64,6 +67,7 @@ describe('enrollCommands', () => {
       expect(os.blocks[2]!.command).toMatch(/^roomlerd enroll /)
     }
     // macOS resolves to the bundle executable — see above.
+    // RETIRED-NAME-ANCHOR: frozen bundle name (macOS TCC grants). FR-21 D5.
     expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomler-agent\.app\S* enroll /)
     expect(windows!.blocks[2]!.command).not.toContain('--machine-global')
   })
@@ -133,6 +137,7 @@ describe('enrollCommands', () => {
       for (const scope of SCOPES) {
         for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope)) {
           for (const block of os.blocks) {
+            // RETIRED-NAME-ANCHOR(4): frozen bundle name (macOS TCC grants). FR-21 D5.
             // macOS is the ONE exception and it is not the retired name
             // resurfacing: the .app's CFBundleExecutable is literally
             // `roomler-agent` (renaming it would void the TCC grants keyed to
@@ -156,6 +161,7 @@ describe('enrollCommands', () => {
     const macos = enrollCommands('agent', ORIGIN, TOKEN).find((o) => o.os === 'macos')!
     const manual = macos.blocks.find((b) => b.id.endsWith('-manual'))!
     expect(manual.command).toContain(
+      // RETIRED-NAME-ANCHOR: frozen bundle name (macOS TCC grants). FR-21 D5.
       '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent enroll',
     )
     expect(manual.command).not.toMatch(/^roomlerd /)

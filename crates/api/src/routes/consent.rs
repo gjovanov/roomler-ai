@@ -72,7 +72,7 @@ async fn resolve(
     // Resolve the in-memory consent slot. Best-effort: the session may have
     // already timed out or closed, in which case there's nothing to grant — the
     // owner still gets a clean 200 (their decision was recorded).
-    if let Err(e) = state.rc_hub.deliver_consent(req.session_id, granted) {
+    if let Err(e) = state.rc_hub.deliver_consent(req.session_id, granted, None) {
         tracing::info!(
             session = %req.session_id, %e,
             "consent slot no longer waiting (session gone / timed out)"

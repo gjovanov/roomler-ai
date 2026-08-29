@@ -13,8 +13,10 @@
       :is-active-speaker="p.streamKey === activeSpeakerKey"
       :object-fit="p.isLocal && selfViewMode === 'in-grid-uncropped' ? 'contain' : 'cover'"
       :show-actions="true"
+      :stream-key="p.streamKey"
       @toggle-pin="$emit('toggle-pin', p.streamKey)"
       @request-pip="$emit('request-pip', p.streamKey)"
+      @spotlight="$emit('spotlight', p.streamKey)"
     />
 
     <!-- Floating self-view -->
@@ -26,12 +28,14 @@
       @mousedown.prevent="startDrag"
     >
       <VideoTile
+        :stream-key="selfParticipant.streamKey"
         :stream="selfParticipant.stream"
         :display-name="selfParticipant.displayName"
         :is-muted="selfParticipant.isMuted"
         :is-local="true"
         :compact="true"
         object-fit="contain"
+        @spotlight="$emit('spotlight', $event)"
       />
     </div>
   </div>
@@ -53,6 +57,7 @@ const props = defineProps<{
 defineEmits<{
   'toggle-pin': [streamKey: string]
   'request-pip': [streamKey: string]
+  spotlight: [streamKey: string]
 }>()
 
 const visibleParticipants = computed(() => props.participants)

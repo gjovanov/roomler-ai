@@ -192,7 +192,7 @@ pub fn has_attention() -> bool {
 // P3e lever E: the worker-aware trio (`attention_path_for_worker`,
 // `raise_attention_machine_aware`, `raise_attention_machine_aware_with_reason`)
 // did NOT move here — it probes the process's worker role via
-// `roomler_agent::system_context::worker_role`, which is the one coupling in
+// `roomlerd::system_context::worker_role`, which is the one coupling in
 // this module that genuinely belongs to the daemon (winlogon-token
 // machinery, `system-context` feature). The trio lives on in
 // `roomler-agent/src/notify.rs`, layered over the primitives below

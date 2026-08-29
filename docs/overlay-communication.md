@@ -117,7 +117,7 @@ plan doc is retired):
   every consumer (LocalAPI `status`/`peers`, the tray, the admin nodes table via
   a TS mirror of the derivation) computes it locally.
 - **MagicDNS answers AAAA** with the derived v6 by default;
-  `ROOMLER_AGENT_DNS_AAAA=0` reverts to A-only — the mixed-fleet escape hatch,
+  `ROOMLERD_DNS_AAAA=0` reverts to A-only — the mixed-fleet escape hatch,
   since a pre-v6 peer's OS doesn't own its derived address and v6 toward it
   blackholes (happy-eyeballs apps fall back on their own).
 - `roomler ping <name> -6` resolves a peer's derived v6; the netstack SOCKS
@@ -244,7 +244,7 @@ flowchart TD
     style T6 fill:#f0f0f0
 ```
 
-| # | Tier | Carrier | Wins when | Flag — `ROOMLER_NODE_OVERLAY_…` |
+| # | Tier | Carrier | Wins when | Flag — `ROOMLERD_OVERLAY_…` |
 |---|---|---|---|---|
 | 1 | LAN direct | UDP, interface socket | peer shares a /24 | `DIRECT` (**on**) |
 | 2 | direct-to-public | UDP, egress socket | peer's NIC is public | `PUBLIC_DIRECT` (off) |
@@ -602,7 +602,7 @@ all.
 
 ## 9. Configuration reference
 
-All flags take the `ROOMLER_NODE_OVERLAY_` prefix; the legacy `ROOMLER_AGENT_`
+All flags take the `ROOMLERD_OVERLAY_` prefix; the legacy `ROOMLER_AGENT_`
 prefix is still honoured.
 
 | Variable | Default | Effect |

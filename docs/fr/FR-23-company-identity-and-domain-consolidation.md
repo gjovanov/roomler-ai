@@ -194,8 +194,9 @@ deliberately, so deleting `apps/roomler-old.yaml` does not cascade.
 | 2 | FR + PR | — | ✅ shipped |
 | 3 | Deploy | previous image tag | ✅ shipped + field-verified (`v20260828-de59383da2fe`) |
 | 3b | Send Apple the correction | — | ⬜ operator action; letter + PDF prepared |
-| 4 | Delete the obsolete `roomler-old` app | git revert in the deploy repo | ⬜ inventoried, **awaiting go-ahead** |
-| 5 | `roomler.live` — serve the app, or 301 | drop the `server_name`; revert the configmap | ⬜ **blocked on a decision** (see below) |
+| 4 | Delete the obsolete `roomler-old` app | — | 🚫 **SKIPPED** by the operator — the old app keeps running; its `janus`/`coturn` subdomains still depend on it |
+| 5 | `roomler.live` → **301** to `roomler.ai` | restore `roomler.live.conf.bak-pre301-*`, `nginx -t`, reload | ✅ shipped + field-verified |
+| 6 | Legal pages describe all three pillars | revert one commit | ✅ shipped (#835) |
 
 ## Acceptance criteria
 
@@ -207,8 +208,9 @@ deliberately, so deleting `apps/roomler-old.yaml` does not cascade.
 - [x] `bun run build` (incl. `vue-tsc --noEmit`) and `bun run test:unit` pass
 - [x] `https://roomler.ai/imprint` is live — verified against the **shipped bundle**, not the source
 - [ ] Apple has the corrected number and the imprint URL
-- [ ] The `roomler-old` namespace, its PVCs, PVs and node-local backing directory are gone
-- [ ] `https://roomler.live` serves the current app; **`roomler.ai` is unaffected**
+- [x] ~~The `roomler-old` namespace … are gone~~ — **withdrawn**: the operator chose to skip the teardown, and `janus.roomler.live` / `coturn.roomler.live` still depend on that namespace
+- [x] `https://roomler.live` **301s to `roomler.ai`**; `roomler.ai` verified unaffected (200, title `Roomler`), and every co-hosted vhost re-checked
+- [x] Terms and Privacy describe **all three pillars**, and the Privacy Policy's false `localStorage` claim is gone
 - [ ] Apple enrolment 5XS5WN8R99 resolves (this FR closes on that, or on a documented unrelated cause)
 
 ## Open decisions
@@ -251,6 +253,43 @@ deliberately, so deleting `apps/roomler-old.yaml` does not cascade.
   `https://roomler.ai` and the dashboard passes `--server ${origin}` — those
   defaults stay untouched.
 
+## Phase 6 — the legal pages described a product that no longer existed
+
+Both pages were dated **February 2026** and defined Roomler as *"a real-time
+collaboration platform … chat, video conferencing, file sharing, and multi-tenant
+workspace management"* — now one of three pillars, and the one carrying the least
+risk. Remote desktop and the private mesh appeared **nowhere** in either document.
+
+That is not an undersell; it is a gap in exactly the places a user takes on an
+obligation. Terms gained three sections that did not exist — the **agent and
+enrolled devices** (authority to install, administrative privilege, self-update,
+host networking changes), **remote access and control** (unattended access as a
+deliberate choice carrying its own notice obligations; sessions recorded as
+events, not content), and the **private network** (subnet routers, exit nodes and
+whose address traffic appears to come from, tunnels, default-deny). Acceptable
+Use previously covered chat abuse and nothing else. `Microsoft` was a supported
+sign-in provider listed nowhere. Ownership and governing law are now answerable
+(**G ROX EOOD**, **Bulgaria**) because the imprint exists.
+
+⚠️ **The Privacy Policy contained a false statement**: *"Roomler uses a JWT …
+stored in your browser's `localStorage`."* Untrue since the cookie-only session
+work (#680/#682/#690/#691) — local storage holds a boolean signed-in hint and
+grid preferences. The policy was publishing a **worse security posture than the
+product has**, in the document people read to find out. Corrected to describe the
+`HttpOnly` cookie, with the reason.
+
+The policy also gained a new **§3 "What we deliberately do not see"** — the
+property that was missing entirely and is the best thing about the design: the
+servers coordinate connections but never carry readable session data, and a relay
+only ever moves ciphertext. Plus the previously-undisclosed categories (device
+records, connection metadata, audit trails, crash reports *and their log tail*,
+push subscriptions, self-hosted analytics with country-level geolocation) and
+retention figures that match the **TTL indexes** rather than gesturing at plan
+limits.
+
+Every claim was checked against code rather than drafted from a template — the
+discipline the repealed-ODR-link defect earned.
+
 ## Field-verification log
 
 | Date | What | Result |
@@ -268,3 +307,9 @@ deliberately, so deleting `apps/roomler-old.yaml` does not cascade.
 | 2026-08-28 | `settings.rs:543` env source | no `list_separator` ⇒ `ROOMLER__APP__CORS_ORIGINS` would **crash the API at boot**, not merely be ignored. Phase 5 is not config-only |
 | 2026-08-28 | `ws/handler.rs:88-113` | the origin check gates the **cookie path only** ⇒ agents unaffected, browser sessions on an untrusted origin lose every socket |
 | 2026-08-28 | Cluster access | `kubectl`+`argocd` on the build host, kubeconfig at `/home/gjovanov/.kube/config`. The earlier "no kubeconfig" was wrong — it checked `/root` only |
+| 2026-08-28 | **Phase 5 shipped as a 301.** `roomler.live` (http + https) | `301 → https://roomler.ai/`; `roomler.ai` **unaffected** (200, title `Roomler`) |
+| 2026-08-28 | Co-hosted vhosts re-checked after the reload | `bauleiter`/`regal`/`asterisk`.roomler.live, `argocd.roomler.ai`, `purestat.ai`, `lgrai.app` all 200. `janus` 404 at `/` but **healthy** (`/janus/info` → 200). `ping` 502 — **pre-existing**, its backend `:4000` has zero listening sockets. `coturn` 000 — that conf has **no HTTPS server block**. nginx error log empty since reload |
+| 2026-08-28 | `roomler.live` cert | wildcard `*.roomler.live`, **DNS-01 via Cloudflare**, valid to 2026-11-18 ⇒ a blanket redirect cannot break renewal |
+| 2026-08-28 | `$tls1_3_early_data` map | was defined **twice** across `conf.d`; the surviving definition is `asterisk.roomler.live.conf`, the file that uses it |
+| 2026-08-28 | Legal-page facts checked against code | `"microsoft"` is a real provider; `localStorage` holds only `SIGNED_IN` + grid prefs (so the policy's JWT claim was **false**); 90-day and 7-day TTLs exist in `crates/db/src/indexes.rs`; crash reports carry `hostname`, `pid`, `log_tail` |
+| 2026-08-28 | Live legal chunks **before** the phase-6 deploy | privacy `JSON Web Token` → **1** (the false claim was live); `HttpOnly` → 0; terms `exit node` → 0; `Microsoft` → 0 |

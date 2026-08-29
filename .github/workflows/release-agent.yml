@@ -196,9 +196,9 @@ jobs:
           # silently collide.
           #
           # ⚠️ THIS MAPPING HAS FIVE MORE COPIES:
-          # agents/roomler-agent/src/artifact_version.rs::msi_product_version_for
+          # agents/roomlerd/src/artifact_version.rs::msi_product_version_for
           # (download verification),
-          # agents/roomler-agent/src/version_sweep.rs::own_msi_version
+          # agents/roomlerd/src/version_sweep.rs::own_msi_version
           # (coexisting-MSI sweep — a divergence there makes an agent rank
           # its OWN install as older and uninstall itself), and the three
           # build.rs VERSIONINFO embeds (roomler-agent, roomler-cli-shim,
@@ -213,7 +213,7 @@ jobs:
           # genuinely-signed OLDER build. The two copies MUST change
           # together: if they diverge, every agent refuses every update and
           # the symptom is a silent fleet-wide update freeze, not an error.
-          # `cargo test -p roomler-agent --lib -- --ignored real_published_msi`
+          # `cargo test -p roomlerd --lib -- --ignored real_published_msi`
           # re-checks the Rust side against a real published MSI.
           if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)$ ]]; then
             vmajor="${BASH_REMATCH[1]}"; vminor="${BASH_REMATCH[2]}"
@@ -381,7 +381,7 @@ jobs:
           # cmake_minimum_required(VERSION < 3.5); CMake 3.31+ errors without
           # this policy shim.
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server"
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server,viewer-indicator-x11"
 
       # P3e Phase 2: the .deb's `roomler` is now the CLI SHIM (re-execs
       # `roomlerd cli`) — the Linux twin of the rc.365 MSI change. It must
@@ -405,7 +405,7 @@ jobs:
           # won't start on a stock box. Ship each lib under its SONAME as a real
           # file (no symlinks) into /usr/lib/roomler-agent; RPATH wires it up.
           sudo apt-get update -qq && sudo apt-get install -y patchelf
-          dst=agents/roomler-agent/vendor-ffmpeg
+          dst=agents/roomlerd/vendor-ffmpeg
           rm -rf "$dst" && mkdir -p "$dst"
           # P3e Phase 3: bundle ONLY the vendored libs the binary actually
           # references. Before the ffmpeg codec+format trim the binary linked
@@ -484,11 +484,34 @@ jobs:
           docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
             apt-get update -qq
             apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2t64 >/dev/null
-            LD_LIBRARY_PATH=/w/agents/roomler-agent/vendor-ffmpeg /w/target/release/roomlerd --version'
+            LD_LIBRARY_PATH=/w/agents/roomlerd/vendor-ffmpeg /w/target/release/roomlerd --version'
 
       - name: Build .deb
-        working-directory: agents/roomler-agent
+        working-directory: agents/roomlerd
         run: cargo deb --no-build --no-strip
+
+      # FR-27 — the headless fleet must not grow a desktop stack.
+      #
+      # The companion ships as its OWN .deb (below) precisely so that k8s
+      # workers, build hosts and relays never pull webkit2gtk/GTK to run a
+      # menu-bar app they cannot display. That separation is one careless
+      # `depends` edit away from being undone, and the regression would be
+      # invisible until someone watched an `apt upgrade` on a server pull 200 MB
+      # of X11. Assert it here, where it is cheap.
+      - name: Guard — the daemon .deb stays headless
+        # No `working-directory`: cargo-deb writes to the WORKSPACE target dir,
+        # not the member's, so this runs from the repo root exactly like the
+        # "Rename + checksum" step below — which has always done so, and is why
+        # only the new step broke.
+        run: |
+          set -euo pipefail
+          deb=$(ls target/debian/roomlerd_*_amd64.deb | head -n1)
+          depends=$(dpkg-deb -f "$deb" Depends)
+          echo "roomlerd Depends: $depends"
+          if echo "$depends" | grep -qiE 'webkit|gtk|appindicator|libx11|wayland'; then
+            echo "::error::the roomlerd .deb grew a desktop dependency — the companion belongs in its own package (FR-27)"
+            exit 1
+          fi
 
       - name: Rename + checksum
         id: pack
@@ -496,8 +519,54 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
-          src=$(ls target/debian/roomler-agent_*_amd64.deb | head -n1)
+          # FR-21 P2a: cargo-deb emits `<package>_<version>_<arch>.deb`, and the
+          # package is `roomlerd` now. The DESTINATION asset name is deliberately
+          # left as `roomler-agent-…` — it is a published, immutable surface that
+          # every prior release already carries, and the updater's picker keys on
+          # the extension + arch token, never the prefix (updater.rs::pick_asset_for_unix).
+          # Renaming it is a separate decision with its own blast radius.
+          src=$(ls target/debian/roomlerd_*_amd64.deb | head -n1)
           dst="roomler-agent-${version}-x86_64-unknown-linux-gnu.deb"
+          mv "$src" "$dst"
+          sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
+          echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
+
+      # FR-27 — the Linux desktop companion, as a SEPARATE package.
+      #
+      # Until now `roomler-desktop` shipped for Windows and macOS only
+      # (`install.sh` said so out loud), which meant a Linux desktop had no
+      # consent prompt and no "being viewed" indicator at all — the daemon's
+      # native overlay is Windows-only. It already COMPILED on Linux (workspace
+      # clippy in ci.yml walks it with webkit2gtk installed); only packaging
+      # was missing.
+      - name: Install desktop build deps (companion only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev
+
+      - name: Build the desktop companion
+        run: cargo build -p roomler-desktop --release
+
+      - name: Build the companion .deb
+        working-directory: agents/roomler-desktop
+        run: cargo deb --no-build --no-strip
+
+      - name: Rename + checksum (companion .deb)
+        id: pack_desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          # cargo-deb writes to the WORKSPACE target dir, but pin that with a
+          # find rather than a guess: a wrong path here fails the whole release
+          # job at its last step.
+          src=$(find . -path ./node_modules -prune -o \
+                       -name 'roomler-desktop_*_amd64.deb' -print | head -n1)
+          [ -n "$src" ] || { echo "::error::cargo deb produced no companion .deb"; exit 1; }
+          dst="roomler-desktop-${version}-x86_64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
@@ -520,6 +589,8 @@ jobs:
           path: |
             ${{ steps.pack.outputs.artifact }}
             ${{ steps.pack.outputs.artifact }}.sha256
+            ${{ steps.pack_desktop.outputs.artifact }}
+            ${{ steps.pack_desktop.outputs.artifact }}.sha256
             ${{ steps.tar.outputs.artifact }}
             ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
@@ -612,7 +683,7 @@ jobs:
       - name: Build agent (release, full + vp9-444, no ffmpeg-encoder)
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server"
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,viewer-indicator-x11"
 
       - name: Build the roomler CLI shim (shipped in the .deb alongside roomlerd)
         run: |
@@ -629,7 +700,7 @@ jobs:
           # then aborts at load. The cargo-deb assets glob is
           # `vendor-ffmpeg/*.so.*` — CI-populated and shared with the x86_64
           # lane's FFmpeg bundle; here it carries libvpx alone.
-          dst=agents/roomler-agent/vendor-ffmpeg
+          dst=agents/roomlerd/vendor-ffmpeg
           rm -rf "$dst" && mkdir -p "$dst"
           vpx7=$(readlink -f /usr/lib/aarch64-linux-gnu/libvpx.so.7)
           cp "$vpx7" "$dst/libvpx.so.7"
@@ -645,10 +716,10 @@ jobs:
           docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
             apt-get update -qq
             apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2t64 >/dev/null
-            LD_LIBRARY_PATH=/w/agents/roomler-agent/vendor-ffmpeg /w/target/release/roomlerd --version'
+            LD_LIBRARY_PATH=/w/agents/roomlerd/vendor-ffmpeg /w/target/release/roomlerd --version'
 
       - name: Build .deb
-        working-directory: agents/roomler-agent
+        working-directory: agents/roomlerd
         run: cargo deb --no-build --no-strip
 
       - name: Rename + checksum
@@ -657,7 +728,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
-          src=$(ls target/debian/roomler-agent_*_arm64.deb | head -n1)
+          # FR-21 P2a: cargo-deb emits `<package>_<version>_<arch>.deb`, and the
+          # package is `roomlerd` now. The DESTINATION asset name is deliberately
+          # left as `roomler-agent-…` — it is a published, immutable surface that
+          # every prior release already carries, and the updater's picker keys on
+          # the extension + arch token, never the prefix (updater.rs::pick_asset_for_unix).
+          # Renaming it is a separate decision with its own blast radius.
+          src=$(ls target/debian/roomlerd_*_arm64.deb | head -n1)
           dst="roomler-agent-${version}-aarch64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
@@ -1024,7 +1101,7 @@ jobs:
         # extra lib on Windows) + audiopus (bundled libopus via CMake).
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
+        run: cargo build -p roomlerd --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
 
       - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
         shell: pwsh
@@ -1032,7 +1109,7 @@ jobs:
           # P4b put the tunnel CLI inside both MSIs so daemon installs subsume
           # it and the MSI stays the ONE updater for the node stack. That is
           # unchanged — what changed (P3e lever D) is HOW: the daemon now owns
-          # the command surface (`roomlerd cli` → roomler_tunnel::cli) and the
+          # the command surface (`roomlerd cli` → roomler_cli::cli) and the
           # MSI carries a ~150 KB shim instead of a second full binary.
           #
           # rc.361 measurements that motivated it: roomler.exe was 22.1 MiB of
@@ -1119,7 +1196,7 @@ jobs:
           # Under ffmpeg-encoder, encoder-smoke FIRST asserts the linked
           # libavcodec is >= 61 (FFmpeg 7+) — the load-bearing replacement
           # for the deleted 5m33s cargo-test link-verify step. On failure:
-          # re-pin ffmpeg-next in agents/roomler-agent/Cargo.toml or
+          # re-pin ffmpeg-next in agents/roomlerd/Cargo.toml or
           # re-vendor via vendor-ffmpeg-windows.yml.
           & "target\release\roomlerd.exe" encoder-smoke --encoder hardware
 
@@ -1229,9 +1306,9 @@ jobs:
       - name: Build MSI (per-User)
         shell: pwsh
         run: |
-          # cargo-wix reads agents/roomler-agent/wix/main.wxs and sets the
+          # cargo-wix reads agents/roomlerd/wix/main.wxs and sets the
           # Version preprocessor variable from --install-version.
-          cargo wix -p roomler-agent --nocapture --no-build --install-version $env:MSI_VERSION
+          cargo wix -p roomlerd --nocapture --no-build --install-version $env:MSI_VERSION
 
       - name: Locate + rename per-User MSI
         id: locate
@@ -1262,12 +1339,12 @@ jobs:
           # to disambiguate. Different UpgradeCode + the mutually-
           # exclusive LaunchConditions ensure a host can only ever
           # have one of the two installed at a time.
-          $wixDir = "agents\roomler-agent\wix"
-          $pmSrc  = "agents\roomler-agent\wix-perMachine\main.wxs"
+          $wixDir = "agents\roomlerd\wix"
+          $pmSrc  = "agents\roomlerd\wix-perMachine\main.wxs"
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item $pmSrc "$wixDir\main.wxs" -Force
           try {
-            cargo wix -p roomler-agent --nocapture --no-build --install-version $env:MSI_VERSION
+            cargo wix -p roomlerd --nocapture --no-build --install-version $env:MSI_VERSION
           } finally {
             Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
           }
@@ -1620,7 +1697,7 @@ jobs:
         # +crt-static is safe; link-verified against the Tauri 2 stack.
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build -p roomler-agent-tray --release
+        run: cargo build -p roomler-desktop --release
 
       - name: Locate + rename tray EXE
         id: locate_tray
@@ -1905,9 +1982,26 @@ jobs:
         # Neither needs a staging line: the bundling step below walks
         # `otool -L` recursively and copies whatever the binary actually
         # links, which is why adding a library here required no change there.
+        #
+        # ⚠️ FR-27 — `viewer-indicator-macos` is deliberately NOT in this set
+        # yet, and turning it on is a decision, not a cleanup.
+        #
+        # The feature does not merely add a window: it moves tokio OFF the main
+        # thread in `main.rs`, because AppKit will not deliver a click to an
+        # Approve button while `#[tokio::main]` parks the main run loop. That
+        # is a change to how every macOS agent STARTS, and macOS updates are
+        # owned by the root helper — a daemon that fails to start cannot pull
+        # its own fix, so recovery is a manual reinstall per Mac.
+        #
+        # It compiles in CI (`macOS overlay compile check` builds
+        # `--lib --bins --features viewer-indicator-macos`), so the code is not
+        # rotting. To enable: build a `workflow_dispatch` artifact with the
+        # feature, run it on a real Mac, confirm the daemon starts AND a prompt
+        # both appears and answers — then add it here. Until then macOS prompts
+        # go to the desktop companion, which works.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder" --target aarch64-apple-darwin
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder" --target aarch64-apple-darwin
 
       # The `roomler` CLI. macOS shipped WITHOUT one until rc.454 — the pkg
       # payload was the .app and nothing else — so `roomler peers` was
@@ -1922,7 +2016,7 @@ jobs:
       # `cargo build` embeds the frontend and no Tauri toolchain is needed on
       # the runner (the same reason the Windows lane uses `cargo build`).
       - name: Build the desktop companion
-        run: cargo build -p roomler-agent-tray --release --target aarch64-apple-darwin
+        run: cargo build -p roomler-desktop --release --target aarch64-apple-darwin
 
       # ── The STABLE self-signed code-signing identity ────────────────────
       # TCC keys Screen Recording / Accessibility grants on the code-signing
@@ -2135,19 +2229,19 @@ jobs:
             echo "::error::the staged binary does not start without Homebrew (exit $rc) — it is not self-contained"
             exit 1
           fi
-          cp agents/roomler-agent/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
+          cp agents/roomlerd/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
           # The privileged half's plist rides along in Resources; the
           # postinstall only installs it into /Library/LaunchDaemons when the
           # operator has opted in. Staged unconditionally so enabling the
           # daemon never requires a different package.
-          cp agents/roomler-agent/packaging/macos/com.roomler.daemon.plist "$APP/Contents/Resources/"
+          cp agents/roomlerd/packaging/macos/com.roomler.daemon.plist "$APP/Contents/Resources/"
           # The companion's LaunchAgent rides here too — the postinstall reads
           # every plist it installs out of this one directory.
-          cp agents/roomler-agent/packaging/macos/com.roomler.desktop.plist "$APP/Contents/Resources/"
+          cp agents/roomlerd/packaging/macos/com.roomler.desktop.plist "$APP/Contents/Resources/"
           # The update half (root LaunchDaemon, DEFAULT ON, opt-out marker
           # /etc/roomler-agent/disable-auto-update). Owns check+download+
           # install so no agent process ever execs its own replacement.
-          cp agents/roomler-agent/packaging/macos/com.roomler.update.plist "$APP/Contents/Resources/"
+          cp agents/roomlerd/packaging/macos/com.roomler.update.plist "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2223,7 +2317,7 @@ jobs:
           DESK=stage/Roomler.app
           mkdir -p "$DESK/Contents/MacOS" "$DESK/Contents/Resources"
           cp target/aarch64-apple-darwin/release/roomler-desktop "$DESK/Contents/MacOS/roomler-desktop"
-          cp agents/roomler-agent-tray/icons/icon.png "$DESK/Contents/Resources/icon.png"
+          cp agents/roomler-desktop/icons/icon.png "$DESK/Contents/Resources/icon.png"
           cat > "$DESK/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2322,7 +2416,7 @@ jobs:
               done
           codesign --force --sign "Developer ID Application" \
                    --options runtime --timestamp \
-                   --entitlements agents/roomler-agent/packaging/macos/entitlements.plist \
+                   --entitlements agents/roomlerd/packaging/macos/entitlements.plist \
                    "stage/roomler-agent.app/Contents/MacOS/roomler-agent"
 
           codesign --force --sign "Developer ID Application" \
@@ -2377,7 +2471,7 @@ jobs:
           # point for `roomlerd enroll` / `--version`, not a second install.
           ln -s /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent \
             payload/usr/local/bin/roomlerd
-          cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
+          cp agents/roomlerd/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
 
           # Turn OFF bundle relocation. This is not a nicety.
