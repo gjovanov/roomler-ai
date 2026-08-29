@@ -123,9 +123,15 @@ export function useConferenceLayout(
   activeSpeakerKey: Ref<string | null>,
   getDisplayName: (userId: string) => string,
   localDisplayName: Ref<string>,
-  // FR-30 — streamKey -> the peer's own "my camera is off". Optional so the
-  // composable stays usable (and testable) without a live call store.
-  remoteVideoPaused?: Map<string, boolean>,
+  // FR-30 — what each peer SAYS about their own camera/mic, keyed by
+  // streamKey. Optional so the composable stays usable (and testable) without
+  // a live call store. ⚠️ An options object rather than more positional
+  // arguments: P1 shipped `remoteVideoPaused` here and audio would have made
+  // it nine in a row, at which point a call site gets one wrong silently.
+  remotePaused?: {
+    video?: Map<string, boolean>
+    audio?: Map<string, boolean>
+  },
 ) {
   const prefs = ref<LayoutPreferences>(loadPrefs())
 
@@ -223,11 +229,13 @@ export function useConferenceLayout(
         userId: remote.userId,
         displayName: name,
         stream: remote.stream,
-        isMuted: false,
+        // FR-30 P3 — was hardcoded `false`, so a remote could never show as
+        // muted. Same signal as the camera, different map.
+        isMuted: remotePaused?.audio?.get(streamKey) === true,
         isLocal: false,
         isScreenShare: isScreen,
         isPinned: prefs.value.pinnedStreamKeys.includes(streamKey),
-        videoPaused: remoteVideoPaused?.get(streamKey) === true,
+        videoPaused: remotePaused?.video?.get(streamKey) === true,
         audioLevel: audioLevels.value.get(streamKey) ?? 0,
       })
     }
