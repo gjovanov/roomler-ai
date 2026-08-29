@@ -1544,6 +1544,9 @@ fn install_tarball_linux(euid: u32, tarball: &std::path::Path) -> Result<u32> {
             let entry = entry?;
             if entry.path().is_file() {
                 let rel = format!(
+                    // RETIRED-NAME-ANCHOR(2): the bundled-library directory is
+                    // baked into the binary as an RPATH. It cannot move without
+                    // a relink, so the updater must stage into the same name.
                     "usr/lib/roomler-agent/{}",
                     entry.file_name().to_string_lossy()
                 );

@@ -181,7 +181,7 @@ agents/roomlerd/
     ├── windows.wxs            # MSI; auto-start at user login
     ├── macos.plist            # LaunchAgent (user, not Daemon, in v1)
     └── linux/
-        ├── roomler-agent.service   # systemd --user
+        ├── roomler.service         # systemd --user
         └── flatpak/...
 ```
 
