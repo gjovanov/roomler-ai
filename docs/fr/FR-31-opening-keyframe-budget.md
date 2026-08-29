@@ -1,6 +1,6 @@
 # FR-31: The opening keyframe of an NVENC session gets one frame's budget — ffmpeg discards the HRD in `cq` mode
 
-Status: **P0 measured (NVENC); P1 designed, not yet shipped** (2026-08-29). Tracking issue: `FR-31`.
+Status: **P0 measured; P1 (post-open VBV) and P1b (`ldkfs`) BOTH REFUTED by the A/B — the opening keyframe is ~1.1–1.3 × `maxrate/fps` and nothing ffmpeg exposes changes that; decision pending on the remaining levers** (2026-08-29). Tracking issue: `FR-31` (#897). Implementation PR #900 is a draft (inert knobs + the `open_vbv_bits` log field).
 Child of the RC-quality program; sibling of FR-10 (relay IDR thrift), FR-17 (relay transport),
 FR-22 (time-to-first-frame). Spec ships with the implementation PR (the default is decided by
 an A/B, see "Open decisions").
@@ -84,11 +84,21 @@ option dictionary and the post-open write cannot drift.
 
 Knob: env `ROOMLERD_NVENC_OPEN_VBV_PCT` / config-surface key `nvenc_open_vbv_pct`
 (new-env ⇒ config-key rule). `0` = kill switch (today's behaviour, byte-identical wire), `100`
-= the HRD the code always claimed. Default: decided by the A/B below, **not** by reasoning —
+= the HRD the code always claimed. Default: ships as `100` (the window the code always claimed); the A/B below decides whether it stays or moves to `40` — a choice made on data, **not** by reasoning —
 the trade is real: a fuller opening IDR is a larger first frame, which on a 2.55 Mbps pipe is
 transit time before first light (a crisp ~300 KB IDR ≈ 1 s) versus today's instant smear that
 takes ~1.2 s to repair. Total bits to crisp are the same either way; what changes is what the
 operator sees meanwhile.
+
+**P0 result (2026-08-29, on #897):** `pct=100` was handed to the driver (log field + `nvenc.c`
+reinit confirmed) and the opening keyframe stayed at 11–16 KB; `tune=hq` likewise; **`maxrate`
+×10 gave a 132–140 KB keyframe and 99–100 % first-light sharpness** — the driver sizes the
+opening IDR as ~1.3 frame-slices of `maxrate`, full stop. `maxrate` itself is not shippable
+(ffmpeg's reconfigure forces a fresh — starved — IDR on any rate change), so **P1b** adds the
+parameter NVENC provides for exactly this ratio, `lowDelayKeyFrameScale` (`ldkfs`), as a second
+knob (`nvenc_ldkfs`, default unset) in the rejection-tolerant `lowlat` tier. P1's knob stays,
+default 0 (inert). If the driver honours `ldkfs` only under CBR, the remaining path is a
+vendored-ffmpeg patch mapping `rc_initial_buffer_occupancy` → `vbvInitialDelay`.
 
 **P0 — the A/B, on this box's own daemon** (self-view over `ROOMLERD_ICE_RELAY_TCP=1`, which
 forces both a relay-class ICE path and the constrained profile — `peer.rs:1376`; the mirror
@@ -98,9 +108,12 @@ tuning; env `ROOMLERD_FFMPEG_TUNE`, no code). Metrics per leg, N ≥ 5, foregrou
 sampling logged: frame-1 bytes on the wire, TTFF, first-light sharpness as a fraction of the
 8 s steady state, time-to-crisp (≥ 90 % of steady state).
 
-**P2 — QSV / AMF.** ffmpeg maps `InitialDelayInKB` from `rc_initial_buffer_occupancy` (0 ⇒
-SDK default) for QSV; AMF's VBV lives in the per-codec files. Measure frame-1 bytes on a
-relayed QSV host (CORPLAP-3 `av1_qsv`) with the same browser hook before touching anything.
+**P2 — QSV / AMF: measured, no action.** CORPLAP-3 (`av1_qsv`, relayed, same cap) opens with
+a **161 B keyframe** (a black first capture) and lands the whole desktop as a **131 KB inter
+frame at +300 ms**, with only ~25 KB of repair over the next 14 frames — ffmpeg maps
+`-bufsize` to `BufferSizeInKB` for QSV, so the explicit reservoir is real there and the
+picture converges in one frame. That is the behaviour P1 aims to give NVENC. AMF: no host in
+the fleet; the same browser hook answers it in ten seconds when one appears.
 
 **Not done, deliberately:** `init_qpI` alone (ffmpeg already sets `enableInitialRCQP=1` with a
 default I-QP of 26 — `nvenc.c:967-983` — and the IDR still came out at maximum QP, so the
@@ -113,8 +126,9 @@ bitrate-targeted mode (rewrites the whole rate model); touching the mid-session 
 Measured with the browser harness (recipe in the handover / `reference_corplap2_checkpoint_lan_capture`),
 on the relay stand-in and then on the real pair `neo16 → PC55331`, N ≥ 5 each, shipped default:
 
-- [ ] frame 1 on the wire is a keyframe carrying **≥ 10× today's bytes** (≥ 56 KB) at the
-      2.55 Mbps constrained cap
+- [ ] the first three frames on the wire carry **≥ 250 KB combined** at the 2.55 Mbps
+      constrained cap (today 124 KB, of which the keyframe is 5.6 KB) — the desktop lands
+      inside the reservoir instead of dribbling in as repairs
 - [ ] first-light sharpness **≥ 80 %** of the 8 s steady-state value (today 47 %)
 - [ ] time-to-crisp (≥ 90 % of steady state) **not worse than today's 1.2 s**
 - [ ] TTFF p50 **not worse than today + 400 ms**; the number is reported either way
@@ -145,3 +159,6 @@ on the relay stand-in and then on the real pair `neo16 → PC55331`, N ≥ 5 eac
 | date | build | note |
 |---|---|---|
 | 2026-08-29 | agent 0.4.15/0.4.17 (PC55331), web `v20260829-40e8fc071129` | P0: the table above; 5/5 runs; sharpening on/off identical; `dc_unopen_drops` uncorrelated. ffmpeg n8.1 `nvenc.c` read: `cq` zeroes the VBV after `-bufsize` is mapped; `vbvInitialDelay` never set; reconfigure honours `rc_buffer_size`. |
+| 2026-08-29 | agent 0.4.17 (CORPLAP-3, `av1_qsv`, relayed) | P2: frame 1 = 161 B key, frame 2 = 131 581 B inter at +300 ms, ~25 KB over the next 14 frames — converges in one frame; QSV needs nothing. |
+| 2026-08-29 | branch build (neo16 self-view, `ROOMLERD_ICE_RELAY_TCP=1`) | P0 A/B: kill switch = baseline (13–16 KB); `pct=100` 11.4 KB ×3; `tune=hq` 11.8–14.2 KB; `maxrate` ×10 → 132–140 KB, first light 99–100 %. P1 refuted; `ldkfs` next. |
+| 2026-08-29 | branch build + `ldkfs=8` (option line confirms `… delay=0 ldkfs=8` accepted) | frame 1 = 17.2 · 15.3 KB — inert under `rc=vbr`+`cq` (documented for single-frame VBV **and CBR**). `maxrate` ×3 → 34.7 KB: the slope is linear. Remaining levers on #897: the relay ceiling (a different FR), a vendored-ffmpeg `vbvInitialDelay` patch (uncertain), or accept the physics. |
