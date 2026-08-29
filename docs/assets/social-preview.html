@@ -1,0 +1,96 @@
+<!doctype html>
+<!--
+  SPDX-License-Identifier: CC-BY-4.0
+  Copyright (C) 2026 G ROX EOOD
+
+  FR-38 — source for docs/assets/social-preview.png, the card GitHub renders for
+  every link to this repository (Hacker News, Reddit, Slack, X). GitHub exposes
+  no API for it, so the PNG is generated here and uploaded once through
+  Settings → General → Social preview.
+
+  Regenerate after editing:
+
+    chrome --headless --disable-gpu --hide-scrollbars \
+           --window-size=1280,640 --default-background-color=00000000 \
+           --screenshot=docs/assets/social-preview.png \
+           docs/assets/social-preview.html
+
+  Constraints that shaped it: the card is often rendered at ~300 px wide in a
+  feed, so the wordmark and the first line must survive a 4x downscale. Nothing
+  smaller than the chips, and no thin weights.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 640px; }
+  body {
+    background: linear-gradient(135deg, #05201d 0%, #0a3b34 48%, #00695c 100%);
+    color: #fff;
+    font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 0 88px; position: relative; overflow: hidden;
+  }
+  /* A suggestion of the mesh, not a diagram — it has to survive a 4x downscale
+     as texture rather than as information. */
+  .mesh { position: absolute; inset: 0; opacity: .30; }
+  .wordmark {
+    font-size: 104px; font-weight: 800; letter-spacing: -.045em; line-height: 1;
+    margin-bottom: 26px;
+  }
+  .wordmark .dot { color: #4ddbc4; }
+  .lede {
+    font-size: 39px; font-weight: 600; line-height: 1.24; letter-spacing: -.018em;
+    max-width: 21ch; margin-bottom: 20px;
+  }
+  .lede em { color: #6fe6d0; font-style: normal; }
+  .sub {
+    font-size: 24px; font-weight: 400; line-height: 1.4;
+    color: rgba(255,255,255,.80); max-width: 30ch; margin-bottom: 40px;
+  }
+  .chips { display: flex; gap: 12px; flex-wrap: wrap; }
+  .chip {
+    font-size: 19px; font-weight: 600; letter-spacing: .01em;
+    padding: 9px 18px; border-radius: 999px;
+    background: rgba(255,255,255,.11);
+    border: 1px solid rgba(255,255,255,.20);
+  }
+  .foot {
+    position: absolute; right: 88px; bottom: 54px; text-align: right;
+    font-size: 21px; color: rgba(255,255,255,.62); line-height: 1.5;
+  }
+  .foot b { color: rgba(255,255,255,.86); font-weight: 600; }
+</style>
+</head>
+<body>
+  <svg class="mesh" viewBox="0 0 1280 640" fill="none" aria-hidden="true">
+    <g stroke="#6fe6d0" stroke-width="1.6" opacity=".55">
+      <path d="M980 118 L1148 300 M980 118 L900 372 M1148 300 L900 372
+               M1148 300 L1196 520 M900 372 L1196 520 M900 372 L1010 566
+               M1196 520 L1010 566 M980 118 L1196 520"/>
+    </g>
+    <g fill="#7ff0d9">
+      <circle cx="980" cy="118" r="11"/><circle cx="1148" cy="300" r="11"/>
+      <circle cx="900" cy="372" r="11"/><circle cx="1196" cy="520" r="11"/>
+      <circle cx="1010" cy="566" r="11"/>
+    </g>
+    <g fill="#7ff0d9" opacity=".22">
+      <circle cx="980" cy="118" r="26"/><circle cx="1148" cy="300" r="26"/>
+      <circle cx="900" cy="372" r="26"/>
+    </g>
+  </svg>
+
+  <div class="wordmark">Roomler<span class="dot">.</span></div>
+  <div class="lede">Remote desktop and <em>WireGuard mesh</em> in one daemon.</div>
+  <div class="sub">Any machine you own, in a browser tab — and on a private encrypted network that travels with you.</div>
+  <div class="chips">
+    <span class="chip">Rust</span>
+    <span class="chip">Self-hostable</span>
+    <span class="chip">Tunnels &amp; SOCKS5</span>
+    <span class="chip">SSH, no sshd</span>
+  </div>
+
+  <div class="foot"><b>github.com/gjovanov/roomler-ai</b><br>AGPL-3.0 server · MPL-2.0 agent</div>
+</body>
+</html>
