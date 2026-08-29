@@ -1,6 +1,6 @@
 # FR-19: Peer relays — tenant-owned UDP relay nodes between direct and DERP
 
-Status: **in progress** — P0–P3b shipped, P3c the mint (#899) merging, P4a the client + P4b the runtime/agent wiring in PR behind `overlay_org_relay` (2026-08-29); proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
+Status: **in progress** — P0–P4b shipped; the fleet release is **0.4.19** (`agent-v0.4.19`, server `v20260829-f1eaac8295eb`), everything dark behind `overlay_org_relay` + `peer_relay_mode`; **P4c the first field mint next** (2026-08-29); proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
 Reference design: [Tailscale peer relays](https://tailscale.com/docs/features/peer-relay).
 Sibling of FR-18 (#801) and FR-17 (#799) — both are about the *cost* of the relay path;
 this FR is about **replacing that path with a better one** rather than tuning it.
