@@ -1,7 +1,8 @@
 # FR-36 — The e2e suite runs outside the cluster, so it cannot test media (and keeps breaking on the seam)
 
 **Issue:** [#928](https://github.com/gjovanov/roomler-ai/issues/928)
-**Status:** proposed — diagnosis measured 2026-08-29, no code yet
+**Status:** P1 **in progress** — three of the blockers are measured and two
+are solved; the specs are still red on a fourth. Nothing shipped yet.
 
 ## Goal
 
@@ -101,4 +102,67 @@ seam for a production-shaped hazard on a node that also runs real workloads.
 
 ## Field-verification log
 
-- (pending)
+**2026-08-29 — P1 probe run.** Everything below was measured against the live
+e2e stack; the stack was left exactly as found.
+
+1. **The runner works in-cluster.** The Playwright image schedules and runs in
+   `roomler-ai-e2e`; from it, `http://roomler2/health` → 200,
+   `http://mailpit:8025` → 200, and `registry.npmjs.org` → 200, so `npm i` in
+   an initContainer is viable. No image build needed.
+
+2. **🔑 A service URL is NOT a secure context, so there is no media API at
+   all.** Running against `http://roomler2`:
+
+   ```
+   navigator.mediaDevices → undefined
+   TypeError: Cannot read properties of undefined (reading 'getUserMedia')
+   ```
+
+   ⚠️ This is invisible from the host-side lane, which reaches the app on
+   `http://127.0.0.1:18080` and gets the **localhost exemption**. Two specs
+   (view loads, subject renders) passed here, so the failure looks like a
+   product bug until you check for the API's existence.
+
+   ⚠️ `--unsafely-treat-insecure-origin-as-secure` does **not** rescue it:
+   Chrome requires `--user-data-dir` alongside it, and Playwright rejects that
+   argument in `launch()` ("Pass userDataDir to launchPersistentContext").
+
+3. **🔑 The fix is to put the browser in the app pod's own network
+   namespace** — an ephemeral container with `--target=roomler2`. Then the app
+   is `http://127.0.0.1`, which IS a secure context, and:
+
+   ```
+   getUserMedia({audio,video}) → ok, tracks live
+   enumerateDevices → fake_device_0 + fake audio in/out
+   getUserMedia({video:{deviceId:{exact:…}}}) → ok      (the shape the app uses)
+   ```
+
+   It also makes the SFU trivially reachable: with no `announced_ip` set, the
+   server resolves **`127.0.0.1`** and hands out host candidates on
+   `127.0.0.1:40742` — the same namespace the browser is in. No routes, no
+   NAT, no announced-IP mapping.
+
+   ⚠️ `frontend_url` must then be `http://127.0.0.1` (no port) for the WS
+   origin check — the port is part of an Origin, so the host-side lane's
+   `http://127.0.0.1:18080` does not match. The two modes cannot share one
+   value, and `cors_origins` cannot be set from a configmap at all (no
+   `list_separator` ⇒ boot crash), so P2 must flip it as it switches lanes.
+
+4. **Still red — a fourth blocker, isolated but not solved.** With media
+   healthy, `conference.spec.ts` + `conference-multi.spec.ts` ran **2 passed /
+   9 failed**, and the server log shows why the tile never appears:
+
+   ```
+   media:join … room_exists=true
+   transports created …
+   media:join transport_created ICE diagnostics … announced_ip=127.0.0.1
+   participant media closed          ← 15 s later, no connect_transport, no produce
+   ```
+
+   The client stops between `transport_created` and `produce`, with **no
+   console error**, healthy `getUserMedia`, and working `enumerateDevices`. So
+   it is not permissions and not device selection — the next look belongs in
+   the client's `device.load()` / send-transport path.
+
+**Stack restored**: probe pod deleted, `frontend_url` back to
+`http://127.0.0.1:18080` so the existing nightly keeps working tonight.
