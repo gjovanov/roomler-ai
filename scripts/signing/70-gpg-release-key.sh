@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# RETIRED-NAME-ANCHOR-BEGIN
+# Every retired name below names a PUBLISHED release asset. Their filenames are
+# fixed by what is already on GitHub Releases (FR-21 D6), and these verify
+# commands are meant to be pasted against a real downloaded artifact.
 # 70-gpg-release-key.sh -- create the release signing key used to produce
 # detached .asc signatures for published artifacts.
 #
@@ -178,3 +182,4 @@ case "${1:-}" in
         exit 1
         ;;
 esac
+# RETIRED-NAME-ANCHOR-END

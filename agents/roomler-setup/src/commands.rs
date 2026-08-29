@@ -431,6 +431,8 @@ mod tests {
             tag: "tunnel-v0.3.0-rc.194".to_string(),
             role: Role::TunnelClient,
             flavour: None,
+            // RETIRED-NAME-ANCHOR(4): fixtures of the INSTALLED layout on hosts that
+            // predate the rename.
             binary_path: Some("/usr/local/bin/roomler-tunnel".to_string()),
             config_path: Some("/home/foo/.config/roomler-tunnel/config.toml".to_string()),
             path_updated: Some(true),

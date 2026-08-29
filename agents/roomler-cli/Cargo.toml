@@ -4,15 +4,18 @@ license = "MPL-2.0"
 publish = false
 version.workspace = true
 edition.workspace = true
-description = "Roomler AI tunnel client — TeamViewer-style native CLI that forwards local TCP ports to a roomler-agent's intranet via the existing Roomler WebRTC plane."
+description = "Roomler AI tunnel client — TeamViewer-style native CLI that forwards local TCP ports to a roomlerd's intranet via the existing Roomler WebRTC plane."
 
 [lib]
 name = "roomler_cli"
 path = "src/lib.rs"
 
 [[bin]]
-# P3d Slice B: OUTPUT binary is `roomler` (the unified CLI). Package
-# (`roomler-tunnel`) + lib (`roomler_tunnel`) names UNCHANGED. CI stages a
+# P3d Slice B: OUTPUT binary is `roomler` (the unified CLI). FR-21 P2b then
+# brought the package (`roomler-cli`) and lib (`roomler_cli`) names into line
+# with it. CI stages a
+# RETIRED-NAME-ANCHOR(3): the alias name is what the DEPLOYED self-updater
+# extracts. It is an input to code already running in the field.
 # `roomler-tunnel.exe` alias into the release zip so the deployed fleet's
 # self-updater (which extracts `roomler-tunnel.exe`) is never orphaned.
 name = "roomler"
@@ -56,6 +59,7 @@ thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
+# RETIRED-NAME-ANCHOR(2): same alias as above, same reason.
 # Self-update: extract the roomler-tunnel binary from the release .zip.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
@@ -99,7 +103,7 @@ tokio-test = { workspace = true }
 tempfile = { workspace = true }
 
 # ---------------------------------------------------------------------------
-# Packaging metadata — mirrors roomler-agent. release-tunnel.yml CI lands
+# Packaging metadata — mirrors roomlerd. release-tunnel.yml CI lands
 # in T4 (or release-agent.yml extended with a second matrix entry).
 # ---------------------------------------------------------------------------
 
@@ -112,11 +116,15 @@ license-file = ["../../LICENSE", "0"]
 extended-description = """\
 Native tunnel client for the Roomler AI platform. Runs on the \
 operator's laptop, opens a local TCP listener, and forwards bytes \
-over a WebRTC P2P data channel to an enrolled roomler-agent that \
+over a WebRTC P2P data channel to an enrolled roomlerd that \
 dials the corresponding intranet destination. The Roomler API is \
 signalling-only — server never sees the payload."""
 section = "net"
 priority = "optional"
+# RETIRED-NAME-ANCHOR-BEGIN
+# The dpkg takeover has to name the REAL predecessor package. A rename here
+# is not a typo, it is a silently broken upgrade: dpkg would see a brand new
+# package and leave the old one owning /usr/bin/roomler.
 # FR-21 P2b: the crate renamed `roomler-tunnel` -> `roomler-cli`, and cargo-deb
 # derives the Debian `Package:` from the crate name, so without these dpkg would
 # see a brand-new package and collide with the installed `roomler-tunnel` over
@@ -128,6 +136,7 @@ priority = "optional"
 name = "roomler-cli"
 provides = "roomler-tunnel"
 replaces = "roomler-tunnel"
+# RETIRED-NAME-ANCHOR-END
 assets = [
     # P3d Slice B: installed CLI binary is `roomler` (the [[bin]] output name).
     ["target/release/roomler", "usr/bin/", "755"],

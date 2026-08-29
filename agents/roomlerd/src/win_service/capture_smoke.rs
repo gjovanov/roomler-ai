@@ -20,7 +20,7 @@
 //!   - `input`: `OpenInputDesktop` → swap. Reproduces what the M3
 //!     supervisor's poll loop will do every 250 ms.
 //!   - `winlogon`: explicitly opens `winsta0\Winlogon`. Requires
-//!     SYSTEM context (run via `psexec -s -i 1 roomler-agent system-
+//!     SYSTEM context (run via `psexec -s -i 1 roomlerd system-
 //!     capture-smoke --desktop winlogon` from an elevated shell).
 //!
 //! Reports first frame size, frame-arrived count over a 5-second
@@ -125,7 +125,7 @@ pub fn run(target: DesktopTarget, frames: u32, timeout_ms: u32) -> Result<()> {
                     anyhow::anyhow!(
                         "OpenDesktopW(Winlogon) returned ACCESS_DENIED — \
                      this mode requires SYSTEM context. Run via \
-                     `psexec -s -i 1 roomler-agent.exe system-capture-smoke --desktop winlogon` \
+                     `psexec -s -i 1 roomlerd.exe system-capture-smoke --desktop winlogon` \
                      from elevated PowerShell."
                     )
                 })?;

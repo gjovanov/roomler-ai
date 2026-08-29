@@ -107,7 +107,7 @@ impl SystemContextInjector {
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
 
         thread::Builder::new()
-            .name("roomler-agent-system-input".into())
+            .name("roomlerd-system-input".into())
             .spawn(move || {
                 if let Err(e) = desktop_rebind::attach_to_winsta0() {
                     let _ = ready_tx.send(Err(anyhow!("attach_to_winsta0: {e}")));

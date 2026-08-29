@@ -730,6 +730,8 @@ impl AgentPeer {
         // PC state → logs + fatal Terminate on Failed + cross-process
         // peer-presence marker for the M3 A1 supervisor.
         //
+        // RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed
+        // before P4b still has; appdirs::app_segment resolves it, so it is an input.
         // The marker file (`%PROGRAMDATA%\roomler-agent\
         // peer-connected.lock`) is the supervisor's signal for
         // "swap user-context worker for SystemContext worker
@@ -1543,6 +1545,8 @@ async fn current_pair_is_relay(
 async fn overlay_remote_is_relay_tier(remote_addr: &str, session_id: bson::oid::ObjectId) -> bool {
     use tunnel_core::localapi::ConnectionType;
 
+    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours;
+    // an operator with it in a script needs to be able to grep for it.
     // node_env: accepts ROOMLERD_/ROOMLER_NODE_/ROOMLER_AGENT_ prefixes + the
     // `overlay_tier_detect` config key via the S2 fallback map.
     if tunnel_core::env::node_env("OVERLAY_TIER_DETECT").as_deref() == Some("0") {
@@ -4741,7 +4745,7 @@ async fn media_pump_ffmpeg_dc(
         // AIMD's rate DROPS land DURING motion as smaller frames instead
         // of production skips. Replaces the rc.445 motion-defer when
         // `bg_rebuild` is on; the defer machinery stays as the
-        // kill-switch fallback (`ROOMLER_AGENT_BG_REBUILD=0`).
+        // kill-switch fallback (`ROOMLERD_BG_REBUILD=0`).
         if bg_rebuild {
             if let Some(handle) = pending_swap.as_ref()
                 && handle.is_finished()
@@ -9807,8 +9811,8 @@ mod overlay_tier_tests {
         // where a real daemon happens to be running).
         // SAFETY: no other test touches this var (set_var is unsafe in
         // edition 2024 because of cross-thread env races).
-        unsafe { std::env::set_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT", "0") };
+        unsafe { std::env::set_var("ROOMLERD_OVERLAY_TIER_DETECT", "0") };
         assert!(!overlay_remote_is_relay_tier("100.64.0.29", sid).await);
-        unsafe { std::env::remove_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT") };
+        unsafe { std::env::remove_var("ROOMLERD_OVERLAY_TIER_DETECT") };
     }
 }
