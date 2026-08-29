@@ -2004,6 +2004,7 @@ async fn media_pump(
     let mut damage_permille_sum: u64 = 0;
     let mut damage_union_sum: u64 = 0;
     let mut damage_bbox_sum: u64 = 0;
+    let mut damage_rects_sum: u64 = 0;
     let mut frames_encoded: u64 = 0;
     let mut frames_keepalive: u64 = 0;
     let mut bytes_written: u64 = 0;
@@ -2028,6 +2029,7 @@ async fn media_pump(
     let mut heartbeat_damage_permille_base: u64 = 0;
     let mut heartbeat_damage_union_base: u64 = 0;
     let mut heartbeat_damage_bbox_base: u64 = 0;
+    let mut heartbeat_damage_rects_base: u64 = 0;
     let mut heartbeat_encode_us_base: u64 = 0;
 
     // Last applied quality preference. Initialised to a sentinel
@@ -2436,6 +2438,9 @@ async fn media_pump(
                     .bbox_permille(frame.width, frame.height)
                     .unwrap_or(0),
             );
+            // FR-29 — few huge rects or many small ones? union==bbox==1000 is
+            // consistent with BOTH, and they imply opposite things about P3.
+            damage_rects_sum += frame.damage.rects().len() as u64;
         }
 
         // Adaptive bitrate: combine quality preference (controller
@@ -2590,6 +2595,10 @@ async fn media_pump(
                 .saturating_sub(heartbeat_damage_bbox_base)
                 .checked_div(damage_frames_window)
                 .unwrap_or(0);
+            let avg_damage_rects = damage_rects_sum
+                .saturating_sub(heartbeat_damage_rects_base)
+                .checked_div(damage_frames_window)
+                .unwrap_or(0);
             info!(
                 %session_id,
                 backend,
@@ -2598,6 +2607,7 @@ async fn media_pump(
                 avg_damage_permille,
                 avg_damage_union_permille,
                 avg_damage_bbox_permille,
+                avg_damage_rects,
                 bytes_written, write_errors,
                 avg_capture_ms, avg_encode_ms,
                 "media pump heartbeat (≈1s window)"
@@ -2608,6 +2618,7 @@ async fn media_pump(
             heartbeat_damage_permille_base = damage_permille_sum;
             heartbeat_damage_union_base = damage_union_sum;
             heartbeat_damage_bbox_base = damage_bbox_sum;
+            heartbeat_damage_rects_base = damage_rects_sum;
             heartbeat_encode_us_base = encode_time_us;
         }
     }
