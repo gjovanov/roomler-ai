@@ -612,6 +612,11 @@ pub struct AgentConfig {
     /// native.
     #[serde(default)]
     pub idle_refine_max_edge: Option<u32>,
+    /// FR-31 — percent of the HRD window the OPENING NVENC keyframe may draw
+    /// on (`ROOMLERD_NVENC_OPEN_VBV_PCT`, 0-400). Built-in default: 100 = the
+    /// window `bufsize` asks for; 0 = kill switch (the pre-FR-31 wire).
+    #[serde(default)]
+    pub nvenc_open_vbv_pct: Option<u32>,
     /// P7c — encoded-size floor (KiB) for a frame to count as motion in
     /// the idle-refine machine; smaller deltas (caret, keystrokes) are
     /// invisible to it (`ROOMLERD_IDLE_REFINE_MIN_FRAME_KB`).
@@ -1696,6 +1701,7 @@ pub fn test_fixture() -> AgentConfig {
         idle_refine_balanced: None,
         gpu_scale: None,
         idle_refine_max_edge: None,
+        nvenc_open_vbv_pct: None,
         idle_refine_min_frame_kb: None,
         idle_refine_major_area_permille: None,
         idle_refine_settle_ms: None,
@@ -1899,7 +1905,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 55]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 24] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 25] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1909,6 +1915,7 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("LANCZOS_MIN_PCT", cfg.lanczos_min_pct),
         ("SCALE_CQ_BOOST", cfg.scale_cq_boost),
         ("IDLE_REFINE_MAX_EDGE", cfg.idle_refine_max_edge),
+        ("NVENC_OPEN_VBV_PCT", cfg.nvenc_open_vbv_pct),
         ("IDLE_REFINE_MIN_FRAME_KB", cfg.idle_refine_min_frame_kb),
         (
             "IDLE_REFINE_MAJOR_AREA_PERMILLE",
