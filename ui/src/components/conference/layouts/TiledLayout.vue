@@ -26,12 +26,14 @@
       @mousedown.prevent="startDrag"
     >
       <VideoTile
+        :stream-key="selfParticipant.streamKey"
         :stream="selfParticipant.stream"
         :display-name="selfParticipant.displayName"
         :is-muted="selfParticipant.isMuted"
         :is-local="true"
         :compact="true"
         object-fit="contain"
+        @spotlight="$emit('spotlight', $event)"
       />
     </div>
   </div>
