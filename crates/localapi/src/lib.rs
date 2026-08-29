@@ -173,6 +173,47 @@ pub struct NodeStatus {
     /// from a daemon predating the responder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disco_answered: Option<u64>,
+    /// FR-19 — this node's org-relay probe responder, or `None` when it is not
+    /// running (the default: `relay_server_enabled` is opt-in).
+    ///
+    /// ⚠️ `None` and a running-but-idle responder are **different states** and
+    /// must stay distinguishable. "No relay here" and "a relay that has
+    /// answered nothing" lead to opposite next actions, and collapsing them is
+    /// how FR-18's `dropped_stale` became unevaluable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_relay: Option<OrgRelayStatus>,
+}
+
+/// FR-19 — the org-relay probe responder's live state (see
+/// [`NodeStatus::org_relay`]).
+///
+/// This exists because the log was not enough in the field: the responder
+/// summarises its counters every 300 s **and sleeps before the first report**,
+/// so a freshly restarted relay is unreadable for five minutes — exactly the
+/// window in which someone is asking "is it working?". Reading it out of
+/// `roomler status` answers that immediately.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OrgRelayStatus {
+    /// The bound `ip:port`.
+    ///
+    /// ⚠️ Present means **bound**, which is NOT the same as reachable. A
+    /// coturn-style DNAT can consume the port in `PREROUTING` while the socket
+    /// sees nothing and `ss -ulnp` shows it free — measured on mars, where that
+    /// confound nearly inverted FR-19's port decision. `answered > 0` is the
+    /// evidence of reachability; this field is only evidence of a listener.
+    pub listening: String,
+    /// Probes answered since start.
+    pub answered: u64,
+    /// Datagrams refused for not being org-relay shaped at all.
+    pub refused_not_shaped: u64,
+    /// Org-relay shaped, but not a probe (wrong length, or a data frame).
+    pub refused_not_probe: u64,
+    /// Refused because the source had spent its per-window allowance.
+    ///
+    /// One counter per refusal REASON rather than a single "refused", because
+    /// during a flood the reason is the whole diagnostic: an attack and a
+    /// misconfigured peer look identical in a total.
+    pub refused_rate_limited: u64,
 }
 
 /// PR-B1 — one bound direct socket's receive liveness (plane or per-device
@@ -2230,6 +2271,45 @@ fn unexpected_response(resp: Response) -> std::io::Error {
 mod tests {
     use super::*;
 
+    /// WIRE SHAPE. A node that is not serving relay probes must produce
+    /// **byte-identical** status JSON to one built before FR-19 existed —
+    /// otherwise every older `roomler status` / desktop reader has its shape
+    /// changed by a feature it does not have.
+    ///
+    /// And the `Some` case must carry the counters even when they are zero:
+    /// "serving, has answered nothing" is a real and important state, and it
+    /// is the one a freshly-restarted relay is in while someone is asking
+    /// whether it works.
+    #[test]
+    fn org_relay_is_absent_when_not_serving_and_explicit_when_it_is() {
+        let mut s = Mock.status();
+        s.org_relay = None;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("org_relay"),
+            "a non-serving node must not emit the key at all: {json}"
+        );
+
+        s.org_relay = Some(OrgRelayStatus {
+            listening: "0.0.0.0:3478".into(),
+            answered: 0,
+            refused_not_shaped: 0,
+            refused_not_probe: 0,
+            refused_rate_limited: 0,
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""listening":"0.0.0.0:3478""#), "{json}");
+        assert!(
+            json.contains(r#""answered":0"#),
+            "zero counters must be PRESENT, not skipped -- 'serving and idle' \
+             is not the same state as 'not serving': {json}"
+        );
+
+        // Round trip, so an older field order or a rename is caught here.
+        let back: NodeStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.org_relay, s.org_relay);
+    }
+
     struct Mock;
     #[async_trait]
     impl LocalApiState for Mock {
@@ -2253,6 +2333,7 @@ mod tests {
                 direct_bind_walks: None,
                 roam_adoptions: None,
                 disco_answered: None,
+                org_relay: None,
                 derp_inbound_drops: None,
                 netcheck: None,
             }
