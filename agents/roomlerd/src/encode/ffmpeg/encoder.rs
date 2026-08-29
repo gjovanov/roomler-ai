@@ -188,6 +188,64 @@ pub(crate) use crate::encode::rate_profile::ffmpeg_maxrate_bps_scaled;
 /// The three products of [`encoder_options`]: `(base, lowlat, summary)`.
 type EncoderOptions = (Vec<(String, String)>, Vec<(String, String)>, String);
 
+/// The HRD window this build hands the encoder, as a percentage of `maxrate`.
+/// The reasoning (rc.234 2×, rc.442/443, the direct 1× default, the AV1 floor)
+/// sits on the `bufsize` push in [`encoder_options`]; this is the ONE place the
+/// number is computed, so the option dictionary and the FR-31 post-open write
+/// cannot drift.
+fn hrd_pct_for(name: &str, constrained: bool) -> usize {
+    let hrd_pct: usize = if constrained {
+        crate::encode::rate_profile::constrained_hrd_pct()
+    } else {
+        crate::encode::rate_profile::direct_hrd_pct()
+    };
+    if name.starts_with("av1_") {
+        hrd_pct.max(200)
+    } else {
+        hrd_pct
+    }
+}
+
+/// FR-31 — percent of the HRD window the OPENING NVENC keyframe may draw on.
+/// `100` = the window `bufsize` already asks for; `0` = kill switch (the
+/// pre-FR-31 wire, byte-identical). Env `ROOMLERD_NVENC_OPEN_VBV_PCT` / config
+/// `nvenc_open_vbv_pct`, clamped to 400.
+const DEFAULT_NVENC_OPEN_VBV_PCT: usize = 100;
+
+fn nvenc_open_vbv_pct() -> usize {
+    node_env("NVENC_OPEN_VBV_PCT")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|p| p.min(400))
+        .unwrap_or(DEFAULT_NVENC_OPEN_VBV_PCT)
+}
+
+/// FR-31 — the reservoir (bits) to hand an NVENC context right after it opens,
+/// or `None` when nothing should be written (not NVENC, or the knob is `0`).
+///
+/// Why this exists: FFmpeg's `nvenc.c` maps `-bufsize` to `vbvBufferSize` and
+/// then, in its `cq` branch (which runs LATER in `nvenc_setup_rate_control`),
+/// zeroes `vbvBufferSize` and `avctx->rc_buffer_size` again — so on NVENC the
+/// window [`encoder_options`] asks for never reaches the driver, and the
+/// driver's `tune=ll` default behaves as a single-frame reservoir. Field
+/// 2026-08-29 (`neo16 → PC55331`, relayed `av1_nvenc`, cap 2.55 Mbps): the
+/// session's only IDR was 5.6 KB (maximum QP) and the desktop arrived as inter
+/// frames over ~1.2 s — the operator's "blurred, then crystallizes". FFmpeg's
+/// reconfigure path DOES honour a later `rc_buffer_size` write (the contract
+/// `set_bitrate` already relies on between frames), so the constructor writes
+/// this value on the context before the first frame is sent.
+fn nvenc_open_vbv_bits(name: &str, maxrate_bps: usize, constrained: bool) -> Option<usize> {
+    if !name.contains("nvenc") {
+        return None;
+    }
+    let pct = nvenc_open_vbv_pct();
+    if pct == 0 {
+        return None;
+    }
+    let window = maxrate_bps.saturating_mul(hrd_pct_for(name, constrained)) / 100;
+    let bits = window.saturating_mul(pct) / 100;
+    (bits > 0).then_some(bits)
+}
+
 /// rc.86 — per-encoder private-option dictionary for constant-quality,
 /// low-latency, screen-content tuning. Keys mirror the FFmpeg CLI: `-cq`,
 /// `-preset`, `-tune`, `-spatial-aq`, `-maxrate` and friends. Any option the
@@ -249,16 +307,7 @@ fn encoder_options(
     // Intel's AV1 VDENC ERRORS (then hangs the driver) on a forced IDR
     // that exceeds the reservoir instead of QP-clamping — the rc.443
     // incident; H.264/HEVC clamp gracefully.
-    let hrd_pct: usize = if constrained {
-        crate::encode::rate_profile::constrained_hrd_pct()
-    } else {
-        crate::encode::rate_profile::direct_hrd_pct()
-    };
-    let hrd_pct = if name.starts_with("av1_") {
-        hrd_pct.max(200)
-    } else {
-        hrd_pct
-    };
+    let hrd_pct = hrd_pct_for(name, constrained);
     let buf = (maxrate_bps.saturating_mul(hrd_pct) / 100).to_string();
     let cq_s = cq.to_string();
     let preset = node_env("FFMPEG_PRESET");
@@ -939,7 +988,23 @@ impl FfmpegEncoder {
                 chroma444,
                 constrained,
             ) {
-                Ok(encoder) => {
+                Ok(mut encoder) => {
+                    // FR-31 — hand NVENC the HRD window BEFORE the opening
+                    // keyframe. FFmpeg's `cq` branch zeroed `rc_buffer_size`
+                    // during open; its reconfigure path re-reads the field on
+                    // the first `send_frame` and applies it to the driver
+                    // (`nvenc_open_vbv_bits` has the whole story).
+                    let open_vbv_bits = nvenc_open_vbv_bits(name, maxrate_bps, constrained);
+                    if let Some(bits) = open_vbv_bits {
+                        // SAFETY: `encoder` owns the `AVCodecContext`, nothing
+                        // else holds it, and no frame has been sent yet — the
+                        // same contract `set_bitrate` relies on between frames.
+                        unsafe {
+                            let ctx = encoder.as_mut_ptr();
+                            (*ctx).rc_buffer_size =
+                                bits.min(i32::MAX as usize) as std::os::raw::c_int;
+                        }
+                    }
                     tracing::info!(
                         encoder = name,
                         width,
@@ -948,6 +1013,7 @@ impl FfmpegEncoder {
                         cq,
                         cq_bias,
                         maxrate_bps,
+                        open_vbv_bits = open_vbv_bits.unwrap_or(0),
                         chroma444,
                         "ffmpeg encoder opened (constant-quality + maxrate cap)"
                     );
@@ -1900,6 +1966,51 @@ mod tests {
             summary.contains("bufsize=6000000"),
             "av1 is floored at the 2x window even on direct, got: {summary}"
         );
+    }
+
+    // FR-31 — serialise the opening-reservoir env test (same lesson as the
+    // AQ lock below: cargo's parallel runner interleaves env writers).
+    static OPEN_VBV_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// FR-31 — the opening-keyframe reservoir follows the HRD window
+    /// `bufsize` asks for (so the option dictionary and the post-open write
+    /// cannot drift), is NVENC-only, and the `0` knob is a true kill switch.
+    #[test]
+    fn nvenc_open_vbv_follows_the_hrd_window_and_the_kill_switch() {
+        let _guard = OPEN_VBV_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: nothing else in the crate touches this var at test time; a
+        // future sibling that does must share OPEN_VBV_ENV_LOCK.
+        let prior = std::env::var("ROOMLERD_NVENC_OPEN_VBV_PCT").ok();
+        unsafe { std::env::remove_var("ROOMLERD_NVENC_OPEN_VBV_PCT") };
+
+        // Default = 100 % of the window; constrained av1 = 2× the ceiling …
+        assert_eq!(
+            nvenc_open_vbv_bits("av1_nvenc", 2_550_000, true),
+            Some(5_100_000)
+        );
+        // … which is exactly what `encoder_options` puts on the wire.
+        let (_, _, summary) = encoder_options("av1_nvenc", 2_550_000, 22, false, false, true);
+        assert!(summary.contains("bufsize=5100000"), "got: {summary}");
+        // Non-NVENC backends never get the post-open write.
+        assert_eq!(nvenc_open_vbv_bits("av1_qsv", 2_550_000, true), None);
+        assert_eq!(nvenc_open_vbv_bits("hevc_amf", 2_550_000, true), None);
+
+        unsafe { std::env::set_var("ROOMLERD_NVENC_OPEN_VBV_PCT", "40") };
+        assert_eq!(
+            nvenc_open_vbv_bits("av1_nvenc", 2_550_000, true),
+            Some(2_040_000)
+        );
+        unsafe { std::env::set_var("ROOMLERD_NVENC_OPEN_VBV_PCT", "0") };
+        assert_eq!(nvenc_open_vbv_bits("av1_nvenc", 2_550_000, true), None);
+        unsafe { std::env::set_var("ROOMLERD_NVENC_OPEN_VBV_PCT", "9999") };
+        assert_eq!(nvenc_open_vbv_pct(), 400, "clamped at 400");
+        unsafe { std::env::set_var("ROOMLERD_NVENC_OPEN_VBV_PCT", "garbage") };
+        assert_eq!(nvenc_open_vbv_pct(), DEFAULT_NVENC_OPEN_VBV_PCT);
+
+        match prior {
+            Some(v) => unsafe { std::env::set_var("ROOMLERD_NVENC_OPEN_VBV_PCT", v) },
+            None => unsafe { std::env::remove_var("ROOMLERD_NVENC_OPEN_VBV_PCT") },
+        }
     }
 
     // P7 (2026-08-20) — serialise the spatial-AQ env test against any future
