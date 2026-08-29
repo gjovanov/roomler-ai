@@ -184,7 +184,7 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
-    // Subscribers (FR-38). `email` is unique so a re-submission updates the
+    // Subscribers (FR-39). `email` is unique so a re-submission updates the
     // existing row rather than creating a second one that the first row's
     // unsubscribe link could never reach. The two token indexes are unique
     // because each token is a capability resolved by lookup, and two rows

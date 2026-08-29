@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! FR-38 — the public subscribe / confirm / unsubscribe routes, against a real
+//! FR-39 — the public subscribe / confirm / unsubscribe routes, against a real
 //! server and a real MongoDB.
 //!
 //! The unit tests in `routes::subscribe` pin the validators. These pin the
