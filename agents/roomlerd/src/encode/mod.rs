@@ -50,6 +50,10 @@ pub mod ffmpeg;
     allow(dead_code)
 )]
 pub mod aimd;
+/// FR-35 — the constrained ceiling learns the pair (pure controller).
+pub mod ceiling_learn;
+/// FR-35 P2 — per-peer rate memory (one JSON file in the data dir).
+pub mod rate_memory;
 
 // Viewer-rate controller (rc.188) — folds the browser's measured `rc:decodestat`
 // (decoded fps + struggling) into a send-fps cap for the DC pumps, so the agent
@@ -457,6 +461,26 @@ pub(crate) fn relay_max_bps() -> u32 {
         .filter(|k| *k > 0)
         .map(|k| k.saturating_mul(1000))
         .unwrap_or(3_000_000)
+}
+
+/// FR-35 — the upper bound the LEARNED constrained ceiling may reach (bps).
+/// `0` = learning off (today's fixed ceiling, no rate memory). Env
+/// `ROOMLERD_RELAY_MAX_HI_KBPS` / config `relay_max_hi_kbps`, gated by the
+/// tribool `relay_ceiling_learn` (`ROOMLERD_RELAY_CEILING_LEARN`, default on).
+/// Default 8 000 kbps — from ONE pair's measurement (`neo16 → PC55331`
+/// sustained ~6–9 Mbps and choked at 12.8); revisit with a second pair.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn relay_max_hi_bps() -> u32 {
+    if !tunnel_core::env::flag("RELAY_CEILING_LEARN", true) {
+        return 0;
+    }
+    node_env("RELAY_MAX_HI_KBPS")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|k| k.saturating_mul(1000))
+        .unwrap_or(8_000_000)
 }
 
 /// rc.190 (B1) — long-edge RESOLUTION cap for a constrained relay-TCP
