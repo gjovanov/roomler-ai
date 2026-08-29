@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! File-transfer data-channel handler.
 //!
 //! Accepts uploads from the controller browser and writes them into

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FP16 (scRGB) → BGRA8 sRGB pixel conversion for ACM / HDR desktops.
 //!
 //! ## Why (field WINHOST-F, 2026-07-23)

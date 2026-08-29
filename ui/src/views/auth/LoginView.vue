@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <v-container class="fill-height pa-2 pa-md-4 pa-xl-6" fluid>
     <v-row align="center" justify="center">

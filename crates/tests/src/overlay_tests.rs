@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Integration tests for overlay IP allocation and RELEASE.
 //!
 //! Removing a device from the fleet returns its host number to the tenant's
@@ -92,6 +94,7 @@ impl Ipam {
                 supports_server_relay_strategy: false,
                 supports_derp_floor: false,
                 supports_overlay_echo: false,
+                supports_org_relay: false,
                 advertised_routes: vec![],
             })
             .await
@@ -811,6 +814,7 @@ async fn agent_delete_releases_the_overlay_node() {
             supports_server_relay_strategy: false,
             supports_derp_floor: false,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             advertised_routes: vec![],
         })
         .await
@@ -897,6 +901,7 @@ async fn a_re_enrolled_removed_machine_gets_a_fresh_overlay_node() {
             supports_server_relay_strategy: false,
             supports_derp_floor: false,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             advertised_routes: vec![],
         })
         .await
@@ -1016,6 +1021,7 @@ async fn tunnel_client_delete_releases_the_overlay_node() {
             supports_server_relay_strategy: false,
             supports_derp_floor: false,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             advertised_routes: vec![],
         })
         .await
@@ -1094,6 +1100,7 @@ async fn agent_delete_does_not_release_a_tunnel_clients_node() {
             supports_server_relay_strategy: false,
             supports_derp_floor: false,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             advertised_routes: vec![],
         })
         .await
@@ -1412,6 +1419,7 @@ async fn renumber_refuses_a_fleet_below_the_version_floor() {
             supports_server_relay_strategy: false,
             supports_derp_floor: false,
             supports_overlay_echo: false,
+            supports_org_relay: false,
             advertised_routes: vec![],
         })
         .await

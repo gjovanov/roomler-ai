@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Platform-agnostic colour conversions for the encoder layer.
 //!
 //! Today the only public entry point is [`bgra_to_nv12`], used by the

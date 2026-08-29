@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P6: the declared-route RECONCILER.
 //!
 //! A route (`tunnel_core::localapi::RouteDescriptor`, persisted as

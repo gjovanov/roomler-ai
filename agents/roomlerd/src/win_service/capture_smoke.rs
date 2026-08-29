@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! WGC session-0 / Winlogon capture smoke binary (M3 derisking spike).
 //!
 //! Why this exists. M3's load-bearing assumption is that

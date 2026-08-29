@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-27 — the native consent panel on X11.
 //!
 //! Linux had no on-screen consent surface of any kind: `indicator/mod.rs`

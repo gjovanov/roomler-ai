@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR(24): names the PRE-RENAME appdirs segment a host installed before
 // P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! Persist agent crash reports to disk for later upload.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR(3): the legacy scheduled-task name install/uninstall must still
 // find.
 //! Cross-platform auto-start-on-boot / login plumbing.
