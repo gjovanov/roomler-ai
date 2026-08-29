@@ -33,6 +33,8 @@
 //! here because the relay answers unauthenticated packets by design, on a port
 //! chosen precisely because corporate egresses permit it.
 
+use super::bind::{MAC_LEN, Mac, NONCE_LEN, Nonce};
+
 /// Geneve `Protocol Type` for org-relay frames. An EtherType-shaped field, so
 /// this is a private/unassigned value; its job is to keep bytes 2..4 non-zero,
 /// which is what stops a frame satisfying WireGuard's four-byte discriminator.
@@ -40,9 +42,6 @@ pub const PROTO_ORG_RELAY: u16 = 0x7788;
 
 /// Fixed Geneve header length with `Opt Len == 0`.
 pub const HEADER_LEN: usize = 8;
-
-/// Total probe-frame length. Fixed so a reply can never exceed its request.
-pub const PROBE_FRAME_LEN: usize = 64;
 
 /// Probe token length (opaque to this module; the server mints it).
 pub const PROBE_TOKEN_LEN: usize = 16;
@@ -128,29 +127,166 @@ pub fn vni_is_mintable(vni: u32) -> bool {
     vni <= VNI_MAX && vni != STUN_COOKIE_VNI && vni != 0
 }
 
-/// Build a fixed-length reachability probe (P1). Carries the server-minted
-/// token and nothing else; the responder echoes the frame verbatim, so request
-/// and reply are the same size by construction.
+// ── Control frames ──────────────────────────────────────────────────────────
+//
+// Every control frame is exactly CONTROL_FRAME_LEN bytes: header (8), a kind
+// byte (1), the kind's fixed fields, zero padding. One size for all of them is
+// what makes the anti-amplification property trivial to state and to test —
+// the reply to a bind is a challenge of the same size, the reply to a probe is
+// the probe itself, and nothing else replies at all.
+
+/// The single size of every control frame.
+pub const CONTROL_FRAME_LEN: usize = 64;
+/// Kept as the historical name for the probe; the same number.
+pub const PROBE_FRAME_LEN: usize = CONTROL_FRAME_LEN;
+/// Byte 8 of a control frame.
+const OFF_KIND: usize = HEADER_LEN;
+/// Fixed fields start here.
+const OFF_BODY: usize = HEADER_LEN + 1;
+
+pub const KIND_PROBE: u8 = 1;
+pub const KIND_BIND: u8 = 2;
+pub const KIND_CHALLENGE: u8 = 3;
+pub const KIND_ANSWER: u8 = 4;
+
+/// A decoded control frame. The variants are the whole handshake vocabulary;
+/// a kind byte outside this set is refused, never guessed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlFrame {
+    /// P1 reachability probe — echoed verbatim by a responder.
+    Probe { token: [u8; PROBE_TOKEN_LEN] },
+    /// Step 1: member → relay.
+    Bind { nonce: Nonce, tag1: Mac },
+    /// Step 2: relay → member.
+    Challenge { nonce: Nonce, cookie: Mac },
+    /// Step 3: member → relay.
+    Answer {
+        nonce: Nonce,
+        cookie: Mac,
+        tag2: Mac,
+    },
+}
+
+impl ControlFrame {
+    fn kind(&self) -> u8 {
+        match self {
+            Self::Probe { .. } => KIND_PROBE,
+            Self::Bind { .. } => KIND_BIND,
+            Self::Challenge { .. } => KIND_CHALLENGE,
+            Self::Answer { .. } => KIND_ANSWER,
+        }
+    }
+
+    /// Encode as a fixed 64-byte frame with the control bit set.
+    pub fn encode(&self, vni: u32) -> [u8; CONTROL_FRAME_LEN] {
+        let mut f = [0u8; CONTROL_FRAME_LEN];
+        f[..HEADER_LEN].copy_from_slice(&OrgRelayHeader { control: true, vni }.encode());
+        f[OFF_KIND] = self.kind();
+        let b = &mut f[OFF_BODY..];
+        match self {
+            Self::Probe { token } => b[..PROBE_TOKEN_LEN].copy_from_slice(token),
+            Self::Bind { nonce, tag1 } => {
+                b[..NONCE_LEN].copy_from_slice(nonce);
+                b[NONCE_LEN..NONCE_LEN + MAC_LEN].copy_from_slice(tag1);
+            }
+            Self::Challenge { nonce, cookie } => {
+                b[..NONCE_LEN].copy_from_slice(nonce);
+                b[NONCE_LEN..NONCE_LEN + MAC_LEN].copy_from_slice(cookie);
+            }
+            Self::Answer {
+                nonce,
+                cookie,
+                tag2,
+            } => {
+                b[..NONCE_LEN].copy_from_slice(nonce);
+                b[NONCE_LEN..NONCE_LEN + MAC_LEN].copy_from_slice(cookie);
+                b[NONCE_LEN + MAC_LEN..NONCE_LEN + 2 * MAC_LEN].copy_from_slice(tag2);
+            }
+        }
+        f
+    }
+
+    /// Decode, returning `(vni, frame)`. Length is checked **exactly**: a
+    /// shorter or longer frame is not a control frame, so an echo or a
+    /// challenge can never be inflated. Total over arbitrary input.
+    pub fn decode(pkt: &[u8]) -> Option<(u32, Self)> {
+        if pkt.len() != CONTROL_FRAME_LEN {
+            return None;
+        }
+        let h = OrgRelayHeader::decode(pkt)?;
+        if !h.control {
+            return None;
+        }
+        let b = &pkt[OFF_BODY..];
+        let take16 = |at: usize| -> [u8; 16] {
+            let mut out = [0u8; 16];
+            out.copy_from_slice(&b[at..at + 16]);
+            out
+        };
+        let frame = match pkt[OFF_KIND] {
+            KIND_PROBE => Self::Probe { token: take16(0) },
+            KIND_BIND => Self::Bind {
+                nonce: take16(0),
+                tag1: take16(NONCE_LEN),
+            },
+            KIND_CHALLENGE => Self::Challenge {
+                nonce: take16(0),
+                cookie: take16(NONCE_LEN),
+            },
+            KIND_ANSWER => Self::Answer {
+                nonce: take16(0),
+                cookie: take16(NONCE_LEN),
+                tag2: take16(NONCE_LEN + MAC_LEN),
+            },
+            _ => return None,
+        };
+        Some((h.vni, frame))
+    }
+}
+
+/// Build a reachability probe. A thin wrapper over [`ControlFrame::Probe`],
+/// kept because P1 shipped this name and the responder tests use it.
 pub fn build_probe(vni: u32, token: &[u8; PROBE_TOKEN_LEN]) -> [u8; PROBE_FRAME_LEN] {
-    let mut f = [0u8; PROBE_FRAME_LEN];
-    f[..HEADER_LEN].copy_from_slice(&OrgRelayHeader { control: true, vni }.encode());
-    f[HEADER_LEN..HEADER_LEN + PROBE_TOKEN_LEN].copy_from_slice(token);
+    ControlFrame::Probe { token: *token }.encode(vni)
+}
+
+/// Parse a probe frame, returning `(vni, token)`. Any other control kind — or
+/// anything that is not exactly one control frame long — is `None`.
+pub fn parse_probe(pkt: &[u8]) -> Option<(u32, [u8; PROBE_TOKEN_LEN])> {
+    match ControlFrame::decode(pkt)? {
+        (vni, ControlFrame::Probe { token }) => Some((vni, token)),
+        _ => None,
+    }
+}
+
+// ── Data frames ─────────────────────────────────────────────────────────────
+
+/// Frame WireGuard ciphertext for the relay: header with the control bit
+/// clear, payload verbatim. The relay forwards the whole frame unchanged and
+/// the far member strips the header — the relay never re-frames, so it can
+/// never be made to emit more than it received.
+pub fn build_data(vni: u32, payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(HEADER_LEN + payload.len());
+    f.extend_from_slice(
+        &OrgRelayHeader {
+            control: false,
+            vni,
+        }
+        .encode(),
+    );
+    f.extend_from_slice(payload);
     f
 }
 
-/// Parse a probe frame, returning `(vni, token)`. Length is checked exactly:
-/// a shorter or longer frame is not a probe, so an echo can never be inflated.
-pub fn parse_probe(pkt: &[u8]) -> Option<(u32, [u8; PROBE_TOKEN_LEN])> {
-    if pkt.len() != PROBE_FRAME_LEN {
-        return None;
-    }
+/// Parse a data frame into `(vni, payload)`. A control frame is not data, and
+/// an empty payload is refused: there is nothing to relay in it, and a
+/// zero-length forward is a free way to make the relay emit a datagram.
+pub fn parse_data(pkt: &[u8]) -> Option<(u32, &[u8])> {
     let h = OrgRelayHeader::decode(pkt)?;
-    if !h.control {
+    if h.control || pkt.len() <= HEADER_LEN {
         return None;
     }
-    let mut token = [0u8; PROBE_TOKEN_LEN];
-    token.copy_from_slice(&pkt[HEADER_LEN..HEADER_LEN + PROBE_TOKEN_LEN]);
-    Some((h.vni, token))
+    Some((h.vni, &pkt[HEADER_LEN..]))
 }
 
 #[cfg(test)]
@@ -347,5 +483,114 @@ mod tests {
         assert!(vni_is_mintable(1));
         assert!(vni_is_mintable(VNI_MAX));
         assert!(!vni_is_mintable(VNI_MAX + 1));
+    }
+
+    /// Every control frame is one size, and every kind round-trips. One size
+    /// is what makes "a reply is never larger than its request" a property of
+    /// the encoding rather than of each handler's discipline.
+    #[test]
+    fn every_control_kind_roundtrips_at_one_fixed_size() {
+        let frames = [
+            ControlFrame::Probe { token: [0x11; 16] },
+            ControlFrame::Bind {
+                nonce: [0x22; 16],
+                tag1: [0x33; 16],
+            },
+            ControlFrame::Challenge {
+                nonce: [0x44; 16],
+                cookie: [0x55; 16],
+            },
+            ControlFrame::Answer {
+                nonce: [0x66; 16],
+                cookie: [0x77; 16],
+                tag2: [0x88; 16],
+            },
+        ];
+        for f in frames {
+            let bytes = f.encode(0x0012_3456);
+            assert_eq!(bytes.len(), CONTROL_FRAME_LEN);
+            assert!(is_org_relay_shaped(&bytes));
+            let (vni, back) = ControlFrame::decode(&bytes).expect("must decode");
+            assert_eq!(vni, 0x0012_3456);
+            assert_eq!(back, f);
+        }
+    }
+
+    /// A kind byte outside the vocabulary is refused, never guessed at — and
+    /// it is refused as a control frame while still being org-relay SHAPED,
+    /// so the caller can count it as "ours but unknown" rather than "junk".
+    #[test]
+    fn an_unknown_control_kind_is_refused_but_still_shaped() {
+        let mut f = ControlFrame::Probe { token: [0; 16] }.encode(9);
+        for kind in [0u8, 5, 0x7F, 0xFF] {
+            f[HEADER_LEN] = kind;
+            assert!(is_org_relay_shaped(&f));
+            assert!(
+                ControlFrame::decode(&f).is_none(),
+                "kind {kind} must be refused"
+            );
+            assert!(parse_probe(&f).is_none());
+        }
+    }
+
+    #[test]
+    fn a_bind_frame_is_not_a_probe_and_vice_versa() {
+        let bind = ControlFrame::Bind {
+            nonce: [1; 16],
+            tag1: [2; 16],
+        }
+        .encode(9);
+        assert!(
+            parse_probe(&bind).is_none(),
+            "a bind must not echo as a probe"
+        );
+        let probe = build_probe(9, &[3; 16]);
+        assert!(matches!(
+            ControlFrame::decode(&probe),
+            Some((9, ControlFrame::Probe { .. }))
+        ));
+    }
+
+    /// Data and control are separated by the control bit alone, so a data
+    /// frame whose payload happens to look like a control body is still data.
+    #[test]
+    fn data_frames_roundtrip_and_the_control_bit_separates_them() {
+        let payload = b"wireguard-ciphertext-goes-here";
+        let d = build_data(0x0042_4242, payload);
+        assert!(is_org_relay_shaped(&d));
+        let (vni, got) = parse_data(&d).expect("data must parse");
+        assert_eq!(vni, 0x0042_4242);
+        assert_eq!(got, payload);
+        assert!(
+            ControlFrame::decode(&d).is_none(),
+            "a data frame is never a control frame"
+        );
+
+        // A control frame is never data, even though it is longer than a header.
+        let c = build_probe(7, &[0; 16]);
+        assert!(parse_data(&c).is_none());
+
+        // An empty payload is not data: nothing to relay, and a zero-length
+        // forward would be a free way to make the relay emit a datagram.
+        let empty = build_data(7, b"");
+        assert!(parse_data(&empty).is_none());
+    }
+
+    #[test]
+    fn control_and_data_decoders_never_panic_on_arbitrary_bytes() {
+        let mut seed = 0xC0FF_EE11u32;
+        for len in 0usize..80 {
+            for _ in 0..64 {
+                let mut buf = vec![0u8; len];
+                for b in buf.iter_mut() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    *b = seed as u8;
+                }
+                let _ = ControlFrame::decode(&buf);
+                let _ = parse_data(&buf);
+            }
+        }
     }
 }
