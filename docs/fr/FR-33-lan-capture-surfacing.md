@@ -1,6 +1,6 @@
 # FR-33: A VPN that captures the LAN prefix should say so — surface LAN capture in `status`, `why` and the RC path pill
 
-Status: **designed, not implemented** (2026-08-29). Tracking issue: `FR-33`.
+Status: **designed, not implemented** (2026-08-29). Tracking issue: `FR-33` (#905).
 Sibling of FR-9 (LAN relay diagnosis) and FR-31 (opening keyframe). Spec on master up front; the
 design is known.
 
