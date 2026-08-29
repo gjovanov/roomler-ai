@@ -1447,6 +1447,9 @@ struct RateMemoryGuard {
     path: Option<std::path::PathBuf>,
     peer: Option<String>,
     stable: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// AIMD decreases seen this session — a LOWER stable rate is only written
+    /// back when this is non-zero (an idle session must not decay the memory).
+    decreases: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
@@ -1459,12 +1462,20 @@ impl Drop for RateMemoryGuard {
         if stable == 0 {
             return;
         }
+        let had_decrease = self.decreases.load(std::sync::atomic::Ordering::Relaxed) > 0;
         let mut mem = crate::encode::rate_memory::RateMemory::load(path);
-        mem.record(peer, stable, crate::encode::rate_memory::now_unix());
+        let kept = mem.record_session(
+            peer,
+            stable,
+            had_decrease,
+            crate::encode::rate_memory::now_unix(),
+        );
         match mem.save(path) {
             Ok(()) => info!(
                 peer,
                 stable_bps = stable,
+                kept_bps = kept,
+                had_decrease,
                 "FR-35 rate memory: stable rate remembered for the pair"
             ),
             Err(e) => {
@@ -4419,6 +4430,7 @@ async fn media_pump_ffmpeg_dc(
         path: rate_memory_path,
         peer: rate_peer_key,
         stable: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        decreases: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
     };
     // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
     // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
@@ -5638,6 +5650,9 @@ async fn media_pump_ffmpeg_dc(
                 governor.stable_bps().unwrap_or(0),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            rate_memory_guard
+                .decreases
+                .store(governor.decreases(), std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(vw) = viewer_window
             && (vw.changed || vw.struggling || vw.age_over)
