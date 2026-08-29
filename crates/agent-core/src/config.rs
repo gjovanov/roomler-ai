@@ -1,7 +1,10 @@
 //! Agent on-disk configuration.
 //!
-//! Stored at `<user config dir>/roomler-agent/config.toml`. On Linux that
-//! resolves to `$XDG_CONFIG_HOME/roomler-agent/` or `~/.config/roomler-agent/`.
+//! Stored at `<user config dir>/roomler/config.toml`. On Linux that
+//! resolves to `$XDG_CONFIG_HOME/roomler/` or `~/.config/roomler/`. A host
+//! installed before the rename keeps its `roomler-agent` tree — see
+//! [`crate::appdirs`], whose `app_segment` picks the old segment only when
+//! that tree already exists.
 //!
 //! The file holds the enrolled agent's identity, its long-lived agent
 //! token, and the server URL. It is the user's responsibility to keep
@@ -63,7 +66,7 @@ pub struct AgentConfig {
     /// match historical self-host behaviour (`docs/remote-control.md`
     /// §11.2 + signaling.rs's pre-Plan-3 auto-grant). Org-controlled
     /// fleets set this to `false` so every session start waits for
-    /// an explicit operator decision via the `roomler-agent consent
+    /// an explicit operator decision via the `roomlerd consent
     /// --session <hex> --approve|--deny` CLI fallback (or, in a
     /// future version, a tray prompt). 30 s timeout → auto-deny.
     /// Has NO effect on the file-DC path — uploads/downloads/dir
@@ -909,7 +912,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub config_schema_version: Option<String>,
 
-    /// roomler-tunnel agent-side allowlist (T2.6). Default is
+    /// Tunnel agent-side allowlist (T2.6). Default is
     /// `enabled` with an empty allowlist — meaning "trust the
     /// server's tenant policy on every `ServerMsg::TcpForwardForward`".
     /// Operators on org-controlled hosts narrow further by populating
@@ -1612,8 +1615,8 @@ pub type WriteLock = std::sync::Arc<tokio::sync::Mutex<()>>;
 ///
 /// `#[cfg(test)]` alone stopped working when this module moved to its own
 /// crate (P3e lever E): a DOWNSTREAM crate's test build compiles THIS crate
-/// in normal mode, so the fixture vanished for `roomler-agent`'s tests. The
-/// `test-fixtures` feature is the standard escape — roomler-agent enables it
+/// in normal mode, so the fixture vanished for `roomlerd`'s tests. The
+/// `test-fixtures` feature is the standard escape — roomlerd enables it
 /// from `[dev-dependencies]` only, so no production build ever carries it.
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn test_fixture() -> AgentConfig {
@@ -1964,7 +1967,8 @@ pub fn default_config_path() -> Result<PathBuf> {
 }
 
 /// rc.52: machine-global config path —
-/// `%PROGRAMDATA%\roomler\roomler-agent\config.toml`.
+/// `%PROGRAMDATA%\roomler\roomler\config.toml` (a pre-rename host keeps
+/// its `\roomler\roomler-agent\` tree — see `appdirs::app_segment`).
 ///
 /// `default_config_path()` resolves to a per-USER profile
 /// (`%APPDATA%` via `ProjectDirs`). A SystemContext worker runs as
@@ -2289,6 +2293,8 @@ machine_name = "devbox"
         let s = p.to_string_lossy().to_lowercase();
         assert!(s.contains("roomler"), "path missing roomler: {s}");
         // S1b: appdirs resolves the NEW `roomler` segment on fresh/migrated
+        // RETIRED-NAME-ANCHOR(6): pins the pre-rename fallback. The whole
+        // point of the assertion is that BOTH segments are accepted.
         // machines and the legacy `roomler-agent` on pre-migration hosts —
         // both are valid; the old exact-tail assertion failed on any clean
         // Windows box.
