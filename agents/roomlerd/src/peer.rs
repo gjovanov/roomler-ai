@@ -2053,7 +2053,7 @@ async fn media_pump(
                 // visible without flooding. DXGI only fires on screen change,
                 // so this can spike briefly then settle.
                 if frames_empty.is_multiple_of(150) {
-                    // FR-28 — this log is now the ONLY periodic signal an idle
+                    // FR-29 — this log is now the ONLY periodic signal an idle
                     // Linux host emits. The media heartbeat fires per 30
                     // ENCODED frames, and once the damage tracker starts
                     // proving captures unnecessary nothing is encoded, so the
@@ -2517,7 +2517,7 @@ async fn media_pump(
             let encode_us_window = encode_time_us.saturating_sub(heartbeat_encode_us_base);
             let avg_capture_ms = capture_us_window / (1_000 * frames_in_window);
             let avg_encode_ms = encode_us_window / (1_000 * frames_in_window);
-            // FR-28 — read from the backend, NOT derived from frames_empty.
+            // FR-29 — read from the backend, NOT derived from frames_empty.
             // The two are different conditions that both surface as Ok(None):
             // frames_empty means the pump was starved, frames_unchanged means
             // the backend proved a capture was unnecessary. Reporting one as
