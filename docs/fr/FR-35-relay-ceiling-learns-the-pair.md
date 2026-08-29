@@ -1,6 +1,6 @@
 # FR-35: The constrained ceiling learns the pair — grow the relay cap on delivery evidence, remember it per peer
 
-Status: **P0 measured; P1 + P2 implemented, not yet field-verified** (2026-08-29). Tracking issue: `FR-35` (#922).
+Status: **P1 + P2 shipped in 0.4.21 (#937); first field run done 2026-08-29 — the mechanics hold, the keyframe criterion does not yet; P2b (no-decay memory, 2× age gate) in PR** (2026-08-29). Tracking issue: `FR-35` (#922).
 Child of the RC-quality program. Follows FR-31 (every opening and repair number on an NVENC relay
 session is proportional to `maxrate`, and nothing ffmpeg exposes changes that) and the parked
 measured-rate line (#678: a sender cannot see capacity it is not using). Operator's directive
@@ -75,12 +75,21 @@ shipped defaults:
 - [ ] time-to-crisp ≤ 0.6 s (today 1.2 s)
 - [ ] a 60 s drag: no send wait > 1 s, viewer-age p99 not worse than the FR-18 numbers, and the
       ceiling never above `hi`
-- [ ] a ~2 Mbps relay (CORPLAP-3, `av1_qsv`): `target_bps` never exceeds the nominal unless every growth
+- [x] a ~2 Mbps relay (CORPLAP-3, `av1_qsv`): `target_bps` never exceeds the nominal unless every growth
       gate passed — read from its heartbeats; the session must not get worse than today
-- [ ] the learned rate survives a daemon restart and expires after 7 days (unit-tested)
+      (0.4.21, 2026-08-29: no learner steps, `learned_ceiling_bps=0`, target ≤ 3.0 Mbps, 65–78 ms)
+- [x] the learned rate survives a daemon restart and expires after 7 days (unit-tested; the file is
+      `…systemprofileAppDataRoamingoomleroomlerdataate_memory.json` for the SYSTEM service)
 - [ ] `relay_ceiling_learn=false` restores today's numbers byte-for-byte
 
 ## Open decisions
+
+- **Growth speed.** With every gate satisfied the ceiling rises ≈ +200 kbps per 15–25 s of
+  sustained drag (`+ceiling/16`, spaced 5 s, but the carried/pinned gates are only met in some
+  windows). Reaching the 2.5× keyframe bar from the nominal needs ~5 min of continuous drag per
+  pair; with the P2b no-decay memory that accumulates across sessions, but a first session on a
+  pair will not get there. Candidate P3: a larger step (ceiling/8) while age ≤ 1.2× floor and
+  carried ≥ 85 %, or a bounded opening probe.
 
 - `hi` default: 8 000 kbps from this one pair; the second corp pair (CORPLAP-3) will say whether the
   gates keep it at the nominal there. Revisit with two pairs of data.
@@ -97,3 +106,4 @@ levers); the direct path's measured clamp.
 | date | build | note |
 |---|---|---|
 | 2026-08-29 | agent 0.4.18 (CORPLAP-2), env `FFMPEG_MAXRATE_KBPS=25500`, web `v20260829-40e8fc071129` | P0: the table above. Two daemon restarts on CORPLAP-2 (apply, restore) via a scheduled task; env cleared afterwards. |
+| 2026-08-29 | agent 0.4.21 (CORPLAP-2 `av1_nvenc`, CORPLAP-3 `av1_qsv`), web `v20260829-0da90b766dc0` | **First field run.** P1 steps logged and gated on CORPLAP-2: `3.0 → 3.19 → 3.39 Mbps` (marquee), `3.0 → 3.19 → 3.39 → 3.60` (window drag, carried 2.1–2.8 Mbps at 66–80 ms); ≈3 steps per minute of sustained drag. P2 seeds: next session opened at `maxrate = 0.85 × remembered` (3.386 → 2.879, 3.598 → 3.059). Opening keyframe on the seeded sessions: 8.0 / 8.4 / 22.9 / 19.5 KB vs 5.7–6.4 KB baseline — but two later seeded sessions at 2.6 Mbps opened at 5.9 KB, so the opener also tracks screen content and the criterion is not yet met. **Defect**: a 14-s idle session wrote its own seed back as the "stable rate" (3.598 → 3.059) — the memory decays 15 % per idle session; fixed in P2b (`record_session`: a lower value needs a decrease). Age gate 1.5× vetoed the evidence windows (66–80 ms over a 43 ms floor) → 2×. CORPLAP-3 negative control clean. |

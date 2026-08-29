@@ -79,7 +79,7 @@ pub struct AppState {
     pub email: Option<Arc<EmailService>>,
     pub push: Option<Arc<PushService>>,
     pub push_subscriptions: Arc<PushSubscriptionDao>,
-    /// FR-38 — the public updates list. Not a user store: no password, no
+    /// FR-39 — the public updates list. Not a user store: no password, no
     /// tenant, no session.
     pub subscribers: Arc<SubscriberDao>,
     pub redis_pubsub: Option<Arc<RedisPubSub>>,

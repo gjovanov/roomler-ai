@@ -3,7 +3,7 @@
 use bson::{DateTime, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
-/// FR-38 — someone who asked to hear about the product without creating an
+/// FR-39 — someone who asked to hear about the product without creating an
 /// account.
 ///
 /// Deliberately NOT a `User`. A subscriber has no password, no tenant, no
