@@ -1842,7 +1842,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     unsafe {
         std::env::set_var("DISPLAY", vd.display());
         if !relay_forced && !host_public {
-            std::env::set_var("ROOMLERD_ICE_RELAY_TCP", "1");
+            tunnel_core::env::test_env::set_as("ROOMLERD_", "ICE_RELAY_TCP", "1");
         }
     }
     let relay_over_tcp = node_env("ICE_RELAY_TCP").as_deref() == Some("1");
@@ -3792,9 +3792,9 @@ mod tests {
 
         // And the current spelling works too, so a migrated host behaves the same.
         unsafe { std::env::remove_var(KEYS[0]) };
-        unsafe { std::env::set_var("ROOMLERD_VIRTUAL_DESKTOP", "1") };
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "VIRTUAL_DESKTOP", "1") };
         assert!(virtual_desktop_requested());
-        unsafe { std::env::remove_var("ROOMLERD_VIRTUAL_DESKTOP") };
+        unsafe { tunnel_core::env::test_env::clear("VIRTUAL_DESKTOP") };
     }
 
     use clap::Parser;

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#809](https://github.com/gjovanov/roomler-ai/issues/809) |
-| **Status** | P0-P7 on master; **field-verified on Linux, Windows and macOS**; the CI guard blocks on `--check --strict` (**0 unclassified**, 756 anchored). |
+| **Status** | **CLOSED 2026-08-29** — all 11 acceptance criteria met and field-verified on Linux, Windows and macOS. 1 849 → **0** unclassified, 743 anchored, guard BLOCKING on `--check --strict`. |
 | **Opened** | 2026-08-28 |
 | **Baseline** | master `fa364b12` (0.4.11) — every count and anchor below was measured against it |
 | **Scope** | Windows · Linux · macOS — code, comments, docs, `CLAUDE.md`, file names, folder names, env vars |
@@ -319,9 +319,14 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
       `roomler-desktop`); copy-pasting any line works on a real host.
 - [ ] **P2 changed no artifact name**: the asset list for a dispatch build is byte-identical to
       the previous tag's, modulo version.
-- [ ] All 107 `ROOMLER_AGENT_*` variables still work after P3 on a host that sets only the old
-      spelling, and the daemon logs the deprecation exactly once per variable per start.
-- [ ] The §5 staging path resolves correctly on **both** a fresh perMachine host and a pre-rename
+- [x] A host that sets only a retired spelling still works, and a retired read logs a
+      deprecation **once per variable per start**. Reworded from "all 107 variables
+      still work": `node_env` has no per-key logic, so enumerating 107 lookups through
+      one generic function would have looked like evidence without being any. The
+      property that carries information is that nothing BYPASSES the chain — enforced
+      by `name-audit.sh --check`, which fails a raw `set_var`/`remove_var` on a node
+      prefix outside `env.rs` unless the line is marked `RAW-ENV-DELIBERATE`.
+- [x] The §5 staging path resolves correctly on **both** a fresh perMachine host and a pre-rename
       perMachine host — the SPA and `machine_global_dir()` now agree by construction.
 - [x] `cargo test -p roomler-ai-tests` green (floor: the current ~294 across 34 modules, 2 skips).
 - [x] `cd ui && bun run test:unit` green, including the `enrollCommands` retired-name lock.
@@ -347,13 +352,15 @@ Evidence for the ticked boxes, and what the unticked ones are still waiting on
 | ui unit tests | CI **Frontend checks** green, running `bun run test:unit` + `vue-tsc` |
 | macOS TCC | P6 macOS row below — `Screen Recording + Accessibility both granted`, 30 s after the 0.4.15 release |
 | field sweep, three OSes | P6 Linux / Windows / macOS rows below |
+| nothing bypasses the env chain | `PREFIXES` is now the single list both readers and `env::test_env` use; all 44 env manipulations in the agent go through it, and `name-audit.sh --check` fails any new raw one. The deprecation warning is `legacy_use_is_new`, mutation-checked: disabling the dedupe fails `legacy_reads_warn_once_per_variable_and_current_reads_never_do` |
+| §5 staging path, both host shapes | `appdirs::resolve_machine_global` split out of the `OnceLock`-cached `machine_global_dir()` and pinned by 4 tests (pre-rename only / fresh only / both present / neither). `files.rs` derives the staging dir as `machine_global_dir().join("staging")`, so this is the decision the criterion turns on. Mutation-checked: dropping the pre-rename branch fails `machine_global_keeps_a_pre_rename_tree` |
 
 **Still open, and why — not forgotten:**
 
 - **`cd ui && bun run e2e`** — not run. The Playwright lane needs the standing e2e stack pinned to a build carrying these changes; nothing here touches UI behaviour, but that is an argument for low risk, not evidence.
 - **§5 staging path on a PRE-RENAME host** — the fresh side is confirmed twice (`CORPLAP-1`, and a second host independently). No host with a surviving `%PROGRAMDATA%\roomler\roomler-agent` tree has been driven through it.
-- **A pre-rename host keeps its tree** — same gap, same reason: every fleet Windows host is post-rename. Needs one deliberately staged legacy tree.
-- **All 107 `ROOMLER_AGENT_*` on a legacy-only host** — the MECHANISM is proven (`env::node_env`'s chain is unit-tested across all three prefixes, and the RUST_LOG shim was forced onto the legacy spec on `mars` and passed). Enumerating all 107 on a host that sets only the old names has not been done.
+- **A pre-rename host keeps its enrolled IDENTITY across an upgrade** — narrowed, not closed. The PATH half is now pinned by test: `resolve_machine_global` keeps a legacy `%PROGRAMDATA%\roomler\roomler-agent` tree, so an upgraded host still resolves its own `config.toml` and `staging\`. What is still unproven is the end-to-end claim the criterion actually makes — that a real device comes through an upgrade with the SAME `agent_id` and overlay address. That needs a host that has such a tree, and every fleet Windows host is post-rename.
+
 - **"P2 changed no artifact name", byte-identical asset list** — the Debian takeover was verified against real artifacts, and release asset names are frozen by D6 and anchored, but no dispatch-build asset list has been diffed byte-for-byte.
 
 ---

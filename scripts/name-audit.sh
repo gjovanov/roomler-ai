@@ -350,6 +350,41 @@ EOF
         rc=1
     fi
 
+    # `env::node_env` reads THREE prefixes so a retired spelling keeps working.
+    # A test that pokes ONE of them directly is not hermetic: it clears one link
+    # and an inherited value under another silently decides the assertion. That
+    # was true of every env test in the agent (14 suffixes, 8 files) in both
+    # directions -- some proved only the retired name, others only the current
+    # one. `env::test_env` clears all three from the same PREFIXES list the
+    # readers use, so this keeps them going through it.
+    #
+    # A site that genuinely needs both spellings live at once (proving which one
+    # WINS) marks itself RAW-ENV-DELIBERATE on or just above the line.
+    raw_env=$(grep -rnE '(set_var|remove_var)\("(ROOMLERD_|ROOMLER_NODE_|ROOMLER_AGENT_)' \
+        --include=*.rs agents crates 2>/dev/null \
+        | grep -v '^crates/tunnel-core/src/env.rs:' || true)
+    unmarked=""
+    while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        f=${hit%%:*}; rest=${hit#*:}; ln=${rest%%:*}
+        case "$ln" in *[!0-9]*|"") continue ;; esac
+        from=$((ln > 4 ? ln - 4 : 1))
+        if ! sed -n "${from},${ln}p" "$f" 2>/dev/null | grep -q 'RAW-ENV-DELIBERATE'; then
+            unmarked="$unmarked        $f:$ln
+"
+        fi
+    done <<EOF
+$raw_env
+EOF
+    if [ -n "$unmarked" ]; then
+        echo "FAIL  raw node_env prefix in env manipulation (use env::test_env):"
+        printf '%s' "$unmarked"
+        echo "      test_env clears ALL prefixes; poking one leaves the test open to"
+        echo "      an inherited value under another spelling deciding it."
+        echo "      If both spellings must be live at once, mark the line RAW-ENV-DELIBERATE."
+        rc=1
+    fi
+
     base_unclassified=$(read_baseline unclassified 999999)
     base_anchors=$(read_baseline anchors 0)
     base_paths=$(read_baseline paths 999999)

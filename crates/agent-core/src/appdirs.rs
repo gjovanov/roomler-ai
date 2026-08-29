@@ -90,15 +90,30 @@ pub fn machine_global_dir() -> PathBuf {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
                 .join(ORG);
-            let new = base.join(NEW_APP);
-            let old = base.join(OLD_APP);
-            if !new.exists() && old.exists() {
-                old // pre-rename install still present -> keep it
-            } else {
-                new // fresh install, or the new tree is already present
-            }
+            resolve_machine_global(&base)
         })
         .clone()
+}
+
+/// The machine-global root under `base` (= `%PROGRAMDATA%\roomler`), resolved
+/// new-then-old.
+///
+/// Split out of [`machine_global_dir`] so the decision can be TESTED. The public
+/// function caches in a `OnceLock` against the real `%PROGRAMDATA%`, so a process
+/// can only ever observe one answer — which left the pre-rename branch, the one
+/// that keeps an upgraded host's enrolled config and its `staging\` dir
+/// reachable, provable only by finding a host that still has such a tree. Every
+/// host in the fleet is post-rename, so that proof was not available; this makes
+/// it a test instead.
+#[cfg(target_os = "windows")]
+fn resolve_machine_global(base: &Path) -> PathBuf {
+    let new = base.join(NEW_APP);
+    let old = base.join(OLD_APP);
+    if !new.exists() && old.exists() {
+        old // pre-rename install still present -> keep it
+    } else {
+        new // fresh install, or the new tree is already present
+    }
 }
 
 /// The SCM-service log directory (`%PROGRAMDATA%\roomler\<segment>\service-logs`).
@@ -572,6 +587,57 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    // ── FR-21: the machine-global segment decision ──────────────────────
+    //
+    // Covers the acceptance criterion that had no host to run on: "the §5
+    // staging path resolves correctly on BOTH a fresh perMachine host and a
+    // pre-rename host". `files.rs` derives the staging dir as
+    // `machine_global_dir().join("staging")` and `machine_global_config_path()`
+    // derives config.toml the same way, so this decision is what it turns on.
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn machine_global_keeps_a_pre_rename_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(ORG);
+        std::fs::create_dir_all(base.join(OLD_APP)).unwrap();
+        // Legacy tree present, new one absent: an upgraded host. Resolving to
+        // the new segment here orphans its enrolled config — the device drops
+        // off the mesh and re-enrols as a stranger.
+        assert_eq!(resolve_machine_global(&base), base.join(OLD_APP));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn machine_global_uses_the_new_tree_on_a_fresh_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(ORG);
+        std::fs::create_dir_all(base.join(NEW_APP)).unwrap();
+        assert_eq!(resolve_machine_global(&base), base.join(NEW_APP));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn machine_global_prefers_new_when_both_trees_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(ORG);
+        std::fs::create_dir_all(base.join(NEW_APP)).unwrap();
+        std::fs::create_dir_all(base.join(OLD_APP)).unwrap();
+        // A migrated host keeps BOTH for a while. New wins, or a host would
+        // fall back to a tree it has already moved off.
+        assert_eq!(resolve_machine_global(&base), base.join(NEW_APP));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn machine_global_defaults_to_new_when_nothing_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join(ORG);
+        // Nothing on disk yet: a first install must create the NEW tree,
+        // never resurrect the retired name.
+        assert_eq!(resolve_machine_global(&base), base.join(NEW_APP));
     }
 }
 
