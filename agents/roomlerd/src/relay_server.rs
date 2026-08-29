@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-19 P1d — start the org-relay reachability responder, if this device
-//! opted in.
+//! FR-19 — start the org-relay server, if this device opted in.
 //!
-//! Process-wide and started once: the responder owns a single UDP socket, so
-//! it is deliberately **not** per-org like [`crate::overlay::maybe_start`].
+//! Process-wide and started once: the relay owns a single UDP socket, so it is
+//! deliberately **not** per-org like [`crate::overlay::maybe_start`].
 //!
 //! # The default path costs nothing
 //!
@@ -21,15 +20,22 @@
 //! free and the socket receives nothing. That is not hypothetical — it is what
 //! mars does, and it is why FR-19's E2E-3 nearly reached the opposite
 //! conclusion about which port corporate egresses permit.
+//!
+//! # P2c: it forwards now
+//!
+//! Since P2c the socket is served by [`RelayServer`], which answers probes,
+//! runs the authenticated bind, and forwards ciphertext between bound
+//! members. Sessions still enter only through [`handle`] — P3 wires that to
+//! the control-WS mint. Until then a relay serves probes and holds no sessions,
+//! which is exactly P1's behaviour.
 
 use std::sync::{Arc, OnceLock};
 
 use tunnel_core::overlay::orgrelay;
-use tunnel_core::overlay::orgrelay::responder::{ProbeResponder, ResponderCounts, ResponderStats};
+use tunnel_core::overlay::orgrelay::bind::CookieKey;
+use tunnel_core::overlay::orgrelay::responder::ResponderCounts;
+use tunnel_core::overlay::orgrelay::server::{RelayCounts, RelayHandle, RelayServer, RelayStats};
 
-/// Set only when the responder actually started, so `None` distinguishes
-/// "not running" from "running and idle" — the distinction FR-19 insists on
-/// for every counter it ships.
 /// Set **only after a successful bind**, so its presence means "this node is
 /// actually serving", never merely "someone asked it to".
 ///
@@ -37,38 +43,57 @@ use tunnel_core::overlay::orgrelay::responder::{ProbeResponder, ResponderCounts,
 /// live relay on a node whose bind had failed — the precise confusion the
 /// `Option` exists to prevent. A failed bind leaves this `None` and says so at
 /// `error!`.
-static RUNNING: OnceLock<(String, Arc<ResponderStats>)> = OnceLock::new();
+static RUNNING: OnceLock<Running> = OnceLock::new();
+
+struct Running {
+    listening: String,
+    stats: Arc<RelayStats>,
+    handle: RelayHandle,
+}
 
 /// Guards against a second start. Separate from [`RUNNING`] because that is
 /// only populated once the socket exists, and the guard has to hold from the
 /// moment the first call is made.
 static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Live counters, or `None` when this node is not serving probes.
+/// Probe counters, or `None` when this node is not serving. Feeds the P1
+/// `NodeStatus::org_relay` field.
 pub fn stats() -> Option<ResponderCounts> {
-    RUNNING.get().map(|(_, s)| s.snapshot())
+    RUNNING.get().map(|r| r.stats.snapshot().probe)
 }
 
-/// The bound address and live counters, or `None` when not serving. Feeds
+/// The full relay counters, or `None` when not serving.
+pub fn relay_stats() -> Option<RelayCounts> {
+    RUNNING.get().map(|r| r.stats.snapshot())
+}
+
+/// The bound address and probe counters, or `None` when not serving. Feeds
 /// `NodeStatus::org_relay`, so `roomler status` answers "is it working?"
 /// immediately instead of waiting out the report loop's 300 s window.
 pub fn status() -> Option<(String, ResponderCounts)> {
-    RUNNING.get().map(|(addr, s)| (addr.clone(), s.snapshot()))
+    RUNNING
+        .get()
+        .map(|r| (r.listening.clone(), r.stats.snapshot().probe))
 }
 
-/// How often the counters are summarised into the log. This IS the reader for
-/// those counters until they reach `NodeStatus`; a counter without one cannot
-/// be used to evaluate anything (FR-18's `dropped_stale` is the precedent).
+/// The session-install handle, or `None` when not serving. P3 uses this to
+/// install and revoke sessions from the control-WS mint messages.
+pub fn handle() -> Option<RelayHandle> {
+    RUNNING.get().map(|r| r.handle.clone())
+}
+
+/// How often the counters are summarised into the log. `roomler status` is
+/// the immediate reader; this is the historical one.
 const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Start the responder if the device opted in. Safe to call once per process.
+/// Start the relay if the device opted in. Safe to call once per process.
 pub fn maybe_start() {
     if !orgrelay::relay_server_enabled() {
         return;
     }
     let port = orgrelay::relay_server_port();
     if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        tracing::warn!("org-relay responder already started; ignoring second start");
+        tracing::warn!("org-relay server already started; ignoring second start");
         return;
     }
     tokio::spawn(async move {
@@ -81,28 +106,42 @@ pub fn maybe_start() {
                 tracing::error!(
                     port,
                     error = %e,
-                    "org-relay responder NOT started: could not bind udp/{port}. \
+                    "org-relay server NOT started: could not bind udp/{port}. \
                      Something else already owns the port, or the daemon lacks \
                      permission for it. The node will not answer relay probes."
                 );
                 return;
             }
         };
-        let local = sock
+        let listening = sock
             .local_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| format!("0.0.0.0:{port}"));
-        let stats = Arc::new(ResponderStats::default());
-        let _ = RUNNING.set((local, stats.clone()));
-        tokio::spawn(report_loop(stats.clone()));
-        ProbeResponder::new(stats).serve(sock).await;
+
+        // The relay's own rotating cookie key. Fresh per start, never
+        // persisted, never leaves the process: it exists so the relay can
+        // re-derive a challenge without storing per-attempt state.
+        let mut key = [0u8; 32];
+        {
+            use rand::RngCore;
+            rand::rng().fill_bytes(&mut key);
+        }
+        let stats = Arc::new(RelayStats::default());
+        let (server, handle) = RelayServer::new(CookieKey::from_bytes(key), stats.clone());
+        let _ = RUNNING.set(Running {
+            listening,
+            stats: stats.clone(),
+            handle,
+        });
+        tokio::spawn(report_loop(stats));
+        server.serve(sock).await;
     });
 }
 
 /// Summarise the counters whenever they change. Silent while nothing happens,
 /// so an idle relay does not fill the log.
-async fn report_loop(stats: Arc<ResponderStats>) {
-    let mut last = ResponderCounts::default();
+async fn report_loop(stats: Arc<RelayStats>) {
+    let mut last = RelayCounts::default();
     loop {
         tokio::time::sleep(REPORT_EVERY).await;
         let now = stats.snapshot();
@@ -110,11 +149,20 @@ async fn report_loop(stats: Arc<ResponderStats>) {
             continue;
         }
         tracing::info!(
-            answered = now.answered,
-            refused_not_shaped = now.refused_not_shaped,
-            refused_not_probe = now.refused_not_probe,
+            probes_answered = now.probe.answered,
+            forwarded = now.forwarded,
+            bound = now.bound,
+            sessions_installed = now.sessions_installed,
+            sessions_revoked = now.sessions_revoked,
+            sessions_reaped = now.sessions_reaped,
+            drop_unbound_source = now.drop_unbound_source,
+            drop_unknown_vni = now.drop_unknown_vni,
+            drop_bad_tag1 = now.drop_bad_tag1,
+            drop_bad_cookie = now.drop_bad_cookie,
+            drop_bad_tag2 = now.drop_bad_tag2,
             refused_rate_limited = now.refused_rate_limited,
-            "org-relay responder counters"
+            panics_caught = now.panics_caught,
+            "org-relay server counters"
         );
         last = now;
     }
@@ -125,16 +173,16 @@ mod tests {
     use super::*;
 
     /// The default is off, and "off" must mean nothing was created — not a
-    /// responder sitting on a socket with zeroed counters. `stats()` returning
+    /// relay sitting on a socket with zeroed counters. `stats()` returning
     /// `None` is how a reader tells those apart.
     #[test]
-    fn a_device_that_did_not_opt_in_reports_no_responder() {
+    fn a_device_that_did_not_opt_in_reports_no_relay() {
         // No env set in this test process, so the gate is closed.
         assert!(!orgrelay::relay_server_enabled());
         maybe_start();
         assert!(
-            stats().is_none(),
-            "opting out must leave no responder, not an idle one"
+            stats().is_none() && handle().is_none(),
+            "opting out must leave no relay, not an idle one"
         );
     }
 }
