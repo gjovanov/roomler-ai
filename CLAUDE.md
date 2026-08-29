@@ -307,7 +307,9 @@ The build host builds the image, pushes to `<internal-registry>/roomler-ai:<tag>
 
 ssh "$BUILD_HOST"
 cd "$REPO" && git pull
-docker build -t "$REGISTRY/roomler-ai:build-$$" .                   # ~5–15 min (cache warm)
+docker build -t "$REGISTRY/roomler-ai:build-$$" \
+  --build-arg VERSION="$(git describe --tags --always)" \
+  --build-arg GIT_SHA="$(git rev-parse HEAD)" .        # ~5–15 min (cache warm)
 TAG="v$(date +%Y%m%d)-$(docker images -q "$REGISTRY/roomler-ai:build-$$" | head -c 12)"
 docker tag "$REGISTRY/roomler-ai:build-$$" "$REGISTRY/roomler-ai:$TAG"
 docker tag "$REGISTRY/roomler-ai:build-$$" "$REGISTRY/roomler-ai:latest"
