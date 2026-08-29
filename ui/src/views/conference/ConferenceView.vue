@@ -298,6 +298,7 @@ const layoutCtrl = useConferenceLayout(
   activeSpeakerKeyRef,
   getDisplayName,
   localDisplayName,
+  conferenceStore.remoteVideoPaused,
 )
 
 const layoutComponent = computed<Component>(() => {

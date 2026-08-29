@@ -5,6 +5,8 @@ export type SelfViewMode = 'in-grid-cropped' | 'in-grid-uncropped' | 'floating-u
 
 export interface LayoutParticipant {
   streamKey: string
+  /** FR-30 — the peer SAID their camera is off. Not derivable from the track. */
+  videoPaused: boolean
   userId: string
   displayName: string
   stream: MediaStream | null
@@ -119,6 +121,9 @@ export function useConferenceLayout(
   activeSpeakerKey: Ref<string | null>,
   getDisplayName: (userId: string) => string,
   localDisplayName: Ref<string>,
+  // FR-30 — streamKey -> the peer's own "my camera is off". Optional so the
+  // composable stays usable (and testable) without a live call store.
+  remoteVideoPaused?: Map<string, boolean>,
 ) {
   const prefs = ref<LayoutPreferences>(loadPrefs())
 
@@ -197,6 +202,9 @@ export function useConferenceLayout(
         isLocal: true,
         isScreenShare: false,
         isPinned: prefs.value.pinnedStreamKeys.includes('local'),
+        // Your own camera state is already visible to you locally; the signal
+        // is about what OTHERS cannot otherwise see.
+        videoPaused: false,
         audioLevel: 0,
       })
     }
@@ -217,6 +225,7 @@ export function useConferenceLayout(
         isLocal: false,
         isScreenShare: isScreen,
         isPinned: prefs.value.pinnedStreamKeys.includes(streamKey),
+        videoPaused: remoteVideoPaused?.get(streamKey) === true,
         audioLevel: audioLevels.value.get(streamKey) ?? 0,
       })
     }
@@ -235,7 +244,9 @@ export function useConferenceLayout(
   function filterHidden(list: LayoutParticipant[]): LayoutParticipant[] {
     if (!prefs.value.hideNonVideo) return list
     return list.filter(
-      (p) => p.isPinned || p.isLocal || hasLiveVideoTrack(p.stream),
+      // FR-30 — a paused sender's track is still `live` and unmuted here, so
+      // the peer's own signal is the only thing that can answer this.
+      (p) => p.isPinned || p.isLocal || (!p.videoPaused && hasLiveVideoTrack(p.stream)),
     )
   }
 
