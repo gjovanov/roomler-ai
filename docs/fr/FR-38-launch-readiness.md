@@ -1,6 +1,6 @@
 # FR-38: The product is unfindable — repository metadata, README, comparison docs, and a way for a visitor to stay in touch
 
-Status: **P0 in progress** (2026-08-29). Tracking issue: `FR-38` (#TBD).
+Status: **P0 in progress** (2026-08-29). Tracking issue: `FR-38` (#951).
 Spec on master up front; the work is known and mostly mechanical.
 
 ## The measurement that motivates it
@@ -14,6 +14,7 @@ Roomler ships. Roomler is not findable. Measured 2026-08-29, all of it from publ
 | GitHub stars / forks | **0 / 0**, on a public repository with 577 releases since `agent-v0.1.0` (2026-04-17). |
 | Web search for the product | returns the **retired** `roomler.live` identity, still described as a chat-and-video platform. FR-23 301'd the domain; search engines still carry the old description. |
 | `roomler.ai` landing page | has no email capture of any kind (`ui/src/views/LandingView.vue` — no newsletter, no waitlist, no changelog subscribe). A visitor who does not register on the spot leaves no trace and cannot be reached again. |
+| Self-hosting the server | **there is no path.** `docker-compose.yml` brings up *dependencies only* (Mongo/Redis/MinIO/coturn) — it does not run the application — and **no container image is published anywhere** (no workflow pushes to GHCR or Docker Hub). `LICENSING.md` promises "you can self-host all of it, free, on unlimited devices, forever"; the licence delivers that, the tooling did not. |
 | Self-hosted software directories | absent from awesome-selfhosted (its *Remote Access* category holds 14 projects), awesome-sysadmin, AlternativeTo, SaaSHub, LibHunt. |
 
 The category itself is demonstrably active — Hacker News gave a comparable open-source
@@ -95,6 +96,7 @@ account** — so that interest which does not convert immediately is not lost pe
 | P3 | `docs/compare/` — five comparison documents | — (docs only) |
 | P4 | `subscribers` model + DAO + the three public routes + rate limit | route not mounted |
 | P5 | landing-page capture UI + Privacy Policy amendment | UI section removed |
+| P6 | `docker-compose.selfhost.yml` + `.env.selfhost.example` + `docs/self-hosting.md` — a one-command self-host path | file is additive; nothing existing changes |
 
 ## Acceptance criteria
 
@@ -110,6 +112,7 @@ account** — so that interest which does not convert immediately is not lost pe
 - [ ] the unsubscribe link in the stored record works with no session and no account
 - [ ] the Privacy Policy describes the subscriber collection, and every sentence of that
       description is true of the code that ships with it
+- [ ] `docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build` brings up a working instance on a clean machine, and `/health` answers 200 **(operator — needs a clean box and a 10–20 min build)**
 - [ ] a 60–90 s demo (enroll → browser desktop → `roomler ssh` → `roomler forward`) exists
       and is embedded in the README **(operator — needs a real capture session)**
 
