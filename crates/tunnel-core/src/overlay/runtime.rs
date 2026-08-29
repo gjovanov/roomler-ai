@@ -1849,6 +1849,12 @@ impl OverlayRuntime {
             // org relay. Advertising it earlier would invite the server to push
             // relay_session frames this build cannot act on.
             supports_org_relay: false,
+            // FR-19 P3c — the server refuses every relay decision for a node
+            // that does not say it is PRIMARY, and pairs this port with the
+            // node's public addresses when it serves. Both stay `None` until
+            // P4 wires the client side (`OrgCtx`, `relay_server_port`).
+            org_primary: None,
+            relay_port: None,
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         }
