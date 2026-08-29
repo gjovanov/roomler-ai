@@ -34,6 +34,12 @@
 //!    profile location; fails gracefully (returns `None`) if the
 //!    profile isn't there.
 //!
+//!
+// RETIRED-NAME-ANCHOR-BEGIN
+// From here down, `roomler-agent` names the PRE-RENAME appdirs segment that
+// a host installed before P4b still has. The resolver returns both segments
+// and the tests pin the order; dropping the retired one is what removed the
+// user-config rung from every post-rename install in the first place.
 //! ## Limitations
 //!
 //! * Assumes the user's profile directory is at `C:\Users\<name>`.
@@ -334,3 +340,4 @@ mod tests {
         assert!(result.is_none());
     }
 }
+// RETIRED-NAME-ANCHOR-END

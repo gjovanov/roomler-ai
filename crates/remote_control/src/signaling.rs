@@ -32,7 +32,7 @@ pub enum Role {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Role advertised in `rc:tunnel.hello`. Distinguishes the
-/// `roomler-tunnel` CLI (which initiates forwards) from the agent
+/// `roomler` CLI (which initiates forwards) from the agent
 /// (which serves them). Wire form: `"client"` | `"agent"`.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -608,7 +608,7 @@ pub enum ClientMsg {
     //     WS so the server can apply the cross-tenant gate + policy
     //     eval before forwarding to the agent.
     //
-    /// Sent right after WS upgrade by either a `roomler-tunnel` client
+    /// Sent right after WS upgrade by either a `roomler` client
     /// or an agent that wants to advertise tunnel support. Locks in
     /// the wire transport for the rest of the session.
     ///
@@ -641,7 +641,7 @@ pub enum ClientMsg {
         /// carry N concurrent opens: the `roomlerd` daemon (P3b-2)
         /// multiplexes many client sessions over its single agent WS and
         /// demuxes the reply by this nonce (post-open it switches to the
-        /// server-minted `session_id`). The standalone `roomler-tunnel`
+        /// server-minted `session_id`). The standalone `roomler`
         /// CLI has a single in-flight open and sends `None`, matching the
         /// reply positionally. `None` is omitted on the wire, so a
         /// pre-P3b-2 server/client stays byte-identical.
@@ -1915,7 +1915,7 @@ pub struct AgentSysStats {
     /// peer-to-peer data channel, which is why `tunnel_audit.bytes_in`/
     /// `bytes_out` have held a literal 0 on every row ever written. These
     /// two are DEVICE-attributed — a daemon-supervised forward belongs to
-    /// the host, not to a person. A dedicated `roomler-tunnel` client's
+    /// the host, not to a person. A dedicated `roomler` client's
     /// flows are user-owned and still report nothing; that needs the same
     /// counters wired into the CLI's own heartbeat.
     ///
