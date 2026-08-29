@@ -7,7 +7,7 @@
 //! fails here too.
 
 use crate::fixtures::test_app::TestApp;
-use roomler_agent::{config::AgentConfig, encode::EncoderPreference, enrollment, signaling};
+use roomlerd::{config::AgentConfig, encode::EncoderPreference, enrollment, signaling};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -38,8 +38,8 @@ fn spawn_agent_signaling_as(
         // the tests crate needs no direct tunnel-core dep. Keep `_view_rx`
         // alive for the lifetime of `run` so its sends don't fail.
         let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
-        let broker = roomler_agent::consent::ConsentBroker::new(
-            roomler_agent::consent::Mode::AutoGrant,
+        let broker = roomlerd::consent::ConsentBroker::new(
+            roomlerd::consent::Mode::AutoGrant,
             std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
         )
         .expect("consent broker init");
@@ -57,17 +57,22 @@ fn spawn_agent_signaling_as(
             // an empty slot is the correct value, not a stub.
             Default::default(),
             broker,
-            roomler_agent::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            roomlerd::tunnel::client_mgr::TunnelClientHub::new("test".into()),
             // Remote config: tests never PUSH one, but the live `exec_enabled`
             // must still be SEEDED from the config this agent was handed —
             // which is exactly what `main.rs` does. See agent_exec_tests for
             // the failure hardcoding `false` produced.
-            roomler_agent::remote_config::RemoteConfigServices::new(
+            roomlerd::remote_config::RemoteConfigServices::new(
                 std::path::PathBuf::from("unused-in-tests.toml"),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 exec_enabled,
                 remote_config_enabled,
             ),
+            // FR-27 — the live remote-control session registry. Tests never
+            // read it back, but the signalling loop registers into it, so a
+            // fresh one per harness is the honest value (not a shared global
+            // that would leak sessions between tests).
+            roomlerd::rc_sessions::RcSessionRegistry::new(),
         )
         .await;
     })
@@ -701,14 +706,14 @@ async fn join_org_pushes_a_live_device_into_a_second_organization() {
     // exactly like a boot-time one.
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = dir.path().join("config.toml");
-    roomler_agent::config::save(&cfg_path, &cfg).unwrap();
+    roomlerd::config::save(&cfg_path, &cfg).unwrap();
     let spawn_rx = stop_rx.clone();
     let spawn_path = cfg_path.clone();
-    roomler_agent::org_join::install(roomler_agent::org_join::JoinRuntime {
+    roomlerd::org_join::install(roomlerd::org_join::JoinRuntime {
         config_path: cfg_path.clone(),
         write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         spawn_org: Box::new(move |org| {
-            let base = roomler_agent::config::load(&spawn_path).expect("reload");
+            let base = roomlerd::config::load(&spawn_path).expect("reload");
             spawn_agent_signaling_as(
                 signaling::OrgCtx::secondary(&org.label),
                 base.for_org(&org),
@@ -774,7 +779,7 @@ async fn join_org_pushes_a_live_device_into_a_second_organization() {
 
     // The config on disk grew a labelled secondary alongside an untouched
     // primary.
-    let saved = roomler_agent::config::load(&cfg_path).unwrap();
+    let saved = roomlerd::config::load(&cfg_path).unwrap();
     assert_eq!(saved.tenant_id, src.tenant_id, "primary identity untouched");
     assert_eq!(saved.agent_id, cfg.agent_id, "primary agent id untouched");
     assert_eq!(saved.orgs.len(), 1);

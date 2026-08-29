@@ -1,7 +1,7 @@
 # Phase 1 Chunk 1B — Linux agent image for the roomler-ai-agent-e2e
 # overlay. Identical pattern to Dockerfile.e2e (multi-stage builder +
 # slim runtime + entrypoint script that touches /results/.done after
-# work completes), but the runtime is `roomler-agent run` driven by a
+# work completes), but the runtime is `roomlerd run` driven by a
 # synthetic frame source instead of Playwright.
 #
 # Feature selection — DELIBERATELY minimal:
@@ -30,7 +30,7 @@ COPY . .
 # Build the agent binary with the e2e-only feature set. `--locked`
 # pins to Cargo.lock so a transient registry change can't shift
 # resolved versions between this build and the workspace.
-RUN cargo build --release -p roomler-agent --locked \
+RUN cargo build --release -p roomlerd --locked \
     --no-default-features \
     --features synthetic-frame-source,openh264-encoder,clipboard
 

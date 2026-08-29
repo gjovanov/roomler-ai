@@ -20,11 +20,11 @@ members = [
     "crates/api",
     "crates/tests",
 
-    "agents/roomler-agent",
-    "agents/roomler-agent-tray",
+    "agents/roomlerd",
+    "agents/roomler-desktop",
     "agents/roomler-cli-shim",
     "agents/roomler-setup",
-    "agents/roomler-tunnel",
+    "agents/roomler-cli",
 ]
 exclude = [
     # Vendored upstream (kept verbatim except the H265 payloader fix);
@@ -103,7 +103,7 @@ wintun-bindings = { path = "crates/vendored/wintun-bindings" }
 scrap = { path = "crates/vendored/scrap" }
 
 [workspace.package]
-version = "0.4.13"
+version = "0.4.17"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 
