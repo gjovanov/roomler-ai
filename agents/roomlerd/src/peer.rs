@@ -4629,7 +4629,7 @@ async fn media_pump_ffmpeg_dc(
         // AIMD's rate DROPS land DURING motion as smaller frames instead
         // of production skips. Replaces the rc.445 motion-defer when
         // `bg_rebuild` is on; the defer machinery stays as the
-        // kill-switch fallback (`ROOMLER_AGENT_BG_REBUILD=0`).
+        // kill-switch fallback (`ROOMLERD_BG_REBUILD=0`).
         if bg_rebuild {
             if let Some(handle) = pending_swap.as_ref()
                 && handle.is_finished()
@@ -9695,8 +9695,8 @@ mod overlay_tier_tests {
         // where a real daemon happens to be running).
         // SAFETY: no other test touches this var (set_var is unsafe in
         // edition 2024 because of cross-thread env races).
-        unsafe { std::env::set_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT", "0") };
+        unsafe { std::env::set_var("ROOMLERD_OVERLAY_TIER_DETECT", "0") };
         assert!(!overlay_remote_is_relay_tier("100.64.0.29", sid).await);
-        unsafe { std::env::remove_var("ROOMLER_AGENT_OVERLAY_TIER_DETECT") };
+        unsafe { std::env::remove_var("ROOMLERD_OVERLAY_TIER_DETECT") };
     }
 }
