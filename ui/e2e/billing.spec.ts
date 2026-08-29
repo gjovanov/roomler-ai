@@ -137,7 +137,6 @@ test.describe('Billing & Subscription', () => {
         max_channels: number
         video_max_participants: number
         cloud_integrations: boolean
-        ai_recognition: boolean
         recordings: boolean
         // S5 pivot — per-user pricing with device caps; kept in
         // lockstep with crates/db tenant.rs::Plan::limits and
@@ -162,7 +161,6 @@ test.describe('Billing & Subscription', () => {
     expect(free.limits.max_channels).toBe(5)
     expect(free.limits.video_max_participants).toBe(4)
     expect(free.limits.cloud_integrations).toBe(false)
-    expect(free.limits.ai_recognition).toBe(false)
     expect(free.limits.recordings).toBe(false)
     expect(free.limits.max_devices).toBe(3)
     expect(free.limits.max_tunnel_clients).toBe(3)
@@ -190,7 +188,6 @@ test.describe('Billing & Subscription', () => {
     expect(biz.name).toBe('Business')
     expect(biz.price_cents).toBe(1600)
     expect(biz.limits.video_max_participants).toBe(100)
-    expect(biz.limits.ai_recognition).toBe(true)
     expect(biz.limits.recordings).toBe(true)
     expect(biz.limits.max_devices).toBe(300)
     expect(biz.limits.max_tunnel_clients).toBe(300)

@@ -234,10 +234,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{file_id}", get(routes::file::get))
         .route("/{file_id}/download", get(routes::file::download))
         .route("/{file_id}", delete(routes::file::delete))
-        .route(
-            "/{file_id}/recognize",
-            post(routes::integration::recognize_file),
-        )
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024));
 
     // Background task routes (under tenant)
