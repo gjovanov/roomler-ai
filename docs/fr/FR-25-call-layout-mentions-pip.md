@@ -139,9 +139,10 @@ false (iOS Safari) rather than shipping a dead control.
 - [x] PiP opens from the toolbar and from a tile; solo call falls back to self-view;
       refusals say why — **needed a second fix (#873)**, see the log
 - [x] Self-view cropped/uncropped visibly changes all three layouts
-- [ ] Hide-non-video converges when a camera toggles, without a reload —
-      ⚠️ **cannot hold as written**: nothing tells a peer the camera went off.
-      See the field log; this needs an FR of its own, not a fix here
+- [x] Hide-non-video converges when a camera toggles, without a reload —
+      needed the missing signal, delivered by **FR-30 (#884, #886)** and
+      field-verified 2026-08-29: the remote tile goes on camera-off and returns
+      on camera-on, no reload
 - [x] Sidebar never spotlights you while a remote is present
 - [x] Double-click spotlights; again restores the previous layout; fullscreen works
 - [x] Unit tests for the layout rules (13 new; there were none)
