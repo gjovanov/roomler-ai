@@ -52,6 +52,17 @@ Every line below was read on `origin/master` at `861d4557`.
    what makes the outcome deterministic instead of timing-dependent: the agent
    states its reason (`timeout` / `no_prompt_surface`) rather than leaving the
    server to infer one from a bare `granted: false`.
+
+   ⚠️ **Corrected again after 0.4.18 (same day).** The reason field alone did
+   NOT make it deterministic, because the hub's fallback timer was armed at the
+   same 30 s the agent prompts for — so the agent's reasoned verdict, arriving
+   ~138 ms after the window, found the session already terminated. mars on
+   0.4.18 got everything right (`native=false have_surface=false`, sent
+   `reason="no_prompt_surface"`) and the controller still saw "nobody
+   answered". The actual fix is `consent::CONSENT_VERDICT_GRACE`: the hub
+   waits 5 s longer than the window it announces, so its own timer is a
+   backstop for a dead agent and never a competitor of a live one. Locked by a
+   paused-clock test that replays the 138 ms gap in both directions.
 4. **`.pending` has exactly one production call site.** Fleet-RPC exec and
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
@@ -297,3 +308,25 @@ line a headless operator gets still named the FR-21-retired `roomler-agent`.
   controller machine.
 - `email` / `push` — both resolve at the **owner**, who is a different account here.
 - macOS and Linux-X11 panels, exec + ssh prompts, macOS Check-for-updates.
+
+### 2026-08-29 — 0.4.18 on mars: the negative control, half right
+
+`agent-v0.4.18` (#877's agent half) rolled to mars, jupiter and NEO16. On mars:
+
+| | observed |
+|---|---|
+| daemon start | `no native consent panel on this host — … this host's X display is the daemon's own virtual desktop` — the guard declined the Xvfb |
+| prompt | `consent prompt surface … native=false have_surface=false` — correct |
+| agent verdict | `decision=Timeout … reason="no_prompt_surface"` at **t+30.138 s** — correct |
+| hub | `session terminated by server reason=ConsentTimeout` at **t+30.000 s** — 138 ms EARLIER |
+| controller | *"Nobody answered the prompt on that device in time."* — the wrong sentence |
+
+So the agent is right and the controller is still told the wrong thing: the hub's
+fallback timer and the agent's window were the same number. Fixed server-side
+(`CONSENT_VERDICT_GRACE`, this FR's last PR); re-test on the next API deploy.
+
+Also on 0.4.18: `companion_version` is live end to end — NEO16 reports `0.4.18`
+(the sidecar the daemon's own refresh wrote), mars reports *absent* (no
+companion, and correctly not an empty string). The release-time picker guard
+ran for the first time on a real tag and printed the daemon `.deb` for both
+arches.
