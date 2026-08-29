@@ -106,7 +106,7 @@ mod tests {
     fn available_default_on_when_env_unset() {
         // SAFETY: tests share the process env; this module is the only
         // one touching ROOMLERD_USE_FFMPEG so no concurrent reads.
-        unsafe { std::env::remove_var("ROOMLERD_USE_FFMPEG") };
+        unsafe { tunnel_core::env::test_env::clear("USE_FFMPEG") };
         // rc.107 — DEFAULT ON in the ffmpeg-encoder build (HEVC-over-DC is
         // the primary path); the feature-off build hardwires available()=false.
         #[cfg(feature = "ffmpeg-encoder")]
@@ -124,23 +124,23 @@ mod tests {
     #[cfg(feature = "ffmpeg-encoder")]
     #[test]
     fn ffmpeg_backend_enabled_default_on_with_explicit_opt_out() {
-        unsafe { std::env::remove_var("ROOMLERD_USE_FFMPEG") };
+        unsafe { tunnel_core::env::test_env::clear("USE_FFMPEG") };
         assert!(ffmpeg_backend_enabled(), "rc.107: unset → ON (default)");
         for on in ["1", "true", "TRUE", "yes", "On", "whatever"] {
-            unsafe { std::env::set_var("ROOMLERD_USE_FFMPEG", on) };
+            unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "USE_FFMPEG", on) };
             assert!(
                 ffmpeg_backend_enabled(),
                 "value {on:?} (not an explicit off-value) should keep the FFmpeg backend ON"
             );
         }
         for off in ["0", "false", "no", "off", ""] {
-            unsafe { std::env::set_var("ROOMLERD_USE_FFMPEG", off) };
+            unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "USE_FFMPEG", off) };
             assert!(
                 !ffmpeg_backend_enabled(),
                 "value {off:?} should explicitly disable the FFmpeg backend"
             );
         }
-        unsafe { std::env::remove_var("ROOMLERD_USE_FFMPEG") };
+        unsafe { tunnel_core::env::test_env::clear("USE_FFMPEG") };
     }
 
     /// rc.66 link verification. Exercises the FFmpeg dep so a missing
