@@ -91,6 +91,7 @@ the controller is black until something moves. The output-suppression on
 | 2 | **First-frame guarantee** | Never let the empty/unchanged path suppress output before the controller has received one frame — force an initial keyframe. Largely subsumed by phase 1 (recovery delivers the frame) + the GDI backstop; this is the belt-and-suspenders for a truly static screen. | — |
 | 3 | **Tell the controller the host is locked** | Unlock-then-approve is the SOUND flow — you unlock (proving you are at the machine), then approve — and with P1+P4 it works. The gap is that the controller has no way to know it is locked, so its "awaiting consent" wait looks like a hang. The agent probes lock state at prompt time and, if locked, sends `rc:consent.pending{host_locked}` over the WS; the hub relays it; the viewer turns the wait into an instruction ("unlock the device and approve, 5-min window"). | advisory + additive; absent = generic wait |
 | 4 | **A 5-minute attended window** | Plain `prompt` gave the operator 30 s — not enough to reach a LOCKED machine, unlock, and approve. Extend `DEFAULT_CONSENT_TIMEOUT` to 5 min (`prompt_then_email`'s host half stays 30 s — its emailed link is the fallback), and show the countdown as `m:ss`. | — |
+| 3b | **Detect the lock from the SERVICE context** | P3 shipped in 0.4.22 but the emit **could never fire on a perMachine/SYSTEM host**: the consent code runs on the SCM service window station (the daemon switches to `WinSta0` per-session, *after* consent), so the `OpenInputDesktop`-based `probe_lock_state()` read the service station's own `Default` → Unlocked, always. Fix = `probe_lock_state_service()` via `WTSQuerySessionInformationW(WTSSessionInfoEx).SessionFlags` (window-station-independent), used at the emit with a fallback to the desktop probe. Field-confirmed on pc50045, 0.4.22; fix ships in 0.4.23. | advisory; WTS UNKNOWN/failure → desktop-probe fallback → generic wait |
 
 Phase 1 is the functional fix (black → live without a refresh) and is safe to
 ship on its own by the `frames_delivered == 0` gate.
@@ -152,3 +153,46 @@ smaller, fully-verifiable "tell the controller it is locked" above.
   instruction instead of a hang.
 - **P4 (window length):** 30 s was too short to walk to a locked machine — raised
   to 5 min.
+
+### 2026-08-30 — P3 shipped in 0.4.22, field-tested on pc50045: the emit was broken
+
+Rolled 0.4.22 (agent) + deployed the API/UI, updated pc50045, staged
+`consent_mode=prompt` + `prompt_owner=true`, and drove sessions from neo16 with the
+operator holding the host on the lock screen.
+
+- **Unlocked path: PASS** — the agent correctly does NOT claim locked; the viewer
+  shows the generic *"Waiting for the agent to allow the connection…"*.
+- **`prompt_owner`: PASS** — the owner session held in `awaiting_consent` (did not
+  owner-auto-grant) and connected only after approval at the device.
+- **Locked path: FAIL — real bug.** With the host genuinely locked (operator held
+  it; zero interfering sessions confirmed via `pump_heartbeats=0`), every attempt
+  still showed the generic message. The agent log confirmed the emit path ran
+  (`consent prompt surface`) but produced **no** `consent prompt on a LOCKED host`
+  line — `probe_lock_state()` returned **Unlocked while locked**.
+  - **Root cause (code-confirmed).** `probe_lock_state()` classifies via
+    `OpenInputDesktop`, whose result is the input desktop of the **calling
+    process's window station**. The consent code runs on the SCM **service**
+    window station (`Service-0x0-…`); the daemon only switches to the interactive
+    `WinSta0` per-session via `attach_to_winsta0()`, when input is wired, **after
+    consent** (`input/system_context_backend.rs`, `capture_pump` worker). The
+    service station has its own `Default` desktop → `classify(true,"Default")` →
+    Unlocked, always. On a perMachine/SYSTEM host the emit was **structurally
+    unable to fire**. (The daemon's `spawn_monitor`, which polls *after* the
+    switch, cleanly logged `transition → Winlogon/Locked`, which is what exposed
+    the asymmetry.)
+  - ⚠️ **CI was green** — the unit tests exercise `classify()`'s desktop-name
+    logic, not the window-station context the emit runs in. The **field test is
+    what caught it** (CI green ≠ done).
+  - ⚠️ pc50045 has **Windows Hello**: it re-unlocked within ~1 s of each Win+L
+    while the operator faced it, which masked the diagnosis for several rounds
+    until the lock was held with the camera covered.
+
+### P3b — detect the lock from the service context (the fix)
+
+`lock_state::probe_lock_state_service()`: read the console session's lock via
+`WTSQuerySessionInformationW(WTSSessionInfoEx).SessionFlags`, which is
+window-station-independent (the documented way to read lock state from a session-0
+service). The emit uses it and falls back to `probe_lock_state()` (still correct
+for a perUser/attended daemon already on `WinSta0`) on WTS unavailable/UNKNOWN.
+Pure `classify_session_flags()` + unit test; Win7/2008R2 flag-inversion caveat
+documented (fleet is Win10/11). Ships in 0.4.23; re-verify on pc50045 held locked.
