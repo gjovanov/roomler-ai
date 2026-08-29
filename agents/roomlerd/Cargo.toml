@@ -283,6 +283,14 @@ tokio-util = { version = "0.7", features = ["compat"] }
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 cpal = { version = "0.15", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# FR-28: the X11 DAMAGE extension, used to answer "did anything change?" --
+# the question XShm cannot answer and DXGI answers for free with WouldBlock.
+# Already present in the Linux graph via enigo/arboard, so this buys the
+# `damage` protocol module rather than a new crate. Optional and tied to
+# `scrap-capture` so signalling-only builds stay unchanged.
+x11rb = { version = "0.13", features = ["damage"], optional = true }
+
 [target.'cfg(unix)'.dependencies]
 # Used for `flock` in the single-instance lock. Tiny crate, ubiquitous.
 libc = "0.2"
@@ -411,7 +419,7 @@ features = [
 [features]
 default = []
 # Enables the scrap-backed screen capture on Linux/Windows/macOS.
-scrap-capture = ["dep:scrap"]
+scrap-capture = ["dep:scrap", "dep:x11rb"]
 # Enables the OpenH264 software video encoder.
 openh264-encoder = ["dep:openh264", "dep:openh264-sys2"]
 # Enables the Windows Media Foundation hardware H.264 encoder. Windows-
