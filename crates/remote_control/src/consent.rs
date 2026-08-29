@@ -118,6 +118,29 @@ pub const ASYNC_CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 /// ending the session — see `Hub::deliver_consent`.
 pub const HOST_PROMPT_TIMEOUT: Duration = DEFAULT_CONSENT_TIMEOUT;
 
+/// FR-27 — how much LONGER than the window it announced the hub waits for the
+/// agent's own verdict before falling back to a bare `ConsentTimeout`.
+///
+/// The agent's prompt window and the hub's fallback timer are both set from
+/// the same `consent_timeout_secs`, so on every non-answer they expire
+/// together and the hub's fires ~130 ms earlier — measured on mars twice
+/// (2026-08-29: `ConsentTimeout` at t+30.000 s, the agent's
+/// `reason="no_prompt_surface"` at t+30.138 s). The agent's verdict is the
+/// one that carries a REASON — "nobody answered" vs "there was nobody to
+/// ask" — and the whole of finding 3 was that those need telling apart; a
+/// hub that terminates first throws the reason away. So the hub's own timer
+/// is a backstop for a DEAD agent, not a peer of the agent's, and it runs
+/// after the agent has had time to say what happened.
+///
+/// ⚠️ Applied to the hub's wait ONLY, never to the number sent on the wire —
+/// the on-host prompt still stands for exactly the announced window.
+pub const CONSENT_VERDICT_GRACE: Duration = Duration::from_secs(5);
+
+/// The hub's actual wait for a window it announced as `window`.
+pub fn hub_consent_deadline(window: Duration) -> Duration {
+    window + CONSENT_VERDICT_GRACE
+}
+
 /// Channel used by the hub to deliver the agent's consent decision.
 pub struct ConsentSlot {
     tx: oneshot::Sender<ConsentOutcome>,
@@ -155,6 +178,74 @@ impl ConsentWaiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mars race, replayed on a paused clock: the window is 30 s, the
+    /// agent's verdict lands 138 ms AFTER it (the measured gap), and the hub
+    /// must still receive that verdict — with its reason — rather than
+    /// having already given up with a bare Timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_verdict_just_after_the_window_still_beats_the_fallback() {
+        let (slot, waiter) = ConsentSlot::new();
+        let window = DEFAULT_CONSENT_TIMEOUT;
+        let wait = tokio::spawn(waiter.wait(hub_consent_deadline(window)));
+        // ⚠️ Poll the waiter ONCE before moving the clock: a spawned task is
+        // not polled by `spawn`, and `timeout` registers its timer on first
+        // poll — advance first and the timer is armed at the already-advanced
+        // instant, the window never "expires", and this test passes without
+        // testing anything (it did, until the negative control below caught
+        // it).
+        tokio::task::yield_now().await;
+        tokio::time::advance(window + Duration::from_millis(138)).await;
+        // Let the waiter observe the elapsed clock — with a bare-window wait
+        // this is where it would have given up.
+        tokio::task::yield_now().await;
+        slot.resolve(ConsentOutcome::NoPromptSurface).unwrap();
+        assert_eq!(wait.await.unwrap(), ConsentOutcome::NoPromptSurface);
+    }
+
+    /// The negative control — the pre-fix behaviour, kept reproducible: with
+    /// the hub waiting exactly the announced window, the same 138 ms-late
+    /// verdict is thrown away and the controller gets a bare Timeout. This
+    /// is what mars did on 0.4.16 AND 0.4.18; if this test ever starts
+    /// failing, the race test above has stopped testing anything.
+    #[tokio::test(start_paused = true)]
+    async fn without_the_grace_the_fallback_wins_the_race() {
+        let (slot, waiter) = ConsentSlot::new();
+        let window = DEFAULT_CONSENT_TIMEOUT;
+        let wait = tokio::spawn(waiter.wait(window));
+        tokio::task::yield_now().await; // arm the timer at t0 (see above)
+        tokio::time::advance(window + Duration::from_millis(138)).await;
+        tokio::task::yield_now().await;
+        // The waiter has already resolved to Timeout; the agent's verdict
+        // finds nobody listening.
+        assert!(slot.resolve(ConsentOutcome::NoPromptSurface).is_err());
+        assert_eq!(wait.await.unwrap(), ConsentOutcome::Timeout);
+    }
+
+    /// And the backstop still exists: an agent that never answers at all is
+    /// timed out by the hub, not waited on forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_agent_is_still_timed_out_after_the_grace() {
+        let (_slot, waiter) = ConsentSlot::new();
+        let wait = tokio::spawn(waiter.wait(hub_consent_deadline(DEFAULT_CONSENT_TIMEOUT)));
+        tokio::task::yield_now().await; // arm the timer at t0 (see above)
+        tokio::time::advance(
+            DEFAULT_CONSENT_TIMEOUT + CONSENT_VERDICT_GRACE + Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(wait.await.unwrap(), ConsentOutcome::Timeout);
+    }
+
+    #[test]
+    fn the_grace_is_added_to_the_wait_not_to_the_window() {
+        // The wire number the agent prompts for is the WINDOW; only the hub's
+        // wait is longer. If these were ever equal the race would be back.
+        assert!(hub_consent_deadline(DEFAULT_CONSENT_TIMEOUT) > DEFAULT_CONSENT_TIMEOUT);
+        assert_eq!(
+            hub_consent_deadline(ASYNC_CONSENT_TIMEOUT),
+            ASYNC_CONSENT_TIMEOUT + CONSENT_VERDICT_GRACE
+        );
+    }
 
     #[tokio::test]
     async fn granted() {
