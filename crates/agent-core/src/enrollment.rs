@@ -162,6 +162,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         idle_refine_balanced: None,
         gpu_scale: None,
         idle_refine_max_edge: None,
+        nvenc_open_vbv_pct: None,
+        nvenc_ldkfs: None,
         idle_refine_min_frame_kb: None,
         idle_refine_major_area_permille: None,
         idle_refine_settle_ms: None,
