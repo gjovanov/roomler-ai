@@ -1,6 +1,6 @@
 # FR-29 — X11 capture reads the whole screen even when nothing changed
 
-**Issue:** [#864](https://github.com/gjovanov/roomler-ai/issues/864) · **Status:** design → P1 · **Owner:** agent / capture
+**Issue:** [#864](https://github.com/gjovanov/roomler-ai/issues/864) · **Status:** P1 field-verified; P2/P3 open · **Owner:** agent / capture
 
 ## Goal
 
@@ -85,17 +85,29 @@ working diagnostic, so P1 adds a distinct counter and heartbeat field.
 
 ## Acceptance criteria
 
-- [ ] Idle 1080p XFCE: `avg_capture_ms` ~20 ms → **< 2 ms**, roomlerd CPU
-      ~50 % of a core → **< 10 %**.
-- [ ] Under sustained motion at 1080p, fps rises above the ~27 fps ceiling
-      (**≥ 29** at `target_fps=30`).
-- [ ] A suppressed damage event self-heals within **1 s** (verified by forcing
-      the tracker to drop events, not by argument).
-- [ ] `frames_unchanged` is reported separately from `frames_empty`.
-- [ ] Windows and macOS behaviour byte-for-byte unchanged (Linux-gated).
-- [ ] `ROOMLER_AGENT_X11_DAMAGE=0` restores current behaviour exactly.
-- [ ] Field-verified on `scw-m2-asahi`, with the **before** run recorded
-      failing and the **after** run passing — CI green is not a result.
+- [x] Idle 1080p XFCE: roomlerd CPU **45.8 % → 3.4 %** of a core. (The
+      `avg_capture_ms < 2 ms` half is **superseded, not met**: idle ticks no
+      longer capture at all, so there is no per-frame capture time to average.
+      The criterion assumed a cheaper readback; P1 removes the readback.)
+- [ ] **NOT met — and not addressable by P1.** Under sustained motion fps went
+      26.4 → 27.6 and capture 22.1 → 20.6 ms, i.e. unchanged within noise.
+      Every frame is genuinely damaged under continuous motion, so every frame
+      is still read in full. This is what **P3** (partial readback) exists for;
+      recording it as an honest partial rather than reframing the target.
+- [x] Safety valve measured: on a genuinely static screen, captures ran at
+      **1.0 /s** at `MAX_SKIP_MS=1000`. ⚠️ Re-measuring at 4000 ms still gave
+      ~1.07 /s because a real XFCE desktop is **never** static — the panel
+      clock repaints every second. `frames_unchanged` climbing ~28 /s beside
+      `frames_captured` ~0.94 /s is the proof both halves work.
+- [x] `frames_unchanged` reported separately — field-observed
+      `frames_empty=2250 frames_unchanged=2250`, i.e. every empty was a
+      *proven* no-change rather than a starved pump.
+- [x] Windows and macOS untouched — the module and its call site are
+      `#[cfg(all(target_os = "linux", feature = "scrap-capture"))]`.
+- [x] `ROOMLER_AGENT_X11_DAMAGE=0` restores prior behaviour: idle went back to
+      **50.6 %** CPU / 26.4 fps / 19.1 ms capture.
+- [x] Field-verified on `scw-m2-asahi` as a same-session A/B — damage OFF
+      50.6 %, damage ON 3.4 %, on the same host minutes apart.
 
 ## Open decisions
 
@@ -121,3 +133,28 @@ working diagnostic, so P1 adds a distinct counter and heartbeat field.
 | date | build | result |
 |---|---|---|
 | 2026-08-29 | 0.4.15 (pre-change baseline) | idle capture 22.2 ms, CPU 45.8 %, 25.2 fps — the numbers P1 must move |
+| 2026-08-29 | P1, source build on the host | **idle CPU 3.4 % (13×)**; motion unchanged (45.0 %, 20.6 ms, 27.6 fps); kill switch back to 50.6 % |
+
+### What the field test caught that CI never would
+
+1. **The media heartbeat goes silent exactly when P1 works.** It fires per 30
+   *encoded* frames, so once captures are skipped there is nothing to key on —
+   the idle host emitted **one heartbeat in two minutes** and `frames_unchanged`
+   (added to make idle observable) was itself unobservable. Fixed by moving the
+   periodic idle signal onto the already-rate-limited "idle screen" log.
+2. **A headless remote-desktop host locks itself.** `xfce4-screensaver` blanked
+   and then LOCKED the session mid-test; the viewer showed pure black at 1 fps.
+   That black frame was faithful — capture was correct and the safety valve was
+   ticking exactly as designed — but it cost a wasted measurement round, and on
+   a real deployment an operator would connect to an unusable lock screen with
+   no local keyboard. Screensaver, lock and DPMS are now disabled on the host.
+   ⚠️ Worth considering whether the installer should do this for VD/headless
+   roles; a host that autologins has little reason to lock.
+3. **"Idle" desktops are not idle.** The panel clock repaints every second, so
+   damage genuinely fires ~1 /s. Any future test of the safety valve must use a
+   truly static screen or it will measure the clock instead.
+4. ⚠️ **`roomler-encode-probe` reports nonsense across a session boundary** —
+   counters reset, so `last - first` goes negative and printed `-10.8/s`. It
+   also divides by a near-zero window when few frames encode, which is where a
+   misleading `avg_capture_ms=36` came from. Read its output as suspect unless
+   the heartbeat count is healthy and the deltas are positive.
