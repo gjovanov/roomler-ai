@@ -283,14 +283,6 @@ tokio-util = { version = "0.7", features = ["compat"] }
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 cpal = { version = "0.15", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# FR-28: the X11 DAMAGE extension, used to answer "did anything change?" --
-# the question XShm cannot answer and DXGI answers for free with WouldBlock.
-# Already present in the Linux graph via enigo/arboard, so this buys the
-# `damage` protocol module rather than a new crate. Optional and tied to
-# `scrap-capture` so signalling-only builds stay unchanged.
-x11rb = { version = "0.13", features = ["damage"], optional = true }
-
 [target.'cfg(unix)'.dependencies]
 # Used for `flock` in the single-instance lock. Tiny crate, ubiquitous.
 libc = "0.2"
@@ -299,8 +291,16 @@ libc = "0.2"
 # lockfile via enigo/arboard, so this adds no new dependency tree. Default
 # features only: the panel is CLICKABLE, so it needs none of the `shape`
 # extension the click-through border would.
+#
+# FR-29 additionally needs the `damage` protocol module, to answer "did
+# anything change?" — the question XShm cannot answer and DXGI answers for
+# free with WouldBlock. ONE declaration for both consumers: two
+# `[target.'cfg(target_os = "linux")'.dependencies]` tables is a duplicate-key
+# error, not a merge. Enabled by `viewer-indicator-x11` (FR-27) and by
+# `scrap-capture` (FR-29) independently; the crate itself is already in the
+# lockfile via enigo/arboard, so this buys a feature, not a dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = { version = "0.13", optional = true }
+x11rb = { version = "0.13", features = ["damage"], optional = true }
 
 # FR-27 — the native macOS consent panel (`viewer-indicator-macos`). All three
 # are already in the lockfile (tauri pulls them for the desktop companion), so

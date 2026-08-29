@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! FR-28 P1 — "did anything change?" for the X11 capture path.
+//! FR-29 P1 — "did anything change?" for the X11 capture path.
 //!
 //! `scrap` on Linux is XShm, and `Capturer::frame()` performs a full-screen
 //! `GetImage` on every call. Unlike Windows DXGI Desktop Duplication — which
@@ -51,22 +51,22 @@ pub struct DamageTracker {
 impl DamageTracker {
     /// Open a tracker, or `None` if damage tracking is unavailable or
     /// switched off. Never returns an error: the caller's fallback is the
-    /// pre-FR-28 behaviour, which is always correct, only slower.
+    /// pre-FR-29 behaviour, which is always correct, only slower.
     pub fn open() -> Option<Self> {
-        // Kill switch. "0"/"false" restores the pre-FR-28 path byte-for-byte.
-        match std::env::var("ROOMLER_AGENT_X11_DAMAGE") {
-            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => {
-                tracing::info!(
-                    "capture: X11 damage tracking disabled by ROOMLER_AGENT_X11_DAMAGE — every tick will do a full readback"
-                );
-                return None;
-            }
-            _ => {}
+        // Kill switch, through the canonical gate helper rather than a raw
+        // `std::env::var`: that is what gives it the `ROOMLERD_` prefix, the
+        // legacy prefix fallbacks, AND the config-file fallback — so an
+        // operator can pin this in config.toml like any other gate instead of
+        // only via the unit's environment.
+        if !tunnel_core::env::flag("X11_DAMAGE", true) {
+            tracing::info!(
+                "capture: X11 damage tracking disabled by ROOMLERD_X11_DAMAGE — every tick will do a full readback"
+            );
+            return None;
         }
 
-        let max_skip = std::env::var("ROOMLER_AGENT_X11_DAMAGE_MAX_SKIP_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        let max_skip = tunnel_core::env::node_env("X11_DAMAGE_MAX_SKIP_MS")
+            .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_MAX_SKIP);
 
@@ -188,9 +188,9 @@ mod tests {
     #[test]
     fn kill_switch_refuses_to_open() {
         // SAFETY: single-threaded test process; no other thread reads env here.
-        unsafe { std::env::set_var("ROOMLER_AGENT_X11_DAMAGE", "0") };
+        unsafe { std::env::set_var("ROOMLERD_X11_DAMAGE", "0") };
         assert!(DamageTracker::open().is_none());
-        unsafe { std::env::remove_var("ROOMLER_AGENT_X11_DAMAGE") };
+        unsafe { std::env::remove_var("ROOMLERD_X11_DAMAGE") };
     }
 
     /// `open()` must never panic and never propagate an error, on any host —
@@ -198,7 +198,7 @@ mod tests {
     /// `None` that costs performance, never a capture backend that won't start.
     #[test]
     fn open_is_infallible_without_a_display() {
-        unsafe { std::env::remove_var("ROOMLER_AGENT_X11_DAMAGE") };
+        unsafe { std::env::remove_var("ROOMLERD_X11_DAMAGE") };
         unsafe { std::env::set_var("DISPLAY", ":-1-not-a-display") };
         let _ = DamageTracker::open();
         unsafe { std::env::remove_var("DISPLAY") };
