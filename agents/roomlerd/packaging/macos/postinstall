@@ -1,3 +1,11 @@
+# RETIRED-NAME-ANCHOR-BEGIN
+# Every retired name here is part of the FROZEN macOS layout: the
+# /Library/Roomler/roomler-agent.app bundle whose name keys the Screen Recording
+# and Accessibility TCC grants (FR-21 D5), the /etc/roomler-agent and
+# /var/log/roomler-agent paths the launchd plists pin to it, and the pre-P4b
+# /Applications bundle this script sweeps.
+# INVARIANT: renaming any of these voids the TCC grants or orphans a path a real
+# Mac has. docs/fr/FR-21
 #!/bin/bash
 #
 # pkg postinstall — runs as root after the payload is copied to
@@ -307,3 +315,4 @@ else
 fi
 
 exit 0
+# RETIRED-NAME-ANCHOR-END

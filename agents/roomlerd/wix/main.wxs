@@ -1,4 +1,12 @@
 <?xml version="1.0" encoding="windows-1252"?>
+<!-- RETIRED-NAME-ANCHOR-BEGIN
+     Every retired name here is MSI identity or legacy cleanup: the
+     roomler_agent_exe FileKey that CustomActions reference and upgrades key off,
+     the inert roomler-agent.exe alias the deployed fleet still resolves, and the
+     pre-P4b install folder this package vacates.
+     INVARIANT: an MSI identifier that ships cannot be renamed without breaking
+     upgrades from every installed version. docs/fr/FR-21
+-->
 <!--
   WiX v3 source for roomler-agent MSI.
 
@@ -415,3 +423,4 @@
         </InstallExecuteSequence>
     </Product>
 </Wix>
+<!-- RETIRED-NAME-ANCHOR-END -->
