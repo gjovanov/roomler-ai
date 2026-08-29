@@ -42,3 +42,6 @@ pub use agent_log::*;
 
 pub mod consent_request;
 pub use consent_request::*;
+
+pub mod subscriber;
+pub use subscriber::*;

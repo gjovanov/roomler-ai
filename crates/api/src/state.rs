@@ -26,9 +26,9 @@ use roomler_ai_services::{
         overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
         push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
         remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
-        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
-        tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
-        tunnel_policy::TunnelPolicyDao, user::UserDao,
+        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao,
+        subscriber::SubscriberDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
+        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -79,6 +79,9 @@ pub struct AppState {
     pub email: Option<Arc<EmailService>>,
     pub push: Option<Arc<PushService>>,
     pub push_subscriptions: Arc<PushSubscriptionDao>,
+    /// FR-39 — the public updates list. Not a user store: no password, no
+    /// tenant, no session.
+    pub subscribers: Arc<SubscriberDao>,
     pub redis_pubsub: Option<Arc<RedisPubSub>>,
     /// True while the Redis pub/sub subscriber holds a live subscription —
     /// flipped by `RedisPubSub::subscribe_with_reconnect` (started in
@@ -320,6 +323,7 @@ impl AppState {
         let email = EmailService::from_settings(&settings.email).map(Arc::new);
 
         let push_subscriptions = Arc::new(PushSubscriptionDao::new(&db));
+        let subscribers = Arc::new(SubscriberDao::new(&db));
         let push = if !settings.push.vapid_private_key.is_empty() {
             match PushService::new(
                 &settings.push.vapid_private_key,
@@ -853,6 +857,7 @@ impl AppState {
             email,
             push,
             push_subscriptions,
+            subscribers,
             redis_pubsub,
             redis_sub_alive,
             storage,
