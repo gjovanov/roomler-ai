@@ -2033,7 +2033,11 @@ async fn media_pump(
 
     loop {
         let capture_started = std::time::Instant::now();
-        let frame: std::sync::Arc<crate::capture::Frame> = match capturer.next_frame().await {
+        // Bound to a local first so the mutable borrow of `capturer` ends
+        // here — the idle arm below reads `capturer.frames_unchanged()`, and
+        // a temporary living to the end of the `match` would keep the borrow.
+        let next_frame = capturer.next_frame().await;
+        let frame: std::sync::Arc<crate::capture::Frame> = match next_frame {
             Ok(Some(f)) => {
                 capture_time_us =
                     capture_time_us.saturating_add(capture_started.elapsed().as_micros() as u64);
@@ -2049,7 +2053,21 @@ async fn media_pump(
                 // visible without flooding. DXGI only fires on screen change,
                 // so this can spike briefly then settle.
                 if frames_empty.is_multiple_of(150) {
-                    info!(%session_id, frames_empty, "capture produced no frame (idle screen)");
+                    // FR-28 — this log is now the ONLY periodic signal an idle
+                    // Linux host emits. The media heartbeat fires per 30
+                    // ENCODED frames, and once the damage tracker starts
+                    // proving captures unnecessary nothing is encoded, so the
+                    // heartbeat goes quiet exactly when the optimisation is
+                    // working. Carry the counters here so a healthy idle host
+                    // stays legible instead of looking hung.
+                    info!(
+                        %session_id,
+                        frames_empty,
+                        frames_unchanged = capturer.frames_unchanged(),
+                        frames_captured,
+                        frames_encoded,
+                        "capture produced no frame (idle screen)"
+                    );
                 }
                 // If the screen has been idle for IDLE_KEEPALIVE and we
                 // have a cached frame, re-encode it. openh264 will emit
