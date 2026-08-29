@@ -89,10 +89,10 @@ The authoritative statement for any given file is its own
 | Regional DERP relay | `crates/derp-relay` | `AGPL-3.0-only` |
 | Integration tests | `crates/tests` | `AGPL-3.0-only` |
 | Web UI | `ui/` | `AGPL-3.0-only` |
-| Remote-control agent (`roomlerd`) | `agents/roomler-agent` | `MPL-2.0` |
-| Tunnel/CLI client (`roomler`) | `agents/roomler-tunnel` | `MPL-2.0` |
+| Remote-control agent (`roomlerd`) | `agents/roomlerd` | `MPL-2.0` |
+| Tunnel/CLI client (`roomler`) | `agents/roomler-cli` | `MPL-2.0` |
 | CLI shim | `agents/roomler-cli-shim` | `MPL-2.0` |
-| Desktop companion | `agents/roomler-agent-tray` | `MPL-2.0` |
+| Desktop companion | `agents/roomler-desktop` | `MPL-2.0` |
 | Install wizard | `agents/roomler-setup` | `MPL-2.0` |
 | Wizard machinery | `crates/roomler-setup-core` | `MPL-2.0` |
 | Agent building blocks | `crates/agent-core` | `MPL-2.0` |
