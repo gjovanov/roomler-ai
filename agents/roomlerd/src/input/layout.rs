@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an
+// operator with it in a script needs to be able to grep for it.
 //! Windows keyboard-layout awareness + auto-switch (rc.227).
 //!
 //! The field symptom this fixes: viewer keyboard = German, remote =
@@ -333,7 +335,7 @@ fn publish_snapshot(active: HKL) {
 /// unchanged state snaps the viewer's select back on failure).
 pub fn request_set_layout(hkl_hex: String) {
     let spawned = std::thread::Builder::new()
-        .name("roomler-agent-layout-set".into())
+        .name("roomlerd-layout-set".into())
         .spawn(move || {
             // SYSTEM-context worker: bind this fresh thread to the
             // interactive desktop first (same preamble as the

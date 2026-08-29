@@ -13,6 +13,10 @@
 //!
 //! Path resolution: uses `logging::log_dir()` as the source-of-truth,
 //! then picks the lexicographically-latest `roomlerd.log.*` file (or a
+// RETIRED-NAME-ANCHOR-BEGIN
+// Rolled log files written BEFORE the rename are still on disk on every
+// upgraded host, and this is what fetches them. Accepting only the current
+// prefix would make an upgraded agent report that it has no logs.
 //! legacy `roomler-agent.log.*` on a pre-rename host — P3d Slice B).
 //! `tracing_appender::rolling::daily` rotates daily so the latest by
 //! name is also the latest by mtime — no I/O needed to choose.
@@ -53,7 +57,8 @@ pub fn current_log_path() -> Result<PathBuf> {
     let mut best: Option<(String, PathBuf)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // RETIRED-NAME-ANCHOR: without the legacy prefix `rc:logs-fetch` answers "no log
+        // RETIRED-NAME-ANCHOR: without the legacy prefix `rc:logs-fetch` answers "no
+        // log
         // file" on an upgraded host that has not rolled yet. See docs/fr/FR-21.
         if !name.starts_with("roomlerd.log") && !name.starts_with("roomler-agent.log") {
             continue;
@@ -391,3 +396,4 @@ mod tests {
         assert!(MONO_THRESHOLD_BYTES <= CHUNK_BYTES);
     }
 }
+// RETIRED-NAME-ANCHOR-END

@@ -3,10 +3,10 @@ M5 verification harness for Windows Service deployment mode.
 
 The agent has shipped two autostart strategies on Windows since 0.1.58:
   - Scheduled Task (default, perUser MSI's RegisterAutostart custom action).
-    Logs to %LOCALAPPDATA%\roomler\roomler-agent\data\logs\.
-  - SCM service `RoomlerAgentService` (M1 + M2, opt-in via
+    Logs to %LOCALAPPDATA%\roomler\roomler\data\logs\.
+  - SCM service `Roomler` (M1 + M2, opt-in via
     `roomlerd service install --as-service` from elevated PS).
-    Logs to %PROGRAMDATA%\roomler\roomler-agent\service-logs\.
+    Logs to %PROGRAMDATA%\roomler\roomler\service-logs\.
 
 Until M5, only the Scheduled Task path was field-tested. This script
 swaps one for the other, runs the host through a manual logout/login
@@ -35,7 +35,7 @@ param(
     # location. The MSI is installed under the *current* user's
     # %LOCALAPPDATA%, so when running elevated as an admin who is not
     # the install user, supply -AgentExe explicitly.
-    [string]$AgentExe = (Join-Path $env:LOCALAPPDATA 'Programs\roomler-agent\roomler-agent.exe'),
+    [string]$AgentExe = (Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerd.exe'),
 
     # How many tail lines to print per log file in Logs action.
     [int]$LogTail = 80
@@ -68,7 +68,7 @@ function Require-AgentExe {
 }
 
 function Get-AgentVersion {
-    # `roomler-agent --version` prints "roomler-agent 0.1.60" or similar.
+    # `roomlerd --version` prints "roomlerd 0.4.x" or similar.
     try {
         $v = & $AgentExe --version 2>&1
         return ($v | Out-String).Trim()
@@ -79,7 +79,7 @@ function Get-AgentVersion {
 
 function Get-TaskState {
     try {
-        $t = Get-ScheduledTask -TaskName 'RoomlerAgent' -ErrorAction Stop
+        $t = Get-ScheduledTask -TaskName 'Roomler' -ErrorAction Stop
         return @{
             Present = $true
             State   = $t.State
@@ -91,7 +91,7 @@ function Get-TaskState {
 }
 
 function Get-ServiceState {
-    $svc = Get-Service -Name 'RoomlerAgentService' -ErrorAction SilentlyContinue
+    $svc = Get-Service -Name 'Roomler' -ErrorAction SilentlyContinue
     if ($null -eq $svc) {
         return @{ Present = $false }
     }
@@ -104,7 +104,7 @@ function Get-ServiceState {
 
 function Show-State {
     Write-Host ''
-    Write-Host '=== Roomler Agent - Current State ===' -ForegroundColor Cyan
+    Write-Host '=== Roomler - Current State ===' -ForegroundColor Cyan
     Write-Host ('Agent EXE: ' + $AgentExe)
     Write-Host ('Agent ver: ' + (Get-AgentVersion))
     $task = Get-TaskState
@@ -136,14 +136,14 @@ function Tail-LogDir {
         return
     }
     # tracing-appender's daily roller writes filenames like
-    # `roomler-agent.log.2026-05-01` (no trailing `.log` extension),
+    # `roomlerd.log.2026-05-01` (no trailing `.log` extension),
     # so a literal `*.log` filter misses everything. Match the
     # documented prefix instead.
-    $files = Get-ChildItem -Path $Dir -Filter 'roomler-agent.log*' -ErrorAction SilentlyContinue |
+    $files = Get-ChildItem -Path $Dir -Filter 'roomlerd*.log*' -ErrorAction SilentlyContinue |
              Sort-Object LastWriteTime -Descending |
              Select-Object -First 2
     if (-not $files) {
-        Write-Host '  (no roomler-agent.log* files)' -ForegroundColor DarkGray
+        Write-Host '  (no roomlerd*.log* files)' -ForegroundColor DarkGray
         return
     }
     foreach ($f in $files) {
@@ -168,7 +168,7 @@ function Do-Status {
 
 function Do-Logs {
     Show-State
-    Tail-LogDir -Dir (Join-Path $env:LOCALAPPDATA 'roomler\roomler-agent\data\logs') -Label 'Scheduled Task / user-mode'
+    Tail-LogDir -Dir (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Label 'Scheduled Task / user-mode'
     # The SCM service host runs as LocalSystem, so its logs follow
     # SYSTEM's profile (NOT %PROGRAMDATA%, despite the
     # `default_log_dir()` helper -- `logging::init()` resolves via
@@ -195,8 +195,8 @@ function Do-Restart {
         Write-Host 'SCM service is not installed; nothing to restart.' -ForegroundColor Red
         exit 5
     }
-    Write-Host 'Restarting RoomlerAgentService (picks up the new EXE on disk)...' -ForegroundColor Cyan
-    Restart-Service -Name 'RoomlerAgentService' -Force
+    Write-Host 'Restarting Roomler (picks up the new EXE on disk)...' -ForegroundColor Cyan
+    Restart-Service -Name 'Roomler' -Force
     Start-Sleep -Seconds 2
     Show-State
     Write-Host ''
@@ -206,14 +206,14 @@ function Do-Restart {
 function Do-SystemLogs {
     # Read the SCM service host's log file. The host runs as
     # LocalSystem, so the log lives under SYSTEM's profile:
-    # `C:\Windows\System32\config\systemprofile\AppData\Local\roomler\roomler-agent\data\logs\`.
+    # `C:\Windows\System32\config\systemprofile\AppData\Local\roomler\roomler\data\logs\`.
     # Reading that path requires Administrator rights even though the
     # files themselves are owned by SYSTEM (the parent directory
     # ACL is admin-only).
     Require-Elevated
     Show-State
     $sysLocalAppData = Join-Path $env:windir 'System32\config\systemprofile\AppData\Local'
-    Tail-LogDir -Dir (Join-Path $sysLocalAppData 'roomler\roomler-agent\data\logs') -Label 'SCM service / SYSTEM (elevated read)'
+    Tail-LogDir -Dir (Join-Path $sysLocalAppData 'roomler\roomler\data\logs') -Label 'SCM service / SYSTEM (elevated read)'
 }
 
 function Do-Smoke {
@@ -222,9 +222,9 @@ function Do-Smoke {
     # server. We can't easily query the cluster from here without
     # creds, so smoke-test locally - confirm the agent process is
     # alive and the persistent-instance lock is held.
-    $procs = Get-Process -Name 'roomler-agent' -ErrorAction SilentlyContinue
+    $procs = Get-Process -Name 'roomlerd' -ErrorAction SilentlyContinue
     if (-not $procs) {
-        Write-Host 'No roomler-agent.exe processes running.' -ForegroundColor Red
+        Write-Host 'No roomlerd.exe processes running.' -ForegroundColor Red
         exit 1
     }
     foreach ($p in $procs) {
@@ -264,17 +264,17 @@ function Do-Install {
 
     # Step 2: register the SCM service if not already present.
     if (-not $svc.Present) {
-        # Stop any orphaned roomler-agent worker processes so the
+        # Stop any orphaned roomlerd worker processes so the
         # supervisor's first spawn doesn't collide with the instance
         # lock held by the old user-mode worker.
-        $procs = Get-Process -Name 'roomler-agent' -ErrorAction SilentlyContinue
+        $procs = Get-Process -Name 'roomlerd' -ErrorAction SilentlyContinue
         if ($procs) {
-            Write-Host "Stopping $($procs.Count) running roomler-agent process(es)..."
+            Write-Host "Stopping $($procs.Count) running roomlerd process(es)..."
             $procs | Stop-Process -Force -ErrorAction Continue
             Start-Sleep -Seconds 2
         }
 
-        Write-Host 'Registering RoomlerAgentService with SCM...'
+        Write-Host 'Registering Roomler with SCM...'
         & $AgentExe service install --as-service
         if ($LASTEXITCODE -ne 0) {
             Write-Host "ERROR: 'service install --as-service' failed (exit $LASTEXITCODE)" -ForegroundColor Red
@@ -287,8 +287,8 @@ function Do-Install {
     # Step 3: ensure it's running.
     $svc = Get-ServiceState
     if ($svc.Status -ne 'Running') {
-        Write-Host 'Starting RoomlerAgentService...'
-        Start-Service -Name 'RoomlerAgentService'
+        Write-Host 'Starting Roomler...'
+        Start-Service -Name 'Roomler'
         Start-Sleep -Seconds 2
     }
 
@@ -326,13 +326,13 @@ function Do-Rollback {
     $svc = Get-ServiceState
     if ($svc.Present) {
         if ($svc.Status -ne 'Stopped') {
-            Write-Host 'Stopping RoomlerAgentService...'
-            try { Stop-Service -Name 'RoomlerAgentService' -Force -ErrorAction Stop } catch {
+            Write-Host 'Stopping Roomler...'
+            try { Stop-Service -Name 'Roomler' -Force -ErrorAction Stop } catch {
                 Write-Host "WARNING: stop failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
             }
             Start-Sleep -Seconds 2
         }
-        Write-Host 'Unregistering RoomlerAgentService...'
+        Write-Host 'Unregistering Roomler...'
         & $AgentExe service uninstall --as-service
         if ($LASTEXITCODE -ne 0) {
             Write-Host "WARNING: 'service uninstall --as-service' exited $LASTEXITCODE" -ForegroundColor DarkYellow
@@ -341,10 +341,10 @@ function Do-Rollback {
         Write-Host 'No SCM service to remove.'
     }
 
-    # Stop any orphaned roomler-agent processes.
-    $procs = Get-Process -Name 'roomler-agent' -ErrorAction SilentlyContinue
+    # Stop any orphaned roomlerd processes.
+    $procs = Get-Process -Name 'roomlerd' -ErrorAction SilentlyContinue
     if ($procs) {
-        Write-Host "Stopping $($procs.Count) running roomler-agent process(es)..."
+        Write-Host "Stopping $($procs.Count) running roomlerd process(es)..."
         $procs | Stop-Process -Force -ErrorAction Continue
         Start-Sleep -Seconds 2
     }
@@ -368,7 +368,7 @@ function Do-Rollback {
 
     Write-Host ''
     Write-Host 'Rollback complete. Log out + back in to trigger the Scheduled Task ONLOGON,' -ForegroundColor Cyan
-    Write-Host 'or run the agent manually:  $env:LOCALAPPDATA\Programs\roomler-agent\roomler-agent.exe run'
+    Write-Host 'or run the agent manually:  $env:LOCALAPPDATA\Programs\Roomler\roomlerd.exe run'
     Write-Host ''
 }
 

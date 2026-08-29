@@ -39,7 +39,7 @@ use std::sync::Arc;
 use crate::ws::redis_pubsub::RedisPubSub;
 use crate::ws::storage::WsStorage;
 
-/// Outbound channel for a connected `roomler-tunnel` client, keyed by
+/// Outbound channel for a connected `roomler` client, keyed by
 /// the `tunnel_session_id` issued on `rc:tunnel.open`. The tunnel WS
 /// handler registers its sender on TunnelOpen success and unregisters
 /// on disconnect / TunnelTerminate; the agent WS handler reads this
@@ -172,7 +172,7 @@ pub struct AppState {
     /// Per-pod request/reply bus.
     pub cluster_bus: Option<Arc<crate::cluster::bus::PodBus>>,
 
-    // roomler-tunnel subsystem
+    // tunnel subsystem
     pub tunnel_clients: Arc<TunnelClientDao>,
     pub tunnel_policies: Arc<TunnelPolicyDao>,
     pub tunnel_audit: Arc<TunnelAuditDao>,
@@ -806,7 +806,7 @@ impl AppState {
             },
         );
 
-        // roomler-tunnel subsystem
+        // tunnel subsystem
         let tunnel_clients = Arc::new(TunnelClientDao::new(&db));
         let tunnel_policies = Arc::new(TunnelPolicyDao::new(&db));
         let tunnel_audit = Arc::new(TunnelAuditDao::new(&db));

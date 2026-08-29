@@ -89,7 +89,7 @@ impl TunnelPeer {
         // `0.0.0.0:5353` per agent. Disabling it removes ~2/3 of the sockets
         // an agent holds (see the `Drop` impl for the leak this compounded)
         // and stops us contending for a port the OS resolver already owns on
-        // Windows — the same unreliability `roomler-agent`'s
+        // Windows — the same unreliability `roomlerd`'s
         // `mdns_resolve` module exists to route around.
         setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
 

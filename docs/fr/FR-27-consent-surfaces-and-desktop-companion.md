@@ -290,6 +290,10 @@ so `resolve_session_authz` takes the admin-without-override arm and the device's
 worst was self-inflicted: publishing a second Linux `.deb` in the agent release froze every
 pre-0.4.16 Linux agent, because their picker takes the FIRST `.deb` for their arch and
 `/api/agent/latest-release` forwards GitHub's order. The other two are that a
+<!-- RETIRED-NAME-ANCHOR(3): a record of what was WRONG. The env spelling is
+     the one those hosts set (read as a fallback by indicator/x11.rs), and the
+     retired binary name is the defect being described — rewriting either
+     would make the log describe something that did not happen. -->
 `ROOMLER_AGENT_VIRTUAL_DESKTOP=1` host wrongly counted as a consent surface, and that the one
 line a headless operator gets still named the FR-21-retired `roomler-agent`.
 

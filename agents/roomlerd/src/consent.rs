@@ -27,7 +27,7 @@
 //! The tray popup (Phase 3) now renders this prompt on attended
 //! sessions: the signaling layer calls [`ConsentBroker::write_pending`]
 //! to drop a `<session>.pending` marker in this same dir, the
-//! `roomler-agent-tray` companion watches for it and shows an
+//! `roomler-desktop` companion watches for it and shows an
 //! Approve/Deny modal, and the operator's choice writes the same
 //! `.approve`/`.deny` sentinel the poll loop below already consumes.
 //! The CLI subcommand remains a headless fallback.
