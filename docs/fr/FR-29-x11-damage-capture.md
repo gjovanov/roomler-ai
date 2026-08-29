@@ -65,7 +65,7 @@ window and drains events before each grab.
 | Phase | What | Kill switch |
 |---|---|---|
 | **P1** | Damage-gated grab: no damage since the last delivered frame ⇒ return `Ok(None)` and skip the XShm readback entirely, reusing the existing idle-screen path. | `ROOMLERD_X11_DAMAGE=0` ⇒ today's behaviour byte-for-byte |
-| **P2** | Emit `Damage::Tracked(rects)` instead of `Damage::Unknown` so ROI hints become real. | same flag; `Unknown` is the fallback, never a wrong rect list |
+| **P2 — SHIPPED (groundwork)** | Emit `Damage::Tracked(rects)` instead of `Damage::Unknown`. ⚠️ Delivers **no user-visible change today**: both would-be consumers are inert (see below). Its value is as P3’s input and as parity with the Windows WGC backend. | same flag; `Unknown` is the fallback, never a wrong rect list |
 | **P3** | Partial readback — `GetImage` only the damaged bounding box into a persistent backbuffer, instead of the full screen. This is where the residual ~20 ms on *active* frames goes. | same flag; falls back to full-frame grab |
 
 ### The safety valve is load-bearing
@@ -163,3 +163,36 @@ working diagnostic, so P1 adds a distinct counter and heartbeat field.
    also divides by a near-zero window when few frames encode, which is where a
    misleading `avg_capture_ms=36` came from. Read its output as suspect unless
    the heartbeat count is healthy and the deltas are positive.
+
+## P2 result (2026-08-29) — it works, and it currently feeds nothing
+
+**Verified**: `damage_tracked_frames` equals `frames_encoded` under load (240/240),
+so every delivered frame now carries real rectangles rather than `Damage::Unknown`.
+**No regression to P1**: idle stayed at **3.3 %** of a core with
+`frames_empty=2850 frames_unchanged=2850` — the skip is fully intact — and motion
+was unchanged (41.5–45 % across runs, within noise of the P1 numbers).
+
+⚠️⚠️ **Both production consumers of `Damage` are inert**, which was not obvious
+until it was checked:
+
+- `encode/mod.rs:758` — `set_roi_hints` is a **default no-op that discards its
+  arguments**, and no encoder overrides it.
+- `rate_profile::note_real_frame_area` and `Damage::area_permille` have **no
+  production callers** — every call site is `#[cfg(test)]`.
+
+So P2 ships correct data that nothing reads. That is stated rather than implied:
+its justification is (a) it is exactly the input P3's partial readback needs, and
+(b) it brings the Linux backend to the contract the Windows WGC backend has had
+since P8a. If P3 is not pursued, P2 is cost without benefit — though the measured
+cost is below noise.
+
+⚠️ **`avg_damage_permille` reads 1000 ‰ under load and that is an upper bound, not
+a measurement.** `Damage::area_permille` SUMS rect areas and caps at the frame, and
+its own doc says overlap over-counts; `RAW_RECTANGLES` yields many overlapping
+rects, so it saturates. For judging whether P3 can pay off, the **union** area is
+the number that matters, and it is not what this field reports.
+
+⚠️ **The media heartbeat cannot sample an idle screen — by construction.** It fires
+per 30 *encoded* frames, so any heartbeat you can read necessarily describes a busy
+second. Two "idle" damage samples that looked alarming were simply busy windows.
+Diagnose idle from the `idle screen` log line, never from the heartbeat.
