@@ -11,6 +11,10 @@
 //!
 //! Path resolution: uses `logging::log_dir()` as the source-of-truth,
 //! then picks the lexicographically-latest `roomlerd.log.*` file (or a
+// RETIRED-NAME-ANCHOR-BEGIN
+// Rolled log files written BEFORE the rename are still on disk on every
+// upgraded host, and this is what fetches them. Accepting only the current
+// prefix would make an upgraded agent report that it has no logs.
 //! legacy `roomler-agent.log.*` on a pre-rename host — P3d Slice B).
 //! `tracing_appender::rolling::daily` rotates daily so the latest by
 //! name is also the latest by mtime — no I/O needed to choose.
@@ -389,3 +393,4 @@ mod tests {
         assert!(MONO_THRESHOLD_BYTES <= CHUNK_BYTES);
     }
 }
+// RETIRED-NAME-ANCHOR-END

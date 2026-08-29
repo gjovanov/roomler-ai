@@ -32,6 +32,8 @@ install -D -m755 target/release/roomler-shim "$root/usr/bin/roomler"
 libs=0
 for lib in "$pkg"/vendor-ffmpeg/*.so.*; do
     [ -e "$lib" ] || break
+    # RETIRED-NAME-ANCHOR(2): RPATH directory baked into the binary; the
+    # staged tree must match it or the tarball cannot load its own FFmpeg.
     install -D -m644 "$lib" "$root/usr/lib/roomler-agent/$(basename "$lib")"
     libs=$((libs + 1))
 done
