@@ -1626,6 +1626,29 @@ impl Hub {
                 self.deliver_consent(session_id, granted, reason.as_deref())
             }
             (
+                Role::Agent,
+                ClientMsg::ConsentPending {
+                    session_id,
+                    host_locked,
+                },
+            ) => {
+                self.check_session_party(ctx, session_id)?;
+                // FR-34 — relay the locked-host hint to the controller so its
+                // "awaiting consent" wait can explain the delay. Advisory only:
+                // a missing session or a dropped controller_tx is a no-op, not
+                // an error — the consent outcome is entirely unaffected.
+                if let Some(arc) = self.inner.sessions.get(&session_id) {
+                    let tx = arc.value().lock().controller_tx.clone();
+                    if let Some(tx) = tx {
+                        let _ = tx.try_send(ServerMsg::ConsentPending {
+                            session_id,
+                            host_locked,
+                        });
+                    }
+                }
+                Ok(())
+            }
+            (
                 role,
                 ClientMsg::Ice {
                     session_id,
