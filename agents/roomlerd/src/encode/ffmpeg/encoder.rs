@@ -206,11 +206,33 @@ fn hrd_pct_for(name: &str, constrained: bool) -> usize {
     }
 }
 
-/// FR-31 — percent of the HRD window the OPENING NVENC keyframe may draw on.
-/// `100` = the window `bufsize` already asks for; `0` = kill switch (the
-/// pre-FR-31 wire, byte-identical). Env `ROOMLERD_NVENC_OPEN_VBV_PCT` / config
-/// `nvenc_open_vbv_pct`, clamped to 400.
-const DEFAULT_NVENC_OPEN_VBV_PCT: usize = 100;
+/// FR-31 — percent of the HRD window handed to an NVENC context right after it
+/// opens (`100` = the window `bufsize` asks for). Env
+/// `ROOMLERD_NVENC_OPEN_VBV_PCT` / config `nvenc_open_vbv_pct`, clamped to 400.
+///
+/// **Default 0 = inert.** The 2026-08-29 A/B (relay stand-in, `av1_nvenc`,
+/// cap 2.55 Mbps) showed the driver honours the reinit (`vbvBufferSize`
+/// 5 100 000 confirmed) and the opening keyframe still comes out at ~1.3 ×
+/// `maxrate / fps` — the buffer SIZE is not what sizes it. Kept as an A/B
+/// knob; the lever that moved the keyframe is [`nvenc_ldkfs`].
+const DEFAULT_NVENC_OPEN_VBV_PCT: usize = 0;
+
+/// FR-31 — NVENC `lowDelayKeyFrameScale` (ffmpeg private option `ldkfs`,
+/// 1-255): the ratio of keyframe bits to inter-frame bits the rate control
+/// allows when it treats the reservoir as a single frame — which is exactly
+/// how it behaves for our `rc=vbr` + `cq` + `tune=ll` open: the A/B
+/// measured the opening IDR at ~1.3 × `maxrate / fps` whatever the VBV size
+/// or tuning (13 KB at 2.55 Mbps, 132-140 KB at 25.5 Mbps). `None` = option
+/// omitted (driver default). Env `ROOMLERD_NVENC_LDKFS` / config
+/// `nvenc_ldkfs`; pushed in the rejection-tolerant `lowlat` tier, so a
+/// driver or FFmpeg build without it drops only this knob, never
+/// `forced-idr`.
+fn nvenc_ldkfs() -> Option<String> {
+    node_env("NVENC_LDKFS")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(255).to_string())
+}
 
 fn nvenc_open_vbv_pct() -> usize {
     node_env("NVENC_OPEN_VBV_PCT")
@@ -384,6 +406,11 @@ fn encoder_options(
         // same 4 frames in ~66 ms → smooth. Independent of tune=ll/forced-idr.
         if let Some(v) = lowlat_knob("FFMPEG_NVENC_DELAY", "0") {
             lowlat.push(("delay".into(), v));
+        }
+        // FR-31 — see `nvenc_ldkfs`: the keyframe-to-inter bit ratio for the
+        // single-frame reservoir the driver runs in this mode.
+        if let Some(k) = nvenc_ldkfs() {
+            lowlat.push(("ldkfs".into(), k));
         }
     } else if name.contains("qsv") {
         // Intel QSV: ICQ-style quality via `global_quality`; `maxrate`
@@ -1983,7 +2010,10 @@ mod tests {
         let prior = std::env::var("ROOMLERD_NVENC_OPEN_VBV_PCT").ok();
         unsafe { std::env::remove_var("ROOMLERD_NVENC_OPEN_VBV_PCT") };
 
-        // Default = 100 % of the window; constrained av1 = 2× the ceiling …
+        // Default 0 = inert (the A/B verdict); nothing is written post-open.
+        assert_eq!(nvenc_open_vbv_bits("av1_nvenc", 2_550_000, true), None);
+        // 100 % of the window: constrained av1 = 2× the ceiling …
+        unsafe { std::env::set_var("ROOMLERD_NVENC_OPEN_VBV_PCT", "100") };
         assert_eq!(
             nvenc_open_vbv_bits("av1_nvenc", 2_550_000, true),
             Some(5_100_000)
@@ -2010,6 +2040,57 @@ mod tests {
         match prior {
             Some(v) => unsafe { std::env::set_var("ROOMLERD_NVENC_OPEN_VBV_PCT", v) },
             None => unsafe { std::env::remove_var("ROOMLERD_NVENC_OPEN_VBV_PCT") },
+        }
+    }
+
+    static LDKFS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// FR-31 — `ldkfs` is omitted by default (driver default), rides the
+    /// rejection-tolerant `lowlat` tier when set, and is clamped to 255.
+    #[test]
+    fn nvenc_ldkfs_default_omitted_env_sets_and_clamps() {
+        let _guard = LDKFS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: nothing else in the crate touches this var at test time; a
+        // future sibling that does must share LDKFS_ENV_LOCK.
+        let prior = std::env::var("ROOMLERD_NVENC_LDKFS").ok();
+        unsafe { std::env::remove_var("ROOMLERD_NVENC_LDKFS") };
+        let (_, lowlat, summary) = encoder_options("av1_nvenc", 2_550_000, 22, false, false, true);
+        assert!(
+            !summary.contains("ldkfs"),
+            "omitted by default, got: {summary}"
+        );
+        assert!(lowlat.iter().all(|(k, _)| k != "ldkfs"));
+
+        unsafe { std::env::set_var("ROOMLERD_NVENC_LDKFS", "16") };
+        let (base, lowlat, summary) =
+            encoder_options("av1_nvenc", 2_550_000, 22, false, false, true);
+        assert!(summary.contains("ldkfs=16"), "got: {summary}");
+        assert!(
+            lowlat.iter().any(|(k, v)| k == "ldkfs" && v == "16"),
+            "rides the lowlat tier"
+        );
+        assert!(
+            base.iter().all(|(k, _)| k != "ldkfs"),
+            "never in the base tier"
+        );
+        // The load-bearing keys are untouched.
+        assert!(summary.contains("forced-idr=1"), "got: {summary}");
+
+        unsafe { std::env::set_var("ROOMLERD_NVENC_LDKFS", "999") };
+        assert_eq!(nvenc_ldkfs().as_deref(), Some("255"), "clamped at 255");
+        unsafe { std::env::set_var("ROOMLERD_NVENC_LDKFS", "0") };
+        assert_eq!(nvenc_ldkfs(), None, "0 = omitted");
+        // Non-NVENC backends never see it.
+        unsafe { std::env::set_var("ROOMLERD_NVENC_LDKFS", "16") };
+        let (_, _, summary) = encoder_options("av1_qsv", 2_550_000, 22, true, false, true);
+        assert!(
+            !summary.contains("ldkfs"),
+            "qsv must not carry an nvenc option, got: {summary}"
+        );
+
+        match prior {
+            Some(v) => unsafe { std::env::set_var("ROOMLERD_NVENC_LDKFS", v) },
+            None => unsafe { std::env::remove_var("ROOMLERD_NVENC_LDKFS") },
         }
     }
 
