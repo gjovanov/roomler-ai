@@ -1,3 +1,12 @@
+// RETIRED-NAME-ANCHOR-BEGIN
+// Every retired name in this module is the legacy half of a dual-read: the
+// `roomler-agent.log*` rolling-file prefix that upgraded hosts still carry (read
+// and pruned alongside `roomlerd.log*`), and the `roomler_agent` tracing target
+// that `mirror_legacy_log_target` keeps honouring for units already on disk in
+// the field — plus the tests that set exactly those to prove the field keeps
+// working.
+// INVARIANT: a retired name here must be one the daemon must still READ. If you
+// add one that is not, that is a bug, not a new exemption. docs/fr/FR-21
 //! Persistent file logging + panic hook.
 //!
 //! Stdout output is preserved for foreground / interactive runs; a daily-
@@ -760,3 +769,4 @@ mod tests {
         prune_old_logs_at(&bogus, SystemTime::now());
     }
 }
+// RETIRED-NAME-ANCHOR-END

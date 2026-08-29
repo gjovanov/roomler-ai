@@ -1,4 +1,4 @@
-//! `roomler-agent` — the native remote-control agent for the Roomler AI
+//! `roomlerd` — the native remote-control agent for the Roomler AI
 //! platform. Runs on the controlled host, connects out to the Roomler API
 //! over WSS, and (eventually) serves a WebRTC peer to a browser controller.
 //!
@@ -74,6 +74,8 @@ enum Command {
         #[arg(long)]
         replace: bool,
         /// rc.52: write the enrolled config to the machine-global
+        // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still resolves
+        // it on a host that has one, so it must stay named here. docs/fr/FR-21
         /// path (`%PROGRAMDATA%\roomler\roomler-agent\config.toml`)
         /// instead of the per-user `%APPDATA%` default. Required for
         /// perMachine + SystemContext hosts so the LocalSystem worker
@@ -265,6 +267,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    // RETIRED-NAME-ANCHOR: names the OLD MSI product this sweep exists to remove.
+    // docs/fr/FR-21
     /// Uninstall older roomler-agent MSI versions left behind on this
     /// host. The release pipeline puts the rc number in the MSI 4th
     /// version field (`0.3.0.N`), which Windows Installer ignores for
@@ -327,7 +331,7 @@ enum Command {
         disconnect: Option<String>,
     },
     /// (internal) Entry point invoked by the Windows Service Control
-    /// Manager when `RoomlerAgentService` starts. Hands the process
+    /// Manager when `Roomler` starts. Hands the process
     /// over to `windows-service`'s dispatcher; the agent main loop
     /// runs inside the SCM thread until Stop is signalled. Hidden
     /// from `--help` because operators never invoke this directly —
@@ -342,7 +346,7 @@ enum Command {
     #[command(hide = true)]
     Netd,
     /// Enable SystemContext mode on a perMachine install. Writes
-    /// `ROOMLERD_ENABLE_SYSTEM_SWAP=1` into the `RoomlerAgentService`
+    /// `ROOMLERD_ENABLE_SYSTEM_SWAP=1` into the `Roomler`
     /// SCM `Environment` REG_MULTI_SZ block and restarts the service so
     /// the supervisor picks up the new env on its next worker spawn.
     /// Requires admin (HKLM write + SCM Stop/Start). Idempotent: re-runs
@@ -358,7 +362,7 @@ enum Command {
         no_restart: bool,
     },
     /// Disable SystemContext mode on a perMachine install. Removes
-    /// `ROOMLERD_ENABLE_SYSTEM_SWAP` from the `RoomlerAgentService`
+    /// `ROOMLERD_ENABLE_SYSTEM_SWAP` from the `Roomler`
     /// SCM `Environment` block and restarts the service. The supervisor
     /// reverts to the user-context worker on next spawn. Requires admin.
     DisableSystemContext {
@@ -367,7 +371,7 @@ enum Command {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Write a single name=value entry into the `RoomlerAgentService`
+    /// Write a single name=value entry into the `Roomler`
     /// SCM `Environment` REG_MULTI_SZ block. Omit `--value` to REMOVE
     /// the entry. Operators may use this directly, or the higher-level
     /// `enable-system-context` / `disable-system-context` wrappers.
@@ -389,7 +393,7 @@ enum Command {
         #[arg(long)]
         value: Option<String>,
     },
-    /// Restart the `RoomlerAgentService` via the SCM. Used after
+    /// Restart the `Roomler` via the SCM. Used after
     /// `set-service-env-var` (or the higher-level
     /// `enable-system-context` / `disable-system-context`) to apply
     /// the new env block. Windows-only; requires admin (SCM
@@ -462,7 +466,7 @@ enum OrgAction {
 enum ServiceAction {
     /// Register the agent for auto-start on the next login.
     Install {
-        /// Windows-only opt-in: register `RoomlerAgentService` with
+        /// Windows-only opt-in: register `Roomler` with
         /// the Service Control Manager (LocalSystem, AutoStart) instead
         /// of the default per-user Scheduled Task. Use for fleet /
         /// unattended deployments or when the host needs to be
@@ -473,14 +477,14 @@ enum ServiceAction {
     /// Remove the auto-start hook. Idempotent.
     Uninstall {
         /// Mirror of `install --as-service`: removes the
-        /// `RoomlerAgentService` SCM entry rather than the Scheduled
+        /// `Roomler` SCM entry rather than the Scheduled
         /// Task. Idempotent. Requires elevation.
         #[arg(long)]
         as_service: bool,
     },
     /// Print the current auto-start status.
     Status {
-        /// Report the SCM-registered `RoomlerAgentService` state
+        /// Report the SCM-registered `Roomler` state
         /// (Running / Stopped / NotInstalled) instead of the
         /// Scheduled Task.
         #[arg(long)]
@@ -774,6 +778,8 @@ async fn daemon_main() -> Result<()> {
     #[cfg(target_os = "windows")]
     let _timer_guard = win_timer::TimerResolutionGuard::request_1ms();
 
+    // RETIRED-NAME-ANCHOR: a migration note names BOTH halves by necessity.
+    // docs/fr/FR-21
     // S1b — one-shot legacy-tree migration (`roomler-agent` → `roomler`).
     // MUST run before `logging::init` (log files open inside the tree) and
     // before ANY appdirs consumer (segment decisions are OnceLock-cached per
@@ -873,7 +879,7 @@ async fn daemon_main() -> Result<()> {
             roomlerd::input::parse_virtual_screen_flag(node_env("VIRTUAL_SCREEN").as_deref());
         tracing::info!(
             virtual_screen_enabled = vscreen,
-            "input mapping — rc.54 ROOMLER_AGENT_VIRTUAL_SCREEN gate (false = legacy enigo.main_display path; true = win32_monitors::primary virtual-screen offset)"
+            "input mapping — rc.54 ROOMLERD_VIRTUAL_SCREEN gate (false = legacy enigo.main_display path; true = win32_monitors::primary virtual-screen offset)"
         );
     }
 
@@ -1005,6 +1011,8 @@ async fn daemon_main() -> Result<()> {
 /// Routed through `crash_recorder::record` so:
 ///
 ///   - Under SystemContext (LocalSystem worker), the sidecar lands in
+// RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still resolves
+// it on a host that has one, so it must stay named here. docs/fr/FR-21
 ///     `%PROGRAMDATA%\roomler\roomler-agent\crashes\` where the
 ///     user-context uploader will find it on a later successful start.
 ///   - Under user-context worker, the sidecar lands in the worker's
@@ -1067,6 +1075,8 @@ fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()>
     Ok(())
 }
 
+// RETIRED-NAME-ANCHOR: names the OLD MSI product this sweep exists to remove.
+// docs/fr/FR-21
 /// Uninstall roomler-agent MSI versions older than the running one
 /// (see [`roomlerd::version_sweep`] for why they pile up). Prints
 /// a one-line summary; exits 0 even on partial failure (best-effort,
@@ -1386,6 +1396,8 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         overlay,
     } = opts;
     // rc.52: --machine-global retargets the write to
+    // RETIRED-NAME-ANCHOR: the PRE-RENAME machine-global tree. `machine_global_dir()` still resolves
+    // it on a host that has one, so it must stay named here. docs/fr/FR-21
     // %PROGRAMDATA%\roomler\roomler-agent\config.toml so a perMachine
     // + SystemContext host's LocalSystem worker can load it pre-logon.
     // machine_id is derived from the SAME path the config is written
@@ -1567,7 +1579,7 @@ fn warning_message_for_user_context_enroll() -> String {
      machine_id) and will look like a different host to the server.\n\
 \n\
 Either:\n\
- (a) start the service: `sc start roomler-agent`  — uses %PROGRAMDATA%;\n\
+ (a) start the service: `sc start Roomler`  — uses %PROGRAMDATA%;\n\
  (b) re-run `enroll` without --machine-global if you want to test in\n\
      THIS user shell (will produce a different agent_id).\n"
         .to_string()
@@ -1641,7 +1653,7 @@ async fn re_enroll_cmd(
             "the enrollment token belongs to a different org (tenant {}) than \
              {org_label:?} (tenant {expect_tenant}). To enroll this machine into an \
              ADDITIONAL org run:\n\n\
-             \troomler-agent enroll --server {server_url} --token <jwt>",
+             \troomlerd enroll --server {server_url} --token <jwt>",
             new_cfg.tenant_id
         );
     }
@@ -1825,7 +1837,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     unsafe {
         std::env::set_var("DISPLAY", vd.display());
         if !relay_forced && !host_public {
-            std::env::set_var("ROOMLER_AGENT_ICE_RELAY_TCP", "1");
+            std::env::set_var("ROOMLERD_ICE_RELAY_TCP", "1");
         }
     }
     let relay_over_tcp = node_env("ICE_RELAY_TCP").as_deref() == Some("1");
@@ -1928,7 +1940,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             instance_lock::AcquireOutcome::Acquired(g) => g,
             instance_lock::AcquireOutcome::AlreadyRunning => {
                 eprintln!(
-                    "Another roomler-agent is already running for this config; exiting.\n\
+                    "Another roomlerd is already running for this config; exiting.\n\
                  (use `roomlerd service status` to check the auto-start hook,\n\
                  or stop the running instance before starting a new one.)"
                 );
@@ -2242,7 +2254,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // the rollback install — that requires fetching a specific tag's
     // installer and ships in 0.1.52 alongside the SHA256 / HMAC
     // manifest work. The operator can downgrade manually via
-    // `roomler-agent self-update --pin <version>` (also 0.1.52) or
+    // `roomlerd self-update --pin <version>` (also 0.1.52) or
     // by reinstalling the previous MSI by hand.
     if config::should_rollback(&cfg, current_pkg, now_unix)
         && let Some(target) = cfg.last_known_good_version.clone()
@@ -2514,7 +2526,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let consent_dir =
         roomlerd::consent::ConsentBroker::default_sentinel_dir().unwrap_or_else(|e| {
             tracing::warn!(error = %e, "could not resolve consent sentinel dir; using temp dir");
-            std::env::temp_dir().join("roomler-agent-consent")
+            std::env::temp_dir().join("roomlerd-consent")
         });
     let consent_broker = roomlerd::consent::ConsentBroker::new(consent_mode, consent_dir)
         .unwrap_or_else(|e| {
@@ -3154,7 +3166,7 @@ async fn service_cmd(action: ServiceAction) -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_install_as_service() -> Result<()> {
     let exe = std::env::current_exe().context("locating current_exe for service install")?;
-    win_service::install(&exe).context("registering RoomlerAgentService with the SCM")?;
+    win_service::install(&exe).context("registering Roomler with the SCM")?;
     println!(
         "Service registered: {} ({}). Launching `sc start {}` will run the service \
          under LocalSystem; AutoStart fires on next boot.",
@@ -3175,7 +3187,7 @@ fn service_install_as_service() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn service_uninstall_as_service() -> Result<()> {
-    win_service::uninstall().context("deregistering RoomlerAgentService")?;
+    win_service::uninstall().context("deregistering Roomler")?;
     println!("Service deregistered ({}).", win_service::NEW_SERVICE_NAME);
     Ok(())
 }
@@ -3254,7 +3266,7 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
     if let Err(e) = environment::restart_service(Duration::from_secs(DEFAULT_RESTART_TIMEOUT_SECS))
     {
         let hint = "Env-var write succeeded; service restart failed. Common cause: a \
-                    `services.msc` window holds a handle on RoomlerAgentService. Close \
+                    `services.msc` window holds a handle on Roomler. Close \
                     any open services consoles and run `roomlerd restart-service` \
                     again.";
         let _ = attempt::record(&attempt::Attempt::failure(
@@ -3263,10 +3275,10 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
             &e.to_string(),
             hint,
         ));
-        return Err(e).context("restarting RoomlerAgentService");
+        return Err(e).context("restarting Roomler");
     }
     let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-    println!("RoomlerAgentService restarted. SystemContext mode is active.");
+    println!("Roomler restarted. SystemContext mode is active.");
     Ok(())
 }
 
@@ -3312,10 +3324,10 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
             &e.to_string(),
             hint,
         ));
-        return Err(e).context("restarting RoomlerAgentService");
+        return Err(e).context("restarting Roomler");
     }
     let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-    println!("RoomlerAgentService restarted. SystemContext mode is disabled.");
+    println!("Roomler restarted. SystemContext mode is disabled.");
     Ok(())
 }
 
@@ -3356,8 +3368,8 @@ fn restart_service_cmd(timeout_secs: u64) -> Result<()> {
     use roomlerd::win_service::environment;
     use std::time::Duration;
     environment::restart_service(Duration::from_secs(timeout_secs))
-        .context("restarting RoomlerAgentService")?;
-    println!("RoomlerAgentService restarted.");
+        .context("restarting Roomler")?;
+    println!("Roomler restarted.");
     Ok(())
 }
 
@@ -3419,6 +3431,11 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
     // it touches nothing, so any uid may ask.
     #[cfg(target_os = "macos")]
     if !check_only && unsafe { libc::geteuid() } != 0 {
+        // RETIRED-NAME-ANCHOR(14): the printed guidance names
+        // /var/log/roomler-agent/update.log and /etc/roomler-agent/disable-auto-update —
+        // real macOS paths fixed by the launchd plists, which are pinned to the frozen
+        // .app bundle name (D5). They sit inside a string literal, so the anchor is on
+        // the statement. docs/fr/FR-21
         return match updater::macos_queue_update_check() {
             Ok(()) => {
                 println!(
@@ -3739,6 +3756,10 @@ mod tests {
     /// which a package upgrade never rewrites. If the prefix migration ever stops
     /// honouring the original spelling, the daemon starts perfectly and quietly
     /// ignores every one of them — the virtual desktop simply never comes up.
+    // RETIRED-NAME-ANCHOR(30): this test EXISTS to prove the legacy
+    // `ROOMLER_AGENT_*` spelling still works — it is taken from the drop-in live on
+    // mars/jupiter/zeus. Rewriting these names would delete the coverage.
+    // docs/fr/FR-21
     #[test]
     fn the_live_drop_in_still_configures_the_virtual_desktop() {
         const KEYS: [&str; 4] = [
@@ -3804,7 +3825,7 @@ mod tests {
     #[test]
     fn parses_set_service_env_var_long_form() {
         let cli = Cli::try_parse_from([
-            "roomler-agent",
+            "roomlerd",
             "set-service-env-var",
             "--name",
             "ROOMLERD_ENABLE_SYSTEM_SWAP",
@@ -3824,7 +3845,7 @@ mod tests {
     #[test]
     fn parses_set_service_env_var_without_value_for_unset() {
         let cli = Cli::try_parse_from([
-            "roomler-agent",
+            "roomlerd",
             "set-service-env-var",
             "--name",
             "ROOMLERD_ENABLE_SYSTEM_SWAP",
@@ -3841,7 +3862,7 @@ mod tests {
 
     #[test]
     fn parses_restart_service_default_timeout() {
-        let cli = Cli::try_parse_from(["roomler-agent", "restart-service"]).unwrap();
+        let cli = Cli::try_parse_from(["roomlerd", "restart-service"]).unwrap();
         match cli.command {
             Some(Command::RestartService { timeout_secs }) => assert_eq!(timeout_secs, 120),
             other => panic!("expected RestartService, got {other:?}"),
@@ -3850,8 +3871,8 @@ mod tests {
 
     #[test]
     fn parses_restart_service_custom_timeout() {
-        let cli = Cli::try_parse_from(["roomler-agent", "restart-service", "--timeout-secs", "60"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["roomlerd", "restart-service", "--timeout-secs", "60"]).unwrap();
         match cli.command {
             Some(Command::RestartService { timeout_secs }) => assert_eq!(timeout_secs, 60),
             other => panic!("expected RestartService --timeout-secs 60, got {other:?}"),
@@ -3861,15 +3882,15 @@ mod tests {
     /// rc.53 Phase 7: the stderr warning for the
     /// `%APPDATA% / %PROGRAMDATA%` same-session asymmetry that WINHOST-B
     /// burned hours on. Locks the marker phrases so a refactor that
-    /// drops "sc start roomler-agent" or "%APPDATA%" or "without
+    /// drops "sc start Roomler" or "%APPDATA%" or "without
     /// --machine-global" trips the test before it ships.
     #[cfg(target_os = "windows")]
     #[test]
     fn enroll_warning_message_contains_expected_phrases() {
         let msg = warning_message_for_user_context_enroll();
         assert!(
-            msg.contains("sc start roomler-agent"),
-            "warning must reference `sc start roomler-agent` so the operator can run option (a): {msg}"
+            msg.contains("sc start Roomler"),
+            "warning must reference `sc start Roomler` so the operator can run option (a): {msg}"
         );
         assert!(
             msg.contains("%APPDATA%"),
@@ -3896,7 +3917,7 @@ mod tests {
     fn rc30_done_page_snippet_parses() {
         // Line 1: set-service-env-var
         let cli = Cli::try_parse_from([
-            "roomler-agent",
+            "roomlerd",
             "set-service-env-var",
             "--name",
             "ROOMLERD_ENABLE_SYSTEM_SWAP",
@@ -3905,13 +3926,19 @@ mod tests {
         ]);
         assert!(cli.is_ok(), "rc.30 snippet line 1 must parse: {cli:?}");
         // Line 2: restart-service
-        let cli = Cli::try_parse_from(["roomler-agent", "restart-service"]);
+        let cli = Cli::try_parse_from(["roomlerd", "restart-service"]);
         assert!(cli.is_ok(), "rc.30 snippet line 2 must parse: {cli:?}");
     }
 
     // ─── rc.52: config-path resolution ladder ──────────────────────────────
 
     #[test]
+    // RETIRED-NAME-ANCHOR-BEGIN
+    // These cases feed the PRE-RENAME machine-global config path on purpose: that is
+    // the path a pre-rename host still has, and picking it correctly is what keeps an
+    // upgraded host from losing its enrolment.
+    // INVARIANT: a retired name here must be a path a real host can still have.
+    // docs/fr/FR-21
     fn pick_config_path_explicit_wins_unconditionally() {
         // --config is an operator override — used verbatim, no
         // existence check, regardless of worker role.
@@ -3986,4 +4013,5 @@ mod tests {
         // Machine-global already exists → don't clobber it.
         assert!(!should_self_heal_config(true, peruser, mg, true));
     }
+    // RETIRED-NAME-ANCHOR-END
 }

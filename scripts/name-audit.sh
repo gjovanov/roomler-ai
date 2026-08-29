@@ -199,6 +199,12 @@ scan() {
                 for (m in marker_line)
                     if (!marker_used[m])
                         print "STALEMARKER\t" file "\t" m "\tmarker covers no retired name"
+                # A BEGIN with no END silently swallows the REST OF THE FILE —
+                # the widest possible exemption, and the one least likely to be
+                # noticed, because everything it hides simply stops being
+                # reported. Caught here rather than trusted to review.
+                if (in_region)
+                    print "STALEMARKER\t" file "\t" region_line "\tBEGIN with no matching END — it exempts the rest of the file"
             }
         ' "$f"
     done
