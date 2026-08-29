@@ -8,6 +8,7 @@
 //! re-fan the node's netmap entry so peers pick up the routes immediately
 //! instead of waiting for the next join.
 
+use roomler_ai_services::quota;
 use std::collections::HashSet;
 
 use axum::{
@@ -331,6 +332,22 @@ pub async fn set_exit_node(
         "MANAGE_AGENTS",
     )
     .await?;
+
+    // FR-32 P1a — `exit_nodes` is advertised per plan and was enforced nowhere.
+    // ⚠ Only ENABLING is gated. Turning an exit node OFF must always be
+    // allowed: a plan downgrade would otherwise trap the tenant with an exit
+    // they cannot withdraw, which is worse than the feature being free.
+    if body.enabled {
+        let tenant = state.tenants.base.find_by_id(tid).await?;
+        if let Err(d) = quota::require_feature(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::ExitNodes,
+        ) {
+            return Err(ApiError::Forbidden(d.message()));
+        }
+    }
+
     let network = state.overlay_networks.get_or_create(tid).await?;
     let network_id = network
         .id
@@ -484,6 +501,22 @@ pub async fn set_magic_dns(
         .magic_dns_domain
         .map(|d| d.trim().trim_matches('.').to_ascii_lowercase())
         .filter(|d| !d.is_empty());
+
+    // FR-32 P1a — `magic_dns` is advertised per plan and was enforced nowhere.
+    // ⚠ Only SETTING a domain is gated; clearing it (`None` = off) must always
+    // be allowed, for the same reason as the exit-node gate above — a downgrade
+    // must never leave a tenant unable to switch the feature off.
+    if domain.is_some() {
+        let tenant = state.tenants.base.find_by_id(tid).await?;
+        if let Err(d) = quota::require_feature(
+            tenant.plan.clone(),
+            tenant.settings.plan_enforcement,
+            quota::Limit::MagicDns,
+        ) {
+            return Err(ApiError::Forbidden(d.message()));
+        }
+    }
+
     if let Some(d) = &domain
         && !d
             .chars()
