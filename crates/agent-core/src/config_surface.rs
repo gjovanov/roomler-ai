@@ -429,6 +429,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "P7 - NVENC spatial AQ. Built-in default: OFF (AQ steals bits from desktop text); true restores it for camera-heavy hosts. Env: ROOMLERD_NVENC_SPATIAL_AQ. Restart required.",
     ),
     (
+        "nvenc_open_vbv_pct",
+        "string",
+        "FR-31 - percent of the HRD window the OPENING NVENC keyframe may draw on (0-400). Empty = built-in 100 (the window bufsize asks for); 0 = kill switch (pre-FR-31 wire: a max-QP first frame that inter frames repair over ~1 s on a relay). Env: ROOMLERD_NVENC_OPEN_VBV_PCT. Restart required.",
+    ),
+    (
         "scale_cq_boost",
         "string",
         "P7 - CQ sharpening steps granted at deep resolution rungs (0-12; spends the maxrate-floor headroom on text). Empty = built-in 4; 0 disables. Env: ROOMLERD_SCALE_CQ_BOOST. Restart required.",
@@ -724,6 +729,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
         "gpu_scale" => cfg.gpu_scale.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
+        "nvenc_open_vbv_pct" => cfg.nvenc_open_vbv_pct.map(|p| p.to_string()),
         "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
         "idle_refine_major_area_permille" => {
             cfg.idle_refine_major_area_permille.map(|p| p.to_string())
@@ -1096,6 +1102,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine_balanced" => cfg.idle_refine_balanced = parse_tribool(value)?,
         "gpu_scale" => cfg.gpu_scale = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
+        "nvenc_open_vbv_pct" => cfg.nvenc_open_vbv_pct = parse_u32_range(key, value, 0, 400)?,
         "idle_refine_min_frame_kb" => {
             cfg.idle_refine_min_frame_kb = parse_u32_range(key, value, 0, 256)?
         }
