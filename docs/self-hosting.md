@@ -45,7 +45,13 @@ secrets:
 ```bash
 openssl rand -hex 32   # → ROOMLER_JWT_SECRET
 openssl rand -hex 32   # → ROOMLER_TURN_SECRET
+openssl rand -hex 24   # → MONGO_ROOT_PASSWORD
+openssl rand -hex 24   # → MINIO_ROOT_PASSWORD
 ```
+
+⚠️ Keep the datastore passwords alphanumeric. The Mongo one is interpolated into
+a connection URL, so `@`, `:`, `/`, `?` or `#` inside it breaks the URL — and the
+resulting failure looks like a wrong password rather than a quoting problem.
 
 Then bring it up:
 

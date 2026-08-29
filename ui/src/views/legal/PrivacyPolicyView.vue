@@ -138,7 +138,22 @@
             through an email delivery provider.
           </p>
 
-          <h3 class="text-h6 font-weight-bold mb-2">2.14 Analytics</h3>
+          <h3 class="text-h6 font-weight-bold mb-2">2.14 Product Update Emails</h3>
+          <p class="text-body-1 legal-muted mb-4">
+            If you give us your email address through the "keep me posted" form on our website, we store that
+            address, which page you submitted it from, and the times you submitted it and confirmed it. We use it
+            for one purpose: occasional email about the product. We do not need an account for this, and the
+            address is <strong>not linked to any account you may separately hold</strong>.
+          </p>
+          <p class="text-body-1 legal-muted mb-4">
+            We use confirmed opt-in: after you submit the form we send one message asking you to confirm, and
+            <strong>we send nothing else unless you click that link</strong>. Every email carries a one-click
+            unsubscribe link that works without signing in. If you unsubscribe, we keep a record that this address
+            opted out — so that it is not silently added again — and stop sending. We do not sell, rent or share
+            this list, and we do not use it for advertising.
+          </p>
+
+          <h3 class="text-h6 font-weight-bold mb-2">2.15 Analytics</h3>
           <p class="text-body-1 legal-muted mb-4">
             We use our own self-hosted analytics to understand how the site is used. It records page views and
             coarse information such as the country a request came from, derived from the IP address. We do not
@@ -233,6 +248,7 @@
             <li class="mb-1">Access and audit records — remote sessions, command execution, SSH decisions and device-reported activity — are deleted automatically <strong>90 days</strong> after they are written.</li>
             <li class="mb-1">Short-lived operational data such as connection diagnostics and crash reports is deleted automatically on a shorter cycle, typically <strong>7 days</strong>.</li>
             <li class="mb-1">Enrollment tokens and similar one-time credentials expire within minutes to hours.</li>
+            <li class="mb-1">Product-update subscriptions are kept until you unsubscribe. After that we retain only the fact that the address opted out, so it cannot be re-added silently; ask us and we will erase that too.</li>
           </ul>
           <p class="text-body-1 legal-muted">
             These deletions are enforced by the database itself rather than by a manual process. When you delete
