@@ -1,3 +1,5 @@
+// RETIRED-NAME-ANCHOR(24): names the PRE-RENAME appdirs segment a host installed before
+// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! Persist agent crash reports to disk for later upload.
 //!
 //! Three callers feed in (panic hook in `logging.rs`, watchdog stall
@@ -14,8 +16,6 @@
 //!
 //! - **Worker** (user-context): writes under `logging::log_dir()/
 //!   crashes/` which resolves to `%LOCALAPPDATA%\roomler\
-// RETIRED-NAME-ANCHOR(24): names the PRE-RENAME appdirs segment a host installed before
-// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //!   roomler-agent\data\logs\crashes\`. The user-context uploader
 //!   reads from this same dir on startup.
 //! - **Supervisor** (LocalSystem, Windows-only): writes under
@@ -96,9 +96,9 @@ pub enum WriterContext {
     /// User-context worker process. Writes under
     /// `logging::log_dir()/crashes/`.
     Worker,
-    /// LocalSystem SCM supervisor. Writes under
     // RETIRED-NAME-ANCHOR(3): the PRE-RENAME tree appdirs still resolves on an upgraded
     // host.
+    /// LocalSystem SCM supervisor. Writes under
     /// `%PROGRAMDATA%\roomler\roomler-agent\crashes\` on Windows,
     /// falls back to the Worker dir on non-Windows (no separate
     /// supervisor process exists there today).

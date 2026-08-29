@@ -77,6 +77,8 @@ pub const STALL_EXIT_CODE: i32 = 2;
 ///     the host without a manual service restart).
 pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 
+// RETIRED-NAME-ANCHOR(2): names the legacy unit deliberately — the hazard
+// being described is precisely that BOTH can be enabled at once.
 /// rc.439: sentinel for "another process already holds this config's
 /// single-instance lock, so this one is redundant — do NOT respawn it."
 ///
@@ -89,8 +91,6 @@ pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 ///     back. So a 0 here is indistinguishable from that, and systemd
 ///     re-launches the redundant process every `RestartSec` forever.
 ///     Field 2026-08-21: buildhost / fleet-host-2 / fleet-host-1 each had two units enabled
-// RETIRED-NAME-ANCHOR(2): names the legacy unit deliberately — the hazard
-// being described is precisely that BOTH can be enabled at once.
 ///     (packaged `roomlerd.service` + a legacy `roomler-agent.service`),
 ///     and the loser burned 1500+ restarts at 5 s intervals for weeks
 ///     while the winner served happily, so nothing looked wrong.

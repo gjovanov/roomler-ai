@@ -411,10 +411,10 @@ pub fn pick_asset_for_platform(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     }
 }
 
-/// Pure Windows asset picker. Filters by the `-perMachine-` infix in
-/// the asset filename (cargo-wix names them
 // RETIRED-NAME-ANCHOR(2): PUBLISHED asset names. Already-released files cannot be
 // renamed and the picker matches them, so they stay verbatim. docs/fr/FR-21
+/// Pure Windows asset picker. Filters by the `-perMachine-` infix in
+/// the asset filename (cargo-wix names them
 /// `roomler-agent-<v>-perMachine-x86_64-…msi`; the perUser MSI uses
 /// `roomler-agent-<v>-x86_64-…msi` with no infix). Falls back to "any
 /// MSI" only if the matching flavour is missing — better to attempt a
@@ -505,6 +505,7 @@ fn host_has_debian_tooling() -> bool {
     })
 }
 
+// RETIRED-NAME-ANCHOR: published asset names, as above. docs/fr/FR-21
 /// Is this release asset the DAEMON's own package, as opposed to something
 /// else in the same release that happens to be a `.deb` for the same arch?
 ///
@@ -518,7 +519,6 @@ fn host_has_debian_tooling() -> bool {
 ///
 /// Positive match, not a denylist of names we happen to know today. The
 /// daemon's published asset names are a deliberately immutable surface
-// RETIRED-NAME-ANCHOR: published asset names, as above. docs/fr/FR-21
 /// (`roomler-agent-…`, plus cargo-deb's `roomlerd_…` spelling on old
 /// releases), so naming them is safe and a new sibling asset cannot creep
 /// through by being unlisted. Locked by
@@ -1164,6 +1164,8 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     }
 }
 
+// RETIRED-NAME-ANCHOR: the pre-rename machine-global path this cleanup exists to
+// find. docs/fr/FR-21
 /// Windows auto-update spawn for a caller that already KNOWS the
 /// flavour of the install being replaced. [`spawn_installer_inner`]
 /// delegates here with the running EXE's classification; the
@@ -1187,8 +1189,6 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
 /// winlogon-token swap, and the resulting LocalSystem worker
 /// tries to read its config from `%APPDATA%` (LocalSystem
 /// profile, empty) instead of the rc.52 machine-global
-// RETIRED-NAME-ANCHOR: the pre-rename machine-global path this cleanup exists to
-// find. docs/fr/FR-21
 /// `%PROGRAMDATA%\roomler\roomler-agent\config.toml` path. Net
 /// effect: every SystemContext-enabled host that auto-updates
 /// loses pre-logon capability and crash-loops until an operator

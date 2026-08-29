@@ -1,3 +1,5 @@
+// RETIRED-NAME-ANCHOR(2): this line EXISTS to explain the retired spelling, so it must
+// contain it.
 //! `roomler status | peers | flows` — the thin-client read verbs.
 //!
 //! These connect to the **local** daemon's LocalAPI (the ACL-gated named pipe /
@@ -6,8 +8,6 @@
 //! [`tunnel_core::localapi::Client`]: no server, no token, no config — the OS
 //! endpoint ACL is the trust boundary. This is the CLI half of the
 //! unification's "thin clients over the LocalAPI" story; at the P3d rename
-// RETIRED-NAME-ANCHOR(2): this line EXISTS to explain the retired spelling, so it must
-// contain it.
 //! `roomler-tunnel <verb>` becomes `roomler <verb>`.
 //!
 //! Everything below the command handlers is a **pure** formatter (`now_ms` is

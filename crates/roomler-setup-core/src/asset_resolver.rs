@@ -41,9 +41,9 @@ pub struct ArtifactHealth {
     /// `"windows-x86_64"`, …).
     #[serde(alias = "flavour", alias = "platform")]
     pub target: String,
-    /// Canonical asset filename, e.g.
     // RETIRED-NAME-ANCHOR(8): names a PUBLISHED release asset. Filenames are fixed by
     // what is already on GitHub Releases (FR-21 D6).
+    /// Canonical asset filename, e.g.
     /// `roomler-agent-0.3.0-rc.28-perMachine-x86_64-pc-windows-msvc.msi`.
     pub filename: String,
     /// Asset size in bytes.
