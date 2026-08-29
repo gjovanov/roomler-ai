@@ -1295,6 +1295,11 @@ async fn handle_media_consume(
                     "producer_id": consumer_info.producer_id,
                     "kind": consumer_info.kind,
                     "rtp_parameters": consumer_info.rtp_parameters,
+                    // FR-30 P4 — the pause EVENT only reaches whoever was
+                    // already in the room, so the state has to ride the
+                    // subscription too. Without it, joining after someone
+                    // muted shows no badge until their next toggle.
+                    "producer_paused": consumer_info.producer_paused,
                 }
             });
             super::dispatcher::send_to_connection_routed(
