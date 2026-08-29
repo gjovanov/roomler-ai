@@ -78,6 +78,39 @@ const HARD_ERROR_FALLBACK_THRESHOLD: u32 = 3;
 /// stare at black frames for long.
 const ACCESS_LOST_FALLBACK_THRESHOLD: u32 = 8;
 
+/// FR-34 — how long a backend may run WITHOUT delivering a single frame before
+/// we treat it as STUCK rather than idle. A DXGI Desktop Duplication bound
+/// during a lock→unlock desktop transition returns `WAIT_TIMEOUT`
+/// (`BackendBail::Transient`) forever — bound to a desktop that will never
+/// change — so `consecutive_empty` climbs without bound and the controller
+/// stays black (field pc50045 2026-08-29: 200k empty / 0 delivered / 13 s
+/// black, recovered only by a reconnect). A working session that merely goes
+/// idle has ALREADY delivered a frame and is exempt via `delivered_since_build`;
+/// this only bounds the never-delivered case. 2 s: well past a healthy DXGI
+/// first frame (<1 s), far under the 13 s the operator sat black.
+const STUCK_CAPTURE_RECOVERY_AFTER: Duration = Duration::from_secs(2);
+
+/// FR-34 kill switch. `ROOMLERD_STUCK_CAPTURE_RECOVERY=0` restores the
+/// pre-FR-34 behaviour (a stuck duplication stays black until a reconnect).
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+fn stuck_capture_recovery_enabled() -> bool {
+    !matches!(
+        std::env::var("ROOMLERD_STUCK_CAPTURE_RECOVERY").as_deref(),
+        Ok("0") | Ok("false") | Ok("no")
+    )
+}
+
+/// The FR-34 stuck-vs-idle decision, pure so it is unit-testable off-Windows.
+/// STUCK = the current backend has delivered no frame since it was built AND
+/// has run longer than [`STUCK_CAPTURE_RECOVERY_AFTER`]. A backend that has
+/// ever delivered (`delivered_since_build`) is idle, never stuck — which is why
+/// `consecutive_empty` alone cannot make this call (a long idle looks identical
+/// to a stuck duplication by that counter).
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+fn capture_is_stuck(delivered_since_build: bool, backend_age: Duration) -> bool {
+    !delivered_since_build && backend_age >= STUCK_CAPTURE_RECOVERY_AFTER
+}
+
 /// rc.108 — once we've fallen back to the slow GDI BitBlt path, retry DXGI
 /// at most this often. The doc-comment has promised a DXGI re-climb since
 /// M3 A1 but the GDI arm never actually did it (latent bug noted in the
@@ -253,6 +286,13 @@ fn worker_main(
     let mut consecutive_hard: u32 = 0;
     let mut consecutive_access_lost: u32 = 0;
     let mut consecutive_empty: u64 = 0;
+    // FR-34 — has the CURRENT backend delivered a frame yet, and when was it
+    // built. Reset together on every backend (re)build so a re-climbed DXGI
+    // that comes up stuck is caught too. This pair distinguishes a stuck
+    // duplication (never delivered) from a working session gone idle
+    // (delivered, now Transient) — indistinguishable from `consecutive_empty`.
+    let mut backend_built_at = Instant::now();
+    let mut delivered_since_build = false;
     // rc.108 — last time we attempted to climb back from a GDI fallback to
     // DXGI. Init to now() so the first re-climb attempt waits one full
     // interval (don't fight a just-failed DXGI startup). Only consulted on
@@ -287,6 +327,8 @@ fn worker_main(
             &mut consecutive_access_lost,
             &mut consecutive_empty,
             &mut last_dxgi_reclimb,
+            &mut backend_built_at,
+            &mut delivered_since_build,
             start,
             cmd.output_cap,
         );
@@ -517,6 +559,9 @@ fn capture_one_blocking(
     // written only on the GDI path (under `scrap-capture`); an unused
     // parameter on the GDI-only build, which Rust does not warn on.
     last_dxgi_reclimb: &mut Instant,
+    // FR-34 — see the two fields' declarations in worker_main.
+    backend_built_at: &mut Instant,
+    delivered_since_build: &mut bool,
     start: Instant,
     // Phase B — forwarded to GPU-capable DXGI backends; GDI ignores it.
     #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))] output_cap: Option<(
@@ -545,6 +590,8 @@ fn capture_one_blocking(
             *backend = ActiveBackend::Dxgi(b);
             *consecutive_hard = 0;
             *consecutive_access_lost = 0;
+            *backend_built_at = Instant::now();
+            *delivered_since_build = false;
             // Fall through — the match below now takes the Dxgi arm and
             // attempts a real frame this tick.
         }
@@ -557,12 +604,48 @@ fn capture_one_blocking(
                 *consecutive_hard = 0;
                 *consecutive_access_lost = 0;
                 *consecutive_empty = 0;
+                *delivered_since_build = true;
                 Ok(Some(dxgi_to_frame(frame, start)))
             }
             Err(BackendBail::Transient) => {
                 *consecutive_hard = 0;
                 *consecutive_access_lost = 0;
                 *consecutive_empty = consecutive_empty.saturating_add(1);
+                // FR-34 — a duplication that has delivered NO frame since it was
+                // built, yet keeps returning empty, is STUCK (bound to a stale
+                // desktop after a lock→unlock: AcquireNextFrame WAIT_TIMEOUTs
+                // forever on a desktop that never changes), not idle. Rebind the
+                // input desktop and fall to the always-delivers GDI BitBlt path
+                // — the AccessLost arm's proven escape; the DXGI reclimb timer
+                // restores DXGI once the desktop settles. GATED on
+                // `delivered_since_build` so a WORKING session's idle (the
+                // legitimate Transient) is byte-for-byte untouched.
+                if capture_is_stuck(*delivered_since_build, backend_built_at.elapsed())
+                    && stuck_capture_recovery_enabled()
+                {
+                    let _ = desktop_rebind::try_change_desktop();
+                    match GdiBackend::primary() {
+                        Ok(g) => {
+                            tracing::warn!(
+                                consecutive_empty = *consecutive_empty,
+                                stuck_after_s = STUCK_CAPTURE_RECOVERY_AFTER.as_secs(),
+                                "system-context capture: DXGI duplication delivered no frames (stuck after a desktop transition) — GDI backstop + desktop rebind (FR-34)"
+                            );
+                            *backend = ActiveBackend::Gdi(g);
+                            *backend_built_at = Instant::now();
+                            *delivered_since_build = false;
+                            *consecutive_empty = 0;
+                            // Let the reclimb timer restore DXGI on the settled desktop.
+                            *last_dxgi_reclimb = Instant::now();
+                            return Ok(None);
+                        }
+                        Err(e2) => {
+                            tracing::error!(%e2, "system-context capture: GDI backstop init failed while DXGI was stuck (FR-34) — staying on DXGI");
+                            // Back off a full window rather than retry every tick.
+                            *backend_built_at = Instant::now();
+                        }
+                    }
+                }
                 Ok(None)
             }
             Err(BackendBail::DesktopMismatch) => {
@@ -605,6 +688,8 @@ fn capture_one_blocking(
                             );
                             *backend = ActiveBackend::Gdi(g);
                             *consecutive_access_lost = 0;
+                            *backend_built_at = Instant::now();
+                            *delivered_since_build = false;
                             return Ok(None);
                         }
                         Err(e2) => {
@@ -660,6 +745,8 @@ fn capture_one_blocking(
                             );
                             *backend = ActiveBackend::Gdi(g);
                             *consecutive_hard = 0;
+                            *backend_built_at = Instant::now();
+                            *delivered_since_build = false;
                         }
                         Err(e2) => {
                             tracing::error!(
@@ -723,6 +810,7 @@ fn capture_one_blocking(
                 Ok(frame) => {
                     *consecutive_hard = 0;
                     *consecutive_empty = 0;
+                    *delivered_since_build = true;
                     Ok(Some(gdi_to_frame(frame, start)))
                 }
                 Err(e) => {
@@ -787,6 +875,25 @@ fn gdi_to_frame(f: GdiFrame, start: Instant) -> Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-34 — the stuck-vs-idle decision, the whole point of which is that a
+    /// backend that has EVER delivered a frame is never treated as stuck (that
+    /// is a working session gone idle), while one that has delivered nothing
+    /// past the timeout is. Locks the pc50045 incident: 0 delivered, long age.
+    #[test]
+    fn capture_is_stuck_only_when_nothing_was_ever_delivered() {
+        let long = STUCK_CAPTURE_RECOVERY_AFTER + Duration::from_millis(1);
+        let short = STUCK_CAPTURE_RECOVERY_AFTER - Duration::from_millis(1);
+        // never delivered + past the window ⇒ stuck (the incident)
+        assert!(capture_is_stuck(false, long));
+        // never delivered but still within the window ⇒ not yet (a slow first frame)
+        assert!(!capture_is_stuck(false, short));
+        // delivered ⇒ never stuck, no matter how long the idle
+        assert!(!capture_is_stuck(true, long));
+        assert!(!capture_is_stuck(true, Duration::from_secs(3600)));
+        // exactly at the threshold counts (>=)
+        assert!(capture_is_stuck(false, STUCK_CAPTURE_RECOVERY_AFTER));
+    }
 
     #[test]
     fn hard_error_threshold_matches_rustdesk() {
