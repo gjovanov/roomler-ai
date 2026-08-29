@@ -1,6 +1,6 @@
 # FR-34 — A locked host: consent you can't see, and a stream that comes up black
 
-**Issue:** #TBD
+**Issue:** [#917](https://github.com/gjovanov/roomler-ai/issues/917)
 **Status:** design
 
 ## Goal
