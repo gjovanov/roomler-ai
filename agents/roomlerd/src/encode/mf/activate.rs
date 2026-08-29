@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! HW H.264 MFT cascade with probe-and-rollback.
 //!
 //! Phase 3 commit 3. This is the entry point replacing the monolithic

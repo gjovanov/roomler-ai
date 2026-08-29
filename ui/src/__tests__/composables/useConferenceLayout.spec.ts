@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { ref, effectScope, nextTick } from 'vue'
 import { reactive } from 'vue'
@@ -53,6 +55,7 @@ function participant(over: Partial<LayoutParticipant> = {}): LayoutParticipant {
     isLocal: false,
     isScreenShare: false,
     isPinned: false,
+    videoPaused: false,
     audioLevel: 0,
     ...over,
   }
@@ -105,7 +108,11 @@ describe('pickPrimaryFallback', () => {
 })
 
 describe('useConferenceLayout', () => {
-  function mount(opts: { local?: FakeStream | null; remotes?: Array<[string, FakeStream]> } = {}) {
+  function mount(opts: {
+    local?: FakeStream | null
+    remotes?: Array<[string, FakeStream]>
+    paused?: Map<string, boolean>
+  } = {}) {
     const scope = effectScope()
     let api!: ReturnType<typeof useConferenceLayout>
     const localStream = ref<MediaStream | null>(opts.local ? asStream(opts.local) : null)
@@ -128,9 +135,10 @@ describe('useConferenceLayout', () => {
         ref(null),
         (id: string) => id,
         ref('Me'),
+        opts.paused,
       )
     })
-    return { api, scope, remoteStreams }
+    return { api, scope, remoteStreams, paused: opts.paused }
   }
 
   it('hide-non-video converges when a camera turns on LATER (the stale-filter bug)', async () => {
@@ -221,5 +229,34 @@ describe('useConferenceLayout', () => {
     void api.layout.value // realise the participants computed
     scope.stop()
     expect(spy).toHaveBeenCalled()
+  })
+
+  // FR-30 (#884) — the peer's OWN signal is the only thing that can answer
+  // "is their camera off": a paused sender's track stays `live` and unmuted on
+  // this side (measured on prod 2026-08-29), so no amount of track inspection
+  // substitutes for it. FR-25 made the filter re-run; it could not make it
+  // right.
+  it('hides a participant whose camera the PEER says is off, even with a live track', () => {
+    const remote = new FakeStream(true)
+    const paused = reactive(new Map<string, boolean>())
+    const { api } = mount({ local: new FakeStream(true), remotes: [['them', remote]], paused })
+    api.prefs.value.hideNonVideo = true
+
+    // Live track, nothing said yet: shown.
+    expect(api.participants.value.map((p) => p.streamKey)).toContain('them')
+
+    paused.set('them', true)
+    expect([...api.layout.value.primary, ...api.layout.value.secondary].map((p) => p.streamKey)).not.toContain('them')
+
+    paused.set('them', false)
+    expect([...api.layout.value.primary, ...api.layout.value.secondary].map((p) => p.streamKey)).toContain('them')
+  })
+
+  it('never hides YOU on your own camera-off — you can already see that', () => {
+    const paused = reactive(new Map<string, boolean>())
+    const { api } = mount({ local: new FakeStream(true), remotes: [], paused })
+    api.prefs.value.hideNonVideo = true
+    paused.set('local', true)
+    expect([...api.layout.value.primary, ...api.layout.value.secondary].map((p) => p.streamKey)).toContain('local')
   })
 })

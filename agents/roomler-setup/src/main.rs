@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR(4): names the two wizards retired in P4c-2 — history, not a live
 // path.
 //! Roomler Setup — the unified 5-step Tauri 2 wizard.

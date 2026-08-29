@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-27 — the live remote-control session registry.
 //!
 //! "Who is watching my screen, and how do I stop them" existed only inside the

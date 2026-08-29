@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! DXGI adapter enumeration and adapter-scoped D3D11 device creation.
 //!
 //! The default-adapter path (`D3D11CreateDevice(None, ...)`) that

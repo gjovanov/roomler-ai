@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Dialer honesty — process-wide "can this HOST raw-UDP-dial relay-band
 //! ports?" latch (field 2026-08-16, CORPLAP-3).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Artifact resolution + download — the shared streaming machinery
 //! behind both wizards' `asset_resolver` wrappers (and the unified
 //! `roomler-setup` app).

@@ -49,6 +49,7 @@ function participant(over: Partial<LayoutParticipant> = {}): LayoutParticipant {
     isLocal: false,
     isScreenShare: false,
     isPinned: false,
+    videoPaused: false,
     audioLevel: 0,
     ...over,
   }
