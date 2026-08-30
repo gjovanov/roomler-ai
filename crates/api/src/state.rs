@@ -933,6 +933,11 @@ impl AppState {
         // singleton per cycle via the same DB-name-scoped claim pattern.
         // No-op task when `stats.enabled=false`.
         crate::stats_rollup::spawn_stats_rollup(state.clone());
+        // FR-20 P1 — drain the per-network DERP byte counters into the
+        // `stats_usage` cost ledger every 60 s. Runs on BOTH pods on purpose:
+        // each writes only the bytes it relayed, into the same deterministic
+        // `_id`, and `$inc` sums them.
+        crate::ws::derp::spawn_derp_usage_flush(state.clone());
         // Stats PR-2 — per-pod mediasoup conference sampler (this pod's
         // own rooms only; media ownership is single-pod per room).
         crate::media_stats::spawn_media_sampler(state.clone());
