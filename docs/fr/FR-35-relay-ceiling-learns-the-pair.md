@@ -1,6 +1,6 @@
 # FR-35: The constrained ceiling learns the pair — grow the relay cap on delivery evidence, remember it per peer
 
-Status: **P1 + P2 + P2b shipped (0.4.21 / 0.4.23); P3 (opener growth, opener grace, held NVENC increases) shipped 0.4.27 / 0.4.28 (#986, #988) — field runs on CORPLAP-2 show ONE keyframe per opener (the pulses are gone) and found two growth defects, fixed by P3b (#996, → 0.4.29); operator read pending** (2026-08-30). Tracking issue: `FR-35` (#922).
+Status: **P1 + P2 + P2b shipped (0.4.21 / 0.4.23); P3 (opener growth, opener grace, held NVENC increases) + P3b (grace-until-drained, measured growth, stable==0 write-back) + P3c (stuck detector so a hot seed cannot freeze the opener, + applied_bps self-correction) shipped 0.4.27 → 0.4.30 (#986/#988/#996/#1001/#1004). Field: IDR pulses gone; opener sharp from frame 1 with a healthy seed; no spurious freeze on a fast path (maxGap <130 ms at the 8 M ceiling). REMAINING: the stuck detector needs a path that cannot carry the seed to exercise — handed to the operator as a neo16→overlay A/B (100.65.4.2 reseeded to the 7 M froze-value).** (2026-08-30). Tracking issue: `FR-35` (#922).
 Child of the RC-quality program. Follows FR-31 (every opening and repair number on an NVENC relay
 session is proportional to `maxrate`, and nothing ffmpeg exposes changes that) and the parked
 measured-rate line (#678: a sender cannot see capacity it is not using). Operator's directive
