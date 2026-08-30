@@ -625,6 +625,25 @@ pub struct AgentConfig {
     /// (`ROOMLERD_RELAY_CEILING_LEARN`). Built-in default: ON.
     #[serde(default)]
     pub relay_ceiling_learn: Option<bool>,
+    /// FR-36 — capture the scanout framebuffer via DRM/KMS, below the
+    /// compositor (`ROOMLERD_DRM_CAPTURE`). Built-in default: **OFF**. The only
+    /// backend that can see a Wayland desktop, a locked screen or the login
+    /// greeter — but it carries no damage information, so turning it on where
+    /// X11 works costs the FR-29 idle-CPU win. Restart required.
+    #[serde(default)]
+    pub drm_capture: Option<bool>,
+    /// FR-36 — inject input through `/dev/uinput`, below the compositor
+    /// (`ROOMLERD_UINPUT`). Built-in default: **OFF**. Pair with `drm_capture`
+    /// on a Wayland host: XTest reaches Xwayland clients only, so without this
+    /// a captured Wayland session is read-only. ⚠️ A uinput device is
+    /// host-global and injects into whatever has focus. Restart required.
+    #[serde(default)]
+    pub uinput: Option<bool>,
+    /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
+    /// unchanged (`ROOMLERD_X11_DAMAGE`). Built-in default: ON; took a Linux
+    /// host's idle capture from 45.8 % of a core to 2.8 %. Restart required.
+    #[serde(default)]
+    pub x11_damage: Option<bool>,
     /// FR-40 — honour `rc:agent.key_rotate` (an admin retiring this device's
     /// overlay key from the dashboard; `ROOMLERD_OVERLAY_KEY_ROTATION`).
     /// Built-in default: ON. A kill switch for a defective implementation,
@@ -1739,6 +1758,9 @@ pub fn test_fixture() -> AgentConfig {
         gpu_scale: None,
         overlay_lan_capture_probe: None,
         relay_ceiling_learn: None,
+        drm_capture: None,
+        uinput: None,
+        x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
         relay_max_hi_kbps: None,
@@ -1875,7 +1897,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 59] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 62] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1892,6 +1914,9 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 59]
         ("GPU_SCALE", cfg.gpu_scale),
         ("OVERLAY_LAN_CAPTURE_PROBE", cfg.overlay_lan_capture_probe),
         ("RELAY_CEILING_LEARN", cfg.relay_ceiling_learn),
+        ("DRM_CAPTURE", cfg.drm_capture),
+        ("UINPUT", cfg.uinput),
+        ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
