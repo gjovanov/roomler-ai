@@ -4700,7 +4700,18 @@ async fn media_pump_ffmpeg_dc(
     // ledger is EMPTY (the opener's tail was still draining 1.1 s after a
     // fixed 2 s ended, and tripped a decrease — field 2026-08-30), capped.
     const OPENER_GRACE: Duration = Duration::from_secs(2);
-    const OPENER_GRACE_MAX: Duration = Duration::from_secs(6);
+    // Backstop only. The stuck detector below normally ends the grace far
+    // sooner; this bounds the pathological case where the byte gate keeps the
+    // grace-end block (further down the loop, past the gate's `continue`) from
+    // ever running. Was 6 s — a hot seed pinned the encoder at ~1 fps for the
+    // whole window (field 2026-08-30, neo16 → CORPLAP-2: a several-second
+    // freeze on connect).
+    const OPENER_GRACE_MAX: Duration = Duration::from_secs(3);
+    // The opener is expected to DRAIN within ~1 s; if the byte gate stays
+    // saturated (inflight pinned, not falling) longer than this, the seed is
+    // too hot for this path — end the grace so the AIMD cuts. A smooth soft
+    // picture beats a frozen crisp one.
+    const OPENER_GRACE_STUCK: Duration = Duration::from_millis(1200);
     // Anchored at the FIRST PACKET, not at pump start: the pump spins for
     // seconds before anything is sent (consent, ICE, the DC opening — the
     // 0.4.27 field run's first packet came 4 s in) and a grace measured from
@@ -4709,6 +4720,10 @@ async fn media_pump_ffmpeg_dc(
     let mut opener_grace_done = false;
     let mut grace_soft_stalls: u32 = 0;
     let mut grace_bp_skips: u32 = 0;
+    // FR-35 P3b — set the first time the byte gate saturates during the grace,
+    // reset whenever inflight falls below half the budget (the opener is
+    // draining). Sustained beyond `OPENER_GRACE_STUCK` ⇒ the seed does not fit.
+    let mut grace_congested_since: Option<std::time::Instant> = None;
     let mut last_deferred_apply_at: Option<std::time::Instant> = None;
     let mut settle_kf_suppressed: u64 = 0;
 
@@ -5142,6 +5157,12 @@ async fn media_pump_ffmpeg_dc(
         };
         let inflight_now = inflight_bytes.load(std::sync::atomic::Ordering::Relaxed);
         let byte_gate = inflight_now >= queue_budget;
+        // FR-35 P3b — the opener is draining whenever the ledger dips below half
+        // the budget; reset the stuck timer so only a genuinely pinned queue
+        // (inflight held high, not falling) is read as "seed too hot".
+        if inflight_now < queue_budget / 2 {
+            grace_congested_since = None;
+        }
         if send_tx.capacity() == 0 || pipeline.followers_congested() || byte_gate {
             if byte_gate && !constrained && !direct_gate_logged {
                 direct_gate_logged = true;
@@ -5166,6 +5187,29 @@ async fn media_pump_ffmpeg_dc(
             // is the same congestion semantic judged in bytes: frame-count
             // depth bounds nothing when native motion frames are 20× rung
             // size, and the queue it allows is pure viewer lag.
+            // FR-35 P3b — but distinguish "burst draining" from "seed too hot".
+            // This gate `continue`s before the grace-end block far below, so a
+            // persistently-saturated queue would keep the grace open (and the
+            // AIMD suppressed) for the whole backstop window. If the queue has
+            // been pinned longer than a legit opener takes to drain, end the
+            // grace NOW so the same-iteration `bp_applied` cuts the live rate.
+            if constrained && !opener_grace_done {
+                match grace_congested_since {
+                    Some(t) if t.elapsed() >= OPENER_GRACE_STUCK => {
+                        opener_grace_done = true;
+                        in_opener_grace.store(false, std::sync::atomic::Ordering::Relaxed);
+                        info!(
+                            %session_id,
+                            codec_label,
+                            stuck_ms = t.elapsed().as_millis() as u64,
+                            grace_bp_skips,
+                            "FR-35 opener grace cut short — the seed does not fit this path; releasing the AIMD to cut"
+                        );
+                    }
+                    Some(_) => {}
+                    None => grace_congested_since = Some(std::time::Instant::now()),
+                }
+            }
             // FR-35 P3 — inside the opener grace the skips are the opening
             // burst draining, not congestion: skip the frame, keep the AIMD.
             let bp_applied = if constrained && !opener_grace_done {
@@ -5722,8 +5766,16 @@ async fn media_pump_ffmpeg_dc(
                     "FR-35 ceiling learner: the pair carried the ceiling — stepping it up"
                 );
             }
+            // FR-35 P3b — the memory wants the rate the pipe actually CARRIED,
+            // not just the learner's above-nominal ceiling. On a short/frozen
+            // session the learner never rises, so `stable_bps()` is None; fall
+            // back to the AIMD's live applied rate so a session whose seed was
+            // too hot (the grace was cut short, the AIMD then cut) records the
+            // converged rate as a decrease and the pair stops re-seeding hot.
             rate_memory_guard.stable.store(
-                governor.stable_bps().unwrap_or(0),
+                governor
+                    .stable_bps()
+                    .unwrap_or_else(|| governor.applied_bps()),
                 std::sync::atomic::Ordering::Relaxed,
             );
             rate_memory_guard
