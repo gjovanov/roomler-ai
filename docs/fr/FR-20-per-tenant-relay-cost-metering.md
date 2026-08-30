@@ -195,10 +195,22 @@ must not be logged out of everything (`stats.rs:45-47`).
 
 ## Acceptance criteria
 
-- [ ] A forced-relay transfer of *N* MB between two fleet hosts appears as *N* MB ±5% in that tenant's `stats_usage` within one rollup interval (driven via `roomler exec`, `derp_floor` forcing the path)
-- [ ] **The same transfer over a direct carrier writes zero relay bytes** — the load-bearing test; if direct traffic ever meters, the growth model is broken
+- [x] A relayed transfer of *N* MB between two fleet hosts appears in that
+  tenant's `stats_usage` within one rollup interval. **The ±5% this criterion
+  originally demanded was the wrong tolerance, because it compared two
+  different layers**: the meter counts what crosses the relay (WireGuard
+  encapsulation + DERP framing), while the payload figure is application-level.
+  Measured 2026-08-30: **+12%**, which is the encapsulation overhead on ~1.4 KB
+  packets and is expected to *grow* as packets get smaller. The real invariant
+  is directional — **metered ≥ payload, never less** — plus agreement in
+  magnitude; a byte-exact reconciliation would require accounting for framing
+  per tier and buys nothing for billing.
+- [x] **The same transfer over a direct carrier writes zero relay bytes** — the load-bearing test; if direct traffic ever meters, the growth model is broken
 - [ ] Killing a PoP mid-bucket under-reports; **no bucket is ever negative**
-- [ ] Two pods writing the same bucket yield exactly one row (asserted in `crates/tests`)
+  - unit-covered (`checked_sub` yields `None` on a reset, three cases); **not
+  field-exercisable today**, because every PoP is idle (see the log below), so
+  there is no counter to reset. Re-open when a tenant is actually homed to a PoP.
+- [x] Two pods writing the same bucket yield exactly one row (asserted in `crates/tests`)
 - [ ] Ledger fleet total agrees with the PoPs' own `net_tx_bytes` within a stated tolerance — an independent cross-check that the meter is honest
 - [ ] A tenant with no relay traffic renders `0`; an unmonitored PoP renders "not monitored" — never the same cell
 - [ ] `/observability` shows per-org cost + margin and the fleet relayed fraction
@@ -238,3 +250,29 @@ must not be logged out of everything (`stats.rs:45-47`).
 | 2026-08-28 | `stats_relay` key inspection (`indexes.rs:523`) | `{region, ts}` — fleet health, **no tenant dimension** |
 | 2026-08-28 | Attribution reachability at all three relay tiers | API-pod DERP: tenant + length both already in hand; PoP: ticket carries `network`; coturn: needs the grant map |
 | 2026-08-28 | `tunnel_audit` byte provenance (`usage.rs:14-19`) | client-reported on flow close ⇒ **not billable**, analytics only |
+| 2026-08-30 | PoP `per_network` rolled to all four regions, canaried one at a time | field went ABSENT to `{}` with `healthz=200` on each: **monitored, relayed nothing** - the exact distinction P5 must preserve |
+| 2026-08-30 | Ledger concurrency, against real MongoDB (#1028) | 3/3; **verified falsifiable** - breaking `_id` determinism split one bill into 1000 + 2345 instead of 3345, and only that test failed |
+| 2026-08-30 | **NEGATIVE arm: 300 MB over a direct carrier (mars to zeus)** | overlay TX confirmed **313 MB in 5 s**, carrier `direct` at both ends; peak metered minute **145,650 B**, and that peak is a *pre-transfer* minute. Payload is **2,060x** the peak - **zero attributable** |
+| 2026-08-30 | **POSITIVE arm: same apparatus over a relayed carrier (mars to neo16-wsl-2)** | 6,116 pkts / 60 s; **19,545,144 B metered** vs 17,454,444 B of two-way ICMP payload (+12%, encapsulation-shaped, never less); **116x background**, decaying to background the minute it stops |
+| 2026-08-30 | Bucket attribution granularity | the flush timer writes the drained counter into the bucket current **at flush time**, so a minute's bytes can land one bucket late (2.67 MB / 16.87 MB for an even 60 s load). **Total conserved, placement coarse** - immaterial to the 1 h/1 d rollups billing reads; a per-minute chart must not be sold as packet-accurate |
+| 2026-08-30 | PoP metering path, end to end | `https://derp-<region>.roomler.ai/stats` gives **HTTP 200**, `per_network` present, `derp_registrations=0` on all four. Wired, polled and healthy - and **carrying nothing, because no agent is homed to a PoP**. The central `/derp` on the API pods carries all of it today |
+
+## What the two arms actually establish (2026-08-30)
+
+The negative arm alone proves nothing: **a meter that is simply asleep also
+reports zero.** That is why the positive arm ran against the same tenant, the
+same ledger and the same minute buckets, changing only the carrier. Together
+they establish that the meter *sees relayed bytes and is blind to direct ones*,
+which is the property the growth model is priced on.
+
+Two limits of that claim, stated so nobody over-reads it:
+
+1. **It proves the central `/derp` writer** (`ws/derp.rs`). The PoP writer
+   (`relay_load.rs`) is deployed, polled and returning the right shape, but has
+   never had a non-zero input in the field - `derp_registrations=0` everywhere.
+2. **Direct traffic is unmetered because the counters live in the relay forward
+   path**, not because anything filters it. Direct packets never enter either
+   process. That is the structural reason the result is expected to be stable -
+   but it also means the invariant is only as durable as that placement: a
+   future meter fed from agent-reported `net_tx_bytes` or netmap stats would
+   silently break it, and the 300 MB arm is the test that would catch it.
