@@ -858,8 +858,8 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 **The floor**
 
-- [ ] `CORPLAP-2` stays on `relay:derp/tcp` throughout, and its reconnect count is unchanged —
-      *prerequisite: a reconnect counter on `NodeStatus`; none exists today.*
+- [x] `CORPLAP-2` stays on `relay:derp/tcp` throughout, and org churn causes zero floor reconnects —
+      *proven DEPLOY-FREE from pod logs (2026-08-30): a mint issues a per-peer DECISION — `org-relay: minted` for the one supported peer, log-only `mint refused reason=PeerUnsupported` for every floor node (no push, no reconnect); `CORPLAP-2`'s single 17 s WS blip was corp flakiness, non-coincident with any mint/revoke (9–11 min apart); `derp_registrations` steady at 12. The `NodeStatus` reconnect counter proved unnecessary. [#805 comment](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5471768287).*
 - [x] Killing every relay mid-session demotes affected pairs within the carrier-health
       deadline. Asserted as a **positive signal** — both ends' demote timestamps inside the
       deadline, sampled from `peers --json` — not as an absence in a log tail.
