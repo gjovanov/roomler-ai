@@ -5775,10 +5775,7 @@ async fn media_pump_ffmpeg_dc(
             in_opener_grace.store(false, std::sync::atomic::Ordering::Relaxed);
             let bytes = opener_bytes.load(std::sync::atomic::Ordering::Relaxed);
             let wait_us = opener_wait_us_max.load(std::sync::atomic::Ordering::Relaxed);
-            let opener_maxrate = encoder
-                .as_ref()
-                .map(|e| e.current_maxrate_bps())
-                .unwrap_or(0);
+            let opener_maxrate = enc.current_maxrate_bps();
             let target = crate::encode::rate_memory::opener_growth_target_bps(
                 bytes,
                 wait_us,
