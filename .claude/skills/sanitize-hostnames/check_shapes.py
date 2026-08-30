@@ -35,7 +35,7 @@ SHAPES = [
     (r"LAPTOP-[A-Z0-9]{7,8}\b", "Windows auto-generated laptop hostname"),
     (r"WIN-[A-Z0-9]{11}\b", "Windows Server auto-generated hostname"),
     (r"\bPC[0-9]{4,6}\b", "corp asset tag, PC-prefixed"),
-    (r"\bCLK[0-9]{5,}\b", "corp asset tag, CORPLAP-3-prefixed"),
+    (r"\bCLK[0-9]{5,}\b", "corp asset tag, three-letter prefix + 5-8 digits"),
     (r"\b[A-Za-z]{3,}-XMG-[A-Za-z0-9]+\b", "owner-name-prefixed laptop hostname"),
     (r"\b[A-Za-z]{3,}s-MacBook[A-Za-z0-9-]*", "Apple default '<owner>s-MacBook'"),
 ]
