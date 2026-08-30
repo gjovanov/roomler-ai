@@ -1,6 +1,6 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** proposed (2026-08-30). Tracking issue: `FR-43`. Anchors verified against
+**Status:** P0 + P1 shipped and field-verified (P1 through 0.4.33 → 0.4.35, see the field-verification log); P2 next. Tracking issue: `FR-43`. Anchors verified against
 master `0bfdc263`.
 
 ## Goal
@@ -117,4 +117,84 @@ companion.
 
 ## Field-verification log
 
-_(empty — P0 has not run)_
+All of it on the operator's MacBook (`Gorans-MacBook-Pro`, Apple Silicon), driven
+remotely — `roomler exec` for P0, `roomler ssh` on the daemon row from P1 onwards.
+
+### 2026-08-30 — P0 spike: the mechanism works, and one half was never measured
+
+From the running root daemon, a capture in session 0 fails with *"could not create image
+from display"*. The same call through `launchctl asuser <console-uid>` produced an 8.4 MB
+screenshot in **233 ms**, and our own binary spawned that way reported both a live GUI
+session and its TCC grants — so the grants survive, which is what made P1 worth building.
+
+**What the spike got wrong, and why:** it never measured the worker's *identity*. The
+probe was `roomlerd caps`, which reports the GUI session and the TCC grants — both of
+which root-in-a-session genuinely has — and says nothing about *which config* the process
+would load. **A probe that shares a blind spot with the design confirms the design.**
+`id -u` was the missing measurement, and it cost the outage below.
+
+### 2026-08-30 — P1 (0.4.33) shipped, then took the Mac's remote-desktop half offline
+
+`launchctl asuser <uid> <cmd>` joins the user's Mach bootstrap namespace but does **not**
+change credentials — `launchctl asuser 501 id -u` prints `0`. Every spawned worker
+therefore ran as root, resolved *root's* profile config, died instantly with
+`no config found at /var/root/Library/Application Support/…`, and was respawned for as
+long as the LaunchAgent stayed unloaded. Nothing bounded the ladder.
+
+Fixed in **#1026** (0.4.34): `sudo -u "#<uid>"` — numeric, so no `getpwuid` lookup and no
+wrong account when a uid has several names — plus `MAX_FAST_EXITS`, because a worker that
+can *never* start is a configuration fault and hammering it hides the cause.
+
+### 2026-08-30 — 0.4.34 re-test: privilege drop verified
+
+Worker pid 4526 at **uid 501 (`gjovanov`)**, parent 4525 = `sudo -u '#501'` at uid 0;
+LaunchAgent confirmed not loaded; `permissions: ["screen-capture", "input"]`.
+`kill -9` → respawned in ~14 s, again uid 501. Stand-down verified separately: with the
+LaunchAgent loaded, `action=LaunchdOwns` and the user half's pid never moved.
+
+Hand-back left an **orphan**: `stop_worker` killed only the direct child, so the agent
+survived re-parented to launchd, held the single-instance lock, and launchd's own worker
+exited *cleanly* on it — `KeepAlive{SuccessfulExit=false}` never retried. Turning the
+supervisor **off** left the Mac running an unsupervised orphan nothing would restart.
+A switch whose off position leaves the machine worse than either steady state is not a
+kill switch. Fixed in **#1029** (0.4.35): own process group + group signal.
+
+### 2026-08-31 — 0.4.35 re-test: #1029 confirmed, and it uncovered the other half
+
+Precondition asserted first (`git merge-base --is-ancestor <fix> agent-v0.4.35`), because
+"merged" is not "released" and "released" is not "installed".
+
+The group structure, measured under supervision:
+
+```
+25894     1 25894     0  roomler-agent   <- root daemon
+34322 25894 34322     0  sudo            <- our child, OWN group (process_group(0))
+34323 34322 34322   501  roomler-agent   <- worker, SAME group, uid 501
+```
+
+`sudo` does not `setsid` here (a separate probe showed a shell under `sudo -u "#501"`
+carrying a pgid inherited from its ancestor), so `kill(-pgid, …)` reaches the whole
+`launchctl → sudo → agent` chain and cannot touch the daemon. **No orphan survived.**
+
+But the hand-back then left **no user half at all**:
+
+```
+22:58:03.902  user half:  WARN single-instance lock held by another process; exiting   <- exit 0
+22:58:08.725  daemon:     INFO macOS supervisor: stopping our GUI worker group … pgid=34322
+```
+
+launchd starts its worker the instant the plist is bootstrapped; it hits our worker's
+lock and exits **0**; up to `POLL` (5 s) later we notice `LaunchdOwns` and kill ours.
+
+**The orphan and this are the same root cause seen from opposite ends: whoever loses the
+single-instance lock exits 0, and `KeepAlive{SuccessfulExit=false}` never retries a clean
+exit.** #1029 fixed *which side* loses; it did not make the hand-back complete. Fixed in
+**#1039**: handing back is two steps, so it is its own `Action::HandBack(uid)` — stop our
+group, then `launchctl kickstart` the LaunchAgent (without `-k`, so it is idempotent).
+
+Separate hazard seen in the same window and filed as **#1040**, not fixed here: while
+losing the lock race during the update, the user half logged
+`rollback installer downloaded — spawning + exiting target=agent-v0.4.33`. Lock-conflict
+exits can read as a crash loop to the rollback machinery, which would *downgrade* a
+healthy host. This is why #1039 deliberately did **not** take the otherwise-obvious route
+of making that exit non-zero.
