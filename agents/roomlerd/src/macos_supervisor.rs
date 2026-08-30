@@ -59,6 +59,12 @@ pub const MAX_FAST_EXITS: u32 = 5;
 /// Backoff ceiling for respawns.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// How many polls the supervisor keeps re-trying to start launchd's own worker
+/// after it has released its own. Bounded because a Mac where launchd simply
+/// refuses should not spawn a `launchctl` every [`POLL`] for the daemon's whole
+/// life; 12 polls is a minute, which is far longer than a hand-back takes.
+pub const KICKSTART_RETRIES: u32 = 12;
+
 /// What the supervisor knows when it decides. Deliberately plain data: the
 /// decision is pure so it can be tested on every platform, while the syscalls
 /// that produce these fields are macOS-only. (macOS has no `cargo test` lane
@@ -90,9 +96,15 @@ pub enum Action {
     Disabled,
     /// Nobody is logged in. Any worker we hold is meaningless — drop it.
     NoGuiSession,
-    /// launchd owns this session's agent; stand down (and drop ours if the
-    /// LaunchAgent came back while we were supervising).
+    /// launchd owns this session's agent and we hold nothing: stand down.
     LaunchdOwns,
+    /// launchd owns this session's agent **and we still hold a worker**:
+    /// stop ours, then make sure theirs is actually running.
+    ///
+    /// A separate state from [`Action::LaunchdOwns`] because the hand-back is
+    /// not just "drop ours" — see [`imp::kickstart_launch_agent`] for the race
+    /// that makes the second half load-bearing.
+    HandBack(u32),
     /// Spawn a worker for this uid.
     Spawn(u32),
     /// The console user changed under a worker we own: replace it.
@@ -118,7 +130,10 @@ pub fn decide(i: Inputs) -> Action {
     // bootstrapped back at any time (a re-install does exactly that) and the
     // loser of that race must be us, not the enrolled agent.
     if i.launch_agent_loaded {
-        return Action::LaunchdOwns;
+        return match i.worker_uid {
+            Some(_) => Action::HandBack(uid),
+            None => Action::LaunchdOwns,
+        };
     }
     match i.worker_uid {
         Some(w) if w == uid => Action::Healthy,
@@ -225,6 +240,80 @@ mod imp {
             .spawn()
     }
 
+    /// Complete a hand-back: make sure launchd's own worker is running.
+    ///
+    /// Dropping our worker is only HALF of handing ownership back, because the
+    /// hand-back is a race and launchd's side loses it **silently**:
+    ///
+    /// 1. the LaunchAgent is bootstrapped, so launchd starts its worker at
+    ///    once;
+    /// 2. that worker finds OUR worker holding the single-instance lock and
+    ///    exits — with status **0**, logging `single-instance lock held by
+    ///    another process; exiting`;
+    /// 3. the plist's `KeepAlive{SuccessfulExit=false}` therefore treats that
+    ///    as a job that ran and finished, and never retries it;
+    /// 4. up to [`POLL`] later we notice `launch_agent_loaded` and stop our
+    ///    worker — by which time launchd has already given up.
+    ///
+    /// Net effect: the Mac ends with **no user half at all**, and nothing
+    /// scheduled to bring one back. Field-measured on 0.4.35, 2026-08-31,
+    /// on the exact sequence #1029 was cut to fix — its process-group kill
+    /// worked (no orphan survived), which is precisely what uncovered this:
+    /// the two are the same root cause seen from opposite ends, namely that
+    /// the loser of the lock race exits cleanly and is never retried.
+    ///
+    /// `launchctl kickstart` (deliberately **without** `-k`) starts the job if
+    /// it is not running and is a no-op if it is, so this is idempotent and
+    /// cannot disturb a healthy launchd-owned worker. It runs AFTER
+    /// [`stop_worker`], which reaps the group, so the lock is free by then.
+    ///
+    /// Returns whether launchd accepted it. A failure has to be **retried by
+    /// the caller**, because by then we have already stopped our own worker:
+    /// the next poll sees [`Action::LaunchdOwns`] (we no longer hold one), so
+    /// nothing would bring the hand-back back around on its own, and the Mac
+    /// would sit with no user half — the exact outcome this function exists to
+    /// prevent. [`KICKSTART_RETRIES`] bounds that, so a Mac where launchd
+    /// genuinely refuses does not spawn a subprocess every [`POLL`] forever.
+    fn kickstart_launch_agent(uid: u32) -> bool {
+        let job = format!("gui/{uid}/{AGENT_LABEL}");
+        match Command::new("launchctl")
+            .arg("kickstart")
+            .arg(&job)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(s) if s.success() => {
+                tracing::info!(
+                    uid,
+                    job = %job,
+                    "macOS supervisor: handed the worker back to launchd"
+                );
+                true
+            }
+            Ok(s) => {
+                tracing::warn!(
+                    uid,
+                    job = %job,
+                    status = ?s.code(),
+                    "macOS supervisor: could not kickstart the LaunchAgent — \
+                     this session may be left with no user half until launchd \
+                     starts one"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    uid,
+                    job = %job,
+                    error = %e,
+                    "macOS supervisor: could not run launchctl kickstart"
+                );
+                false
+            }
+        }
+    }
+
     /// Stop a worker we own — the whole process GROUP, not just our child.
     ///
     /// `launchctl asuser … sudo -u '#uid' … run` gives us a three-deep chain
@@ -305,6 +394,11 @@ mod imp {
         let mut fast_exits: u32 = 0;
         let mut wait_until: Option<Instant> = None;
         let mut last_action: Option<Action> = None;
+        // Polls left to keep re-trying launchd's own worker after a hand-back
+        // whose kickstart failed. 0 = nothing owed. (`//`, not `///`: a doc
+        // comment on a `let` is an `unused_doc_comments` warning, and this
+        // module compiles only in the macOS lane, where warnings are denied.)
+        let mut kickstart_debt: u32 = 0;
 
         loop {
             // Reap first, so `worker_uid` reflects reality this tick.
@@ -369,11 +463,55 @@ mod imp {
                     // Logged once via the transition logger above; nothing to
                     // do until the situation changes.
                 }
-                Action::NoGuiSession | Action::LaunchdOwns => {
+                Action::NoGuiSession => {
                     fast_exits = 0;
+                    // Nobody is logged in, so there is no LaunchAgent to owe a
+                    // kickstart to; forget any debt from the last session.
+                    kickstart_debt = 0;
                     if let Some((uid, child, _)) = worker.take() {
-                        stop_worker(uid, child, "session ended or launchd took ownership");
+                        stop_worker(uid, child, "GUI session ended");
                     }
+                }
+                Action::LaunchdOwns => {
+                    fast_exits = 0;
+                    // We hold no worker here, so `HandBack` will never come
+                    // around again — this is the ONLY place a failed hand-back
+                    // can be retried from. See `kickstart_launch_agent`.
+                    if kickstart_debt > 0 {
+                        match uid_now {
+                            // Cleared by success, not by reaching zero: those
+                            // are opposite outcomes and must not share a
+                            // branch.
+                            Some(uid) if kickstart_launch_agent(uid) => kickstart_debt = 0,
+                            Some(uid) => {
+                                kickstart_debt -= 1;
+                                if kickstart_debt == 0 {
+                                    tracing::error!(
+                                        uid,
+                                        "macOS supervisor: gave up starting launchd's own \
+                                         worker — this session has no user half until \
+                                         launchd or an operator starts one"
+                                    );
+                                }
+                            }
+                            // Unreachable while the action is LaunchdOwns
+                            // (`decide` returns NoGuiSession without a console
+                            // uid), but a debt owed to a session that no longer
+                            // exists is not a debt.
+                            None => kickstart_debt = 0,
+                        }
+                    }
+                }
+                Action::HandBack(uid) => {
+                    fast_exits = 0;
+                    if let Some((held, child, _)) = worker.take() {
+                        stop_worker(held, child, "launchd took ownership");
+                    }
+                    kickstart_debt = if kickstart_launch_agent(uid) {
+                        0
+                    } else {
+                        KICKSTART_RETRIES
+                    };
                 }
                 Action::Replace(uid) => {
                     fast_exits = 0;
@@ -501,14 +639,61 @@ mod tests {
             Action::LaunchdOwns
         );
         // Including when we already hold a worker: a re-install bootstraps
-        // the plist back, and the loser of that race must be us.
+        // the plist back, and the loser of that race must be us. Holding one
+        // makes it a HAND-BACK rather than a plain stand-down, because
+        // dropping ours is only half the job.
         assert_eq!(
             decide(Inputs {
                 launch_agent_loaded: true,
                 worker_uid: Some(501),
                 ..base()
             }),
+            Action::HandBack(501)
+        );
+    }
+
+    /// Handing back is two steps, so it is its own state.
+    ///
+    /// Field-measured on 0.4.35 (2026-08-31): stopping our worker without
+    /// starting launchd's left the Mac with NO user half, because launchd's
+    /// worker had already lost the single-instance lock race and exited **0**
+    /// — which `KeepAlive{SuccessfulExit=false}` never retries. Collapsing
+    /// this back into `LaunchdOwns` would silently restore that outage, so
+    /// the distinction is asserted rather than assumed.
+    #[test]
+    fn handing_back_is_distinct_from_standing_down() {
+        // Nothing held: there is nothing to hand back.
+        assert_eq!(
+            decide(Inputs {
+                launch_agent_loaded: true,
+                worker_uid: None,
+                ..base()
+            }),
             Action::LaunchdOwns
+        );
+        // The uid carried is the CONSOLE user's — the session whose
+        // LaunchAgent has to end up running — not necessarily the uid our
+        // stale worker was spawned for.
+        assert_eq!(
+            decide(Inputs {
+                launch_agent_loaded: true,
+                console_uid: Some(502),
+                worker_uid: Some(501),
+                ..base()
+            }),
+            Action::HandBack(502)
+        );
+        // No session means no LaunchAgent to hand back TO: dropping our
+        // worker is the whole job, and kickstarting `gui/<nobody>` would
+        // fail. `console_uid` is checked before `launch_agent_loaded`.
+        assert_eq!(
+            decide(Inputs {
+                launch_agent_loaded: true,
+                console_uid: None,
+                worker_uid: Some(501),
+                ..base()
+            }),
+            Action::NoGuiSession
         );
     }
 
