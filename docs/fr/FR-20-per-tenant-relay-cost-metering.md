@@ -121,6 +121,38 @@ Instead write a TTL'd `turn_grant` map (username → tenant) at *issuance*, wher
 the API already knows the tenant. A grant that has expired out of the map yields
 an **unattributed** bucket, never a wrongly-attributed one.
 
+> ### ⚠️ C AS WRITTEN ABOVE CANNOT WORK — measured on the live fleet, 2026-08-30
+>
+> The `turn_grant` map resolves *username → tenant*. But **the username never
+> appears in the metrics**, so there is nothing to resolve. Read from the real
+> exporter on a coturn worker (`10.10.10.11:9641`, coturn **4.17.2**), the entire
+> set of label combinations it emits is:
+>
+> ```
+> {realm="roomler.ai"}   {type="TCP"}   {type="TLS/TCP"}   {type="UDP"}
+> ```
+>
+> `grep -c 'user=|username='` over the whole payload returns **0**. Every
+> `turn_traffic_*` series is a **realm-level aggregate**. Building the parser and
+> the grant map as specified would produce a lookup that matches nothing — the
+> same "machinery in front of data that does not exist" this FR already refused
+> twice elsewhere.
+>
+> **Two mechanisms do exist in 4.17.2**, and choosing between them is an
+> operational decision, not an implementation detail:
+>
+> | Option | Cost |
+> |---|---|
+> | `--prometheus-username-labels` | Minimal code — the specced design then works verbatim. ⚠️ But our usernames are `{expiry}:{id}`, **unique per issuance and never reused**, so every credential mints a new time series: an unbounded, monotonically growing label set in coturn's registry. A textbook cardinality bomb, made worse by the timestamp the username format is *required* to carry (it is HMAC input). |
+> | `-O, --redis-statsdb` | Per-session records carrying username and byte counts; no cardinality growth, and we already run Redis. Needs a new integration and its schema verified. |
+>
+> **Recommendation: defer C, and prefer redis-statsdb when it is taken up.**
+> Per-tenant TURN attribution buys nothing until there is a tenant to attribute
+> to, and the fleet-total TURN cost is *already* visible — `stats_relay` carries
+> each region's `rx_mbps`/`tx_mbps` from the host counters, so a realm-total
+> would be nearly redundant with what is collected today. It also does not belong
+> in `stats_usage`, which is per-tenant by construction.
+
 ### Cost model
 
 `config/relay-costs.toml` maps meter → unit cost, edited in one place, so
@@ -156,7 +188,7 @@ must not be logged out of everything (`stats.rs:45-47`).
 |---|---|---|
 | **P1** | `stats_usage` + rollups + **A** (API-pod DERP). Smallest end-to-end slice; proves the shape on real traffic. | meter writes are additive; flag off ⇒ no rows |
 | **P2** | **B** — PoP `per_network` counters + poller attribution | PoP omitting `per_network` ⇒ "not monitored", never `0` |
-| **P3** | **C** — coturn `turn_traffic_*` + `turn_grant` map | absent grant ⇒ unattributed bucket, not a wrong one |
+| ~~**P3**~~ | **C — BLOCKED, see the boxed note in Key design.** coturn 4.17.2 emits NO `user` label (measured on the live fleet), so a username→tenant map resolves nothing. Needs `--prometheus-username-labels` (cardinality bomb: usernames are unique per issuance) or `--redis-statsdb`. Deferred; prefer redis-statsdb. | n/a — not built |
 | **P4** | `sfu_participant_seconds` folded in — mostly a rollup over existing `stats_call_user` | rollup-only |
 | **P5** | `relay-costs.toml` + `/observability` Cost & usage section | UI-only |
 | **P6** | `/tenant/{tid}/analytics` Usage section | UI-only |
