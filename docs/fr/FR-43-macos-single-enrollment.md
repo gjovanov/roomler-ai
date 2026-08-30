@@ -166,6 +166,11 @@ Precondition asserted first (`git merge-base --is-ancestor <fix> agent-v0.4.35`)
 
 The group structure, measured under supervision:
 
+<!-- RETIRED-NAME-ANCHOR(5): verbatim `ps` output from the MacBook. The macOS
+     bundle is deliberately NOT renamed — its name keys the TCC grants, so
+     renaming it would drop Screen Recording + Accessibility on every Mac
+     (FR-21). Rewriting the capture to the current name would make it a
+     transcription rather than evidence. -->
 ```
 25894     1 25894     0  roomler-agent   <- root daemon
 34322 25894 34322     0  sudo            <- our child, OWN group (process_group(0))
