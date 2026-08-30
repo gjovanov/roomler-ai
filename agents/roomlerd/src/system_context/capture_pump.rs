@@ -92,6 +92,20 @@ const ACCESS_LOST_FALLBACK_THRESHOLD: u32 = 8;
 /// first frame (<1 s), far under the 13 s the operator sat black.
 const STUCK_CAPTURE_RECOVERY_AFTER: Duration = Duration::from_secs(2);
 
+/// FR-34 P2 (first-frame guarantee). P1's stuck-recovery already prevents a
+/// PERMANENT black on a genuinely static screen — but only after
+/// [`STUCK_CAPTURE_RECOVERY_AFTER`] (2 s), because a static desktop makes DXGI
+/// `AcquireNextFrame` WAIT_TIMEOUT (deliver nothing) with no way to tell it
+/// apart from a stuck duplication until the window elapses. This shorter window
+/// primes ONE GDI BitBlt frame — which always grabs the current screen — so the
+/// controller sees the desktop within ~300 ms of connect instead of ~2 s.
+/// Deliberately does NOT swap the backend or set `delivered_since_build`: DXGI
+/// keeps running and takes over at full quality the instant it delivers a real
+/// frame (so a merely-slow-first-frame DXGI is never abandoned), and a
+/// truly-STUCK DXGI is still caught by the 2 s stuck-recovery below. One-shot
+/// per session via `first_frame_primed`.
+const FIRST_FRAME_GDI_AFTER: Duration = Duration::from_millis(300);
+
 /// FR-34 kill switch. `ROOMLERD_STUCK_CAPTURE_RECOVERY=0` restores the
 /// pre-FR-34 behaviour (a stuck duplication stays black until a reconnect).
 #[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
@@ -111,6 +125,21 @@ fn stuck_capture_recovery_enabled() -> bool {
 #[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
 fn capture_is_stuck(delivered_since_build: bool, backend_age: Duration) -> bool {
     !delivered_since_build && backend_age >= STUCK_CAPTURE_RECOVERY_AFTER
+}
+
+/// FR-34 P2 — should this tick prime a one-shot GDI first frame? True when the
+/// backend has delivered NO frame yet, we have not already primed one this
+/// session, and the shorter [`FIRST_FRAME_GDI_AFTER`] window has elapsed. Pure so
+/// it is unit-testable off-Windows. The full stuck window ([`capture_is_stuck`])
+/// is strictly longer, so a screen that is merely slow to first-frame primes ONE
+/// GDI frame here and is NOT declared stuck.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+fn first_frame_should_prime(
+    delivered_since_build: bool,
+    first_frame_primed: bool,
+    backend_age: Duration,
+) -> bool {
+    !delivered_since_build && !first_frame_primed && backend_age >= FIRST_FRAME_GDI_AFTER
 }
 
 /// rc.108 — once we've fallen back to the slow GDI BitBlt path, retry DXGI
@@ -295,6 +324,12 @@ fn worker_main(
     // (delivered, now Transient) — indistinguishable from `consecutive_empty`.
     let mut backend_built_at = Instant::now();
     let mut delivered_since_build = false;
+    // FR-34 P2 — one-shot: has this SESSION primed a first frame via the
+    // GDI backstop yet? Session-scoped (worker_main runs per SystemContextCapture,
+    // i.e. per capture session), NOT reset on backend rebuild — the fast-first-frame
+    // guarantee is only meaningful at connect, and a re-climbed backend's stuck
+    // case is already the 2 s `capture_is_stuck` path.
+    let mut first_frame_primed = false;
     // rc.108 — last time we attempted to climb back from a GDI fallback to
     // DXGI. Init to now() so the first re-climb attempt waits one full
     // interval (don't fight a just-failed DXGI startup). Only consulted on
@@ -331,6 +366,7 @@ fn worker_main(
             &mut last_dxgi_reclimb,
             &mut backend_built_at,
             &mut delivered_since_build,
+            &mut first_frame_primed,
             start,
             cmd.output_cap,
         );
@@ -574,6 +610,10 @@ fn capture_one_blocking(
     #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))]
     backend_built_at: &mut Instant,
     delivered_since_build: &mut bool,
+    // FR-34 P2 — one-shot first-frame prime flag (see worker_main). Only read on
+    // the DXGI Transient path under `scrap-capture`.
+    #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))]
+    first_frame_primed: &mut bool,
     start: Instant,
     // Phase B — forwarded to GPU-capable DXGI backends; GDI ignores it.
     #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))] output_cap: Option<(
@@ -623,6 +663,39 @@ fn capture_one_blocking(
                 *consecutive_hard = 0;
                 *consecutive_access_lost = 0;
                 *consecutive_empty = consecutive_empty.saturating_add(1);
+                // FR-34 P2 — first-frame guarantee. Before the 2 s stuck window,
+                // if DXGI has delivered NO frame yet and we have not already
+                // primed one, grab a SINGLE GDI BitBlt (which always returns the
+                // current screen) once `FIRST_FRAME_GDI_AFTER` has passed — so the
+                // controller sees the desktop within ~300 ms of connect to a
+                // static screen instead of ~2 s. Deliberately does NOT swap the
+                // backend or set `delivered_since_build`: DXGI keeps running and
+                // takes over at full quality the instant it delivers a real frame
+                // (a merely-slow first frame is never abandoned), and a
+                // truly-STUCK DXGI is still caught by `capture_is_stuck` below.
+                if first_frame_should_prime(
+                    *delivered_since_build,
+                    *first_frame_primed,
+                    backend_built_at.elapsed(),
+                ) && stuck_capture_recovery_enabled()
+                {
+                    *first_frame_primed = true;
+                    match GdiBackend::primary().and_then(|mut g| g.frame()) {
+                        Ok(frame) => {
+                            tracing::info!(
+                                age_ms = backend_built_at.elapsed().as_millis() as u64,
+                                "system-context capture: primed first frame via one-shot GDI while DXGI warms up (FR-34 P2)"
+                            );
+                            return Ok(Some(gdi_to_frame(frame, start)));
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                %e,
+                                "FR-34 P2: one-shot GDI first-frame prime failed; deferring to stuck-recovery"
+                            );
+                        }
+                    }
+                }
                 // FR-34 — a duplication that has delivered NO frame since it was
                 // built, yet keeps returning empty, is STUCK (bound to a stale
                 // desktop after a lock→unlock: AcquireNextFrame WAIT_TIMEOUTs
@@ -905,6 +978,25 @@ mod tests {
         assert!(!capture_is_stuck(true, Duration::from_secs(3600)));
         // exactly at the threshold counts (>=)
         assert!(capture_is_stuck(false, STUCK_CAPTURE_RECOVERY_AFTER));
+    }
+
+    #[test]
+    fn first_frame_primes_before_delivery_and_before_the_stuck_window() {
+        let after = FIRST_FRAME_GDI_AFTER + Duration::from_millis(1);
+        let before = FIRST_FRAME_GDI_AFTER - Duration::from_millis(1);
+        // never delivered, not yet primed, past the short window ⇒ prime once
+        assert!(first_frame_should_prime(false, false, after));
+        // still inside the short window ⇒ let DXGI try first
+        assert!(!first_frame_should_prime(false, false, before));
+        // already primed this session ⇒ never re-prime
+        assert!(!first_frame_should_prime(false, true, after));
+        // DXGI already delivered a real frame ⇒ no GDI prime needed
+        assert!(!first_frame_should_prime(true, false, after));
+        // The prime window MUST be strictly shorter than the stuck window, so a
+        // static screen shows a GDI first frame long before it is declared stuck
+        // — and a stuck DXGI still trips `capture_is_stuck` (prime does not set
+        // `delivered_since_build`).
+        assert!(FIRST_FRAME_GDI_AFTER < STUCK_CAPTURE_RECOVERY_AFTER);
     }
 
     #[test]
