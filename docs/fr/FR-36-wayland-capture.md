@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture, and unattended access
 
-**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **P1 landed behind `ROOMLERD_DRM_CAPTURE` (default OFF). Greeter AND locked-session capture field-verified — the two cases the portal refuses. 4K rate is the open problem** (2026-08-29) · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **P1 capture + P4 uinput input both landed and field-verified (opt-in). Greeter and locked-session capture proven; keystrokes reach GNOME Wayland. 4K rate is the open problem** (2026-08-30) · **Owner:** agent / capture
 
 ## Goal
 
@@ -111,7 +111,7 @@ exists to serve, and is no longer on the critical path for this host.
 | **P1** ✅ | DRM/KMS capture as a fifth `ScreenCapture` backend (`capture/drm_backend.rs`): enumerate CRTCs, `drmModeGetFB2` the active scanout, PRIME-export, mmap, deliver `Frame`s. Handles **`XR24` + `XR30`** (both measured in the field). | **`ROOMLERD_DRM_CAPTURE=1` to opt IN** — see below |
 | **P2** | **Detiling** — EGL import + convert to linear. **NOT needed on Apple Silicon** (plane is LINEAR-only, measured); required for Intel `*_RC_CCS`, Nvidia block-linear. Deferred off the critical path. | same flag ⇒ fall back to portal/X11 |
 | **P3** | **Privilege split.** A minimal helper holding `CAP_SYS_ADMIN`, passing **DMA-BUF fds over `SCM_RIGHTS`**; the daemon never needs the capability itself. | same flag |
-| **P4** | Input on Wayland via **`uinput`** — XTest/enigo does not reach native Wayland clients, so capture without this is a read-only session. | separate flag |
+| **P4** ✅ | Input on Wayland via **`uinput`** (`input/uinput_backend.rs`) — a virtual kernel device, so events enter through evdev beneath the display server. XTest reaches Xwayland clients ONLY, so without this a captured Wayland session is read-only. | **`ROOMLERD_UINPUT=1` to opt IN** |
 
 **Backend priority: DRM/KMS → portal/PipeWire → X11**, but DRM is **opt-in**
 (`ROOMLERD_DRM_CAPTURE=1`) rather than the Linux default — the inverse of this
@@ -197,7 +197,11 @@ out of scope becomes in-scope here.
       not reframed: see the open decision below
 - [ ] Sustained-motion fps **≥ 29** at `target_fps=30`. At 1080p the headroom
       is there; at 4K the measured ceiling is **~19 fps**
-- [ ] Input reaches native Wayland clients (uinput), not only Xwayland ones
+- [x] Input reaches native Wayland clients (uinput), not only Xwayland ones —
+      8 injected characters arrived in **GNOME Shell's own search box on
+      Wayland**, read back off the scanout plane. Pointer verified objectively
+      on X11: `0.25,0.75` → `480,809`, `0.8,0.2` → `1535,215`.
+      ⚠️ `KeyText` and touch are **not** implemented (see open decisions)
 - [x] X11/Windows/macOS unchanged — the backend is Linux-only, feature-gated,
       AND env-gated off; with the flag unset the same host still selects
       `backend=scrap` with X11 damage tracking active
@@ -241,6 +245,17 @@ out of scope becomes in-scope here.
   access and simultaneously a policy question — it must be gated and audited,
   not quietly enabled.
 
+- ⚠️ **`KeyText` is deliberately NOT implemented in the uinput backend.** evdev
+  carries physical keys, so synthesising text needs the TARGET's keyboard
+  layout — assuming US would type mojibake on every other layout. It drops
+  loudly once per session rather than corrupting input quietly. A real fix
+  reads the compositor's active layout (or uses the `xkbcommon` mapping) and is
+  its own piece of work. Touch is likewise unimplemented (needs `ABS_MT_*`).
+- ⚠️ **A uinput device is host-global.** It appears in every application's
+  device list and injects into whatever has focus, including the greeter and
+  the lock screen — the same policy weight as DRM capture, and the reason the
+  gate is opt-in rather than a kill switch.
+
 ## Out of scope
 
 - Replacing X11 or Windows/macOS capture. This adds a backend.
@@ -261,3 +276,6 @@ out of scope becomes in-scope here.
 | 2026-08-29 | **P1 at the LOGIN GREETER** | ✅ autologin disabled, lightdm restarted, **nobody logged in** (`loginctl`: only a `greeter` session for user `lightdm`). Shipping path: `NoopCapture`, zero frames. DRM: **20/20 at 1920×1080, 6.85 ms**, image is the lightdm greeter — user dropdown, password field, Log In button. This is the case the portal structurally refuses (no session ⇒ no portal) |
 | 2026-08-29 | **P1 on a LOCKED session** | ✅ with a real locker running (`xfce4-screensaver`, `/lock/enabled=true`) DRM captured the **XFCE unlock dialog** — user `m1`, password field, Switch User / Cancel / Unlock. ⚠️ **The first attempt was a false negative twice over**, see below |
 | 2026-08-29 | ⚠️ two false results caught | (1) `loginctl lock-session` reported success but `LockedHint` stayed `no` and no locker process existed — the screen was never locked, and the capture was an ordinary desktop. Claiming it would have been a **vacuous pass**. (2) With the locker genuinely active but idle, the capture was **pure black with every counter green** (15/15 frames, 6.71 ms). Waking the dialog with harmless input (mouse move + shift; no password typed) produced the lock screen — so the black was a **genuinely black screen**, faithfully reported |
+| 2026-08-30 | **P4 uinput — pointer, objectively** | ✅ X11 session, `input-smoke --move-to`: `0.25,0.75` → pointer at **480,809**; `0.8,0.2` → **1535,215** (`xdotool getmouselocation`). Sub-pixel error is the 0..=32767 → 0..1919 scaling, not a mapping bug |
+| 2026-08-30 | **P4 uinput — keyboard on WAYLAND, end to end** | ✅ 8 characters injected through `/dev/uinput` on GNOME Wayland arrived in **GNOME Shell's own search box** — the capture read back `terminal` in the search field with Xfce Terminal / Terminal / Konsole / XTerm as results. 21.4 M bytes differed between the before and after frames. Closed loop: **injected below the compositor, observed below the compositor** |
+| 2026-08-30 | P4 hygiene | The virtual device is destroyed on drop — no `Roomler Virtual Input` left in `/sys/devices/virtual/input` after the run. Host returned to XFCE with `backend=scrap` and damage tracking active |
