@@ -82,6 +82,77 @@
             </v-col>
             <v-col cols="12" md="6">
               <v-card>
+                <v-card-title class="text-subtitle-1">
+                  Relayed share
+                  <span class="text-caption text-medium-emphasis ml-1">last hour</span>
+                </v-card-title>
+                <v-card-text>
+                  <div class="text-h4 mb-1">
+                    <template v-if="relayedPct !== null">{{ relayedPct }}%</template>
+                    <span v-else class="text-h6 text-medium-emphasis">no reporters</span>
+                  </div>
+                  <!--
+                    Framed as something to ACT on, not as a bill. A high share
+                    means this org's network is refusing direct paths, which
+                    their own IT can usually fix; that is why the copy names
+                    the likely cause instead of just stating a number.
+                  -->
+                  <p class="text-caption text-medium-emphasis mb-2">
+                    Share of this org's peer links that could not connect
+                    directly and fell back to a relay.
+                    <strong>Connections, not bytes.</strong>
+                    A rising share usually means firewall or NAT policy is
+                    blocking direct paths — relayed links are slower and
+                    higher-latency than direct ones.
+                  </p>
+                  <div class="text-caption">
+                    <span class="mr-3">Direct: {{ mix?.direct ?? 0 }}</span>
+                    <span class="mr-3">Relay: {{ mix?.relay ?? 0 }}</span>
+                    <span>DERP: {{ mix?.derp ?? 0 }}</span>
+                  </div>
+                </v-card-text>
+              </v-card>
+            </v-col>
+            <v-col cols="12" md="6">
+              <v-card>
+                <v-card-title class="text-subtitle-1">Resources used</v-card-title>
+                <v-card-text>
+                  <v-table density="compact">
+                    <tbody>
+                      <tr>
+                        <td>Relayed traffic</td>
+                        <td class="text-right">{{ relayedBytes }}</td>
+                      </tr>
+                      <tr>
+                        <td>Conference participant-time</td>
+                        <td class="text-right">{{ sfuHours }}</td>
+                      </tr>
+                      <tr>
+                        <td>
+                          TURN relayed
+                          <span class="text-caption text-medium-emphasis">
+                            not measured
+                          </span>
+                        </td>
+                        <td class="text-right text-medium-emphasis">—</td>
+                      </tr>
+                      <tr>
+                        <td>Files stored</td>
+                        <td class="text-right">{{ storedBytes }}</td>
+                      </tr>
+                    </tbody>
+                  </v-table>
+                  <p class="text-caption text-medium-emphasis mt-2 mb-0">
+                    Relayed traffic and participant-time are measured over
+                    {{ range }} on our own relays; storage is what the org holds
+                    right now. Traffic that connected directly is never
+                    measured, so it is not counted here.
+                  </p>
+                </v-card-text>
+              </v-card>
+            </v-col>
+            <v-col cols="12" md="6">
+              <v-card>
                 <v-card-title class="text-subtitle-1">Peer latency</v-card-title>
                 <v-card-text>
                   <time-series-chart
@@ -254,7 +325,12 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useTenantStore } from '@/stores/tenant'
-import { useStatsStore, type SeriesPayload, type SeriesPoint } from '@/stores/stats'
+import {
+  useStatsStore,
+  type ResourcesPayload,
+  type SeriesPayload,
+  type SeriesPoint,
+} from '@/stores/stats'
 import { canQueryAnalytics } from '@/utils/permissions'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 import UptimeStrip from '@/components/stats/UptimeStrip.vue'
@@ -275,6 +351,29 @@ const range = ref<StatsRange>('7d')
 const machines = ref<SeriesPayload | null>(null)
 const calls = ref<SeriesPayload | null>(null)
 const tunnels = ref<SeriesPayload | null>(null)
+const resources = ref<ResourcesPayload | null>(null)
+
+// FR-20 P6. Every getter below passes `null` through rather than coercing it:
+// a relayed share of 0% claims a flawless mesh, and an unmonitored meter shown
+// as 0 claims we measured something we did not.
+const mix = computed(() => resources.value?.carrier_mix ?? null)
+const relayedPct = computed<number | null>(() => {
+  const f = mix.value?.relayed_fraction
+  return f === null || f === undefined ? null : Math.round(f * 1000) / 10
+})
+const relayedBytes = computed(() => {
+  const m = resources.value?.meters?.derp_bytes
+  return m && m.monitored && m.total !== null ? fmtBytes(m.total) : '—'
+})
+const sfuHours = computed(() => {
+  const m = resources.value?.meters?.sfu_participant_seconds
+  if (!m || !m.monitored || m.total === null) return '—'
+  return `${(m.total / 3600).toFixed(1)} h`
+})
+const storedBytes = computed(() => {
+  const b = resources.value?.storage?.bytes
+  return typeof b === 'number' ? fmtBytes(b) : '—'
+})
 
 const callMinutesSeries = computed<SeriesPoint[]>(() =>
   (calls.value?.series ?? []).map((p) => ({
@@ -297,14 +396,16 @@ function fmtBytes(v: number): string {
 
 async function load() {
   if (!allowed.value || !props.tenantId) return
-  const [m, c, t] = await Promise.all([
+  const [m, c, t, r] = await Promise.all([
     statsStore.fetchMachines(props.tenantId, range.value).catch(() => null),
     statsStore.fetchCalls(props.tenantId, range.value).catch(() => null),
     statsStore.fetchTunnels(props.tenantId, range.value).catch(() => null),
+    statsStore.fetchResources(props.tenantId, range.value).catch(() => null),
   ])
   machines.value = m
   calls.value = c
   tunnels.value = t
+  resources.value = r
 }
 
 watch([() => props.tenantId, range, allowed], load, { immediate: true })

@@ -212,9 +212,9 @@ must not be logged out of everything (`stats.rs:45-47`).
   there is no counter to reset. Re-open when a tenant is actually homed to a PoP.
 - [x] Two pods writing the same bucket yield exactly one row (asserted in `crates/tests`)
 - [ ] Ledger fleet total agrees with the PoPs' own `net_tx_bytes` within a stated tolerance — an independent cross-check that the meter is honest
-- [ ] A tenant with no relay traffic renders `0`; an unmonitored PoP renders "not monitored" — never the same cell
-- [ ] `/observability` shows per-org cost + margin and the fleet relayed fraction
-- [ ] `/tenant/{tid}/analytics` shows the org's own usage and relayed fraction
+- [x] A tenant with no relay traffic renders `0`; an unmonitored PoP renders "not monitored" — never the same cell
+- [x] `/observability` shows per-org cost + margin and the fleet relayed fraction
+- [x] `/tenant/{tid}/analytics` shows the org's own usage and relayed fraction
 - [ ] Measured DERP forward-path overhead is within noise of the pre-change baseline
 
 ## Open decisions
@@ -276,3 +276,57 @@ Two limits of that claim, stated so nobody over-reads it:
    but it also means the invariant is only as durable as that placement: a
    future meter fed from agent-reported `net_tx_bytes` or netmap stats would
    silently break it, and the 300 MB arm is the test that would catch it.
+
+## Correction: "relayed fraction" cannot be a BYTE fraction (2026-08-30)
+
+The Surfaces section above calls it *"the fraction of traffic that could not go
+direct"*, which reads as bytes. **That number is not computable, and building it
+would contradict the FR's own foundation.** Direct bytes are measured nowhere —
+the meters live in the relay forward path, which is exactly why a direct
+transfer meters zero — so there is no denominator. Any byte-level fraction
+would have to invent the direct half.
+
+Both surfaces therefore render the relayed share of **peer connections**,
+labelled as such on the card itself. Two properties travel with it:
+
+- **It is agent-reported** (`sys.transports.{direct,relay,derp}`), so it is a
+  claim by the fleet rather than a server measurement — the same provenance
+  split as `ssh_activity` vs `ssh_audit`, and the same rule applies: it may
+  raise an alarm, it must never price a bill.
+- **No reporters yields `null`, not `0`.** A zero here reads as a flawless
+  mesh, which is the most flattering possible way to be wrong.
+
+This costs nothing that mattered: the fraction was wanted as a NAT-traversal
+regression alarm, and connections are the better signal for that anyway — one
+chatty relayed pair can dominate a byte share while a hundred pairs quietly
+fall back to relay.
+
+## Decision: the tenant surface shows UNITS, not money (2026-08-30)
+
+Settles open decision 3. `/observability` renders currency because the operator
+is reading their own cost; `/tenant/{tid}/analytics` deliberately does not:
+
+1. These are **our costs, not the org's bill**. A figure that appears on no
+   invoice invites a dispute, and with no quotas there is nothing to measure it
+   against.
+2. The tenant surface exists to be **acted on** — a high relayed share means
+   that org's network is refusing direct paths, which their own IT can usually
+   fix. Pricing it buries a networking finding under a currency symbol.
+
+The unit figures are already what a quota would be denominated in, and the
+payload carries `quota: null` so the slot renders dark rather than implying an
+unlimited plan is a satisfied one.
+
+## Decision: costs live only in `config/relay-costs.toml` (2026-08-30)
+
+No default price exists anywhere in the code, and `RelayCosts` is all
+`Option`. An unset cost renders **"not priced"**; a defaulted `0.00` would
+render as *"this org is free to serve"* and imply **100 % margin** — the single
+number someone would actually make a pricing decision on. Same contract as the
+absent GeoIP database honestly reporting `country: unknown`.
+
+`mrr_cents` is a **list-price estimate** (`price_monthly_cents` x seats), not
+billed revenue: `BillingInfo` stores Stripe ids and a status but no amount.
+`subscription_status` travels with each row so a `canceled` org's MRR is
+visibly notional, and margin pro-rates the monthly price to the selected range
+— comparing a month of revenue against a day of cost is off by 30x.

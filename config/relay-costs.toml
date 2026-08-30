@@ -1,0 +1,35 @@
+# FR-20 P5 — unit costs for the metered relay/SFU resources.
+#
+# This file is the ONLY place a price appears. Nothing in the code carries a
+# default: a missing or partial file makes `/observability` render **"not
+# priced"** rather than a currency figure, for the same reason the GeoIP
+# database's absence renders `country: unknown` instead of guessing. A
+# fabricated 0.00 would read as "this org costs us nothing" and, worse, as
+# 100 % margin — the two most expensive numbers on the page to get wrong.
+#
+# Edit here, redeploy, done. Every value may also be overridden per
+# environment with `ROOMLER__RELAY_COSTS__<KEY>`; the k8s deployment uses the
+# env form so a price change does not require an image rebuild.
+#
+# ⚠ These are COSTS (what the resource costs us), not prices (what a customer
+# pays). Plan prices live in `Plan::price_monthly_cents`, and margin on
+# `/observability` is the difference. Do not "unify" the two.
+
+[relay_costs]
+# ISO-4217, rendered next to every figure. No conversion is performed
+# anywhere — every value below must already be in this currency.
+currency = "EUR"
+
+# Egress billed by the relay hosts, per GB forwarded on a tenant's behalf.
+# Measured by us, on our own hardware, in the relay forward path — see the
+# FR-20 field log for why this is the only byte figure billing may read.
+derp_gb = 0.010
+
+# coturn-relayed egress, per GB. Present so the shape is complete; FR-20 P3 is
+# BLOCKED (coturn 4.17.2 emits no `user` label, so bytes cannot be attributed
+# to a tenant), which is why the meter reports "not monitored" and never 0.
+turn_gb = 0.010
+
+# The SFU's real marginal cost, per participant-hour: a conference's cost
+# scales with participants x time, not with the number of calls.
+sfu_participant_hour = 0.0040
