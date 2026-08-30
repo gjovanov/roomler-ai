@@ -161,7 +161,12 @@ static DERP_NETWORK_BYTES: LazyLock<DashMap<ObjectId, AtomicU64>> = LazyLock::ne
 
 const USAGE_FLUSH: Duration = Duration::from_secs(60);
 
-/// Add `n` relayed bytes for `network_id`. One atomic add on the hot path.
+/// Add `n` relayed bytes for `network_id`.
+///
+/// Steady state is a DashMap `get` (hash + shard read-lock) followed by one
+/// relaxed atomic add — the lookup dominates, not the atomic. Measured by
+/// `bench_add_network_bytes_cost` below; see FR-20 for the numbers and what
+/// they mean against the fleet's real frame rate.
 fn add_network_bytes(network_id: ObjectId, n: u64) {
     if let Some(c) = DERP_NETWORK_BYTES.get(&network_id) {
         c.fetch_add(n, Ordering::Relaxed);
@@ -709,6 +714,71 @@ fn forward_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-20 acceptance: *"measured DERP forward-path overhead is within noise
+    /// of the pre-change baseline"*. `#[ignore]`d — it is a measurement, not a
+    /// pass/fail assertion, and its numbers are machine-specific.
+    ///
+    /// ```text
+    /// cargo test -p roomler-ai-api --lib bench_add_network_bytes_cost \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// Shape chosen deliberately: every thread hammers the SAME network id.
+    /// That is both the realistic case (one busy tenant is one network) and the
+    /// worst one — a single DashMap shard and a single cache line contended by
+    /// every forwarding task. Spreading across ids would flatter the result.
+    #[test]
+    #[ignore]
+    fn bench_add_network_bytes_cost() {
+        use std::time::Instant;
+
+        const ITERS: u64 = 2_000_000;
+        let threads: usize = std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4);
+        let net = ObjectId::new();
+        // Warm the entry so we measure the steady-state `get` path rather than
+        // the once-per-network `entry().or_insert_with()` branch.
+        add_network_bytes(net, 0);
+
+        let run = |label: &str, f: &(dyn Fn() + Sync)| {
+            let t0 = Instant::now();
+            std::thread::scope(|sc| {
+                for _ in 0..threads {
+                    sc.spawn(|| {
+                        for _ in 0..ITERS {
+                            f();
+                        }
+                    });
+                }
+            });
+            let el = t0.elapsed();
+            let ops = ITERS * threads as u64;
+            let per = el.as_nanos() as f64 / ops as f64;
+            println!("  {label:<26} {per:>7.2} ns/op   ({ops} ops on {threads} threads)");
+            per
+        };
+
+        println!("add_network_bytes cost, {threads} threads on ONE network id:");
+        // Floor: the atomic alone, with the lookup already done.
+        let counter = AtomicU64::new(0);
+        let floor = run("atomic add only", &|| {
+            counter.fetch_add(1400, Ordering::Relaxed);
+        });
+        // The real hot path.
+        let real = run("add_network_bytes", &|| add_network_bytes(net, 1400));
+
+        println!(
+            "  lookup overhead over the atomic: {:.2} ns/op",
+            real - floor
+        );
+        // Grounding: the busiest minute this deployment has ever recorded was
+        // 16.87 MB of DERP at ~1.4 KB/frame, i.e. ~200 frames/s fleet-wide.
+        let frames_per_sec = 200.0;
+        let core_pct = real * frames_per_sec / 1e9 * 100.0;
+        println!("  at 200 frames/s (the busiest minute on record): {core_pct:.6}% of one core");
+    }
 
     fn pk(byte: u8) -> DerpPubKey {
         [byte; 32]
