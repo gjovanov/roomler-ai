@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) · **Status:** design · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** design · **Owner:** agent / capture
 
 ## Goal
 
