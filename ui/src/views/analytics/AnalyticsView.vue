@@ -98,12 +98,14 @@
                     the likely cause instead of just stating a number.
                   -->
                   <p class="text-caption text-medium-emphasis mb-2">
-                    Share of this org's peer links that could not connect
-                    directly and fell back to a relay.
+                    Share of this org's peer links currently <em>on</em> a
+                    relay rather than a direct path.
                     <strong>Connections, not bytes.</strong>
-                    A rising share usually means firewall or NAT policy is
-                    blocking direct paths — relayed links are slower and
-                    higher-latency than direct ones.
+                    New links start relayed and upgrade within moments, so a
+                    small share is normal — <strong>a rising trend</strong>
+                    is the signal, and it usually means firewall or NAT
+                    policy is blocking direct paths. Relayed links are
+                    slower and higher-latency than direct ones.
                   </p>
                   <div class="text-caption">
                     <span class="mr-3">Direct: {{ mix?.direct ?? 0 }}</span>
