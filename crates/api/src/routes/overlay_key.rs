@@ -163,6 +163,12 @@ pub async fn rotate_overlay_key(
                 requested_by: auth.user_id,
                 requested_at: DateTime::now(),
                 delivered_at: None,
+                // P1c — what the device holds NOW; a join under another key
+                // is the proof the rotation happened, report or no report.
+                public_key_before: agent
+                    .overlay_identity
+                    .as_ref()
+                    .map(|i| i.public_key.clone()),
             };
             state
                 .agents
@@ -275,6 +281,7 @@ mod tests {
             request_id: "r1".into(),
             requested_by: ObjectId::new(),
             requested_at: now,
+            public_key_before: None,
             delivered_at: delivered_secs_ago
                 .map(|s| DateTime::from_millis(now.timestamp_millis() - s * 1000)),
         }
