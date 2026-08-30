@@ -149,9 +149,13 @@ pub async fn handle_agent_socket(
     // reconnects before its `rotated` report is written, and re-pushing the
     // same order there made it refuse a duplicate and overwrite its own
     // success (P1b, first field run) — see `overlay_key::should_redeliver`.
+    // ⚠️ And never an order the device has ALREADY executed: its join under
+    // another key is the proof (P1d, third cycle — a lost report plus two
+    // reconnects turned one click into three rotations).
     let mut pending_key_rotation: Option<String> = None;
     if let Ok(row) = state.agents.find_in_tenant(tenant_id, agent_id).await {
         if let Some(req) = row.key_rotation.as_ref()
+            && !crate::routes::overlay_key::order_is_satisfied(req, row.overlay_identity.as_ref())
             && crate::routes::overlay_key::should_redeliver(
                 req,
                 row.key_rotation_report.as_ref(),
