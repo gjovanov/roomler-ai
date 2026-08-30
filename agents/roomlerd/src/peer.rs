@@ -1464,11 +1464,13 @@ impl Drop for RateMemoryGuard {
         let (Some(path), Some(peer)) = (self.path.as_ref(), self.peer.as_ref()) else {
             return;
         };
-        if stable == 0 {
-            return;
-        }
         let had_decrease = self.decreases.load(std::sync::atomic::Ordering::Relaxed) > 0;
         let opener_drain = self.opener_drain.load(std::sync::atomic::Ordering::Relaxed);
+        // NOT gated on `stable != 0`: the ceiling learner only reports a stable
+        // rate above the nominal, so a short static session (the common case)
+        // has `stable == 0` yet still carries opener growth evidence. Let
+        // `record_session` decide — it returns 0 (and we skip the save) only
+        // when there is genuinely nothing to remember.
         let mut mem = crate::encode::rate_memory::RateMemory::load(path);
         let kept = mem.record_session(
             peer,
@@ -1477,6 +1479,9 @@ impl Drop for RateMemoryGuard {
             opener_drain,
             crate::encode::rate_memory::now_unix(),
         );
+        if kept == 0 {
+            return;
+        }
         match mem.save(path) {
             Ok(()) => info!(
                 peer,
