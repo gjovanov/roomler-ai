@@ -1450,13 +1450,11 @@ struct RateMemoryGuard {
     /// AIMD decreases seen this session — a LOWER stable rate is only written
     /// back when this is non-zero (an idle session must not decay the memory).
     decreases: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// FR-35 P3 — the pipe's burst drain rate measured on the opening burst
-    /// (`rate_memory::opener_drain_bps`); `0` = not measured. A clean session
-    /// grows the memory toward it, so a pair converges in ONE session instead
-    /// of needing minutes of sustained drag.
+    /// FR-35 P3 — the memory target the opening burst implied
+    /// (`rate_memory::opener_growth_target_bps`, already capped at `hi`);
+    /// `0` = nothing to learn. A clean session grows the memory to it, so a
+    /// pair converges in a few sessions instead of needing minutes of drag.
     opener_drain: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// The learned ceiling's cap (`relay_max_hi_bps`); growth never passes it.
-    hi_bps: u32,
 }
 
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
@@ -1477,7 +1475,6 @@ impl Drop for RateMemoryGuard {
             stable,
             had_decrease,
             opener_drain,
-            self.hi_bps,
             crate::encode::rate_memory::now_unix(),
         );
         match mem.save(path) {
@@ -1486,7 +1483,7 @@ impl Drop for RateMemoryGuard {
                 stable_bps = stable,
                 kept_bps = kept,
                 had_decrease,
-                opener_drain_bps = opener_drain,
+                growth_target_bps = opener_drain,
                 "FR-35 rate memory: stable rate remembered for the pair"
             ),
             Err(e) => {
@@ -4461,7 +4458,6 @@ async fn media_pump_ffmpeg_dc(
         stable: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         decreases: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         opener_drain: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        hi_bps: rate_hi_bps,
     };
     // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
     // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
@@ -4695,7 +4691,11 @@ async fn media_pump_ffmpeg_dc(
     // 5-s step. For the first `OPENER_GRACE` of a constrained session, soft
     // stalls and backpressure skips are counted but not fed to the AIMD; a
     // HARD stall (≥ 1 s) still is.
+    // Held at least this long after the first packet and until the send
+    // ledger is EMPTY (the opener's tail was still draining 1.1 s after a
+    // fixed 2 s ended, and tripped a decrease — field 2026-08-30), capped.
     const OPENER_GRACE: Duration = Duration::from_secs(2);
+    const OPENER_GRACE_MAX: Duration = Duration::from_secs(6);
     // Anchored at the FIRST PACKET, not at pump start: the pump spins for
     // seconds before anything is sent (consent, ICE, the DC opening — the
     // 0.4.27 field run's first packet came 4 s in) and a grace measured from
@@ -5763,25 +5763,42 @@ async fn media_pump_ffmpeg_dc(
         // frame later.
         // FR-35 P3 — end of the opener grace: turn what the send task saw
         // into the pipe's burst drain rate, for the pair memory.
-        if !opener_grace_done && opener_started.is_some_and(|t| t.elapsed() >= OPENER_GRACE) {
+        if !opener_grace_done
+            && opener_started.is_some_and(|t| {
+                let elapsed = t.elapsed();
+                (elapsed >= OPENER_GRACE
+                    && inflight_bytes.load(std::sync::atomic::Ordering::Relaxed) == 0)
+                    || elapsed >= OPENER_GRACE_MAX
+            })
+        {
             opener_grace_done = true;
             in_opener_grace.store(false, std::sync::atomic::Ordering::Relaxed);
             let bytes = opener_bytes.load(std::sync::atomic::Ordering::Relaxed);
             let wait_us = opener_wait_us_max.load(std::sync::atomic::Ordering::Relaxed);
-            let drain = crate::encode::rate_memory::opener_drain_bps(bytes, wait_us);
+            let opener_maxrate = encoder
+                .as_ref()
+                .map(|e| e.current_maxrate_bps())
+                .unwrap_or(0);
+            let target = crate::encode::rate_memory::opener_growth_target_bps(
+                bytes,
+                wait_us,
+                opener_maxrate,
+                rate_hi_bps,
+            );
             if constrained {
                 rate_memory_guard
                     .opener_drain
-                    .store(drain, std::sync::atomic::Ordering::Relaxed);
+                    .store(target, std::sync::atomic::Ordering::Relaxed);
                 info!(
                     %session_id,
                     codec_label,
                     opener_bytes = bytes,
                     opener_wait_max_ms = wait_us / 1000,
-                    opener_drain_bps = drain,
+                    opener_maxrate_bps = opener_maxrate,
+                    growth_target_bps = target,
                     grace_soft_stalls,
                     grace_bp_skips,
-                    "FR-35 opener grace over — the opening burst's drain rate is the pair's burst capacity"
+                    "FR-35 opener grace over — the opening burst sized the pair memory's next step"
                 );
             }
         }
