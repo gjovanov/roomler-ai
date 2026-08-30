@@ -202,6 +202,32 @@ enum Command {
         #[arg(long, default_value = "never")]
         downscale: String,
     },
+    /// Smoke-test input injection on THIS host: open the injector cascade
+    /// and drive a scripted sequence through it. Reports which backend
+    /// answered.
+    ///
+    /// The counterpart to `capture-smoke`, and needed for the same reason:
+    /// "does input work here" was otherwise only answerable through a full
+    /// remote-control session. It matters most on Wayland, where XTest does
+    /// not fail — it succeeds and does nothing.
+    #[command(hide = true, name = "input-smoke")]
+    InputSmoke {
+        /// Move the pointer to this normalised position first, e.g. `0.5,0.5`.
+        #[arg(long)]
+        move_to: Option<String>,
+        /// Click a button after moving: `left` | `right` | `middle`.
+        #[arg(long)]
+        click: Option<String>,
+        /// Type this ASCII text. ⚠️ Mapped through a **US layout** table that
+        /// exists only for this smoke test — the injector itself deliberately
+        /// refuses to synthesise text, because evdev carries physical keys and
+        /// guessing a layout types mojibake on every other one.
+        #[arg(long)]
+        text: Option<String>,
+        /// Milliseconds between events.
+        #[arg(long, default_value_t = 25)]
+        delay_ms: u64,
+    },
     /// M3 derisking spike: probe Windows.Graphics.Capture init from
     /// the requested desktop. Three modes — `default` (no swap, sanity
     /// baseline; should always pass in a user session), `input`
@@ -983,6 +1009,17 @@ async fn daemon_main() -> Result<()> {
             fps,
             downscale,
         } => capture_smoke_cmd(frames, dump.as_deref(), fps, &downscale).await,
+        Command::InputSmoke {
+            move_to,
+            click,
+            text,
+            delay_ms,
+        } => input_smoke_cmd(
+            move_to.as_deref(),
+            click.as_deref(),
+            text.as_deref(),
+            delay_ms,
+        ),
         Command::SystemCaptureSmoke {
             desktop,
             frames,
@@ -3733,6 +3770,125 @@ async fn capture_smoke_cmd(
         println!("capture-smoke: wrote {path} ({} bytes)", out.len());
     }
     Ok(())
+}
+
+/// `input-smoke` CLI dispatch — "does input injection work on this host?"
+///
+/// Goes through `input::open_default` rather than naming a backend, so it
+/// answers the operator's actual question (which one did this host pick?) and
+/// puts the cascade itself under test.
+fn input_smoke_cmd(
+    move_to: Option<&str>,
+    click: Option<&str>,
+    text: Option<&str>,
+    delay_ms: u64,
+) -> Result<()> {
+    use roomlerd::input::{Button, InputMsg};
+
+    let mut inj = roomlerd::input::open_default();
+    println!("input-smoke: has_permission={}", inj.has_permission());
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+
+    let mut pos = (0.5f32, 0.5f32);
+    if let Some(spec) = move_to {
+        let (a, b) = spec.split_once(',').ok_or_else(|| {
+            anyhow::anyhow!("--move-to wants `x,y` (normalised 0..1), got {spec:?}")
+        })?;
+        pos = (a.trim().parse()?, b.trim().parse()?);
+        inj.inject(InputMsg::MouseMove {
+            x: pos.0,
+            y: pos.1,
+            mon: 0,
+        })?;
+        println!("input-smoke: moved to {:?}", pos);
+        pause();
+    }
+
+    if let Some(b) = click {
+        let btn = match b.trim().to_ascii_lowercase().as_str() {
+            "left" => Button::Left,
+            "right" => Button::Right,
+            "middle" => Button::Middle,
+            other => bail!("unknown --click {other:?} (left|right|middle)"),
+        };
+        for down in [true, false] {
+            inj.inject(InputMsg::MouseButton {
+                btn,
+                down,
+                x: pos.0,
+                y: pos.1,
+                mon: 0,
+            })?;
+            pause();
+        }
+        println!("input-smoke: clicked {b}");
+    }
+
+    if let Some(t) = text {
+        let mut sent = 0usize;
+        let mut skipped = 0usize;
+        for ch in t.chars() {
+            let Some((hid, shift)) = ascii_to_hid(ch) else {
+                skipped += 1;
+                continue;
+            };
+            // 0xe1 = HID Left Shift.
+            if shift {
+                inj.inject(InputMsg::Key {
+                    code: 0xe1,
+                    down: true,
+                    mods: 0,
+                })?;
+            }
+            inj.inject(InputMsg::Key {
+                code: hid,
+                down: true,
+                mods: 0,
+            })?;
+            pause();
+            inj.inject(InputMsg::Key {
+                code: hid,
+                down: false,
+                mods: 0,
+            })?;
+            if shift {
+                inj.inject(InputMsg::Key {
+                    code: 0xe1,
+                    down: false,
+                    mods: 0,
+                })?;
+            }
+            pause();
+            sent += 1;
+        }
+        println!("input-smoke: typed {sent} chars, {skipped} unmappable");
+    }
+    println!("input-smoke: done");
+    Ok(())
+}
+
+/// ASCII → HID usage (page 0x07), **US layout**, for `input-smoke` only.
+///
+/// ⚠️ Deliberately NOT in the injector. evdev carries physical keys, so
+/// turning text into keystrokes needs the TARGET's layout; assuming US there
+/// would type mojibake on every other layout. Here the operator is typing a
+/// known test string and can see the result, so the assumption is visible and
+/// bounded.
+fn ascii_to_hid(ch: char) -> Option<(u32, bool)> {
+    let lower = ch.to_ascii_lowercase();
+    let shift = ch.is_ascii_uppercase();
+    let hid = match lower {
+        'a'..='z' => 0x04 + (lower as u32 - 'a' as u32),
+        '1'..='9' => 0x1e + (lower as u32 - '1' as u32),
+        '0' => 0x27,
+        ' ' => 0x2c,
+        '\n' => 0x28,
+        '-' => 0x2d,
+        '.' => 0x37,
+        '/' => 0x38,
+        _ => return None,
+    };
+    Some((hid, shift))
 }
 
 /// `system-capture-smoke` CLI dispatch. Synchronous (no .await) — the
