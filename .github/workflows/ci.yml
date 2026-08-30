@@ -173,12 +173,25 @@ jobs:
       # readers and its deny reason was constructed only in tests, which
       # `--all-targets` would have surfaced as unused).
       #
-      # Scoped to the two server crates rather than `--workspace`: those are
+      # Scoped to the audited crates rather than `--workspace`: these are
       # verified green, while the wider workspace has not been audited under
       # `--all-targets` and must not be flipped blind. Widen it per crate as
       # each is checked.
-      - name: Run clippy on the server crates (incl. test targets)
-        run: cargo clippy -p roomler-ai-api -p roomler-ai-services --all-targets -- -D warnings
+      #
+      # `roomler-ai-tests` joined the list in #894. It is the crate that most
+      # needed it: virtually all of it is `#[cfg(test)]`, so the `--workspace`
+      # step above compiles almost NONE of it, and 24 lints had accumulated
+      # unread — 9 when the issue was filed on 2026-08-29, 24 by the time it was
+      # fixed, which is the accrual rate of a guard nobody runs.
+      #
+      # This is the same crate whose history is "it rotted because nothing ran
+      # it" (#646). Lints are the cheap half of that guard, and they were off for
+      # exactly the crate with the worst record. It also catches a specific
+      # mistake nothing else does: a `mod x_tests;` added to `lib.rs` WITHOUT its
+      # `#[cfg(test)]` gate compiles the module's helpers into the lib target as
+      # dead code, which only `--all-targets` surfaces.
+      - name: Run clippy on the audited crates (incl. test targets)
+        run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests --all-targets -- -D warnings
 
       # `crates/api` unit tests ran in NO lane until now: the clippy step above
       # is `--workspace` WITHOUT `--all-targets`, so it does not even compile
