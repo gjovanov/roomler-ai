@@ -113,8 +113,19 @@ PipeWire installed**, not by reasoning about it.
 
 - **Which of the three dependency shapes above.** This is the decision the FR
   turns on; everything else is ordinary work.
-- **Does `/dev/uinput` exist and work in WSL2?** If yes, P4 disappears and
-  FR-36's uinput backend covers input for free. Measure before designing.
+- ⚠️ **`/dev/uinput` WORKS in WSL2 — but that is not the question.** Measured
+  2026-08-31: `CONFIG_INPUT_UINPUT=m`, the module loads, and FR-36's injector
+  created a device and accepted a pointer move (`input: backend=uinput`,
+  `has_permission=true`). So injection is not the obstacle.
+  ⚠️⚠️ **`/dev/input/` is otherwise EMPTY on WSL2** — no evdev devices at all,
+  because WSLg's input arrives over RDP rather than from libinput. A uinput
+  device therefore publishes events that, on present evidence, **nothing in
+  WSL2 consumes**. So P4 probably survives — not because uinput fails, but
+  because the reader is missing.
+  **Still unproven, and it is the thing to test first:** whether a *nested*
+  compositor (`gnome-shell --nested` under WSLg) reads evdev. If it does, P4
+  disappears; if it does not, the portal's RemoteDesktop interface is the only
+  input path and P4 is mandatory. One nested session answers it.
 - **Restore tokens: store or not.** They are per-compositor, invalidated by
   reboot/logout, and a failed locked-session attempt can consume one. Storing a
   token that is silently dead is worse than prompting.
@@ -137,3 +148,4 @@ PipeWire installed**, not by reasoning about it.
 | 2026-08-31 | 0.4.33, WSL2 | **`/dev/dri` absent** — DRM capture impossible. `/dev/dxg` + `libnvidia-encode.so` present; caps probe reports `ffmpeg-av1_nvenc`, `ffmpeg-hevc_nvenc`, `ffmpeg-h264_nvenc` on an RTX 5090 |
 | 2026-08-31 | 0.4.33, WSL2 | Xvfb virtual desktop + `av1_nvenc`: 1920×1080, `avg_encode_ms=10.4`, 77 kbps idle, ~41 ms. Establishes the encode half works; only capture is missing |
 | 2026-08-31 | 0.4.33, Asahi | Wayland captured via DRM at 1920×1080, but **software encode only** — no video-encode driver exists for Apple Silicon on Linux |
+| 2026-08-31 | 0.4.33, WSL2 | **uinput measured, and it reframes P4.** `CONFIG_INPUT_UINPUT=m`, module loads, FR-36's injector created a device and accepted a move (`has_permission=true`) — injection is not the obstacle. But `/dev/input/` is **empty** (WSLg takes input over RDP, not evdev), so nothing appears to consume those events. P4 likely survives because the *reader* is missing, not the writer. Untested: whether a nested `gnome-shell` reads evdev |
