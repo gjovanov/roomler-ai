@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture, and unattended access
 
-**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **END-TO-END PROVEN: the browser renders a GNOME Wayland desktop, drives it, and TYPES into it — via DRM capture + uinput, both opt-in. Greeter + locked screen also verified** (2026-08-30) · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **COMPLETE on every functional criterion: the browser renders a GNOME Wayland desktop, drives it, types into it, sees the greeter and a locked screen, and survives a reboot with nobody logged in** (2026-08-30) · **Owner:** agent / capture
 
 ## Goal
 
@@ -211,7 +211,13 @@ out of scope becomes in-scope here.
       reports it faithfully, but a viewer connecting to an idle locked host
       sees black until something wakes the display — do not diagnose that as a
       capture failure; it is FR-34 territory
-- [ ] Survives a reboot with nobody logged in interactively
+- [x] **Survives a reboot with nobody logged in interactively — VERIFIED
+      2026-08-30.** Cold boot with autologin disabled: `loginctl` showed only a
+      `greeter` session for user `lightdm`, and the browser rendered **the login
+      greeter** (`connected`, 26 fps, 1920×1080). The daemon was started at boot
+      by its unit, and both config gates survived the reboot in
+      `/etc/roomler/config.toml` — which is the point of them being config keys
+      rather than env.
 - [x] `avg_capture_ms` **< 10 ms** at **1080p** — measured **5.84 ms** for the
       whole backend (1.58 ms of that is the framebuffer read; the rest is the
       BGRA repack). Same host/session, scrap measured 5.11 ms
@@ -349,3 +355,11 @@ out of scope becomes in-scope here.
 | 2026-08-30 | **🏆 END-TO-END BROWSER SESSION — PASSED** | The `roomler.ai` viewer rendered `scw-m2-asahi`'s **GNOME Wayland** desktop (`connected`, H.264 SW, ~16 fps, **2048×1080** for a 4096×2160 panel ⇒ the fused downscale fed the encoder). Daemon log for that session: `capture: backend=drm … node="/dev/dri/card2" 4096x2160` + `input: backend=uinput`. **Gates came from CONFIG, not env** (`config-backed env fallbacks registered keys=[…DRM_CAPTURE…UINPUT]`) — decisive, because the serving daemon was spawned by the host's auto-start hook *outside systemd*, where a unit env block could not have reached it. A browser click opened **GNOME Shell's own calendar panel**; `Escape` closed it. ⚠️ Typing did NOT arrive — the viewer sends `KeyText`, which the backend drops by design: **navigate yes, type no** |
 | 2026-08-30 | how the blocker was cleared | The auto-updater had already installed release **0.4.30**, which carries the merged FR-36 stack — so the test ran against the **shipped artifact**, not a dev build, and no binary swap was needed after all. Gates were set with `roomlerd cli config set`. ⚠️ A dead-man switch (`systemd-run --on-active=…` restoring the packaged service) was armed throughout; the host briefly went offline during a bad `systemd-run` invocation (`--config` was swallowed as a systemd-run option — it needs `--`) and the hook restored it within seconds |
 | 2026-08-30 | **🏆 P4b — typing works through the browser** | Typed `echo FR36-TYPED-OK-123` in the viewer → **exactly that appeared at the remote GNOME Wayland terminal prompt**, `Enter` ran it, the shell echoed the result. Uppercase, digits and punctuation all correct ⇒ shift handling right. Daemon: `uinput: typed text will be sent as physical keys for this layout layout="us" detected="us"`. Full round trip: browser → WebRTC → roomlerd → uinput → evdev → libinput → mutter → terminal → bash. ⚠️ The first two attempts showed nothing and the code was NOT at fault — typing on a bare GNOME desktop does nothing (no focus), and GNOME 48 has no Activities button to click. Putting a real terminal on the desktop was what made the test decisive |
+| 2026-08-30 | **🏆 survives a reboot, nobody logged in** | Cold boot, autologin disabled ⇒ `loginctl` shows only a `greeter` session for `lightdm`. The browser rendered **the lightdm greeter** at `connected`, 26 fps, 1920×1080. Gates survived in `/etc/roomler/config.toml` — the payoff for making them config keys rather than env |
+<!-- RETIRED-NAME-ANCHOR(6): `roomler-agent.service` is named deliberately —
+     it is the retired-name systemd unit that was still ENABLED on this host
+     and racing `roomlerd.service` for the single-instance lock. The unit
+     literally exists under that name on pre-rename machines, so an operator
+     hunting this restart storm must be able to grep for it. FR-21 / FR-36. -->
+
+| 2026-08-30 | **root cause of this host's restart storm — FOUND and FIXED** | Not an "auto-start hook": **two units**. `roomler-agent.service` (the RETIRED name, `ExecStart=/usr/bin/roomlerd run`, no `--config`) was still **enabled** and owned the live process, while `roomlerd.service` (current name, `--config`) was disabled. They race for the single-instance lock. ⚠️ **Every `systemctl start roomlerd` I ran during this FR started the second unit to fight the first** — I was generating the storms I was diagnosing. Fixed by `disable roomler-agent` + `enable roomlerd`; verified across a second reboot: one daemon, under `roomlerd.service`, **0 lock refusals since boot** |
