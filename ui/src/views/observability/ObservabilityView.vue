@@ -136,10 +136,12 @@
                 <span v-else class="text-medium-emphasis text-h6">no reporters</span>
               </div>
               <div class="text-caption text-medium-emphasis mt-1">
-                share of peer links that could not go direct, last hour.
+                share of peer links currently <em>on</em> a relay carrier.
                 <strong>Connections, not bytes</strong> — direct traffic is
                 deliberately never measured, so a byte share is not computable.
-                Agent-reported: an alarm, not a bill.
+                Agent-reported, and it counts freshly-created pairs that
+                start relayed and are still upgrading, so read the trend
+                rather than the absolute. An alarm, not a bill.
               </div>
             </v-card-text>
           </v-card>
@@ -569,6 +571,11 @@ function money(v: number | null | undefined): string | null {
   // Sub-cent costs are normal at these unit prices, so show enough digits to
   // avoid rendering a real cost as 0.00 — which would be the same lie by
   // rounding that the null-handling above exists to prevent.
+  // Below four decimals, fall back to a threshold rather than 0.0000: a row
+  // of zeros reads as "free" just as convincingly as 0.00 does, which is the
+  // lie this function exists to avoid. Measured on prod 2026-08-31: a live
+  // org's 24h DERP cost was 0.0000024.
+  if (v > 0 && v < 0.0001) return `< 0.0001 ${currency.value}`.trim()
   const digits = v > 0 && v < 0.01 ? 4 : 2
   return `${v.toFixed(digits)} ${currency.value}`.trim()
 }
