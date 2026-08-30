@@ -47,6 +47,7 @@ use roomler_ai_remote_control::derp_ticket;
 use roomler_ai_remote_control::derp_ticket::jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -60,10 +61,22 @@ type Registry = Arc<DashMap<DerpKey, mpsc::Sender<Vec<u8>>>>;
 const DERP_SEND_QUEUE: usize = 256;
 const DERP_MAX_FRAME: usize = 2048;
 
+/// FR-20 B — bytes this PoP has relayed, per overlay network, since process
+/// start. **Cumulative and never reset**: the API's poller diffs successive
+/// `/stats` samples, exactly as it already does for the host `net_*_bytes`
+/// counters.
+///
+/// ⚠ This binary stays **DB-free** — that is a design invariant, not an
+/// oversight. It holds the ticket's public key and nothing else, so a PoP
+/// cannot attribute a network to a tenant and must not try. It counts; the API
+/// resolves and bills.
+type NetworkBytes = Arc<DashMap<String, AtomicU64>>;
+
 #[derive(Clone)]
 struct RelayState {
     registry: Registry,
     ticket_key: Arc<DecodingKey>,
+    network_bytes: NetworkBytes,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +101,7 @@ async fn main() {
     let state = RelayState {
         registry: Arc::new(DashMap::new()),
         ticket_key: Arc::new(ticket_key),
+        network_bytes: Arc::new(DashMap::new()),
     };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -168,6 +182,21 @@ async fn stats(State(state): State<RelayState>) -> axum::Json<serde_json::Value>
         "net_tx_bytes": tx,
         "uptime_s": uptime_s,
         "derp_registrations": state.registry.len(),
+        // FR-20 B — cumulative relayed bytes per overlay network, since this
+        // process started. The API poller diffs successive samples and resolves
+        // network → tenant; this binary never learns which tenant is which.
+        //
+        // ⚠ A restart resets these to zero, so the poller's diff for that
+        // interval goes NEGATIVE and is discarded — the bucket under-reports
+        // rather than going wrong, the identical trade the host `net_*_bytes`
+        // counters above already make. Do not "fix" it with a fabricated
+        // carry-over; an invented byte on a cost ledger is worse than a
+        // missing one.
+        "per_network": state
+            .network_bytes
+            .iter()
+            .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+            .collect::<std::collections::HashMap<String, u64>>(),
         "coturn": coturn_prometheus().await,
     }))
 }
@@ -268,7 +297,13 @@ async fn handle_socket(state: RelayState, socket: WebSocket, network: String, ti
         tokio::select! {
             msg = ws_rx.next() => match msg {
                 Some(Ok(Message::Binary(frame))) => {
-                    forward_frame(&state.registry, &network, &self_pubkey, &frame[..]);
+                    forward_frame(
+                        &state.registry,
+                        &state.network_bytes,
+                        &network,
+                        &self_pubkey,
+                        &frame[..],
+                    );
                 }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 Some(Ok(_)) => {} // text/ping/pong — axum auto-pongs
@@ -289,7 +324,13 @@ async fn handle_socket(state: RelayState, socket: WebSocket, network: String, ti
 /// `[dst_pk(32)‖payload]` from `src` → `[src_pk(32)‖payload]` to dst, only
 /// within `network`. Drops silently on short/oversized frames, unknown dst,
 /// or a full destination queue (the carrier is loss-tolerant).
-fn forward_frame(registry: &Registry, network: &str, src_pubkey: &DerpPubKey, frame: &[u8]) {
+fn forward_frame(
+    registry: &Registry,
+    network_bytes: &NetworkBytes,
+    network: &str,
+    src_pubkey: &DerpPubKey,
+    frame: &[u8],
+) {
     if frame.len() < 32 || frame.len() > DERP_MAX_FRAME {
         return;
     }
@@ -303,7 +344,20 @@ fn forward_frame(registry: &Registry, network: &str, src_pubkey: &DerpPubKey, fr
     let mut out = Vec::with_capacity(32 + payload.len());
     out.extend_from_slice(src_pubkey);
     out.extend_from_slice(payload);
-    let _ = sender.try_send(out);
+    let n = out.len() as u64;
+    // FR-20 B — count only what we actually delivered. Same rule as the API
+    // pod: a frame dropped on a full queue cost us nothing and must not appear
+    // on any tenant's ledger. One atomic add; the PoP never touches a DB.
+    if sender.try_send(out).is_ok() {
+        if let Some(c) = network_bytes.get(network) {
+            c.fetch_add(n, Ordering::Relaxed);
+        } else {
+            network_bytes
+                .entry(network.to_string())
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(n, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +383,7 @@ mod tests {
         let state = RelayState {
             registry: Arc::new(DashMap::new()),
             ticket_key: Arc::new(key),
+            network_bytes: Arc::new(DashMap::new()),
         };
         let registry = state.registry.clone();
         let app = router(state);
