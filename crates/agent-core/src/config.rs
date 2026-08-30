@@ -95,6 +95,20 @@ pub struct AgentConfig {
     #[serde(default)]
     pub exec_enabled: bool,
 
+    /// FR-43 P1 — on macOS, let the ROOT daemon spawn and babysit the
+    /// GUI-session worker instead of leaving that to a separate LaunchAgent.
+    /// First step toward ONE enrollment (one device row) for a Mac: two
+    /// processes are forced by the OS, two device rows are not.
+    ///
+    /// Default OFF — with it off the two halves behave exactly as today. Even
+    /// ON, the supervisor stands down whenever the LaunchAgent is loaded, so
+    /// one enrollment is never served twice (the hub displaces the older
+    /// control WS, which would flap). See `macos_supervisor`.
+    ///
+    /// No effect on any other platform.
+    #[serde(default)]
+    pub macos_supervise_gui_worker: bool,
+
     /// Whether this device accepts configuration pushed from its control
     /// plane (see `docs/remote-config.md`).
     ///
@@ -1692,6 +1706,7 @@ pub fn test_fixture() -> AgentConfig {
         enable_remote_browse: true,
         auto_grant_session: true,
         exec_enabled: false,
+        macos_supervise_gui_worker: false,
         remote_config_enabled: false,
         ssh_enabled: false,
         ssh_port: None,
