@@ -12,3 +12,7 @@ agents/roomlerd/packaging/linux/debian/* text eol=lf
 # end in CR, and the shell scripts are run on Linux hosts.
 agents/roomlerd/packaging/linux/*.service text eol=lf
 scripts/*.sh text eol=lf
+
+# The sanitisation guard runs on Linux CI; a CRLF shebang would break it.
+.claude/skills/sanitize-hostnames/*.sh text eol=lf
+.claude/skills/sanitize-hostnames/*.py text eol=lf
