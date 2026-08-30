@@ -117,7 +117,7 @@ companion.
 
 ## Field-verification log
 
-All of it on the operator's MacBook (`Gorans-MacBook-Pro`, Apple Silicon), driven
+All of it on the operator's MacBook (Apple Silicon), driven
 remotely — `roomler exec` for P0, `roomler ssh` on the daemon row from P1 onwards.
 
 ### 2026-08-30 — P0 spike: the mechanism works, and one half was never measured
@@ -147,7 +147,7 @@ can *never* start is a configuration fault and hammering it hides the cause.
 
 ### 2026-08-30 — 0.4.34 re-test: privilege drop verified
 
-Worker pid 4526 at **uid 501 (`gjovanov`)**, parent 4525 = `sudo -u '#501'` at uid 0;
+Worker pid 4526 at **uid 501 (the console user, not root)**, parent 4525 = `sudo -u '#501'` at uid 0;
 LaunchAgent confirmed not loaded; `permissions: ["screen-capture", "input"]`.
 `kill -9` → respawned in ~14 s, again uid 501. Stand-down verified separately: with the
 LaunchAgent loaded, `action=LaunchdOwns` and the user half's pid never moved.
