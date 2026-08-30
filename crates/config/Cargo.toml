@@ -9,3 +9,8 @@ edition.workspace = true
 config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# FR-20 P5 — parses the shipped `config/relay-costs.toml` in a test, so a
+# mistyped key there cannot fail silently into an unpriced deployment.
+toml.workspace = true
