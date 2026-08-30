@@ -192,6 +192,7 @@ and permission-gated; a defective push is stopped by the device switch.
 |---|---|---|---|
 | P0 | spec + issue + ledger claim | — | this |
 | P1 | verb + order + device mint/persist/report/reconnect + route + audit + ceiling + reconcile-on-connect + UI action/state/pubkey column; release | `overlay_key_rotation` | implemented — PR #963 (server + agent + UI, unit + integration tests); release + field verification pending |
+| P1b | the duplicate-delivery race found by the first field run: a freshly delivered order (< 120 s) is not re-pushed on the device's own reconnect, and a refusal never overwrites a `rotated` report for the same order | — | implemented, PR pending |
 | P2 | retired keys: refuse at join + DERP, self-heal order, pubkey index | none needed (refusal is fail-closed) | open |
 | P3 | `roomler overlay rotate-key [--org]` over LocalAPI (break-glass when the control plane is the compromised thing); tunnel-only clients (`roomler` standalone) | — | open |
 
@@ -200,14 +201,13 @@ and permission-gated; a defective push is stopped by the device switch.
 - [ ] the route on a device advertising the verb returns `delivered`; the device log shows
       mint → save → report → reconnect; the node row's `wg_public_key` and `key_epoch` change
       within 10 s and the dashboard reads `rotated`
-- [ ] neo16's `roomler peers --json` shows CORPLAP-3 under the NEW public key with a working
-      carrier, and traffic flows (RC session or overlay ping) within 30 s of the click
+- [x] neo16's daemon reinstalled CORPLAP-3 under the NEW public key (`peer's WG public key changed - reinstalling its carrier`, 00:19:39, 12 s after the re-join) and traffic flows: overlay ping 4/4 at 84–97 ms within 60 s of the click (`roomler peers --json` carries no key field — the log line is the evidence)
 - [ ] the old public key is on no peer's WG device afterwards (`roomler peers` on ≥ 2 peers)
 - [ ] a device on `0.4.24` or older (no verb) gets `unsupported` on the route, not a spinner
 - [ ] a device that is offline is `queued`, and rotates on its next connect with no operator action
 - [ ] a second click within 60 s is `refused: rate_limited` and audited
 - [ ] `overlay_key_rotation = false` on the device ⇒ `refused: disabled`, key unchanged
-- [ ] the request and the report carry public keys only — a test asserts the serialised
+- [x] the request and the report carry public keys only — a test asserts the serialised
       `KeyRotate` frame has no key-shaped field, and the audit row stores none
 - [ ] (P2) a join presenting a retired key is refused `key_retired`, and a device with the verb
       is ordered to rotate instead of staying off-mesh
@@ -239,3 +239,4 @@ and permission-gated; a defective push is stopped by the device switch.
 | date | build | note |
 |---|---|---|
 | 2026-08-30 | — | P0: exposure bounded to ONE device / ONE key by a masked transcript scan; no token, no SSH host key. |
+| 2026-08-30 00:19 UTC | CORPLAP-3 `0.4.25`, web `v20260830-3cde7568624e` | **First field run**, ordered from the device grid. Device log: `rc:agent.key_rotate — new overlay key persisted` (00:19:26.031, old `148DYcQn…`) → `overlay key rotated — reconnecting … key_epoch=1` (.335) → `rc:overlay.join sent` (00:19:27.127); `config.toml` `overlay_wg_key_epoch = 1`; server identity `1xbYDyZ2qm… / e1` within the first API sample; neo16 reinstalled the peer at 00:19:39 and overlay ping to 100.65.4.30 ran 4/4 at 84–97 ms. **Defect (P1b)**: 00:19:27.157 — 30 ms after the join — the reconnect's register re-pushed the SAME order (its `rotated` report, sent on the dying session and written by a spawned task, had not landed), the device refused the duplicate under its 60 s ceiling, and that refusal overwrote the `rotated` report ⇒ the dashboard read `refused (rate_limited)` for a rotation that succeeded. Fixed by `should_redeliver` (no re-push inside 120 s of delivery) + a conditional report write (a refusal never overwrites a `rotated` report for the same order). Second run pending on the fix. |
