@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture, and unattended access
 
-**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **COMPLETE on every functional criterion: the browser renders a GNOME Wayland desktop, drives it, types into it, sees the greeter and a locked screen, and survives a reboot with nobody logged in** (2026-08-30) · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **CLOSED 2026-08-30 — every functional criterion field-verified.** The browser renders a GNOME Wayland desktop, drives it, types into it, sees the greeter and a locked screen, and survives a reboot with nobody logged in. ⚠️ Two performance numbers did NOT meet their stated bar; see the acceptance list · **Owner:** agent / capture
 
 ## Goal
 
@@ -236,6 +236,23 @@ out of scope becomes in-scope here.
       AND env-gated off; with the flag unset the same host still selects
       `backend=scrap` with X11 damage tracking active
 - [x] Field-verified with the **before** state recorded beside the after
+
+
+## Why this is closed with two criteria unmet
+
+`avg_capture_ms < 10 ms` is met at 1080p (5.84 ms) and **not** at native 4K
+(43.8 ms undownscaled). That number is not going to move much: 15.2 ms of it is
+the framebuffer read itself, and the rest is a repack whose output is the same
+size as its input, so the fusion trick that fixed the downscaled path has no
+equivalent here. It is memory bandwidth on a unified-memory machine.
+
+It is closed anyway because **the bar was the wrong proxy at 4K**. What the FR
+actually needs is a usable session, and the production path — `Auto`, which
+halves anything above 3.5 Mpx — delivers **24.0 ms, ~30 fps** at 4K. The
+underlying goal is met; the intermediate metric is not, and it is recorded that
+way rather than reworded into a pass.
+
+Reopen this if a 4K Wayland session is measured behaving worse than that.
 
 ## Open decisions / risks
 
