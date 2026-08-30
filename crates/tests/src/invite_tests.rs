@@ -88,7 +88,7 @@ async fn test_create_targeted_invite() {
 #[tokio::test]
 async fn test_accept_shareable_invite() {
     let app = TestApp::spawn().await;
-    let (admin, tenant_id, code) = setup_with_invite(&app, "inv3").await;
+    let (_admin, tenant_id, code) = setup_with_invite(&app, "inv3").await;
 
     // Register a new user
     let new_user = app
@@ -275,7 +275,7 @@ async fn test_list_invites() {
 #[tokio::test]
 async fn test_revoke_invite() {
     let app = TestApp::spawn().await;
-    let (admin, tenant_id, code) = setup_with_invite(&app, "inv7").await;
+    let (admin, tenant_id, _code) = setup_with_invite(&app, "inv7").await;
 
     // Get invite ID from list
     let resp = app

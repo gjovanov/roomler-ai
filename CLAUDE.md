@@ -102,7 +102,8 @@ cd ui && bun run e2e                   # Playwright E2E tests (24 spec files)
 
 # Static Analysis
 cargo fmt --all -- --check                  # Rust fmt (matches CI)
-cargo clippy --workspace --all-targets --all-features -- -D warnings   # Rust lint (matches CI — include --all-targets so test-only lints fire)
+cargo clippy --workspace -- -D warnings                                 # Rust lint — what CI runs across the workspace
+cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests --all-targets -- -D warnings   # + CI's audited-crate pass, where test-only lints fire
 cargo check --workspace                     # Rust compilation check
 cd ui && vue-tsc --noEmit                  # Vue TypeScript check
 

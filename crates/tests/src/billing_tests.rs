@@ -388,7 +388,7 @@ async fn webhook_with_valid_signature_processes_checkout_completed() {
     assert_eq!(billing.get_str("customer_id").unwrap(), "cus_test_456");
     assert_eq!(billing.get_str("subscription_id").unwrap(), "sub_test_123");
     assert_eq!(billing.get_str("status").unwrap(), "active");
-    assert_eq!(billing.get_bool("cancel_at_period_end").unwrap(), false);
+    assert!(!billing.get_bool("cancel_at_period_end").unwrap());
 }
 
 #[tokio::test]
@@ -567,7 +567,7 @@ async fn webhook_subscription_updated_sets_status() {
         .get_document("billing")
         .expect("billing should exist");
     assert_eq!(billing.get_str("status").unwrap(), "active");
-    assert_eq!(billing.get_bool("cancel_at_period_end").unwrap(), true);
+    assert!(billing.get_bool("cancel_at_period_end").unwrap());
 }
 
 #[tokio::test]
