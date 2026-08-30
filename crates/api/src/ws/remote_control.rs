@@ -145,16 +145,20 @@ pub async fn handle_agent_socket(
     let mut desired_config = None;
     // FR-40 — a standing rotation order with no answer yet is re-ordered on
     // connect (the offline case, through the same path as the online one).
+    // ⚠️ NOT an order delivered seconds ago: the device that just rotated
+    // reconnects before its `rotated` report is written, and re-pushing the
+    // same order there made it refuse a duplicate and overwrite its own
+    // success (P1b, first field run) — see `overlay_key::should_redeliver`.
     let mut pending_key_rotation: Option<String> = None;
     if let Ok(row) = state.agents.find_in_tenant(tenant_id, agent_id).await {
-        if let Some(req) = row.key_rotation.as_ref() {
-            let answered = row
-                .key_rotation_report
-                .as_ref()
-                .is_some_and(|r| r.request_id == req.request_id);
-            if !answered {
-                pending_key_rotation = Some(req.request_id.clone());
-            }
+        if let Some(req) = row.key_rotation.as_ref()
+            && crate::routes::overlay_key::should_redeliver(
+                req,
+                row.key_rotation_report.as_ref(),
+                bson::DateTime::now(),
+            )
+        {
+            pending_key_rotation = Some(req.request_id.clone());
         }
         // Prefs = the persisted probe table ordered by RTT (nearest first) —
         // the load-aware fallback ladder until a fresh report replaces it.
