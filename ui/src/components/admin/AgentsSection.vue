@@ -2019,7 +2019,7 @@ function keyRotationChip(
         icon: 'mdi-update',
         text: 'agent too old for key rotation',
         tooltip:
-          "This device's agent predates key rotation (0.4.24+). Update it — the order stays queued.",
+          "This device's agent predates key rotation (0.4.25+). Update it — the order stays queued.",
       }
     default:
       return null
