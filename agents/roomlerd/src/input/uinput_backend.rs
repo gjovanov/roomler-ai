@@ -60,6 +60,9 @@ const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
+/// `KEY_LEFTSHIFT` — needed directly by the KeyText path, which presses shift
+/// around a character rather than going through the HID table for it.
+const KEY_LEFTSHIFT: u16 = 42;
 
 /// Absolute axis range. 0..=32767 is the conventional span for an absolute
 /// pointing device; the compositor scales it to the current screen, so this
@@ -189,6 +192,12 @@ pub struct UinputInjector {
     /// unsupported stream cannot flood the daemon log.
     warned_text: bool,
     warned_touch: bool,
+    /// FR-36 P4b — the verified keyboard layout for this host, if we have a
+    /// table for it, plus the raw name that was detected. The name is kept even
+    /// when unsupported so the refusal can SAY what it found: "unsupported
+    /// layout" is not actionable, "unsupported layout `de`" is.
+    layout: Option<super::keylayout::Layout>,
+    layout_name: String,
 }
 
 impl UinputInjector {
@@ -268,11 +277,27 @@ impl UinputInjector {
         std::thread::sleep(SETTLE);
         info!("input: backend=uinput (virtual kernel device, below the compositor)");
 
+        let (layout, layout_name) = super::keylayout::detect();
+        match layout {
+            Some(l) => info!(
+                layout = l.as_str(),
+                detected = layout_name.as_str(),
+                "uinput: typed text will be sent as physical keys for this layout"
+            ),
+            None => warn!(
+                detected = layout_name.as_str(),
+                "uinput: no verified key table for this keyboard layout — typed text will NOT \
+                 arrive (pointer and non-text keys are unaffected)"
+            ),
+        }
+
         Ok(Self {
             dev,
             wheel_rem: (0.0, 0.0),
             warned_text: false,
             warned_touch: false,
+            layout,
+            layout_name,
         })
     }
 
@@ -390,17 +415,57 @@ impl InputInjector for UinputInjector {
                 self.emit(EV_KEY, key, i32::from(down))?;
                 self.sync()
             }
-            InputMsg::KeyText { .. } => {
-                // Not implemented: turning text into keystrokes needs the
-                // TARGET's keyboard layout, which evdev deliberately knows
-                // nothing about — it carries physical keys. Guessing a US
-                // layout would type mojibake on every other layout, so this
-                // drops loudly once rather than corrupting input quietly.
-                if !self.warned_text {
+            InputMsg::KeyText { text } => {
+                // FR-36 P4b. evdev carries PHYSICAL keys, so typing text means
+                // pressing the key that produces each character *under this
+                // host's layout*. We do that only for a layout we have a
+                // verified table for; anything else refuses loudly rather than
+                // typing the US mapping at a keyboard whose keys are elsewhere.
+                let Some(layout) = self.layout else {
+                    if !self.warned_text {
+                        self.warned_text = true;
+                        warn!(
+                            detected = self.layout_name.as_str(),
+                            "uinput: typed text dropped — no verified key table for this layout. \
+                             Pointer and non-text keys still work."
+                        );
+                    }
+                    return Ok(());
+                };
+                let mut skipped = 0usize;
+                for ch in text.chars() {
+                    let Some(k) = layout.stroke(ch) else {
+                        // A character this layout cannot reach (accented, CJK,
+                        // or needing a dead-key sequence). Skip it rather than
+                        // substituting something wrong.
+                        skipped += 1;
+                        continue;
+                    };
+                    if k.shift {
+                        self.emit(EV_KEY, KEY_LEFTSHIFT, 1)?;
+                    }
+                    let Some(code) = hid_to_evdev(k.hid) else {
+                        skipped += 1;
+                        if k.shift {
+                            self.emit(EV_KEY, KEY_LEFTSHIFT, 0)?;
+                        }
+                        continue;
+                    };
+                    self.emit(EV_KEY, code, 1)?;
+                    self.emit(EV_KEY, code, 0)?;
+                    if k.shift {
+                        self.emit(EV_KEY, KEY_LEFTSHIFT, 0)?;
+                    }
+                    // One report per character: a compositor coalescing an
+                    // entire string into a single frame can drop repeats of the
+                    // same key, which is exactly what typing "ll" looks like.
+                    self.sync()?;
+                }
+                if skipped > 0 && !self.warned_text {
                     self.warned_text = true;
                     warn!(
-                        "uinput: KeyText is not supported (evdev carries physical keys, not text; \
-                         synthesising it needs the target's layout) — text input will not arrive"
+                        layout = layout.as_str(),
+                        skipped, "uinput: some characters are not typeable under this layout"
                     );
                 }
                 Ok(())
