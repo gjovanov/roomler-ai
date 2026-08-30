@@ -41,7 +41,7 @@ async fn create_room_for_call() {
     assert_eq!(resp.status().as_u16(), 200);
     let json: Value = resp.json().await.unwrap();
     assert_eq!(json["name"], "Team Standup");
-    assert!(json["id"].as_str().unwrap().len() > 0);
+    assert!(!json["id"].as_str().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1460,15 +1460,14 @@ async fn same_user_disconnect_notifies_only_other_connections() {
 
     // Neither ws1 nor ws2 should receive a second peer_left
     let extra1 = tokio::time::timeout(std::time::Duration::from_millis(500), ws1.next()).await;
-    match extra1 {
-        Ok(Some(Ok(msg))) => {
-            let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-            assert_ne!(
-                parsed["type"], "media:peer_left",
-                "ws1 should not receive a second peer_left"
-            );
-        }
-        _ => {} // timeout — correct
+    // Anything other than a message — i.e. the timeout — is the CORRECT outcome
+    // here, so only the message case has anything to assert.
+    if let Ok(Some(Ok(msg))) = extra1 {
+        let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        assert_ne!(
+            parsed["type"], "media:peer_left",
+            "ws1 should not receive a second peer_left"
+        );
     }
 
     ws1.close(None).await.ok();
@@ -1555,16 +1554,15 @@ async fn same_user_second_connection_receives_existing_producers_with_connection
     // not receive any new_producer messages. This test just verifies the join
     // completes cleanly without errors for same-user multi-connection.
     let extra = tokio::time::timeout(std::time::Duration::from_millis(500), ws2.next()).await;
-    match extra {
-        Ok(Some(Ok(msg))) => {
-            let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-            // If somehow there's a message, it should not be an error
-            assert_ne!(
-                parsed["type"], "media:error",
-                "Second same-user connection should not trigger errors"
-            );
-        }
-        _ => {} // timeout — expected since no producers exist
+    // The timeout is the EXPECTED outcome — no producers exist — so only a
+    // message that actually arrives has anything to prove.
+    if let Ok(Some(Ok(msg))) = extra {
+        let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        // If somehow there's a message, it should not be an error
+        assert_ne!(
+            parsed["type"], "media:error",
+            "Second same-user connection should not trigger errors"
+        );
     }
 
     ws1.close(None).await.ok();
