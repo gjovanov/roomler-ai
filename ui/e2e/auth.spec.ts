@@ -56,7 +56,7 @@ test.describe('Authentication', () => {
     await expect(page).toHaveURL(/\/login/)
   })
 
-  test('an invalid session cookie redirects to login page', async ({ page, context }) => {
+  test('an invalid session cookie keeps you out of the app', async ({ page, context }) => {
     const user = uniqueUser()
     await registerUserViaApi(user)
 
@@ -76,10 +76,17 @@ test.describe('Authentication', () => {
     await context.clearCookies()
     await context.addCookies([{ ...session!, value: 'expired.invalid.token' }])
 
-    // Navigate to an authenticated route — the API call 401s and the
-    // interceptor must land us on /login rather than on a half-rendered app.
+    // Navigate to an authenticated route. The property under test is that a
+    // bad cookie does NOT get you into the app — not which door you are shown.
+    //
+    // ⚠️ It can be either: the router guard sends an unauthenticated visitor to
+    // /landing, while the 401 interceptor sends them to /login, and which wins
+    // is a race. Asserting /login alone made this flaky (it failed on /landing
+    // in the 2026-08-30 nightly and passed on retry), so assert the invariant.
     await page.goto('/')
-    await expect(page).toHaveURL(/\/login/, { timeout: 10000 })
+    await expect(page).toHaveURL(/\/(login|landing)/, { timeout: 10000 })
+    // And nothing authenticated rendered behind it.
+    await expect(page.getByRole('link', { name: 'Rooms' })).toHaveCount(0)
   })
 
   test('nav menu hides profile/logout when unauthenticated', async ({ page }) => {
