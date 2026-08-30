@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-43 P1 — the root daemon as supervisor of the GUI-session worker.
 //!
 //! macOS is the one platform where one process cannot serve both planes: a
