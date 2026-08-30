@@ -679,7 +679,6 @@ async fn media_join_routes_to_owner_pod_single_router() {
         Some(tenant.admin.id.as_str())
     );
 
-    use futures::SinkExt;
     ws1.close(None).await.ok();
     ws2.close(None).await.ok();
 }
@@ -726,7 +725,6 @@ async fn media_owner_shutdown_releases_claim_rejoin_wins() {
     let rec = OwnerRecord::parse(&raw).unwrap();
     assert_eq!(rec.pod_id, app2.state.pod.pod_id);
 
-    use futures::SinkExt;
     ws2.close(None).await.ok();
 }
 
@@ -786,7 +784,6 @@ async fn media_conflict_folds_loser_island() {
     assert_eq!(closed["type"], "media:room_closed", "{closed}");
     assert_eq!(closed["data"]["reason"].as_str(), Some("rehomed"));
 
-    use futures::SinkExt;
     ws1.close(None).await.ok();
 }
 
@@ -842,7 +839,7 @@ async fn derp_split_rehomes_toward_newest_registration() {
                 node_ref: NodeRef::Agent {
                     agent_id: bson::oid::ObjectId::parse_str(aid).unwrap(),
                 },
-                network_id: network_id,
+                network_id,
                 machine_id: machine.to_string(),
                 name: name.to_string(),
                 overlay_ip: ip.to_string(),
@@ -1019,7 +1016,7 @@ async fn cluster_status_reports_pod_counters_and_gauges() {
 #[tokio::test]
 async fn shutdown_releases_tunnel_and_derp_records() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-    use futures::{SinkExt, StreamExt};
+    use futures::SinkExt;
     use roomler_ai_api::cluster::directory::{derp_key, tunnel_key};
     use roomler_ai_api::ws::derp_cluster::pk_hex;
     use roomler_ai_remote_control::models::NodeRef;
