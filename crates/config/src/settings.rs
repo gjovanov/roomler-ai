@@ -799,3 +799,42 @@ mod s6_tests {
         assert_eq!(s.resolve_announced_ip(Some("also")), None);
     }
 }
+
+#[cfg(test)]
+mod relay_cost_file_tests {
+    use super::RelayCosts;
+
+    /// The shipped `config/relay-costs.toml` must actually parse into the
+    /// struct, with every field populated.
+    ///
+    /// This exists because a mistyped key there fails *silently and safely*:
+    /// serde leaves the field `None`, the surface renders "not priced", and
+    /// nothing errors — so the deployment looks configured while quietly
+    /// pricing nothing. That is the failure mode most likely to survive
+    /// review, since the file reads correctly to a human.
+    #[test]
+    fn the_shipped_cost_file_parses_with_every_field_set() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/relay-costs.toml");
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{path}: {e} — the file is the single source of prices"));
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            relay_costs: RelayCosts,
+        }
+        let w: Wrapper = toml::from_str(&raw).expect("relay-costs.toml must be valid TOML");
+        let c = w.relay_costs;
+
+        assert!(c.currency.is_some(), "currency unset — figures would render bare");
+        assert!(c.derp_gb.is_some(), "derp_gb unset — the one meter we actually collect");
+        assert!(c.turn_gb.is_some(), "turn_gb unset");
+        assert!(
+            c.sfu_participant_hour.is_some(),
+            "sfu_participant_hour unset"
+        );
+        // A zero cost is indistinguishable on screen from "free to serve", and
+        // it is never what an operator means by filling this file in.
+        assert!(c.derp_gb.unwrap() > 0.0);
+        assert!(c.sfu_participant_hour.unwrap() > 0.0);
+    }
+}
