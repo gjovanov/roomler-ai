@@ -345,8 +345,15 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
       server behaviour this suite exercises.
 - [x] **macOS TCC grants survive the upgrade**: Screen Recording and Accessibility are *not*
       re-prompted, and remote control works with no human action.
-- [ ] A pre-rename host (legacy `%PROGRAMDATA%\roomler\roomler-agent` tree present) keeps its
+- [x] A pre-rename host (legacy `%PROGRAMDATA%\roomler\roomler-agent` tree present) keeps its
       enrolled identity — same `agent_id`, same overlay address — across the upgrade.
+      **Field-verified 2026-08-30 on a purpose-built throwaway Windows Server 2022 VM**
+      (Hyper-V, clean install, no roomler trees). Full log in §12.
+      ⚠️ The criterion names `%PROGRAMDATA%`, but on Windows the *identity* is resolved by
+      `project_dirs()` (the PER-USER tree), not `machine_global_dir()` — `default_config_path()`
+      has no Windows branch for the machine-global root, which carries `staging\`, crashes and
+      `service-logs\` instead. Both trees were legacy in this test and both migrated, so the
+      criterion holds as written; the wording is narrower than the code.
 - [x] Field: post-roll `roomler exec` sweep across the fleet on all three OSes; every host reports
       the expected binary, service/unit/launchd label, config path and log path.
 
@@ -365,17 +372,25 @@ Evidence for the ticked boxes, and what the unticked ones are still waiting on
 | macOS TCC | P6 macOS row below — `Screen Recording + Accessibility both granted`, 30 s after the 0.4.15 release |
 | field sweep, three OSes | P6 Linux / Windows / macOS rows below |
 | e2e, no new failures | nightly lane `scripts/e2e-nightly.sh`, 2026-08-29 11:34Z on `v20260829-673a1686220f`: `OK (13 failed, 3 skipped, 154 passed)`. `OK` is the script's verdict that every failure matched `scripts/e2e-expected-failures.txt`. Post-rename tree. ⚠️ Predates #895/#924/#941, none of which touch the UI or server behaviour it exercises |
+| pre-rename host keeps its identity | Throwaway Server 2022 VM: genuinely pre-rename agent `0.3.0-rc.83` (binary still named `roomler-agent.exe`) enrolled against prod → `agent_id 6a93ef77…6b90`, resolving `config_path=%APPDATA%\roomler\roomler-agent\config\config.toml` + `machine_global=C:\ProgramData\roomler\roomler-agent`. Its OWN auto-updater then fired (`new release available … current=0.3.0-rc.83 latest=agent-v0.4.27`) and upgraded it. 0.4.27 logged all four legacy-tree migrations, kept the same `agent_id`, and took overlay `100.65.4.35`. Stricter second pass: legacy-only state re-created against the CURRENT binary → migrated again, **same `agent_id`, same `100.65.4.35`**. Fleet view showed `fr21-prerename-vm 100.65.4.35` online. Device then deleted: `{"deleted":true,"overlay_released":true,"overlay_ip":"100.65.4.35"}` |
 | no artifact name changed | `gh release view` asset lists for `agent-v0.4.14` vs `agent-v0.4.23`, version-normalised and diffed: nothing removed, nothing renamed. Real published artifacts, not a rehearsal build |
 | nothing bypasses the env chain | `PREFIXES` is now the single list both readers and `env::test_env` use; all 44 env manipulations in the agent go through it, and `name-audit.sh --check` fails any new raw one. The deprecation warning is `legacy_use_is_new`, mutation-checked: disabling the dedupe fails `legacy_reads_warn_once_per_variable_and_current_reads_never_do` |
 | §5 staging path, both host shapes | `appdirs::resolve_machine_global` split out of the `OnceLock`-cached `machine_global_dir()` and pinned by 4 tests (pre-rename only / fresh only / both present / neither). `files.rs` derives the staging dir as `machine_global_dir().join("staging")`, so this is the decision the criterion turns on. Mutation-checked: dropping the pre-rename branch fails `machine_global_keeps_a_pre_rename_tree` |
 
-**Still open, and why — not forgotten.** **12 of 13 ticked; one genuinely blocked.**
-Issue #809 is closed (its own result comment reads "11/11", counting only the boxes ticked
-at that moment). The one below is not bookkeeping — it names a host state that does not
-exist in the fleet, and inventing partial credit for it would defeat the point of the list.
+**Nothing open. 13 of 13 ticked**, the last one field-verified 2026-08-30 on a purpose-built
+throwaway Windows Server 2022 VM (§12). Issue #809 was closed earlier at a stated "11/11",
+which counted only the boxes ticked at that moment; the list is now genuinely complete.
 
-- **§5 staging path on a PRE-RENAME host** — the fresh side is confirmed twice (`CORPLAP-1`, and a second host independently). No host with a surviving `%PROGRAMDATA%\roomler\roomler-agent` tree has been driven through it.
-- **A pre-rename host keeps its enrolled IDENTITY across an upgrade** — narrowed twice, still open on the shape the box names. **The property itself is field-proven on Linux**: mars, jupiter and zeus were real `roomler-agent` installs upgraded through the `apt-get install` primary path, and came out with **node id and overlay IP unchanged**. What is unproven is the WINDOWS shape the criterion actually names — a host where `%PROGRAMDATA%\roomler\roomler-agent` exists and `%PROGRAMDATA%\roomler\roomler` does not, which is the only input that selects the other branch of the resolver. That branch is pinned by test (`resolve_machine_global`, 4 cases, mutation-checked) and is the same one `appdirs` has used since P4b for the per-user tree — but no device has been driven through it: every fleet Windows host is post-rename (`CORPLAP-1` verified twice), and this dev box has a live enrolled daemon, so producing that state means deliberately orphaning a real enrollment. It needs a **staged throwaway Windows VM** — legacy tree planted, no new one. A real task, not a five-minute check.
+Both pre-rename shapes were exercised in that run, on the same host:
+
+- **§5 staging path on a PRE-RENAME host** — `C:\ProgramData\roomler\roomler-agent` was the live
+  machine-global root under `rc.83` (`machine_global=` logged), and `0.4.27` migrated it to
+  `…\roomler\roomler`. `staging\` derives from `machine_global_dir()`, so this is the branch the
+  criterion turns on. Previously confirmed only on the fresh side (`CORPLAP-1`, twice).
+- **A pre-rename host keeps its enrolled IDENTITY across an upgrade** — the property was already
+  field-proven on **Linux** (mars/jupiter/zeus, real `roomler-agent` installs through
+  `apt-get install`, node id + overlay IP unchanged). It is now proven on the **Windows** shape
+  the box actually names, which is the input that selects the other branch of the resolver.
 
 ---
 
@@ -484,6 +499,7 @@ whole of it.
 
 | date | what | result |
 |---|---|---|
+| 2026-08-30 | **THE LAST CRITERION — a genuine pre-rename Windows host, upgraded.** No such host exists in the fleet (all post-rename) and this dev box has a live enrollment, so one was BUILT: a throwaway Hyper-V VM, Windows Server 2022 Evaluation applied straight from the Microsoft ISO to a VHDX (`Expand-WindowsImage` + the GUEST image's own `bcdboot` — the host's Win11 `bcdboot` fails `193`), unattended via `Panther\unattend.xml`, driven entirely over PowerShell Direct. Clean host: no `roomler` trees at all. Installed the genuinely pre-rename **`0.3.0-rc.83`** (May build; binary still named `roomler-agent.exe`) and enrolled it against **production**. | **PASS, and by the product's own upgrade path.** rc.83 logged `config_path=%APPDATA%\roomler\roomler-agent\config\config.toml` and `machine_global=C:\ProgramData\roomler\roomler-agent` — both LEGACY — loaded `agent_id 6a93ef77…6b90` and sent `rc:agent.hello`. Its **own auto-updater** then fired (`new release available … current=0.3.0-rc.83 latest=agent-v0.4.27`) and installed 0.4.27, which logged all four legacy-tree migrations (`roomler-agent` → `roomler`, per-user config + data, LocalAppData data, ProgramData) and came up on the **same `agent_id`**, taking overlay **`100.65.4.35`**. Stricter second pass against the CURRENT binary: legacy-only state re-created (all three roots renamed back, no new tree anywhere) → migrated again, **same `agent_id`, same `100.65.4.35`**. Fleet view: `fr21-prerename-vm 100.65.4.35` online. Torn down after: device deleted (`{"deleted":true,"overlay_released":true,"overlay_ip":"100.65.4.35"}` — the lease returned to the pool, nothing burned), VM + 16 GB of artifacts removed, temporary host firewall rule removed. |
 | 2026-08-28 | **Debian takeover, against real artifacts.** Built `.deb` from `release-agent.yml` run `33150602388`; published `agent-v0.4.11` `.deb` as the upgrade-from side. | **PASS.** `Package: roomlerd`, `Provides: roomler-agent`, `Replaces: roomler-tunnel, roomler-agent`. Upgrade via `dpkg -i` (the self-updater's *fallback*, the stricter path): **exit 0, zero overwrite conflicts**; `/usr/bin/roomlerd` + `/usr/bin/roomler` ownership transferred to `roomlerd`; unit present. Vestigial `ii roomler-agent` remains exactly as designed, and the one-time `--remove roomler-agent` sweep exits 0 with **all files surviving**. Asset filename unchanged (`roomler-agent-0.4.11-…deb`), so the "no artifact name moves" criterion holds. |
 | 2026-08-29 | **P7 — `--strict` reached, and three real defects found on the way.** `unclassified` 1006 -> 0; 732 anchored sites, 0 stale markers. (1) `user_profile::active_user_config_path()` hardcoded the PRE-rename appdirs segment, so on every post-rename install the path could not exist and the caller's `exists()` filter silently dropped the user-config rung — indistinguishable from "no logged-in user", the documented `None` case. It survived because the test asserted `ends_with("\\roomler-agent\\config\\config.toml")`: the test pinned the bug. Now dual-segment, with a pure test on candidate ORDER; mutation-checked red/green. (2) An anchor block had been inserted ABOVE `#!/bin/bash` in the macOS `postinstall`, so `installer` could not execute it and EVERY `.pkg` install failed at `Validating packages`. Red on `installer-smoke` for nine commits, misread as the flakiness master shows on the same job — master fails LATER (`helper job still loaded after opt-out`, after a successful install). One job name, two failures. `--check` now fails any tracked file whose shebang is not line 1 — the anchor system's own failure mode, caught by nothing else. (3) Nine env keys were exercised in tests only through the RETIRED spelling, i.e. the third link of a three-link fallback; the spelling the code and docs use was covered by nothing, and `hw_auto_disabled_reads_env` cleared one name while reading a chain preferring the other. Plus a break this branch itself caused: the e2e image moved to `/etc/roomler` while its StatefulSet still mounted `/etc/roomler-agent`, and its data PVC mounted a directory the daemon never writes to. |
 | 2026-08-28 | Full release lane under the renamed packages (dispatch). | **PASS** — both `.deb`s, `.msi`, `.pkg`, companion EXE all build. |
