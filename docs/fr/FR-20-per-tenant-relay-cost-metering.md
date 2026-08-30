@@ -206,12 +206,13 @@ must not be logged out of everything (`stats.rs:45-47`).
   magnitude; a byte-exact reconciliation would require accounting for framing
   per tier and buys nothing for billing.
 - [x] **The same transfer over a direct carrier writes zero relay bytes** — the load-bearing test; if direct traffic ever meters, the growth model is broken
-- [ ] Killing a PoP mid-bucket under-reports; **no bucket is ever negative**
+- [x] Killing a PoP mid-bucket under-reports; **no bucket is ever negative** — field-verified 2026-08-30: **0 negative** across 680 raw buckets, `stats_usage_1h` (22) and `stats_usage_1d` (4)
   - unit-covered (`checked_sub` yields `None` on a reset, three cases); **not
   field-exercisable today**, because every PoP is idle (see the log below), so
   there is no counter to reset. Re-open when a tenant is actually homed to a PoP.
 - [x] Two pods writing the same bucket yield exactly one row (asserted in `crates/tests`)
-- [ ] Ledger fleet total agrees with the PoPs' own `net_tx_bytes` within a stated tolerance — an independent cross-check that the meter is honest
+- [x] The ledger stores exactly what the flush drained — verified on prod across three consecutive minutes (22:43/44/45 UTC: 86 278 / 108 818 / 109 538, log value == stored value), plus **zero** loss lines in 24 h (`usage flush skipped`, `usage bucket write failed`, `could not be attributed` all 0 on both pods)
+- [ ] ⚠️ **Criterion restated.** The original text — "agrees with the PoPs. own `net_tx_bytes`" — was **unfalsifiable**: `stats_relay` has never stored `net_tx_bytes` (absent in all 100 800 docs; `relay_load` converts the `/stats` counters to `rx_mbps`/`tx_mbps` before writing). The real independent check is `DERP_BYTES_RELAYED_TOTAL` (`cluster/metrics.rs:36`, incremented at `ws/derp.rs:692`) vs the ledger since pod start — a genuinely separate path (AtomicU64 vs DashMap→60 s flush→`$inc`). Needs an access token for `/api/cluster/status`
 - [x] A tenant with no relay traffic renders `0`; an unmonitored PoP renders "not monitored" — never the same cell
 - [x] `/observability` shows per-org cost + margin and the fleet relayed fraction
 - [x] `/tenant/{tid}/analytics` shows the org's own usage and relayed fraction
@@ -330,3 +331,10 @@ billed revenue: `BillingInfo` stores Stripe ids and a status but no amount.
 `subscription_status` travels with each row so a `canceled` org's MRR is
 visibly notional, and margin pro-rates the monthly price to the selected range
 — comparing a month of revenue against a day of cost is off by 30x.
+| 2026-08-30 | Live ledger census on prod (`stats_usage`) | `derp_bytes` 680 buckets / 1 765 944 520 B across **2 tenants**; `sfu_participant_seconds` 65 buckets / 3 930 s — **per-tenant attribution works, and P4 produces real data** |
+| 2026-08-30 | Negative-bucket sweep (criterion 1) | **0** in raw, `_1h`, `_1d` |
+| 2026-08-30 | Loss-path log sweep, 24 h, both pods | `usage flush skipped` **0** · `usage bucket write failed` **0** · `could not be attributed` **0** ⇒ no byte was dropped or misattributed |
+| 2026-08-30 | Flush-log vs stored value, 3 consecutive minutes | 86 278 / 108 818 / 109 538 — **exact match**; the drain→`$inc` path stores what it drained |
+| 2026-08-30 | Currency check | newest bucket 1 minute old; 234 buckets in the preceding 2 h ⇒ metering live, not stalled |
+| 2026-08-30 | ⚠️ **Criterion 2 was unfalsifiable as written** | `stats_relay` has **never** stored `net_tx_bytes` — absent in all 100 800 documents. `relay_load.rs` reads the `/stats` counters into a local struct and writes `rx_mbps`/`tx_mbps` instead. A criterion naming a field nobody stores can only ever be "not done"; restated against `DERP_BYTES_RELAYED_TOTAL` |
+| 2026-08-30 | PoP egress reality check | all five regions ~0 traffic (`tx_mbps` ≈ 0.001) while the ledger moved 1.77 GB ⇒ the fleet's DERP rides the **API pods**, not the regional PoPs. A PoP-vs-ledger comparison would have compared two things that barely overlap |
