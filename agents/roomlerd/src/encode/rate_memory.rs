@@ -21,25 +21,41 @@ use serde::{Deserialize, Serialize};
 /// A remembered rate older than this is ignored (and dropped on the next save).
 pub const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// P3 — the memory grows to this fraction of the opener's measured drain rate.
+/// P3 — the memory grows to this fraction of the opener's MEASURED drain rate.
 pub const OPENER_DRAIN_PCT: u64 = 75;
 /// Below this many bytes the opening burst says nothing about the pipe.
 pub const OPENER_MIN_BYTES: u64 = 100_000;
-/// A burst that never queued at all is clamped to this wait, i.e. the estimate
-/// saturates at `bytes × 8 / 20 ms` (then `hi` caps it).
-pub const OPENER_MIN_WAIT_US: u64 = 20_000;
+/// Below this queue-wait the burst never queued — it fit the transport's own
+/// send buffer (SCTP's, on a DataChannel) and drained at whatever rate
+/// without telling us. Field 2026-08-30: a 238 KB opener with a 0 ms wait on
+/// the same coturn path that a 451 KB opener had just measured at 4.5 Mbps.
+pub const OPENER_QUEUED_MIN_US: u64 = 100_000;
+/// A burst that never queued proves only "not slower than this": grow by a
+/// bounded step per clean session instead — the next, larger opener then
+/// queues and measures.
+pub const OPENER_UNQUEUED_STEP_PCT: u64 = 150;
 
-/// The pipe's burst drain rate implied by the opening burst: `bytes` sent and
-/// the longest queue-wait a frame saw while draining it. The last frame of a
-/// burst waits for everything before it, so `bytes / wait` is the rate the
-/// pipe actually drained at — an over-estimate by one frame's share, which
-/// [`OPENER_DRAIN_PCT`] absorbs. `0` = too small a burst to judge.
-pub fn opener_drain_bps(bytes: u64, wait_us: u64) -> u32 {
-    if bytes < OPENER_MIN_BYTES {
+/// The memory target implied by the opening burst, already capped at `hi`:
+/// `bytes` sent and the longest queue-wait a frame saw while draining it,
+/// with the opener's own `maxrate` as the base for the bounded step. The
+/// last frame of a burst waits for everything before it, so `bytes / wait`
+/// is the rate the pipe drained at — an over-estimate by one frame's share,
+/// which [`OPENER_DRAIN_PCT`] absorbs. `0` = nothing to learn from.
+pub fn opener_growth_target_bps(
+    bytes: u64,
+    wait_us: u64,
+    opener_maxrate_bps: u32,
+    hi_bps: u32,
+) -> u32 {
+    if bytes < OPENER_MIN_BYTES || hi_bps == 0 {
         return 0;
     }
-    let wait = wait_us.max(OPENER_MIN_WAIT_US);
-    (bytes.saturating_mul(8).saturating_mul(1_000_000) / wait).min(u32::MAX as u64) as u32
+    let target = if wait_us < OPENER_QUEUED_MIN_US {
+        (opener_maxrate_bps as u64) * OPENER_UNQUEUED_STEP_PCT / 100
+    } else {
+        bytes.saturating_mul(8).saturating_mul(1_000_000) / wait_us * OPENER_DRAIN_PCT / 100
+    };
+    target.min(hi_bps as u64) as u32
 }
 
 const FILE_NAME: &str = "rate_memory.json";
@@ -88,7 +104,7 @@ impl RateMemory {
     /// Returns the value now on record.
     ///
     /// P3 — growth without drag. The opening burst is a free probe of the
-    /// pipe's burst capacity (`opener_drain_bps`); a session that saw no
+    /// pipe's burst capacity (`opener_growth_target_bps`); a session that saw no
     /// decrease grows the memory toward [`OPENER_DRAIN_PCT`] of it, capped
     /// at `hi_bps`, so a pair reaches its crisp opener in one session instead
     /// of after minutes of sustained drag (the first field runs: ≈3 learner
@@ -99,8 +115,7 @@ impl RateMemory {
         peer: &str,
         stable_bps: u32,
         had_decrease: bool,
-        opener_drain_bps: u32,
-        hi_bps: u32,
+        growth_target_bps: u32,
         now_unix: u64,
     ) -> u32 {
         let mut value = stable_bps;
@@ -110,10 +125,8 @@ impl RateMemory {
             {
                 value = old;
             }
-            let target =
-                ((opener_drain_bps as u64) * OPENER_DRAIN_PCT / 100).min(hi_bps as u64) as u32;
-            if target > value {
-                value = target;
+            if growth_target_bps > value {
+                value = growth_target_bps;
             }
         }
         self.record(peer, value, now_unix);
@@ -197,87 +210,92 @@ mod tests {
 
     #[test]
     fn an_idle_session_never_lowers_the_memory_but_a_decrease_does() {
-        const HI: u32 = 8_000_000;
         let now = 1_788_000_000u64;
         let mut m = RateMemory::default();
-        assert_eq!(
-            m.record_session("p", 3_598_387, false, 0, HI, now),
-            3_598_387
-        );
+        assert_eq!(m.record_session("p", 3_598_387, false, 0, now), 3_598_387);
         // Idle session opened at 85 % and held it: no evidence, keep the old.
         assert_eq!(
-            m.record_session("p", 3_058_628, false, 0, HI, now + 60),
+            m.record_session("p", 3_058_628, false, 0, now + 60),
             3_598_387
         );
         assert_eq!(m.entries["p"].at_unix, now + 60, "timestamp refreshed");
         // A session that saw a decrease may lower it.
         assert_eq!(
-            m.record_session("p", 3_058_628, true, 0, HI, now + 120),
+            m.record_session("p", 3_058_628, true, 0, now + 120),
             3_058_628
         );
         // A higher value always replaces, decrease or not.
         assert_eq!(
-            m.record_session("p", 4_000_000, false, 0, HI, now + 180),
+            m.record_session("p", 4_000_000, false, 0, now + 180),
             4_000_000
         );
         assert_eq!(
-            m.record_session("p", 4_100_000, true, 0, HI, now + 240),
+            m.record_session("p", 4_100_000, true, 0, now + 240),
             4_100_000
         );
     }
 
-    /// P3 — the opener's drain rate grows the memory in ONE clean session,
-    /// never past `hi`, never on a session that saw a decrease, and never
-    /// below what the session itself proved.
+    /// P3 — the opener grows the memory in ONE clean session, never past `hi`,
+    /// never on a session that saw a decrease, and never below what the
+    /// session itself proved.
     #[test]
-    fn a_clean_session_grows_the_memory_toward_the_opener_drain_rate() {
+    fn a_clean_session_grows_the_memory_from_the_opener() {
         const HI: u32 = 8_000_000;
         let now = 1_788_000_000u64;
+        // Field 2026-08-30, coturn path: a 451 KB opener queued 802 ms ⇒ the
+        // pipe drained at 4.5 Mbps ⇒ target 75 % of it.
+        let measured = opener_growth_target_bps(451_464, 802_000, 2_550_000, HI);
+        assert_eq!(measured, 3_377_535);
         let mut m = RateMemory::default();
-        // First session on the pair at the 3 Mbps nominal; the 221 KB opener
-        // drained in 221 ms ⇒ 8 Mbps burst capacity ⇒ memory 6 Mbps.
-        let drain = opener_drain_bps(221_000, 221_000);
-        assert_eq!(drain, 8_000_000);
         assert_eq!(
-            m.record_session("p", 3_000_000, false, drain, HI, now),
-            6_000_000
+            m.record_session("p", 2_709_375, false, measured, now),
+            3_377_535
         );
-        // A thin pipe: 131 KB in 524 ms ⇒ 2 Mbps ⇒ target 1.5 Mbps < the
+        // Same path, next session: a 238 KB opener that never queued (0 ms —
+        // it fit SCTP's buffer) is NOT a fat pipe: a bounded ×1.5 step on the
+        // opener's own maxrate, so the next, larger opener measures.
+        let unqueued = opener_growth_target_bps(238_306, 0, 2_870_000, HI);
+        assert_eq!(unqueued, 4_305_000);
+        assert_eq!(
+            m.record_session("p", 2_870_000, false, unqueued, now + 60),
+            4_305_000
+        );
+        // A thin pipe: 131 KB in 524 ms ⇒ 2 Mbps ⇒ 1.5 Mbps target < the
         // session's own 3 Mbps — the memory does not go below what was held.
-        let thin = opener_drain_bps(131_000, 524_000);
-        assert_eq!(thin, 2_000_000);
+        let thin = opener_growth_target_bps(131_000, 524_000, 3_000_000, HI);
+        assert_eq!(thin, 1_500_000);
         let mut t = RateMemory::default();
         assert_eq!(
-            t.record_session("q", 3_000_000, false, thin, HI, now),
+            t.record_session("q", 3_000_000, false, thin, now),
             3_000_000
         );
-        // A fat pipe (no queueing at all) saturates at `hi`.
-        let fat = opener_drain_bps(221_000, 3_000);
-        assert!(fat > HI);
+        // A measured fat pipe saturates at `hi`.
+        let fat = opener_growth_target_bps(2_000_000, 200_000, 3_000_000, HI);
+        assert_eq!(fat, HI);
+        assert_eq!(t.record_session("q", 3_000_000, false, fat, now + 60), HI);
+        // A decrease in the session wins over the evidence.
         assert_eq!(
-            t.record_session("q", 3_000_000, false, fat, HI, now + 60),
-            HI
-        );
-        // A decrease in the session wins over the drain evidence.
-        assert_eq!(
-            t.record_session("q", 3_400_000, true, fat, HI, now + 120),
+            t.record_session("q", 3_400_000, true, fat, now + 120),
             3_400_000
         );
-        // Learning off (hi = 0): the drain never grows anything.
-        assert_eq!(
-            m.record_session("r", 3_000_000, false, drain, 0, now),
-            3_000_000
-        );
+        // Learning off (hi = 0): nothing to learn.
+        assert_eq!(opener_growth_target_bps(451_464, 802_000, 2_550_000, 0), 0);
     }
 
     #[test]
     fn a_small_opening_burst_is_not_evidence() {
-        assert_eq!(opener_drain_bps(30_000, 5_000), 0);
-        assert_eq!(opener_drain_bps(99_999, 1), 0);
         assert_eq!(
-            opener_drain_bps(100_000, 0),
-            40_000_000,
-            "clamped to a 20 ms wait"
+            opener_growth_target_bps(30_000, 5_000, 3_000_000, 8_000_000),
+            0
+        );
+        assert_eq!(
+            opener_growth_target_bps(99_999, 900_000, 3_000_000, 8_000_000),
+            0
+        );
+        // The bounded step never passes hi either.
+        assert_eq!(
+            opener_growth_target_bps(100_000, 0, 7_000_000, 8_000_000),
+            8_000_000
         );
     }
 
