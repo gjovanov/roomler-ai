@@ -66,7 +66,10 @@ test.describe('Billing & Subscription', () => {
     await expect(page.getByText('Channels').first()).toBeVisible()
     await expect(page.getByText('Video Participants').first()).toBeVisible()
     await expect(page.getByText('Cloud Integrations').first()).toBeVisible()
-    await expect(page.getByText('AI Recognition').first()).toBeVisible()
+    // 'AI Recognition' was deliberately removed with the feature itself
+    // (d5599976, FR-32 #898). The nightly caught this as a regression and was
+    // right to — a spec cannot tell a removal from a breakage, which is the
+    // point of it failing rather than being quietly relaxed.
     await expect(page.getByText('Recordings').first()).toBeVisible()
   })
 
