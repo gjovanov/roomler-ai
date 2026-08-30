@@ -3836,6 +3836,16 @@ async fn media_pump_vp9_444_dc(
             // 2026-08-26 — area-scaled AIMD floor (flat 1.5 M on a
             // constrained transport; see `encode::area_min_bitrate_bps`).
             let aimd_floor = crate::encode::area_min_bitrate_bps(w, h, constrained_transport);
+            // Shared-pipeline egress split (see `shared_split_ceiling_bps`):
+            // N viewers of one constrained encoder send N copies over the same
+            // relay uplink; divide the ceiling by the live viewer count.
+            let ceiling = crate::encode::shared_split_ceiling_bps(
+                ceiling,
+                (1 + pipeline.follower_count()) as u32,
+                aimd_floor,
+                constrained_transport,
+                crate::encode::shared_rate_split_enabled(),
+            );
             if let Some(applied) = governor.pre_encode_tick(
                 ceiling,
                 aimd_floor,
@@ -5600,11 +5610,24 @@ async fn media_pump_ffmpeg_dc(
         // FR-35 — the plan's ceiling, lifted by what the learner has proven
         // (and by the pair's remembered rate at open).
         let ceiling = governor.effective_ceiling(rate.ceiling_bps, constrained);
-        // 2026-08-26 — feed the direct byte gate's fallback reference and
-        // compute the area-scaled AIMD floor from the ACTUAL encode dims
-        // (see `encode::area_min_bitrate_bps` — flat 1.5 M on constrained).
-        last_ceiling_bps = ceiling;
+        // 2026-08-26 — compute the area-scaled AIMD floor from the ACTUAL
+        // encode dims (see `encode::area_min_bitrate_bps` — flat 1.5 M on
+        // constrained); it also floors the shared-pipeline egress split.
         let aimd_floor = crate::encode::area_min_bitrate_bps(w, h, constrained);
+        // Shared-pipeline egress split: N viewers of ONE constrained encoder
+        // send N separate copies over the SAME relay uplink, so divide the
+        // ceiling by the live viewer count (see `shared_split_ceiling_bps`).
+        // Recomputed every iteration, so it tracks joins/leaves live.
+        let ceiling = crate::encode::shared_split_ceiling_bps(
+            ceiling,
+            (1 + pipeline.follower_count()) as u32,
+            aimd_floor,
+            constrained,
+            crate::encode::shared_rate_split_enabled(),
+        );
+        // Feed the direct byte gate's fallback reference (constrained uses the
+        // fixed relay budget instead, so the split value here is harmless).
+        last_ceiling_bps = ceiling;
         let need_rebuild = match encoder_dims {
             Some((ew, eh)) => ew != w || eh != h,
             None => true,
