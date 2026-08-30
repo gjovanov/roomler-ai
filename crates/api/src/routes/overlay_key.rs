@@ -79,7 +79,7 @@ impl KeyRotationDenyReason {
                  to land (or fail) before ordering another"
             }
             Self::AgentUnsupported => {
-                "this device's agent predates overlay-key rotation (needs 0.4.24 or later) — \
+                "this device's agent predates overlay-key rotation (needs 0.4.25 or later) — \
                  push an update first, then rotate"
             }
         }
