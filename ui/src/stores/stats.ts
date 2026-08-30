@@ -110,6 +110,32 @@ export interface CostPayload {
   } | null
 }
 
+/**
+ * FR-20 P6 - an org's OWN metered consumption, in UNITS not money.
+ *
+ * No currency here on purpose: these are our costs, not the org's bill, and
+ * there are no quotas yet for a figure to mean anything against. The value of
+ * the surface is that a high relayed share is a *networking* finding the org's
+ * own IT can act on, and pricing it would obscure that.
+ */
+export interface ResourcesPayload {
+  enabled: boolean
+  range?: string
+  window_secs?: number
+  meters?: Record<string, { total: number | null; monitored: boolean }>
+  storage?: { bytes: number; files: number } | null
+  carrier_mix?: {
+    direct: number
+    relay: number
+    derp: number
+    relayed_fraction: number | null
+    basis?: string
+    window?: string
+  } | null
+  /** null until quotas exist; the slot renders dark rather than as satisfied */
+  quota?: unknown | null
+}
+
 export interface OrgsPayload {
   enabled: boolean
   tenants?: Array<{ id: string; name: string; slug?: string }>
@@ -337,6 +363,9 @@ export const useStatsStore = defineStore('stats', () => {
   async function fetchCost(range: string): Promise<CostPayload> {
     return api.get<CostPayload>(`/admin/stats/cost?range=${range}`)
   }
+  async function fetchResources(tenantId: string, range: string): Promise<ResourcesPayload> {
+    return api.get<ResourcesPayload>(`/tenant/${tenantId}/stats/resources?range=${range}`)
+  }
   async function fetchUsers(range: string): Promise<UsersPayload> {
     return api.get<UsersPayload>(`/admin/stats/users?range=${range}`)
   }
@@ -388,6 +417,7 @@ export const useStatsStore = defineStore('stats', () => {
     fetchRelayHistory,
     fetchOrgs,
     fetchCost,
+    fetchResources,
     fetchUsers,
     fetchAdminMachines,
     fetchAdminCalls,
