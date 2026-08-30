@@ -200,9 +200,9 @@ and permission-gated; a defective push is stopped by the device switch.
 
 ## Acceptance criteria (field, the real device: CORPLAP-3, single org, `0.4.25+`)
 
-- [ ] the route on a device advertising the verb returns `delivered`; the device log shows
+- [x] the route on a device advertising the verb returns `delivered`; the device log shows
       mint → save → report → reconnect; the node row's `wg_public_key` and `key_epoch` change
-      within 10 s and the dashboard reads `rotated`
+      within 10 s and the dashboard reads `rotated` (final run 02:09 UTC: order :08.9 → epoch 5 at :09.4 → join :10.2 → report ingested :10.23 → `rotated` in the UI within 5 s)
 - [x] neo16's daemon reinstalled CORPLAP-3 under the NEW public key (`peer's WG public key changed - reinstalling its carrier`, 00:19:39, 12 s after the re-join) and traffic flows: overlay ping 4/4 at 84–97 ms within 60 s of the click (`roomler peers --json` carries no key field — the log line is the evidence)
 - [x] the old public key is on no peer's WG device afterwards — `peer's WG public key changed — reinstalling its carrier` on neo16 AND mars, 18 ms after the join (`remove_peer_state` drops the old key; `roomler peers --json` carries no key field, so the log line is the evidence)
 - [ ] a device on `0.4.24` or older (no verb) gets `unsupported` on the route, not a spinner — integration-tested (`an_offline_device_is_queued_and_the_state_is_honest_about_it`); not field-verified: every fleet device had auto-updated past the verb by the time this was tried
