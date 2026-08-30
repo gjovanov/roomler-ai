@@ -1450,6 +1450,13 @@ struct RateMemoryGuard {
     /// AIMD decreases seen this session — a LOWER stable rate is only written
     /// back when this is non-zero (an idle session must not decay the memory).
     decreases: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// FR-35 P3 — the pipe's burst drain rate measured on the opening burst
+    /// (`rate_memory::opener_drain_bps`); `0` = not measured. A clean session
+    /// grows the memory toward it, so a pair converges in ONE session instead
+    /// of needing minutes of sustained drag.
+    opener_drain: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The learned ceiling's cap (`relay_max_hi_bps`); growth never passes it.
+    hi_bps: u32,
 }
 
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
@@ -1463,11 +1470,14 @@ impl Drop for RateMemoryGuard {
             return;
         }
         let had_decrease = self.decreases.load(std::sync::atomic::Ordering::Relaxed) > 0;
+        let opener_drain = self.opener_drain.load(std::sync::atomic::Ordering::Relaxed);
         let mut mem = crate::encode::rate_memory::RateMemory::load(path);
         let kept = mem.record_session(
             peer,
             stable,
             had_decrease,
+            opener_drain,
+            self.hi_bps,
             crate::encode::rate_memory::now_unix(),
         );
         match mem.save(path) {
@@ -1476,6 +1486,7 @@ impl Drop for RateMemoryGuard {
                 stable_bps = stable,
                 kept_bps = kept,
                 had_decrease,
+                opener_drain_bps = opener_drain,
                 "FR-35 rate memory: stable rate remembered for the pair"
             ),
             Err(e) => {
@@ -4431,6 +4442,8 @@ async fn media_pump_ffmpeg_dc(
         peer: rate_peer_key,
         stable: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         decreases: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        opener_drain: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        hi_bps: rate_hi_bps,
     };
     // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
     // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
@@ -4626,6 +4639,13 @@ async fn media_pump_ffmpeg_dc(
     let send_wait_us_sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_wait_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // FR-35 P3 — the opener as a burst probe: bytes sent and the longest
+    // queue-wait seen while the opening grace is on. Their ratio is the
+    // pipe's burst drain rate — the one number that sizes a crisp opener —
+    // and every session measures it for free (P0 had to do it by hand).
+    let opener_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let opener_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let in_opener_grace = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     // The longest blocked send the task has seen since the pump last
     // looked, µs. A separate cell from the heartbeat's max because this
     // one is a CONTROL input drained every loop, while that one is a
@@ -4649,6 +4669,19 @@ async fn media_pump_ffmpeg_dc(
     // Resolved once: a per-frame env read would sit in the hot path.
     let send_stall_threshold = crate::encode::send_stall_threshold();
     let mut send_stalls: u64 = 0;
+    // FR-35 P3 — opener grace. The opening keyframe + desktop repair is a
+    // burst by design (P0: this path absorbs bursts far above its sustainable
+    // rate). Read as congestion it cut the seeded 5.95 Mbps session ×0.85
+    // within 1.8 s of connecting (send_wait_max 367 ms, 73 backpressure skips
+    // — field 2026-08-30) and the AIMD then climbed back one starved IDR per
+    // 5-s step. For the first `OPENER_GRACE` of a constrained session, soft
+    // stalls and backpressure skips are counted but not fed to the AIMD; a
+    // HARD stall (≥ 1 s) still is.
+    const OPENER_GRACE: Duration = Duration::from_secs(2);
+    let pump_started = std::time::Instant::now();
+    let mut opener_grace_done = false;
+    let mut grace_soft_stalls: u32 = 0;
+    let mut grace_bp_skips: u32 = 0;
     let mut last_deferred_apply_at: Option<std::time::Instant> = None;
     let mut settle_kf_suppressed: u64 = 0;
 
@@ -4727,6 +4760,9 @@ async fn media_pump_ffmpeg_dc(
         let send_wait_us_max = send_wait_us_max.clone();
         let send_wait_frames = send_wait_frames.clone();
         let send_stall_us = send_stall_us.clone();
+        let opener_wait_us_max = opener_wait_us_max.clone();
+        let opener_bytes = opener_bytes.clone();
+        let in_opener_grace = in_opener_grace.clone();
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
         tokio::spawn(async move {
@@ -4813,6 +4849,11 @@ async fn media_pump_ffmpeg_dc(
                             send_wait_us_max.fetch_max(waited_us, Relaxed);
                             send_wait_frames.fetch_add(1, Relaxed);
                             send_stall_us.fetch_max(waited_us, Relaxed);
+                            // FR-35 P3 — the opening burst as a probe.
+                            if in_opener_grace.load(Relaxed) {
+                                opener_wait_us_max.fetch_max(waited_us, Relaxed);
+                                opener_bytes.fetch_add(total as u64, Relaxed);
+                            }
                         }
                     }
                     // Byte-budget ledger: the frame left the queue (delivered
@@ -5098,7 +5139,15 @@ async fn media_pump_ffmpeg_dc(
             // is the same congestion semantic judged in bytes: frame-count
             // depth bounds nothing when native motion frames are 20× rung
             // size, and the queue it allows is pure viewer lag.
-            if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
+            // FR-35 P3 — inside the opener grace the skips are the opening
+            // burst draining, not congestion: skip the frame, keep the AIMD.
+            let bp_applied = if constrained && !opener_grace_done {
+                grace_bp_skips += 1;
+                None
+            } else {
+                governor.on_backpressure_skip(std::time::Instant::now())
+            };
+            if let Some(applied) = bp_applied
                 && let Some(enc) = encoder.as_mut()
             {
                 // rc.445 — congestion here means motion almost surely;
@@ -5690,12 +5739,46 @@ async fn media_pump_ffmpeg_dc(
         // different response. Feeding the SAMPLE rather than taking the move
         // lets `pre_encode_tick` below apply it through the normal arms one
         // frame later.
+        // FR-35 P3 — end of the opener grace: turn what the send task saw
+        // into the pipe's burst drain rate, for the pair memory.
+        if !opener_grace_done && pump_started.elapsed() >= OPENER_GRACE {
+            opener_grace_done = true;
+            in_opener_grace.store(false, std::sync::atomic::Ordering::Relaxed);
+            let bytes = opener_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            let wait_us = opener_wait_us_max.load(std::sync::atomic::Ordering::Relaxed);
+            let drain = crate::encode::rate_memory::opener_drain_bps(bytes, wait_us);
+            if constrained {
+                rate_memory_guard
+                    .opener_drain
+                    .store(drain, std::sync::atomic::Ordering::Relaxed);
+                info!(
+                    %session_id,
+                    codec_label,
+                    opener_bytes = bytes,
+                    opener_wait_max_ms = wait_us / 1000,
+                    opener_drain_bps = drain,
+                    grace_soft_stalls,
+                    grace_bp_skips,
+                    "FR-35 opener grace over — the opening burst's drain rate is the pair's burst capacity"
+                );
+            }
+        }
         if let Some(threshold) = send_stall_threshold {
             let stalled_us = send_stall_us.swap(0, std::sync::atomic::Ordering::Relaxed);
             if constrained && stalled_us >= threshold.as_micros() as u64 {
                 send_stalls += 1;
-                governor
-                    .note_send_stall(Duration::from_micros(stalled_us), std::time::Instant::now());
+                // FR-35 P3 — a soft stall inside the opener grace is the
+                // opening burst draining; only a HARD stall is fed.
+                let hard =
+                    stalled_us >= crate::encode::ceiling_learn::HARD_STALL.as_micros() as u64;
+                if !opener_grace_done && !hard {
+                    grace_soft_stalls += 1;
+                } else {
+                    governor.note_send_stall(
+                        Duration::from_micros(stalled_us),
+                        std::time::Instant::now(),
+                    );
+                }
             }
         }
 
@@ -5721,8 +5804,24 @@ async fn media_pump_ffmpeg_dc(
             // defer) — relay keeps the rc.445 motion-defer below, the
             // posture that was field-proven there. Also the fallback
             // with the hatch off.
-            if enc.supports_dynamic_bitrate() {
+            // FR-35 P3 — an INCREASE on a constrained NVENC session is held
+            // like a rebuild: the in-place reconfigure is a starved IDR
+            // (FR-31) — a visible blur pulse on a static screen — and the
+            // seeded field run (2026-08-30) showed one per 5-s AIMD step. It
+            // flushes through the spaced quiet arm below, coalesced to the
+            // latest target. Decreases still land at once, and anchor the
+            // spacing so the climb back cannot start on the very next step.
+            let held_increase = constrained
+                && relay_idr_thrift
+                && enc.supports_dynamic_bitrate()
+                && applied.bps > enc.current_maxrate_bps();
+            if held_increase {
+                deferred_bps = Some(applied.bps);
+            } else if enc.supports_dynamic_bitrate() {
                 deferred_bps = None;
+                if constrained && relay_idr_thrift {
+                    last_deferred_apply_at = Some(std::time::Instant::now());
+                }
                 enc.set_bitrate(applied.bps);
             } else if bg_rebuild && !constrained {
                 swap_wanted = Some(applied.bps);
@@ -5793,7 +5892,11 @@ async fn media_pump_ffmpeg_dc(
                 // refresh. Jump the (stale) queue for it.
                 deferred_bps = None;
                 last_deferred_apply_at = Some(std::time::Instant::now());
-                send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The epoch discard exists for a REBUILD's stale queue; an
+                // in-place (NVENC) apply keeps the same encoder and stream.
+                if !enc.supports_dynamic_bitrate() {
+                    send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 enc.set_bitrate(bps);
                 info!(
                     %session_id,
