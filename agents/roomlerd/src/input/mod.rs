@@ -87,6 +87,12 @@ pub mod layout;
 ))]
 pub mod system_context_backend;
 
+/// FR-36 P4 — input via `/dev/uinput`, below the compositor. The companion to
+/// `capture::drm_backend`: XTest reaches Xwayland clients only, so without
+/// this a captured Wayland session is READ-ONLY. Linux-only by construction.
+#[cfg(all(target_os = "linux", feature = "uinput-input"))]
+pub mod uinput_backend;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Button {
@@ -222,6 +228,29 @@ pub fn open_default() -> Box<dyn InputInjector + Send> {
                     %e,
                     "worker_role::probe_self in input::open_default failed — assuming user-context"
                 );
+            }
+        }
+    }
+    // FR-36 P4 — uinput, below the compositor. Opt-in for the same reason the
+    // DRM capture backend is: a virtual input device is host-global and shows
+    // up in every application's device list, so one must never appear merely
+    // because a host upgraded. `ROOMLERD_UINPUT=1`, normally paired with
+    // `ROOMLERD_DRM_CAPTURE=1` on a Wayland host.
+    //
+    // ⚠️ Placed AHEAD of enigo deliberately: on a native Wayland desktop XTest
+    // reaches only Xwayland clients, so enigo does not fail — it succeeds and
+    // does nothing, which is far harder to diagnose than an error.
+    #[cfg(all(target_os = "linux", feature = "uinput-input"))]
+    {
+        if uinput_backend::env_enabled() {
+            match uinput_backend::UinputInjector::new() {
+                Ok(u) => return Box::new(u),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "ROOMLERD_UINPUT=1 but uinput init failed — falling through to the standard backend"
+                    );
+                }
             }
         }
     }

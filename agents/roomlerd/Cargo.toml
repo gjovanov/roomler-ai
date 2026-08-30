@@ -518,8 +518,19 @@ media-hw = ["media", "mf-encoder"]
 # the same reason `ssh-server` is — the code is present with its gates closed,
 # so a Wayland host opts in with an env var instead of a custom build.
 drm-capture = ["dep:drm"]
+# FR-36 P4 — input injection through `/dev/uinput`, below the compositor.
+# The companion to `drm-capture`: XTest reaches Xwayland clients ONLY, so on a
+# native Wayland desktop enigo does not fail, it succeeds and does nothing —
+# a captured session would be read-only. Linux-only in effect; needs no new
+# crate (libc is already a cfg(unix) dep).
+#
+# ⚠️ Compiling it in switches nothing: `ROOMLERD_UINPUT` defaults to OFF,
+# because a virtual input device is host-global and appears in every
+# application's device list. Shipped in `full` with its gate closed, same as
+# `drm-capture`.
+uinput-input = []
 # Everything needed for a full remote-control session, software only.
-full = ["media", "enigo-input", "clipboard", "audio", "drm-capture"]
+full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
