@@ -2,7 +2,7 @@
 # FR-32 — Eleven of fourteen plan limits are advertised and enforced nowhere
 
 **Issue:** [#898](https://github.com/gjovanov/roomler-ai/issues/898) ·
-**Status:** P0+P1a+P1b+P1c shipped & field-verified on `v20260829-0da90b766dc0`; P2 pending ·
+**Status:** P0–P1c + integration tests shipped; **P2 complete for existing tenants** (all 65 on `Enforce`); default stays `Warn` by standing decision · field-verified on `v20260830-eaba9f4b0554` ·
 **Parent arc:** pricing (P1 of the sequence agreed under [FR-24](FR-24-licensing-split.md))
 
 ## Goal
@@ -75,6 +75,10 @@ So: `TenantSettings.plan_enforcement: Off | Warn | Enforce`, **default `Warn`**.
 
 `Warn` is the default rather than `Off` because a mode that does nothing produces no data,
 and the entire purpose of P1 is to learn who *would* be denied before anyone is.
+
+> ⚠ **That rationale is now historical.** The observe phase is over and every existing tenant
+> is on `Enforce`, but the default is still `Warn` — for a *different*, deliberate reason. See
+> "Standing decision: the default stays `Warn` during early growth" below before changing it.
 
 ### 2. One decision point, not eleven
 
@@ -248,6 +252,28 @@ one more"), and conflating them would mark every tenant exactly at its limit as 
 - [ ] Denial records are queryable per tenant, so "who would break" can be answered before any flip.
 - [ ] No tenant is moved to `Enforce` without its warn data being read first — recorded per tenant in the field log.
 
+## Standing decision: the default stays `Warn` during early growth
+
+**Operator, 2026-08-30.** Every existing tenant is on `Enforce`, but
+`PlanEnforcement::default()` remains `Warn`, so **new signups are not enforced**.
+
+The original justification for that default is spent — it existed for the observe phase, which
+is over. The current justification is different and deliberate:
+
+- The grandfathering hazard **does not apply to a new tenant**. It starts at zero usage and
+  cannot be retroactively over a limit, so `Warn` is not protecting anyone from a state we put
+  them in.
+- It is a **go-to-market choice**: while the product is in early growth, a promising signup must
+  not be stopped at 10 members or 100 MB before anyone has spoken to them.
+
+⚠ The consequence, stated plainly because it reads like a bug: the advertised plan limits **do
+not fire for anyone who signs up**. That is intended, for now, and is recorded on the
+`PlanEnforcement` enum itself so the next reader does not "fix" it.
+
+**Revisit when** the product leaves early growth, or when a real (non-test, non-internal) tenant
+is on a paid plan — whichever comes first. Flipping `#[default]` to `Enforce` is the whole
+change.
+
 ## Open decisions
 
 1. **`max_message_history` is not a gate.** Free advertises 5 000 messages; enforcement could
@@ -327,3 +353,27 @@ that the lower issue number keeps `FR-N` while the higher renumbers. `FR-32` was
 be *free* rather than *vacated* before being taken — `git log -S "FR-32"` over the ledger
 returns nothing and no issue was ever titled FR-32 — because a vacated number must never be
 reused.
+
+### 2026-08-30 — P2 complete for existing tenants; AI recognition removed
+
+**All 65 live tenants moved to `Enforce`** (`matched=65 modified=63` — the two Enterprise orgs
+were already there; `not-enforce remaining: 0`). Checked first that no live lane depended on the
+test-debris tenants: the newest is **183 days old** and **0 tenants** were created in the
+preceding 7 days. App-level confirmation: `/health` 200, `/api/stripe/plans` 200, and **0**
+deserialisation errors / ERROR / panics across 3 258 log lines.
+
+**AI document recognition removed entirely** (#974, `8d8d07a04`, deployed
+`v20260830-eaba9f4b0554`) after verifying it unused in prod — `recognized_content` on 0 of 22
+files, 0 recognition tasks ever. −643/+52 across 25 files, including the `ROOMLER__CLAUDE__*`
+config surface. `POST …/recognize` now returns **404**.
+
+**Free video 0 → 4** (#959, deployed `v20260830-078ebef47b2a`), advertised publicly.
+
+The report's verdict across the arc — the same number meaning three different things:
+
+| State | `would_break` | Why |
+|---|---|---|
+| before the coverage fix | 0 / 65 | the video gate was not measured |
+| after the coverage fix | 63 / 65 | every Free tenant would have lost conferencing |
+| after Free → 4 | 63 / 65 | `AiRecognition` only |
+| after removing AI recognition | **0 / 65** | genuinely clean, and now trustworthy |
