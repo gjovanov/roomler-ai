@@ -216,7 +216,11 @@ must not be logged out of everything (`stats.rs:45-47`).
 - [x] A tenant with no relay traffic renders `0`; an unmonitored PoP renders "not monitored" — never the same cell
 - [x] `/observability` shows per-org cost + margin and the fleet relayed fraction
 - [x] `/tenant/{tid}/analytics` shows the org's own usage and relayed fraction
-- [ ] Measured DERP forward-path overhead is within noise of the pre-change baseline
+- [x] Measured DERP forward-path overhead is within noise of the pre-change
+  baseline — **99.92 ns/frame**, i.e. **0.002 % of one core** at the busiest
+  minute this deployment has ever recorded. See the log below; the numbers
+  come from `bench_add_network_bytes_cost`, not from an argument about how
+  cheap an atomic is.
 
 ## Open decisions
 
@@ -257,6 +261,7 @@ must not be logged out of everything (`stats.rs:45-47`).
 | 2026-08-30 | **POSITIVE arm: same apparatus over a relayed carrier (mars to neo16-wsl-2)** | 6,116 pkts / 60 s; **19,545,144 B metered** vs 17,454,444 B of two-way ICMP payload (+12%, encapsulation-shaped, never less); **116x background**, decaying to background the minute it stops |
 | 2026-08-30 | Bucket attribution granularity | the flush timer writes the drained counter into the bucket current **at flush time**, so a minute's bytes can land one bucket late (2.67 MB / 16.87 MB for an even 60 s load). **Total conserved, placement coarse** - immaterial to the 1 h/1 d rollups billing reads; a per-minute chart must not be sold as packet-accurate |
 | 2026-08-30 | PoP metering path, end to end | `https://derp-<region>.roomler.ai/stats` gives **HTTP 200**, `per_network` present, `derp_registrations=0` on all four. Wired, polled and healthy - and **carrying nothing, because no agent is homed to a PoP**. The central `/derp` on the API pods carries all of it today |
+| 2026-08-31 | Forward-path overhead, measured (`bench_add_network_bytes_cost`, 8 threads on ONE network id — the realistic AND worst case) | atomic alone **16.39 ns**, `add_network_bytes` **99.92 ns**, so the DashMap lookup is **83.53 ns — 5x the atomic**. At 200 frames/s (the busiest recorded minute, 16.87 MB at ~1.4 KB/frame) that is **0.002 % of one core**, and ~500x headroom before it reaches 1 %. Against FR-18's 200 ms p99 the added per-frame latency is ~5e-7 of the budget |
 
 ## What the two arms actually establish (2026-08-30)
 
@@ -338,3 +343,25 @@ visibly notional, and margin pro-rates the monthly price to the selected range
 | 2026-08-30 | Currency check | newest bucket 1 minute old; 234 buckets in the preceding 2 h ⇒ metering live, not stalled |
 | 2026-08-30 | ⚠️ **Criterion 2 was unfalsifiable as written** | `stats_relay` has **never** stored `net_tx_bytes` — absent in all 100 800 documents. `relay_load.rs` reads the `/stats` counters into a local struct and writes `rx_mbps`/`tx_mbps` instead. A criterion naming a field nobody stores can only ever be "not done"; restated against `DERP_BYTES_RELAYED_TOTAL` |
 | 2026-08-30 | PoP egress reality check | all five regions ~0 traffic (`tx_mbps` ≈ 0.001) while the ledger moved 1.77 GB ⇒ the fleet's DERP rides the **API pods**, not the regional PoPs. A PoP-vs-ledger comparison would have compared two things that barely overlap |
+
+## Correction: the hot path is a LOOKUP plus an atomic, not "one atomic add"
+
+The code comment (and this spec's P1 note) said *"one atomic add on the hot
+path"*. Measured, that understates it by 6x: steady state is a DashMap `get`
+— hash, shard read-lock, deref — **and then** the relaxed `fetch_add`, and the
+**lookup is 5x the cost of the atomic** (83.53 vs 16.39 ns). Most of the
+atomic's own cost is cache-line ping-pong between cores, not the instruction.
+
+It does not matter at today's volumes and the criterion passes on a large
+margin. It is recorded because the claim was wrong, not because the number is:
+a reader who believed "one atomic add" would mis-budget this path by 6x when
+DERP throughput grows.
+
+**The lever, if it ever matters**: a DERP connection forwards for a network
+that is fixed for the life of the session, so the counter could be resolved
+**once at session start** and held, removing the per-frame lookup entirely
+(`DashMap<ObjectId, Arc<AtomicU64>>`, since entries are drained with `swap(0)`
+and never removed, so a cached handle stays valid). Deliberately NOT done —
+at 0.002 % of a core it would be optimising something 500x below where it could
+begin to matter, and the cached handle is one more thing to keep correct across
+re-homing.
