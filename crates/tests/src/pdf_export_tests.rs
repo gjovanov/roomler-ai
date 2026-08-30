@@ -95,6 +95,6 @@ async fn export_conversation_as_pdf() {
 
     let body = resp.bytes().await.unwrap();
     // PDF files start with %PDF
-    assert!(body.len() > 0);
+    assert!(!body.is_empty());
     assert_eq!(&body[0..5], b"%PDF-");
 }
