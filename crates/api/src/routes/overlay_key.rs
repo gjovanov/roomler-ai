@@ -240,9 +240,89 @@ pub async fn rotate_overlay_key(
     }))
 }
 
+/// P1b — how long a DELIVERED order is trusted to be in progress before the
+/// connect-time reconcile pushes it again. Found in the first field run: the
+/// device's `rotated` report rides the dying session and is written by a
+/// spawned task, while the device reconnects ~500 ms later — its register ran
+/// the reconcile before the report landed, re-pushed the SAME order, the
+/// device refused the duplicate under its own 60 s ceiling, and that refusal
+/// overwrote the `rotated` report. A freshly delivered order is being
+/// executed; its answer is seconds away. Past this window an unanswered order
+/// is assumed dropped (the device crashed mid-rotation, say) and re-sent.
+pub const REDELIVER_AFTER_SECS: i64 = 120;
+
+/// Whether a standing order should be pushed again on THIS connect.
+pub fn should_redeliver(
+    request: &KeyRotationRequest,
+    report: Option<&roomler_ai_remote_control::models::KeyRotationReport>,
+    now: DateTime,
+) -> bool {
+    if report.is_some_and(|r| r.request_id == request.request_id) {
+        return false;
+    }
+    match request.delivered_at {
+        None => true,
+        Some(at) => (now.timestamp_millis() - at.timestamp_millis()) / 1000 >= REDELIVER_AFTER_SECS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn req(delivered_secs_ago: Option<i64>, now: DateTime) -> KeyRotationRequest {
+        KeyRotationRequest {
+            request_id: "r1".into(),
+            requested_by: ObjectId::new(),
+            requested_at: now,
+            delivered_at: delivered_secs_ago
+                .map(|s| DateTime::from_millis(now.timestamp_millis() - s * 1000)),
+        }
+    }
+
+    fn report(request_id: &str) -> roomler_ai_remote_control::models::KeyRotationReport {
+        roomler_ai_remote_control::models::KeyRotationReport {
+            request_id: request_id.into(),
+            outcome: roomler_ai_remote_control::models::KeyRotationOutcome::Rotated,
+            old_public_key: None,
+            new_public_key: None,
+            key_epoch: 1,
+            detail: None,
+            reported_at: DateTime::now(),
+        }
+    }
+
+    /// The duplicate-delivery race from the first field run.
+    #[test]
+    fn a_freshly_delivered_order_is_not_pushed_again_on_reconnect() {
+        let now = DateTime::now();
+        assert!(!should_redeliver(&req(Some(1), now), None, now));
+        assert!(!should_redeliver(
+            &req(Some(REDELIVER_AFTER_SECS - 1), now),
+            None,
+            now
+        ));
+    }
+
+    #[test]
+    fn an_undelivered_or_stale_unanswered_order_is_pushed() {
+        let now = DateTime::now();
+        assert!(should_redeliver(&req(None, now), None, now));
+        assert!(should_redeliver(
+            &req(Some(REDELIVER_AFTER_SECS), now),
+            None,
+            now
+        ));
+        assert!(should_redeliver(&req(Some(3600), now), None, now));
+    }
+
+    #[test]
+    fn an_answered_order_is_never_pushed_and_an_old_answer_does_not_count() {
+        let now = DateTime::now();
+        assert!(!should_redeliver(&req(None, now), Some(&report("r1")), now));
+        // A report about an EARLIER order says nothing about this one.
+        assert!(should_redeliver(&req(None, now), Some(&report("r0")), now));
+    }
 
     #[test]
     fn the_ceiling_refuses_before_anything_else() {
