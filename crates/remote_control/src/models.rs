@@ -1120,6 +1120,13 @@ pub struct KeyRotationRequest {
     /// for the device's next connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<DateTime>,
+    /// P1c — the overlay PUBLIC key the device held when the order was placed
+    /// (its [`OverlayIdentity`] at that moment; absent if it had never
+    /// joined). The join under a DIFFERENT key is what proves the rotation:
+    /// the device's report rides the session that is about to end and can be
+    /// lost (second field run), and a report is only ever a claim anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key_before: Option<String>,
 }
 
 /// How a device answered a rotation order. Every arm but [`Self::Rotated`] is
