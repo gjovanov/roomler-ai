@@ -1067,6 +1067,15 @@ impl AgentPeer {
                             "video-bytes DC stashed for Y.3 media-pump branch"
                         );
                         *video_bytes_stash.lock().await = Some(dc.clone());
+                        // A shared-pipeline FOLLOWER forces its join-IDR ~33 ms
+                        // after registering (during AgentPeer::new), long before
+                        // this DC finished negotiating — and the follower chunker
+                        // drops anything that arrives while the DC is None/!Open,
+                        // so that IDR was lost and the follower is `synced` with
+                        // no keyframe: a BLACK SCREEN until the next natural IDR
+                        // (field 2026-08-30, two viewers of CORPLAP-3). Now the
+                        // DC is live, re-sync onto a fresh IDR. No-op for a leader.
+                        crate::media_share::resync_follower(session_id);
                         attach_log_only(dc, session_id);
                     }
                     _ => attach_log_only(dc, session_id),
