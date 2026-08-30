@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture, and unattended access
 
-**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **P1 capture + P4 uinput input landed and field-verified (opt-in). Greeter and locked-session capture proven; keystrokes reach GNOME Wayland; 4K `Auto` down to 24 ms** (2026-08-30) · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **END-TO-END PROVEN: the browser renders a GNOME Wayland desktop and drives it, via DRM capture + uinput, both opt-in. Greeter + locked screen also verified. Remaining gap: `KeyText` (you can navigate but not type)** (2026-08-30) · **Owner:** agent / capture
 
 ## Goal
 
@@ -179,20 +179,30 @@ out of scope becomes in-scope here.
       primary display: connection refused)` and delivers **zero frames**
 - [x] The P1 backend is **wired into the capture cascade** and delivers
       `Frame`s through the `ScreenCapture` trait (`roomlerd capture-smoke`)
-- [ ] A **browser-visible remote-control session** against that Wayland
-      desktop. ⚠️ **Attempted 2026-08-30 and BLOCKED on host state, not on the
-      feature.** It needs the FR-36 build running *as the daemon* with both
-      gates on, and `scw-m2-asahi` has an **auto-start hook that respawns
-      `roomlerd run` (no `--config`) within ~3 s of a kill** — it retook the
-      single-instance lock before the FR-36 binary could, which exited
-      immediately. That hook is also how the orphan in the host's long-running
-      restart storm keeps reappearing. Two things learned the hard way:
-      `systemctl stop roomlerd` **kills the whole cgroup**, including a
-      `setsid`-detached script spawned from a `roomler exec` (run the swap from
-      a `systemd-run` transient unit instead); and the only channel to this host
-      *is* the daemon, so fighting its supervisor risks locking oneself out.
-      Do this on a host whose daemon is not self-respawning, or disable the hook
-      first with console access available.
+- [x] **A browser-visible remote-control session against that Wayland desktop —
+      PASSED 2026-08-30.** The viewer at `roomler.ai/.../remote` rendered the
+      GNOME Wayland desktop of `scw-m2-asahi` (`connected`, H.264 SW, ~16 fps),
+      and the daemon log names both backends for that session:
+      `capture: backend=drm … node="/dev/dri/card2" 4096x2160` and
+      `input: backend=uinput`. The gates came from **config, not env** —
+      `config-backed env fallbacks registered keys=[…"DRM_CAPTURE"…"UINPUT"]` —
+      which is the config-surface work paying off, because the daemon that
+      served this session was spawned by the host's auto-start hook, outside
+      systemd, where a unit env block would never have reached it.
+      ⚠️ The viewer reported **2048×1080** for a 4096×2160 panel: the fused
+      downscale is what fed the encoder. The X11 path would have shown
+      1920×1080 — and on Wayland, nothing at all.
+- [x] **Input, through the browser** — a click on the remote view opened
+      **GNOME Shell's own calendar panel**, and `Escape` closed it again. So the
+      pointer path and the physical-key (HID) path both reach a native Wayland
+      compositor.
+      ⚠️⚠️ **But you cannot TYPE.** The viewer sends composed text as
+      `KeyText`, which this backend drops by design, and the daemon logged
+      exactly that: `uinput: KeyText is not supported … text input will not
+      arrive`. The documented limitation therefore has a concrete user-visible
+      shape — **navigate yes, type no** — and only the end-to-end test could
+      surface it. That makes layout-aware `KeyText` the highest-value follow-up,
+      ahead of anything else left on this FR.
 - [x] Streams **while the session is locked**, and **at the login greeter** —
       the cases the portal structurally refuses. Greeter: **20/20 frames with
       nobody logged in**. Locked: the XFCE unlock dialog captured.
@@ -318,3 +328,5 @@ out of scope becomes in-scope here.
 | 2026-08-30 | P4 hygiene | The virtual device is destroyed on drop — no `Roomler Virtual Input` left in `/sys/devices/virtual/input` after the run. Host returned to XFCE with `backend=scrap` and damage tracking active |
 | 2026-08-30 | **P1b — fuse the downscale into the repack** | ✅ 4K `Auto`: **52.9 ms → 24.0 ms**, i.e. *faster than not downscaling* (43.8 ms) — the write is 4× smaller while the read stays sequential. ~30 fps at 4K instead of ~19. ⚠️⚠️ **The first attempt made it 6× WORSE (329.8 ms)**: sampling two source rows a pitch apart per output pixel, because **the scanout mapping punishes strided reads brutally**. Row-buffering into cached scratch — sequential reads, identical arithmetic — is what won. A unit test pins the fused output byte-for-byte against the two-step route it replaced |
 | 2026-08-30 | **end-to-end browser session — ATTEMPTED, blocked** | ⚠️ Swapping the FR-36 build in as the daemon failed: the host's **auto-start hook respawned the packaged `roomlerd run` (no `--config`) within ~3 s**, retook the single-instance lock, and the FR-36 binary exited at once. ⚠️ `systemctl stop roomlerd` also **killed the swap script itself** — a `setsid`-detached child of a `roomler exec` is still in the unit's cgroup, and systemd kills the cgroup. Use a `systemd-run` transient unit. Host restored to XFCE + the packaged daemon (`NRestarts=0`, one process, no lock refusals) — cleaner than it was found, since the long-running orphan is gone |
+| 2026-08-30 | **🏆 END-TO-END BROWSER SESSION — PASSED** | The `roomler.ai` viewer rendered `scw-m2-asahi`'s **GNOME Wayland** desktop (`connected`, H.264 SW, ~16 fps, **2048×1080** for a 4096×2160 panel ⇒ the fused downscale fed the encoder). Daemon log for that session: `capture: backend=drm … node="/dev/dri/card2" 4096x2160` + `input: backend=uinput`. **Gates came from CONFIG, not env** (`config-backed env fallbacks registered keys=[…DRM_CAPTURE…UINPUT]`) — decisive, because the serving daemon was spawned by the host's auto-start hook *outside systemd*, where a unit env block could not have reached it. A browser click opened **GNOME Shell's own calendar panel**; `Escape` closed it. ⚠️ Typing did NOT arrive — the viewer sends `KeyText`, which the backend drops by design: **navigate yes, type no** |
+| 2026-08-30 | how the blocker was cleared | The auto-updater had already installed release **0.4.30**, which carries the merged FR-36 stack — so the test ran against the **shipped artifact**, not a dev build, and no binary swap was needed after all. Gates were set with `roomlerd cli config set`. ⚠️ A dead-man switch (`systemd-run --on-active=…` restoring the packaged service) was armed throughout; the host briefly went offline during a bad `systemd-run` invocation (`--config` was swallowed as a systemd-run option — it needs `--`) and the hook restored it within seconds |
