@@ -120,6 +120,14 @@ pub struct FollowerSink {
     pub priority: Arc<AtomicU8>,
     pub capture_native_dims: Arc<AtomicU64>,
     pub encoded_dims: Arc<AtomicU64>,
+    /// FR-17 — whether THIS follower's controller negotiated per-chunk
+    /// framing (`chunk-framing` in `rc:session.request`). It is a per-SESSION
+    /// property, so a follower can disagree with the owner; the follower
+    /// chunker MUST frame exactly as this follower's browser expects, or the
+    /// receiver parses a chunk header out of raw payload and decodes nothing
+    /// (field 2026-08-30: every chunk-framing follower was a black screen —
+    /// the owner framed, the follower chunker did not).
+    pub chunk_framing: bool,
 }
 
 struct DetachState {
@@ -617,7 +625,12 @@ pub fn try_join(
     }
     let session_id = sink.session_id;
     let (send_tx, send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(FOLLOWER_SEND_DEPTH);
-    spawn_follower_chunker(session_id, sink.video_bytes_dc.clone(), send_rx);
+    spawn_follower_chunker(
+        session_id,
+        sink.video_bytes_dc.clone(),
+        send_rx,
+        sink.chunk_framing,
+    );
     let detach = Arc::new(DetachState {
         notify: tokio::sync::Notify::new(),
         reason: Mutex::new(None),
@@ -729,9 +742,14 @@ fn spawn_follower_chunker(
     session_id: bson::oid::ObjectId,
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    chunk_framing: bool,
 ) {
     tokio::spawn(async move {
         const SCTP_CHUNK_SIZE: usize = 16 * 1024;
+        // Per-follower frame sequence, exactly like the owner's send task:
+        // the browser reassembler compares it for equality only, so a
+        // follower's numbering being independent of the owner's is fine.
+        let mut frame_seq: u32 = 0;
         while let Some(wire) = rx.recv().await {
             let Some(dc) = video_bytes_dc.lock().await.clone() else {
                 continue;
@@ -742,14 +760,34 @@ fn spawn_follower_chunker(
                 continue;
             }
             let total = wire.len();
+            let chunk_count = total.div_ceil(SCTP_CHUNK_SIZE).max(1) as u16;
+            let mut chunk_idx: u16 = 0;
+            frame_seq = frame_seq.wrapping_add(1);
             let mut off = 0usize;
             while off < total {
                 let end = (off + SCTP_CHUNK_SIZE).min(total);
-                if let Err(e) = dc.send(&wire.slice(off..end)).await {
+                // MUST match the owner's send task (`media_pump_ffmpeg_dc`):
+                // apply the FR-17 8-byte chunk header when this follower
+                // negotiated it, or send raw slices when it did not. Sending
+                // raw slices to a chunk-framing browser hands it a chunk
+                // header parsed from AV1 payload — undecodable, a black screen.
+                let res = if chunk_framing {
+                    let framed = crate::peer::chunk_framed(
+                        frame_seq,
+                        chunk_idx,
+                        chunk_count,
+                        &wire.slice(off..end),
+                    );
+                    dc.send(&bytes::Bytes::from(framed)).await
+                } else {
+                    dc.send(&wire.slice(off..end)).await
+                };
+                if let Err(e) = res {
                     tracing::debug!(session = %session_id, %e, "media_share follower: DC send failed");
                     break;
                 }
                 off = end;
+                chunk_idx = chunk_idx.wrapping_add(1);
             }
         }
         tracing::debug!(session = %session_id, "media_share follower chunker exiting");
