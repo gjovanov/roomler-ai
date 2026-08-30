@@ -1,6 +1,6 @@
 # FR-35: The constrained ceiling learns the pair — grow the relay cap on delivery evidence, remember it per peer
 
-Status: **P1 + P2 + P2b shipped (0.4.21 / 0.4.23); P3 (opener-drain growth, opener grace, held NVENC increases) implemented 2026-08-30 — release + field verification on CORPLAP-2 pending** (2026-08-30). Tracking issue: `FR-35` (#922).
+Status: **P1 + P2 + P2b shipped (0.4.21 / 0.4.23); P3 (opener growth, opener grace, held NVENC increases) shipped 0.4.27 / 0.4.28 (#986, #988) — field runs on CORPLAP-2 show ONE keyframe per opener (the pulses are gone) and found two growth defects, fixed by P3b (#996, → 0.4.29); operator read pending** (2026-08-30). Tracking issue: `FR-35` (#922).
 Child of the RC-quality program. Follows FR-31 (every opening and repair number on an NVENC relay
 session is proportional to `maxrate`, and nothing ffmpeg exposes changes that) and the parked
 measured-rate line (#678: a sender cannot see capacity it is not using). Operator's directive
@@ -87,10 +87,17 @@ shipped defaults:
 - **Growth speed — DECIDED 2026-08-30 (P3).** Sessions in the field last seconds and are mostly idle, so
   drag-evidence growth never reaches the crisp opener; and the FR-31 verdict forbids a boost-then-step-down
   (the step-down IDR replaces the crisp picture). P3 therefore grows the memory from evidence every session
-  has for free: **the opening burst is a burst probe** — `opener_drain_bps = bytes / max_send_wait` over the
-  first 2 s — and a session that saw no decrease records `max(stable, 75 % × drain)` capped at `hi`
-  (`rate_memory::record_session`). A 221 KB opener that drained in 221 ms says 8 Mbps ⇒ the pair opens at
-  0.85 × 6 Mbps next time; a 2 Mbps pipe stays at the nominal; a decrease still lowers.
+  has for free: **the opening burst is a burst probe** — `bytes` sent and `max_send_wait` seen while the
+  opener drains — and a session that saw no decrease records `max(stable, growth_target)`
+  (`rate_memory::opener_growth_target_bps` + `record_session`). **P3b (#996)** shaped the target from the
+  0.4.28 field runs: a burst that **queued** (`max_send_wait ≥ 100 ms`) measured the pipe, target =
+  75 % × `bytes / max_send_wait` (a 451 KB opener that waited 802 ms says 4.5 Mbps ⇒ 3.38 M); a burst that
+  **never queued** (a 238 KB opener with a 0 ms wait — it fit SCTP's send buffer) proves only "not slower
+  than this", so the target is a bounded **×1.5 step on the opener's own maxrate** (the next, larger opener
+  then queues and measures) — the first implementation read it as 95 Mbps and wrote the memory straight
+  to `hi`. Both are capped at `hi`; a 2 Mbps pipe stays at the nominal; a decrease still lowers. The grace
+  holds until the send ledger is EMPTY (≥ 2 s, ≤ 6 s): a fixed 2 s ended while a 451 KB tail was still
+  draining and the AIMD took the decrease the grace exists to prevent.
   Two companions, both found on the seeded field run: an **opener grace** (soft send-wait stalls and
   backpressure skips inside the first 2 s are the opener draining, not congestion — they had cut a 5.95 Mbps
   session ×0.85 within 1.8 s) and **held NVENC increases on a constrained session** (an in-place
