@@ -864,6 +864,7 @@ mod tests {
             priority: Arc::new(AtomicU8::new(1)),
             capture_native_dims: Arc::new(AtomicU64::new(0)),
             encoded_dims: Arc::new(AtomicU64::new(0)),
+            chunk_framing: false,
         }
     }
 
