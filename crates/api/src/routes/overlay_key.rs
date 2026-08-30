@@ -257,7 +257,29 @@ pub async fn rotate_overlay_key(
 /// is assumed dropped (the device crashed mid-rotation, say) and re-sent.
 pub const REDELIVER_AFTER_SECS: i64 = 120;
 
-/// Whether a standing order should be pushed again on THIS connect.
+/// P1d — an order is SATISFIED once the device has joined under a key that
+/// differs from the one it held when the order was placed, whether or not a
+/// report ever arrived. Found in the third cycle: the run-2 order's report was
+/// lost, the P1b window expired, and every later reconnect (a pod roll, then
+/// the 0.4.26 restart) re-delivered the same order — the device rotated three
+/// times for one click. The join is the proof; a satisfied order is never
+/// pushed again. Orders placed before the snapshot existed (no
+/// `public_key_before`) cannot be judged this way and fall back to the report.
+pub fn order_is_satisfied(
+    request: &KeyRotationRequest,
+    identity: Option<&roomler_ai_remote_control::models::OverlayIdentity>,
+) -> bool {
+    match (request.public_key_before.as_deref(), identity) {
+        (Some(before), Some(id)) => {
+            id.public_key != before
+                && id.joined_at.timestamp_millis() >= request.requested_at.timestamp_millis()
+        }
+        _ => false,
+    }
+}
+
+/// Whether a standing order should be pushed again on THIS connect (the
+/// report-and-timing half; callers also check [`order_is_satisfied`]).
 pub fn should_redeliver(
     request: &KeyRotationRequest,
     report: Option<&roomler_ai_remote_control::models::KeyRotationReport>,
@@ -297,6 +319,35 @@ mod tests {
             detail: None,
             reported_at: DateTime::now(),
         }
+    }
+
+    fn ident(key: &str, at: DateTime) -> roomler_ai_remote_control::models::OverlayIdentity {
+        roomler_ai_remote_control::models::OverlayIdentity {
+            public_key: key.into(),
+            key_epoch: 1,
+            joined_at: at,
+        }
+    }
+
+    /// The third cycle: one click must never become three rotations.
+    #[test]
+    fn an_order_the_device_already_executed_is_satisfied_by_its_join_alone() {
+        let now = DateTime::now();
+        let later = DateTime::from_millis(now.timestamp_millis() + 5_000);
+        let earlier = DateTime::from_millis(now.timestamp_millis() - 5_000);
+        let mut r = req(Some(3600), now); // long past the P1b window, no report
+        r.public_key_before = Some("OLD==".into());
+        assert!(order_is_satisfied(&r, Some(&ident("NEW==", later))));
+        // Same key after the order: nothing happened yet.
+        assert!(!order_is_satisfied(&r, Some(&ident("OLD==", later))));
+        // A different key but from a join BEFORE the order proves nothing.
+        assert!(!order_is_satisfied(&r, Some(&ident("NEW==", earlier))));
+        // No snapshot (pre-P1c order) or no identity: cannot be judged.
+        assert!(!order_is_satisfied(
+            &req(Some(3600), now),
+            Some(&ident("NEW==", later))
+        ));
+        assert!(!order_is_satisfied(&r, None));
     }
 
     /// The duplicate-delivery race from the first field run.
