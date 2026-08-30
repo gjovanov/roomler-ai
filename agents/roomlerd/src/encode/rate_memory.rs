@@ -105,11 +105,15 @@ impl RateMemory {
     ///
     /// P3 — growth without drag. The opening burst is a free probe of the
     /// pipe's burst capacity (`opener_growth_target_bps`); a session that saw no
-    /// decrease grows the memory toward [`OPENER_DRAIN_PCT`] of it, capped
-    /// at `hi_bps`, so a pair reaches its crisp opener in one session instead
-    /// of after minutes of sustained drag (the first field runs: ≈3 learner
-    /// steps per minute of drag, and the operator's sessions last seconds).
-    /// A decrease still lowers the memory to the session's stable rate.
+    /// decrease grows the memory toward it, capped at `hi`, so a pair reaches
+    /// its crisp opener in a few sessions instead of after minutes of sustained
+    /// drag (the first field runs: ≈3 learner steps per minute of drag, and the
+    /// operator's sessions last seconds). ⚠️ The learner only reports a stable
+    /// rate ABOVE the nominal, so the common short session lands here with
+    /// `stable_bps == 0` — the write-back must run on the opener evidence ALONE,
+    /// which is why the guard's Drop no longer short-circuits on `stable == 0`
+    /// (P3b, field 2026-08-30: a clean session measured 7.3 Mbps and discarded
+    /// it). A decrease from a real learner rate still lowers to it.
     pub fn record_session(
         &mut self,
         peer: &str,
@@ -118,16 +122,22 @@ impl RateMemory {
         growth_target_bps: u32,
         now_unix: u64,
     ) -> u32 {
-        let mut value = stable_bps;
-        if !had_decrease {
-            if let Some(old) = self.seed_for(peer, now_unix)
-                && old > value
-            {
-                value = old;
-            }
-            if growth_target_bps > value {
-                value = growth_target_bps;
-            }
+        // The ceiling learner only reports a stable rate ABOVE the nominal, so a
+        // short static session — the common case — arrives here with
+        // `stable_bps == 0`. That is NOT evidence to lower anything: the memory
+        // stays at least what was remembered, and the opener still grows it.
+        // A decrease from a real learner rate (`stable_bps > 0`) is the one
+        // path allowed to lower.
+        let old = self.seed_for(peer, now_unix).unwrap_or(0);
+        let value = if had_decrease && stable_bps > 0 {
+            stable_bps
+        } else {
+            stable_bps.max(old).max(growth_target_bps)
+        };
+        if value == 0 {
+            // Nothing to remember (empty memory, idle session, no growth) — do
+            // not write a zero entry.
+            return 0;
         }
         self.record(peer, value, now_unix);
         value
@@ -278,6 +288,29 @@ mod tests {
             t.record_session("q", 3_400_000, true, fat, now + 120),
             3_400_000
         );
+        // 🔑 The COMMON case: a short static session reports stable=0 (the
+        // learner never rose above the nominal). The opener evidence alone must
+        // still grow the memory — before P3b the guard's Drop discarded it.
+        let mut u = RateMemory::default();
+        assert_eq!(u.record_session("z", 5_000_000, false, 0, now), 5_000_000);
+        assert_eq!(
+            u.record_session("z", 0, false, 7_307_342, now + 60),
+            7_307_342
+        );
+        // stable=0 with NO growth keeps the memory (idle keep-alive), never zeroes it.
+        assert_eq!(u.record_session("z", 0, false, 0, now + 120), 7_307_342);
+        assert_eq!(
+            u.entries["z"].at_unix,
+            now + 120,
+            "timestamp refreshed on idle"
+        );
+        // stable=0 + a decrease flag must NOT lower a learned memory (a decrease
+        // is only real evidence when the learner had a rate above the nominal).
+        assert_eq!(u.record_session("z", 0, true, 0, now + 180), 7_307_342);
+        // An empty memory with no evidence at all records nothing (returns 0).
+        let mut e = RateMemory::default();
+        assert_eq!(e.record_session("none", 0, false, 0, now), 0);
+        assert!(!e.entries.contains_key("none"));
         // Learning off (hi = 0): nothing to learn.
         assert_eq!(opener_growth_target_bps(451_464, 802_000, 2_550_000, 0), 0);
     }
