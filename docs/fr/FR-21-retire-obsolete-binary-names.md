@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#809](https://github.com/gjovanov/roomler-ai/issues/809) |
-| **Status** | **CLOSED 2026-08-29** — all 11 acceptance criteria met and field-verified on Linux, Windows and macOS. 1 849 → **0** unclassified, 743 anchored, guard BLOCKING on `--check --strict`. |
+| **Status** | **DONE 2026-08-30 — all 13 acceptance criteria field-verified**, on Linux, Windows and macOS; the last one (a pre-rename host keeping its enrolled identity across an upgrade) on a purpose-built throwaway Windows VM, §12. 1 849 → **0** unclassified, 743 anchored, guard BLOCKING on `--check --strict`. ⚠️ The issue was closed 2026-08-29 at a stated "11/11", which counted only the boxes ticked at that moment — this line said the same and was wrong in both directions. |
 | **Opened** | 2026-08-28 |
 | **Baseline** | master `fa364b12` (0.4.11) — every count and anchor below was measured against it |
 | **Scope** | Windows · Linux · macOS — code, comments, docs, `CLAUDE.md`, file names, folder names, env vars |
