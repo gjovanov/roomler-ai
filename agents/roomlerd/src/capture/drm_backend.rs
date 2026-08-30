@@ -44,7 +44,7 @@ use tracing::info;
 
 use drm::buffer::DrmFourcc;
 
-use super::{Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture, downscale_bgra_2x};
+use super::{Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 /// `/dev/dri/cardN` nodes to probe. The kernel numbers these from 0, but the
 /// numbering is NOT stable across kernel upgrades — on the Asahi field host the
@@ -412,9 +412,29 @@ fn grab(
     let Some((_, mapping)) = cached.as_ref() else {
         return Ok(None);
     };
-    let bgra = repack_to_bgra(mapping.as_slice(), width, height, pitch, ten_bit);
-
-    let scaled = maybe_downscale(bgra, width, height, downscale);
+    // Decide the output size BEFORE touching pixels, so a downscaled frame is
+    // produced in ONE pass instead of building a full-size intermediate and
+    // filtering it afterwards. At 4K that is the difference between
+    // read 35 MB → write 35 MB → read 35 MB → write 8.8 MB and
+    // read 35 MB → write 8.8 MB; the backend there is memory-bandwidth bound,
+    // so the pass count is the cost.
+    let scaled = if wants_half(width, height, downscale) {
+        Scaled {
+            data: repack_bgra_half(mapping.as_slice(), width, height, pitch, ten_bit),
+            width: width / 2,
+            height: height / 2,
+            stride: (width / 2) * 4,
+            source: Some((width, height)),
+        }
+    } else {
+        Scaled {
+            data: repack_to_bgra(mapping.as_slice(), width, height, pitch, ten_bit),
+            width,
+            height,
+            stride: width * 4,
+            source: None,
+        }
+    };
 
     Ok(Some(Frame {
         width: scaled.width,
@@ -444,34 +464,84 @@ struct Scaled {
     source: Option<(u32, u32)>,
 }
 
-/// Mirror the scrap backend's policy so a host does not get a different
-/// picture size purely because it switched capture backend. Shares
-/// `DOWNSCALE_TRIGGER_PIXELS` and the box filter with scrap rather than
-/// copying either.
-fn maybe_downscale(data: Vec<u8>, width: u32, height: u32, policy: DownscalePolicy) -> Scaled {
-    let pixels = width as u64 * height as u64;
-    let want = match policy {
+/// Mirror the scrap backend's policy — sharing `DOWNSCALE_TRIGGER_PIXELS`
+/// rather than restating the threshold — so a host does not get a different
+/// picture size purely because it switched capture backend.
+fn wants_half(width: u32, height: u32, policy: DownscalePolicy) -> bool {
+    if width < 2 || height < 2 {
+        return false;
+    }
+    match policy {
         DownscalePolicy::Always => true,
         DownscalePolicy::Never => false,
-        DownscalePolicy::Auto => pixels >= super::DOWNSCALE_TRIGGER_PIXELS,
-    };
-    if !want || width < 2 || height < 2 {
-        return Scaled {
-            data,
-            width,
-            height,
-            stride: width * 4,
-            source: None,
-        };
+        DownscalePolicy::Auto => (width as u64 * height as u64) >= super::DOWNSCALE_TRIGGER_PIXELS,
     }
-    let (small, w, h) = downscale_bgra_2x(&data, width, height, width * 4);
-    Scaled {
-        data: small,
-        width: w,
-        height: h,
-        stride: w * 4,
-        source: Some((width, height)),
+}
+
+/// Repack **and** 2×2 box-downsample in a single pass over the scanout buffer.
+///
+/// Same filter as `capture::downscale_bgra_2x` (average four samples per
+/// channel, `+2/4` round) and therefore the same picture — but it never
+/// materialises the full-size frame, which is the whole point: this backend is
+/// memory-bandwidth bound, so the win is one fewer read and one 4×-smaller
+/// write, not a cheaper inner loop.
+fn repack_bgra_half(src: &[u8], width: u32, height: u32, pitch: u32, ten_bit: bool) -> Vec<u8> {
+    let (dw, dh) = ((width / 2) as usize, (height / 2) as usize);
+    let pitch = pitch as usize;
+    let mut out = vec![0u8; dw * dh * 4];
+    // ⚠️ Copy each source row pair into cached scratch FIRST, then filter from
+    // there. Reading the two rows directly would alternate between addresses a
+    // whole pitch apart on every output pixel, and the scanout mapping punishes
+    // strided access brutally: the naive version measured 329 ms/frame at 4K
+    // against 53 ms for read-everything-then-filter. Sequential reads out of
+    // this mapping are the constraint — not the number of passes over it.
+    let row_bytes = (width as usize) * 4;
+    let mut scratch = vec![0u8; row_bytes * 2];
+    for y in 0..dh {
+        scratch[..row_bytes].copy_from_slice(&src[2 * y * pitch..2 * y * pitch + row_bytes]);
+        scratch[row_bytes..]
+            .copy_from_slice(&src[(2 * y + 1) * pitch..(2 * y + 1) * pitch + row_bytes]);
+        let (r0, r1) = (0usize, row_bytes);
+        let src = &scratch[..];
+        let dst = &mut out[y * dw * 4..(y + 1) * dw * 4];
+        for x in 0..dw {
+            let o = 2 * x * 4;
+            // Average in the SOURCE's own precision, then narrow — narrowing
+            // first would throw away the two bits that make averaging 10-bit
+            // samples worth doing at all.
+            let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
+            for base in [r0 + o, r0 + o + 4, r1 + o, r1 + o + 4] {
+                if ten_bit {
+                    let v = u32::from_le_bytes([
+                        src[base],
+                        src[base + 1],
+                        src[base + 2],
+                        src[base + 3],
+                    ]);
+                    b += v & 0x3FF;
+                    g += (v >> 10) & 0x3FF;
+                    r += (v >> 20) & 0x3FF;
+                } else {
+                    b += u32::from(src[base]);
+                    g += u32::from(src[base + 1]);
+                    r += u32::from(src[base + 2]);
+                }
+            }
+            let narrow = |sum: u32| -> u8 {
+                if ten_bit {
+                    // 4 samples of 10 bits → /4 back to 10, then >>2 to 8.
+                    (((sum + 2) / 4) >> 2) as u8
+                } else {
+                    ((sum + 2) / 4) as u8
+                }
+            };
+            dst[x * 4] = narrow(b);
+            dst[x * 4 + 1] = narrow(g);
+            dst[x * 4 + 2] = narrow(r);
+            dst[x * 4 + 3] = 0xFF;
+        }
     }
+    out
 }
 
 fn now_us() -> u64 {
@@ -567,6 +637,69 @@ mod tests {
             2,
             "row 1 must start at src[pitch], not src[w*4]"
         );
+    }
+
+    /// The fused path exists to save memory passes, NOT to change the picture.
+    /// Pin it against the two-step route it replaced: repack to full-size BGRA,
+    /// then run the shared 2×2 box filter, and require identical bytes.
+    ///
+    /// ⚠️ This is the test that would catch a fusion that quietly shifted the
+    /// sample grid by a pixel — which looks fine in a screenshot and is wrong.
+    #[cfg(feature = "scrap-capture")]
+    #[test]
+    fn fused_half_matches_repack_then_downscale_for_xr24() {
+        // 4×4 XR24 with a padded pitch, values chosen so every 2×2 block
+        // averages to something non-uniform.
+        let (w, h, pitch) = (4u32, 4u32, 20u32);
+        let mut src = vec![0u8; (pitch * h) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let o = y * pitch as usize + x * 4;
+                src[o] = (x * 17 + y * 3) as u8;
+                src[o + 1] = (x * 5 + y * 29) as u8;
+                src[o + 2] = (x * 11 + y * 7) as u8;
+                src[o + 3] = 0x00;
+            }
+        }
+        let full = repack_to_bgra(&src, w, h, pitch, false);
+        let (two_step, tw, th) = super::super::downscale_bgra_2x(&full, w, h, w * 4);
+        let fused = repack_bgra_half(&src, w, h, pitch, false);
+        assert_eq!((tw, th), (w / 2, h / 2));
+        assert_eq!(fused, two_step, "fusing must not change the picture");
+    }
+
+    /// 10-bit has no two-step equivalent to compare against (the shared filter
+    /// only knows BGRA), so pin the arithmetic itself: averaging must happen in
+    /// the SOURCE's precision and narrow afterwards. Narrowing first would
+    /// discard exactly the bits that make averaging 10-bit samples useful.
+    #[test]
+    fn fused_half_averages_xr30_in_source_precision() {
+        // Four pixels with 10-bit R = 4, 8, 12, 16 → mean 10 → 8-bit 10>>2 = 2.
+        let (w, h, pitch) = (2u32, 2u32, 8u32);
+        let mut src = vec![0u8; (pitch * h) as usize];
+        for (i, r) in [4u32, 8, 12, 16].iter().enumerate() {
+            let (x, y) = (i % 2, i / 2);
+            let word = r << 20;
+            let o = y * pitch as usize + x * 4;
+            src[o..o + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let out = repack_bgra_half(&src, w, h, pitch, true);
+        assert_eq!(out.len(), 4, "2x2 → 1 pixel");
+        assert_eq!(out[2], 2, "R: mean of 4,8,12,16 in 10-bit is 10 → 8-bit 2");
+        assert_eq!(out[3], 0xFF);
+    }
+
+    /// The policy has to match scrap's, or a host gets a different picture size
+    /// purely from switching backend.
+    #[test]
+    fn wants_half_follows_the_shared_threshold() {
+        assert!(!wants_half(1920, 1080, DownscalePolicy::Never));
+        assert!(wants_half(1920, 1080, DownscalePolicy::Always));
+        // 1080p is under the trigger; 4K is over it.
+        assert!(!wants_half(1920, 1080, DownscalePolicy::Auto));
+        assert!(wants_half(4096, 2160, DownscalePolicy::Auto));
+        // Degenerate sizes must never halve into nothing.
+        assert!(!wants_half(1, 1, DownscalePolicy::Always));
     }
 
     /// A framebuffer with no reported modifier is a pre-modifier one, which is
