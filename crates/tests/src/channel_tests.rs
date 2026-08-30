@@ -195,7 +195,7 @@ async fn explore_rooms_returns_plain_array() {
         "Expected plain array, got: {}",
         &body[..100.min(body.len())]
     );
-    assert!(parsed.as_array().unwrap().len() >= 1);
+    assert!(!parsed.as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
