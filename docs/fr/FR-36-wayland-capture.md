@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture, and unattended access
 
-**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **P1 landed behind `ROOMLERD_DRM_CAPTURE` (default OFF) — a Wayland desktop that was uncapturable now delivers frames; 4K rate is the open problem** (2026-08-29) · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **P1 landed behind `ROOMLERD_DRM_CAPTURE` (default OFF). Greeter AND locked-session capture field-verified — the two cases the portal refuses. 4K rate is the open problem** (2026-08-29) · **Owner:** agent / capture
 
 ## Goal
 
@@ -181,8 +181,13 @@ out of scope becomes in-scope here.
       `Frame`s through the `ScreenCapture` trait (`roomlerd capture-smoke`)
 - [ ] A **browser-visible remote-control session** against that Wayland
       desktop — capture is proven, encode/transport end-to-end is not
-- [ ] Streams **while the session is locked**, and **at the login greeter** —
-      the cases the portal structurally refuses
+- [x] Streams **while the session is locked**, and **at the login greeter** —
+      the cases the portal structurally refuses. Greeter: **20/20 frames with
+      nobody logged in**. Locked: the XFCE unlock dialog captured.
+      ⚠️ **A locked-and-IDLE screen is genuinely BLACK in scanout.** DRM
+      reports it faithfully, but a viewer connecting to an idle locked host
+      sees black until something wakes the display — do not diagnose that as a
+      capture failure; it is FR-34 territory
 - [ ] Survives a reboot with nobody logged in interactively
 - [x] `avg_capture_ms` **< 10 ms** at **1080p** — measured **5.84 ms** for the
       whole backend (1.58 ms of that is the framebuffer read; the rest is the
@@ -225,6 +230,12 @@ out of scope becomes in-scope here.
 - Cursor: the hardware cursor plane is captured separately; hotspot is
   approximate on bare metal. (Measured: `plane-1` sits unbound at `fb=0` while
   `plane-0` carries the desktop.)
+- ⚠️⚠️ **The policy hazard is no longer hypothetical — it is demonstrated.** The
+  greeter capture contains lightdm's **password field**, and the locked capture
+  contains XFCE's **unlock dialog**. That is precisely the capability unattended
+  access needs and precisely what must never be quietly enabled: gate it, audit
+  it, and make the viewer indicator (FR-27) reachable on those surfaces before
+  this leaves opt-in.
 - Interaction with FR-27 (consent) and FR-34 (locked host): DRM capture makes
   the agent able to see a **locked** screen. That is the point for unattended
   access and simultaneously a policy question — it must be gated and audited,
@@ -247,3 +258,6 @@ out of scope becomes in-scope here.
 | 2026-08-29 | **P1 backend, X11 (XFCE), 1080p** | ✅ `open_default` picks `backend=drm` under `ROOMLERD_DRM_CAPTURE=1`; correct desktop image. **5.84 ms/frame, 30/30 delivered.** Same host, same session, scrap: **5.11 ms** but **1/30 delivered, 29 proven unchanged** — FR-29 damage tracking working, and the reason DRM must not be the default |
 | 2026-08-29 | **P1 backend, GNOME Wayland, 4K** | ✅ **before:** the shipping path logs `scrap capture unavailable — falling back to NoopCapture (no primary display: connection refused)` — **zero frames**. **after:** `backend=drm`, **30/30 at 4096×2160 XR30**, correct image. ⚠️ **42.9 ms/frame raw, 52.9 ms with `Auto` downscale** ⇒ ~19 fps. Memory-bandwidth bound (~70 MB/frame). A vectorisable-loop rewrite was tried and **REFUTED** (43.8 vs 42.4 ms — no change) |
 | 2026-08-29 | daemon impact | `roomlerd` restarted **once** during the whole session (`NRestarts=1`, 18:04), not coincident with either lightdm restart; ended `active/running`. The FR-19 relay it also hosts stayed reachable throughout (every measurement above arrived over its own control WS) |
+| 2026-08-29 | **P1 at the LOGIN GREETER** | ✅ autologin disabled, lightdm restarted, **nobody logged in** (`loginctl`: only a `greeter` session for user `lightdm`). Shipping path: `NoopCapture`, zero frames. DRM: **20/20 at 1920×1080, 6.85 ms**, image is the lightdm greeter — user dropdown, password field, Log In button. This is the case the portal structurally refuses (no session ⇒ no portal) |
+| 2026-08-29 | **P1 on a LOCKED session** | ✅ with a real locker running (`xfce4-screensaver`, `/lock/enabled=true`) DRM captured the **XFCE unlock dialog** — user `m1`, password field, Switch User / Cancel / Unlock. ⚠️ **The first attempt was a false negative twice over**, see below |
+| 2026-08-29 | ⚠️ two false results caught | (1) `loginctl lock-session` reported success but `LockedHint` stayed `no` and no locker process existed — the screen was never locked, and the capture was an ordinary desktop. Claiming it would have been a **vacuous pass**. (2) With the locker genuinely active but idle, the capture was **pure black with every counter green** (15/15 frames, 6.71 ms). Waking the dialog with harmless input (mouse move + shift; no password typed) produced the lock screen — so the black was a **genuinely black screen**, faithfully reported |
