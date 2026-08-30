@@ -299,14 +299,13 @@ pub(crate) const DOWNSCALE_TRIGGER_PIXELS: u64 = 3_500_000;
 /// and comfortably less than openh264 would have spent encoding the full
 /// 4K frame it replaces.
 ///
-/// ⚠️ Gated on its two consumers. This used to live INSIDE `scrap_backend`, so
-/// the module's own feature gate covered it implicitly; moving it here to share
-/// it with the DRM backend removed that cover and made it dead code in every
-/// feature set that has neither backend. CI caught it on three lanes.
-#[cfg(any(
-    feature = "scrap-capture",
-    all(target_os = "linux", feature = "drm-capture")
-))]
+/// ⚠️ Gated on `scrap-capture` ALONE. It used to live inside `scrap_backend`,
+/// where the module gate covered it implicitly; moving it here to share it cost
+/// that cover and made it dead code in feature sets with neither backend (CI
+/// caught it on three lanes). It then STOPPED being shared: FR-36 fused the
+/// downscale into the DRM repack, so widening the gate back would recreate the
+/// same dead-code failure in a DRM-only build — the same trap, in reverse.
+#[cfg(feature = "scrap-capture")]
 pub(crate) fn downscale_bgra_2x(
     src: &[u8],
     src_w: u32,
