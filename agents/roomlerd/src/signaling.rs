@@ -1159,7 +1159,13 @@ async fn connect_once(
     // the session with the InputArbiter (participants rail + mode seed).
     let mut pending_session_meta: HashMap<
         bson::oid::ObjectId,
-        (String, Option<roomler_ai_remote_control::models::InputMode>),
+        (
+            String,
+            Option<roomler_ai_remote_control::models::InputMode>,
+            // FR-27 follow-up — the asking org, carried so the "Being viewed
+            // by" banner can be raised at peer-build time (not request time).
+            Option<String>,
+        ),
     > = HashMap::new();
     // T2.10d: one `AgentTunnelPeer` per active `roomler`
     // session. Distinct map from `peers` (remote-control sessions)
@@ -1902,7 +1908,13 @@ async fn handle_server_msg(
     >,
     pending_session_meta: &mut HashMap<
         bson::oid::ObjectId,
-        (String, Option<roomler_ai_remote_control::models::InputMode>),
+        (
+            String,
+            Option<roomler_ai_remote_control::models::InputMode>,
+            // FR-27 follow-up — the asking org, carried so the "Being viewed
+            // by" banner can be raised at peer-build time (not request time).
+            Option<String>,
+        ),
     >,
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
     tunnel_quic_peers: &mut HashMap<
@@ -2010,7 +2022,10 @@ async fn handle_server_msg(
             pending_permissions.insert(session_id, permissions);
             // P6 — controller name (participants rail / ghost labels) +
             // the device policy's input arbitration mode.
-            pending_session_meta.insert(session_id, (controller_name.clone(), input_mode));
+            pending_session_meta.insert(
+                session_id,
+                (controller_name.clone(), input_mode, asking_org.clone()),
+            );
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -2025,22 +2040,19 @@ async fn handle_server_msg(
                 org = ?asking_org,
                 "incoming session request — running consent broker"
             );
-            // Show the "someone is watching" overlay on the controlled
-            // host. Harmless no-op on non-Windows or when the feature
-            // is disabled. Indicator goes up at request time (not after
-            // grant) so an in-prompt operator sees the visual cue
-            // alongside the prompt — defence-in-depth against a sneaky
-            // unattended grant.
-            // FR-27 — the same call also publishes the session to the LocalAPI
-            // registry, so the companion's "Being viewed by …" banner and its
-            // Disconnect exist on every platform, not just the one with a
-            // native overlay.
-            indicator.show_session_full(
-                session_id,
-                controller_name.clone(),
-                permissions.wire_names(),
-                asking_org.clone().unwrap_or_default(),
-            );
+            // FR-27 follow-up (field, 2026-08-30) — the "Being viewed by …"
+            // banner + LocalAPI session registry publish are NO LONGER raised
+            // here, at request time. They used to go up alongside the consent
+            // prompt as defence-in-depth, but "Being viewed by X" is FALSE
+            // while consent is still pending — nobody is viewing yet — and next
+            // to a "Remote control request" it reads as a contradiction. The
+            // `show_session_full` call now fires at PEER-BUILD (`rc:sdp.offer`
+            // handler, below), so the banner + registry entry appear only once
+            // the session is actually established and pixels flow. That covers
+            // every mode uniformly: auto-grant reaches peer-build within ~1 ms
+            // (the banner still appears at once, its only defence-in-depth
+            // case), while prompt / email / push reach it only after approval.
+            // `asking_org` is stashed in `pending_session_meta` for that call.
             // Spawn a task to run the broker decision in the
             // background; auto-grant resolves <1ms, prompt mode can
             // take up to 30s — we MUST NOT block the WS read loop.
@@ -2323,9 +2335,15 @@ async fn handle_server_msg(
             // P6 — controller name + policy input mode for the arbiter
             // registration. Missing (harness skipped rc:request) → an
             // anonymous label + the agent-default (free) mode.
-            let (controller_name, input_mode) = pending_session_meta
+            let (controller_name, input_mode, asking_org) = pending_session_meta
                 .remove(&session_id)
-                .unwrap_or_else(|| ("Controller".to_string(), None));
+                .unwrap_or_else(|| ("Controller".to_string(), None, None));
+            // FR-27 follow-up — capture what the "Being viewed by" banner needs
+            // BEFORE `controller_name` is moved into `AgentPeer::new` below.
+            // The banner is raised once the peer is established (after
+            // `handle_offer`), not at request time. `permissions` is Copy.
+            let banner_name = controller_name.clone();
+            let banner_org = asking_org.unwrap_or_default();
 
             let peer = match AgentPeer::new(
                 session_id,
@@ -2380,6 +2398,19 @@ async fn handle_server_msg(
                     return Ok(());
                 }
             };
+
+            // FR-27 follow-up — the session is now established (peer built,
+            // answer ready): raise the "Being viewed by …" banner and publish
+            // to the LocalAPI session registry. Deferred to here from request
+            // time so it never shows while consent is still pending — "Being
+            // viewed by X" is only true once pixels actually flow. Harmless
+            // no-op on non-Windows / when the indicator feature is disabled.
+            indicator.show_session_full(
+                session_id,
+                banner_name,
+                permissions.wire_names(),
+                banner_org,
+            );
 
             send_msg(
                 ws,
