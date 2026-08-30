@@ -467,6 +467,21 @@ const KEYS: &[(&str, &str, &str)] = &[
         "FR-35 - let the constrained (relay) ceiling grow above the nominal 3 Mbps on delivery evidence (AIMD pinned at the ceiling, the window carried >=70% of it, no decrease/stall for 10 s, viewer age within 1.5x floor) and remember the pair's stable rate so the next session opens there. Built-in default: on. Env: ROOMLERD_RELAY_CEILING_LEARN. Restart required.",
     ),
     (
+        "drm_capture",
+        "tribool",
+        "FR-36 - capture the scanout framebuffer via DRM/KMS, BELOW the compositor. The only backend that can see a Wayland desktop, a locked screen or the login greeter (the xdg portal refuses all three). Built-in default: OFF - it carries no damage information, so enabling it where X11 works costs the FR-29 idle-CPU win. Env: ROOMLERD_DRM_CAPTURE. Restart required.",
+    ),
+    (
+        "uinput",
+        "tribool",
+        "FR-36 - inject input through /dev/uinput, below the compositor. Pair with drm_capture on a Wayland host: XTest reaches Xwayland clients ONLY, so without this a captured Wayland session is read-only. Built-in default: OFF - a uinput device is host-global and injects into whatever has focus, including the greeter and lock screen. Env: ROOMLERD_UINPUT. Restart required.",
+    ),
+    (
+        "x11_damage",
+        "tribool",
+        "FR-29 - skip the XShm readback when XDAMAGE proves the screen is unchanged. Built-in default: on; took a Linux host's idle capture from 45.8% of a core to 2.8%. Env: ROOMLERD_X11_DAMAGE. Restart required.",
+    ),
+    (
         "overlay_key_rotation",
         "tribool",
         "FR-40 - honour rc:agent.key_rotate: an admin retiring this device's overlay (WireGuard) key from the dashboard. The device mints the new key locally, persists it and re-joins the mesh under it; the server never sees a private key. Built-in default: on (a kill switch, not a gate - the order leaks nothing). Env: ROOMLERD_OVERLAY_KEY_ROTATION. Restart required.",
@@ -754,6 +769,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "gpu_scale" => cfg.gpu_scale.map(fmt_bool),
         "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe.map(fmt_bool),
         "relay_ceiling_learn" => cfg.relay_ceiling_learn.map(fmt_bool),
+        "drm_capture" => cfg.drm_capture.map(fmt_bool),
+        "uinput" => cfg.uinput.map(fmt_bool),
+        "x11_damage" => cfg.x11_damage.map(fmt_bool),
         "overlay_key_rotation" => cfg.overlay_key_rotation.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
         "relay_max_hi_kbps" => cfg.relay_max_hi_kbps.map(|p| p.to_string()),
@@ -1131,6 +1149,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "gpu_scale" => cfg.gpu_scale = parse_tribool(value)?,
         "overlay_lan_capture_probe" => cfg.overlay_lan_capture_probe = parse_tribool(value)?,
         "relay_ceiling_learn" => cfg.relay_ceiling_learn = parse_tribool(value)?,
+        "drm_capture" => cfg.drm_capture = parse_tribool(value)?,
+        "uinput" => cfg.uinput = parse_tribool(value)?,
+        "x11_damage" => cfg.x11_damage = parse_tribool(value)?,
         "overlay_key_rotation" => cfg.overlay_key_rotation = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
         "relay_max_hi_kbps" => cfg.relay_max_hi_kbps = parse_u32_range(key, value, 0, 100_000)?,
@@ -1341,6 +1362,70 @@ mod tests {
         apply(&mut cfg, "overlay_quic", None).unwrap();
         assert_eq!(cfg.overlay_quic, None);
         assert!(apply(&mut cfg, "overlay_quic", Some("maybe")).is_err());
+    }
+
+    /// FR-36 — the DRM-capture / uinput pair, set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule; both shipped as env-only first
+    /// and this closes that gap).
+    ///
+    /// ⚠️ The property worth locking is that **unset means OFF for both**, and
+    /// that unset is distinguishable from an explicit `false`. Both switch on
+    /// behaviour a host must opt into: DRM capture carries no damage
+    /// information (turning it on where X11 works costs the FR-29 idle-CPU
+    /// win), and a uinput device is host-global, injecting into whatever has
+    /// focus — including the greeter and the lock screen.
+    #[test]
+    fn fr36_drm_capture_and_uinput_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.drm_capture, None, "unset by default");
+        assert_eq!(cfg.uinput, None, "unset by default");
+
+        for key in ["drm_capture", "uinput", "x11_damage"] {
+            apply(&mut cfg, key, Some("on")).unwrap();
+            assert_eq!(
+                entry_for(&cfg, key).unwrap().value.as_deref(),
+                Some("true"),
+                "{key} echoes what was set"
+            );
+            apply(&mut cfg, key, Some("off")).unwrap();
+            assert_eq!(
+                entry_for(&cfg, key).unwrap().value.as_deref(),
+                Some("false")
+            );
+            apply(&mut cfg, key, None).unwrap();
+            assert_eq!(
+                entry_for(&cfg, key).unwrap().value,
+                None,
+                "{key} clears back to unset, which is NOT the same as false"
+            );
+            assert!(apply(&mut cfg, key, Some("sometimes")).is_err());
+        }
+        assert_eq!(cfg.drm_capture, None);
+        assert_eq!(cfg.uinput, None);
+    }
+
+    /// The bridge is what makes a config key reach the backend at all — the
+    /// gates read `ROOMLERD_*` via `env::flag`, and `main.rs` feeds those
+    /// fallbacks from this array. A key that is absent here is editable and
+    /// inert, which looks exactly like a broken feature.
+    #[test]
+    fn fr36_keys_are_wired_into_the_env_bridge() {
+        let mut cfg = crate::config::test_fixture();
+        cfg.drm_capture = Some(true);
+        cfg.uinput = Some(true);
+        cfg.x11_damage = Some(false);
+        let bridged = crate::config::env_bridge_bools(&cfg);
+        for (name, want) in [
+            ("DRM_CAPTURE", Some(true)),
+            ("UINPUT", Some(true)),
+            ("X11_DAMAGE", Some(false)),
+        ] {
+            let got = bridged
+                .iter()
+                .find(|(k, _)| *k == name)
+                .unwrap_or_else(|| panic!("{name} missing from env_bridge_bools"));
+            assert_eq!(got.1, want, "{name} bridges the configured value");
+        }
     }
 
     /// rc.276 — the forced-TLS-relay probe key set/echo/clear (per the
