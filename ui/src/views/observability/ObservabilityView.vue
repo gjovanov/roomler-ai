@@ -112,6 +112,104 @@
         </v-col>
       </v-row>
 
+      <!-- ── Cost & usage (FR-20 P5) ─────────────────────────────────── -->
+      <div class="d-flex align-center mt-6 mb-2" style="gap: 12px">
+        <h2 class="text-h6">Cost &amp; usage</h2>
+        <span class="text-caption text-medium-emphasis">
+          measured over {{ range }}
+        </span>
+      </div>
+
+      <!--
+        The two headline cards. Both are deliberately allowed to say "no data"
+        instead of "0" — a fabricated zero here reads as "we relay nothing and
+        it costs us nothing", which are the two most expensive claims on the
+        page to get wrong.
+      -->
+      <v-row dense>
+        <v-col cols="12" sm="6" md="4">
+          <v-card>
+            <v-card-text>
+              <div class="text-caption text-medium-emphasis">Relayed connections</div>
+              <div class="text-h5">
+                <template v-if="relayedPct !== null">{{ relayedPct }}%</template>
+                <span v-else class="text-medium-emphasis text-h6">no reporters</span>
+              </div>
+              <div class="text-caption text-medium-emphasis mt-1">
+                share of peer links that could not go direct, last hour.
+                <strong>Connections, not bytes</strong> — direct traffic is
+                deliberately never measured, so a byte share is not computable.
+                Agent-reported: an alarm, not a bill.
+              </div>
+            </v-card-text>
+          </v-card>
+        </v-col>
+
+        <v-col v-for="m in fleetMeters" :key="m.key" cols="12" sm="6" md="4">
+          <v-card>
+            <v-card-text>
+              <div class="text-caption text-medium-emphasis">{{ m.label }}</div>
+              <div v-if="!m.monitored" class="text-h6 text-medium-emphasis">
+                not monitored
+              </div>
+              <div v-else class="text-h5">{{ m.total }}</div>
+              <div class="text-caption text-medium-emphasis mt-1">
+                <template v-if="!m.monitored">{{ m.why }}</template>
+                <template v-else-if="m.cost !== null">{{ m.cost }} over {{ range }}</template>
+                <template v-else>not priced — set it in config/relay-costs.toml</template>
+              </div>
+            </v-card-text>
+          </v-card>
+        </v-col>
+      </v-row>
+
+      <v-alert
+        v-if="cost && cost.enabled && !cost.priced"
+        type="info"
+        variant="tonal"
+        density="compact"
+        class="mt-2"
+      >
+        No unit costs are configured, so every cost below reads
+        <strong>not priced</strong> rather than 0.00. Set them in
+        <code>config/relay-costs.toml</code> (or <code>ROOMLER__RELAY_COSTS__*</code>).
+      </v-alert>
+
+      <v-card class="mt-2">
+        <v-data-table
+          :headers="costHeaders"
+          :items="costRows"
+          :items-per-page="10"
+          density="compact"
+          class="text-body-2"
+        >
+          <template #item.relay="{ item }">{{ item.relay }}</template>
+          <template #item.sfu="{ item }">{{ item.sfu }}</template>
+          <template #item.cost="{ item }">
+            <span :class="item.cost === null ? 'text-medium-emphasis' : ''">
+              {{ item.cost === null ? 'not priced' : item.cost }}
+            </span>
+          </template>
+          <template #item.mrr="{ item }">
+            <span :title="item.mrrTitle">{{ item.mrr }}</span>
+          </template>
+          <template #item.margin="{ item }">
+            <span
+              :class="item.marginClass"
+              :title="'list-price estimate over ' + range + ', not billed revenue'"
+            >
+              {{ item.margin }}
+            </span>
+          </template>
+        </v-data-table>
+      </v-card>
+      <p class="text-caption text-medium-emphasis mt-1 mb-0">
+        MRR and margin are <strong>list-price estimates</strong> (plan price x
+        seats, pro-rated to {{ range }}), not billed revenue — Stripe holds the
+        real amounts, and discounts, trials and annual terms are not reflected
+        here. Cost counts only what we measured ourselves on our own relays.
+      </p>
+
       <!-- ── Orgs ────────────────────────────────────────────────────── -->
       <div class="d-flex align-center mt-6 mb-2" style="gap: 12px">
         <h2 class="text-h6">Organizations</h2>
@@ -341,6 +439,7 @@ import { computed, ref, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import {
   useStatsStore,
+  type CostPayload,
   type OrgsPayload,
   type SeriesPayload,
   type SeriesPoint,
@@ -450,11 +549,115 @@ watch(
   { immediate: true },
 )
 
+// ── Cost & usage (FR-20 P5) ────────────────────────────────────────────
+//
+// Every formatter below has one job beyond formatting: keep `null` visible.
+// `null` means "we did not measure this" or "nobody priced this", and the
+// moment it renders as 0 the page starts asserting things the server never
+// said — that an org costs nothing to serve, or that the mesh is flawless.
+const cost = ref<CostPayload | null>(null)
+
+async function loadCost() {
+  cost.value = await statsStore.fetchCost(range.value)
+}
+
+const currency = computed(() => cost.value?.currency ?? '')
+
+/** Money, or `null` passed straight through. Never coerces. */
+function money(v: number | null | undefined): string | null {
+  if (v === null || v === undefined) return null
+  // Sub-cent costs are normal at these unit prices, so show enough digits to
+  // avoid rendering a real cost as 0.00 — which would be the same lie by
+  // rounding that the null-handling above exists to prevent.
+  const digits = v > 0 && v < 0.01 ? 4 : 2
+  return `${v.toFixed(digits)} ${currency.value}`.trim()
+}
+
+function gb(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined) return '—'
+  return `${(bytes / 1e9).toFixed(2)} GB`
+}
+
+function hours(secs: number | null | undefined): string {
+  if (secs === null || secs === undefined) return '—'
+  return `${(secs / 3600).toFixed(1)} h`
+}
+
+const relayedPct = computed<number | null>(() => {
+  const f = cost.value?.carrier_mix?.relayed_fraction
+  return f === null || f === undefined ? null : Math.round(f * 1000) / 10
+})
+
+const METER_LABELS: Record<string, string> = {
+  derp_bytes: 'DERP relayed',
+  turn_bytes: 'TURN relayed',
+  sfu_participant_seconds: 'SFU participant-hours',
+}
+
+const fleetMeters = computed(() =>
+  Object.entries(cost.value?.meters ?? {}).map(([key, m]) => ({
+    key,
+    label: METER_LABELS[key] ?? key,
+    monitored: m.monitored !== false,
+    why: m.why ?? '',
+    total: key === 'sfu_participant_seconds' ? hours(m.total) : gb(m.total),
+    cost: money(m.cost),
+  })),
+)
+
+const costHeaders = [
+  { title: 'Org', key: 'name' },
+  { title: 'Plan', key: 'plan' },
+  { title: 'Seats', key: 'seats' },
+  { title: 'DERP relayed', key: 'relay' },
+  { title: 'SFU', key: 'sfu' },
+  { title: 'Cost', key: 'cost' },
+  { title: 'MRR (est.)', key: 'mrr' },
+  { title: 'Margin (est.)', key: 'margin' },
+]
+
+const costRows = computed(() => {
+  const p = cost.value
+  if (!p?.orgs) return []
+  // MRR is monthly; cost covers the requested window. Pro-rate the revenue to
+  // the same window rather than comparing a month against a day.
+  const share = (p.window_secs ?? 86_400) / (30 * 86_400)
+  return p.orgs
+    .map((o) => {
+      const mrr = (o.mrr_cents / 100) * share
+      const margin = o.cost === null ? null : mrr - o.cost
+      return {
+        name: o.name || o.slug || o.tenant_id,
+        plan: o.plan ?? '—',
+        seats: o.seats,
+        relay: gb(o.meters?.derp_bytes?.total ?? 0),
+        sfu: hours(o.meters?.sfu_participant_seconds?.total ?? 0),
+        cost: money(o.cost),
+        mrr: money(mrr),
+        mrrTitle:
+          `${(o.mrr_cents / 100).toFixed(2)} ${currency.value}/month list price` +
+          (o.subscription_status ? ` — subscription ${o.subscription_status}` : ''),
+        margin: money(margin),
+        marginClass: margin !== null && margin < 0 ? 'text-error' : '',
+        _sort: o.cost ?? -1,
+      }
+    })
+    // Costliest first: the page exists to answer "who is expensive to serve".
+    .sort((a, b) => b._sort - a._sort)
+})
+
 watch(
   [isPlatformAdmin, range],
   async () => {
     if (!isPlatformAdmin.value) return
     orgs.value = await statsStore.fetchOrgs().catch(() => null)
+    // Same watcher as the orgs table: cost is range-scoped and platform-only,
+    // and it must survive its own failure without blanking the page - a failed
+    // fetch leaves `cost` null, which every formatter already renders as
+    // "no data" rather than as zero.
+    await loadCost().catch(() => {
+      cost.value = null
+    })
     globalCalls.value = await statsStore.fetchAdminCalls(range.value).catch(() => null)
     users.value = await statsStore.fetchUsers(range.value).catch(() => null)
     if (selectedOrg.value) await selectOrg(selectedOrg.value)
@@ -552,4 +755,5 @@ function fmt(v: number | null | undefined): string {
 function fmtPct(v: number | null | undefined): string {
   return typeof v === 'number' && Number.isFinite(v) ? `${Math.round(v * 100)}%` : '—'
 }
+
 </script>
