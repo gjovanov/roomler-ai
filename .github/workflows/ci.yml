@@ -59,6 +59,32 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check --all
 
+      # This repo is PUBLIC, and field notes are written in the heat of
+      # debugging — which is exactly when someone writes down the name of the
+      # machine they are debugging. Committed hostnames are reconnaissance
+      # value: they map the fleet and say which host runs what.
+      #
+      # The check is deliberately SHAPE-based, not name-based, so it needs no
+      # secret: the map that pairs each real name with its replacement lives
+      # outside the repo and must stay there. Shape is also the stronger test.
+      # The 2026-08-30 whole-history sweep started from a four-name map, applied
+      # it to every blob, every commit message and every issue — and this scan
+      # still found two more machines nobody had ever listed, one of them
+      # published in an FR spec since the PR that created it. A map finds the
+      # machines you know about; this finds the class.
+      #
+      # When it fires: add the real name to the map (outside the repo), re-run
+      # the sweep, and let this go green. Never add a real name to its
+      # allowlist. See .claude/skills/sanitize-hostnames/SKILL.md.
+      - name: No real machine names committed
+        run: |
+          # The selftest plants a canary of every shape and asserts the guard
+          # FAILS, then asserts it passes on the real tree. It runs first
+          # because this guard has silently self-disarmed three times, and each
+          # time the symptom was a confident "none found".
+          bash .claude/skills/sanitize-hostnames/selftest.sh
+          python3 .claude/skills/sanitize-hostnames/check_shapes.py --root .
+
       # The companion's icons shipped as 1x1 PLACEHOLDERS for its whole life.
       # Windows tolerated them; macOS aborts the process before the app starts —
       # `tao`'s tray setup panics on "dimensions don't match the number of
