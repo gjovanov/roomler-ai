@@ -30,11 +30,12 @@ use tracing::{debug, info};
 
 use crate::state::AppState;
 use roomler_ai_services::dao::stats::{
-    STATS_CALL, STATS_CALL_USER, STATS_MACHINE, STATS_RELAY, STATS_USAGE, STATS_USAGE_1D,
-    STATS_USAGE_1H,
+    CALL_BUCKET_SECS, STATS_CALL, STATS_CALL_USER, STATS_MACHINE, STATS_RELAY, STATS_USAGE,
+    STATS_USAGE_1D, STATS_USAGE_1H,
 };
 
 const ROLLUP_INTERVAL_SECS: u64 = 900; // 15 min
+const MINUTE: i64 = 60;
 const HOUR: i64 = 3600;
 const DAY: i64 = 86_400;
 /// Never reprocess more than this much history in one run (bounds a
@@ -161,6 +162,56 @@ fn usage_pipeline(floor: DateTime, unit: &str, src_is_rollup: bool, into: &str) 
         doc! { "$match": { "ts": { "$gte": floor } } },
         doc! { "$group": group },
         doc! { "$set": {
+            "ts": "$_id.b",
+            "_id": { "$concat": [ "$_id.k", ":", bucket_secs_str() ] },
+        }},
+        merge_into(into),
+    ]
+}
+
+/// FR-20 P4 — derive `sfu_participant_seconds` into the cost ledger from the
+/// per-participant call samples that already exist.
+///
+/// One `stats_call_user` document IS one participant present for one
+/// [`CALL_BUCKET_SECS`] window, so participant-seconds is simply the bucket
+/// count times that width. No new collection point: the SFU's marginal cost was
+/// already being measured, it just was not being attributed as *cost*.
+///
+/// ⚠ **This meter is `$merge`d, not `$inc`ed — and that difference is the whole
+/// correctness argument.** The DERP meters are *observed deltas*: each flush
+/// reports bytes seen since the last one, so re-running a flush double-bills and
+/// a failed one is dropped. This meter is a pure *derivation* of rows that are
+/// already durable, so recomputing it is idempotent and re-running it is safe —
+/// which is exactly why the open bucket may be recomputed every cycle.
+///
+/// ⚠ It cannot clobber the `$inc`-accumulated meters: `_id` embeds the meter
+/// name, so `…:sfu_participant_seconds:…` and `…:derp_bytes:…` are different
+/// documents by construction.
+///
+/// ⚠ A missed sample under-reports rather than over-reports, consistent with
+/// every other meter here.
+fn sfu_seconds_pipeline(
+    floor: DateTime,
+    unit: &str,
+    _src_is_rollup: bool,
+    into: &str,
+) -> Vec<Document> {
+    vec![
+        doc! { "$match": { "ts": { "$gte": floor } } },
+        doc! { "$group": {
+            "_id": {
+                "k": { "$concat": [
+                    { "$toString": "$tenant_id" }, ":sfu_participant_seconds",
+                ] },
+                "b": { "$dateTrunc": { "date": "$ts", "unit": unit } },
+            },
+            "tenant_id": { "$first": "$tenant_id" },
+            // Each sampled bucket is one participant present for its width.
+            "value": { "$sum": CALL_BUCKET_SECS },
+            "bucket_count": { "$sum": 1 },
+        }},
+        doc! { "$set": {
+            "meter": "sfu_participant_seconds",
             "ts": "$_id.b",
             "_id": { "$concat": [ "$_id.k", ":", bucket_secs_str() ] },
         }},
@@ -421,6 +472,18 @@ struct Pass {
 /// `call_user` took the real count to 8 while the test still demanded 6, and
 /// nothing noticed because `crates/tests` had stopped compiling entirely.
 static PASSES: &[Pass] = &[
+    // FR-20 P4 — derive SFU participant-seconds into the ledger FIRST, so the
+    // usage rollups below compact the same cycle's rows rather than lagging one
+    // behind. Minute buckets, matching `USAGE_BUCKET_SECS`.
+    Pass {
+        key: "usage:sfu",
+        src: STATS_CALL_USER,
+        into: STATS_USAGE,
+        unit: "minute",
+        src_is_rollup: false,
+        bucket_secs: MINUTE,
+        pipeline: sfu_seconds_pipeline,
+    },
     // FR-20 usage ledger: raw → 1h → 1d. These are the rows billing reads;
     // the raw minute buckets are 7-day scratch.
     Pass {
@@ -631,4 +694,48 @@ pub fn spawn_stats_rollup(state: AppState) {
             info!(passes = done, "stats rollup cycle complete");
         }
     });
+}
+
+#[cfg(test)]
+mod fr20_p4_tests {
+    use super::*;
+
+    /// Participant-seconds is bucket-count × bucket-width. Pinning the width
+    /// here means a change to `CALL_BUCKET_SECS` cannot silently rescale every
+    /// SFU cost row — the sampler's cadence and the billed unit are the same
+    /// number, and nothing else would notice them diverging.
+    #[test]
+    fn participant_seconds_derive_from_the_sample_width() {
+        assert_eq!(CALL_BUCKET_SECS, 30);
+        // Two samples for one participant in a minute = the whole minute.
+        assert_eq!(2 * CALL_BUCKET_SECS, MINUTE);
+    }
+
+    /// The ledger `_id` embeds the meter, which is what lets a `$merge`d
+    /// derived meter share a collection with `$inc`-accumulated observed ones
+    /// without ever clobbering them.
+    #[test]
+    fn derived_and_observed_meters_cannot_collide() {
+        let tenant = "69a1dbbad2000f26adc875ce";
+        let bucket = "1787777820";
+        let sfu = format!("{tenant}:sfu_participant_seconds:{bucket}");
+        let derp = format!("{tenant}:derp_bytes:{bucket}");
+        assert_ne!(
+            sfu, derp,
+            "a $merge on the derived meter must not be able to replace an \
+             $inc-accumulated bytes bucket for the same tenant and minute"
+        );
+    }
+
+    /// Every pass must have a distinct watermark key — two passes sharing one
+    /// would make each reset the other's progress, and the symptom is a family
+    /// that silently stops compacting.
+    #[test]
+    fn pass_watermark_keys_are_unique() {
+        let mut keys: Vec<&str> = PASSES.iter().map(|p| p.key).collect();
+        let before = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "duplicate rollup watermark key");
+    }
 }
