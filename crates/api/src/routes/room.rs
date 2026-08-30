@@ -570,6 +570,19 @@ pub async fn call_join(
     // Notify room members about updated participant count
     let room = state.rooms.base.find_by_id_in_tenant(tid, rid).await.ok();
     let participant_count = room.as_ref().map(|r| r.participant_count).unwrap_or(0);
+    // #754: this was the string literal `"in_progress"`, which made the event
+    // ASSERT a status the database might not hold. `call/join` never sets
+    // `conference_status` — only `call/start` does — so joining a call that has
+    // already auto-ended (last participant left) broadcast `in_progress` over a
+    // room whose stored status was `ended`, and every client believed it.
+    //
+    // The room is already in hand two lines up, so the truthful value costs
+    // nothing. Same shape as the `call_leave` broadcast below, fallback
+    // included, so the two cannot drift apart again.
+    let conference_status = room
+        .as_ref()
+        .and_then(|r| r.conference_status.clone())
+        .unwrap_or_else(|| "in_progress".into());
     let member_ids = state
         .rooms
         .find_member_user_ids(rid)
@@ -581,7 +594,7 @@ pub async fn call_join(
             "data": {
                 "room_id": rid.to_hex(),
                 "participant_count": participant_count,
-                "conference_status": "in_progress",
+                "conference_status": conference_status,
             }
         });
         crate::ws::dispatcher::broadcast_with_redis(
