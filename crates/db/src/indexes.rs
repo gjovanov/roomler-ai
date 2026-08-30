@@ -556,6 +556,26 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // FR-20 — the cost ledger. One bucket per (tenant, meter, minute), with a
+    // deterministic `_id` so both pods `$inc` the same document.
+    //
+    // ⚠ 7-day raw retention like its siblings: the durable record is the
+    // rollup (`_1h` 90 d, `_1d` 730 d), and billing reads those. Raw minute
+    // buckets exist to be compacted, not to be the ledger of record.
+    create_indexes(
+        db,
+        "stats_usage",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "meter": 1, "ts": 1 }),
+            // ⚠ No separate `{ts: 1}` index: the TTL index below already IS
+            // one, and declaring both is an IndexOptionsConflict (same key
+            // pattern, different options) as well as a wasted WiredTiger file
+            // per test database. The siblings above deliberately don't either.
+            index_ttl(bson::doc! { "ts": 1 }, 7 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Per-agent minute buckets from the heartbeat handler (the agent's
     // owning pod is the single writer).
     create_indexes(
@@ -689,10 +709,12 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.
     for (coll, ttl_days) in [
-        ("stats_relay_1h", 90u64),
+        ("stats_usage_1h", 90u64),
+        ("stats_relay_1h", 90),
         ("stats_machine_1h", 90),
         ("stats_call_1h", 90),
         ("stats_call_user_1h", 90),
+        ("stats_usage_1d", 730),
         ("stats_relay_1d", 730),
         ("stats_machine_1d", 730),
         ("stats_call_1d", 730),

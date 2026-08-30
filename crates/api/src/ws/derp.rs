@@ -151,6 +151,132 @@ fn tunnel_budget_permits(network_id: ObjectId, src: &DerpPubKey, len: usize) -> 
         false
     }
 }
+// ── FR-20 collection point A — per-network relayed bytes ─────────────
+//
+// Accumulated lock-free on the forward path and drained by
+// `spawn_derp_usage_flush` every `USAGE_FLUSH`. Keyed by NETWORK because that
+// is what `forward_frame` holds; the flusher resolves network → tenant, which
+// is a query it can afford and the hot path cannot.
+static DERP_NETWORK_BYTES: LazyLock<DashMap<ObjectId, AtomicU64>> = LazyLock::new(DashMap::new);
+
+const USAGE_FLUSH: Duration = Duration::from_secs(60);
+
+/// Add `n` relayed bytes for `network_id`. One atomic add on the hot path.
+fn add_network_bytes(network_id: ObjectId, n: u64) {
+    if let Some(c) = DERP_NETWORK_BYTES.get(&network_id) {
+        c.fetch_add(n, Ordering::Relaxed);
+        return;
+    }
+    // First frame for this network on this pod. `or_insert` races benignly —
+    // whichever writer lands second adds onto the winner's counter.
+    DERP_NETWORK_BYTES
+        .entry(network_id)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(n, Ordering::Relaxed);
+}
+
+/// Take and zero every network's accumulated bytes.
+///
+/// `swap(0)` rather than remove-and-reinsert: a frame arriving mid-drain lands
+/// on the live counter and is carried into the NEXT bucket instead of being
+/// lost to a removed entry.
+fn drain_network_bytes() -> Vec<(ObjectId, u64)> {
+    DERP_NETWORK_BYTES
+        .iter()
+        .filter_map(|e| {
+            let n = e.value().swap(0, Ordering::Relaxed);
+            (n > 0).then(|| (*e.key(), n))
+        })
+        .collect()
+}
+
+/// FR-20 P1 — drain the per-network byte counters into `stats_usage` every
+/// [`USAGE_FLUSH`].
+///
+/// Runs on both pods. Each writes only the bytes IT relayed, into the same
+/// deterministic `_id`, and Mongo's `$inc` sums them — so no lease and no
+/// leader election is needed for the ledger to be correct on a 2-pod
+/// deployment.
+pub fn spawn_derp_usage_flush(state: AppState) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(USAGE_FLUSH);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if !state.settings.stats.enabled {
+                continue;
+            }
+            let drained = drain_network_bytes();
+            if drained.is_empty() {
+                continue;
+            }
+
+            // ONE query for every network in this batch, not one per network:
+            // the flusher runs while frames keep arriving, so its cost has to
+            // stay flat in the number of active tenants.
+            let ids: Vec<ObjectId> = drained.iter().map(|(id, _)| *id).collect();
+            let mut tenant_of: std::collections::HashMap<ObjectId, ObjectId> =
+                std::collections::HashMap::new();
+            match state
+                .overlay_networks
+                .base
+                .find_many(bson::doc! { "_id": { "$in": &ids } }, None)
+                .await
+            {
+                Ok(rows) => {
+                    for n in rows {
+                        if let Some(nid) = n.id {
+                            tenant_of.insert(nid, n.tenant_id);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Drop this batch rather than retry: `$inc` is additive, so
+                    // a retry that partially succeeded would double-bill. An
+                    // under-reported minute is the cheaper error.
+                    warn!(%e, batches = drained.len(), "fr-20: usage flush skipped (network lookup failed)");
+                    continue;
+                }
+            }
+
+            let now = bson::DateTime::now().timestamp_millis() / 1000;
+            let (mut written, mut unattributed) = (0u64, 0u64);
+            for (network_id, bytes) in drained {
+                let Some(tenant_id) = tenant_of.get(&network_id).copied() else {
+                    // The network row is gone (tenant deleted mid-bucket).
+                    // Counted and logged, never guessed at — an unattributed
+                    // byte must not become a wrongly-attributed one.
+                    unattributed += bytes;
+                    continue;
+                };
+                if let Err(e) = state
+                    .stats
+                    .add_usage(
+                        tenant_id,
+                        roomler_ai_services::dao::stats::Meter::DerpBytes,
+                        now,
+                        bytes as i64,
+                    )
+                    .await
+                {
+                    warn!(%tenant_id, %e, "fr-20: usage bucket write failed (bucket under-reports)");
+                    continue;
+                }
+                written += bytes;
+            }
+            if unattributed > 0 {
+                warn!(
+                    unattributed_bytes = unattributed,
+                    "fr-20: relayed bytes could not be attributed to a tenant"
+                );
+            }
+            if written > 0 {
+                tracing::debug!(derp_bytes = written, "fr-20: usage flushed");
+            }
+        }
+    });
+}
+
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// First 8 hex chars of a pubkey — enough to correlate registration,
@@ -564,6 +690,19 @@ fn forward_frame(
         // the control plane. Counted only on a SUCCESSFUL enqueue: a dropped
         // frame is not carried, so it must not inflate the offload baseline.
         crate::cluster::metrics::DERP_BYTES_RELAYED_TOTAL.fetch_add(out_len, Ordering::Relaxed);
+        // FR-20 collection point A — the same bytes, attributed per network so
+        // they can become a per-tenant cost bucket.
+        //
+        // ⚠ Counted at the SAME point and on the same condition as the line
+        // above, deliberately: we bill only for what we actually carried. A
+        // frame dropped by the shaper, the ACL, or a full queue costs us
+        // nothing and must not appear on anyone's ledger.
+        //
+        // ⚠ One `fetch_add` and nothing else. This is the relay latency path —
+        // FR-18 exists because of queueing here — so there is no Mongo write,
+        // no allocation and no lock held across an await. The flusher
+        // (`spawn_derp_usage_flush`) does the I/O on its own timer.
+        add_network_bytes(network_id, out_len);
     }
 }
 
