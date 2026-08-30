@@ -4417,7 +4417,25 @@ async fn media_pump_ffmpeg_dc(
     // nominated pair's remote address (the viewer host).
     let rate_hi_bps = crate::encode::relay_max_hi_bps();
     let rate_peer_key = if constrained && rate_hi_bps > 0 {
-        nominated_remote_ip(&pc).await
+        // The pair may not be nominated yet at pump start (the 0.4.27 field
+        // run's first packet came 4 s in): no key then means no seed AND no
+        // write-back, i.e. the memory silently off for the session. Poll
+        // briefly; the pump has nothing to send before the DC opens anyway.
+        let mut key = None;
+        for _ in 0..20 {
+            key = nominated_remote_ip(&pc).await;
+            if key.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if key.is_none() {
+            info!(
+                %session_id,
+                "FR-35 rate memory: no nominated pair within 4 s of pump start — memory off for this session"
+            );
+        }
+        key
     } else {
         None
     };
@@ -4678,7 +4696,11 @@ async fn media_pump_ffmpeg_dc(
     // stalls and backpressure skips are counted but not fed to the AIMD; a
     // HARD stall (≥ 1 s) still is.
     const OPENER_GRACE: Duration = Duration::from_secs(2);
-    let pump_started = std::time::Instant::now();
+    // Anchored at the FIRST PACKET, not at pump start: the pump spins for
+    // seconds before anything is sent (consent, ICE, the DC opening — the
+    // 0.4.27 field run's first packet came 4 s in) and a grace measured from
+    // pump start had expired before the opener existed.
+    let mut opener_started: Option<std::time::Instant> = None;
     let mut opener_grace_done = false;
     let mut grace_soft_stalls: u32 = 0;
     let mut grace_bp_skips: u32 = 0;
@@ -5741,7 +5763,7 @@ async fn media_pump_ffmpeg_dc(
         // frame later.
         // FR-35 P3 — end of the opener grace: turn what the send task saw
         // into the pipe's burst drain rate, for the pair memory.
-        if !opener_grace_done && pump_started.elapsed() >= OPENER_GRACE {
+        if !opener_grace_done && opener_started.is_some_and(|t| t.elapsed() >= OPENER_GRACE) {
             opener_grace_done = true;
             in_opener_grace.store(false, std::sync::atomic::Ordering::Relaxed);
             let bytes = opener_bytes.load(std::sync::atomic::Ordering::Relaxed);
@@ -6077,6 +6099,8 @@ async fn media_pump_ffmpeg_dc(
         let has_keyframe = packets.iter().any(|p| p.is_keyframe);
         if has_keyframe && !first_keyframe_logged {
             first_keyframe_logged = true;
+            // FR-35 P3 — the opener starts here.
+            opener_started = Some(std::time::Instant::now());
             info!(
                 %session_id, codec_label, encoder = enc.name(),
                 "FFmpeg DC pump: first key-flagged packet emitted (rc.98 — confirms IDR flagging; NVENC needs forced-idr=1)"
