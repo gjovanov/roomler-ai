@@ -180,7 +180,19 @@ out of scope becomes in-scope here.
 - [x] The P1 backend is **wired into the capture cascade** and delivers
       `Frame`s through the `ScreenCapture` trait (`roomlerd capture-smoke`)
 - [ ] A **browser-visible remote-control session** against that Wayland
-      desktop — capture is proven, encode/transport end-to-end is not
+      desktop. ⚠️ **Attempted 2026-08-30 and BLOCKED on host state, not on the
+      feature.** It needs the FR-36 build running *as the daemon* with both
+      gates on, and `scw-m2-asahi` has an **auto-start hook that respawns
+      `roomlerd run` (no `--config`) within ~3 s of a kill** — it retook the
+      single-instance lock before the FR-36 binary could, which exited
+      immediately. That hook is also how the orphan in the host's long-running
+      restart storm keeps reappearing. Two things learned the hard way:
+      `systemctl stop roomlerd` **kills the whole cgroup**, including a
+      `setsid`-detached script spawned from a `roomler exec` (run the swap from
+      a `systemd-run` transient unit instead); and the only channel to this host
+      *is* the daemon, so fighting its supervisor risks locking oneself out.
+      Do this on a host whose daemon is not self-respawning, or disable the hook
+      first with console access available.
 - [x] Streams **while the session is locked**, and **at the login greeter** —
       the cases the portal structurally refuses. Greeter: **20/20 frames with
       nobody logged in**. Locked: the XFCE unlock dialog captured.
@@ -283,3 +295,4 @@ out of scope becomes in-scope here.
 | 2026-08-30 | **P4 uinput — keyboard on WAYLAND, end to end** | ✅ 8 characters injected through `/dev/uinput` on GNOME Wayland arrived in **GNOME Shell's own search box** — the capture read back `terminal` in the search field with Xfce Terminal / Terminal / Konsole / XTerm as results. 21.4 M bytes differed between the before and after frames. Closed loop: **injected below the compositor, observed below the compositor** |
 | 2026-08-30 | P4 hygiene | The virtual device is destroyed on drop — no `Roomler Virtual Input` left in `/sys/devices/virtual/input` after the run. Host returned to XFCE with `backend=scrap` and damage tracking active |
 | 2026-08-30 | **P1b — fuse the downscale into the repack** | ✅ 4K `Auto`: **52.9 ms → 24.0 ms**, i.e. *faster than not downscaling* (43.8 ms) — the write is 4× smaller while the read stays sequential. ~30 fps at 4K instead of ~19. ⚠️⚠️ **The first attempt made it 6× WORSE (329.8 ms)**: sampling two source rows a pitch apart per output pixel, because **the scanout mapping punishes strided reads brutally**. Row-buffering into cached scratch — sequential reads, identical arithmetic — is what won. A unit test pins the fused output byte-for-byte against the two-step route it replaced |
+| 2026-08-30 | **end-to-end browser session — ATTEMPTED, blocked** | ⚠️ Swapping the FR-36 build in as the daemon failed: the host's **auto-start hook respawned the packaged `roomlerd run` (no `--config`) within ~3 s**, retook the single-instance lock, and the FR-36 binary exited at once. ⚠️ `systemctl stop roomlerd` also **killed the swap script itself** — a `setsid`-detached child of a `roomler exec` is still in the unit's cgroup, and systemd kills the cgroup. Use a `systemd-run` transient unit. Host restored to XFCE + the packaged daemon (`NRestarts=0`, one process, no lock refusals) — cleaner than it was found, since the long-running orphan is gone |
