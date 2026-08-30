@@ -50,6 +50,12 @@ COPY files/nginx-pod.conf /etc/nginx/conf.d/default.conf
 # the build host drops the file in before `docker build`. Absent ⇒ the
 # analytics honestly report `country: unknown` — see files/geoip/README.
 COPY files/geoip/ /usr/share/roomler/geoip/
+# FR-20 P5 - unit costs for the metered relay/SFU resources. The binary
+# resolves `config/relay-costs.toml` relative to its CWD, which is `/` here.
+# Same contract as the GeoIP directory above: absent is a supported state and
+# renders "not priced", never a fabricated 0.00 (which would also imply 100%
+# margin). `ROOMLER__RELAY_COSTS__*` overrides it without an image rebuild.
+COPY config/ /config/
 RUN rm -f /etc/nginx/sites-enabled/default
 RUN printf '#!/bin/sh\nnginx\nexec roomler-ai-api\n' > /entrypoint.sh && chmod +x /entrypoint.sh
 EXPOSE 80
