@@ -1059,6 +1059,10 @@ async fn connect_once(
     // supervisors can open sessions over it; the guard clears it to `None` on
     // every exit path (like `_connected_guard`), so a supervisor holding the
     // dead egress re-waits for the next connection's sink.
+    // FR-40 P1c — if the PREVIOUS session of this org ended in a key
+    // rotation, say so again on this healthy socket: the copy sent on the
+    // dying session can be lost (it was, in the second field run).
+    drain_pending_rotation_report(&cfg.tenant_id, &outbound_tx);
     let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
     // Phase 3b: if overlay is enabled, start the node runtime (relay mode)
     // and capture the channel its `rc:overlay.*` events flow into. The
@@ -1806,6 +1810,50 @@ fn report_key_rotated(
     };
     if outbound_tx.try_send(msg).is_err() {
         debug!("rc:agent.key_rotated dropped (outbound queue full or closed)");
+    }
+}
+
+/// FR-40 P1c — a `rotated` report to re-send on the NEXT session of the org
+/// that rotated. The first copy rides the session that is about to end and
+/// can be lost — in the second field run the server never received it and
+/// resolved `delivered` for a rotation it had itself verified at the join.
+/// The re-send rides a healthy socket; the server's conditional write makes
+/// the duplicate harmless.
+struct PendingRotationReport {
+    request_id: String,
+    old_public_key: Option<String>,
+    new_public_key: String,
+    key_epoch: u32,
+}
+
+/// Keyed per org (tenant id): every org loop lives in this one daemon and
+/// must only re-send its OWN rotation.
+fn pending_rotation_reports() -> &'static std::sync::Mutex<HashMap<String, PendingRotationReport>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PendingRotationReport>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn drain_pending_rotation_report(tenant_id: &str, outbound_tx: &mpsc::Sender<ClientMsg>) {
+    let pending = pending_rotation_reports()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(tenant_id);
+    if let Some(p) = pending {
+        info!(
+            request_id = %p.request_id,
+            key_epoch = p.key_epoch,
+            "rc:agent.key_rotated — re-sending the rotation report on the new session"
+        );
+        report_key_rotated(
+            outbound_tx,
+            &p.request_id,
+            roomler_ai_remote_control::models::KeyRotationOutcome::Rotated,
+            p.old_public_key.as_deref(),
+            Some(&p.new_public_key),
+            p.key_epoch,
+            None,
+        );
     }
 }
 
@@ -3400,6 +3448,20 @@ async fn handle_server_msg(
                     key_epoch,
                     "rc:agent.key_rotate — new overlay key persisted; reconnecting under it"
                 );
+                // P1c — queue the same report for the NEXT session first
+                // (the copy below rides a socket that is about to close).
+                pending_rotation_reports()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        tenant_id.to_string(),
+                        PendingRotationReport {
+                            request_id: request_id.clone(),
+                            old_public_key: old_public.clone(),
+                            new_public_key: new_public.clone(),
+                            key_epoch,
+                        },
+                    );
                 report_key_rotated(
                     outbound_tx,
                     &request_id,
