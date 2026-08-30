@@ -2788,6 +2788,17 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         shutdown_rx.clone(),
         Some(rtt_hook),
     );
+    // FR-43 P1 — on macOS, optionally let THIS (root) daemon own the
+    // GUI-session worker instead of a separate LaunchAgent. Default off; even
+    // on, it stands down while the LaunchAgent is loaded, so enabling it on a
+    // live Mac is a no-op until the plist is booted out. Not spawned at all on
+    // other platforms — there is no second half to supervise.
+    #[cfg(target_os = "macos")]
+    let macos_supervisor_task = tokio::spawn(roomlerd::macos_supervisor::run(
+        cfg.macos_supervise_gui_worker,
+        shutdown_rx.clone(),
+    ));
+
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
         async move {

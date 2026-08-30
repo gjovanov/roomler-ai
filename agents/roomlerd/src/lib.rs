@@ -53,6 +53,7 @@ pub mod localapi_state;
 pub mod lock_overlay;
 pub mod lock_state;
 pub mod logs_fetch;
+pub mod macos_supervisor;
 pub mod mdns_resolve;
 pub mod remote_config;
 // P5 — crate-private: its surface leans on `peer::TargetResolution`
