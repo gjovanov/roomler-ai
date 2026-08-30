@@ -780,7 +780,33 @@ async fn call_leave_cleans_up_participant_media() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 
-    // Re-join via REST
+    // Re-join the way the PRODUCT does. #754: this used `call/join` alone, and
+    // that sequence does not exist in the client. `ConferenceView::doJoin` runs
+    // `startCall` then `joinCall` UNCONDITIONALLY — it does not choose between
+    // them — so every real re-entry starts first.
+    //
+    // It matters here because the single participant leaving auto-ends the call
+    // (count 0 + in_progress -> `end_call`), and `call/join` never restores
+    // `conference_status`; only `call/start` does. Joining alone therefore left
+    // the room `ended` in Mongo, and the later `media:join` was correctly refused
+    // by the C-4 claim gate. The test was asserting a pre-C-4 contract.
+    //
+    // `call/start` is transition-gated, so the extra call is a no-op whenever the
+    // call is already running — which is exactly why the client can afford to
+    // issue it every time.
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/call/start",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
     let resp = app
         .auth_post(
             &format!(
@@ -818,6 +844,115 @@ async fn call_leave_cleans_up_participant_media() {
     );
 
     ws.close(None).await.ok();
+}
+
+/// #754 — `call/join` must broadcast the status the DATABASE holds, not a
+/// literal. It used to send `"conference_status": "in_progress"` hardcoded, so
+/// joining a call that had already auto-ended told every client in the room the
+/// call was live when the stored status was `ended`.
+///
+/// Worth its own test rather than riding on the media one: that test needs a
+/// mediasoup worker and is skipped on CI, so the product bug it exposed had no
+/// coverage anywhere the runner would notice. This asserts the same contract
+/// with HTTP + WS only, so it runs everywhere.
+#[tokio::test]
+async fn call_join_broadcasts_the_stored_status_not_a_literal() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("joinstatus").await;
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .json(&serde_json::json!({ "name": "Status Truth" }))
+        .send()
+        .await
+        .unwrap();
+    let room: Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap();
+
+    let post = |p: String| {
+        app.auth_post(&p, &tenant.admin.access_token)
+            .json(&serde_json::json!({}))
+            .send()
+    };
+
+    // Start → join → leave. The single participant leaving auto-ends the call.
+    post(format!(
+        "/api/tenant/{}/room/{}/call/start",
+        tenant.tenant_id, room_id
+    ))
+    .await
+    .unwrap();
+    post(format!(
+        "/api/tenant/{}/room/{}/call/join",
+        tenant.tenant_id, room_id
+    ))
+    .await
+    .unwrap();
+    post(format!(
+        "/api/tenant/{}/room/{}/call/leave",
+        tenant.tenant_id, room_id
+    ))
+    .await
+    .unwrap();
+
+    // The DB's own answer — whatever the broadcast claims must equal THIS.
+    let stored = {
+        let resp = app
+            .auth_get(
+                &format!("/api/tenant/{}/room/{}", tenant.tenant_id, room_id),
+                &tenant.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap();
+        let json: Value = resp.json().await.unwrap();
+        json["conference_status"].as_str().unwrap_or("").to_string()
+    };
+    assert_eq!(
+        stored, "ended",
+        "precondition: the last participant leaving must auto-end the call — \
+         without it this test would pass for the wrong reason"
+    );
+
+    // Listen before joining, or the broadcast is gone before we look.
+    let ws_url = format!("ws://{}/ws?token={}", app.addr, tenant.admin.access_token);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect failed");
+    ws.next().await; // connected
+
+    post(format!(
+        "/api/tenant/{}/room/{}/call/join",
+        tenant.tenant_id, room_id
+    ))
+    .await
+    .unwrap();
+
+    let mut seen = None;
+    for _ in 0..10 {
+        let Ok(Some(Ok(msg))) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await
+        else {
+            break;
+        };
+        let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        if parsed["type"] == "room:call_updated" {
+            seen = parsed["data"]["conference_status"]
+                .as_str()
+                .map(str::to_string);
+            break;
+        }
+    }
+
+    let broadcast = seen.expect("no room:call_updated arrived after call/join");
+    assert_eq!(
+        broadcast, stored,
+        "call/join broadcast `{broadcast}` while the database held `{stored}` — \
+         the event must not assert a status the DB does not have (#754)"
+    );
 }
 
 // --- TCP transport + TURN config tests ---
