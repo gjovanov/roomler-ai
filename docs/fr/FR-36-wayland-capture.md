@@ -245,6 +245,28 @@ out of scope becomes in-scope here.
   this decision toward reimplementing: vendoring adds a C build dep to every
   Linux agent build plus a drift-gate obligation, and its main value (detiling)
   is exactly the part Apple Silicon does not need. Re-open for tiled GPUs.
+- ⚠️ **Which host can run the end-to-end browser test? Surveyed 2026-08-30:
+  none of the fleet's Linux hosts can.**
+
+  | host | DRM | connected outputs |
+  |---|---|---|
+  | `scw-m2-asahi` | `apple-drm` + `asahi` | **1** (`card2-HDMI-A-1`, 4096×2160) |
+  | `jupiter` / `zeus` | `amdgpu` | **0** |
+  | `mars` | no DRM device at all | — |
+
+  So `scw-m2-asahi` is the *only* fleet machine with live scanout, and it is
+  the one whose auto-start hook makes swapping the daemon impractical. Three
+  ways forward, all operator calls: console access to that host to disable the
+  hook; a new host with a real display; or `vkms` (a virtual CRTC — the module
+  is present there, and it is the documented answer for a genuinely headless
+  box) on a machine that is not a production cluster node.
+- ⚠️ **P2 (detiling) is still OPEN for AMD/Intel/Nvidia — do not read the
+  headless survey as retiring it.** `jupiter`'s `amdgpu` planes advertise
+  `DRM_FORMAT_MOD_LINEAR` only, but that GPU has **nothing plugged in**, and a
+  driver with no display to drive has no reason to offer a tiled scanout
+  modifier. A desktop AMD card with an attached monitor is expected to expose
+  `AMD_FMT_MOD` tiled formats. The Apple-Silicon result stands on its own
+  because that plane *is* driving a 4K display; this one proves nothing.
 - Multi-monitor: per-CRTC capture with physical origin/scale mapping.
 - Cursor: the hardware cursor plane is captured separately; hotspot is
   approximate on bare metal. (Measured: `plane-1` sits unbound at `fb=0` while
