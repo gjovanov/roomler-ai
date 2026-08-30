@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
+// RETIRED-NAME-ANCHOR-BEGIN
+// This module puts a name on the operator's PATH. Every occurrence below
+// is the name that is ALREADY there on installed hosts, and the release
+// zip still carries a roomler-tunnel.exe alias for exactly that reason.
+// Flipping the wizard to write `roomler` is a BEHAVIOUR change (it leaves
+// the old entry stranded and changes the command an operator types), so
+// it is deliberately not part of a rename sweep. FR-21 followup.
 //! Per-platform integration after the CLI archive is extracted.
 //!
 //! Three jobs, each `#[cfg]`-gated to its OS:
@@ -7,15 +14,8 @@
 //! - **Windows**: append the install dir to the user-PATH registry
 //!   value at `HKCU\Environment`. Best-effort Start-Menu shortcut
 //!   creation in v1 — the .lnk write is deferred to Phase B; v1 just
-// RETIRED-NAME-ANCHOR-BEGIN
-// This module puts a name on the operator's PATH. Every occurrence below
-// is the name that is ALREADY there on installed hosts, and the release
-// zip still carries a roomler-tunnel.exe alias for exactly that reason.
-// Flipping the wizard to write `roomler` is a BEHAVIOUR change (it leaves
 //!   ensures `roomler-tunnel` is on PATH so the operator can run it
 //!   from any shell.
-// the old entry stranded and changes the command an operator types), so
-// it is deliberately not part of a rename sweep. FR-21 followup.
 //! - **Linux**: symlink the binary into `~/.local/bin/roomler-tunnel`.
 //!   `.desktop` file is deferred to Phase B (it's only useful with
 //!   the first-forward feature so the desktop entry has a meaningful
