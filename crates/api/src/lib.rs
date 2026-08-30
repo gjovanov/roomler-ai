@@ -643,6 +643,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/relay/current", get(routes::stats::admin_relay_current))
         .route("/relay/history", get(routes::stats::admin_relay_history))
         .route("/orgs", get(routes::stats::admin_orgs))
+        // FR-20 P5 - per-org metered cost + margin inputs. Platform
+        // admin only, and it reports "not priced"/"not monitored"
+        // rather than zero for anything it has not measured.
+        .route("/cost", get(routes::cost::admin_cost))
         .route("/users", get(routes::stats::admin_users))
         .route("/machines", get(routes::stats::admin_machines))
         .route("/calls", get(routes::stats::admin_calls))
