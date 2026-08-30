@@ -205,6 +205,93 @@ async fn members_without_manage_agents_and_foreign_tenants_are_refused() {
     assert!(a["key_rotation"].is_null(), "{a}");
 }
 
+/// P1c — the join is the proof: with the device's key snapshotted into the
+/// order, a join under a different key resolves `rotated` with NO report at
+/// all (the second field run), and a refusal report for the same order does
+/// not change that (the first field run).
+#[tokio::test]
+async fn a_verified_identity_change_resolves_rotated_without_a_report() {
+    use roomler_ai_remote_control::models::{
+        KeyRotationOutcome, KeyRotationReport, OverlayIdentity,
+    };
+    use roomler_ai_services::dao::agent::AgentDao;
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("fr40f").await;
+    let aid = enroll(&app, &t.tenant_id, &t.admin.access_token, "mach-fr40-f").await;
+    let (tid, aid_oid) = (
+        ObjectId::parse_str(&t.tenant_id).unwrap(),
+        ObjectId::parse_str(&aid).unwrap(),
+    );
+    let dao = AgentDao::new(&app.db);
+    let identity = |key: &str, epoch: u32| OverlayIdentity {
+        public_key: key.into(),
+        key_epoch: epoch,
+        joined_at: bson::DateTime::now(),
+    };
+
+    // The device holds OLD== when the order is placed.
+    dao.record_overlay_identity(tid, aid_oid, &identity("OLD==", 0))
+        .await
+        .unwrap();
+    app.auth_post(
+        &format!("/api/tenant/{}/agent/{aid}/overlay-key/rotate", t.tenant_id),
+        &t.admin.access_token,
+    )
+    .send()
+    .await
+    .unwrap();
+    let a = get_agent(&app, &t.tenant_id, &aid, &t.admin.access_token).await;
+    assert_eq!(
+        a["key_rotation"]["public_key_before"].as_str(),
+        Some("OLD==")
+    );
+    assert_eq!(a["overlay_public_key"].as_str(), Some("OLD=="));
+    let rid = a["key_rotation"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // It joins under NEW== and no report ever arrives: rotated.
+    dao.record_overlay_identity(tid, aid_oid, &identity("NEW==", 1))
+        .await
+        .unwrap();
+    let a = get_agent(&app, &t.tenant_id, &aid, &t.admin.access_token).await;
+    assert_eq!(
+        a["key_rotation"]["state"].as_str(),
+        Some("rotated"),
+        "{}",
+        a["key_rotation"]
+    );
+    assert_eq!(a["overlay_public_key"].as_str(), Some("NEW=="));
+    assert_eq!(a["overlay_key_epoch"].as_u64(), Some(1));
+
+    // A refusal for the same order (the duplicate-delivery race) cannot undo
+    // what the join proved.
+    dao.record_key_rotation_report(
+        tid,
+        aid_oid,
+        &KeyRotationReport {
+            request_id: rid,
+            outcome: KeyRotationOutcome::RateLimited,
+            old_public_key: None,
+            new_public_key: None,
+            key_epoch: 1,
+            detail: None,
+            reported_at: bson::DateTime::now(),
+        },
+    )
+    .await
+    .unwrap();
+    let a = get_agent(&app, &t.tenant_id, &aid, &t.admin.access_token).await;
+    assert_eq!(
+        a["key_rotation"]["state"].as_str(),
+        Some("rotated"),
+        "{}",
+        a["key_rotation"]
+    );
+}
+
 /// P1b — the duplicate-delivery race from the first field run: the device's
 /// `rotated` report must survive a later refusal for the SAME order, while a
 /// report about a different order, or a later `rotated`, still replaces it.
