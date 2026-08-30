@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture, and unattended access
 
-**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **END-TO-END PROVEN: the browser renders a GNOME Wayland desktop and drives it, via DRM capture + uinput, both opt-in. Greeter + locked screen also verified. Remaining gap: `KeyText` (you can navigate but not type)** (2026-08-30) · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **END-TO-END PROVEN: the browser renders a GNOME Wayland desktop, drives it, and TYPES into it — via DRM capture + uinput, both opt-in. Greeter + locked screen also verified** (2026-08-30) · **Owner:** agent / capture
 
 ## Goal
 
@@ -196,13 +196,14 @@ out of scope becomes in-scope here.
       **GNOME Shell's own calendar panel**, and `Escape` closed it again. So the
       pointer path and the physical-key (HID) path both reach a native Wayland
       compositor.
-      ⚠️⚠️ **But you cannot TYPE.** The viewer sends composed text as
-      `KeyText`, which this backend drops by design, and the daemon logged
-      exactly that: `uinput: KeyText is not supported … text input will not
-      arrive`. The documented limitation therefore has a concrete user-visible
-      shape — **navigate yes, type no** — and only the end-to-end test could
-      surface it. That makes layout-aware `KeyText` the highest-value follow-up,
-      ahead of anything else left on this FR.
+      ✅ **And you can now TYPE too (P4b, 2026-08-30).** The viewer sends
+      composed text as `KeyText`, which the first cut dropped by design. It is
+      now turned into physical keystrokes for a **detected, verified** layout:
+      typing `echo FR36-TYPED-OK-123` in the browser put exactly that at the
+      remote Wayland terminal prompt, and `Enter` ran it. Uppercase, digits and
+      punctuation all survive, so the shift handling is right.
+      ⚠️ Unknown layouts still refuse loudly, naming what was detected — see the
+      open decisions for why this is a table and not `libxkbcommon`.
 - [x] Streams **while the session is locked**, and **at the login greeter** —
       the cases the portal structurally refuses. Greeter: **20/20 frames with
       nobody logged in**. Locked: the XFCE unlock dialog captured.
@@ -303,6 +304,23 @@ out of scope becomes in-scope here.
   the lock screen — the same policy weight as DRM capture, and the reason the
   gate is opt-in rather than a kill switch.
 
+- ⚠️ **`KeyText` types only for layouts with a verified table (`us` today).**
+  evdev carries physical keys, so "type z" means "press the key that produces z
+  *under this host's layout*" — on a German layout that is the key labelled `y`.
+  `libxkbcommon` is the correct general answer and was **rejected on deployment
+  grounds**: it is a dynamic system library, and linking it would put
+  `libxkbcommon.so` in `roomlerd`'s `DT_NEEDED` on every Linux build. Headless
+  fleet hosts have no reason to carry it, and a missing `.so` does not degrade
+  a feature — the loader refuses to start the daemon at all. That exact failure
+  already cost this project once (vendored FFmpeg dylibs baking a Homebrew path
+  into the macOS agent; dyld killed it at launch on every end-user Mac).
+  So: detect the layout, type only where verified, refuse loudly otherwise.
+  Adding a layout means adding a table and checking it — an unverified entry is
+  worse than an absent one. ⚠️ There is deliberately **no operator override
+  knob**: a new env would need a config-surface key to be settable the normal
+  way and there is no string bridge yet, but more to the point, if detection is
+  wrong the fix is to detect better, not to paper over it.
+
 ## Out of scope
 
 - Replacing X11 or Windows/macOS capture. This adds a backend.
@@ -330,3 +348,4 @@ out of scope becomes in-scope here.
 | 2026-08-30 | **end-to-end browser session — ATTEMPTED, blocked** | ⚠️ Swapping the FR-36 build in as the daemon failed: the host's **auto-start hook respawned the packaged `roomlerd run` (no `--config`) within ~3 s**, retook the single-instance lock, and the FR-36 binary exited at once. ⚠️ `systemctl stop roomlerd` also **killed the swap script itself** — a `setsid`-detached child of a `roomler exec` is still in the unit's cgroup, and systemd kills the cgroup. Use a `systemd-run` transient unit. Host restored to XFCE + the packaged daemon (`NRestarts=0`, one process, no lock refusals) — cleaner than it was found, since the long-running orphan is gone |
 | 2026-08-30 | **🏆 END-TO-END BROWSER SESSION — PASSED** | The `roomler.ai` viewer rendered `scw-m2-asahi`'s **GNOME Wayland** desktop (`connected`, H.264 SW, ~16 fps, **2048×1080** for a 4096×2160 panel ⇒ the fused downscale fed the encoder). Daemon log for that session: `capture: backend=drm … node="/dev/dri/card2" 4096x2160` + `input: backend=uinput`. **Gates came from CONFIG, not env** (`config-backed env fallbacks registered keys=[…DRM_CAPTURE…UINPUT]`) — decisive, because the serving daemon was spawned by the host's auto-start hook *outside systemd*, where a unit env block could not have reached it. A browser click opened **GNOME Shell's own calendar panel**; `Escape` closed it. ⚠️ Typing did NOT arrive — the viewer sends `KeyText`, which the backend drops by design: **navigate yes, type no** |
 | 2026-08-30 | how the blocker was cleared | The auto-updater had already installed release **0.4.30**, which carries the merged FR-36 stack — so the test ran against the **shipped artifact**, not a dev build, and no binary swap was needed after all. Gates were set with `roomlerd cli config set`. ⚠️ A dead-man switch (`systemd-run --on-active=…` restoring the packaged service) was armed throughout; the host briefly went offline during a bad `systemd-run` invocation (`--config` was swallowed as a systemd-run option — it needs `--`) and the hook restored it within seconds |
+| 2026-08-30 | **🏆 P4b — typing works through the browser** | Typed `echo FR36-TYPED-OK-123` in the viewer → **exactly that appeared at the remote GNOME Wayland terminal prompt**, `Enter` ran it, the shell echoed the result. Uppercase, digits and punctuation all correct ⇒ shift handling right. Daemon: `uinput: typed text will be sent as physical keys for this layout layout="us" detected="us"`. Full round trip: browser → WebRTC → roomlerd → uinput → evdev → libinput → mutter → terminal → bash. ⚠️ The first two attempts showed nothing and the code was NOT at fault — typing on a bare GNOME desktop does nothing (no focus), and GNOME 48 has no Activities button to click. Putting a real terminal on the desktop was what made the test decisive |
