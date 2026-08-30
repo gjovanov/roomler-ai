@@ -59,6 +59,12 @@ pub const MAX_FAST_EXITS: u32 = 5;
 /// Backoff ceiling for respawns.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// How many polls the supervisor keeps re-trying to start launchd's own worker
+/// after it has released its own. Bounded because a Mac where launchd simply
+/// refuses should not spawn a `launchctl` every [`POLL`] for the daemon's whole
+/// life; 12 polls is a minute, which is far longer than a hand-back takes.
+pub const KICKSTART_RETRIES: u32 = 12;
+
 /// What the supervisor knows when it decides. Deliberately plain data: the
 /// decision is pure so it can be tested on every platform, while the syscalls
 /// that produce these fields are macOS-only. (macOS has no `cargo test` lane
@@ -261,10 +267,14 @@ mod imp {
     /// cannot disturb a healthy launchd-owned worker. It runs AFTER
     /// [`stop_worker`], which reaps the group, so the lock is free by then.
     ///
-    /// A failure here is logged, not retried: the next poll sees
-    /// [`Action::HandBack`] again for as long as we still hold a worker, and
-    /// once we do not, launchd's own supervision is the right thing to trust.
-    fn kickstart_launch_agent(uid: u32) {
+    /// Returns whether launchd accepted it. A failure has to be **retried by
+    /// the caller**, because by then we have already stopped our own worker:
+    /// the next poll sees [`Action::LaunchdOwns`] (we no longer hold one), so
+    /// nothing would bring the hand-back back around on its own, and the Mac
+    /// would sit with no user half — the exact outcome this function exists to
+    /// prevent. [`KICKSTART_RETRIES`] bounds that, so a Mac where launchd
+    /// genuinely refuses does not spawn a subprocess every [`POLL`] forever.
+    fn kickstart_launch_agent(uid: u32) -> bool {
         let job = format!("gui/{uid}/{AGENT_LABEL}");
         match Command::new("launchctl")
             .arg("kickstart")
@@ -279,6 +289,7 @@ mod imp {
                     job = %job,
                     "macOS supervisor: handed the worker back to launchd"
                 );
+                true
             }
             Ok(s) => {
                 tracing::warn!(
@@ -289,6 +300,7 @@ mod imp {
                      this session may be left with no user half until launchd \
                      starts one"
                 );
+                false
             }
             Err(e) => {
                 tracing::warn!(
@@ -297,6 +309,7 @@ mod imp {
                     error = %e,
                     "macOS supervisor: could not run launchctl kickstart"
                 );
+                false
             }
         }
     }
@@ -381,6 +394,11 @@ mod imp {
         let mut fast_exits: u32 = 0;
         let mut wait_until: Option<Instant> = None;
         let mut last_action: Option<Action> = None;
+        // Polls left to keep re-trying launchd's own worker after a hand-back
+        // whose kickstart failed. 0 = nothing owed. (`//`, not `///`: a doc
+        // comment on a `let` is an `unused_doc_comments` warning, and this
+        // module compiles only in the macOS lane, where warnings are denied.)
+        let mut kickstart_debt: u32 = 0;
 
         loop {
             // Reap first, so `worker_uid` reflects reality this tick.
@@ -445,10 +463,43 @@ mod imp {
                     // Logged once via the transition logger above; nothing to
                     // do until the situation changes.
                 }
-                Action::NoGuiSession | Action::LaunchdOwns => {
+                Action::NoGuiSession => {
                     fast_exits = 0;
+                    // Nobody is logged in, so there is no LaunchAgent to owe a
+                    // kickstart to; forget any debt from the last session.
+                    kickstart_debt = 0;
                     if let Some((uid, child, _)) = worker.take() {
                         stop_worker(uid, child, "GUI session ended");
+                    }
+                }
+                Action::LaunchdOwns => {
+                    fast_exits = 0;
+                    // We hold no worker here, so `HandBack` will never come
+                    // around again — this is the ONLY place a failed hand-back
+                    // can be retried from. See `kickstart_launch_agent`.
+                    if kickstart_debt > 0 {
+                        match uid_now {
+                            // Cleared by success, not by reaching zero: those
+                            // are opposite outcomes and must not share a
+                            // branch.
+                            Some(uid) if kickstart_launch_agent(uid) => kickstart_debt = 0,
+                            Some(uid) => {
+                                kickstart_debt -= 1;
+                                if kickstart_debt == 0 {
+                                    tracing::error!(
+                                        uid,
+                                        "macOS supervisor: gave up starting launchd's own \
+                                         worker — this session has no user half until \
+                                         launchd or an operator starts one"
+                                    );
+                                }
+                            }
+                            // Unreachable while the action is LaunchdOwns
+                            // (`decide` returns NoGuiSession without a console
+                            // uid), but a debt owed to a session that no longer
+                            // exists is not a debt.
+                            None => kickstart_debt = 0,
+                        }
                     }
                 }
                 Action::HandBack(uid) => {
@@ -456,7 +507,11 @@ mod imp {
                     if let Some((held, child, _)) = worker.take() {
                         stop_worker(held, child, "launchd took ownership");
                     }
-                    kickstart_launch_agent(uid);
+                    kickstart_debt = if kickstart_launch_agent(uid) {
+                        0
+                    } else {
+                        KICKSTART_RETRIES
+                    };
                 }
                 Action::Replace(uid) => {
                     fast_exits = 0;
