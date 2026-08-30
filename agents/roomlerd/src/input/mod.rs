@@ -93,6 +93,12 @@ pub mod system_context_backend;
 #[cfg(all(target_os = "linux", feature = "uinput-input"))]
 pub mod uinput_backend;
 
+/// FR-36 P4b — character → physical key, per keyboard layout. Split out from
+/// the uinput backend because "which key produces this character" is a layout
+/// question, not a uinput one, and it is the part most likely to grow.
+#[cfg(all(target_os = "linux", feature = "uinput-input"))]
+pub mod keylayout;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Button {
