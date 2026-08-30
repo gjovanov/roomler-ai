@@ -354,6 +354,10 @@ pub struct KeyRotationView {
     pub requested_by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
+    /// P1c — the key the device held when the order was placed; the grid's
+    /// current key next to it is the rotation made visible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key_before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<KeyRotationReportView>,
     pub state: KeyRotationState,
@@ -415,13 +419,57 @@ fn key_rotation_view(
     identity: Option<&roomler_ai_remote_control::models::OverlayIdentity>,
     caps: &roomler_ai_remote_control::models::AgentCaps,
 ) -> Option<KeyRotationView> {
-    use roomler_ai_remote_control::models::{KeyRotationOutcome, RpcCap};
-
     let req = request?;
     // Only a report about THIS order counts — an answer to a superseded one
     // says nothing about it (the remote-config revision rule).
     let current = report.as_ref().filter(|r| r.request_id == req.request_id);
-    let state = match current.map(|r| r.outcome) {
+    // P1c — the join is the proof. A device that has joined under a key
+    // different from the one it held when the order was placed HAS rotated:
+    // whatever the report says (a refusal for this order can only be the
+    // duplicate-delivery race), and whether a report arrived at all (it rides
+    // the dying session and was lost in the second field run).
+    let moved = match (req.public_key_before.as_deref(), identity) {
+        (Some(before), Some(id)) => {
+            id.public_key != before
+                && id.joined_at.timestamp_millis() >= req.requested_at.timestamp_millis()
+        }
+        _ => false,
+    };
+    let state = if moved {
+        KeyRotationState::Rotated
+    } else {
+        key_rotation_state_from_report(&req, current, identity, caps)
+    };
+    Some(KeyRotationView {
+        request_id: req.request_id,
+        requested_at: fmt_dt(req.requested_at),
+        requested_by: req.requested_by.to_hex(),
+        delivered_at: req.delivered_at.map(fmt_dt),
+        public_key_before: req.public_key_before,
+        report: report.map(|r| KeyRotationReportView {
+            request_id: r.request_id,
+            outcome: r.outcome,
+            old_public_key: r.old_public_key,
+            new_public_key: r.new_public_key,
+            key_epoch: r.key_epoch,
+            detail: r.detail,
+            reported_at: fmt_dt(r.reported_at),
+        }),
+        state,
+    })
+}
+
+/// The report-driven half of the resolution (everything short of a verified
+/// identity change).
+fn key_rotation_state_from_report(
+    req: &roomler_ai_remote_control::models::KeyRotationRequest,
+    current: Option<&roomler_ai_remote_control::models::KeyRotationReport>,
+    identity: Option<&roomler_ai_remote_control::models::OverlayIdentity>,
+    caps: &roomler_ai_remote_control::models::AgentCaps,
+) -> KeyRotationState {
+    use roomler_ai_remote_control::models::{KeyRotationOutcome, RpcCap};
+
+    match current.map(|r| r.outcome) {
         Some(KeyRotationOutcome::Rotated) => {
             let joined_under_new =
                 match (current.and_then(|r| r.new_public_key.as_deref()), identity) {
@@ -453,23 +501,7 @@ fn key_rotation_view(
         None if !caps.has_rpc(RpcCap::KeyRotate) => KeyRotationState::Unsupported,
         None if req.delivered_at.is_some() => KeyRotationState::Delivered,
         None => KeyRotationState::Queued,
-    };
-    Some(KeyRotationView {
-        request_id: req.request_id,
-        requested_at: fmt_dt(req.requested_at),
-        requested_by: req.requested_by.to_hex(),
-        delivered_at: req.delivered_at.map(fmt_dt),
-        report: report.map(|r| KeyRotationReportView {
-            request_id: r.request_id,
-            outcome: r.outcome,
-            old_public_key: r.old_public_key,
-            new_public_key: r.new_public_key,
-            key_epoch: r.key_epoch,
-            detail: r.detail,
-            reported_at: fmt_dt(r.reported_at),
-        }),
-        state,
-    })
+    }
 }
 
 /// The remote-config state of one device, as the dashboard needs to read it.
@@ -1541,6 +1573,148 @@ fn normalize_routes(raw: Vec<String>) -> Result<Vec<String>, ApiError> {
         )));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod key_rotation_state_tests {
+    use super::{KeyRotationState, key_rotation_view};
+    use bson::{DateTime, oid::ObjectId};
+    use roomler_ai_remote_control::models::{
+        AgentCaps, KeyRotationOutcome, KeyRotationReport, KeyRotationRequest, OverlayIdentity,
+    };
+
+    fn caps(with_verb: bool) -> AgentCaps {
+        AgentCaps {
+            rpc: if with_verb {
+                vec!["key-rotate".into()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        }
+    }
+    fn req(before: Option<&str>, delivered: bool, at: DateTime) -> KeyRotationRequest {
+        KeyRotationRequest {
+            request_id: "r1".into(),
+            requested_by: ObjectId::new(),
+            requested_at: at,
+            delivered_at: delivered.then_some(at),
+            public_key_before: before.map(str::to_string),
+        }
+    }
+    fn ident(key: &str, epoch: u32, at: DateTime) -> OverlayIdentity {
+        OverlayIdentity {
+            public_key: key.into(),
+            key_epoch: epoch,
+            joined_at: at,
+        }
+    }
+    fn report(rid: &str, outcome: KeyRotationOutcome, new: Option<&str>) -> KeyRotationReport {
+        KeyRotationReport {
+            request_id: rid.into(),
+            outcome,
+            old_public_key: None,
+            new_public_key: new.map(str::to_string),
+            key_epoch: 1,
+            detail: None,
+            reported_at: DateTime::now(),
+        }
+    }
+    fn state(
+        r: KeyRotationRequest,
+        rep: Option<KeyRotationReport>,
+        id: Option<&OverlayIdentity>,
+        c: &AgentCaps,
+    ) -> KeyRotationState {
+        key_rotation_view(Some(r), rep, id, c).unwrap().state
+    }
+
+    /// The second field run: the device's report was lost on the dying
+    /// session, but it joined under a new key — that IS the rotation.
+    #[test]
+    fn a_verified_identity_change_is_rotated_with_no_report_at_all() {
+        let t0 = DateTime::from_millis(1_700_000_000_000);
+        let later = DateTime::from_millis(1_700_000_005_000);
+        let id = ident("NEW==", 2, later);
+        assert_eq!(
+            state(req(Some("OLD=="), true, t0), None, Some(&id), &caps(true)),
+            KeyRotationState::Rotated
+        );
+    }
+
+    /// The first field run: the duplicate's refusal must not hide a rotation
+    /// the join already proved.
+    #[test]
+    fn a_verified_identity_change_beats_a_refusal_report() {
+        let t0 = DateTime::from_millis(1_700_000_000_000);
+        let later = DateTime::from_millis(1_700_000_005_000);
+        let id = ident("NEW==", 2, later);
+        let refusal = report("r1", KeyRotationOutcome::RateLimited, None);
+        assert_eq!(
+            state(
+                req(Some("OLD=="), true, t0),
+                Some(refusal),
+                Some(&id),
+                &caps(true)
+            ),
+            KeyRotationState::Rotated
+        );
+    }
+
+    /// An unchanged key is NOT a rotation, however the join is timed; and a
+    /// join that predates the order proves nothing.
+    #[test]
+    fn an_unchanged_or_stale_identity_falls_back_to_the_report() {
+        let t0 = DateTime::from_millis(1_700_000_000_000);
+        let later = DateTime::from_millis(1_700_000_005_000);
+        let earlier = DateTime::from_millis(1_699_999_000_000);
+        let same = ident("OLD==", 1, later);
+        assert_eq!(
+            state(req(Some("OLD=="), true, t0), None, Some(&same), &caps(true)),
+            KeyRotationState::Delivered
+        );
+        let old_join = ident("NEW==", 2, earlier);
+        assert_eq!(
+            state(
+                req(Some("OLD=="), true, t0),
+                None,
+                Some(&old_join),
+                &caps(true)
+            ),
+            KeyRotationState::Delivered
+        );
+        // No snapshot (the device had never joined): report-driven only.
+        assert_eq!(
+            state(req(None, false, t0), None, Some(&same), &caps(false)),
+            KeyRotationState::Unsupported
+        );
+        assert_eq!(
+            state(req(None, false, t0), None, None, &caps(true)),
+            KeyRotationState::Queued
+        );
+    }
+
+    #[test]
+    fn a_rotated_report_needs_the_join_to_count_as_done() {
+        let t0 = DateTime::from_millis(1_700_000_000_000);
+        let rep = report("r1", KeyRotationOutcome::Rotated, Some("NEW=="));
+        let joined = ident("NEW==", 2, t0);
+        assert_eq!(
+            state(
+                req(None, true, t0),
+                Some(rep.clone()),
+                Some(&joined),
+                &caps(true)
+            ),
+            KeyRotationState::Rotated
+        );
+        // Report just now, identity still old: rotating (grace), not an error.
+        let old = ident("OLD==", 1, t0);
+        assert_eq!(
+            state(req(None, true, t0), Some(rep), Some(&old), &caps(true)),
+            KeyRotationState::Rotating
+        );
+    }
 }
 
 #[cfg(test)]
