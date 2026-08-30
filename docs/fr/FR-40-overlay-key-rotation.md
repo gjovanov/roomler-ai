@@ -1,6 +1,6 @@
 # FR-40: Rotate a device's overlay key from the dashboard — the server orders a re-mint it never sees
 
-Status: **P0 shipped; P1 implemented (PR #963), awaiting release 0.4.24 + field verification on CORPLAP-3** (2026-08-30). Tracking issue: `FR-40` (#962).
+Status: **P0 shipped; P1 implemented (PR #963), released as agent-v0.4.25 (0.4.24 was cut by another session before the merge), field verification on CORPLAP-3 pending** (2026-08-30). Tracking issue: `FR-40` (#962).
 Sibling of the remote-configuration work (`docs/remote-config.md`) — same push / report-back /
 reconcile-on-connect shape — and of `rc:agent.update`, which is the operator's mental model for
 it ("update now", but for the key).
@@ -195,7 +195,7 @@ and permission-gated; a defective push is stopped by the device switch.
 | P2 | retired keys: refuse at join + DERP, self-heal order, pubkey index | none needed (refusal is fail-closed) | open |
 | P3 | `roomler overlay rotate-key [--org]` over LocalAPI (break-glass when the control plane is the compromised thing); tunnel-only clients (`roomler` standalone) | — | open |
 
-## Acceptance criteria (field, the real device: CORPLAP-3, single org, `0.4.24+`)
+## Acceptance criteria (field, the real device: CORPLAP-3, single org, `0.4.25+`)
 
 - [ ] the route on a device advertising the verb returns `delivered`; the device log shows
       mint → save → report → reconnect; the node row's `wg_public_key` and `key_epoch` change
@@ -203,7 +203,7 @@ and permission-gated; a defective push is stopped by the device switch.
 - [ ] neo16's `roomler peers --json` shows CORPLAP-3 under the NEW public key with a working
       carrier, and traffic flows (RC session or overlay ping) within 30 s of the click
 - [ ] the old public key is on no peer's WG device afterwards (`roomler peers` on ≥ 2 peers)
-- [ ] a device on `0.4.23` (no verb) gets `unsupported` on the route, not a spinner
+- [ ] a device on `0.4.24` or older (no verb) gets `unsupported` on the route, not a spinner
 - [ ] a device that is offline is `queued`, and rotates on its next connect with no operator action
 - [ ] a second click within 60 s is `refused: rate_limited` and audited
 - [ ] `overlay_key_rotation = false` on the device ⇒ `refused: disabled`, key unchanged
