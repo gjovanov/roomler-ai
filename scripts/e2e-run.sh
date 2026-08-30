@@ -39,7 +39,9 @@ if [ -n "$TAG" ]; then
     || die "could not set the image"
   kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >/dev/null || die "the stack did not roll to $TAG"
 fi
-note "stack on $(kubectl -n "$NS" get deploy roomler2 -o jsonpath='{.spec.template.spec.containers[0].image}')"
+# ⚠️ Select the app container BY NAME. `containers[0]` is the sidecar now, and
+# this line reported the browser image as "the stack" the first time it ran.
+note "stack on $(kubectl -n "$NS" get deploy roomler2   -o jsonpath='{.spec.template.spec.containers[?(@.name=="roomler2")].image}')"
 
 POD=$(kubectl -n "$NS" get pod -l app=roomler2 -o jsonpath='{.items[0].metadata.name}')
 [ -n "$POD" ] || die "no roomler2 pod in $NS"
