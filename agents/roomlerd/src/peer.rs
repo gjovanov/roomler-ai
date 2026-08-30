@@ -2878,6 +2878,7 @@ async fn run_ffmpeg_dc_session(
             priority: priority.clone(),
             capture_native_dims: capture_native_dims.clone(),
             encoded_dims: encoded_dims.clone(),
+            chunk_framing,
         };
         if let Some(guard) = crate::media_share::try_join(
             crate::media_share::PipelineKey::FfmpegDc(profile_label),
@@ -2953,6 +2954,7 @@ async fn run_vp9_444_dc_session(
             priority: priority.clone(),
             capture_native_dims: capture_native_dims.clone(),
             encoded_dims: encoded_dims.clone(),
+            chunk_framing,
         };
         if let Some(guard) = crate::media_share::try_join(
             crate::media_share::PipelineKey::Vp9Dc {
