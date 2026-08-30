@@ -1,6 +1,6 @@
 # FR-35: The constrained ceiling learns the pair — grow the relay cap on delivery evidence, remember it per peer
 
-Status: **P1 + P2 shipped in 0.4.21 (#937); first field run done 2026-08-29 — the mechanics hold, the keyframe criterion does not yet; P2b (no-decay memory, 2× age gate) in PR** (2026-08-29). Tracking issue: `FR-35` (#922).
+Status: **P1 + P2 + P2b shipped (0.4.21 / 0.4.23); P3 (opener-drain growth, opener grace, held NVENC increases) implemented 2026-08-30 — release + field verification on CORPLAP-2 pending** (2026-08-30). Tracking issue: `FR-35` (#922).
 Child of the RC-quality program. Follows FR-31 (every opening and repair number on an NVENC relay
 session is proportional to `maxrate`, and nothing ffmpeg exposes changes that) and the parked
 measured-rate line (#678: a sender cannot see capacity it is not using). Operator's directive
@@ -84,12 +84,18 @@ shipped defaults:
 
 ## Open decisions
 
-- **Growth speed.** With every gate satisfied the ceiling rises ≈ +200 kbps per 15–25 s of
-  sustained drag (`+ceiling/16`, spaced 5 s, but the carried/pinned gates are only met in some
-  windows). Reaching the 2.5× keyframe bar from the nominal needs ~5 min of continuous drag per
-  pair; with the P2b no-decay memory that accumulates across sessions, but a first session on a
-  pair will not get there. Candidate P3: a larger step (ceiling/8) while age ≤ 1.2× floor and
-  carried ≥ 85 %, or a bounded opening probe.
+- **Growth speed — DECIDED 2026-08-30 (P3).** Sessions in the field last seconds and are mostly idle, so
+  drag-evidence growth never reaches the crisp opener; and the FR-31 verdict forbids a boost-then-step-down
+  (the step-down IDR replaces the crisp picture). P3 therefore grows the memory from evidence every session
+  has for free: **the opening burst is a burst probe** — `opener_drain_bps = bytes / max_send_wait` over the
+  first 2 s — and a session that saw no decrease records `max(stable, 75 % × drain)` capped at `hi`
+  (`rate_memory::record_session`). A 221 KB opener that drained in 221 ms says 8 Mbps ⇒ the pair opens at
+  0.85 × 6 Mbps next time; a 2 Mbps pipe stays at the nominal; a decrease still lowers.
+  Two companions, both found on the seeded field run: an **opener grace** (soft send-wait stalls and
+  backpressure skips inside the first 2 s are the opener draining, not congestion — they had cut a 5.95 Mbps
+  session ×0.85 within 1.8 s) and **held NVENC increases on a constrained session** (an in-place
+  reconfigure is a starved IDR; the AIMD's climb back produced one visible pulse per 5-s step — increases
+  now flush through the existing spaced quiet arm, coalesced; decreases land at once and anchor the spacing).
 
 - `hi` default: 8 000 kbps from this one pair; the second corp pair (CLK) will say whether the
   gates keep it at the nominal there. Revisit with two pairs of data.
@@ -107,3 +113,4 @@ levers); the direct path's measured clamp.
 |---|---|---|
 | 2026-08-29 | agent 0.4.18 (PC55331), env `FFMPEG_MAXRATE_KBPS=25500`, web `v20260829-40e8fc071129` | P0: the table above. Two daemon restarts on PC55331 (apply, restore) via a scheduled task; env cleared afterwards. |
 | 2026-08-29 | agent 0.4.21 (CORPLAP-2 `av1_nvenc`, CORPLAP-3 `av1_qsv`), web `v20260829-0da90b766dc0` | **First field run.** P1 steps logged and gated on CORPLAP-2: `3.0 → 3.19 → 3.39 Mbps` (marquee), `3.0 → 3.19 → 3.39 → 3.60` (window drag, carried 2.1–2.8 Mbps at 66–80 ms); ≈3 steps per minute of sustained drag. P2 seeds: next session opened at `maxrate = 0.85 × remembered` (3.386 → 2.879, 3.598 → 3.059). Opening keyframe on the seeded sessions: 8.0 / 8.4 / 22.9 / 19.5 KB vs 5.7–6.4 KB baseline — but two later seeded sessions at 2.6 Mbps opened at 5.9 KB, so the opener also tracks screen content and the criterion is not yet met. **Defect**: a 14-s idle session wrote its own seed back as the "stable rate" (3.598 → 3.059) — the memory decays 15 % per idle session; fixed in P2b (`record_session`: a lower value needs a decrease). Age gate 1.5× vetoed the evidence windows (66–80 ms over a 43 ms floor) → 2×. CLK negative control clean. |
+| 2026-08-30 08:19–08:21 UTC | agent 0.4.26 (CORPLAP-2 `av1_nvenc`, DERP relay), web `v20260830-6a166a1ec9f7` | **Seeded-opener A/B, same screen a minute apart** (memory hand-seeded at 7 Mbps from P0). Baseline 3.0 Mbps: a ~0 KB black keyframe, the desktop as ONE 221 KB inter frame at +176 ms, first painted sample already at steady sharpness, one keyframe in 12 s. Seeded 5.95 Mbps: 30 KB keyframe (50 % sharpness) → 172 KB P → first light 200 ms earlier, 90 % of steady within ~190 ms — but a **×0.85 decrease inside 1.8 s** (`send_wait_max 367 ms`, 73 backpressure skips — the opener draining) and then **three AIMD climb-back steps at 5-s spacing, each an in-place NVENC reconfigure = a starved IDR** (166 KB at +0.3 s, 222 KB at +5.3 s; sharpness dipped to 91 % at +5.4 s). Also measured: the opener burst drained at ≈ 8 Mbps — the P0 number, now free. ⚠️ Windows PowerShell's `Set-Content -Encoding UTF8` writes a BOM that serde rejects (the memory read as EMPTY until rewritten BOM-free). |
