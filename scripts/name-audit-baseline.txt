@@ -1,5 +1,5 @@
 # FR-21 name-audit baseline — regenerate with scripts/name-audit.sh --update-baseline
 # Every number here must go DOWN (except anchors, which must not).
 unclassified=0
-anchors=743
+anchors=745
 paths=0
