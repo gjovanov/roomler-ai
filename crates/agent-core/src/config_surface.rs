@@ -93,6 +93,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Run Fleet-RPC commands sent by the server (commands inherit the daemon's SYSTEM/root identity). Default: OFF.",
     ),
     (
+        "macos_supervise_gui_worker",
+        "bool",
+        "macOS only. Let the root daemon spawn and babysit the GUI-session worker (FR-43 P1). Stands down whenever the LaunchAgent is loaded, so one enrollment is never served twice. Default: OFF.",
+    ),
+    (
         "remote_config_enabled",
         "bool",
         "Accept configuration pushed by the control plane. NEVER settable by the server — it is what keeps exec_enabled/ssh_enabled refusable by a compromised one. Turning it ON delegates that last refusal. Default: OFF.",
@@ -676,6 +681,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "auto_grant_session" => Some(fmt_bool(cfg.auto_grant_session)),
         "enable_remote_browse" => Some(fmt_bool(cfg.enable_remote_browse)),
         "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
+        "macos_supervise_gui_worker" => Some(fmt_bool(cfg.macos_supervise_gui_worker)),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
@@ -821,6 +827,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // Clearing the key (`value: None`) resets to OFF, not ON — the
         // fail-safe direction for a gate that grants root.
         "exec_enabled" => cfg.exec_enabled = parse_bool_or(value, false)?,
+        "macos_supervise_gui_worker" => {
+            cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
+        }
         // Same fail-safe direction, and note WHERE this is settable from:
         // locally (this surface — CLI, desktop companion), never from a
         // server push. A future config-push handler must reject this field
