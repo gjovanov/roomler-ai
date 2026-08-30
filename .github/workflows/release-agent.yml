@@ -2772,15 +2772,85 @@ jobs:
     permissions:
       issues: write
     steps:
-      - name: File an issue
+      # One issue per CONDITION, not one per occurrence. This step used to call
+      # `gh issue create` unconditionally, so every failed rehearsal opened a new
+      # issue and nothing ever closed one: by 2026-08-30 there were TEN open,
+      # dating back to 08-15, all describing a lane that had been green for eight
+      # consecutive runs. An alert nobody can close is one nobody reads, and the
+      # count stops meaning anything — which is worse than no alert, because the
+      # backlog looks like a standing problem.
+      #
+      # So: reuse the open issue if there is one, and let the success path below
+      # close it. `--search` is scoped `in:title` against the fixed prefix, which
+      # is why the date lives at the END of the title.
+      - name: File or update the alert issue
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          gh issue create --repo "${{ github.repository }}" \
-            --title "Seed rehearsal failed — release-lane caches NOT refreshed ($(date -u +%F))" \
-            --body "$(printf 'The artifacts-only release-agent rehearsal (weekly cron or seed-release-caches.yml dispatch) failed: %s\n\nUntil a rehearsal succeeds on master, agent tag builds run with cold cargo caches (~+14 min on the Windows MSI job). cache-on-failure means partial seeds may still have been saved, but the failure itself needs fixing.\n\nRe-run after fixing:\n\n    gh workflow run release-agent.yml --ref master -f version=<workspace version> -f publish_release=false\n' "$run_url")"
+          existing=$(gh issue list --repo "${{ github.repository }}" --state open \
+            --search 'in:title "Seed rehearsal failed"' --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "reusing open alert #$existing"
+            gh issue comment "$existing" --repo "${{ github.repository }}" \
+              --body "$(printf 'Rehearsal failed again on %s: %s\n\nStill unresolved — the caches remain unrefreshed. This issue closes automatically when a rehearsal succeeds.\n' "$(date -u +%F)" "$run_url")"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "Seed rehearsal failed — release-lane caches NOT refreshed ($(date -u +%F))" \
+              --body "$(printf 'The artifacts-only release-agent rehearsal (weekly cron or seed-release-caches.yml dispatch) failed: %s\n\nUntil a rehearsal succeeds on master, agent tag builds run with cold cargo caches (~+14 min on the Windows MSI job). cache-on-failure means partial seeds may still have been saved, but the failure itself needs fixing.\n\nThis issue is reused by later failures and CLOSED automatically by the next successful rehearsal, so an open one always means "currently broken".\n\nRe-run after fixing:\n\n    gh workflow run release-agent.yml --ref master -f version=<workspace version> -f publish_release=false\n' "$run_url")"
+          fi
+
+
+  # ---------------------------------------------------------------------------
+  # 5b. Seed rehearsal RECOVERED — close the alert. Without this the alert above
+  #     is write-only: it can open an issue but never retract one, so an open
+  #     issue proves only that the lane broke ONCE, at some point, possibly weeks
+  #     ago and long since fixed. That is exactly what happened — ten open
+  #     issues on 2026-08-30 against eight consecutive green runs.
+  #
+  #     Pairing open with close is what makes the signal readable: an open alert
+  #     now means "the lane is broken RIGHT NOW", which is the only version of it
+  #     worth paging on.
+  #
+  #     Same `is_release == 'false'` guard as the alert, so tag builds never
+  #     touch it; tag failures are loud on their own.
+  # ---------------------------------------------------------------------------
+  seed-recovery-close:
+    name: Close the seed alert on a green rehearsal
+    if: >-
+      always() &&
+      needs.validate-version.outputs.is_release == 'false' &&
+      needs.build-linux.result == 'success' &&
+      needs.build-linux-arm64.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.build-windows-companions.result == 'success' &&
+      needs.build-macos.result == 'success'
+    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Close any open seed-rehearsal alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Every open alert, not just the newest: the pre-dedup ones accumulated
+          # and a single-issue close would leave the rest standing forever.
+          nums=$(gh issue list --repo "${{ github.repository }}" --state open \
+            --search 'in:title "Seed rehearsal failed"' --limit 50 --json number --jq '.[].number')
+          if [ -z "$nums" ]; then
+            echo "no open seed alert — nothing to close"
+            exit 0
+          fi
+          for n in $nums; do
+            echo "closing #$n"
+            gh issue close "$n" --repo "${{ github.repository }}" --reason completed \
+              --comment "$(printf 'Rehearsal succeeded on %s: %s\n\nThe release-lane caches are refreshed, so the condition this issue reports no longer holds. Closed automatically; it reopens as a new issue if a later rehearsal fails.\n' "$(date -u +%F)" "$run_url")"
+          done
 
   # ---------------------------------------------------------------------------
   # 6. Post-release re-seed — after every successful TAG release, dispatch
