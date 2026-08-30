@@ -47,7 +47,7 @@ async fn export_conversation_creates_background_task() {
     assert_eq!(resp.status().as_u16(), 200);
     let json: Value = resp.json().await.unwrap();
     assert_eq!(json["status"], "pending");
-    assert!(json["task_id"].as_str().unwrap().len() > 0);
+    assert!(!json["task_id"].as_str().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -141,7 +141,7 @@ async fn export_task_completes_and_download_works() {
 
     let body = resp.bytes().await.unwrap();
     // XLSX files start with PK zip signature
-    assert!(body.len() > 0);
+    assert!(!body.is_empty());
     assert_eq!(body[0], 0x50); // 'P'
     assert_eq!(body[1], 0x4B); // 'K'
 }
