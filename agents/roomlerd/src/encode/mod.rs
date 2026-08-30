@@ -463,6 +463,46 @@ pub(crate) fn relay_max_bps() -> u32 {
         .unwrap_or(3_000_000)
 }
 
+/// Shared-pipeline egress split (default ON; `ROOMLERD_SHARED_RATE_SPLIT=0` /
+/// `false` reverts). On a CONSTRAINED (relay) transport every viewer of a
+/// shared encoder gets its OWN ciphertext copy over the SAME host uplink to
+/// the relay, so N viewers = N× egress; the DC pumps divide the ceiling by the
+/// live viewer count so all copies together fit the pipe the AIMD is clamping
+/// to. Without it a 2nd viewer's motion oversubscribes the relay and the
+/// leader's ICE disconnects (field CORPLAP-3, two neo16 viewers, 2026-08-30).
+/// Direct paths don't share a bottleneck this way and are never split.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn shared_rate_split_enabled() -> bool {
+    !matches!(
+        node_env("SHARED_RATE_SPLIT").as_deref(),
+        Some("0") | Some("false")
+    )
+}
+
+/// The per-viewer ceiling on a shared CONSTRAINED pipeline: the full ceiling
+/// divided by the viewer count, floored at the per-stream minimum so no copy
+/// drops below usable quality (the reactive backpressure/AIMD path trims any
+/// residual oversubscription). A no-op for a single viewer or when disabled.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn shared_split_ceiling_bps(
+    ceiling_bps: u32,
+    viewers: u32,
+    floor_bps: u32,
+    constrained: bool,
+    enabled: bool,
+) -> u32 {
+    if !enabled || !constrained || viewers <= 1 {
+        return ceiling_bps;
+    }
+    (ceiling_bps / viewers).max(floor_bps)
+}
+
 /// FR-35 — the upper bound the LEARNED constrained ceiling may reach (bps).
 /// `0` = learning off (today's fixed ceiling, no rate memory). Env
 /// `ROOMLERD_RELAY_MAX_HI_KBPS` / config `relay_max_hi_kbps`, gated by the
@@ -1403,6 +1443,26 @@ mod tests {
             },
             None => unsafe { tunnel_core::env::test_env::clear("IDLE_REFINE_BALANCED") },
         }
+    }
+
+    #[test]
+    fn shared_split_divides_constrained_ceiling_by_viewers() {
+        use super::shared_split_ceiling_bps as split;
+        const FLOOR: u32 = 1_500_000;
+        // Single viewer: never split, on any transport.
+        assert_eq!(split(6_000_000, 1, FLOOR, true, true), 6_000_000);
+        // Direct transport: never split even with many viewers (each viewer
+        // has its own good path; the relay uplink is not the bottleneck).
+        assert_eq!(split(6_000_000, 3, FLOOR, false, true), 6_000_000);
+        // Disabled (kill switch): never split.
+        assert_eq!(split(6_000_000, 2, FLOOR, true, false), 6_000_000);
+        // Two constrained viewers with headroom: half each, sum == the pipe.
+        assert_eq!(split(6_000_000, 2, FLOOR, true, true), 3_000_000);
+        // Three viewers: a third each.
+        assert_eq!(split(6_000_000, 3, FLOOR, true, true), 2_000_000);
+        // Floored: a thin relay can't split below usable quality — the
+        // reactive backpressure/AIMD path trims the residual oversubscription.
+        assert_eq!(split(2_500_000, 2, FLOOR, true, true), FLOOR);
     }
 
     // rc.191 — BOTH tests below read/write ROOMLERD_RELAY_MAX_KBPS;
