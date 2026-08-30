@@ -60,6 +60,56 @@ export interface RelayCurrent {
   agent_rtt?: Array<{ region: string; rtt_avg_ms: number; agents: number }>
 }
 
+/**
+ * FR-20 P5 - per-org metered cost.
+ *
+ * `null` is meaningful everywhere in this payload and must survive to the
+ * screen: a `cost` of null is *not priced*, a meter with `monitored: false`
+ * is *not measured*, and a null `relayed_fraction` means *nobody reported*.
+ * Rendering any of them as 0 states something the server did not measure -
+ * and 0 cost additionally implies 100% margin, which is the number an
+ * operator would actually act on.
+ */
+export interface CostMeter {
+  total: number | null
+  cost: number | null
+  monitored?: boolean
+  why?: string
+}
+
+export interface CostOrg {
+  tenant_id: string
+  name?: string
+  slug?: string
+  plan?: string
+  subscription_status?: string
+  seats: number
+  /** list-price estimate (plan price x seats), NOT billed revenue */
+  mrr_cents: number
+  meters: Record<string, CostMeter>
+  cost: number | null
+}
+
+export interface CostPayload {
+  enabled: boolean
+  range?: string
+  window_secs?: number
+  currency?: string | null
+  priced?: boolean
+  unit_costs?: Record<string, number | null>
+  meters?: Record<string, CostMeter>
+  orgs?: CostOrg[]
+  /** carrier mix by CONNECTION, agent-reported - an alarm, never a bill */
+  carrier_mix?: {
+    direct: number
+    relay: number
+    derp: number
+    relayed_fraction: number | null
+    basis?: string
+    window?: string
+  } | null
+}
+
 export interface OrgsPayload {
   enabled: boolean
   tenants?: Array<{ id: string; name: string; slug?: string }>
@@ -284,6 +334,9 @@ export const useStatsStore = defineStore('stats', () => {
   async function fetchOrgs(): Promise<OrgsPayload> {
     return api.get<OrgsPayload>('/admin/stats/orgs')
   }
+  async function fetchCost(range: string): Promise<CostPayload> {
+    return api.get<CostPayload>(`/admin/stats/cost?range=${range}`)
+  }
   async function fetchUsers(range: string): Promise<UsersPayload> {
     return api.get<UsersPayload>(`/admin/stats/users?range=${range}`)
   }
@@ -334,6 +387,7 @@ export const useStatsStore = defineStore('stats', () => {
     fetchRelayCurrent,
     fetchRelayHistory,
     fetchOrgs,
+    fetchCost,
     fetchUsers,
     fetchAdminMachines,
     fetchAdminCalls,

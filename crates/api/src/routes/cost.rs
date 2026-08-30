@@ -38,7 +38,7 @@ use super::stats::{
     RangeQuery, agg, disabled_payload, floor_dt, range_spec, require_platform_admin, tier_coll,
 };
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler_ai_config::settings::RelayCosts;
+use roomler_ai_config::RelayCosts;
 use roomler_ai_db::models::tenant::Plan;
 
 /// Meters this deployment actually collects. A meter absent from this list is
