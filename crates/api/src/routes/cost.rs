@@ -202,6 +202,13 @@ pub async fn admin_cost(
     //
     // ⚠ Agent-reported, so it is a claim by the fleet, not a server
     // measurement. Good enough to raise an alarm; it must never price a bill.
+    //
+    // ⚠ It is also a SNAPSHOT of carriers, not a count of failures.
+    // `overlay_derp_floor` is on by default and floors fresh pairs at birth,
+    // so a pair that is merely young is indistinguishable from one that
+    // could not go direct. Prod 2026-08-31 read 43.7%, with 3,800 of the
+    // 3,917 relayed links on DERP. The UI therefore says "currently on a
+    // relay" and points the reader at the trend, not the absolute.
     let mix = agg(
         &state,
         "stats_machine",
