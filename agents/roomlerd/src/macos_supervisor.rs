@@ -51,6 +51,11 @@ pub const HEALTHY_RUN: Duration = Duration::from_secs(30);
 
 /// Backoff floor for respawns.
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
+/// How many consecutive fast exits before the supervisor stops trying. The
+/// 2026-08-30 outage looped because nothing bounded this: a worker that can
+/// NEVER start is a configuration fault, and hammering it hides the cause.
+pub const MAX_FAST_EXITS: u32 = 5;
+
 /// Backoff ceiling for respawns.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -69,6 +74,11 @@ pub struct Inputs {
     /// Whether `gui/<uid>/com.roomler.agent` is loaded — i.e. launchd already
     /// owns a worker for this session.
     pub launch_agent_loaded: bool,
+    /// Consecutive workers that exited faster than [`HEALTHY_RUN`]. A worker
+    /// that can never start (no per-user enrollment on this Mac, say) would
+    /// otherwise respawn forever; past [`MAX_FAST_EXITS`] the supervisor
+    /// stops and says why.
+    pub consecutive_fast_exits: u32,
     /// The uid our own live worker was spawned for, if we have one.
     pub worker_uid: Option<u32>,
 }
@@ -87,6 +97,10 @@ pub enum Action {
     Spawn(u32),
     /// The console user changed under a worker we own: replace it.
     Replace(u32),
+    /// Too many workers died on arrival — stop spawning and say why. Cleared
+    /// by anything that changes the situation: a session change, the
+    /// LaunchAgent returning, or the switch going off.
+    GaveUp,
     /// Our worker matches the current session and is alive.
     Healthy,
 }
@@ -109,6 +123,7 @@ pub fn decide(i: Inputs) -> Action {
     match i.worker_uid {
         Some(w) if w == uid => Action::Healthy,
         Some(_) => Action::Replace(uid),
+        None if i.consecutive_fast_exits >= MAX_FAST_EXITS => Action::GaveUp,
         None => Action::Spawn(uid),
     }
 }
@@ -169,15 +184,37 @@ mod imp {
             .unwrap_or(false)
     }
 
-    /// Spawn the agent into `uid`'s GUI session.
+    /// Spawn the agent into `uid`'s GUI session, **as that user**.
     ///
-    /// No `--config`: the child runs AS that user, so `appdirs` resolves the
-    /// user's own config — the same enrollment the LaunchAgent would have
-    /// used. P1 changes who launches the worker, nothing about its identity.
+    /// ⚠️ `launchctl asuser <uid> <cmd>` joins the user's Mach bootstrap
+    /// namespace but does **NOT** change credentials — `launchctl asuser 501
+    /// id -u` prints `0`. Shipping without the `sudo -u` half cost a real
+    /// outage on 2026-08-30: every worker started as ROOT, resolved root's
+    /// profile config, died instantly with
+    /// `no config found at /var/root/Library/Application Support/...`, and the
+    /// supervisor respawned it on the backoff ladder for as long as the
+    /// LaunchAgent stayed unloaded. The session half of the P0 spike was
+    /// right; the identity half was never measured, because the probe used
+    /// `caps` — which reports the GUI session and the TCC grants (both of
+    /// which root-in-a-session genuinely has) and says nothing about *which*
+    /// config the process would load.
+    ///
+    /// `sudo -u "#<uid>"` takes a numeric id, so this needs no `getpwuid`
+    /// lookup and cannot pick the wrong account when a uid has several names.
+    /// Verified on the MacBook: `asuser + sudo -u "#501"` yields uid 501,
+    /// `has_input_permission: true`, and a config that resolves.
+    ///
+    /// No `--config`: the child now really is that user, so `appdirs`
+    /// resolves the user's own config — the same enrollment the LaunchAgent
+    /// would have used. P1 changes who launches the worker, nothing about its
+    /// identity.
     fn spawn_worker(uid: u32, exe: &std::path::Path) -> std::io::Result<Child> {
         Command::new("launchctl")
             .arg("asuser")
             .arg(uid.to_string())
+            .arg("sudo")
+            .arg("-u")
+            .arg(format!("#{uid}"))
             .arg(exe)
             .arg("run")
             .env(SUPERVISED_MARKER, "1")
@@ -227,6 +264,7 @@ mod imp {
 
         let mut worker: Option<(u32, Child, Instant)> = None;
         let mut backoff = BACKOFF_MIN;
+        let mut fast_exits: u32 = 0;
         let mut wait_until: Option<Instant> = None;
         let mut last_action: Option<Action> = None;
 
@@ -242,6 +280,11 @@ mod imp {
             });
             if let Some((uid, ran)) = exited {
                 backoff = next_backoff(backoff, ran);
+                fast_exits = if ran >= HEALTHY_RUN {
+                    0
+                } else {
+                    fast_exits + 1
+                };
                 tracing::warn!(
                     uid,
                     ran_secs = ran.as_secs(),
@@ -260,23 +303,42 @@ mod imp {
                 // Only ask launchd when there is a session to ask about.
                 launch_agent_loaded: uid_now.is_some_and(launch_agent_loaded),
                 worker_uid: worker.as_ref().map(|(u, _, _)| *u),
+                consecutive_fast_exits: fast_exits,
             });
 
             // Log transitions, not every tick: this loop runs every 5 s for
             // the daemon's whole life.
             if last_action != Some(action) {
-                tracing::info!(?action, console_uid = ?uid_now, "macOS supervisor state");
+                if matches!(action, Action::GaveUp) {
+                    tracing::error!(
+                        console_uid = ?uid_now,
+                        fast_exits,
+                        max = MAX_FAST_EXITS,
+                        "macOS supervisor: the GUI worker died on arrival too many times — \
+                         NOT retrying. Almost always this Mac has no per-user enrollment: \
+                         the worker runs AS the console user and loads THAT user's config. \
+                         Check with: launchctl asuser <uid> sudo -u '#<uid>' roomlerd caps"
+                    );
+                } else {
+                    tracing::info!(?action, console_uid = ?uid_now, "macOS supervisor state");
+                }
                 last_action = Some(action);
             }
 
             match action {
                 Action::Healthy | Action::Disabled => {}
+                Action::GaveUp => {
+                    // Logged once via the transition logger above; nothing to
+                    // do until the situation changes.
+                }
                 Action::NoGuiSession | Action::LaunchdOwns => {
+                    fast_exits = 0;
                     if let Some((uid, child, _)) = worker.take() {
                         stop_worker(uid, child, "session ended or launchd took ownership");
                     }
                 }
                 Action::Replace(uid) => {
+                    fast_exits = 0;
                     if let Some((old, child, _)) = worker.take() {
                         tracing::info!(
                             old_uid = old,
@@ -336,6 +398,7 @@ mod tests {
             console_uid: Some(501),
             launch_agent_loaded: false,
             worker_uid: None,
+            consecutive_fast_exits: 0,
         }
     }
 
@@ -449,5 +512,70 @@ mod tests {
         );
         // The boundary itself counts as healthy.
         assert_eq!(next_backoff(BACKOFF_MAX, HEALTHY_RUN), BACKOFF_MIN);
+    }
+
+    /// The 2026-08-30 outage in one assertion: a worker that dies on arrival
+    /// must eventually STOP being respawned. Nothing bounded this, so the
+    /// supervisor hammered a doomed worker for as long as the LaunchAgent
+    /// stayed unloaded, and the machine looked simply dead.
+    #[test]
+    fn gives_up_after_enough_workers_die_on_arrival() {
+        for n in 0..MAX_FAST_EXITS {
+            assert_eq!(
+                decide(Inputs {
+                    consecutive_fast_exits: n,
+                    ..base()
+                }),
+                Action::Spawn(501),
+                "still trying at {n} failures"
+            );
+        }
+        assert_eq!(
+            decide(Inputs {
+                consecutive_fast_exits: MAX_FAST_EXITS,
+                ..base()
+            }),
+            Action::GaveUp
+        );
+    }
+
+    /// Giving up must not be a latch: anything that changes the situation
+    /// gets another go, because the usual fix (enrol the per-user half, log
+    /// in) happens outside this process.
+    #[test]
+    fn giving_up_yields_to_a_changed_situation() {
+        let wedged = Inputs {
+            consecutive_fast_exits: MAX_FAST_EXITS + 3,
+            ..base()
+        };
+        assert_eq!(
+            decide(Inputs {
+                launch_agent_loaded: true,
+                ..wedged
+            }),
+            Action::LaunchdOwns
+        );
+        assert_eq!(
+            decide(Inputs {
+                console_uid: None,
+                ..wedged
+            }),
+            Action::NoGuiSession
+        );
+        assert_eq!(
+            decide(Inputs {
+                enabled: false,
+                ..wedged
+            }),
+            Action::Disabled
+        );
+        // And a live worker is still healthy — the counter only gates SPAWN.
+        assert_eq!(
+            decide(Inputs {
+                worker_uid: Some(501),
+                ..wedged
+            }),
+            Action::Healthy
+        );
     }
 }
