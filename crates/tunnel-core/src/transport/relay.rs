@@ -1547,8 +1547,28 @@ mod turn_tests {
             "DataChannel message round-tripped over the self-hosted TURN relay"
         );
 
-        pc_a.close().await.unwrap();
-        pc_b.close().await.unwrap();
+        // Teardown is CLEANUP, not the subject — and it must not be able to fail
+        // this test. Everything the test exists to prove was asserted above: the
+        // relay-to-relay pair converged and carried a DataChannel message through
+        // our own TURN. `close()` afterwards says nothing about that.
+        //
+        // #855 recorded this failing in CI as
+        //   `data_channels: sending reset packet in non-Established state`
+        // on a PR whose entire diff was a `println!` in another crate. That is
+        // webrtc-rs resetting a channel whose SCTP association is no longer (or
+        // not yet) Established — a teardown race on a loaded runner, arriving
+        // AFTER the round trip already succeeded. Unwrapping it turned a passed
+        // test into a red lane that gates every PR.
+        //
+        // Reported rather than swallowed (visible under `--nocapture`), because a
+        // close error that stops mattering silently is how a real teardown
+        // regression would hide here later.
+        if let Err(e) = pc_a.close().await {
+            eprintln!("pc_a.close() after a successful round trip: {e} (not a failure — see #855)");
+        }
+        if let Err(e) = pc_b.close().await {
+            eprintln!("pc_b.close() after a successful round trip: {e} (not a failure — see #855)");
+        }
     }
 
     // ───────────── LIVE coturn smokes (Phase 3 e2e, ignored) ─────────────
