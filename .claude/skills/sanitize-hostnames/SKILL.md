@@ -24,9 +24,26 @@ name and its replacement sit **side by side**, so committing it would publish
 exactly what the sweep exists to remove. Never commit it, never quote it in a
 commit message, never paste it into an issue or a PR.
 
-**This file is written tag-free on purpose.** A sweep walks the repo, and the
-first version of this document named real tags in its own prose — so the sweep
-rewrote its explanations into nonsense.
+**Every file in this directory is written tag-free on purpose, prose included.**
+A sweep walks the repo and does not exempt its own tooling. The first version of
+this document named real tags in its explanations and the sweep rewrote them
+into nonsense; the second time round the Python docstrings did it, and a history
+rewrite turned *"a three-letter shorthand like `<tag>`"* into a sentence naming
+an alias, and *"`<old-alias>` → `<new-alias>`"* into `X → X`.
+
+So: describe the RULES, never the instances. Check this directory against the
+map after any sweep —
+
+```bash
+python3 .claude/skills/sanitize-hostnames/sanitize.py \
+    --map <map> --root .claude/skills/sanitize-hostnames --check   # want 0 / none
+```
+
+⚠️ Note what survived both times: the regexes. `\bCLK…` has no word boundary
+before the letters (the preceding `b` of `\b` is a word character), so patterns
+are accidentally immune while the comments beside them are not. The tool keeps
+working and only its explanation rots — which is the failure mode that lasts,
+because nothing fails.
 
 ### Map format
 
