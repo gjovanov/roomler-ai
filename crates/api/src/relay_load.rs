@@ -94,6 +94,12 @@ struct Agg {
     coturn_sessions: f64,
     derp_registrations: f64,
     uptime_s: f64,
+    /// FR-20 B — the PoP's CUMULATIVE relayed bytes per overlay network.
+    /// Volume, so summed across a region's endpoints like the `net_*` pair.
+    /// Absent from the payload ⇒ this PoP predates the field and the region is
+    /// simply **not monitored** — which is why it stays an empty map rather
+    /// than a zero: a zero would be indistinguishable from "relayed nothing".
+    per_network: std::collections::HashMap<String, u64>,
 }
 
 impl Agg {
@@ -129,6 +135,13 @@ impl Agg {
         self.allocations += body["coturn"]["allocations"].as_f64().unwrap_or(0.0);
         self.coturn_sessions += body["coturn"]["sessions"].as_f64().unwrap_or(0.0);
         self.derp_registrations += f("derp_registrations");
+        if let Some(map) = body["per_network"].as_object() {
+            for (network, v) in map {
+                if let Some(n) = v.as_u64() {
+                    *self.per_network.entry(network.clone()).or_insert(0) += n;
+                }
+            }
+        }
     }
 }
 
@@ -155,6 +168,10 @@ pub fn spawn_poller(
     load: RelayLoadMap,
     settings: &roomler_ai_config::RelaySettings,
     stats: Option<Arc<StatsDao>>,
+    // FR-20 B — resolves an overlay network id to its tenant so PoP-relayed
+    // bytes can be attributed. `None` ⇒ metering off; the load poller itself
+    // is unaffected.
+    networks: Option<Arc<roomler_ai_services::dao::overlay_network::OverlayNetworkDao>>,
 ) {
     let poll_secs = settings.stats_poll_secs;
     let busy_load = settings.busy_load;
@@ -192,6 +209,10 @@ pub fn spawn_poller(
         // across samples.
         let mut prev_tx: HashMap<String, (u64, Instant)> = HashMap::new();
         let mut prev_rx: HashMap<String, (u64, Instant)> = HashMap::new();
+        // FR-20 B — (region, network) → the last CUMULATIVE byte total seen.
+        // The PoP counters never reset except on restart, so what we bill is
+        // the diff between successive samples.
+        let mut prev_net: HashMap<(String, String), u64> = HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(poll_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -285,6 +306,53 @@ pub fn spawn_poller(
                     };
                     if let Err(e) = st.upsert_relay_sample(&sample).await {
                         debug!(%region, %e, "relay load: sample persist failed");
+                    }
+
+                    // FR-20 B — attribute this PoP's relayed bytes.
+                    //
+                    // ⚠ The PoP counters are CUMULATIVE, so what we bill is the
+                    // DIFF against the previous sample. A PoP restart resets
+                    // them, making the diff negative — that interval is dropped
+                    // and the new total becomes the baseline, so the bucket
+                    // UNDER-reports rather than going negative or inventing a
+                    // carry-over. Same trade the `net_*_bytes` rate above makes.
+                    if let Some(nets) = &networks {
+                        for (network, cumulative) in &agg.per_network {
+                            let key = (region.clone(), network.clone());
+                            let prev = prev_net.insert(key, *cumulative);
+                            let Some(delta) = prev.and_then(|p| cumulative.checked_sub(p)) else {
+                                // First sample for this pair, or a restart.
+                                continue;
+                            };
+                            if delta == 0 {
+                                continue;
+                            }
+                            let Ok(nid) = bson::oid::ObjectId::parse_str(network) else {
+                                continue;
+                            };
+                            match nets.base.find_by_id(nid).await {
+                                Ok(n) => {
+                                    if let Err(e) = st
+                                        .add_usage(
+                                            n.tenant_id,
+                                            roomler_ai_services::dao::stats::Meter::DerpBytes,
+                                            unix_now(),
+                                            delta as i64,
+                                        )
+                                        .await
+                                    {
+                                        debug!(%region, %e, "fr-20: PoP usage bucket write failed");
+                                    }
+                                }
+                                // Unresolvable ⇒ logged and dropped. An
+                                // unattributed byte must never become a
+                                // wrongly-attributed one.
+                                Err(_) => debug!(
+                                    %region, %network,
+                                    "fr-20: PoP bytes for an unknown network — unattributed"
+                                ),
+                            }
+                        }
                     }
                 }
             }
@@ -417,5 +485,37 @@ mod tests {
         assert!((r - 8.0).abs() < 0.01, "got {r}");
         // Counter reset (reboot) → no rate, not a negative one.
         assert_eq!(rate_mbps(Some((5_000_000, t0)), 1_000_000, t1), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod fr20_tests {
+    /// The PoP counters are cumulative, so what gets billed is the DIFF. This
+    /// pins the three cases, because two of them are ways to bill wrongly.
+    ///
+    /// `checked_sub` is the whole mechanism: it yields `None` on a counter
+    /// reset, which the poller treats as "re-baseline, bill nothing", so the
+    /// interval under-reports instead of going negative or inventing a
+    /// carry-over. An invented byte on a cost ledger is worse than a missing
+    /// one — the missing one is recoverable, the invented one is a refund.
+    #[test]
+    fn cumulative_counters_are_billed_as_diffs() {
+        // Normal: bill the increment, not the total.
+        assert_eq!(5_000u64.checked_sub(3_000), Some(2_000));
+        // Idle interval: nothing to bill.
+        assert_eq!(3_000u64.checked_sub(3_000), Some(0));
+        // PoP restart (counter reset): no diff exists, so bill NOTHING and
+        // let the new total become the baseline.
+        assert_eq!(100u64.checked_sub(3_000), None);
+    }
+
+    /// A region with no `per_network` in its payload is a PoP that predates
+    /// the field: "not monitored", which must not be confused with "relayed
+    /// zero bytes". An empty map produces no buckets at all; a zero would
+    /// produce a row asserting the tenant used nothing.
+    #[test]
+    fn a_missing_per_network_object_yields_no_buckets() {
+        let body = serde_json::json!({ "region": "eu", "net_rx_bytes": 1 });
+        assert!(body["per_network"].as_object().is_none());
     }
 }

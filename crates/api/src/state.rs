@@ -445,6 +445,18 @@ impl AppState {
             relay_load.clone(),
             &settings.relay,
             settings.stats.enabled.then(|| stats.clone()),
+            // FR-20 B — the network → tenant resolver. Gated on the same flag:
+            // stats off ⇒ no metering, and the load poller is unaffected.
+            //
+            // A plain DAO rather than the configured `overlay_networks` below:
+            // that one is constructed later in this function AND carries the
+            // block-prefix allocator config, which only the ALLOCATION paths
+            // need. The poller does exactly one read — `_id` → `tenant_id` —
+            // so a read-only instance is both sufficient and honest about it.
+            settings
+                .stats
+                .enabled
+                .then(|| Arc::new(OverlayNetworkDao::new(&db))),
         );
         // Multi-region DERP tickets: load the signer when a key is configured;
         // log the derived public key so the operator can copy it to PoPs.
