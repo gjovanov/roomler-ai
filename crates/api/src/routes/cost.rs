@@ -29,13 +29,14 @@
 
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
 };
 use bson::{Bson, doc};
 use std::collections::HashMap;
 
 use super::stats::{
-    RangeQuery, agg, disabled_payload, floor_dt, range_spec, require_platform_admin, tier_coll,
+    RangeQuery, agg, disabled_payload, floor_dt, parse_tid, range_spec, require_platform_admin,
+    require_tenant_stats, tier_coll,
 };
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 use roomler_ai_config::RelayCosts;
@@ -269,6 +270,140 @@ pub async fn admin_cost(
         "meters": fleet_meters,
         "orgs": orgs,
         "carrier_mix": carrier_mix,
+    })))
+}
+
+/// `GET /api/tenant/{tenant_id}/stats/resources?range=…` — an org's own
+/// metered consumption.
+///
+/// # Deliberately reports UNITS, not money
+///
+/// The platform surface renders currency because the operator is reading their
+/// own cost. This one does not, and the omission is the design:
+///
+/// * These are **our costs**, not the org's bill. Showing "your traffic cost
+///   €0.03" invites a dispute about a number that appears on no invoice, and
+///   there are no quotas yet for it to mean anything against.
+/// * The point of this surface is **actionable**: a high relayed share means
+///   *that org's network is blocking direct paths*, which their own IT can
+///   fix. That is a networking finding, and pricing it obscures it.
+///
+/// When quotas land, the unit figures here are already the ones a quota would
+/// be denominated in.
+///
+/// # Membership, and 404 on failure
+///
+/// `require_tenant_stats(.., need_manage = false)`: every member may see what
+/// their own org consumed. Failures are 404 rather than 403 because the web
+/// client wipes tokens on 403 — a member removed from the org mid-poll must
+/// not be logged out of everything.
+pub async fn tenant_resources(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<RangeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tid = parse_tid(&tenant_id)?;
+    require_tenant_stats(&state, tid, auth.user_id, false).await?;
+    if !state.settings.stats.enabled {
+        return Ok(disabled_payload());
+    }
+    let (window, tier) = range_spec(q.range.as_deref())?;
+
+    let usage = agg(
+        &state,
+        &tier_coll("stats_usage", tier),
+        vec![
+            doc! { "$match": { "tenant_id": tid, "ts": { "$gte": floor_dt(window) } } },
+            doc! { "$group": { "_id": "$meter", "total": { "$sum": "$value" } } },
+            doc! { "$set": { "meter": "$_id" } },
+            doc! { "$unset": "_id" },
+        ],
+    )
+    .await?;
+    let mut totals: HashMap<String, f64> = HashMap::new();
+    for u in &usage {
+        totals.insert(str_of(u, "meter"), f64_of(u, "total"));
+    }
+    let meters: serde_json::Map<String, serde_json::Value> = MONITORED
+        .iter()
+        .map(|m| {
+            (
+                (*m).to_string(),
+                // A monitored meter with no rows is a real measurement — this
+                // org relayed nothing — so zero is the honest value here, in
+                // contrast to `turn_bytes` below which nobody counted.
+                serde_json::json!({
+                    "total": totals.get(*m).copied().unwrap_or(0.0),
+                    "monitored": true,
+                }),
+            )
+        })
+        .chain(std::iter::once((
+            "turn_bytes".to_string(),
+            serde_json::json!({ "total": serde_json::Value::Null, "monitored": false }),
+        )))
+        .collect();
+
+    // Storage is a live sum of what the org is holding right now, not a
+    // rate over the range — so it is deliberately not range-scoped, and the
+    // payload names it `at` rather than folding it in with the meters.
+    let storage = agg(
+        &state,
+        "files",
+        vec![
+            doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
+            doc! { "$group": {
+                "_id": Bson::Null,
+                "bytes": { "$sum": "$size" },
+                "files": { "$sum": 1 },
+            }},
+            doc! { "$unset": "_id" },
+        ],
+    )
+    .await?;
+
+    // This org's own carrier mix — the actionable half. Same caveats as the
+    // platform view: CONNECTIONS not bytes (direct bytes are measured
+    // nowhere), agent-reported, and `null` when nothing reported rather than
+    // a 0 that would read as a perfect mesh.
+    let mix = agg(
+        &state,
+        "stats_machine",
+        vec![
+            doc! { "$match": { "tenant_id": tid, "ts": { "$gte": floor_dt(3_600) } } },
+            doc! { "$group": {
+                "_id": Bson::Null,
+                "direct": { "$sum": "$sys.transports.direct" },
+                "relay":  { "$sum": "$sys.transports.relay" },
+                "derp":   { "$sum": "$sys.transports.derp" },
+            }},
+            doc! { "$unset": "_id" },
+        ],
+    )
+    .await?;
+    let carrier_mix = mix.first().map(|m| {
+        let (d, r, p) = (f64_of(m, "direct"), f64_of(m, "relay"), f64_of(m, "derp"));
+        let denom = d + r + p;
+        serde_json::json!({
+            "direct": d, "relay": r, "derp": p,
+            "relayed_fraction": if denom > 0.0 { Some((r + p) / denom) } else { None },
+            "basis": "connections",
+            "window": "1h",
+        })
+    });
+
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "range": q.range.unwrap_or_else(|| "24h".into()),
+        "window_secs": window,
+        "meters": meters,
+        "storage": storage.first().cloned(),
+        "carrier_mix": carrier_mix,
+        // No quotas exist yet. The field is present and null so the UI can
+        // render the slot dark instead of pretending an unlimited plan is a
+        // satisfied one — and so adding quotas is a server-side change only.
+        "quota": serde_json::Value::Null,
     })))
 }
 
