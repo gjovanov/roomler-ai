@@ -276,14 +276,14 @@ mod imp {
             Ok(s) if s.success() => {
                 tracing::info!(
                     uid,
-                    target,
+                    job = %job,
                     "macOS supervisor: handed the worker back to launchd"
                 );
             }
             Ok(s) => {
                 tracing::warn!(
                     uid,
-                    job,
+                    job = %job,
                     status = ?s.code(),
                     "macOS supervisor: could not kickstart the LaunchAgent — \
                      this session may be left with no user half until launchd \
@@ -293,7 +293,7 @@ mod imp {
             Err(e) => {
                 tracing::warn!(
                     uid,
-                    job,
+                    job = %job,
                     error = %e,
                     "macOS supervisor: could not run launchctl kickstart"
                 );
