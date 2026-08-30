@@ -74,7 +74,7 @@ async fn a_fresh_address_is_stored_unconfirmed_with_both_tokens() {
     assert_eq!(resp.status(), 202);
 
     let doc = row(&app, "fresh@example.com").await.expect("no row stored");
-    assert_eq!(doc.get_bool("confirmed").unwrap(), false);
+    assert!(!doc.get_bool("confirmed").unwrap());
     assert_eq!(doc.get_str("source").unwrap(), "landing");
     assert!(
         doc.get_str("confirm_token").is_ok(),

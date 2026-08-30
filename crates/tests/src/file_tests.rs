@@ -46,8 +46,8 @@ async fn upload_file_to_room() {
     assert_eq!(json["filename"], "test.txt");
     assert_eq!(json["content_type"], "text/plain");
     assert_eq!(json["size"], 13); // "Hello, World!" = 13 bytes
-    assert!(json["id"].as_str().unwrap().len() > 0);
-    assert!(json["url"].as_str().unwrap().len() > 0);
+    assert!(!json["id"].as_str().unwrap().is_empty());
+    assert!(!json["url"].as_str().unwrap().is_empty());
 }
 
 #[tokio::test]
