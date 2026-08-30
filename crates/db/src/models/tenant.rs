@@ -28,9 +28,31 @@ pub struct Tenant {
 ///
 /// Mirrors [`crate::models::OverlayNetwork`]'s `acl_mode` deliberately, and for
 /// the same reason: turning eleven previously-unenforced gates on against a live
-/// fleet would lock out tenants that *we* let over the line. `Warn` is the
-/// default rather than `Off` because a mode that does nothing produces no data,
-/// and learning who *would* be denied is the entire point of the observe phase.
+/// fleet would lock out tenants that *we* let over the line.
+///
+/// # ⚠ `Warn` is the default BY STANDING DECISION — do not "fix" it
+///
+/// The original reason was the observe phase: a mode that does nothing produces
+/// no data, and learning who *would* be denied was the point. **That reason is
+/// spent.** The observe phase is over, every existing tenant has been moved to
+/// [`Self::Enforce`], and the argument for keeping `Warn` as the default is now
+/// a different one:
+///
+/// The grandfathering hazard does not apply to a NEW tenant — it starts at zero
+/// usage and cannot be retroactively over a limit. So `Warn` here is not a
+/// safety net; it is a deliberate **go-to-market choice** (operator, 2026-08-30):
+/// while the product is in early growth, a promising signup must not be stopped
+/// at 10 members or 100 MB before anyone has spoken to them.
+///
+/// The consequence is worth stating plainly, because it looks like a bug: with
+/// this default, the advertised plan limits **do not fire for anyone who signs
+/// up**. That is intended for now.
+///
+/// **Revisit when** the product leaves early growth, or when a real (non-test,
+/// non-internal) tenant is on a paid plan — whichever comes first. Flipping
+/// `#[default]` to `Enforce` is the whole change; the mode stays as a per-tenant
+/// escape hatch and as the grandfathering mechanism for any future gate
+/// introduced against existing usage. See FR-32 (#898).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanEnforcement {
