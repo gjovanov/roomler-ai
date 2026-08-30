@@ -350,6 +350,54 @@ EOF
         rc=1
     fi
 
+    # An anchor block dropped into the MIDDLE of a `//!`/`///` doc comment
+    # splits two sentences at once -- the doc's and the anchor's own -- and
+    # nothing catches it: the file still compiles, still passes `cargo fmt`,
+    # and the audit still counts the anchor. It happened in
+    # `roomler-setup-core/src/integration.rs`, where the module doc read
+    # "...v1 just" and resumed five lines later at "ensures `roomler-tunnel`
+    # is on PATH", while the anchor's own "(it leaves" ... "the old entry
+    # stranded" was split around it. Leftover from converting `///` markers
+    # to `//`: they were converted in place instead of being hoisted out.
+    #
+    # The tell is an anchor's prose resuming AFTER doc lines, before any code.
+    # `#` is a comment only OUTSIDE Rust -- inside it starts an attribute
+    # (`#[arg(long)]`), and treating those as prose flags every correctly
+    # placed anchor (16 false positives when this check was first written).
+    split_anchor=""
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        case "$f" in *.rs) hash_is_comment=0 ;; *) hash_is_comment=1 ;; esac
+        if awk -v H="$hash_is_comment" '
+              function isdoc(l) { return l ~ /^[[:space:]]*(\/\/!|\/\/\/)/ }
+              function isprose(l) {
+                  if (isdoc(l)) return 0
+                  if (l ~ /^[[:space:]]*\/\//) return 1
+                  if (H == "1" && l ~ /^[[:space:]]*#/) return 1
+                  return 0
+              }
+              /RETIRED-NAME-ANCHOR/ && !/RETIRED-NAME-ANCHOR-END/ { st=1; sd=0; rs=0; next }
+              st==1 {
+                  if (isdoc($0))   { sd=1; next }
+                  if (isprose($0)) { if (sd) rs=1; next }
+                  if (rs) { found=1 }
+                  st=0; next
+              }
+              END { exit(found ? 0 : 1) }
+           ' "$f"; then
+            split_anchor="$split_anchor $f"
+        fi
+    done <<EOF
+$(git ls-files 2>/dev/null)
+EOF
+    if [ -n "$split_anchor" ]; then
+        echo "FAIL  an anchor block is interleaved with a doc comment:"
+        for f in $split_anchor; do echo "        $f"; done
+        echo "      Hoist the whole anchor block ABOVE the doc comment (or below it),"
+        echo "      never into the middle -- it silently splits both sentences."
+        rc=1
+    fi
+
     # `env::node_env` reads THREE prefixes so a retired spelling keeps working.
     # A test that pokes ONE of them directly is not hermetic: it clears one link
     # and an inherited value under another silently decides the assertion. That
