@@ -31,6 +31,23 @@ pub const STATS_CALL_USER: &str = "stats_call_user";
 pub const STATS_CALL_USER_1H: &str = "stats_call_user_1h";
 pub const STATS_CALL_USER_1D: &str = "stats_call_user_1d";
 pub const STATS_MESH: &str = "stats_mesh";
+/// FR-20 — the cost ledger. One bucket per `(tenant, meter, minute)`.
+///
+/// ⚠ **Only server-measured quantities go in here.** `tunnel_audit`'s byte
+/// columns are reported by the client endpoint on flow close — the payload is
+/// P2P, so the server never saw it — which makes them a *claim by a host we do
+/// not control*. Same distinction as `ssh_audit` (our decision, authoritative)
+/// versus `ssh_activity` (the device's account of itself), and the same rule:
+/// **never fold them together.** Client-reported bytes stay in analytics,
+/// labelled as such; only what we measured ourselves may drive cost.
+///
+/// ⚠ **Never metered:** direct P2P sessions, device count, signalling, mesh
+/// coordination, chat. A direct session costs the control plane kilobytes of
+/// signalling — metering it would invert the growth model and bill against
+/// exactly the outcome the NAT-traversal work exists to produce.
+pub const STATS_USAGE: &str = "stats_usage";
+pub const STATS_USAGE_1H: &str = "stats_usage_1h";
+pub const STATS_USAGE_1D: &str = "stats_usage_1d";
 pub const CALL_SESSIONS: &str = "call_sessions";
 pub const STATS_META: &str = "stats_meta";
 
@@ -42,6 +59,37 @@ pub const CALL_BUCKET_SECS: i64 = 30;
 /// Round a unix-seconds timestamp down to its bucket start.
 pub fn bucket_start(unix_secs: i64, bucket_secs: i64) -> i64 {
     unix_secs - unix_secs.rem_euclid(bucket_secs)
+}
+
+/// FR-20 usage buckets are one minute wide. Narrow enough that a pod restart
+/// loses at most a minute of a tenant's bytes, wide enough that the flush is a
+/// handful of upserts rather than a write per frame.
+pub const USAGE_BUCKET_SECS: i64 = 60;
+
+/// A cost driver. The wire/storage spelling is the `snake_case` variant name,
+/// so adding one is a `match` arm the compiler demands.
+///
+/// ⚠ Deliberately NOT a free-form string: a typo'd meter name would create a
+/// silent second ledger line that sums to nothing and reconciles against
+/// nothing, and it would look exactly like a tenant with no usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Meter {
+    /// Relay bytes forwarded on this tenant's behalf by an API pod's `/derp`.
+    DerpBytes,
+    /// coturn-relayed bytes (FR-20 P3).
+    TurnBytes,
+    /// The SFU's real marginal cost (FR-20 P4).
+    SfuParticipantSeconds,
+}
+
+impl Meter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Meter::DerpBytes => "derp_bytes",
+            Meter::TurnBytes => "turn_bytes",
+            Meter::SfuParticipantSeconds => "sfu_participant_seconds",
+        }
+    }
 }
 
 /// One successful relay-PoP `/stats` poll, ready to persist.
@@ -93,6 +141,48 @@ impl StatsDao {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// FR-20 — add `value` to a tenant's meter for the bucket containing `unix`.
+    ///
+    /// The `_id` is deterministic (`{tenant}:{meter}:{bucket}`), so both pods
+    /// address the same document and Mongo's `$inc` sums their contributions
+    /// atomically. That, not a lease, is what makes the 2-pod deployment
+    /// race-free — the same property `stats_relay` and `stats_machine` rely on.
+    ///
+    /// ⚠ `$inc` is additive, not idempotent: a **retried** flush would
+    /// double-count. So a failed flush is dropped, never retried, and the
+    /// bucket under-reports. That is the same trade the cumulative PoP and
+    /// host-total counters already make, and it is the right direction — a
+    /// cost ledger that occasionally under-bills is recoverable; one that
+    /// double-bills is a refund and a trust problem.
+    pub async fn add_usage(
+        &self,
+        tenant_id: ObjectId,
+        meter: Meter,
+        unix: i64,
+        value: i64,
+    ) -> DaoResult<()> {
+        if value <= 0 {
+            return Ok(());
+        }
+        let bucket = bucket_start(unix, USAGE_BUCKET_SECS);
+        let id = format!("{}:{}:{}", tenant_id.to_hex(), meter.as_str(), bucket);
+        self.upsert(
+            STATS_USAGE,
+            doc! { "_id": &id },
+            doc! {
+                "$inc": { "value": value },
+                // Immutable identity, written once. Kept out of `$inc` so a
+                // concurrent writer cannot rewrite what the bucket IS.
+                "$setOnInsert": {
+                    "tenant_id": tenant_id,
+                    "meter": meter.as_str(),
+                    "ts": DateTime::from_millis(bucket * 1000),
+                },
+            },
+        )
+        .await
     }
 
     /// Successful poll → full `$set` (overwrites a failure-only bucket).
@@ -387,5 +477,56 @@ mod tests {
         // Determinism across writers is the whole point: same second →
         // same bucket id on both pods.
         assert_eq!(bucket_start(1754400015, 30), bucket_start(1754400029, 30));
+    }
+}
+
+#[cfg(test)]
+mod fr20_tests {
+    use super::*;
+
+    /// The ledger `_id` is the whole concurrency story: both pods must compute
+    /// the SAME id for the same (tenant, meter, minute) so Mongo's `$inc` sums
+    /// their contributions instead of them racing. If this ever became
+    /// non-deterministic, the two pods would write two rows and the bill would
+    /// silently halve per pod.
+    #[test]
+    fn the_usage_id_is_deterministic_per_tenant_meter_minute() {
+        let t = ObjectId::parse_str("69a1dbbad2000f26adc875ce").unwrap();
+        let id = |unix| {
+            format!(
+                "{}:{}:{}",
+                t.to_hex(),
+                Meter::DerpBytes.as_str(),
+                bucket_start(unix, USAGE_BUCKET_SECS)
+            )
+        };
+        // Same minute, different seconds, different pods ⇒ one document.
+        assert_eq!(id(1754400001), id(1754400059));
+        // Next minute ⇒ a new document.
+        assert_ne!(id(1754400059), id(1754400060));
+        assert!(id(1754400001).ends_with(":derp_bytes:1754400000"));
+    }
+
+    /// A meter's stored spelling is a persisted key: renaming one orphans every
+    /// historical bucket, and the new name reads as a tenant with no usage
+    /// rather than as an error.
+    #[test]
+    fn meter_wire_names_are_locked() {
+        assert_eq!(Meter::DerpBytes.as_str(), "derp_bytes");
+        assert_eq!(Meter::TurnBytes.as_str(), "turn_bytes");
+        assert_eq!(
+            Meter::SfuParticipantSeconds.as_str(),
+            "sfu_participant_seconds"
+        );
+    }
+
+    /// Two meters for one tenant in one minute are two ledger lines, never one.
+    #[test]
+    fn meters_do_not_collide_in_one_bucket() {
+        let t = ObjectId::new();
+        let b = bucket_start(1754400001, USAGE_BUCKET_SECS);
+        let derp = format!("{}:{}:{}", t.to_hex(), Meter::DerpBytes.as_str(), b);
+        let turn = format!("{}:{}:{}", t.to_hex(), Meter::TurnBytes.as_str(), b);
+        assert_ne!(derp, turn);
     }
 }

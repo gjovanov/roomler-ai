@@ -29,7 +29,10 @@ use bson::{Bson, DateTime, Document, doc};
 use tracing::{debug, info};
 
 use crate::state::AppState;
-use roomler_ai_services::dao::stats::{STATS_CALL, STATS_CALL_USER, STATS_MACHINE, STATS_RELAY};
+use roomler_ai_services::dao::stats::{
+    STATS_CALL, STATS_CALL_USER, STATS_MACHINE, STATS_RELAY, STATS_USAGE, STATS_USAGE_1D,
+    STATS_USAGE_1H,
+};
 
 const ROLLUP_INTERVAL_SECS: u64 = 900; // 15 min
 const HOUR: i64 = 3600;
@@ -114,6 +117,50 @@ fn relay_pipeline(floor: DateTime, unit: &str, src_is_rollup: bool, into: &str) 
         doc! { "$group": group },
         doc! { "$set": {
             "region": "$_id.k",
+            "ts": "$_id.b",
+            "_id": { "$concat": [ "$_id.k", ":", bucket_secs_str() ] },
+        }},
+        merge_into(into),
+    ]
+}
+
+/// FR-20 — compact the cost ledger. Raw minute buckets → `_1h` → `_1d`.
+///
+/// ⚠ Every measure here is a `$sum`, never an `$avg`. These are **cost
+/// drivers**: bytes relayed in an hour is the sum of the bytes relayed in its
+/// minutes. Averaging one — the way the relay/machine pipelines legitimately
+/// average a *gauge* like load or RTT — would silently divide the bill by the
+/// bucket count, and it would look entirely plausible sitting next to them.
+fn usage_pipeline(floor: DateTime, unit: &str, src_is_rollup: bool, into: &str) -> Vec<Document> {
+    // The grouping key is (tenant, meter), so a tenant's meters stay separate
+    // all the way down and a rollup row is still attributable.
+    let group = if !src_is_rollup {
+        doc! {
+            "_id": {
+                "k": { "$concat": [ { "$toString": "$tenant_id" }, ":", "$meter" ] },
+                "b": { "$dateTrunc": { "date": "$ts", "unit": unit } },
+            },
+            "tenant_id": { "$first": "$tenant_id" },
+            "meter": { "$first": "$meter" },
+            "bucket_count": { "$sum": 1 },
+            "value": { "$sum": "$value" },
+        }
+    } else {
+        doc! {
+            "_id": {
+                "k": { "$concat": [ { "$toString": "$tenant_id" }, ":", "$meter" ] },
+                "b": { "$dateTrunc": { "date": "$ts", "unit": unit } },
+            },
+            "tenant_id": { "$first": "$tenant_id" },
+            "meter": { "$first": "$meter" },
+            "bucket_count": { "$sum": "$bucket_count" },
+            "value": { "$sum": "$value" },
+        }
+    };
+    vec![
+        doc! { "$match": { "ts": { "$gte": floor } } },
+        doc! { "$group": group },
+        doc! { "$set": {
             "ts": "$_id.b",
             "_id": { "$concat": [ "$_id.k", ":", bucket_secs_str() ] },
         }},
@@ -374,6 +421,26 @@ struct Pass {
 /// `call_user` took the real count to 8 while the test still demanded 6, and
 /// nothing noticed because `crates/tests` had stopped compiling entirely.
 static PASSES: &[Pass] = &[
+    // FR-20 usage ledger: raw → 1h → 1d. These are the rows billing reads;
+    // the raw minute buckets are 7-day scratch.
+    Pass {
+        key: "usage:1h",
+        src: STATS_USAGE,
+        into: STATS_USAGE_1H,
+        unit: "hour",
+        src_is_rollup: false,
+        bucket_secs: HOUR,
+        pipeline: usage_pipeline,
+    },
+    Pass {
+        key: "usage:1d",
+        src: STATS_USAGE_1H,
+        into: STATS_USAGE_1D,
+        unit: "day",
+        src_is_rollup: true,
+        bucket_secs: DAY,
+        pipeline: usage_pipeline,
+    },
     // relay: raw → 1h → 1d
     Pass {
         key: "relay:1h",
