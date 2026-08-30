@@ -149,6 +149,7 @@ pub use imp::run;
 mod imp {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::time::Instant;
 
@@ -218,17 +219,54 @@ mod imp {
             .arg(exe)
             .arg("run")
             .env(SUPERVISED_MARKER, "1")
+            // Own process group, so `stop_worker` can take the whole
+            // launchctl -> sudo -> agent chain down instead of orphaning it.
+            .process_group(0)
             .spawn()
     }
 
-    /// Stop a worker we own. Best effort by construction: `launchctl asuser`
-    /// re-parents the agent into the user's bootstrap, so killing our direct
-    /// child does not guarantee the grandchild dies. P1 accepts that (the
-    /// only paths here are shutdown and a session change, both of which the
-    /// worker itself also notices); P2 gets a real handshake over LocalAPI.
+    /// Stop a worker we own — the whole process GROUP, not just our child.
+    ///
+    /// `launchctl asuser … sudo -u '#uid' … run` gives us a three-deep chain
+    /// (launchctl → sudo → agent), so killing the direct child leaves the
+    /// agent alive and re-parented to launchd. Field-measured on 2026-08-30
+    /// while restoring the Mac after the P1 test: the orphan kept running,
+    /// held the agent's **single-instance lock**, and launchd's own
+    /// LaunchAgent worker therefore exited with
+    /// `single-instance lock held by another process; exiting` — cleanly, so
+    /// `KeepAlive{SuccessfulExit=false}` never retried it. Net effect: turning
+    /// the supervisor OFF left the Mac running an UNSUPERVISED orphan that
+    /// nothing would restart. Handing ownership back has to be clean, or the
+    /// kill switch is not one.
+    ///
+    /// [`spawn_worker`] therefore puts the chain in its own process group
+    /// (`process_group(0)`), and this kills the group: SIGTERM, a short grace
+    /// period, then SIGKILL for whatever is left.
     fn stop_worker(uid: u32, mut child: Child, why: &str) {
-        tracing::info!(uid, why, "macOS supervisor: stopping our GUI worker");
-        let _ = child.kill();
+        let pgid = child.id() as i32;
+        tracing::info!(
+            uid,
+            why,
+            pgid,
+            "macOS supervisor: stopping our GUI worker group"
+        );
+        // SAFETY: `kill` with a negative pid signals the process group; the
+        // group is one we created in `spawn_worker`, so it contains only our
+        // own descendants. A failure here is not actionable (the group may
+        // already be gone), hence the ignored return.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        for _ in 0..20 {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        // SAFETY: same contract as above.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
         let _ = child.wait();
     }
 
