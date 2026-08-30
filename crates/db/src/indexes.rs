@@ -567,7 +567,10 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
         "stats_usage",
         vec![
             index(bson::doc! { "tenant_id": 1, "meter": 1, "ts": 1 }),
-            index(bson::doc! { "ts": 1 }),
+            // ⚠ No separate `{ts: 1}` index: the TTL index below already IS
+            // one, and declaring both is an IndexOptionsConflict (same key
+            // pattern, different options) as well as a wasted WiredTiger file
+            // per test database. The siblings above deliberately don't either.
             index_ttl(bson::doc! { "ts": 1 }, 7 * 24 * 60 * 60),
         ],
     )
