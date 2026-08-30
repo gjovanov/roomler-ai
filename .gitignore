@@ -20,7 +20,23 @@ media/
 ui/test-results/
 ui/playwright-report/
 ui/e2e/video/output/
-.claude/
+# Everything under .claude/ is local, EXCEPT the hostname-sanitisation tooling,
+# which has to be TRACKED. Note the shape: git never descends into an excluded
+# DIRECTORY to look for a negation inside it, so a plain `.claude/` followed by
+# a `!` deeper down does nothing. The exclusion has to be re-stated with `/*` at
+# each level so the one path being kept stays reachable.
+#
+# This exists because the old `.claude/` rule silently ate this tool once
+# already: commit 2e68cf3 (2026-08-28) is titled "...+ add the sweep as a
+# skill", and its diffstat is a balanced 97/97 rename with no new files -- the
+# skill it claimed to add never entered the repo at all, so it was gone by the
+# next session and the sweep had to be rebuilt from scratch. A prevention
+# mechanism that is not committed is not a prevention mechanism.
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/sanitize-hostnames/
+.claude/skills/sanitize-hostnames/__pycache__/
 dist/
 # Operator-supplied GeoLite2 databases — licensed data, never committed.
 files/geoip/*.mmdb

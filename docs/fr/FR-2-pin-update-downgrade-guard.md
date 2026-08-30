@@ -24,7 +24,7 @@ every agent's `0.4.1` version, then pushed the stale pin anyway:
   re-pinned up.
 - Windows hosts refused at MSI level (MajorUpgrade blocks lower
   ProductVersions) — the only layer that pushed back.
-- One accidental benefit: DESKTOP-DCTCK23 (stuck on rc.475) needed exactly that
+- One accidental benefit: WINHOST-I (stuck on rc.475) needed exactly that
   rc.484 transition rung — proving the *deliberate* downgrade/side-grade path
   must stay available (`force`).
 
