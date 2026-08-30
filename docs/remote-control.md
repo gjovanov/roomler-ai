@@ -553,6 +553,18 @@ something. The floor defeats `auto` only; `email`/`push` do not auto-grant, so a
 device that merely refuses to auto-grant has no standing to force a second
 prompt onto the host.
 
+⚠️ **This surprises operators** (field, 2026-08-30): a device whose *server*
+policy reads `consent_mode = auto` — including one you own — can still prompt on
+every session, and nothing server-side fixes it. The reason is that
+`auto_grant_session` lives in the device's own `config.toml`, and as a gate-4
+floor it is **deliberately not remotely configurable** — a control plane that
+could flip it would not be a floor. It **defaults to `true`** (auto-grant), so a
+device that prompts has it explicitly set to `false`; that `false` overrides both
+the `auto` directive *and* the owner shortcut. To change it, do so **on the
+host** — `roomler config set auto_grant_session <true|false>` — then restart the
+daemon (the config surface notes changes apply on the next start). Making a
+device auto-grant is a device-owner decision the server cannot make for it.
+
 **Prompt surfaces.** A chain, probed per prompt and logged per prompt
 (`native` + `have_surface` on one line):
 
