@@ -685,6 +685,43 @@ pub fn replay_video_info(session: bson::oid::ObjectId) {
     }
 }
 
+/// A follower's `video-bytes` DC just opened.
+///
+/// The join forces a pipeline IDR the instant the follower registers (during
+/// `AgentPeer::new`, ~33 ms after `try_join`), but this video DC finishes
+/// negotiating hundreds of ms later — and [`spawn_follower_chunker`] DROPS
+/// anything that arrives while the DC is `None`/`!Open`. So that join-IDR is
+/// lost, yet [`Pipeline::fan_out`] already flipped the follower to `synced`
+/// when it queued it: the follower then receives only deltas it cannot
+/// decode — a BLACK SCREEN until the next natural keyframe. Now that the DC
+/// is live, reset the follower to unsynced and request a fresh IDR so it
+/// re-syncs onto a keyframe the chunker will actually deliver. No-op when the
+/// session is a leader (not in any pipeline's follower list) — mirrors
+/// [`replay_video_info`], which handles the same race for the control DC.
+pub fn resync_follower(session: bson::oid::ObjectId) {
+    let pipelines: Vec<Arc<Mutex<PipelineInner>>> =
+        registry().lock().unwrap().values().cloned().collect();
+    for inner in pipelines {
+        let mut guard = inner.lock().unwrap();
+        let found = guard.followers.iter_mut().any(|f| {
+            if f.sink.session_id == session {
+                f.synced = false;
+                true
+            } else {
+                false
+            }
+        });
+        if found {
+            guard.kf_needed = true;
+            tracing::info!(
+                %session,
+                "media_share: follower video DC live — re-syncing onto a fresh IDR (join-IDR was dropped pre-open)"
+            );
+            return;
+        }
+    }
+}
+
 /// The follower's DC send task — the same 16 KiB chunk discipline as the
 /// owner pumps' send tasks (single consumer per DC keeps chunk order for
 /// the browser reassembler).
