@@ -56,7 +56,7 @@ on a machine with no scanout. The backend priority stays
 | **P1** | Detect: is `org.freedesktop.portal.ScreenCast` actually on the session bus? Report it in `capture-smoke` so "why did this host pick X11" is answerable without a session. | n/a (read-only) |
 | **P2** | ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P3** | PipeWire consumer: attach to the node, negotiate a format, deliver `Frame`s through the existing `ScreenCapture` trait as a **sixth backend**. | same |
-| **P4** | Input. The portal's **RemoteDesktop** interface can inject, and is the natural pair. ⚠️ First measure whether `/dev/uinput` works in WSL2 — if it does, FR-36's uinput backend already covers input and P4 is unnecessary. | separate flag |
+| **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
 
 ### The seam is unchanged
 
@@ -113,7 +113,23 @@ PipeWire installed**, not by reasoning about it.
 
 - **Which of the three dependency shapes above.** This is the decision the FR
   turns on; everything else is ordinary work.
-- ⚠️ **`/dev/uinput` WORKS in WSL2 — but that is not the question.** Measured
+- ✅ ~~**Does `/dev/uinput` work in WSL2?**~~ **ANSWERED 2026-08-31 — P4 is
+  MANDATORY, and the reason is not the one expected.**
+  - uinput itself works: `CONFIG_INPUT_UINPUT=m`, module loads, FR-36's
+    injector creates a device (`has_permission=true`).
+  - The evdev subsystem works too — a *persistent* uinput device appears as
+    `/dev/input/event0` and **libinput enumerates it on `seat0`**. `/dev/input/`
+    is normally empty only because nothing has created a device, not because
+    the subsystem is missing. (⚠️ FR-36's injector destroys its device on drop,
+    so a quick `ls` afterwards shows nothing and reads as failure.)
+  - **But a NESTED compositor does not read evdev.** Weston under WSLg loads
+    `wayland-backend.so` and uses `xdg_wm_base` — no libinput, no udev, no
+    device enumeration. A nested compositor takes input from its **parent**,
+    and WSL2 can only run nested or headless compositors because there is no
+    DRM to run a libinput-backed seat on.
+  ⇒ Injected events are published and nothing consumes them. **The portal's
+  RemoteDesktop interface is the only input path for this case**, which makes
+  ScreenCast + RemoteDesktop a coherent pair rather than capture-only.
   2026-08-31: `CONFIG_INPUT_UINPUT=m`, the module loads, and FR-36's injector
   created a device and accepted a pointer move (`input: backend=uinput`,
   `has_permission=true`). So injection is not the obstacle.
@@ -149,3 +165,4 @@ PipeWire installed**, not by reasoning about it.
 | 2026-08-31 | 0.4.33, WSL2 | Xvfb virtual desktop + `av1_nvenc`: 1920×1080, `avg_encode_ms=10.4`, 77 kbps idle, ~41 ms. Establishes the encode half works; only capture is missing |
 | 2026-08-31 | 0.4.33, Asahi | Wayland captured via DRM at 1920×1080, but **software encode only** — no video-encode driver exists for Apple Silicon on Linux |
 | 2026-08-31 | 0.4.33, WSL2 | **uinput measured, and it reframes P4.** `CONFIG_INPUT_UINPUT=m`, module loads, FR-36's injector created a device and accepted a move (`has_permission=true`) — injection is not the obstacle. But `/dev/input/` is **empty** (WSLg takes input over RDP, not evdev), so nothing appears to consume those events. P4 likely survives because the *reader* is missing, not the writer. Untested: whether a nested `gnome-shell` reads evdev |
+| 2026-08-31 | 0.4.33 + weston 13, WSL2 | **The nested-compositor input question, ANSWERED.** A persistent uinput device appears as `/dev/input/event0` and **libinput enumerates it on `seat0`** — so the evdev subsystem is fully alive in WSL2. But weston under WSLg loads `wayland-backend.so` / `xdg_wm_base` with **no libinput, no udev, no device enumeration**: a nested compositor reads its PARENT, not evdev. And WSL2 can only run nested or headless compositors, having no DRM to host a libinput seat. ⇒ **P4 is mandatory**; the portal's RemoteDesktop is the only input path here |
