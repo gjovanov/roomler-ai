@@ -660,6 +660,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/machines", get(routes::stats::tenant_machines))
         .route("/calls", get(routes::stats::tenant_calls))
         .route("/tunnels", get(routes::stats::tenant_tunnels))
+        // FR-20 P6 - the org's OWN metered consumption, in units rather
+        // than money: these are our costs, not their bill, and the point of
+        // the surface is that a high relayed share is something their own
+        // network team can act on. Membership only; failures 404.
+        .route("/resources", get(routes::cost::tenant_resources))
         // `/usage` needs MANAGE_AGENTS (everyone's activity); `/usage/{uid}`
         // is self-service for your OWN row, MANAGE_AGENTS for anyone else's.
         .route("/usage", get(routes::usage::tenant_usage))

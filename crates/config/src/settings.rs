@@ -825,8 +825,14 @@ mod relay_cost_file_tests {
         let w: Wrapper = toml::from_str(&raw).expect("relay-costs.toml must be valid TOML");
         let c = w.relay_costs;
 
-        assert!(c.currency.is_some(), "currency unset — figures would render bare");
-        assert!(c.derp_gb.is_some(), "derp_gb unset — the one meter we actually collect");
+        assert!(
+            c.currency.is_some(),
+            "currency unset — figures would render bare"
+        );
+        assert!(
+            c.derp_gb.is_some(),
+            "derp_gb unset — the one meter we actually collect"
+        );
         assert!(c.turn_gb.is_some(), "turn_gb unset");
         assert!(
             c.sfu_participant_hour.is_some(),
