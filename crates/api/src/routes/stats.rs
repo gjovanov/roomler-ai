@@ -363,7 +363,7 @@ fn relay_series_pipeline(region: &str, floor: DateTime, tier: Tier) -> Vec<Docum
 }
 
 /// Suffix for the tier's source collection.
-fn tier_coll(base: &str, tier: Tier) -> String {
+pub(crate) fn tier_coll(base: &str, tier: Tier) -> String {
     match tier {
         Tier::Raw => base.to_string(),
         Tier::Hour => format!("{base}_1h"),
