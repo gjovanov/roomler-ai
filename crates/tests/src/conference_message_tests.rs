@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 use crate::fixtures::test_app::TestApp;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use serde_json::Value;
-use tokio_tungstenite::tungstenite::Message;
 
 /// Helper: create a room + start a call, return room_id.
 async fn create_room_and_start_call(

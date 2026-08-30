@@ -270,7 +270,7 @@ async fn list_agents_shows_enrolled_agent() {
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["name"].as_str().unwrap(), "laptop");
     // No live WS yet → is_online must be false.
-    assert_eq!(items[0]["is_online"].as_bool().unwrap(), false);
+    assert!(!items[0]["is_online"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -406,7 +406,7 @@ async fn agent_hello_marks_status_online() {
             .await
             .unwrap();
         if resp["status"].as_str() == Some("online") {
-            assert_eq!(resp["is_online"].as_bool().unwrap(), true);
+            assert!(resp["is_online"].as_bool().unwrap());
             assert_eq!(resp["agent_version"].as_str().unwrap(), "0.1.0");
             // Drain one message just to make sure we can still read — there
             // should be none queued, but the next `next()` may time out which

@@ -82,7 +82,7 @@ async fn rate_limit_recovers_after_wait() {
     // ⚠️ Precondition, and the reason this test is no longer vacuous: if the
     // burst was never exhausted, "it works again afterwards" asserts nothing.
     assert!(
-        statuses.iter().any(|&s| s == 429),
+        statuses.contains(&429),
         "precondition: the burst must actually be exhausted before recovery means anything"
     );
 
