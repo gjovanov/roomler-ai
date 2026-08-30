@@ -205,6 +205,82 @@ async fn members_without_manage_agents_and_foreign_tenants_are_refused() {
     assert!(a["key_rotation"].is_null(), "{a}");
 }
 
+/// P1b — the duplicate-delivery race from the first field run: the device's
+/// `rotated` report must survive a later refusal for the SAME order, while a
+/// report about a different order, or a later `rotated`, still replaces it.
+#[tokio::test]
+async fn a_refusal_never_overwrites_a_rotated_report_for_the_same_order() {
+    use roomler_ai_remote_control::models::{KeyRotationOutcome, KeyRotationReport};
+    use roomler_ai_services::dao::agent::AgentDao;
+
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("fr40e").await;
+    let aid = enroll(&app, &t.tenant_id, &t.admin.access_token, "mach-fr40-e").await;
+    let (tid, aid_oid) = (
+        ObjectId::parse_str(&t.tenant_id).unwrap(),
+        ObjectId::parse_str(&aid).unwrap(),
+    );
+    let dao = AgentDao::new(&app.db);
+    let report = |request_id: &str, outcome: KeyRotationOutcome| KeyRotationReport {
+        request_id: request_id.into(),
+        outcome,
+        old_public_key: None,
+        new_public_key: Some("NEW==".into()),
+        key_epoch: 1,
+        detail: None,
+        reported_at: bson::DateTime::now(),
+    };
+
+    let read = || async {
+        let a = get_agent(&app, &t.tenant_id, &aid, &t.admin.access_token).await;
+        a["key_rotation"].clone()
+    };
+
+    // An order on the row, then the device's success.
+    app.auth_post(
+        &format!("/api/tenant/{}/agent/{aid}/overlay-key/rotate", t.tenant_id),
+        &t.admin.access_token,
+    )
+    .send()
+    .await
+    .unwrap();
+    let rid = read().await["request_id"].as_str().unwrap().to_string();
+    assert!(
+        dao.record_key_rotation_report(tid, aid_oid, &report(&rid, KeyRotationOutcome::Rotated))
+            .await
+            .unwrap()
+    );
+
+    // The duplicate's refusal for the SAME order: withheld.
+    let wrote = dao
+        .record_key_rotation_report(tid, aid_oid, &report(&rid, KeyRotationOutcome::RateLimited))
+        .await
+        .unwrap();
+    assert!(
+        !wrote,
+        "a refusal must not overwrite a rotated report for the same order"
+    );
+    let kr = read().await;
+    assert_eq!(kr["report"]["outcome"].as_str(), Some("rotated"), "{kr}");
+
+    // A refusal for a DIFFERENT order replaces (the row's report is the last
+    // word about the latest order), and a later rotated always replaces.
+    assert!(
+        dao.record_key_rotation_report(
+            tid,
+            aid_oid,
+            &report("other-order", KeyRotationOutcome::Disabled)
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        dao.record_key_rotation_report(tid, aid_oid, &report(&rid, KeyRotationOutcome::Rotated))
+            .await
+            .unwrap()
+    );
+}
+
 /// Small helper so the audit reads stay one expression.
 trait TryCollectVec {
     async fn try_collect_vec(self) -> Vec<bson::Document>;

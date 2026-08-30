@@ -566,12 +566,29 @@ impl AgentDao {
         agent_id: ObjectId,
         report: &roomler_ai_remote_control::models::KeyRotationReport,
     ) -> DaoResult<bool> {
+        use roomler_ai_remote_control::models::KeyRotationOutcome;
+
         let bson = bson::to_bson(report).unwrap_or(bson::Bson::Null);
+        // P1b — a rotation that happened, happened. A LATER refusal for the
+        // SAME order (the duplicate-delivery race: the reconnect re-received
+        // the order and the device refused it under its own ceiling) must
+        // not overwrite the device's `rotated`. Any report about a different
+        // order, and any `rotated`, still replaces. Returns `false` when the
+        // write was withheld.
+        let filter = if report.outcome == KeyRotationOutcome::Rotated {
+            doc! { "_id": agent_id, "tenant_id": tenant_id }
+        } else {
+            doc! {
+                "_id": agent_id,
+                "tenant_id": tenant_id,
+                "$nor": [ {
+                    "key_rotation_report.request_id": &report.request_id,
+                    "key_rotation_report.outcome": "rotated",
+                } ],
+            }
+        };
         self.base
-            .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
-                doc! { "$set": { "key_rotation_report": bson } },
-            )
+            .update_one(filter, doc! { "$set": { "key_rotation_report": bson } })
             .await
     }
 
