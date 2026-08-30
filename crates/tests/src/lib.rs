@@ -90,4 +90,6 @@ mod tenant_archive_tests;
 #[cfg(test)]
 mod tunnel_tests;
 #[cfg(test)]
+mod usage_ledger_tests;
+#[cfg(test)]
 mod ws_auth_tests;
