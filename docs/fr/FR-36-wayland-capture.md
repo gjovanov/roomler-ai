@@ -1,6 +1,6 @@
 # FR-36 — Wayland capture, and unattended access
 
-**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **P1 capture + P4 uinput input both landed and field-verified (opt-in). Greeter and locked-session capture proven; keystrokes reach GNOME Wayland. 4K rate is the open problem** (2026-08-30) · **Owner:** agent / capture
+**Issue:** [#929](https://github.com/gjovanov/roomler-ai/issues/929) · **Status:** **P1 capture + P4 uinput input landed and field-verified (opt-in). Greeter and locked-session capture proven; keystrokes reach GNOME Wayland; 4K `Auto` down to 24 ms** (2026-08-30) · **Owner:** agent / capture
 
 ## Goal
 
@@ -192,11 +192,12 @@ out of scope becomes in-scope here.
 - [x] `avg_capture_ms` **< 10 ms** at **1080p** — measured **5.84 ms** for the
       whole backend (1.58 ms of that is the framebuffer read; the rest is the
       BGRA repack). Same host/session, scrap measured 5.11 ms
-- [ ] **`avg_capture_ms` at native 4K: 42.9 ms — FAILS the bar by 4×**
-      (52.9 ms with the production `Auto` downscale). ⚠️ Recorded as a failure,
-      not reframed: see the open decision below
-- [ ] Sustained-motion fps **≥ 29** at `target_fps=30`. At 1080p the headroom
-      is there; at 4K the measured ceiling is **~19 fps**
+- [~] **4K: 43.8 ms undownscaled (still over the bar), but 24.0 ms via the
+      production `Auto` path** after P1b fused the downscale into the repack —
+      down from 52.9 ms, and faster than not downscaling at all
+- [~] Sustained-motion fps **≥ 29** at `target_fps=30`. 1080p has headroom;
+      4K through the production `Auto` path is now **~30 fps** (24.0 ms of a
+      33 ms budget), up from ~19. Undownscaled 4K remains ~23 fps
 - [x] Input reaches native Wayland clients (uinput), not only Xwayland ones —
       8 injected characters arrived in **GNOME Shell's own search box on
       Wayland**, read back off the scanout plane. Pointer verified objectively
@@ -214,17 +215,19 @@ out of scope becomes in-scope here.
   `IN_FORMATS` advertises `DRM_FORMAT_MOD_LINEAR` and nothing else, so a tiled
   scanout buffer is not representable on this hardware. Verified live under both
   Xorg and mutter.
-- ⚠️ **4K is the open problem, and it is memory bandwidth, not the loop.** The
-  whole backend costs **42.9 ms/frame** at 4096×2160 10-bit (~19 fps) against
-  5.84 ms at 1080p. Reading is 15.2 ms of that; the BGRA repack is most of the
-  rest, and `Auto` downscale ADDS 10 ms because it is a second full pass.
-  ⚠️ A vectorisable-loop rewrite (paired `chunks_exact`) was tried and
-  **REFUTED** — 43.8 ms vs 42.4 ms, i.e. no change — so the cost is the ~70 MB/
-  frame of traffic, not instruction count. **The identified fix is to fuse the
-  downscale INTO the repack**: today the `Auto` path is read 35 MB → write
-  35 MB → read 35 MB → write 8.8 MB; fused it becomes read 35 MB → write
-  8.8 MB. Predicted ~2.5×, unmeasured. Alternatives remain: cap the advertised
-  mode, or accept a lower fps at 4K.
+- ✅ ~~**4K is the open problem, and it is memory bandwidth, not the loop.**~~
+  **Largely fixed 2026-08-30 by fusing the downscale into the repack** —
+  `Auto` at 4K went **52.9 ms → 24.0 ms**, which is *faster than not
+  downscaling at all* (43.8 ms), because the write is 4× smaller while the read
+  stays the same. ~30 fps at 4K instead of ~19.
+  ⚠️⚠️ **The first attempt at this made it 6× WORSE (329.8 ms)** and the
+  refutation is the useful part: the naive fusion sampled two source rows a
+  whole pitch apart on every output pixel, and **the scanout mapping punishes
+  strided access brutally**. Copying each row pair into cached scratch first —
+  sequential reads, same arithmetic — is what won. **The cost model is
+  sequential-vs-strided reads out of the mapping, NOT the number of passes over
+  it**, which is also why the earlier "vectorise the loop" attempt changed
+  nothing. Remaining at 4K undownscaled: 43.8 ms, still over the bar.
 - Vendor `libdrmtap` (MIT, C + meson) vs reimplement the narrow slice in Rust.
   **The P1 probe is ~120 lines of libdrm calls with no detiling**, which shifts
   this decision toward reimplementing: vendoring adds a C build dep to every
@@ -279,3 +282,4 @@ out of scope becomes in-scope here.
 | 2026-08-30 | **P4 uinput — pointer, objectively** | ✅ X11 session, `input-smoke --move-to`: `0.25,0.75` → pointer at **480,809**; `0.8,0.2` → **1535,215** (`xdotool getmouselocation`). Sub-pixel error is the 0..=32767 → 0..1919 scaling, not a mapping bug |
 | 2026-08-30 | **P4 uinput — keyboard on WAYLAND, end to end** | ✅ 8 characters injected through `/dev/uinput` on GNOME Wayland arrived in **GNOME Shell's own search box** — the capture read back `terminal` in the search field with Xfce Terminal / Terminal / Konsole / XTerm as results. 21.4 M bytes differed between the before and after frames. Closed loop: **injected below the compositor, observed below the compositor** |
 | 2026-08-30 | P4 hygiene | The virtual device is destroyed on drop — no `Roomler Virtual Input` left in `/sys/devices/virtual/input` after the run. Host returned to XFCE with `backend=scrap` and damage tracking active |
+| 2026-08-30 | **P1b — fuse the downscale into the repack** | ✅ 4K `Auto`: **52.9 ms → 24.0 ms**, i.e. *faster than not downscaling* (43.8 ms) — the write is 4× smaller while the read stays sequential. ~30 fps at 4K instead of ~19. ⚠️⚠️ **The first attempt made it 6× WORSE (329.8 ms)**: sampling two source rows a pitch apart per output pixel, because **the scanout mapping punishes strided reads brutally**. Row-buffering into cached scratch — sequential reads, identical arithmetic — is what won. A unit test pins the fused output byte-for-byte against the two-step route it replaced |
