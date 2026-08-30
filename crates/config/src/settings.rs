@@ -23,6 +23,10 @@ pub struct Settings {
     pub releases: ReleasesSettings,
     pub overlay: OverlaySettings,
     pub stats: StatsSettings,
+    /// FR-20 P5 — unit costs for the metered resources. Deliberately
+    /// **not** `Default`: absent means *not priced*, never zero.
+    #[serde(default)]
+    pub relay_costs: RelayCosts,
 }
 
 /// Multi-org P2b — tenant-block addressing for the overlay mesh.
@@ -529,11 +533,49 @@ pub struct PushSettings {
     pub contact: String,
 }
 
+/// FR-20 P5 — what a metered unit costs us, read from `config/relay-costs.toml`
+/// (or `ROOMLER__RELAY_COSTS__*`).
+///
+/// # Every field is `Option` on purpose
+///
+/// There is no default price anywhere in the code, and there must not be one.
+/// An unset cost renders as **"not priced"** on `/observability`; a defaulted
+/// one would render as a *number*, and a wrong cost is far worse than a
+/// visibly missing one — it also produces a bogus **margin**, which is the
+/// figure someone would actually make a pricing decision on. Same discipline
+/// as the absent GeoIP database honestly reporting `country: unknown`.
+///
+/// ⚠ These are COSTS, not prices. What a customer pays lives in
+/// `Plan::price_monthly_cents`; margin is the difference between the two.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RelayCosts {
+    /// ISO-4217 code rendered beside every figure. No conversion happens
+    /// anywhere, so every cost below must already be in this currency.
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// Cost per GB forwarded by a DERP relay on a tenant's behalf.
+    #[serde(default)]
+    pub derp_gb: Option<f64>,
+    /// Cost per GB relayed by coturn. Priced here for completeness; the
+    /// meter behind it is not collected (FR-20 P3 is blocked on coturn
+    /// emitting no `user` label), so the surface reports it *unmonitored*.
+    #[serde(default)]
+    pub turn_gb: Option<f64>,
+    /// Cost per SFU participant-hour — conference cost scales with
+    /// participants x time, not with call count.
+    #[serde(default)]
+    pub sfu_participant_hour: Option<f64>,
+}
+
 impl Settings {
     pub fn load() -> Result<Self, ConfigError> {
         let config = Config::builder()
             .add_source(File::with_name("config/default").required(false))
             .add_source(File::with_name("config/local").required(false))
+            // FR-20 P5 — unit costs, kept in their own file so a price edit
+            // is one line in one place. Optional: absent leaves every cost
+            // `None`, which renders as "not priced" rather than as zero.
+            .add_source(File::with_name("config/relay-costs").required(false))
             .add_source(Environment::default().separator("__").prefix("ROOMLER"))
             .set_default("app.host", "0.0.0.0")?
             .set_default("app.port", 3000)?
