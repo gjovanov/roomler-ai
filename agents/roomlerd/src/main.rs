@@ -3780,6 +3780,24 @@ async fn caps_cmd() -> Result<()> {
     println!("hw_encoders: {:?}", caps.hw_encoders);
     println!("transports: {:?}", caps.transports);
     println!("has_input_permission: {}", caps.has_input_permission);
+    // macOS has a THIRD state and `has_input_permission` cannot express it.
+    // That field is a CONJUNCTION — feature && gui_session_available() &&
+    // input_permission_granted() — so a root LaunchDaemon prints `false`
+    // because it is not in a GUI session, NOT because the grant is missing.
+    // `permissions` is where `caps` already distinguishes them
+    // (`no-gui-session` vs `screen-capture` / `input`); it just was never
+    // printed, so the CLI could only ever show the ambiguous half.
+    //
+    // Cost paid 2026-08-30: a week of "Accessibility is still revoked"
+    // reports, every one of them read off the macOS `-daemon` row, while the
+    // grant had been in place since 08-28 and the per-user half saw it fine.
+    // The comment on `permissions` in encode/caps.rs predicts exactly this
+    // ("the device list tells the operator to go fix something that is not
+    // broken") — the prediction was right and the CLI was the blind spot.
+    println!(
+        "permissions: {:?}",
+        caps.permissions.clone().unwrap_or_default()
+    );
     println!("supports_clipboard: {}", caps.supports_clipboard);
     println!("supports_file_transfer: {}", caps.supports_file_transfer);
     println!(
