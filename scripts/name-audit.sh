@@ -118,12 +118,16 @@ TOKENS='roomler-agent|roomler_agent|ROOMLER_AGENT_|RoomlerAgent|Roomler Agent|ro
 #
 #   * this script          — it contains every token by construction
 #   * the baseline         — it records counts, and may quote a token
-#   * the FR-21 spec       — its subject IS the retired names
+#   * an FR spec whose SUBJECT is the retired names (FR-21 retired them,
+#     FR-46 eradicates them) — such a spec cannot discuss its own topic
+#     without naming it, and anchoring every mention would bury the prose.
+#     This is a rule about the file's job, not a place to park work: a spec
+#     that merely MENTIONS a retired name does not qualify.
 is_excluded() {
     case "$1" in
         scripts/name-audit.sh) return 0 ;;
         "$BASELINE_FILE") return 0 ;;
-        docs/fr/FR-21-*) return 0 ;;
+        docs/fr/FR-21-*|docs/fr/FR-46-*) return 0 ;;
         *) return 1 ;;
     esac
 }
