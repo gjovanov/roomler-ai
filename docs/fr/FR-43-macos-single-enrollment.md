@@ -1,6 +1,6 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** P0 + P1 shipped and field-verified (P1 through 0.4.33 → 0.4.35, see the field-verification log); P2 next. Tracking issue: `FR-43`. Anchors verified against
+**Status:** P0 + P1 **complete and field-verified** (0.4.33 → 0.4.36, see the field-verification log); P2 next. Tracking issue: `FR-43`. Anchors verified against
 master `0bfdc263`.
 
 ## Goal
@@ -203,3 +203,29 @@ losing the lock race during the update, the user half logged
 exits can read as a crash loop to the rollback machinery, which would *downgrade* a
 healthy host. This is why #1039 deliberately did **not** take the otherwise-obvious route
 of making that exit non-zero.
+
+### 2026-08-31 — 0.4.36: hand-back complete, P1 done
+
+Same sequence, on a build carrying #1039. Takeover clean (worker uid 501 in its own
+process group); bootstrapping the LaunchAgent back left **no orphan** *and* launchd owning
+exactly one user half.
+
+The log is the result worth keeping, because the race still fires:
+
+```
+00:09:01.773  user half:  WARN single-instance lock held by another process; exiting
+00:09:02.424  daemon:     INFO macOS supervisor state action=HandBack(501)
+00:09:02.424  daemon:     INFO stopping our GUI worker group ... pgid=71668
+00:09:12.672  daemon:     INFO handed the worker back to launchd uid=501
+00:09:17.684  daemon:     INFO macOS supervisor state action=LaunchdOwns
+```
+
+launchd's worker still loses the lock race and still exits 0; the kickstart is what brings
+it back. A failure condition that reproduced and was recovered from is better evidence
+than one that failed to occur.
+
+Hand-back takes ~10 s end to end (SIGTERM, grace, SIGKILL, reap, kickstart), during which
+the session has no user half. Bounded and self-healing; noted, not tuned.
+
+**P1 is complete.** The switch stays default-off until P2 gives the daemon something to
+delegate to.
