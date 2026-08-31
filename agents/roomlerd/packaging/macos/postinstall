@@ -360,17 +360,35 @@ if [ ! -f /etc/roomler/disable-auto-update ] && [ ! -f /etc/roomler-agent/disabl
 else
   if [ -f "$UPDATE_PLIST_TARGET" ]; then
     rm -f "$UPDATE_PLIST_TARGET"
-    # Bootout ONLY when the helper job is idle. If an update is in flight the
-    # helper is this script's own ancestor — booting the job would kill the
-    # whole process group, this script included, and fail the install at its
-    # last step. An idle-but-loaded job that we cannot boot out is harmless:
-    # the helper checks the opt-out marker itself at startup and exits.
-    if launchctl print system/com.roomler.update 2>/dev/null | grep -q "state = running"; then
-      echo "roomler update helper opt-out recorded; the loaded job unloads at next boot"
-      echo "  (cannot bootout now — an update is in flight and the job is our ancestor)"
-    else
+    # Bootout ONLY when the helper job is idle. If an update is genuinely in
+    # flight the helper is this script's own ancestor — booting the job would
+    # kill the whole process group, this script included, and fail the install
+    # at its last step.
+    #
+    # FR-46: but "running" also covers a helper that merely woke a second ago
+    # and is about to exit, which a re-cycle in the PREVIOUS install makes
+    # likely — and treating that as in-flight left a job the operator had just
+    # asked to be gone loaded until the next reboot. So wait briefly for it to
+    # go idle instead of deciding on one sample. A real self-update stays busy
+    # far longer than this and still falls through to the announce path, so the
+    # ancestor protection is unchanged; a transiently-waking one is now
+    # actually removed, which is what the marker asked for.
+    helper_idle=0
+    i=0
+    while [ "$i" -lt 10 ]; do
+      if ! launchctl print system/com.roomler.update 2>/dev/null | grep -q "state = running"; then
+        helper_idle=1
+        break
+      fi
+      i=$((i + 1))
+      sleep 1
+    done
+    if [ "$helper_idle" -eq 1 ]; then
       launchctl bootout system/com.roomler.update 2>/dev/null || true
       echo "roomler update helper REMOVED — /etc/roomler/disable-auto-update is set."
+    else
+      echo "roomler update helper opt-out recorded; the loaded job unloads at next boot"
+      echo "  (still running after 10s — an update is in flight and the job is our ancestor)"
     fi
     echo "  This Mac will no longer self-update; new releases must be installed by hand:"
     echo "    curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon …"
