@@ -3196,6 +3196,24 @@ pub struct OverlayBlock {
     /// The rendered range, e.g. `"100.65.0.0/22"`. This is copied to
     /// `OverlayNetwork.cidr` — the registry is the authority.
     pub cidr: String,
+    /// FR-47 P5b — this block's POSITION in its network's block list, from 0.
+    ///
+    /// The ordinal space is the blocks concatenated in allocation order
+    /// ([`BlockList`]), so the order has to be recoverable exactly — get it
+    /// wrong and every ordinal above the misplaced block silently re-points at
+    /// a different address.
+    ///
+    /// ⚠️ It is an explicit field because **neither obvious key works**.
+    /// `slot` fails: [`OverlayBlockState::Reclaimed`] ranges are re-issued
+    /// from BELOW the cursor, so a newly-allocated block can carry a lower
+    /// slot than one allocated years earlier. `created_at` fails too, for the
+    /// mirror reason — the reclaim path reuses the ROW, so its `created_at`
+    /// is the date the range was first carved for a different tenant.
+    ///
+    /// `#[serde(default)]` reads every pre-P5b row as `0`, which is correct:
+    /// before multi-block a network had exactly one assigned block.
+    #[serde(default)]
+    pub seq: u32,
     pub tenant_id: ObjectId,
     pub network_id: ObjectId,
     pub state: OverlayBlockState,

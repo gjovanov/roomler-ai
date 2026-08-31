@@ -99,6 +99,31 @@ impl OverlayBlockDao {
             .await
     }
 
+    /// FR-47 P5b — every ASSIGNED block backing `network_id`, in allocation
+    /// order (`seq` ascending). This is the network's address space.
+    ///
+    /// ⚠️ Sorted on `seq`, never on `slot` or `created_at`. Both of those are
+    /// wrong for a re-issued [`OverlayBlockState::Reclaimed`] range: it comes
+    /// from below the allocation cursor (so its slot is low) and it reuses the
+    /// original row (so its `created_at` is old). Ordering by either would put
+    /// a newly-added block ahead of the blocks already in use and shift every
+    /// ordinal above it onto a different address.
+    pub async fn find_assigned_for_network_ordered(
+        &self,
+        network_id: ObjectId,
+    ) -> DaoResult<Vec<OverlayBlock>> {
+        self.base
+            .find_many(
+                doc! {
+                    "network_id": network_id,
+                    "state": bson::to_bson(&OverlayBlockState::Assigned)
+                        .unwrap_or(bson::Bson::Null),
+                },
+                Some(doc! { "seq": 1 }),
+            )
+            .await
+    }
+
     /// Every block ever carved for a tenant, newest first — the assigned one
     /// plus its quarantined predecessors (the renumber trail).
     pub async fn list_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<Vec<OverlayBlock>> {
@@ -125,6 +150,7 @@ impl OverlayBlockDao {
         tenant_id: ObjectId,
         network_id: ObjectId,
         prefix: u8,
+        seq: u32,
     ) -> DaoResult<OverlayBlock> {
         let slots = block_slots_for_prefix(prefix).ok_or_else(|| {
             DaoError::Validation(format!(
@@ -142,7 +168,10 @@ impl OverlayBlockDao {
                 // justifies re-issuing a range an operator has reclaimed —
                 // the alternative is handing the tenant no address at all.
                 None => {
-                    if let Some(b) = self.take_reclaimed(tenant_id, network_id, slots).await? {
+                    if let Some(b) = self
+                        .take_reclaimed(tenant_id, network_id, slots, seq)
+                        .await?
+                    {
                         tracing::warn!(
                             %tenant_id, cidr = %b.cidr, slot = b.slot,
                             "overlay blocks: monotonic space exhausted; re-issued a \
@@ -164,6 +193,7 @@ impl OverlayBlockDao {
                 slots,
                 end_slot: slot + slots,
                 cidr,
+                seq,
                 tenant_id,
                 network_id,
                 state: OverlayBlockState::Assigned,
@@ -237,6 +267,7 @@ impl OverlayBlockDao {
         tenant_id: ObjectId,
         network_id: ObjectId,
         slots: u32,
+        seq: u32,
     ) -> DaoResult<Option<OverlayBlock>> {
         let now = DateTime::now();
         let candidates = self
@@ -267,6 +298,12 @@ impl OverlayBlockDao {
                         "network_id": network_id,
                         "released_reason": bson::Bson::Null,
                         "released_at": bson::Bson::Null,
+                        // FR-47 P5b — a reclaimed row is REUSED, so its old
+                        // `seq` belongs to whatever network held it before.
+                        // Restamp it or the block lands at the wrong position
+                        // in its new network's list and shifts every ordinal
+                        // above it.
+                        "seq": seq,
                         "updated_at": now,
                     }},
                 )
