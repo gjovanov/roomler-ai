@@ -565,7 +565,11 @@ mod imp {
                 }
                 Action::Spawn(uid) => {
                     if wait_until.is_none_or(|t| Instant::now() >= t) {
-                        let secret = delegate.mint();
+                        // Opens the per-uid socket AND mints the secret:
+                        // the endpoint must exist before the child can dial it,
+                        // and tying the two together means neither can be
+                        // set up without the other.
+                        let secret = delegate.open_for(uid);
                         match spawn_worker(uid, &exe, &secret) {
                             Ok(child) => {
                                 tracing::info!(uid, "macOS supervisor: spawned GUI worker");
