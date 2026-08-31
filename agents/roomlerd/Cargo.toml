@@ -252,6 +252,10 @@ base64 = { workspace = true }
 
 # Random fallback for machine_id
 rand = { workspace = true }
+# FR-43 P2a — constant-time secret comparison on the delegation attach
+# path. Already in the graph via tunnel-core, so this is a declaration,
+# not a new dependency.
+subtle = { version = "2.6", default-features = false }
 
 # RFC2822 date parsing for the Phase 8 pre-flight clock-skew check
 # (parses the server's HTTP Date: header). Already a workspace dep.

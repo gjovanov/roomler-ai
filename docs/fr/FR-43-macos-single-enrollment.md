@@ -217,6 +217,24 @@ ship until P2 has field evidence, not merely CI.
 5. **"Make the GUI half primary and give it a privileged helper."** Works while someone
    is logged in, and silently drops the mesh + SSH at the login window and on a headless
    reboot — a regression against what the daemon half exists for.
+6. **"Pass the delegation channel as an inherited socketpair fd, so possession of the fd
+   IS the authorisation."** Strictly better than a spawn-time secret — nothing to leak,
+   no one-attached-worker bookkeeping, no new verb reachable by other processes, and the
+   channel dies with the process. It does not survive P1's spawn chain: **`sudo` closes
+   inherited descriptors**. Measured on the MacBook 2026-08-31 rather than read out of
+   sudo's manual —
+
+   | chain | fd 3 in the child |
+   |---|---|
+   | `launchctl asuser 501 <exe>` | **inherited** (`/etc/hosts`, 213 bytes) |
+   | `launchctl asuser 501 sudo -u '#501' <exe>` | **gone** |
+
+   Note the first row: `launchctl asuser` itself preserves fds, so this becomes available
+   the day the chain drops `sudo` and drops privilege **in-process** instead — the
+   machinery already exists (`RunAs::ConsoleUser`, `exec::apply_run_as`, P5). That is a
+   real future simplification, but it would replace the identity mechanism that has only
+   just been field-verified after costing an outage, so it is not a P2 dependency. Worth
+   revisiting at P3, when the daemon owns the spawn unconditionally.
 
 ## Open decisions
 
