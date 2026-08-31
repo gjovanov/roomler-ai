@@ -117,10 +117,11 @@ pub(crate) fn filter_component_releases(
     out
 }
 
-// RETIRED-NAME-ANCHOR(60): `roomler-agent-*` is the published RELEASE-ASSET
-// name, which release-agent.yml freezes deliberately ("a published, immutable
-// surface that every prior release already carries"). The updater's picker
-// keys on it, so the doc and the test below must quote it exactly.
+// RETIRED-NAME-ANCHOR(60): `roomler-agent-*` is what releases cut BEFORE FR-46 (#1051)
+// carry — those files are immutable, so the doc and fixtures below must quote them
+// exactly or they assert against names no release ever had. New releases publish
+// `roomlerd-…`; this ordering never keyed on the daemon prefix at all, only on the
+// `roomler-desktop-` companion one, which is why the rename did not touch it.
 /// Push the desktop-companion artifacts to the END of every release's asset
 /// list, so a client scanning for "the first `.deb` for my arch" cannot pick
 /// one up.

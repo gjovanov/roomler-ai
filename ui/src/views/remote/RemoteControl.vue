@@ -1781,7 +1781,7 @@ async function onFilePicked(ev: Event) {
 // falling back to the machine-global root while no update is in flight).
 //
 // FR-21 P4: this was a hardcoded
-// RETIRED-NAME-ANCHOR: quotes the defective literal this fix removed; the old
+// RETIRED-NAME-RECORD: quotes the defective literal this fix removed; the old
 // spelling is the evidence, not a stale reference. docs/fr/FR-21
 // `C:\ProgramData\roomler\roomler-agent\staging`, which was right only on
 // hosts carrying the pre-rename tree — `machine_global_dir()` resolves the
