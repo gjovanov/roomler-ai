@@ -3257,6 +3257,123 @@ pub fn block_align_slot(after: u32, slots: u32) -> u32 {
     after.div_ceil(slots) * slots
 }
 
+// ---------------------------------------------------------------------------
+// FR-47 P5a — an org's address space as a LIST of blocks
+// ---------------------------------------------------------------------------
+
+/// An organization's overlay address space: an ordered, **append-only** list
+/// of blocks addressed by one continuous ordinal space.
+///
+/// Ordinals run `1..=capacity()` across the whole list — `1..=1022` in block 0,
+/// `1023..=2044` in block 1, and so on. That concatenation is what lets a
+/// network outgrow its first block **without renumbering a single device**:
+/// growth appends a block at the tail and every existing ordinal keeps meaning
+/// exactly the address it already meant.
+///
+/// ⚠️ **Append-only is load-bearing, not a convention.** Every entry in
+/// `OverlayNetwork.free_hosts` is an ordinal, and so is every address a live
+/// node holds. Insert or remove a block anywhere but the tail and every
+/// ordinal above it silently re-points at a different address — which is the
+/// one failure this whole FR exists to prevent. The invariant holds for free
+/// today because blocks are *quarantined*, never removed
+/// ([`OverlayBlockState::Quarantined`]).
+///
+/// A single-block list behaves **identically** to the bare
+/// [`overlay_ip`] / [`overlay_host`] pair it generalizes; that equivalence is
+/// pinned by test, because it is what makes multi-block safe to ship behind a
+/// flag on a live fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockList {
+    /// Blocks in allocation order. Order IS the ordinal layout.
+    cidrs: Vec<String>,
+}
+
+impl BlockList {
+    /// Build from blocks in allocation order (oldest first).
+    ///
+    /// Blocks that cannot lease anything are dropped rather than kept as
+    /// zero-width entries: a `/31` in the middle of the list would contribute
+    /// no ordinals but would still be a position someone could later "fix"
+    /// into a real block, shifting everything above it.
+    pub fn new<I, S>(cidrs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            cidrs: cidrs
+                .into_iter()
+                .map(Into::into)
+                .filter(|c| cidr_max_host(c).is_some_and(|m| m > 0))
+                .collect(),
+        }
+    }
+
+    /// The single-block case — exactly today's behaviour.
+    pub fn single(cidr: &str) -> Self {
+        Self::new([cidr])
+    }
+
+    /// Blocks in allocation order.
+    pub fn cidrs(&self) -> &[String] {
+        &self.cidrs
+    }
+
+    /// Total leasable ordinals across every block.
+    pub fn capacity(&self) -> u32 {
+        self.cidrs
+            .iter()
+            .filter_map(|c| cidr_max_host(c))
+            .fold(0u32, |a, b| a.saturating_add(b))
+    }
+
+    /// The address for a whole-space ordinal, or `None` past the end.
+    pub fn ip_for_ordinal(&self, ordinal: u32) -> Option<String> {
+        if ordinal == 0 {
+            return None; // host 0 is the network address, never leased
+        }
+        let mut remaining = ordinal;
+        for cidr in &self.cidrs {
+            let width = cidr_max_host(cidr)?;
+            if remaining <= width {
+                return overlay_ip(cidr, remaining);
+            }
+            remaining -= width;
+        }
+        None
+    }
+
+    /// The whole-space ordinal an address maps to, or `None` when no block in
+    /// this list contains it.
+    pub fn ordinal_for_ip(&self, ip: &str) -> Option<u32> {
+        let mut base = 0u32;
+        for cidr in &self.cidrs {
+            let width = cidr_max_host(cidr)?;
+            // `overlay_host` returns Some(0) for the network address itself,
+            // which is not a lease — skip it rather than reporting ordinal 0.
+            if let Some(h) = overlay_host(cidr, ip)
+                && h > 0
+            {
+                return Some(base + h);
+            }
+            base += width;
+        }
+        None
+    }
+
+    /// The block that actually contains `ip`.
+    ///
+    /// This is what a netmap sends a node as its own `cidr`: an agent derives
+    /// its TUN netmask and its subnet-router NAT scope from that string, and
+    /// both are only correct for the block the node's OWN address lives in.
+    pub fn cidr_for_ip(&self, ip: &str) -> Option<&str> {
+        self.cidrs
+            .iter()
+            .find(|c| overlay_host(c, ip).is_some())
+            .map(|c| c.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3885,5 +4002,91 @@ mod tests {
         }))
         .expect("unknown keys are ignored, not fatal");
         assert_eq!(pushed.ssh_enabled, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod block_list_tests {
+    use super::*;
+
+    /// THE compatibility property: a one-block list is byte-for-byte the
+    /// behaviour of the bare `overlay_ip`/`overlay_host` pair. Multi-block
+    /// ships behind a flag on a live fleet, so "off" has to be provably the
+    /// old code path rather than a re-implementation that agrees most of the
+    /// time.
+    #[test]
+    fn a_single_block_list_is_exactly_the_old_pair() {
+        let cidr = "100.65.4.0/22";
+        let bl = BlockList::single(cidr);
+        assert_eq!(bl.capacity(), cidr_max_host(cidr).unwrap());
+        for h in [1u32, 2, 7, 255, 256, 1021, 1022] {
+            let want = overlay_ip(cidr, h).unwrap();
+            assert_eq!(bl.ip_for_ordinal(h).as_deref(), Some(want.as_str()));
+            assert_eq!(bl.ordinal_for_ip(&want), Some(h));
+        }
+        // Past the end in both directions.
+        assert_eq!(bl.ip_for_ordinal(1023), None);
+        assert_eq!(bl.ip_for_ordinal(0), None);
+        assert_eq!(bl.ordinal_for_ip("100.66.0.1"), None);
+    }
+
+    /// Ordinals concatenate across blocks, and the round-trip holds over the
+    /// seam — which is the only place it can plausibly break.
+    #[test]
+    fn ordinals_concatenate_across_blocks_and_round_trip() {
+        let bl = BlockList::new(["100.65.4.0/22", "100.65.8.0/22", "100.66.0.0/20"]);
+        assert_eq!(bl.capacity(), 1022 + 1022 + 4094);
+
+        // Last of block 0, first of block 1 — the seam.
+        assert_eq!(bl.ip_for_ordinal(1022).as_deref(), Some("100.65.7.254"));
+        assert_eq!(bl.ip_for_ordinal(1023).as_deref(), Some("100.65.8.1"));
+        // Last of block 1, first of block 2 — the second seam.
+        assert_eq!(bl.ip_for_ordinal(2044).as_deref(), Some("100.65.11.254"));
+        assert_eq!(bl.ip_for_ordinal(2045).as_deref(), Some("100.66.0.1"));
+
+        for o in [1u32, 1022, 1023, 2044, 2045, 6138] {
+            let ip = bl.ip_for_ordinal(o).expect("in range");
+            assert_eq!(bl.ordinal_for_ip(&ip), Some(o), "round trip at ordinal {o}");
+        }
+        assert_eq!(bl.ip_for_ordinal(bl.capacity() + 1), None);
+    }
+
+    /// Appending a block must not move a single existing ordinal. This is the
+    /// property that makes growth non-disruptive, and it is the whole reason
+    /// the list is append-only.
+    #[test]
+    fn appending_a_block_moves_no_existing_ordinal() {
+        let before = BlockList::new(["100.65.4.0/22"]);
+        let after = BlockList::new(["100.65.4.0/22", "100.65.8.0/22"]);
+        for o in 1..=before.capacity() {
+            assert_eq!(
+                before.ip_for_ordinal(o),
+                after.ip_for_ordinal(o),
+                "ordinal {o} moved when a block was appended"
+            );
+        }
+        assert!(before.ip_for_ordinal(1023).is_none());
+        assert!(after.ip_for_ordinal(1023).is_some());
+    }
+
+    /// A node is told the block its OWN address lives in — an agent derives
+    /// its TUN netmask and NAT scope from that string, and the first block
+    /// would be wrong for a node living in the second.
+    #[test]
+    fn cidr_for_ip_names_the_block_that_contains_the_address() {
+        let bl = BlockList::new(["100.65.4.0/22", "100.65.8.0/22"]);
+        assert_eq!(bl.cidr_for_ip("100.65.4.2"), Some("100.65.4.0/22"));
+        assert_eq!(bl.cidr_for_ip("100.65.8.2"), Some("100.65.8.0/22"));
+        assert_eq!(bl.cidr_for_ip("100.70.0.1"), None);
+    }
+
+    /// A block that can lease nothing is dropped, so it can never become a
+    /// position that later shifts every ordinal above it.
+    #[test]
+    fn unleasable_blocks_are_dropped_not_kept_as_zero_width() {
+        let bl = BlockList::new(["100.65.4.0/22", "100.65.8.0/31", "100.65.12.0/22"]);
+        assert_eq!(bl.cidrs().len(), 2);
+        assert_eq!(bl.capacity(), 2044);
+        assert_eq!(bl.ip_for_ordinal(1023).as_deref(), Some("100.65.12.1"));
     }
 }
