@@ -31,12 +31,16 @@
 //! carries none of that hazard, which is why detection can land ahead of the
 //! decision about how to reach PipeWire.
 
+/// FR-45 P3c-ii — the sixth `ScreenCapture` backend.
+pub mod backend;
 /// FR-45 P3a — reaching `libpipewire` through `dlopen`, never a link.
 pub mod pipewire;
 /// FR-45 P3b — SPA POD serialisation, so a format can be negotiated.
 pub mod pod;
 /// FR-45 P2b — the ScreenCast handshake itself, run inside the session.
 pub mod screencast;
+/// FR-45 P3c-ii — the frame wire format between helper and daemon.
+pub mod wire;
 
 use std::fmt;
 
@@ -290,7 +294,11 @@ pub mod helper {
     /// The human-readable line goes to **stderr**, which the parent inherits,
     /// so the daemon's log carries the child's own account of what it saw next
     /// to the parent's verdict. Same reasoning as the caps probe.
-    pub fn run(screencast: bool) {
+    pub fn run(screencast: bool, stream: bool) {
+        if stream {
+            run_stream();
+            return;
+        }
         if screencast {
             run_screencast();
             return;
@@ -318,6 +326,113 @@ pub mod helper {
     /// is a stronger guarantee than a caller that holds it and is careful, and
     /// it is what makes "the daemon never sees the token" structurally true
     /// rather than merely intended.
+    /// What the child announces before it starts writing pixels.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct StreamStarted {
+        pub width: u32,
+        pub height: u32,
+        pub video_format: u32,
+    }
+
+    /// Marks the streaming handshake line. A THIRD marker, distinct from the
+    /// other two, so a parent expecting a stream can never be handed a
+    /// detection result by a helper built from another revision.
+    const STREAM_MARKER: &str = "ROOMLER_PORTAL_STREAM:";
+
+    /// P3c-ii, child side — open a session, then write frames on stdout until
+    /// the parent goes away.
+    ///
+    /// ⚠️ **stdout is binary after the handshake line.** Everything
+    /// diagnostic goes to stderr, which the parent inherits: a stray
+    /// `println!` here does not add a log line, it corrupts a frame.
+    fn run_stream() {
+        eprintln!("portal-helper: opening a ScreenCast session for streaming");
+        let session = match super::screencast::open() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("portal-helper: {e}");
+                std::process::exit(1);
+            }
+        };
+        let (Some(fd), Some(first)) = (session.pipewire_fd, session.report.streams.first()) else {
+            eprintln!("portal-helper: the portal gave no stream to attach to");
+            std::process::exit(1);
+        };
+        let node_id = first.node_id;
+
+        let handle = match super::pipewire::stream(fd, node_id, DEFAULT_MAX_FPS) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("portal-helper: {e}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "portal-helper: streaming {}x{} (spa format {})",
+            handle.format.width, handle.format.height, handle.format.video_format
+        );
+
+        let started = StreamStarted {
+            width: handle.format.width,
+            height: handle.format.height,
+            video_format: handle.format.video_format,
+        };
+        match serde_json::to_string(&started) {
+            Ok(j) => println!("{STREAM_MARKER}{j}"),
+            Err(e) => {
+                eprintln!("portal-helper: could not encode the handshake: {e}");
+                std::process::exit(1);
+            }
+        }
+        use std::io::Write;
+        if std::io::stdout().flush().is_err() {
+            std::process::exit(1);
+        }
+
+        // From here on stdout carries nothing but frames.
+        let mut out = std::io::stdout().lock();
+        while let Ok((h, bytes)) = handle.frames.recv() {
+            // A write failure means the parent closed the pipe — the normal
+            // way this process ends. Exit quietly rather than logging a
+            // shutdown as an error.
+            if out.write_all(&h.encode()).is_err() || out.write_all(&bytes).is_err() {
+                break;
+            }
+            if out.flush().is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Parent side — spawn the helper for streaming and hand back the child.
+    ///
+    /// Unlike [`spawn_in_session`], this does NOT wait: the child lives as
+    /// long as the capture does.
+    pub fn spawn_streaming(_target_fps: u32) -> anyhow::Result<std::process::Child> {
+        spawn_child(&["--stream"]).map_err(|e| match e {
+            SpawnError::NoSession => {
+                anyhow::anyhow!("nobody is at this machine's screen — the portal is attended-only")
+            }
+            SpawnError::Other(why) => anyhow::anyhow!(why),
+        })
+    }
+
+    /// Read the streaming handshake line, skipping anything the child wrote
+    /// before it.
+    pub fn read_stream_handshake(r: &mut impl std::io::BufRead) -> anyhow::Result<StreamStarted> {
+        let mut line = String::new();
+        for _ in 0..64 {
+            line.clear();
+            if r.read_line(&mut line)? == 0 {
+                anyhow::bail!("the portal helper exited before announcing a stream");
+            }
+            if let Some(json) = line.trim().strip_prefix(STREAM_MARKER) {
+                return Ok(serde_json::from_str(json)?);
+            }
+        }
+        anyhow::bail!("the portal helper never announced a stream")
+    }
+
     fn run_screencast() {
         eprintln!("portal-helper: opening a ScreenCast session");
         let outcome = super::screencast::open().map(|session| {
@@ -386,10 +501,12 @@ pub mod helper {
     /// `timeout` is per-mode on purpose: a detection is a few D-Bus round
     /// trips, while opening a ScreenCast session can legitimately block for as
     /// long as a human takes to read a consent dialog.
-    pub(crate) fn spawn_in_session(
-        extra_args: &[&str],
-        timeout: std::time::Duration,
-    ) -> Result<String, SpawnError> {
+    /// Build and start the helper as the console user. Shared by the
+    /// collect-and-wait path and the streaming one, so the session lookup, the
+    /// session environment and the privilege drop exist exactly once — the
+    /// three things that must not drift between two ways of running the same
+    /// child.
+    fn spawn_child(extra_args: &[&str]) -> Result<std::process::Child, SpawnError> {
         let sess = match crate::companion::graphical_session() {
             Ok(s) => s,
             Err(e) => {
@@ -415,6 +532,9 @@ pub mod helper {
             )
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
+            // Inherited on purpose: the child's own account of what it saw
+            // belongs in the daemon log, and stdout is reserved for the
+            // marked line (or, when streaming, for pixels).
             .stderr(std::process::Stdio::inherit());
         if let Some(d) = &sess.display {
             cmd.env("DISPLAY", d);
@@ -431,10 +551,15 @@ pub mod helper {
                 "cannot run the portal helper as the session's owner: {e}"
             )));
         }
+        cmd.spawn()
+            .map_err(|e| SpawnError::Other(format!("spawning the portal helper: {e}")))
+    }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| SpawnError::Other(format!("spawning the portal helper: {e}")))?;
+    pub(crate) fn spawn_in_session(
+        extra_args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<String, SpawnError> {
+        let mut child = spawn_child(extra_args)?;
 
         // Drain stdout on another thread while waiting: a child that filled
         // the pipe would otherwise deadlock against our own wait.
