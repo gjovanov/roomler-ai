@@ -616,6 +616,44 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
         }
     }
 
+    // FR-45 P3c-ii — the portal, tried AFTER DRM and BEFORE X11.
+    //
+    // ⚠️ OPT-IN, like DRM, and for a sharper reason: this path is ATTENDED
+    // ONLY. It needs a logged-in user, and the first use shows that user a
+    // consent dialog. Defaulting it on would mean an unattended host silently
+    // waiting on a dialog nobody will ever answer — a hang dressed up as a
+    // feature. A host that wants it sets `ROOMLERD_PORTAL_CAPTURE=1`.
+    //
+    // Ordering: DRM sees a locked screen and a greeter and needs no consent,
+    // so it stays first wherever there is a CRTC. The portal is what serves
+    // the hosts DRM cannot reach at all.
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    {
+        if tunnel_core::env::flag("PORTAL_CAPTURE", false) {
+            match portal::backend::PortalCapture::open(_target_fps) {
+                Ok(c) => {
+                    tracing::info!(
+                        width = c.width(),
+                        height = c.height(),
+                        "capture: backend=portal (ROOMLERD_PORTAL_CAPTURE=1, xdg-desktop-portal \
+                         ScreenCast — ATTENDED)"
+                    );
+                    return Box::new(c);
+                }
+                Err(e) => {
+                    // Loud, like DRM's: the operator asked for this explicitly,
+                    // so falling through silently would look like the feature
+                    // simply not working.
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "ROOMLERD_PORTAL_CAPTURE=1 but portal capture could not open — falling \
+                         through to the standard cascade"
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "scrap-capture")]
     {
         match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
