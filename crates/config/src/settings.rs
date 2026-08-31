@@ -36,11 +36,21 @@ pub struct Settings {
 /// the same address on a host enrolled in both. Blocks carve each tenant a
 /// disjoint slice so one daemon can carry N orgs on one interface.
 ///
-/// The rollout is deliberately staged: `blocks_enabled=false` (the shipped
-/// default) is provably the pre-P2b behaviour, and turning it on affects only
-/// networks created AFTER the flip. Migrating an existing tenant is always an
-/// explicit admin action (`POST …/overlay-block/renumber`), because it has to
-/// cycle every node's WS to re-bind their addresses.
+/// FR-47 — carving is ON by default. It shipped `false` for a staged rollout
+/// and then stayed off, which made isolation opt-in: measured on prod
+/// 2026-08-31, two of four overlay networks were still on the shared `/10`
+/// and **held overlapping addresses**, because nothing carves a network the
+/// operator does not explicitly ask for. A default that has to be remembered
+/// is not a default.
+///
+/// Flipping it affects only networks created AFTER the flip — `ensure_block`'s
+/// virginity guard refuses to re-base a network that has already leased an
+/// address. Migrating an existing tenant stays an explicit admin action
+/// (`POST …/overlay-block/renumber`), because it has to cycle every node's WS
+/// to re-bind their addresses.
+///
+/// `blocks_enabled=false` remains the kill switch, and is still exactly the
+/// pre-P2b behaviour.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OverlaySettings {
     /// Carve a fresh block for every NEWLY created tenant overlay network.
@@ -62,7 +72,7 @@ pub struct OverlaySettings {
 impl Default for OverlaySettings {
     fn default() -> Self {
         Self {
-            blocks_enabled: false,
+            blocks_enabled: true,
             block_prefix: 22,
             // rc.301 shipped the P2a forward-compat set (prefix-aware
             // keep-set, bounded IPAM, remove-before-upsert deltas, gated DNS).
@@ -648,7 +658,7 @@ impl Settings {
             .set_default("stats.enabled", true)?
             .set_default("stats.platform_admins", None::<String>)?
             .set_default("stats.geoip_mmdb", None::<String>)?
-            .set_default("overlay.blocks_enabled", false)?
+            .set_default("overlay.blocks_enabled", true)?
             .set_default("overlay.block_prefix", 22)?
             .set_default("overlay.block_version_floor", "0.3.0-rc.301")?
             .set_default("oauth.base_url", "http://localhost:5001")?

@@ -1147,7 +1147,10 @@ async fn seed_two_nodes(ipam: &Ipam) {
 /// zero writes — no block consumed, no address moved, no cursor touched.
 #[tokio::test]
 async fn renumber_dry_run_plans_without_writing() {
-    let app = TestApp::spawn().await;
+    // FR-47 — carving is ON by default now, so this test pins it OFF. It is
+    // specifically about migrating a network that STARTED on the shared legacy
+    // range, which a carved network never does.
+    let app = TestApp::spawn_with_settings(|s| s.overlay.blocks_enabled = false).await;
     let seeded = app.seed_tenant("ovblk1").await;
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
     seed_two_nodes(&ipam).await;
@@ -1378,7 +1381,9 @@ async fn blocks_are_disjoint_across_tenants() {
 /// which black-holes that host's mesh. `force` is the documented override.
 #[tokio::test]
 async fn renumber_refuses_a_fleet_below_the_version_floor() {
-    let app = TestApp::spawn().await;
+    // FR-47 — carving pinned OFF: the fleet-floor refusal is about migrating a
+    // network off the shared legacy range (see the dry-run test above).
+    let app = TestApp::spawn_with_settings(|s| s.overlay.blocks_enabled = false).await;
     let seeded = app.seed_tenant("ovblkfloor").await;
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
 
@@ -1561,4 +1566,39 @@ async fn carving_claims_a_block_for_new_networks_only() {
         .unwrap();
     assert_eq!(legacy_status["cidr"], OverlayNetwork::DEFAULT_CIDR);
     assert_eq!(legacy_status["legacy"], true);
+}
+
+/// FR-47 — the SHIPPED default carves. `spawn()` takes no settings override,
+/// so this asserts what a real deployment does out of the box.
+///
+/// It is a separate test from `carving_claims_a_block_for_new_networks_only`
+/// on purpose: that one passes `blocks_enabled = true` explicitly and so would
+/// keep passing if the default silently reverted. Carving was default-OFF for
+/// its whole life, and the cost was measured on production — two orgs holding
+/// overlapping addresses on the shared `/10`, because isolation was opt-in and
+/// nobody opted in. A default nobody asserts is a default that can drift back.
+#[tokio::test]
+async fn the_shipped_default_carves_a_block_for_a_new_org() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovcarve-default").await;
+
+    let status: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/overlay-block", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status["legacy"], false,
+        "a brand-new org must not land on the shared 100.64.0.0/10"
+    );
+    assert_eq!(status["carving_enabled"], true);
+    assert_eq!(status["cidr"], "100.65.0.0/22");
+    assert_eq!(status["capacity"], 1022);
 }

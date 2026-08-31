@@ -141,9 +141,22 @@ impl OverlayNetworkDao {
                     // on the legacy shared range, which is exactly where it
                     // was before P2b. Loud, because a full registry needs an
                     // operator.
+                    //
+                    // FR-47 — the message names the CONSEQUENCE, not just the
+                    // failure. Landing on the shared `/10` is not a degraded
+                    // mode this tenant absorbs privately: every tenant that
+                    // takes this branch is seeded at `.1`, so they hold each
+                    // OTHER's addresses, and a device enrolled in two of them
+                    // is refused outright. That is the exact collision class
+                    // blocks exist to prevent, so an operator reading the log
+                    // has to see it stated rather than inferred from "carve
+                    // failed".
                     tracing::error!(
                         tenant_id = %net.tenant_id, %network_id, %e,
-                        "overlay blocks: carve failed; tenant stays on the shared /10"
+                        alert = "overlay_block_carve_failed",
+                        "overlay blocks: carve FAILED; tenant falls back to the shared \
+                         100.64.0.0/10 and will now OVERLAP every other tenant that did \
+                         the same — allocate registry space or a wider prefix"
                     );
                     return Ok(net);
                 }
