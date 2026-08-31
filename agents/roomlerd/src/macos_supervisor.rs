@@ -224,7 +224,7 @@ mod imp {
     /// resolves the user's own config — the same enrollment the LaunchAgent
     /// would have used. P1 changes who launches the worker, nothing about its
     /// identity.
-    fn spawn_worker(uid: u32, exe: &std::path::Path) -> std::io::Result<Child> {
+    fn spawn_worker(uid: u32, exe: &std::path::Path, secret: &str) -> std::io::Result<Child> {
         Command::new("launchctl")
             .arg("asuser")
             .arg(uid.to_string())
@@ -234,6 +234,12 @@ mod imp {
             .arg(exe)
             .arg("run")
             .env(SUPERVISED_MARKER, "1")
+            // FR-43 P2a — the worker's authorisation to attach the delegation
+            // channel. Per spawn, so a worker we have released cannot come
+            // back; environment rather than a file because a file would have to
+            // survive every exit path including SIGKILL, and a stale one is a
+            // standing credential.
+            .env(crate::delegate::ATTACH_SECRET_ENV, secret)
             // Own process group, so `stop_worker` can take the whole
             // launchctl -> sudo -> agent chain down instead of orphaning it.
             .process_group(0)
@@ -331,7 +337,17 @@ mod imp {
     /// [`spawn_worker`] therefore puts the chain in its own process group
     /// (`process_group(0)`), and this kills the group: SIGTERM, a short grace
     /// period, then SIGKILL for whatever is left.
-    fn stop_worker(uid: u32, mut child: Child, why: &str) {
+    fn stop_worker(
+        uid: u32,
+        mut child: Child,
+        why: &str,
+        delegate: &crate::delegate::DelegateHost,
+    ) {
+        // FR-43 P2a — revoke FIRST, before the process is even signalled: a
+        // worker being torn down must not be able to (re)attach on its way out,
+        // and doing it here rather than at the four call sites is what makes
+        // "someone forgot one" unrepresentable.
+        delegate.revoke();
         let pgid = child.id() as i32;
         tracing::info!(
             uid,
@@ -363,7 +379,11 @@ mod imp {
     /// caller: a supervisor that can take the daemon down with it would trade
     /// a missing remote-desktop half for a missing mesh — a worse failure
     /// than the one it exists to fix.
-    pub async fn run(enabled: bool, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    pub async fn run(
+        enabled: bool,
+        delegate: crate::delegate::DelegateHost,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         let is_root = unsafe { libc::geteuid() } == 0;
         if !enabled || !is_root {
@@ -469,7 +489,7 @@ mod imp {
                     // kickstart to; forget any debt from the last session.
                     kickstart_debt = 0;
                     if let Some((uid, child, _)) = worker.take() {
-                        stop_worker(uid, child, "GUI session ended");
+                        stop_worker(uid, child, "GUI session ended", &delegate);
                     }
                 }
                 Action::LaunchdOwns => {
@@ -505,7 +525,7 @@ mod imp {
                 Action::HandBack(uid) => {
                     fast_exits = 0;
                     if let Some((held, child, _)) = worker.take() {
-                        stop_worker(held, child, "launchd took ownership");
+                        stop_worker(held, child, "launchd took ownership", &delegate);
                     }
                     kickstart_debt = if kickstart_launch_agent(uid) {
                         0
@@ -521,13 +541,14 @@ mod imp {
                             new_uid = uid,
                             "macOS supervisor: console user changed"
                         );
-                        stop_worker(old, child, "console user changed");
+                        stop_worker(old, child, "console user changed", &delegate);
                     }
                     // Spawn on the next tick, through the normal Spawn arm.
                 }
                 Action::Spawn(uid) => {
                     if wait_until.is_none_or(|t| Instant::now() >= t) {
-                        match spawn_worker(uid, &exe) {
+                        let secret = delegate.mint();
+                        match spawn_worker(uid, &exe, &secret) {
                             Ok(child) => {
                                 tracing::info!(uid, "macOS supervisor: spawned GUI worker");
                                 worker = Some((uid, child, Instant::now()));
@@ -553,7 +574,7 @@ mod imp {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         if let Some((uid, child, _)) = worker.take() {
-                            stop_worker(uid, child, "daemon shutting down");
+                            stop_worker(uid, child, "daemon shutting down", &delegate);
                         }
                         return;
                     }
