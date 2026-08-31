@@ -161,13 +161,8 @@ const DAEMON_FILE_NAME: &str = "roomlerd.exe";
 #[cfg(not(target_os = "windows"))]
 const DAEMON_FILE_NAME: &str = "roomlerd";
 
-// RETIRED-NAME-ANCHOR(8): the macOS bundle executable is FROZEN (D5) — it keys the host
-// TCC grants.
-/// The macOS bundle's executable. Named `roomler-agent`, not `roomlerd`:
-/// `CFBundleExecutable` conventionally matches the bundle, CI asserts the two
-/// plists point here, and renaming it would invalidate the TCC grants keyed to
-/// this binary.
+/// The macOS bundle's executable. `CFBundleExecutable` matches the bundle name,
+/// and CI asserts the launchd plists point here — FR-46 P5b moved all three
+/// together, which is the only way a bundle rename is safe.
 #[cfg(target_os = "macos")]
-// RETIRED-NAME-ANCHOR(2): the macOS .app bundle name is FROZEN (FR-21 D5) —
-// it keys the host's Screen Recording and Accessibility TCC grants.
-const MACOS_BUNDLE_DAEMON: &str = "/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent";
+const MACOS_BUNDLE_DAEMON: &str = "/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd";
