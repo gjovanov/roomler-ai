@@ -1,4 +1,4 @@
-# FR-48 — roomlerd leaks WebRTC-ICE UDP sockets on the relay node
+# FR-48 — roomlerd leaks unconnected ephemeral UDP sockets on the relay node
 
 **Issue:** gjovanov/roomler-ai#1086 · **Surfaced by:** FR-19 box 886 relay-node socket census ([#805](https://github.com/gjovanov/roomler-ai/issues/805#issuecomment-5484369356)) · **Status:** proposed (investigation)
 
@@ -15,7 +15,7 @@ Hourly `ss -H -uanp | grep -c roomlerd`, 24 samples over 22 h:
 
 ## Design / investigation
 The 2026-08-22 fix added `close()` + a `Drop` net to `tunnel_core::transport::webrtc_dc::TunnelPeer` (mirroring `AgentPeer`) because *"an `RTCPeerConnection`'s UDP sockets are owned by tasks the ICE agent spawned, not by the struct, so an `Arc` drop leaves every one live."* This leak is the **same class on a different path** — one that creates an `RTCPeerConnection` / gathers ICE and is dropped without `close()`. Paths to audit (P1):
-- **carrier direct-upgrade probes** — the "relentless re-upgrade" ladder re-attempts direct for DERP-locked peers periodically; a socket leaked per attempt would give exactly the observed ~+3/h, org-independent. **Prime suspect.**
+- ~~carrier direct-upgrade / `public-dial` probes~~ — **RULED OUT (P1, 2026-09-01, [#1086 comment](https://github.com/gjovanov/roomler-ai/issues/1086#issuecomment-5485353447))**: `overlay/carrier_plane.rs` binds these **once per engine** behind `bind_gate`, stores them in `st.binds`, and handles the one re-bind race cleanly (aborts the new tasks, drops the new socket `Arc`s). Not a per-attempt leak. Remaining suspects: WebRTC-ICE (`peer.rs`/`webrtc_dc.rs` error paths), a QUIC/`quinn` endpoint, an STUN/srflx-refresh socket. ⚠️ the "WebRTC-ICE" attribution is a *signature* match, NOT confirmed — a headless relay does little WebRTC.
 - org-relay reachability probes; STUN/srflx refresh; the caps-probe child;
 - any `AgentPeer`/`TunnelPeer` construction on an **error path** that returns before `close()` (the 2026-08-22 fix noted `run_tunnel_session` has many `?` early returns).
 
