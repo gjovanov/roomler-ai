@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** design · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a shipped, field-verified · **Owner:** agent / capture
 
 ## Goal
 
@@ -54,7 +54,7 @@ on a machine with no scanout. The backend priority stays
 | Phase | What | Kill switch |
 |---|---|---|
 | **P1** ✅ | Detect whether `org.freedesktop.portal.ScreenCast` is actually exposed, and report WHY not, in `capture-smoke` (`capture/portal.rs`). Uses zbus, which is pure Rust and adds no system `.so`. | n/a (read-only) |
-| **P2a** | `portal-helper` hidden subcommand spawned through the EXISTING `companion.rs` session mechanism (systemd-run --uid + session bus). Prove it by running P1 `detect()` from the daemon and getting `available`. | `ROOMLERD_PORTAL_CAPTURE=0` |
+| **P2a** ✅ | `portal-helper` hidden subcommand, spawned as the console user with that session's bus. Proven by running `detect()` from the daemon and getting `available` where it previously could only say `no-session-bus`. ⚠️ Built with the verified **privilege drop**, not `systemd-run` as planned — see below. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P2b** | The helper opens the ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P3** | PipeWire consumer: attach to the node, negotiate a format, deliver `Frame`s through the existing `ScreenCapture` trait as a **sixth backend**. | same |
 | **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
@@ -191,10 +191,24 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 
 ### Phases as they now stand
 
-- **P2a** — `portal-helper` hidden subcommand, spawned through the
-  `companion.rs` session mechanism. Prove it by having it run P1's `detect()`
-  *from the daemon* and return `available`, which today only succeeds when the
-  environment is built by hand.
+- **P2a** ✅ **shipped and field-verified** (#1054) — `portal-helper` hidden
+  subcommand; the daemon spawns itself as the console user pointed at that
+  session's bus, the child reports one `ROOMLER_PORTAL_JSON:{…}` line, and
+  `detect_in_session()` parses it back.
+
+  ⚠️ **Departed from the plan above, deliberately.** #1050 said `systemd-run
+  --uid`, mirroring the consent companion. It is spawned as a **direct child
+  with the verified privilege drop** instead, for two reasons P2b needs: a
+  direct child can be handed the PipeWire fd over `SCM_RIGHTS` on a
+  socketpair, and it dies with the daemon that owns it. It also drops
+  privilege without depending on systemd being the init system. Not
+  `CommandExt::uid()` — that leaves the child in root's supplementary groups,
+  a silent retention bug rather than a visible failure.
+
+  🔑 **The near-miss this phase existed to avoid is still live for P3**: a
+  helper *subcommand* does not by itself solve the dependency problem, because
+  it is the same ELF and so the same `DT_NEEDED`. The subcommand bought the
+  session context; only `dlopen` buys the linkage.
 - **P2b** — the helper opens the ScreenCast session and passes the PipeWire fd
   back over `SCM_RIGHTS` (the FR-36 P3 shape, which was designed and never
   built).
@@ -217,7 +231,7 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 - [ ] Backend order holds: a host with a real CRTC still picks **DRM**, and the
       portal is chosen only when DRM finds none
 - [ ] X11/Windows/macOS unchanged; the kill switch restores the current cascade
-- [ ] Field-verified with the **before** state recorded beside the after
+- [x] Field-verified with the **before** state recorded beside the after — done for P2a (`no-session-bus` → `available`, with an in-session control); each later phase repeats it
 - [ ] The spec and the UI both say **attended-only** — no greeter, no locked
       screen
 
@@ -284,3 +298,6 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-08-31 | P1, Asahi **as root** | `portal=no-session-bus`. ⚠️ **This is the architecture, not a test artefact** — the daemon is root, the portal is per-user-session, so P2/P3 need a session-resident component before any PipeWire code |
 | 2026-08-31 | P1, Asahi **inside the GNOME Wayland session** | `portal=no-screencast`, **independently confirmed with `busctl`** (lists Account, Camera, FileChooser, Notification … but neither ScreenCast nor RemoteDesktop) despite `xdg-desktop-portal-gnome` being installed. ⛔ **No fleet host currently exposes the interface P2 would call.** FR-36 blamed an X11 session for this; it reproduces under Wayland, so that explanation was wrong |
 | 2026-08-31 | **P2 blocker diagnosed and cleared** | Not the session type (FR-36's guess) and not a missing package. `xdg-desktop-portal-gnome` was `inactive (dead)` — a `static` D-Bus-activated unit nothing had triggered — while mutter was already exposing its own ScreenCast/RemoteDesktop APIs. ⚠️ Starting the backend alone did NOT help: the frontend caches its backend selection at startup and had to be restarted after it. Result: `portal=available (screencast v5, remote_desktop=true)` — P2 unblocked, P4 viable, and the detector's `Available` branch exercised for the first time |
+| 2026-08-31 | **P2a, Asahi — the loginctl call underneath it never worked** | `loginctl list-sessions --no-legend --no-pager -o value -p Id` — what `graphical_session()` ran — **exits 1 with empty stdout**, measured on systemd **255** (Ubuntu 24.04, two hosts) and **257** (Fedora 42): those are `show-*` options and `list-sessions` rejects them. The function read that as an empty session list, i.e. “nobody is at this machine's screen”, on every Linux host, always. ⚠️ The column layout also differs between the two releases (257 inserts `LEADER` and `CLASS`), so only column one is safe to parse; both real samples are now in a test |
+| 2026-08-31 | **P2a FIELD-VERIFIED — 0.4.37, Asahi, GNOME Wayland** | Three runs, one binary. **CONTROL** as `m1` inside the session: `available (screencast v5, remote_desktop=true)`. **BEFORE** as root, plain `detect()` (the P1 behaviour): `no-session-bus`. **AFTER** as root through `detect_in_session()`: `available (screencast v5, remote_desktop=true)` — matching the control exactly. Root's environment was confirmed to carry none of `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` / `DISPLAY` / `WAYLAND_DISPLAY`, i.e. the daemon's own situation. 🔑 The AFTER trace shows **both** halves: the child's own line on inherited stderr, then the parent's parsed verdict |
+| 2026-08-31 | P2a — what the loginctl fix could **not** be shown to fix here | The claim that the broken lookup also stopped FR-27's consent companion is **reasoned, not observed on this host**: `roomler-desktop` is not installed on Asahi, so `ensure_running_inner` returns `Unsupported` one step BEFORE reaching `graphical_session()` (the daemon log carries 15 “prompts go to the desktop companion” lines and no session-lookup failure). What IS measured: the old command exits 1 on both systemd versions, and P2a — which calls the same function — works only with the fix |
