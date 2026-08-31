@@ -171,7 +171,62 @@ WS serves it exactly as today. ⚠️ This makes P2 genuinely reversible and P3 
 once the second enrollment is gone, the fallback is gone with it. P3 must therefore not
 ship until P2 has field evidence, not merely CI.
 
-### Open questions for implementation
+### P2b-2 design — the worker serves a delegated session
+
+Measured against master `4fa59b9c`, and the measurements are what make it small.
+
+### The seam is the SENDER, not the message
+
+The instinct is to route each reply as it is produced. That is not needed, and
+the numbers say why:
+
+| in the five rc arms | count |
+|---|---|
+| direct `send_msg(ws, …)` | **3**, all in the `SdpOffer` arm |
+| `outbound_tx` uses | **1** — `AgentPeer::new(…, outbound_tx.clone(), …)` |
+
+Everything an rc session later emits — ICE, `SessionStats`, its own
+`Terminate` — leaves through the sender the **peer was constructed with**. So a
+delegated session needs one decision, taken once, at peer construction: hand it
+a sender whose drain wraps each `ClientMsg` in a `DelegateFrame::FromWorker`
+instead of the worker's own WS queue. No per-message routing, and nothing
+downstream needs to know it is delegated.
+
+The three direct sends are the only remainder, and they take a small
+`ReplySink` (`Ws(&mut …)` | `Delegate(&…)`) so the daemon path stays
+byte-for-byte what it is today.
+
+### Where the worker runs it
+
+In the loop it already has. The worker keeps its own enrollment and WS through
+P2 (that is the fallback), so `connect_once` simply gains the delegation
+channel as another `select!` source; delegated messages go through the SAME
+`handle_server_msg` with the SAME session state, differing only in the sender
+their peer was built with. Session ids come from the daemon's row and cannot
+collide with the worker's own.
+
+### It is field-falsifiable, which P2b-1 was not
+
+`AgentCaps.permissions` — including `no-gui-session` — is **reporting only**;
+nothing server-side gates session creation on it (`models.rs:112-138` is
+explicit that readers should treat it as "not a capture target"). So a
+controller can open a session against the DAEMON's row today, and the test is
+binary: pixels appear, or they do not.
+
+### Order of work
+
+1. `ReplySink` + the three `SdpOffer` sends (pure refactor, no behaviour
+   change on the daemon path).
+2. The delegated sender at `AgentPeer::new`.
+3. The worker's `select!` arm.
+
+⚠️ Step 1 touches the shared session-setup path, so it breaks remote desktop on
+**every** platform if it is wrong — not just macOS. The integration lane
+(`agent_e2e_tests` drives a full `rc:*` round-trip in-process) is the check that
+actually covers it, and it does NOT run on a PR unless `crates/tests/**` is
+touched: dispatch it on the branch before merging.
+
+## Open questions for implementation
 
 - **Session ownership on worker death.** If the worker dies mid-session the daemon holds a
   live server-side session with nothing behind it. It must `Terminate` with a reason the
