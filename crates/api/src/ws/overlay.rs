@@ -37,7 +37,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_remote_control::models::{OverlayAclMode, OverlayPolicy};
 use roomler_ai_remote_control::{
-    models::{AgentStatus, NodeRef, OverlayNode, overlay_ip},
+    models::{AgentStatus, NodeRef, OverlayNode},
     signaling::{
         ClientMsg, IceServer, NetmapPeer, OverlayJoinRefusal, OverlayNetworkInfo,
         RelayStrategyWire, ServerMsg,
@@ -374,17 +374,34 @@ async fn handle_overlay_join(
             // locking the device out of the overlay for the daemon's lifetime;
             // now the bad entry is already consumed off the pool and the next
             // allocate gets a clean one.
+            // FR-47 P5c — the network's address space. One block for every
+            // network that has not grown, which is byte-for-byte the old
+            // `network.max_host()` / `overlay_ip(network.cidr, …)` pair.
+            let blocks = state.overlay_networks.block_list(&network).await;
             const CREATE_ATTEMPTS: usize = 3;
             let mut created = None;
             for attempt in 1..=CREATE_ATTEMPTS {
                 // Multi-org P2a: the allocation is bounded by the network's
                 // OWN block ceiling — exhaustion refuses the join loudly
                 // instead of leasing into a neighbor tenant's block.
-                let host = match state
-                    .overlay_networks
-                    .allocate_host(network_id, network.max_host())
-                    .await
-                {
+                //
+                // FR-47 P5c: with multi-block on, a full space GROWS instead
+                // of refusing — a block is appended at the tail, which adds
+                // ordinals above everything already leased and moves no
+                // existing device. Off (the default), this is exactly the
+                // P2a call it replaces.
+                let alloc = if state.settings.overlay.multi_block_enabled {
+                    state
+                        .overlay_networks
+                        .allocate_host_or_grow(&network, state.settings.overlay.block_prefix)
+                        .await
+                } else {
+                    state
+                        .overlay_networks
+                        .allocate_host(network_id, blocks.capacity())
+                        .await
+                };
+                let host = match alloc {
                     Ok(h) => h,
                     Err(e) => {
                         // Exhaustion vs a store fault are different problems
@@ -400,12 +417,23 @@ async fn handle_overlay_join(
                         return;
                     }
                 };
-                let Some(ip) = overlay_ip(&network.cidr, host) else {
+                // FR-47 P5c — resolve through the BLOCK LIST, not the
+                // network's single cidr: past the first block, ordinal N does
+                // not live in `network.cidr` at all. A single-block list is
+                // byte-for-byte `overlay_ip`, so this is unchanged for every
+                // network that has not grown.
+                //
+                // Re-read after a possible grow — `blocks` above was captured
+                // before the allocation, so it would not know about a block
+                // this very call appended.
+                let blocks = state.overlay_networks.block_list(&network).await;
+                let Some(ip) = blocks.ip_for_ordinal(host) else {
                     refuse(
                         OverlayJoinRefusal::NetworkUnavailable,
                         format!(
-                            "the network's CIDR {} cannot express host ordinal {host}",
-                            network.cidr
+                            "the network's address space {:?} cannot express host \
+                             ordinal {host}",
+                            blocks.cidrs()
                         ),
                     )
                     .await;
