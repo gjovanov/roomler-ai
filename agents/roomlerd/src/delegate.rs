@@ -55,14 +55,59 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-
-use tunnel_core::localapi::DelegateFrame;
+use tokio::net::{UnixListener, UnixStream};
 
 /// Bytes of entropy in a minted secret, hex-encoded on the wire. The channel is
 /// local and the secret lives for one spawn, so this is far past what an
 /// attacker could grind, and it costs nothing.
 const SECRET_BYTES: usize = 32;
+
+/// Directory holding the delegation socket.
+///
+/// Deliberately NOT the LocalAPI directory. `/var/run/roomler` is `0700 root`
+/// so that nothing unprivileged can even reach the control socket, and that is
+/// worth keeping exactly as it is: the worker needs to traverse ITS directory,
+/// and widening the control socket's would trade a real protection for an
+/// unrelated feature.
+const DELEGATE_DIR: &str = "/var/run/roomler-delegate";
+
+/// One frame on the delegation channel.
+///
+/// Newline-delimited JSON, matching the LocalAPI protocol's shape but not its
+/// wire: this is a private protocol between two processes of one install, so it
+/// lives here rather than in the shared protocol crate.
+///
+/// P2a carries the handshake and liveness. The rc-session payloads
+/// (`SessionCreated` / `SdpOffer` / `SdpAnswer` / `Ice` / `Terminate` inbound,
+/// `SdpAnswer` / `Ice` / `SessionStats` / `Terminate` outbound) land in P2b.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "t", content = "d", rename_all = "snake_case")]
+pub enum DelegateFrame {
+    /// Daemon → worker, first frame: the attach was accepted.
+    Attached {
+        /// The daemon's version, so a worker can refuse a mismatch loudly
+        /// instead of failing obscurely on a payload it cannot parse. Both ends
+        /// ship in one binary, but the update path replaces them independently.
+        daemon_version: String,
+    },
+    /// Either direction — liveness. A channel with no traffic is
+    /// indistinguishable from a wedged one, and the daemon must be able to tell
+    /// "no sessions right now" from "the worker is gone" *before* a controller
+    /// is waiting on it.
+    Ping,
+    /// Either direction — the answer to [`DelegateFrame::Ping`].
+    Pong,
+}
+
+/// The socket a worker running as `uid` dials.
+///
+/// Per-uid, so a console-user change cannot leave the new worker dialling the
+/// old one's endpoint.
+pub fn socket_path(uid: u32) -> std::path::PathBuf {
+    std::path::Path::new(DELEGATE_DIR).join(format!("{uid}.sock"))
+}
 
 /// The daemon's end of the delegation channel.
 #[derive(Clone, Default)]
@@ -76,6 +121,26 @@ struct Inner {
     /// may attach — the default, and the disabled state.
     secret: Mutex<Option<String>>,
     attached: AtomicBool,
+    /// The socket path currently bound, so [`DelegateHost::revoke`] can unlink
+    /// it. `None` = not listening.
+    listening: Mutex<Option<std::path::PathBuf>>,
+}
+
+/// `chown` a path to `uid`, keeping its existing group.
+fn chown_to(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("path contains a NUL"))?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call;
+    // `-1` for gid means "leave the group unchanged", which is the documented
+    // contract of chown(2).
+    let rc = unsafe { libc::chown(c.as_ptr(), uid, u32::MAX) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 impl DelegateHost {
@@ -83,14 +148,97 @@ impl DelegateHost {
         Self::default()
     }
 
-    /// Mint a fresh secret for a worker about to be spawned, replacing any
-    /// previous one. Returns the value to put in the child's environment.
+    /// Open (or re-open) the delegation socket for `uid` and mint the secret
+    /// that authorises a worker on it. Returns the secret to hand the child.
+    ///
+    /// Two independent gates, and both are needed:
+    ///
+    /// - **the socket** is `0600` owned by `uid`, in a `0711` directory, so no
+    ///   other unprivileged user can even open it;
+    /// - **the secret** is what stops any OTHER process of that same uid — the
+    ///   worker is an ordinary user process, and so is an attacker's.
+    ///
+    /// Errors are logged and swallowed: a daemon that cannot open this socket
+    /// still supervises a worker that serves its own sessions, which is P1
+    /// behaviour and fine. Refusing to spawn would trade a missing feature for
+    /// a missing remote-desktop half.
+    pub fn open_for(&self, uid: u32) -> String {
+        let secret = self.mint();
+        if let Err(e) = self.listen(uid) {
+            tracing::warn!(uid, error = %e, "delegation: could not open the worker socket");
+        }
+        secret
+    }
+
+    /// Bind the per-uid socket and serve attaches on it until [`revoke`].
+    fn listen(&self, uid: u32) -> std::io::Result<()> {
+        self.listen_in(std::path::Path::new(DELEGATE_DIR), uid)
+    }
+
+    /// [`listen`] with the directory injected, so the permission bits — which
+    /// are one of the two authorisation gates, not decoration — can be
+    /// asserted by a test that is not root and cannot write to `/var/run`.
+    fn listen_in(&self, dir: &std::path::Path, uid: u32) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir)?;
+        // 0711: a worker must TRAVERSE to reach its socket, but nothing needs
+        // to enumerate the directory, and not listing it means one user cannot
+        // even learn that another has a worker.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711))?;
+
+        let path = dir.join(format!("{uid}.sock"));
+        // A stale socket from a previous daemon would make bind() fail with
+        // EADDRINUSE; nothing else may live at this path.
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        // chown AFTER chmod: the window between them is 0600 root-owned, which
+        // is closed, whereas the reverse order would briefly leave a uid-owned
+        // socket at the default mode.
+        chown_to(&path, uid)?;
+
+        *self.inner.listening.lock().expect("listen mutex") = Some(path.clone());
+        let host = self.clone();
+        tokio::spawn(async move {
+            tracing::info!(uid, path = %path.display(), "delegation: listening for the worker");
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let host = host.clone();
+                        tokio::spawn(async move { host.serve_stream(stream).await });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "delegation: accept failed; stopping listener");
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Read the attach line off a fresh connection, then serve it.
+    async fn serve_stream(&self, stream: UnixStream) {
+        let (rd, wr) = tokio::io::split(stream);
+        let mut lines = BufReader::new(rd).lines();
+        let offered = match lines.next_line().await {
+            Ok(Some(line)) => line.trim().to_string(),
+            _ => {
+                tracing::debug!("delegation: connection closed before offering a secret");
+                return;
+            }
+        };
+        self.serve(&offered, Box::new(lines.into_inner()), Box::new(wr))
+            .await;
+    }
+
+    /// Mint a fresh secret, replacing any previous one.
     ///
     /// Synchronous on purpose: the critical section is one `Option<String>`
     /// swap, and an async lock would force every caller to be async —
     /// including `stop_worker`, which is deliberately blocking because it
     /// waits out a SIGTERM grace period.
-    pub fn mint(&self) -> String {
+    fn mint(&self) -> String {
         use rand::RngCore;
         let mut raw = [0u8; SECRET_BYTES];
         rand::rng().fill_bytes(&mut raw);
@@ -106,6 +254,12 @@ impl DelegateHost {
     /// caller can forget at one of the four places a worker can stop.
     pub fn revoke(&self) {
         *self.inner.secret.lock().expect("secret mutex") = None;
+        // Unlink the socket too. The accept loop ends when the listener drops
+        // with the process, but a path left behind is an endpoint a later
+        // worker could dial and sit on forever waiting for a greeting.
+        if let Some(path) = self.inner.listening.lock().expect("listen mutex").take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Serve one attach attempt. Returns when the channel closes.
@@ -365,5 +519,97 @@ mod tests {
         assert!(!secret_eq("ab", "abc"));
         assert!(!secret_eq("abc", "abd"));
         assert!(!secret_eq("", "x"));
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    /// The socket's mode and ownership ARE an authorisation gate — the secret
+    /// stops another process of the same user, and these stop every other user.
+    /// A future change that widened them would look like a permissions tidy-up
+    /// in review, so they are asserted.
+    #[tokio::test]
+    async fn the_socket_is_0600_and_the_directory_is_traversable_only() {
+        let tmp = std::env::temp_dir().join(format!("roomler-deleg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let host = DelegateHost::new();
+        let uid = unsafe { libc::getuid() };
+        host.listen_in(&tmp, uid).expect("listen");
+
+        let dir_mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o711,
+            "directory must be traversable, not listable"
+        );
+
+        let sock = tmp.join(format!("{uid}.sock"));
+        let md = std::fs::metadata(&sock).unwrap();
+        assert_eq!(
+            md.permissions().mode() & 0o777,
+            0o600,
+            "socket must be 0600"
+        );
+        assert_eq!(md.uid(), uid, "socket must belong to the worker's user");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// End to end over a real unix socket: the right secret is greeted, and a
+    /// wrong one gets a close with no bytes — the property the whole design
+    /// rests on, exercised through the actual transport rather than in-process.
+    #[tokio::test]
+    async fn a_real_connection_is_greeted_or_silently_closed() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let tmp = std::env::temp_dir().join(format!("roomler-deleg-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let host = DelegateHost::new();
+        let uid = unsafe { libc::getuid() };
+        let secret = host.mint();
+        host.listen_in(&tmp, uid).expect("listen");
+        let sock = tmp.join(format!("{uid}.sock"));
+
+        // Wrong secret: closed, no bytes.
+        let mut bad = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        bad.write_all(
+            b"not-the-secret
+",
+        )
+        .await
+        .unwrap();
+        let (brd, _bwr) = tokio::io::split(bad);
+        assert!(
+            BufReader::new(brd)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .is_none(),
+            "a wrong secret must get no bytes at all"
+        );
+
+        // Right secret: greeted.
+        let mut good = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        good.write_all(
+            format!(
+                "{secret}
+"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (grd, _gwr) = tokio::io::split(good);
+        let greeting = BufReader::new(grd).lines().next_line().await.unwrap();
+        assert!(
+            greeting.is_some_and(|g| g.contains("attached")),
+            "the right secret must be greeted"
+        );
+
+        host.revoke();
+        assert!(!sock.exists(), "revoke must unlink the socket");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
