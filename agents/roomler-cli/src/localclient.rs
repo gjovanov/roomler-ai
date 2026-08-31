@@ -1370,6 +1370,20 @@ fn print_status(s: &NodeStatus) {
     {
         println!("  roam adopts {r} (peer endpoints adopted via WG-style roaming)");
     }
+    // FR-46 — only printed when NON-EMPTY. An empty list is the common case and
+    // says almost nothing (a knob read lazily is absent until it is read), so
+    // printing "legacy env: none" every time would read as an all-clear it has
+    // not earned. A hit, by contrast, is authoritative: this daemon really is
+    // running on a retired variable name.
+    if let Some(uses) = s.legacy_env_uses.as_ref()
+        && !uses.is_empty()
+    {
+        println!(
+            "  legacy env  {} READ through a retired name: {}",
+            uses.len(),
+            uses.join(", ")
+        );
+    }
 }
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {
