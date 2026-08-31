@@ -1602,3 +1602,64 @@ async fn the_shipped_default_carves_a_block_for_a_new_org() {
     assert_eq!(status["cidr"], "100.65.0.0/22");
     assert_eq!(status["capacity"], 1022);
 }
+
+/// FR-47 — a PLATFORM operator can renumber a tenant it is not a member of.
+///
+/// The block toolkit was unusable as a set before this: `reclaim` and
+/// `reconcile-hosts` are platform-operator, so an operator could reclaim
+/// ranges fleet-wide and return leaked ordinals, but could not migrate the
+/// one tenant those operations exist to serve without first being made a
+/// member of it.
+///
+/// It is consistency rather than escalation — `reclaim` already governs the
+/// GLOBAL registry, which is strictly more powerful than renumbering one
+/// tenant — but it is still a widened door, so both sides are pinned: this
+/// test proves the platform arm opens it, and
+/// `renumber_requires_manage_agents` still proves an ordinary member cannot.
+#[tokio::test]
+async fn a_platform_operator_can_renumber_a_tenant_it_does_not_belong_to() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.overlay.blocks_enabled = false;
+        s.stats.platform_admins = Some(admin_id.to_hex());
+    })
+    .await;
+    let seeded = app.seed_tenant("ovblk-padmin").await;
+
+    // A token for an id that is on the allowlist and is NOT a member of the
+    // tenant — the whole point of the arm.
+    let tokens = app
+        .state
+        .auth
+        .generate_tokens(admin_id, "padmin@test.io", "padmin")
+        .unwrap();
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &tokens.access_token,
+        )
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "a platform operator must be able to plan a renumber"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["dry_run"], true,
+        "a bare body must still default to a PLAN"
+    );
+    assert_eq!(body["applied"], false);
+    assert_eq!(body["old_cidr"], OverlayNetwork::DEFAULT_CIDR);
+
+    // And the tenant is genuinely untouched by the plan.
+    let net = OverlayNetworkDao::new(&app.db)
+        .get_or_create(tid(&seeded.tenant_id))
+        .await
+        .unwrap();
+    assert_eq!(net.cidr, OverlayNetwork::DEFAULT_CIDR);
+}
