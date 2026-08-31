@@ -365,3 +365,5 @@ and never removed, so a cached handle stays valid). Deliberately NOT done —
 at 0.002 % of a core it would be optimising something 500x below where it could
 begin to matter, and the cached handle is one more thing to keep correct across
 re-homing.
+| 2026-09-01 | `bench_add_network_bytes_cost` — the hot-path cost, finally run | atomic-only **13.69** ns/op · `add_network_bytes` **111.53** ns/op · lookup overhead **97.84** ns/op (8 threads, one shared network id = worst case). At 200 frames/s: **0.0022 % of one core** |
+| 2026-09-01 | ⚠️ Optimized figure unavailable, and it does not matter | release fails on `mediasoup-sys` (meson subproject) in WSL, and the build host runs cargo 1.75 (no edition 2024). The debug number is an **upper bound** — release is strictly faster — and the margin is ~10⁴, so no decision turns on it. ~98 ns of added per-frame latency is invisible beside a network hop in milliseconds |
