@@ -30,15 +30,24 @@
 //! actually useful to an operator reading `ps`; only the secret is on the
 //! pipe.
 //!
-//! ## Why the worker dials, when the daemon is the one that wants to push
+//! ## Why a DEDICATED socket, and not the LocalAPI one
 //!
-//! Because the daemon already owns a listening socket at a path every session
-//! can name (`/var/run/roomler`), and the worker does not. Giving the worker a
-//! listener would mean a second path to agree on, a second ACL, a second
-//! dispatch surface, and a startup ordering problem — the daemon could not push
-//! before the worker's listener existed. Dialling inverts all of that: the
-//! channel exists exactly when the worker is alive to serve it, which is also
-//! the only time it means anything.
+//! Because an unprivileged worker cannot open the control socket, and must not
+//! be able to: `/var/run/roomler/roomler.sock` is `0600 root` inside a `0700
+//! root` directory, and it carries `config set`, `route add` and the rest. The
+//! first shape of this code dialled it and failed in the field with
+//! `Permission denied (os error 13)`.
+//!
+//! The fix is better than the thing it replaces. The delegation channel now has
+//! its own `0600`-owned-by-the-worker socket in a `0711` directory, which means
+//! LocalAPI keeps its request/response invariant **completely untouched** —
+//! there is no longer any streaming exception on the control protocol at all.
+//! The exception was the invasive part of the design; the field removed it.
+//!
+//! The worker still DIALS rather than listens: the daemon knows the console uid
+//! and can create the endpoint before spawning, so there is no ordering
+//! problem, and a channel that exists exactly when a worker is alive to serve
+//! it is the honest shape.
 //!
 //! ## Failure is quiet and non-fatal, deliberately
 //!
@@ -52,8 +61,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::delegate::DelegateFrame;
 use crate::delegate::write_frame;
-use tunnel_core::localapi::DelegateFrame;
 
 /// How often the worker proves the channel is alive.
 ///
@@ -132,7 +141,27 @@ async fn attach_once(
     secret: &str,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    let (rd, mut wr) = tunnel_core::localapi::attach_as_worker(secret).await?;
+    // Dial the daemon's DEDICATED delegation socket, not the LocalAPI control
+    // socket. The control socket is `0600 root` in a `0700 root` directory —
+    // an unprivileged worker cannot open it, and it should not be able to: it
+    // carries `config set`, `route add` and the rest. Field-measured on the
+    // MacBook, where the first shape of this code failed with
+    // `Permission denied (os error 13)`.
+    let uid = unsafe { libc::getuid() };
+    let path = crate::delegate::socket_path(uid);
+    let mut stream = tokio::net::UnixStream::connect(&path).await?;
+    {
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(secret.as_bytes()).await?;
+        stream
+            .write_all(
+                b"
+",
+            )
+            .await?;
+        stream.flush().await?;
+    }
+    let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = BufReader::new(rd).lines();
 
     // The daemon greets an accepted attach and silently closes a refused one,

@@ -2883,11 +2883,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     // to the loop that actually owns that session.
     let rc_sessions = roomlerd::rc_sessions::RcSessionRegistry::new();
 
-    // FR-43 P2a — the macOS GUI-worker delegation channel. Built
-    // unconditionally so the LocalAPI state has one shape everywhere, but it
-    // hands out nothing until the supervisor mints a secret for a worker it
-    // spawned: no secret issued IS the refusal, so "the feature is off" needs
-    // no separate branch.
+    // FR-43 P2a — the macOS GUI-worker delegation channel. It opens no socket
+    // and hands out nothing until the supervisor spawns a worker: no secret
+    // issued and no endpoint bound IS the refusal, so "the feature is off"
+    // needs no separate branch.
+    #[cfg(target_os = "macos")]
     let delegate_host = roomlerd::delegate::DelegateHost::new();
 
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
@@ -2911,7 +2911,6 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
             // …and the live gate-4 flags, so a `config set` here is in force
             // as fast as a pushed one (docs/remote-config.md).
             .with_remote_config(remote_cfg.clone())
-            .with_delegate(delegate_host.clone())
             // Multi-org P1 — live per-enrollment rows for `roomler status`.
             // FR-27 — live remote-control sessions, so the desktop app can
             // render "Being viewed by ..." and offer a Disconnect. Written by
