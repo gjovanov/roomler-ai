@@ -529,11 +529,11 @@ fn host_has_debian_tooling() -> bool {
 /// Gated like its only caller: a Windows build has no Linux picker to call it.
 #[cfg(any(not(target_os = "windows"), test))]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-// RETIRED-NAME-ANCHOR(2): every published release asset is named `roomler-agent-…` and
-// always will be — release-agent.yml keeps that destination name deliberately, because
-// it is an immutable surface prior releases already carry and the picker keys on it.
-// Dropping the prefix here makes every Linux agent stop finding its own update.
-// docs/fr/FR-21
+// RETIRED-NAME-ANCHOR(2): the legacy arm. Since FR-46 (#1051) new releases publish
+// `roomlerd-…`, so this prefix names only ALREADY-PUBLISHED assets — but it is a LIVE
+// fallback, not decoration: a host updating from a release cut before the rename still
+// finds its own `.deb` through it. Deletable once no such release is a candidate.
+// Locked by `pick_linux_asset_takes_the_renamed_daemon_deb`. docs/fr/FR-46
 fn is_daemon_asset(lower_name: &str) -> bool {
     lower_name.starts_with("roomler-agent") || lower_name.starts_with("roomlerd")
 }
@@ -2946,6 +2946,53 @@ mod tests {
         ));
         assert!(!is_daemon_asset(
             "roomler-desktop-0.4.15-x86_64-unknown-linux-gnu.deb"
+        ));
+    }
+
+    /// FR-46 (#1051): the daemon's published asset is named `roomlerd-…` from
+    /// this release on. The rename was argued from reading every picker; this
+    /// asserts it instead, on the one path where the prefix is load-bearing.
+    ///
+    /// The other three paths cannot regress from a rename because they never
+    /// look at the prefix (Windows keys on `.msi` + `-permachine-`, macOS on
+    /// `.pkg`, `scripts/install.sh` on an arch+format suffix), and a pre-0.4.16
+    /// agent takes the first arch-matching `.deb`, which the server orders
+    /// daemon-first via a `roomler-desktop-` DENYLIST — so it is unaffected by
+    /// what the daemon is called.
+    ///
+    /// ⚠️ The legacy arm must stay: already-published releases carry the old
+    /// name and an older host may still be updating from one.
+    #[test]
+    fn pick_linux_asset_takes_the_renamed_daemon_deb() {
+        let mk = |name: &str| GithubAsset {
+            name: name.into(),
+            browser_download_url: "https://example.invalid/x".into(),
+            size: 1,
+            digest: None,
+        };
+        let x86 = &["x86_64", "amd64"][..];
+
+        // Companion FIRST again — asset order is GitHub's, not ours.
+        let release = vec![
+            mk("roomler-desktop-0.4.38-x86_64-unknown-linux-gnu.deb"),
+            mk("roomlerd-0.4.38-x86_64-unknown-linux-gnu.deb"),
+            mk("roomlerd-0.4.38-x86_64-unknown-linux-gnu.tar.gz"),
+        ];
+        let picked =
+            pick_linux_asset(&release, x86, true).expect("must find the renamed daemon deb");
+        assert_eq!(picked.name, "roomlerd-0.4.38-x86_64-unknown-linux-gnu.deb");
+
+        assert!(is_daemon_asset(
+            "roomlerd-0.4.38-x86_64-unknown-linux-gnu.deb"
+        ));
+        assert!(is_daemon_asset(
+            "roomlerd-0.4.38-x86_64-unknown-linux-gnu.tar.gz"
+        ));
+
+        // RETIRED-NAME-ANCHOR(3): the legacy arm is a LIVE fallback for releases
+        // already published under the old name — not decoration. docs/fr/FR-46
+        assert!(is_daemon_asset(
+            "roomler-agent-0.4.15-x86_64-unknown-linux-gnu.deb"
         ));
     }
 

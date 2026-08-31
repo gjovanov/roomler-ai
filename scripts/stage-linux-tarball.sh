@@ -1,7 +1,10 @@
 #!/usr/bin/env sh
 # RETIRED-NAME-ANCHOR-BEGIN
-# The tarball name names a PUBLISHED release asset. Filenames are fixed by what is already on GitHub Releases (FR-21 D6), and usr/share/doc/roomler-agent is the dpkg doc
-# directory that travels with it.
+# FR-46: the ARCHIVE name is now `roomlerd-…`. Every consumer was measured first —
+# the extractor uses `--strip-components=1` so the internal dir name is inert, and no
+# picker keys on the prefix. What stays frozen here is `usr/lib/roomler-agent` (the
+# RPATH baked into the shipped binary by patchelf, which must move in lockstep with
+# it, not before) and `usr/share/doc/roomler-agent`. docs/fr/FR-46
 # Stage the Linux payload and tar it — the distro-agnostic install path for
 # hosts with no dpkg/apt (Fedora, RHEL, SUSE, Arch …), which otherwise cannot
 # install ANY published artifact and so can never self-update.
@@ -18,7 +21,7 @@ set -eu
 
 version="${1:?version}"
 triple="${2:?target triple}"
-name="roomler-agent-${version}-${triple}"
+name="roomlerd-${version}-${triple}"
 root="/tmp/${name}"
 
 pkg=agents/roomlerd

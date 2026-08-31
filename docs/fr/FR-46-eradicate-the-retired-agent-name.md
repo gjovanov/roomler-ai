@@ -131,7 +131,7 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 |---|---|---|---|
 | P0 | spec + issue + taxonomy decision | — | **this doc** |
 | P1a | split the marker into ANCHOR (live) / `RETIRED-NAME-RECORD` (history); `records` pinned exactly so nothing can be laundered | revert the audit script | **shipped** |
-| P1b | publish daemon assets as `roomlerd-*`; move the workflow guard | revert the workflow; assets are additive | |
+| P1b | publish daemon assets as `roomlerd-*`; guard rewritten as a companion denylist | revert the workflow; published assets are immutable and additive | **shipped — needs a release to field-prove** |
 | P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` / additive reg key | **4 hosts done** (3 Linux + 1 Windows) |
 | P2b | env prefix: delete the legacy arm | restore the arm | **STILL BLOCKED** — 7 devices unverifiable (below) |
 | P2c | remaining cheap classes: log filenames, install/staging paths, e2e image, `TermsView`, wizard PATH | per-item revert | |
