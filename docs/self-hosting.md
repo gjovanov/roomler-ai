@@ -59,10 +59,12 @@ Then bring it up:
 docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build
 ```
 
-> **The first build takes 10–20 minutes** — it compiles the Rust server and
-> mediasoup from source. Subsequent starts are seconds. A prebuilt image is
-> tracked in [FR-39](fr/FR-39-launch-readiness.md); until it ships, `--build` is
-> the only path.
+> **The first build compiles the Rust server and mediasoup from source.**
+> Measured **6 minutes** on a 2024 laptop (16 cores, Docker Desktop + WSL2);
+> budget 15–20 on a small VPS or 2–4 cores. Subsequent starts are seconds.
+> A prebuilt image — which would make this a 60-second pull instead — is tracked
+> in [FR-42](fr/FR-42-selfhost-verified-on-a-clean-box.md); until it ships,
+> `--build` is the only path.
 
 Watch it come up:
 
@@ -88,11 +90,25 @@ the machine you want to reach:
 
 ```bash
 # Linux / macOS
-curl -fsSL http://<your-host>:8080/api/setup/install.sh | sh -s -- --role daemon --token <enrollment-jwt>
+curl -fsSL http://<your-host>:8080/api/setup/install.sh | sh -s -- \
+    --role daemon --server http://<your-host>:8080 --token <enrollment-jwt>
 
 # Windows (PowerShell, elevated)
-irm http://<your-host>:8080/api/setup/install.ps1 | iex
+& ([scriptblock]::Create((irm http://<your-host>:8080/api/setup/install.ps1))) `
+    -Role daemon-system -Server http://<your-host>:8080 -Token <enrollment-jwt>
 ```
+
+⚠️ **`--server` / `-Server` is not optional on a self-hosted instance.** Both
+installers default to `https://roomler.ai` (`scripts/install.sh`'s `SERVER=`,
+`scripts/install.ps1`'s `$Server`), and they are piped from the network, so
+neither can see which host you fetched it from. Omit it and the agent downloads
+from you and then tries to enroll against the *hosted* service with a token only
+your server can verify — failing with an authentication error that says nothing
+about the real cause. Use the same URL you set as `ROOMLER_PUBLIC_URL`.
+
+⚠️ **On Windows, `irm … | iex` cannot pass arguments at all** — no `-Server`,
+no `-Token`. The `scriptblock` form above is the one that can, and it is what
+`scripts/install.ps1`'s own header documents.
 
 The token is single-use and expires in 10 minutes. The agent connects
 **outbound only** — nothing needs to be opened on the machine you are enrolling.
