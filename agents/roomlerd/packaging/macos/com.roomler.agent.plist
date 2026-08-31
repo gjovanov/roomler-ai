@@ -6,7 +6,7 @@
      paths below are pinned to it by launchd. A rename voids the grants
      silently: the daemon runs and captures a black screen. -->
 <!--
-  LaunchAgent for roomler-agent. Installed to ~/Library/LaunchAgents/ by
+  LaunchAgent for roomlerd. Installed to ~/Library/LaunchAgents/ by
   the .pkg's post-install script. Runs in the user's session (required for
   ScreenCaptureKit / CoreGraphics capture and for CGEvent input injection;
   neither works in a LaunchDaemon running as _root in session 0).
@@ -26,7 +26,7 @@
     <!-- RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS; renaming
          it silently drops Screen Recording + Accessibility on every Mac. FR-21 D5
          freezes it. docs/fr/FR-21 -->
-        <string>/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent</string>
+        <string>/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd</string>
         <string>run</string>
     </array>
 
@@ -43,9 +43,9 @@
     <string>Interactive</string>
 
     <key>StandardOutPath</key>
-    <string>/tmp/roomler-agent.out.log</string>
+    <string>/tmp/roomlerd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/roomler-agent.err.log</string>
+    <string>/tmp/roomlerd.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
