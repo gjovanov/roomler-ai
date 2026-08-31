@@ -1,5 +1,8 @@
 # FR-21 name-audit baseline — regenerate with scripts/name-audit.sh --update-baseline
-# Every number here must go DOWN (except anchors, which must not).
+# anchors is LIVE compatibility and must trend to 0 (FR-46); records is the
+# historical record and is pinned exactly. Both fail the guard if they move
+# without this file moving with them, in either direction.
 unclassified=0
-anchors=747
+anchors=746
+records=2
 paths=0

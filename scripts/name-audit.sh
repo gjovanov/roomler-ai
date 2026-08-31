@@ -44,6 +44,36 @@
 #   is prose, not a marker — so a comment that merely talks ABOUT the scheme
 #   cannot accidentally exempt the line beneath it.
 #
+# TWO CLASSES: ANCHOR (live) vs RECORD (history)          [FR-46, issue #1051]
+#
+#   FR-21 marked every deliberate occurrence with ONE marker, because under its
+#   constraint — migrate or anchor, never disrupt the fleet — they all had the
+#   same consequence: delete it and you strand a host. FR-46 lifts that
+#   constraint (re-enrollment is authorised), and the population splits:
+#
+#     RETIRED-NAME-ANCHOR   LIVE compatibility. Code that RESOLVES, MATCHES or
+#                           WRITES the retired name at runtime — appdirs trees,
+#                           service and task names, log prefixes, env arms,
+#                           asset pickers. This class is the work: it can and
+#                           must reach zero.
+#
+#     RETIRED-NAME-RECORD   The HISTORICAL RECORD. Prose and fixtures that name
+#                           the retired thing IN ORDER TO EXPLAIN IT — migration
+#                           notes, field observations quoting what was actually
+#                           measured, tests whose input is by definition a
+#                           historical artifact. This class must NOT be renamed:
+#                           doing so misreports history. It never reaches zero,
+#                           and that is correct.
+#
+#   The distinction is about the SITE'S JOB, not about difficulty. A migration
+#   note is RECORD; the code the note describes is ANCHOR. Reclassifying is
+#   exactly as easy as fixing and looks identical in a diff, which is why
+#   `records` is pinned EXACTLY in the baseline: the live count can never be
+#   reduced by relabelling, and every new RECORD costs a reviewed baseline bump
+#   that has to say what it is recording.
+#
+#   Both classes take the same forms — `RETIRED-NAME-RECORD:`,
+#   `RETIRED-NAME-RECORD(N):`, and `RETIRED-NAME-RECORD-BEGIN` / `-END`.
 # THE GUARD IS A PAIR, NOT A RATCHET
 #
 #   A pure "unclassified == 0" check would be red for the whole program, and a
@@ -118,12 +148,16 @@ TOKENS='roomler-agent|roomler_agent|ROOMLER_AGENT_|RoomlerAgent|Roomler Agent|ro
 #
 #   * this script          — it contains every token by construction
 #   * the baseline         — it records counts, and may quote a token
-#   * the FR-21 spec       — its subject IS the retired names
+#   * an FR spec whose SUBJECT is the retired names (FR-21 retired them,
+#     FR-46 eradicates them) — such a spec cannot discuss its own topic
+#     without naming it, and anchoring every mention would bury the prose.
+#     This is a rule about the file's job, not a place to park work: a spec
+#     that merely MENTIONS a retired name does not qualify.
 is_excluded() {
     case "$1" in
         scripts/name-audit.sh) return 0 ;;
         "$BASELINE_FILE") return 0 ;;
-        docs/fr/FR-21-*) return 0 ;;
+        docs/fr/FR-21-*|docs/fr/FR-46-*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -144,7 +178,7 @@ scan() {
     for f in $files; do
         is_excluded "$f" && continue
         TOKENS="$TOKENS" awk -v file="$f" '
-            BEGIN { cover = 0; in_block = 0; span = 1 }
+            BEGIN { cover = 0; in_block = 0; span = 1; cover_kind = "ANCHORED"; region_kind = "ANCHORED" }
             {
                 line = $0
                 sub(/\r$/, "", line)
@@ -158,13 +192,14 @@ scan() {
                 # often than it is renumbered — so a region that is frozen as a
                 # body (an appendix recording what operators actually typed, a
                 # legacy-cleanup module) says so explicitly at both ends.
-                if (line ~ /RETIRED-NAME-ANCHOR-BEGIN/) {
+                if (line ~ /RETIRED-NAME-(ANCHOR|RECORD)-BEGIN/) {
+                    region_kind = (line ~ /RETIRED-NAME-RECORD-BEGIN/) ? "RECORD" : "ANCHORED"
                     in_region = 1
                     region_line = NR
                     region_used[NR] = 0
                     next
                 }
-                if (line ~ /RETIRED-NAME-ANCHOR-END/) {
+                if (line ~ /RETIRED-NAME-(ANCHOR|RECORD)-END/) {
                     if (!in_region)
                         print "STALEMARKER\t" file "\t" NR "\tEND without a matching BEGIN"
                     else if (!region_used[region_line])
@@ -174,7 +209,7 @@ scan() {
                 }
                 if (in_region) {
                     if (has_token) {
-                        print "ANCHORED\t" file "\t" NR "\t" line
+                        print region_kind "\t" file "\t" NR "\t" line
                         region_used[region_line] = 1
                     }
                     next
@@ -192,7 +227,11 @@ scan() {
                 # Safe by inspection, not by hope: all 146 span markers in the tree
                 # use `RETIRED-NAME-ANCHOR:` or `RETIRED-NAME-ANCHOR(N):`, and the
                 # BEGIN/END region markers are consumed above before this runs.
-                is_marker = (line ~ /RETIRED-NAME-ANCHOR(\([0-9]+\))?:/)
+                is_marker = (line ~ /RETIRED-NAME-(ANCHOR|RECORD)(\([0-9]+\))?:/)
+                # Which CLASS this marker declares. ANCHOR is live compatibility and
+                # must reach zero; RECORD is the historical record and must not be
+                # renamed at all. See docs/fr/FR-46.
+                marker_kind = (line ~ /RETIRED-NAME-RECORD(\([0-9]+\))?:/) ? "RECORD" : "ANCHORED"
                 # Comment syntaxes across the tree: Rust/TS //, shell/YAML/systemd #,
                 # block-comment continuation *, /*, XML <!--, ini ;.
                 is_comment = (bare ~ /^(\/\/|#|\*|\/\*|<!--|;)/)
@@ -214,7 +253,7 @@ scan() {
                     # by "this comment explains the line below it", and it stops at the
                     # first code line so the exemption cannot silently widen.
                     span = 1
-                    if (match(line, /RETIRED-NAME-ANCHOR\([0-9]+\)/)) {
+                    if (match(line, /RETIRED-NAME-(ANCHOR|RECORD)\([0-9]+\)/)) {
                         n = substr(line, RSTART, RLENGTH)
                         gsub(/[^0-9]/, "", n)
                         span = n + 0
@@ -224,6 +263,7 @@ scan() {
                     marker_line[NR] = 1
                     marker_used[NR] = 0
                     last_marker = NR
+                    cover_kind = marker_kind
                 } else if (in_block) {
                     if (is_comment) {
                         cover = NR                       # still inside the comment block
@@ -235,7 +275,7 @@ scan() {
 
                 if (has_token) {
                     if (NR <= cover) {
-                        print "ANCHORED\t" file "\t" NR "\t" line
+                        print cover_kind "\t" file "\t" NR "\t" line
                         if (last_marker) marker_used[last_marker] = 1
                     } else {
                         print "UNCLASSIFIED\t" file "\t" NR "\t" line
@@ -282,7 +322,7 @@ for arg in "$@"; do
         --check)           MODE=check ;;
         --update-baseline) MODE=update ;;
         --strict)          STRICT=1 ;;
-        -h|--help)         sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)         sed -n "2,$(( $(grep -n '^set -euo pipefail' "$0" | head -1 | cut -d: -f1) - 1 ))p" "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -292,6 +332,7 @@ PATHS=$(scan_paths)
 
 n_unclassified=$(printf '%s\n' "$RESULTS" | grep -c '^UNCLASSIFIED' || true)
 n_anchored=$(printf '%s\n' "$RESULTS" | grep -c '^ANCHORED' || true)
+n_records=$(printf '%s\n' "$RESULTS" | grep -c '^RECORD' || true)
 n_stale=$(printf '%s\n' "$RESULTS" | grep -c '^STALEMARKER' || true)
 n_paths=$(printf '%s\n' "$PATHS" | grep -c . || true)
 n_files=$(printf '%s\n' "$RESULTS" | grep '^UNCLASSIFIED' | cut -f2 | sort -u | grep -c . || true)
@@ -313,18 +354,22 @@ report)
 summary)
     echo "unclassified : $n_unclassified occurrences in $n_files files"
     echo "anchored     : $n_anchored (deliberately frozen, marked)"
+    echo "record       : $n_records (historical record — must NOT be renamed; see docs/fr/FR-46)"
     echo "stale markers: $n_stale"
     echo "paths        : $n_paths file/folder names"
     ;;
 update)
     {
         echo "# FR-21 name-audit baseline — regenerate with scripts/name-audit.sh --update-baseline"
-        echo "# Every number here must go DOWN (except anchors, which must not)."
+        echo "# anchors is LIVE compatibility and must trend to 0 (FR-46); records is the"
+        echo "# historical record and is pinned exactly. Both fail the guard if they move"
+        echo "# without this file moving with them, in either direction."
         echo "unclassified=$n_unclassified"
         echo "anchors=$n_anchored"
+        echo "records=$n_records"
         echo "paths=$n_paths"
     } > "$BASELINE_FILE"
-    echo "baseline written: unclassified=$n_unclassified anchors=$n_anchored paths=$n_paths"
+    echo "baseline written: unclassified=$n_unclassified anchors=$n_anchored records=$n_records paths=$n_paths"
     ;;
 check)
     rc=0
@@ -376,7 +421,7 @@ EOF
                   if (H == "1" && l ~ /^[[:space:]]*#/) return 1
                   return 0
               }
-              /RETIRED-NAME-ANCHOR/ && !/RETIRED-NAME-ANCHOR-END/ { st=1; sd=0; rs=0; next }
+              /RETIRED-NAME-(ANCHOR|RECORD)/ && !/RETIRED-NAME-(ANCHOR|RECORD)-END/ { st=1; sd=0; rs=0; next }
               st==1 {
                   if (isdoc($0))   { sd=1; next }
                   if (isprose($0)) { if (sd) rs=1; next }
@@ -435,6 +480,7 @@ EOF
 
     base_unclassified=$(read_baseline unclassified 999999)
     base_anchors=$(read_baseline anchors 0)
+    base_records=$(read_baseline records 0)
     base_paths=$(read_baseline paths 999999)
 
     if [ "$n_stale" -gt 0 ]; then
@@ -469,6 +515,27 @@ EOF
         rc=1
     fi
 
+    # RECORD is pinned exactly, in BOTH directions, for the same reason anchors
+    # are — but the failure it prevents is different and worse. An ANCHOR that
+    # disappears strands a host; a RECORD that appears launders a live
+    # compatibility site into permanence, because reclassifying is exactly as
+    # easy as fixing and looks identical in a diff. Pinning it means every new
+    # RECORD is a deliberate, reviewed act with a number attached, and the live
+    # count can never be reduced by relabelling.
+    if [ "$n_records" -ne "$base_records" ]; then
+        if [ "$n_records" -gt "$base_records" ]; then
+            echo "FAIL  records rose $base_records -> $n_records."
+            echo "      A new RECORD says a site names the retired thing IN ORDER TO EXPLAIN IT"
+            echo "      and can never be renamed. If it is live compatibility, it is an ANCHOR."
+        else
+            echo "FAIL  records dropped $base_records -> $n_records."
+            echo "      Deleting a RECORD erases the account of what actually happened."
+        fi
+        echo "      Run: scripts/name-audit.sh --update-baseline   (and commit it in this PR,"
+        echo "      saying in the PR body which record was added or retired, and why)."
+        rc=1
+    fi
+
     if [ "$STRICT" -eq 1 ]; then
         if [ "$n_unclassified" -ne 0 ]; then
             echo "FAIL  $n_unclassified unclassified occurrence(s); strict mode requires 0."
@@ -486,7 +553,7 @@ EOF
     fi
 
     if [ "$rc" -eq 0 ]; then
-        echo "OK    unclassified=$n_unclassified (<= $base_unclassified)  anchors=$n_anchored (>= $base_anchors)  paths=$n_paths (<= $base_paths)"
+        echo "OK    unclassified=$n_unclassified (<= $base_unclassified)  anchors=$n_anchored (== $base_anchors)  records=$n_records (== $base_records)  paths=$n_paths (<= $base_paths)"
     fi
     exit "$rc"
     ;;

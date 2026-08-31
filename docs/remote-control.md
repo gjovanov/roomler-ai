@@ -704,7 +704,7 @@ keyboard component.*
 
 <!-- RETIRED-NAME-ANCHOR-BEGIN: §17-19 are historical appendices. They record what the
      product was called and what operators actually typed at the time (0.1.32 - rc.26),
-     so rewriting `roomlerd` to `roomlerd` here would falsify the record rather
+     so rewriting `roomler-agent` to `roomlerd` here would falsify the record rather
      than update it. The CURRENT encoder reference is docs/encoders.md. docs/fr/FR-21 -->
 
 ## 17. Hardware encoder backends
