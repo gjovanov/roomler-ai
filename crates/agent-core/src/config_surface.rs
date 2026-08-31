@@ -482,6 +482,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "FR-36 - inject input through /dev/uinput, below the compositor. Pair with drm_capture on a Wayland host: XTest reaches Xwayland clients ONLY, so without this a captured Wayland session is read-only. Built-in default: OFF - a uinput device is host-global and injects into whatever has focus, including the greeter and lock screen. Env: ROOMLERD_UINPUT. Restart required.",
     ),
     (
+        "portal_capture",
+        "tribool",
+        "FR-45 - capture a Wayland desktop through xdg-desktop-portal ScreenCast + PipeWire. The ATTENDED path: needs a logged-in user session, and the first use shows that user a consent dialog (later ones restore the grant without asking). Serves hosts DRM cannot reach - no scanout, nested compositors. Built-in default: OFF - an unattended host would wait forever on a dialog nobody answers. Tried after DRM, before X11. Env: ROOMLERD_PORTAL_CAPTURE. Restart required.",
+    ),
+    (
+        "portal_input",
+        "tribool",
+        "FR-45 P4 - inject input through the portal RemoteDesktop interface, riding the SAME portal session (one consent dialog covers see+touch). Built-in default: ON while a portal capture is live, inert otherwise - on those hosts the portal is the only input path anything actually reads (XTest reaches nothing on Wayland, uinput events have no consumer). Off = the portal session is view-only. Env: ROOMLERD_PORTAL_INPUT. Restart required.",
+    ),
+    (
         "x11_damage",
         "tribool",
         "FR-29 - skip the XShm readback when XDAMAGE proves the screen is unchanged. Built-in default: on; took a Linux host's idle capture from 45.8% of a core to 2.8%. Env: ROOMLERD_X11_DAMAGE. Restart required.",
@@ -777,6 +787,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "relay_ceiling_learn" => cfg.relay_ceiling_learn.map(fmt_bool),
         "drm_capture" => cfg.drm_capture.map(fmt_bool),
         "uinput" => cfg.uinput.map(fmt_bool),
+        "portal_capture" => cfg.portal_capture.map(fmt_bool),
+        "portal_input" => cfg.portal_input.map(fmt_bool),
         "x11_damage" => cfg.x11_damage.map(fmt_bool),
         "overlay_key_rotation" => cfg.overlay_key_rotation.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
@@ -1160,6 +1172,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "relay_ceiling_learn" => cfg.relay_ceiling_learn = parse_tribool(value)?,
         "drm_capture" => cfg.drm_capture = parse_tribool(value)?,
         "uinput" => cfg.uinput = parse_tribool(value)?,
+        "portal_capture" => cfg.portal_capture = parse_tribool(value)?,
+        "portal_input" => cfg.portal_input = parse_tribool(value)?,
         "x11_damage" => cfg.x11_damage = parse_tribool(value)?,
         "overlay_key_rotation" => cfg.overlay_key_rotation = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
@@ -1389,7 +1403,13 @@ mod tests {
         assert_eq!(cfg.drm_capture, None, "unset by default");
         assert_eq!(cfg.uinput, None, "unset by default");
 
-        for key in ["drm_capture", "uinput", "x11_damage"] {
+        for key in [
+            "drm_capture",
+            "uinput",
+            "x11_damage",
+            "portal_capture",
+            "portal_input",
+        ] {
             apply(&mut cfg, key, Some("on")).unwrap();
             assert_eq!(
                 entry_for(&cfg, key).unwrap().value.as_deref(),
@@ -1423,11 +1443,15 @@ mod tests {
         cfg.drm_capture = Some(true);
         cfg.uinput = Some(true);
         cfg.x11_damage = Some(false);
+        cfg.portal_capture = Some(true);
+        cfg.portal_input = Some(false);
         let bridged = crate::config::env_bridge_bools(&cfg);
         for (name, want) in [
             ("DRM_CAPTURE", Some(true)),
             ("UINPUT", Some(true)),
             ("X11_DAMAGE", Some(false)),
+            ("PORTAL_CAPTURE", Some(true)),
+            ("PORTAL_INPUT", Some(false)),
         ] {
             let got = bridged
                 .iter()

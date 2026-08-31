@@ -181,6 +181,12 @@ enum Command {
         /// diagnostic goes to stderr.
         #[arg(long)]
         stream: bool,
+        /// FR-45 P4 — with --stream: open the session through RemoteDesktop
+        /// and consume InputMsg JSON lines on stdin, injecting them into the
+        /// session. Falls back to capture-only where the portal has no
+        /// RemoteDesktop backend.
+        #[arg(long)]
+        input: bool,
     },
     /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
     /// the session helper and print what came back.
@@ -1081,10 +1087,14 @@ async fn daemon_main() -> Result<()> {
                 anyhow::bail!("portal-session is Linux-only and needs the `portal-capture` feature")
             }
         }
-        Command::PortalHelper { screencast, stream } => {
+        Command::PortalHelper {
+            screencast,
+            stream,
+            input,
+        } => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                roomlerd::capture::portal::helper::run(screencast, stream);
+                roomlerd::capture::portal::helper::run(screencast, stream, input);
                 Ok(())
             }
             // A build without the feature must say so rather than exit 0 with
@@ -1093,7 +1103,7 @@ async fn daemon_main() -> Result<()> {
             // answer from "this binary cannot ask".
             #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
             {
-                let _ = (screencast, stream);
+                let _ = (screencast, stream, input);
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \
                      build cannot query the desktop portal"
