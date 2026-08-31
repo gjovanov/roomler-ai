@@ -989,58 +989,6 @@ pub enum Request {
         #[serde(default)]
         session_secs: u64,
     },
-    /// FR-43 P2 — a GUI-session worker volunteering to serve this daemon's
-    /// remote-control sessions.
-    ///
-    /// ⚠️ **The only verb that does not answer and return to the request
-    /// loop.** On success the connection stops being a request/response channel
-    /// and becomes a bidirectional [`DelegateFrame`] stream owned by
-    /// [`LocalApiState::rc_attach`] until EOF. The exception is deliberate and
-    /// confined to this one arm: trickle ICE arrives when the network decides,
-    /// not when someone asks, and long-polling it would put a round-trip on the
-    /// path a human experiences as "how long until my screen appears".
-    ///
-    /// ⚠️ **The socket ACL does not authorise this one.** For every other
-    /// verb the 0600 socket *is* the boundary — a caller that can open it is the
-    /// owning user or root. That is not enough here: the legitimate worker is an
-    /// ordinary user-session process, and so is an attacker's, so without
-    /// `secret` any process in the session could volunteer to serve
-    /// remote-control sessions for the whole device. The secret is minted per
-    /// spawn and handed to the worker in its environment — never written to
-    /// disk, never off the host.
-    RcAttach { secret: String },
-}
-
-/// One frame on an attached delegation channel (FR-43 P2).
-///
-/// Newline-delimited JSON in both directions, same as the request protocol: a
-/// different shape here would buy nothing and cost a second parser.
-///
-/// P2a carries only the handshake and liveness. The rc-session payloads
-/// (`SessionCreated` / `SdpOffer` / `SdpAnswer` / `Ice` / `Terminate` inbound,
-/// `SdpAnswer` / `Ice` / `SessionStats` / `Terminate` outbound) land in P2b.
-/// The channel is built and proven on its own first because it is the invasive
-/// half — an exception to this protocol's central invariant deserves to be
-/// verified without rc semantics layered on top of it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(tag = "t", content = "d", rename_all = "snake_case")]
-pub enum DelegateFrame {
-    /// Daemon → worker, first frame: the attach was accepted.
-    Attached {
-        /// The daemon's version, so a worker can refuse a mismatch loudly
-        /// instead of failing obscurely on a payload it cannot parse. Both ends
-        /// ship in one binary, but the update path replaces them independently
-        /// (the `.pkg` postinstall restarts the daemon; the worker is whatever
-        /// launchd or the supervisor last started).
-        daemon_version: String,
-    },
-    /// Either direction — liveness. A channel with no traffic is
-    /// indistinguishable from a wedged one, and the daemon must be able to tell
-    /// "no sessions right now" from "the worker is gone" *before* a controller
-    /// is waiting on it.
-    Ping,
-    /// Either direction — the answer to [`DelegateFrame::Ping`].
-    Pong,
 }
 
 /// One editable config entry (S2 config surface). Values travel as
@@ -1371,27 +1319,6 @@ pub trait LocalApiState: Send + Sync {
     }
     /// S2 — tail a daemon log file (async — file I/O). Default:
     /// unsupported; the agent daemon overrides.
-    /// FR-43 P2 — take ownership of an attached delegation channel.
-    ///
-    /// Called ONLY after [`Request::RcAttach`], and the connection is handed
-    /// over wholesale: this method owns both halves until EOF, and
-    /// `serve_connection` returns when it does. Returning early closes the
-    /// channel.
-    ///
-    /// **The default refuses**, so every existing impl, every mock, and every
-    /// thin client that links this crate is unchanged and cannot be talked into
-    /// serving remote-control sessions. Only the macOS daemon overrides it.
-    /// Default-deny is the right way round here: the cost of a wrong `false` is
-    /// a session that falls back to the worker's own enrollment, and the cost of
-    /// a wrong `true` is an unauthorised process serving the device's screen.
-    async fn rc_attach(
-        &self,
-        _secret: &str,
-        _rd: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-        _wr: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-    ) {
-    }
-
     async fn tail_log(&self, _source: &str, _max_bytes: Option<u64>) -> Response {
         Response::Error {
             message: "log tailing is not supported on this node".into(),
@@ -1433,14 +1360,6 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         Request::ConsentDecide { session_id, allow } => Response::ConsentDecided {
             ok: state.consent_decide(session_id, *allow),
         },
-        // FR-43 P2 — stream-only; `serve_connection` intercepts it before the
-        // pure dispatch ever sees it. Reachable only by calling `handle`
-        // directly, which is a programming error rather than an attack, so it
-        // says so plainly. It deliberately reveals NOTHING about whether the
-        // secret was valid — that answer exists only inside `rc_attach`.
-        Request::RcAttach { .. } => Response::Error {
-            message: "rc_attach is a streaming verb; it has no request/response form".into(),
-        },
         Request::RcSessions => Response::RcSessions(state.rc_sessions()),
         Request::RcDisconnect { session_id } => Response::RcDisconnected {
             ok: state.rc_disconnect(session_id),
@@ -1481,28 +1400,13 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
 /// spawns one task per connection: `serve_connection(stream, state.as_ref())`.
 pub async fn serve_connection<S>(stream: S, state: &dyn LocalApiState) -> std::io::Result<()>
 where
-    // `Send + 'static` is what boxing the halves for the FR-43 P2 delegation
-    // hand-off costs. Every real caller is a `UnixStream` / named pipe and
-    // already satisfies both.
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(rd).lines();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
-        }
-        // FR-43 P2 — the one verb that does not answer and loop. On a
-        // successful attach the connection stops being a request/response
-        // channel and belongs to `rc_attach` until EOF; on refusal we return
-        // WITHOUT a response, because a refused caller should learn nothing
-        // about why (a distinguishable "bad secret" answer is an oracle a
-        // local attacker can grind against, and there is nothing legitimate to
-        // retry with).
-        if let Ok(Request::RcAttach { secret }) = serde_json::from_str::<Request>(&line) {
-            let rd = lines.into_inner();
-            state.rc_attach(&secret, Box::new(rd), Box::new(wr)).await;
-            return Ok(());
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             // The async verbs — await them here; everything else is a pure sync
@@ -2012,45 +1916,6 @@ pub async fn connect() -> std::io::Result<Client> {
             std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket")
         }))
     }
-}
-
-/// FR-43 P2a — dial the SYSTEM daemon and attach as its delegation worker.
-///
-/// Deliberately **not** [`connect`]: that prefers the per-user socket, and on
-/// exactly the host this exists for (macOS, two halves) the per-user socket is
-/// the WORKER'S OWN. A worker that attached to itself would be a channel with
-/// nothing on the other end, reporting success — the same "truthful about the
-/// process, misleading about the machine" trap [`other_daemon_socket`] exists
-/// to document.
-///
-/// Returns the two halves of the connection, already past the attach line. The
-/// caller reads the greeting: the daemon greets an accepted attach and
-/// **silently closes a refused one**, so a stream that ends before the greeting
-/// IS the refusal. There is no reason on the wire on purpose — see the
-/// `RcAttach` docs.
-#[cfg(unix)]
-pub async fn attach_as_worker(
-    secret: &str,
-) -> std::io::Result<(
-    Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-    Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-)> {
-    use tokio::io::AsyncWriteExt;
-    let mut stream = tokio::net::UnixStream::connect(system_socket_path()).await?;
-    let line = serde_json::to_string(&Request::RcAttach {
-        secret: secret.to_string(),
-    })
-    .expect("Request serialises");
-    stream.write_all(line.as_bytes()).await?;
-    stream
-        .write_all(
-            b"
-",
-        )
-        .await?;
-    stream.flush().await?;
-    let (rd, wr) = tokio::io::split(stream);
-    Ok((Box::new(rd), Box::new(wr)))
 }
 
 /// The OTHER daemon's socket, when this host runs two and [`connect`] would
@@ -3486,91 +3351,6 @@ mod tests {
         assert!(
             !json.contains("\"surface\""),
             "an empty surface must be omitted: {json}"
-        );
-    }
-    /// FR-43 P2 — the default `rc_attach` must REFUSE.
-    ///
-    /// This is the property that keeps every thin client that links this crate
-    /// (the desktop companion, the tunnel CLI) from being talked into serving
-    /// remote-control sessions: they inherit the default and never override it.
-    /// A future refactor that gave the trait a permissive default would be a
-    /// privilege escalation reachable from any process that can open the
-    /// socket, and would look entirely reasonable in review — hence a test.
-    #[tokio::test]
-    async fn rc_attach_defaults_to_refusing() {
-        // A default `rc_attach` returns immediately without reading or writing,
-        // so the writer stays untouched: nothing was served.
-        let (client, server) = tokio::io::duplex(1024);
-        let (rd, wr) = tokio::io::split(server);
-        Mock.rc_attach("any-secret", Box::new(rd), Box::new(wr))
-            .await;
-        drop(client);
-    }
-
-    /// `handle` must never be a back door into attaching, and must not become
-    /// an oracle for whether a secret was right.
-    #[test]
-    fn rc_attach_has_no_request_response_form() {
-        let resp = handle(
-            &Request::RcAttach {
-                secret: "hunter2".into(),
-            },
-            &Mock,
-        );
-        match resp {
-            Response::Error { message } => {
-                assert!(
-                    message.contains("streaming"),
-                    "should say why, not just fail: {message}"
-                );
-                // The refusal must not depend on, or leak, the secret.
-                assert!(
-                    !message.contains("hunter2"),
-                    "the refusal echoed the secret: {message}"
-                );
-            }
-            other => panic!("expected an Error, got {other:?}"),
-        }
-    }
-
-    /// The wire spellings of the delegation frames are a compatibility surface:
-    /// the daemon and the worker are replaced independently (the `.pkg`
-    /// postinstall restarts the daemon; the worker is whatever launchd or the
-    /// supervisor last started), so a rename does not fail loudly — it makes
-    /// one half silently unable to talk to the other.
-    #[test]
-    fn delegate_frame_wire_shape_is_locked() {
-        let attached = serde_json::to_string(&DelegateFrame::Attached {
-            daemon_version: "0.4.37".into(),
-        })
-        .unwrap();
-        assert_eq!(
-            attached,
-            r#"{"t":"attached","d":{"daemon_version":"0.4.37"}}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&DelegateFrame::Ping).unwrap(),
-            r#"{"t":"ping"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&DelegateFrame::Pong).unwrap(),
-            r#"{"t":"pong"}"#
-        );
-        // And it round-trips, so a reader on the other half agrees.
-        let back: DelegateFrame = serde_json::from_str(&attached).unwrap();
-        assert_eq!(
-            back,
-            DelegateFrame::Attached {
-                daemon_version: "0.4.37".into()
-            }
-        );
-    }
-
-    #[test]
-    fn rc_attach_request_wire_shape_is_locked() {
-        assert_eq!(
-            serde_json::to_string(&Request::RcAttach { secret: "s".into() }).unwrap(),
-            r#"{"t":"rc_attach","d":{"secret":"s"}}"#
         );
     }
 }
