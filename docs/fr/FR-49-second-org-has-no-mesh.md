@@ -1,7 +1,7 @@
 # FR-49: A second org gets no mesh, and every surface reports normally
 
 **Issue:** [#1084](https://github.com/gjovanov/roomler-ai/issues/1084) ·
-Status: **P0 — spec** (2026-08-31) · Found while enrolling four demo devices for
+Status: **P1–P3 implemented, field-verified** (2026-08-31) · Found while enrolling four demo devices for
 [FR-41](FR-41-product-demo-recording.md) (#965).
 
 ## Goal
@@ -113,9 +113,9 @@ five-minute fix and the two days this cost in the field.
 
 | # | Phase | Kill switch | Status |
 |---|-------|-------------|--------|
-| P1 | Report `overlay_mode` in `org ls`, `status`, `peers` | read-only; nothing to disable | planned |
-| P2 | `org overlay <label> <mode>` + `--overlay` targets the enrolled identity | the verb is opt-in; `--overlay` stays one-way | planned |
-| P3 | `peers --org` / `status --org` | flag absent = today's output byte-for-byte | planned |
+| P1 | Report `overlay_mode` in `org ls`, `status`, `peers` | read-only; nothing to disable | **shipped** |
+| P2 | `org overlay <label> <mode>` + `--overlay` targets the enrolled identity | the verb is opt-in; `--overlay` stays one-way | **shipped** |
+| P3 | `peers --org` | flag absent = today's output byte-for-byte | **shipped** (`status --org` dropped — the enrollment block is short and complete, so a filter would hide context rather than reduce noise) |
 
 ## Acceptance criteria
 
@@ -156,5 +156,63 @@ five-minute fix and the two days this cost in the field.
 - **Whether `status --org` is worth it** or `peers --org` alone covers the need.
 
 ## Field-verification log
+### 2026-08-31 — on this box's real two-org config, and against the LIVE (older) daemon
 
-_(appended as it happens)_
+`roomlerd org ls` on a genuinely multi-org device now carries the column:
+
+```
+LABEL          PRIMARY   ENABLED  OVERLAY   ORG (tenant)               SERVER
+primary        yes       yes      tun       69a1dbba…                  https://roomler.ai
+jovanov                  yes      tun       6a712a57…                  https://roomler.ai
+```
+
+and on a config holding a dark org it says so in words as well as in the column:
+
+```
+acme                     yes      off       2222…
+beta                     yes      netstack  3333…
+
+note: 1 enrolled but NOT on the mesh (overlay off): acme
+      `roomlerd org overlay <label> netstack|tun` joins one; restart the daemon to apply.
+```
+
+`roomler status` grew the block it never had — `NodeStatus.orgs` had been on the
+wire since multi-org P1 and was rendered by NOTHING but `--json`:
+
+```
+  enrollments
+    primary        connected, overlay ? (primary)
+    jovanov        connected, overlay ?
+```
+
+⚠️ **That `?` is the absent≠off criterion verified for free, against a genuinely
+older daemon** — the live one does not send `overlay_mode`, and the new CLI
+prints "unknown" rather than asserting the claim it never made.
+
+`peers --org` scopes to one enrollment (2 sections → 1), and an unknown label
+answers `No enrollment labelled "nosuch" — see \`roomlerd org ls\`.`
+
+Every refusal on the new verb was exercised and none of them wrote anything:
+
+| input | result |
+|---|---|
+| `org overlay beta tunn` | `unknown overlay mode "tunn" — expected one of: off, netstack, tun` |
+| `org overlay primary tun` | refused, names `overlay_enabled` as the right knob |
+| `org overlay nosuch tun` | `no org labelled "nosuch" — see \`roomlerd org ls\`` |
+
+**The regression lock is falsifiable**: restoring the old `apply_overlay_flag`
+(always set the primary) makes
+`overlay_flag_enables_the_org_that_was_actually_enrolled` fail. ⚠️ The other
+three overlay-flag tests still PASS against the broken version — they lock
+adjacent properties, and only that one catches the defect.
+
+### Not field-verified
+
+- **The `peers` dark-org section** cannot fire against a daemon that predates
+  the change (it reports no `overlay_mode`, and absent is deliberately not
+  `off`). Its selection is locked as a pure function instead —
+  `only_an_enabled_overlay_off_org_with_no_peers_is_dark` — covering all four
+  exclusions. Real proof needs a release.
+- **`org overlay … tun` actually joining a mesh**, which needs a daemon restart
+  on a two-org host.
+
