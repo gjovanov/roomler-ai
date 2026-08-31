@@ -6081,6 +6081,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // terminates it (previously it survived until the next request's
       // orphan reap or the consent timeout).
       if (phase.value !== 'requesting') {
+        // #1045 — a create for the session we're ALREADY tracking is not a
+        // ghost: it's the server re-affirming our live session (the coalesce
+        // echo, where a duplicate request on this same socket is answered with
+        // our existing id). Terminating on it would kill the session we're in.
+        if (typeof msg.session_id === 'string' && msg.session_id === sessionId.value) {
+          return
+        }
         console.warn(
           '[rc] rc:session.created outside an active request (phase',
           phase.value,
@@ -6281,6 +6288,22 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // #1045 — while `awaiting_consent` the SERVER owns the timeout and a
+      // human is at the host prompt. An un-scoped transient here (an
+      // agent_offline bounced by our own hangup for a PRIOR session while the
+      // agent WS flaps) must NOT fire the reconnect ladder: that re-sends the
+      // request on this same socket and, on a multi-viewer agent, spawns a
+      // SECOND session — a second host prompt on a second surface (native busy
+      // => companion). A genuine agent drop during consent arrives as a SCOPED
+      // rc:terminate, handled above; ignore the un-scoped noise.
+      if (!msg.session_id && phase.value === 'awaiting_consent') {
+        console.info(
+          '[rc] un-scoped transient rc:error (',
+          msg.code,
+          ') during awaiting_consent - ignoring (server owns the consent timeout)',
+        )
+        return
+      }
       // (2026-08-05 winhost-a wedge) An un-scoped transient (no session_id -
       // e.g. agent_offline bounced by our own hangup for the PREVIOUS
       // session while the agent's WS flaps) passes the gate and used to
