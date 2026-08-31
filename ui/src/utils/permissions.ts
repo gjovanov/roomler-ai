@@ -10,11 +10,15 @@
  * THIS catalog, so a bit missing here is a bit silently stripped from any
  * role that gets saved.
  *
- * ⚠️ JS bitwise operands are coerced to **signed int32**. Bits 0–30 are safe
- * (`1 << 30` is positive), but composites must not be built with a shift:
- * `(1 << 31) - 1` is −2147483649 in JS, not 2147483647. Hence `2 ** 31 - 1`
- * below. A future bit 31 would make `1 << 31` negative and break every mask
- * operation in this file — it needs BigInt or string masks, not a new entry.
+ * ⚠️ JS bitwise operands are coerced to **signed int32**, so this file uses NO
+ * bitwise operators on a mask — see `maskHas`/`maskSet`/`maskClear`/`maskUnion`,
+ * which are arithmetic and exact to bit 52 (#888). A composite must likewise not
+ * be built with a shift: `(1 << 31) - 1` is −2147483649 in JS, not 2147483647.
+ *
+ * The ceiling is therefore bit 52, not bit 30, and it is the JSON number's
+ * 2^53 integer limit rather than anything about the wire or the server (`u64`).
+ * Adding a bit above 30 needs a catalog entry here and nothing else; adding one
+ * above 52 needs BigInt or string masks end to end.
  */
 
 export interface PermissionFlag {
@@ -131,7 +135,7 @@ function byKeys(keys: string[]): number {
   return keys.reduce((mask, key) => {
     const flag = PERMISSION_FLAGS.find((f) => f.key === key)
     if (!flag) throw new Error(`unknown permission key: ${key}`)
-    return mask | flag.bit
+    return maskSet(mask, flag.bit)
   }, 0)
 }
 
@@ -156,8 +160,8 @@ export const DEFAULT_MEMBER = byKeys([
  * views ARE included — seeing what the fleet served is a different job from
  * being able to serve it.
  */
-export const DEFAULT_ADMIN =
-  DEFAULT_MEMBER |
+export const DEFAULT_ADMIN = maskUnion(
+  DEFAULT_MEMBER,
   byKeys([
     'MANAGE_CHANNELS',
     'MANAGE_ROLES',
@@ -176,7 +180,8 @@ export const DEFAULT_ADMIN =
     'VIEW_REMOTE_AUDIT',
     'VIEW_EXEC_AUDIT',
     'VIEW_SSH_AUDIT',
-  ])
+  ]),
+)
 
 /**
  * Every defined bit — server `ALL = (1 << 31) - 1` = bits 0–30.
@@ -186,16 +191,85 @@ export const DEFAULT_ADMIN =
 export const ALL_PERMISSIONS = 2 ** 31 - 1
 
 /**
+ * Mask arithmetic that is exact to `Number.MAX_SAFE_INTEGER`, i.e. bits 0–52.
+ *
+ * #888: the ceiling was bit 30 because every mask operation here used a JS
+ * bitwise operator, and those coerce both operands to **signed int32** —
+ * `1 << 31` is negative and anything above bit 31 is truncated outright. The
+ * limit was never the wire and never the server (which is `u64`): a JSON number
+ * carries an integer EXACTLY up to 2^53, verified rather than assumed —
+ * `2 ** 52` survives `JSON.parse(JSON.stringify(...))` unchanged, while
+ * `2 ** 40 & 2 ** 40` does not survive the operator.
+ *
+ * So the fix is arithmetic, not `BigInt`. That keeps `number` end to end — no
+ * string-on-the-wire, no server serialisation change, no client-compat break —
+ * and moves the ceiling from **31 flags to 53**, which at the observed rate of a
+ * few bits a year is a decade rather than a stopgap.
+ *
+ * ⚠️ `maskSet`/`maskClear` are add/subtract and are therefore only correct when
+ * guarded by `maskHas`. They are written that way on purpose: `|` and `&~` are
+ * exactly the operators that silently truncate, and the role editor WRITES BACK
+ * the mask it builds, so a truncation here does not throw — it strips
+ * permissions from a saved role and looks like a successful save.
+ */
+function maskHas(mask: number, bit: number): boolean {
+  return Math.floor(mask / bit) % 2 === 1
+}
+
+function maskSet(mask: number, bit: number): number {
+  return maskHas(mask, bit) ? mask : mask + bit
+}
+
+function maskClear(mask: number, bit: number): number {
+  return maskHas(mask, bit) ? mask - bit : mask
+}
+
+/**
+ * Arithmetic `(mask & flag) === flag`: every set bit of `flag` is set in `mask`.
+ *
+ * Walks the bits rather than consulting `PERMISSION_FLAGS`, deliberately. A
+ * catalog-driven version would silently IGNORE any bit the catalog does not
+ * know — and a mask arriving from a newer server is exactly the case where that
+ * happens, so the check would quietly answer "yes, you have it" for a
+ * permission this build has never heard of.
+ */
+function maskContainsAll(mask: number, flag: number): boolean {
+  let m = mask
+  let f = flag
+  while (f > 0) {
+    if (f % 2 === 1 && m % 2 !== 1) return false
+    m = Math.floor(m / 2)
+    f = Math.floor(f / 2)
+  }
+  return true
+}
+
+/** Arithmetic `a | b`, exact to bit 52. */
+function maskUnion(a: number, b: number): number {
+  let out = a
+  let bit = 1
+  let rest = b
+  while (rest > 0) {
+    if (rest % 2 === 1) out = maskSet(out, bit)
+    rest = Math.floor(rest / 2)
+    bit *= 2
+  }
+  return out
+}
+
+export { maskHas, maskSet, maskClear, maskUnion }
+
+/**
  * Mirror of the server check: ADMINISTRATOR bypasses everything, else the
  * flag's bits must all be present.
  */
 export function hasPermission(mask: number, flag: number): boolean {
-  return (mask & ADMINISTRATOR) !== 0 || (mask & flag) === flag
+  return maskHas(mask, ADMINISTRATOR) || maskContainsAll(mask, flag)
 }
 
 /** Labels of the flags present in `mask`, in catalog order. */
 export function describePermissions(mask: number): string[] {
-  return PERMISSION_FLAGS.filter((f) => (mask & f.bit) !== 0).map((f) => f.label)
+  return PERMISSION_FLAGS.filter((f) => maskHas(mask, f.bit)).map((f) => f.label)
 }
 
 /**

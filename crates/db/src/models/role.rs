@@ -89,15 +89,22 @@ pub mod permissions {
     /// and an org may well want one reviewer for bounded commands and another
     /// for interactive sessions.
     pub const VIEW_SSH_AUDIT: u64 = 1 << 30;
-    // ⚠️ Bit 30 is the LAST bit the UI can represent. Its mirror
-    // (`ui/src/utils/permissions.ts`) checks masks with JS int32 bitwise ops,
-    // under which `1 << 31` is negative and `1 << 32` wraps to 1, and its spec
-    // pins the ceiling at bit 30 by design. A bit defined here that the UI
-    // cannot render is a permission nobody can grant from the product.
-    // FR-19's relay approval therefore rides MANAGE_AGENTS + EXEC_DEVICE (an
-    // EXEC_DEVICE holder can already enable a relay on any exec-enabled
-    // device as root, so the coupling grants nothing new) until the mask
-    // moves to BigInt — tracked in #888.
+    // ⚠️ Bit 52 is the ceiling, and the reason is the JSON number rather than
+    // anything here: a mask crosses the wire as a JSON integer, which is exact
+    // only below 2^53. The UI mirror (`ui/src/utils/permissions.ts`) does its
+    // mask arithmetic WITHOUT bitwise operators for exactly this reason — JS
+    // coerces those to signed int32, which is what capped the catalog at bit 30
+    // until #888. Adding a bit at 31..52 now needs a catalog entry there and
+    // nothing else; going above 52 needs BigInt or string masks end to end.
+    //
+    // ⚠️ Still true, and the thing to check when adding one: a bit defined HERE
+    // that the UI does not list is a permission nobody can grant from the
+    // product. The mirror is hand-maintained and its spec locks the count.
+    //
+    // FR-19's relay approval rides MANAGE_AGENTS + EXEC_DEVICE (an EXEC_DEVICE
+    // holder can already enable a relay on any exec-enabled device as root, so
+    // the coupling grants nothing new). That was a workaround for the ceiling;
+    // it can now become a dedicated bit whenever FR-19 wants one.
 
     /// Default member permissions
     pub const DEFAULT_MEMBER: u64 = VIEW_CHANNELS
