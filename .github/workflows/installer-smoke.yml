@@ -980,6 +980,12 @@ jobs:
           # install with ROOMLER_MACOS_DAEMON=1 logged the per-user lines and
           # none of the daemon ones — and the dead condition was removed.
           echo "=== install 1: enabled via the marker ==="
+          # FR-46 P5a — deliberately seeded at the LEGACY path, so this install
+          # exercises the postinstall migration end to end rather than only the
+          # happy path. A marker the migration failed to carry would fall through
+          # to the else branch and BOOT OUT the daemon, which is the failure this
+          # whole phase is shaped around.
+          # RETIRED-NAME-ANCHOR(2): the migration SOURCE, seeded on purpose.
           sudo mkdir -p /etc/roomler-agent
           sudo touch /etc/roomler-agent/enable-daemon
           sudo installer -verbose -pkg dist/smoke.pkg -target /
@@ -987,6 +993,13 @@ jobs:
           test -f /Library/LaunchDaemons/com.roomler.daemon.plist \
             || { echo "::error::daemon plist missing after an enabled install"; exit 1; }
           echo "  daemon installed"
+          # The migration must have MOVED it, not copied it: a legacy directory
+          # left behind would be read again by the dual-read gates forever.
+          test -f /etc/roomler/enable-daemon \
+            || { echo "::error::the marker was not migrated to /etc/roomler"; exit 1; }
+          test ! -d /etc/roomler-agent \
+            || { echo "::error::the legacy /etc/roomler-agent survived the migration"; exit 1; }
+          echo "  config dir migrated off the retired name"
 
           echo "=== install 2: plain, i.e. what a self-update runs ==="
           sudo installer -verbose -pkg dist/smoke.pkg -target /
@@ -1000,7 +1013,7 @@ jobs:
           # daemon goes. Otherwise this test would pass by making the removal
           # branch unreachable, which is the opposite defect.
           echo "=== install 3: marker removed = a real opt-out ==="
-          sudo rm -f /etc/roomler-agent/enable-daemon
+          sudo rm -f /etc/roomler/enable-daemon
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           dump_log
           if [ -f /Library/LaunchDaemons/com.roomler.daemon.plist ]; then
@@ -1026,6 +1039,13 @@ jobs:
             || { echo "::error::update plist vanished across plain re-installs"; exit 1; }
 
           echo "=== opt out: marker set -> the helper must GO ==="
+          # FR-46 P5a — by this point install 1 has already migrated the directory,
+          # so `/etc/roomler` EXISTS and the migration (dest-absent only) will not
+          # run again. That makes this block exercise the DUAL-READ fallback arm:
+          # an opt-out marker sitting at the legacy path must still be honoured,
+          # because reading only the current path would auto-update a Mac whose
+          # operator opted out. Deliberate coverage, not an accident of ordering.
+          # RETIRED-NAME-ANCHOR(2): the legacy opt-out path, seeded on purpose.
           sudo mkdir -p /etc/roomler-agent
           sudo touch /etc/roomler-agent/disable-auto-update
           sudo installer -verbose -pkg dist/smoke.pkg -target /

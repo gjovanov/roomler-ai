@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- RETIRED-NAME-ANCHOR-BEGIN
-     /etc/roomler-agent is this daemon's REAL config directory. This file
-     is what passes it, and the .pkg postinstall is what creates it, so the
-     path is not a stale name: it is the contract between the two. FR-21 D5.
+     `/etc/roomler` is this daemon's REAL config directory — FR-46 P5a moved it
+     off the retired name, and the .pkg postinstall migrates an existing Mac
+     before this file is installed. The BUNDLE path below is a different story:
+     it keys the TCC grants and stays frozen until P5b. docs/fr/FR-46
 -->
 <!--
   LaunchDAEMON for roomlerd — the privileged half.
@@ -21,7 +22,7 @@
   logged in.
 
   Opt-in: the postinstall only loads this when the operator asks for it
-  (`/etc/roomler-agent/enable-daemon` present — the marker is the ONLY
+  (`/etc/roomler/enable-daemon` present — the marker is the ONLY
   channel; PackageKit scripts inherit no environment, which is why the old
   ROOMLER_MACOS_DAEMON=1 form never worked and was removed). A root daemon
   on someone's Mac is a posture decision, not a side effect of installing a
@@ -43,7 +44,7 @@
          freezes it. docs/fr/FR-21 -->
         <string>/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent</string>
         <string>--config</string>
-        <string>/etc/roomler-agent/config.toml</string>
+        <string>/etc/roomler/config.toml</string>
         <string>run</string>
     </array>
 
@@ -61,9 +62,9 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/var/log/roomler-agent/daemon.log</string>
+    <string>/var/log/roomler/daemon.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/roomler-agent/daemon.log</string>
+    <string>/var/log/roomler/daemon.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
