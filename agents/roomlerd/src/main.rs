@@ -1927,6 +1927,53 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     Ok(Some(vd))
 }
 
+/// Resolves when the OS asks this process to stop — SIGTERM on Unix.
+///
+/// This is the signal every *deliberate* stop uses: `systemctl stop` and
+/// `systemctl restart`, `launchctl kickstart -k` and `launchctl bootout`, a
+/// `dpkg`/`.pkg` upgrade replacing the binary, a reboot, and the FR-43 macOS
+/// supervisor handing its worker back. None of those are the agent failing.
+///
+/// It was **not handled at all** until 2026-08-31 (#1040): the shutdown select
+/// waited on `tokio::signal::ctrl_c()`, which on Unix is SIGINT only, under a
+/// comment that claimed "Ctrl-C / SIGTERM". A SIGTERM therefore killed the
+/// process outright, `last_run_unhealthy` stayed `true` on disk, and the next
+/// start counted a crash. Three of those inside `CRASH_WINDOW_SECS` while the
+/// running version had not yet been promoted to last-known-good — i.e. inside
+/// the first `CLEAN_RUN_THRESHOLD_SECS` after an update — trip
+/// `should_rollback` and **downgrade the host**. Measured on the MacBook: two
+/// `launchctl kickstart -k`s inside the window took `crash_count` 0 → 1 with
+/// `previous run did not reach clean-run threshold — counting as crash`, and
+/// the FR-43 supervisor (which cycles a worker in seconds) reproduced the full
+/// chain to `rollback installer downloaded — spawning + exiting`.
+///
+/// Windows has no SIGTERM — the service path handles its own SCM stop — so
+/// this never resolves there.
+async fn terminate_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                // Never installed ⇒ never fires. Say so once: the
+                // consequence is silent (deliberate stops go back to
+                // looking like crashes), which is exactly the failure
+                // mode #1040 was about.
+                tracing::warn!(
+                    error = %e,
+                    "could not install a SIGTERM handler; a service stop will be counted as a crash"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
+}
+
 /// How `run` terminates when another process already owns the
 /// single-instance lock.
 ///
@@ -3167,7 +3214,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         None
     };
 
-    // Wait for Ctrl-C / SIGTERM.
+    // Wait for an internal shutdown, Ctrl-C (SIGINT), or SIGTERM.
     let mut graceful_shutdown = false;
     tokio::select! {
         res = sig_task => {
@@ -3193,6 +3240,14 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             graceful_shutdown = true;
             let _ = shutdown_tx.send(true);
             // Give the signaling task a short window to flush.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // Being asked to stop is not failing to run. See `terminate_signal`
+        // for what this cost before it existed (#1040).
+        _ = terminate_signal() => {
+            tracing::info!("SIGTERM received; shutting down gracefully");
+            graceful_shutdown = true;
+            let _ = shutdown_tx.send(true);
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
