@@ -54,7 +54,7 @@ on a machine with no scanout. The backend priority stays
 | Phase | What | Kill switch |
 |---|---|---|
 | **P1** ✅ | Detect whether `org.freedesktop.portal.ScreenCast` is actually exposed, and report WHY not, in `capture-smoke` (`capture/portal.rs`). Uses zbus, which is pure Rust and adds no system `.so`. | n/a (read-only) |
-| **P2** ⛔ BLOCKED | ⚠️ Needs a SESSION-RESIDENT component first (the daemon is root, no session bus), AND a host that actually exposes ScreenCast — none does today. ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
+| **P2** | ⚠️ Needs a SESSION-RESIDENT component first — the daemon is root and has no session bus. (The "no host exposes ScreenCast" blocker is CLEARED: see the diagnosis below.) ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P3** | PipeWire consumer: attach to the node, negotiate a format, deliver `Frame`s through the existing `ScreenCapture` trait as a **sixth backend**. | same |
 | **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
 
@@ -115,6 +115,39 @@ and attributed it to an X11 session; it reproduces under Wayland, so that
 explanation was wrong. **P2 cannot start until this is understood**, because
 there is currently no host in the fleet that offers the interface P2 would
 call.
+
+
+## ✅ The P2 blocker is diagnosed and cleared (2026-08-31)
+
+`scw-m2-asahi` exposed no ScreenCast for a reason that had nothing to do with
+the session type FR-36 blamed, and nothing to do with a missing package:
+
+1. `XDG_CURRENT_DESKTOP=GNOME`, `XDG_SESSION_TYPE=wayland`, `gnome.portal`
+   installed, and **mutter was already exposing its own
+   `org.gnome.Mutter.ScreenCast` / `RemoteDesktop` APIs** — the compositor side
+   was never the problem.
+2. **`xdg-desktop-portal-gnome` was `inactive (dead)`.** It is a `static`,
+   D-Bus-activated unit and nothing in that session had triggered it, so the
+   frontend served only the interfaces it can provide alone (Account, Camera,
+   FileChooser, Notification …).
+3. ⚠️ **Starting the backend was not enough.** The frontend caches its backend
+   selection at startup; the interfaces appeared only after
+   `systemctl --user restart xdg-desktop-portal` *with the backend already up*.
+
+```
+portal=available (screencast v5, remote_desktop=true)
+```
+
+⇒ **P2 is unblocked**, `RemoteDesktop` is present so **P4 is viable**, and the
+`Available` branch of the P1 detector — the one branch that had never been
+exercised — is verified.
+
+⚠️ **The ordering fragility is itself a design input.** A host can have every
+package installed and still offer nothing, depending on service start order, so
+the agent must **detect at session time and never cache** the answer. The P1
+advice string was corrected accordingly: it used to say "install the backend",
+which on this host would have sent the reader to a package that was already
+there.
 
 ## Acceptance criteria
 
@@ -195,3 +228,4 @@ call.
 | 2026-08-31 | P1, WSL2 | `portal=no-screencast — xdg-desktop-portal is running but exposes no ScreenCast — install the backend matching your compositor`. The FR-36 case, now named rather than guessed at |
 | 2026-08-31 | P1, Asahi **as root** | `portal=no-session-bus`. ⚠️ **This is the architecture, not a test artefact** — the daemon is root, the portal is per-user-session, so P2/P3 need a session-resident component before any PipeWire code |
 | 2026-08-31 | P1, Asahi **inside the GNOME Wayland session** | `portal=no-screencast`, **independently confirmed with `busctl`** (lists Account, Camera, FileChooser, Notification … but neither ScreenCast nor RemoteDesktop) despite `xdg-desktop-portal-gnome` being installed. ⛔ **No fleet host currently exposes the interface P2 would call.** FR-36 blamed an X11 session for this; it reproduces under Wayland, so that explanation was wrong |
+| 2026-08-31 | **P2 blocker diagnosed and cleared** | Not the session type (FR-36's guess) and not a missing package. `xdg-desktop-portal-gnome` was `inactive (dead)` — a `static` D-Bus-activated unit nothing had triggered — while mutter was already exposing its own ScreenCast/RemoteDesktop APIs. ⚠️ Starting the backend alone did NOT help: the frontend caches its backend selection at startup and had to be restarted after it. Result: `portal=available (screencast v5, remote_desktop=true)` — P2 unblocked, P4 viable, and the detector's `Available` branch exercised for the first time |
