@@ -1211,12 +1211,10 @@ fn installed_daemon_candidates() -> Vec<PathBuf> {
             // The pkg's symlink into the bundle. Preferred: every launchd
             // plist and TCC grant keys on the bundle path it points at.
             PathBuf::from("/usr/local/bin/roomlerd"),
-            // The bundle itself, if the symlink is missing.
-            // RETIRED-NAME-ANCHOR: the macOS .app bundle name KEYS THE TCC GRANTS —
-            // renaming it silently drops Screen Recording + Accessibility on every Mac.
-            // FR-21 D5 freezes it; this is the path that bundle really has.
-            // docs/fr/FR-21
-            PathBuf::from("/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent"),
+            // The bundle itself, if the symlink is missing. Every launchd plist
+            // and TCC grant keys on this path, so it moves only with a rename that
+            // moves the plists too (FR-46 P5b).
+            PathBuf::from("/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"),
         ]
     }
     #[cfg(all(unix, not(target_os = "macos")))]

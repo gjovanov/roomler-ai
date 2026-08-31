@@ -54,8 +54,7 @@ describe('enrollCommands', () => {
     expect(linux!.blocks[2]!.command).toContain(`--server ${ORIGIN}`)
     // NOT `roomlerd`: on macOS the daemon lives inside the .app bundle and no
     // binary by that name exists anywhere on the machine.
-    // RETIRED-NAME-ANCHOR: frozen bundle name (macOS TCC grants). FR-21 D5.
-    expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomler-agent\.app\S* enroll /)
+    expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomlerd\.app\S* enroll /)
   })
 
   it('maps the user scope to the per-user roles', () => {
@@ -67,8 +66,7 @@ describe('enrollCommands', () => {
       expect(os.blocks[2]!.command).toMatch(/^roomlerd enroll /)
     }
     // macOS resolves to the bundle executable — see above.
-    // RETIRED-NAME-ANCHOR: frozen bundle name (macOS TCC grants). FR-21 D5.
-    expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomler-agent\.app\S* enroll /)
+    expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomlerd\.app\S* enroll /)
     expect(windows!.blocks[2]!.command).not.toContain('--machine-global')
   })
 
@@ -137,15 +135,14 @@ describe('enrollCommands', () => {
       for (const scope of SCOPES) {
         for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope)) {
           for (const block of os.blocks) {
-            // RETIRED-NAME-ANCHOR(4): frozen bundle name (macOS TCC grants). FR-21 D5.
-            // macOS is the ONE exception and it is not the retired name
-            // resurfacing: the .app's CFBundleExecutable is literally
-            // `roomler-agent` (renaming it would void the TCC grants keyed to
-            // that binary), both launchd plists name that path, and CI asserts
-            // it. Everywhere else the name is retired and must stay gone.
-            if (os.os !== 'macos') {
-              expect(block.command).not.toContain('roomler-agent')
-            }
+            // FR-46 P5b REMOVED the macOS exception. The .app, its executable
+            // and both launchd plists now carry the current name, so this
+            // assertion holds on every platform — and leaving the exemption in
+            // would have quietly stopped testing the one platform that still
+            // had the name, which is the opposite of what this suite is for.
+            // RETIRED-NAME-ANCHOR(3): the retired forms are the SUBJECT of the
+            // assertion; naming them is how it asserts they are gone.
+            expect(block.command).not.toContain('roomler-agent')
             expect(block.command).not.toContain('roomler-tunnel')
             expect(block.command).not.toContain('https://roomler.ai')
           }
@@ -161,8 +158,7 @@ describe('enrollCommands', () => {
     const macos = enrollCommands('agent', ORIGIN, TOKEN).find((o) => o.os === 'macos')!
     const manual = macos.blocks.find((b) => b.id.endsWith('-manual'))!
     expect(manual.command).toContain(
-      // RETIRED-NAME-ANCHOR: frozen bundle name (macOS TCC grants). FR-21 D5.
-      '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent enroll',
+      '/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd enroll',
     )
     expect(manual.command).not.toMatch(/^roomlerd /)
   })
