@@ -35,7 +35,8 @@ docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --b
 ```
 
 Then open <http://localhost:8080>. The first build compiles Rust and mediasoup
-from source and takes 10–20 minutes; after that, startup is seconds. Full
+from source — measured 6 minutes on a 16-core laptop, budget 15–20 on a small
+VPS; after that, startup is seconds. Full
 walkthrough — TLS, reverse proxy, media ports, backups —
 in **[`docs/self-hosting.md`](docs/self-hosting.md)**.
 
@@ -51,7 +52,8 @@ machine you want to reach:
 # Linux / macOS
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon --token <enrollment-jwt>
 # Windows (PowerShell, elevated)
-irm https://roomler.ai/api/setup/install.ps1 | iex
+& ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) `
+    -Role daemon-system -Token <enrollment-jwt>
 ```
 
 The agent connects **outbound only** — nothing is opened on the machine you
