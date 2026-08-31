@@ -4,6 +4,10 @@ import { describe, expect, it } from 'vitest'
 import {
   ADMINISTRATOR,
   ALL_PERMISSIONS,
+  maskClear,
+  maskHas,
+  maskSet,
+  maskUnion,
   DEFAULT_ADMIN,
   DEFAULT_MEMBER,
   PERMISSION_FLAGS,
@@ -30,13 +34,15 @@ describe('permission catalog', () => {
     expect(new Set(bits).size).toBe(31)
     const keys = PERMISSION_FLAGS.map((f) => f.key)
     expect(new Set(keys).size).toBe(31)
-    // Every bit is a single power of two inside the defined range. Bit 30 is
-    // the ceiling: `1 << 31` is NEGATIVE under JS int32 coercion, so a bit
-    // that high cannot be represented here at all.
+    // Every bit is a single power of two. The ceiling is now bit 52, not 30
+    // (#888): the file uses arithmetic rather than bitwise operators, so the
+    // limit is the JSON number's exact-integer range, not int32 coercion.
+    // Still capped here so an entry above 2^52 fails loudly rather than
+    // silently losing precision.
     for (const bit of bits) {
-      expect(bit & (bit - 1)).toBe(0)
+      expect(Number.isInteger(Math.log2(bit))).toBe(true)
       expect(bit).toBeGreaterThan(0)
-      expect(bit).toBeLessThanOrEqual(1 << 30)
+      expect(bit).toBeLessThanOrEqual(2 ** 52)
     }
   })
 
@@ -318,5 +324,69 @@ describe('canGrantDeviceExec / canGrantDeviceSsh', () => {
     // cannot tell whether the DEVICE refused or they did.
     expect(canGrantDeviceExec(null, false)).toBe(false)
     expect(canGrantDeviceSsh(null, false)).toBe(false)
+  })
+})
+
+describe('#888 — the ceiling is bit 52, not bit 30', () => {
+  // The bug was never the wire and never the server (u64): it was that every
+  // mask operation used a JS bitwise operator, and those coerce to signed
+  // int32. These pin the arithmetic helpers across the range that unlocks.
+  const HIGH = [2 ** 31, 2 ** 40, 2 ** 52]
+
+  it('the OLD bitwise approach really does break there — the reason this exists', () => {
+    for (const bit of HIGH) {
+      // `mask & bit` is how every check in this file used to be written.
+      expect((bit & bit) === bit).toBe(false)
+    }
+    // ...and bit 30 is exactly where it still worked, which is why the ceiling
+    // sat there rather than anywhere principled.
+    expect(((1 << 30) & (1 << 30)) === 1 << 30).toBe(true)
+  })
+
+  it('maskHas reads high bits the bitwise version could not', () => {
+    for (const bit of HIGH) {
+      expect(maskHas(bit, bit)).toBe(true)
+      expect(maskHas(0, bit)).toBe(false)
+      // and does not confuse a neighbouring bit for it
+      expect(maskHas(bit * 2, bit)).toBe(false)
+    }
+  })
+
+  it('maskSet / maskClear round-trip a high bit without disturbing the rest', () => {
+    for (const bit of HIGH) {
+      const base = DEFAULT_ADMIN
+      const set = maskSet(base, bit)
+      expect(maskHas(set, bit)).toBe(true)
+      // every previously-held permission survives — the failure mode here is a
+      // saved role coming back with permissions silently stripped
+      expect(describePermissions(set)).toEqual(describePermissions(base))
+      expect(maskClear(set, bit)).toBe(base)
+      // idempotent in both directions
+      expect(maskSet(set, bit)).toBe(set)
+      expect(maskClear(base, bit)).toBe(base)
+    }
+  })
+
+  it('hasPermission honours a high-bit flag, and ADMINISTRATOR still bypasses', () => {
+    for (const bit of HIGH) {
+      expect(hasPermission(bit, bit)).toBe(true)
+      expect(hasPermission(0, bit)).toBe(false)
+      expect(hasPermission(ADMINISTRATOR, bit)).toBe(true)
+    }
+  })
+
+  it('a high-bit mask survives the wire — JSON carries it exactly', () => {
+    for (const bit of HIGH) {
+      const mask = maskSet(DEFAULT_ADMIN, bit)
+      const round = JSON.parse(JSON.stringify({ permissions: mask })).permissions
+      expect(round).toBe(mask)
+      expect(Number.isSafeInteger(round)).toBe(true)
+    }
+  })
+
+  it('maskUnion composes disjoint and overlapping masks like `|` used to', () => {
+    expect(maskUnion(0b0101, 0b0011)).toBe(0b0111)
+    expect(maskUnion(DEFAULT_MEMBER, DEFAULT_MEMBER)).toBe(DEFAULT_MEMBER)
+    expect(maskHas(maskUnion(DEFAULT_MEMBER, 2 ** 45), 2 ** 45)).toBe(true)
   })
 })
