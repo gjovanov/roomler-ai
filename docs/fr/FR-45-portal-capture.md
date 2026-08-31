@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a shipped, field-verified · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a shipped; P2b shipped, verified through `Start` · **Owner:** agent / capture
 
 ## Goal
 
@@ -55,8 +55,8 @@ on a machine with no scanout. The backend priority stays
 |---|---|---|
 | **P1** ✅ | Detect whether `org.freedesktop.portal.ScreenCast` is actually exposed, and report WHY not, in `capture-smoke` (`capture/portal.rs`). Uses zbus, which is pure Rust and adds no system `.so`. | n/a (read-only) |
 | **P2a** ✅ | `portal-helper` hidden subcommand, spawned as the console user with that session's bus. Proven by running `detect()` from the daemon and getting `available` where it previously could only say `no-session-bus`. ⚠️ Built with the verified **privilege drop**, not `systemd-run` as planned — see below. | `ROOMLERD_PORTAL_CAPTURE=0` |
-| **P2b** | The helper opens the ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
-| **P3** | PipeWire consumer: attach to the node, negotiate a format, deliver `Frame`s through the existing `ScreenCapture` trait as a **sixth backend**. | same |
+| **P2b** 🟡 | The helper opens the ScreenCast session: `CreateSession` → `SelectSources` → `Start` → `OpenPipeWireRemote`, giving a PipeWire node id. Consent dialog handled via `persist_mode`/`restore_token`. ⚠️ The fd **stays in the helper** — see the corrected decision below. Field-verified through `Start`; the grant itself awaits a human click. | `ROOMLERD_PORTAL_CAPTURE=0` |
+| **P3** | PipeWire consumer **inside the helper**, via `dlopen`: attach to the node, negotiate a format, and deliver `Frame`s to the daemon — buffer fds over `SCM_RIGHTS` once at negotiation, then a ready-message per frame — surfacing through the existing `ScreenCapture` trait as a **sixth backend**. | same |
 | **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
 
 ### The seam is unchanged
@@ -209,11 +209,27 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
   helper *subcommand* does not by itself solve the dependency problem, because
   it is the same ELF and so the same `DT_NEEDED`. The subcommand bought the
   session context; only `dlopen` buys the linkage.
-- **P2b** — the helper opens the ScreenCast session and passes the PipeWire fd
-  back over `SCM_RIGHTS` (the FR-36 P3 shape, which was designed and never
-  built).
+- **P2b** 🟡 **shipped, field-verified through `Start`** (#1059) —
+  `CreateSession` → `SelectSources` → `Start` → `OpenPipeWireRemote`.
+
+  ⚠️⚠️ **This plan contradicted itself and the contradiction is now resolved.**
+  It said P2b passes the PipeWire fd to the daemon over `SCM_RIGHTS` (inherited
+  from FR-36's design) *and* that P3 consumes PipeWire inside the helper. Those
+  cannot both be true. Decided:
+
+  > **The helper consumes PipeWire. The fd never crosses to the daemon.**
+
+  1. **Fault isolation** — the `encode::caps` lesson exactly: third-party
+     driver code that faults inside the daemon costs a crash-loop, not a
+     degraded feature. `libpipewire` loads SPA plugins on vendor GPU stacks.
+  2. **It is not slower** — PipeWire negotiates a *pool* of buffers, so those
+     fds cross once and per frame only "buffer N is ready" flows. Frames
+     crossing a process boundary is not pixels being copied.
+  3. **The helper already runs as the session's user**, whose PipeWire it is.
+
+  `SCM_RIGHTS` therefore moves to P3, carrying **buffer** fds.
 - **P3** — PipeWire consumption inside the helper, via `dlopen`. The daemon
-  never links it.
+  never links it, and after the decision above never connects to it either.
 - **P4** — RemoteDesktop input in the same helper and the same session.
 
 ## Acceptance criteria
@@ -301,3 +317,6 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-08-31 | **P2a, Asahi — the loginctl call underneath it never worked** | `loginctl list-sessions --no-legend --no-pager -o value -p Id` — what `graphical_session()` ran — **exits 1 with empty stdout**, measured on systemd **255** (Ubuntu 24.04, two hosts) and **257** (Fedora 42): those are `show-*` options and `list-sessions` rejects them. The function read that as an empty session list, i.e. “nobody is at this machine's screen”, on every Linux host, always. ⚠️ The column layout also differs between the two releases (257 inserts `LEADER` and `CLASS`), so only column one is safe to parse; both real samples are now in a test |
 | 2026-08-31 | **P2a FIELD-VERIFIED — 0.4.37, Asahi, GNOME Wayland** | Three runs, one binary. **CONTROL** as `m1` inside the session: `available (screencast v5, remote_desktop=true)`. **BEFORE** as root, plain `detect()` (the P1 behaviour): `no-session-bus`. **AFTER** as root through `detect_in_session()`: `available (screencast v5, remote_desktop=true)` — matching the control exactly. Root's environment was confirmed to carry none of `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` / `DISPLAY` / `WAYLAND_DISPLAY`, i.e. the daemon's own situation. 🔑 The AFTER trace shows **both** halves: the child's own line on inherited stderr, then the parent's parsed verdict |
 | 2026-08-31 | P2a — what the loginctl fix could **not** be shown to fix here | The claim that the broken lookup also stopped FR-27's consent companion is **reasoned, not observed on this host**: `roomler-desktop` is not installed on Asahi, so `ensure_running_inner` returns `Unsupported` one step BEFORE reaching `graphical_session()` (the daemon log carries 15 “prompts go to the desktop companion” lines and no session-lookup failure). What IS measured: the old command exits 1 on both systemd versions, and P2a — which calls the same function — works only with the fix |
+| 2026-08-31 | **P2b — zbus panics inside a tokio runtime, again** | The first field run of the handshake died on `Cannot start a runtime from within a runtime` before making a single portal call. P1's `detect()` already ran its D-Bus work on its own thread for exactly this reason; `open()` was written without the guard. 🔑 The fix put the thread INSIDE `open()` rather than at the call site, so the next entry point cannot reintroduce it — the same shape as the `ResolvedSessionPolicy` lesson: make the mistake unrepresentable, not merely fixed |
+| 2026-08-31 | **P2b field-verified through `Start` — Asahi, GNOME Wayland** | The live bus objects are the evidence: `…/session/1_170/roomler_ss_472905_1` (CreateSession succeeded) and `…/request/1_170/roomler_start_472905_3` (Start pending). The pid in both tokens is the helper's, and `1_170` is its unique name `:1.170` mangled per the portal spec — so **the request-path derivation is confirmed in the field**, which matters because getting it wrong hangs forever rather than failing. `xdg-desktop-portal-gnome` up, `Start` outstanding 7+ min: the consent dialog is waiting to be answered |
+| 2026-08-31 | P2b — what could **not** be observed | The dialog's VISIBILITY is inferred from the pending `Request` plus a live backend, not seen: GNOME refuses `org.gnome.Shell.Screenshot` to unsandboxed callers, and `capture-smoke` does not wire FR-36's config-gated DRM backend, so the screen could not be photographed. ⚠️ Also: `pkill -x roomlerd` on a host reached over the overlay kills the daemon carrying your own SSH — ~40 s of no access until systemd restarted it |
