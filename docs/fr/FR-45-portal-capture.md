@@ -264,9 +264,14 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
       Verified by running it, not by inspection — `dlopen` only, **0**
       `DT_NEEDED` entries on both architectures, and a live run with the
       library bind-mounted away that still completed the portal handshake
-- [ ] Backend order holds: a host with a real CRTC still picks **DRM**, and the
-      portal is chosen only when DRM finds none
-- [ ] X11/Windows/macOS unchanged; the kill switch restores the current cascade
+- [x] Backend order holds: a host with a real CRTC still picks **DRM**, and the
+      portal is chosen only when DRM finds none — measured on a host that has
+      BOTH: DRM-only → `backend=drm`; **both flags → still `backend=drm`**;
+      neither → the portal does not engage at all (no helper, no dialog)
+- [x] X11/Windows/macOS unchanged; the kill switch restores the current
+      cascade — with no flag set the cascade is byte-for-byte what it was, and
+      the portal code is Linux-only, feature-gated AND env-gated, so it cannot
+      reach the other platforms. Windows/macOS CI lanes green throughout
 - [x] Field-verified with the **before** state recorded beside the after — done for P2a (`no-session-bus` → `available`, with an in-session control); each later phase repeats it
 - [ ] The spec and the UI both say **attended-only** — no greeter, no locked
       screen
@@ -352,3 +357,4 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-08-31 | P3c-i — why the report is shaped that way | A black frame and a working capture are BOTH “frames received”, so `frames: 3` alone would have been exactly the unfalsifiable claim this FR keeps rejecting. The report leads with `nonzero_sampled/sampled` + a checksum because those are the only fields that distinguish them. ⚠️ Sampled on a PRIME stride, not read whole: this runs in the `process` callback and a 4K frame is 33 MB. ⚠️ A buffer must be returned with `pw_stream_queue_buffer` on EVERY path — holding them starves the pool and the stream stops silently, looking exactly like a source that produced nothing. ⚠️ `spa_data.fd` is `int64_t`, not `int` |
 | 2026-08-31 | **P3c-ii FIELD-VERIFIED — THE BACKEND WORKS, 0.4.40, Asahi** | `capture-smoke` as **root**, the same command that validates DRM and scrap: `capture: backend=portal (ROOMLERD_PORTAL_CAPTURE=1 … ATTENDED) width=1920 height=1080` then `delivered=5 empty=0 unchanged=0 1920x1080 stride=7680 format=Bgra mean_ms=27.70 worst_ms=34.57`. 🔑 **The dumped frame is a correct picture** — right geometry, right colours (a swapped channel order would have made the sky orange) and the cursor composited in, confirming the `CURSOR_EMBEDDED` request. ⚠️ **Honest limit: this host ALSO has DRM capture.** The portal path is proven; it is NOT yet proven on the host FR-45 was opened for (WSL2, no `/dev/dri`), which still has no ScreenCast backend |
 | 2026-08-31 | **P3c-ii — a pipe and a copy, NOT `SCM_RIGHTS`** | The plan's fd-passing is the right OPTIMISATION and the wrong first version. (1) `Frame` owns a `Vec<u8>`, so the daemon copies regardless — fds would save the helper→daemon copy only, not “zero copy” end to end. (2) Passing the compositor's own buffers means NOT queueing them back until the daemon has read them: a per-frame round trip and a stall the compositor can see, and getting it wrong produces **torn frames**, which look like a codec bug. Start correct; optimise when a measurement says to. ⚠️ Both sides DROP rather than block — the helper's `try_send` runs on PipeWire's own thread |
+| 2026-08-31 | **Cascade order verified — the portal does not hijack a DRM host** | Three runs on a host that has BOTH: `ROOMLERD_DRM_CAPTURE=1` → `backend=drm`; **both flags → still `backend=drm`** (DRM first, as documented); neither → the portal never engages — no helper spawned, no dialog. 🔑 Worth measuring rather than assuming: adding a backend to a cascade is exactly where an opt-in quietly becomes a default, and here the failure mode would have been an unattended host waiting on a consent dialog nobody would answer |
