@@ -24,10 +24,22 @@
 //! screen and receives the keystrokes.
 //!
 //! So the daemon mints a fresh secret for each worker it spawns and hands it
-//! over in the spawn environment. It is never written to disk and never leaves
-//! the host. `sudo` in the spawn chain closes inherited descriptors, which is
-//! why this is a secret rather than the structurally safer inherited
-//! socketpair — measured, and recorded under "Dead hypotheses" in the FR.
+//! over **on the worker's stdin**. It is never written to disk, never in argv,
+//! and never leaves the host.
+//!
+//! ⚠️ Two obvious alternatives were measured on a real Mac and rejected, and
+//! both failures are silent, which is why they were measured rather than
+//! assumed:
+//!
+//! - **the environment** — `sudo` in the spawn chain runs under the stock
+//!   `Defaults env_reset` and discards it. This is not hypothetical: P1's
+//!   `ROOMLER_MACOS_SUPERVISED` marker went out this way and never reached a
+//!   single worker, unnoticed because nothing read it yet.
+//! - **an inherited socketpair**, where possession of the fd would BE the
+//!   authorisation — strictly better, but `sudo` closes inherited descriptors
+//!   too. Recorded under "Dead hypotheses" in the FR, including that
+//!   `launchctl asuser` alone preserves them, so it returns if the chain ever
+//!   drops `sudo`.
 //!
 //! ## Default-deny, three ways
 //!
@@ -46,15 +58,6 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 use tunnel_core::localapi::DelegateFrame;
-
-/// Environment variable carrying the per-spawn attach secret to the worker.
-///
-/// ⚠️ Environment, deliberately, not a file: a file would have to be created,
-/// ACL'd and cleaned up on every path out of the supervisor — including the
-/// ones that end in SIGKILL — and a stale one is a standing credential. The
-/// environment of a process the daemon spawned is readable by root and by that
-/// user, which is the same audience the secret already has to trust.
-pub const ATTACH_SECRET_ENV: &str = "ROOMLER_MACOS_ATTACH_SECRET";
 
 /// Bytes of entropy in a minted secret, hex-encoded on the wire. The channel is
 /// local and the secret lives for one spawn, so this is far past what an
