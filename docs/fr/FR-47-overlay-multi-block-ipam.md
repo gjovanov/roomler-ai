@@ -59,7 +59,29 @@ return them to. No eviction path can reach them, because they belong to no row.
 On a `/22` (1 022 usable) that is survivable. The *rate* is the point — it is the org that
 has been running longest, and half its issued space has leaked.
 
-### 1d. What is NOT broken — a correction worth recording
+### 1d. The two legacy networks are not the same problem
+
+Read before starting P4, and it changed P4:
+
+| network | tenant | nodes | versions | status | last write |
+|---|---|---|---|---|---|
+| A | **row does not exist** (`9bc1…4472`) | `mbb-mars` `.1`, `mbb-zeus` `.2` | `0.3.0-rc.209` | both offline | 2026-07-23 |
+| B | `demo` | 5 nodes, `.1`–`.5` | 0.4.37–0.4.40 | all online | live |
+
+The overlap is concrete: `mbb-mars` and `macbook-pro` both hold `100.64.0.1`.
+
+**A is not migrated, it is cleaned up.** Its tenant row is gone, so there is no
+org to migrate and no admin to authorise it, and its agents sit *below* the
+`0.3.0-rc.301` floor — a renumber would refuse without `--force` even if one
+made sense. ⚠️ It also points at a cascade gap: §13 of `docs/multi-org.md`
+records that there is **no tenant-delete route at all**, yet this tenant is gone
+and left its network, nodes and addresses behind. Whatever removed it did not go
+through `release_overlay_node`.
+
+**B migrates cleanly** — every device is online and far above the floor, so
+`below_floor` is empty and no `--force` is needed.
+
+### 1e. What is NOT broken — a correction worth recording
 
 An earlier assessment of this area claimed the allocator had no per-block ceiling and would
 bleed into a neighbouring block. **That is false, and was false when it was written.**
@@ -165,7 +187,7 @@ leak is purely historical or still active.
 | **P1** | Carving on by default; configmap key; carve-failure alert + `headroom` threshold | `overlay.blocks_enabled` |
 | **P2** | `OverlayJoinRefused` frame; agent surfaces it; per-network utilization in `GET …/overlay-block` | additive; frame is ignorable |
 | **P3** | `reconcile-hosts` admin route | dry-run default |
-| **P4** | Migrate both legacy networks (2 nodes, then 5) | existing renumber runbook |
+| **P4** | Migrate `demo` (5 nodes); clean up the orphaned network — see §1d | existing renumber runbook |
 | **P5** | Multi-block per org (a–e) | `overlay.multi_block_enabled`, default off |
 | **P6** | Docs: `multi-org.md` §4/§10/§11/§12, `data-model.md` | — |
 
