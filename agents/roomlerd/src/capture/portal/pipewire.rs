@@ -626,6 +626,13 @@ struct Shared {
     frames: u32,
     format: Option<NegotiatedFormat>,
     first_frame: Option<FrameReport>,
+    /// Where copied frames go, when streaming. `None` = P3c-i's
+    /// count-and-report mode.
+    frame_tx: Option<std::sync::mpsc::SyncSender<(super::wire::FrameHeader, Vec<u8>)>>,
+    /// Frames thrown away because the consumer was behind. Counted rather than
+    /// silent: a capture dropping most of what it produces is a very different
+    /// problem from one producing nothing.
+    dropped: u64,
     outcome: Option<Result<NegotiatedFormat, String>>,
     /// How many Format params arrived that could not be used yet. Reported so
     /// a timeout can say whether nothing came at all or several came and none
@@ -701,6 +708,19 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
         if shared.frames == 1 {
             shared.first_frame = Some(unsafe { inspect(pw_buf) });
         }
+        // P3c-ii — copy out and hand off, while the buffer is still ours.
+        if let Some(tx) = &shared.frame_tx
+            && let Some(fmt) = &shared.format
+            && let Some((h, bytes)) = unsafe { copy_out(pw_buf, fmt) }
+        {
+            // ⚠️ DROP when the consumer is behind; never block. This runs on
+            // PipeWire's own thread, so waiting here stalls the compositor's
+            // producer — and a capture pipeline wants the NEWEST frame, not a
+            // queue of stale ones.
+            if tx.try_send((h, bytes)).is_err() {
+                shared.dropped += 1;
+            }
+        }
         unsafe { (shared.lib.syms.pw_stream_queue_buffer)(stream, pw_buf) };
 
         if shared.frames >= shared.want_frames {
@@ -713,6 +733,47 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             }
         }
     });
+}
+
+/// Copy the pixels out of a buffer, with a header describing them.
+///
+/// ⚠️ Copied while the buffer is still dequeued — it goes back to the
+/// compositor immediately after, and reading it later is reading pixels
+/// someone else is writing.
+///
+/// # Safety
+/// `pw_buf` must be a buffer just dequeued from the stream.
+unsafe fn copy_out(
+    pw_buf: *mut PwBuffer,
+    fmt: &NegotiatedFormat,
+) -> Option<(super::wire::FrameHeader, Vec<u8>)> {
+    let spa_buf = unsafe { (*pw_buf).buffer };
+    if spa_buf.is_null() || unsafe { (*spa_buf).n_datas } == 0 {
+        return None;
+    }
+    let d = unsafe { &*(*spa_buf).datas };
+    // A DmaBuf is not mapped; there is nothing to copy. P3c-i reports the type
+    // so this is diagnosable rather than a silent absence of frames.
+    if d.data.is_null() || d.chunk.is_null() {
+        return None;
+    }
+    let chunk = unsafe { &*d.chunk };
+    if chunk.size == 0 || chunk.stride <= 0 {
+        return None;
+    }
+    let offset = (chunk.offset as usize).min(d.maxsize as usize);
+    let len = (chunk.size as usize).min(d.maxsize as usize - offset);
+    let bytes = unsafe { std::slice::from_raw_parts((d.data as *const u8).add(offset), len) };
+    Some((
+        super::wire::FrameHeader {
+            width: fmt.width,
+            height: fmt.height,
+            stride: chunk.stride as u32,
+            video_format: fmt.video_format,
+            len: len as u32,
+        },
+        bytes.to_vec(),
+    ))
 }
 
 /// Read what one buffer says about itself.
@@ -927,7 +988,7 @@ pub fn negotiate(
 ) -> Result<(NegotiatedFormat, Option<FrameReport>), PwError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let r = negotiate_blocking(fd, node_id, max_fps, want_frames);
+        let r = negotiate_blocking(fd, node_id, max_fps, want_frames, None);
         // The receiver may already have timed out; nothing to do about that.
         let _ = tx.send(r);
     });
@@ -937,11 +998,13 @@ pub fn negotiate(
 
 const NEGOTIATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+#[allow(clippy::type_complexity)]
 fn negotiate_blocking(
     fd: std::os::fd::OwnedFd,
     node_id: u32,
     max_fps: u32,
     want_frames: u32,
+    frame_tx: Option<std::sync::mpsc::SyncSender<(super::wire::FrameHeader, Vec<u8>)>>,
 ) -> Result<(NegotiatedFormat, Option<FrameReport>), PwError> {
     let lib = Lib::load()?;
     let conn = Connection::open(lib.clone(), fd)?;
@@ -967,6 +1030,8 @@ fn negotiate_blocking(
         frames: 0,
         format: None,
         first_frame: None,
+        frame_tx,
+        dropped: 0,
         outcome: None,
         rejected: 0,
     });
@@ -983,6 +1048,8 @@ fn negotiate_blocking(
         // Registered only when frames are wanted: with none wanted this is
         // pure negotiation and a process callback would just churn buffers.
         process: (want_frames > 0).then_some(on_process as _),
+        // NOTE: when streaming, `want_frames` is u32::MAX, so the callback is
+        // registered and the loop never reaches its own finish condition.
         drained: None,
         command: None,
         trigger_done: None,
@@ -1038,6 +1105,79 @@ fn negotiate_blocking(
             "the PipeWire loop ended without negotiating a format".into(),
         )),
     }
+}
+
+/// A running capture: the agreed format, plus frames as they arrive.
+pub struct StreamHandle {
+    pub format: NegotiatedFormat,
+    /// ⚠️ Bounded and lossy by design — see the `try_send` in `on_process`.
+    /// A closed channel means the PipeWire loop stopped.
+    pub frames: std::sync::mpsc::Receiver<(super::wire::FrameHeader, Vec<u8>)>,
+}
+
+/// Open a stream and keep it running, delivering frames until dropped.
+///
+/// ⚠️ The PipeWire loop thread is **detached and never joined**: it lives for
+/// the life of the helper process, which ends when the daemon closes its pipe.
+/// Acceptable for the same reason the negotiation timeout was — this is a
+/// short-lived helper, not the daemon.
+pub fn stream(
+    fd: std::os::fd::OwnedFd,
+    node_id: u32,
+    max_fps: u32,
+) -> Result<StreamHandle, PwError> {
+    // Depth 2: enough that a brief hiccup in the writer costs no frame, small
+    // enough that what arrives is always nearly current.
+    let (frame_tx, frames) = std::sync::mpsc::sync_channel(2);
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        // u32::MAX so the loop never satisfies its finish condition and runs
+        // until the process ends.
+        let r = negotiate_blocking(fd, node_id, max_fps, u32::MAX, Some(frame_tx));
+        // Only reached once the loop has ended, which for a stream is a fault.
+        let _ = err_tx.send(r.err());
+    });
+
+    // 🔑 Wait for a FRAME, not for negotiation: a format that never produces
+    // pixels is the failure this whole phase exists to catch, and the header
+    // carries the format anyway.
+    let deadline = std::time::Instant::now() + NEGOTIATE_TIMEOUT;
+    let first = loop {
+        match frames.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok((h, _bytes)) => break h,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(e)) = err_rx.try_recv() {
+                    return Err(e);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(PwError::Other(
+                        "no frame arrived before the deadline".into(),
+                    ));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(match err_rx.try_recv() {
+                    Ok(Some(e)) => e,
+                    _ => PwError::Other("the PipeWire loop ended".into()),
+                });
+            }
+        }
+    };
+
+    // That first frame is consumed to learn the format. Dropping one frame
+    // once is cheaper than any machinery to put it back, and the caller gets
+    // every frame after it.
+    Ok(StreamHandle {
+        format: NegotiatedFormat {
+            video_format: first.video_format,
+            width: first.width,
+            height: first.height,
+            fps_num: 0,
+            fps_denom: 1,
+        },
+        frames,
+    })
 }
 
 #[cfg(test)]
