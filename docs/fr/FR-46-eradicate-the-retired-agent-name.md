@@ -37,6 +37,17 @@ falsifiable, or the classification becomes a way to launder `LIVE` sites into pe
 is new) and guards them differently: `live` ratchets **down** and must reach 0; `record` is
 pinned **exactly**, so a site cannot be quietly reclassified to dodge the live ratchet.
 
+⚠️ **An anchor's own explanation can be swept, and nothing catches it.** The historical-appendix
+region in `docs/remote-control.md` read *"rewriting `roomlerd` to `roomlerd` here would falsify
+the record"* — it landed correct in `f3cc9240` and was mangled by FR-21's own `--strict` sweep
+(`21004d78`), which rewrote the retired name inside the sentence that exists to say the name
+must not be rewritten. **The audit is structurally blind to this**: it counts occurrences of
+retired names, so a name wrongly REPLACED by the current one simply reads as progress — the
+count went down. (Restoring it here moved `anchors` 745 → 746, which is the same signal
+arriving far too late to help.) Swept the tree for the shape — exactly one instance, fixed
+here. The lesson is the sanitize skill's own: *the tool keeps working and only its
+explanation rots, which is the failure mode that lasts, because nothing fails.*
+
 ## Root finding: the published-asset freeze is much narrower than FR-21 recorded
 
 FR-21's D6 froze anchors on "already-published asset filenames are immutable and the updater
@@ -50,6 +61,8 @@ that path already dual-matches. Measured against master:
 | Linux ≥ 0.4.16 `is_daemon_asset` | `starts_with("roomler-agent")` OR `starts_with("roomlerd")` | **already dual** |
 | Linux ≤ 0.4.15 | first `.deb` matching arch | **no** (order-dependent; fixed server-side) |
 | server `order_assets_daemon_first` | `starts_with("roomler-desktop-")` | **no** — a companion *denylist*, not a daemon allowlist |
+| `scripts/install.sh` | `<arch>-unknown-linux-gnu\.<fmt>` — a SUFFIX | **no** (relies on the same server ordering) |
+| wizard `asset_resolver.rs` | nothing — `filename` is a plain `String` | **no**; its anchors are doc comments and test fixtures only |
 
 ⇒ **New releases can publish `roomlerd-<v>-…` without freezing any host**, including the
 dormant pre-0.4.15 rows. The frozen surface is only the *already-published* files, which stop
