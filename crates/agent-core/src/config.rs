@@ -653,6 +653,22 @@ pub struct AgentConfig {
     /// host-global and injects into whatever has focus. Restart required.
     #[serde(default)]
     pub uinput: Option<bool>,
+    /// FR-45 — capture a Wayland desktop through xdg-desktop-portal
+    /// ScreenCast and PipeWire (`ROOMLERD_PORTAL_CAPTURE`). Built-in default: **OFF** — the
+    /// portal is ATTENDED-only (needs a logged-in user; the first use shows
+    /// that user a consent dialog), so defaulting it on would leave an
+    /// unattended host waiting on a dialog nobody will answer. Tried after
+    /// DRM, before X11. Restart required.
+    #[serde(default)]
+    pub portal_capture: Option<bool>,
+    /// FR-45 P4 — inject input through the portal's RemoteDesktop interface,
+    /// riding the SAME session as `portal_capture`
+    /// (`ROOMLERD_PORTAL_INPUT`). Built-in default: **ON** while a portal
+    /// capture is live — on those hosts the portal is the only input path
+    /// with a reader behind it — and inert otherwise. Off = the portal
+    /// session is view-only. Restart required.
+    #[serde(default)]
+    pub portal_input: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
     /// unchanged (`ROOMLERD_X11_DAMAGE`). Built-in default: ON; took a Linux
     /// host's idle capture from 45.8 % of a core to 2.8 %. Restart required.
@@ -1775,6 +1791,8 @@ pub fn test_fixture() -> AgentConfig {
         relay_ceiling_learn: None,
         drm_capture: None,
         uinput: None,
+        portal_capture: None,
+        portal_input: None,
         x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
@@ -1912,7 +1930,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 62] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 64] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1931,6 +1949,8 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 62]
         ("RELAY_CEILING_LEARN", cfg.relay_ceiling_learn),
         ("DRM_CAPTURE", cfg.drm_capture),
         ("UINPUT", cfg.uinput),
+        ("PORTAL_CAPTURE", cfg.portal_capture),
+        ("PORTAL_INPUT", cfg.portal_input),
         ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),
         ("OVERLAY_QUIC", cfg.overlay_quic),
