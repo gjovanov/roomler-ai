@@ -1973,6 +1973,11 @@ impl OverlayRuntime {
             // (absent = refused), and `relay_port` is what the mint pairs with
             // this node's public addresses when it serves.
             supports_org_relay: super::direct::org_relay_enabled(),
+            // FR-47 — unconditionally true: understanding a refusal is not a
+            // feature to roll out behind a flag, it is the difference between
+            // "the server told us why" and waiting forever on a netmap that
+            // is never coming.
+            supports_join_refusal: true,
             org_primary: Some(self.org_primary),
             relay_port: super::orgrelay::relay_server_enabled()
                 .then(super::orgrelay::relay_server_port),
