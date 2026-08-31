@@ -73,6 +73,10 @@ pub enum PipeWireStatus {
     Negotiated {
         library_version: String,
         format: NegotiatedFormat,
+        /// `None` when only negotiation was asked for. `Some` carries what
+        /// actually arrived in the buffers — which is the only thing that
+        /// distinguishes a working capture from a black one.
+        frames: Option<FrameReport>,
     },
     Failed(String),
 }
@@ -87,7 +91,16 @@ impl std::fmt::Display for PipeWireStatus {
             PipeWireStatus::Negotiated {
                 library_version,
                 format,
+                frames: None,
             } => write!(f, "negotiated {format} (libpipewire {library_version})"),
+            PipeWireStatus::Negotiated {
+                library_version,
+                format,
+                frames: Some(fr),
+            } => write!(
+                f,
+                "negotiated {format}; {fr} (libpipewire {library_version})"
+            ),
             PipeWireStatus::Failed(why) => write!(f, "unavailable — {why}"),
         }
     }
@@ -114,17 +127,23 @@ pub fn probe(fd: std::os::fd::OwnedFd) -> PipeWireStatus {
 
 /// P3b-ii — connect a stream to the portal's node and report what the
 /// compositor agreed to.
-pub fn negotiate_status(fd: std::os::fd::OwnedFd, node_id: u32, max_fps: u32) -> PipeWireStatus {
+pub fn negotiate_status(
+    fd: std::os::fd::OwnedFd,
+    node_id: u32,
+    max_fps: u32,
+    want_frames: u32,
+) -> PipeWireStatus {
     // Read before the fd moves: the version is worth reporting on both arms,
     // and by the time negotiation fails the library handle is gone.
     let library_version = match Lib::load() {
         Ok(l) => l.version(),
         Err(e) => return PipeWireStatus::Failed(e.to_string()),
     };
-    match negotiate(fd, node_id, max_fps) {
-        Ok(format) => PipeWireStatus::Negotiated {
+    match negotiate(fd, node_id, max_fps, want_frames) {
+        Ok((format, frames)) => PipeWireStatus::Negotiated {
             library_version,
             format,
+            frames,
         },
         Err(e) => PipeWireStatus::Failed(e.to_string()),
     }
@@ -240,6 +259,8 @@ pw_syms! {
         u32,
     ) -> c_int,
     pw_stream_destroy: unsafe extern "C" fn(*mut c_void),
+    pw_stream_dequeue_buffer: unsafe extern "C" fn(*mut c_void) -> *mut PwBuffer,
+    pw_stream_queue_buffer: unsafe extern "C" fn(*mut c_void, *mut PwBuffer) -> c_int,
 }
 
 /// A loaded `libpipewire`.
@@ -435,6 +456,135 @@ const PW_STREAM_FLAG_MAP_BUFFERS: u32 = 1 << 2;
 /// `enum spa_param_type` — the *negotiated* format (not `EnumFormat`).
 const SPA_PARAM_FORMAT: u32 = 4;
 
+// ── P3c-i: buffers ──────────────────────────────────────────────────────
+
+/// `struct pw_buffer`, `pipewire/stream.h`.
+#[repr(C)]
+struct PwBuffer {
+    buffer: *mut SpaBuffer,
+    user_data: *mut c_void,
+    size: u64,
+    requested: u64,
+    time: u64,
+}
+
+/// `struct spa_buffer`, `spa/buffer/buffer.h`.
+#[repr(C)]
+struct SpaBuffer {
+    n_metas: u32,
+    n_datas: u32,
+    metas: *mut c_void,
+    datas: *mut SpaData,
+}
+
+/// `struct spa_data`. ⚠️ `fd` is `int64_t`, not an `int` — getting that wrong
+/// shifts every field after it.
+#[repr(C)]
+struct SpaData {
+    ty: u32,
+    flags: u32,
+    fd: i64,
+    mapoffset: u32,
+    maxsize: u32,
+    data: *mut c_void,
+    chunk: *mut SpaChunk,
+}
+
+/// `struct spa_chunk` — where the *valid* bytes are. `maxsize` is the
+/// allocation; this is the frame.
+#[repr(C)]
+struct SpaChunk {
+    offset: u32,
+    size: u32,
+    stride: i32,
+    flags: i32,
+}
+
+/// `enum spa_data_type`.
+const SPA_DATA_MEM_PTR: u32 = 1;
+const SPA_DATA_MEM_FD: u32 = 2;
+const SPA_DATA_DMA_BUF: u32 = 3;
+
+fn data_type_name(t: u32) -> &'static str {
+    match t {
+        0 => "Invalid",
+        SPA_DATA_MEM_PTR => "MemPtr",
+        SPA_DATA_MEM_FD => "MemFd",
+        SPA_DATA_DMA_BUF => "DmaBuf",
+        4 => "MemId",
+        _ => "unknown",
+    }
+}
+
+/// What actually arrived in the buffers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FrameReport {
+    pub frames: u32,
+    /// `enum spa_data_type` of the first plane.
+    pub data_type: u32,
+    pub data_type_name: String,
+    pub stride: i32,
+    /// `chunk.size` — the valid bytes, not the allocation.
+    pub bytes: u32,
+    /// How many of the sampled bytes were non-zero, and how many were looked
+    /// at. 🔑 **This is the point of the whole report**: a black frame and a
+    /// working capture are both "frames received", and only content tells them
+    /// apart.
+    pub nonzero_sampled: u32,
+    pub sampled: u32,
+    /// Cheap hash of the sampled bytes. Two runs differing here means the
+    /// screen changed between them — i.e. these are live pixels, not a
+    /// constant.
+    pub checksum: u32,
+    /// Set when the buffer could not be read at all, with the reason.
+    pub unreadable: Option<String>,
+}
+
+impl std::fmt::Display for FrameReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(why) = &self.unreadable {
+            return write!(
+                f,
+                "{} frame(s) as {} but unreadable — {why}",
+                self.frames, self.data_type_name
+            );
+        }
+        write!(
+            f,
+            "{} frame(s), {} stride={} {} bytes, {}/{} sampled bytes non-zero, checksum {:#010x}",
+            self.frames,
+            self.data_type_name,
+            self.stride,
+            self.bytes,
+            self.nonzero_sampled,
+            self.sampled,
+            self.checksum
+        )
+    }
+}
+
+/// Walk a frame cheaply: hash and count non-zero bytes over a sample.
+///
+/// Sampled rather than read whole because this runs in the realtime-ish
+/// `process` callback and a 4K frame is 33 MB. The stride is prime so the
+/// sample cannot align with a repeating pattern and miss content — a full read
+/// would be no more convincing and much slower.
+fn sample(bytes: &[u8]) -> (u32, u32, u32) {
+    const STEP: usize = 997;
+    let (mut hash, mut nonzero, mut n) = (2166136261u32, 0u32, 0u32);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        hash = (hash ^ b as u32).wrapping_mul(16777619);
+        if b != 0 {
+            nonzero += 1;
+        }
+        n += 1;
+        i += STEP;
+    }
+    (hash, nonzero, n)
+}
+
 /// The format the compositor actually agreed to.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NegotiatedFormat {
@@ -467,6 +617,15 @@ impl std::fmt::Display for NegotiatedFormat {
 struct Shared {
     lib: Arc<Lib>,
     main_loop: *mut c_void,
+    /// Set once the stream exists, so `process` can dequeue from it.
+    stream: Option<*mut c_void>,
+    /// 0 means "stop as soon as a format is settled" — the P3b-ii behaviour,
+    /// kept because it isolates negotiation from delivery when one of them
+    /// breaks.
+    want_frames: u32,
+    frames: u32,
+    format: Option<NegotiatedFormat>,
+    first_frame: Option<FrameReport>,
     outcome: Option<Result<NegotiatedFormat, String>>,
     /// How many Format params arrived that could not be used yet. Reported so
     /// a timeout can say whether nothing came at all or several came and none
@@ -523,6 +682,102 @@ unsafe extern "C" fn on_state_changed(
     });
 }
 
+/// Called when a buffer is ready. Dequeue, look, queue it straight back.
+///
+/// ⚠️ The buffer **must** be returned with `pw_stream_queue_buffer` on every
+/// path. Holding them starves the pool and the stream simply stops — silently,
+/// looking exactly like a source that produced nothing.
+unsafe extern "C" fn on_process(data: *mut c_void) {
+    guard(data, |shared| {
+        let Some(stream) = shared.stream else { return };
+        let pw_buf = unsafe { (shared.lib.syms.pw_stream_dequeue_buffer)(stream) };
+        if pw_buf.is_null() {
+            // Out of buffers is normal back-pressure, not an error.
+            return;
+        }
+        shared.frames += 1;
+        // Inspect only the first frame in depth; after that just count, so a
+        // slow callback cannot become the reason frames stop arriving.
+        if shared.frames == 1 {
+            shared.first_frame = Some(unsafe { inspect(pw_buf) });
+        }
+        unsafe { (shared.lib.syms.pw_stream_queue_buffer)(stream, pw_buf) };
+
+        if shared.frames >= shared.want_frames {
+            let format = shared.format.clone();
+            match format {
+                Some(f) => shared.finish(Ok(f)),
+                // Frames without a format should be impossible; say so rather
+                // than inventing one.
+                None => shared.finish(Err("frames arrived before a format did".into())),
+            }
+        }
+    });
+}
+
+/// Read what one buffer says about itself.
+///
+/// # Safety
+/// `pw_buf` must be a buffer just dequeued from the stream.
+unsafe fn inspect(pw_buf: *mut PwBuffer) -> FrameReport {
+    let mut r = FrameReport {
+        frames: 0,
+        data_type: 0,
+        data_type_name: "none".into(),
+        stride: 0,
+        bytes: 0,
+        nonzero_sampled: 0,
+        sampled: 0,
+        checksum: 0,
+        unreadable: None,
+    };
+    let spa_buf = unsafe { (*pw_buf).buffer };
+    if spa_buf.is_null() || unsafe { (*spa_buf).n_datas } == 0 {
+        r.unreadable = Some("the buffer carried no data planes".into());
+        return r;
+    }
+    let d = unsafe { &*(*spa_buf).datas };
+    r.data_type = d.ty;
+    r.data_type_name = data_type_name(d.ty).to_string();
+
+    let chunk = d.chunk;
+    if chunk.is_null() {
+        r.unreadable = Some("the plane has no chunk".into());
+        return r;
+    }
+    let chunk = unsafe { &*chunk };
+    r.stride = chunk.stride;
+    r.bytes = chunk.size;
+
+    // ⚠️ A DmaBuf is NOT mapped, even with MAP_BUFFERS — `data` is null and
+    // the pixels live on the GPU. Reading it needs a GBM/EGL import, which is
+    // a whole dependency this FR has been avoiding. Report it rather than
+    // dereferencing null, because "which memory type did we get" is exactly
+    // the question P3c-ii has to answer.
+    if d.data.is_null() {
+        r.unreadable = Some(format!(
+            "{} planes are not mmap'd (data is null) — a DmaBuf needs a GBM import",
+            r.data_type_name
+        ));
+        return r;
+    }
+    if chunk.size == 0 {
+        r.unreadable = Some("the chunk is empty".into());
+        return r;
+    }
+
+    // Clamp to the allocation: `offset`/`size` come from the producer and the
+    // header says to treat them modulo `maxsize`.
+    let offset = (chunk.offset as usize).min(d.maxsize as usize);
+    let len = (chunk.size as usize).min(d.maxsize as usize - offset);
+    let bytes = unsafe { std::slice::from_raw_parts((d.data as *const u8).add(offset), len) };
+    let (checksum, nonzero, sampled) = sample(bytes);
+    r.checksum = checksum;
+    r.nonzero_sampled = nonzero;
+    r.sampled = sampled;
+    r
+}
+
 unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const c_void) {
     guard(data, |shared| {
         // A null param means "this parameter was cleared", and ids other than
@@ -535,7 +790,14 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
             None => return shared.finish(Err("the format param was unreadable".into())),
         };
         match parse_format(&bytes) {
-            Ok(f) => shared.finish(Ok(f)),
+            Ok(f) => {
+                shared.format = Some(f.clone());
+                // With frames wanted, a settled format is the START, not the
+                // finish: keep the loop running so `process` can deliver.
+                if shared.want_frames == 0 {
+                    shared.finish(Ok(f));
+                }
+            }
             // ⚠️ Do NOT finish here. `param_changed` can fire more than once,
             // and an early one may still carry choices where the final one
             // carries values — PipeWire fixates as it negotiates. Treating the
@@ -661,10 +923,11 @@ pub fn negotiate(
     fd: std::os::fd::OwnedFd,
     node_id: u32,
     max_fps: u32,
-) -> Result<NegotiatedFormat, PwError> {
+    want_frames: u32,
+) -> Result<(NegotiatedFormat, Option<FrameReport>), PwError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let r = negotiate_blocking(fd, node_id, max_fps);
+        let r = negotiate_blocking(fd, node_id, max_fps, want_frames);
         // The receiver may already have timed out; nothing to do about that.
         let _ = tx.send(r);
     });
@@ -678,7 +941,8 @@ fn negotiate_blocking(
     fd: std::os::fd::OwnedFd,
     node_id: u32,
     max_fps: u32,
-) -> Result<NegotiatedFormat, PwError> {
+    want_frames: u32,
+) -> Result<(NegotiatedFormat, Option<FrameReport>), PwError> {
     let lib = Lib::load()?;
     let conn = Connection::open(lib.clone(), fd)?;
 
@@ -697,9 +961,16 @@ fn negotiate_blocking(
     let mut shared = Box::new(Shared {
         lib: lib.clone(),
         main_loop: conn.main_loop,
+        // Set below, once the stream exists.
+        stream: None,
+        want_frames,
+        frames: 0,
+        format: None,
+        first_frame: None,
         outcome: None,
         rejected: 0,
     });
+    shared.stream = Some(stream);
     let events = Box::new(PwStreamEvents {
         version: 2,
         destroy: None,
@@ -709,7 +980,9 @@ fn negotiate_blocking(
         param_changed: Some(on_param_changed),
         add_buffer: None,
         remove_buffer: None,
-        process: None,
+        // Registered only when frames are wanted: with none wanted this is
+        // pure negotiation and a process callback would just churn buffers.
+        process: (want_frames > 0).then_some(on_process as _),
         drained: None,
         command: None,
         trigger_done: None,
@@ -754,8 +1027,12 @@ fn negotiate_blocking(
     unsafe { (lib.syms.pw_stream_destroy)(stream) };
     drop(conn);
 
+    let frames = shared.first_frame.take().map(|mut fr| {
+        fr.frames = shared.frames;
+        fr
+    });
     match outcome {
-        Some(Ok(f)) => Ok(f),
+        Some(Ok(f)) => Ok((f, frames)),
         Some(Err(e)) => Err(PwError::Other(e)),
         None => Err(PwError::Other(
             "the PipeWire loop ended without negotiating a format".into(),

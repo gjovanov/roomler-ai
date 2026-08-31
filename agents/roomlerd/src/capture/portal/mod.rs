@@ -265,6 +265,10 @@ pub mod helper {
     /// at something else.
     const DEFAULT_MAX_FPS: u32 = 60;
 
+    /// How many frames the helper pulls before reporting. A handful proves
+    /// delivery works; this is a proof, not a capture session.
+    const WANT_FRAMES: u32 = 3;
+
     /// P2b's marker. A **separate** marker rather than a variant inside one
     /// payload, so a parent asking for detection can never be handed a session
     /// report (or the reverse) by a helper built from a different revision.
@@ -323,7 +327,7 @@ pub mod helper {
             // reported. ⚠️ Still no frames: buffer delivery is P3c.
             report.pipewire = match (session.pipewire_fd, report.streams.first()) {
                 (Some(fd), Some(s)) => {
-                    super::pipewire::negotiate_status(fd, s.node_id, DEFAULT_MAX_FPS)
+                    super::pipewire::negotiate_status(fd, s.node_id, DEFAULT_MAX_FPS, WANT_FRAMES)
                 }
                 // A session with no stream cannot be negotiated against, and
                 // saying "not attempted" is the truth rather than a failure.
