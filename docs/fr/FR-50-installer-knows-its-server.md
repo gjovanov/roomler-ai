@@ -1,6 +1,6 @@
 # FR-50: The installer cannot know which server handed it to you
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
+**Issue:** [#1083](https://github.com/gjovanov/roomler-ai/issues/1083) ·
 Status: **P0 — spec** (2026-08-31) · Child of
 [FR-42](FR-42-selfhost-verified-on-a-clean-box.md) (#967), which found this by
 running the documented self-host path on a clean box.

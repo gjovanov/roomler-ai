@@ -1,6 +1,6 @@
 # FR-49: A second org gets no mesh, and every surface reports normally
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
+**Issue:** [#1084](https://github.com/gjovanov/roomler-ai/issues/1084) ·
 Status: **P0 — spec** (2026-08-31) · Found while enrolling four demo devices for
 [FR-41](FR-41-product-demo-recording.md) (#965).
 
