@@ -67,7 +67,7 @@ pub const LOW_WATER_MARK_BYTES: usize = 1024 * 1024;
 /// never filled a whole chunk worked fine. Was `64 * 1024` (= 65536).
 pub const CHUNK_BYTES: usize = u16::MAX as usize;
 
-// RETIRED-NAME-ANCHOR(24): a field observation, recorded under the name the
+// RETIRED-NAME-RECORD(24): a field observation, recorded under the name the
 // binary had when it was measured. Rewriting it would misreport history.
 /// Per-flow inbound mailbox capacity (in messages, not bytes). When
 /// the receiver is slow, the [`FlowDemux::on_message`] handler awaits
