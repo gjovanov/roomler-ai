@@ -530,6 +530,20 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 /// malloc lock held by another thread at fork time never gets released in the
 /// child. So `getpwnam`/`getgrouplist` (both of which allocate) happen in the
 /// parent, and the child only makes bare syscalls over already-owned memory.
+/// FR-45's portal helper spawns a *synchronous* child that must become the
+/// console user, so the one verified drop is re-exported rather than copied.
+/// Deliberately re-exported instead of widening the module: everything else in
+/// here — `resolve`, `Account`, `drop_body` — stays private, so the crate has
+/// exactly one way to drop privilege and no way to assemble a partial one.
+///
+/// ⚠️ The cfg mirrors its ONE consumer (`capture::portal`) exactly. A helper
+/// gated more loosely than the code that uses it is dead on every other lane,
+/// and `-D warnings` turns that into a build failure in CI rather than here —
+/// the same trap FR-36 hit when a shared helper moved out of a feature-gated
+/// module and lost its implicit gate. Widen this only alongside a caller.
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+pub(crate) use unix_priv::drop_to_std;
+
 #[cfg(unix)]
 mod unix_priv {
     use std::ffi::CString;
@@ -648,55 +662,93 @@ mod unix_priv {
             .into_owned()
     }
 
+    /// The drop itself, as a closure a `Command` of either flavour installs.
+    ///
+    /// Extracted so this body exists exactly ONCE. A second copy would be a
+    /// second place to get the ordering below wrong, and — worse — a fix
+    /// applied to one copy would silently miss the other, in code whose
+    /// failure mode is a child that runs with more privilege than intended
+    /// while looking entirely healthy.
+    ///
+    /// SAFETY: every statement is an async-signal-safe syscall over memory
+    /// owned by the closure. No allocation, no locks — see the module docs.
+    fn drop_body(acct: &Account) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+        let (uid, gid) = (acct.uid, acct.gid);
+        let groups = acct.groups.clone();
+        move || {
+            // ORDER IS LOAD-BEARING. Supplementary groups and the primary
+            // gid must be set BEFORE the uid: after `setuid` the process
+            // no longer has the privilege to change either, so a reversed
+            // order silently leaves the child in root's groups. That is
+            // the classic privilege-retention bug, and it looks like a
+            // successful drop from the outside.
+            // `as _` on the count: Linux takes `size_t`, macOS takes
+            // `c_int`. Same release-only-build reasoning as the buffer
+            // above — macOS agent builds happen at tag time, not in CI.
+            if unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if unsafe { libc::setgid(gid) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if unsafe { libc::setuid(uid) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Verify rather than assume. `setuid` can succeed partially in
+            // some configurations, and a command that runs with more
+            // privilege than intended must never start.
+            if unsafe { libc::getuid() } != uid || unsafe { libc::geteuid() } != uid {
+                return Err(std::io::Error::other("privilege drop did not take effect"));
+            }
+            Ok(())
+        }
+    }
+
+    /// The environment a shell needs to behave as that user. Without HOME the
+    /// shell writes history and dotfiles into the daemon's home — as the wrong
+    /// user, usually failing, occasionally succeeding, which is worse.
+    ///
+    /// Two near-identical copies below rather than a generic: `tokio`'s and
+    /// `std`'s `Command` share no trait, and the three lines carry no
+    /// invariant. The part that DOES carry one is `drop_body`, and that is
+    /// shared.
+    ///
     /// Resolve `account` and arrange for the child to become it.
-    /// `pre_exec` below is tokio's own inherent method on `Command`, not
-    /// std's `CommandExt` — importing the extension trait here is redundant
-    /// and `-D warnings` rejects it.
+    /// `pre_exec` here is tokio's own inherent method on `Command`; the
+    /// `CommandExt` import that `drop_to_std` needs does not affect it,
+    /// because an inherent method wins over a trait method.
     pub(super) fn drop_to(cmd: &mut tokio::process::Command, account: &str) -> Result<(), String> {
         let acct = resolve(account)?;
-
-        // The environment a shell needs to behave as that user. Without HOME
-        // the shell writes history and dotfiles into the daemon's home — as
-        // the wrong user, usually failing, occasionally succeeding, which is
-        // worse.
         cmd.env("HOME", &acct.home)
             .env("USER", &acct.name)
             .env("LOGNAME", &acct.name);
+        // SAFETY: see `drop_body`.
+        unsafe { cmd.pre_exec(drop_body(&acct)) };
+        Ok(())
+    }
 
-        let (uid, gid) = (acct.uid, acct.gid);
-        let groups = acct.groups.clone();
-
-        // SAFETY: everything below is an async-signal-safe syscall over memory
-        // owned by the closure. No allocation, no locks — see the module docs.
-        unsafe {
-            cmd.pre_exec(move || {
-                // ORDER IS LOAD-BEARING. Supplementary groups and the primary
-                // gid must be set BEFORE the uid: after `setuid` the process
-                // no longer has the privilege to change either, so a reversed
-                // order silently leaves the child in root's groups. That is
-                // the classic privilege-retention bug, and it looks like a
-                // successful drop from the outside.
-                // `as _` on the count: Linux takes `size_t`, macOS takes
-                // `c_int`. Same release-only-build reasoning as the buffer
-                // above — macOS agent builds happen at tag time, not in CI.
-                if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setgid(gid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setuid(uid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Verify rather than assume. `setuid` can succeed partially in
-                // some configurations, and a command that runs with more
-                // privilege than intended must never start.
-                if libc::getuid() != uid || libc::geteuid() != uid {
-                    return Err(std::io::Error::other("privilege drop did not take effect"));
-                }
-                Ok(())
-            });
-        }
+    /// The same drop for a synchronous `std::process::Command`.
+    ///
+    /// FR-45's portal helper needs it: that spawn happens on the capture
+    /// cascade's synchronous path, and it must reach the console user's
+    /// session bus. Going through this rather than a bare `CommandExt::uid`
+    /// is the whole point — `uid()` alone leaves the child holding root's
+    /// supplementary groups, which is precisely the retention bug `drop_body`
+    /// documents. One privilege story, as with exec / pty / sftp.
+    ///
+    /// Gated to match its consumer — see the re-export above for why.
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    pub(crate) fn drop_to_std(
+        cmd: &mut std::process::Command,
+        account: &str,
+    ) -> Result<(), String> {
+        use std::os::unix::process::CommandExt as _;
+        let acct = resolve(account)?;
+        cmd.env("HOME", &acct.home)
+            .env("USER", &acct.name)
+            .env("LOGNAME", &acct.name);
+        // SAFETY: see `drop_body`.
+        unsafe { cmd.pre_exec(drop_body(&acct)) };
         Ok(())
     }
 
