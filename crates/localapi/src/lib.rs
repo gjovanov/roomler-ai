@@ -286,6 +286,17 @@ pub struct OrgStatus {
     /// primary enrollment may drive the machine-wide self-updater.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub updates_ignored: u32,
+    /// FR-49 — this enrollment's overlay participation: `off` | `netstack` |
+    /// `tun` (`OrgOverlayMode::wire`).
+    ///
+    /// ⚠️ **Empty means "this daemon does not report it", NOT "off".** A
+    /// secondary org defaults to `off` and its WS still connects, so an org
+    /// with no mesh was indistinguishable from a healthy one on every surface
+    /// an operator has — which is the whole reason this field exists. Rendering
+    /// an absent value as `off` would put that same lie back, one layer up, and
+    /// it is the identical trap to an absent age reading as 0 ms.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub overlay_mode: String,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -2979,6 +2990,7 @@ mod tests {
             connected: false,
             terminal_error: None,
             updates_ignored: 0,
+            overlay_mode: String::new(),
         };
         assert_eq!(
             serde_json::to_string(&row).unwrap(),
@@ -3004,6 +3016,25 @@ mod tests {
         assert_eq!(serde_json::from_str::<NodeStatus>(&s).unwrap(), with);
         // Empty orgs is omitted entirely (old-CLI-identical wire).
         assert!(!serde_json::to_string(&st).unwrap().contains("orgs"));
+    }
+
+    /// FR-49 — an OLDER daemon reports no `overlay_mode`, and that must parse
+    /// as "unknown", never as `off`. The two are opposite claims: `off` says
+    /// the operator's device is not on that org's mesh; absent says nobody
+    /// asked. Collapsing them would rebuild the exact ambiguity this field was
+    /// added to remove.
+    #[test]
+    fn an_absent_overlay_mode_is_not_off() {
+        let old = r#"{"label":"acme","server_url":"https://acme.invalid","primary":false,"enabled":true,"connected":true}"#;
+        let row: OrgStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(row.overlay_mode, "", "absent stays empty, not \"off\"");
+        assert_ne!(row.overlay_mode, "off");
+
+        // And a reporting daemon's `off` is carried verbatim, so the two are
+        // distinguishable downstream.
+        let reported = r#"{"label":"acme","server_url":"https://acme.invalid","primary":false,"enabled":true,"connected":true,"overlay_mode":"off"}"#;
+        let row: OrgStatus = serde_json::from_str(reported).unwrap();
+        assert_eq!(row.overlay_mode, "off");
     }
 
     #[test]
