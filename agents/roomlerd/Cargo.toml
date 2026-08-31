@@ -315,6 +315,14 @@ x11rb = { version = "0.13", features = ["damage"], optional = true }
 # and rustix are already in the lockfile.
 drm = { version = "0.15", optional = true }
 
+# FR-45 P1 — desktop-portal detection (`portal-capture`). zbus is PURE RUST: it
+# speaks the D-Bus wire protocol itself and does NOT link libdbus, so it adds no
+# system `.so` to roomlerd's DT_NEEDED. That distinction is the whole reason
+# detection can land ahead of FR-45's open dependency decision — reaching
+# PipeWire is what carries the "a missing library stops the daemon starting on
+# headless hosts" hazard, and this does not. Already in the lockfile.
+zbus = { version = "5", default-features = false, features = ["blocking-api"], optional = true }
+
 # FR-27 — the native macOS consent panel (`viewer-indicator-macos`). All three
 # are already in the lockfile (tauri pulls them for the desktop companion), so
 # this is a target-scoped direct dep rather than new supply-chain surface.
@@ -518,6 +526,10 @@ media-hw = ["media", "mf-encoder"]
 # the same reason `ssh-server` is — the code is present with its gates closed,
 # so a Wayland host opts in with an env var instead of a custom build.
 drm-capture = ["dep:drm"]
+# FR-45 P1 — detect whether xdg-desktop-portal actually exposes ScreenCast, so
+# `capture-smoke` can say WHY a host fell through to X11. Detection only; the
+# capture path itself is P2/P3. Linux-only in effect.
+portal-capture = ["dep:zbus"]
 # FR-36 P4 — input injection through `/dev/uinput`, below the compositor.
 # The companion to `drm-capture`: XTest reaches Xwayland clients ONLY, so on a
 # native Wayland desktop enigo does not fail, it succeeds and does nothing —
@@ -530,7 +542,7 @@ drm-capture = ["dep:drm"]
 # `drm-capture`.
 uinput-input = []
 # Everything needed for a full remote-control session, software only.
-full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input"]
+full = ["media", "enigo-input", "clipboard", "audio", "drm-capture", "uinput-input", "portal-capture"]
 # Everything needed including the MF hardware encoder. Production
 # Windows MSI builds with this.
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
