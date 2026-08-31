@@ -177,16 +177,76 @@ pub async fn netcheck(json: bool) -> Result<()> {
 }
 
 /// `roomler peers` — every peer this node sees, with its live connection type.
-pub async fn peers(json: bool) -> Result<()> {
+///
+/// FR-49 — `org` scopes the output to ONE enrollment. Not only ergonomics: on a
+/// device in a customer org and a personal one this prints every org's node
+/// names together, which makes it unusable on a shared screen or in a bug
+/// report. And the orgs are fetched (not just the peers) so that an enrollment
+/// with its overlay OFF can be SHOWN as such: it has no peers, so it used to
+/// produce no section at all — indistinguishable from an org whose peers merely
+/// happen to be offline.
+pub async fn peers(json: bool, org: Option<String>) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
     let peers = client.peers().await.map_err(daemon_err)?;
+    let peers: Vec<PeerInfo> = match &org {
+        Some(want) => peers.into_iter().filter(|p| &p.org == want).collect(),
+        None => peers,
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&peers)?);
-    } else {
-        print_peers(&peers, now_ms());
-        print_other_daemon_hint();
+        return Ok(());
     }
+    // A second round trip on a local pipe, for the one thing the peer list
+    // cannot say: which enrollments exist but contribute no peers, and why.
+    let orgs = client
+        .status()
+        .await
+        .map(|s| s.orgs)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|o| org.as_deref().is_none_or(|w| o.label == w))
+        .collect::<Vec<_>>();
+    if let Some(want) = &org
+        && orgs.is_empty()
+        && peers.is_empty()
+    {
+        println!("No enrollment labelled {want:?} — see `roomlerd org ls`.");
+        return Ok(());
+    }
+    print_peers(&peers, now_ms());
+    print_dark_orgs(&orgs, &peers);
+    print_other_daemon_hint();
     Ok(())
+}
+
+/// FR-49 — name the enrollments that contribute no peers BECAUSE they are not
+/// on a mesh, which `print_peers` cannot do: it only ever sees peers, and an
+/// overlay-off org has none.
+///
+/// ⚠️ Only for an org with **no rows at all**. An org that has peers is already
+/// visible, and an org whose overlay is on but whose peers are all offline is a
+/// different state that must keep looking different.
+///
+/// The selection is [`dark_orgs`] so it can be locked by a test: the whole
+/// point is which orgs are and are not in it, and getting that wrong rebuilds
+/// the ambiguity this exists to remove.
+fn print_dark_orgs(orgs: &[tunnel_core::localapi::OrgStatus], peers: &[PeerInfo]) {
+    let dark = dark_orgs(orgs, peers);
+    if dark.is_empty() {
+        return;
+    }
+    for o in dark {
+        println!();
+        println!("  ── org: {} ──", o.label);
+        println!(
+            "  (overlay OFF — this enrollment is not on a mesh, so it has no peers. \
+             It is not \"no peers online\".)"
+        );
+        println!(
+            "  join it with: roomlerd org overlay {} netstack   (then restart the daemon)",
+            o.label
+        );
+    }
 }
 
 /// `roomler why <peer>` — F: explain, for ONE pair, why it rides the carrier
@@ -1183,6 +1243,7 @@ fn print_status(s: &NodeStatus) {
             "disconnected"
         }
     );
+    print_orgs(&s.orgs);
     // P5/S4 — exit-node routing (only when this node is configured as a client).
     // S3b — when active, also report whether global IPv6 rides the exit or is
     // fail-closed (Windows exit / no v6 uplink). S4b — and whether DNS is steered
@@ -1386,6 +1447,77 @@ fn print_status(s: &NodeStatus) {
     }
 }
 
+/// FR-49 — the per-enrollment block in `roomler status`.
+///
+/// `NodeStatus.orgs` has been on the wire since multi-org P1 and was rendered
+/// by NOTHING but `--json`, so on a device in two orgs the human output said
+/// nothing about the second at all. Skipped entirely for a single-org daemon,
+/// keeping that output byte-identical.
+fn print_orgs(orgs: &[tunnel_core::localapi::OrgStatus]) {
+    if orgs.len() < 2 {
+        return;
+    }
+    println!("  enrollments");
+    for o in orgs {
+        let conn = if !o.enabled {
+            "disabled"
+        } else if o.connected {
+            "connected"
+        } else {
+            "disconnected"
+        };
+        // ⚠️ Empty is "this daemon does not report it", NOT "off" — those are
+        // opposite claims and an older daemon must not be made to assert the
+        // one it never made.
+        let overlay = match o.overlay_mode.as_str() {
+            "" => "overlay ?".to_string(),
+            "off" => "overlay OFF".to_string(),
+            m => format!("overlay {m}"),
+        };
+        let primary = if o.primary { " (primary)" } else { "" };
+        println!("    {:<14} {conn}, {overlay}{primary}", o.label);
+        if let Some(err) = &o.terminal_error {
+            println!("                   stopped: {err}");
+        }
+    }
+    // The line that closes the gap this FR is about: enabled + connected +
+    // no mesh looks exactly like healthy, and the operator has to be told.
+    let dark: Vec<&str> = orgs
+        .iter()
+        .filter(|o| o.enabled && o.overlay_mode == "off")
+        .map(|o| o.label.as_str())
+        .collect();
+    if !dark.is_empty() {
+        println!(
+            "                   ⚠️ enrolled but NOT on the mesh: {} \
+             (`roomlerd org overlay <label> netstack`)",
+            dark.join(", ")
+        );
+    }
+}
+
+/// The orgs `print_dark_orgs` names: enabled, overlay explicitly `off`, and
+/// contributing no peer rows.
+///
+/// ⚠️ Four exclusions, each load-bearing:
+/// - an org with peers is already visible, so naming it would be noise;
+/// - an org whose overlay is ON but whose peers are all offline is a DIFFERENT
+///   state and must keep looking different — that is the distinction the whole
+///   FR is about;
+/// - a DISABLED org has no signalling loop either, so "not on a mesh" is not
+///   the interesting thing about it;
+/// - an EMPTY `overlay_mode` means the daemon does not report one, which is not
+///   a claim that the overlay is off (absent ≠ off).
+fn dark_orgs<'a>(
+    orgs: &'a [tunnel_core::localapi::OrgStatus],
+    peers: &[PeerInfo],
+) -> Vec<&'a tunnel_core::localapi::OrgStatus> {
+    orgs.iter()
+        .filter(|o| o.enabled && o.overlay_mode == "off")
+        .filter(|o| !peers.iter().any(|p| p.org == o.label))
+        .collect()
+}
+
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {
     println!(
         "  {:<20} {:<16} {:<26} {:<15} {:>7} LAST SEEN",
@@ -1560,6 +1692,50 @@ mod tests {
         d.relay_kind = Some("turn".into());
         d.relay_transport = Some("udp".into());
         assert_eq!(relay_qualified_label(&d), "direct");
+    }
+
+    fn org(label: &str, overlay_mode: &str, enabled: bool) -> tunnel_core::localapi::OrgStatus {
+        tunnel_core::localapi::OrgStatus {
+            label: label.into(),
+            server_url: "https://example.invalid".into(),
+            tenant_id: None,
+            agent_id: None,
+            primary: false,
+            enabled,
+            connected: true,
+            terminal_error: None,
+            updates_ignored: 0,
+            overlay_mode: overlay_mode.into(),
+        }
+    }
+
+    /// FR-49 — an org with no mesh and an org with no peers must not render
+    /// identically. Before this, an overlay-off org produced no section at all
+    /// in `roomler peers`, which is exactly what an org whose peers happen to
+    /// be offline produces.
+    #[test]
+    fn only_an_enabled_overlay_off_org_with_no_peers_is_dark() {
+        let orgs = vec![
+            org("dark", "off", true),        // ← the case this exists for
+            org("meshed-idle", "tun", true), // overlay ON, no peers yet: NOT dark
+            org("disabled", "off", false),   // no signalling loop either
+            org("unreported", "", true),     // older daemon: absent is not "off"
+            org("has-peers", "off", true),   // already visible in the table
+        ];
+        let peers = vec![peer("node-a", "has-peers")];
+        let dark: Vec<&str> = dark_orgs(&orgs, &peers)
+            .into_iter()
+            .map(|o| o.label.as_str())
+            .collect();
+        assert_eq!(dark, vec!["dark"]);
+    }
+
+    /// The single-org case must stay byte-identical: nothing to say, so
+    /// nothing is said.
+    #[test]
+    fn a_single_org_daemon_has_no_dark_orgs_and_no_enrollment_block() {
+        assert!(dark_orgs(&[], &[]).is_empty());
+        assert!(dark_orgs(&[org("solo", "tun", true)], &[]).is_empty());
     }
 
     /// Single-org (every row unlabelled) must render as ONE unheaded group —

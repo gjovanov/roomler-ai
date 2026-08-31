@@ -210,6 +210,12 @@ enum Command {
     /// List the peers the local daemon currently sees, with each peer's live
     /// connection type (direct / relay / tunnel / blocked / offline).
     Peers {
+        /// FR-49 - show only this enrollment (`roomlerd org ls`; `primary` for
+        /// the scalar identity). Without it every org's peers are printed
+        /// together, which on a device enrolled in a customer org and a
+        /// personal one is unusable on a shared screen or in a bug report.
+        #[arg(long)]
+        org: Option<String>,
         #[command(flatten)]
         fmt: OutputFmt,
     },
@@ -622,7 +628,7 @@ where
             lines,
             fmt,
         } => localclient::logs(source, max_bytes, grep, lines, fmt.json).await,
-        Command::Peers { fmt } => localclient::peers(fmt.json).await,
+        Command::Peers { org, fmt } => localclient::peers(fmt.json, org).await,
         Command::Why { peer, fmt } => localclient::why(&peer, fmt.json).await,
         Command::Netcheck { fmt } => localclient::netcheck(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
@@ -967,7 +973,11 @@ mod tests {
             let cli = Cli::try_parse_from(["roomler", verb]).unwrap();
             match (verb, cli.command) {
                 ("status", Command::Status { fmt }) => assert!(!fmt.json),
-                ("peers", Command::Peers { fmt }) => assert!(!fmt.json),
+                ("peers", Command::Peers { org, fmt }) => {
+                    assert!(!fmt.json);
+                    // FR-49 - absent means "every org", never "the primary".
+                    assert!(org.is_none());
+                }
                 ("flows", Command::Flows { fmt }) => assert!(!fmt.json),
                 (v, other) => panic!("verb {v} parsed as {other:?}"),
             }
