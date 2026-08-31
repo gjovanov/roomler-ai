@@ -91,20 +91,26 @@ the machine you want to reach:
 ```bash
 # Linux / macOS
 curl -fsSL http://<your-host>:8080/api/setup/install.sh | sh -s -- \
-    --role daemon --server http://<your-host>:8080 --token <enrollment-jwt>
+    --role daemon --token <enrollment-jwt>
 
 # Windows (PowerShell, elevated)
 & ([scriptblock]::Create((irm http://<your-host>:8080/api/setup/install.ps1))) `
-    -Role daemon-system -Server http://<your-host>:8080 -Token <enrollment-jwt>
+    -Role daemon-system -Token <enrollment-jwt>
 ```
 
-⚠️ **`--server` / `-Server` is not optional on a self-hosted instance.** Both
-installers default to `https://roomler.ai` (`scripts/install.sh`'s `SERVER=`,
-`scripts/install.ps1`'s `$Server`), and they are piped from the network, so
-neither can see which host you fetched it from. Omit it and the agent downloads
-from you and then tries to enroll against the *hosted* service with a token only
-your server can verify — failing with an authentication error that says nothing
-about the real cause. Use the same URL you set as `ROOMLER_PUBLIC_URL`.
+The script you fetch **already points at your server**: the route that serves it
+substitutes your `ROOMLER_PUBLIC_URL` for the built-in default before the bytes
+leave the process, because a piped script has no way to see the URL it came from
+(FR-50). You can still pass `--server` / `-Server` to override it.
+
+⚠️ **This depends on `ROOMLER_PUBLIC_URL` being right.** If it is not a plain
+`scheme://host[:port]`, the server logs a warning and serves the script with the
+hosted default untouched — at which point the agent downloads from you and then
+tries to enroll against `roomler.ai` with a token only your server can verify,
+failing with an authentication error that says nothing about the real cause.
+Pass `--server` explicitly if you see that warning. The same value drives your
+OAuth returns, invite links and CORS policy, so it is worth getting right
+regardless.
 
 ⚠️ **On Windows, `irm … | iex` cannot pass arguments at all** — no `-Server`,
 no `-Token`. The `scriptblock` form above is the one that can, and it is what

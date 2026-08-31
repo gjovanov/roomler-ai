@@ -43,6 +43,18 @@
 
 set -eu
 
+# ⚠️ FR-50 — this line is REWRITTEN at serve time by the server that hands you
+# this script (`crates/api/src/routes/setup_release.rs`), so a script fetched
+# from a self-hosted Roomler enrols against THAT server and not the hosted one.
+# A piped script cannot see the URL it was fetched from — there is no $0 and no
+# filename — so the substitution has to happen on the server side. The literal
+# below is the default for a checkout, and it is also what a server serves
+# UNCHANGED when its own `app.frontend_url` is not a plain scheme://host[:port].
+# `--server` still overrides either.
+#
+# ⚠️ The API holds this exact text as a needle and a unit test asserts it
+# appears exactly once, so editing it fails the build rather than silently
+# disabling the substitution. Change both together.
 SERVER="https://roomler.ai"
 ROLE=""
 TOKEN=""
