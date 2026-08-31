@@ -549,7 +549,7 @@ pub async fn renumber(
     let block = state
         .overlay_networks
         .blocks()
-        .allocate(tid, network_id, prefix)
+        .allocate(tid, network_id, prefix, 0)
         .await?;
     let plan =
         plan_renumber(&plan_nodes, &network.cidr, &block.cidr).map_err(ApiError::BadRequest)?;
