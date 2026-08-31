@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a shipped; P2b shipped, verified through `Start` · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a + P2b shipped, field-verified. P3 next · **Owner:** agent / capture
 
 ## Goal
 
@@ -55,7 +55,7 @@ on a machine with no scanout. The backend priority stays
 |---|---|---|
 | **P1** ✅ | Detect whether `org.freedesktop.portal.ScreenCast` is actually exposed, and report WHY not, in `capture-smoke` (`capture/portal.rs`). Uses zbus, which is pure Rust and adds no system `.so`. | n/a (read-only) |
 | **P2a** ✅ | `portal-helper` hidden subcommand, spawned as the console user with that session's bus. Proven by running `detect()` from the daemon and getting `available` where it previously could only say `no-session-bus`. ⚠️ Built with the verified **privilege drop**, not `systemd-run` as planned — see below. | `ROOMLERD_PORTAL_CAPTURE=0` |
-| **P2b** 🟡 | The helper opens the ScreenCast session: `CreateSession` → `SelectSources` → `Start` → `OpenPipeWireRemote`, giving a PipeWire node id. Consent dialog handled via `persist_mode`/`restore_token`. ⚠️ The fd **stays in the helper** — see the corrected decision below. Field-verified through `Start`; the grant itself awaits a human click. | `ROOMLERD_PORTAL_CAPTURE=0` |
+| **P2b** ✅ | The helper opens the ScreenCast session: `CreateSession` → `SelectSources` → `Start` → `OpenPipeWireRemote`, giving a PipeWire node id. Consent handled via `persist_mode`/`restore_token`. ⚠️ The fd **stays in the helper**, and so does the token — see the corrected decisions below. Field-verified end to end: root → helper → live session, **15 ms, no dialog**. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P3** | PipeWire consumer **inside the helper**, via `dlopen`: attach to the node, negotiate a format, and deliver `Frame`s to the daemon — buffer fds over `SCM_RIGHTS` once at negotiation, then a ready-message per frame — surfacing through the existing `ScreenCapture` trait as a **sixth backend**. | same |
 | **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
 
@@ -209,7 +209,7 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
   helper *subcommand* does not by itself solve the dependency problem, because
   it is the same ELF and so the same `DT_NEEDED`. The subcommand bought the
   session context; only `dlopen` buys the linkage.
-- **P2b** 🟡 **shipped, field-verified through `Start`** (#1059) —
+- **P2b** ✅ **shipped and field-verified end to end** (#1059) —
   `CreateSession` → `SelectSources` → `Start` → `OpenPipeWireRemote`.
 
   ⚠️⚠️ **This plan contradicted itself and the contradiction is now resolved.**
@@ -320,3 +320,6 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-08-31 | **P2b — zbus panics inside a tokio runtime, again** | The first field run of the handshake died on `Cannot start a runtime from within a runtime` before making a single portal call. P1's `detect()` already ran its D-Bus work on its own thread for exactly this reason; `open()` was written without the guard. 🔑 The fix put the thread INSIDE `open()` rather than at the call site, so the next entry point cannot reintroduce it — the same shape as the `ResolvedSessionPolicy` lesson: make the mistake unrepresentable, not merely fixed |
 | 2026-08-31 | **P2b field-verified through `Start` — Asahi, GNOME Wayland** | The live bus objects are the evidence: `…/session/1_170/roomler_ss_472905_1` (CreateSession succeeded) and `…/request/1_170/roomler_start_472905_3` (Start pending). The pid in both tokens is the helper's, and `1_170` is its unique name `:1.170` mangled per the portal spec — so **the request-path derivation is confirmed in the field**, which matters because getting it wrong hangs forever rather than failing. `xdg-desktop-portal-gnome` up, `Start` outstanding 7+ min: the consent dialog is waiting to be answered |
 | 2026-08-31 | P2b — what could **not** be observed | The dialog's VISIBILITY is inferred from the pending `Request` plus a live backend, not seen: GNOME refuses `org.gnome.Shell.Screenshot` to unsandboxed callers, and `capture-smoke` does not wire FR-36's config-gated DRM backend, so the screen could not be photographed. ⚠️ Also: `pkill -x roomlerd` on a host reached over the overlay kills the daemon carrying your own SSH — ~40 s of no access until systemd restarted it |
+| 2026-08-31 | **P2b COMPLETE — 0.4.37, Asahi, GNOME Wayland** | Three passes, one binary. **1.** As the user, no stored token: a consent dialog, answered by a human, **1,831,429 ms**; returns `node_id=83`, `1920x1080`, `pipewire_fd_ok=true`, `cursor_mode_used=2` (embedded, of `available_cursor_modes=7`), `available_source_types=7`. **2.** As the user, token stored: **15 ms, no dialog**, `restore_token_sent=true`, same node. **3.** THE PRODUCTION PATH — as **root** through the session helper: **15 ms**, `node_id=83`, `pipewire_fd_ok=true`. 🔑 The 122,000× gap between pass 1 and pass 2 is what makes “did it prompt?” falsifiable rather than asserted. Token file `600 m1`, 36 bytes |
+| 2026-08-31 | **P2b — the dialog was NOT where it was looked for** | `Start` sat pending 30 min while the screen showed no dialog. The backend log had the clue — `xdg-desktop-por[392832]: Failed to associate portal window with parent window` — because `parent_window` is `""` for a CLI caller. ⚠️ Diagnosing this needed the product's OWN capture: GNOME refuses `org.gnome.Shell.Screenshot` AND `org.gnome.Shell.Introspect.GetWindows` to unsandboxed callers, so FR-36's DRM backend was the only way to see the screen — via `ROOMLERD_DRM_CAPTURE=1`, since `capture-smoke` does not register the S2 config fallbacks the daemon does |
+| 2026-08-31 | **P2b — the report was carrying the credential** | `SessionReport` documented that the daemon never sees the restore token, and carried it. Noticed because the helper's stdout, redirected to a log for the field test, had the token in plaintext. `open()` now loads and stores it internally and the report says only WHETHER a grant was persisted. 🔑 A caller that cannot hold a credential cannot leak it — stronger than a caller that holds it and is careful |
