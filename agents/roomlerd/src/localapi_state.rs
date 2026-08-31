@@ -180,6 +180,10 @@ pub struct DaemonState {
     /// `None` in unit tests → the save still lands, only the live re-seed is
     /// skipped.
     remote_config: Option<crate::remote_config::RemoteConfigServices>,
+    /// FR-43 P2a — the macOS GUI-worker delegation channel. `None` on every
+    /// platform and every configuration that does not supervise a worker, and
+    /// the trait's default-deny `rc_attach` then applies unchanged.
+    delegate: Option<crate::delegate::DelegateHost>,
 }
 
 /// Multi-org P1 — one enrollment's live handles, seeded by `run_cmd` and
@@ -246,7 +250,17 @@ impl DaemonState {
             orgs: None,
             org_views: None,
             remote_config: None,
+            delegate: None,
         }
+    }
+
+    /// FR-43 P2a — attach the macOS GUI-worker delegation host, so an
+    /// authorised worker can take the channel. Builder-style, like the other
+    /// optional wiring, so every existing call site (tests included) keeps the
+    /// default-deny behaviour without edit.
+    pub fn with_delegate(mut self, host: crate::delegate::DelegateHost) -> Self {
+        self.delegate = Some(host);
+        self
     }
 
     /// FR-27 — attach the live remote-control session registry, so a thin
@@ -344,6 +358,23 @@ impl DaemonState {
 
 #[async_trait]
 impl LocalApiState for DaemonState {
+    /// FR-43 P2a — hand an authorised GUI worker the delegation channel.
+    ///
+    /// Absent a `DelegateHost` this falls through to doing nothing, which is
+    /// the trait's default and a refusal: a daemon that is not supervising a
+    /// worker has no worker to be talking to.
+    async fn rc_attach(
+        &self,
+        secret: &str,
+        rd: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        wr: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) {
+        match self.delegate.as_ref() {
+            Some(host) => host.serve(secret, rd, wr).await,
+            None => tracing::warn!("delegation attach refused: this daemon supervises no worker"),
+        }
+    }
+
     fn status(&self) -> NodeStatus {
         NodeStatus {
             node_id: self.node_id.clone(),
