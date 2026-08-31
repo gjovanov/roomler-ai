@@ -1663,3 +1663,47 @@ async fn a_platform_operator_can_renumber_a_tenant_it_does_not_belong_to() {
         .unwrap();
     assert_eq!(net.cidr, OverlayNetwork::DEFAULT_CIDR);
 }
+
+/// FR-47 P5b — a network's `BlockList` is its assigned blocks in ALLOCATION
+/// order, and today that is always exactly one block.
+///
+/// The single-entry case is the one that matters right now: it must be
+/// byte-for-byte the old `overlay_ip`/`overlay_host` behaviour, because
+/// multi-block ships behind a flag and "off" has to be provably the old path.
+#[tokio::test]
+async fn a_networks_block_list_is_its_assigned_blocks_in_allocation_order() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.overlay.blocks_enabled = true;
+        s.overlay.block_prefix = 22;
+    })
+    .await;
+    let seeded = app.seed_tenant("ovbl-list").await;
+    let dao = OverlayNetworkDao::new(&app.db).with_block_prefix(Some(22));
+    let net = dao.get_or_create(tid(&seeded.tenant_id)).await.unwrap();
+
+    let bl = dao.block_list(&net).await;
+    assert_eq!(
+        bl.cidrs(),
+        std::slice::from_ref(&net.cidr),
+        "one carved block"
+    );
+    assert_eq!(bl.capacity(), 1022);
+    // Identical to the bare pair it generalizes.
+    for h in [1u32, 7, 1022] {
+        let want = roomler_ai_remote_control::models::overlay_ip(&net.cidr, h).unwrap();
+        assert_eq!(bl.ip_for_ordinal(h).as_deref(), Some(want.as_str()));
+        assert_eq!(bl.ordinal_for_ip(&want), Some(h));
+    }
+
+    // A LEGACY network (no registry row at all) still resolves, via its own
+    // cidr — it must stay addressable or every un-migrated tenant breaks.
+    let legacy_seeded = app.seed_tenant("ovbl-legacy").await;
+    let legacy_dao = OverlayNetworkDao::new(&app.db);
+    let legacy = legacy_dao
+        .get_or_create(tid(&legacy_seeded.tenant_id))
+        .await
+        .unwrap();
+    let lbl = legacy_dao.block_list(&legacy).await;
+    assert_eq!(lbl.cidrs(), &[OverlayNetwork::DEFAULT_CIDR.to_string()]);
+    assert_eq!(lbl.ordinal_for_ip("100.64.0.7"), Some(7));
+}
