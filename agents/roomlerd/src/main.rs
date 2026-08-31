@@ -176,6 +176,11 @@ enum Command {
         /// first run; later runs carry a restore token and do not.
         #[arg(long)]
         screencast: bool,
+        /// FR-45 P3c-ii — open a session and then write frames on stdout until
+        /// the parent goes away. ⚠️ stdout is BINARY in this mode; everything
+        /// diagnostic goes to stderr.
+        #[arg(long)]
+        stream: bool,
     },
     /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
     /// the session helper and print what came back.
@@ -1076,10 +1081,10 @@ async fn daemon_main() -> Result<()> {
                 anyhow::bail!("portal-session is Linux-only and needs the `portal-capture` feature")
             }
         }
-        Command::PortalHelper { screencast } => {
+        Command::PortalHelper { screencast, stream } => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                roomlerd::capture::portal::helper::run(screencast);
+                roomlerd::capture::portal::helper::run(screencast, stream);
                 Ok(())
             }
             // A build without the feature must say so rather than exit 0 with
@@ -1088,7 +1093,7 @@ async fn daemon_main() -> Result<()> {
             // answer from "this binary cannot ask".
             #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
             {
-                let _ = screencast;
+                let _ = (screencast, stream);
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \
                      build cannot query the desktop portal"
