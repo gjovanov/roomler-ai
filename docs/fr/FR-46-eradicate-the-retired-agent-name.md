@@ -132,8 +132,8 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | P0 | spec + issue + taxonomy decision | — | **this doc** |
 | P1a | split the marker into ANCHOR (live) / `RETIRED-NAME-RECORD` (history); `records` pinned exactly so nothing can be laundered | revert the audit script | **shipped** |
 | P1b | publish daemon assets as `roomlerd-*`; move the workflow guard | revert the workflow; assets are additive | |
-| P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` per host | **3 cluster hosts done** |
-| P2b | env prefix: delete the legacy arm — ONLY after a fleet-wide re-measure finds no setter | restore the arm | blocked on that sweep |
+| P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` / additive reg key | **4 hosts done** (3 Linux + 1 Windows) |
+| P2b | env prefix: delete the legacy arm | restore the arm | **STILL BLOCKED** — 7 devices unverifiable (below) |
 | P2c | remaining cheap classes: log filenames, install/staging paths, e2e image, `TermsView`, wizard PATH | per-item revert | |
 | P3 | re-enrollment classes: appdirs trees, Windows service + task, install folder, systemd `ReadWritePaths` | staged rollout + rollback build | |
 | P4 | wire values (QUIC ALPN, WebRTC stream id) — dual-accept window, then cleanup | dual-accept stays until cleanup | |
@@ -158,8 +158,8 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 
 | # | decision | owner | state |
 |---|---|---|---|
-| 1 | The dormant pre-0.4.15 rows: re-enroll or accept losing them? | operator | **open** |
-| 2 | macOS re-consent — who is physically at each Mac, and when? | operator | **open** (gates P5) |
+| 1 | The dormant pre-0.4.15 rows: re-enroll or accept losing them? | operator | **ANSWERED 2026-08-31 — either is acceptable.** So the appdirs / service / task anchors (P3) are no longer gated on preserving them |
+| 2 | macOS re-consent — a human at each Mac | operator | **ANSWERED 2026-08-31 — authorised.** P5 is unblocked, but stays LAST and staged one host: the grants cannot be re-approved remotely, so a wrong rename is a fleet-wide capture/input outage until someone visits |
 | 3 | Does "complete" include git history (D3)? | operator | proposed: **no** |
 | 4 | Is `roomlerd-*` the final published asset spelling? | — | proposed: **yes** |
 
@@ -174,4 +174,5 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 
 | date | build | what was proven |
 |---|---|---|
-| 2026-08-31 | fleet, live | `ROOMLER_AGENT_VIRTUAL_DESKTOP*` is STILL SET on all three cluster hosts (4 entries each, operator-authored drop-in) — so the arm is load-bearing today, and the handover's "cheap class" framing was wrong. Migrated all three make-before-break: both spellings, identical values, `.bak` kept; `systemctl show` resolves 8 entries of which 4 are `ROOMLERD_`; daemons untouched and still `active` |
+| 2026-08-31 | fleet, live | **Sweep 1 (systemd):** `ROOMLER_AGENT_VIRTUAL_DESKTOP*` is STILL SET on all three cluster hosts (4 entries each, operator-authored drop-in) — so the arm is load-bearing today and the handover's "cheap class" framing was wrong. Migrated all three make-before-break: both spellings, identical values, `.bak` kept, `systemctl show` resolves 8 of which 4 are `ROOMLERD_`, daemons untouched and still `active` |
+| 2026-08-31 | fleet, live | **Sweep 2 (whole fleet, via Fleet RPC):** probed all 12 online devices through `roomler exec`, whose child inherits the daemon's own environment — so this reads what the daemon ACTUALLY has, not what a config file claims. Found a **second, independent setter the systemd-only theory would have missed**: a Windows host carries `ROOMLER_AGENT_VP9_FPS=60` **machine-wide in HKLM**, not in any unit file. Migrated additively (`ROOMLERD_VP9_FPS=60` added, legacy kept). ⚠️ **7 devices remain unverifiable** — 3 online with `exec_enabled` false (gate 4, which is exactly the gate a server cannot overrule) and 4 offline. So P2b stays blocked on evidence, not on effort |
