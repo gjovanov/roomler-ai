@@ -196,6 +196,12 @@ pub struct OrgRuntime {
     pub connected: Arc<AtomicBool>,
     pub terminal_error: Arc<Mutex<Option<String>>>,
     pub updates_ignored: Arc<std::sync::atomic::AtomicU32>,
+    /// FR-49 — this enrollment's overlay participation (`OrgOverlayMode::wire`).
+    ///
+    /// A config-level decision rather than a live handle, so it needs no `Arc`;
+    /// it is re-seeded whenever a row is, which is also when the config that
+    /// decides it was last read.
+    pub overlay_mode: &'static str,
 }
 
 /// Shared registry of [`OrgRuntime`] rows (primary first).
@@ -431,6 +437,7 @@ impl LocalApiState for DaemonState {
                                         .ok()
                                         .and_then(|t| t.clone()),
                                     updates_ignored: o.updates_ignored.load(Ordering::Relaxed),
+                                    overlay_mode: o.overlay_mode.to_string(),
                                 })
                                 .collect()
                         })
