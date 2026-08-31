@@ -2862,6 +2862,13 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // to the loop that actually owns that session.
     let rc_sessions = roomlerd::rc_sessions::RcSessionRegistry::new();
 
+    // FR-43 P2a — the macOS GUI-worker delegation channel. Built
+    // unconditionally so the LocalAPI state has one shape everywhere, but it
+    // hands out nothing until the supervisor mints a secret for a worker it
+    // spawned: no secret issued IS the refusal, so "the feature is off" needs
+    // no separate branch.
+    let delegate_host = roomlerd::delegate::DelegateHost::new();
+
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(
             localapi_state::DaemonState::new(
@@ -2883,6 +2890,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             // …and the live gate-4 flags, so a `config set` here is in force
             // as fast as a pushed one (docs/remote-config.md).
             .with_remote_config(remote_cfg.clone())
+            .with_delegate(delegate_host.clone())
             // Multi-org P1 — live per-enrollment rows for `roomler status`.
             // FR-27 — live remote-control sessions, so the desktop app can
             // render "Being viewed by ..." and offer a Disconnect. Written by
@@ -2926,10 +2934,21 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // live Mac is a no-op until the plist is booted out. Not spawned at all on
     // other platforms — there is no second half to supervise.
     #[cfg(target_os = "macos")]
-    let macos_supervisor_task = tokio::spawn(roomlerd::macos_supervisor::run(
+    // Deliberately not aborted at shutdown, unlike the tasks below: this one
+    // exits on the shutdown watch itself, and its exit path is what stops and
+    // revokes the worker. An abort would skip exactly that.
+    let _macos_supervisor_task = tokio::spawn(roomlerd::macos_supervisor::run(
         cfg.macos_supervise_gui_worker,
+        delegate_host.clone(),
         shutdown_rx.clone(),
     ));
+
+    // FR-43 P2a — the WORKER half. Returns immediately unless this process was
+    // spawned by a supervisor that gave it an attach secret, so it is inert for
+    // a launchd-owned worker, a hand-run `roomlerd run`, and the daemon itself.
+    #[cfg(unix)]
+    // Same: exits on the shutdown watch, so no abort.
+    let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(shutdown_rx.clone()));
 
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
