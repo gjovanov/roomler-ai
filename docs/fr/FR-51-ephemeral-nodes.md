@@ -128,7 +128,7 @@ pass.
 
 ⇒ The reaper needs **its own query** — `ephemeral == true AND deleted_at: null AND
 last_seen_at < now − ttl` — and should reuse the sweep's **cluster-singleton shape** (a Redis
-`NX` claim keyed by DB name, `device_presence.rs:312`) rather than its scan set. Two pods
+`NX` claim keyed by DB name, `device_presence.rs:313`, claimed at `:326`) rather than its scan set. Two pods
 must not both reap.
 
 ### F3 — the removal sequence already exists, its ORDER is load-bearing, and the reaper must *call* it
