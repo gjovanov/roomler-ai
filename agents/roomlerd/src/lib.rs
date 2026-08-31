@@ -28,7 +28,6 @@ pub mod code_signature;
 pub mod companion;
 pub mod consent;
 pub mod crash_uploader;
-#[cfg(unix)]
 pub mod delegate;
 #[cfg(unix)]
 pub mod delegate_worker;

@@ -2889,6 +2889,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     // needs no separate branch.
     #[cfg(target_os = "macos")]
     let delegate_host = roomlerd::delegate::DelegateHost::new();
+    // Only macOS has a GUI worker to delegate to; everywhere else this is
+    // `None` and the delegation branch in `handle_server_msg` is unreachable.
+    #[cfg(target_os = "macos")]
+    let delegate_for_signaling = Some(delegate_host.clone());
+    #[cfg(not(target_os = "macos"))]
+    let delegate_for_signaling: Option<roomlerd::delegate::DelegateHost> = None;
 
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(
@@ -3029,6 +3035,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
             async move {
                 match signaling::run(
                     org_ctx,
+                    // FR-43 P2b — secondary orgs never drive the host-global
+                    // GUI worker (see `handle_server_msg`'s primary gate).
+                    None,
                     org_cfg,
                     encoder_preference,
                     rx,
@@ -3190,6 +3199,8 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                     async move {
                         match signaling::run(
                             org_ctx,
+                            // Secondary org — see above.
+                            None,
                             org_cfg,
                             enc,
                             rx,
@@ -3257,6 +3268,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         async move {
             signaling::run(
                 primary_ctx,
+                // FR-43 P2b — the PRIMARY loop is the only one that may hand a
+                // session to the GUI worker.
+                delegate_for_signaling,
                 cfg,
                 encoder_preference,
                 rx,
