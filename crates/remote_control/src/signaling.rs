@@ -185,6 +185,59 @@ impl<'de> Deserialize<'de> for AgentCloseReason {
     }
 }
 
+/// FR-47 — why an [`ServerMsg::OverlayJoinRefused`] was sent.
+///
+/// Enumerated rather than free text because the daemon acts on it: address
+/// exhaustion is an operator problem that retrying cannot fix, while a
+/// transient store failure is worth another attempt. The `detail` string
+/// carries the human-readable specifics.
+///
+/// `Deserialize` is hand-written for the same reason [`AgentCloseReason`]'s
+/// is: a fielded node must survive a server that learned a new reason. Unknown
+/// decodes to [`Unknown`](OverlayJoinRefusal::Unknown), which the daemon
+/// reports verbatim and treats as non-retryable — the conservative arm, since
+/// a reason we cannot interpret is not one we can safely retry against.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayJoinRefusal {
+    /// Every host ordinal in the tenant's block is leased. Retrying cannot
+    /// help; the block needs to grow or devices need releasing.
+    AddressSpaceExhausted,
+    /// The tenant's network row or CIDR could not be resolved.
+    NetworkUnavailable,
+    /// A transient persistence failure. Retryable.
+    StoreUnavailable,
+    /// A reason this build does not know.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for OverlayJoinRefusal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "address_space_exhausted" => OverlayJoinRefusal::AddressSpaceExhausted,
+            "network_unavailable" => OverlayJoinRefusal::NetworkUnavailable,
+            "store_unavailable" => OverlayJoinRefusal::StoreUnavailable,
+            _ => OverlayJoinRefusal::Unknown,
+        })
+    }
+}
+
+impl OverlayJoinRefusal {
+    /// Is another join attempt worth making?
+    ///
+    /// Only the transient arm. Exhaustion in particular must NOT retry: the
+    /// daemon would hammer a server that is already telling an operator it is
+    /// out of addresses, and the reconnect loop would bury the one log line
+    /// that explains the outage.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, OverlayJoinRefusal::StoreUnavailable)
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Inbound from clients (agent or controller browser)
 // ────────────────────────────────────────────────────────────────────────────
@@ -1014,6 +1067,16 @@ pub enum ClientMsg {
         /// "I SERVE relays" — this says "I can USE one".
         #[serde(default)]
         supports_org_relay: bool,
+        /// FR-47 — this node understands [`ServerMsg::OverlayJoinRefused`], so
+        /// a join the server cannot complete comes back as a stated reason
+        /// instead of silence. Absent from an older node ⇒ `false`, and such a
+        /// node keeps exactly the pre-FR-47 behaviour: it waits for a netmap
+        /// that never arrives, and the server-side ERROR log is the only
+        /// signal. Deliberately NOT persisted — the refusal decision is made
+        /// inside the same handler that parsed this join, so there is nothing
+        /// to remember.
+        #[serde(default)]
+        supports_join_refusal: bool,
         /// FR-19 (P3c) — whether this join comes from the device's PRIMARY
         /// org. Relay serving and relay use are primary-only: a UDP listener
         /// is host-global, and a secondary org's admin must not be able to
@@ -1972,6 +2035,28 @@ pub enum ServerMsg {
     /// refreshed by traffic and never fires under a WireGuard keepalive.
     #[serde(rename = "rc:overlay.relay_revoke")]
     OverlayRelayRevoke { vni: u32 },
+
+    /// FR-47 — the join could not be completed, and this says why.
+    ///
+    /// Before this frame a join that failed IPAM was a server-side `warn!` and
+    /// nothing else: the node sat waiting for a netmap that would never come,
+    /// so a device that could not be given an address looked exactly like one
+    /// that was merely offline — to the operator as much as to the daemon.
+    ///
+    /// Hello-gated on `supports_join_refusal`, following the
+    /// [`ServerMsg::RelayRegions`] convention: a fielded agent's `ServerMsg`
+    /// deserializer errors on an unknown variant, and while that error is
+    /// absorbed harmlessly (`pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fires`
+    /// locks it), a frame nobody can read is not worth sending. Pre-FR-47
+    /// nodes keep exactly today's behaviour, and the server-side ERROR log
+    /// remains their signal.
+    #[serde(rename = "rc:overlay.join_refused")]
+    OverlayJoinRefused {
+        reason: OverlayJoinRefusal,
+        /// Operator-facing detail. Safe to log; never contains another
+        /// tenant's identifiers.
+        detail: String,
+    },
 
     /// Multi-region relay PoPs: the probe-target list the server pushes to a
     /// node that advertised `supports_relay_regions` (hello-gated — the agent's
@@ -3920,6 +4005,63 @@ mod tests {
 
     // ─── rc:overlay.* wire-format locks ───────────────────────────────
 
+    /// FR-47 — the refusal frame round-trips, and an OLD node that omits
+    /// `supports_join_refusal` decodes as `false` so the server withholds it.
+    #[test]
+    fn overlay_join_refused_roundtrips_and_the_capability_defaults_off() {
+        let m = ServerMsg::OverlayJoinRefused {
+            reason: OverlayJoinRefusal::AddressSpaceExhausted,
+            detail: "every host ordinal up to 1022 is leased".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.join_refused""#));
+        assert!(s.contains(r#""reason":"address_space_exhausted""#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayJoinRefused { reason, detail } => {
+                assert_eq!(reason, OverlayJoinRefusal::AddressSpaceExhausted);
+                assert!(
+                    !reason.is_retryable(),
+                    "a full block does not empty on retry"
+                );
+                assert!(detail.contains("1022"));
+            }
+            other => panic!("expected OverlayJoinRefused, got {other:?}"),
+        }
+
+        // A pre-FR-47 join carries no capability field at all.
+        let old = r#"{"t":"rc:overlay.join","wg_public_key":"k","key_epoch":0,
+            "supported":[],"mtu":1280,"endpoints":[]}"#;
+        match serde_json::from_str::<ClientMsg>(old).unwrap() {
+            ClientMsg::OverlayJoin {
+                supports_join_refusal,
+                ..
+            } => assert!(
+                !supports_join_refusal,
+                "an older node must default OFF, so the server never sends it a \
+                 frame it cannot parse"
+            ),
+            other => panic!("expected OverlayJoin, got {other:?}"),
+        }
+    }
+
+    /// A reason this build has never heard of must not fail the frame — the
+    /// same forward-compat hatch `AgentCloseReason` has. It lands on
+    /// `Unknown`, which is deliberately NOT retryable: a refusal we cannot
+    /// interpret is not one we can safely retry against.
+    #[test]
+    fn an_unknown_refusal_reason_decodes_to_unknown_and_is_not_retryable() {
+        let json = r#"{"t":"rc:overlay.join_refused","reason":"quota_exceeded_v9",
+            "detail":"from a newer server"}"#;
+        match serde_json::from_str::<ServerMsg>(json).unwrap() {
+            ServerMsg::OverlayJoinRefused { reason, detail } => {
+                assert_eq!(reason, OverlayJoinRefusal::Unknown);
+                assert!(!reason.is_retryable());
+                assert_eq!(detail, "from a newer server");
+            }
+            other => panic!("expected OverlayJoinRefused, got {other:?}"),
+        }
+    }
+
     #[test]
     fn overlay_join_roundtrip() {
         let m = ClientMsg::OverlayJoin {
@@ -3935,6 +4077,7 @@ mod tests {
             supports_forced_derp: true,
             supports_overlay_echo: false,
             supports_org_relay: false,
+            supports_join_refusal: true,
             org_primary: None,
             relay_port: None,
             supports_server_relay_strategy: true,

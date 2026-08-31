@@ -915,6 +915,28 @@ pub fn intercept(
         ServerMsg::OverlayNetmapDelta {
             upserts, removes, ..
         } => OverlayEvent::NetmapDelta { upserts, removes },
+        // FR-47 — the server could not complete our join and said why.
+        //
+        // Logged at ERROR and consumed here rather than forwarded as an
+        // `OverlayEvent`: there is no runtime to tell, because the runtime is
+        // exactly what never came up. Before this frame existed the same
+        // situation produced NOTHING on this host — the daemon simply waited
+        // on a netmap forever, which is indistinguishable from a slow server.
+        //
+        // Deliberately not retried here even when `is_retryable()`: the
+        // signalling loop already reconnects on its own ladder, and a retry
+        // at this layer would race it. The flag is carried for the operator
+        // and for whoever adds a backoff decision later.
+        ServerMsg::OverlayJoinRefused { reason, detail } => {
+            tracing::error!(
+                ?reason,
+                %detail,
+                retryable = reason.is_retryable(),
+                "overlay: the server REFUSED our join — this node has no overlay \
+                 address and will not appear in the mesh"
+            );
+            return None;
+        }
         ServerMsg::OverlayRelayGrant {
             ice_servers,
             peer_node_id,
