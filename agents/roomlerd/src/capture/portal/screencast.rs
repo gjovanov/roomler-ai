@@ -145,9 +145,26 @@ impl OpenError {
     }
 }
 
-/// Run the handshake. Blocking, and it can block for as long as a human takes
-/// to answer a dialog — the caller bounds it, not this function.
+/// Run the handshake.
+///
+/// Blocking, and it can block for as long as a human takes to answer a dialog
+/// — the caller bounds it, not this function.
+///
+/// ⚠️ **Runs on its own thread, and that is not optional.** `zbus`'s blocking
+/// API panics when called from inside a tokio runtime, and `portal-helper` is
+/// dispatched from `#[tokio::main]`. [`super::detect`] already carried this
+/// guard and this function was written without it, which cost a field run:
+/// *"Cannot start a runtime from within a runtime"*, before any portal call
+/// was made. The guard belongs HERE rather than at each call site, so the next
+/// entry point cannot reintroduce it.
 pub fn open(restore_token: Option<&str>) -> Result<SessionReport, OpenError> {
+    let token = restore_token.map(str::to_owned);
+    std::thread::spawn(move || open_blocking(token.as_deref()))
+        .join()
+        .unwrap_or_else(|_| Err(OpenError::failed("the portal handshake thread panicked")))
+}
+
+fn open_blocking(restore_token: Option<&str>) -> Result<SessionReport, OpenError> {
     let started = Instant::now();
     // Recorded up front: `restore_token` is shadowed further down by the one
     // the portal hands BACK, and conflating "we offered a token" with "we were
