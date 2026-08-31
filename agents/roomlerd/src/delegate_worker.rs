@@ -3,10 +3,32 @@
 //! FR-43 P2a — the worker side of the GUI-worker delegation channel.
 //!
 //! The counterpart to [`crate::delegate`]. A worker the macOS supervisor
-//! spawned finds its attach secret in the environment
-//! ([`crate::delegate::ATTACH_SECRET_ENV`]), dials the daemon's LocalAPI
-//! socket, and holds the channel open for the daemon to push sessions down in
-//! P2b.
+//! spawned is told so with `run --supervised` and reads its attach secret as
+//! one line on **stdin**, then dials the daemon's LocalAPI socket and holds the
+//! channel open for the daemon to push sessions down in P2b.
+//!
+//! ## Why stdin, and not the environment
+//!
+//! Because the environment does not arrive. The spawn chain runs through
+//! `sudo`, and this host's `/etc/sudoers` carries the stock `Defaults
+//! env_reset`, so everything the parent sets is discarded — measured on a real
+//! Mac, and the reason P1's `ROOMLER_MACOS_SUPERVISED` marker turned out never
+//! to have reached a single worker. Nothing noticed because nothing read it
+//! yet.
+//!
+//! Of the three channels that DO survive the chain (measured: stdin, `sudo -E`,
+//! and a `VAR=value` argument), stdin is the only one that is neither
+//! world-readable nor dependent on sudoers policy:
+//!
+//! | channel | who can read it |
+//! |---|---|
+//! | `VAR=value` argument | **any** user on the box, via `ps` |
+//! | `sudo -E` environment | root and the owning uid — but silently empty again if a policy ever sets `!setenv` |
+//! | **stdin** | only the parent that holds the pipe |
+//!
+//! The `--supervised` flag is deliberately in argv, where it is harmless and
+//! actually useful to an operator reading `ps`; only the secret is on the
+//! pipe.
 //!
 //! ## Why the worker dials, when the daemon is the one that wants to push
 //!
@@ -50,15 +72,22 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Run the worker's side of the channel for the process lifetime.
 ///
-/// Returns immediately when there is no attach secret in the environment, which
-/// is every case except a worker the supervisor itself spawned: launchd-owned
-/// workers, hand-run `roomlerd run`, and every non-macOS platform.
-pub async fn run(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    let Some(secret) = std::env::var(crate::delegate::ATTACH_SECRET_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
-        tracing::debug!("delegation: no attach secret in the environment; not attaching");
+/// Returns immediately unless this process was started as `run --supervised`,
+/// which is every case except a worker the supervisor itself spawned:
+/// launchd-owned workers, a hand-run `roomlerd run`, and the daemon.
+pub async fn run(supervised: bool, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    if !supervised {
+        tracing::debug!("delegation: not a supervised worker; not attaching");
+        return;
+    }
+    let Some(secret) = read_secret_from_stdin().await else {
+        // LOUD, not silent: `--supervised` with no secret means the supervisor
+        // and the worker disagree about how the secret travels, which is
+        // exactly the failure that made P1's env marker a no-op for three
+        // releases without anyone noticing.
+        tracing::warn!(
+            "delegation: started with --supervised but no secret arrived on stdin; not attaching"
+        );
         return;
     };
 
@@ -170,6 +199,39 @@ async fn attach_once(
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+/// Read the attach secret: one line on stdin, bounded.
+///
+/// Bounded because a worker that hangs waiting for a line that will never come
+/// is worse than one that gives up — the supervisor would see a process that
+/// starts and does nothing, and the operator would see a remote-desktop half
+/// that is running and useless. Five seconds is far longer than a parent that
+/// already has the secret in hand needs.
+async fn read_secret_from_stdin() -> Option<String> {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::io::BufReader::new(tokio::io::stdin())
+            .read_line(&mut line)
+            .await
+    })
+    .await;
+    match read {
+        Ok(Ok(n)) if n > 0 => {
+            let secret = line.trim().to_string();
+            (!secret.is_empty()).then_some(secret)
+        }
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "delegation: could not read the secret from stdin");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("delegation: timed out waiting for the secret on stdin");
+            None
         }
     }
 }
