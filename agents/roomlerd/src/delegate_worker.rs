@@ -213,6 +213,20 @@ async fn attach_once(
                         Ok(DelegateFrame::Attached { .. }) => {
                             tracing::debug!("delegation: a second `attached` frame; ignoring");
                         }
+                        // P2b-1 observes the traffic; P2b-2 serves it. Logging
+                        // it first is deliberate: it proves the nine kinds
+                        // cross correctly, in order, against real sessions,
+                        // BEFORE any peer lifecycle moves across the boundary.
+                        Ok(DelegateFrame::ToWorker { msg }) => {
+                            tracing::info!(
+                                kind = crate::delegate::server_msg_kind(&msg),
+                                "delegation: received an rc message from the daemon (not yet served — FR-43 P2b-2)"
+                            );
+                        }
+                        Ok(DelegateFrame::FromWorker { .. }) => {
+                            // Worker → daemon only.
+                            tracing::warn!("delegation: daemon sent a `from_worker` frame; ignoring");
+                        }
                         // Skip, never close: a NEWER daemon may push a frame
                         // this worker has never heard of, and an additive
                         // protocol is only additive if old readers skip it.
