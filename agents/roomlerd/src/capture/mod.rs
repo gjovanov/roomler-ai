@@ -27,6 +27,11 @@ pub mod x11_damage;
 #[cfg(all(target_os = "linux", feature = "drm-capture"))]
 pub mod drm_backend;
 
+/// FR-45 P1 — desktop-portal availability. Detection only: whether ScreenCast
+/// exists at all, and why not. The capture path itself is P2/P3.
+#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+pub mod portal;
+
 #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
 pub mod wgc_backend;
 
