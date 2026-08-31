@@ -65,6 +65,28 @@ being updated.
 ones carry a version), and the binding reads the MSI's own `ProductVersion`, using the filename
 only to dispatch on extension. That anchor's reason is overstated; the fixtures are free.
 
+## Root finding: the env prefix is a FLEET MIGRATION, not a cheap deletion
+
+`ROOMLER_AGENT_*` is the largest single live class (~38 anchors) and the handover filed it
+under "cheap classes". It is not. `env::node_env` reads three prefixes — `ROOMLERD_`,
+`ROOMLER_NODE_`, `ROOMLER_AGENT_` — and the anchor on that chain claims real hosts still set the
+retired spelling in **operator-authored systemd drop-ins that a package upgrade never
+rewrites**.
+
+**Field-measured 2026-08-31 rather than trusted**: all three cluster hosts carry exactly four
+`ROOMLER_AGENT_VIRTUAL_DESKTOP*` entries in `/etc/systemd/system/roomlerd.service.d/`. The
+claim is current, not stale.
+
+⇒ **Ordering is load-bearing.** Delete the arm before rewriting the hosts and the daemon starts
+fine and silently ignores four settings per node — no error, no log line, just a headless
+cluster node that quietly stops offering a virtual desktop. The migration must be
+make-before-break: rewrite every host that sets the retired spelling, confirm, *then* delete
+the arm.
+
+⚠️ A host is only discoverable this way if someone goes and looks. There is no inventory of
+operator-authored drop-ins, so "every host that sets it" is a claim that has to be re-measured
+across the whole fleet — not just the hosts that happen to be in a runbook — before the arm
+comes out.
 ## The three one-way doors
 
 ### D1 — macOS bundle identity (the only genuine blocker)
@@ -97,7 +119,9 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | P0 | spec + issue + taxonomy decision | — | **this doc** |
 | P1a | split the marker into ANCHOR (live) / `RETIRED-NAME-RECORD` (history); `records` pinned exactly so nothing can be laundered | revert the audit script | **shipped** |
 | P1b | publish daemon assets as `roomlerd-*`; move the workflow guard | revert the workflow; assets are additive | |
-| P2 | cheap classes: env prefix deprecation, log filenames, install/staging paths, e2e image, `TermsView`, wizard PATH | per-item revert | |
+| P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` per host | **3 cluster hosts done** |
+| P2b | env prefix: delete the legacy arm — ONLY after a fleet-wide re-measure finds no setter | restore the arm | blocked on that sweep |
+| P2c | remaining cheap classes: log filenames, install/staging paths, e2e image, `TermsView`, wizard PATH | per-item revert | |
 | P3 | re-enrollment classes: appdirs trees, Windows service + task, install folder, systemd `ReadWritePaths` | staged rollout + rollback build | |
 | P4 | wire values (QUIC ALPN, WebRTC stream id) — dual-accept window, then cleanup | dual-accept stays until cleanup | |
 | P5 | macOS bundle (D1) — one host, verified, then fleet | do not proceed past host 1 | |
@@ -137,4 +161,4 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 
 | date | build | what was proven |
 |---|---|---|
-| | | |
+| 2026-08-31 | fleet, live | `ROOMLER_AGENT_VIRTUAL_DESKTOP*` is STILL SET on all three cluster hosts (4 entries each, operator-authored drop-in) — so the arm is load-bearing today, and the handover's "cheap class" framing was wrong. Migrated all three make-before-break: both spellings, identical values, `.bak` kept; `systemctl show` resolves 8 entries of which 4 are `ROOMLERD_`; daemons untouched and still `active` |
