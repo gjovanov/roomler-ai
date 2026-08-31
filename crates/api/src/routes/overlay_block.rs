@@ -991,6 +991,142 @@ fn cidr_contains(cidr: &str, ip: &str) -> bool {
     (u32::from(base) & mask) == (u32::from(ip) & mask)
 }
 
+// ---------------------------------------------------------------------------
+// FR-47 P3 — host-ordinal reconciliation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ReconcileHostsRequest {
+    /// Plan only (the default). Nothing is released unless this is `false`.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcileHostsResponse {
+    pub dry_run: bool,
+    pub cidr: String,
+    /// The IPAM cursor: ordinals `1..next_host` have been issued at some point.
+    pub next_host: u32,
+    /// Ordinals a live node currently holds.
+    pub live: u32,
+    /// Ordinals already sitting in the recycle pool.
+    pub pooled: u32,
+    /// Issued ordinals held by nothing and pooled by nothing — the leak.
+    pub orphaned: Vec<u32>,
+    /// Orphans actually returned to the pool (empty on a dry run).
+    pub released: Vec<u32>,
+    /// Orphans `release_host` declined, with the count. A refusal is not an
+    /// error: the guards exist precisely so this path cannot corrupt the pool.
+    pub refused: usize,
+}
+
+/// Issued ordinals that belong to no live node and are not already pooled.
+///
+/// Pure so it can be tested: the range is half-open (`next_host` is the NEXT
+/// one to hand out, never itself issued) and host 0 is the network address,
+/// which the allocator never leases. Both bounds are off-by-one bait, and a
+/// mistake at either end is destructive here rather than merely wrong — an
+/// over-eager orphan list would release an ordinal a live node is using and
+/// hand two devices the same address.
+fn orphaned_ordinals(
+    next_host: u32,
+    live: &std::collections::HashSet<u32>,
+    pooled: &std::collections::HashSet<u32>,
+) -> Vec<u32> {
+    (1..next_host)
+        .filter(|h| !live.contains(h) && !pooled.contains(h))
+        .collect()
+}
+
+/// POST /api/tenant/{tenant_id}/overlay-block/reconcile-hosts — return leaked
+/// host ordinals to the tenant's recycle pool. Platform operator only;
+/// dry-run by default.
+///
+/// The leak is real and measurable: on production 2026-08-31 the oldest carved
+/// network had issued 35 ordinals, of which 17 were held by live nodes and 1
+/// sat in `free_hosts` — the other ~17 belonged to no document at all. They
+/// were released before the recycle pool existed, so there was nothing to
+/// return them to, and no eviction path can reach them because they are not
+/// attached to a row anyone can delete.
+///
+/// ⚠️ Every orphan goes back through [`OverlayNetworkDao::release_host`] and
+/// never by writing `free_hosts` directly. That is the whole design of this
+/// route. `release_host` carries three guards — `$addToSet` against a double
+/// release, `next_host > host` against an ordinal the cursor never issued, and
+/// the `MAX_FREE_HOSTS` size cap — and a reconcile that bypassed them to
+/// "fix" bookkeeping could hand two live nodes the same address, which is
+/// strictly worse than the leak it set out to repair.
+///
+/// ⚠️ Running this twice, a month apart, answers a question nothing else can:
+/// whether the leak is purely historical (pre-2026-07-29 releases) or whether
+/// a live path is still dropping ordinals.
+pub async fn reconcile_hosts(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<ReconcileHostsRequest>,
+) -> Result<Json<ReconcileHostsResponse>, ApiError> {
+    if !state.platform_admins.contains(&auth.user_id) {
+        return Err(ApiError::NotFound("Not found".to_string()));
+    }
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("bad tenant id".to_string()))?;
+    let network = state.overlay_networks.get_or_create(tid).await?;
+    let network_id = network
+        .id
+        .ok_or_else(|| ApiError::Internal("overlay network has no id".to_string()))?;
+
+    // Ordinals a live node holds. A node whose address does not invert under
+    // the CURRENT cidr is skipped rather than guessed at: it was leased under
+    // a since-changed range, and inventing an ordinal for it could release one
+    // that a different node legitimately holds.
+    let nodes = state
+        .overlay_nodes
+        .list_active_in_network(tid, network_id)
+        .await?;
+    let live: std::collections::HashSet<u32> = nodes
+        .iter()
+        .filter_map(|n| overlay_host(&network.cidr, &n.overlay_ip))
+        .collect();
+    let pooled: std::collections::HashSet<u32> = network.free_hosts.iter().copied().collect();
+
+    let orphaned = orphaned_ordinals(network.next_host, &live, &pooled);
+
+    let mut released = Vec::new();
+    let mut refused = 0usize;
+    if !body.dry_run {
+        for h in &orphaned {
+            match state.overlay_networks.release_host(network_id, *h).await {
+                Ok(true) => released.push(*h),
+                // Declined by a guard, or the pool is full. Neither is an
+                // error — the ordinal simply stays leaked, exactly as before.
+                Ok(false) => refused += 1,
+                Err(e) => {
+                    tracing::warn!(%network_id, host = h, %e, "reconcile-hosts: release failed");
+                    refused += 1;
+                }
+            }
+        }
+        tracing::warn!(
+            admin = %auth.user_id, %tenant_id, cidr = %network.cidr,
+            released = released.len(), refused,
+            "overlay ipam: operator reconciled leaked host ordinals"
+        );
+    }
+
+    Ok(Json(ReconcileHostsResponse {
+        dry_run: body.dry_run,
+        cidr: network.cidr,
+        next_host: network.next_host,
+        live: live.len() as u32,
+        pooled: pooled.len() as u32,
+        orphaned,
+        released,
+        refused,
+    }))
+}
+
 #[cfg(test)]
 mod reclaim_tests {
     use super::cidr_contains;
@@ -1010,5 +1146,47 @@ mod reclaim_tests {
         assert!(!cidr_contains("not-a-cidr", "100.65.0.5"));
         assert!(!cidr_contains("100.65.0.0/22", "::1"));
         assert!(!cidr_contains("100.65.0.0/99", "100.65.0.5"));
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+
+    fn set(v: &[u32]) -> HashSet<u32> {
+        v.iter().copied().collect()
+    }
+
+    /// The production shape this route was written for: the oldest carved
+    /// network had issued 35 ordinals, 17 held by live nodes and 1 pooled.
+    #[test]
+    fn orphans_are_the_issued_ordinals_nothing_holds() {
+        let live = set(&[1, 2, 3]);
+        let pooled = set(&[5]);
+        // Issued 1..=6 (cursor at 7): 4 and 6 belong to nothing.
+        assert_eq!(orphaned_ordinals(7, &live, &pooled), vec![4, 6]);
+    }
+
+    /// Both bounds are off-by-one bait, and being wrong here releases an
+    /// address a live node is using.
+    #[test]
+    fn the_cursor_itself_was_never_issued_and_host_zero_is_the_network() {
+        let empty = set(&[]);
+        // Cursor at 3 ⇒ only 1 and 2 were ever handed out. 3 must NOT appear.
+        assert_eq!(orphaned_ordinals(3, &empty, &empty), vec![1, 2]);
+        // A virgin network has issued nothing at all.
+        assert!(orphaned_ordinals(1, &empty, &empty).is_empty());
+        assert!(orphaned_ordinals(0, &empty, &empty).is_empty());
+        // Host 0 is the network address and is never a candidate.
+        assert!(!orphaned_ordinals(9, &empty, &empty).contains(&0));
+    }
+
+    /// A fully-accounted network reports no work, which is what a SECOND run
+    /// a month later should say if the leak really was historical.
+    #[test]
+    fn a_reconciled_network_has_nothing_left_to_reclaim() {
+        let live = set(&[1, 3]);
+        let pooled = set(&[2, 4]);
+        assert!(orphaned_ordinals(5, &live, &pooled).is_empty());
     }
 }
