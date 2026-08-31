@@ -2109,15 +2109,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # P3d Slice B: the built binary is now `roomlerd` (the [[bin]] output
-          # name). macOS is NOT the fleet, so the .app/binary INTERNAL name stays
-          # `roomler-agent` for now (CFBundleExecutable + com.roomler.agent plist
-          # Label unchanged — out of scope); only the SOURCE path is updated so
-          # the copy resolves. Renaming the macOS .app internals is a follow-up.
+          # FR-46 P5b: the .app, its executable and CFBundleName now all carry the
+          # CURRENT name. CFBundleIdentifier stays `com.roomler.agent` on purpose —
+          # it is not a retired name, it doubles as the launchd Label, and it is what
+          # TCC attributes the grants to, so changing it would widen the blast radius
+          # of a rename that already costs a re-approval at every Mac.
           BIN=target/aarch64-apple-darwin/release/roomlerd
-          APP=stage/roomler-agent.app
+          APP=stage/roomlerd.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp "$BIN" "$APP/Contents/MacOS/roomler-agent"
+          cp "$BIN" "$APP/Contents/MacOS/roomlerd"
           # Bundle every non-system dylib the binary loads into the .app, so
           # it is self-contained on a Mac that has never seen Homebrew.
           #
@@ -2193,8 +2193,8 @@ jobs:
             done < <(otool -L "$target" | tail -n +2 | awk '{print $1}')
           }
           echo "=== bundling non-system dylibs ==="
-          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomler-agent"
-          bundle_deps "$APP/Contents/MacOS/roomler-agent"
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomlerd"
+          bundle_deps "$APP/Contents/MacOS/roomlerd"
           ls -1 "$FW" 2>/dev/null || echo "    (none needed)"
 
           # install_name_tool invalidates the linker's ad-hoc signature, and an
@@ -2204,7 +2204,7 @@ jobs:
           # codesign steps below replace these with the Developer ID identity.
           # $SIGN_ID is the STABLE self-signed identity (or "-" ad-hoc
           # fallback) — see the import step for why stability matters (TCC).
-          find "$APP" -type f \( -name '*.dylib' -o -name 'roomler-agent' \) \
+          find "$APP" -type f \( -name '*.dylib' -o -name 'roomlerd' \) \
             -exec codesign --force --timestamp=none --sign "$SIGN_ID" {} \;
 
           echo "=== GATE: no Mach-O in the .app may reference a non-system path ==="
@@ -2240,7 +2240,7 @@ jobs:
             hidden=1
           fi
           rc=0
-          "$APP/Contents/MacOS/roomler-agent" --version || rc=$?
+          "$APP/Contents/MacOS/roomlerd" --version || rc=$?
           [ "$hidden" -eq 1 ] && mv /opt/homebrew/opt.hidden /opt/homebrew/opt
           if [ "$rc" -ne 0 ]; then
             echo "::error::the staged binary does not start without Homebrew (exit $rc) — it is not self-contained"
@@ -2256,7 +2256,7 @@ jobs:
           # every plist it installs out of this one directory.
           cp agents/roomlerd/packaging/macos/com.roomler.desktop.plist "$APP/Contents/Resources/"
           # The update half (root LaunchDaemon, DEFAULT ON, opt-out marker
-          # /etc/roomler-agent/disable-auto-update). Owns check+download+
+          # /etc/roomler/disable-auto-update). Owns check+download+
           # install so no agent process ever execs its own replacement.
           cp agents/roomlerd/packaging/macos/com.roomler.update.plist "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
@@ -2264,9 +2264,9 @@ jobs:
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-              <key>CFBundleExecutable</key>          <string>roomler-agent</string>
+              <key>CFBundleExecutable</key>          <string>roomlerd</string>
               <key>CFBundleIdentifier</key>          <string>com.roomler.agent</string>
-              <key>CFBundleName</key>                <string>Roomler Agent</string>
+              <key>CFBundleName</key>                <string>Roomler Daemon</string>
               <key>CFBundleShortVersionString</key>  <string>${VERSION}</string>
               <key>CFBundleVersion</key>             <string>${VERSION}</string>
               <key>CFBundlePackageType</key>         <string>APPL</string>
@@ -2274,9 +2274,9 @@ jobs:
               <key>LSUIElement</key>                 <true/>
               <key>NSPrincipalClass</key>            <string>NSApplication</string>
               <key>NSScreenCaptureUsageDescription</key>
-                  <string>Roomler Agent captures the screen to stream it to an authorised remote controller.</string>
+                  <string>Roomler Daemon captures the screen to stream it to an authorised remote controller.</string>
               <key>NSAppleEventsUsageDescription</key>
-                  <string>Roomler Agent injects input events on behalf of an authorised remote controller.</string>
+                  <string>Roomler Daemon injects input events on behalf of an authorised remote controller.</string>
           </dict>
           </plist>
           PLIST
@@ -2427,18 +2427,18 @@ jobs:
           # codesign refuses with "is already signed" — and since the Apple
           # secrets have never been configured, this whole branch has never
           # executed, so nothing would have caught it but a release.
-          find stage/roomler-agent.app/Contents/Frameworks -type f -name '*.dylib' -print0 \
+          find stage/roomlerd.app/Contents/Frameworks -type f -name '*.dylib' -print0 \
             | while IFS= read -r -d '' dylib; do
                 codesign --force --sign "Developer ID Application" --options runtime --timestamp "$dylib"
               done
           codesign --force --sign "Developer ID Application" \
                    --options runtime --timestamp \
                    --entitlements agents/roomlerd/packaging/macos/entitlements.plist \
-                   "stage/roomler-agent.app/Contents/MacOS/roomler-agent"
+                   "stage/roomlerd.app/Contents/MacOS/roomlerd"
 
           codesign --force --sign "Developer ID Application" \
                    --options runtime --timestamp \
-                   "stage/roomler-agent.app"
+                   "stage/roomlerd.app"
 
           # The CLI shim ships in the same .pkg, outside the bundle. Sign it
           # HERE: nothing may `cargo build` after this point (a relink strips
@@ -2458,7 +2458,7 @@ jobs:
           # It is a background service with no window and nothing to launch —
           # putting it in /Applications gave the user two Roomler icons, one of
           # which does nothing when double-clicked, and made the internal
-          # `roomler-agent` name look like a stale leftover next to `Roomler`.
+          # internal daemon name look like a stale leftover next to `Roomler`.
           # /Library/<Vendor> is the conventional home for a helper the user
           # never opens, and Finder and Launchpad do not surface it.
           #
@@ -2469,7 +2469,7 @@ jobs:
           # ⚠️ The path is part of the TCC identity, so this move costs every
           # existing Mac one re-grant. Unavoidable, and cheapest now while the
           # platform has almost no installs.
-          cp -R stage/roomler-agent.app payload/Library/Roomler/
+          cp -R stage/roomlerd.app payload/Library/Roomler/
           # The CLI. Until rc.454 the macOS payload was the .app and NOTHING
           # else — no `roomler` on PATH, so `roomler peers` was impossible on a
           # Mac even though the daemon carries the whole command surface. Same
@@ -2486,7 +2486,7 @@ jobs:
           # bundle (its name is CFBundleExecutable and every launchd plist and
           # TCC grant is keyed to that path), so this is a convenience entry
           # point for `roomlerd enroll` / `--version`, not a second install.
-          ln -s /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent \
+          ln -s /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd \
             payload/usr/local/bin/roomlerd
           cp agents/roomlerd/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
@@ -2498,8 +2498,8 @@ jobs:
           # bundle with this identifier already lives and installs THERE,
           # ignoring the payload path. Measured on a CI runner:
           #
-          #   PackageKit: Applications/roomler-agent.app relocated to
-          #               Users/runner/work/.../payload/Applications/roomler-agent.app
+          #   PackageKit: Applications/roomlerd.app relocated to
+          #               Users/runner/work/.../payload/Applications/roomlerd.app
           #
           # …i.e. it installed into the staging directory it had just been built
           # from. On a user's Mac the same rule redirects the install to any
@@ -2570,10 +2570,10 @@ jobs:
           PKG="${{ steps.pkg.outputs.artifact }}"
 
           echo "=== codesign (app bundle, strict) ==="
-          codesign --verify --strict --verbose=2 stage/roomler-agent.app
+          codesign --verify --strict --verbose=2 stage/roomlerd.app
 
           echo "=== hardened runtime ==="
-          codesign -d --verbose=2 stage/roomler-agent.app 2>&1 | grep -q 'flags=.*runtime' \
+          codesign -d --verbose=2 stage/roomlerd.app 2>&1 | grep -q 'flags=.*runtime' \
             || { echo "::error::hardened runtime is NOT enabled on the app bundle -- notarisation would reject it"; exit 1; }
 
           echo "=== pkg signature ==="

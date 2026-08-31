@@ -464,9 +464,11 @@ jobs:
           [ "$count" -ge 3 ] || { echo "::error::expected >=3 launchd jobs, found $count"; exit 1; }
           dupes=$(echo "$labels" | sort | uniq -d)
           [ -z "$dupes" ] || { echo "::error::duplicate launchd Label(s): $dupes"; exit 1; }
-          # RETIRED-NAME-ANCHOR(2): asserts the frozen bundle path. Its name keys the
-          # macOS TCC grants; FR-21 D5 freezes it. docs/fr/FR-21
-          grep -q '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent' \
+          # FR-46 P5b — the daemon plist must point INSIDE the bundle, at the
+          # renamed executable. This assert is why a half-done rename cannot ship:
+          # a plist still naming the old path installs fine and the daemon simply
+          # never starts, which reads as "the overlay is down", not as a typo.
+          grep -q '/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd' \
             agents/roomlerd/packaging/macos/com.roomler.daemon.plist
 
       - name: macOS overlay against a real utun

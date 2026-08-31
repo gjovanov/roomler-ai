@@ -330,7 +330,7 @@ install_daemon_macos() {
     # renaming would change the binary's TCC identity and force every existing
     # Mac to re-grant Screen Recording and Accessibility. The old probe led
     # with `roomlerd`, which never exists, and relied on the fallback.
-    daemon_bin="/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent"
+    daemon_bin="/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
         say "download-only: would run: sudo installer -pkg $pkg -target /"

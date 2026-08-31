@@ -1,16 +1,16 @@
 #!/bin/bash
 # RETIRED-NAME-ANCHOR-BEGIN
-# The retired names left in this script are of TWO kinds, and they are not
-# interchangeable. The `/Library/Roomler/roomler-agent.app` bundle name KEYS
-# the Screen Recording and Accessibility TCC grants, so it stays frozen until
-# P5b renames it with a human at each Mac (FR-46 D1). The `/etc/roomler-agent`
-# and `/var/log/roomler-agent` paths are NO LONGER frozen — FR-46 P5a migrates
-# them to `/etc/roomler` and `/var/log/roomler` at the top of this script, and
-# what remains of them here is the migration source plus two dual-read gates.
-# INVARIANT: renaming the BUNDLE voids the TCC grants. docs/fr/FR-46
+# FR-46 P5b renamed the bundle: `/Library/Roomler/roomlerd.app`, executable
+# `roomlerd`, CFBundleName `Roomler Daemon`. CFBundleIdentifier is deliberately
+# UNCHANGED (`com.roomler.agent`) — it is not a retired name, it doubles as the
+# launchd Label, and it is what TCC attributes grants to.
+# What is left below is retired-by-necessity: the two SWEEPS that find a
+# pre-rename bundle in order to delete it, the P5a config/log migration
+# sources, and two dual-read gates. All of them are deletable once no Mac can
+# still be on the old layout. docs/fr/FR-46
 #
 # pkg postinstall — runs as root after the payload is copied to
-# /Library/Roomler/roomler-agent.app. We drop the LaunchAgent plist into the
+# /Library/Roomler/roomlerd.app. We drop the LaunchAgent plist into the
 # current console user's ~/Library/LaunchAgents/ and launchctl bootstrap it
 # into their gui/<uid> domain so the agent starts immediately.
 #
@@ -32,6 +32,30 @@ CONSOLE_USER=$(stat -f "%Su" /dev/console)
 if [ -d /Applications/roomler-agent.app ]; then
   rm -rf /Applications/roomler-agent.app
   echo "removed the old /Applications/roomler-agent.app (the daemon now lives in /Library/Roomler)"
+fi
+
+# FR-46 P5b — sweep the PRE-RENAME bundle. A pkg install is ADDITIVE, so the
+# payload lands the new `roomlerd.app` beside the old `roomler-agent.app` and
+# the old one would sit there forever: a second copy of the daemon, still
+# signed, still launchable, and still the entry a Mac's Privacy panes point at.
+# Leaving it is worse than untidy — an operator hunting the right thing to
+# approve would find TWO plausible candidates and no way to tell them apart.
+#
+# Safe while the old agent is still running: macOS unlinks a running binary
+# without killing it, and the launchd jobs below are re-bootstrapped onto the
+# new path in this same script.
+#
+# RETIRED-NAME-ANCHOR(3): the pre-P5b bundle path. This sweep is the only
+# reason it is still named anywhere, and it goes when no Mac can have one.
+if [ -d /Library/Roomler/roomler-agent.app ]; then
+  rm -rf /Library/Roomler/roomler-agent.app
+  echo "removed the pre-rename /Library/Roomler/roomler-agent.app (now roomlerd.app)"
+  echo "  ⚠️  Screen Recording and Accessibility were granted to the OLD bundle."
+  echo "     macOS does not carry a grant across a rename, so approve the new"
+  echo "     entry in System Settings > Privacy & Security:"
+  echo "       Screen & System Audio Recording -> Roomler Daemon"
+  echo "       Accessibility                   -> Roomler Daemon"
+  echo "     and remove the stale 'Roomler Agent' entry if it is still listed."
 fi
 
 # ---------------------------------------------------------------------------
@@ -93,7 +117,7 @@ fi
 # honest outcome is: payload installed, autostart deferred to the next login,
 # said plainly.
 if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = root ]; then
-  echo "roomler-agent: payload installed, but NO GUI session is logged in"
+  echo "roomlerd: payload installed, but NO GUI session is logged in"
   echo "  (console user is '${CONSOLE_USER:-unknown}'), so the LaunchAgent was"
   echo "  not registered. Log in on this Mac and re-run the installer, or:"
   echo "    sudo installer -pkg <the .pkg> -target /"
@@ -144,7 +168,7 @@ LAUNCH_AGENTS_DIR="$CONSOLE_HOME/Library/LaunchAgents"
 # RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS -- renaming it
 # silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it.
 # docs/fr/FR-21
-PLIST_SOURCE="/Library/Roomler/roomler-agent.app/Contents/Resources/com.roomler.agent.plist"
+PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.agent.plist"
 PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.agent.plist"
 
 mkdir -p "$LAUNCH_AGENTS_DIR"
@@ -161,9 +185,9 @@ chmod 644 "$PLIST_TARGET"
 # for a launchctl edge case (a session that exists but will not accept a
 # bootstrap) is the wrong way round.
 if replace_launchd_service "gui/$CONSOLE_UID" com.roomler.agent "$PLIST_TARGET"; then
-  echo "roomler-agent installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
+  echo "roomlerd installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
 else
-  echo "roomler-agent installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
+  echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
   echo "  bootstrap failed after retries: $(cat /tmp/roomler-bootstrap.err 2>/dev/null)"
   echo "  The plist is in place, so it will start at the next login, or now via:"
   echo "    launchctl bootstrap gui/$CONSOLE_UID $PLIST_TARGET"
@@ -177,7 +201,7 @@ rm -f /tmp/roomler-bootstrap.err
 # RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS -- renaming it
 # silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it.
 # docs/fr/FR-21
-DESKTOP_PLIST_SOURCE="/Library/Roomler/roomler-agent.app/Contents/Resources/com.roomler.desktop.plist"
+DESKTOP_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.desktop.plist"
 DESKTOP_PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.desktop.plist"
 if [ -f "$DESKTOP_PLIST_SOURCE" ] && [ -d /Applications/Roomler.app ]; then
   cp "$DESKTOP_PLIST_SOURCE" "$DESKTOP_PLIST_TARGET"
@@ -230,7 +254,7 @@ echo "(the Roomler menu-bar app shows which of the two is missing, with a button
 # RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS -- renaming it
 # silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it.
 # docs/fr/FR-21
-DAEMON_PLIST_SOURCE="/Library/Roomler/roomler-agent.app/Contents/Resources/com.roomler.daemon.plist"
+DAEMON_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.daemon.plist"
 DAEMON_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.daemon.plist"
 
 # FR-46 — dual-read while a Mac may still be mid-migration. The migration at
@@ -260,7 +284,7 @@ if [ -f /etc/roomler/enable-daemon ] || [ -f /etc/roomler-agent/enable-daemon ];
     echo "roomler system daemon installed (overlay/tunnel run as root)."
     if [ ! -f /etc/roomler/config.toml ]; then
       echo "  NOT ENROLLED YET — the daemon needs its own enrollment:"
-      echo "    sudo /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent \\"
+      echo "    sudo /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd \\"
       echo "      --config /etc/roomler/config.toml \\"
       echo "      enroll --server <url> --token <enrollment-jwt> --name <label>"
       echo "    sudo launchctl kickstart -k system/com.roomler.daemon"
@@ -308,7 +332,7 @@ fi
 # whole process group — `installer` included, mid-payload. Bootstrap only
 # when not yet loaded; a changed plist takes effect at next boot.
 # ---------------------------------------------------------------------------
-UPDATE_PLIST_SOURCE="/Library/Roomler/roomler-agent.app/Contents/Resources/com.roomler.update.plist"
+UPDATE_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.update.plist"
 UPDATE_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.update.plist"
 
 # FR-46 — dual-read, and note the SENSE: this is an OPT-OUT. Reading only the

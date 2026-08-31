@@ -666,9 +666,9 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="0.0.0-smoke"
-          APP=stage/roomler-agent.app
+          APP=stage/roomlerd.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
-          cp target/aarch64-apple-darwin/release/roomlerd "$APP/Contents/MacOS/roomler-agent"
+          cp target/aarch64-apple-darwin/release/roomlerd "$APP/Contents/MacOS/roomlerd"
 
           # The same dependency walk the release lane runs. Without it the
           # binary loads Homebrew paths that exist here and nowhere else, and
@@ -688,13 +688,13 @@ jobs:
               install_name_tool -change "$dep" "@rpath/$base" "$target"
             done
           }
-          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomler-agent"
-          bundle_deps "$APP/Contents/MacOS/roomler-agent"
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomlerd"
+          bundle_deps "$APP/Contents/MacOS/roomlerd"
           # Deliberately AD-HOC here, diverging from the release lane's stable
           # self-signed identity: identity stability is a FLEET property (TCC
           # grants surviving updates), meaningless on a throwaway runner — and
           # fork PRs have no secrets, so requiring the cert would break them.
-          find "$APP" -type f \( -name '*.dylib' -o -name 'roomler-agent' \) \
+          find "$APP" -type f \( -name '*.dylib' -o -name 'roomlerd' \) \
             -exec codesign --force --sign - {} \;
 
           cp agents/roomlerd/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
@@ -705,7 +705,7 @@ jobs:
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>CFBundleExecutable</key><string>roomler-agent</string>
+            <key>CFBundleExecutable</key><string>roomlerd</string>
             <key>CFBundleIdentifier</key><string>com.roomler.agent</string>
             <key>CFBundleVersion</key><string>${VERSION}</string>
             <key>LSUIElement</key><true/>
@@ -745,7 +745,7 @@ jobs:
           cp -R "$DESK" payload/Applications/
           cp target/aarch64-apple-darwin/release/roomler-shim payload/usr/local/bin/roomler
           chmod 755 payload/usr/local/bin/roomler
-          ln -s /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent \
+          ln -s /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd \
             payload/usr/local/bin/roomlerd
           cp agents/roomlerd/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
@@ -807,7 +807,7 @@ jobs:
           echo "=== install.log (roomler + script lines) ==="
           sudo tail -200 /var/log/install.log | grep -iE "roomler|script|error|fail" || true
           echo "=== what landed anyway ==="
-          ls -la /Library/Roomler/roomler-agent.app/Contents/MacOS/ 2>&1 || true
+          ls -la /Library/Roomler/roomlerd.app/Contents/MacOS/ 2>&1 || true
           ls -la /usr/local/bin/roomler 2>&1 || true
           echo "=== is /Applications what we think it is? ==="
           ls -ld /Applications 2>&1 || true
@@ -815,7 +815,7 @@ jobs:
           # pkgbuild infers the .app as a bundle component, and bundle
           # components are RELOCATABLE by default: PackageKit may install one
           # wherever it finds an existing copy rather than at the payload path.
-          sudo find / -maxdepth 6 -name 'roomler-agent.app' -not -path '*/work/*' 2>/dev/null || true
+          sudo find / -maxdepth 6 -name 'roomlerd.app' -not -path '*/work/*' 2>/dev/null || true
           echo "=== component metadata (relocatable? install-location?) ==="
           rm -rf /tmp/pkgexp
           pkgutil --expand dist/smoke.pkg /tmp/pkgexp 2>&1 || true
@@ -825,7 +825,7 @@ jobs:
       - name: Assert the payload landed where everything expects it
         run: |
           set -euo pipefail
-          BIN=/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent
+          BIN=/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd
           # Both plists and the docs name this path literally, and a rename
           # would void every TCC grant keyed to the binary.
           test -x "$BIN" || { echo "::error::missing $BIN"; exit 1; }
@@ -839,6 +839,30 @@ jobs:
           /usr/local/bin/roomlerd --version >/dev/null \
             || { echo "::error::roomlerd on PATH does not run"; exit 1; }
           echo "  payload OK"
+
+      # FR-46 P5b — the pre-rename bundle must be SWEPT, not left beside the new
+      # one. A pkg install is additive, so without the sweep an upgraded Mac
+      # keeps a second signed, launchable copy of the daemon — and, worse, the
+      # copy that every existing Privacy grant still points at. An operator
+      # hunting the right thing to approve would find two candidates.
+      #
+      # Seeded and re-installed rather than asserted on a fresh box, because on
+      # a fresh box the old bundle never exists and the assert would pass while
+      # proving nothing.
+      - name: The pre-rename bundle is swept by an upgrade
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /Library/Roomler/roomler-agent.app/Contents/MacOS
+          sudo cp /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd \
+            /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent
+          test -d /Library/Roomler/roomler-agent.app \
+            || { echo "::error::could not seed the pre-rename bundle"; exit 1; }
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
+          test ! -d /Library/Roomler/roomler-agent.app \
+            || { echo "::error::the pre-rename bundle survived the upgrade"; exit 1; }
+          test -x /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd \
+            || { echo "::error::the sweep took the CURRENT bundle with it"; exit 1; }
+          echo "  pre-rename bundle swept; current bundle intact"
 
       - name: Assert the LaunchAgent is registered, and the root half is not
         run: |
@@ -943,7 +967,7 @@ jobs:
           # as working because `has_input_permission` was a compile-time
           # constant. Being able to assert this at all is the point of moving
           # it to a runtime probe.
-          caps="$(/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent caps 2>&1 || true)"
+          caps="$(/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd caps 2>&1 || true)"
           echo "$caps"
           if echo "$caps" | grep -qi 'has_input_permission: true'; then
             echo "::error::input advertised as granted on a runner that granted nothing"
