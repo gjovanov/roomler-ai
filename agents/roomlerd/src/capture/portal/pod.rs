@@ -365,9 +365,46 @@ pub fn video_enum_format(max_fps: u32) -> Result<Object, String> {
 pub enum ParsedValue {
     Id(u32),
     Int(i32),
-    Rectangle { width: u32, height: u32 },
-    Fraction { num: u32, denom: u32 },
-    Unsupported { pod_type: u32 },
+    Rectangle {
+        width: u32,
+        height: u32,
+    },
+    Fraction {
+        num: u32,
+        denom: u32,
+    },
+    /// A choice, carrying its kind and its **first** element (the default, or
+    /// for [`ChoiceKind::None`] the only value there is).
+    ///
+    /// 🔑 This exists because of a SPA convention that is easy to miss: a
+    /// **fixed value is still written as a Choice** — kind `None`, one
+    /// element. That is why `spa_pod_get_id` and friends unwrap choices rather
+    /// than rejecting them. Measured on GNOME 48: a fully negotiated format
+    /// arrived with *every* property as a Choice, `mediaType` included, which
+    /// can only ever be "video".
+    Choice {
+        kind: u32,
+        first: Box<ParsedValue>,
+    },
+    Unsupported {
+        pod_type: u32,
+    },
+}
+
+impl ParsedValue {
+    /// The settled value, unwrapping a `Choice(None)`.
+    ///
+    /// ⚠️ Only `None` unwraps. A `Range` or `Enum` still has genuine
+    /// alternatives, so returning its default would report a value the other
+    /// side never committed to — the difference between "1920×1080" and
+    /// "somewhere between 1×1 and 8192×8192, probably".
+    pub fn fixed(&self) -> Option<&ParsedValue> {
+        match self {
+            ParsedValue::Choice { kind, first } if *kind == ChoiceKind::None as u32 => Some(first),
+            ParsedValue::Choice { .. } => None,
+            other => Some(other),
+        }
+    }
 }
 
 /// An object read off the wire.
@@ -439,6 +476,24 @@ fn parse_value(pod_type: u32, body: &[u8]) -> Result<ParsedValue, String> {
             num: read_u32(body, 0)?,
             denom: read_u32(body, 4)?,
         },
+        // Choice body: kind(4) flags(4) child-header(8) then the elements,
+        // the first of which is described by that header. Only the first is
+        // read — it is the default, and for kind `None` the only one.
+        ty::CHOICE => {
+            let kind = read_u32(body, 0)?;
+            let child_size = read_u32(body, 8)? as usize;
+            let child_type = read_u32(body, 12)?;
+            let child_body = body.get(16..16 + child_size).ok_or_else(|| {
+                format!(
+                    "choice claims a {child_size}-byte element, body is {}",
+                    body.len()
+                )
+            })?;
+            ParsedValue::Choice {
+                kind,
+                first: Box::new(parse_value(child_type, child_body)?),
+            }
+        }
         other => ParsedValue::Unsupported { pod_type: other },
     })
 }
@@ -708,21 +763,52 @@ mod tests {
         assert!(e.contains("body"), "{e}");
     }
 
-    /// A choice where a fixed value was expected must be reported, not
-    /// unwrapped. Reading the first element of a range as though it were the
-    /// negotiated value would report a size the compositor never agreed to.
+    /// 🔑 The convention that cost a field run: **SPA writes a settled value
+    /// as a `Choice(None)` with one element.** A negotiated format on GNOME 48
+    /// arrived with every property wrapped that way — `mediaType` included,
+    /// which can only ever be "video". So `fixed()` must unwrap `None`…
     #[test]
-    fn a_choice_is_not_mistaken_for_a_fixed_value() {
-        let parsed = parse_object(&video_enum_format(60).unwrap().to_pod()).unwrap();
+    fn a_choice_of_none_reads_as_the_settled_value() {
+        let o = Object {
+            object_type: ty::OBJECT_FORMAT,
+            id: 4,
+            props: vec![Prop {
+                key: ty::FORMAT_VIDEO_SIZE,
+                value: Value::choice(
+                    ChoiceKind::None,
+                    vec![Value::Rectangle {
+                        width: 1920,
+                        height: 1080,
+                    }],
+                )
+                .unwrap(),
+            }],
+        };
+        let parsed = parse_object(&o.to_pod()).unwrap();
         assert_eq!(
-            parsed.get(ty::FORMAT_VIDEO_SIZE),
-            Some(&ParsedValue::Unsupported {
-                pod_type: ty::CHOICE
+            parsed.get(ty::FORMAT_VIDEO_SIZE).unwrap().fixed(),
+            Some(&ParsedValue::Rectangle {
+                width: 1920,
+                height: 1080
             })
         );
-        // The plain Id properties in the same object still read normally.
+    }
+
+    /// …and must NOT unwrap a Range or Enum. Those still have real
+    /// alternatives, so returning the default would report a value the other
+    /// side never committed to — "1920×1080" versus "somewhere between 1×1 and
+    /// 8192×8192, probably".
+    #[test]
+    fn a_range_is_not_mistaken_for_a_settled_value() {
+        let parsed = parse_object(&video_enum_format(60).unwrap().to_pod()).unwrap();
+        let size = parsed.get(ty::FORMAT_VIDEO_SIZE).expect("size is present");
+        assert!(
+            matches!(size, ParsedValue::Choice { kind, .. } if *kind == ChoiceKind::Range as u32)
+        );
+        assert_eq!(size.fixed(), None, "a range must not read as settled");
+        // A plain (unwrapped) value stays readable through the same accessor.
         assert_eq!(
-            parsed.get(ty::FORMAT_MEDIA_TYPE),
+            parsed.get(ty::FORMAT_MEDIA_TYPE).unwrap().fixed(),
             Some(&ParsedValue::Id(ty::MEDIA_TYPE_VIDEO))
         );
     }

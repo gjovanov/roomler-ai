@@ -572,6 +572,9 @@ fn describe(bytes: &[u8]) -> String {
                         ParsedValue::Int(x) => format!("Int({x})"),
                         ParsedValue::Rectangle { width, height } => format!("{width}x{height}"),
                         ParsedValue::Fraction { num, denom } => format!("{num}/{denom}"),
+                        ParsedValue::Choice { kind, first } => {
+                            format!("choice(kind={kind}, {first:?})")
+                        }
                         ParsedValue::Unsupported { pod_type } => format!("pod-type#{pod_type}"),
                     };
                     format!("0x{k:x}={v}")
@@ -609,21 +612,30 @@ fn parse_format(bytes: &[u8]) -> Result<NegotiatedFormat, String> {
     use super::pod::{ParsedValue, parse_object, ty};
     let o = parse_object(bytes).map_err(|e| format!("parsing the negotiated format: {e}"))?;
 
-    let ParsedValue::Id(video_format) = *o
+    // ⚠️ Every lookup goes through `.fixed()`. SPA writes a settled value as a
+    // `Choice(None)` holding one element — a negotiated format on GNOME 48
+    // arrives with EVERY property wrapped that way, `mediaType` included. A
+    // `Range` or `Enum` still means "not settled yet" and `.fixed()` returns
+    // None, which keeps the caller waiting instead of reporting a default as
+    // though it were agreed.
+    let Some(ParsedValue::Id(video_format)) = o
         .get(ty::FORMAT_VIDEO_FORMAT)
         .ok_or("the negotiated format has no video format")?
+        .fixed()
     else {
-        return Err("the negotiated video format is not a plain id".into());
+        return Err("the video format is not settled yet".into());
     };
-    let ParsedValue::Rectangle { width, height } = *o
+    let Some(ParsedValue::Rectangle { width, height }) = o
         .get(ty::FORMAT_VIDEO_SIZE)
         .ok_or("the negotiated format has no size")?
+        .fixed()
     else {
-        return Err("the negotiated size is not a plain rectangle".into());
+        return Err("the size is not settled yet".into());
     };
+    let (video_format, width, height) = (*video_format, *width, *height);
     // Framerate is genuinely optional — some sources leave it unset rather
     // than committing to a rate — so its absence is 0/1, not a failure.
-    let (fps_num, fps_denom) = match o.get(ty::FORMAT_VIDEO_FRAMERATE) {
+    let (fps_num, fps_denom) = match o.get(ty::FORMAT_VIDEO_FRAMERATE).and_then(|v| v.fixed()) {
         Some(ParsedValue::Fraction { num, denom }) => (*num, *denom),
         _ => (0, 1),
     };
