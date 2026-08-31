@@ -54,7 +54,8 @@ on a machine with no scanout. The backend priority stays
 | Phase | What | Kill switch |
 |---|---|---|
 | **P1** ✅ | Detect whether `org.freedesktop.portal.ScreenCast` is actually exposed, and report WHY not, in `capture-smoke` (`capture/portal.rs`). Uses zbus, which is pure Rust and adds no system `.so`. | n/a (read-only) |
-| **P2** | ⚠️ Needs a SESSION-RESIDENT component first — the daemon is root and has no session bus. (The "no host exposes ScreenCast" blocker is CLEARED: see the diagnosis below.) ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
+| **P2a** | `portal-helper` hidden subcommand spawned through the EXISTING `companion.rs` session mechanism (systemd-run --uid + session bus). Prove it by running P1 `detect()` from the daemon and getting `available`. | `ROOMLERD_PORTAL_CAPTURE=0` |
+| **P2b** | The helper opens the ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P3** | PipeWire consumer: attach to the node, negotiate a format, deliver `Frame`s through the existing `ScreenCapture` trait as a **sixth backend**. | same |
 | **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
 
@@ -149,6 +150,58 @@ advice string was corrected accordingly: it used to say "install the backend",
 which on this host would have sent the reader to a package that was already
 there.
 
+
+## P2 plan — the session-resident component already exists as a pattern
+
+P1 found that the daemon is root and has no session bus. The obvious reading is
+"FR-45 needs a broker written". It does not: `agents/roomlerd/src/companion.rs`
+already spawns a process **as the console user with the session bus wired up**,
+and has done since FR-27 used it as a consent-prompt surface.
+
+The Linux arm (`#[cfg(all(unix, not(target_os = "macos")))]`) does exactly what
+P2 needs:
+
+```rust
+Command::new("systemd-run")
+    --uid={sess.uid}
+    --setenv=XDG_RUNTIME_DIR=/run/user/{uid}
+    --setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus
+```
+
+That is the same environment that had to be hand-built as
+`runuser -u m1 -- env XDG_RUNTIME_DIR=… DBUS_SESSION_BUS_ADDRESS=…` to make P1
+detection succeed at all. `graphical_session()` already resolves the session
+and uid; there is nothing to invent.
+
+### 🔑 And it answers the dependency question — but only in one combination
+
+| shape | session context | `DT_NEEDED` on the daemon |
+|---|---|---|
+| link PipeWire into the daemon | ❌ no session bus | ⛔ **stops headless daemons starting** |
+| hidden subcommand of the same binary, PipeWire **linked** | ✅ | ⛔ **same binary, same `DT_NEEDED`** |
+| separate helper binary | ✅ | ✅ but a new packaged artifact + version skew |
+| **hidden subcommand + `dlopen`** | ✅ | ✅ |
+
+⚠️ The middle row is the trap worth naming: a helper *subcommand* does **not**
+by itself solve the linkage problem, because it is the same ELF. Only `dlopen`
+(or a genuinely separate binary) does. **`roomlerd portal-helper` +
+`dlopen(libpipewire)`** takes the session context from the companion pattern and
+the deployment safety from `dlopen`, with no new artifact — the `caps-probe`
+precedent (`current_exe()`, `#[command(hide = true)]`).
+
+### Phases as they now stand
+
+- **P2a** — `portal-helper` hidden subcommand, spawned through the
+  `companion.rs` session mechanism. Prove it by having it run P1's `detect()`
+  *from the daemon* and return `available`, which today only succeeds when the
+  environment is built by hand.
+- **P2b** — the helper opens the ScreenCast session and passes the PipeWire fd
+  back over `SCM_RIGHTS` (the FR-36 P3 shape, which was designed and never
+  built).
+- **P3** — PipeWire consumption inside the helper, via `dlopen`. The daemon
+  never links it.
+- **P4** — RemoteDesktop input in the same helper and the same session.
+
 ## Acceptance criteria
 
 - [ ] A **nested GNOME Wayland session in WSL2** (per the WSLg + `gnome-shell
@@ -170,8 +223,10 @@ there.
 
 ## Open decisions
 
-- **Which of the three dependency shapes above.** This is the decision the FR
-  turns on; everything else is ordinary work.
+- ✅ ~~**Which of the three dependency shapes.**~~ **Decided: hidden subcommand +
+  `dlopen`.** A helper subcommand alone does NOT solve the linkage problem — it
+  is the same ELF, so the same `DT_NEEDED`. Only `dlopen` (or a separate binary,
+  which costs an artifact and version skew) does. See the P2 plan table.
 - ✅ ~~**Does `/dev/uinput` work in WSL2?**~~ **ANSWERED 2026-08-31 — P4 is
   MANDATORY, and the reason is not the one expected.**
   - uinput itself works: `CONFIG_INPUT_UINPUT=m`, module loads, FR-36's
