@@ -112,6 +112,47 @@ authorisation covers fleet disruption; it does not conjure a person in front of 
 Ships **last**, staged one host, with FR-21's criterion re-used (Screen Recording +
 Accessibility both granted in the agent log within ~30 s of start).
 
+
+#### P5 readiness — what the macOS pass actually needs (scoped 2026-08-31)
+
+Re-consent is authorised and the Mac is to hand, so P5 is no longer *blocked*. It is still
+**last**, and this records why it must be one focused pass rather than an increment.
+
+**Surface**: ~13 files. Three launchd plists, `packaging/macos/postinstall` (30 occurrences —
+the riskiest single file), `updater.rs` (the root-helper update chain, FR-5), `install.sh`,
+`installer-smoke.yml` (13), `release-agent.yml` (12), the shim, the desktop companion, and
+`ci.yml`'s self-containment gate. Four distinct identities move together or not at all:
+
+| identity | where | breaks if wrong |
+|---|---|---|
+| `.app` bundle name | plists, postinstall, workflows | **TCC grants void** — no capture, no input |
+| `CFBundleExecutable` | the bundle + `ci.yml` assert | the daemon does not launch |
+| `/Library/Roomler/<bundle>` + its symlink | postinstall | `.pkg` installs to a path nothing runs |
+| `/etc/roomler-agent/config.toml` | `com.roomler.daemon.plist` `--config` | **the daemon loses its enrolment** |
+
+⚠️ The config path is the one sweep 3 found: on macOS the "legacy" appdirs path is the LIVE
+one, passed explicitly as `--config`, so it does **not** move by itself when appdirs changes.
+It cannot be migrated on-device either — the plist argument is explicit, so copying the config
+to `/etc/roomler` changes nothing until a release ships a new plist.
+
+**Why it cannot be iterated cheaply**: there is no macOS host in the build loop, macOS artifacts
+are produced **only at tag time**, and each attempt therefore costs a tag plus a full build plus
+an install. Two failure modes are already documented and both are silent-at-review:
+a `postinstall` whose shebang was pushed off line 1 broke the `.pkg` at *"Validating packages"*,
+and a bundle built on a runner with Homebrew baked `/opt/homebrew` paths into its dylibs and
+**dyld killed the agent at launch on every end-user Mac**.
+
+**Order for the pass**, once P2b and P4 are done:
+
+1. Move all four identities in one commit; `ci.yml`'s self-containment and `CFBundleExecutable`
+   asserts are the cheap gate that must fail first if the set is inconsistent.
+2. Carry the config path as a **dual read** for exactly one release — old plist arg and new both
+   resolving — so a host that takes the update out of order is not stranded.
+3. Tag, build, install on the one Mac, re-approve Screen Recording + Accessibility by hand.
+4. Acceptance is FR-21's: both grants present in the agent log within ~30 s of start, plus a
+   remote-control session that actually paints and accepts input.
+5. Only then the second Mac.
+
 ### D2 — the updater chicken-and-egg
 
 A frozen agent cannot receive its own fix. Precedent: publishing a second Linux `.deb` froze
@@ -133,7 +174,7 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | P1a | split the marker into ANCHOR (live) / `RETIRED-NAME-RECORD` (history); `records` pinned exactly so nothing can be laundered | revert the audit script | **shipped** |
 | P1b | publish daemon assets as `roomlerd-*`; guard rewritten as a companion denylist | revert the workflow; published assets are immutable and additive | **shipped — needs a release to field-prove** |
 | P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` / additive reg key | **4 hosts done** (3 Linux + 1 Windows) |
-| P2b | env prefix: delete the legacy arm | restore the arm | **STILL BLOCKED** — 7 devices unverifiable (below) |
+| P2b | env prefix: delete the legacy arm | restore the arm | **blocked on 4 OFFLINE devices only** — every online device is now measured and migrated |
 | P2c | remaining cheap classes: log filenames, install/staging paths, e2e image, wizard PATH | per-item revert | **`TermsView` done**; the rest open |
 | P3 | re-enrollment classes: appdirs trees, Windows service + task, install folder, systemd `ReadWritePaths` | staged rollout + rollback build | **unblocked; Linux measured CLEAN, macOS is NOT** (below) |
 | P4 | wire values (QUIC ALPN, WebRTC stream id) — dual-accept window, then cleanup | dual-accept stays until cleanup | |
@@ -184,3 +225,5 @@ were free. An anchor is a *claim*, and FR-21 wrote them under time pressure acro
 | 2026-08-31 | fleet, live | **Sweep 1 (systemd):** `ROOMLER_AGENT_VIRTUAL_DESKTOP*` is STILL SET on all three cluster hosts (4 entries each, operator-authored drop-in) — so the arm is load-bearing today and the handover's "cheap class" framing was wrong. Migrated all three make-before-break: both spellings, identical values, `.bak` kept, `systemctl show` resolves 8 of which 4 are `ROOMLERD_`, daemons untouched and still `active` |
 | 2026-08-31 | fleet, live | **Sweep 2 (whole fleet, via Fleet RPC):** probed all 12 online devices through `roomler exec`, whose child inherits the daemon's own environment — so this reads what the daemon ACTUALLY has, not what a config file claims. Found a **second, independent setter the systemd-only theory would have missed**: a Windows host carries `ROOMLER_AGENT_VP9_FPS=60` **machine-wide in HKLM**, not in any unit file. Migrated additively (`ROOMLERD_VP9_FPS=60` added, legacy kept). ⚠️ **7 devices remain unverifiable** — 3 online with `exec_enabled` false (gate 4, which is exactly the gate a server cannot overrule) and 4 offline. So P2b stays blocked on evidence, not on effort |
 | 2026-08-31 | fleet, live | **Sweep 3 (appdirs trees, gates P3):** on the reachable Unix devices the legacy tree is **already gone on Linux** — all three carry `/etc/roomler` + `/root/.config/roomler` and neither legacy path — so the appdirs dual-read costs Linux nothing to remove. **macOS is the opposite**: it has `/etc/roomler-agent` and **no** `/etc/roomler`, i.e. on that platform the "legacy" path is the *live* one the `com.roomler.daemon.plist` passes as `--config`. So removing the appdirs fallback is NOT one change — it is free on Linux and a coordinated plist + config move on macOS, which belongs next to P5, not before it. ⚠️ The Windows per-user tree is **still unmeasured**: `roomler exec` runs as SYSTEM, whose `%APPDATA%` is the service profile, while enrollment writes the *enrolling user's* profile |
+| 2026-08-31 | fleet, live | **Sweep 4 (the one that found the method was wrong).** Re-swept every online device after two more got `exec_enabled`. Three corrections to sweep 2, all of them mine: (1) a `tail -1` had hidden a SECOND var on the Windows host — `ROOMLER_AGENT_LOCAL_TURN=1` beside `VP9_FPS`; (2) the probe read the PROCESS environment, and **Windows drops empty variables**, so three more legacy entries sat in the registry invisible to it (`VIEWER_RATE_RECOVER`, `OVERLAY_VPN_BYPASS`, `OVERLAY_UPLINK_IF`) — the registry is the surface a FUTURE start reads, and it is the one that matters; (3) the dev box and its WSL sibling report `exec_enabled` false and did not need it — they are **this** machine, inspectable directly, and the box carried a third setter (`ROOMLER_AGENT_GPU_CLOCK_PIN`). Actions: `LOCAL_TURN` mirrored; the four inert entries DELETED (empty parses identically to absent for all of them, and `VIEWER_RATE_RECOVER` has **no reader in the tree at all**); the dead legacy install directory removed from the machine PATH (it did not exist on disk). Every other Windows host is clean at registry level, as are the Asahi and macOS hosts. ⇒ **only the 4 OFFLINE devices are now unmeasured** |
+| 2026-08-31 | code read | **The instrumentation to answer P2b already exists and is write-only.** `env::note_legacy_use` emits a WARN — *"value read through a RETIRED variable name"* — the first time any legacy prefix is read. It has **no counter, no LocalAPI field and no consumer**, and it fires once near startup, so `roomler logs --grep` (a ≤64 KiB TAIL) cannot answer for a long-running daemon. Surfacing it as a counter in `peers --json` would turn P2b from a manual sweep into a fleet-wide read, the same shape the overlay-ACL rollout used with `rx_denied` |
