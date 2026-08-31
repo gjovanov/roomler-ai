@@ -466,6 +466,12 @@ impl LocalApiState for DaemonState {
             }),
             #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
             org_relay: None,
+            // FR-46 — what this daemon has actually READ through a retired
+            // prefix. Always `Some`, never `None`, on a daemon new enough to
+            // have the field: `None` is reserved for "this daemon predates the
+            // field", and reporting it for an empty set would make an answered
+            // question indistinguishable from an unanswerable one.
+            legacy_env_uses: Some(tunnel_core::env::legacy_env_uses()),
         }
     }
 
