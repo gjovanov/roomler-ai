@@ -718,6 +718,57 @@ impl Hub {
             let _ = self.terminate(sid, EndReason::ControllerHangup);
         }
 
+        // #1045 — coalesce a DUPLICATE request that arrives on the SAME
+        // controller CONNECTION already holding a LIVE session against this
+        // agent, instead of minting a second. One Connect can emit two
+        // `rc:session.request`s: an un-scoped transient `rc:error` (e.g. an
+        // `agent_offline` bounced by our own hangup for a prior session while
+        // the agent WS flaps) fires the viewer's reconnect ladder while the
+        // first session still sits in AwaitingConsent, and that retry rides the
+        // SAME WS socket. The orphan reap above only clears DEAD controllers; a
+        // still-pending first session keeps an OPEN controller_tx, so on a P6
+        // agent (max_sessions >= 2 for multi-viewer, which lets the request past
+        // the AgentBusy gate below) the second request created a second session
+        // AND a second host consent prompt on a second surface (the native panel
+        // is single-instance, so #2 fell to the companion — the field symptom).
+        //
+        // Keyed on the CONNECTION (`same_channel`), not the user: two genuine
+        // TABS of one user are two WS connections and must each get their own
+        // session (multi-viewer + #307's per-connection teardown stay intact);
+        // a retry from one tab is the same channel. Re-point the requester at the
+        // existing session — no new agent Request means no second prompt, and the
+        // session counter is untouched.
+        let existing = self.inner.sessions.iter().find_map(|e| {
+            let s = e.value().lock();
+            let is_dup = s.agent_id == agent_id
+                && s.controller_tx
+                    .as_ref()
+                    .map(|tx| ptr_eq(tx, &controller_tx) && !tx.is_closed())
+                    .unwrap_or(false);
+            is_dup.then(|| (s.id, s.permissions))
+        });
+        if let Some((existing_id, existing_perms)) = existing {
+            info!(
+                "coalescing duplicate rc:session.request from controller {} to agent {} onto live \
+                 session {} (same connection; no second consent prompt)",
+                controller_user_id.to_hex(),
+                agent_id.to_hex(),
+                existing_id.to_hex()
+            );
+            // Answer the requesting controller with the REAL session id so its
+            // viewer converges on the one session. Sent to the NEW controller_tx
+            // (this request's socket) — the same controller. Every retry path
+            // resets the viewer to `requesting` before it re-sends, so the
+            // `rc:session.created` handler adopts this id rather than treating it
+            // as a ghost.
+            let _ = controller_tx.try_send(ServerMsg::SessionCreated {
+                session_id: existing_id,
+                agent_id,
+                permissions: Some(existing_perms),
+            });
+            return Ok(existing_id);
+        }
+
         let (agent_org, agent_arbitrates) = {
             let mut agent = self
                 .inner
@@ -2511,6 +2562,136 @@ mod tests {
         assert!(
             matches!(res_c, Err(Error::AgentBusy)),
             "a live session must still occupy the slot, got {res_c:?}"
+        );
+    }
+
+    /// #1045 — a DUPLICATE `rc:session.request` on the SAME controller
+    /// connection (the viewer's reconnect ladder re-firing while the first
+    /// session still awaits consent, on the same WS socket) must COALESCE onto
+    /// the live session, not mint a second: a second session means a second host
+    /// consent prompt on a second surface (native panel single-instance =>
+    /// companion), the field symptom. Two DIFFERENT connections (real tabs /
+    /// multi-viewer) must still each get their own — #307's per-connection rule.
+    #[tokio::test]
+    async fn create_session_coalesces_duplicate_on_same_connection() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        // max_sessions = 3 (a P6 multi-viewer agent) so the duplicate is NOT
+        // caught by the AgentBusy gate — this is the case the field hit.
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            false,
+        );
+        let user = ObjectId::new();
+
+        // One WS connection → one controller_tx. Both requests ride clones of
+        // it, so `same_channel` sees them as the same tab. `ctl_rx` stays alive
+        // so the channel isn't closed (a closed one would be orphan-reaped).
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let sid1 = hub
+            .create_session(
+                agent_id,
+                user,
+                "tab A".into(),
+                ctl_tx.clone(),
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                None, // chunk_framing
+                false,
+                ConsentMode::Prompt,
+                None,
+                None, // local_relay
+                None, // input_mode
+                None, // tenant_name
+            )
+            .unwrap();
+        // The retry: same connection, second request.
+        let sid2 = hub
+            .create_session(
+                agent_id,
+                user,
+                "tab A (retry)".into(),
+                ctl_tx.clone(),
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                None, // chunk_framing
+                false,
+                ConsentMode::Prompt,
+                None,
+                None, // local_relay
+                None, // input_mode
+                None, // tenant_name
+            )
+            .unwrap();
+        assert_eq!(
+            sid2, sid1,
+            "the duplicate must coalesce onto the live session"
+        );
+        assert!(
+            hub.session_snapshot(sid1).is_some(),
+            "the one live session must survive"
+        );
+
+        // The core: the agent is prompted EXACTLY ONCE, not twice.
+        let mut requests = 0;
+        while let Ok(msg) = agent_rx.try_recv() {
+            if matches!(msg, ServerMsg::Request { .. }) {
+                requests += 1;
+            }
+        }
+        assert_eq!(
+            requests, 1,
+            "the agent must receive exactly one Request => one consent prompt"
+        );
+
+        // The requester learns the REAL session id from BOTH answers, so its
+        // viewer converges on the single session.
+        let mut created = Vec::new();
+        while let Ok(msg) = ctl_rx.try_recv() {
+            if let ServerMsg::SessionCreated { session_id, .. } = msg {
+                created.push(session_id);
+            }
+        }
+        assert_eq!(
+            created,
+            vec![sid1, sid1],
+            "both SessionCreated answers point at the live session"
+        );
+
+        // Guard against over-coalescing: a SECOND, DIFFERENT connection (a real
+        // second tab / second viewer) must still get its OWN session.
+        let (ctl_tx2, _ctl_rx2) = mpsc::channel(8);
+        let sid3 = hub
+            .create_session(
+                agent_id,
+                user,
+                "tab B".into(),
+                ctl_tx2,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                None, // chunk_framing
+                false,
+                ConsentMode::Prompt,
+                None,
+                None, // local_relay
+                None, // input_mode
+                None, // tenant_name
+            )
+            .unwrap();
+        assert_ne!(
+            sid3, sid1,
+            "a different connection is a different session (multi-viewer / #307)"
         );
     }
 
