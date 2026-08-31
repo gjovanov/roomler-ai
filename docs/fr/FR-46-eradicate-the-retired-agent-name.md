@@ -112,6 +112,47 @@ authorisation covers fleet disruption; it does not conjure a person in front of 
 Ships **last**, staged one host, with FR-21's criterion re-used (Screen Recording +
 Accessibility both granted in the agent log within ~30 s of start).
 
+
+#### P5 readiness — what the macOS pass actually needs (scoped 2026-08-31)
+
+Re-consent is authorised and the Mac is to hand, so P5 is no longer *blocked*. It is still
+**last**, and this records why it must be one focused pass rather than an increment.
+
+**Surface**: ~13 files. Three launchd plists, `packaging/macos/postinstall` (30 occurrences —
+the riskiest single file), `updater.rs` (the root-helper update chain, FR-5), `install.sh`,
+`installer-smoke.yml` (13), `release-agent.yml` (12), the shim, the desktop companion, and
+`ci.yml`'s self-containment gate. Four distinct identities move together or not at all:
+
+| identity | where | breaks if wrong |
+|---|---|---|
+| `.app` bundle name | plists, postinstall, workflows | **TCC grants void** — no capture, no input |
+| `CFBundleExecutable` | the bundle + `ci.yml` assert | the daemon does not launch |
+| `/Library/Roomler/<bundle>` + its symlink | postinstall | `.pkg` installs to a path nothing runs |
+| `/etc/roomler-agent/config.toml` | `com.roomler.daemon.plist` `--config` | **the daemon loses its enrolment** |
+
+⚠️ The config path is the one sweep 3 found: on macOS the "legacy" appdirs path is the LIVE
+one, passed explicitly as `--config`, so it does **not** move by itself when appdirs changes.
+It cannot be migrated on-device either — the plist argument is explicit, so copying the config
+to `/etc/roomler` changes nothing until a release ships a new plist.
+
+**Why it cannot be iterated cheaply**: there is no macOS host in the build loop, macOS artifacts
+are produced **only at tag time**, and each attempt therefore costs a tag plus a full build plus
+an install. Two failure modes are already documented and both are silent-at-review:
+a `postinstall` whose shebang was pushed off line 1 broke the `.pkg` at *"Validating packages"*,
+and a bundle built on a runner with Homebrew baked `/opt/homebrew` paths into its dylibs and
+**dyld killed the agent at launch on every end-user Mac**.
+
+**Order for the pass**, once P2b and P4 are done:
+
+1. Move all four identities in one commit; `ci.yml`'s self-containment and `CFBundleExecutable`
+   asserts are the cheap gate that must fail first if the set is inconsistent.
+2. Carry the config path as a **dual read** for exactly one release — old plist arg and new both
+   resolving — so a host that takes the update out of order is not stranded.
+3. Tag, build, install on the one Mac, re-approve Screen Recording + Accessibility by hand.
+4. Acceptance is FR-21's: both grants present in the agent log within ~30 s of start, plus a
+   remote-control session that actually paints and accepts input.
+5. Only then the second Mac.
+
 ### D2 — the updater chicken-and-egg
 
 A frozen agent cannot receive its own fix. Precedent: publishing a second Linux `.deb` froze
