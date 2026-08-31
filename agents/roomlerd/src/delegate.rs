@@ -55,13 +55,18 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
 /// Bytes of entropy in a minted secret, hex-encoded on the wire. The channel is
 /// local and the secret lives for one spawn, so this is far past what an
 /// attacker could grind, and it costs nothing.
+// Used by `mint`, which only the unix listener path calls in production; the
+// tests exercise it on every platform.
+#[cfg_attr(not(unix), allow(dead_code))]
 const SECRET_BYTES: usize = 32;
 
 /// Directory holding the delegation socket.
@@ -71,6 +76,7 @@ const SECRET_BYTES: usize = 32;
 /// worth keeping exactly as it is: the worker needs to traverse ITS directory,
 /// and widening the control socket's would trade a real protection for an
 /// unrelated feature.
+#[cfg(unix)]
 const DELEGATE_DIR: &str = "/var/run/roomler-delegate";
 
 /// One frame on the delegation channel.
@@ -82,7 +88,7 @@ const DELEGATE_DIR: &str = "/var/run/roomler-delegate";
 /// P2a carries the handshake and liveness. The rc-session payloads
 /// (`SessionCreated` / `SdpOffer` / `SdpAnswer` / `Ice` / `Terminate` inbound,
 /// `SdpAnswer` / `Ice` / `SessionStats` / `Terminate` outbound) land in P2b.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "t", content = "d", rename_all = "snake_case")]
 pub enum DelegateFrame {
     /// Daemon → worker, first frame: the attach was accepted.
@@ -99,14 +105,79 @@ pub enum DelegateFrame {
     Ping,
     /// Either direction — the answer to [`DelegateFrame::Ping`].
     Pong,
+    /// Daemon → worker: an rc-session message the daemon received on its
+    /// control WS and is not able to serve itself.
+    ///
+    /// Carries `ServerMsg` verbatim rather than a translated shape. The two
+    /// ends are the same binary, so a parallel representation would be a
+    /// second definition of a wire that already exists — and the one thing
+    /// worse than a protocol is two of them drifting apart.
+    ToWorker { msg: Box<ServerMsg> },
+    /// Worker → daemon: an rc-session message to put on the control WS.
+    FromWorker { msg: Box<ClientMsg> },
 }
 
 /// The socket a worker running as `uid` dials.
 ///
 /// Per-uid, so a console-user change cannot leave the new worker dialling the
 /// old one's endpoint.
+#[cfg(unix)]
 pub fn socket_path(uid: u32) -> std::path::PathBuf {
     std::path::Path::new(DELEGATE_DIR).join(format!("{uid}.sock"))
+}
+
+/// May this server message be handed to the GUI worker?
+///
+/// A **whitelist**: five variants in, everything else stays with the daemon.
+///
+/// ⚠️ The catch-all is deliberate, and it was not the first design. Listing
+/// every variant would make the compiler force a decision on each new one —
+/// the `RpcCap::wire()` pattern — but `ServerMsg` has ~25 variants of which
+/// only these five are remote-desktop, and the rest are tunnel, SSH, RPC,
+/// config and forwarding. An exhaustive arm would be a 25-line list that
+/// conflicts with every parallel branch adding a variant, to guard a default
+/// that is already the safe one: a new variant NOT being delegated is a
+/// feature gap someone notices, while a new variant being delegated by
+/// accident would hand device authority to an unprivileged process. The
+/// catch-all fails in the right direction, so the test below locks the intent
+/// instead of the compiler.
+///
+/// ⚠️ `Terminate` and `Ice` are shared with the TUNNEL subsystem, which the
+/// daemon serves itself. They are delegable only because the tunnel arms carry
+/// their own `Tunnel*` variants — if that ever stops being true, this
+/// whitelist starts routing tunnel signalling into a GUI worker.
+pub fn delegable_inbound(msg: &ServerMsg) -> bool {
+    matches!(
+        msg,
+        ServerMsg::SessionCreated { .. }
+            | ServerMsg::SdpOffer { .. }
+            | ServerMsg::SdpAnswer { .. }
+            | ServerMsg::Ice { .. }
+            | ServerMsg::Terminate { .. }
+    )
+}
+
+/// May this client message come FROM the GUI worker and go up the control WS?
+///
+/// The mirror of [`delegable_inbound`], and the more security-relevant of the
+/// two: the daemon's WS is the device's authenticated identity, so anything the
+/// worker can put on it, the worker says **as the device**. An unprivileged
+/// process must not be able to emit `SshActivity` (forging the device's own
+/// account of itself), `ConfigStatus` (lying about what it applied),
+/// `RpcResult`, or a `TunnelOpen`.
+///
+/// ⚠️ Consent is deliberately absent: FR-27 put the decision in the daemon
+/// (`consent::strictest_of`, the local floor) and the prompt on the companion
+/// surface, so a worker emitting a verdict would be answering a question it was
+/// never asked.
+pub fn delegable_outbound(msg: &ClientMsg) -> bool {
+    matches!(
+        msg,
+        ClientMsg::SdpAnswer { .. }
+            | ClientMsg::Ice { .. }
+            | ClientMsg::SessionStats { .. }
+            | ClientMsg::Terminate { .. }
+    )
 }
 
 /// The daemon's end of the delegation channel.
@@ -124,9 +195,21 @@ struct Inner {
     /// The socket path currently bound, so [`DelegateHost::revoke`] can unlink
     /// it. `None` = not listening.
     listening: Mutex<Option<std::path::PathBuf>>,
+    /// Where a worker's replies go: the control WS's outbound queue.
+    ///
+    /// Re-set on every WS (re)connect, because the sender belongs to the
+    /// connection and not to the daemon. `None` = no live WS, and a worker
+    /// reply is then dropped with a log line rather than queued for a socket
+    /// that may never come back.
+    outbound: Mutex<Option<tokio::sync::mpsc::Sender<ClientMsg>>>,
+    /// The queue toward the attached worker. Set while a worker is attached,
+    /// `None` otherwise — so "is anyone there?" and "where do I send it?" are
+    /// one question with one answer, and cannot disagree.
+    to_worker: Mutex<Option<tokio::sync::mpsc::Sender<DelegateFrame>>>,
 }
 
 /// `chown` a path to `uid`, keeping its existing group.
+#[cfg(unix)]
 fn chown_to(path: &std::path::Path, uid: u32) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -162,6 +245,7 @@ impl DelegateHost {
     /// still supervises a worker that serves its own sessions, which is P1
     /// behaviour and fine. Refusing to spawn would trade a missing feature for
     /// a missing remote-desktop half.
+    #[cfg(unix)]
     pub fn open_for(&self, uid: u32) -> String {
         let secret = self.mint();
         if let Err(e) = self.listen(uid) {
@@ -171,6 +255,7 @@ impl DelegateHost {
     }
 
     /// Bind the per-uid socket and serve attaches on it until [`revoke`].
+    #[cfg(unix)]
     fn listen(&self, uid: u32) -> std::io::Result<()> {
         self.listen_in(std::path::Path::new(DELEGATE_DIR), uid)
     }
@@ -178,6 +263,7 @@ impl DelegateHost {
     /// [`listen`] with the directory injected, so the permission bits — which
     /// are one of the two authorisation gates, not decoration — can be
     /// asserted by a test that is not root and cannot write to `/var/run`.
+    #[cfg(unix)]
     fn listen_in(&self, dir: &std::path::Path, uid: u32) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(dir)?;
@@ -218,6 +304,7 @@ impl DelegateHost {
     }
 
     /// Read the attach line off a fresh connection, then serve it.
+    #[cfg(unix)]
     async fn serve_stream(&self, stream: UnixStream) {
         let (rd, wr) = tokio::io::split(stream);
         let mut lines = BufReader::new(rd).lines();
@@ -238,13 +325,44 @@ impl DelegateHost {
     /// swap, and an async lock would force every caller to be async —
     /// including `stop_worker`, which is deliberately blocking because it
     /// waits out a SIGTERM grace period.
-    fn mint(&self) -> String {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn mint(&self) -> String {
         use rand::RngCore;
         let mut raw = [0u8; SECRET_BYTES];
         rand::rng().fill_bytes(&mut raw);
         let secret = raw.iter().map(|b| format!("{b:02x}")).collect::<String>();
         *self.inner.secret.lock().expect("secret mutex") = Some(secret.clone());
         secret
+    }
+
+    /// Point the channel at the current control WS's outbound queue.
+    ///
+    /// Called on every (re)connect. Until it is, a worker's replies are dropped
+    /// — which is correct: there is no session without a WS, so a reply that
+    /// arrives without one belongs to a session the server has already
+    /// forgotten.
+    pub fn set_outbound(&self, tx: tokio::sync::mpsc::Sender<ClientMsg>) {
+        *self.inner.outbound.lock().expect("outbound mutex") = Some(tx);
+    }
+
+    /// Hand a server message to the attached worker.
+    ///
+    /// Returns `false` when there is no worker, which is the caller's signal to
+    /// serve it locally exactly as before. ⚠️ It does NOT check
+    /// [`delegable_inbound`] — that decision belongs at the call site, where
+    /// the alternative (handling it locally) is visible.
+    pub fn send_to_worker(&self, msg: &ServerMsg) -> bool {
+        let tx = self
+            .inner
+            .to_worker
+            .lock()
+            .expect("to_worker mutex")
+            .clone();
+        let Some(tx) = tx else { return false };
+        tx.try_send(DelegateFrame::ToWorker {
+            msg: Box::new(msg.clone()),
+        })
+        .is_ok()
     }
 
     /// Forget the current secret — the worker it belonged to is gone.
@@ -260,6 +378,8 @@ impl DelegateHost {
         if let Some(path) = self.inner.listening.lock().expect("listen mutex").take() {
             let _ = std::fs::remove_file(path);
         }
+        #[cfg(not(unix))]
+        let _ = &self.inner.listening;
     }
 
     /// Serve one attach attempt. Returns when the channel closes.
@@ -307,7 +427,8 @@ impl DelegateHost {
         }
     }
 
-    /// The frame loop. P2a answers liveness and nothing else.
+    /// The frame loop: liveness, plus the rc-session messages in both
+    /// directions (P2b).
     async fn run(
         &self,
         rd: Box<dyn AsyncRead + Send + Unpin>,
@@ -321,8 +442,30 @@ impl DelegateHost {
         )
         .await?;
 
+        // Bounded on purpose. An unbounded queue toward a worker that has
+        // stopped reading is a memory leak that looks like a working channel;
+        // a full one is a `send_to_worker` that returns false, and the caller
+        // then serves locally, which is the honest degradation.
+        let (to_worker_tx, mut to_worker_rx) = tokio::sync::mpsc::channel(64);
+        *self.inner.to_worker.lock().expect("to_worker mutex") = Some(to_worker_tx);
+
         let mut lines = BufReader::new(rd).lines();
-        while let Some(line) = lines.next_line().await? {
+        loop {
+            let line = tokio::select! {
+                queued = to_worker_rx.recv() => {
+                    match queued {
+                        Some(frame) => {
+                            write_frame(&mut wr, &frame).await?;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                line = lines.next_line() => match line? {
+                    Some(l) => l,
+                    None => break,
+                },
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -334,6 +477,12 @@ impl DelegateHost {
                     // about which end it is; say so rather than ignore it.
                     tracing::warn!("delegation: worker sent an `attached` frame; ignoring");
                 }
+                Ok(DelegateFrame::FromWorker { msg }) => self.relay_upstream(*msg),
+                Ok(DelegateFrame::ToWorker { .. }) => {
+                    // Daemon → worker only. A worker sending one is confused
+                    // about which end it is.
+                    tracing::warn!("delegation: worker sent a `to_worker` frame; ignoring");
+                }
                 Err(e) => {
                     // Do NOT close on an unknown frame: a NEWER worker may send
                     // something this daemon has never heard of, and an additive
@@ -343,7 +492,33 @@ impl DelegateHost {
                 }
             }
         }
+        *self.inner.to_worker.lock().expect("to_worker mutex") = None;
         Ok(())
+    }
+
+    /// Put a worker's reply on the control WS — if the whitelist allows it.
+    ///
+    /// ⚠️ The check is HERE, not at the worker, and that is the whole point:
+    /// the worker is unprivileged and may be compromised, so a filter it
+    /// applies to itself is not a filter. Anything it may put on this socket it
+    /// says AS THE DEVICE.
+    fn relay_upstream(&self, msg: ClientMsg) {
+        if !delegable_outbound(&msg) {
+            tracing::warn!(
+                kind = msg_kind(&msg),
+                "delegation: worker tried to send a message it is not allowed to; dropping"
+            );
+            return;
+        }
+        let tx = self.inner.outbound.lock().expect("outbound mutex").clone();
+        match tx {
+            Some(tx) => {
+                if tx.try_send(msg).is_err() {
+                    tracing::warn!("delegation: control WS queue full or closed; dropped a reply");
+                }
+            }
+            None => tracing::debug!("delegation: no control WS; dropped a worker reply"),
+        }
     }
 }
 
@@ -522,7 +697,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod socket_tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -611,5 +786,98 @@ mod socket_tests {
         host.revoke();
         assert!(!sock.exists(), "revoke must unlink the socket");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+/// The serde tag of a `ServerMsg`, for logs.
+pub fn server_msg_kind(msg: &ServerMsg) -> String {
+    serde_json::to_value(msg)
+        .ok()
+        .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(String::from))
+        .unwrap_or_else(|| "?".into())
+}
+
+/// The serde tag of a `ClientMsg`, for logs — a refusal that does not say WHAT
+/// was refused is a refusal nobody can act on.
+fn msg_kind(msg: &ClientMsg) -> String {
+    serde_json::to_value(msg)
+        .ok()
+        .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(String::from))
+        .unwrap_or_else(|| "?".into())
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use roomler_ai_remote_control::models::EndReason;
+
+    fn oid() -> bson::oid::ObjectId {
+        bson::oid::ObjectId::new()
+    }
+
+    /// The five that make a remote-desktop session, and nothing else.
+    ///
+    /// This test is the guard the compiler is NOT providing: `delegable_inbound`
+    /// ends in a catch-all, deliberately (see its docs), so widening the
+    /// whitelist is a one-line edit that would read in review as "support the
+    /// new message". Anything added here should be justified in the same breath.
+    #[test]
+    fn only_rc_session_messages_reach_the_worker() {
+        assert!(delegable_inbound(&ServerMsg::SdpOffer {
+            session_id: oid(),
+            sdp: String::new(),
+            ice_servers: Vec::new(),
+        }));
+        assert!(delegable_inbound(&ServerMsg::Ice {
+            session_id: oid(),
+            candidate: serde_json::Value::Null,
+        }));
+        assert!(delegable_inbound(&ServerMsg::Terminate {
+            session_id: oid(),
+            reason: EndReason::ControllerHangup,
+        }));
+
+        // The device's authority must never cross the boundary. A sample, not
+        // the whole complement — the catch-all covers the rest, and each of
+        // these would be a distinct escalation.
+        assert!(!delegable_inbound(&ServerMsg::UpdateNow { pin: None }));
+    }
+
+    /// The daemon's WS is the DEVICE's identity: anything the worker can put on
+    /// it, it says as the device. The more security-relevant direction.
+    #[test]
+    fn a_worker_may_only_answer_for_its_own_session() {
+        assert!(delegable_outbound(&ClientMsg::SdpAnswer {
+            session_id: oid(),
+            sdp: String::new(),
+        }));
+        assert!(delegable_outbound(&ClientMsg::Ice {
+            session_id: oid(),
+            candidate: serde_json::Value::Null,
+        }));
+        assert!(delegable_outbound(&ClientMsg::Terminate {
+            session_id: oid(),
+            reason: EndReason::AgentHangup,
+        }));
+
+        // Consent is the interesting refusal: FR-27 put the decision in the
+        // DAEMON and the prompt on the companion surface, so a worker emitting
+        // a verdict would be answering a question it was never asked.
+        assert!(!delegable_outbound(&ClientMsg::Consent {
+            session_id: oid(),
+            granted: true,
+            reason: None,
+        }));
+    }
+
+    /// A refused message must be identifiable in the log — a refusal that does
+    /// not say WHAT was refused is one nobody can act on.
+    #[test]
+    fn refusals_name_the_message() {
+        let k = msg_kind(&ClientMsg::Terminate {
+            session_id: oid(),
+            reason: EndReason::AgentHangup,
+        });
+        assert!(!k.is_empty() && k != "?", "got {k}");
     }
 }
