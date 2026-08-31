@@ -38,7 +38,7 @@ Mac became two rows. Cost, paid daily: every `roomler exec` / `roomler ssh` must
 the *right* row (the GUI row cannot reach root, the root row cannot see the screen), the
 install needs two tokens, and Devices shows one machine twice.
 
-## Key design — port our own Windows supervisor to launchd
+## Key design — port our own Windows supervisor to launchd (P1; see the P2 correction below)
 
 The root daemon becomes the **single enrolled identity** (control WS, overlay, SSH, from
 boot); the GUI-session process becomes an **unenrolled worker** it spawns and drives.
@@ -66,6 +66,123 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
 | P1 | Daemon-as-supervisor: spawn + babysit + session-change respawn. Worker still enrolled — nothing changes for the server yet. | `macos_supervise_gui_worker` (default **off** ⇒ today's two independent halves) |
 | P2 | Session delegation: the daemon's WS accepts an rc session and drives the worker over LocalAPI. | per-session fallback — delegation failure re-serves from the worker's own enrollment |
 | P3 | Collapse the enrollment: installer mints ONE token; existing two-row Macs migrate. | `--daemon-token` keeps working (two-row install stays reachable for a release) |
+
+## P2 design — session delegation over LocalAPI
+
+Anchors below verified against master `3980e79d`.
+
+### ⚠️ First, a correction to "Key design" above: P2 has no Windows precedent
+
+"Port our own Windows supervisor to launchd" is true of **P1 and only P1**. The Windows
+SCM service is a *pure launcher*: `win_service/mod.rs:396` hands off to
+`supervisor::run(worker_exe, vec!["run"], …)` and does nothing else, so the spawned worker
+is the entire agent — control WS, overlay, capture, input, all in one process. Windows
+never had to split the planes, because a SYSTEM process can attach to the interactive
+desktop (`win_service/desktop.rs`). **There is no delegation protocol to port.** P2 is new
+work, and the design below should be read as such rather than as a translation.
+
+### Why not the Windows shape (worker enrolled, daemon only supervising)
+
+Because it deletes the reason the macOS daemon half exists. With nobody logged in there
+would be no agent at all: no overlay, no `roomler ssh`, no `roomler exec`, no presence —
+exactly the "reachable before anyone logs in" property `win_service/mod.rs`'s own module
+docs list as the point of service mode. So the **daemon must hold the enrollment**, and
+the session has to reach the worker some other way.
+
+### Why not "let the worker open its own WS for the session"
+
+Tempting, and it would remove the IPC entirely. It cannot work as-is: `Hub::register_agent`
+(`crates/remote_control/src/hub.rs:278`) is keyed on `agent_id`, and a second connection
+**displaces** the first — the displaced socket is cancelled within milliseconds by design
+(`hub.rs:88-94`). A worker dialling in as the same device would knock the daemon's control
+WS off the air, which is precisely the login/displace/relaunch loop P1's stand-down exists
+to prevent. Making it work would mean teaching the server about session-scoped secondary
+connections: a server change, a new authenticated surface, and a new way for a compromised
+device to hold two sockets. Not worth it to avoid a unix socket we already own.
+
+### What actually has to cross the boundary
+
+Of the 28 `ServerMsg` and 28 `ClientMsg` variants the agent handles today, the rc session
+needs **nine**, and no media among them:
+
+| direction | messages |
+|---|---|
+| daemon → worker | `SessionCreated`, `SdpOffer`, `SdpAnswer`, `Ice`, `Terminate` |
+| worker → daemon | `SdpAnswer`, `Ice`, `SessionStats`, `Terminate` |
+
+Everything else stays where it already is: `RpcExec*`, `Ssh*`, `Tunnel*`, `Config*`,
+`Derp*`, `KeyRotate`, `JoinOrg` and the whole overlay are daemon-side concerns and do not
+move. Input, clipboard and file transfer ride the session's **data channels**, so once the
+worker owns the peer they never touch the socket either. Pixels never cross it. This is the
+property that makes the whole phase affordable: the IPC carries a few hundred bytes at
+session setup and then nothing.
+
+### The transport problem, stated honestly
+
+LocalAPI is **strictly request→response**: `serve_connection` reads newline-delimited JSON,
+answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1393-1401`); `TailLog`'s
+own doc calls itself "poll-based follow (no streaming)" (`lib.rs:939`). There is no server
+push, and delegation needs it in both directions — trickle ICE arrives whenever the network
+decides, not when someone asks.
+
+Three options, and the trade is latency versus a protocol exception:
+
+1. **Long-poll** (`RcPoll` blocks until a frame is queued, `RcPush` for the reverse). Fits
+   the existing protocol with zero changes. Costs a round-trip of latency on every ICE
+   candidate — i.e. on the session-setup critical path — and still holds a connection open
+   permanently, so it buys nothing operationally.
+2. **One streaming verb** — `RcAttach`. The worker connects and sends it; from that point
+   the daemon treats *that connection* as a bidirectional frame channel until EOF. A
+   documented, single-verb exception to the request/response rule, confined to one match
+   arm and invisible to every other caller.
+3. **A second LocalAPI server in the worker**, so daemon→worker push is an ordinary
+   request. No protocol change, but two dispatch surfaces to secure instead of one, a
+   second socket path to agree on, and a startup ordering problem (the daemon cannot push
+   before the worker's listener exists).
+
+**Recommendation: (2).** The exception is real and should be written down rather than
+disguised as polling. It keeps one socket, one ACL, one dispatch surface, and it is the
+only option whose latency does not sit on the path a human perceives as "how long until my
+screen appears".
+
+⚠️ `RcAttach` must be **daemon-only**, not something any local process can call: it would
+otherwise let any user-session process on the box volunteer to serve remote-control
+sessions. The socket's own ACL is the trust boundary today
+(`lib.rs:1704-1720` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
+because the worker is an ordinary user process and so is an attacker's. The attach must
+carry the one-shot secret the daemon passed to the worker in its spawn environment, and the
+daemon must accept exactly one attached worker at a time.
+
+### Consent
+
+Stays in the daemon, and this is not a compromise — FR-27 already built the mechanism.
+`PromptSurface` (`agents/roomlerd/src/consent.rs:184`) is a chain, and its **companion**
+rung is precisely "a per-user process the daemon starts on demand"
+(`companion::ensure_running()`). A session-0 daemon has no native surface and correctly
+falls through to it. So the daemon keeps the policy decision (`strictest_of`, the local
+floor) and the prompt appears in the user's session, with no new mechanism.
+
+### Kill switch and fallback
+
+Per the phase table: delegation failure **re-serves from the worker's own enrollment**.
+That is only meaningful while P2 and P3 are separate — during P2 the worker is still
+enrolled, so a failed `RcAttach` means the daemon declines the session and the worker's own
+WS serves it exactly as today. ⚠️ This makes P2 genuinely reversible and P3 genuinely not:
+once the second enrollment is gone, the fallback is gone with it. P3 must therefore not
+ship until P2 has field evidence, not merely CI.
+
+### Open questions for implementation
+
+- **Session ownership on worker death.** If the worker dies mid-session the daemon holds a
+  live server-side session with nothing behind it. It must `Terminate` with a reason the
+  controller can act on, rather than let the controller watch a frozen screen — the same
+  argument that made `rc:consent.reason` worth splitting in FR-27.
+- **Does `SessionCreated` carry everything the worker needs** (permissions, TURN creds,
+  relay region) or does the worker need daemon state as well? If the latter, the attach
+  handshake should carry it once rather than per-session.
+- **Ordering.** ICE candidates may arrive before the worker has attached. The daemon needs
+  a small per-session queue, or an explicit "not ready" refusal — silently dropping them
+  would produce a session that half-works, which is worse than one that fails.
 
 ## Acceptance criteria
 
