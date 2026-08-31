@@ -444,3 +444,272 @@ mod tests {
         }
     }
 }
+
+// ─── FR-49: a second org gets a mesh, or says it has none ───────────────────
+//
+// These two live in the LIB, not in `main.rs`, because CI runs
+// `cargo test -p roomlerd --lib` and never `--bins`: a regression lock in the
+// binary compiles (clippy --tests) and never RUNS. `apply_overlay_flag` is
+// exactly the kind of thing that needs a lock that can fire.
+
+/// FR-49 — apply `enroll --overlay` to the identity that was ACTUALLY enrolled.
+///
+/// Before this it unconditionally set `cfg.overlay_enabled`, the PRIMARY's flag:
+/// `enroll --server B --token … --overlay` on a host already in org A appended
+/// B with `overlay_mode = off` and turned the mesh on for **A**. The flag read
+/// as granted and landed on the wrong org, and nothing reported it.
+///
+/// ⚠️ A secondary gets `netstack`, not `tun`. `tun` shares the primary's adapter
+/// and needs `overlay_multi_org` plus the same control plane (and is impossible
+/// on macOS), so a bare flag that installed OS routes could wedge a host — the
+/// thing "never self-wedge" exists to prevent. `netstack` is a userspace stack
+/// behind a loopback SOCKS5 front: no TUN, no routes, no privilege. Anything
+/// else is the explicit `org overlay` verb.
+///
+/// ⚠️ One-way, like the primary flag it replaces: an enrollment refresh must
+/// never drop a host out of a mesh it had already joined.
+pub fn apply_overlay_flag(
+    cfg: &mut crate::config::AgentConfig,
+    outcome: &crate::enrollment::EnrollOutcome,
+) {
+    use crate::enrollment::EnrollOutcome;
+    match outcome {
+        EnrollOutcome::RefreshedOrg { label } | EnrollOutcome::AppendedOrg { label } => {
+            let label = label.clone();
+            let Some(org) = cfg.orgs.iter_mut().find(|o| o.label == label) else {
+                return;
+            };
+            if org.overlay_mode == crate::config::OrgOverlayMode::Off {
+                org.overlay_mode = crate::config::OrgOverlayMode::Netstack;
+                tracing::info!(
+                    org = %label,
+                    "overlay participation enabled by --overlay (netstack)"
+                );
+            } else {
+                tracing::info!(
+                    org = %label, mode = org.overlay_mode.wire(),
+                    "--overlay: org already participates, left unchanged"
+                );
+            }
+        }
+        _ => {
+            if !cfg.overlay_enabled {
+                cfg.overlay_enabled = true;
+                tracing::info!("overlay participation enabled by --overlay");
+            }
+        }
+    }
+}
+
+/// FR-49 — `roomlerd org overlay <label> <off|netstack|tun>`.
+pub fn set_org_overlay(
+    cfg: &mut crate::config::AgentConfig,
+    label: &str,
+    mode: &str,
+) -> Result<()> {
+    if label == crate::config::PRIMARY_ORG_LABEL {
+        bail!(
+            "the primary's overlay participation is `overlay_enabled`, not a per-org \
+             mode — set it with `roomler config set overlay_enabled true` (or \
+             `enroll --overlay`)"
+        );
+    }
+    // No fallback on an unparseable mode. A typo that silently left the device
+    // off the mesh would be this FR's own defect, re-committed by its fix.
+    let Some(parsed) = crate::config::OrgOverlayMode::parse(mode) else {
+        bail!("unknown overlay mode {mode:?} — expected one of: off, netstack, tun");
+    };
+    // Read what we need for the advisories BEFORE taking the mutable borrow.
+    let multi_org = cfg.overlay_multi_org;
+    let primary_server = cfg.server_url.clone();
+    let Some(entry) = cfg.orgs.iter_mut().find(|o| o.label == label) else {
+        bail!("no org labelled {label:?} — see `roomlerd org ls`");
+    };
+    let before = entry.overlay_mode;
+    entry.overlay_mode = parsed;
+    if before == parsed {
+        println!("Org {label:?} overlay is already {}.", parsed.wire());
+        return Ok(());
+    }
+    println!(
+        "Org {label:?} overlay {} → {}. Restart the daemon to apply.",
+        before.wire(),
+        parsed.wire()
+    );
+
+    // Warn about the two preconditions `tun` has that `netstack` does not,
+    // HERE rather than at the next daemon start — a refusal buried in a log an
+    // operator is not watching is the failure mode this FR is about. These are
+    // advisory: the setting is still written, because the operator may be
+    // fixing the preconditions in the same sitting.
+    if parsed == crate::config::OrgOverlayMode::Tun {
+        if !multi_org {
+            println!(
+                "warning: `tun` for a secondary needs `overlay_multi_org = true` \
+                 (it is currently false) — set it with \
+                 `roomler config set overlay_multi_org true`, or use `netstack`, \
+                 which needs no OS privilege at all."
+            );
+        }
+        if entry.server_url != primary_server {
+            println!(
+                "warning: `tun` is restricted to orgs sharing the primary's control \
+                 plane; this org is on {} and the primary on {}. Use `netstack`.",
+                entry.server_url, primary_server
+            );
+        }
+        if cfg!(target_os = "macos") {
+            println!(
+                "warning: macOS has no multi-address TUN, so a secondary cannot join \
+                 over the shared adapter. Use `netstack`."
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fr49_tests {
+    //! FR-49 — these locks live in the LIB because CI runs
+    //! `cargo test -p roomlerd --lib` and never `--bins`: the same tests in
+    //! `main.rs` would compile (clippy --tests) and never RUN.
+    use super::*;
+
+    fn two_org_cfg() -> crate::config::AgentConfig {
+        let mut cfg = crate::config::test_fixture();
+        cfg.overlay_enabled = false;
+        cfg.orgs.push(crate::config::OrgEntry {
+            label: "acme".into(),
+            server_url: "https://example.invalid".into(),
+            ws_url: None,
+            agent_token: "t2".into(),
+            agent_id: "a2".into(),
+            tenant_id: "t2id".into(),
+            enabled: true,
+            overlay_mode: crate::config::OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        });
+        cfg
+    }
+
+    /// THE regression lock. `--overlay` used to set the PRIMARY's flag no
+    /// matter which identity was enrolled, so enrolling into a second org
+    /// turned the mesh on for the first one and left the second dark.
+    #[test]
+    fn overlay_flag_enables_the_org_that_was_actually_enrolled() {
+        let mut cfg = two_org_cfg();
+        apply_overlay_flag(
+            &mut cfg,
+            &crate::enrollment::EnrollOutcome::AppendedOrg {
+                label: "acme".into(),
+            },
+        );
+        assert_eq!(
+            cfg.find_org("acme").unwrap().overlay_mode,
+            crate::config::OrgOverlayMode::Netstack,
+            "the enrolled org joins the mesh"
+        );
+        assert!(
+            !cfg.overlay_enabled,
+            "and the PRIMARY is untouched — that was the bug"
+        );
+    }
+
+    /// A secondary gets `netstack`, never `tun`: `tun` needs the shared
+    /// adapter, `overlay_multi_org` and the same control plane, and is
+    /// impossible on macOS. A bare flag must not install OS routes.
+    #[test]
+    fn overlay_flag_never_picks_tun_for_a_secondary() {
+        let mut cfg = two_org_cfg();
+        apply_overlay_flag(
+            &mut cfg,
+            &crate::enrollment::EnrollOutcome::AppendedOrg {
+                label: "acme".into(),
+            },
+        );
+        assert_ne!(
+            cfg.find_org("acme").unwrap().overlay_mode,
+            crate::config::OrgOverlayMode::Tun
+        );
+    }
+
+    /// One-way, inherited from the flag this replaces: a re-enrolment must
+    /// never drop a host out of a mesh it had joined.
+    #[test]
+    fn overlay_flag_never_downgrades_an_org_that_already_participates() {
+        let mut cfg = two_org_cfg();
+        cfg.orgs[0].overlay_mode = crate::config::OrgOverlayMode::Tun;
+        apply_overlay_flag(
+            &mut cfg,
+            &crate::enrollment::EnrollOutcome::RefreshedOrg {
+                label: "acme".into(),
+            },
+        );
+        assert_eq!(
+            cfg.find_org("acme").unwrap().overlay_mode,
+            crate::config::OrgOverlayMode::Tun,
+            "tun must survive a refresh, not fall back to netstack"
+        );
+    }
+
+    /// The primary path still works exactly as before.
+    #[test]
+    fn overlay_flag_still_enables_the_primary_on_a_primary_outcome() {
+        for outcome in [
+            crate::enrollment::EnrollOutcome::FreshPrimary,
+            crate::enrollment::EnrollOutcome::RefreshedPrimary,
+            crate::enrollment::EnrollOutcome::ReplacedPrimary,
+        ] {
+            let mut cfg = two_org_cfg();
+            apply_overlay_flag(&mut cfg, &outcome);
+            assert!(cfg.overlay_enabled, "{outcome:?} should enable the primary");
+            assert_eq!(
+                cfg.find_org("acme").unwrap().overlay_mode,
+                crate::config::OrgOverlayMode::Off,
+                "{outcome:?} must not touch a secondary"
+            );
+        }
+    }
+
+    #[test]
+    fn org_overlay_verb_sets_the_mode_and_refuses_nonsense() {
+        let mut cfg = two_org_cfg();
+        set_org_overlay(&mut cfg, "acme", "tun").unwrap();
+        assert_eq!(
+            cfg.find_org("acme").unwrap().overlay_mode,
+            crate::config::OrgOverlayMode::Tun
+        );
+        // Idempotent, and case-insensitive on the operator's input.
+        set_org_overlay(&mut cfg, "acme", "TUN").unwrap();
+        assert_eq!(
+            cfg.find_org("acme").unwrap().overlay_mode,
+            crate::config::OrgOverlayMode::Tun
+        );
+        // And it can be turned back off — a visibility fix that could only
+        // add participation would be a trap of its own.
+        set_org_overlay(&mut cfg, "acme", "off").unwrap();
+        assert_eq!(
+            cfg.find_org("acme").unwrap().overlay_mode,
+            crate::config::OrgOverlayMode::Off
+        );
+
+        // ⚠️ A typo must FAIL, not fall back. Silently leaving a device off
+        // the mesh is the exact defect this FR closes.
+        let mut cfg = two_org_cfg();
+        assert!(set_org_overlay(&mut cfg, "acme", "tunn").is_err());
+        assert!(set_org_overlay(&mut cfg, "acme", "").is_err());
+        assert!(set_org_overlay(&mut cfg, "nosuch", "tun").is_err());
+        // The primary is not a per-org mode.
+        assert!(set_org_overlay(&mut cfg, crate::config::PRIMARY_ORG_LABEL, "tun").is_err());
+        assert_eq!(
+            cfg.find_org("acme").unwrap().overlay_mode,
+            crate::config::OrgOverlayMode::Off,
+            "no refusal may have written anything"
+        );
+    }
+}

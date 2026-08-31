@@ -560,6 +560,24 @@ enum OrgAction {
     /// primary drives machine-wide effects: self-update source, attention
     /// sentinels, the (P1) overlay TUN, and declared tunnel routes.
     SetPrimary { label: String },
+    /// FR-49 — put a secondary enrollment on (or off) that org's overlay mesh.
+    ///
+    /// Before this the only way was to hand-edit `config.toml` — the file that
+    /// also holds the agent token and the SSH host private key, is written
+    /// atomically with a `.prev` sibling, and on Windows lives under a
+    /// machine-global ACL-restricted directory. Takes effect on the next daemon
+    /// start (the overlay engine is built once, at startup).
+    Overlay {
+        /// The org's label (`org ls`). `primary` is refused — the primary's
+        /// participation is `overlay_enabled`, set by `enroll --overlay`.
+        label: String,
+        /// `off` | `netstack` | `tun`.
+        ///
+        /// `netstack` is the userspace stack: no TUN, no OS routes, no
+        /// privilege. `tun` shares the primary's adapter and needs
+        /// `overlay_multi_org` plus the same control plane.
+        mode: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1655,9 +1673,21 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // that already joined the mesh must not silently drop it back out (the
     // same invariant `enrollment.rs` protects when merging an existing
     // config).
-    if overlay && !cfg.overlay_enabled {
-        cfg.overlay_enabled = true;
-        tracing::info!("overlay participation enabled by --overlay");
+    //
+    // FR-49 — and it applies to the identity ACTUALLY ENROLLED. Before this it
+    // always set the primary's flag: `enroll --server B --token … --overlay` on
+    // a host already in org A appended B with `overlay_mode = off` and turned
+    // the mesh on for **A**. The flag read as granted and landed on the wrong
+    // org, which nothing then reported.
+    //
+    // ⚠️ A secondary gets `netstack`, not `tun`. `tun` shares the primary's
+    // adapter and needs `overlay_multi_org` + the same control plane (and is
+    // impossible on macOS), so a bare flag that installed OS routes could wedge
+    // a host — the one thing "never self-wedge" exists to prevent. `netstack`
+    // is a userspace stack behind a loopback SOCKS5 front: no TUN, no routes,
+    // no privilege. Anything else is the explicit `org overlay` verb.
+    if overlay {
+        roomlerd::org_join::apply_overlay_flag(&mut cfg, &outcome);
     }
 
     config::save(&target_path, &cfg).map_err(|e| {
@@ -1708,6 +1738,28 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
                  `roomlerd org ls`.",
                 1 + cfg.orgs.len()
             );
+            // FR-49 — say what the mesh is doing. A secondary defaults to
+            // `overlay_mode = off` while its WS still connects, so without this
+            // line the device looks fully enrolled and is on no mesh, and the
+            // operator finds out days later by wondering why a peer is missing.
+            let mode = cfg
+                .find_org(label)
+                .map(|o| o.overlay_mode)
+                .unwrap_or_default();
+            if mode == config::OrgOverlayMode::Off {
+                println!(
+                    "⚠️  This org's OVERLAY IS OFF, so the machine is enrolled but NOT on \
+                     its mesh — it will not appear in `roomler peers` for {label:?} and \
+                     cannot be reached by overlay address there. Remote control, exec \
+                     and SSH over the control plane still work."
+                );
+                println!(
+                    "    Join it with: roomlerd org overlay {label} netstack   \
+                     (then restart the daemon)"
+                );
+            } else {
+                println!("Overlay for {label:?}: {}.", mode.wire());
+            }
         }
     }
     println!("Config written to: {}", target_path.display());
@@ -1881,24 +1933,32 @@ fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
     })?;
     match action {
         OrgAction::Ls => {
+            // FR-49 — OVERLAY is here because its absence was the defect: an
+            // appended org gets `overlay_mode = off`, its WS still connects,
+            // and every surface an operator had reported it as healthy. ENABLED
+            // and OVERLAY are different questions — a row can be enabled (it
+            // has a signalling loop, it answers exec and SSH) and still be on
+            // no mesh at all.
             println!(
-                "{:<14} {:<9} {:<8} {:<26} SERVER",
-                "LABEL", "PRIMARY", "ENABLED", "ORG (tenant)"
+                "{:<14} {:<9} {:<8} {:<9} {:<26} SERVER",
+                "LABEL", "PRIMARY", "ENABLED", "OVERLAY", "ORG (tenant)"
             );
             println!(
-                "{:<14} {:<9} {:<8} {:<26} {}",
+                "{:<14} {:<9} {:<8} {:<9} {:<26} {}",
                 config::PRIMARY_ORG_LABEL,
                 "yes",
                 "yes",
+                cfg.primary_overlay_mode().wire(),
                 cfg.tenant_id,
                 cfg.server_url
             );
             for o in &cfg.orgs {
                 println!(
-                    "{:<14} {:<9} {:<8} {:<26} {}",
+                    "{:<14} {:<9} {:<8} {:<9} {:<26} {}",
                     o.label,
                     "",
                     if o.enabled { "yes" } else { "no" },
+                    o.overlay_mode.wire(),
                     o.tenant_id,
                     o.server_url
                 );
@@ -1906,6 +1966,27 @@ fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
             let problems = cfg.validate_orgs();
             for p in problems {
                 eprintln!("warning: {p}");
+            }
+            // Say it once, in words, for the case the column exists to catch.
+            // A table column is only read by someone who already suspects the
+            // answer is there; this line reaches the operator who does not.
+            let dark: Vec<&str> = cfg
+                .orgs
+                .iter()
+                .filter(|o| o.enabled && o.overlay_mode == config::OrgOverlayMode::Off)
+                .map(|o| o.label.as_str())
+                .collect();
+            if !dark.is_empty() {
+                println!();
+                println!(
+                    "note: {} enrolled but NOT on the mesh (overlay off): {}",
+                    dark.len(),
+                    dark.join(", ")
+                );
+                println!(
+                    "      `roomlerd org overlay <label> netstack|tun` joins one; \
+                     restart the daemon to apply."
+                );
             }
             return Ok(());
         }
@@ -1936,6 +2017,9 @@ fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
                  for the new primary starts OFF — re-enable with `roomler config set \
                  overlay_enabled true` if wanted. Restart the daemon to apply."
             );
+        }
+        OrgAction::Overlay { label, mode } => {
+            roomlerd::org_join::set_org_overlay(&mut cfg, &label, &mode)?
         }
     }
     config::save(config_path, &cfg).context("saving config")?;
@@ -2852,6 +2936,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
             connected: localapi_connected.clone(),
             terminal_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
             updates_ignored: primary_ctx.updates_ignored.clone(),
+            overlay_mode: cfg.primary_overlay_mode().wire(),
         }];
         for ((org, problem), org_ctx) in org_partition.iter().zip(org_ctxs.iter()) {
             let org_ctx = org_ctx.clone();
@@ -2867,6 +2952,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                 connected: connected.clone(),
                 terminal_error: terminal.clone(),
                 updates_ignored: org_ctx.updates_ignored.clone(),
+                overlay_mode: org.overlay_mode.wire(),
             });
             if org.enabled && problem.is_none() {
                 org_spawns.push((org.clone(), org_ctx, connected, terminal));
@@ -3146,6 +3232,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                         connected: connected.clone(),
                         terminal_error: terminal.clone(),
                         updates_ignored: org_ctx.updates_ignored.clone(),
+                        overlay_mode: org.overlay_mode.wire(),
                     });
                 }
                 // The per-org config is synthesized from the CURRENT on-disk
