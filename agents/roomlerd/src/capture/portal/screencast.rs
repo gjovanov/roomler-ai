@@ -122,6 +122,11 @@ pub struct SessionReport {
     pub cursor_mode_used: u32,
     pub available_cursor_modes: Option<u32>,
     pub available_source_types: Option<u32>,
+    /// P3a — what came of handing the fd to PipeWire. Filled in after the
+    /// handshake by whoever chose to try, so a caller that only wants the
+    /// session still gets an honest `NotAttempted` rather than a false
+    /// negative.
+    pub pipewire: super::pipewire::PipeWireStatus,
 }
 
 /// Why a session could not be opened. Separated from a bare string because
@@ -165,13 +170,13 @@ impl OpenError {
 /// *"Cannot start a runtime from within a runtime"*, before any portal call
 /// was made. The guard belongs HERE rather than at each call site, so the next
 /// entry point cannot reintroduce it.
-pub fn open() -> Result<SessionReport, OpenError> {
+pub fn open() -> Result<Session, OpenError> {
     std::thread::spawn(open_blocking)
         .join()
         .unwrap_or_else(|_| Err(OpenError::failed("the portal handshake thread panicked")))
 }
 
-fn open_blocking() -> Result<SessionReport, OpenError> {
+fn open_blocking() -> Result<Session, OpenError> {
     let started = Instant::now();
     // 🔑 The token is loaded and stored HERE, so it never leaves this module.
     // A caller that cannot hold the credential cannot leak it — which is a
@@ -263,39 +268,56 @@ fn open_blocking() -> Result<SessionReport, OpenError> {
     };
 
     // ── 4. OpenPipeWireRemote — a direct call, NOT a Request ────────────
-    let pipewire_fd_ok = match portal.call_method(
+    //
+    // The fd is KEPT from P3a onward. It is the connection to the session's
+    // PipeWire, and it is what `pipewire::probe` (and later the stream) uses.
+    // It never travels to the daemon — see the module docs.
+    let pipewire_fd = match portal.call_method(
         "OpenPipeWireRemote",
         &(&sess_path, HashMap::<&str, Value>::new()),
     ) {
         Ok(msg) => match msg.body().deserialize::<zbus::zvariant::OwnedFd>() {
-            Ok(fd) => {
-                // Held only to prove the chain works, then dropped: P2b opens
-                // no stream. P3 is where this fd starts a PipeWire connection.
-                let fd: std::os::fd::OwnedFd = fd.into();
-                drop(fd);
-                true
-            }
+            Ok(fd) => Some(std::os::fd::OwnedFd::from(fd)),
             Err(e) => {
                 tracing::warn!(%e, "portal: OpenPipeWireRemote returned no usable fd");
-                false
+                None
             }
         },
         Err(e) => {
             tracing::warn!(%e, "portal: OpenPipeWireRemote failed");
-            false
+            None
         }
     };
 
-    Ok(SessionReport {
-        streams,
-        restore_token_stored,
-        pipewire_fd_ok,
-        restore_token_sent,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        cursor_mode_used: cursor_mode,
-        available_cursor_modes,
-        available_source_types,
+    Ok(Session {
+        report: SessionReport {
+            streams,
+            restore_token_stored,
+            pipewire_fd_ok: pipewire_fd.is_some(),
+            restore_token_sent,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            cursor_mode_used: cursor_mode,
+            available_cursor_modes,
+            available_source_types,
+            // Filled in by the caller, which owns the decision to try.
+            pipewire: super::pipewire::PipeWireStatus::NotAttempted,
+        },
+        pipewire_fd,
     })
+}
+
+/// An opened session: what to report, plus the thing that cannot be reported.
+///
+/// ⚠️ The fd is deliberately outside [`SessionReport`], which is the
+/// serialisable half. A file descriptor cannot cross that boundary and — per
+/// the module docs — must not: it stays in this process, where PipeWire is
+/// consumed.
+pub struct Session {
+    pub report: SessionReport,
+    /// `None` when `OpenPipeWireRemote` gave us nothing. Everything before it
+    /// can succeed and still leave no connection, which is why
+    /// `pipewire_fd_ok` is reported rather than assumed.
+    pub pipewire_fd: Option<std::os::fd::OwnedFd>,
 }
 
 /// Where the portal's `restore_token` lives between runs.

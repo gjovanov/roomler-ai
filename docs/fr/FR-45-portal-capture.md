@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a + P2b shipped, field-verified. P3 next · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a + P2b + P3a shipped, field-verified. P3b next · **Owner:** agent / capture
 
 ## Goal
 
@@ -56,7 +56,8 @@ on a machine with no scanout. The backend priority stays
 | **P1** ✅ | Detect whether `org.freedesktop.portal.ScreenCast` is actually exposed, and report WHY not, in `capture-smoke` (`capture/portal.rs`). Uses zbus, which is pure Rust and adds no system `.so`. | n/a (read-only) |
 | **P2a** ✅ | `portal-helper` hidden subcommand, spawned as the console user with that session's bus. Proven by running `detect()` from the daemon and getting `available` where it previously could only say `no-session-bus`. ⚠️ Built with the verified **privilege drop**, not `systemd-run` as planned — see below. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P2b** ✅ | The helper opens the ScreenCast session: `CreateSession` → `SelectSources` → `Start` → `OpenPipeWireRemote`, giving a PipeWire node id. Consent handled via `persist_mode`/`restore_token`. ⚠️ The fd **stays in the helper**, and so does the token — see the corrected decisions below. Field-verified end to end: root → helper → live session, **15 ms, no dialog**. | `ROOMLERD_PORTAL_CAPTURE=0` |
-| **P3** | PipeWire consumer **inside the helper**, via `dlopen`: attach to the node, negotiate a format, and deliver `Frame`s to the daemon — buffer fds over `SCM_RIGHTS` once at negotiation, then a ready-message per frame — surfacing through the existing `ScreenCapture` trait as a **sixth backend**. | same |
+| **P3a** ✅ | Reach `libpipewire` by **`dlopen`**, never a link, and connect the portal's fd to it. Verified three ways: **0** `DT_NEEDED` entries on x86_64 AND aarch64; a live connect (`libpipewire 1.4.11`); and graceful degradation with the library hidden in a mount namespace. Zero new dependencies. | same |
+| **P3b** | Attach to the node, negotiate a format (SPA PODs), and deliver `Frame`s to the daemon — buffer fds over `SCM_RIGHTS` once at negotiation, then a ready-message per frame — surfacing through the existing `ScreenCapture` trait as a **sixth backend**. | same |
 | **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
 
 ### The seam is unchanged
@@ -228,8 +229,22 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
   3. **The helper already runs as the session's user**, whose PipeWire it is.
 
   `SCM_RIGHTS` therefore moves to P3, carrying **buffer** fds.
-- **P3** — PipeWire consumption inside the helper, via `dlopen`. The daemon
-  never links it, and after the decision above never connects to it either.
+- **P3a** ✅ **shipped and field-verified** (#1062) — `dlopen` reaches
+  `libpipewire`, and the portal's fd connects to it. The daemon never links it,
+  and after the P2b decision never connects to it either.
+
+  🔑 **Proven by construction, not by finding a bare host.** `readelf -d` shows
+  **zero** `DT_NEEDED` entries matching `pipewire`/`libspa` on both
+  architectures — if it is not a load-time dependency, the loader never looks
+  for it, which is stronger than testing one host that happens to lack it.
+  Graceful degradation was then shown *live* by bind-mounting the library away
+  inside a mount namespace: the binary ran, the portal handshake still
+  succeeded, and PipeWire reported unavailable naming the sonames it tried.
+
+  ⚠️ It does **not** prove frames flow. That is P3b, and a non-null pointer is
+  not a picture.
+- **P3b** — format negotiation (SPA PODs) and buffer delivery, then the sixth
+  `ScreenCapture` backend.
 - **P4** — RemoteDesktop input in the same helper and the same session.
 
 ## Acceptance criteria
@@ -242,8 +257,10 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
       why not**, on a host where it is absent — FR-36 measured a host where
       `xdg-desktop-portal` was running yet exposed **neither ScreenCast nor
       RemoteDesktop**, so availability must be *detected*, never assumed
-- [ ] **The daemon still starts on a host with no PipeWire library present.**
-      Verified by running it, not by inspection
+- [x] **The daemon still starts on a host with no PipeWire library present.**
+      Verified by running it, not by inspection — `dlopen` only, **0**
+      `DT_NEEDED` entries on both architectures, and a live run with the
+      library bind-mounted away that still completed the portal handshake
 - [ ] Backend order holds: a host with a real CRTC still picks **DRM**, and the
       portal is chosen only when DRM finds none
 - [ ] X11/Windows/macOS unchanged; the kill switch restores the current cascade
@@ -323,3 +340,5 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-08-31 | **P2b COMPLETE — 0.4.37, Asahi, GNOME Wayland** | Three passes, one binary. **1.** As the user, no stored token: a consent dialog, answered by a human, **1,831,429 ms**; returns `node_id=83`, `1920x1080`, `pipewire_fd_ok=true`, `cursor_mode_used=2` (embedded, of `available_cursor_modes=7`), `available_source_types=7`. **2.** As the user, token stored: **15 ms, no dialog**, `restore_token_sent=true`, same node. **3.** THE PRODUCTION PATH — as **root** through the session helper: **15 ms**, `node_id=83`, `pipewire_fd_ok=true`. 🔑 The 122,000× gap between pass 1 and pass 2 is what makes “did it prompt?” falsifiable rather than asserted. Token file `600 m1`, 36 bytes |
 | 2026-08-31 | **P2b — the dialog was NOT where it was looked for** | `Start` sat pending 30 min while the screen showed no dialog. The backend log had the clue — `xdg-desktop-por[392832]: Failed to associate portal window with parent window` — because `parent_window` is `""` for a CLI caller. ⚠️ Diagnosing this needed the product's OWN capture: GNOME refuses `org.gnome.Shell.Screenshot` AND `org.gnome.Shell.Introspect.GetWindows` to unsandboxed callers, so FR-36's DRM backend was the only way to see the screen — via `ROOMLERD_DRM_CAPTURE=1`, since `capture-smoke` does not register the S2 config fallbacks the daemon does |
 | 2026-08-31 | **P2b — the report was carrying the credential** | `SessionReport` documented that the daemon never sees the restore token, and carried it. Noticed because the helper's stdout, redirected to a log for the field test, had the token in plaintext. `open()` now loads and stores it internally and the report says only WHETHER a grant was persisted. 🔑 A caller that cannot hold a credential cannot leak it — stronger than a caller that holds it and is careful |
+| 2026-08-31 | **P3a field-verified 3 ways — 0.4.37, Asahi + WSL** | **(a) Structural:** `readelf -d` reports **0** `DT_NEEDED` entries matching `pipewire`/`libspa` on the x86_64 AND aarch64 builds, `ldd` shows nothing, and the binary runs — so the loader can never refuse to start over a library that is not linked. **(b) Success:** `portal-helper --screencast` → `pipewire: connected (libpipewire 1.4.11)` with `node_id=83`, reached entirely through `dlopen`. **(c) Failure:** with `libpipewire-0.3.so.0` bind-mounted over inside a mount namespace, the binary still ran, the portal handshake still succeeded (`node_id=82`, 14 ms) and PipeWire degraded to `unavailable — libpipewire not present (tried …)`. Zero dependencies added |
+| 2026-08-31 | P3a — a scare I caused and then disproved | After the namespace test I read `stat -c%s /usr/lib64/libpipewire-0.3.so.0` as **27 bytes** and concluded the bind mount had leaked and broken the host's PipeWire. It had not. ⚠️ **GNU `stat` does not dereference a symlink by default** — that path IS a symlink and 27 is the length of its target string `libpipewire-0.3.so.0.1411.0`; `stat -L` reports the real 797568. `unshare -m` also defaults to PRIVATE propagation, so nothing could have leaked. Library rpm-intact, all three PipeWire services active, and a re-run connected. 🔑 Hiding a library in a mount namespace is a clean, contained way to test a `dlopen` fallback — just measure it with `stat -L` |
