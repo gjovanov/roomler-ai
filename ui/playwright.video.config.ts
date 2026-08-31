@@ -25,7 +25,13 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      // ⚠️ `channel: 'chrome'` uses the INSTALLED Chrome, not Playwright's
+      // bundled Chromium — and for this spec that is load-bearing, not a
+      // preference. The bundled build ships without proprietary codecs, so a
+      // remote-desktop session that negotiates H.264/HEVC connects and then
+      // never decodes a frame: the canvas stays blank and the scene times out
+      // with no error anywhere that names the cause. Cost three takes to find.
+      use: { ...devices['Desktop Chrome'], channel: 'chrome' },
     },
   ],
   webServer: process.env.E2E_BASE_URL
