@@ -766,8 +766,19 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
 }
 
 fn inject_all(injector: &mut Option<Box<dyn super::InputInjector + Send>>, msgs: &[InputMsg]) {
-    let inj = injector.get_or_insert_with(super::open_default);
     for m in msgs {
+        // FR-45 P4 — while a portal capture with granted input is live, the
+        // portal session owns injection: on the hosts that backend serves,
+        // the OS injector's events have no reader at all (which is why the
+        // portal is in use). Checked PER EVENT, not at injector creation —
+        // the injector is created lazily at the first event while the portal
+        // capture opens concurrently from another task, so a one-time choice
+        // would race startup and freeze the loser in for the process life.
+        #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+        if crate::capture::portal::input_route::try_route(m) {
+            continue;
+        }
+        let inj = injector.get_or_insert_with(super::open_default);
         if let Err(e) = inj.inject(m.clone()) {
             tracing::debug!(%e, "input arbiter: inject failed");
         }

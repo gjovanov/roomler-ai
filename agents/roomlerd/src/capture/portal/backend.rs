@@ -33,6 +33,10 @@ pub struct PortalCapture {
     rx: std::sync::mpsc::Receiver<Frame>,
     width: u32,
     height: u32,
+    /// P4 — the generation token of the input route this capture registered,
+    /// present while it owns the process's injected input. `Drop` unregisters
+    /// with it, so a stale drop can never tear down a successor's route.
+    input_route_generation: Option<u64>,
 }
 
 impl PortalCapture {
@@ -42,7 +46,15 @@ impl PortalCapture {
     /// `open_default` can fall through to the rest of the cascade with a reason
     /// in the log.
     pub fn open(target_fps: u32) -> Result<Self> {
-        let mut child = super::helper::spawn_streaming(target_fps)?;
+        // P4 — input rides the same portal session unless the operator turned
+        // it off (`ROOMLERD_PORTAL_INPUT=0`). Default ON: on the hosts this
+        // backend exists for, the portal is the only input path with a reader
+        // behind it — enigo's XTest reaches nothing on a Wayland desktop and
+        // uinput's events have no consumer (FR-45 field log) — so a
+        // capture-only default would ship a read-only session and call it
+        // working.
+        let want_input = tunnel_core::env::flag("PORTAL_INPUT", true);
+        let mut child = super::helper::spawn_streaming(target_fps, want_input)?;
         let stdout = child
             .stdout
             .take()
@@ -53,6 +65,43 @@ impl PortalCapture {
         //    than showing up as a stream that never starts.
         let started = super::helper::read_stream_handshake(&mut reader)?;
         let (width, height) = (started.width, started.height);
+
+        // 1b. P4 — the input wire: `InputMsg` JSON lines onto the helper's
+        //     stdin, fed through a bounded channel so a wedged helper costs
+        //     dropped input events, never a blocked arbiter thread.
+        let mut input_route_generation = None;
+        if started.input_ok {
+            if let Some(stdin) = child.stdin.take() {
+                let (tx, input_rx) = std::sync::mpsc::sync_channel::<crate::input::InputMsg>(256);
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let mut w = std::io::BufWriter::new(stdin);
+                    while let Ok(msg) = input_rx.recv() {
+                        let Ok(line) = serde_json::to_string(&msg) else {
+                            continue;
+                        };
+                        // Flushed per event: input is latency, not throughput.
+                        if w.write_all(line.as_bytes()).is_err()
+                            || w.write_all(b"\n").is_err()
+                            || w.flush().is_err()
+                        {
+                            // The helper is gone; the route dies with the
+                            // capture that registered it.
+                            break;
+                        }
+                    }
+                });
+                input_route_generation = Some(super::input_route::register(tx));
+                tracing::info!(
+                    "portal capture: input routed through the portal RemoteDesktop session"
+                );
+            }
+        } else if want_input {
+            tracing::warn!(
+                "portal capture: the helper reported no input — the session is VIEW-ONLY \
+                 (no RemoteDesktop backend on this portal, or the devices were not granted)"
+            );
+        }
 
         // 2. Frames, on their own thread. Bounded at 1: dropping a stale frame
         //    is the correct behaviour for a live capture.
@@ -80,6 +129,7 @@ impl PortalCapture {
             rx,
             width,
             height,
+            input_route_generation,
         })
     }
 
@@ -98,6 +148,10 @@ impl Drop for PortalCapture {
     /// indicator stays up after the session ends, which is both a privacy
     /// surprise and a support call.
     fn drop(&mut self) {
+        // The route first, so no event is claimed for a helper being killed.
+        if let Some(generation) = self.input_route_generation.take() {
+            super::input_route::unregister(generation);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
