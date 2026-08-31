@@ -567,7 +567,14 @@ pub fn build_router(state: AppState) -> Router {
     // migration onto it. `renumber` defaults to a DRY RUN.
     let overlay_block_routes = Router::new()
         .route("/", get(routes::overlay_block::get_block))
-        .route("/renumber", post(routes::overlay_block::renumber));
+        .route("/renumber", post(routes::overlay_block::renumber))
+        // FR-47 P3 — return leaked host ordinals to the recycle pool.
+        // Platform-operator only (checked in-handler, like the block reclaim
+        // route) and dry-run by default.
+        .route(
+            "/reconcile-hosts",
+            post(routes::overlay_block::reconcile_hosts),
+        );
 
     let public_tunnel_routes = Router::new()
         .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
