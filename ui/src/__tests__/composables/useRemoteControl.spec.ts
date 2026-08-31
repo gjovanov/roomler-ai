@@ -3738,8 +3738,10 @@ describe('P7 — FSR sharpening sizing policy (computeRenderTarget)', () => {
     expect(normalizeSharpenMode('auto')).toBe('auto')
     expect(normalizeSharpenMode('on')).toBe('on')
     expect(normalizeSharpenMode('off')).toBe('off')
-    expect(normalizeSharpenMode('banana')).toBe('on') // FR-26: default is now ON
-    expect(normalizeSharpenMode(null)).toBe('on')
+    // Default reverted to 'auto' (2026-08-31): 'on' ran RCAS at 1:1 and
+    // amplified per-frame quantisation drift into a static-content shimmer.
+    expect(normalizeSharpenMode('banana')).toBe('auto')
+    expect(normalizeSharpenMode(null)).toBe('auto')
     expect(normalizeSharpness('0.25')).toBe(0.25)
     expect(normalizeSharpness(1.5)).toBe(1.5)
     expect(normalizeSharpness('9')).toBe(2)
@@ -3773,16 +3775,17 @@ describe('P7 — FSR localStorage knobs', () => {
     localStorage.removeItem('roomler-rc-fsr-sharpness')
   })
 
-  // FR-26 flipped the default from 'auto' (sharpen only when upscaling) to
-  // 'on' — the viewer is used for text far more than for video.
-  it('storedSharpenMode defaults to ON and honours auto/off', () => {
-    expect(storedSharpenMode()).toBe('on')
+  // FR-26 flipped the default to 'on', but 'on' runs RCAS at 1:1 and turned
+  // per-frame quantisation drift into a static-content shimmer (field
+  // 2026-08-31). Reverted the default to 'auto' — sharpen only when upscaling.
+  it('storedSharpenMode defaults to AUTO and honours on/off', () => {
+    expect(storedSharpenMode()).toBe('auto')
     localStorage.setItem('roomler-rc-sharpen', 'off')
     expect(storedSharpenMode()).toBe('off')
-    localStorage.setItem('roomler-rc-sharpen', 'auto')
-    expect(storedSharpenMode()).toBe('auto')
-    localStorage.setItem('roomler-rc-sharpen', 'banana')
+    localStorage.setItem('roomler-rc-sharpen', 'on')
     expect(storedSharpenMode()).toBe('on')
+    localStorage.setItem('roomler-rc-sharpen', 'banana')
+    expect(storedSharpenMode()).toBe('auto')
   })
 
   // FR-26 — per-pill toolbar toggles.
