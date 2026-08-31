@@ -1032,6 +1032,7 @@ async fn daemon_main() -> Result<()> {
                                 }
                             );
                         }
+                        println!("  pipewire: {}", r.pipewire);
                         println!(
                             "  pipewire_fd_ok={} restore_token={} sent_token={} elapsed={}ms",
                             r.pipewire_fd_ok,
