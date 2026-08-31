@@ -283,11 +283,20 @@ async fn terminate_clears_state_so_next_request_works() {
     // terminate frame here — the controller-side terminate is
     // sufficient to drive the agent's cleanup; the test's job is
     // to prove the NEXT request works.
+    //
+    // ⚠️ The wire tag is `rc:terminate` and the reason is a snake_case
+    // `EndReason` — the values the real viewer sends (`useRemoteControl`'s
+    // disconnect). The former `rc:session.terminate` / `user-cancelled` matched
+    // NEITHER, so the frame silently failed to parse and session A was never
+    // torn down; the test only passed because `create_session` always minted a
+    // fresh id. #1045's same-connection coalesce exposed that: with the real
+    // terminate, session A is gone and request #2 correctly gets a new id;
+    // without it, the leaked live session on this same socket coalesces.
     ws.send(Message::Text(
         json!({
-            "t": "rc:session.terminate",
+            "t": "rc:terminate",
             "session_id": sid_a,
-            "reason": "user-cancelled",
+            "reason": "controller_hangup",
         })
         .to_string()
         .into(),
