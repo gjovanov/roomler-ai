@@ -139,6 +139,18 @@ enum Command {
         /// `ROOMLERD_ENCODER` env var.
         #[arg(long)]
         encoder: Option<String>,
+        /// FR-43 P2a (macOS) — this process was started by the root daemon's
+        /// GUI-worker supervisor, and its delegation-channel secret is waiting
+        /// on stdin as a single line.
+        ///
+        /// A FLAG rather than an environment variable because the spawn chain
+        /// runs through `sudo`, and `Defaults env_reset` discards the
+        /// environment — measured on a real host, which is how P1's
+        /// `ROOMLER_MACOS_SUPERVISED` marker turned out never to have arrived
+        /// at all. The secret itself stays OFF the command line: argv is world
+        /// readable via `ps`, while the pipe is only the parent's.
+        #[arg(long, hide = true)]
+        supervised: bool,
     },
     /// Run the codec capability probes and print the result as one
     /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
@@ -968,7 +980,12 @@ async fn daemon_main() -> Result<()> {
 
     let config_path = resolve_config_path(cli.config.clone())?;
 
-    let cmd = cli.command.unwrap_or(Command::Run { encoder: None });
+    let cmd = cli.command.unwrap_or(Command::Run {
+        encoder: None,
+        // A bare `roomlerd` is never a supervised worker: the supervisor always
+        // spawns `run --supervised` explicitly.
+        supervised: false,
+    });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
     // spawns + observes for crashes. On non-zero exit from that path,
     // record a sidecar with the WORKER's log tail BEFORE returning so
@@ -1009,7 +1026,10 @@ async fn daemon_main() -> Result<()> {
             re_enroll_cmd(&config_path, &token, org.as_deref()).await
         }
         Command::Org { action } => org_cmd(&config_path, action),
-        Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
+        Command::Run {
+            encoder,
+            supervised,
+        } => run_cmd(&config_path, encoder.as_deref(), supervised).await,
         Command::CapsProbe => {
             roomlerd::encode::caps::print_probe_result();
             Ok(())
@@ -2130,7 +2150,7 @@ fn macos_permission_preflight() {
     );
 }
 
-async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()> {
+async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: bool) -> Result<()> {
     if !config_path.exists() {
         bail!(
             "no config found at {}. Run `roomlerd enroll` first.",
@@ -2943,12 +2963,18 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         shutdown_rx.clone(),
     ));
 
-    // FR-43 P2a — the WORKER half. Returns immediately unless this process was
-    // spawned by a supervisor that gave it an attach secret, so it is inert for
-    // a launchd-owned worker, a hand-run `roomlerd run`, and the daemon itself.
+    // FR-43 P2a — the WORKER half. Inert unless `--supervised` says the root
+    // daemon started us and put an attach secret on our stdin, so a
+    // launchd-owned worker, a hand-run `roomlerd run` and the daemon itself all
+    // skip it entirely.
     #[cfg(unix)]
     // Same: exits on the shutdown watch, so no abort.
-    let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(shutdown_rx.clone()));
+    let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(
+        supervised,
+        shutdown_rx.clone(),
+    ));
+    #[cfg(not(unix))]
+    let _ = supervised;
 
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
