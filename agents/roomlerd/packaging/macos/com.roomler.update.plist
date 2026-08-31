@@ -54,7 +54,7 @@
     <!-- RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS; renaming
          it silently drops Screen Recording + Accessibility on every Mac. FR-21 D5
          freezes it. docs/fr/FR-21 -->
-        <string>/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent</string>
+        <string>/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd</string>
         <string>update-helper</string>
     </array>
 
