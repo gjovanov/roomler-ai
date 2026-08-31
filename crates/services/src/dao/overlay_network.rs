@@ -3,7 +3,7 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use mongodb::options::ReturnDocument;
-use roomler_ai_remote_control::models::{OverlayAclMode, OverlayNetwork, PeerRelayMode};
+use roomler_ai_remote_control::models::{BlockList, OverlayAclMode, OverlayNetwork, PeerRelayMode};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 use super::overlay_block::OverlayBlockDao;
@@ -46,6 +46,39 @@ impl OverlayNetworkDao {
     /// (the renumber endpoint).
     pub fn blocks(&self) -> &OverlayBlockDao {
         &self.blocks
+    }
+
+    /// FR-47 P5b — a network's address space as a [`BlockList`].
+    ///
+    /// One entry today for every network in existence, so this is the
+    /// single-block path and therefore byte-for-byte the old
+    /// `overlay_ip`/`overlay_host` behaviour (pinned by
+    /// `a_single_block_list_is_exactly_the_old_pair`). It becomes multi-entry
+    /// only once P5c starts appending blocks on exhaustion.
+    ///
+    /// Falls back to the network's own `cidr` when the registry has nothing:
+    /// that is a LEGACY network on the shared `/10`, which never had a block
+    /// row and must still be addressable.
+    pub async fn block_list(&self, net: &OverlayNetwork) -> BlockList {
+        let Some(network_id) = net.id else {
+            return BlockList::single(&net.cidr);
+        };
+        match self
+            .blocks
+            .find_assigned_for_network_ordered(network_id)
+            .await
+        {
+            Ok(blocks) if !blocks.is_empty() => BlockList::new(blocks.into_iter().map(|b| b.cidr)),
+            // A registry read failure must not invent an address space. The
+            // network's own cidr is what every pre-P5b code path used, so
+            // falling back to it degrades to today's behaviour rather than to
+            // an empty list that would refuse every lease.
+            Ok(_) => BlockList::single(&net.cidr),
+            Err(e) => {
+                tracing::warn!(%network_id, %e, "overlay: block list read failed; using the network cidr");
+                BlockList::single(&net.cidr)
+            }
+        }
     }
 
     /// P2b — the prefix new networks are carved at, when carving is on.
@@ -132,7 +165,7 @@ impl OverlayNetworkDao {
             Some(b) => b,
             None => match self
                 .blocks
-                .allocate(net.tenant_id, network_id, prefix)
+                .allocate(net.tenant_id, network_id, prefix, 0)
                 .await
             {
                 Ok(b) => b,
