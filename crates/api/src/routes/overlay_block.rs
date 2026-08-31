@@ -369,6 +369,51 @@ pub async fn get_block(
     }))
 }
 
+/// Authorize a block operation on `tid`: a **platform operator**, or a tenant
+/// admin holding `MANAGE_AGENTS`.
+///
+/// FR-47 — the platform arm was added because the routes around this one
+/// already had it and this one did not, which made the block toolkit
+/// unusable as a set: `POST /api/admin/overlay-block/reclaim` and
+/// `…/reconcile-hosts` are platform-operator, so an operator could reclaim
+/// ranges fleet-wide and return leaked ordinals, but could not migrate the
+/// one tenant those operations exist to serve without first being made a
+/// member of it.
+///
+/// ⚠️ This is **consistency, not escalation**, and the reasoning matters
+/// before anyone widens it further. A platform operator already governs the
+/// GLOBAL block registry through `reclaim` — a strictly more powerful
+/// capability than renumbering a single tenant, since a mis-reclaimed range
+/// can be re-issued to a *different* org. Granting the smaller power to the
+/// same list closes a gap rather than opening one. It is emphatically not a
+/// licence to route ordinary tenant operations through `platform_admins`.
+///
+/// The platform path is logged at WARN with the tenant it acted on: an
+/// operator reaching into an org they are not a member of should leave a
+/// trace, and a renumber is disruptive enough to want one.
+async fn require_block_operator(
+    state: &AppState,
+    tid: ObjectId,
+    user_id: ObjectId,
+    op: &str,
+) -> Result<(), ApiError> {
+    if state.platform_admins.contains(&user_id) {
+        warn!(
+            admin = %user_id, tenant = %tid, %op,
+            "overlay blocks: platform operator acting on a tenant"
+        );
+        return Ok(());
+    }
+    require_permission(
+        state,
+        tid,
+        user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await
+}
+
 /// POST /api/tenant/{tenant_id}/overlay-block/renumber — plan (default) or
 /// perform the tenant's migration onto its own block.
 pub async fn renumber(
@@ -379,14 +424,7 @@ pub async fn renumber(
 ) -> Result<Json<RenumberResponse>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    require_permission(
-        &state,
-        tid,
-        auth.user_id,
-        permissions::MANAGE_AGENTS,
-        "MANAGE_AGENTS",
-    )
-    .await?;
+    require_block_operator(&state, tid, auth.user_id, "renumber").await?;
 
     let prefix = body.prefix.unwrap_or(state.settings.overlay.block_prefix);
     if !(OVERLAY_BLOCK_MIN_PREFIX..=OVERLAY_BLOCK_MAX_PREFIX).contains(&prefix) {
