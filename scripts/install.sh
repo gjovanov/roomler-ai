@@ -55,14 +55,13 @@ SYSTEM=0
 # in the wrong tree entirely. Must match roomlerd.service's ROOMLERD_CONFIG.
 SYSTEM_CONFIG="/etc/roomler/config.toml"
 # macOS's privileged half has its OWN path, and it is NOT $SYSTEM_CONFIG above:
-# RETIRED-NAME-ANCHOR(3): /etc/roomler-agent is the REAL macOS daemon config
-# dir — the shipped com.roomler.daemon.plist passes it as --config and the
-# .pkg postinstall creates it. Renaming it here alone strands the daemon.
-# com.roomler.daemon.plist passes `--config /etc/roomler-agent/config.toml`
-# explicitly, and the agent's root-aware config ladder is Linux-only. Reusing
-# one variable for both would enroll into a file nothing reads.
-MACOS_DAEMON_CONFIG="/etc/roomler-agent/config.toml"
-MACOS_DAEMON_MARKER="/etc/roomler-agent/enable-daemon"
+# com.roomler.daemon.plist passes it explicitly as `--config`, and the agent's
+# root-aware config ladder is Linux-only. Reusing one variable for both would
+# enroll into a file nothing reads.
+# FR-46 P5a moved this off the retired name; the .pkg postinstall migrates an
+# existing Mac and both gates it guards dual-read during the changeover.
+MACOS_DAEMON_CONFIG="/etc/roomler/config.toml"
+MACOS_DAEMON_MARKER="/etc/roomler/enable-daemon"
 DAEMON_TOKEN=""
 NO_ENROLL=0
 # FR-27 — the Linux desktop companion. Empty = decide by probing for a
