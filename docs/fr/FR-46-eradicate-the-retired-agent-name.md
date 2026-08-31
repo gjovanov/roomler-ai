@@ -153,6 +153,42 @@ and a bundle built on a runner with Homebrew baked `/opt/homebrew` paths into it
    remote-control session that actually paints and accepts input.
 5. Only then the second Mac.
 
+
+#### P5b — what moved, and what deliberately did not
+
+Four things move **together**, because moving any subset installs cleanly and then fails at
+runtime in a way that reads as something else entirely:
+
+| | old | new |
+|---|---|---|
+| bundle | `/Library/Roomler/roomler-agent.app` | `/Library/Roomler/roomlerd.app` |
+| `CFBundleExecutable` | `roomler-agent` | `roomlerd` |
+| `CFBundleName` (what the Privacy panes DISPLAY) | `Roomler Agent` | `Roomler Daemon` |
+| TCC usage strings | "Roomler Agent captures…" | "Roomler Daemon captures…" |
+
+**`CFBundleIdentifier` stays `com.roomler.agent`** — deliberately. It is not a retired name
+(`roomler.agent`, not `roomler-agent`), it doubles as the launchd `Label`, and it is what TCC
+attributes grants to. Changing it would widen the blast radius of a rename that already costs a
+re-approval, for no eradication benefit.
+
+⚠️ **The grants do not carry over.** The path changes, so macOS treats the renamed bundle as a
+different app: Screen Recording and Accessibility must be approved again, and the stale
+`Roomler Agent` entry should be removed by hand. The postinstall says so on the host when it
+sweeps the old bundle, because the alternative is an operator discovering it from a black screen.
+
+**The sweep is the part that is easy to forget.** A `.pkg` install is additive, so without it an
+upgraded Mac keeps a second signed, launchable copy of the daemon — and it is the copy every
+existing grant still points at, so the Privacy pane would offer two plausible entries with no way
+to tell them apart. `installer-smoke` now seeds a fake pre-rename bundle, re-installs, and asserts
+it is gone **and** that the current one survived — seeded rather than asserted on a fresh box,
+where the old bundle never exists and the assertion would pass while proving nothing.
+
+⚠️ **A blind spot in the audit, found here.** `enrollCommands.ts` was left holding an anchor that
+covered nothing once its last retired name was renamed — and the guard could not report it,
+because the file is only scanned when `git grep -l` finds a token in it. A file whose LAST retired
+name goes away keeps its orphaned marker invisibly. Cleaned up by hand; it is the same shape as
+the sweep that rewrote an anchor's own explanation, one level out.
+
 ### D2 — the updater chicken-and-egg
 
 A frozen agent cannot receive its own fix. Precedent: publishing a second Linux `.deb` froze
@@ -179,7 +215,7 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | P3 | re-enrollment classes: appdirs trees, Windows service + task, install folder, systemd `ReadWritePaths` | staged rollout + rollback build | **unblocked; Linux measured CLEAN, macOS is NOT** (below) |
 | P4 | wire values (QUIC ALPN, WebRTC stream id) — dual-accept window, then cleanup | dual-accept stays until cleanup | |
 | P5a | macOS config + log paths off the retired name (no TCC risk) | dual-read gates; migration is dest-absent-only and never deletes | **✅ proven by the macOS pkg smoke** |
-| P5b | macOS BUNDLE rename (D1) — the only TCC-keyed identity left; one host, verified, then fleet | do not proceed past host 1 | |
+| P5b | macOS BUNDLE rename — `roomlerd.app` / `roomlerd` / CFBundleName `Roomler Daemon`; CFBundleIdentifier deliberately UNCHANGED | postinstall sweeps the old bundle; revert = one release | **shipped — needs re-approval at each Mac** |
 | P6 | retire the machinery: `anchors=0`, guard flips to record-only | — | |
 
 

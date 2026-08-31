@@ -92,13 +92,11 @@ export function enrollCommands(
     command: `curl -fsSL ${base}/api/setup/install.sh | sh -s -- --role ${shRole}${os === 'linux' && machineWide ? ' --system' : ''} --token ${tok} --server ${base} --name ${manualName}`,
   })
 
-  // macOS installs the daemon inside an .app bundle whose executable keeps the
-  // legacy name (renaming it would void the TCC grants keyed to that binary),
-  // and there is no `roomlerd` anywhere on the box — so the generic
-  // `roomlerd enroll` this used to print could not work on a Mac.
-  // RETIRED-NAME-ANCHOR: frozen -- the bundle name keys the macOS TCC grants, and this
-  // is the only binary that actually exists on a Mac. FR-21 D5. docs/fr/FR-21
-  const macAgentBin = '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent'
+  // macOS installs the daemon inside an .app bundle, and there is no bare
+  // `roomlerd` on PATH for the enrolling user — so the generic `roomlerd
+  // enroll` this used to print could not work on a Mac. FR-46 P5b renamed the
+  // bundle, so the path below carries the current name like every other OS.
+  const macAgentBin = '/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd'
 
   const manual = (os: EnrollOs): CommandBlock => ({
     id: `${kind}-${os}-manual`,
