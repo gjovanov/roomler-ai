@@ -1,6 +1,6 @@
 # FR-47: One address space per org — carve by default, grow without renumbering
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
+**Issue:** [#1071](https://github.com/gjovanov/roomler-ai/issues/1071) ·
 **Status:** proposed · **Owner:** overlay/networking
 
 ## Goal
