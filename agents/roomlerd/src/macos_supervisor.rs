@@ -172,10 +172,6 @@ mod imp {
     /// we stand down — see the module docs.
     const AGENT_LABEL: &str = "com.roomler.agent";
 
-    /// Marks a worker as OURS, so a later phase can tell a supervised worker
-    /// from a launchd-owned one without guessing from the process tree.
-    const SUPERVISED_MARKER: &str = "ROOMLER_MACOS_SUPERVISED";
-
     /// The console user's uid, or `None` when nobody is logged in.
     ///
     /// `/dev/console`'s owner is the canonical answer and the same one the
@@ -225,7 +221,7 @@ mod imp {
     /// would have used. P1 changes who launches the worker, nothing about its
     /// identity.
     fn spawn_worker(uid: u32, exe: &std::path::Path, secret: &str) -> std::io::Result<Child> {
-        Command::new("launchctl")
+        let mut child = Command::new("launchctl")
             .arg("asuser")
             .arg(uid.to_string())
             .arg("sudo")
@@ -233,17 +229,39 @@ mod imp {
             .arg(format!("#{uid}"))
             .arg(exe)
             .arg("run")
-            .env(SUPERVISED_MARKER, "1")
-            // FR-43 P2a — the worker's authorisation to attach the delegation
-            // channel. Per spawn, so a worker we have released cannot come
-            // back; environment rather than a file because a file would have to
-            // survive every exit path including SIGKILL, and a stale one is a
-            // standing credential.
-            .env(crate::delegate::ATTACH_SECRET_ENV, secret)
+            // FR-43 P2a — tell the worker it is ours, and that its
+            // delegation-channel secret is waiting on stdin.
+            //
+            // ⚠️ This REPLACES the `ROOMLER_MACOS_SUPERVISED` environment
+            // marker P1 shipped, which never arrived at a single worker:
+            // `sudo` runs under the stock `Defaults env_reset` and discards the
+            // parent's environment. Measured on the MacBook 2026-08-31 —
+            // `ps -E` on a live supervised worker showed ZERO `ROOMLER_MACOS*`
+            // variables. Nothing had noticed because nothing read the marker
+            // yet, which is precisely what made it worth checking before
+            // building on it.
+            .arg("--supervised")
+            // The secret goes on the pipe, never in argv: `ps` is world
+            // readable and the pipe is only ours.
+            .stdin(Stdio::piped())
             // Own process group, so `stop_worker` can take the whole
             // launchctl -> sudo -> agent chain down instead of orphaning it.
             .process_group(0)
-            .spawn()
+            .spawn()?;
+        // Write it and immediately drop the handle: the worker reads ONE line
+        // and the EOF is what tells it there is no more. Holding the pipe open
+        // would leave a worker that read a partial line waiting forever.
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            if let Err(e) = writeln!(stdin, "{secret}") {
+                // Not fatal: the worker will time out waiting, log loudly, and
+                // simply not attach. It is still a fully enrolled agent that
+                // serves its own sessions, so the remote-desktop half keeps
+                // working — degrading to P1 behaviour is the right failure.
+                tracing::warn!(error = %e, "macOS supervisor: could not hand the worker its delegation secret");
+            }
+        }
+        Ok(child)
     }
 
     /// Complete a hand-back: make sure launchd's own worker is running.
