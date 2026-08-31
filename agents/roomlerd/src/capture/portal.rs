@@ -117,7 +117,19 @@ impl fmt::Display for PortalStatus {
 /// Introspects rather than trusting the bus name: a portal with no
 /// compositor-matching backend owns the name and answers, while offering
 /// neither interface we need.
+///
+/// ⚠️ Runs the D-Bus work on its own thread. `zbus`'s blocking API panics when
+/// called from inside a tokio runtime (it would block the reactor it is
+/// standing on), and this is reachable from both the async CLI path and the
+/// synchronous `open_default` cascade. A thread makes it safe from either
+/// without forcing every caller to be async.
 pub fn detect() -> PortalStatus {
+    std::thread::spawn(detect_blocking)
+        .join()
+        .unwrap_or_else(|_| PortalStatus::Unknown("detection thread panicked".into()))
+}
+
+fn detect_blocking() -> PortalStatus {
     let conn = match zbus::blocking::Connection::session() {
         Ok(c) => c,
         // No session bus at all — the ordinary case on a headless daemon, and

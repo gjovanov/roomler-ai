@@ -321,7 +321,7 @@ drm = { version = "0.15", optional = true }
 # detection can land ahead of FR-45's open dependency decision — reaching
 # PipeWire is what carries the "a missing library stops the daemon starting on
 # headless hosts" hazard, and this does not. Already in the lockfile.
-zbus = { version = "5", default-features = false, features = ["blocking-api"], optional = true }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "tokio"], optional = true }
 
 # FR-27 — the native macOS consent panel (`viewer-indicator-macos`). All three
 # are already in the lockfile (tauri pulls them for the desktop companion), so
