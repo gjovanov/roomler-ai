@@ -311,6 +311,9 @@ the agent is deliberately not AGPL.
 [COMMERCIAL.md](COMMERCIAL.md) for an AGPL exception ·
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for third-party obligations
 
+How the project earns — and what is deliberately free — is in
+[docs/business-model.md](docs/business-model.md).
+
 Releases up to the commit that introduced the split were MIT, retained in
 [LICENSE-MIT](LICENSE-MIT). That grant is irrevocable.
 
