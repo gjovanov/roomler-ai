@@ -354,6 +354,178 @@ pub fn video_enum_format(max_fps: u32) -> Result<Object, String> {
     })
 }
 
+// ── reading PODs back ───────────────────────────────────────────────────
+
+/// A value read off the wire.
+///
+/// `Unsupported` rather than an error: PipeWire may put properties in a format
+/// we never asked about, and a parser that fails on the first unfamiliar type
+/// would turn "one extra field" into "no capture at all".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedValue {
+    Id(u32),
+    Int(i32),
+    Rectangle {
+        width: u32,
+        height: u32,
+    },
+    Fraction {
+        num: u32,
+        denom: u32,
+    },
+    /// A choice, carrying its kind and its **first** element (the default, or
+    /// for [`ChoiceKind::None`] the only value there is).
+    ///
+    /// 🔑 This exists because of a SPA convention that is easy to miss: a
+    /// **fixed value is still written as a Choice** — kind `None`, one
+    /// element. That is why `spa_pod_get_id` and friends unwrap choices rather
+    /// than rejecting them. Measured on GNOME 48: a fully negotiated format
+    /// arrived with *every* property as a Choice, `mediaType` included, which
+    /// can only ever be "video".
+    Choice {
+        kind: u32,
+        first: Box<ParsedValue>,
+    },
+    Unsupported {
+        pod_type: u32,
+    },
+}
+
+impl ParsedValue {
+    /// The settled value, unwrapping a `Choice(None)`.
+    ///
+    /// ⚠️ Only `None` unwraps. A `Range` or `Enum` still has genuine
+    /// alternatives, so returning its default would report a value the other
+    /// side never committed to — the difference between "1920×1080" and
+    /// "somewhere between 1×1 and 8192×8192, probably".
+    pub fn fixed(&self) -> Option<&ParsedValue> {
+        match self {
+            ParsedValue::Choice { kind, first } if *kind == ChoiceKind::None as u32 => Some(first),
+            ParsedValue::Choice { .. } => None,
+            other => Some(other),
+        }
+    }
+}
+
+/// An object read off the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedObject {
+    pub object_type: u32,
+    pub id: u32,
+    pub props: Vec<(u32, ParsedValue)>,
+}
+
+impl ParsedObject {
+    pub fn get(&self, key: u32) -> Option<&ParsedValue> {
+        self.props.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+}
+
+/// Parse an object POD.
+///
+/// ⚠️ Every read is bounds-checked against the slice, and no length taken from
+/// the data is trusted to be in range. The input is a copy of memory owned by
+/// another process's library: this is exactly where "the header says 4 GB"
+/// must be a returned error and not a panic or a wild read.
+///
+/// Used on `param_changed`, where the value is the *negotiated* format and so
+/// carries plain values rather than choices — a `Choice` here is reported as
+/// unsupported instead of being silently unwrapped, since reading one as
+/// though it were fixed would report a made-up size.
+pub fn parse_object(bytes: &[u8]) -> Result<ParsedObject, String> {
+    let (_size, pod_type, body) = split_pod(bytes)?;
+    if pod_type != ty::OBJECT {
+        return Err(format!("expected an object pod, got type {pod_type}"));
+    }
+    if body.len() < 8 {
+        return Err(format!("object body is {} bytes, needs 8", body.len()));
+    }
+    let object_type = read_u32(body, 0)?;
+    let id = read_u32(body, 4)?;
+
+    // Each property is: key(4) flags(4) then a full POD value, padded to 8.
+    let mut props = Vec::new();
+    let mut off = 8usize;
+    while off + 8 <= body.len() {
+        let key = read_u32(body, off)?;
+        // `flags` sits at off+4 and is not acted on: none of the flags defined
+        // today change how a value is READ.
+        let (v_size, v_type, v_body) = split_pod(
+            body.get(off + 8..)
+                .ok_or_else(|| format!("property at {off} runs past the object"))?,
+        )?;
+        props.push((key, parse_value(v_type, v_body)?));
+        off += 8 + round_up_8(8 + v_size as usize);
+    }
+    Ok(ParsedObject {
+        object_type,
+        id,
+        props,
+    })
+}
+
+fn parse_value(pod_type: u32, body: &[u8]) -> Result<ParsedValue, String> {
+    Ok(match pod_type {
+        ty::ID => ParsedValue::Id(read_u32(body, 0)?),
+        ty::INT => ParsedValue::Int(read_u32(body, 0)? as i32),
+        ty::RECTANGLE => ParsedValue::Rectangle {
+            width: read_u32(body, 0)?,
+            height: read_u32(body, 4)?,
+        },
+        ty::FRACTION => ParsedValue::Fraction {
+            num: read_u32(body, 0)?,
+            denom: read_u32(body, 4)?,
+        },
+        // Choice body: kind(4) flags(4) child-header(8) then the elements,
+        // the first of which is described by that header. Only the first is
+        // read — it is the default, and for kind `None` the only one.
+        ty::CHOICE => {
+            let kind = read_u32(body, 0)?;
+            let child_size = read_u32(body, 8)? as usize;
+            let child_type = read_u32(body, 12)?;
+            let child_body = body.get(16..16 + child_size).ok_or_else(|| {
+                format!(
+                    "choice claims a {child_size}-byte element, body is {}",
+                    body.len()
+                )
+            })?;
+            ParsedValue::Choice {
+                kind,
+                first: Box::new(parse_value(child_type, child_body)?),
+            }
+        }
+        other => ParsedValue::Unsupported { pod_type: other },
+    })
+}
+
+/// Split a POD into `(body size, type, body)`, refusing anything that would
+/// read past the end.
+fn split_pod(bytes: &[u8]) -> Result<(u32, u32, &[u8]), String> {
+    if bytes.len() < 8 {
+        return Err(format!("a pod header needs 8 bytes, got {}", bytes.len()));
+    }
+    let size = read_u32(bytes, 0)?;
+    let pod_type = read_u32(bytes, 4)?;
+    let body = bytes.get(8..8 + size as usize).ok_or_else(|| {
+        format!(
+            "pod claims a {size}-byte body but only {} remain",
+            bytes.len() - 8
+        )
+    })?;
+    Ok((size, pod_type, body))
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Result<u32, String> {
+    let s = bytes
+        .get(at..at + 4)
+        .ok_or_else(|| format!("wanted 4 bytes at {at}, have {}", bytes.len()))?;
+    Ok(u32::from_ne_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn round_up_8(n: usize) -> usize {
+    n.div_ceil(8) * 8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +685,132 @@ mod tests {
         assert_eq!(words[1], ty::OBJECT);
         assert_eq!(words[2], ty::OBJECT_FORMAT);
         assert_eq!(words[3], ty::PARAM_ENUM_FORMAT);
+    }
+
+    /// Build → parse → compare. Not a substitute for PipeWire accepting the
+    /// bytes, but it catches the whole class where the writer and the reader
+    /// disagree about layout — which is exactly what `param_changed` would hit
+    /// in the field, where the only symptom is a plausible-looking wrong size.
+    #[test]
+    fn a_negotiated_format_round_trips() {
+        let o = Object {
+            object_type: ty::OBJECT_FORMAT,
+            // A NEGOTIATED format comes back with id 4 (SPA_PARAM_Format) and
+            // plain values, not the choices we sent.
+            id: 4,
+            props: vec![
+                Prop {
+                    key: ty::FORMAT_MEDIA_TYPE,
+                    value: Value::Id(ty::MEDIA_TYPE_VIDEO),
+                },
+                Prop {
+                    key: ty::FORMAT_MEDIA_SUBTYPE,
+                    value: Value::Id(ty::MEDIA_SUBTYPE_RAW),
+                },
+                Prop {
+                    key: ty::FORMAT_VIDEO_FORMAT,
+                    value: Value::Id(ty::VIDEO_FORMAT_BGRX),
+                },
+                Prop {
+                    key: ty::FORMAT_VIDEO_SIZE,
+                    value: Value::Rectangle {
+                        width: 1920,
+                        height: 1080,
+                    },
+                },
+                Prop {
+                    key: ty::FORMAT_VIDEO_FRAMERATE,
+                    value: Value::Fraction { num: 60, denom: 1 },
+                },
+            ],
+        };
+        let parsed = parse_object(&o.to_pod()).expect("should parse");
+        assert_eq!(parsed.object_type, ty::OBJECT_FORMAT);
+        assert_eq!(parsed.id, 4);
+        assert_eq!(parsed.props.len(), 5, "every property must survive");
+        assert_eq!(
+            parsed.get(ty::FORMAT_VIDEO_FORMAT),
+            Some(&ParsedValue::Id(ty::VIDEO_FORMAT_BGRX))
+        );
+        assert_eq!(
+            parsed.get(ty::FORMAT_VIDEO_SIZE),
+            Some(&ParsedValue::Rectangle {
+                width: 1920,
+                height: 1080
+            })
+        );
+        assert_eq!(
+            parsed.get(ty::FORMAT_VIDEO_FRAMERATE),
+            Some(&ParsedValue::Fraction { num: 60, denom: 1 })
+        );
+    }
+
+    /// The parser reads a copy of another process's memory, so a length taken
+    /// from the data must never be trusted. Truncation at every offset must
+    /// produce an error — never a panic, and never a value read past the end.
+    #[test]
+    fn truncation_anywhere_is_an_error_not_a_panic() {
+        let full = video_enum_format(60).unwrap().to_pod();
+        for cut in 0..full.len() {
+            // Any result is acceptable except a panic; the point is that no
+            // input length can crash the helper.
+            let _ = parse_object(&full[..cut]);
+        }
+        // A header promising far more body than exists must be refused.
+        let mut lying = full.clone();
+        lying[0..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let e = parse_object(&lying).unwrap_err();
+        assert!(e.contains("body"), "{e}");
+    }
+
+    /// 🔑 The convention that cost a field run: **SPA writes a settled value
+    /// as a `Choice(None)` with one element.** A negotiated format on GNOME 48
+    /// arrived with every property wrapped that way — `mediaType` included,
+    /// which can only ever be "video". So `fixed()` must unwrap `None`…
+    #[test]
+    fn a_choice_of_none_reads_as_the_settled_value() {
+        let o = Object {
+            object_type: ty::OBJECT_FORMAT,
+            id: 4,
+            props: vec![Prop {
+                key: ty::FORMAT_VIDEO_SIZE,
+                value: Value::choice(
+                    ChoiceKind::None,
+                    vec![Value::Rectangle {
+                        width: 1920,
+                        height: 1080,
+                    }],
+                )
+                .unwrap(),
+            }],
+        };
+        let parsed = parse_object(&o.to_pod()).unwrap();
+        assert_eq!(
+            parsed.get(ty::FORMAT_VIDEO_SIZE).unwrap().fixed(),
+            Some(&ParsedValue::Rectangle {
+                width: 1920,
+                height: 1080
+            })
+        );
+    }
+
+    /// …and must NOT unwrap a Range or Enum. Those still have real
+    /// alternatives, so returning the default would report a value the other
+    /// side never committed to — "1920×1080" versus "somewhere between 1×1 and
+    /// 8192×8192, probably".
+    #[test]
+    fn a_range_is_not_mistaken_for_a_settled_value() {
+        let parsed = parse_object(&video_enum_format(60).unwrap().to_pod()).unwrap();
+        let size = parsed.get(ty::FORMAT_VIDEO_SIZE).expect("size is present");
+        assert!(
+            matches!(size, ParsedValue::Choice { kind, .. } if *kind == ChoiceKind::Range as u32)
+        );
+        assert_eq!(size.fixed(), None, "a range must not read as settled");
+        // A plain (unwrapped) value stays readable through the same accessor.
+        assert_eq!(
+            parsed.get(ty::FORMAT_MEDIA_TYPE).unwrap().fixed(),
+            Some(&ParsedValue::Id(ty::MEDIA_TYPE_VIDEO))
+        );
     }
 
     /// BGRx has to be the preferred pixel order: it is what the rest of the

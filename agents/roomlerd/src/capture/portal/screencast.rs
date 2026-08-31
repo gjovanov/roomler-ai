@@ -303,6 +303,7 @@ fn open_blocking() -> Result<Session, OpenError> {
             pipewire: super::pipewire::PipeWireStatus::NotAttempted,
         },
         pipewire_fd,
+        _conn: conn,
     })
 }
 
@@ -318,6 +319,19 @@ pub struct Session {
     /// can succeed and still leave no connection, which is why
     /// `pipewire_fd_ok` is reported rather than assumed.
     pub pipewire_fd: Option<std::os::fd::OwnedFd>,
+    /// ⚠️⚠️ **Holding this open is what keeps the PipeWire node alive.**
+    ///
+    /// A portal session is owned by the D-Bus connection that created it. Drop
+    /// the connection and the portal tears the session down, which removes the
+    /// node — and a stream connecting to it then fails with the wonderfully
+    /// unhelpful `no target node available`, long after the handshake that
+    /// looked completely successful.
+    ///
+    /// Measured, not guessed: the first field run of P3b-ii failed exactly
+    /// that way because this field did not exist and the connection died when
+    /// `open_blocking` returned. The underscore is deliberate — nothing reads
+    /// it, and removing it "because it is unused" re-breaks capture.
+    _conn: zbus::blocking::Connection,
 }
 
 /// Where the portal's `restore_token` lives between runs.
