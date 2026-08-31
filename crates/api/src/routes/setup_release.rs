@@ -227,10 +227,10 @@ fn substitutable_origin(frontend_url: &str) -> Option<String> {
     {
         return None;
     }
-    if let Some(p) = port {
-        if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
+    if let Some(p) = port
+        && (p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
     }
     Some(format!("{scheme}://{hostport}"))
 }
