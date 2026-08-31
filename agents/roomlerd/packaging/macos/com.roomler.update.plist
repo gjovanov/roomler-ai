@@ -75,9 +75,9 @@
     <integer>60</integer>
 
     <key>StandardOutPath</key>
-    <string>/var/log/roomler-agent/update.log</string>
+    <string>/var/log/roomler/update.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/roomler-agent/update.log</string>
+    <string>/var/log/roomler/update.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
