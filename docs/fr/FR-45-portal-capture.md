@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a + P2b + P3a shipped, field-verified. P3b next · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 + P2a + P2b + P3a shipped, field-verified; P3b-i shipped (not yet PipeWire-validated). P3b-ii next · **Owner:** agent / capture
 
 ## Goal
 
@@ -57,7 +57,8 @@ on a machine with no scanout. The backend priority stays
 | **P2a** ✅ | `portal-helper` hidden subcommand, spawned as the console user with that session's bus. Proven by running `detect()` from the daemon and getting `available` where it previously could only say `no-session-bus`. ⚠️ Built with the verified **privilege drop**, not `systemd-run` as planned — see below. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P2b** ✅ | The helper opens the ScreenCast session: `CreateSession` → `SelectSources` → `Start` → `OpenPipeWireRemote`, giving a PipeWire node id. Consent handled via `persist_mode`/`restore_token`. ⚠️ The fd **stays in the helper**, and so does the token — see the corrected decisions below. Field-verified end to end: root → helper → live session, **15 ms, no dialog**. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P3a** ✅ | Reach `libpipewire` by **`dlopen`**, never a link, and connect the portal's fd to it. Verified three ways: **0** `DT_NEEDED` entries on x86_64 AND aarch64; a live connect (`libpipewire 1.4.11`); and graceful degradation with the library hidden in a mount namespace. Zero new dependencies. | same |
-| **P3b** | Attach to the node, negotiate a format (SPA PODs), and deliver `Frame`s to the daemon — buffer fds over `SCM_RIGHTS` once at negotiation, then a ready-message per frame — surfacing through the existing `ScreenCapture` trait as a **sixth backend**. | same |
+| **P3b-i** ✅ | SPA POD serialisation in Rust. Forced, not chosen: `nm -D --defined-only libpipewire-0.3.so.0 \| grep -c '^spa_'` is **0**, because the whole builder API is `static inline` — there is nothing to `dlsym`, and linking would undo P3a. Byte-exact tests against the header layout. ⚠️ **NOT yet validated by PipeWire itself** — that is P3b-ii. | same |
+| **P3b-ii** | Attach to the node, negotiate a format, and deliver `Frame`s to the daemon — buffer fds over `SCM_RIGHTS` once at negotiation, then a ready-message per frame — surfacing through the existing `ScreenCapture` trait as a **sixth backend**. | same |
 | **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
 
 ### The seam is unchanged
