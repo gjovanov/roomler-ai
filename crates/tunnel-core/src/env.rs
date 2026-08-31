@@ -273,6 +273,37 @@ fn note_legacy_use(prefix: &str, suffix: &str) {
     }
 }
 
+/// Every retired-prefix variable this process has actually READ, deduped.
+///
+/// Hoisted out of [`legacy_use_is_new`] by FR-46 (#1051) so the set can be
+/// READ, not only warned about. The warning alone was write-only: it fires once
+/// near startup, so a `roomler logs` tail on a long-running daemon cannot find
+/// it, and answering "does any host still depend on a retired name?" meant
+/// sweeping env vars and registries by hand — which under-reported twice.
+static LEGACY_SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn legacy_seen() -> &'static Mutex<HashSet<String>> {
+    LEGACY_SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Full names (`PREFIX` + `SUFFIX`) this process has read through a RETIRED
+/// prefix, sorted. Surfaced on `NodeStatus` so the question can be asked of a
+/// running daemon instead of guessed at from the outside.
+///
+/// ⚠️ **Empty means "nothing retired has been read YET", not "this host sets
+/// none."** Knobs are read lazily — some only on a code path that has not run —
+/// so an empty list is weak evidence of absence and strong evidence of
+/// presence. It is the same asymmetry as `ssh_activity`: the positive is
+/// authoritative, the negative is not.
+pub fn legacy_env_uses() -> Vec<String> {
+    let Ok(set) = legacy_seen().lock() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = set.iter().cloned().collect();
+    out.sort();
+    out
+}
+
 /// Record `(prefix, suffix)` and report whether it had NOT been seen before.
 ///
 /// Split out so the once-per-variable rule is testable without capturing
@@ -283,9 +314,7 @@ fn legacy_use_is_new(prefix: &str, suffix: &str) -> bool {
         // the hot path lock-free: `relay_max_bps` and friends re-read per frame.
         return false;
     }
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let Ok(mut set) = seen.lock() else {
+    let Ok(mut set) = legacy_seen().lock() else {
         // A poisoned set must never take the daemon down over a warning, and
         // must not spam either: treat it as already-seen.
         return false;
@@ -590,6 +619,47 @@ mod tests {
         // variable, so it warns on its own — otherwise one noisy host would
         // mask every other legacy setting it has.
         assert!(warned(PREFIXES[1], "FR21_DEPRECATION_PROBE_TWO"));
+    }
+
+    /// FR-46 (#1051): the dedupe set is also the ANSWER to "does this host
+    /// still depend on a retired name?", so it must be readable, not only
+    /// warnable. Before this the set was a local static inside
+    /// `legacy_use_is_new` and the only trace of a legacy read was one WARN
+    /// line near startup — unreachable from a `roomler logs` tail on a
+    /// long-running daemon, which is exactly when the question gets asked.
+    #[test]
+    fn legacy_uses_are_readable_and_exclude_the_current_spelling() {
+        const S: &str = "FR46_READBACK_PROBE";
+        let before = super::legacy_env_uses();
+
+        // The current spelling must never enter the set: it is not a legacy
+        // use, and counting it would make every host look dirty forever.
+        super::legacy_use_is_new(PREFIXES[0], S);
+        assert!(
+            !super::legacy_env_uses()
+                .iter()
+                .any(|v| v == &format!("{}{S}", PREFIXES[0])),
+            "the current prefix must never be recorded as a legacy use"
+        );
+
+        super::legacy_use_is_new(PREFIXES[1], S);
+        let after = super::legacy_env_uses();
+        let want = format!("{}{S}", PREFIXES[1]);
+        assert!(
+            after.contains(&want),
+            "{want} must be readable after a read"
+        );
+
+        // Sorted, so two hosts' reports diff cleanly rather than by insertion
+        // order — the whole point is comparing them across a fleet.
+        let mut sorted = after.clone();
+        sorted.sort();
+        assert_eq!(after, sorted, "the report must be sorted");
+
+        assert!(
+            after.len() > before.len(),
+            "a new legacy read must grow the set"
+        );
     }
 
     /// Did `note_legacy_use` emit for this (prefix, suffix)? Reads the dedupe

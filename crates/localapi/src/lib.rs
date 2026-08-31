@@ -193,6 +193,28 @@ pub struct NodeStatus {
     /// how FR-18's `dropped_stale` became unevaluable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_relay: Option<OrgRelayStatus>,
+    // RETIRED-NAME-ANCHOR: names the retired prefixes this field exists to DETECT.
+    // It is live compatibility, not history: delete the legacy arm in `node_env` and
+    // this field has nothing left to report, so it goes with it. docs/fr/FR-46
+    /// FR-46 (#1051) — full env-var names this daemon has actually READ through
+    /// a RETIRED prefix since it started (`ROOMLER_AGENT_*`, `ROOMLER_NODE_*`),
+    /// sorted and deduped. `None` from a daemon predating the field.
+    ///
+    /// This exists because the warning was write-only. `env::note_legacy_use`
+    /// logs once per variable near startup, so a `roomler logs` tail on a
+    /// long-running daemon cannot find it, and "does any host still depend on a
+    /// retired name?" had to be answered by sweeping env vars and registries by
+    /// hand — which under-reported twice: once to a `tail -1`, once because
+    /// Windows drops EMPTY variables from a process env block while leaving
+    /// them in the registry a future start will read.
+    ///
+    /// ⚠️ **`Some([])` means "nothing retired has been read YET", NOT "this
+    /// host sets none."** Knobs are read lazily and some sit on a code path
+    /// that has not run. The positive is authoritative; the negative is weak
+    /// evidence — the same asymmetry as `ssh_activity`, and it must not be
+    /// collapsed into "clean".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_env_uses: Option<Vec<String>>,
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -2365,6 +2387,7 @@ mod tests {
                 roam_adoptions: None,
                 disco_answered: None,
                 org_relay: None,
+                legacy_env_uses: Some(Vec::new()),
                 derp_inbound_drops: None,
                 netcheck: None,
             }
