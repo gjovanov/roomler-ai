@@ -155,18 +155,36 @@ slices of the `/10`.
   the old range; handing that range to another tenant would give it a live
   neighbour's address. The row stays as the forensic record of who held it.
 
-**Carve-on-create** is behind `overlay.blocks_enabled` (default **off** — with
-the flag off the DAO makes zero registry reads and behaves exactly as it did
-pre-P2b). Only a *virgin* network is carved: re-basing a populated one under
-live nodes would leave every leased address outside its own CIDR. Migrating a
-populated tenant is the renumber endpoint's job, because only that path
-rewrites the node rows and cycles the sockets.
+**Carve-on-create** is `overlay.blocks_enabled`, **default ON since FR-47**.
+Setting it to `false` is the kill switch and is still exactly the pre-P2b
+behaviour (the DAO then makes zero registry reads). Only a *virgin* network is
+carved: re-basing a populated one under live nodes would leave every leased
+address outside its own CIDR. Migrating a populated tenant is the renumber
+endpoint's job, because only that path rewrites the node rows and cycles the
+sockets.
+
+⚠️ It shipped default-**off** for a staged rollout and then simply stayed off,
+which quietly made isolation opt-in. Measured on production 2026-08-31: of four
+overlay networks, two were still on the shared `100.64.0.0/10` and therefore
+**held overlapping addresses** — both seeded at `.1`, so both owned
+`100.64.0.1` and `.2`. The two carved networks existed only because someone had
+renumbered them by hand. That is the exact collision class this registry was
+built to make unrepresentable, surviving because the mechanism that prevents it
+was never switched on. Hence the flip: a default that has to be remembered is
+not a default.
+
+⚠️ A failed carve does **not** fail the join — `ensure_block` falls back to the
+shared `/10` and logs at ERROR with `alert = "overlay_block_carve_failed"`.
+That is the right availability trade, but every tenant taking that branch is
+seeded at `.1` and so overlaps every other one that did, which is why the
+message names the consequence and why a fresh carve WARNs
+(`alert = "overlay_block_registry_pressure"`) once the slot cursor passes 80%.
 
 **Config:**
 
 | Key | Env | Default |
 |---|---|---|
-| `overlay.blocks_enabled` | `ROOMLER__OVERLAY__BLOCKS_ENABLED` | `false` |
+| `overlay.blocks_enabled` | `ROOMLER__OVERLAY__BLOCKS_ENABLED` | `true` (FR-47; `false` = kill switch) |
 | `overlay.block_prefix` | `ROOMLER__OVERLAY__BLOCK_PREFIX` | `22` (1022 devices; 4032 tenants fit) |
 | `overlay.block_version_floor` | `ROOMLER__OVERLAY__BLOCK_VERSION_FLOOR` | `0.3.0-rc.301` |
 
