@@ -172,7 +172,7 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 |---|---|---|---|
 | P0 | spec + issue + taxonomy decision | — | **this doc** |
 | P1a | split the marker into ANCHOR (live) / `RETIRED-NAME-RECORD` (history); `records` pinned exactly so nothing can be laundered | revert the audit script | **shipped** |
-| P1b | publish daemon assets as `roomlerd-*`; guard rewritten as a companion denylist | revert the workflow; published assets are immutable and additive | **shipped — needs a release to field-prove** |
+| P1b | publish daemon assets as `roomlerd-*`; guard rewritten as a companion denylist | revert the workflow; published assets are immutable and additive | **✅ FIELD-PROVEN on 0.4.40** |
 | P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` / additive reg key | **4 hosts done** (3 Linux + 1 Windows) |
 | P2b | env prefix: delete the legacy arm | restore the arm | **blocked on 4 OFFLINE devices only** — every online device is now measured and migrated |
 | P2c | remaining cheap classes: log filenames, install/staging paths, e2e image, wizard PATH | per-item revert | **`TermsView` done**; the rest open |
@@ -197,8 +197,7 @@ were free. An anchor is a *claim*, and FR-21 wrote them under time pressure acro
       count is pinned exactly (a new one is a deliberate, reviewed act)
 - [ ] a pre-rename host upgrades to the FR-46 build and keeps its enrolled identity **or** is
       re-enrolled by a documented, proven procedure — decided per class, recorded here
-- [ ] `roomlerd-*` assets are published and every picker in the fleet finds them (measured, not
-      reasoned: one host per OS takes an update across the rename)
+- [x] `roomlerd-*` assets are published and every picker in the fleet finds them — **FIELD-PROVEN 2026-08-31 on 0.4.40** (measured, not reasoned; see the log below)
 - [ ] macOS: Screen Recording + Accessibility granted in the agent log within ~30 s of start on
       the staged host, before any second Mac is touched
 
@@ -222,6 +221,7 @@ were free. An anchor is a *claim*, and FR-21 wrote them under time pressure acro
 
 | date | build | what was proven |
 |---|---|---|
+| 2026-08-31 | **0.4.40** | **P1b FIELD-PROVEN — the fleet updated ACROSS the rename.** `agent-v0.4.38/39/40` all post-date the P1b merge and publish every daemon artifact as `roomlerd-<v>-…` (both `.deb` arches, both tarballs, both MSI flavours, the `.pkg`), with the companion correctly still `roomler-desktop-…` and the release titled `roomlerd 0.4.40`. Agents on **all three OSes** are running 0.4.40 — two Linux, one Windows, one macOS — and every one of them came from a **pre-rename** build, since 0.4.37 was the last release before the change. The mechanism is visible rather than inferred: a Linux host's journal reads `new release available — spawning installer and exiting current=0.4.37 latest=agent-v0.4.40 path=/tmp/roomlerd-update/roomlerd-0.4.40-x86_64-unknown-linux-gnu.deb`, i.e. the picker chose the RENAMED asset, and `installer .asc verified against the pinned release signing key asset=roomlerd-0.4.40-…deb` — so the GPG sidecar naming followed the rename too. That last line is the one worth noting: the pinned-key verify is **fail-closed**, so a sidecar whose name had not tracked the asset would have frozen every Linux and macOS update instead of failing loudly |
 | 2026-08-31 | fleet, live | **Sweep 1 (systemd):** `ROOMLER_AGENT_VIRTUAL_DESKTOP*` is STILL SET on all three cluster hosts (4 entries each, operator-authored drop-in) — so the arm is load-bearing today and the handover's "cheap class" framing was wrong. Migrated all three make-before-break: both spellings, identical values, `.bak` kept, `systemctl show` resolves 8 of which 4 are `ROOMLERD_`, daemons untouched and still `active` |
 | 2026-08-31 | fleet, live | **Sweep 2 (whole fleet, via Fleet RPC):** probed all 12 online devices through `roomler exec`, whose child inherits the daemon's own environment — so this reads what the daemon ACTUALLY has, not what a config file claims. Found a **second, independent setter the systemd-only theory would have missed**: a Windows host carries `ROOMLER_AGENT_VP9_FPS=60` **machine-wide in HKLM**, not in any unit file. Migrated additively (`ROOMLERD_VP9_FPS=60` added, legacy kept). ⚠️ **7 devices remain unverifiable** — 3 online with `exec_enabled` false (gate 4, which is exactly the gate a server cannot overrule) and 4 offline. So P2b stays blocked on evidence, not on effort |
 | 2026-08-31 | fleet, live | **Sweep 3 (appdirs trees, gates P3):** on the reachable Unix devices the legacy tree is **already gone on Linux** — all three carry `/etc/roomler` + `/root/.config/roomler` and neither legacy path — so the appdirs dual-read costs Linux nothing to remove. **macOS is the opposite**: it has `/etc/roomler-agent` and **no** `/etc/roomler`, i.e. on that platform the "legacy" path is the *live* one the `com.roomler.daemon.plist` passes as `--config`. So removing the appdirs fallback is NOT one change — it is free on Linux and a coordinated plist + config move on macOS, which belongs next to P5, not before it. ⚠️ The Windows per-user tree is **still unmeasured**: `roomler exec` runs as SYSTEM, whose `%APPDATA%` is the service profile, while enrollment writes the *enrolling user's* profile |
