@@ -1221,6 +1221,33 @@ pub enum OrgOverlayMode {
     Tun,
 }
 
+impl OrgOverlayMode {
+    /// FR-49 — the ONE spelling, shared by the TOML (`#[serde(rename_all =
+    /// "lowercase")]`), `roomlerd org ls`, `roomler status` and the LocalAPI
+    /// `OrgStatus.overlay_mode`. The match is exhaustive, so a new variant
+    /// cannot reach an operator surface without someone naming it.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Netstack => "netstack",
+            Self::Tun => "tun",
+        }
+    }
+
+    /// Parse an operator-supplied mode. Deliberately strict and with NO
+    /// fallback: `roomlerd org overlay <label> tunn` must fail loudly rather
+    /// than quietly leaving a device off the mesh — which is the entire defect
+    /// FR-49 exists to close.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "netstack" => Some(Self::Netstack),
+            "tun" => Some(Self::Tun),
+            _ => None,
+        }
+    }
+}
+
 /// The reserved label naming the config's scalar (primary) identity.
 pub const PRIMARY_ORG_LABEL: &str = "primary";
 
@@ -1228,6 +1255,25 @@ impl AgentConfig {
     /// Enabled secondary enrollments, in config order.
     pub fn enabled_secondary_orgs(&self) -> impl Iterator<Item = &OrgEntry> {
         self.orgs.iter().filter(|o| o.enabled)
+    }
+
+    /// FR-49 — the PRIMARY identity's overlay participation, expressed in the
+    /// same vocabulary as a secondary's `overlay_mode`, so one column can hold
+    /// both.
+    ///
+    /// The primary predates `OrgOverlayMode` and stores this as
+    /// `overlay_enabled` plus the presence of a `netstack_socks_port`, which is
+    /// why the mapping lives here rather than being read off a field: there is
+    /// no field to read, and every caller that reconstructed it by hand would
+    /// be a place for the two to drift.
+    pub fn primary_overlay_mode(&self) -> OrgOverlayMode {
+        if !self.overlay_enabled {
+            OrgOverlayMode::Off
+        } else if self.netstack_socks_port.is_some() {
+            OrgOverlayMode::Netstack
+        } else {
+            OrgOverlayMode::Tun
+        }
     }
 
     /// Find a secondary org by label (case-sensitive).
