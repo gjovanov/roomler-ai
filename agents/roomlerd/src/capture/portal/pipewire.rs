@@ -468,6 +468,10 @@ struct Shared {
     lib: Arc<Lib>,
     main_loop: *mut c_void,
     outcome: Option<Result<NegotiatedFormat, String>>,
+    /// How many Format params arrived that could not be used yet. Reported so
+    /// a timeout can say whether nothing came at all or several came and none
+    /// fixated — different problems with different fixes.
+    rejected: u32,
 }
 
 impl Shared {
@@ -530,8 +534,57 @@ unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const 
             Some(b) => b,
             None => return shared.finish(Err("the format param was unreadable".into())),
         };
-        shared.finish(parse_format(&bytes));
+        match parse_format(&bytes) {
+            Ok(f) => shared.finish(Ok(f)),
+            // ⚠️ Do NOT finish here. `param_changed` can fire more than once,
+            // and an early one may still carry choices where the final one
+            // carries values — PipeWire fixates as it negotiates. Treating the
+            // first Format as final turned a working stream into
+            // "the negotiated video format is not a plain id" in the field.
+            // Keep waiting; the deadline is the backstop.
+            Err(why) => {
+                shared.rejected += 1;
+                eprintln!(
+                    "portal-helper: format #{} not usable yet ({why}); contents: {}",
+                    shared.rejected,
+                    describe(&bytes)
+                );
+            }
+        }
     });
+}
+
+/// A one-line summary of a format POD, for when it could not be used.
+///
+/// Exists because "not a plain id" on its own does not say *what* arrived, and
+/// the alternative is another build-and-deploy cycle to find out.
+fn describe(bytes: &[u8]) -> String {
+    use super::pod::{ParsedValue, parse_object};
+    match parse_object(bytes) {
+        Err(e) => format!("<unparseable: {e}>"),
+        Ok(o) => {
+            let props: Vec<String> = o
+                .props
+                .iter()
+                .map(|(k, v)| {
+                    let v = match v {
+                        ParsedValue::Id(x) => format!("Id({x})"),
+                        ParsedValue::Int(x) => format!("Int({x})"),
+                        ParsedValue::Rectangle { width, height } => format!("{width}x{height}"),
+                        ParsedValue::Fraction { num, denom } => format!("{num}/{denom}"),
+                        ParsedValue::Unsupported { pod_type } => format!("pod-type#{pod_type}"),
+                    };
+                    format!("0x{k:x}={v}")
+                })
+                .collect();
+            format!(
+                "object#{:x} id={} [{}]",
+                o.object_type,
+                o.id,
+                props.join(" ")
+            )
+        }
+    }
 }
 
 /// Copy a POD out of the library's memory so it can be parsed safely.
@@ -633,6 +686,7 @@ fn negotiate_blocking(
         lib: lib.clone(),
         main_loop: conn.main_loop,
         outcome: None,
+        rejected: 0,
     });
     let events = Box::new(PwStreamEvents {
         version: 2,
