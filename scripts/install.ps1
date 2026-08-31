@@ -61,6 +61,12 @@
 param(
     [ValidateSet('daemon-user', 'daemon-machine', 'daemon-system', 'tunnel-client')]
     [string]$Role = 'daemon-system',
+    # ⚠️ FR-50 — REWRITTEN at serve time by the server that hands you this
+    # script (crates/api/src/routes/setup_release.rs), so a script fetched from
+    # a self-hosted Roomler enrols against THAT server. Full reasoning in the
+    # matching comment in install.sh. ⚠️ The API holds this exact text as a
+    # needle and a unit test asserts it appears exactly once, so editing it
+    # fails the build rather than silently disabling the substitution.
     [string]$Server = 'https://roomler.ai',
     [string]$Token = '',
     [string]$Name = $env:COMPUTERNAME,
