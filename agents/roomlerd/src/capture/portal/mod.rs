@@ -259,6 +259,12 @@ pub mod helper {
     /// and would be mistaken for the result the first time it said anything.
     const MARKER: &str = "ROOMLER_PORTAL_JSON:";
 
+    /// What we ask the compositor for as an upper bound. It is a *range* max,
+    /// not a demand — the source picks its own rate within it, and asking for
+    /// a single fixed rate is how a negotiation fails on a display that runs
+    /// at something else.
+    const DEFAULT_MAX_FPS: u32 = 60;
+
     /// P2b's marker. A **separate** marker rather than a variant inside one
     /// payload, so a parent asking for detection can never be handed a session
     /// report (or the reverse) by a helper built from a different revision.
@@ -312,12 +318,16 @@ pub mod helper {
         eprintln!("portal-helper: opening a ScreenCast session");
         let outcome = super::screencast::open().map(|session| {
             let mut report = session.report;
-            // P3a — the fd goes straight to PipeWire and no further. Reaching
-            // it is the deliverable of this phase; keeping a stream open would
-            // be P3b pretending to be finished.
-            report.pipewire = match session.pipewire_fd {
-                Some(fd) => super::pipewire::probe(fd),
-                None => super::pipewire::PipeWireStatus::NotAttempted,
+            // P3b-ii — the fd goes to PipeWire, a stream is connected to the
+            // node the portal named, and the compositor's chosen format is
+            // reported. ⚠️ Still no frames: buffer delivery is P3c.
+            report.pipewire = match (session.pipewire_fd, report.streams.first()) {
+                (Some(fd), Some(s)) => {
+                    super::pipewire::negotiate_status(fd, s.node_id, DEFAULT_MAX_FPS)
+                }
+                // A session with no stream cannot be negotiated against, and
+                // saying "not attempted" is the truth rather than a failure.
+                _ => super::pipewire::PipeWireStatus::NotAttempted,
             };
             report
         });
