@@ -46,6 +46,10 @@ fn spawn_agent(
         let remote_config_enabled = cfg.remote_config_enabled;
         let _ = signaling::run(
             signaling::OrgCtx::primary(),
+            // FR-43 P2b — no GUI-worker delegation in tests: `None` is not a
+            // stub but the real production value on every platform except a
+            // macOS daemon that is supervising a worker.
+            None,
             cfg,
             EncoderPreference::Software,
             stop_rx,
