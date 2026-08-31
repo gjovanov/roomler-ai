@@ -134,11 +134,18 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | P1b | publish daemon assets as `roomlerd-*`; guard rewritten as a companion denylist | revert the workflow; published assets are immutable and additive | **shipped — needs a release to field-prove** |
 | P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` / additive reg key | **4 hosts done** (3 Linux + 1 Windows) |
 | P2b | env prefix: delete the legacy arm | restore the arm | **STILL BLOCKED** — 7 devices unverifiable (below) |
-| P2c | remaining cheap classes: log filenames, install/staging paths, e2e image, `TermsView`, wizard PATH | per-item revert | |
+| P2c | remaining cheap classes: log filenames, install/staging paths, e2e image, wizard PATH | per-item revert | **`TermsView` done**; the rest open |
 | P3 | re-enrollment classes: appdirs trees, Windows service + task, install folder, systemd `ReadWritePaths` | staged rollout + rollback build | **unblocked; Linux measured CLEAN, macOS is NOT** (below) |
 | P4 | wire values (QUIC ALPN, WebRTC stream id) — dual-accept window, then cleanup | dual-accept stays until cleanup | |
 | P5 | macOS bundle (D1) — one host, verified, then fleet | do not proceed past host 1 | |
 | P6 | retire the machinery: `anchors=0`, guard flips to record-only | — | |
+
+
+⚠️ **Check each anchor's stated reason before paying its price.** Two of them have now been
+found false on inspection: `artifact_version.rs` calls its fixtures "PUBLISHED release asset"
+names that no release ever carried, and `TermsView` called a section heading a "defined term in
+the Terms" when the Terms define the word in the body and reference the heading nowhere. Both
+were free. An anchor is a *claim*, and FR-21 wrote them under time pressure across ~1 849 sites.
 
 ## Acceptance criteria
 
