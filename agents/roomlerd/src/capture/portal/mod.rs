@@ -33,6 +33,8 @@
 
 /// FR-45 P3a — reaching `libpipewire` through `dlopen`, never a link.
 pub mod pipewire;
+/// FR-45 P3b — SPA POD serialisation, so a format can be negotiated.
+pub mod pod;
 /// FR-45 P2b — the ScreenCast handshake itself, run inside the session.
 pub mod screencast;
 
