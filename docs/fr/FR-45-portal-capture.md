@@ -53,8 +53,8 @@ on a machine with no scanout. The backend priority stays
 
 | Phase | What | Kill switch |
 |---|---|---|
-| **P1** | Detect: is `org.freedesktop.portal.ScreenCast` actually on the session bus? Report it in `capture-smoke` so "why did this host pick X11" is answerable without a session. | n/a (read-only) |
-| **P2** | ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
+| **P1** ✅ | Detect whether `org.freedesktop.portal.ScreenCast` is actually exposed, and report WHY not, in `capture-smoke` (`capture/portal.rs`). Uses zbus, which is pure Rust and adds no system `.so`. | n/a (read-only) |
+| **P2** ⛔ BLOCKED | ⚠️ Needs a SESSION-RESIDENT component first (the daemon is root, no session bus), AND a host that actually exposes ScreenCast — none does today. ScreenCast session: `CreateSession` → `SelectSources` → `Start` → receive a PipeWire node id + fd. Handle the consent dialog and `persist_mode`/`restore_token`. | `ROOMLERD_PORTAL_CAPTURE=0` |
 | **P3** | PipeWire consumer: attach to the node, negotiate a format, deliver `Frame`s through the existing `ScreenCapture` trait as a **sixth backend**. | same |
 | **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
 
@@ -90,13 +90,39 @@ Three options, in the order they should be evaluated:
 ⚠️ Whichever is chosen, **prove it by starting the daemon on a host without
 PipeWire installed**, not by reasoning about it.
 
+
+## ⚠️⚠️ P1 found the thing that shapes P2, and it is not PipeWire
+
+**The daemon runs as root and has no D-Bus session bus.** Detection from the
+daemon's own context returns `no-session-bus` on a host whose GNOME Wayland
+session is right there and active. That is not a test artefact — the portal is
+**per user session** by construction, and a root daemon is not in one.
+
+So **P2/P3 need a session-resident component before they need a single line of
+PipeWire code**: something running as the logged-in user that opens the portal
+session and hands the result back to the daemon. That partially resurrects the
+"session broker" FR-36 superseded — legitimately this time, because FR-45 *is*
+the attended path, and the reason FR-36 rejected it (it made the portal
+reachable but the portal refuses when locked) does not apply to a case that
+never claimed to work locked.
+
+⚠️ **And a second, harder blocker.** On `scw-m2-asahi`, running **inside** the
+active GNOME Wayland session with `xdg-desktop-portal-gnome` installed, the
+portal exposes **neither `ScreenCast` nor `RemoteDesktop`** — verified
+independently with `busctl`, which lists Account, Camera, FileChooser,
+Notification and eleven others but not those two. FR-36 measured the same thing
+and attributed it to an X11 session; it reproduces under Wayland, so that
+explanation was wrong. **P2 cannot start until this is understood**, because
+there is currently no host in the fleet that offers the interface P2 would
+call.
+
 ## Acceptance criteria
 
 - [ ] A **nested GNOME Wayland session in WSL2** (per the WSLg + `gnome-shell
       --nested` recipe) is captured and rendered in the browser
 - [ ] That session encodes with **`*_nvenc`**, and `avg_encode_ms` is within
       ~2× the 10.4 ms already measured on that host
-- [ ] `roomlerd capture-smoke` reports **whether the portal is available and
+- [x] `roomlerd capture-smoke` reports **whether the portal is available and
       why not**, on a host where it is absent — FR-36 measured a host where
       `xdg-desktop-portal` was running yet exposed **neither ScreenCast nor
       RemoteDesktop**, so availability must be *detected*, never assumed
@@ -166,3 +192,6 @@ PipeWire installed**, not by reasoning about it.
 | 2026-08-31 | 0.4.33, Asahi | Wayland captured via DRM at 1920×1080, but **software encode only** — no video-encode driver exists for Apple Silicon on Linux |
 | 2026-08-31 | 0.4.33, WSL2 | **uinput measured, and it reframes P4.** `CONFIG_INPUT_UINPUT=m`, module loads, FR-36's injector created a device and accepted a move (`has_permission=true`) — injection is not the obstacle. But `/dev/input/` is **empty** (WSLg takes input over RDP, not evdev), so nothing appears to consume those events. P4 likely survives because the *reader* is missing, not the writer. Untested: whether a nested `gnome-shell` reads evdev |
 | 2026-08-31 | 0.4.33 + weston 13, WSL2 | **The nested-compositor input question, ANSWERED.** A persistent uinput device appears as `/dev/input/event0` and **libinput enumerates it on `seat0`** — so the evdev subsystem is fully alive in WSL2. But weston under WSLg loads `wayland-backend.so` / `xdg_wm_base` with **no libinput, no udev, no device enumeration**: a nested compositor reads its PARENT, not evdev. And WSL2 can only run nested or headless compositors, having no DRM to host a libinput seat. ⇒ **P4 is mandatory**; the portal's RemoteDesktop is the only input path here |
+| 2026-08-31 | P1, WSL2 | `portal=no-screencast — xdg-desktop-portal is running but exposes no ScreenCast — install the backend matching your compositor`. The FR-36 case, now named rather than guessed at |
+| 2026-08-31 | P1, Asahi **as root** | `portal=no-session-bus`. ⚠️ **This is the architecture, not a test artefact** — the daemon is root, the portal is per-user-session, so P2/P3 need a session-resident component before any PipeWire code |
+| 2026-08-31 | P1, Asahi **inside the GNOME Wayland session** | `portal=no-screencast`, **independently confirmed with `busctl`** (lists Account, Camera, FileChooser, Notification … but neither ScreenCast nor RemoteDesktop) despite `xdg-desktop-portal-gnome` being installed. ⛔ **No fleet host currently exposes the interface P2 would call.** FR-36 blamed an X11 session for this; it reproduces under Wayland, so that explanation was wrong |

@@ -3712,6 +3712,16 @@ async fn capture_smoke_cmd(
         "always" => DownscalePolicy::Always,
         other => bail!("unknown --downscale {other:?} (never|auto|always)"),
     };
+    // FR-45 P1 — say whether the desktop portal could have served this host.
+    // Printed BEFORE the cascade runs, because the useful question when a
+    // Wayland host falls through to X11 is "was the portal even an option?",
+    // and answering it should not require opening a session.
+    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    {
+        let st = roomlerd::capture::portal::detect();
+        println!("capture-smoke: portal={st} — {}", st.advice());
+    }
+
     let mut cap = capture::open_default(fps.max(1), policy);
     let mut delivered = 0u32;
     let mut empty = 0u32;
