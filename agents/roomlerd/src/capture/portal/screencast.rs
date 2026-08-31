@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 //! FR-45 P2b — open a ScreenCast session through the desktop portal.
+//! FR-45 P4 — or a **RemoteDesktop** session, which is a ScreenCast session
+//! that can also inject input.
 //!
 //! [P2a](super::helper) established that the daemon can *reach* the portal, by
 //! running a helper inside the console user's session. This is what that helper
-//! goes on to do: the four-step ScreenCast handshake, ending with a PipeWire
-//! node id and a connection fd.
+//! goes on to do: the four-step handshake, ending with a PipeWire node id and a
+//! connection fd.
 //!
 //! ## The Request/Response pattern, and the one way to get it wrong
 //!
@@ -18,6 +20,25 @@
 //! request path is derivable in advance (that is why `handle_token` exists),
 //! and arming afterwards is a race the portal wins whenever it answers without
 //! asking anyone — exactly the restore-token case this phase depends on.
+//!
+//! ## How input changes the handshake (P4) — and how it deliberately doesn't
+//!
+//! A RemoteDesktop session is not a second session next to the capture one: it
+//! is the SAME session, created and started through the RemoteDesktop
+//! interface instead, with `SelectDevices` slotted in before the unchanged
+//! `SelectSources`. One session means one consent dialog covering both "see"
+//! and "touch", one restore token, and one PipeWire stream — the shape
+//! gnome-remote-desktop uses. `Start` and `CreateSession` move to the
+//! interface that owns the session; `SelectSources` and `OpenPipeWireRemote`
+//! stay on ScreenCast, addressed at the shared session path.
+//!
+//! ⚠️ Persistence moves with ownership: an input session persists through
+//! `SelectDevices.persist_mode` (RemoteDesktop v2+), NOT through
+//! `SelectSources` — the portal ignores ScreenCast persistence options on a
+//! remote desktop session. And the two grants are stored apart
+//! ([`TokenStore`]): a capture-only token cannot restore an input session,
+//! and quietly widening a stored "see" grant into "see and touch" without a
+//! dialog is exactly what must not happen.
 //!
 //! ## 🔑 The PipeWire fd stays HERE
 //!
@@ -50,7 +71,7 @@ use std::time::Instant;
 
 use zbus::zvariant::{OwnedValue, Value};
 
-use super::{PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE};
+use super::{PORTAL_BUS, PORTAL_PATH, REMOTE_DESKTOP_IFACE, SCREENCAST_IFACE};
 
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
 
@@ -66,7 +87,14 @@ const SOURCE_MONITOR: u32 = 1;
 const CURSOR_HIDDEN: u32 = 1;
 const CURSOR_EMBEDDED: u32 = 2;
 
-/// `SelectSources.persist_mode` — persist until the user revokes it.
+/// `SelectDevices.types` — the RemoteDesktop device kinds we ask for. No
+/// touchscreen (4): nothing on the wire maps to it yet (`InputMsg::Touch` is
+/// dropped by every backend), and asking for a grant nothing uses widens the
+/// consent dialog for no capability.
+const DEVICE_KEYBOARD: u32 = 1;
+const DEVICE_POINTER: u32 = 2;
+
+/// `persist_mode` — persist until the user revokes it.
 ///
 /// This is what makes the phase testable without a human in the loop twice:
 /// the first `Start` prompts and hands back a `restore_token`; a later start
@@ -77,14 +105,29 @@ const PERSIST_UNTIL_REVOKED: u32 = 2;
 const RESPONSE_OK: u32 = 0;
 const RESPONSE_CANCELLED: u32 = 1;
 
+/// What kind of session to open. It changes which portal interface OWNS the
+/// session — and therefore what the consent dialog asks for and which token
+/// store the grant lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// ScreenCast only: pixels, no input. Detection, `capture-smoke`, and the
+    /// kill-switch (`ROOMLERD_PORTAL_INPUT=0`) path.
+    CaptureOnly,
+    /// RemoteDesktop: the same pixels, plus keyboard+pointer injection.
+    WithInput,
+}
+
 /// One screencast stream the portal handed us.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StreamInfo {
     /// The PipeWire node to attach to. The whole point of the handshake.
     pub node_id: u32,
     /// Advertised size, when the portal gives one. `None` is not an error —
-    /// the authoritative size comes from PipeWire's format negotiation in P3,
-    /// and treating this as authoritative would bake in a guess.
+    /// the authoritative PIXEL size comes from PipeWire's format negotiation
+    /// in P3. ⚠️ For input this pair is not a fallback but the primary: it is
+    /// the stream's LOGICAL size, the coordinate space
+    /// `NotifyPointerMotionAbsolute` expects, and under a HiDPI scale factor
+    /// it differs from the pixel size.
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub source_type: Option<u32>,
@@ -116,6 +159,13 @@ pub struct SessionReport {
     /// makes "did it prompt?" answerable: a restored session returns in
     /// milliseconds, a prompted one takes as long as a human takes.
     pub restore_token_sent: bool,
+    /// P4 — whether the portal granted input devices on this session. Always
+    /// `false` for [`SessionKind::CaptureOnly`]; for `WithInput` it reports
+    /// what `Start` actually returned, because a compositor may grant the
+    /// pixels and not the devices. `serde(default)` so a report from an older
+    /// helper reads as "no input", never as a parse failure.
+    #[serde(default)]
+    pub input_granted: bool,
     pub elapsed_ms: u64,
     /// What the portal says it can do, for the log. Cheap, and the difference
     /// between "we chose hidden" and "hidden was all it had".
@@ -170,28 +220,43 @@ impl OpenError {
 /// *"Cannot start a runtime from within a runtime"*, before any portal call
 /// was made. The guard belongs HERE rather than at each call site, so the next
 /// entry point cannot reintroduce it.
-pub fn open() -> Result<Session, OpenError> {
-    std::thread::spawn(open_blocking)
+pub fn open(kind: SessionKind) -> Result<Session, OpenError> {
+    std::thread::spawn(move || open_blocking(kind))
         .join()
         .unwrap_or_else(|_| Err(OpenError::failed("the portal handshake thread panicked")))
 }
 
-fn open_blocking() -> Result<Session, OpenError> {
+fn open_blocking(kind: SessionKind) -> Result<Session, OpenError> {
     let started = Instant::now();
     // 🔑 The token is loaded and stored HERE, so it never leaves this module.
     // A caller that cannot hold the credential cannot leak it — which is a
     // stronger guarantee than a caller that holds it and is careful.
-    let store = TokenStore::for_current_user();
+    let store = TokenStore::for_current_user(kind);
     let restore_token = store.load();
     let restore_token = restore_token.as_deref();
     let restore_token_sent = restore_token.is_some();
     let conn = zbus::blocking::Connection::session()
         .map_err(|e| OpenError::failed(format!("session bus: {e}")))?;
-    let portal = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE)
+    let screencast = zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, SCREENCAST_IFACE)
         .map_err(|e| OpenError::failed(format!("portal proxy: {e}")))?;
 
-    let available_cursor_modes = portal.get_property::<u32>("AvailableCursorModes").ok();
-    let available_source_types = portal.get_property::<u32>("AvailableSourceTypes").ok();
+    // The proxy that OWNS the session: CreateSession and Start go through it.
+    // For an input session that is RemoteDesktop; SelectSources and
+    // OpenPipeWireRemote stay on ScreenCast either way, addressed at the
+    // shared session path.
+    let remote_desktop;
+    let owner = match kind {
+        SessionKind::CaptureOnly => &screencast,
+        SessionKind::WithInput => {
+            remote_desktop =
+                zbus::blocking::Proxy::new(&conn, PORTAL_BUS, PORTAL_PATH, REMOTE_DESKTOP_IFACE)
+                    .map_err(|e| OpenError::failed(format!("remote-desktop proxy: {e}")))?;
+            &remote_desktop
+        }
+    };
+
+    let available_cursor_modes = screencast.get_property::<u32>("AvailableCursorModes").ok();
+    let available_source_types = screencast.get_property::<u32>("AvailableSourceTypes").ok();
 
     // Ask for an embedded cursor when the portal offers one — matching what
     // the DRM backend produces — and fall back rather than failing, since a
@@ -201,45 +266,81 @@ fn open_blocking() -> Result<Session, OpenError> {
         _ => CURSOR_HIDDEN,
     };
 
-    // ── 1. CreateSession ────────────────────────────────────────────────
+    // ── 1. CreateSession — on the owning interface ──────────────────────
     let (req_token, sess_token) = (next_token("cs"), next_token("ss"));
     let mut opts: HashMap<&str, Value> = HashMap::new();
     opts.insert("handle_token", Value::from(req_token.as_str()));
     opts.insert("session_handle_token", Value::from(sess_token.as_str()));
-    let results = call_with_response(&conn, &portal, "CreateSession", &(opts,), &req_token)?;
+    let results = call_with_response(&conn, owner, "CreateSession", &(opts,), &req_token)?;
     let session_handle = results
         .get("session_handle")
         .and_then(string_of)
         .ok_or_else(|| OpenError::failed("CreateSession returned no session_handle"))?;
+    // ⚠️ `session_handle` is an object path on the wire, not a string. Sending
+    // it as `s` is accepted by serde and rejected by the portal with a
+    // signature mismatch that names neither the argument nor the call.
+    let sess_path = object_path(&session_handle)?;
 
-    // ── 2. SelectSources ────────────────────────────────────────────────
+    // ── 1b. SelectDevices — input sessions only ─────────────────────────
+    //
+    // Persistence rides HERE for an input session (RemoteDesktop v2+), not on
+    // SelectSources: one session, one grant, one token — covering both the
+    // pixels and the devices. On v1 there is nothing to persist through, so
+    // the session works but prompts every time, and saying so beats silence.
+    if kind == SessionKind::WithInput {
+        let rd_version = owner.get_property::<u32>("version").ok();
+        let persistable = rd_version.is_some_and(|v| v >= 2);
+        if !persistable {
+            tracing::warn!(
+                ?rd_version,
+                "portal: RemoteDesktop cannot persist grants — every session will prompt"
+            );
+        }
+        let req_token = next_token("dev");
+        let mut opts: HashMap<&str, Value> = HashMap::new();
+        opts.insert("handle_token", Value::from(req_token.as_str()));
+        opts.insert("types", Value::from(DEVICE_KEYBOARD | DEVICE_POINTER));
+        if persistable {
+            opts.insert("persist_mode", Value::from(PERSIST_UNTIL_REVOKED));
+            if let Some(tok) = restore_token {
+                opts.insert("restore_token", Value::from(tok));
+            }
+        }
+        call_with_response(
+            &conn,
+            owner,
+            "SelectDevices",
+            &(&sess_path, opts),
+            &req_token,
+        )?;
+    }
+
+    // ── 2. SelectSources — always on ScreenCast ─────────────────────────
     let req_token = next_token("sel");
     let mut opts: HashMap<&str, Value> = HashMap::new();
     opts.insert("handle_token", Value::from(req_token.as_str()));
     opts.insert("types", Value::from(SOURCE_MONITOR));
     opts.insert("multiple", Value::from(false));
     opts.insert("cursor_mode", Value::from(cursor_mode));
-    opts.insert("persist_mode", Value::from(PERSIST_UNTIL_REVOKED));
-    if let Some(tok) = restore_token {
-        opts.insert("restore_token", Value::from(tok));
+    if kind == SessionKind::CaptureOnly {
+        opts.insert("persist_mode", Value::from(PERSIST_UNTIL_REVOKED));
+        if let Some(tok) = restore_token {
+            opts.insert("restore_token", Value::from(tok));
+        }
     }
-    // ⚠️ `session_handle` is an object path on the wire, not a string. Sending
-    // it as `s` is accepted by serde and rejected by the portal with a
-    // signature mismatch that names neither the argument nor the call.
-    let sess_path = object_path(&session_handle)?;
     call_with_response(
         &conn,
-        &portal,
+        &screencast,
         "SelectSources",
         &(&sess_path, opts),
         &req_token,
     )?;
 
-    // ── 3. Start — this is the step that can show a dialog ───────────────
+    // ── 3. Start — on the owner; this is the step that can show a dialog ─
     let req_token = next_token("start");
     let mut opts: HashMap<&str, Value> = HashMap::new();
     opts.insert("handle_token", Value::from(req_token.as_str()));
-    let results = call_with_response(&conn, &portal, "Start", &(&sess_path, "", opts), &req_token)?;
+    let results = call_with_response(&conn, owner, "Start", &(&sess_path, "", opts), &req_token)?;
 
     let streams = results
         .get("streams")
@@ -250,6 +351,20 @@ fn open_blocking() -> Result<Session, OpenError> {
         return Err(OpenError::failed(
             "the portal granted the request but returned no streams",
         ));
+    }
+    // What the compositor actually granted — asked-for is not given. A
+    // capture-only session honestly reports no input rather than absent-means
+    // -whatever.
+    let devices_granted = match kind {
+        SessionKind::CaptureOnly => 0,
+        SessionKind::WithInput => results.get("devices").and_then(u32_of).unwrap_or(0),
+    };
+    let input_granted = devices_granted & (DEVICE_KEYBOARD | DEVICE_POINTER) != 0;
+    if kind == SessionKind::WithInput && !input_granted {
+        tracing::warn!(
+            devices_granted,
+            "portal: the session started but no input devices were granted — capture only"
+        );
     }
     // Persisted immediately, before anything is reported: a caller that reads
     // the report and re-runs must find the token already on disk, or the
@@ -272,7 +387,7 @@ fn open_blocking() -> Result<Session, OpenError> {
     // The fd is KEPT from P3a onward. It is the connection to the session's
     // PipeWire, and it is what `pipewire::probe` (and later the stream) uses.
     // It never travels to the daemon — see the module docs.
-    let pipewire_fd = match portal.call_method(
+    let pipewire_fd = match screencast.call_method(
         "OpenPipeWireRemote",
         &(&sess_path, HashMap::<&str, Value>::new()),
     ) {
@@ -295,6 +410,7 @@ fn open_blocking() -> Result<Session, OpenError> {
             restore_token_stored,
             pipewire_fd_ok: pipewire_fd.is_some(),
             restore_token_sent,
+            input_granted,
             elapsed_ms: started.elapsed().as_millis() as u64,
             cursor_mode_used: cursor_mode,
             available_cursor_modes,
@@ -303,11 +419,12 @@ fn open_blocking() -> Result<Session, OpenError> {
             pipewire: super::pipewire::PipeWireStatus::NotAttempted,
         },
         pipewire_fd,
-        _conn: conn,
+        input_session: input_granted.then(|| sess_path.into()),
+        conn,
     })
 }
 
-/// An opened session: what to report, plus the thing that cannot be reported.
+/// An opened session: what to report, plus the things that cannot be reported.
 ///
 /// ⚠️ The fd is deliberately outside [`SessionReport`], which is the
 /// serialisable half. A file descriptor cannot cross that boundary and — per
@@ -319,6 +436,10 @@ pub struct Session {
     /// can succeed and still leave no connection, which is why
     /// `pipewire_fd_ok` is reported rather than assumed.
     pub pipewire_fd: Option<std::os::fd::OwnedFd>,
+    /// P4 — the session's object path, present exactly when input devices
+    /// were granted. What [`super::input::InputContext`] addresses `Notify*`
+    /// calls at.
+    pub input_session: Option<zbus::zvariant::OwnedObjectPath>,
     /// ⚠️⚠️ **Holding this open is what keeps the PipeWire node alive.**
     ///
     /// A portal session is owned by the D-Bus connection that created it. Drop
@@ -329,9 +450,17 @@ pub struct Session {
     ///
     /// Measured, not guessed: the first field run of P3b-ii failed exactly
     /// that way because this field did not exist and the connection died when
-    /// `open_blocking` returned. The underscore is deliberate — nothing reads
-    /// it, and removing it "because it is unused" re-breaks capture.
-    _conn: zbus::blocking::Connection,
+    /// `open_blocking` returned. Private on purpose — [`Self::connection`]
+    /// hands out a borrow for the input path, and nothing can *take* it.
+    conn: zbus::blocking::Connection,
+}
+
+impl Session {
+    /// The connection the session lives on. The input pump builds its
+    /// RemoteDesktop proxy over this — same connection, same session.
+    pub fn connection(&self) -> &zbus::blocking::Connection {
+        &self.conn
+    }
 }
 
 /// Where the portal's `restore_token` lives between runs.
@@ -343,6 +472,11 @@ pub struct Session {
 /// helper already runs as them, so it reads and writes this itself and the
 /// token never reaches the daemon at all.
 ///
+/// ⚠️ **One file per session kind.** An input session's token attests a wider
+/// grant ("see and touch") than a capture session's ("see"), and the portal
+/// will not restore a session of one shape from the other's token anyway —
+/// sharing the file would just burn whichever grant was stored first.
+///
 /// ⚠️ Mode 0600, and the directory 0700, for the same reason `config.toml` is:
 /// anything that can read it can re-open the grant.
 pub struct TokenStore {
@@ -350,9 +484,9 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
-    /// `$XDG_STATE_HOME/roomler/portal-restore-token`, falling back to the
-    /// spec's default of `$HOME/.local/state`.
-    pub fn for_current_user() -> Self {
+    /// `$XDG_STATE_HOME/roomler/portal-restore-token[-rd]`, falling back to
+    /// the spec's default of `$HOME/.local/state`.
+    pub fn for_current_user(kind: SessionKind) -> Self {
         let base = std::env::var_os("XDG_STATE_HOME")
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_absolute())
@@ -361,8 +495,12 @@ impl TokenStore {
                     .map(|h| std::path::PathBuf::from(h).join(".local").join("state"))
             })
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let file = match kind {
+            SessionKind::CaptureOnly => "portal-restore-token",
+            SessionKind::WithInput => "portal-restore-token-rd",
+        };
         Self {
-            path: base.join("roomler").join("portal-restore-token"),
+            path: base.join("roomler").join(file),
         }
     }
 
@@ -491,6 +629,15 @@ fn string_of(v: &OwnedValue) -> Option<String> {
     match <&Value>::from(v) {
         Value::Str(s) => Some(s.to_string()),
         Value::ObjectPath(p) => Some(p.to_string()),
+        _ => None,
+    }
+}
+
+/// A `u32` out of an `a{sv}` value — the `devices` bitmask in a Start
+/// response.
+fn u32_of(v: &OwnedValue) -> Option<u32> {
+    match <&Value>::from(v) {
+        Value::U32(n) => Some(*n),
         _ => None,
     }
 }
@@ -670,6 +817,16 @@ mod tests {
         assert_eq!(got[0].width, None);
     }
 
+    /// The `devices` bitmask arrives boxed in a variant like every `a{sv}`
+    /// value; a non-u32 there reads as "nothing granted", never a panic.
+    #[test]
+    fn devices_bitmask_is_plucked_or_refused() {
+        let n = OwnedValue::try_from(Value::from(3u32)).unwrap();
+        assert_eq!(u32_of(&n), Some(3));
+        let s = OwnedValue::try_from(Value::from("3")).unwrap();
+        assert_eq!(u32_of(&s), None);
+    }
+
     /// The token is a standing grant to screencast someone's desktop without
     /// asking again. It round-trips, and it lands 0600 — anything that can
     /// read it can re-open the grant.
@@ -718,11 +875,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The two grants live in DIFFERENT files: an input token attests more
+    /// than a capture token, and sharing the file would burn whichever grant
+    /// was stored first.
+    #[test]
+    fn token_stores_are_separated_by_session_kind() {
+        let cap = TokenStore::for_current_user(SessionKind::CaptureOnly);
+        let inp = TokenStore::for_current_user(SessionKind::WithInput);
+        assert_ne!(cap.path, inp.path);
+        assert!(
+            inp.path
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().ends_with("-rd")),
+            "the input store is the -rd file"
+        );
+    }
+
     /// Cancelled has to stay distinguishable from a fault all the way out:
     /// a person saying no must never be retried as a transient error.
     #[test]
     fn cancelled_reads_as_a_person_not_a_fault() {
         assert!(OpenError::Cancelled.to_string().contains("declined"));
         assert_ne!(OpenError::Cancelled, OpenError::Ended);
+    }
+
+    /// A report serialised WITHOUT `input_granted` (an older helper) must
+    /// deserialise as "no input", never fail — the daemon and helper can skew
+    /// by one revision across an update.
+    #[test]
+    fn a_report_without_input_granted_reads_as_no_input() {
+        let json = r#"{
+            "streams": [],
+            "restore_token_stored": false,
+            "pipewire_fd_ok": false,
+            "restore_token_sent": false,
+            "elapsed_ms": 1,
+            "cursor_mode_used": 1,
+            "available_cursor_modes": null,
+            "available_source_types": null,
+            "pipewire": "NotAttempted"
+        }"#;
+        let r: SessionReport = serde_json::from_str(json).unwrap();
+        assert!(!r.input_granted);
     }
 }

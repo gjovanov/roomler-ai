@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. P4 (RemoteDesktop input) next · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. P4 (RemoteDesktop input) BUILT — field verification pending · **Owner:** agent / capture
 
 ## Goal
 
@@ -61,7 +61,7 @@ on a machine with no scanout. The backend priority stays
 | **P3b-ii** ✅ | `pw_stream_new`/`add_listener`/`connect` with the EnumFormat param, and the parser `param_changed` needs. **This validates P3b-i** — PipeWire parsed the hand-written POD. Field-verified as root: **negotiated BGRx 1920x1080 (libpipewire 1.4.11) in 12 ms**, and BGRx was our first preference. | same |
 | **P3c-i** ✅ | `process` → `pw_stream_dequeue_buffer` → inspect → queue back. **A picture exists.** Field-verified as root: 3 frames, **MemFd**, stride 7680 (= 1920x4), 8 294 400 bytes (= a full frame), **8291/8320 sampled bytes non-zero**, and the checksum CHANGES between runs — live pixels, not a constant. | same |
 | **P3c-ii** ✅ | Frames to the daemon and the **sixth `ScreenCapture` backend**, picked after DRM and before X11. ⚠️ A pipe and a copy, **not** `SCM_RIGHTS` — see the corrected decision below. Field-verified through `capture-smoke` as root: `backend=portal`, **delivered=5 empty=0**, 1920x1080 Bgra, `mean_ms=27.70`, and the dumped frame is a correct picture. | `ROOMLERD_PORTAL_CAPTURE=1` |
-| **P4** ⚠️ MANDATORY | Input via the portal's **RemoteDesktop** interface. Measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. ScreenCast + RemoteDesktop is therefore a pair, not capture-only. | separate flag |
+| **P4** 🔨 BUILT (2026-09-01, unverified in the field) | Input via the portal's **RemoteDesktop** interface, riding the SAME session as capture — `CreateSession`/`Start` move to RemoteDesktop, `SelectDevices` (keyboard+pointer, persist on v2+) slots in before the unchanged `SelectSources`, so ONE consent dialog covers see+touch and one restore token covers both (stored apart from the capture-only token: `portal-restore-token-rd`). The daemon's input arbiter forwards `InputMsg` JSON lines to the helper's stdin; the helper maps them to `Notify*` (evdev keycodes via the shared FR-36 table; typed text as Unicode keysyms, layout-proof; absolute motion in the stream's LOGICAL size). Falls back to capture-only where the portal has no RemoteDesktop (wlr, measured). Motivation measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. | `ROOMLERD_PORTAL_INPUT=0` (config `portal_input`) |
 
 ### The seam is unchanged
 
@@ -248,7 +248,40 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
   not a picture.
 - **P3b** — format negotiation (SPA PODs) and buffer delivery, then the sixth
   `ScreenCapture` backend.
-- **P4** — RemoteDesktop input in the same helper and the same session.
+- **P4** — RemoteDesktop input in the same helper and the same session. BUILT
+  2026-09-01; the design decisions worth knowing before editing:
+  - **One session, both halves.** `SessionKind::WithInput` re-homes
+    `CreateSession`/`Start` onto RemoteDesktop and adds `SelectDevices`;
+    `SelectSources`/`OpenPipeWireRemote` stay on ScreenCast against the shared
+    session path. One dialog, one token, one PipeWire node.
+  - **The input wire is `InputMsg` JSON lines on the helper's stdin.** Same
+    binary both ends, serde already on the type, so no second wire enum and no
+    version-skew surface; an unparseable line costs that event only.
+  - **Routing is per-event, not per-backend-choice**
+    (`portal::input_route::try_route` in the arbiter's single inject funnel):
+    the OS injector is created lazily at the FIRST event while the portal
+    capture opens concurrently, so a one-time choice would race startup.
+    Registration is generation-checked so a stale capture `Drop` cannot tear
+    down its successor's route. Overload DROPS rather than falling through —
+    splitting one gesture across two injection backends is worse than a lost
+    event.
+  - **Keys are evdev keycodes** (`NotifyKeyboardKeycode`, the shared
+    `input::hid_evdev` table FR-36 built — moved out of the uinput backend
+    because the two consumers sit behind different features). **Typed text is
+    Unicode keysyms** (`NotifyKeyboardKeysym`, codepoint+0x01000000 above
+    Latin-1) — layout-proof, the exact property the uinput backend cannot
+    offer.
+  - **Absolute motion is addressed in the stream's LOGICAL size** (the
+    portal's advertised stream size), not the negotiated pixel size — they
+    differ under a HiDPI scale factor. Wire coords are normalised 0..1, so
+    the conversion is one multiply in the helper.
+  - ⚠️ **Axis sign follows libinput (positive = down/right), NOT evdev** —
+    copying the uinput backend's REL_WHEEL inversion here scrolls backwards.
+    Pinned by a unit test; still needs a field check.
+  - ⚠️ `ROOMLERD_PORTAL_INPUT` defaults **ON** (unlike the capture flag): it
+    is inert unless a portal capture is already live, and on those hosts the
+    portal is the only input path with a reader behind it — a capture-only
+    default would ship a read-only session and call it working.
 
 ## Acceptance criteria
 
@@ -278,6 +311,15 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 - [x] Field-verified with the **before** state recorded beside the after — done for P2a (`no-session-bus` → `available`, with an in-session control); each later phase repeats it
 - [ ] The spec and the UI both say **attended-only** — no greeter, no locked
       screen
+- [ ] **P4: input lands.** On a portal-captured GNOME Wayland session, pointer
+      motion/click and typed text injected from the controller visibly act on
+      the host (cursor moves in the captured frames — cursor_mode=embedded
+      makes this self-evidencing), scroll direction is CORRECT (the sign
+      convention is a unit test, not yet a field fact), and
+      `ROOMLERD_PORTAL_INPUT=0` restores a view-only session
+- [ ] **P4: one dialog, then none.** The first input session shows ONE consent
+      dialog covering screen+devices; the next session restores from
+      `portal-restore-token-rd` without prompting (RemoteDesktop v2+)
 
 ## Open decisions
 
@@ -365,3 +407,4 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-09-01 | **⛔ WSL2 is blocked one layer DEEPER than the FR thought** | `xdg-desktop-portal-wlr`: `unable to receive a valid format from wlr_screencopy`. Cause, from sway's own log: `drmGetDevices2 failed: No such file or directory` — **no `/dev/dri` ⇒ wlroots has no renderer ⇒ screencopy can advertise no buffer format.** Reproduced on the **wayland (nested)** AND **headless** backends, and with the default AND **`WLR_RENDERER=pixman`** software renderers. 🔑 So the same missing `/dev/dri` that blocked FR-36's DRM path also blocks the PORTAL path on WSL2 — the portal was supposed to be the way around it, and it is not |
 | 2026-09-01 | **⚠️ And the wlr backend has NO RemoteDesktop at all** | `wlr.portal` declares `Interfaces=…Screenshot;…ScreenCast;` only. Our detector reported it correctly — **the first field exercise of the `remote_desktop=false` branch**: “ScreenCast available but NO RemoteDesktop — capture would be read-only”. ⇒ **P4 cannot be delivered through wlr**, so WSL2 has no portal input path either, on top of having no capture |
 | 2026-09-01 | P3b-i validated a second time, for free | The wlr backend logged our `SelectSources` options straight back: `types:1  multiple:0  cursor_mode:2  persist_mode:2` — exactly what we sent. That is a **second, independent implementation parsing the hand-written POD**, on a different compositor stack from the one that validated it first. The error taxonomy held too: `Ended`, not `Cancelled`, because nobody declined — the portal gave up |
+| 2026-09-01 | **P4 BUILT — compile+unit-tested, NOT yet field-run** | RemoteDesktop input riding the capture session: arbiter → helper stdin (`InputMsg` JSON lines) → `Notify*`. Unit-locked: HID→evdev via the shared FR-36 table, Unicode keysyms for typed text, logical-size coordinate scaling, wheel detent accumulation, the libinput axis sign, route registration generations. Config keys `portal_capture`/`portal_input` added to the surface (the P3c env `ROOMLERD_PORTAL_CAPTURE` had NO config key — closed against the standing rule). Pending: the Asahi GNOME field run — dialog wording, devices actually granted, restore-token round trip, scroll SIGN, HiDPI logical-vs-pixel scaling on a 2× panel |
