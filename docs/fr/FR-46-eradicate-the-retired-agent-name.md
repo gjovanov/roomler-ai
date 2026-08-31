@@ -95,17 +95,17 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | # | phase | kill switch | status |
 |---|---|---|---|
 | P0 | spec + issue + taxonomy decision | — | **this doc** |
-| P1a | split the marker; reclassify every marker; guard `live` down / `record` exact | revert the audit script | |
+| P1a | split the marker into ANCHOR (live) / `RETIRED-NAME-RECORD` (history); `records` pinned exactly so nothing can be laundered | revert the audit script | **shipped** |
 | P1b | publish daemon assets as `roomlerd-*`; move the workflow guard | revert the workflow; assets are additive | |
 | P2 | cheap classes: env prefix deprecation, log filenames, install/staging paths, e2e image, `TermsView`, wizard PATH | per-item revert | |
 | P3 | re-enrollment classes: appdirs trees, Windows service + task, install folder, systemd `ReadWritePaths` | staged rollout + rollback build | |
 | P4 | wire values (QUIC ALPN, WebRTC stream id) — dual-accept window, then cleanup | dual-accept stays until cleanup | |
 | P5 | macOS bundle (D1) — one host, verified, then fleet | do not proceed past host 1 | |
-| P6 | retire the machinery: `live=0`, guard flips to record-only | — | |
+| P6 | retire the machinery: `anchors=0`, guard flips to record-only | — | |
 
 ## Acceptance criteria
 
-- [ ] `name-audit.sh` reports **`live = 0`** and CI blocks on it
+- [ ] `name-audit.sh` reports **`anchors = 0`** — the counter is the LIVE class — and CI blocks on it
 - [ ] no runtime path, service name, scheduled task, env var, log filename, wire value or
       bundle identity read or written by shipping code contains a retired name
 - [ ] every remaining occurrence is `RECORD`-classified with a stated reason, and the record
