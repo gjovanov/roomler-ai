@@ -158,7 +158,21 @@ enum Command {
     /// shell answers a *different* question — whether YOUR session has a
     /// portal — which is why it is hidden.
     #[command(hide = true, name = "portal-helper")]
-    PortalHelper,
+    PortalHelper {
+        /// FR-45 P2b — instead of just detecting, open a ScreenCast session
+        /// and report its PipeWire node id. ⚠️ Shows a consent dialog on the
+        /// first run; later runs carry a restore token and do not.
+        #[arg(long)]
+        screencast: bool,
+    },
+    /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
+    /// the session helper and print what came back.
+    ///
+    /// The root-side counterpart to `portal-helper --screencast`: this is the
+    /// path the capture cascade will take, so it is the one worth testing.
+    /// ⚠️ Blocks while a person answers the consent dialog.
+    #[command(hide = true, name = "portal-session")]
+    PortalSession,
     /// (internal, macOS) The body of the `com.roomler.update` LaunchDaemon:
     /// consume the wake file, then check → download → verify → run
     /// `installer -pkg … -target /` as root, waiting on it. Root-only and
@@ -1000,10 +1014,51 @@ async fn daemon_main() -> Result<()> {
             roomlerd::encode::caps::print_probe_result();
             Ok(())
         }
-        Command::PortalHelper => {
+        Command::PortalSession => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                roomlerd::capture::portal::helper::run();
+                match roomlerd::capture::portal::helper::open_session() {
+                    Ok(r) => {
+                        println!("portal-session: {} stream(s)", r.streams.len());
+                        for s in &r.streams {
+                            println!(
+                                "  node_id={} size={}",
+                                s.node_id,
+                                match (s.width, s.height) {
+                                    (Some(w), Some(h)) => format!("{w}x{h}"),
+                                    // Absent is normal — PipeWire's own format
+                                    // negotiation is authoritative, not this.
+                                    _ => "(not advertised)".into(),
+                                }
+                            );
+                        }
+                        println!(
+                            "  pipewire_fd_ok={} restore_token={} sent_token={} elapsed={}ms",
+                            r.pipewire_fd_ok,
+                            // ⚠️ Never print the token itself: it is a standing
+                            // grant, and this output goes to a daemon log.
+                            if r.restore_token.is_some() {
+                                "yes (stored)"
+                            } else {
+                                "no"
+                            },
+                            r.restore_token_sent,
+                            r.elapsed_ms
+                        );
+                        Ok(())
+                    }
+                    Err(e) => anyhow::bail!("portal-session: {e}"),
+                }
+            }
+            #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
+            {
+                anyhow::bail!("portal-session is Linux-only and needs the `portal-capture` feature")
+            }
+        }
+        Command::PortalHelper { screencast } => {
+            #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+            {
+                roomlerd::capture::portal::helper::run(screencast);
                 Ok(())
             }
             // A build without the feature must say so rather than exit 0 with
@@ -1012,6 +1067,7 @@ async fn daemon_main() -> Result<()> {
             // answer from "this binary cannot ask".
             #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
             {
+                let _ = screencast;
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \
                      build cannot query the desktop portal"

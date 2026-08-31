@@ -31,12 +31,15 @@
 //! carries none of that hazard, which is why detection can land ahead of the
 //! decision about how to reach PipeWire.
 
+/// FR-45 P2b — the ScreenCast handshake itself, run inside the session.
+pub mod screencast;
+
 use std::fmt;
 
 /// The portal's well-known bus name and object path.
-const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
-const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
-const SCREENCAST_IFACE: &str = "org.freedesktop.portal.ScreenCast";
+pub(crate) const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
+pub(crate) const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+pub(crate) const SCREENCAST_IFACE: &str = "org.freedesktop.portal.ScreenCast";
 const REMOTE_DESKTOP_IFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 
 /// What we found, in enough detail to act on.
@@ -252,6 +255,11 @@ pub mod helper {
     /// and would be mistaken for the result the first time it said anything.
     const MARKER: &str = "ROOMLER_PORTAL_JSON:";
 
+    /// P2b's marker. A **separate** marker rather than a variant inside one
+    /// payload, so a parent asking for detection can never be handed a session
+    /// report (or the reverse) by a helper built from a different revision.
+    const SESSION_MARKER: &str = "ROOMLER_PORTAL_SESSION:";
+
     /// Set in the child's environment; `detect_in_session` refuses to spawn
     /// when it sees it.
     pub(super) const CHILD_ENV: &str = "ROOMLERD_PORTAL_CHILD";
@@ -262,13 +270,17 @@ pub mod helper {
     /// This is a backstop against a hung bus, not a performance budget.
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-    /// The `portal-helper` child's entire job, for P2a: detect, print one
-    /// marked line. It grows a ScreenCast session in P2b.
+    /// The `portal-helper` child's entire job: do one thing inside the
+    /// session, print one marked line.
     ///
     /// The human-readable line goes to **stderr**, which the parent inherits,
     /// so the daemon's log carries the child's own account of what it saw next
     /// to the parent's verdict. Same reasoning as the caps probe.
-    pub fn run() {
+    pub fn run(screencast: bool) {
+        if screencast {
+            run_screencast();
+            return;
+        }
         let st = super::detect();
         eprintln!("portal-helper: {st} — {}", st.advice());
         match serde_json::to_string(&st) {
@@ -283,28 +295,103 @@ pub mod helper {
         }
     }
 
+    /// P2b — open a ScreenCast session and report it.
+    ///
+    /// 🔑 **The restore token is read and written HERE, by the child, never by
+    /// the daemon.** It is a standing grant the person at the screen gave to
+    /// *their* session; it lives in their own state directory at 0600 and has
+    /// no reason to travel to a root process. Keeping it on this side of the
+    /// boundary also means the daemon cannot leak or log it.
+    fn run_screencast() {
+        let store = super::screencast::TokenStore::for_current_user();
+        let existing = store.load();
+        eprintln!(
+            "portal-helper: opening a ScreenCast session (restore token: {})",
+            if existing.is_some() {
+                "present, expecting no dialog"
+            } else {
+                "none — the person at the screen will be asked"
+            }
+        );
+
+        let outcome = super::screencast::open(existing.as_deref());
+        if let Ok(report) = &outcome
+            && let Some(tok) = &report.restore_token
+        {
+            // Persist BEFORE reporting: a parent that reads the report and
+            // immediately re-runs must find the token already on disk, or the
+            // second run prompts again and the whole point is lost.
+            if let Err(e) = store.save(tok) {
+                eprintln!("portal-helper: could not persist the restore token: {e}");
+            }
+        }
+        match &outcome {
+            Ok(r) => eprintln!(
+                "portal-helper: {} stream(s), node_id={:?}, fd_ok={}, {} ms",
+                r.streams.len(),
+                r.streams.first().map(|s| s.node_id),
+                r.pipewire_fd_ok,
+                r.elapsed_ms
+            ),
+            Err(e) => eprintln!("portal-helper: {e}"),
+        }
+        let wire: Result<super::screencast::SessionReport, super::screencast::OpenError> = outcome;
+        match serde_json::to_string(&wire) {
+            Ok(json) => println!("{SESSION_MARKER}{json}"),
+            Err(e) => eprintln!("portal-helper: could not encode the session report: {e}"),
+        }
+    }
+
     /// Parent side. Every failure — no session, no drop, no spawn, timeout,
     /// unparseable output — resolves to a status rather than an error, because
     /// the caller's question is "can the portal serve this host" and every one
     /// of those answers it with *no*.
     pub(super) fn probe() -> PortalStatus {
+        match spawn_in_session(&[], TIMEOUT) {
+            Ok(text) => parse_marked(&text).unwrap_or_else(|| {
+                PortalStatus::Unknown("the portal helper reported nothing usable".into())
+            }),
+            // Nobody is at this machine's screen. That is not a fault, it IS
+            // the answer, and `NoSessionBus`'s advice already says the portal
+            // is an attended path by design.
+            Err(SpawnError::NoSession) => PortalStatus::NoSessionBus,
+            Err(SpawnError::Other(why)) => PortalStatus::Unknown(why),
+        }
+    }
+
+    /// Why the helper could not be run at all, as distinct from what it said.
+    ///
+    /// `NoSession` is split out because it is the one arm that is a legitimate
+    /// answer rather than a failure, and every caller maps it differently.
+    pub(crate) enum SpawnError {
+        NoSession,
+        Other(String),
+    }
+
+    /// Spawn the helper inside the console user's session and return its
+    /// stdout. Shared by every helper mode, so the session lookup, the
+    /// privilege drop and the deadlock-free drain exist once.
+    ///
+    /// `timeout` is per-mode on purpose: a detection is a few D-Bus round
+    /// trips, while opening a ScreenCast session can legitimately block for as
+    /// long as a human takes to read a consent dialog.
+    pub(crate) fn spawn_in_session(
+        extra_args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<String, SpawnError> {
         let sess = match crate::companion::graphical_session() {
             Ok(s) => s,
             Err(e) => {
-                // Nobody is at this machine's screen. That is not a fault, it
-                // IS the answer, and `NoSessionBus`'s advice already says the
-                // portal is an attended path by design.
-                tracing::debug!(%e, "portal: no graphical session to probe from");
-                return PortalStatus::NoSessionBus;
+                tracing::debug!(%e, "portal: no graphical session to run the helper in");
+                return Err(SpawnError::NoSession);
             }
         };
-        let exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => return PortalStatus::Unknown(format!("resolving our own path: {e}")),
-        };
+        let exe = std::env::current_exe()
+            .map_err(|e| SpawnError::Other(format!("resolving our own path: {e}")))?;
 
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("portal-helper")
+            .args(extra_args)
             .env(CHILD_ENV, "1")
             // The two variables that put a process in a user's session. The
             // uid drop below is what makes them usable: `XDG_RUNTIME_DIR` is
@@ -329,15 +416,14 @@ pub mod helper {
         // child in root's supplementary groups, which is a silent retention
         // bug rather than a visible failure.
         if let Err(e) = crate::exec::drop_to_std(&mut cmd, &sess.name) {
-            return PortalStatus::Unknown(format!(
+            return Err(SpawnError::Other(format!(
                 "cannot run the portal helper as the session's owner: {e}"
-            ));
+            )));
         }
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return PortalStatus::Unknown(format!("spawning the portal helper: {e}")),
-        };
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| SpawnError::Other(format!("spawning the portal helper: {e}")))?;
 
         // Drain stdout on another thread while waiting: a child that filled
         // the pipe would otherwise deadlock against our own wait.
@@ -351,7 +437,7 @@ pub mod helper {
             buf
         });
 
-        let deadline = std::time::Instant::now() + TIMEOUT;
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
@@ -363,19 +449,18 @@ pub mod helper {
                     let _ = child.wait();
                     let _ = reader.join();
                     tracing::warn!(
-                        timeout_s = TIMEOUT.as_secs(),
+                        timeout_s = timeout.as_secs(),
                         "portal: the helper hung — treating the portal as unavailable"
                     );
-                    return PortalStatus::Unknown("the portal helper hung".into());
+                    return Err(SpawnError::Other("the portal helper hung".into()));
                 }
-                Err(e) => return PortalStatus::Unknown(format!("waiting for the helper: {e}")),
+                Err(e) => {
+                    return Err(SpawnError::Other(format!("waiting for the helper: {e}")));
+                }
             }
         }
 
-        let text = reader.join().unwrap_or_default();
-        parse_marked(&text).unwrap_or_else(|| {
-            PortalStatus::Unknown("the portal helper reported nothing usable".into())
-        })
+        Ok(reader.join().unwrap_or_default())
     }
 
     /// Pull the status out of the child's stdout.
@@ -384,10 +469,45 @@ pub mod helper {
     /// chatty child breaks, and the failure looks like an unavailable portal
     /// rather than a parse bug.
     fn parse_marked(out: &str) -> Option<PortalStatus> {
+        parse_marked_as(out, MARKER)
+    }
+
+    /// The generic form. Finds the marked line — never "the last line", which
+    /// breaks the first time anything else writes to stdout — and decodes it.
+    fn parse_marked_as<T: serde::de::DeserializeOwned>(out: &str, marker: &str) -> Option<T> {
         out.lines()
-            .find_map(|l| l.trim().strip_prefix(MARKER))
+            .find_map(|l| l.trim().strip_prefix(marker))
             .and_then(|json| serde_json::from_str(json).ok())
     }
+
+    /// P2b parent side — open a ScreenCast session inside the console user's
+    /// session and return what the helper reports.
+    ///
+    /// ⚠️ The timeout is long because **the first call shows a consent dialog**
+    /// and a person has to answer it. That is not a defect to engineer away:
+    /// it is the property that makes FR-45 an attended path, and the reason
+    /// this can never replace FR-36's greeter and lock-screen capture.
+    /// Subsequent calls carry a restore token and return in milliseconds.
+    pub fn open_session() -> Result<super::screencast::SessionReport, String> {
+        match spawn_in_session(&["--screencast"], SCREENCAST_TIMEOUT) {
+            Ok(text) => match parse_marked_as::<
+                Result<super::screencast::SessionReport, super::screencast::OpenError>,
+            >(&text, SESSION_MARKER)
+            {
+                Some(Ok(report)) => Ok(report),
+                Some(Err(e)) => Err(e.to_string()),
+                None => Err("the portal helper reported no session".into()),
+            },
+            Err(SpawnError::NoSession) => {
+                Err("nobody is at this machine's screen — the portal is an attended path".into())
+            }
+            Err(SpawnError::Other(why)) => Err(why),
+        }
+    }
+
+    /// Long enough for a person to notice a dialog and decide. Beyond this the
+    /// honest reading is that nobody is there, which is a refusal, not a hang.
+    const SCREENCAST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     #[cfg(test)]
     mod tests {
