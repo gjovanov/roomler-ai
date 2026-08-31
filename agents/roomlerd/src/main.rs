@@ -148,6 +148,17 @@ enum Command {
     /// already reports.
     #[command(hide = true, name = "caps-probe")]
     CapsProbe,
+    /// (internal, Linux) FR-45 P2a — run inside the console user's session and
+    /// report the desktop portal's availability as one
+    /// `ROOMLER_PORTAL_JSON:{…}` line.
+    ///
+    /// Spawned by the daemon, never by operators. It exists because the daemon
+    /// is root and the portal is per-user-session: there is no way to ask the
+    /// question from where the daemon stands. Running it by hand from your own
+    /// shell answers a *different* question — whether YOUR session has a
+    /// portal — which is why it is hidden.
+    #[command(hide = true, name = "portal-helper")]
+    PortalHelper,
     /// (internal, macOS) The body of the `com.roomler.update` LaunchDaemon:
     /// consume the wake file, then check → download → verify → run
     /// `installer -pkg … -target /` as root, waiting on it. Root-only and
@@ -988,6 +999,24 @@ async fn daemon_main() -> Result<()> {
         Command::CapsProbe => {
             roomlerd::encode::caps::print_probe_result();
             Ok(())
+        }
+        Command::PortalHelper => {
+            #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+            {
+                roomlerd::capture::portal::helper::run();
+                Ok(())
+            }
+            // A build without the feature must say so rather than exit 0 with
+            // no marked line: the parent would read silence as "the portal is
+            // unavailable on this host", which is a different and misleading
+            // answer from "this binary cannot ask".
+            #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
+            {
+                anyhow::bail!(
+                    "portal-helper is Linux-only and needs the `portal-capture` feature; this \
+                     build cannot query the desktop portal"
+                )
+            }
         }
         Command::UpdateHelper => {
             #[cfg(target_os = "macos")]
@@ -3771,9 +3800,15 @@ async fn capture_smoke_cmd(
     // Printed BEFORE the cascade runs, because the useful question when a
     // Wayland host falls through to X11 is "was the portal even an option?",
     // and answering it should not require opening a session.
+    //
+    // P2a: asks THROUGH THE SESSION HELPER. Run as root — which is how the
+    // daemon runs, and how an operator reaches this over `roomler exec`/ssh —
+    // the direct call can only ever answer `no-session-bus`, so this line was
+    // previously unable to report a working portal on any host where one
+    // existed. That gap is exactly what P2a closes, and this is where it shows.
     #[cfg(all(target_os = "linux", feature = "portal-capture"))]
     {
-        let st = roomlerd::capture::portal::detect();
+        let st = roomlerd::capture::portal::detect_in_session();
         println!("capture-smoke: portal={st} — {}", st.advice());
     }
 

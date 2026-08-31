@@ -403,34 +403,71 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
     Ok(EnsureOutcome::Started)
 }
 
+/// ⚠️ `pub(crate)` because FR-45's portal helper needs the same answer: the
+/// portal is per-user-session and the daemon is root, so *both* the consent
+/// companion and the capture helper have to find whoever is at the screen.
+/// Two copies of this `loginctl` walk would be two things to keep in step
+/// with a compositor that reports its session differently.
 #[cfg(all(unix, not(target_os = "macos")))]
-struct GraphicalSession {
-    uid: u32,
-    display: Option<String>,
-    wayland_display: Option<String>,
+pub(crate) struct GraphicalSession {
+    pub(crate) uid: u32,
+    /// The account NAME. `systemd-run --uid=` takes the number, but the
+    /// verified privilege drop resolves by name (`getpwnam` gives it the home
+    /// directory and supplementary groups a uid alone cannot), so both are
+    /// carried rather than re-derived at each call site.
+    ///
+    /// ⚠️ The allow is scoped to lanes with no reader rather than blanket, so
+    /// if the portal helper ever stops using this the warning comes back
+    /// instead of staying suppressed forever. Kept unconditional (rather than
+    /// `cfg`-gated) because gating one field fragments the struct, its single
+    /// constructor and the guard that fills it, for a string that costs
+    /// nothing to carry.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "portal-capture")),
+        allow(dead_code)
+    )]
+    pub(crate) name: String,
+    pub(crate) display: Option<String>,
+    pub(crate) wayland_display: Option<String>,
+}
+
+/// Session ids out of `loginctl list-sessions --no-legend`.
+///
+/// ⚠️ **Only the first column is parsed, and that is the whole point.** The
+/// rest of the table is not stable across systemd releases — measured on the
+/// fleet, systemd 255 lays it out `SESSION UID USER SEAT TTY STATE IDLE SINCE`
+/// and systemd 257 lays it out `SESSION UID USER SEAT LEADER CLASS TTY IDLE
+/// SINCE`. Anything read positionally from those would be a different field
+/// per host. The id is column one on both; every real property comes from
+/// `show-session`, which is key=value and version-stable.
+///
+/// ⚠️ Ids are NOT numeric — logind hands out `c1`, `c2` for greeter sessions —
+/// so they stay strings.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn session_ids(list_output: &str) -> Vec<&str> {
+    list_output
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .collect()
 }
 
 /// The active graphical login session, via `loginctl`. `None` on a headless
 /// box — again, the correct answer, not a failure.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn graphical_session() -> Result<GraphicalSession> {
+pub(crate) fn graphical_session() -> Result<GraphicalSession> {
+    // ⚠️ NOT `-o value -p Id`. Those are `show-*` options; `list-sessions`
+    // rejects them with `Unknown output 'value'` and exits 1, which this
+    // function then read as an empty session list — i.e. "nobody is at the
+    // screen" on every Linux host, always. Measured on systemd 255 (Ubuntu)
+    // and 257 (Fedora): rejected on both, so it never worked anywhere rather
+    // than regressing. The visible symptom was the FR-27 consent companion
+    // silently never starting, which only shows up where the companion is the
+    // chosen surface — GNOME/KDE Wayland, exactly the hosts FR-45 targets.
     let out = std::process::Command::new("loginctl")
-        .args([
-            "list-sessions",
-            "--no-legend",
-            "--no-pager",
-            "-o",
-            "value",
-            "-p",
-            "Id",
-        ])
+        .args(["list-sessions", "--no-legend", "--no-pager"])
         .output()
         .context("spawning loginctl")?;
-    for id in String::from_utf8_lossy(&out.stdout).lines() {
-        let id = id.trim();
-        if id.is_empty() {
-            continue;
-        }
+    for id in session_ids(&String::from_utf8_lossy(&out.stdout)) {
         let show = std::process::Command::new("loginctl")
             .args(["show-session", id, "--no-pager"])
             .output()
@@ -452,8 +489,15 @@ fn graphical_session() -> Result<GraphicalSession> {
         let Some(uid) = field("User").and_then(|u| u.parse::<u32>().ok()) else {
             continue;
         };
+        // A session with no `Name` is not usable by the privilege drop, so
+        // skip it rather than return one that will fail later — the next
+        // session in the list may well be serviceable.
+        let Some(name) = field("Name") else {
+            continue;
+        };
         return Ok(GraphicalSession {
             uid,
+            name,
             display: field("Display"),
             wayland_display: (ty == "wayland").then(|| {
                 // loginctl does not report WAYLAND_DISPLAY; the near-universal
@@ -674,5 +718,49 @@ fn respawn_desktop(respawn: RespawnContext, dest: &std::path::Path) {
                 Err(e) => tracing::warn!(error = %e, "query_user_token failed for desktop respawn"),
             }
         }
+    }
+}
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod tests {
+    use super::session_ids;
+
+    /// Both samples are REAL `loginctl list-sessions --no-legend --no-pager`
+    /// output, captured from fleet hosts on 2026-08-31. They are here because
+    /// the column layout genuinely differs between the two releases, and the
+    /// previous code's failure was invisible: it asked for a `show-*` output
+    /// mode that `list-sessions` rejects, got an empty list, and reported
+    /// "nobody is at this machine's screen" on a host with a logged-in user.
+    /// A test over invented output would have passed just as happily.
+    #[test]
+    fn session_ids_survive_both_observed_column_layouts() {
+        // systemd 255 (Ubuntu 24.04): SESSION UID USER SEAT TTY STATE IDLE SINCE
+        let s255 = "7173 1000 gjovanov - -     active no  -\n\
+                    7631 1000 gjovanov - pts/5 active yes 17h ago\n\
+                    7767 1000 gjovanov - -     active no  -\n";
+        assert_eq!(session_ids(s255), ["7173", "7631", "7767"]);
+
+        // systemd 257 (Fedora 42): a LEADER and a CLASS column appear, so
+        // every positional field after the first one shifts.
+        let s257 = "1 1000 m1 -     1447   manager - no -\n\
+                    3 1000 m1 seat0 101848 user    - no -\n\
+                    5 1000 m1 -     434840 user    - no -\n";
+        assert_eq!(session_ids(s257), ["1", "3", "5"]);
+    }
+
+    /// A headless host lists nothing, and blank lines must not become empty
+    /// ids that then get handed to `show-session`.
+    #[test]
+    fn empty_and_blank_output_yields_no_ids() {
+        assert!(session_ids("").is_empty());
+        assert!(session_ids("\n   \n\t\n").is_empty());
+    }
+
+    /// Greeter sessions are `c1`, `c2`… — ids are strings, and a numeric
+    /// parse would silently drop exactly the session a lock-screen prompt
+    /// needs to find.
+    #[test]
+    fn non_numeric_greeter_ids_are_kept() {
+        assert_eq!(session_ids("c1 42 gdm seat0 - active no -\n"), ["c1"]);
     }
 }
