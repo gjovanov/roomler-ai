@@ -529,13 +529,17 @@ jobs:
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
           # FR-21 P2a: cargo-deb emits `<package>_<version>_<arch>.deb`, and the
-          # package is `roomlerd` now. The DESTINATION asset name is deliberately
-          # left as `roomler-agent-…` — it is a published, immutable surface that
-          # every prior release already carries, and the updater's picker keys on
-          # the extension + arch token, never the prefix (updater.rs::pick_asset_for_unix).
-          # Renaming it is a separate decision with its own blast radius.
+          # package is `roomlerd`. FR-46 (#1051) took the DESTINATION name over
+          # too, after measuring every consumer rather than assuming: Windows
+          # keys on `.msi` + the `-permachine-` infix, macOS on `.pkg`, Linux
+          # >=0.4.16 on `is_daemon_asset` (which ALREADY accepts `roomlerd`),
+          # <=0.4.15 on the first `.deb` matching arch, `scripts/install.sh` on
+          # an arch+format SUFFIX, and the server-side ordering on a
+          # `roomler-desktop-` denylist. Not one of them keys on this prefix, so
+          # the rename freezes nothing. Already-published assets keep their old
+          # names and stay reachable through the legacy arm.
           src=$(ls target/debian/roomlerd_*_amd64.deb | head -n1)
-          dst="roomler-agent-${version}-x86_64-unknown-linux-gnu.deb"
+          dst="roomlerd-${version}-x86_64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
@@ -589,7 +593,7 @@ jobs:
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
           sh scripts/stage-linux-tarball.sh "$version" x86_64-unknown-linux-gnu
-          echo "artifact=roomler-agent-${version}-x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "artifact=roomlerd-${version}-x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -738,13 +742,17 @@ jobs:
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
           # FR-21 P2a: cargo-deb emits `<package>_<version>_<arch>.deb`, and the
-          # package is `roomlerd` now. The DESTINATION asset name is deliberately
-          # left as `roomler-agent-…` — it is a published, immutable surface that
-          # every prior release already carries, and the updater's picker keys on
-          # the extension + arch token, never the prefix (updater.rs::pick_asset_for_unix).
-          # Renaming it is a separate decision with its own blast radius.
+          # package is `roomlerd`. FR-46 (#1051) took the DESTINATION name over
+          # too, after measuring every consumer rather than assuming: Windows
+          # keys on `.msi` + the `-permachine-` infix, macOS on `.pkg`, Linux
+          # >=0.4.16 on `is_daemon_asset` (which ALREADY accepts `roomlerd`),
+          # <=0.4.15 on the first `.deb` matching arch, `scripts/install.sh` on
+          # an arch+format SUFFIX, and the server-side ordering on a
+          # `roomler-desktop-` denylist. Not one of them keys on this prefix, so
+          # the rename freezes nothing. Already-published assets keep their old
+          # names and stay reachable through the legacy arm.
           src=$(ls target/debian/roomlerd_*_arm64.deb | head -n1)
-          dst="roomler-agent-${version}-aarch64-unknown-linux-gnu.deb"
+          dst="roomlerd-${version}-aarch64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
@@ -757,7 +765,7 @@ jobs:
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
           sh scripts/stage-linux-tarball.sh "$version" aarch64-unknown-linux-gnu
-          echo "artifact=roomler-agent-${version}-aarch64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "artifact=roomlerd-${version}-aarch64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -1332,7 +1340,7 @@ jobs:
           # release run. Consumers are suffix-agnostic in both directions
           # (agent_release.rs / updater.rs match on ".msi" + the
           # "-permachine-" infix), so older published releases keep resolving.
-          $dst = "roomler-agent-$env:VERSION-x86_64-pc-windows-msvc.msi"
+          $dst = "roomlerd-$env:VERSION-x86_64-pc-windows-msvc.msi"
           Move-Item $msi.FullName $dst
           "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
@@ -1365,7 +1373,7 @@ jobs:
           $msi = Get-ChildItem "target/wix/*.msi" | Select-Object -First 1
           if (-not $msi) { throw "per-Machine MSI not produced" }
           # Suffix-free -- see the per-User rename above.
-          $dst = "roomler-agent-$env:VERSION-perMachine-x86_64-pc-windows-msvc.msi"
+          $dst = "roomlerd-$env:VERSION-perMachine-x86_64-pc-windows-msvc.msi"
           Move-Item $msi.FullName $dst
           "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
@@ -2525,7 +2533,7 @@ jobs:
           # step below, not encoded in a filename. install.sh's
           # `aarch64-apple-darwin[^"]*\.pkg` regex matches either way, so
           # already-published `-unsigned` releases keep resolving too.
-          artifact="dist/roomler-agent-$VERSION-aarch64-apple-darwin.pkg"
+          artifact="dist/roomlerd-$VERSION-aarch64-apple-darwin.pkg"
 
           if [[ "${{ steps.apple.outputs.mode }}" == "full" ]]; then
             productbuild --package component.pkg --sign "Developer ID Installer" "$artifact"
@@ -2733,7 +2741,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.validate-version.outputs.tag }}
-          name: roomler-agent ${{ needs.validate-version.outputs.version }}
+          name: roomlerd ${{ needs.validate-version.outputs.version }}
           # prerelease must stay false so GitHub's /releases/latest API
           # returns this release — the agent's built-in auto-updater
           # polls that endpoint every 6 h. Marking 0.x as prerelease
@@ -2984,9 +2992,16 @@ jobs:
                 | select(endswith(".deb"))
                 | select(contains($a)) ] | first // ""' <<<"$feed")
             echo "$arch -> ${first:-<no .deb>}"
+            # FR-46: match the COMPANION, not an allowlist of daemon prefixes. The
+            # old form (`""|roomler-agent-*`) hard-coded the daemon asset name, so
+            # renaming that asset silently turned this guard into a permanent
+            # warning — a stale allowlist that fires on the correct state. What
+            # `order_assets_daemon_first` actually asserts server-side is a
+            # `roomler-desktop-` DENYLIST, so replay exactly that and the guard
+            # survives any future daemon rename.
             case "$first" in
-              ""|roomler-agent-*) ;;
-              *) echo "::warning::a pre-0.4.16 $arch agent would install '$first' as its daemon update — the companion must sort AFTER the daemon in /api/agent/latest-release (agent_release::order_assets_daemon_first)" ;;
+              roomler-desktop-*) echo "::warning::a pre-0.4.16 $arch agent would install '$first' as its daemon update — the companion must sort AFTER the daemon in /api/agent/latest-release (agent_release::order_assets_daemon_first)" ;;
+              *) ;;
             esac
           done
 # RETIRED-NAME-ANCHOR-END
