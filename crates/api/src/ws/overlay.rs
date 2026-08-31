@@ -39,7 +39,8 @@ use roomler_ai_remote_control::models::{OverlayAclMode, OverlayPolicy};
 use roomler_ai_remote_control::{
     models::{AgentStatus, NodeRef, OverlayNode, overlay_ip},
     signaling::{
-        ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo, RelayStrategyWire, ServerMsg,
+        ClientMsg, IceServer, NetmapPeer, OverlayJoinRefusal, OverlayNetworkInfo,
+        RelayStrategyWire, ServerMsg,
     },
     turn_creds,
     worker_pick::pick_worker_fnv1a,
@@ -95,6 +96,7 @@ pub async fn relay_overlay_msg_from_node(
             supports_derp_floor,
             supports_overlay_echo,
             supports_org_relay,
+            supports_join_refusal,
             org_primary,
             relay_port,
             advertised_routes,
@@ -114,6 +116,7 @@ pub async fn relay_overlay_msg_from_node(
                 supports_derp_floor,
                 supports_overlay_echo,
                 supports_org_relay,
+                supports_join_refusal,
                 org_primary,
                 relay_port,
                 advertised_routes,
@@ -239,11 +242,34 @@ async fn handle_overlay_join(
     supports_derp_floor: bool,
     supports_overlay_echo: bool,
     supports_org_relay: bool,
+    supports_join_refusal: bool,
     org_primary: Option<bool>,
     relay_port: Option<u16>,
     advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
+    // FR-47 — refuse OUT LOUD. Every early return below used to be a
+    // server-side `warn!` and nothing else, leaving the node waiting on a
+    // netmap that would never arrive; `refuse` sends the reason when the node
+    // can read one and logs it either way.
+    let refuse = |reason: OverlayJoinRefusal, detail: String| {
+        let node_ref = node_ref.clone();
+        async move {
+            tracing::error!(
+                ?node_ref, ?reason, %detail,
+                alert = "overlay_join_refused",
+                "overlay.join: refused"
+            );
+            if supports_join_refusal {
+                send_to_node_ref(
+                    state,
+                    &node_ref,
+                    ServerMsg::OverlayJoinRefused { reason, detail },
+                )
+                .await;
+            }
+        }
+    };
     let Some((tenant_id, machine_id, display_name)) =
         resolve_tenant_and_machine(state, ident).await
     else {
@@ -258,7 +284,7 @@ async fn handle_overlay_join(
     let network = match state.overlay_networks.get_or_create(tenant_id).await {
         Ok(n) => n,
         Err(e) => {
-            warn!(%tenant_id, %e, "overlay.join: get_or_create network failed");
+            refuse(OverlayJoinRefusal::NetworkUnavailable, format!("{e}")).await;
             return;
         }
     };
@@ -361,12 +387,28 @@ async fn handle_overlay_join(
                 {
                     Ok(h) => h,
                     Err(e) => {
-                        warn!(%tenant_id, %e, "overlay.join: IPAM allocate failed");
+                        // Exhaustion vs a store fault are different problems
+                        // with different fixes: one needs a bigger block, the
+                        // other needs a retry. `allocate_host` reports
+                        // exhaustion as `Validation`, everything else as a
+                        // driver error.
+                        let reason = match e {
+                            DaoError::Validation(_) => OverlayJoinRefusal::AddressSpaceExhausted,
+                            _ => OverlayJoinRefusal::StoreUnavailable,
+                        };
+                        refuse(reason, format!("{e}")).await;
                         return;
                     }
                 };
                 let Some(ip) = overlay_ip(&network.cidr, host) else {
-                    warn!(%tenant_id, cidr = %network.cidr, host, "overlay.join: bad CIDR/host");
+                    refuse(
+                        OverlayJoinRefusal::NetworkUnavailable,
+                        format!(
+                            "the network's CIDR {} cannot express host ordinal {host}",
+                            network.cidr
+                        ),
+                    )
+                    .await;
                     return;
                 };
                 match state
