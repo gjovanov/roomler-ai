@@ -182,7 +182,7 @@
         </div>
 
         <v-alert
-          v-if="(form.permissions & ADMINISTRATOR) !== 0"
+          v-if="maskHas(form.permissions, ADMINISTRATOR)"
           type="warning"
           variant="tonal"
           density="compact"
@@ -198,7 +198,7 @@
             <v-checkbox
               v-for="flag in flagsFor(group)"
               :key="flag.key"
-              :model-value="(form.permissions & flag.bit) !== 0"
+              :model-value="maskHas(form.permissions, flag.bit)"
               :label="flag.label"
               density="compact"
               hide-details
@@ -253,6 +253,9 @@ import {
   PERMISSION_FLAGS,
   PERMISSION_GROUPS,
   describePermissions,
+  maskHas,
+  maskSet,
+  maskClear,
 } from '@/utils/permissions'
 
 const props = defineProps<{ tenantId: string }>()
@@ -275,7 +278,7 @@ function hex(color: number): string {
 }
 
 function isAdministrator(mask: number): boolean {
-  return (mask & ADMINISTRATOR) !== 0
+  return maskHas(mask, ADMINISTRATOR)
 }
 
 function permissionSummary(mask: number): string {
@@ -327,8 +330,11 @@ function openEditDialog(role: Role) {
   editDialog.value = true
 }
 
+// #888: `|` and `&~` coerce to signed int32, which silently truncates any bit
+// above 30 — and this is the WRITE path, so the corrupted mask is what gets
+// saved. It would not throw; the role would just come back missing permissions.
 function toggleFlag(bit: number, on: boolean) {
-  form.permissions = on ? form.permissions | bit : form.permissions & ~bit
+  form.permissions = on ? maskSet(form.permissions, bit) : maskClear(form.permissions, bit)
 }
 
 function applyPreset(mask: number) {
