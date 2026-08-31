@@ -97,9 +97,17 @@ pub struct StreamInfo {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionReport {
     pub streams: Vec<StreamInfo>,
-    /// Hand this to the next `open()` to skip the dialog. `None` means the
-    /// portal declined to persist the grant, which is its right.
-    pub restore_token: Option<String>,
+    /// Whether a grant was persisted for next time — **not the token itself**.
+    ///
+    /// ⚠️ The token deliberately does not travel in this struct. It is a
+    /// standing grant to screencast someone's desktop without asking again,
+    /// the child both stores and reloads it, and the daemon has no use for it.
+    /// Carrying it here would have put a credential on a pipe and into every
+    /// future `Debug` of this type for no purpose — the first version of this
+    /// struct did exactly that while its own docs claimed the daemon never
+    /// sees it. `false` means the portal declined to persist the grant, which
+    /// is its right, and costs one dialog next time.
+    pub restore_token_stored: bool,
     /// Whether `OpenPipeWireRemote` actually yielded a usable fd. Reported
     /// rather than assumed: everything up to it can succeed and still leave
     /// nothing to connect to.
@@ -157,18 +165,20 @@ impl OpenError {
 /// *"Cannot start a runtime from within a runtime"*, before any portal call
 /// was made. The guard belongs HERE rather than at each call site, so the next
 /// entry point cannot reintroduce it.
-pub fn open(restore_token: Option<&str>) -> Result<SessionReport, OpenError> {
-    let token = restore_token.map(str::to_owned);
-    std::thread::spawn(move || open_blocking(token.as_deref()))
+pub fn open() -> Result<SessionReport, OpenError> {
+    std::thread::spawn(open_blocking)
         .join()
         .unwrap_or_else(|_| Err(OpenError::failed("the portal handshake thread panicked")))
 }
 
-fn open_blocking(restore_token: Option<&str>) -> Result<SessionReport, OpenError> {
+fn open_blocking() -> Result<SessionReport, OpenError> {
     let started = Instant::now();
-    // Recorded up front: `restore_token` is shadowed further down by the one
-    // the portal hands BACK, and conflating "we offered a token" with "we were
-    // given a token" would make the did-it-prompt signal meaningless.
+    // 🔑 The token is loaded and stored HERE, so it never leaves this module.
+    // A caller that cannot hold the credential cannot leak it — which is a
+    // stronger guarantee than a caller that holds it and is careful.
+    let store = TokenStore::for_current_user();
+    let restore_token = store.load();
+    let restore_token = restore_token.as_deref();
     let restore_token_sent = restore_token.is_some();
     let conn = zbus::blocking::Connection::session()
         .map_err(|e| OpenError::failed(format!("session bus: {e}")))?;
@@ -236,7 +246,21 @@ fn open_blocking(restore_token: Option<&str>) -> Result<SessionReport, OpenError
             "the portal granted the request but returned no streams",
         ));
     }
-    let restore_token = results.get("restore_token").and_then(string_of);
+    // Persisted immediately, before anything is reported: a caller that reads
+    // the report and re-runs must find the token already on disk, or the
+    // second run prompts again and the whole point of persisting is lost.
+    let restore_token_stored = match results.get("restore_token").and_then(string_of) {
+        Some(tok) => match store.save(&tok) {
+            Ok(()) => true,
+            Err(e) => {
+                // Not fatal: the session is open and usable. It costs one
+                // dialog next time, and saying so beats silence.
+                tracing::warn!(%e, "portal: could not persist the restore token");
+                false
+            }
+        },
+        None => false,
+    };
 
     // ── 4. OpenPipeWireRemote — a direct call, NOT a Request ────────────
     let pipewire_fd_ok = match portal.call_method(
@@ -264,7 +288,7 @@ fn open_blocking(restore_token: Option<&str>) -> Result<SessionReport, OpenError
 
     Ok(SessionReport {
         streams,
-        restore_token,
+        restore_token_stored,
         pipewire_fd_ok,
         restore_token_sent,
         elapsed_ms: started.elapsed().as_millis() as u64,

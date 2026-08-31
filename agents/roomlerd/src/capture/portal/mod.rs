@@ -297,34 +297,16 @@ pub mod helper {
 
     /// P2b — open a ScreenCast session and report it.
     ///
-    /// 🔑 **The restore token is read and written HERE, by the child, never by
-    /// the daemon.** It is a standing grant the person at the screen gave to
-    /// *their* session; it lives in their own state directory at 0600 and has
-    /// no reason to travel to a root process. Keeping it on this side of the
-    /// boundary also means the daemon cannot leak or log it.
+    /// 🔑 **The restore token never appears here.** It is a standing grant the
+    /// person at the screen gave to *their* session, and `screencast::open`
+    /// both loads and stores it internally, in their own state directory at
+    /// 0600. A caller that cannot hold the credential cannot leak it — which
+    /// is a stronger guarantee than a caller that holds it and is careful, and
+    /// it is what makes "the daemon never sees the token" structurally true
+    /// rather than merely intended.
     fn run_screencast() {
-        let store = super::screencast::TokenStore::for_current_user();
-        let existing = store.load();
-        eprintln!(
-            "portal-helper: opening a ScreenCast session (restore token: {})",
-            if existing.is_some() {
-                "present, expecting no dialog"
-            } else {
-                "none — the person at the screen will be asked"
-            }
-        );
-
-        let outcome = super::screencast::open(existing.as_deref());
-        if let Ok(report) = &outcome
-            && let Some(tok) = &report.restore_token
-        {
-            // Persist BEFORE reporting: a parent that reads the report and
-            // immediately re-runs must find the token already on disk, or the
-            // second run prompts again and the whole point is lost.
-            if let Err(e) = store.save(tok) {
-                eprintln!("portal-helper: could not persist the restore token: {e}");
-            }
-        }
+        eprintln!("portal-helper: opening a ScreenCast session");
+        let outcome = super::screencast::open();
         match &outcome {
             Ok(r) => eprintln!(
                 "portal-helper: {} stream(s), node_id={:?}, fd_ok={}, {} ms",

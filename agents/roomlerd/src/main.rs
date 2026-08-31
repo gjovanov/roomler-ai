@@ -1037,7 +1037,7 @@ async fn daemon_main() -> Result<()> {
                             r.pipewire_fd_ok,
                             // ⚠️ Never print the token itself: it is a standing
                             // grant, and this output goes to a daemon log.
-                            if r.restore_token.is_some() {
+                            if r.restore_token_stored {
                                 "yes (stored)"
                             } else {
                                 "no"
