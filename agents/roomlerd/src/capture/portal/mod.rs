@@ -31,6 +31,8 @@
 //! carries none of that hazard, which is why detection can land ahead of the
 //! decision about how to reach PipeWire.
 
+/// FR-45 P3a — reaching `libpipewire` through `dlopen`, never a link.
+pub mod pipewire;
 /// FR-45 P2b — the ScreenCast handshake itself, run inside the session.
 pub mod screencast;
 
@@ -306,14 +308,25 @@ pub mod helper {
     /// rather than merely intended.
     fn run_screencast() {
         eprintln!("portal-helper: opening a ScreenCast session");
-        let outcome = super::screencast::open();
+        let outcome = super::screencast::open().map(|session| {
+            let mut report = session.report;
+            // P3a — the fd goes straight to PipeWire and no further. Reaching
+            // it is the deliverable of this phase; keeping a stream open would
+            // be P3b pretending to be finished.
+            report.pipewire = match session.pipewire_fd {
+                Some(fd) => super::pipewire::probe(fd),
+                None => super::pipewire::PipeWireStatus::NotAttempted,
+            };
+            report
+        });
         match &outcome {
             Ok(r) => eprintln!(
-                "portal-helper: {} stream(s), node_id={:?}, fd_ok={}, {} ms",
+                "portal-helper: {} stream(s), node_id={:?}, fd_ok={}, {} ms; pipewire: {}",
                 r.streams.len(),
                 r.streams.first().map(|s| s.node_id),
                 r.pipewire_fd_ok,
-                r.elapsed_ms
+                r.elapsed_ms,
+                r.pipewire
             ),
             Err(e) => eprintln!("portal-helper: {e}"),
         }
