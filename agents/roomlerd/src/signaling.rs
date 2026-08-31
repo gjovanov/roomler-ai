@@ -444,6 +444,13 @@ pub async fn run(
     // for the config's scalar identity; `run_cmd` synthesizes a per-org
     // `AgentConfig` via `AgentConfig::for_org` for secondaries).
     ctx: OrgCtx,
+    // FR-43 P2b — the macOS GUI-worker delegation channel. Owned so the
+    // reconnect loop can lend it per attempt; `None` on every platform and
+    // configuration that does not supervise a worker. Only the PRIMARY org's
+    // loop ever uses it (`handle_server_msg` gates on `ctx.is_primary`), but it
+    // is passed to all of them so the gate lives in one place rather than at
+    // three call sites that could each forget it.
+    delegate: Option<crate::delegate::DelegateHost>,
     // `mut` for exactly one reason: FR-40 key rotation swaps the overlay
     // secret in this snapshot between two connections (see
     // `ConnectError::KeyRotated`). Nothing else writes it after start.
@@ -570,6 +577,7 @@ pub async fn run(
             derp_ticket_slot.clone(),
             tunnel_hub.clone(),
             &mut slowness_cycles,
+            delegate.as_ref(),
             &mut kill_rx,
             &mut consent_rx,
         )
@@ -939,6 +947,9 @@ async fn connect_once(
     // lives in `run`'s loop so it spans reconnects; reset on a clean close
     // and on a netstate Major (new network = new regime).
     slowness_cycles: &mut u32,
+    // FR-43 P2b — the macOS GUI-worker channel when one is attached. `None`
+    // everywhere else, and the delegation branch is then unreachable.
+    delegate: Option<&crate::delegate::DelegateHost>,
     // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
     // (not owned) so the same receiver survives across reconnects.
     kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
@@ -1064,6 +1075,19 @@ async fn connect_once(
     // dying session can be lost (it was, in the second field run).
     drain_pending_rotation_report(&cfg.tenant_id, &outbound_tx);
     let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
+    // FR-43 P2b — point the delegation channel at THIS connection's outbound
+    // queue, so a worker's `SdpAnswer` / `Ice` reach the server.
+    //
+    // Re-set on every reconnect, deliberately: the sender belongs to the
+    // connection, not the daemon. A worker reply that arrives while no WS is
+    // up is dropped rather than queued, because a session without a control
+    // plane is a session the server has already forgotten — queueing it would
+    // deliver an answer to a question nobody is still asking.
+    if let Some(delegate) = delegate
+        && ctx.is_primary
+    {
+        delegate.set_outbound(outbound_tx.clone());
+    }
     // Phase 3b: if overlay is enabled, start the node runtime (relay mode)
     // and capture the channel its `rc:overlay.*` events flow into. The
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
@@ -1659,6 +1683,7 @@ async fn connect_once(
                                 &derp_ticket_slot,
                                 cfg,
                                 remote_cfg,
+                                delegate,
                             )
                             .await?;
                         }
@@ -1933,7 +1958,40 @@ async fn handle_server_msg(
     // taken off the wire.
     agent_cfg: &AgentConfig,
     remote_cfg: &crate::remote_config::RemoteConfigServices,
+    // FR-43 P2b — the macOS GUI-worker channel, when one is attached. `None`
+    // on every other platform and whenever no worker has attached, and the
+    // delegation branch below is then unreachable.
+    delegate: Option<&crate::delegate::DelegateHost>,
 ) -> Result<(), ConnectError> {
+    // FR-43 P2b — hand a remote-desktop session to the GUI worker, if there is
+    // one. This sits ahead of the whole dispatch rather than inside each of
+    // the five handlers: one place to read, one place to audit, and no way for
+    // a handler to be added later that quietly forgets to check.
+    //
+    // ⚠️ `send_to_worker` returning false is NOT an error — it means no worker
+    // is attached (or its queue is full), and the message then falls through
+    // to the local handlers exactly as before. On a root macOS daemon that
+    // local path cannot serve pixels, which is the whole reason P2 exists; but
+    // failing SOFT is still right, because the alternative is a session that
+    // vanishes rather than one that fails the way it always has.
+    //
+    // ⚠️ PRIMARY ORG ONLY. The GUI worker is host-global — one screen, one
+    // keyboard — while the server models policy per org, so a secondary org's
+    // admin must not be able to drive it. Same rule, and the same reason, as
+    // `rc:agent.update`, exec and the FR-19 relay: a host-global resource
+    // belongs to the enrollment that owns the host.
+    if let Some(delegate) = delegate
+        && ctx.is_primary
+        && crate::delegate::delegable_inbound(&msg)
+        && delegate.send_to_worker(&msg)
+    {
+        tracing::debug!(
+            kind = crate::delegate::server_msg_kind(&msg),
+            "delegated an rc message to the GUI worker"
+        );
+        return Ok(());
+    }
+
     match msg {
         ServerMsg::Request {
             session_id,
