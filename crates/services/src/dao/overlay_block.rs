@@ -25,6 +25,49 @@ pub struct BlockHeadroom {
     pub reclaimed: u32,
 }
 
+/// Fraction of the slot space above which a fresh carve warns.
+///
+/// FR-47 — pressure is reported at the moment it is *created* rather than by a
+/// poller, because a carve is the only event that moves the cursor and it
+/// happens at most once per organization. The alternative — a periodic
+/// `headroom()` sweep — would add a query loop to every pod to observe a value
+/// that changes a handful of times a year.
+const REGISTRY_PRESSURE_WARN_PCT: u32 = 80;
+
+/// WARN once the monotonic cursor crosses [`REGISTRY_PRESSURE_WARN_PCT`].
+///
+/// Worth a distinct signal because the failure it precedes is not a refusal:
+/// when the registry runs out, `ensure_block` falls back to the shared `/10`,
+/// and tenants that land there silently overlap one another. By the time that
+/// shows up as "a device cannot enroll in both orgs", the addresses have
+/// already been handed out.
+fn warn_if_registry_is_filling(end_slot: u32) {
+    let (used, total, pct) = registry_pressure(end_slot);
+    if pct >= REGISTRY_PRESSURE_WARN_PCT {
+        tracing::warn!(
+            used,
+            total,
+            pct,
+            alert = "overlay_block_registry_pressure",
+            "overlay blocks: the slot registry is {pct}% consumed; when it is full, new \
+             tenants fall back to the shared 100.64.0.0/10 and begin overlapping each \
+             other — reclaim quarantined ranges or widen the /10 policy"
+        );
+    }
+}
+
+/// `(used, total, percent)` for a cursor sitting at `end_slot`. Split out from
+/// the logging so the arithmetic is testable: a threshold that never fires and
+/// a threshold that never needs to fire look identical in production.
+fn registry_pressure(end_slot: u32) -> (u32, u32, u32) {
+    let total = OVERLAY_BLOCK_SLOT_COUNT - OVERLAY_BLOCK_FIRST_SLOT;
+    let used = end_slot.saturating_sub(OVERLAY_BLOCK_FIRST_SLOT);
+    // `used * 100` overflows u32 above ~42 M; the slot space is 4 032, so a
+    // u64 widen is not needed — but the saturating form documents the bound.
+    let pct = used.saturating_mul(100) / total.max(1);
+    (used, total, pct)
+}
+
 /// Multi-org P2b — the GLOBAL registry of overlay address blocks.
 ///
 /// One row per carved range. Unlike every other DAO here this collection is
@@ -130,7 +173,10 @@ impl OverlayBlockDao {
                 updated_at: now,
             };
             match self.base.insert_one(&block).await {
-                Ok(id) => return self.base.find_by_id(id).await,
+                Ok(id) => {
+                    warn_if_registry_is_filling(slot + slots);
+                    return self.base.find_by_id(id).await;
+                }
                 Err(DaoError::DuplicateKey(e)) if attempt < ATTEMPTS => {
                     // Either another allocator took this slot (retry lands
                     // above it) or this network already holds an assigned
@@ -333,5 +379,43 @@ impl OverlayBlockDao {
             .sort(doc! { "end_slot": -1 })
             .await?;
         Ok(top.map(|b| b.end_slot).unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registry holds 4 032 slots above the legacy reserve, and the whole
+    /// point of the warning is to fire BEFORE the fallback-to-shared-/10 path
+    /// starts handing overlapping ranges out. Pin both ends of the threshold.
+    #[test]
+    fn registry_pressure_crosses_at_the_documented_threshold() {
+        let total = OVERLAY_BLOCK_SLOT_COUNT - OVERLAY_BLOCK_FIRST_SLOT;
+        assert_eq!(total, 4032, "the slot space these percentages describe");
+
+        // An empty registry is 0%, and the first carve does not warn.
+        assert_eq!(registry_pressure(OVERLAY_BLOCK_FIRST_SLOT).2, 0);
+        assert!(registry_pressure(OVERLAY_BLOCK_FIRST_SLOT + 1).2 < REGISTRY_PRESSURE_WARN_PCT);
+
+        // Just below the threshold stays quiet; at it, and above, it fires.
+        //
+        // `div_ceil`, not `* 80 / 100`: the percentage itself truncates, so the
+        // first slot count that REPORTS 80% is ceil(4032 × 0.8) = 3226, and
+        // 3225 still reports 79. Computing the crossing point with the same
+        // truncating division the code uses put this assert one slot low and
+        // the test failed — which is the whole reason the arithmetic is pulled
+        // out of the log line and pinned here.
+        let at = OVERLAY_BLOCK_FIRST_SLOT + (total * REGISTRY_PRESSURE_WARN_PCT).div_ceil(100);
+        assert_eq!(registry_pressure(at - 1).2, REGISTRY_PRESSURE_WARN_PCT - 1);
+        assert!(registry_pressure(at).2 >= REGISTRY_PRESSURE_WARN_PCT);
+        assert_eq!(registry_pressure(OVERLAY_BLOCK_SLOT_COUNT).2, 100);
+    }
+
+    /// A cursor below the reserve (an empty registry reports 0, not 64) must
+    /// not underflow into a bogus "100%" that cries wolf on a fresh install.
+    #[test]
+    fn registry_pressure_does_not_underflow_below_the_reserve() {
+        assert_eq!(registry_pressure(0), (0, 4032, 0));
     }
 }
