@@ -1661,18 +1661,17 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
         // that cannot update. On a two-half install the ROOT daemon updates
         // the shared bundle, so the host still moves forward.
         let euid = unsafe { libc::geteuid() };
-        // RETIRED-NAME-ANCHOR(16): the bail! message names
-        // /var/log/roomler-agent/update.log — the macOS log path fixed by the launchd
-        // plists, which are pinned to the frozen .app bundle name (D5). The marker
-        // cannot sit on that line: it would land inside the string literal.
-        // docs/fr/FR-21
+        // RETIRED-NAME-ANCHOR(21): the pre-P4b /Applications/roomler-agent.app path
+        // this sweep still has to name, plus the .app bundle itself, which keys the
+        // TCC grants and stays frozen until P5b. The macOS LOG path is no longer
+        // among them — FR-46 P5a moved it to /var/log/roomler. docs/fr/FR-46
         if euid != 0 {
             bail!(
                 "refusing to self-update: `installer -target /` requires root, but this \
                  agent runs as uid {euid} (the per-user LaunchAgent). Exiting here would \
                  take the agent offline without installing anything. Updates on macOS are \
                  owned by the root update helper (com.roomler.update) — wake it with \
-                 `touch {MACOS_UPDATE_TRIGGER}` and watch /var/log/roomler-agent/update.log, \
+                 `touch {MACOS_UPDATE_TRIGGER}` and watch /var/log/roomler/update.log, \
                  or install by hand: `sudo installer -pkg <pkg> -target /`."
             );
         }
@@ -2227,20 +2226,20 @@ async fn macos_forward_triggers(
                          the latest release; pinned installs are manual (sudo installer -pkg …)"
                     );
                 }
-                // RETIRED-NAME-ANCHOR(18): both arms name real macOS paths from inside
-                // string literals — /var/log/roomler-agent/update.log and the
-                // /etc/roomler-agent/disable-auto-update opt-out marker — so the anchor
-                // sits on the statement. docs/fr/FR-21
+                // RETIRED-NAME-ANCHOR(2): the anchor now covers only this comment's own
+                // mention of the legacy paths. FR-46 P5a moved the live strings below to
+                // /var/log/roomler and /etc/roomler; the legacy /var/log/roomler-agent and
+                // /etc/roomler-agent are migrated by the .pkg postinstall. docs/fr/FR-46
                 match macos_queue_update_check() {
                     Ok(()) => tracing::info!(
                         trigger = MACOS_UPDATE_TRIGGER,
                         "rc:agent.update queued for the root update helper (com.roomler.update); \
-                         watch /var/log/roomler-agent/update.log"
+                         watch /var/log/roomler/update.log"
                     ),
                     Err(e) => tracing::warn!(
                         error = %e,
                         "could not write the update-helper wake file — if this Mac has \
-                         /etc/roomler-agent/disable-auto-update set, updates are manual"
+                         /etc/roomler/disable-auto-update set, updates are manual"
                     ),
                 }
             }
@@ -2280,10 +2279,20 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
     // marker is set, but a loaded job can linger until reboot (it must not
     // bootout its own ancestor mid-install) — so the helper honours the
     // marker itself, making the lingering job harmless.
-    // RETIRED-NAME-ANCHOR(2): the opt-out marker, read here. Its path is part of the
-    // documented macOS contract and exists on hosts today. docs/fr/FR-21
-    if std::path::Path::new("/etc/roomler-agent/disable-auto-update").exists() {
-        tracing::info!("auto-update opted out (/etc/roomler-agent/disable-auto-update) — exiting");
+    // FR-46 P5a — dual-read, and the SENSE is what makes it mandatory: this is
+    // an OPT-OUT. Reading only the current path would auto-update a Mac whose
+    // operator opted out under the legacy one, which is the one outcome the
+    // marker exists to prevent. The .pkg postinstall migrates the directory, so
+    // the legacy arm is normally dead; it covers a host whose move could not
+    // happen and a helper still running from before the migration.
+    // RETIRED-NAME-ANCHOR(6): the legacy opt-out marker, honoured as a fallback.
+    // Deletable once no Mac can still have one. docs/fr/FR-46
+    const OPT_OUT: [&str; 2] = [
+        "/etc/roomler/disable-auto-update",
+        "/etc/roomler-agent/disable-auto-update",
+    ];
+    if let Some(marker) = OPT_OUT.iter().find(|p| std::path::Path::new(p).exists()) {
+        tracing::info!(marker = %marker, "auto-update opted out — exiting");
         return Ok(());
     }
 
