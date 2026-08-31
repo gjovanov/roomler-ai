@@ -178,6 +178,23 @@ services:
       # Set this false once you have configured ROOMLER__EMAIL__*.
       ROOMLER__AUTH__AUTO_VERIFY: ${ROOMLER_AUTO_VERIFY:-true}
       RUST_LOG: ${ROOMLER_LOG:-info}
+    # ⚠️ Zero-dependency on purpose. The runtime image has no curl, no wget and
+    # no nc (checked), and adding one to a production image just to run a
+    # liveness probe is a poor trade. bash's /dev/tcp is a shell builtin and
+    # bash is already in debian-slim — so this costs nothing and makes
+    # `docker compose ps` report the app as healthy rather than merely running.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/80 && printf "GET /health HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q "200 OK"'
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      # The first start runs schema migrations behind a lease, so give it room
+      # before a failing probe starts counting against `retries`.
+      start_period: 45s
     networks: [roomler]
 
 volumes:
