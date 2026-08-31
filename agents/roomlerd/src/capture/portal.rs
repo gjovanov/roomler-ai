@@ -77,8 +77,18 @@ impl PortalStatus {
                 ..
             } => "portal ScreenCast available but NO RemoteDesktop — capture would be read-only",
             PortalStatus::NoScreenCast => {
-                "xdg-desktop-portal is running but exposes no ScreenCast — install the backend \
-                 matching your compositor (xdg-desktop-portal-gnome / -kde / -wlr)"
+                // ⚠️ A MISSING backend is only one cause, and on the one host
+                // where this was actually diagnosed it was not the cause: the
+                // backend was installed, but its (static, D-Bus-activated)
+                // unit was dead — and starting it alone still did not help,
+                // because the FRONTEND caches its backend selection at
+                // startup and has to be restarted after the backend is up.
+                // Advice that only said "install it" sent the reader to a
+                // package that was already there.
+                "xdg-desktop-portal is running but exposes no ScreenCast. Check the backend for \
+                 your compositor is INSTALLED AND RUNNING (systemctl --user status \
+                 xdg-desktop-portal-gnome / -kde / -wlr), then restart the frontend (systemctl \
+                 --user restart xdg-desktop-portal) — it caches its backend selection at startup"
             }
             PortalStatus::PortalAbsent => {
                 "no xdg-desktop-portal on the session bus — install xdg-desktop-portal plus a \
