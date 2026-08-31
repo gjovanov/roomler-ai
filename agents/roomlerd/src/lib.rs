@@ -28,6 +28,9 @@ pub mod code_signature;
 pub mod companion;
 pub mod consent;
 pub mod crash_uploader;
+pub mod delegate;
+#[cfg(unix)]
+pub mod delegate_worker;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod derp;
 pub mod display_match;
