@@ -71,12 +71,19 @@ export const RCAS_ONLY_MAX_SCALE = 1.05
  *  near-max crispness without ringing on hard text edges. */
 export const DEFAULT_RCAS_SHARPNESS = 0.25
 
-/** localStorage `roomler-rc-sharpen` → mode. FR-26 moved the default from
- *  'auto' (sharpen only when upscaling) to **'on'** — operators run the
- *  viewer for text far more often than for video, and always-on RCAS is
- *  what makes remote text crisp at 1:1 too. 'auto'/'off' stay selectable. */
+/** localStorage `roomler-rc-sharpen` → mode. FR-26 defaulted this to **'on'**
+ *  (always-sharpen for crisp 1:1 text), but 'on' runs RCAS on the
+ *  `needScale <= 1` path (`computeRenderTarget`) which — as the comment there
+ *  says — "invites shimmer": RCAS amplifies the encoder's per-frame
+ *  quantisation drift on a static, high-contrast frame, so the picture pulses
+ *  blurry↔crisp even with NOTHING moving. Field 2026-08-31: constant
+ *  blur/crystallize on static Excel-like cells from one viewer's browser
+ *  across two native-res (1080p direct) hosts. Reverted the default to
+ *  **'auto'** — sharpen ONLY when actually upscaling (a downscaled/relay
+ *  stream, RCAS's intended "crisp text at low resolution" case), never at
+ *  1:1. 'on'/'off' stay selectable for operators who want always-on RCAS. */
 export function normalizeSharpenMode(v: unknown): SharpenMode {
-  return v === 'on' || v === 'off' || v === 'auto' ? v : 'on'
+  return v === 'on' || v === 'off' || v === 'auto' ? v : 'auto'
 }
 
 /** localStorage `roomler-rc-fsr-sharpness` → RCAS stops, clamped 0..2. */
