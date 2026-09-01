@@ -9,6 +9,7 @@
 //! Module map:
 //!
 //! - [`hub`]         — process-global registry of online agents and live sessions
+//! - [`connect_code`] — FR-52: the dictatable handle an outsider names a device by
 //! - [`session`]     — session state machine (Pending → AwaitingConsent → Active → Closed)
 //! - [`signaling`]   — `rc:*` WebSocket message types and dispatch
 //! - [`consent`]     — controller-requested-control consent flow
@@ -32,6 +33,7 @@
 // agent-side consumers opt out with `default-features = false`.
 #[cfg(feature = "server")]
 pub mod audit;
+pub mod connect_code;
 pub mod consent;
 pub mod derp_ticket;
 pub mod error;

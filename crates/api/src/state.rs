@@ -19,8 +19,9 @@ use roomler_ai_services::{
     AuthService, EmailService, GiphyService, OAuthService, PushService, TaskService,
     dao::{
         activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
-        consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
-        invite::InviteDao, key_rotation_audit::KeyRotationAuditDao, message::MessageDao,
+        consent_request::ConsentRequestDao, exec_audit::ExecAuditDao,
+        external_rc_audit::ExternalRcAuditDao, file::FileDao, invite::InviteDao,
+        key_rotation_audit::KeyRotationAuditDao, message::MessageDao,
         newsletter_issue::NewsletterIssueDao, newsletter_send::NewsletterSendDao,
         notification::NotificationDao, overlay_network::OverlayNetworkDao,
         overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
@@ -118,6 +119,9 @@ pub struct AppState {
     /// FR-19 peer-relay decisions: approvals (who made a device a relay) and
     /// mints (what the server routed through it), granted or refused.
     pub peer_relay_audit: Arc<PeerRelayAuditDao>,
+    /// FR-52 — cross-org access decisions: who opened a device to outsiders,
+    /// and every refusal. The server's own record, never the session's.
+    pub external_rc_audit: Arc<ExternalRcAuditDao>,
     /// P8 — device-reported session activity. Separate from `ssh_audit`
     /// because one is the server's decision and the other is a claim by the
     /// device; see `SshActivityEvent`.
@@ -405,6 +409,7 @@ impl AppState {
         let config_audit = Arc::new(ConfigAuditDao::new(&db));
         let key_rotation_audit = Arc::new(KeyRotationAuditDao::new(&db));
         let peer_relay_audit = Arc::new(PeerRelayAuditDao::new(&db));
+        let external_rc_audit = Arc::new(ExternalRcAuditDao::new(&db));
         let ssh_activity = Arc::new(SshActivityDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
             &db,
@@ -896,6 +901,7 @@ impl AppState {
             config_audit,
             key_rotation_audit,
             peer_relay_audit,
+            external_rc_audit,
             ssh_activity,
             agent_crashes,
             agent_logs,

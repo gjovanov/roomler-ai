@@ -334,6 +334,21 @@ pub enum RpcCap {
     /// Only advertised by builds with an overlay surface (`overlay-l3` /
     /// `overlay-netstack`): a build with no key has nothing to rotate.
     KeyRotate,
+    /// FR-52 — this device understands **cross-org remote access**: it honours
+    /// `external_access_enabled` (gate 3), can verify the device-held password
+    /// (gate 4), and tells the person at the machine that the controller is
+    /// from OUTSIDE the organization.
+    ///
+    /// ⚠️ The prompt half is why this gates the ADMIN approval and not just
+    /// the session. An older agent shows the ordinary "Alex wants to control
+    /// this machine" panel with no hint that Alex is a stranger — so approving
+    /// such a device would put a promise on screen that the device does not
+    /// keep, and consent given under it would not be informed consent.
+    ///
+    /// ⚠️ Equality-matched, like every verb here. `external-access` shares no
+    /// prefix with an existing verb today; if a shorter `external` is ever
+    /// added, the `ssh` / `ssh-consent` trap applies and the test locks it.
+    ExternalAccess,
 }
 
 impl RpcCap {
@@ -353,11 +368,12 @@ impl RpcCap {
             Self::ConfigReport => "config-report",
             Self::RelayServer => "relay-server",
             Self::KeyRotate => "key-rotate",
+            Self::ExternalAccess => "external-access",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 8] = [
+    pub const ALL: [RpcCap; 9] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -366,6 +382,7 @@ impl RpcCap {
         Self::ConfigReport,
         Self::RelayServer,
         Self::KeyRotate,
+        Self::ExternalAccess,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -777,6 +794,39 @@ pub struct Agent {
     /// as the two above: every pre-FR-19 row deserialises to "not approved".
     #[serde(default)]
     pub peer_relay_policy: PeerRelayPolicy,
+    /// FR-52 gate 2 — approval for control by someone OUTSIDE this org. Same
+    /// closed default as the three above.
+    #[serde(default)]
+    pub external_access_policy: ExternalAccessPolicy,
+    /// FR-52 — the dictatable handle an outsider names this device by
+    /// (`crate::connect_code`). Canonical form: 12 Crockford base32
+    /// characters, no dashes.
+    ///
+    /// `None` — every pre-FR-52 row, and every device nobody has minted one
+    /// for — means the device is simply unaddressable from outside, which is
+    /// the correct default: a code is minted on demand, not at enrollment, so
+    /// enabling the feature writes nothing to a fleet that is not using it.
+    ///
+    /// ⚠️ NOT a secret and NOT a credential — gate 4 (the device-held
+    /// password) is what stops a stranger, and gate 2 is what lets them try.
+    /// What the code's 60 bits buy is that the fleet cannot be ENUMERATED.
+    /// It is nonetheless not published to ordinary members: `AgentResponse`
+    /// deliberately omits it, because `list_agents` requires only tenant
+    /// membership and handing every member a working address for every device
+    /// is a wider audience than the admin who is supposed to be handing it out.
+    ///
+    /// ⚠️ Globally unique across tenants — an outsider types a code with no
+    /// org context, so it has to resolve on its own — and its unique index is
+    /// NOT scoped to live rows. A tombstone keeps its code reserved forever,
+    /// on purpose: recycling one would silently point a stranger who still has
+    /// the old note at a DIFFERENT machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_code: Option<String>,
+    /// When [`Self::connect_code`] was last minted or rotated. Rotation is the
+    /// revocation story for a leaked code, so "since when has this code been
+    /// the valid one?" has to be answerable from the row as well as the audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_code_rotated_at: Option<DateTime>,
     /// Device config an operator has ASKED for, reconciled by the agent when
     /// it next connects (`docs/remote-config.md` step 2).
     ///
@@ -2099,6 +2149,443 @@ impl OverlayPolicy {
 
 pub(crate) fn default_true() -> bool {
     true
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// FR-52 — cross-org remote access
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Per-device approval for control by someone **outside the organization** —
+/// gate 2 of five (`docs/fr/FR-52-cross-org-remote-access.md` §3).
+///
+/// Shaped on [`PeerRelayPolicy`], and default-closed for the same reason:
+/// every pre-feature row deserialises to "not approved", so shipping the
+/// feature can never retroactively open a device.
+///
+/// ⚠️ This is an org-admin gate, not the device's. Approving here grants
+/// nothing on its own — the device must still opt in locally
+/// (`external_access_enabled`, gate 3) and the outsider must still prove the
+/// device-held password (gate 4). What it *does* decide is the CEILING: an org
+/// can allow an outsider to watch a screen without letting them touch it, and
+/// no device-side setting can widen that.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct ExternalAccessPolicy {
+    /// Approved for external control. Default `false`.
+    #[serde(default)]
+    pub approved: bool,
+    /// Ceiling on what an external session may be granted. `None` — the
+    /// default, and every pre-feature row — means
+    /// [`DEFAULT_EXTERNAL_PERMISSIONS`], NOT "unrestricted": an unset ceiling
+    /// must be the narrow one, or forgetting to set it would be the widest
+    /// possible grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_permissions: Option<Permissions>,
+    /// When the approval lapses. `None` = it stands until cleared.
+    ///
+    /// Exists because the common case for this feature is temporary: a
+    /// contractor, a support engagement, a vendor with a two-week window. An
+    /// approval that can only be revoked by remembering to revoke it is one
+    /// that outlives its reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime>,
+}
+
+/// What an external session may be granted when the device's policy names no
+/// ceiling: **view and input, nothing else**.
+///
+/// Narrower than [`Permissions::default`] (which adds `CLIPBOARD`, and is
+/// grandfathered into `FILES` by the hub). Clipboard and file transfer move
+/// data across the org boundary in both directions, and an outsider should get
+/// them because an admin decided to, never because nobody narrowed the
+/// default. FR-52 open decision 3.
+pub const DEFAULT_EXTERNAL_PERMISSIONS: Permissions =
+    Permissions::from_bits_truncate(Permissions::VIEW.bits() | Permissions::INPUT.bits());
+
+impl ExternalAccessPolicy {
+    /// Split into the two halves the server uses: what is checked when a
+    /// session is AUTHORIZED ([`ExternalAccessGates`]) and what bounds the
+    /// session once it is ([`ExternalAccessSpec`]).
+    ///
+    /// The destructure is deliberately EXHAUSTIVE — no `..` — for the reason
+    /// [`SshPolicy::split`] is: a field added to this policy stops compiling
+    /// HERE until someone routes it into one of the halves in writing. That is
+    /// how `consent_mode` came to cross the SSH wire for weeks while being
+    /// destructured away, and this policy has the same hazard with a worse
+    /// blast radius.
+    pub fn split(self) -> (ExternalAccessGates, ExternalAccessSpec) {
+        let ExternalAccessPolicy {
+            approved,
+            max_permissions,
+            expires_at,
+        } = self;
+        (
+            ExternalAccessGates {
+                approved,
+                expires_at,
+            },
+            ExternalAccessSpec { max_permissions },
+        )
+    }
+}
+
+/// The authorize-time half of an [`ExternalAccessPolicy`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalAccessGates {
+    pub approved: bool,
+    pub expires_at: Option<DateTime>,
+}
+
+impl ExternalAccessGates {
+    /// Is this approval usable *now*?
+    ///
+    /// Takes the clock as an argument rather than reading it, so the boundary
+    /// is testable without sleeping. An approval whose instant has passed is
+    /// exactly as closed as one that was never granted — there is no grace,
+    /// because the whole point of the expiry is that nobody has to remember.
+    pub fn is_open_at(&self, now: DateTime) -> bool {
+        self.approved && self.expires_at.is_none_or(|exp| exp > now)
+    }
+}
+
+/// The session-time half of an [`ExternalAccessPolicy`] — the ceiling a
+/// session's grant is clamped to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalAccessSpec {
+    pub max_permissions: Option<Permissions>,
+}
+
+impl ExternalAccessSpec {
+    /// The effective ceiling: what the admin set, or
+    /// [`DEFAULT_EXTERNAL_PERMISSIONS`] when they set nothing.
+    pub fn ceiling(&self) -> Permissions {
+        self.max_permissions.unwrap_or(DEFAULT_EXTERNAL_PERMISSIONS)
+    }
+
+    /// Clamp a requested grant to the ceiling.
+    ///
+    /// Intersection, never substitution: a request for less than the ceiling
+    /// stays less, and a request for more is trimmed rather than refused —
+    /// an outsider whose viewer asks for clipboard should get a session
+    /// without it, not an error they cannot act on.
+    pub fn clamp(&self, requested: Permissions) -> Permissions {
+        requested & self.ceiling()
+    }
+}
+
+/// Why an external-access decision was refused.
+///
+/// The FR-52 sibling of [`SshDenyReason`] / [`PeerRelayDenyReason`], kept
+/// separate for the reason those two are separate from each other: the
+/// vocabulary is its own. Every arm is auditable, and the refused rows are the
+/// ones an operator hunting "why can my contractor not connect?" reads.
+///
+/// ⚠️ These wire spellings are a compatibility surface — the audit view filters
+/// on them. Locked by test.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalRcDenyReason {
+    /// The caller lacks `MANAGE_AGENTS`, so they may not touch device policy
+    /// at all.
+    NotDeviceAdmin,
+    /// The caller holds `MANAGE_AGENTS` but not `REMOTE_CONTROL`, and asked to
+    /// ADD an approval. Clearing one needs only `MANAGE_AGENTS` — revocation
+    /// is not a grant.
+    CannotGrantExternal,
+    /// The device's agent does not advertise [`RpcCap::ExternalAccess`], so it
+    /// cannot honour the gates or tell the person at the machine that the
+    /// controller is an outsider. Approving it would put a promise on screen
+    /// that the device does not keep.
+    DeviceUnsupported,
+}
+
+impl ExternalRcDenyReason {
+    /// Every variant — walked by a test, so a new one cannot be added without
+    /// a wire spelling and a message.
+    pub const ALL: &'static [ExternalRcDenyReason] = &[
+        Self::NotDeviceAdmin,
+        Self::CannotGrantExternal,
+        Self::DeviceUnsupported,
+    ];
+
+    /// One line an operator can act on. Names WHICH gate said no, for the
+    /// reason [`SshDenyReason::message`] does: "denied" with no reason turns a
+    /// five-second fix into a support ticket.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotDeviceAdmin => {
+                "you do not have the MANAGE_AGENTS permission in this organization"
+            }
+            Self::CannotGrantExternal => {
+                "granting external access also requires the REMOTE_CONTROL permission \
+                 (clearing it does not)"
+            }
+            Self::DeviceUnsupported => {
+                "this device's agent is too old for external access — it cannot tell the \
+                 person at the machine that the controller is from outside the organization"
+            }
+        }
+    }
+}
+
+/// What an [`ExternalRcAuditEvent`] row is about.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalRcAuditAction {
+    /// An admin set (or cleared) a device's [`ExternalAccessPolicy`] — the
+    /// privilege-granting act.
+    Approve,
+    /// An admin minted or rotated a device's connect code. Audited because
+    /// rotation is the revocation story for a leaked code, so "when did this
+    /// code start being valid?" has to be answerable.
+    RotateCode,
+}
+
+/// One external-access decision, granted or refused. TTL-expired after 90 days
+/// like [`SshAuditEvent`].
+///
+/// ⚠️ A row records the SERVER's decision. It is deliberately not a record of
+/// the session: the server's involvement ends when it says yes, and the
+/// session rides a path it never observes — the same discipline as
+/// [`SshAuditEvent`] and [`PeerRelayAuditEvent`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExternalRcAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub action: ExternalRcAuditAction,
+    /// The device the row is about.
+    pub agent_id: ObjectId,
+    /// The admin who asked.
+    pub user_id: ObjectId,
+    /// Display name of the acting admin, so a row stays readable after the
+    /// account is renamed or removed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor: String,
+    /// `approve` — the requested approval state. The field a reader scans for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved: Option<bool>,
+    /// `approve` — the ceiling that was set, in the pipe-separated wire form
+    /// (`"VIEW | INPUT"`). Absent when the policy named none, which means
+    /// [`DEFAULT_EXTERNAL_PERMISSIONS`] applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_permissions: Option<String>,
+    /// `approve` — when the approval lapses, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime>,
+    pub at: DateTime,
+    /// Refusal reason; `None` = the decision went through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<ExternalRcDenyReason>,
+}
+
+impl ExternalRcAuditEvent {
+    pub const COLLECTION: &'static str = "external_rc_audit";
+}
+
+#[cfg(test)]
+mod external_access_tests {
+    use super::*;
+
+    /// An untouched policy is closed. The whole default-deny story rests on
+    /// this one assertion holding for every row that predates the feature.
+    #[test]
+    fn default_policy_is_closed() {
+        let p = ExternalAccessPolicy::default();
+        assert!(!p.approved);
+        let (gates, _) = p.split();
+        assert!(!gates.is_open_at(DateTime::now()));
+    }
+
+    /// A pre-FR-52 agent document has no `external_access_policy` key at all.
+    /// It must deserialise to the closed default rather than fail the whole
+    /// row — a device that stops loading is worse than one that stays shut.
+    #[test]
+    fn absent_policy_deserialises_closed() {
+        let p: ExternalAccessPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(p, ExternalAccessPolicy::default());
+        assert!(!p.approved);
+    }
+
+    /// An UNSET ceiling is the narrow one. If this ever flips to
+    /// `Permissions::all()`, forgetting to set a ceiling becomes the widest
+    /// possible grant to a stranger.
+    #[test]
+    fn unset_ceiling_is_view_and_input_only() {
+        let spec = ExternalAccessSpec {
+            max_permissions: None,
+        };
+        assert_eq!(spec.ceiling(), Permissions::VIEW | Permissions::INPUT);
+        assert!(!spec.ceiling().contains(Permissions::CLIPBOARD));
+        assert!(!spec.ceiling().contains(Permissions::FILES));
+    }
+
+    /// The clamp trims rather than refuses, and never widens.
+    #[test]
+    fn clamp_is_an_intersection_in_both_directions() {
+        let spec = ExternalAccessSpec {
+            max_permissions: Some(Permissions::VIEW | Permissions::INPUT),
+        };
+        // Asking for more than the ceiling is trimmed to it.
+        assert_eq!(
+            spec.clamp(Permissions::all()),
+            Permissions::VIEW | Permissions::INPUT
+        );
+        // Asking for less than the ceiling stays less — a view-only watcher
+        // must not be handed input because the ceiling allowed it.
+        assert_eq!(spec.clamp(Permissions::VIEW), Permissions::VIEW);
+    }
+
+    /// ⚠️ This policy is a **storage** shape and must never be an HTTP one.
+    ///
+    /// `bson::DateTime` speaks extended JSON in both directions: it REFUSES the
+    /// plain `"2026-09-05T10:00:00Z"` that `Date.toISOString()` produces (so a
+    /// body carrying what the dialog's picker yields fails to deserialize —
+    /// a 4xx on an optional field, with nothing on screen to explain it), and it
+    /// EMITS `{"$date":{"$numberLong":…}}` (a TRUTHY object, so a client
+    /// presence check passes and the value renders as `[object Object]`).
+    ///
+    /// Both halves were found by test before shipping. `routes::external_access`
+    /// therefore owns an `ExternalAccessPolicyBody` whose `expires_at` is an
+    /// RFC3339 `String`, converted at the edge. This test pins the reason that
+    /// indirection exists, so nobody deletes it as ceremony.
+    #[test]
+    fn the_stored_policy_speaks_extended_json_which_is_why_the_api_has_its_own_shape() {
+        // Inbound: the browser's form is REFUSED here.
+        let iso: Result<ExternalAccessPolicy, _> =
+            serde_json::from_str(r#"{"approved":true,"expires_at":"2026-09-05T10:00:00Z"}"#);
+        assert!(
+            iso.is_err(),
+            "if this ever starts parsing, the API's String hop can be revisited"
+        );
+
+        // Outbound: an object, not a string. The trap is that it is truthy.
+        let p = ExternalAccessPolicy {
+            approved: true,
+            max_permissions: None,
+            expires_at: Some(DateTime::from_millis(1_788_602_400_000)),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(
+            v["expires_at"].is_object(),
+            "a bson::DateTime serialises as an object; returning this struct \
+             from a handler is what produces [object Object] on screen"
+        );
+    }
+
+    #[test]
+    fn expiry_closes_the_gate_with_no_grace() {
+        let now = DateTime::from_millis(1_000_000);
+        let past = DateTime::from_millis(999_999);
+        let future = DateTime::from_millis(1_000_001);
+
+        let open = ExternalAccessGates {
+            approved: true,
+            expires_at: Some(future),
+        };
+        assert!(open.is_open_at(now));
+
+        let lapsed = ExternalAccessGates {
+            approved: true,
+            expires_at: Some(past),
+        };
+        assert!(!lapsed.is_open_at(now));
+
+        // Exactly at the instant is CLOSED — the bound is exclusive, so a
+        // reader never has to wonder which side of it they are on.
+        let boundary = ExternalAccessGates {
+            approved: true,
+            expires_at: Some(now),
+        };
+        assert!(!boundary.is_open_at(now));
+
+        // No expiry stands until cleared.
+        let standing = ExternalAccessGates {
+            approved: true,
+            expires_at: None,
+        };
+        assert!(standing.is_open_at(now));
+    }
+
+    /// An expiry cannot resurrect an approval that was never granted.
+    #[test]
+    fn expiry_never_opens_an_unapproved_device() {
+        let g = ExternalAccessGates {
+            approved: false,
+            expires_at: Some(DateTime::from_millis(i64::MAX)),
+        };
+        assert!(!g.is_open_at(DateTime::from_millis(0)));
+    }
+
+    /// Wire spellings are what the audit view filters on; a rename here
+    /// silently empties a filtered view rather than failing.
+    #[test]
+    fn deny_reason_wire_strings_are_locked() {
+        for (reason, wire) in [
+            (ExternalRcDenyReason::NotDeviceAdmin, "not_device_admin"),
+            (
+                ExternalRcDenyReason::CannotGrantExternal,
+                "cannot_grant_external",
+            ),
+            (
+                ExternalRcDenyReason::DeviceUnsupported,
+                "device_unsupported",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{wire}\"")
+            );
+        }
+    }
+
+    /// Walks `ALL`, so a variant added without a message shows up here rather
+    /// than as an empty string in front of an operator.
+    #[test]
+    fn every_deny_reason_has_a_message_and_is_listed() {
+        for r in ExternalRcDenyReason::ALL {
+            assert!(!r.message().is_empty(), "{r:?} has no message");
+        }
+        // A new variant that was not added to ALL fails to round-trip here.
+        let seen: Vec<_> = ExternalRcDenyReason::ALL.to_vec();
+        assert_eq!(seen.len(), 3, "ALL must list every variant");
+    }
+
+    #[test]
+    fn audit_action_wire_strings_are_locked() {
+        assert_eq!(
+            serde_json::to_string(&ExternalRcAuditAction::Approve).unwrap(),
+            "\"approve\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExternalRcAuditAction::RotateCode).unwrap(),
+            "\"rotate_code\""
+        );
+    }
+
+    /// A refusal row must not carry grant-only fields — the reason the SSH
+    /// audit builds its row from `outcome.as_ref().ok()` rather than from the
+    /// request.
+    #[test]
+    fn a_refusal_row_serialises_without_the_grant_fields() {
+        let ev = ExternalRcAuditEvent {
+            id: None,
+            tenant_id: ObjectId::new(),
+            action: ExternalRcAuditAction::Approve,
+            agent_id: ObjectId::new(),
+            user_id: ObjectId::new(),
+            actor: "alex".into(),
+            approved: None,
+            max_permissions: None,
+            expires_at: None,
+            at: DateTime::now(),
+            denied: Some(ExternalRcDenyReason::NotDeviceAdmin),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert!(json.get("approved").is_none());
+        assert!(json.get("max_permissions").is_none());
+        assert!(json.get("expires_at").is_none());
+        assert_eq!(json["denied"], "not_device_admin");
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

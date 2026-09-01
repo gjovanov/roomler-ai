@@ -277,6 +277,24 @@ pub async fn ensure_indexes(db: &Database, multi_block: bool) -> Result<(), mong
             // (the CI-fleet case this feature exists for) never turns the
             // 60 s reap cycle into a collection scan.
             index(bson::doc! { "ephemeral": 1, "deleted_at": 1, "last_seen_at": 1 }),
+            // FR-52 — the connect code an outsider names a device by. Unique
+            // GLOBALLY, not per tenant: a stranger types a code with no org
+            // context, so it has to resolve on its own.
+            //
+            // ⚠️ Deliberately NOT scoped to live rows. Every other unique index
+            // in this file that could be is (`$type: "null"` on `deleted_at`),
+            // and this one is the exception on purpose: a tombstone keeps its
+            // code reserved forever, so a code recycled onto a new device can
+            // never point someone holding the old note at a DIFFERENT machine.
+            // The cost is one reserved string per removed device, which is the
+            // cheap side of that trade.
+            //
+            // Partial on `$exists` so the overwhelming majority of rows — every
+            // device nobody minted a code for — are simply not in the index.
+            index_unique_partial(
+                bson::doc! { "connect_code": 1 },
+                bson::doc! { "connect_code": { "$exists": true } },
+            ),
         ],
     )
     .await?;
@@ -599,6 +617,24 @@ pub async fn ensure_indexes(db: &Database, multi_block: bool) -> Result<(), mong
     create_indexes(
         db,
         "ssh_audit",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index(bson::doc! { "agent_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
+    // FR-52 cross-org remote access — the server's own record of every
+    // external-access decision, granted or refused. Same 90-day TTL and the
+    // same reason as `ssh_audit`: the REFUSED rows are the point, because an
+    // approval handed to the wrong person is the thing an incident review is
+    // looking for and a grant that quietly never happened is the thing a
+    // support call is.
+    create_indexes(
+        db,
+        "external_rc_audit",
         vec![
             index(bson::doc! { "tenant_id": 1, "at": -1 }),
             index(bson::doc! { "agent_id": 1, "at": -1 }),

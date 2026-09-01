@@ -209,6 +209,14 @@ export interface Agent {
    *  dialog's own default is `console_user` for exactly that reason — don't
    *  "helpfully" fill this in. */
   ssh_policy?: SshPolicy
+  /** FR-52 gate 2 — approval for control by someone OUTSIDE this org.
+   *
+   *  Absent = never approved, which is also the correct reading for every
+   *  device that predates the feature. Unlike {@link ssh_policy} there is no
+   *  hazard in an absent value here: the server's default is `approved:
+   *  false`, so a spread of `undefined` yields a closed dialog rather than an
+   *  open door. */
+  external_access_policy?: ExternalAccessPolicy
   /** Remote config: what an operator asked this device to run, what the device
    *  said it did, and where that leaves things (`docs/remote-config.md`).
    *
@@ -285,6 +293,45 @@ export interface SshPolicy {
   /** Only `auto` (unattended) and `prompt` are honoured. `null` = prompt —
    *  an absent directive means ask, the fail-safe the agent also applies. */
   consent_mode: ConsentMode | null
+}
+
+/** FR-52 gate 2 — a device's approval for control by someone OUTSIDE the org.
+ *
+ *  ⚠️ Approving grants nothing on its own. The device must still opt in
+ *  locally, the outsider must still prove the device-held password, and the
+ *  person at the machine still consents. What this DOES decide is the ceiling
+ *  — and an absent `max_permissions` is the NARROW one (`VIEW | INPUT`), never
+ *  "unrestricted". */
+export interface ExternalAccessPolicy {
+  approved: boolean
+  /** Pipe-separated names (`"VIEW | INPUT"`), matching the rest of the `rc:*`
+   *  surface. `null`/absent = the server's built-in ceiling. */
+  max_permissions?: string | null
+  /** ISO instant, or absent for an approval that stands until cleared. */
+  expires_at?: string | null
+}
+
+/** One approved device as the external-access settings view lists it. */
+export interface ExternalDevice {
+  id: string
+  name: string
+  status: AgentStatusValue
+  /** Display form, `XXXX-XXXX-XXXX`. `null` when no code has been minted —
+   *  an approved device with no code is not reachable, which is the most
+   *  common "why can they not connect?" answer. */
+  connect_code: string | null
+  connect_code_rotated_at: string | null
+  /** Always the RESOLVED ceiling, never an unset placeholder. */
+  max_permissions: string
+  expires_at: string | null
+  /** Whether the device's agent understands cross-org access at all. An
+   *  approved device on an old agent is approved and unreachable. */
+  supported: boolean
+}
+
+export interface ExternalAccessSettings {
+  enabled: boolean
+  devices: ExternalDevice[]
 }
 
 /** What the device did with a pushed desired-config. Mirrors the Rust
@@ -959,6 +1006,73 @@ export const useAgentStore = defineStore('agents', () => {
     orgSshEnabled.value = resp.remote_ssh_enabled
   }
 
+  // ── FR-52 — cross-org remote access ──────────────────────────────
+  //
+  // A THIRD org switch, separate from exec's and SSH's, because those two
+  // govern what a MEMBER may do and this one governs whether a stranger may
+  // do anything at all. Nothing about letting employees run commands implies
+  // letting outsiders onto a screen.
+
+  /** Whether the ORG can be reached from outside at all (gate 1). `null`
+   *  until fetched, and left `null` on a 403 — the same "not an admin is not
+   *  disabled" rule as the exec and SSH switches. */
+  const orgExternalAccessEnabled = ref<boolean | null>(null)
+  /** Devices approved under gate 2, with their connect codes. Only ever
+   *  populated for a `MANAGE_AGENTS` holder — the ordinary device list
+   *  deliberately omits connect codes. */
+  const externalDevices = ref<ExternalDevice[]>([])
+
+  async function fetchExternalAccess(tenantId: string) {
+    try {
+      const resp = await api.get<ExternalAccessSettings>(`/tenant/${tenantId}/external-access`)
+      orgExternalAccessEnabled.value = resp.enabled
+      externalDevices.value = resp.devices
+    } catch {
+      orgExternalAccessEnabled.value = null
+      externalDevices.value = []
+    }
+  }
+
+  /** Flip gate 1. MANAGE_TENANT server-side. */
+  async function setOrgExternalAccessEnabled(tenantId: string, enabled: boolean) {
+    const resp = await api.put<{ enabled: boolean }>(`/tenant/${tenantId}/external-access`, {
+      enabled,
+    })
+    orgExternalAccessEnabled.value = resp.enabled
+  }
+
+  /** Replace a device's external-access approval (gate 2).
+   *
+   *  MANAGE_AGENTS + REMOTE_CONTROL to grant, MANAGE_AGENTS alone to clear.
+   *  A rejected save must leave the caller's dialog OPEN — the server refuses
+   *  an approval on a device whose agent is too old to say "this controller is
+   *  from outside your organization", and silently closing would look like it
+   *  worked. */
+  async function updateExternalAccessPolicy(
+    tenantId: string,
+    agentId: string,
+    policy: ExternalAccessPolicy,
+  ) {
+    await api.put(`/tenant/${tenantId}/agent/${agentId}/external-access-policy`, policy)
+    const idx = agents.value.findIndex((a) => a.id === agentId)
+    if (idx !== -1) agents.value[idx]!.external_access_policy = policy
+  }
+
+  /** Mint or rotate a device's connect code. One call for both, because
+   *  rotation IS the revocation story for a leaked code. */
+  async function rotateConnectCode(tenantId: string, agentId: string): Promise<string> {
+    const resp = await api.post<{ connect_code: string; rotated_at: string }>(
+      `/tenant/${tenantId}/agent/${agentId}/connect-code`,
+      {},
+    )
+    const dev = externalDevices.value.find((d) => d.id === agentId)
+    if (dev) {
+      dev.connect_code = resp.connect_code
+      dev.connect_code_rotated_at = resp.rotated_at
+    }
+    return resp.connect_code
+  }
+
   // ── FR-51 — ephemeral enrollment keys ────────────────────────────
   //
   // A reusable credential that mints self-removing devices (CI runners,
@@ -1180,6 +1294,12 @@ export const useAgentStore = defineStore('agents', () => {
     orgSshEnabled,
     fetchOrgSshEnabled,
     setOrgSshEnabled,
+    orgExternalAccessEnabled,
+    externalDevices,
+    fetchExternalAccess,
+    setOrgExternalAccessEnabled,
+    updateExternalAccessPolicy,
+    rotateConnectCode,
     orgEphemeralKeysEnabled,
     fetchOrgEphemeralKeysEnabled,
     setOrgEphemeralKeysEnabled,

@@ -14,6 +14,7 @@ pub mod cost;
 pub mod device;
 pub mod enroll_key;
 pub mod export;
+pub mod external_access;
 pub mod file;
 pub mod giphy;
 pub(crate) mod helpers;

@@ -408,6 +408,89 @@ describe('useAgentStore', () => {
 
   // ── FR-51 — ephemeral enrollment keys ──────────────────────────────
 
+  // FR-52 — cross-org remote access. A THIRD org switch: exec and SSH decide
+  // what a MEMBER may do, this decides whether a non-member may do anything.
+
+  it('the external-access switch is a third independent flag on its own route', async () => {
+    mockApi.get.mockResolvedValueOnce({ enabled: true, devices: [] })
+    const s = useAgentStore()
+    await s.fetchExternalAccess(TENANT_ID)
+    expect(s.orgExternalAccessEnabled).toBe(true)
+    // A fetch of one switch must never populate another's flag.
+    expect(s.orgExecEnabled).toBeNull()
+    expect(s.orgSshEnabled).toBeNull()
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/external-access`)
+  })
+
+  it('a 403 on external access leaves it UNKNOWN, not off', async () => {
+    // "Not an admin" is not "disabled". Claiming the org is off would send
+    // someone hunting through per-device settings for a switch that is fine.
+    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    const s = useAgentStore()
+    await s.fetchExternalAccess(TENANT_ID)
+    expect(s.orgExternalAccessEnabled).toBeNull()
+    expect(s.externalDevices).toEqual([])
+  })
+
+  it('rotating a connect code REPLACES the stored one', async () => {
+    // Rotation is the revocation story for a leaked code, so a store that kept
+    // the old value would show an admin an address that no longer works.
+    mockApi.get.mockResolvedValueOnce({
+      enabled: true,
+      devices: [
+        {
+          id: 'a1',
+          name: 'Laptop',
+          status: 'online',
+          connect_code: 'AAAA-BBBB-CCCC',
+          connect_code_rotated_at: '2026-09-01T09:00:00Z',
+          max_permissions: 'VIEW | INPUT',
+          expires_at: null,
+          supported: true,
+        },
+      ],
+    })
+    const s = useAgentStore()
+    await s.fetchExternalAccess(TENANT_ID)
+    expect(s.externalDevices[0]!.connect_code).toBe('AAAA-BBBB-CCCC')
+
+    mockApi.post.mockResolvedValueOnce({
+      connect_code: 'K7Q2-9XM4-TB3F',
+      rotated_at: '2026-09-01T10:00:00Z',
+    })
+    const next = await s.rotateConnectCode(TENANT_ID, 'a1')
+    expect(next).toBe('K7Q2-9XM4-TB3F')
+    expect(s.externalDevices[0]!.connect_code).toBe('K7Q2-9XM4-TB3F')
+    expect(mockApi.post.mock.calls.at(-1)![0]).toBe(
+      `/tenant/${TENANT_ID}/agent/a1/connect-code`,
+    )
+  })
+
+  it('saving an external-access policy writes it back onto the agent row', async () => {
+    // The dialog PUTs the WHOLE shape, so the store must keep the saved policy
+    // — a stale row would reopen the dialog on the old ceiling and the next
+    // save would silently widen what an outsider may do.
+    mockApi.get.mockResolvedValueOnce({ items: [mkAgent({ id: 'a1' })], total: 1 })
+    const s = useAgentStore()
+    await s.fetchAgents(TENANT_ID)
+    expect(s.agents[0]!.external_access_policy).toBeUndefined()
+
+    mockApi.put.mockResolvedValueOnce({})
+    await s.updateExternalAccessPolicy(TENANT_ID, 'a1', {
+      approved: true,
+      max_permissions: 'VIEW',
+      expires_at: null,
+    })
+    expect(s.agents[0]!.external_access_policy).toEqual({
+      approved: true,
+      max_permissions: 'VIEW',
+      expires_at: null,
+    })
+    expect(mockApi.put.mock.calls.at(-1)![0]).toBe(
+      `/tenant/${TENANT_ID}/agent/a1/external-access-policy`,
+    )
+  })
+
   it('the ephemeral-keys org switch is its own flag and its own route', async () => {
     mockApi.get.mockResolvedValueOnce({ ephemeral_keys_enabled: true })
     const s = useAgentStore()
