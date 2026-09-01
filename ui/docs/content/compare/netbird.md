@@ -45,7 +45,7 @@ Included on the same server and accounts.
 
 ## Side by side
 
-| | Roomler | NetBird |
+| Capability | Roomler | NetBird |
 |---|---|---|
 | Private mesh | Yes | Yes |
 | Exit nodes, subnet routes | Yes | Yes |

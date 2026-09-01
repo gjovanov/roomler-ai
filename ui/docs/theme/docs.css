@@ -293,7 +293,7 @@ a.chip--link:hover { background: #cfe9e6; text-decoration: none; }
 .callout--tip     { border-left-color: #43a047; background: #f3faf3; }
 .callout--tip .callout__head { color: #2e7d32; }
 .callout--warning { border-left-color: var(--amber); background: var(--amber-soft); }
-.callout--warning .callout__head { color: #a17800; }
+.callout--warning .callout__head { color: #8a6600; }
 .callout--danger  { border-left-color: var(--coral); background: var(--coral-soft); }
 .callout--danger .callout__head { color: #c62828; }
 
@@ -305,7 +305,7 @@ a.chip--link:hover { background: #cfe9e6; text-decoration: none; }
 }
 .card:hover { transform: translateY(-4px); box-shadow: var(--shadow-card); }
 .card__icon { display: inline-flex; color: var(--teal); margin-bottom: 9px; }
-.card__title { font-size: 1rem; font-weight: 700; margin: 0 0 5px; }
+.card__title { font-size: 1rem; font-weight: 700; margin: 0 0 5px; border-bottom: 0; padding-bottom: 0; scroll-margin-top: 0; }
 .card__text { font-size: .9rem; color: var(--ink-muted); margin: 0; }
 
 .badge-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(238px, 1fr)); gap: 14px; margin: 0 0 1.6em; }
@@ -479,7 +479,7 @@ html[data-os="linux"]   .os-tablist > .os-tab[data-os="linux"] {
 .section-card__icon { display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 42px; border-radius: 11px; background: var(--teal-soft); color: var(--teal-deep); margin-bottom: 11px; }
 .section-card__icon--coral { background: var(--coral-soft); color: #c62828; }
 .section-card__icon--deep { background: #e0f2f1; color: var(--teal-deep); }
-.section-card__title { font-size: 1.06rem; font-weight: 700; margin: 0 0 5px; }
+.section-card__title { font-size: 1.06rem; font-weight: 700; margin: 0 0 5px; border-bottom: 0; padding-bottom: 0; scroll-margin-top: 0; }
 .section-card__blurb { font-size: .9rem; color: var(--ink-muted); margin: 0 0 9px; }
 .section-card__count { font-size: .78rem; color: var(--ink-faint); }
 

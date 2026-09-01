@@ -52,7 +52,7 @@ its own identity system.
 
 ## Side by side
 
-| | Roomler | Tailscale |
+| Capability | Roomler | Tailscale |
 |---|---|---|
 | Private mesh | Yes | Yes |
 | Remote desktop | **Built in** | No — bring your own |

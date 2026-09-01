@@ -258,7 +258,7 @@ function sectionIndexBody(section: (typeof SECTIONS)[number], pages: DocPage[]):
     .map(
       (p) =>
         `<a class="section-card" href="${p.url}">` +
-        `<h3 class="section-card__title">${escapeHtml(p.title)}</h3>` +
+        `<h2 class="section-card__title">${escapeHtml(p.title)}</h2>` +
         `<p class="section-card__blurb">${escapeHtml(p.description)}</p></a>`,
     )
     .join('')
@@ -305,7 +305,7 @@ function makeTagIndex(tag: string, pages: DocPage[]): DocPage {
     .map(
       (p) =>
         `<a class="section-card" href="${p.url}">` +
-        `<h3 class="section-card__title">${escapeHtml(p.title)}</h3>` +
+        `<h2 class="section-card__title">${escapeHtml(p.title)}</h2>` +
         `<p class="section-card__blurb">${escapeHtml(p.description)}</p>` +
         `<span class="section-card__count">${escapeHtml(p.section?.title ?? 'Docs')}</span></a>`,
     )
