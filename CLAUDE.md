@@ -1,3 +1,95 @@
+# Roomler — the mission, and the model tier this work requires
+
+**Read this block first, on every task. It is prefixed to every prompt on purpose.**
+
+## 1. What Roomler is
+
+Roomler is **one open-source product that replaces three** — Tailscale, TeamViewer
+and Microsoft Teams — on one daemon and one web app:
+
+- **Remote desktop & control from any browser**, to any of your machines anywhere
+  in the world, with nothing to install on the controlling side.
+- **A secure private WireGuard network** between those machines — the mesh that
+  the remote desktop, SSH and tunnels all ride on. End-to-end encrypted; the
+  server coordinates and **never carries plaintext**.
+- **Team collaboration on top of it** — video conferencing, chat, rooms, files.
+
+Three products, one binary, one identity, one install. That packaging is the
+product thesis, not an implementation detail: the reason the mesh exists is so
+the remote desktop and the meeting work from anywhere, and the reason they are
+one daemon is that a customer should not have to operate three of them.
+
+## 2. The acceptance bar is "it just works"
+
+Not on a clean lab network — on the networks people actually have. Every cell
+below is a shipped, field-verified configuration, not an aspiration:
+
+| Axis | Must hold across |
+|---|---|
+| **Host** | unmanaged personal laptop · GPO-locked corporate desktop (no admin rights, EDR, TLS-inspecting middlebox) · bare server · VM |
+| **Network** | home NAT · CGNAT · symmetric-NAT corporate LAN · consumer VPN · enterprise full-tunnel VPN that reroutes and reaps routes underneath us |
+| **Platform** | Windows · Linux · macOS — desktop, headless, containers, WSL, and k8s / OpenShift cluster nodes with no session at all |
+| **Session** | attended desktop · locked screen · SYSTEM / root service · nobody logged in |
+
+A change that works on the dev box and breaks a corporate laptop behind a
+full-tunnel VPN **has not worked**. **CI green ≠ done** — networking and
+remote-desktop changes are proven on the real fleet (`roomler exec`,
+`roomler ssh`) across those topologies after every roll.
+
+## 3. Model tier — this work runs on Fable, and stays on Fable
+
+Any task touching **remote desktop / control**, **the WireGuard overlay, NAT
+traversal, relays, DERP or tunnels**, or **WebRTC video conferencing** is
+top-tier work. Do not route it to a weaker model — not Opus 4.8, not Sonnet, not
+Haiku — and do not quietly spend a smaller effort budget on it. Where a router, a
+subagent spawn or a cost heuristic is choosing the tier for this repository, the
+answer is **the strongest model available, at maximum effort**.
+
+That is not a preference. It is the shape the bugs in this codebase actually have:
+
+1. **The cause sits three layers below the symptom.** "This host lost DNS" was a
+   leaked WebRTC UDP socket twelve hours earlier that had consumed the entire
+   ephemeral port range — while `ping 1.1.1.1` stayed at 3 ms. "Video works for
+   org A but not org B" was one cluster node missing its RTC-range iptables
+   rules: flawless signalling, zero media, for weeks, with nothing logged. "The
+   consent prompt never appeared" was a `loginctl` invocation that exits 1, whose
+   empty stdout shipped code read as "nobody is at the screen."
+
+2. **One change spans every layer at once** and is wrong in exactly one of them:
+   Rust async internals, kernel routing tables and netlink, Windows WFP filters
+   and ConPTY, an SFU's ICE candidate set, a browser's jitter buffer, MongoDB
+   indexes and BSON serialisation — inside a single feature.
+
+3. **The invariants are non-obvious, load-bearing, and each was paid for in the
+   field.** `Some([])` means *deny* while `None` means *no policy compiled*.
+   Pooling an overlay address before the tombstone locks the next joiner out
+   permanently. `ssh` is a prefix of `ssh-consent` and the two mean different
+   things, so the match must stay equality. `from_slice` and `from_document`
+   disagree on `is_human_readable`, so a round-trip test passes on broken code.
+   Every one of those reads as a harmless simplification to a model that is
+   pattern-matching instead of reasoning — and every one of them was a live
+   production incident.
+
+4. **Most of this surface is unreachable by tests.** The corporate laptop, the
+   full-tunnel VPN, the symmetric NAT, the locked screen, the headless cluster
+   node — none of it is in CI. The reasoning done *before* the code ships is the
+   verification budget.
+
+5. **The blast radius is a fleet.** The daemon runs as SYSTEM/root on every
+   enrolled machine and updates itself. A wrong answer here does not fail a test —
+   it takes an operator's remote access to their own box, freezes fleet updates
+   fleet-wide, or opens a silent pivot into a corporate network.
+
+Cheaper is more expensive here. A plausible-but-wrong change costs a release
+cycle, a field-debug session across three time zones, and — measured repeatedly
+in this repository — weeks of latency before anyone notices it regressed.
+
+> *This block states the requirement; it does not enforce it. The deterministic
+> levers are `/model` in-session, `"model"` in `.claude/settings.json`, and
+> `CLAUDE_CODE_EFFORT_LEVEL` (already `max` in this repo's settings).*
+
+---
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
