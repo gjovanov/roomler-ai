@@ -950,6 +950,7 @@ mod tests {
             // own tests in `crates/tests/src/ephemeral_tests.rs`.
             ephemeral: false,
             ephemeral_ttl_secs: None,
+            enroll_key_id: None,
             os: OsKind::Linux,
             agent_version: "0".into(),
             companion_version: None,
