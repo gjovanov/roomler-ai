@@ -1927,6 +1927,16 @@ pub enum ServerMsg {
         self_ip: String,
         network: OverlayNetworkInfo,
         peers: Vec<NetmapPeer>,
+        /// ⚠️ `#[serde(default)]` because this field is REQUIRED to decode the
+        /// frame and is read by NOBODY. The agent destructures
+        /// `{ self_ip, network, peers, .. }` and discards it; the resync it was
+        /// added for was never built.
+        ///
+        /// Without the default, a netmap that omitted `epoch` — a rolled-back
+        /// server, or any future sender that forgets it — fails the whole
+        /// `ServerMsg` parse and the node gets NO address and NO peers. A field
+        /// no consumer reads must not be able to destroy the frame carrying it.
+        #[serde(default)]
         epoch: u64,
     },
 
@@ -1935,6 +1945,12 @@ pub enum ServerMsg {
     /// ACL-change/rekey).
     #[serde(rename = "rc:overlay.netmap_delta")]
     OverlayNetmapDelta {
+        /// Defaulted for the same reason as [`ServerMsg::OverlayNetmap`]'s: the
+        /// agent reads `{ upserts, removes, .. }` and never this. A delta lost
+        /// to a missing `epoch` silently strands a peer add or, worse, a peer
+        /// REMOVAL — leaving a node routing to an address that has been
+        /// recycled to someone else.
+        #[serde(default)]
         epoch: u64,
         #[serde(default)]
         upserts: Vec<NetmapPeer>,
@@ -4028,6 +4044,54 @@ mod tests {
     }
 
     // ─── rc:overlay.* wire-format locks ───────────────────────────────
+
+    /// A netmap missing `epoch` still decodes.
+    ///
+    /// `epoch` was REQUIRED and read by nobody: the agent destructures
+    /// `{ self_ip, network, peers, .. }`, and the resync it was added for was
+    /// never built. So a sender that omitted it failed the whole `ServerMsg`
+    /// parse, and the node got no address and no peers — a total mesh failure
+    /// caused by a field with no consumer.
+    ///
+    /// This is the shape of the bug, not just the instance: any required field
+    /// on a frame the agent must parse can silently destroy it. The parse arm
+    /// in `signaling.rs` now WARNs when an `rc:`-tagged frame fails to decode,
+    /// so the next one is visible instead of invisible.
+    #[test]
+    fn a_netmap_without_epoch_still_decodes_and_does_not_strand_the_node() {
+        let no_epoch = r#"{"t":"rc:overlay.netmap","self_ip":"100.65.0.7",
+            "network":{"cidr":"100.65.0.0/22","mtu":1280},"peers":[]}"#;
+        match serde_json::from_str::<ServerMsg>(no_epoch).unwrap() {
+            ServerMsg::OverlayNetmap {
+                self_ip,
+                epoch,
+                peers,
+                ..
+            } => {
+                assert_eq!(self_ip, "100.65.0.7", "the address still arrives");
+                assert_eq!(epoch, 0, "a missing epoch defaults rather than failing");
+                assert!(peers.is_empty());
+            }
+            other => panic!("expected OverlayNetmap, got {other:?}"),
+        }
+
+        // Same for a delta — where the cost of losing one is worse: a dropped
+        // REMOVAL leaves a node routing to an address that may since have been
+        // recycled to a different device.
+        let delta = r#"{"t":"rc:overlay.netmap_delta","upserts":[],
+            "removes":["6a95ba653d54d39b773c56ba"]}"#;
+        match serde_json::from_str::<ServerMsg>(delta).unwrap() {
+            ServerMsg::OverlayNetmapDelta { epoch, removes, .. } => {
+                assert_eq!(epoch, 0);
+                assert_eq!(
+                    removes.iter().map(|o| o.to_hex()).collect::<Vec<_>>(),
+                    vec!["6a95ba653d54d39b773c56ba".to_string()],
+                    "the removal survives a missing epoch"
+                );
+            }
+            other => panic!("expected OverlayNetmapDelta, got {other:?}"),
+        }
+    }
 
     /// FR-47 P5d — a netmap from a pre-P5d server decodes, and carries no
     /// block list rather than an invented one.
