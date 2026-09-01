@@ -19,7 +19,10 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
-    include: ['src/**/*.spec.ts', 'src/**/*.test.ts'],
+    // `docs/**` is FR-60's static documentation generator. Its specs live
+    // next to it rather than under src/, because it is a build-time tool
+    // and not part of the SPA bundle.
+    include: ['src/**/*.spec.ts', 'src/**/*.test.ts', 'docs/**/*.spec.ts'],
     // Vuetify inlining pushes the first `await import('../vuetify')`
     // past the 5-s default on cold caches (CI runners + fresh local
     // clones). Bump once; the rest of the suite is unaffected.
