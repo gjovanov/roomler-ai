@@ -64,6 +64,24 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/remote/ConsentView.vue'),
   },
   {
+    // FR-58 — where the subscribe confirm link lands (the API 303s here with
+    // ?status=ok|invalid). No meta.auth AND no meta.guest: the page must render
+    // identically for signed-in and signed-out — `meta.guest` would bounce a
+    // signed-in user to the dashboard, which is how the previous target
+    // (`/?subscribe=…`, auth-gated) showed the outcome to nobody.
+    path: '/newsletter/confirmed',
+    name: 'newsletter-confirmed',
+    component: () => import('@/views/newsletter/NewsletterOutcomeView.vue'),
+    props: { kind: 'confirmed' },
+  },
+  {
+    // FR-58 — where the unsubscribe link lands. Same rules as above.
+    path: '/newsletter/unsubscribed',
+    name: 'newsletter-unsubscribed',
+    component: () => import('@/views/newsletter/NewsletterOutcomeView.vue'),
+    props: { kind: 'unsubscribed' },
+  },
+  {
     path: '/',
     component: () => import('@/components/layout/AppLayout.vue'),
     meta: { auth: true },

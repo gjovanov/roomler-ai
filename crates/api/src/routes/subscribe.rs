@@ -178,9 +178,10 @@ pub async fn confirm(
     Path(token): Path<String>,
 ) -> Result<Redirect, ApiError> {
     let ok = state.subscribers.confirm(&token).await.unwrap_or(false);
-    Ok(Redirect::to(&landing(
+    Ok(Redirect::to(&outcome_page(
         &state,
-        if ok { "confirmed" } else { "invalid" },
+        "confirmed",
+        if ok { "ok" } else { "invalid" },
     )))
 }
 
@@ -194,15 +195,46 @@ pub async fn unsubscribe(
     Path(token): Path<String>,
 ) -> Result<Redirect, ApiError> {
     let ok = state.subscribers.unsubscribe(&token).await.unwrap_or(false);
-    Ok(Redirect::to(&landing(
+    Ok(Redirect::to(&outcome_page(
         &state,
-        if ok { "unsubscribed" } else { "invalid" },
+        "unsubscribed",
+        if ok { "ok" } else { "invalid" },
     )))
 }
 
-fn landing(state: &AppState, status: &str) -> String {
+/// `POST /api/subscribe/unsubscribe/{token}` — the RFC 8058 one-click target
+/// (`List-Unsubscribe-Post: List-Unsubscribe=One-Click`), so Gmail/Yahoo can
+/// unsubscribe a recipient from their own UI (FR-58).
+///
+/// Three properties are the contract, not conveniences:
+/// - **Plain 200 for every outcome.** Providers want a 2xx and follow no
+///   redirects; and a distinguishable miss would be a token-space oracle the
+///   GET above already refuses to be.
+/// - **The form body is discarded unread.** Providers POST
+///   `List-Unsubscribe=One-Click` as a urlencoded body; an extractor that
+///   415s on an unexpected content-type would break exactly the callers this
+///   route exists for. The token in the path is the whole input.
+/// - Idempotent, same as the GET — the DAO stamp is a no-op on repeat.
+pub async fn unsubscribe_oneclick(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> StatusCode {
+    let ok = state.subscribers.unsubscribe(&token).await.unwrap_or(false);
+    info!(ok, "one-click unsubscribe handled");
+    StatusCode::OK
+}
+
+/// Where a confirm/unsubscribe link lands a human: the public SPA outcome
+/// pages (`/newsletter/confirmed` / `/newsletter/unsubscribed`).
+///
+/// ⚠️ This used to be `{base}/?subscribe=…`, and no human ever saw the
+/// outcome: `/` is auth-gated in the SPA router and its guard exact-matches
+/// `fullPath === '/'`, so a logged-out confirmer bounced to `/login` and a
+/// signed-in one rendered the dashboard — the landing handler for the query
+/// was dead code (FR-58 field evidence 2).
+fn outcome_page(state: &AppState, page: &str, status: &str) -> String {
     let base = state.settings.app.frontend_url.trim_end_matches('/');
-    format!("{base}/?subscribe={status}")
+    format!("{base}/newsletter/{page}?status={status}")
 }
 
 #[cfg(test)]
