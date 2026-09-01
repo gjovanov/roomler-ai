@@ -4531,11 +4531,41 @@ async fn media_pump_ffmpeg_dc(
     // an explicit env override wins either way. P3 — `mut`: the persisted-flip
     // rebuild retargets it mid-session.
     let mut target_fps: u32 = ffmpeg_target_fps(constrained);
+    // FR-59 P5 — a pair the rate memory remembers as slow opens with fewer
+    // pixels and fewer frames. The bitrate levers (P1-P4) can make the
+    // encoder TRACK a 400 kbps pipe but cannot make 1920x1200 at 30 fps
+    // legible through it — that is ~1.7 KB per frame. Resolved ONCE here,
+    // never as a mid-session rung: every rung flip pays a blocking encoder
+    // open (0.65-0.87 s measured on Iris Xe) plus a fresh IDR, which is why
+    // `priority_relay_cap`'s dims-caps are off by default. Opening at the
+    // right size costs neither.
+    let slow_link_profile = if constrained {
+        crate::encode::rate_profile::slow_link_profile(
+            rate_seed,
+            crate::encode::slow_link_profile_enabled(),
+        )
+    } else {
+        None
+    };
+    if let Some(p) = slow_link_profile {
+        target_fps = target_fps.min(p.max_fps);
+        info!(
+            %session_id,
+            codec_label,
+            remembered_bps = ?rate_seed,
+            max_long_edge = p.max_long_edge,
+            max_fps = p.max_fps,
+            target_fps,
+            "FR-59 P5 slow-link profile engaged — the pair is remembered as slow, \
+             opening with fewer pixels and fewer frames"
+        );
+    }
     let downscale = crate::capture::DownscalePolicy::Never;
     info!(
         %session_id,
         codec_label,
         target_fps,
+        slow_link = slow_link_profile.is_some(),
         "FFmpeg DC pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
@@ -5556,10 +5586,22 @@ async fn media_pump_ffmpeg_dc(
             native_h: cap_native_h,
             merged_target: user_target,
             merged_priority_cap: pipeline.merged_priority_cap(
-                crate::encode::priority_relay_cap(
-                    priority.load(std::sync::atomic::Ordering::Relaxed),
-                    constrained,
-                ),
+                // FR-59 P5 — the slow-link profile's long-edge cap rides the
+                // SAME slot as the Priority dial's, so it flows through
+                // `plan_dims` unchanged and an explicit operator pick still
+                // wins by the existing merge rules. `min` rather than
+                // replace: a dial that already asked for fewer pixels than
+                // the profile keeps them.
+                match (
+                    crate::encode::priority_relay_cap(
+                        priority.load(std::sync::atomic::Ordering::Relaxed),
+                        constrained,
+                    ),
+                    slow_link_profile.map(|p| p.max_long_edge),
+                ) {
+                    (Some(dial), Some(slow)) => Some(dial.min(slow)),
+                    (dial, slow) => dial.or(slow),
+                },
                 constrained,
             ),
             refined: idle_refine.refined(),
