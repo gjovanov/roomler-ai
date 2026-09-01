@@ -33,7 +33,9 @@
         <div class="text-subtitle-1 font-weight-bold mb-1">
           Get an email when something notable ships
         </div>
-        <StayInTouch variant="light" source="landing-prompt" @subscribed="onSubscribed" />
+        <!-- hide-lede: the card title above already says it — the field pass
+             caught the double text on the live page (FR-58 P6). -->
+        <StayInTouch variant="light" source="landing-prompt" hide-lede @subscribed="onSubscribed" />
       </v-card-text>
     </v-card>
   </v-slide-y-reverse-transition>
