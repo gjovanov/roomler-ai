@@ -3,6 +3,15 @@
 use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 
+/// The development default for `app.frontend_url`.
+///
+/// A constant rather than a literal because two places need to agree on it: the
+/// default below, and the production startup check that warns when a deployment
+/// is still running on it (FR-50 P3, `crates/api/src/main.rs`). Written twice,
+/// they drift, and the drift is silent in the direction that matters — the
+/// check simply stops firing and nobody learns their links are broken.
+pub const DEFAULT_FRONTEND_URL: &str = "http://localhost:5000";
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub app: AppSettings,
@@ -637,7 +646,7 @@ impl Settings {
             // handshake with the session cookie — so a wrong default is a
             // local-dev outage, not a cosmetic mismatch. Production overrides
             // it via `ROOMLER__APP__FRONTEND_URL` and is unaffected.
-            .set_default("app.frontend_url", "http://localhost:5000")?
+            .set_default("app.frontend_url", DEFAULT_FRONTEND_URL)?
             .set_default("app.rate_limit_per_sec", 1)?
             .set_default("app.rate_limit_burst", 60)?
             .set_default("app.rate_limit_trusted_hops", 1)?
