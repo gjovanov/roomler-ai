@@ -359,8 +359,27 @@ pub fn default_install_root() -> anyhow::Result<PathBuf> {
         Ok(dirs
             .data_local_dir()
             .join("Programs")
-            // RETIRED-NAME-ANCHOR: the tunnel CLI's enrolled-config segment; see
-            // agents/roomler-cli/src/config.rs. Frozen together. docs/fr/FR-21
+            // RETIRED-NAME-ANCHOR: the tunnel wizard's per-user INSTALL dir.
+            //
+            // ⚠️ FR-46 CORRECTION. This anchor used to read "the tunnel CLI's
+            // enrolled-config segment; see agents/roomler-cli/src/config.rs.
+            // Frozen together." That reason is false, and it mattered, because it
+            // described this rename as blocked on a CREDENTIAL migration it is not
+            // blocked on. They are independent call sites: the credential resolves
+            // through `ProjectDirs::config_dir()`, this resolves through
+            // `data_local_dir()`, and nothing derives the config path from the
+            // binary's location — so renaming this directory cannot orphan an
+            // enrollment. The config segment IS frozen, for its own reason, and
+            // carries its own anchor.
+            //
+            // What actually blocks it is smaller and different, and both halves
+            // are real: (1) a pre-rename install strands a stale HKCU PATH entry,
+            // and PATH ORDER decides which `roomler.exe` wins — so the rename
+            // needs a `remove_user_path_segment` beside it, exactly as the Unix
+            // arm needed `retire_legacy_symlink`; (2) the retired name appears
+            // TWICE on this path — the ProjectDirs application segment and this
+            // leaf — so finishing it is a layout decision, not a string swap.
+            // docs/fr/FR-46
             .join("roomler-tunnel"))
     }
     #[cfg(target_os = "linux")]
