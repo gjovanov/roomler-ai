@@ -91,6 +91,9 @@ pub struct ViewerWindow {
     /// FR-59 P3 — the ceiling that window's ARRIVAL rate justifies.
     /// `None` unless `link_congested` — see `viewer_rate::LinkLoop`.
     pub link_ceiling_bps: Option<u32>,
+    /// FR-59 P4 — production is pausing this long so the transit queue
+    /// can drain. `None` = no drain ordered this window.
+    pub drain_for_ms: Option<u32>,
 }
 
 /// Outcome of a heartbeat tier step, emitted only when the
@@ -128,6 +131,9 @@ pub struct GovernorFlags {
     /// ceiling while its transit queue is growing
     /// (`encode::viewer_rate_clamp_enabled`).
     pub viewer_rate_clamp: bool,
+    /// FR-59 P4 — a transit queue too deep to cut our way out of is
+    /// DRAINED by pausing production (`encode::queue_drain_enabled`).
+    pub queue_drain: bool,
 }
 
 impl Default for GovernorFlags {
@@ -140,6 +146,7 @@ impl Default for GovernorFlags {
             floor_relief: true,
             seed_contradiction: true,
             viewer_rate_clamp: true,
+            queue_drain: true,
         }
     }
 }
@@ -158,6 +165,7 @@ impl GovernorFlags {
             floor_relief: super::slow_link_floor_enabled(),
             seed_contradiction: super::seed_contradiction_enabled(),
             viewer_rate_clamp: super::viewer_rate_clamp_enabled(),
+            queue_drain: super::queue_drain_enabled(),
         }
     }
 }
@@ -237,6 +245,10 @@ pub struct RateGovernor {
     /// RAW rather than pre-discounted, because it feeds two consumers
     /// with different margins: the P3 ceiling clamp and the P1 floor.
     link_rx_bps: Option<(u32, Instant)>,
+    /// FR-59 P4 — production is paused until this instant so the transit
+    /// queue can drain. An INSTANT rather than a countdown, because the
+    /// pump polls it from a loop that may not tick at all while paused.
+    drain_until: Option<Instant>,
 }
 
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
@@ -289,7 +301,33 @@ impl RateGovernor {
             relieved_floor_bps: None,
             link_loop: viewer_rate::LinkLoop::new(),
             link_rx_bps: None,
+            drain_until: None,
         }
+    }
+
+    /// FR-59 P4 — is production paused for a queue drain right now?
+    ///
+    /// Polled by the pump every iteration. Clearing the deadline here
+    /// (rather than on a timer) is what tells the link loop the drain was
+    /// SERVED, so the next deep window can order another one — without
+    /// that hand-back a single drain would suppress every later one.
+    pub fn draining(&mut self, now: Instant) -> bool {
+        match self.drain_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.drain_until = None;
+                self.link_loop.drain_served();
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// FR-59 P3/P4 — link-loop telemetry: congested windows, drains
+    /// ordered, and the live queue-depth estimate (ms).
+    pub fn link_stats(&self) -> (u32, u32, i32) {
+        let (drains, depth) = self.link_loop.drain_stats();
+        (self.link_loop.congested_windows(), drains, depth)
     }
 
     /// FR-59 P6 — take the ceiling a measurement contradicted, if one was
@@ -665,6 +703,24 @@ impl RateGovernor {
             .map(|(rx_bps, queue_ms)| self.link_loop.observe(rx_bps, queue_ms))
             .unwrap_or_default();
         let link_acts = constrained && self.slow_link.viewer_rate_clamp;
+        // FR-59 P4 — a queue too deep to cut our way out of. A rate cut
+        // drains at `capacity − inflow`, which on a converged session is
+        // nearly nothing: at 90 % of a 400 kbps pipe a 2 s backlog clears
+        // at 40 kbps, i.e. over ~20 s. Stopping production sets inflow to
+        // zero, so the same backlog clears in the ~2 s it represents.
+        //
+        // ⚠ Deliberately NO forced keyframe on resume: a pause loses no
+        // frames, so the delta chain is intact, and an IDR at these rates
+        // is itself seconds of transit — the cure would re-create the
+        // disease. This is why P4 pauses rather than discarding the
+        // agent-side queue (which is, on this path, 1–4 KB anyway: the
+        // queue that matters is downstream and cannot be recalled).
+        let drain_for_ms = verdict
+            .drain_for_ms
+            .filter(|_| constrained && self.slow_link.queue_drain);
+        if let Some(ms) = drain_for_ms {
+            self.drain_until = Some(now + Duration::from_millis(ms as u64));
+        }
         if link_acts {
             match (verdict.congested, link) {
                 (true, Some((rx_bps, _))) => self.link_rx_bps = Some((rx_bps, now)),
@@ -718,6 +774,7 @@ impl RateGovernor {
             ceiling_grown,
             link_congested: link_over,
             link_ceiling_bps: verdict.ceiling_bps,
+            drain_for_ms,
         })
     }
 
@@ -1146,6 +1203,108 @@ mod tests {
             "the clamp must not outlive the congestion (got {})",
             g.applied_bps()
         );
+    }
+
+    /// FR-59 P4 — a queue deep enough that a rate cut cannot clear it
+    /// pauses production, the pause EXPIRES on its own, and expiring is
+    /// what re-arms the next drain.
+    #[test]
+    fn a_deep_queue_pauses_production_and_the_pause_expires() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        assert!(!g.draining(start), "nothing to drain yet");
+
+        let mut t = start;
+        let mut ordered = None;
+        for _ in 0..6 {
+            t += Duration::from_millis(1100);
+            let w = g
+                .tick_viewer_window(
+                    t,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || 0,
+                    || viewer_rate::pack_link(400_000, 300),
+                    true,
+                    |o| o,
+                    0,
+                )
+                .expect("window due");
+            if let Some(ms) = w.drain_for_ms {
+                ordered = Some(ms);
+                break;
+            }
+        }
+        let ms = ordered.expect("a 900 ms-deep queue must order a drain");
+        assert_eq!(ms, viewer_rate::DRAIN_MAX_MS, "bounded sub-second");
+        // The pump is paused for exactly that long, and not a tick longer.
+        assert!(g.draining(t));
+        assert!(g.draining(t + Duration::from_millis(ms as u64 - 1)));
+        assert!(!g.draining(t + Duration::from_millis(ms as u64)));
+        // Expiry handed the drain back, so the loop may order another.
+        let (_, drains, _) = g.link_stats();
+        assert_eq!(drains, 1);
+        let mut t2 = t + Duration::from_secs(1);
+        let mut second = None;
+        for _ in 0..6 {
+            t2 += Duration::from_millis(1100);
+            let w = g
+                .tick_viewer_window(
+                    t2,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || 0,
+                    || viewer_rate::pack_link(400_000, 300),
+                    true,
+                    |o| o,
+                    0,
+                )
+                .expect("window due");
+            if w.drain_for_ms.is_some() {
+                second = Some(());
+                break;
+            }
+        }
+        assert!(second.is_some(), "a served drain must re-arm");
+    }
+
+    /// FR-59 P4 kill switch, and the direct-path guarantee: a drain is a
+    /// visible freeze, so it must be impossible to get one where it was
+    /// not asked for.
+    #[test]
+    fn the_drain_is_off_by_switch_and_on_direct() {
+        for (label, flags, constrained) in [
+            (
+                "kill switch",
+                GovernorFlags {
+                    queue_drain: false,
+                    ..GovernorFlags::default()
+                },
+                true,
+            ),
+            ("direct path", GovernorFlags::default(), false),
+        ] {
+            let start = Instant::now();
+            let mut g = RateGovernor::new(30, DEPTH, flags, 0, None, start);
+            let mut t = start;
+            for _ in 0..10 {
+                t += Duration::from_millis(1100);
+                let w = g
+                    .tick_viewer_window(
+                        t,
+                        30,
+                        || viewer_rate::pack_report(30, false),
+                        || 0,
+                        || viewer_rate::pack_link(400_000, 400),
+                        constrained,
+                        |o| o,
+                        0,
+                    )
+                    .expect("window due");
+                assert_eq!(w.drain_for_ms, None, "{label}: must not order a drain");
+                assert!(!g.draining(t), "{label}: must never pause");
+            }
+        }
     }
 
     /// FR-59 P3 kill switch, and the direct-path guarantee (AC5).

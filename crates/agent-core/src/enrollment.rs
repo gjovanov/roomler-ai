@@ -200,6 +200,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         constrained_queue_measured: None,
         seed_contradiction: None,
         viewer_rate_clamp: None,
+        queue_drain: None,
         bg_rebuild: None,
         par_convert: None,
         fps_pace: None,

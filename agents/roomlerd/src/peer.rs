@@ -3790,7 +3790,11 @@ async fn media_pump_vp9_444_dc(
             constrained_transport,
             |own_div| pipeline.step_viewer_windows(own_div, target_fps),
             bytes_written.load(std::sync::atomic::Ordering::Relaxed),
-        ) && (vw.changed || vw.struggling || vw.age_over || vw.link_congested)
+        ) && (vw.changed
+            || vw.struggling
+            || vw.age_over
+            || vw.link_congested
+            || vw.drain_for_ms.is_some())
         {
             info!(
                 %session_id,
@@ -3799,6 +3803,7 @@ async fn media_pump_vp9_444_dc(
                 age_over = vw.age_over,
                 link_congested = vw.link_congested,
                 link_ceiling_bps = ?vw.link_ceiling_bps,
+                drain_for_ms = ?vw.drain_for_ms,
                 age_ms = vw.age_ms.map(|(a, _)| a),
                 age_floor_ms = vw.age_ms.and(governor.viewer_age().map(|(_, f)| f)),
                 cap_fps = vw.cap_fps,
@@ -3806,6 +3811,17 @@ async fn media_pump_vp9_444_dc(
                 frames_skipped_decode = governor.frames_skipped_decode(),
                 "VP9-444 DC pump: viewer-rate fps cap"
             );
+        }
+        // FR-59 P4 — the transit queue is deeper than a rate cut can clear
+        // in reasonable time, so stop feeding it and let it drain. Skipping
+        // production (rather than discarding what is already queued) is the
+        // only lever that reaches a queue living in the relay and the
+        // carrier: those bytes are already gone and cannot be recalled.
+        // Bounded sub-second, and NO forced keyframe on resume — a pause
+        // loses no frames, so the delta chain survives it intact.
+        if governor.draining(std::time::Instant::now()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
         }
         if governor.should_skip_delta_frame(force_keyframe_this_iter) {
             continue;
@@ -4143,6 +4159,9 @@ async fn media_pump_vp9_444_dc(
                 viewer_age_implausible = governor.viewer_age_implausible(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
+                // FR-59 P3/P4 — (congested windows, drains ordered, live
+                // queue-depth estimate in ms) from the viewer-side loop.
+                link_stats = ?governor.link_stats(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
             qp_sum = 0;
@@ -5861,7 +5880,11 @@ async fn media_pump_ffmpeg_dc(
                 .store(governor.decreases(), std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(vw) = viewer_window
-            && (vw.changed || vw.struggling || vw.age_over || vw.link_congested)
+            && (vw.changed
+                || vw.struggling
+                || vw.age_over
+                || vw.link_congested
+                || vw.drain_for_ms.is_some())
         {
             info!(
                 %session_id,
@@ -5871,6 +5894,7 @@ async fn media_pump_ffmpeg_dc(
                 age_over = vw.age_over,
                 link_congested = vw.link_congested,
                 link_ceiling_bps = ?vw.link_ceiling_bps,
+                drain_for_ms = ?vw.drain_for_ms,
                 age_ms = vw.age_ms.map(|(a, _)| a),
                 age_floor_ms = vw.age_ms.and(governor.viewer_age().map(|(_, f)| f)),
                 cap_fps = vw.cap_fps,
@@ -5878,6 +5902,17 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_decode = governor.frames_skipped_decode(),
                 "FFmpeg DC pump: viewer-rate fps cap"
             );
+        }
+        // FR-59 P4 — the transit queue is deeper than a rate cut can clear
+        // in reasonable time, so stop feeding it and let it drain. Skipping
+        // production (rather than discarding what is already queued) is the
+        // only lever that reaches a queue living in the relay and the
+        // carrier: those bytes are already gone and cannot be recalled.
+        // Bounded sub-second, and NO forced keyframe on resume — a pause
+        // loses no frames, so the delta chain survives it intact.
+        if governor.draining(std::time::Instant::now()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
         }
         if governor.should_skip_delta_frame(force_keyframe_this_iter) {
             continue;
@@ -6482,6 +6517,9 @@ async fn media_pump_ffmpeg_dc(
                 // relief let go" and "nothing was ever measured" read the
                 // same, and they need opposite fixes.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
+                // FR-59 P3/P4 — (congested windows, drains ordered, live
+                // queue-depth estimate in ms) from the viewer-side loop.
+                link_stats = ?governor.link_stats(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
