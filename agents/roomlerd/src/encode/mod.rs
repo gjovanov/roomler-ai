@@ -352,6 +352,21 @@ pub fn queue_drain_enabled() -> bool {
     tunnel_core::env::node_env("QUEUE_DRAIN").as_deref() != Some("0")
 }
 
+/// FR-59 P5 kill switch (2026-09-01): when on (default), a constrained
+/// session whose pair the rate memory remembers as SLOW opens with fewer
+/// pixels and fewer frames (see `rate_profile::slow_link_profile`).
+///
+/// The bitrate levers can make the encoder track a 400 kbps pipe; they
+/// cannot make 1920×1200 at 30 fps legible through it — that is ~1.7 KB
+/// per frame. `0` = open at the session's normal size regardless.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn slow_link_profile_enabled() -> bool {
+    tunnel_core::env::node_env("SLOW_LINK_PROFILE").as_deref() != Some("0")
+}
+
 /// Drag-latency P3 kill switch (2026-08-27): when on (default), a
 /// rebuild-bound bitrate apply (QSV/AMF — no in-place reconfigure)
 /// opens the replacement encoder on a BLOCKING THREAD while the current
