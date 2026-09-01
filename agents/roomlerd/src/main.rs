@@ -4196,6 +4196,18 @@ fn apps_probe_cmd() -> anyhow::Result<()> {
         Some(why) => println!("NOT listed: {why}"),
         None => println!("NOT listed: (nothing — this source is the whole desktop)"),
     }
+    // FR-56 P5 — a desktop being reachable does not make the buttons work.
+    if cov.missing_tools.is_empty() {
+        println!("missing tools: (none — every helper this backend runs is installed)");
+    } else {
+        println!("missing tools:");
+        for t in &cov.missing_tools {
+            println!("  {} — blocks {} ({})", t.tool, t.blocks, t.install);
+        }
+        println!(
+            "  ⚠️  the desktop IS reachable, so listing and focusing still work — it is the launch buttons above that would fail at click time"
+        );
+    }
 
     match be.list() {
         Ok(windows) => {
