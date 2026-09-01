@@ -261,6 +261,13 @@ const VIEWER_WINDOW: Duration = Duration::from_secs(1);
 /// clears the clamp on the first non-congested window anyway.
 const LINK_CEILING_TTL: Duration = Duration::from_secs(15);
 
+/// FR-59 — queue depth (ms) at or below which the arrival-rate clamp is
+/// released. Deliberately NOT zero: the estimate is a running integral of a
+/// noisy derivative, so it rarely lands exactly on 0, and a release that
+/// waits for perfection never fires. One `QUEUE_GROWTH_MS` worth of residue
+/// is the same quantum the loop already treats as "not growing".
+const LINK_RELEASE_DEPTH_MS: i32 = viewer_rate::QUEUE_GROWTH_MS as i32;
+
 impl RateGovernor {
     /// `flags` carries every kill switch (see [`GovernorFlags`]); the
     /// pumps resolve them once from env/config, tests pass them
@@ -388,6 +395,33 @@ impl RateGovernor {
     /// protects the TURN path.
     pub fn measured_goodput_bps(&self, now: Instant) -> Option<u32> {
         self.goodput.estimate_bps(now)
+    }
+
+    /// FR-59 — what this session believes the PIPE carries: the agent's own
+    /// blocked-send goodput, the viewer's arrival rate while its queue is
+    /// growing, or the lower of the two. Constrained transports only.
+    ///
+    /// ⚠ Use this, not [`Self::measured_goodput_bps`], for anything that
+    /// asks "how fast is the link". Field 2026-09-02, a 150 kbit shaped
+    /// link: `goodput_bps` was `None` in **every** window of a 47-window
+    /// run, because the agent's sends never blocked — the queue was
+    /// downstream. P2's queue budget read the goodput-only accessor and so
+    /// could never engage (`frames_skipped_backpressure=0` throughout),
+    /// while P1's floor relief, which reads the widened value, engaged and
+    /// drove the target to 200 kbps. Same missing widening, one call site
+    /// updated and the other not.
+    pub fn measured_pipe_bps(&self, now: Instant, constrained: bool) -> Option<u32> {
+        if !constrained {
+            return None;
+        }
+        let link = match self.link_rx_bps {
+            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
+            _ => None,
+        };
+        match (self.goodput.estimate_bps(now), link) {
+            (Some(g), Some(rx)) => Some(g.min(rx)),
+            (g, rx) => g.or(rx),
+        }
     }
 
     /// `(accepted, rejected)` goodput WINDOWS — heartbeat telemetry.
@@ -724,9 +758,26 @@ impl RateGovernor {
         if link_acts {
             match (verdict.congested, link) {
                 (true, Some((rx_bps, _))) => self.link_rx_bps = Some((rx_bps, now)),
-                // Cleared the moment a window is NOT congested: the clamp
-                // describes a live overload, not a remembered one.
-                (false, Some(_)) => self.link_rx_bps = None,
+                // FR-59 — released only once the queue has actually DRAINED,
+                // not the moment it stops growing.
+                //
+                // ⚠ The first version cleared on any non-congested window,
+                // reasoning that the clamp "describes a live overload".
+                // Field 2026-09-02, 150 kbit, 47 windows: congestion is
+                // detected in bursts (2 consecutive growing windows), so the
+                // clamp engaged and released repeatedly — the relief held in
+                // only 5 of 47 windows while the depth estimate sat at
+                // 119-651 ms and paint age reached 4,656 ms. Growth stopping
+                // is not the queue going away; a session that has converged
+                // ONTO the pipe has zero growth and a full queue, which is
+                // exactly when releasing the clamp re-opens the overshoot.
+                //
+                // So hold while the integral says the queue is still there,
+                // and let the AIMD's own additive increase do the climbing
+                // back — down fast, up slow.
+                (false, Some(_)) if self.link_loop.depth_ms() <= LINK_RELEASE_DEPTH_MS => {
+                    self.link_rx_bps = None
+                }
                 _ => {}
             }
         }
@@ -1305,6 +1356,98 @@ mod tests {
                 assert!(!g.draining(t), "{label}: must never pause");
             }
         }
+    }
+
+    /// FR-59 — the clamp must SURVIVE a window that merely stops growing.
+    ///
+    /// The field regression this locks (2026-09-02, 150 kbit, 47 windows):
+    /// congestion is detected in bursts, so releasing on the first
+    /// non-congested window made the relief flap — it held in 5 of 47
+    /// windows while the depth estimate sat at 119–651 ms and paint age
+    /// reached 4,656 ms. A session that has converged ONTO the pipe has
+    /// zero growth and a full queue, which is precisely when releasing
+    /// re-opens the overshoot.
+    #[test]
+    fn the_arrival_clamp_holds_until_the_queue_has_drained() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let mut t = start;
+        let step = |g: &mut RateGovernor, t: &mut Instant, q: i16| {
+            *t += Duration::from_millis(1100);
+            g.tick_viewer_window(
+                *t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || 0,
+                || viewer_rate::pack_link(400_000, q),
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due")
+        };
+        // Two growing windows arm the clamp and build depth to 600 ms.
+        step(&mut g, &mut t, 300);
+        assert!(step(&mut g, &mut t, 300).link_congested);
+        // A FLAT window: growth stopped, but 600 ms of queue is still out
+        // there. The clamp must hold.
+        let w = step(&mut g, &mut t, 0);
+        assert!(!w.link_congested, "not growing any more");
+        t += Duration::from_millis(10);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert!(
+            g.relieved_floor_bps().is_some(),
+            "the clamp must survive a merely-not-growing window"
+        );
+        // Now drain it: negative drift until the integral is spent.
+        for _ in 0..8 {
+            step(&mut g, &mut t, -300);
+        }
+        t += Duration::from_millis(10);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert!(
+            g.relieved_floor_bps().is_none(),
+            "…and release once the queue is actually gone"
+        );
+    }
+
+    /// FR-59 — `measured_pipe_bps` is the widened estimate every "how fast
+    /// is the link" consumer must use. The field defect it closes: on a
+    /// link whose sends never block there is NO goodput estimate, so the
+    /// goodput-only accessor left P2's queue budget permanently inert while
+    /// P1's floor relief — reading the widened value — engaged.
+    #[test]
+    fn the_pipe_estimate_includes_the_viewer_when_goodput_is_absent() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        // No blocked sends at all — the harness case.
+        assert_eq!(g.measured_goodput_bps(start), None);
+        let mut t = start;
+        for _ in 0..3 {
+            t += Duration::from_millis(1100);
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || 0,
+                || viewer_rate::pack_link(400_000, 300),
+                true,
+                |o| o,
+                0,
+            );
+        }
+        assert_eq!(
+            g.measured_goodput_bps(t),
+            None,
+            "the goodput-only view still sees nothing"
+        );
+        assert_eq!(
+            g.measured_pipe_bps(t, true),
+            Some(400_000),
+            "…while the widened view has the viewer's arrival rate"
+        );
+        // Direct transports never consume it.
+        assert_eq!(g.measured_pipe_bps(t, false), None);
     }
 
     /// FR-59 P3 kill switch, and the direct-path guarantee (AC5).
