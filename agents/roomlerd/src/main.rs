@@ -947,6 +947,11 @@ async fn daemon_main() -> Result<()> {
     }
 
     logging::init();
+
+    // FR-46 P2b — the retired env prefix is no longer READ, so a host that
+    // still sets one must be TOLD rather than quietly ignored. Straight after
+    // logging::init, because the whole point is that it reaches the log.
+    tunnel_core::env::warn_on_retired_env();
     for note in roomlerd::appdirs::migration_notes() {
         tracing::info!(%note, "appdirs legacy-tree migration");
     }
