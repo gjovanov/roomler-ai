@@ -359,11 +359,20 @@ fn open_blocking(kind: SessionKind) -> Result<Session, OpenError> {
         SessionKind::CaptureOnly => 0,
         SessionKind::WithInput => results.get("devices").and_then(u32_of).unwrap_or(0),
     };
-    let input_granted = devices_granted & (DEVICE_KEYBOARD | DEVICE_POINTER) != 0;
+    // ⚠️ BOTH devices required, not "any" (`== mask`, not `& mask != 0`). The
+    // downstream route has no per-device split — `try_route` claims EVERY input
+    // event — so a partial grant (say pointer refused, keyboard granted) would
+    // otherwise report input working while every mouse event is claimed by the
+    // portal and silently dropped for the ungranted class. Treating a partial
+    // grant as "no input" degrades to a capture-only session, which is the safe
+    // outcome. GNOME grants all-or-nothing today, so this only ever bites a
+    // future compositor that grants partially — but it bites safely.
+    let want = DEVICE_KEYBOARD | DEVICE_POINTER;
+    let input_granted = devices_granted & want == want;
     if kind == SessionKind::WithInput && !input_granted {
         tracing::warn!(
             devices_granted,
-            "portal: the session started but no input devices were granted — capture only"
+            "portal: the session started without BOTH keyboard and pointer granted — capture only"
         );
     }
     // Persisted immediately, before anything is reported: a caller that reads

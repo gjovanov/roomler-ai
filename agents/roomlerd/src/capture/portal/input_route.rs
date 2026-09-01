@@ -19,12 +19,34 @@
 //! A per-event lookup costs a mutex and makes the answer always current:
 //! capture restarts, session ends, kill switch — the route follows.
 //!
-//! ## Registration is generation-checked
+//! ## One desktop, so one active route — with correct handoff
 //!
-//! Two captures can overlap during a reopen (new helper up before the old
-//! one's `Drop` ran). `register` hands back a generation token and
-//! `unregister` is a no-op unless the token is current — so a stale `Drop`
-//! can never tear down its successor's route.
+//! Every portal helper injects into the SAME physical desktop (one seat0
+//! session per host), and the arbiter already arbitrates which session may
+//! inject. So all arbitrated input should reach ONE portal helper. The
+//! registry is therefore an ORDERED list of the live helpers, and [`try_route`]
+//! always targets the OLDEST surviving one:
+//!
+//! - Registration APPENDS; it never overwrites. A second concurrent viewer's
+//!   capture cannot silently steal the route from the first — the earlier
+//!   finding where viewer B's `register` clobbered viewer A's slot and B's
+//!   teardown then set it to `None`, leaving A falling through to the
+//!   do-nothing OS injector, input-dead mid-session.
+//! - The active target changes ONLY when the current owner's capture drops,
+//!   which happens as that session ends. Because closing a portal session
+//!   releases its own virtual devices, a key held via the departing helper is
+//!   released by the compositor; a stale release routed to the new owner's
+//!   helper lands on the same physical desktop and is a harmless no-op there.
+//!   So a held modifier is never stranded — the route-steal stuck-key finding.
+//! - Within one session the active target is STABLE for the session's whole
+//!   life, so a key-down and its later up always reach the same helper.
+//!
+//! ⚠️ The one residual: concurrent multi-viewer portal input all funnels
+//! through the oldest helper's RemoteDesktop session. On one physical desktop
+//! that is correct (whoever holds the floor injects into the one screen), and
+//! it is far better than the alternative of clobbering or splitting. If a
+//! future host ever presents two independent portal desktops in one daemon,
+//! this needs per-desktop routing — but no such host exists today.
 
 use std::sync::Mutex;
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -36,49 +58,58 @@ struct Route {
     generation: u64,
 }
 
-static ROUTE: Mutex<Option<Route>> = Mutex::new(None);
+/// The live portal input helpers, oldest first. Empty ⇒ no portal route ⇒ the
+/// caller uses the OS injector.
+static ROUTES: Mutex<Vec<Route>> = Mutex::new(Vec::new());
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Install the live portal input sender. Returns the generation token
-/// [`unregister`] needs.
+/// Append a live portal input sender and return its generation token for
+/// [`unregister`]. Never replaces an existing route — a concurrent second
+/// capture is added AFTER the first, and the first stays the active target
+/// until it unregisters.
 pub fn register(tx: SyncSender<InputMsg>) -> u64 {
     let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let mut route = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
-    *route = Some(Route { tx, generation });
+    let mut routes = ROUTES.lock().unwrap_or_else(|e| e.into_inner());
+    routes.push(Route { tx, generation });
     generation
 }
 
-/// Remove the route installed by the matching [`register`]. A stale token —
-/// a `Drop` racing its replacement — leaves the current route standing.
+/// Remove the route registered under `generation`. If it was the active
+/// (oldest) one, the next-oldest becomes active automatically — no gap, no
+/// fall-through to the OS injector while another portal session is still live.
 pub fn unregister(generation: u64) {
-    let mut route = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
-    if route.as_ref().is_some_and(|r| r.generation == generation) {
-        *route = None;
-    }
+    let mut routes = ROUTES.lock().unwrap_or_else(|e| e.into_inner());
+    routes.retain(|r| r.generation != generation);
 }
 
 /// Offer one event to the portal route.
 ///
-/// `true` means the portal OWNS this event — including when the channel was
-/// full and the event was dropped, because falling through to the OS injector
-/// on overload would split one input stream across two backends mid-gesture.
-/// `false` means no live route: the caller injects normally.
+/// `true` means the portal OWNS this event — including when the target channel
+/// was full and the event was dropped, because falling through to the OS
+/// injector on overload would split one gesture across two backends. Targets
+/// the OLDEST live helper; a helper whose channel has disconnected (its `Drop`
+/// has not run yet) is skipped in favour of the next. `false` means no live
+/// portal route at all: the caller injects normally.
 pub fn try_route(msg: &InputMsg) -> bool {
-    let route = ROUTE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(r) = route.as_ref() else {
+    let routes = ROUTES.lock().unwrap_or_else(|e| e.into_inner());
+    if routes.is_empty() {
         return false;
-    };
-    match r.tx.try_send(msg.clone()) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            tracing::debug!("portal input route full — event dropped");
-            true
-        }
-        // The helper is gone but Drop has not run yet. Claim the event anyway
-        // — the session this input belongs to is the portal one, and it is
-        // ending.
-        Err(TrySendError::Disconnected(_)) => true,
     }
+    for r in routes.iter() {
+        match r.tx.try_send(msg.clone()) {
+            Ok(()) => return true,
+            // The oldest live helper is the target and it is behind; drop
+            // rather than split the gesture to the OS injector.
+            Err(TrySendError::Full(_)) => return true,
+            // This helper is gone but its Drop has not unregistered it yet —
+            // hand off to the next-oldest.
+            Err(TrySendError::Disconnected(_)) => continue,
+        }
+    }
+    // Portal helpers exist but every one is mid-teardown. Still claim the
+    // event: these sessions are ending, and the OS injector reaches nothing on
+    // the hosts this backend serves.
+    true
 }
 
 #[cfg(test)]
@@ -99,30 +130,54 @@ mod tests {
     /// splitting these into separate `#[test]`s would make them race each
     /// other's registrations.
     #[test]
-    fn route_lifecycle() {
+    fn route_lifecycle_and_handoff() {
         // No route: the caller keeps the event.
         assert!(!try_route(&mv()));
 
-        // Registered: events flow.
-        let (tx, rx) = std::sync::mpsc::sync_channel(2);
-        let generation = register(tx);
+        // One viewer: events flow to it.
+        let (tx_a, rx_a) = std::sync::mpsc::sync_channel(4);
+        let gen_a = register(tx_a);
         assert!(try_route(&mv()));
-        assert!(matches!(rx.try_recv(), Ok(InputMsg::MouseMove { .. })));
+        assert!(matches!(rx_a.try_recv(), Ok(InputMsg::MouseMove { .. })));
 
-        // Full: still OWNED (dropped), never split across backends.
+        // A SECOND viewer joins. It must NOT steal the route: events keep
+        // going to A (the oldest), and B receives nothing yet.
+        let (tx_b, rx_b) = std::sync::mpsc::sync_channel(4);
+        let gen_b = register(tx_b);
         assert!(try_route(&mv()));
+        assert!(
+            matches!(rx_a.try_recv(), Ok(InputMsg::MouseMove { .. })),
+            "the first viewer stays the active target"
+        );
+        assert!(
+            rx_b.try_recv().is_err(),
+            "a second concurrent viewer does not steal the route"
+        );
+
+        // A (the owner) leaves. The route HANDS OFF to B automatically —
+        // never a gap that would fall through to the do-nothing OS injector.
+        unregister(gen_a);
         assert!(try_route(&mv()));
-        assert!(try_route(&mv()), "full channel still claims the event");
+        assert!(
+            matches!(rx_b.try_recv(), Ok(InputMsg::MouseMove { .. })),
+            "teardown of the owner promotes the next-oldest, not None"
+        );
 
-        // A STALE unregister must not tear down a successor's route.
-        let (tx2, rx2) = std::sync::mpsc::sync_channel(2);
-        let generation2 = register(tx2);
-        unregister(generation); // the old capture's Drop, racing
-        assert!(try_route(&mv()), "successor route survives a stale Drop");
-        assert!(matches!(rx2.try_recv(), Ok(InputMsg::MouseMove { .. })));
+        // Full channel is still OWNED (dropped), never split to the OS backend.
+        for _ in 0..8 {
+            let _ = try_route(&mv());
+        }
+        assert!(try_route(&mv()), "a full channel still claims the event");
 
-        // The CURRENT unregister clears it.
-        unregister(generation2);
+        // A stale unregister of the already-departed owner is a no-op — B
+        // survives (an old capture's Drop racing a newer registration must
+        // remove only its own entry).
+        unregister(gen_a);
+        assert!(try_route(&mv()));
+        let _ = rx_b.try_recv();
+
+        // Last viewer leaves: no route, caller falls back to the OS injector.
+        unregister(gen_b);
         assert!(!try_route(&mv()));
     }
 }

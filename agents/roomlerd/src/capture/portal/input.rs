@@ -37,25 +37,20 @@
 //!   copying the uinput backend's inversion here would scroll backwards.
 
 use crate::input::hid_evdev::hid_to_evdev;
-use crate::input::{Button, InputMsg, WheelMode};
+use crate::input::{InputMsg, WheelMode, button_code};
 
-/// `NotifyPointerButton` wants Linux `BTN_*` codes.
-fn button_code(btn: Button) -> i32 {
-    match btn {
-        Button::Left => 0x110,
-        Button::Right => 0x111,
-        Button::Middle => 0x112,
-        Button::Back => 0x113,
-        Button::Forward => 0x114,
-    }
-}
-
-/// The keysym for one typed character, or `None` for a control character we
-/// cannot honestly express.
+/// The keysym for one typed character, or `None` for one we cannot honestly
+/// express as a printable keysym.
 ///
-/// The rules are X11's: Latin-1 (U+0020..=U+00FF) IS the keysym range
-/// 0x20..=0xFF; everything above rides the Unicode escape 0x0100_0000 + cp.
-/// Return and Tab are the two C0 controls a text field actually receives.
+/// The rules are X11's: the PRINTABLE Latin-1 ranges (U+0020..=U+007E and
+/// U+00A0..=U+00FF) ARE the keysym values; everything above U+00FF rides the
+/// Unicode escape 0x0100_0000 + cp. Return and Tab are the two C0 controls a
+/// text field actually receives.
+///
+/// ⚠️ DEL (0x7F) and the C1 controls (0x80..=0x9F) are deliberately excluded:
+/// they fall INSIDE the raw Latin-1 numeric span but are control characters,
+/// not printable keysyms, so mapping them to a bare keysym would send an
+/// undefined value. They return `None` like the C0 controls below 0x20.
 fn keysym_of(ch: char) -> Option<u32> {
     match ch {
         '\n' | '\r' => Some(0xFF0D), // XK_Return
@@ -63,9 +58,9 @@ fn keysym_of(ch: char) -> Option<u32> {
         c => {
             let cp = c as u32;
             match cp {
-                0x20..=0xFF => Some(cp),
-                0x100.. => Some(0x0100_0000 + cp),
-                _ => None,
+                0x20..=0x7E | 0xA0..=0xFF => Some(cp), // printable Latin-1
+                0x100.. => Some(0x0100_0000 + cp),     // Unicode escape plane
+                _ => None,                             // C0, DEL (0x7F), C1 (0x80..=0x9F)
             }
         }
     }
@@ -121,7 +116,7 @@ pub fn plan(msg: &InputMsg, logical: (f64, f64), wheel: &mut WheelAccum) -> Vec<
             vec![
                 to_abs(*x, *y),
                 PortalCall::Button {
-                    code: button_code(*btn),
+                    code: i32::from(button_code(*btn)),
                     down: *down,
                 },
             ]
@@ -218,41 +213,38 @@ impl InputContext {
     /// Execute one call. Errors are returned, not logged — the pump decides
     /// how loud to be, and it deliberately keeps going: one refused event
     /// must not end input for the session.
+    ///
+    /// ⚠️ **`call_noreply`, not `call_method`.** The `Notify*` methods return
+    /// nothing (`-` in the introspected signature), and input is latency, not
+    /// throughput: at ~1000 pointer events/second a per-event round-trip
+    /// waiting for an empty method-return is pure delay. `call_noreply` sets
+    /// `NO_REPLY_EXPECTED` and returns as soon as the message is written,
+    /// while still surfacing a send error (a dead session) to the pump.
     fn execute(&self, call: PortalCall) -> Result<(), zbus::Error> {
         use std::collections::HashMap;
         let opts: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
         let sess = &self.session;
         match call {
-            PortalCall::MotionAbs { x, y } => self
-                .proxy
-                .call_method(
-                    "NotifyPointerMotionAbsolute",
-                    &(sess, opts, self.node_id, x, y),
-                )
-                .map(drop),
+            PortalCall::MotionAbs { x, y } => self.proxy.call_noreply(
+                "NotifyPointerMotionAbsolute",
+                &(sess, opts, self.node_id, x, y),
+            ),
             PortalCall::Button { code, down } => self
                 .proxy
-                .call_method("NotifyPointerButton", &(sess, opts, code, u32::from(down)))
-                .map(drop),
+                .call_noreply("NotifyPointerButton", &(sess, opts, code, u32::from(down))),
             PortalCall::Axis { dx, dy } => self
                 .proxy
-                .call_method("NotifyPointerAxis", &(sess, opts, dx, dy))
-                .map(drop),
+                .call_noreply("NotifyPointerAxis", &(sess, opts, dx, dy)),
             PortalCall::AxisDiscrete { axis, steps } => self
                 .proxy
-                .call_method("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps))
-                .map(drop),
-            PortalCall::Keycode { code, down } => self
-                .proxy
-                .call_method(
-                    "NotifyKeyboardKeycode",
-                    &(sess, opts, code, u32::from(down)),
-                )
-                .map(drop),
+                .call_noreply("NotifyPointerAxisDiscrete", &(sess, opts, axis, steps)),
+            PortalCall::Keycode { code, down } => self.proxy.call_noreply(
+                "NotifyKeyboardKeycode",
+                &(sess, opts, code, u32::from(down)),
+            ),
             PortalCall::Keysym { sym, down } => self
                 .proxy
-                .call_method("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down)))
-                .map(drop),
+                .call_noreply("NotifyKeyboardKeysym", &(sess, opts, sym, u32::from(down))),
         }
     }
 }
@@ -309,6 +301,7 @@ pub fn run_pump(ctx: InputContext, stdin: std::io::Stdin) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::Button;
 
     const LOGICAL: (f64, f64) = (1920.0, 1080.0);
 
@@ -440,11 +433,26 @@ mod tests {
     #[test]
     fn keysyms_follow_the_x11_unicode_rules() {
         assert_eq!(keysym_of('a'), Some(0x61));
-        assert_eq!(keysym_of('é'), Some(0xE9), "Latin-1 is the identity zone");
+        assert_eq!(
+            keysym_of('é'),
+            Some(0xE9),
+            "printable Latin-1 is the identity zone"
+        );
         assert_eq!(keysym_of('€'), Some(0x0100_20AC), "Unicode escape plane");
         assert_eq!(keysym_of('\n'), Some(0xFF0D));
         assert_eq!(keysym_of('\t'), Some(0xFF09));
         assert_eq!(keysym_of('\u{7}'), None, "other C0 controls are dropped");
+        // ⚠️ DEL and the C1 controls sit INSIDE the raw Latin-1 numeric span
+        // but are not printable keysyms — they must be dropped, not sent as a
+        // bare undefined keysym.
+        assert_eq!(keysym_of('\u{7F}'), None, "DEL is not a printable keysym");
+        assert_eq!(keysym_of('\u{80}'), None, "C1 controls are dropped");
+        assert_eq!(keysym_of('\u{9F}'), None, "C1 controls are dropped");
+        assert_eq!(
+            keysym_of('\u{A0}'),
+            Some(0xA0),
+            "NBSP resumes printable Latin-1"
+        );
     }
 
     /// Typed text becomes press+release pairs, in order.
