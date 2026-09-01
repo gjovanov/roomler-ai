@@ -28,10 +28,25 @@
 //! - `NotifyKeyboardKeycode` takes **evdev** keycodes (KEY_A = 30) — not
 //!   X keycodes (evdev+8), not keysyms. gnome-remote-desktop sends exactly
 //!   these; the shared [`hid_to_evdev`] table already speaks them.
-//! - `KeyText` goes through **keysyms**, where Unicode makes it layout-proof:
-//!   keysym = codepoint for U+0020..U+00FF, codepoint + 0x0100_0000 above.
-//!   The compositor resolves the keysym against its own keymap, so this types
-//!   correctly on layouts the uinput backend refuses (its table is physical).
+//! - `KeyText` goes through **keysyms**: keysym = codepoint for the printable
+//!   Latin-1 ranges, codepoint + 0x0100_0000 above. The compositor resolves
+//!   each against its OWN keymap, so this needs no char→key table of ours and
+//!   gets shifted levels for free — which is what the uinput backend has to
+//!   hand-maintain per layout.
+//!
+//!   ⚠️⚠️ **It is NOT layout-proof, and the failure is SILENT.** Measured on
+//!   GNOME with a US keymap (2026-09-01, FR-45 field log): `@ # ~` typed
+//!   correctly — shifted levels the keymap can reach — while `é € £` produced
+//!   **nothing at all**, with `NotifyKeyboardKeysym` returning success for
+//!   every one of them. A character the host's active keymap cannot produce is
+//!   dropped by the compositor, and nothing on this side can see that happen.
+//!   [`run_pump`] therefore warns once when it forwards a non-ASCII keysym, so
+//!   "my accented characters vanish" is diagnosable from the daemon log rather
+//!   than being an unattributable mystery.
+//!
+//!   The real fix is what gnome-remote-desktop does — temporarily remap a
+//!   spare keycode to the wanted keysym — which is a feature, not a tweak, and
+//!   is deliberately not attempted here.
 //! - Axis sign follows libinput: **positive is down/right**, matching the
 //!   browser's wheel delta directly. ⚠️ evdev `REL_WHEEL` is the opposite —
 //!   copying the uinput backend's inversion here would scroll backwards.
@@ -261,6 +276,8 @@ pub fn run_pump(ctx: InputContext, stdin: std::io::Stdin) {
     let mut dropped_parse = 0u64;
     let mut failed_calls = 0u64;
     let mut executed = 0u64;
+    let mut nonascii_keysyms = 0u64;
+    let mut warned_nonascii = false;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let trimmed = line.trim();
@@ -277,6 +294,26 @@ pub fn run_pump(ctx: InputContext, stdin: std::io::Stdin) {
                 continue;
             }
         };
+        // ⚠️ The compositor silently drops a keysym its active keymap cannot
+        // produce (measured: é € £ on a US keymap typed NOTHING while the call
+        // returned success). We cannot observe that, so say it ONCE here —
+        // otherwise the only symptom is "some characters never arrive", with
+        // nothing in any log to explain it.
+        if let InputMsg::KeyText { text } = &msg {
+            let n = text.chars().filter(|c| !c.is_ascii()).count() as u64;
+            if n > 0 {
+                nonascii_keysyms += n;
+                if !warned_nonascii {
+                    warned_nonascii = true;
+                    eprintln!(
+                        "portal-helper: forwarding non-ASCII text as keysyms — characters the \
+                         host's active keymap cannot produce are dropped BY THE COMPOSITOR, \
+                         silently and with a successful return. If accented or symbol characters \
+                         never appear, that is why."
+                    );
+                }
+            }
+        }
         for call in plan(&msg, ctx.logical, &mut wheel) {
             match ctx.execute(call) {
                 Ok(()) => executed += 1,
@@ -294,7 +331,7 @@ pub fn run_pump(ctx: InputContext, stdin: std::io::Stdin) {
     }
     eprintln!(
         "portal-helper: input pump ended (executed={executed} failed={failed_calls} \
-         unparseable={dropped_parse})"
+         unparseable={dropped_parse} non_ascii_keysyms={nonascii_keysyms})"
     );
 }
 
