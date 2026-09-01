@@ -5233,7 +5233,13 @@ async fn media_pump_ffmpeg_dc(
         // viewer paint age ran 2.3-7.1 s. A held goodput estimate may only
         // ever LOWER the reference rate.
         let queue_budget = if constrained {
-            let measured = governor.measured_goodput_bps(std::time::Instant::now());
+            // FR-59 — the WIDENED pipe estimate, not the goodput-only one.
+            // On a link where the agent's own sends never block there is no
+            // goodput estimate at all (field 2026-09-02: `None` in every
+            // window of a 47-window run at 150 kbit), and this gate could
+            // never engage while P1's floor relief — reading the same
+            // evidence through `measured_pipe_bps` — did.
+            let measured = governor.measured_pipe_bps(std::time::Instant::now(), constrained);
             let reference = crate::encode::rate_profile::constrained_queue_reference_bps(
                 crate::encode::relay_max_bps(),
                 measured,
