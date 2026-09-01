@@ -1445,6 +1445,23 @@ fn print_status(s: &NodeStatus) {
             uses.join(", ")
         );
     }
+    // FR-46 P2b — a retired variable is SET but not read. Printed even though
+    // it changes nothing, because that is exactly the problem: the daemon runs
+    // fine while the host is configured for a spelling nothing honours, so the
+    // only way anyone finds out is if something says so.
+    //
+    // A sibling of the block above, NOT nested inside it: after P2b nothing
+    // reads a retired prefix, so `legacy_env_uses` is empty on exactly the
+    // hosts this line exists for, and nesting would make it dead code.
+    if let Some(present) = s.retired_env_present.as_ref()
+        && !present.is_empty()
+    {
+        println!(
+            "  retired env {} SET and IGNORED: {} (rename to ROOMLERD_*)",
+            present.len(),
+            present.join(", ")
+        );
+    }
 }
 
 /// FR-49 — the per-enrollment block in `roomler status`.

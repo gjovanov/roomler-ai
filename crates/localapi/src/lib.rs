@@ -197,8 +197,9 @@ pub struct NodeStatus {
     // It is live compatibility, not history: delete the legacy arm in `node_env` and
     // this field has nothing left to report, so it goes with it. docs/fr/FR-46
     /// FR-46 (#1051) — full env-var names this daemon has actually READ through
-    /// a RETIRED prefix since it started (`ROOMLER_AGENT_*`, `ROOMLER_NODE_*`),
-    /// sorted and deduped. `None` from a daemon predating the field.
+    /// a RETIRED prefix since it started (`ROOMLER_NODE_*`), sorted and deduped.
+    /// `None` from a daemon predating the field. Since FR-46 P2b `ROOMLER_AGENT_*`
+    /// can never appear here — it is not read at all; see `retired_env_present`.
     ///
     /// This exists because the warning was write-only. `env::note_legacy_use`
     /// logs once per variable near startup, so a `roomler logs` tail on a
@@ -215,6 +216,22 @@ pub struct NodeStatus {
     /// collapsed into "clean".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_env_uses: Option<Vec<String>>,
+    /// FR-46 P2b — retired-prefix variables that are SET on this host and are
+    /// NOT read by anything. `None` from a daemon predating the field.
+    ///
+    /// ⚠️ Distinct from [`Self::legacy_env_uses`], and folding the two together
+    /// would lose the distinction that matters: that one is "a non-current
+    /// prefix was READ" (rename it, something depends on it), this one is "a
+    /// retired prefix EXISTS and was ignored" (the host was configured for a
+    /// spelling the daemon no longer honours). Opposite actions.
+    ///
+    /// This exists because the alternative to reporting is silence: the read
+    /// chain simply stops seeing the variable, the daemon starts fine, and the
+    /// host quietly runs without a setting its operator believes is applied.
+    /// Two fleet sweeps found exactly that shape — systemd drop-ins no package
+    /// upgrade rewrites, and machine-wide registry values in no runbook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_env_present: Option<Vec<String>>,
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -2399,6 +2416,7 @@ mod tests {
                 disco_answered: None,
                 org_relay: None,
                 legacy_env_uses: Some(Vec::new()),
+                retired_env_present: Some(Vec::new()),
                 derp_inbound_drops: None,
                 netcheck: None,
             }
