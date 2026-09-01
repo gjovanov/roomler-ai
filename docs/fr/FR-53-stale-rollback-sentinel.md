@@ -1,5 +1,7 @@
 # FR-53: A recovered device warns about a crash loop forever
 
+> **CLOSED 2026-09-01** — issue #1123 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
+
 **Issue:** [#1123](https://github.com/gjovanov/roomler-ai/issues/1123) ·
 Status: **P1 implemented; P2 needs a release** (2026-09-01) · Found while shooting FR-41's demo: the
 device on camera was displaying this.
