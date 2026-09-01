@@ -6,6 +6,7 @@
 [![Platforms](https://img.shields.io/badge/agent-Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-informational)](#platform-support)
 [![Releases](https://img.shields.io/github/v/release/gjovanov/roomler-ai?filter=agent-*&label=agent)](https://github.com/gjovanov/roomler-ai/releases)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-unlimited%20devices-009688)](docs/self-hosting.md)
+[![Docs](https://img.shields.io/badge/docs-roomler.ai%2Fdocs-009688)](https://roomler.ai/docs/)
 
 Put the desktop of any machine you own into a browser tab, and join all of those
 machines into one private encrypted network that travels with you — so a laptop
