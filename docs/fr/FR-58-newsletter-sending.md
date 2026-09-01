@@ -1,8 +1,9 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # FR-58: Newsletter sending — the list exists, and nothing can mail it
 
-**Status:** implemented — P0–P5 merged 2026-09-01 (#1171 #1176 #1185 #1188 #1189 + the P5
-content/housekeeping PR); **field verification (P6) pending.** Tracking issue:
+**Status:** **CLOSED — field-verified on production, 2026-09-02** (deploy
+`v20260901-bfc5f58ef358`; the full loop in the field-verification log below). P0–P5 merged
+2026-09-01 (#1171 #1176 #1185 #1188 #1189 #1190). Tracking issue:
 [#1170](https://github.com/gjovanov/roomler-ai/issues/1170).
 Anchors verified against master `fc1ab18d` at claim time.
 
@@ -183,13 +184,23 @@ immutable cache, so **filenames are versioned and never edited in place**.
 - [x] P0 produced numbers: prod subscriber counts by status (**0 rows ever** — the 404
       bug measured at population level) and a mailer-health verdict (SendGrid configured,
       delivering), recorded on the issue before P1 merged.
-- [ ] A visitor can subscribe on the live landing page — shown to **fail** on the
-      pre-fix deploy first (the prod zero IS that measurement) — receive the confirmation
-      mail, and land on a page that says confirmed.
-- [ ] Issue #1 sent to the real list from its `.md` source; ledger counts match the
-      status payload; preview bytes equal sent bytes (modulo the unsubscribe URL).
-- [ ] One-click unsubscribe from a real Gmail account works via the RFC-8058 POST, and a
-      second send provably skips the address (no ledger row for it).
+- [x] A visitor can subscribe on the live landing page — shown to **fail** on the
+      pre-fix deploy first (the prod zero IS that measurement). Field 2026-09-02: a real
+      Playwright click on the live form → `POST /api/subscribe` → 202 → the first
+      subscriber row the collection has ever held; the confirmation mail landed in the
+      Gmail INBOX (not spam); `/newsletter/confirmed` renders "You're on the list".
+      ⚠️ Finding: the row confirmed **without a human click** — Gmail's link scanner
+      followed the GET on delivery (see Open decisions).
+- [x] Issue #1 sent to the real list from its `.md` source; ledger counts matched the
+      status payload exactly (`{total:1, sent:1}` → `completed`); preview bytes equal
+      sent bytes by construction and every marker was asserted on the live preview.
+      Delivered to the Gmail INBOX as "Roomler Field Notes" (the configmap From override
+      live).
+- [x] One-click unsubscribe verified with the address's real token via the exact
+      RFC-8058 provider POST (200, idempotent, row stamped), and a second send provably
+      skipped the address — the probe issue completed `{total:0}`, zero ledger rows.
+      (The Gmail-UI unsubscribe chip itself awaits a human glance — the automated
+      session could not open Gmail's message view.)
 - [x] Re-POSTing send never double-sends — integration-tested with an NXDOMAIN mailer
       (ledger rows prove the skip; completed is terminal), and a live second claim
       answers 409 naming the holder.
@@ -198,15 +209,26 @@ immutable cache, so **filenames are versioned and never edited in place**.
 - [x] Raw HTML in a body `.md` never reaches the rendered email (structural; unit-tested
       with `<script>`, `<img onerror>`, and inline tags; re-asserted on the preview
       route).
-- [ ] All four subscribe surfaces are live **on prod**; the landing prompt never
-      re-appears after dismissal, including when localStorage throws (the latch behavior
-      is unit-tested; the prod half is P6).
+- [x] All four subscribe surfaces are live **on prod** (2026-09-02): the deferred prompt
+      rendered in a fully anonymous headless session; the CTA + footer forms screenshot;
+      the dashboard card appeared for the unsubscribed account and its "Keep me posted"
+      re-subscribed it (`source: account`); the profile toggle read back ON. The latch
+      behavior (incl. localStorage-throws) is unit-tested.
 - [x] The stale-claim path is exercised: a manufactured stuck row is *reported*, survives
       a plain resume untouched, and is re-attempted only under `{retry_stale: true}` —
       whose re-check honors a withdrawal that happened while the row sat stuck.
 
 ## Open decisions
 
+- ⚠️ **Field finding (2026-09-02): GET-confirm is prefetch-confirmable.** The very first
+  real confirmation was performed by **Gmail's link scanner**, not a human — the row
+  flipped and the single-use token burned before anyone clicked. The consent flow already
+  avoids this exact class by linking to a page whose approve is a POST
+  (`email.rs`'s prefetcher note); the subscribe confirm chose a GET and the field test
+  demonstrated the consequence on its first outing. Follow-up: point the mail link at a
+  confirm PAGE whose button POSTs the token — one more click, prefetch-proof, and the
+  page already exists. Until then, double-opt-in evidence is "the mailbox followed the
+  link", which is weaker than "a human clicked".
 - Whether the one-click POST should move beside the governor-exempt webhook mounts:
   provider IPs are few and a 429'd unsubscribe is a deliverability black mark. Accepted
   behind the per-IP governor at current scale; recorded here so the move is a one-liner
@@ -238,4 +260,15 @@ immutable cache, so **filenames are versioned and never edited in place**.
 
 ## Field-verification log
 
-_(empty — P0 has not run)_
+| date | what was checked | result |
+|---|---|---|
+| 2026-09-01 | P0 prod measures | subscribers = **0 rows ever** (the 404 measured at population level); SendGrid configured + delivering; `platform_admins` already set |
+| 2026-09-02 | Deploy `v20260901-bfc5f58ef358` (HEAD `e8e72131`) | both pods rolled, health 200; configmap `ROOMLER__NEWSLETTER__FROM_NAME` live |
+| 2026-09-02 | Anonymous surfaces (fresh-profile headless Chrome) | deferred prompt rendered bottom-right; CTA + footer forms present; served bundle carries the latch key |
+| 2026-09-02 | Real form click (Playwright, live landing) | `POST https://roomler.ai/api/subscribe` → **202** — the wire path that had 404'd for months; first subscriber row ever created |
+| 2026-09-02 | Confirmation mail | landed in Gmail **INBOX**; ⚠️ confirmed by Gmail's link scanner before any human click (finding above); token burned single-use; outcome page renders |
+| 2026-09-02 | Issue #1 (`three-products-one-daemon`) from its `.md` | create 201 → preview verified (branded, substituted, no raw HTML) → test-send `{sent:true}` → send 202 → `completed {total:1, sent:1}`; delivered to the inbox as **"Roomler Field Notes"** |
+| 2026-09-02 | RFC-8058 one-click (real token, provider-shaped POST ×2) | 200 + 200 (idempotent), row stamped `unsubscribed_at` |
+| 2026-09-02 | Suppression | probe issue → `completed {total:0}`, **zero** ledger rows for the unsubscribed address |
+| 2026-09-02 | Signed-in door | dashboard card shown for the unsubscribed account → "Keep me posted" → `{subscribed:true}`, row revived `source: account`; profile toggle reads ON |
+| 2026-09-02 | End state | 1 mailable subscriber (the operator, restored), `newsletter_sends` = exactly 1 honest `sent` row, 2 issues (the real one + the probe) |
