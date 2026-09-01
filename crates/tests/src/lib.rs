@@ -60,6 +60,8 @@ mod key_rotation_tests;
 #[cfg(test)]
 mod member_tests;
 #[cfg(test)]
+mod newsletter_tests;
+#[cfg(test)]
 mod notification_tests;
 #[cfg(test)]
 mod oauth_tests;
