@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" aria-labelledby="acl-title acl-desc">
+  <!-- Sibling of hero-mesh.svg / private-network.svg — same visual system. -->
+  <title id="acl-title">Default-deny access control</title>
+  <desc id="acl-desc">
+    Three machines on the left try to reach three services on the right through
+    a policy wall. Two connections are allowed and flow through; one is refused
+    at the wall and turns back. Every attempt, allowed or refused, is written to
+    an audit line beneath.
+  </desc>
+  <style>
+    .flow { stroke-dasharray: 6 8; animation: acl-flow 1.4s linear infinite; }
+    @keyframes acl-flow { to { stroke-dashoffset: -28; } }
+    /* The refused packet never leaves the scene: it advances, is stopped, and
+       returns — so a glance at any moment still shows all three verdicts. */
+    .blocked { animation: acl-block 3.2s ease-in-out infinite; }
+    @keyframes acl-block {
+      0%   { transform: translateX(0); opacity: 0; }
+      15%  { opacity: 1; }
+      45%  { transform: translateX(96px); opacity: 1; }
+      60%  { transform: translateX(74px); opacity: 1; }
+      100% { transform: translateX(0); opacity: 0; }
+    }
+    .spark { transform-box: fill-box; transform-origin: center; animation: acl-spark 3.2s ease-in-out infinite; }
+    @keyframes acl-spark { 0%,42% { opacity: 0; transform: scale(.6); } 50% { opacity: 1; transform: scale(1); } 70%,100% { opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      .flow, .blocked, .spark { animation: none; }
+      .blocked { opacity: 1; transform: translateX(74px); }
+      .spark { opacity: 1; }
+    }
+  </style>
+
+  <rect width="760" height="400" fill="none" />
+
+  <!-- left: machines -->
+  <g fill="#009688">
+    <rect x="40" y="70"  width="120" height="52" rx="8" opacity=".14" />
+    <rect x="40" y="168" width="120" height="52" rx="8" opacity=".14" />
+    <rect x="40" y="266" width="120" height="52" rx="8" opacity=".14" />
+  </g>
+  <g fill="#00796B" font-size="14">
+    <text x="100" y="101" text-anchor="middle">laptop</text>
+    <text x="100" y="199" text-anchor="middle">server</text>
+    <text x="100" y="297" text-anchor="middle">contractor</text>
+  </g>
+
+  <!-- the policy wall -->
+  <rect x="352" y="48" width="56" height="292" rx="10" fill="#00796B" opacity=".12" />
+  <rect x="352" y="48" width="56" height="292" rx="10" fill="none" stroke="#00796B" stroke-width="2" stroke-dasharray="4 6" />
+  <text x="380" y="36" text-anchor="middle" font-size="13" fill="#00796B" font-weight="600">policy</text>
+
+  <!-- allowed: two flows straight through -->
+  <g stroke="#009688" stroke-width="3" fill="none" stroke-linecap="round">
+    <path class="flow" d="M164 96 H600" />
+    <path class="flow" d="M164 194 H600" />
+  </g>
+
+  <!-- refused: advances, is stopped at the wall, returns -->
+  <g>
+    <circle class="blocked" cx="176" cy="292" r="7" fill="#ef5350" />
+    <circle class="spark" cx="380" cy="292" r="17" fill="none" stroke="#ef5350" stroke-width="2.5" />
+  </g>
+  <path d="M164 292 H344" stroke="#ef5350" stroke-width="3" stroke-dasharray="3 7" fill="none" opacity=".45" stroke-linecap="round" />
+  <!-- what it WANTED to reach, drawn faintly so the refusal has an object -->
+  <path d="M416 292 H600" stroke="#ef5350" stroke-width="2" stroke-dasharray="2 8" fill="none" opacity=".28" stroke-linecap="round" />
+  <!-- the verdict itself never animates away -->
+  <g stroke="#ef5350" stroke-width="3.5" stroke-linecap="round" opacity=".9">
+    <path d="M368 280 L392 304" />
+    <path d="M392 280 L368 304" />
+  </g>
+
+  <!-- right: services -->
+  <g fill="#009688">
+    <rect x="600" y="70"  width="120" height="52" rx="8" opacity=".14" />
+    <rect x="600" y="168" width="120" height="52" rx="8" opacity=".14" />
+    <rect x="600" y="266" width="120" height="52" rx="8" opacity=".14" />
+  </g>
+  <g fill="#00796B" font-size="14">
+    <text x="660" y="101" text-anchor="middle">:22 ssh</text>
+    <text x="660" y="199" text-anchor="middle">:5432 db</text>
+    <text x="660" y="297" text-anchor="middle">:5432 db</text>
+  </g>
+
+  <!-- audit: every decision is recorded, including the refusal -->
+  <g font-size="12.5" fill="#00796B">
+    <text x="40" y="366" opacity=".85">audit</text>
+    <text x="92" y="366" opacity=".7">laptop → :22 allow</text>
+    <text x="256" y="366" opacity=".7">server → :5432 allow</text>
+    <text x="452" y="366" fill="#ef5350" font-weight="600">contractor → :5432 deny</text>
+  </g>
+</svg>

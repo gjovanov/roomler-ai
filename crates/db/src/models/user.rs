@@ -41,10 +41,46 @@ pub struct User {
     pub oauth_providers: Vec<OAuthProvider>,
     #[serde(default)]
     pub notification_preferences: NotificationPrefs,
+    /// FR-12 P3 — the tutorial's own state, mirrored here so it follows the
+    /// PERSON rather than the browser profile. `#[serde(default)]` because
+    /// every user document predates this field.
+    #[serde(default)]
+    pub tutorial: TutorialState,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,
 }
+
+/// FR-12 P3 — tutorial progress, server-side.
+///
+/// The client keeps the same state in `localStorage` and works entirely
+/// without this; the mirror exists so someone who did the tour on their
+/// laptop is not walked through it again on their phone.
+///
+/// ⚠️ `done` is CLIENT-SUPPLIED and lands on the caller's own user document,
+/// so it is bounded on write (`MAX_TUTORIAL_CHAPTERS` ids, each
+/// `MAX_TUTORIAL_CHAPTER_ID_LEN`). Without a bound this is an unbounded
+/// write primitive against your own row — small, but there is no reason to
+/// leave it open.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct TutorialState {
+    /// Chapter ids the user has ticked off. A SET in spirit; stored as a
+    /// list because that is what the client holds and the order it ticks
+    /// them in is mildly interesting.
+    #[serde(default)]
+    pub done: Vec<String>,
+    /// When the welcome tour first auto-opened for this user. Presence is
+    /// the whole signal — it gates the auto-open, and it is never cleared by
+    /// normal use, so nobody is ambushed twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_at: Option<DateTime>,
+}
+
+/// A tutorial has chapters in the single digits; 64 is room to grow with a
+/// ceiling that is still obviously a ceiling.
+pub const MAX_TUTORIAL_CHAPTERS: usize = 64;
+/// Chapter ids are slugs (`get-started`, `remote-desktop`).
+pub const MAX_TUTORIAL_CHAPTER_ID_LEN: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserStatusInfo {

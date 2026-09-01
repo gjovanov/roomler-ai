@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
 };
 use nanoid::nanoid;
+use roomler_ai_db::models::TutorialState;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -52,6 +53,34 @@ pub struct UserResponse {
     /// route re-checks server-side.
     #[serde(default)]
     pub is_platform_admin: bool,
+    /// FR-12 P3 — the caller's tutorial state, carried on the response the
+    /// client already fetches at boot rather than costing a second round
+    /// trip. Empty for a brand-new account, by construction.
+    #[serde(default)]
+    pub tutorial: TutorialResponse,
+}
+
+/// The wire shape of `TutorialState`.
+///
+/// It exists for one reason: `bson::DateTime` serialises as
+/// `{"$date":{"$numberLong":"…"}}`, which a browser has no business parsing
+/// and which happens to be TRUTHY, so a client testing presence would work by
+/// accident and a client formatting it would print `[object Object]`. Every
+/// other timestamp this API returns is RFC 3339; this one is too.
+#[derive(Debug, Serialize, Default)]
+pub struct TutorialResponse {
+    pub done: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seen_at: Option<String>,
+}
+
+impl From<TutorialState> for TutorialResponse {
+    fn from(t: TutorialState) -> Self {
+        Self {
+            done: t.done,
+            seen_at: t.seen_at.and_then(|d| d.try_to_rfc3339_string().ok()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +273,7 @@ pub async fn register(
                     display_name: user.display_name,
                     avatar: user.avatar,
                     is_platform_admin: state.platform_admins.contains(&user_id),
+                    tutorial: user.tutorial.into(),
                 }),
             }),
         ));
@@ -344,6 +374,7 @@ pub async fn login(
             display_name: user.display_name,
             avatar: user.avatar,
             is_platform_admin: state.platform_admins.contains(&user_id),
+            tutorial: user.tutorial.into(),
         },
         invite_tenant: None,
     };
@@ -450,6 +481,7 @@ pub async fn me(
         display_name: user.display_name,
         avatar: user.avatar,
         is_platform_admin: state.platform_admins.contains(&auth.user_id),
+        tutorial: user.tutorial.into(),
     }))
 }
 
@@ -505,6 +537,7 @@ pub async fn refresh(
             display_name: user.display_name,
             avatar: user.avatar,
             is_platform_admin: state.platform_admins.contains(&user_id),
+            tutorial: user.tutorial.into(),
         },
         invite_tenant: None,
     };
