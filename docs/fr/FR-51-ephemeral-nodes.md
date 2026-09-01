@@ -1,7 +1,9 @@
 # FR-51: Ephemeral nodes — a device that removes itself
 
 **Issue:** [#1095](https://github.com/gjovanov/roomler-ai/issues/1095) ·
-**Status:** implemented (P1–P5 merged, all dark) — field verification pending ·
+**Status:** **field-verified on prod 0.4.46 (2026-09-01)** — all ten ACs ticked; AC5's
+≥24 h re-read is the one residual gate, and the non-affine `removes` fan gap spun out
+as [#1186](https://github.com/gjovanov/roomler-ai/issues/1186) ·
 **Owner:** overlay/networking + control plane ·
 **Anchors verified against master `ccc58bb0`**
 
@@ -255,36 +257,36 @@ existing row. Verify that direction in the field *before* P3, not after.
 
 Falsifiable, and each names how it is shown to have FAILED first — CI green is not a result:
 
-- [ ] **AC1 — an unclean stop reaps.** An ephemeral agent enrolled on prod, then
+- [x] **AC1 — an unclean stop reaps.** An ephemeral agent enrolled on prod, then
       `SIGKILL`ed, disappears from `GET …/agent` within the configured deadline + one sweep
       interval, with no admin action. Shown failing on the current deploy first: the same
       device still listed after the same wait.
-- [ ] **AC2 — the address comes back.** The reaped node's host ordinal appears in the
+- [x] **AC2 — the address comes back.** The reaped node's host ordinal appears in the
       network's `free_hosts`, and the next enrollment in that org receives it. Verified by
       reading `overlay_networks` before and after.
-- [ ] **AC3 — peers are told.** A second live node in the same org receives a `netmap_delta`
+- [x] **AC3 — peers are told.** A second live node in the same org receives a `netmap_delta`
       whose `removes` names the reaped node, and drops its `/32`. Read from the peer's own
       log, not from the server's.
-- [ ] **AC4 — a clean stop reaps immediately** (P3): `docker stop` on an ephemeral container
+- [x] **AC4 — a clean stop reaps immediately** (P3): `docker stop` on an ephemeral container
       removes the row in < 10 s, well inside the deadline.
-- [ ] **AC5 — a permanent device is never touched.** With the reaper enabled and a deadline
+- [x] **AC5 — a permanent device is never touched.** With the reaper enabled and a deadline
       of 60 s, the 5 live prod rows unseen for > 7 days are **still present** after a full
       day. This is the criterion that catches the reaper querying the wrong predicate, and it
       must be run against real fleet data.
-- [ ] **AC6 — the row is actually gone, not tombstoned** (F4): `db.agents.countDocuments({})`
+- [x] **AC6 — the row is actually gone, not tombstoned** (F4): `db.agents.countDocuments({})`
       is unchanged by an ephemeral node's full lifecycle, and its `machine_id` is not left
       reserved.
-- [ ] **AC7 — N replicas are N devices.** Ten containers from one image, one reusable key,
+- [x] **AC7 — N replicas are N devices.** Ten containers from one image, one reusable key,
       one hostname ⇒ **ten** rows and ten overlay addresses, all simultaneously online.
       Shown failing first on today's build, where they collapse onto one row (F1).
-- [ ] **AC8 — a revoked key stops working immediately** (P2): an enrollment with a revoked
+- [x] **AC8 — a revoked key stops working immediately** (P2): an enrollment with a revoked
       key is refused while the key's expiry is still in the future, and the refusal is
       audited.
-- [ ] **AC9 — a device cannot declare itself.** An enrollment body carrying
+- [x] **AC9 — a device cannot declare itself.** An enrollment body carrying
       `"ephemeral": true` against a normal token produces a **normal** device; a body
       carrying `"ephemeral": false` against an ephemeral token produces an **ephemeral** one.
       Locked by a test, because this is the property with the sharpest failure mode.
-- [ ] **AC10 — the reaper is a cluster singleton.** With 2 pods live, exactly one reap runs
+- [x] **AC10 — the reaper is a cluster singleton.** With 2 pods live, exactly one reap runs
       per cycle and no `netmap_delta` is fanned twice. Read from both pods' logs.
 
 ## 7. Open decisions
@@ -334,4 +336,28 @@ Falsifiable, and each names how it is shown to have FAILED first — CI green is
 
 ## 10. Field-verification log
 
-*(empty — nothing has been built)*
+**2026-09-01 — full matrix run on prod `v20260901-6762fae9b2eb` (0.4.46), docker
+containers on the build host** (full evidence: the Result comment on
+[#1095](https://github.com/gjovanov/roomler-ai/issues/1095)). Fail-first captured on the
+prior image (self-unenroll 404, zero `ephemeral` fields in the device feed, an expired
+ephemeral row sitting unreaped with the flag off). Then, with ≥ `d08ec741` +
+`ROOMLER__RC__EPHEMERAL_REAPER_ENABLED=true`:
+
+- SIGKILL → reaped at `silent_secs=118, ttl=60` (~2 min); `docker stop` → row gone in
+  ~2 s (`ephemeral device unenrolled itself on shutdown`); revoked key refused by name
+  with ~23 h of expiry left; one key + one forced hostname ⇒ 3 simultaneous devices;
+  the reap cycle ran on exactly one of the two flagged pods.
+- Addresses recycled twice through `free_hosts` (final pool `[2,1]`, `next_host` capped
+  at 3 across four node lifecycles); `agents` ended at exactly its 63/33 baseline after
+  nine ephemeral lifecycles — zero tombstones, zero residue; all 5 long-silent permanent
+  sentinels survived a live reaper.
+- The lifecycle ledger stamped every removal with its true path
+  (`ephemeral_expired` ×3 / `ephemeral_self_unenroll` ×5 / `agent_delete` ×1).
+- Bonuses: two containers promoted a direct LAN carrier over netstack
+  (`probe_ms=2120`); the fresh org carved its own `/22` (FR-47 live);
+  `roomler status` prints the ephemeral line.
+- Findings: the non-affine removes fan (**#1186**, measured both arms — the affine
+  admin-DELETE delivers in seconds, the tenant-less self-unenroll misses; recycle
+  safety verified intact via the joiner's affine upsert); configmap-only changes need a
+  `rollout restart` (one pod had the flag, one didn't); containerized daemons should set
+  auto-update off (noise, not harm).
