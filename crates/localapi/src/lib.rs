@@ -138,6 +138,12 @@ pub struct NodeStatus {
     /// would read as "clear".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lan_captures: Option<Vec<LanCaptureStatus>>,
+    /// FR-47 — the last overlay join the server REFUSED, if any. `None` means
+    /// no refusal has been seen this daemon lifetime (or the daemon predates
+    /// the field). See [`JoinRefusalStatus`] for why it is not cleared once a
+    /// later join succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_refusal: Option<JoinRefusalStatus>,
     /// B4 (overlay v3) — the measured netcheck capability vector + its age
     /// (`roomler netcheck`). `None` from a pre-B4 daemon or before the
     /// first measurement completes (~45 s after start).
@@ -2311,6 +2317,39 @@ fn unexpected_response(resp: Response) -> std::io::Error {
     }
 }
 
+/// FR-47 — the last time the server REFUSED this node's overlay join, as
+/// [`NodeStatus::join_refusal`] reports it.
+///
+/// The failure this exists for: before the refusal frame, a node that could
+/// not be given an address simply waited for a netmap that never arrived, so
+/// it was indistinguishable from one that was merely offline — on the host as
+/// much as on the dashboard. The daemon log carries the reason now; this puts
+/// it where an operator actually looks first.
+///
+/// ⚠️ Reported even after a LATER join succeeds, with its timestamp, rather
+/// than being cleared: "we were refused twenty minutes ago and are fine now"
+/// is a different and more useful fact than silence, and it is the only trace
+/// left once the log has rotated. `connected` already says whether the node is
+/// up right now, so this cannot be mistaken for the current state.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct JoinRefusalStatus {
+    /// The enumerated reason, as the wire spelled it
+    /// (`address_space_exhausted`, `network_unavailable`, `store_unavailable`,
+    /// or `unknown` from a newer server).
+    #[serde(default)]
+    pub reason: String,
+    /// The server's human-readable detail.
+    #[serde(default)]
+    pub detail: String,
+    /// Unix seconds when the refusal arrived.
+    #[serde(default)]
+    pub at_unix: i64,
+    /// Whether another attempt could plausibly succeed. A full block does not
+    /// empty on retry; a transient store fault might.
+    #[serde(default)]
+    pub retryable: bool,
+}
+
 /// FR-33 — one captured LAN prefix, as [`NodeStatus::lan_captures`] reports it.
 /// Detect-and-report only: the daemon never routes around a capture.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -2392,6 +2431,7 @@ mod tests {
                 srflx: None,
                 warm_relay: None,
                 lan_captures: None,
+                join_refusal: None,
                 orgs: Vec::new(),
                 direct_socks: Vec::new(),
                 direct_bind_walks: None,

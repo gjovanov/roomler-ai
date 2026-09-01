@@ -1310,6 +1310,36 @@ fn print_status(s: &NodeStatus) {
             );
         }
     }
+    // FR-47 — the server refused this node's overlay join. Printed even when
+    // the node is connected NOW: "we were refused, and here is why" is the
+    // only trace left once the daemon log has rotated, and `connected` above
+    // already reports the current state so this cannot be read as it.
+    //
+    // Absent field = a daemon predating it, and then nothing is printed —
+    // silence must never be mistaken for "never refused" on an old build.
+    if let Some(r) = &s.join_refusal {
+        let ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 - r.at_unix)
+            .unwrap_or(0)
+            .max(0);
+        let when = if ago < 90 {
+            format!("{ago}s ago")
+        } else if ago < 5400 {
+            format!("{}m ago", ago / 60)
+        } else {
+            format!("{}h ago", ago / 3600)
+        };
+        let hint = if r.retryable {
+            "transient — a retry may succeed"
+        } else {
+            "retrying will not help; an operator has to act"
+        };
+        println!("  join        REFUSED {when} — {} ({hint})", r.reason);
+        if !r.detail.is_empty() {
+            println!("              {}", r.detail);
+        }
+    }
     // NAT-traversal — the srflx line exists because an empty srflx tier is the
     // single most useful answer to "why is every peer on relay?", and it used
     // to be invisible: both failure paths logged at debug! only.
