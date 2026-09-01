@@ -1,5 +1,7 @@
 # FR-50: The installer cannot know which server handed it to you
 
+> **CLOSED 2026-09-01** — issue #1083 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
+
 **Issue:** [#1083](https://github.com/gjovanov/roomler-ai/issues/1083) ·
 Status: **P0 — spec** (2026-08-31) · Child of
 [FR-42](FR-42-selfhost-verified-on-a-clean-box.md) (#967), which found this by
