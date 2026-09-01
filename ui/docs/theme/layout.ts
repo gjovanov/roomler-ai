@@ -41,6 +41,11 @@ export interface DocPage {
   faq: boolean
   /** ISO date from git, for the sitemap and the page footer. */
   lastmod: string
+  /** Path under `content/` this page was authored from, without extension.
+   *  Absent for GENERATED pages — tag indexes, and a section index nobody
+   *  wrote. Those must not offer "Edit this page": the link would point at
+   *  a file that does not exist, which is a 404 shipped on 32 pages. */
+  sourceFile?: string
 }
 
 export interface NavSection {
@@ -292,8 +297,11 @@ ${page.html}
     </div>
     ${pager(prev, next)}
     <p class="page-meta">
-      Last updated <time datetime="${page.lastmod}">${page.lastmod}</time> ·
-      <a href="https://github.com/gjovanov/roomler-ai/edit/master/ui/docs/content/${page.slug}.md" target="_blank" rel="noopener noreferrer">Edit this page</a>
+      Last updated <time datetime="${page.lastmod}">${page.lastmod}</time>${
+        page.sourceFile
+          ? ` ·\n      <a href="https://github.com/gjovanov/roomler-ai/edit/master/ui/docs/content/${page.sourceFile}.md" target="_blank" rel="noopener noreferrer">Edit this page</a>`
+          : ''
+      }
     </p>
   </main>
 

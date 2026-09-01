@@ -237,6 +237,7 @@ function loadPage(file: string): DocPage {
     plain: '',
     faq: optionalBoolean(data, 'faq') ?? false,
     lastmod: lastMod.get(rel) ?? TODAY,
+    sourceFile: slug,
   }
   page.plain = stripTags(html)
   return page
