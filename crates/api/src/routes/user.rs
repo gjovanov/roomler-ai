@@ -265,6 +265,36 @@ pub async fn update_profile(
     Ok(Json(serde_json::json!({ "updated": true })))
 }
 
+/// FR-12 P3 — PUT /api/user/tutorial.
+///
+/// Both fields are optional and independent: the view writes `done` when a
+/// chapter is ticked and `seen: true` exactly once, on the first auto-open.
+#[derive(Debug, Deserialize)]
+pub struct UpdateTutorialRequest {
+    /// The chapter ids this user has completed. Replaces the stored list.
+    pub done: Option<Vec<String>>,
+    /// `true` marks the welcome tour as shown. There is no way to unset it
+    /// from here — see `set_tutorial_state`.
+    pub seen: Option<bool>,
+}
+
+/// The tutorial is a convenience, never a gate: if this route is unreachable
+/// the client keeps working from `localStorage` alone. It is therefore
+/// authenticated but deliberately unremarkable — a user may only ever write
+/// their OWN state, which is why there is no id in the path.
+pub async fn update_tutorial(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<UpdateTutorialRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let updated = state
+        .users
+        .set_tutorial_state(auth.user_id, body.done, body.seen)
+        .await?;
+
+    Ok(Json(serde_json::json!({ "updated": updated })))
+}
+
 #[derive(Debug, Serialize)]
 pub struct MyMembershipResponse {
     /// Combined permission bitmask across all the caller's roles in this
