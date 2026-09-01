@@ -128,10 +128,20 @@ services:
     networks: [roomler]
 
   roomler:
-    # Build from source today (~10-20 min the first time; Rust + mediasoup).
-    # `image:` names the result so a rebuild is cached and so a published
-    # image can be dropped in later without editing this file.
-    image: ${ROOMLER_IMAGE:-roomler-ai:selfhost}
+    # Two ways to get this running, and the fast one is the default:
+    #
+    #   docker compose … pull && docker compose … up -d     ← pulls, ~1 minute
+    #   docker compose … up -d --build                      ← builds, ~6-20 min
+    #
+    # ⚠️ `up -d` ALONE will BUILD, not pull. Compose treats a service that has
+    # a `build:` section as buildable, so a missing image is built rather than
+    # fetched. That is why the documented quickstart runs `pull` first — it is
+    # not decoration, and skipping it silently costs the operator the 20
+    # minutes this image exists to save.
+    #
+    # `build:` stays because it is the AGPL promise in practice: the published
+    # image must never be the only way to run the server.
+    image: ${ROOMLER_IMAGE:-ghcr.io/gjovanov/roomler-ai:latest}
     build:
       context: .
       args:
