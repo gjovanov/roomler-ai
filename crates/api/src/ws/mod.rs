@@ -20,6 +20,7 @@ pub mod derp_acl;
 pub mod derp_cluster;
 pub mod device_presence;
 pub mod dispatcher;
+pub mod ephemeral;
 pub mod handler;
 pub mod media_cluster;
 pub mod org_relay;
