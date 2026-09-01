@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { defineStore } from 'pinia'
-import type { ServerTutorialState } from '@/composables/useTutorialProgress'
+import {
+  seedTutorialFromServer,
+  type ServerTutorialState,
+} from '@/composables/useTutorialProgress'
 import { ref, computed } from 'vue'
 import { api } from '@/api/client'
 import router from '@/plugins/router'
@@ -24,6 +27,24 @@ interface User {
 
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<User | null>(null)
+
+  /**
+   * Everything that must happen the moment we learn who the caller is.
+   *
+   * FR-12 P3: the tutorial's server-side state is folded into THIS browser
+   * here rather than in a view, because "we just learned who the user is" is
+   * the actual event and any route can be the first one they land on. It sat
+   * in `AppLayout.maybeAutoOpenTour` first, which was wrong twice over: that
+   * function bails on the tutorial route itself and runs at most once per
+   * load, and neither condition has anything to do with seeding. Field-caught
+   * on prod - a browser with no local state showed `0/8 done` for an account
+   * the server said had completed a chapter.
+   */
+  function adoptSession(u: User) {
+    user.value = u
+    seedTutorialFromServer(u.id, u.tutorial)
+  }
+
   const loading = ref(false)
   const error = ref<string | null>(null)
 
@@ -48,7 +69,7 @@ export const useAuthStore = defineStore('auth', () => {
         username,
         password,
       })
-      user.value = data.user
+      adoptSession(data.user)
       signedIn.value = true
       markSignedIn()
       subscribePush().catch(() => {})
@@ -87,7 +108,7 @@ export const useAuthStore = defineStore('auth', () => {
       // needs email activation first, so this is NOT a session yet. Only the
       // auto-verified path (e2e overlay) signs in, and it sets cookies.
       if (data.user) {
-        user.value = data.user
+        adoptSession(data.user)
         signedIn.value = true
         markSignedIn()
         subscribePush().catch(() => {})
@@ -104,7 +125,7 @@ export const useAuthStore = defineStore('auth', () => {
   async function fetchMe() {
     if (!signedIn.value) return
     try {
-      user.value = await api.get<User>('/auth/me')
+      adoptSession(await api.get<User>('/auth/me'))
       subscribePush().catch(() => {})
     } catch {
       // The hint said signed in and the server disagreed. It is the authority.

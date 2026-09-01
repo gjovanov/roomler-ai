@@ -602,7 +602,6 @@ import {
   hasSeenTour,
   markTourSeen,
   pushTutorialState,
-  seedTutorialFromServer,
   shouldAutoOpenTour,
 } from '@/composables/useTutorialProgress'
 
@@ -918,11 +917,6 @@ async function maybeAutoOpenTour() {
   const uid = auth.user?.id
   if (!tid || !uid) return
   if (route.name === 'tutorial') return
-  // FR-12 P3 — fold the account's stored state in BEFORE the seen-flag read,
-  // so a person who did the tour on another machine is not walked through it
-  // again here. Seeding is local-only and costs no request: the state rode in
-  // on the /auth/me response this session already made.
-  seedTutorialFromServer(uid, auth.user?.tutorial)
   if (hasSeenTour(uid)) {
     tourChecked = true
     return
