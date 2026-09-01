@@ -18,14 +18,24 @@ goes **peer-to-peer** and is end-to-end encrypted: the server introduces the two
 ends and enforces policy, and never sees your pixels, keystrokes, files or
 tunnelled bytes.
 
+<!-- ⚠️ The MP4 is deliberately NOT linked as "watch". GitHub refuses to render a
+     player for a blob this size — the blob page says "Sorry about that, but we
+     can't show files that are this big right now" — and both the raw URL and
+     `?raw=1` serve `application/octet-stream`, so a browser downloads rather
+     than plays. A link promising a player and delivering an apology is worse
+     than no link. The GIF above IS the demo for anyone scrolling past; the MP4
+     is offered honestly, as a download.
+     To get a real inline player, the video has to be uploaded through GitHub's
+     web UI (drag it into an issue comment) and embedded by its
+     user-attachments URL — a manual step, like the social preview. -->
 <p align="center">
-  <a href="roomler-demo.mp4">
-    <img src="docs/assets/demo-preview.gif" alt="A Windows 11 desktop running inside a browser tab, pinging a MacBook across the encrypted mesh — four replies, no packet loss" width="800">
-  </a>
+  <img src="docs/assets/demo-preview.gif" alt="A Windows 11 desktop running inside a browser tab, pinging a MacBook across the encrypted mesh — four replies, no packet loss" width="800">
 </p>
 <p align="center">
   <i>A Windows 11 laptop, live in a browser tab, pinging a MacBook across the mesh.</i><br>
-  <a href="roomler-demo.mp4"><b>▶ Watch the full 90-second demo</b></a> — two machines, two operating systems, one tab.
+  Two machines, two operating systems, one tab —
+  <a href="https://raw.githubusercontent.com/gjovanov/roomler-ai/master/roomler-demo.mp4">the full 90-second demo</a>
+  is a 3.8&nbsp;MB MP4 download.
 </p>
 
 ## Run it
@@ -176,8 +186,10 @@ reactions, mentions and file sharing, plus HD video calls with screen sharing an
 recordings — on the same server and the same accounts as everything above. If
 your team already lives here to reach its machines, meetings and chat come free.
 
-<a href="roomler-intro.mp4">
-  <img src="https://img.shields.io/badge/%E2%96%B6%20Watch-Collaboration%20Walkthrough%20(2%3A24)-009688?style=for-the-badge" alt="Watch the collaboration walkthrough video" />
+<!-- Same GitHub limitation as the demo above, and worse here: this file is
+     10 MB. "Watch" was a promise the blob page cannot keep. -->
+<a href="https://raw.githubusercontent.com/gjovanov/roomler-ai/master/roomler-intro.mp4">
+  <img src="https://img.shields.io/badge/Collaboration%20Walkthrough-2%3A24%20%C2%B7%2010%20MB%20MP4-009688?style=for-the-badge" alt="Download the collaboration walkthrough video (2:24, 10 MB MP4)" />
 </a>
 
 | In detail | |
