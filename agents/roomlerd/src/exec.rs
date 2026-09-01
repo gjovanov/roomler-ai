@@ -541,7 +541,11 @@ pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Re
 /// and `-D warnings` turns that into a build failure in CI rather than here —
 /// the same trap FR-36 hit when a shared helper moved out of a feature-gated
 /// module and lost its implicit gate. Widen this only alongside a caller.
-#[cfg(all(target_os = "linux", feature = "portal-capture"))]
+///
+/// Widened for FR-56 P1: `apps::linux` needs it too, and `apps` is compiled on
+/// every Linux build rather than behind `portal-capture` — so the gate is now
+/// the platform alone. Both callers are Linux-only, so no other lane sees it.
+#[cfg(target_os = "linux")]
 pub(crate) use unix_priv::drop_to_std;
 
 #[cfg(unix)]
@@ -737,7 +741,7 @@ mod unix_priv {
     /// documents. One privilege story, as with exec / pty / sftp.
     ///
     /// Gated to match its consumer — see the re-export above for why.
-    #[cfg(all(target_os = "linux", feature = "portal-capture"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn drop_to_std(
         cmd: &mut std::process::Command,
         account: &str,

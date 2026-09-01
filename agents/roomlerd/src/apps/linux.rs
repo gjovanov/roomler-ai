@@ -23,6 +23,7 @@
 //! session" works within the 3-message protocol (no separate verb).
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -44,25 +45,80 @@ const MAX_TMUX_SESSIONS: usize = 32;
 /// window's id (best-effort; `None` on miss and the browser re-lists).
 const LAUNCH_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How to reach the desktop we manage.
+///
+/// FR-56 P1. Before this there was only a display string, which silently
+/// encoded a second assumption: that the DAEMON owns the X server. That is
+/// true in virtual-desktop mode and false everywhere else, and it is why
+/// Remote Apps never engaged on a Wayland host — see [`discover`].
+pub enum Target {
+    /// Virtual-desktop mode: the daemon started Xvfb and owns it, so commands
+    /// run as the daemon with nothing but `DISPLAY`. Byte-for-byte the
+    /// pre-FR-56 behaviour, and the only population using this today.
+    Daemon { display: String },
+    /// A logged-in user's session — X11, or Wayland whose compositor runs
+    /// Xwayland (mutter does, even headless). Commands are **dropped to that
+    /// account** and carry the session's X cookie.
+    ///
+    /// ⚠️ The privilege drop is not politeness. `launch` spawns a terminal and
+    /// a tmux server; doing that as root on somebody's own desktop session
+    /// would put a root shell on their screen and leave root-owned state in
+    /// their runtime dir. The daemon owning Xvfb is the *only* case where
+    /// running as the daemon is the right answer.
+    Session {
+        display: String,
+        /// `None` is legal: an X server started without auth accepts anyone.
+        /// ⚠️ But on a compositor-started Xwayland it is effectively required —
+        /// without it every call dies `Authorization required, but no
+        /// authorization protocol specified`, which is what `DISPLAY`-only did.
+        xauthority: Option<PathBuf>,
+        /// The account to drop to, by NAME (`getpwnam` gives the home dir and
+        /// supplementary groups a uid alone cannot).
+        user: String,
+    },
+}
+
 pub struct LinuxWm {
-    display: String,
+    target: Target,
 }
 
 impl LinuxWm {
-    pub fn new(display: String) -> Self {
-        Self { display }
+    pub fn new(target: Target) -> Self {
+        Self { target }
     }
 
-    fn cmd(&self, program: &str) -> Command {
+    /// Build a command aimed at the target desktop.
+    ///
+    /// ⚠️ Fallible on purpose. If the privilege drop cannot be installed the
+    /// only safe outcome is to run NOTHING — silently falling back would run a
+    /// user's terminal as root, which is the exact failure this exists to
+    /// prevent. An infallible `cmd()` cannot express that.
+    fn cmd(&self, program: &str) -> Result<Command> {
         let mut c = Command::new(program);
-        c.env("DISPLAY", &self.display);
-        c
+        match &self.target {
+            Target::Daemon { display } => {
+                c.env("DISPLAY", display);
+            }
+            Target::Session {
+                display,
+                xauthority,
+                user,
+            } => {
+                c.env("DISPLAY", display);
+                if let Some(xa) = xauthority {
+                    c.env("XAUTHORITY", xa);
+                }
+                crate::exec::drop_to_std(&mut c, user)
+                    .map_err(|e| anyhow::anyhow!("cannot run `{program}` as {user}: {e}"))?;
+            }
+        }
+        Ok(c)
     }
 
     /// Run a helper and capture its output. A `NotFound` spawn error is
     /// rewritten into an actionable "install X" message.
     fn run_capture(&self, program: &str, args: &[&str], apt: &str) -> Result<Output> {
-        self.cmd(program)
+        self.cmd(program)?
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -80,7 +136,7 @@ impl LinuxWm {
     /// Spawn a detached, stdio-null child (an xterm / GUI app). The child
     /// keeps running after the handle drops (std, unlike tokio).
     fn spawn_detached(&self, program: &str, args: &[&str], apt: &str) -> Result<()> {
-        self.cmd(program)
+        self.cmd(program)?
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -134,6 +190,26 @@ impl WindowManager for LinuxWm {
     fn list(&self) -> Result<Vec<WindowInfo>> {
         // Live X windows.
         let out = self.run_capture("wmctrl", &["-l"], "wmctrl")?;
+        // ⚠️ The status check is load-bearing, and it was missing. `wmctrl -l`
+        // against a display it cannot open writes NOTHING to stdout and exits
+        // non-zero, so parsing stdout regardless turned "I could not reach the
+        // desktop" into `Ok(vec![])` — *no windows*, which is a different
+        // claim and a reassuring one. Measured under FR-56 P1: pointing the
+        // daemon at `:99` (no X server there) reported `windows: 0` rather
+        // than an error. `focus` and `tmux new-session` already check; only
+        // this one did not, and discovery makes it matter — the display is now
+        // found rather than owned, so it CAN go stale (a compositor restart
+        // invalidates the cookie) where an Xvfb the daemon started could not.
+        if !out.status.success() {
+            bail!(
+                "wmctrl could not read the window list from {}: {}",
+                match &self.target {
+                    Target::Daemon { display } => display.clone(),
+                    Target::Session { display, .. } => display.clone(),
+                },
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
         let raw = parse_wmctrl_list(&String::from_utf8_lossy(&out.stdout));
         let active = self.active_window();
 
@@ -289,6 +365,165 @@ fn is_safe_session(s: &str) -> bool {
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Work out how to reach a desktop on this host, or say why we cannot.
+///
+/// FR-56 P1. The old gate was `env::var_os("DISPLAY").is_some()` **on the
+/// daemon**, which is only ever true in virtual-desktop mode — so on a Wayland
+/// host Remote Apps did not fail, it never engaged.
+///
+/// Order is deliberate:
+///
+/// 1. **The daemon's own `DISPLAY`** wins. That is Xvfb mode, it is the only
+///    population using this feature today, and it must stay byte-for-byte
+///    unchanged — a "smarter" probe that reordered this would change behaviour
+///    for the one set of hosts already relying on it.
+/// 2. Otherwise, whoever is at the screen ([`crate::companion::graphical_session`],
+///    already built for FR-27's consent prompt and FR-45's capture helper).
+///    A Wayland session counts: mutter runs **Xwayland** even headless, so X11
+///    tooling reaches its windows.
+///
+/// ⚠️ Candidates are **verified, not guessed**: each `DISPLAY`+cookie pair is
+/// tried against `wmctrl -m` and the first that answers wins. `loginctl` does
+/// not report a `Display=` for every Wayland session, so a guess of `:0` is
+/// unavoidable — but an unverified guess would surface later as a confusing
+/// "no windows" instead of an honest "no desktop".
+pub fn discover() -> Option<Target> {
+    if let Some(display) = std::env::var_os("DISPLAY").and_then(|d| d.into_string().ok()) {
+        // Virtual-desktop mode. Unchanged, including running as the daemon:
+        // the daemon started that Xvfb and owns it.
+        return Some(Target::Daemon { display });
+    }
+
+    let sess = crate::companion::graphical_session().ok()?;
+    let xauthority = find_xauthority(sess.uid);
+    // loginctl reports `Display=` for X11 sessions and often not for Wayland
+    // ones; `:0` is what a compositor-started Xwayland almost always takes.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(d) = sess.display.clone() {
+        candidates.push(d);
+    }
+    for d in [":0", ":1"] {
+        if !candidates.iter().any(|c| c == d) {
+            candidates.push(d.to_string());
+        }
+    }
+
+    for candidate in candidates {
+        let target = Target::Session {
+            display: candidate.clone(),
+            xauthority: xauthority.clone(),
+            user: sess.name.clone(),
+        };
+        match probe(&target) {
+            Probe::Answered => {
+                // ⚠️ NOT `%display`: tracing's `%x` shorthand expands through
+                // its own `field::display` helper, so a local named `display`
+                // makes the macro resolve the FUNCTION instead — and rustc
+                // 1.95 ICEs while rendering that error rather than printing
+                // it (`--message-format=short` shows it).
+                tracing::info!(
+                    display = %candidate,
+                    user = %sess.name,
+                    xauthority = ?xauthority,
+                    "apps: found a usable desktop in the user's session"
+                );
+                return Some(target);
+            }
+            // wmctrl missing is not "no desktop" — it is a dependency the
+            // existing error message already names actionably ("apt install
+            // wmctrl"). Returning the target lets that message reach the
+            // operator instead of a silent `supported:false`.
+            Probe::ToolMissing => return Some(target),
+            Probe::NoDisplay => continue,
+        }
+    }
+    tracing::debug!(
+        user = %sess.name,
+        "apps: a graphical session exists but no X display answered — a Wayland \
+         compositor with no Xwayland cannot be managed by the X11 backend"
+    );
+    None
+}
+
+/// Outcome of poking a candidate desktop.
+enum Probe {
+    /// An X server answered — this target is usable.
+    Answered,
+    /// `wmctrl` is not installed. Says nothing about the display.
+    ToolMissing,
+    /// `wmctrl` ran and could not open that display.
+    NoDisplay,
+}
+
+/// Try `wmctrl -m` against a candidate. Doubles as the dependency check,
+/// because `wmctrl` is what the whole backend runs on.
+fn probe(target: &Target) -> Probe {
+    let wm = LinuxWm::new(match target {
+        Target::Daemon { display } => Target::Daemon {
+            display: display.clone(),
+        },
+        Target::Session {
+            display,
+            xauthority,
+            user,
+        } => Target::Session {
+            display: display.clone(),
+            xauthority: xauthority.clone(),
+            user: user.clone(),
+        },
+    });
+    let Ok(mut cmd) = wm.cmd("wmctrl") else {
+        return Probe::NoDisplay;
+    };
+    match cmd
+        .arg("-m")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(st) if st.success() => Probe::Answered,
+        Ok(_) => Probe::NoDisplay,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::ToolMissing,
+        Err(_) => Probe::NoDisplay,
+    }
+}
+
+/// Where a session's X cookie lives.
+///
+/// ⚠️ Measured, not assumed: with `DISPLAY` alone and no cookie every call
+/// dies `Authorization required, but no authorization protocol specified` —
+/// which is precisely what the pre-FR-56 code did, since `linux.rs` set
+/// `DISPLAY` and nothing else. The compositor-generated name is a glob
+/// (`.mutter-Xwaylandauth.XXXXXX`), so the directory is scanned rather than a
+/// path guessed.
+fn find_xauthority(uid: u32) -> Option<PathBuf> {
+    let run = PathBuf::from(format!("/run/user/{uid}"));
+    // Newest first: a compositor restart leaves the old cookie behind, and the
+    // stale one authorises nothing.
+    let mut mutter: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&run)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".mutter-Xwaylandauth")
+        })
+        .filter_map(|e| {
+            let m = e.metadata().ok()?.modified().ok()?;
+            Some((m, e.path()))
+        })
+        .collect();
+    mutter.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    if let Some((_, path)) = mutter.into_iter().next() {
+        return Some(path);
+    }
+    // GDM's X11 sessions, then the classic home-directory cookie.
+    [run.join("gdm/Xauthority"), run.join("Xauthority")]
+        .into_iter()
+        .find(|c| c.is_file())
 }
 
 #[cfg(test)]
