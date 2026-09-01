@@ -1,6 +1,6 @@
 # FR-54: An organization can vanish and leave its mesh behind
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
+**Issue:** [#1130](https://github.com/gjovanov/roomler-ai/issues/1130) ·
 **Status:** proposed · **Owner:** overlay/networking
 
 ## Goal
