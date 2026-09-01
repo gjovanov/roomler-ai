@@ -63,6 +63,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::delegate::DelegateFrame;
 use crate::delegate::write_frame;
+use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 
 /// How often the worker proves the channel is alive.
 ///
@@ -84,11 +85,25 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Returns immediately unless this process was started as `run --supervised`,
 /// which is every case except a worker the supervisor itself spawned:
 /// launchd-owned workers, a hand-run `roomlerd run`, and the daemon.
-pub async fn run(supervised: bool, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+pub async fn run(
+    supervised: bool,
+    // FR-43 P2b-2 — the signalling loop's two ends: delegated messages go IN,
+    // a delegated session's replies come OUT. `None` when this process is not
+    // a worker, in which case `supervised` is false too and we return at once.
+    channels: Option<(
+        tokio::sync::mpsc::Sender<ServerMsg>,
+        tokio::sync::mpsc::Receiver<ClientMsg>,
+    )>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     if !supervised {
         tracing::debug!("delegation: not a supervised worker; not attaching");
         return;
     }
+    let Some((to_signaling, mut from_signaling)) = channels else {
+        tracing::warn!("delegation: --supervised but no signalling channels; not attaching");
+        return;
+    };
     let Some(secret) = read_secret_from_stdin().await else {
         // LOUD, not silent: `--supervised` with no secret means the supervisor
         // and the worker disagree about how the secret travels, which is
@@ -103,7 +118,7 @@ pub async fn run(supervised: bool, mut shutdown: tokio::sync::watch::Receiver<bo
     let mut backoff = BACKOFF_MIN;
     let mut last_error: Option<String> = None;
     loop {
-        match attach_once(&secret, &mut shutdown).await {
+        match attach_once(&secret, &to_signaling, &mut from_signaling, &mut shutdown).await {
             Ok(()) => {
                 tracing::info!("delegation: channel closed by the daemon");
                 backoff = BACKOFF_MIN;
@@ -139,6 +154,8 @@ pub async fn run(supervised: bool, mut shutdown: tokio::sync::watch::Receiver<bo
 /// One attach attempt: connect, authorise, then pump until the channel ends.
 async fn attach_once(
     secret: &str,
+    to_signaling: &tokio::sync::mpsc::Sender<ServerMsg>,
+    from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // Dial the daemon's DEDICATED delegation socket, not the LocalAPI control
@@ -213,15 +230,21 @@ async fn attach_once(
                         Ok(DelegateFrame::Attached { .. }) => {
                             tracing::debug!("delegation: a second `attached` frame; ignoring");
                         }
-                        // P2b-1 observes the traffic; P2b-2 serves it. Logging
-                        // it first is deliberate: it proves the nine kinds
-                        // cross correctly, in order, against real sessions,
-                        // BEFORE any peer lifecycle moves across the boundary.
                         Ok(DelegateFrame::ToWorker { msg }) => {
-                            tracing::info!(
-                                kind = crate::delegate::server_msg_kind(&msg),
-                                "delegation: received an rc message from the daemon (not yet served — FR-43 P2b-2)"
-                            );
+                            let kind = crate::delegate::server_msg_kind(&msg);
+                            // A full queue means the signalling loop is wedged,
+                            // not merely busy. Dropping and SAYING SO beats
+                            // blocking this loop, which would also stop the
+                            // liveness ping and make the daemon think the
+                            // channel died when it is the loop that is stuck.
+                            if to_signaling.try_send(*msg).is_err() {
+                                tracing::warn!(
+                                    kind,
+                                    "delegation: signalling queue full or closed; dropped a message"
+                                );
+                            } else {
+                                tracing::debug!(kind, "delegation: serving an rc message");
+                            }
                         }
                         Ok(DelegateFrame::FromWorker { .. }) => {
                             // Worker → daemon only.
@@ -232,6 +255,19 @@ async fn attach_once(
                         // protocol is only additive if old readers skip it.
                         Err(e) => tracing::debug!(error = %e, "delegation: skipping a frame"),
                     },
+                }
+            }
+            // Replies from a delegated session: the answer, its peer's ICE,
+            // its stats, its terminate. Written from THIS loop so they are
+            // ordered with respect to each other and to the liveness frames.
+            reply = from_signaling.recv() => {
+                match reply {
+                    Some(msg) => {
+                        write_frame(&mut wr, &DelegateFrame::FromWorker { msg: Box::new(msg) })
+                            .await?;
+                    }
+                    // The signalling loop is gone; so is any session it held.
+                    None => return Ok(()),
                 }
             }
             _ = tokio::time::sleep(PING_EVERY) => {
