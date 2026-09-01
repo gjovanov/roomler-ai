@@ -72,7 +72,10 @@ async function submit() {
   if (busy.value || !email.value.trim()) return
   busy.value = true
   try {
-    await api.post('/api/subscribe', { email: email.value.trim(), source: props.source })
+    // ⚠️ Path is relative to the client's BASE_URL, which is already '/api' —
+    // this line once said '/api/subscribe', the wire request was
+    // POST /api/api/subscribe, and every submission 404'd (FR-58 evidence 1).
+    await api.post('/subscribe', { email: email.value.trim(), source: props.source })
     // Success is the ONLY branch, by design — see the comment at the top of
     // this file. The server does not tell us which outcome occurred.
     done.value = true

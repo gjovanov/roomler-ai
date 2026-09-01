@@ -190,11 +190,9 @@ import { onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
-import { useSnackbar } from '@/composables/useSnackbar'
 import { enrollCommands } from '@/utils/enrollCommands'
 
 const route = useRoute()
-const { showSnackbar } = useSnackbar()
 
 const capabilities = [
   'Remote desktop',
@@ -313,25 +311,12 @@ const plans = ref<LandingPlan[]>([
   { id: 'business', name: 'Business', price_cents: 1600, features: ['300 devices', 'Everything in Pro', 'Priority support'] },
 ])
 
-// FR-39 — where the confirm / unsubscribe links land. The API redirects here
-// with `?subscribe=<outcome>` rather than rendering its own page, so the
-// message arrives in the product's own voice. The param is stripped afterwards
-// so a reload does not repeat the message and a shared URL carries no state.
-const SUBSCRIBE_MESSAGES: Record<string, { text: string; color: string }> = {
-  confirmed: { text: "You're on the list — thanks.", color: 'success' },
-  unsubscribed: { text: "You've been unsubscribed. No more emails.", color: 'success' },
-  invalid: { text: 'That link is no longer valid — it may already have been used.', color: 'warning' },
-}
+// FR-58: the old `?subscribe=<outcome>` snackbar that lived here was dead
+// code — the API's redirect target (`/?subscribe=…`) is auth-gated, so this
+// view never received the query. Outcomes now render on the public
+// `/newsletter/confirmed` + `/newsletter/unsubscribed` pages.
 
 onMounted(async () => {
-  const outcome = SUBSCRIBE_MESSAGES[String(route.query.subscribe ?? '')]
-  if (outcome) {
-    showSnackbar(outcome.text, outcome.color, 6000)
-    const url = new URL(window.location.href)
-    url.searchParams.delete('subscribe')
-    window.history.replaceState({}, '', url.toString())
-  }
-
   try {
     const resp = await fetch('/api/stripe/plans')
     if (resp.ok) {
