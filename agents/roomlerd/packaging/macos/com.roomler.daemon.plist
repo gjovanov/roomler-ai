@@ -1,11 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- RETIRED-NAME-ANCHOR-BEGIN
-     `/etc/roomler` is this daemon's REAL config directory — FR-46 P5a moved it
-     off the retired name, and the .pkg postinstall migrates an existing Mac
-     before this file is installed. The BUNDLE path below is a different story:
-     it keys the TCC grants and stays frozen until P5b. docs/fr/FR-46
--->
 <!--
   LaunchDAEMON for roomlerd — the privileged half.
 
@@ -39,9 +33,6 @@
 
     <key>ProgramArguments</key>
     <array>
-    <!-- RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS; renaming
-         it silently drops Screen Recording + Accessibility on every Mac. FR-21 D5
-         freezes it. docs/fr/FR-21 -->
         <string>/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd</string>
         <string>--config</string>
         <string>/etc/roomler/config.toml</string>
@@ -72,5 +63,4 @@
         <string>info</string>
     </dict>
 </dict>
-  <!-- RETIRED-NAME-ANCHOR-END -->
 </plist>

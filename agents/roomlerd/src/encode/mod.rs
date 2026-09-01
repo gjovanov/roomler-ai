@@ -134,12 +134,13 @@ pub(crate) mod resample;
 /// (rc.191 field flake). Module-scoped (not tests-mod-private) since P8b
 /// so `policy::tests` can take the same lock.
 // RETIRED-NAME-ANCHOR-BEGIN
-// Every retired name below is a test deliberately setting the LEGACY
-// `ROOMLER_AGENT_*` env spelling. That coverage is the thing proving hosts in the
-// field keep working after FR-21 P3 made `ROOMLERD_*` the documented prefix —
-// rewriting these would delete the proof while leaving the tests green.
+// Every retired name below is a test deliberately feeding the RETIRED
+// `ROOMLER_AGENT_*` spelling in, to prove it does NOTHING. Until FR-46 P2b it
+// proved the opposite — that field hosts kept working — and the names are the
+// same either way, so rewriting them deletes the coverage while leaving the
+// tests green.
 // INVARIANT: a retired name here must be one a real host can still have set.
-// docs/fr/FR-21
+// docs/fr/FR-46
 #[cfg(test)]
 pub(crate) static RELAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1302,9 +1303,12 @@ mod tests {
         // test that touches these vars, and it clears BOTH before each read.
         // Clearing only one would let an inherited value of the other decide
         // every assertion below, silently — which is what it did before.
-        const NAMES: [&str; 2] = ["ROOMLERD_HW_AUTO", "ROOMLER_AGENT_HW_AUTO"];
+        // FR-46 P2b: only the CURRENT spelling is read. The retired one is
+        // asserted separately below — it must be inert, not merely absent.
+        const NAMES: [&str; 1] = ["ROOMLERD_HW_AUTO"];
+        const RETIRED: &str = "ROOMLER_AGENT_HW_AUTO";
         let clear = || {
-            for n in NAMES {
+            for n in NAMES.iter().copied().chain([RETIRED]) {
                 unsafe { std::env::remove_var(n) };
             }
         };
@@ -1331,15 +1335,18 @@ mod tests {
             }
         }
 
-        // The primary name wins when both are set — otherwise a stale alias on
-        // a field host would quietly override the value an operator just set.
+        // FR-46 P2b: the retired spelling is INERT. Asserted on its own rather
+        // than dropped from the loop above, because "we stopped testing it" and
+        // "it stopped working" look identical in a diff, and only one of them
+        // is what this change intended.
         clear();
-        // RAW-ENV-DELIBERATE: `test_env::set_as` clears the sibling
-        // spellings, and this assertion needs BOTH set at once so the chain has
-        // something to choose between.
-        unsafe { std::env::set_var("ROOMLERD_HW_AUTO", "1") };
-        unsafe { std::env::set_var("ROOMLER_AGENT_HW_AUTO", "0") };
-        assert!(!hw_auto_disabled(), "ROOMLERD_* must take precedence");
+        // RAW-ENV-DELIBERATE: `test_env::set_as` refuses a prefix that is no
+        // longer in the read chain, and this needs the retired one set alone.
+        unsafe { std::env::set_var(RETIRED, "0") };
+        assert!(
+            !hw_auto_disabled(),
+            "{RETIRED} must be ignored — it is retired, not an alias"
+        );
         clear();
     }
 
@@ -1485,10 +1492,12 @@ mod tests {
         // SAFETY: set_var/remove_var are unsafe in Rust 2024 because concurrent
         // reads can race. Every test that touches these vars holds
         // RELAY_ENV_LOCK, and `clear` removes BOTH spellings before each read.
-        const NAMES: [&str; 2] = ["ROOMLERD_RELAY_MAX_KBPS", "ROOMLER_AGENT_RELAY_MAX_KBPS"];
+        // FR-46 P2b — see hw_auto_disabled_reads_env.
+        const NAMES: [&str; 1] = ["ROOMLERD_RELAY_MAX_KBPS"];
+        const RETIRED: &str = "ROOMLER_AGENT_RELAY_MAX_KBPS";
         let prior: Vec<Option<String>> = NAMES.iter().map(|n| std::env::var(n).ok()).collect();
         let clear = || {
-            for n in NAMES {
+            for n in NAMES.iter().copied().chain([RETIRED]) {
                 unsafe { std::env::remove_var(n) };
             }
         };
@@ -1526,18 +1535,18 @@ mod tests {
             assert_eq!(relay_max_bps(), 3_000_000, "{name}: non-numeric -> default");
         }
 
-        // The current spelling wins when both are set — otherwise a stale alias
-        // on a field host would quietly override the value an operator just set.
+        // FR-46 P2b: the retired spelling is INERT — it does not override, and
+        // it does not apply on its own either. Asserted rather than dropped:
+        // "we stopped testing it" and "it stopped working" look identical in a
+        // diff, and only one of them is what this change intended.
         clear();
-        // RAW-ENV-DELIBERATE: `test_env::set_as` clears the sibling
-        // spellings, and this assertion needs BOTH set at once so the chain has
-        // something to choose between.
-        unsafe { std::env::set_var("ROOMLERD_RELAY_MAX_KBPS", "1500") };
-        unsafe { std::env::set_var("ROOMLER_AGENT_RELAY_MAX_KBPS", "4200") };
+        // RAW-ENV-DELIBERATE: `test_env::set_as` refuses a prefix that is no
+        // longer in the read chain, and this needs the retired one set alone.
+        unsafe { std::env::set_var(RETIRED, "4200") };
         assert_eq!(
             relay_max_bps(),
-            1_500_000,
-            "ROOMLERD_* must take precedence"
+            3_000_000,
+            "{RETIRED} must be ignored — the default stands"
         );
 
         // Restore the pre-test environment.
@@ -1554,9 +1563,9 @@ mod tests {
         let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The `x.min(relay_max_bps())` clamp the pump applies must pull a
         // 0.20-bpp 2560x1600@30 VP9-444 target (12_441_600 bps) down to the
-        // 3 Mbps relay ceiling. BOTH spellings are cleared: clearing only one
-        // let the other decide the ceiling this asserts against.
-        const NAMES: [&str; 2] = ["ROOMLERD_RELAY_MAX_KBPS", "ROOMLER_AGENT_RELAY_MAX_KBPS"];
+        // 3 Mbps relay ceiling. Only the CURRENT spelling needs clearing: FR-46
+        // P2b retired the other, so an inherited one cannot decide this ceiling.
+        const NAMES: [&str; 1] = ["ROOMLERD_RELAY_MAX_KBPS"];
         let prior: Vec<Option<String>> = NAMES.iter().map(|n| std::env::var(n).ok()).collect();
         for n in NAMES {
             unsafe { std::env::remove_var(n) };
