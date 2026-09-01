@@ -561,9 +561,26 @@ function main(): void {
   for (const asset of usedAssets) {
     cpSync(asset, join(OUT_ASSETS, asset.split(sep).pop()!))
   }
-  const social = join(REPO_ROOT, 'docs', 'assets', 'social-preview.png')
-  if (existsSync(social)) cpSync(social, join(OUT_ASSETS, 'social-preview.png'))
-  else console.warn('[docs] warning: docs/assets/social-preview.png missing — OG image will 404')
+  // ⚠️ The OG image must live INSIDE `ui/`. The Docker UI stage is
+  // `COPY ui/ .` and nothing else, so a card read from the repo's
+  // `docs/assets/` exists on a dev box and is ABSENT in the image — every
+  // page's `og:image` would 404 in production while looking perfect
+  // locally. Same class as the `@types/node` optional-peer divergence.
+  //
+  // A gate rather than a warning, for the same reason as the other gates:
+  // this URL is referenced by all 96 pages, and a warning in a Docker build
+  // log is precisely the thing nobody reads.
+  const social = join(DOCS_ROOT, 'assets', 'social-preview.png')
+  if (!existsSync(social)) {
+    console.error(
+      `\n[docs] BUILD FAILED — the Open Graph image is missing:\n` +
+        `        ${relative(REPO_ROOT, social)}\n` +
+        `        Every page references it as og:image, and it MUST live under ui/ —\n` +
+        `        the Docker UI stage copies ui/ and nothing else.\n`,
+    )
+    process.exit(1)
+  }
+  cpSync(social, join(OUT_ASSETS, 'social-preview.png'))
 
   // Site-root SEO files.
   //
