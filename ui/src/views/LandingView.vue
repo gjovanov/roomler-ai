@@ -12,7 +12,7 @@
       <v-btn variant="text" href="#features" class="d-none d-sm-inline-flex">Features</v-btn>
       <v-btn variant="text" href="#download" class="d-none d-sm-inline-flex">Download</v-btn>
       <v-btn variant="text" href="#pricing" class="d-none d-sm-inline-flex">Pricing</v-btn>
-      <!-- FR-58: `href`, not `:to` — /docs is statically generated HTML served
+      <!-- FR-60: `href`, not `:to` — /docs is statically generated HTML served
            by nginx, not a route in this SPA's router. A router-link would
            resolve to the 404 view. -->
       <v-btn variant="text" href="/docs/" class="d-none d-md-inline-flex">Docs</v-btn>
