@@ -272,3 +272,358 @@ async fn test_send_refuses_loudly_without_a_mailer() {
         .expect("issue row exists");
     assert_eq!(row.get_str("status").unwrap(), "draft");
 }
+
+// ── P3: ledger + fan-out + status ───────────────────────────────────────
+//
+// Mailer for these tests: SMTP at an `.invalid` host — guaranteed NXDOMAIN,
+// so every send fails FAST and deterministically. (A dead loopback PORT is
+// not usable here: this WSL swallows loopback SYNs to unbound ports, which
+// would turn every failure into a 30 s timeout.)
+
+fn admin_app_settings(
+    admin_id: ObjectId,
+) -> impl FnOnce(&mut roomler_ai_config::Settings) + Send + 'static {
+    move |s| {
+        s.stats.platform_admins = Some(admin_id.to_hex());
+        s.email.smtp_host = Some("mailer.does-not-exist.invalid".into());
+        s.email.smtp_port = Some(1025);
+    }
+}
+
+/// Seed a subscriber row directly. ⚠️ `unsubscribed_at` is OMITTED unless
+/// set — `mailable()` filters on `unsubscribed_at: null`, and an explicit
+/// null row would be unrepresentative of what the subscribe path writes.
+async fn seed_subscriber(
+    app: &TestApp,
+    email: &str,
+    confirmed: bool,
+    unsubscribed: bool,
+) -> ObjectId {
+    let mut d = doc! {
+        "email": email,
+        "source": "test",
+        "confirmed": confirmed,
+        "unsubscribe_token": format!("tok-{email}"),
+        "created_at": bson::DateTime::now(),
+    };
+    if unsubscribed {
+        d.insert("unsubscribed_at", bson::DateTime::now());
+    }
+    app.db
+        .collection::<bson::Document>("subscribers")
+        .insert_one(d)
+        .await
+        .unwrap()
+        .inserted_id
+        .as_object_id()
+        .unwrap()
+}
+
+async fn issue_object_id(app: &TestApp, slug: &str) -> ObjectId {
+    app.db
+        .collection::<bson::Document>("newsletter_issues")
+        .find_one(doc! { "slug": slug })
+        .await
+        .unwrap()
+        .expect("issue exists")
+        .get_object_id("_id")
+        .unwrap()
+}
+
+fn minutes_ago(m: i64) -> bson::DateTime {
+    bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - m * 60 * 1000)
+}
+
+/// Poll until the issue completes — the fan-out is async behind a 202.
+async fn wait_completed(app: &TestApp, slug: &str) {
+    for _ in 0..60 {
+        let row = app
+            .db
+            .collection::<bson::Document>("newsletter_issues")
+            .find_one(doc! { "slug": slug })
+            .await
+            .unwrap()
+            .expect("issue exists");
+        if row.get_str("status").unwrap() == "completed" {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    panic!("issue `{slug}` never completed");
+}
+
+#[tokio::test]
+async fn send_refuses_before_claiming_when_no_mailer() {
+    let admin_id = ObjectId::new();
+    // platform_admins set, email left UNCONFIGURED.
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(admin_id.to_hex());
+    })
+    .await;
+    let admin = token_for(&app, admin_id);
+
+    app.auth_post("/api/admin/newsletter/issues", &admin)
+        .json(&issue_json("refuse-me"))
+        .send()
+        .await
+        .unwrap();
+    let r = app
+        .auth_post("/api/admin/newsletter/issues/refuse-me/send", &admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    // The refusal happened BEFORE the claim — the issue must still be a
+    // sendable draft once a mailer exists, not a stuck `sending`.
+    let row = app
+        .db
+        .collection::<bson::Document>("newsletter_issues")
+        .find_one(doc! { "slug": "refuse-me" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get_str("status").unwrap(), "draft");
+}
+
+#[tokio::test]
+async fn send_ledgers_the_snapshot_and_completes_honestly() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(admin_app_settings(admin_id)).await;
+    let admin = token_for(&app, admin_id);
+
+    seed_subscriber(&app, "a@test.io", true, false).await;
+    seed_subscriber(&app, "b@test.io", true, false).await;
+    seed_subscriber(&app, "c@test.io", true, false).await;
+    seed_subscriber(&app, "pending@test.io", false, false).await;
+    seed_subscriber(&app, "gone@test.io", true, true).await;
+
+    app.auth_post("/api/admin/newsletter/issues", &admin)
+        .json(&issue_json("real-send"))
+        .send()
+        .await
+        .unwrap();
+
+    let r = app
+        .auth_post("/api/admin/newsletter/issues/real-send/send", &admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 202);
+    let accepted: serde_json::Value = r.json().await.unwrap();
+    assert!(!accepted["claimed_by"].as_str().unwrap().is_empty());
+
+    wait_completed(&app, "real-send").await;
+
+    // Status: terminal is `completed`, and the counts carry the truth — an
+    // all-failed issue must never read as "sent".
+    let r = app
+        .auth_get("/api/admin/newsletter/issues/real-send/status", &admin)
+        .send()
+        .await
+        .unwrap();
+    let st: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(st["status"], "completed");
+    assert_eq!(st["counts"]["total"], 3, "only the mailable snapshot");
+    assert_eq!(
+        st["counts"]["failed"], 3,
+        "the mailer host does not resolve"
+    );
+    assert_eq!(st["counts"]["sent"], 0);
+    assert_eq!(st["counts"]["stale"], 0);
+    assert_eq!(st["failed_sample"].as_array().unwrap().len(), 3);
+    assert!(
+        st["failed_sample"][0]["error"].as_str().unwrap().len() > 5,
+        "failures carry the backend error"
+    );
+
+    // The ledger: exactly one row per mailable subscriber; pending and
+    // unsubscribed never got one.
+    let sends = app.db.collection::<bson::Document>("newsletter_sends");
+    assert_eq!(sends.count_documents(doc! {}).await.unwrap(), 3);
+    assert_eq!(
+        sends
+            .count_documents(doc! { "email": { "$in": ["pending@test.io", "gone@test.io"] } })
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Re-POSTing send never double-sends: completed is terminal.
+    let r = app
+        .auth_post("/api/admin/newsletter/issues/real-send/send", &admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409, "one issue, one send");
+    assert_eq!(sends.count_documents(doc! {}).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn a_live_claim_is_never_usurped() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(admin_app_settings(admin_id)).await;
+    let admin = token_for(&app, admin_id);
+
+    app.auth_post("/api/admin/newsletter/issues", &admin)
+        .json(&issue_json("busy"))
+        .send()
+        .await
+        .unwrap();
+    app.db
+        .collection::<bson::Document>("newsletter_issues")
+        .update_one(
+            doc! { "slug": "busy" },
+            doc! { "$set": {
+                "status": "sending",
+                "claimed_by": "other-pod",
+                "claimed_at": bson::DateTime::now(),
+            } },
+        )
+        .await
+        .unwrap();
+
+    let r = app
+        .auth_post("/api/admin/newsletter/issues/busy/send", &admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("other-pod"),
+        "the refusal names the live claim holder: {body}"
+    );
+}
+
+#[tokio::test]
+async fn stale_rows_are_reported_live_and_retried_only_on_request() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(admin_app_settings(admin_id)).await;
+    let admin = token_for(&app, admin_id);
+    let sends = app.db.collection::<bson::Document>("newsletter_sends");
+    let issues = app.db.collection::<bson::Document>("newsletter_issues");
+
+    // ── Issue A: a stale row, resumed WITHOUT the flag — reported, untouched.
+    let s1 = seed_subscriber(&app, "stuck@test.io", true, false).await;
+    app.auth_post("/api/admin/newsletter/issues", &admin)
+        .json(&issue_json("stale-plain"))
+        .send()
+        .await
+        .unwrap();
+    let a_id = issue_object_id(&app, "stale-plain").await;
+    sends
+        .insert_one(doc! {
+            "issue_id": a_id, "subscriber_id": s1, "email": "stuck@test.io",
+            "status": "claimed", "claimed_at": minutes_ago(25), "updated_at": minutes_ago(25),
+        })
+        .await
+        .unwrap();
+    issues
+        .update_one(
+            doc! { "slug": "stale-plain" },
+            doc! { "$set": { "status": "sending", "claimed_by": "dead-pod", "claimed_at": minutes_ago(20) } },
+        )
+        .await
+        .unwrap();
+
+    // Reported live, while still `sending`.
+    let r = app
+        .auth_get("/api/admin/newsletter/issues/stale-plain/status", &admin)
+        .send()
+        .await
+        .unwrap();
+    let st: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(st["status"], "sending");
+    assert_eq!(st["counts"]["stale"], 1);
+    assert_eq!(st["stale_addresses"][0], "stuck@test.io");
+
+    // Plain resume: the stale issue-claim is re-claimable, the stale ROW is
+    // not touched — "maybe delivered" stays a human decision.
+    let r = app
+        .auth_post("/api/admin/newsletter/issues/stale-plain/send", &admin)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 202, "a stale claim is the resume path");
+    wait_completed(&app, "stale-plain").await;
+    let r = app
+        .auth_get("/api/admin/newsletter/issues/stale-plain/status", &admin)
+        .send()
+        .await
+        .unwrap();
+    let st: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(st["counts"]["total"], 1);
+    assert_eq!(
+        st["counts"]["stale"], 1,
+        "without retry_stale the ambiguous row survives, counted"
+    );
+    assert_eq!(st["counts"]["failed"], 0);
+
+    // ── Issue B: retry_stale re-attempts — and the re-check honors a
+    // withdrawal that happened while the row sat stuck.
+    let s2 = seed_subscriber(&app, "left@test.io", true, false).await;
+    app.auth_post("/api/admin/newsletter/issues", &admin)
+        .json(&issue_json("stale-retry"))
+        .send()
+        .await
+        .unwrap();
+    let b_id = issue_object_id(&app, "stale-retry").await;
+    sends
+        .insert_one(doc! {
+            "issue_id": b_id, "subscriber_id": s2, "email": "left@test.io",
+            "status": "claimed", "claimed_at": minutes_ago(25), "updated_at": minutes_ago(25),
+        })
+        .await
+        .unwrap();
+    issues
+        .update_one(
+            doc! { "slug": "stale-retry" },
+            doc! { "$set": { "status": "sending", "claimed_by": "dead-pod", "claimed_at": minutes_ago(20) } },
+        )
+        .await
+        .unwrap();
+    // The subscriber withdrew while the row was stuck.
+    app.db
+        .collection::<bson::Document>("subscribers")
+        .update_one(
+            doc! { "_id": s2 },
+            doc! { "$set": { "unsubscribed_at": bson::DateTime::now(), "confirmed": false } },
+        )
+        .await
+        .unwrap();
+
+    let r = app
+        .auth_post("/api/admin/newsletter/issues/stale-retry/send", &admin)
+        .json(&serde_json::json!({ "retry_stale": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 202);
+    wait_completed(&app, "stale-retry").await;
+    let r = app
+        .auth_get("/api/admin/newsletter/issues/stale-retry/status", &admin)
+        .send()
+        .await
+        .unwrap();
+    let st: serde_json::Value = r.json().await.unwrap();
+    // Two rows, and each proves a different phase: the reclaimed stale row
+    // (s2) was re-checked and the withdrawal honored — suppressed, never
+    // mailed; and the snapshot phase correctly claimed the OTHER still-
+    // mailable subscriber (s1, from the issue-A scenario) for THIS issue —
+    // an issue's audience is the whole current list, not one stuck row.
+    assert_eq!(st["counts"]["total"], 2);
+    assert_eq!(
+        st["counts"]["suppressed"], 1,
+        "the reclaimed row was re-checked and the withdrawal honored — never mailed"
+    );
+    assert_eq!(
+        st["counts"]["failed"], 1,
+        "the snapshot phase mailed the still-subscribed s1 (dead-DNS ⇒ failed)"
+    );
+    assert_eq!(st["counts"]["stale"], 0);
+}
