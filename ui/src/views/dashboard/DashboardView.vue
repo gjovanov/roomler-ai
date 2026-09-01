@@ -4,6 +4,32 @@
   <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
     <h1 class="text-h5 text-md-h4 mb-2 mb-md-4">{{ $t('nav.dashboard') }}</h1>
 
+    <!-- FR-58 P4 — one-time ask, only on POSITIVE evidence of "not
+         subscribed" (a failed load must never prompt), per-user latch. -->
+    <v-alert
+      v-if="showNewsletterAsk"
+      class="mb-4"
+      color="primary"
+      variant="tonal"
+      density="comfortable"
+    >
+      <div class="d-flex flex-wrap align-center justify-space-between ga-3">
+        <div>
+          <div class="font-weight-bold">Get product updates</div>
+          <div class="text-body-2">
+            Roomler Field Notes — never more than monthly, one-click unsubscribe,
+            straight to {{ authStore.user?.email }}.
+          </div>
+        </div>
+        <div class="d-flex ga-2">
+          <v-btn size="small" color="primary" :loading="nlBusy" @click="acceptNewsletter">
+            Keep me posted
+          </v-btn>
+          <v-btn size="small" variant="text" @click="dismissNewsletter">No thanks</v-btn>
+        </div>
+      </div>
+    </v-alert>
+
     <v-row v-if="tenantStore.tenants.length === 0">
       <v-col cols="12" md="6">
         <v-card>
@@ -70,16 +96,54 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
 import { useTenantStore } from '@/stores/tenant'
+import { useNewsletterPref } from '@/composables/useNewsletterPref'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useValidation } from '@/composables/useValidation'
 
+const authStore = useAuthStore()
 const tenantStore = useTenantStore()
 const router = useRouter()
 const { showSuccess, showError } = useSnackbar()
 const { rules } = useValidation()
+
+// ── FR-58 P4: the one-time newsletter ask ────────────────────────────────
+const { subscribed: nlSubscribed, busy: nlBusy, load: nlLoad, set: nlSet } = useNewsletterPref()
+// Until storage proves otherwise, behave as already-dismissed — unreadable
+// storage must fail toward not annoying (the tutorial-latch house rule).
+const nlDismissed = ref(true)
+const askKey = () => `roomler:newsletter-ask:${authStore.user?.id ?? 'anon'}`
+function readAskDismissed(): boolean {
+  try {
+    return localStorage.getItem(askKey()) !== null
+  } catch {
+    return true
+  }
+}
+function latchAsk() {
+  try {
+    localStorage.setItem(askKey(), new Date().toISOString())
+  } catch {
+    // Worst case: asked again next visit.
+  }
+}
+const showNewsletterAsk = computed(() => nlSubscribed.value === false && !nlDismissed.value)
+async function acceptNewsletter() {
+  if (await nlSet(true)) {
+    showSuccess('Subscribed — product updates only, never more than monthly')
+    latchAsk()
+    nlDismissed.value = true
+  } else {
+    showError('Could not subscribe — please try again')
+  }
+}
+function dismissNewsletter() {
+  latchAsk()
+  nlDismissed.value = true
+}
 
 const formRef = ref()
 const name = ref('')
@@ -117,5 +181,7 @@ async function handleCreate() {
 
 onMounted(() => {
   tenantStore.fetchTenants()
+  nlDismissed.value = readAskDismissed()
+  if (!nlDismissed.value) nlLoad()
 })
 </script>
