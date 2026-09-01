@@ -127,8 +127,8 @@ function renderEnroll(kind: 'agent' | 'tunnel', groupId: string): string {
   }
 
   return (
-    `<div class="os-tabs" data-os-tabs>${radios.join('')}` +
-    `<div class="os-tablist" role="tablist">${tabs.join('')}</div>` +
+    `<div class="os-tabs" data-os-tabs role="group" aria-label="Choose an operating system">${radios.join('')}` +
+    `<div class="os-tablist">${tabs.join('')}</div>` +
     `<div class="os-panels">${panels.join('')}</div></div>`
   )
 }
@@ -252,8 +252,8 @@ function renderOsTabs(ctx: PrePassCtx, body: string, groupId: string): string {
   }
 
   return (
-    `<div class="os-tabs" data-os-tabs>${radios.join('')}` +
-    `<div class="os-tablist" role="tablist">${tabs.join('')}</div>` +
+    `<div class="os-tabs" data-os-tabs role="group" aria-label="Choose an operating system">${radios.join('')}` +
+    `<div class="os-tablist">${tabs.join('')}</div>` +
     `<div class="os-panels">${panels.join('')}</div></div>`
   )
 }
