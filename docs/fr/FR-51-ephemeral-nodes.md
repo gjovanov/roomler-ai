@@ -1,7 +1,8 @@
 # FR-51: Ephemeral nodes — a device that removes itself
 
 **Issue:** [#1095](https://github.com/gjovanov/roomler-ai/issues/1095) ·
-**Status:** proposed · **Owner:** overlay/networking + control plane ·
+**Status:** implemented (P1–P5 merged, all dark) — field verification pending ·
+**Owner:** overlay/networking + control plane ·
 **Anchors verified against master `ccc58bb0`**
 
 The roomler answer to [Tailscale ephemeral nodes](https://tailscale.com/docs/features/ephemeral-nodes).
