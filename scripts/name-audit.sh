@@ -458,6 +458,50 @@ EOF
         rc=1
     fi
 
+    # An anchor placed inside a `\`-continued STRING LITERAL becomes part of the
+    # STRING, not a comment. Rust's line continuation swallows the newline and
+    # the leading whitespace, so the marker text is emitted by whatever that
+    # string builds.
+    #
+    # Not hypothetical, and not cosmetic. `service.rs` generated the per-user
+    # systemd unit and the macOS LaunchAgent plist from two such literals, and
+    # an FR-21 anchor sat inside BOTH. The unit came out carrying
+    # `// RETIRED-NAME-ANCHOR(2): renaming a lib renames its TRACING TARGET.`
+    # as a directive line, and the plist came out with the same text between
+    # `<key>EnvironmentVariables</key>` and its `<dict>` — which is invalid XML,
+    # so launchctl cannot load the LaunchAgent at all.
+    #
+    # Nothing else catches it: the file compiles, `cargo fmt` is happy, and the
+    # audit counts the anchor exactly as it would anywhere else.
+    #
+    # Detected by the one signal that is unambiguous — the PREVIOUS line ends in
+    # a backslash. Tested with `substr` rather than a regex on purpose: `/\\$/`
+    # silently fails to match here while `/\\\\$/` works, and this script has
+    # been bitten by that class of escape often enough already.
+    in_literal=""
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        case "$f" in *.rs) ;; *) continue ;; esac
+        if awk '
+              /RETIRED-NAME-(ANCHOR|RECORD)/ &&
+              length(prev) > 0 && substr(prev, length(prev), 1) == "\\" { found = 1 }
+              { prev = $0 }
+              END { exit(found ? 0 : 1) }
+           ' "$f"; then
+            in_literal="$in_literal $f"
+        fi
+    done <<EOF
+$(git ls-files 2>/dev/null)
+EOF
+    if [ -n "$in_literal" ]; then
+        echo "FAIL  an anchor sits inside a \\-continued string literal:"
+        for f in $in_literal; do echo "        $f"; done
+        echo "      Rust's line continuation eats the newline, so the marker text is"
+        echo "      EMITTED by whatever that string builds — a systemd unit, a plist."
+        echo "      Move it above the format!/literal, never inside it."
+        rc=1
+    fi
+
     # `env::node_env` reads THREE prefixes so a retired spelling keeps working.
     # A test that pokes ONE of them directly is not hermetic: it clears one link
     # and an inherited value under another silently decides the assertion. That
