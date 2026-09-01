@@ -1749,7 +1749,41 @@ async fn connect_once(
                             )
                             .await?;
                         }
-                        Err(e) => debug!(%e, text = %text.as_str(), "ignoring non-rc:* frame"),
+                        // A parse failure has TWO causes that this arm used to
+                        // report as one, and the difference is the difference
+                        // between noise and an outage.
+                        //
+                        // Something that is not ours at all (a proxy's keepalive,
+                        // a future frame family) is genuinely ignorable — debug.
+                        //
+                        // But a frame whose `t` starts with `rc:` IS ours and
+                        // failed to decode, which means the server sent
+                        // something this build cannot read and the frame is
+                        // being dropped whole. For an `rc:overlay.netmap` that
+                        // is the entire mesh: no address, no peers, and — at
+                        // debug — no sign of it. That is not hypothetical: a
+                        // REQUIRED field the client never reads (`epoch`) is
+                        // enough to trigger it, and the message would have
+                        // claimed the frame was "non-rc:*" while naming an
+                        // `rc:` tag in its own payload.
+                        //
+                        // Deliberately not fatal: dropping one frame is still
+                        // better than exiting, and an old agent meeting a new
+                        // frame family must keep running. It just has to SAY so.
+                        Err(e) => {
+                            let tag = serde_json::from_str::<serde_json::Value>(&text)
+                                .ok()
+                                .and_then(|v| v.get("t")?.as_str().map(str::to_string));
+                            match tag {
+                                Some(t) if t.starts_with("rc:") => warn!(
+                                    %e, %t,
+                                    "DROPPED a roomler frame this build cannot decode — the \
+                                     server sent a shape we do not understand; anything it \
+                                     carried (a netmap, a session) did not arrive"
+                                ),
+                                _ => debug!(%e, text = %text.as_str(), "ignoring non-rc:* frame"),
+                            }
+                        }
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
