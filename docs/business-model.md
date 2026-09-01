@@ -50,7 +50,7 @@ Almost nothing scales with usage. Two things do.
 
 | Cost driver | Scales with | Metered? |
 |---|---|---|
-| **Relay traffic** (DERP + TURN) | bytes that could not go peer-to-peer | ✅ `derp_bytes` · ⚠️ `turn_bytes` blocked |
+| **Relay traffic** (DERP + TURN) | bytes that could not go peer-to-peer | ✅ `derp_bytes` · `turn_bytes` **deliberately not collected** — coturn 4.17.2 exposes no per-user label, and per-tenant TURN buys nothing until a tenant relays material volume (FR-20 P3) |
 | **SFU conferencing** | participant-seconds | ✅ `sfu_participant_seconds` |
 | Object storage | GB stored | not yet metered |
 | Everything else | ~flat | n/a |
@@ -199,7 +199,7 @@ upgrade-intent signal available**, and they come free with enforcement.
 | 1 | Tier reshape — metric, prices, currency | ~a month of FR-20 data |
 | 2 | Price the AGPL exception | first real enquiry |
 | 3 | `Enterprise`: make real or delete | #1 |
-| 4 | HEVC patent pool: licence, or ship HEVC off by default in commercial builds | operator |
+| ~~4~~ | ~~HEVC patent pool~~ — **decided 2026-09-01: HEVC stays ON by default.** Only vendor hardware encoders ship (`*_nvenc`/`*_qsv`/`*_amf`/`*_videotoolbox`); we distribute no HEVC implementation, and the vendor licenses the silicon. Reasoning + the three things that keep it true in [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) | — |
 | 5 | Retire or right-size the idle regional PoP fleet | infra budget review |
 | 6 | Meter object storage | whether it ever becomes material |
 
