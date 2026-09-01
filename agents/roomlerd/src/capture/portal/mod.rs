@@ -383,8 +383,24 @@ pub mod helper {
                 SessionKind::CaptureOnly => "ScreenCast (capture only)",
             }
         );
+        // ⚠️ An input session that fails — a declined dialog, a timeout, a
+        // compositor that offered RemoteDesktop but would not grant it — must
+        // NOT cost CAPTURE. Retry capture-only rather than exiting, so a host
+        // where capture-only works is never left with no capture just because
+        // the input half was refused. (The kill switch already defaults input
+        // OFF; this is the belt to that braces.)
         let mut session = match super::screencast::open(kind) {
             Ok(s) => s,
+            Err(e) if kind == SessionKind::WithInput => {
+                eprintln!("portal-helper: the input session failed ({e}) — retrying capture-only");
+                match super::screencast::open(SessionKind::CaptureOnly) {
+                    Ok(s) => s,
+                    Err(e2) => {
+                        eprintln!("portal-helper: {e2}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("portal-helper: {e}");
                 std::process::exit(1);
@@ -430,9 +446,24 @@ pub mod helper {
                     f64::from(handle.format.height),
                 ),
             };
-            match super::input::InputContext::new(session.connection(), sess_path, node_id, logical)
-            {
-                Ok(ctx) => {
+            // ⚠️⚠️ The `InputContext` (a `zbus::blocking::Proxy`) MUST be built
+            // OFF the tokio runtime thread. `run_stream` runs synchronously
+            // inside the `#[tokio::main]` daemon, and zbus's blocking API does
+            // a fresh `Runtime::block_on` internally — which panics "Cannot
+            // start a runtime from within a runtime" on a runtime thread. This
+            // is the exact hazard `screencast::open` documents and guards with
+            // its own thread; the first cut of P4 rebuilt the proxy here on the
+            // tokio thread and would have panicked the instant input was
+            // granted (masked in the field run because consent blocked first).
+            // Build it on a joined thread so `input_ok` stays honest, then run
+            // the pump — also off-runtime — on its own thread.
+            let conn = session.connection().clone();
+            let built = std::thread::spawn(move || {
+                super::input::InputContext::new(&conn, sess_path, node_id, logical)
+            })
+            .join();
+            match built {
+                Ok(Ok(ctx)) => {
                     std::thread::spawn(move || super::input::run_pump(ctx, std::io::stdin()));
                     input_ok = true;
                     eprintln!(
@@ -440,8 +471,11 @@ pub mod helper {
                         logical.0, logical.1
                     );
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     eprintln!("portal-helper: input context failed: {e} — capture only");
+                }
+                Err(_) => {
+                    eprintln!("portal-helper: input context thread panicked — capture only");
                 }
             }
         }
