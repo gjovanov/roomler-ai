@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # FR-55: A device stays reachable instead of quietly sleeping
 
-**Status:** proposed (2026-09-01). Tracking issue: `FR-55`. Anchors verified against
+**Status:** proposed (2026-09-01). Tracking issue: [#1154](https://github.com/gjovanov/roomler-ai/issues/1154). Anchors verified against
 master `40da643d`.
 
 ## Goal
