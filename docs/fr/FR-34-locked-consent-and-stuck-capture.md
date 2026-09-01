@@ -1,5 +1,7 @@
 # FR-34 — A locked host: consent you can't see, and a stream that comes up black
 
+> **CLOSED 2026-08-30** — issue #917 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
+
 **Issue:** [#917](https://github.com/gjovanov/roomler-ai/issues/917)
 **Status:** design
 

@@ -1,5 +1,7 @@
 # FR-42: Self-hosting, actually watched coming up on a clean machine
 
+> **CLOSED 2026-09-01** — issue #967 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
+
 Status: **P0 in progress** (2026-08-30). Tracking issue: `FR-42` (#967).
 Child of FR-39 (#951), which shipped `docker-compose.selfhost.yml` and
 `docs/self-hosting.md` **without anyone ever running them end to end**.
