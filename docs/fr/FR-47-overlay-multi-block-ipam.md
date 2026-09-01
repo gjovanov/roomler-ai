@@ -1,7 +1,7 @@
 # FR-47: One address space per org — carve by default, grow without renumbering
 
 **Issue:** [#1071](https://github.com/gjovanov/roomler-ai/issues/1071) ·
-**Status:** proposed · **Owner:** overlay/networking
+**Status:** shipped — P0–P6 complete; the isolation half **field-verified in production**, the growth half (P5a–e) shipped **dark** behind `overlay.multi_block_enabled` · **Owner:** overlay/networking
 
 ## Goal
 
@@ -185,17 +185,28 @@ leak is purely historical or still active.
 |---|---|---|---|
 | **P0** | Spec + ledger row + issue | ✅ shipped | — |
 | **P1** | Carving on by default; configmap key; carve-failure alert + `headroom` threshold | ✅ shipped + **field-verified** | `overlay.blocks_enabled` |
-| **P2** | `OverlayJoinRefused` frame | ✅ shipped — daemon log only; the `roomler status` surface is **not built** | additive; frame is ignorable |
+| **P2** | `OverlayJoinRefused` frame + `roomler status` surface | ✅ shipped | additive; frame is ignorable |
 | **P3** | `reconcile-hosts` admin route | ✅ shipped + **run against prod** (17 ordinals reclaimed) | dry-run default |
 | **P4** | Migrate `demo`; clean up the orphaned network | ✅ done — the legacy `/10` holds no live node | existing renumber runbook |
 | **P5a** | `BlockList` — the ordinal↔address model | ✅ shipped | — |
 | **P5b** | Block list ordered by an explicit `seq` | ✅ shipped | — |
 | **P5c** | A full network grows instead of refusing | ✅ shipped, **dark** | `overlay.multi_block_enabled`, default off |
-| **P5d** | The wire: `cidrs` + per-recipient `cidr` | ⬜ not started | — |
-| **P5e** | `plan_renumber` N→M; union scope for RPF and NAT | ⬜ not started | — |
-| **P6** | Docs | 🟡 partial — `multi-org.md` §4.2 updated in P1 | — |
+| **P5d** | The wire: `cidrs` + per-recipient `cidr` | ✅ shipped, **dark** | same flag |
+| **P5e** | Per-block NAT scope (Linux + Windows) | ✅ shipped, **dark** | same flag |
+| **P6** | Docs | ✅ this file + `multi-org.md` §4.2 | — |
 
-⚠️ **P5d is the riskiest remaining piece and is deliberately unstarted.** It changes what an existing wire field *means* (per-recipient rather than per-network), and a mistake there mis-sizes the TUN netmask fleet-wide. Its compatibility claim — that a pre-P5 agent meshes correctly against a multi-block org — has to be tested against a **real old binary**, not just a pinned decoder. There is also no pressure: the largest org in production holds 17 devices against a 1 022 ceiling, so multi-block is capability built ahead of need.
+### What is NOT field-verified
+
+⚠️ **A real pre-P5d agent BINARY meshing against a multi-block org.**
+`overlay_growth_tests` proves the *server* shapes the netmap correctly — the
+1023rd device grows the org over a real WebSocket, is told its own block, and
+costs the first 1 022 nothing. It cannot prove an *old daemon* sizes its TUN
+netmask and NAT scope correctly from that string. That needs an old binary
+against a grown org, and until it is run, multi-block should stay off.
+
+⚠️ **No org has ever actually grown.** The largest holds 17 devices against a
+1 022 ceiling, so P5a–P5e is capability built ahead of need. That is why every
+phase of it is behind one flag that is off.
 
 ## 5. Acceptance criteria
 
