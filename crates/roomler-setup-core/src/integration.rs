@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR-BEGIN
-// This module puts a name on the operator's PATH. Every occurrence below
-// is the name that is ALREADY there on installed hosts, and the release
-// zip still carries a roomler-tunnel.exe alias for exactly that reason.
-// Flipping the wizard to write `roomler` is a BEHAVIOUR change (it leaves
-// the old entry stranded and changes the command an operator types), so
-// it is deliberately not part of a rename sweep. FR-21 followup.
+// What is left here is the WINDOWS half. The per-user install DIR is named by
+// the extract step, not by this module, and the release zip still carries a
+// roomler-tunnel.exe alias for hosts that already have it on PATH — so the
+// occurrences below describe a layout this module only appends to.
+// The LINUX half is done: FR-46 flipped the symlink to `~/.local/bin/roomler`
+// and REMOVES a pre-rename one instead of stranding it, which is what the
+// objection recorded here actually asked for. docs/fr/FR-46
 //! Per-platform integration after the CLI archive is extracted.
 //!
 //! Three jobs, each `#[cfg]`-gated to its OS:
@@ -16,7 +17,8 @@
 //!   creation in v1 — the .lnk write is deferred to Phase B; v1 just
 //!   ensures `roomler-tunnel` is on PATH so the operator can run it
 //!   from any shell.
-//! - **Linux**: symlink the binary into `~/.local/bin/roomler-tunnel`.
+//! - **Linux**: symlink the binary into `~/.local/bin/roomler`, and
+//!   remove a pre-rename `roomler-tunnel` symlink if one is there.
 //!   `.desktop` file is deferred to Phase B (it's only useful with
 //!   the first-forward feature so the desktop entry has a meaningful
 //!   `Exec=…` line).
@@ -52,7 +54,7 @@ pub struct IntegrationReport {
     /// Resolved path the operator should run / add to their shell rc.
     /// e.g. `C:\Users\foo\AppData\Local\Programs\roomler-tunnel\
     /// roomler-tunnel.exe` (Windows) or `/home/foo/.local/bin/
-    /// roomler-tunnel` (Linux).
+    /// roomler` (Linux).
     pub binary_path: PathBuf,
 }
 
@@ -283,6 +285,7 @@ fn integrate_unix(tunnel_binary: &Path) -> Result<IntegrationReport> {
             tunnel_binary.display()
         )
     })?;
+    retire_legacy_symlink(&symlink_path);
     Ok(IntegrationReport {
         path_updated: true,
         shortcut_created: false, // deferred to Phase B
@@ -290,7 +293,35 @@ fn integrate_unix(tunnel_binary: &Path) -> Result<IntegrationReport> {
     })
 }
 
-/// Resolve `~/.local/bin/roomler-tunnel`. The XDG-style path works
+/// Remove the pre-rename `roomler-tunnel` symlink this wizard used to create.
+///
+/// FR-46: the anchor that used to sit on this module argued, correctly, that
+/// flipping the name is a BEHAVIOUR change because it "leaves the old entry
+/// stranded". That objection is answered by removing it rather than by not
+/// renaming — an operator ends up with exactly one `roomler` on PATH instead of
+/// one working name and one dangling one.
+///
+/// ⚠️ Only a SYMLINK is removed. This wizard has only ever created symlinks
+/// here, so a regular file of that name is someone else's and is left alone.
+/// Best-effort throughout: failing to tidy an old symlink must never fail an
+/// install that has already succeeded.
+// RETIRED-NAME-ANCHOR(3): the pre-rename symlink this exists to DELETE.
+// Deletable once no host can still have one. docs/fr/FR-46
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn retire_legacy_symlink(current: &Path) {
+    let Some(parent) = current.parent() else {
+        return;
+    };
+    let legacy = parent.join("roomler-tunnel");
+    if legacy
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        let _ = std::fs::remove_file(&legacy);
+    }
+}
+
+/// Resolve `~/.local/bin/roomler`. The XDG-style path works
 /// on both Linux and macOS — modern shells include it in PATH by
 /// default; for the operators where it isn't, the Done step surfaces
 /// a one-line `export PATH=…` they can drop into their shell rc.
@@ -298,11 +329,7 @@ fn integrate_unix(tunnel_binary: &Path) -> Result<IntegrationReport> {
 fn unix_local_bin_path() -> Result<PathBuf> {
     let dirs = directories::UserDirs::new()
         .ok_or_else(|| anyhow::anyhow!("could not resolve user home dir"))?;
-    Ok(dirs
-        .home_dir()
-        .join(".local")
-        .join("bin")
-        .join("roomler-tunnel"))
+    Ok(dirs.home_dir().join(".local").join("bin").join("roomler"))
 }
 
 #[cfg(test)]
@@ -315,9 +342,9 @@ mod tests {
             path_updated: true,
             shortcut_created: false,
             binary_path: PathBuf::from(if cfg!(windows) {
-                r"C:\Users\foo\bin\roomler-tunnel.exe"
+                r"C:\Users\foo\bin\roomler.exe"
             } else {
-                "/home/foo/.local/bin/roomler-tunnel"
+                "/home/foo/.local/bin/roomler"
             }),
         };
         let json = serde_json::to_string(&report).unwrap();

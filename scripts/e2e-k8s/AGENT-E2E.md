@@ -7,12 +7,7 @@ without operator setup.
 
 ## What ships in this chunk (1B)
 
-<!-- RETIRED-NAME-ANCHOR-BEGIN
-     roomler-agent-e2e is a DOCKER IMAGE NAME that is already in the internal
-     registry and referenced by kustomization.yaml and the StatefulSet. All
-     three must agree, and changing them requires a coordinated re-push;
-     until then the standing e2e namespace pulls the existing name. -->
-- **`Dockerfile.agent-e2e`** — multi-stage build of `roomler-agent`
+- **`Dockerfile.agent-e2e`** — multi-stage build of `roomlerd`
   with `--features synthetic-frame-source,openh264-encoder,clipboard`.
   Runtime is debian:trixie-slim + curl + ca-certificates + libssl3 +
   libgcc-s1 (~80 MiB final image).
@@ -27,8 +22,8 @@ without operator setup.
   - `statefulset-agent-e2e.yaml` — 2-replica StatefulSet of the
     synthetic-frame agents.
   - `kustomization.yaml` — extended to include the 4 new files plus
-    the new image rewrite (`gjovanov/roomler-agent-e2e` →
-    `<internal-registry>/roomler-agent-e2e:latest`).
+    the new image rewrite (`gjovanov/roomlerd-e2e` →
+    `<internal-registry>/roomlerd-e2e:latest`).
 
 ## Bring-up steps (run from the build host)
 
@@ -41,8 +36,8 @@ without operator setup.
 
 ssh "$BUILD_HOST"
 cd "$REPO" && git pull
-docker build -f Dockerfile.agent-e2e -t "$REGISTRY/roomler-agent-e2e:latest" .
-docker push "$REGISTRY/roomler-agent-e2e:latest"
+docker build -f Dockerfile.agent-e2e -t "$REGISTRY/roomlerd-e2e:latest" .
+docker push "$REGISTRY/roomlerd-e2e:latest"
 ```
 
 Image size sanity-check: ~80–100 MiB. If it's >200 MiB something
@@ -125,4 +120,3 @@ curl -fsS http://roomler2.roomler-ai-e2e/api/tenant/<tenant_id>/agent \
   so any test that drives mouse/keyboard against the agent will get
   silently dropped. Phase 2 covers input via an alternative image
   (Xvfb sidecar) or a Windows agent.
-<!-- RETIRED-NAME-ANCHOR-END -->
