@@ -3485,6 +3485,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** Live inbound-RTP stats: bitrate, fps, codec. Zero until the first
    *  two polls land (we need two snapshots to derive bitrate). */
   const stats = ref<RcStats>({ ...EMPTY_STATS })
+  // e2e hook (FR-61): the live stats ref — a path-agnostic "frames are
+  // flowing" oracle (fps/bitrate update on the RTP path AND every DC pump,
+  // where inbound-rtp getStats is silent).
+  ;(window as unknown as Record<string, unknown>).__roomler_remote_stats = stats
   /** Remote cursor state. `pos` = null Ã¢ÂÂ hide the overlay + fall back
    *  to the initials badge. Shape bitmaps are cached so the canvas
    *  paint is just a `drawImage`. */
@@ -6811,6 +6815,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       iceServers: iceServers as RTCIceServer[],
       bundlePolicy: 'max-bundle',
     })
+    // e2e hook (FR-61): the live PC, so specs can assert framesDecoded via
+    // getStats() instead of settling for currentTime heuristics — the hook
+    // remote-session-smoke.spec.ts documents wishing it had.
+    ;(window as unknown as Record<string, unknown>).__roomler_remote_pc = pc
 
     pc.ontrack = (ev) => {
       // Opt-in host audio arrives on its own m=audio section. Route it
