@@ -12,6 +12,7 @@ pub mod cluster;
 pub mod consent;
 pub mod cost;
 pub mod device;
+pub mod enroll_key;
 pub mod export;
 pub mod file;
 pub mod giphy;
