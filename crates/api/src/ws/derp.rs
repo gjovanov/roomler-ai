@@ -43,7 +43,10 @@
 //! single-replica Recreate deployment, so a web deploy severs all DERP links
 //! (they rebuild via the carrier `dead` latch) and it can't scale past one
 //! replica — fine for the handful of corp pairs this tier serves.
-
+use super::derp_acl::DerpAclCache;
+use super::handler::WsParams;
+use super::overlay::{NodeIdentity, current_node};
+use crate::state::AppState;
 use axum::{
     extract::{
         Query, State, WebSocketUpgrade,
@@ -60,42 +63,30 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-
-use super::derp_acl::DerpAclCache;
-use super::handler::WsParams;
-use super::overlay::{NodeIdentity, current_node};
-use crate::state::AppState;
-
 /// 32-byte WireGuard public key — the DERP addressing unit.
 pub type DerpPubKey = [u8; 32];
-
 /// Registry key. A pubkey is only reachable WITHIN its overlay network, so the
 /// network id is part of the key — a forward lookup can never cross a network
 /// boundary (the same hard isolation the netmap enforces).
 pub type DerpKey = (ObjectId, DerpPubKey);
-
 /// `(network_id, dst_pubkey)` → a bounded sender feeding that peer's live WS
 /// write task. Shared across every `/derp` connection (lives in `AppState`).
 pub type DerpRegistry = Arc<DashMap<DerpKey, mpsc::Sender<Vec<u8>>>>;
-
 /// C-5 — per-connection close signal: the cluster convergence sweep
 /// (`ws/derp_cluster.rs`) fires it to rehome a socket parked on the
 /// wrong pod; the socket loop's cancel arm breaks, teardown releases
 /// the directory record, and the client's reconnect re-lands per the
 /// current LB map.
 pub type DerpCancelRegistry = Arc<DashMap<DerpKey, Arc<tokio::sync::Notify>>>;
-
 /// Per-connection outbound queue depth. Bounded so a slow or hostile consumer
 /// can't grow the relay's memory without bound; on overflow we DROP the frame
 /// (WG/QUIC are loss-tolerant — a dropped carrier datagram just retransmits).
 const DERP_SEND_QUEUE: usize = 256;
-
 /// Max DERP frame = `[pubkey(32) || WG-carrier datagram]`. The carrier datagram
 /// stays ≤ the overlay MTU (~1280–1420) + WG overhead; 2 KiB matches the relay
 /// carrier's `MAX_DATAGRAM` with headroom for the 32-byte pubkey prefix and is
 /// comfortably ≥ `mtu + WG_OVERHEAD + 32`.
 const DERP_MAX_FRAME: usize = 2048;
-
 /// Server→client keepalive Ping cadence on every `/derp` connection. Must sit
 /// WELL inside the shortest idle timeout on the path — HAProxy fronts the
 /// pods with `timeout client/server 300s` and NO `timeout tunnel`, so an
@@ -104,19 +95,16 @@ const DERP_MAX_FRAME: usize = 2048;
 /// traffic settled). 30 s matches the control-WS keepalive convention and
 /// gives 10× headroom.
 const DERP_KEEPALIVE: Duration = Duration::from_secs(30);
-
 /// Lifetime counters for the two forward-path drop classes. A missing dst is
 /// byte-identical to peer-offline from the sender's side, so the count is the
 /// ONLY server-side evidence of a one-way DERP pair (the split-brain class).
 static DERP_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DERP_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
-
 /// Per-(network, dst) pacing for the drop evidence lines — WG retries at
 /// handshake rate (~every 5 s per pair), so an unpaced log would emit
 /// hundreds of identical lines per dead pair per minute.
 static MISS_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap::new);
 static FULL_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap::new);
-
 /// R4 — tunnel-leg shaping. The `quic-derp-v1` tunnel flavor multiplexes
 /// QUIC over this relay, and unlike the WG floor traffic the plane was
 /// sized for, a tunnel can be an elephant flow (a git clone). Per
@@ -131,7 +119,6 @@ static TUNNEL_BUCKETS: LazyLock<DashMap<DerpKey, std::sync::Mutex<(f64, Instant)
     LazyLock::new(DashMap::new);
 const TUNNEL_RATE_BYTES_PER_SEC: f64 = 375_000.0; // ~3 Mbit/s sustained
 const TUNNEL_BURST_BYTES: f64 = 1_048_576.0; // 1 MiB burst
-
 /// Debit `len` bytes from the (network, src) tunnel bucket; `false` = over
 /// budget, drop the frame (QUIC retransmits under its congestion control,
 /// which converges onto the sustained rate).
@@ -158,9 +145,7 @@ fn tunnel_budget_permits(network_id: ObjectId, src: &DerpPubKey, len: usize) -> 
 // is what `forward_frame` holds; the flusher resolves network → tenant, which
 // is a query it can afford and the hot path cannot.
 static DERP_NETWORK_BYTES: LazyLock<DashMap<ObjectId, AtomicU64>> = LazyLock::new(DashMap::new);
-
 const USAGE_FLUSH: Duration = Duration::from_secs(60);
-
 /// Add `n` relayed bytes for `network_id`.
 ///
 /// Steady state is a DashMap `get` (hash + shard read-lock) followed by one
@@ -179,7 +164,6 @@ fn add_network_bytes(network_id: ObjectId, n: u64) {
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(n, Ordering::Relaxed);
 }
-
 /// Take and zero every network's accumulated bytes.
 ///
 /// `swap(0)` rather than remove-and-reinsert: a frame arriving mid-drain lands
@@ -194,7 +178,6 @@ fn drain_network_bytes() -> Vec<(ObjectId, u64)> {
         })
         .collect()
 }
-
 /// FR-20 P1 — drain the per-network byte counters into `stats_usage` every
 /// [`USAGE_FLUSH`].
 ///
@@ -215,7 +198,6 @@ pub fn spawn_derp_usage_flush(state: AppState) {
             if drained.is_empty() {
                 continue;
             }
-
             // ONE query for every network in this batch, not one per network:
             // the flusher runs while frames keep arriving, so its cost has to
             // stay flat in the number of active tenants.
@@ -243,7 +225,6 @@ pub fn spawn_derp_usage_flush(state: AppState) {
                     continue;
                 }
             }
-
             let now = bson::DateTime::now().timestamp_millis() / 1000;
             let (mut written, mut unattributed) = (0u64, 0u64);
             for (network_id, bytes) in drained {
@@ -281,15 +262,12 @@ pub fn spawn_derp_usage_flush(state: AppState) {
         }
     });
 }
-
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(30);
-
 /// First 8 hex chars of a pubkey — enough to correlate registration,
 /// forward-drop, and client-side lines without dumping whole keys.
 pub fn pk8(pk: &DerpPubKey) -> String {
     pk.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
-
 /// `true` once per [`DROP_LOG_INTERVAL`] per key — books the emission slot.
 fn drop_log_due(map: &DashMap<DerpKey, Instant>, key: DerpKey) -> bool {
     // Opportunistic sweep so dead pairs don't accrete on a long-lived pod.
@@ -305,7 +283,6 @@ fn drop_log_due(map: &DashMap<DerpKey, Instant>, key: DerpKey) -> bool {
     }
     due
 }
-
 /// Minute-cadence census of this pod's DERP registry: per-network entry
 /// counts, plus the two lifetime drop counters. One greppable line per pod
 /// per minute while anything is registered (and one final line on the
@@ -346,7 +323,6 @@ pub fn spawn_registry_census(state: &crate::state::AppState) {
         }
     });
 }
-
 /// `GET /derp?token=<agent-jwt>` — upgrade to the DERP relay WS. Agent-only,
 /// same audience as `/ws?role=agent`.
 pub async fn derp_upgrade(
@@ -373,7 +349,6 @@ pub async fn derp_upgrade(
                 .unwrap();
         }
     };
-
     // S6 — DERP relays are pod-local: two mesh peers only meet if their
     // /derp sockets land on the SAME pod, so the LB hashes on `tid` and
     // the server rejects a present-but-wrong claim.
@@ -403,7 +378,6 @@ pub async fn derp_upgrade(
                 .unwrap();
         }
     };
-
     // The agent's row is the revocation list — an agent token is valid for a
     // year, so its signature says nothing about whether we still accept the
     // device. DELETION was already covered here by accident: the cascade
@@ -438,12 +412,10 @@ pub async fn derp_upgrade(
                 .unwrap();
         }
     }
-
     ws.max_message_size(crate::ws::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(crate::ws::MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_derp_socket(state, socket, agent_id))
 }
-
 /// Drive one DERP connection: resolve the agent's node, validate its
 /// registration pubkey, add it to the registry, then pump frames until the
 /// socket closes.
@@ -464,9 +436,7 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
         .id
         .map(|i| i.to_hex())
         .unwrap_or_else(|| "-".to_string());
-
     let (mut ws_tx, mut ws_rx) = socket.split();
-
     // First frame MUST be the 32-byte registration pubkey, and it MUST equal
     // this node's own `wg_public_key` — a node can only register ITS OWN key,
     // never a peer's (which would let it intercept that peer's frames).
@@ -490,7 +460,6 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
         );
         return;
     }
-
     let key: DerpKey = (network_id, self_pubkey);
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(DERP_SEND_QUEUE);
     // Last-writer-wins on re-registration: a reconnect for the same pubkey
@@ -510,7 +479,6 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
     state.derp_cancels.insert(key, cancel.clone());
     super::derp_cluster::on_derp_register(&state, network_id, &self_pubkey, agent_id).await;
     info!(%agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey), "derp: node registered");
-
     // Write task: drain outbound frames → WS binary, interleaved with a
     // server-side keepalive Ping. A DERP link whose pairs are all parked on
     // better carriers goes COMPLETELY quiet (it exists as standby), and
@@ -546,7 +514,6 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
         }
         let _ = ws_tx.close().await;
     });
-
     // Read loop: forward each data frame to its dst within THIS network.
     loop {
         tokio::select! {
@@ -575,7 +542,6 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
             }
         }
     }
-
     // Deregister — but ONLY if we're still the registered sender. A newer
     // reconnect (last-writer-wins) may have replaced us; we must not evict it.
     let removal_was_ours = state
@@ -591,7 +557,6 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
     write.abort();
     info!(%agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey), "derp: node disconnected");
 }
-
 /// Parse `[dst_pubkey(32) || payload]` sent by `src_pubkey`, and forward
 /// `[src_pubkey(32) || payload]` to the destination — but ONLY to a peer
 /// registered in the SAME `network_id` (hard scope). Silently drops on: a short
@@ -618,7 +583,6 @@ fn forward_frame(
     let mut dst = [0u8; 32];
     dst.copy_from_slice(&frame[..32]);
     let payload = &frame[32..];
-
     // One lock-free lookup. Absent ⇒ fail open (no table built for this
     // network: ACL off, or not yet rebuilt after a restart).
     if let Some(table) = acl.get(&network_id)
@@ -634,7 +598,6 @@ fn forward_frame(
         );
         return;
     }
-
     // R4 — shape tunnel-class payloads (see the bucket's doc); WG + disco
     // frames pass untouched.
     if !tunnel_core::transport::derp::payload_is_wg_or_disco(payload)
@@ -651,7 +614,6 @@ fn forward_frame(
         }
         return;
     }
-
     // Clone the sender out of the shard guard so we don't hold the DashMap lock
     // across the (non-blocking) try_send.
     let sender = match registry.get(&(network_id, dst)) {
@@ -673,7 +635,6 @@ fn forward_frame(
             return;
         }
     };
-
     let mut out = Vec::with_capacity(32 + payload.len());
     out.extend_from_slice(src_pubkey);
     out.extend_from_slice(payload);
@@ -710,11 +671,9 @@ fn forward_frame(
         add_network_bytes(network_id, out_len);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// FR-20 acceptance: *"measured DERP forward-path overhead is within noise
     /// of the pre-change baseline"*. `#[ignore]`d — it is a measurement, not a
     /// pass/fail assertion, and its numbers are machine-specific.
@@ -732,7 +691,6 @@ mod tests {
     #[ignore]
     fn bench_add_network_bytes_cost() {
         use std::time::Instant;
-
         const ITERS: u64 = 2_000_000;
         let threads: usize = std::thread::available_parallelism()
             .map(|n| n.get().min(8))
@@ -741,7 +699,6 @@ mod tests {
         // Warm the entry so we measure the steady-state `get` path rather than
         // the once-per-network `entry().or_insert_with()` branch.
         add_network_bytes(net, 0);
-
         let run = |label: &str, f: &(dyn Fn() + Sync)| {
             let t0 = Instant::now();
             std::thread::scope(|sc| {
@@ -759,7 +716,6 @@ mod tests {
             println!("  {label:<26} {per:>7.2} ns/op   ({ops} ops on {threads} threads)");
             per
         };
-
         println!("add_network_bytes cost, {threads} threads on ONE network id:");
         // Floor: the atomic alone, with the lookup already done.
         let counter = AtomicU64::new(0);
@@ -768,7 +724,6 @@ mod tests {
         });
         // The real hot path.
         let real = run("add_network_bytes", &|| add_network_bytes(net, 1400));
-
         println!(
             "  lookup overhead over the atomic: {:.2} ns/op",
             real - floor
@@ -779,31 +734,26 @@ mod tests {
         let core_pct = real * frames_per_sec / 1e9 * 100.0;
         println!("  at 200 frames/s (the busiest minute on record): {core_pct:.6}% of one core");
     }
-
     fn pk(byte: u8) -> DerpPubKey {
         [byte; 32]
     }
-
     fn frame(dst: &DerpPubKey, payload: &[u8]) -> Vec<u8> {
         let mut f = Vec::with_capacity(32 + payload.len());
         f.extend_from_slice(dst);
         f.extend_from_slice(payload);
         f
     }
-
     /// No table for any network — the fail-open posture, and the pre-ACL
     /// behaviour every test above asserts.
     fn no_acl() -> DerpAclCache {
         Arc::new(DashMap::new())
     }
-
     /// A cache holding one network's table.
     fn acl_with(net: ObjectId, table: crate::ws::derp_acl::DerpAllowTable) -> DerpAclCache {
         let c: DerpAclCache = Arc::new(DashMap::new());
         c.insert(net, Arc::new(table));
         c
     }
-
     #[test]
     fn forwards_within_network_and_rewrites_src() {
         let reg: DerpRegistry = Arc::new(DashMap::new());
@@ -811,15 +761,12 @@ mod tests {
         let (a, b) = (pk(0xAA), pk(0xBB));
         let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
         reg.insert((net, b), b_tx);
-
         // A → B with payload [1,2,3]; B should receive [A-pubkey || 1,2,3].
         forward_frame(&reg, &no_acl(), net, &a, &frame(&b, &[1, 2, 3]));
-
         let got = b_rx.try_recv().expect("B should receive the frame");
         assert_eq!(&got[..32], &a, "src prefix must be rewritten to the sender");
         assert_eq!(&got[32..], &[1, 2, 3]);
     }
-
     #[test]
     fn never_crosses_a_network_boundary() {
         let reg: DerpRegistry = Arc::new(DashMap::new());
@@ -830,17 +777,14 @@ mod tests {
         let (b_in_b_tx, mut b_in_b_rx) = mpsc::channel::<Vec<u8>>(8);
         reg.insert((net_a, b), b_in_a_tx);
         reg.insert((net_b, b), b_in_b_tx);
-
         // A sends from net_a → only net_a's B receives; net_b's B never does.
         forward_frame(&reg, &no_acl(), net_a, &a, &frame(&b, &[9]));
-
         assert!(b_in_a_rx.try_recv().is_ok(), "same-network dst delivered");
         assert!(
             b_in_b_rx.try_recv().is_err(),
             "cross-network dst must NOT be delivered"
         );
     }
-
     #[test]
     fn unknown_dst_is_dropped_silently() {
         let reg: DerpRegistry = Arc::new(DashMap::new());
@@ -848,7 +792,6 @@ mod tests {
         // No registrations at all — forwarding must not panic.
         forward_frame(&reg, &no_acl(), net, &pk(0xAA), &frame(&pk(0xCC), &[1]));
     }
-
     /// The bypass this gate closes: both ends are registered in the same
     /// network and hold each other's pubkeys, but the ACL denies the pair.
     #[test]
@@ -858,7 +801,6 @@ mod tests {
         let (a, b) = (pk(0xAA), pk(0xBB));
         let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
         reg.insert((net, b), b_tx);
-
         // Table enforces and lists no A→B pair.
         let acl = acl_with(
             net,
@@ -869,7 +811,6 @@ mod tests {
             b_rx.try_recv().is_err(),
             "a pair the overlay ACL denies must not relay through DERP"
         );
-
         // Same registry, same frame — permitted once the pair is allowed.
         let acl = acl_with(
             net,
@@ -878,7 +819,6 @@ mod tests {
         forward_frame(&reg, &acl, net, &a, &frame(&b, &[1, 2, 3]));
         assert!(b_rx.try_recv().is_ok(), "an allowed pair must still relay");
     }
-
     /// `warn` must never drop — the evidence-first cutover, mirroring the
     /// netmap shaping and the node-side reverse-path filter.
     #[test]
@@ -888,7 +828,6 @@ mod tests {
         let (a, b) = (pk(0xAA), pk(0xBB));
         let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
         reg.insert((net, b), b_tx);
-
         let acl = acl_with(
             net,
             crate::ws::derp_acl::DerpAllowTable::for_test(false, &[]),
@@ -896,7 +835,6 @@ mod tests {
         forward_frame(&reg, &acl, net, &a, &frame(&b, &[7]));
         assert!(b_rx.try_recv().is_ok(), "warn mode must not drop");
     }
-
     #[test]
     fn short_frame_without_full_pubkey_is_dropped() {
         let reg: DerpRegistry = Arc::new(DashMap::new());
@@ -906,5 +844,159 @@ mod tests {
         // 10 bytes < 32 → no dst pubkey → dropped, nothing delivered.
         forward_frame(&reg, &no_acl(), net, &pk(0xAA), &[0u8; 10]);
         assert!(dst_rx.try_recv().is_err());
+    }
+    // ── FR-20: the billing invariant ────────────────────────────────────
+    //
+    // The ledger must count EXACTLY the bytes this pod carried — no more, and
+    // nothing at all for a frame it dropped. That is pinned per DROP PATH
+    // rather than once on the happy path, because every `return` in
+    // `forward_frame` is a branch where the bytes cost us nothing: an edit
+    // that hoisted `add_network_bytes` above one of them would bill a tenant
+    // for traffic that never left the pod, and no existing test would notice.
+    //
+    // ⚠️ Reads the one network's counter directly instead of calling
+    // `drain_network_bytes()`: the drain takes EVERY network and zeroes it, so
+    // using it here would steal the counters of tests running in parallel in
+    // this same binary. A fresh `ObjectId` per test keeps each case isolated.
+    fn billed(net: ObjectId) -> u64 {
+        DERP_NETWORK_BYTES
+            .get(&net)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+    #[test]
+    fn a_relayed_frame_bills_exactly_the_bytes_it_carried() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        let (a, b) = (pk(0xAA), pk(0xBB));
+        let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
+        reg.insert((net, b), b_tx);
+        forward_frame(&reg, &no_acl(), net, &a, &frame(&b, &[1, 2, 3]));
+        assert!(b_rx.try_recv().is_ok(), "precondition: the frame relayed");
+        // What goes on the wire is `src_pubkey || payload` — 32 + 3 — not the
+        // inbound frame length. Billing the inbound length would double-count
+        // the dst pubkey the pod strips off.
+        assert_eq!(
+            billed(net),
+            35,
+            "the ledger must bill the bytes actually sent (32 src + 3 payload)"
+        );
+    }
+    #[test]
+    fn two_relayed_frames_accumulate() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        let (a, b) = (pk(0xAA), pk(0xBB));
+        let (b_tx, _b_rx) = mpsc::channel::<Vec<u8>>(8);
+        reg.insert((net, b), b_tx);
+        forward_frame(&reg, &no_acl(), net, &a, &frame(&b, &[1, 2, 3]));
+        forward_frame(&reg, &no_acl(), net, &a, &frame(&b, &[4, 5]));
+        assert_eq!(billed(net), 35 + 34, "the bucket is additive across frames");
+    }
+    #[test]
+    fn an_unregistered_dst_bills_nothing() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        // Nobody registered: the frame is dropped before it is ever built.
+        forward_frame(
+            &reg,
+            &no_acl(),
+            net,
+            &pk(0xAA),
+            &frame(&pk(0xBB), &[1, 2, 3]),
+        );
+        assert_eq!(
+            billed(net),
+            0,
+            "a dropped frame costs nothing and bills nothing"
+        );
+    }
+    #[test]
+    fn a_cross_network_frame_bills_neither_network() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let (net_a, net_b) = (ObjectId::new(), ObjectId::new());
+        let b = pk(0xBB);
+        let (b_tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        // B exists, but only in net_b. A sends from net_a.
+        reg.insert((net_b, b), b_tx);
+        forward_frame(&reg, &no_acl(), net_a, &pk(0xAA), &frame(&b, &[1, 2, 3]));
+        assert_eq!(billed(net_a), 0, "the sender's network carried nothing");
+        assert_eq!(
+            billed(net_b),
+            0,
+            "and the bystander network must not be billed"
+        );
+    }
+    #[test]
+    fn an_acl_denied_frame_bills_nothing() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        let (a, b) = (pk(0xAA), pk(0xBB));
+        let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
+        reg.insert((net, b), b_tx);
+        // Enforcing table that lists neither pair ⇒ the frame is refused.
+        // ⚠️ `for_test(true, …)`, not `default()`: a default table is WARN mode,
+        // which permits — so the precondition below would pass while billing
+        // zero for the wrong reason. It caught exactly that when first written.
+        let acl = acl_with(
+            net,
+            crate::ws::derp_acl::DerpAllowTable::for_test(true, &[]),
+        );
+        forward_frame(&reg, &acl, net, &a, &frame(&b, &[1, 2, 3]));
+        assert!(b_rx.try_recv().is_err(), "precondition: the ACL dropped it");
+        assert_eq!(
+            billed(net),
+            0,
+            "policy-refused traffic never left the pod, so it must not be billed"
+        );
+    }
+    #[test]
+    fn a_frame_dropped_on_a_full_queue_bills_nothing() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        let (a, b) = (pk(0xAA), pk(0xBB));
+        // Capacity 1, pre-filled ⇒ the next try_send fails.
+        let (b_tx, _b_rx) = mpsc::channel::<Vec<u8>>(1);
+        b_tx.try_send(vec![0u8; 4]).expect("prime the queue");
+        reg.insert((net, b), b_tx);
+        forward_frame(&reg, &no_acl(), net, &a, &frame(&b, &[1, 2, 3]));
+        assert_eq!(
+            billed(net),
+            0,
+            "a frame the pod could not enqueue was never carried — the slow-consumer \
+             path must not become a bill"
+        );
+    }
+    #[test]
+    fn warn_mode_acl_delivers_and_therefore_bills() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        let (a, b) = (pk(0xAA), pk(0xBB));
+        let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
+        reg.insert((net, b), b_tx);
+        // Warn mode lists no pair but permits anyway — the point of warn is to
+        // gather evidence WITHOUT dropping. The bytes really do leave the pod,
+        // so the mirror of the test above holds: they must be billed.
+        let acl = acl_with(
+            net,
+            crate::ws::derp_acl::DerpAllowTable::for_test(false, &[]),
+        );
+        forward_frame(&reg, &acl, net, &a, &frame(&b, &[1, 2, 3]));
+        assert!(b_rx.try_recv().is_ok(), "precondition: warn mode delivers");
+        assert_eq!(
+            billed(net),
+            35,
+            "traffic warn mode carried is traffic we paid for"
+        );
+    }
+    #[test]
+    fn a_malformed_frame_bills_nothing() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        let (b_tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+        reg.insert((net, pk(0xBB)), b_tx);
+        // Under 32 bytes: no dst pubkey to parse.
+        forward_frame(&reg, &no_acl(), net, &pk(0xAA), &[0u8; 10]);
+        assert_eq!(billed(net), 0);
     }
 }
