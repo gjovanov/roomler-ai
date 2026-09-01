@@ -50,4 +50,73 @@ impl NewsletterIssueDao {
             )
             .await
     }
+
+    /// One CAS claims the send: a `draft`, or a `sending` whose claim went
+    /// stale (the pod died mid-fan-out) — re-POSTing send IS the resume path.
+    /// A `completed` issue is never re-claimable: one issue, one send; stale
+    /// rows at completion are terminal ambiguity, reported, not re-openable.
+    pub async fn claim_for_send(
+        &self,
+        slug: &str,
+        pod_id: &str,
+        stale_after_secs: i64,
+    ) -> DaoResult<Option<NewsletterIssue>> {
+        let cutoff =
+            DateTime::from_millis(DateTime::now().timestamp_millis() - stale_after_secs * 1000);
+        let claimed = self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "slug": slug,
+                    "$or": [
+                        { "status": "draft" },
+                        { "status": "sending", "claimed_at": { "$lt": cutoff } },
+                    ],
+                },
+                doc! { "$set": {
+                    "status": "sending",
+                    "claimed_by": pod_id,
+                    "claimed_at": DateTime::now(),
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .return_document(mongodb::options::ReturnDocument::After)
+            .await?;
+        Ok(claimed)
+    }
+
+    /// Keep the claim visibly alive while the fan-out runs. Scoped to this
+    /// pod's own claim so a superseded task can't extend a claim it lost.
+    pub async fn heartbeat(&self, slug: &str, pod_id: &str) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "slug": slug, "status": "sending", "claimed_by": pod_id },
+                doc! { "$set": { "claimed_at": DateTime::now() } },
+            )
+            .await
+    }
+
+    /// Terminal — `completed`, never "sent": the counts carry the truth.
+    pub async fn complete(
+        &self,
+        slug: &str,
+        counts: roomler_ai_db::models::IssueCounts,
+    ) -> DaoResult<bool> {
+        let counts = bson::to_bson(&counts)?;
+        self.base
+            .update_one(
+                doc! { "slug": slug, "status": "sending" },
+                doc! {
+                    "$set": {
+                        "status": "completed",
+                        "counts": counts,
+                        "sent_at": DateTime::now(),
+                        "updated_at": DateTime::now(),
+                    },
+                    "$unset": { "claimed_by": "", "claimed_at": "" },
+                },
+            )
+            .await
+    }
 }

@@ -428,3 +428,157 @@ pub async fn test_send(
         .map_err(|e| ApiError::Internal(format!("test-send failed: {e:#}")))?;
     Ok(Json(TestSendResult { sent: true, to }))
 }
+
+// ── P3: the fan-out ─────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SendRequest {
+    /// Re-attempt ledger rows stuck `claimed` past the staleness cutoff — an
+    /// explicit operator decision, never automatic: a stuck row is "maybe
+    /// delivered", and auto-retry converts that into "maybe delivered twice".
+    #[serde(default)]
+    pub retry_stale: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SendAccepted {
+    pub slug: String,
+    pub status: IssueStatus,
+    pub claimed_by: String,
+}
+
+/// `POST /api/admin/newsletter/issues/{slug}/send` — claim and fan out.
+/// Re-POSTing is the RESUME path: the CAS re-claims a `sending` issue whose
+/// claim went stale (dead pod), and the ledger makes the re-run idempotent.
+pub async fn send(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(slug): Path<String>,
+    body: Option<Json<SendRequest>>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_platform_admin(&state, &auth)?;
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+
+    // Refuse BEFORE claiming: ledgering an entire list into `failed` on a
+    // misconfigured pod would be strictly worse than refusing loudly.
+    if state.email.is_none() {
+        return Err(ApiError::BadRequest(
+            "no mailer configured — set ROOMLER__EMAIL__API_KEY or SMTP host/port".into(),
+        ));
+    }
+
+    let claimed = state
+        .newsletter_issues
+        .claim_for_send(
+            &slug,
+            &state.pod.pod_id,
+            crate::newsletter_send::ISSUE_CLAIM_STALE_SECS,
+        )
+        .await?;
+
+    match claimed {
+        Some(issue) => {
+            let accepted = SendAccepted {
+                slug: issue.slug.clone(),
+                status: issue.status,
+                claimed_by: state.pod.pod_id.clone(),
+            };
+            tokio::spawn(crate::newsletter_send::run_send(
+                state.clone(),
+                issue,
+                req.retry_stale,
+            ));
+            Ok((StatusCode::ACCEPTED, Json(accepted)))
+        }
+        None => match state.newsletter_issues.get_by_slug(&slug).await? {
+            None => Err(ApiError::NotFound("no such issue".into())),
+            Some(i) => match i.status {
+                IssueStatus::Completed => Err(ApiError::Conflict(
+                    "issue already completed — one issue, one send; counts carry the truth".into(),
+                )),
+                IssueStatus::Sending => Err(ApiError::Conflict(format!(
+                    "already sending on pod {} since {} — a live claim is never usurped; \
+                     re-POST after it goes stale to resume",
+                    i.claimed_by.as_deref().unwrap_or("?"),
+                    i.claimed_at.map(rfc3339).unwrap_or_default(),
+                ))),
+                IssueStatus::Draft => Err(ApiError::Conflict(
+                    "claim raced another caller — try again".into(),
+                )),
+            },
+        },
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct FailedRow {
+    pub email: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IssueStatusView {
+    pub slug: String,
+    pub status: IssueStatus,
+    /// Live from the ledger while sending; the stored snapshot once
+    /// completed. `sent` means "accepted by the mail backend", not delivered.
+    pub counts: IssueCounts,
+    /// Rows stuck `claimed` — these recipients MAY or MAY NOT have received
+    /// the issue (crash between backend accept and our mark). Capped sample.
+    pub stale_addresses: Vec<String>,
+    /// Capped sample of failures with their backend errors.
+    pub failed_sample: Vec<FailedRow>,
+    pub claimed_by: Option<String>,
+    pub claimed_at: Option<String>,
+    pub sent_at: Option<String>,
+}
+
+/// `GET /api/admin/newsletter/issues/{slug}/status`
+pub async fn status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(slug): Path<String>,
+) -> Result<Json<IssueStatusView>, ApiError> {
+    require_platform_admin(&state, &auth)?;
+    let issue = state
+        .newsletter_issues
+        .get_by_slug(&slug)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("no such issue".into()))?;
+    let issue_id = issue.id.expect("a stored issue has an id");
+    let cutoff = crate::newsletter_send::stale_cutoff();
+
+    let counts = match (issue.status, issue.counts) {
+        (IssueStatus::Completed, Some(stored)) => stored,
+        _ => state.newsletter_sends.counts(issue_id, cutoff).await?,
+    };
+    let stale_addresses = state
+        .newsletter_sends
+        .stale_rows(issue_id, cutoff)
+        .await?
+        .into_iter()
+        .take(20)
+        .map(|r| r.email)
+        .collect();
+    let failed_sample = state
+        .newsletter_sends
+        .failed_sample(issue_id, 20)
+        .await?
+        .into_iter()
+        .map(|r| FailedRow {
+            email: r.email,
+            error: r.error,
+        })
+        .collect();
+
+    Ok(Json(IssueStatusView {
+        slug: issue.slug,
+        status: issue.status,
+        counts,
+        stale_addresses,
+        failed_sample,
+        claimed_by: issue.claimed_by,
+        claimed_at: issue.claimed_at.map(rfc3339),
+        sent_at: issue.sent_at.map(rfc3339),
+    }))
+}
