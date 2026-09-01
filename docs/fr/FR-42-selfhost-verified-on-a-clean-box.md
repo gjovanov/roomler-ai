@@ -69,19 +69,20 @@ is what counts as a pass:
 | P0 | bring the stack up from the documented commands; record every deviation | `docker compose down -v` |
 | P1 | fix what broke — compose, env example, or the document | revert the hunk |
 | P2 | enrol a device against the self-hosted server and reach it | remove the test device |
-| P3 | publish a prebuilt image so the first run is minutes, not a source build | workflow is dispatch-only |
+| P3 | publish a prebuilt image so the first run is minutes, not a source build | workflow is dispatch-only — **shipped** (#1133) |
 
 ## Acceptance criteria
 
-- [ ] `docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build`
+- [x] `docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build`
       succeeds from a clean clone, using only commands copied from the document
-- [ ] `curl -fsS http://localhost:8080/health` answers 200
-- [ ] an account can register, and an organization can be created from the dashboard
-- [ ] the measured first-build time is recorded, and `docs/self-hosting.md` states it
+- [x] `curl -fsS http://localhost:8080/health` answers 200
+- [x] an account can register, and an organization can be created from the dashboard
+- [x] the measured first-build time is recorded, and `docs/self-hosting.md` states it
       honestly
-- [ ] a device enrols against the self-hosted server via the doc's own one-liner, and
-      appears online
-- [ ] every deviation between the document and reality is either fixed or written down
+- [~] a device enrols against the self-hosted server via the doc's own one-liner, and
+      appears online — **enrolment proven, "online" not** (see the log: this host
+      already runs a daemon, and one machine serves one)
+- [x] every deviation between the document and reality is either fixed or written down
 - [ ] `docker compose down -v` leaves the machine clean
 
 ## Open decisions
@@ -110,5 +111,9 @@ automatic TLS · arm64 validation · backup/restore drills beyond the documented
 | 2026-08-30 | **the documented user journey works** | register → **201** (`auto-verified`, as `ROOMLER_AUTO_VERIFY=true` intends) · login → 200 · create organization → 200 (`Self Host Demo`, plan `free`) · mint agent enrolment token → 200 |
 | 2026-08-30 | ⚠️ **DEFECT — the installer would enroll against the WRONG SERVER** | `scripts/install.sh` line 46 hardcodes `SERVER="https://roomler.ai"` and `install.ps1` line 64 `$Server = 'https://roomler.ai'`. Both are piped from the network, so **neither can see which host it was fetched from**. `docs/self-hosting.md` omitted `--server`, so a self-hoster would download the installer from their own server and then enroll the agent against the **hosted** service using a token only their own server can verify — an authentication failure that says nothing about the real cause, on the first thing anyone does after the stack comes up. Doc fixed |
 | 2026-08-30 | ⚠️ **DEFECT — `irm … | iex` cannot pass arguments at all** | The Windows one-liner in `docs/self-hosting.md` **and in the README** could pass neither `-Server` nor `-Token`. `scripts/install.ps1`'s own header documents the `& ([scriptblock]::Create((irm …))) -Role … -Token …` form; both docs now use it. Pre-existing in the README, propagated by FR-39 |
+| 2026-09-01 | **the installer defect is CLOSED, and proven on the served bytes** | FR-50 (#1083) made the route substitute `app.frontend_url` at serve time. The self-hosted stack now serves `SERVER="http://localhost:8080"`, and prod serves the committed script byte-for-byte. The doc no longer tells the reader to pass `--server` |
+| 2026-09-01 | **a device DOES enrol against the self-hosted server** | Took the `SERVER` value **out of the served script** and enrolled with it: `Enrollment successful. Agent id: 6a96aca4…`, and the device appears in that server's own `/api/tenant/<tid>/agent` list. So the chain the one-liner walks — serve → read → enrol — works end to end |
+| 2026-09-01 | ⚠️ **"appears online" could NOT be proven on this host, for a structural reason** | The probe daemon never reached signalling: the machine already runs one, and the single-instance lock is the *point* (`One daemon per enrolled machine` — it is why multi-org is `[[orgs]]` rather than N installs). Proving `online` needs a host with no daemon, which is a clean-VM test rather than a gap in the product |
+| 2026-09-01 | 🔑 **an isolated `--config` does NOT isolate the UPDATER** | Running the probe with its own config pointed at the self-hosted server made the host **self-update system-wide** — `apt-get` installed `roomlerd-0.4.42` over 0.4.41 while the real daemon was running. The enrolment is per-config; the updater is per-MACHINE, exactly as `docs/multi-org.md` says. It then left the running daemon on the **deleted inode** (`/usr/bin/roomlerd (deleted)`, `--version` reporting the new one) until a restart. Re-run such a probe with `auto_update = false`, and expect to restart the host daemon afterwards |
 | 2026-08-30 | ⚠️ the build-time claim was wrong | Doc said "10–20 minutes"; **measured 359 s** on 16 cores. Restated with the measurement and the hardware it was measured on, since "10–20 min" is what makes someone abandon halfway on a slow box and distrust the doc on a fast one |
 | 2026-08-30 | ⚠️ **no healthcheck on the app service — FIXED** | `docker compose ps` reported `roomler` merely `running`, so nothing could gate on it. The runtime image has **no curl, no wget and no nc** (checked in the container), and adding one to a production image just to run a liveness probe is a poor trade — so the probe uses **bash's `/dev/tcp` builtin**, which is already there. Verified live: `roomler=Up 37 seconds (healthy)` |
