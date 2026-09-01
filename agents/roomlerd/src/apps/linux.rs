@@ -28,6 +28,7 @@ use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use super::MissingTool;
 use super::{
     Coverage, LaunchOutcome, ResolvedApp, WindowInfo, WindowManager, classify_title,
     next_tmux_session_name, parse_tmux_sessions, parse_wmctrl_list,
@@ -191,6 +192,51 @@ impl LinuxWm {
     }
 }
 
+/// Is `program` runnable — i.e. would `Command::new(program)` find it?
+///
+/// ⚠️ Resolved against the **daemon's** `PATH` on purpose, because that is
+/// what the spawn will use: [`crate::exec::drop_to_std`] changes the child's
+/// uid from a `pre_exec` hook, long after the environment was inherited, so
+/// the target user's login `PATH` never enters into it. Asking the question
+/// any other way would answer about an environment the child never gets.
+///
+/// ⚠️ Best-effort in ONE direction: a hit means the file exists and carries an
+/// execute bit, not that this user may run it (a restrictive ACL or a `noexec`
+/// mount still fails at spawn). It is here to catch "the package is not
+/// installed" — the case actually measured — and a wrong answer degrades to
+/// today's behaviour, a clear error at click time.
+fn on_path(program: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(program);
+        std::fs::metadata(&candidate)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
+}
+
+/// Every helper this backend shells out to, with what it costs to lack it.
+///
+/// ⚠️ `wmctrl` is deliberately NOT here: without it there is no backend at all
+/// (`list` and `focus` ARE wmctrl), so its absence has to surface as a plain
+/// error from the call itself, not as a partial capability in a reply that
+/// otherwise reads like success.
+const HELPERS: &[MissingTool] = &[
+    MissingTool {
+        tool: "tmux",
+        blocks: "persistent shell sessions (the ones that survive an agent restart)",
+        install: "apt install tmux",
+    },
+    MissingTool {
+        tool: "xterm",
+        blocks: "launching shells and terminal apps (GUI apps still launch)",
+        install: "apt install xterm",
+    },
+];
+
 impl WindowManager for LinuxWm {
     /// FR-56 P2 — what this listing covers.
     ///
@@ -213,6 +259,14 @@ impl WindowManager for LinuxWm {
                  them (X11/Xwayland windows are listed)"
                     .to_string()
             }),
+            // FR-56 P5 — probed per call, never cached. A host can gain `tmux`
+            // at any moment, and FR-45 already learned that a cached
+            // capability answers about the wrong start order.
+            missing_tools: HELPERS
+                .iter()
+                .filter(|h| !on_path(h.tool))
+                .cloned()
+                .collect(),
         }
     }
 
@@ -561,6 +615,99 @@ fn find_xauthority(uid: u32) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-56 P5. `on_path` must answer about the DAEMON's `PATH`, since that
+    /// is what the spawned child inherits — the uid change happens later, in a
+    /// `pre_exec` hook, and never touches the environment.
+    ///
+    /// ⚠️ Asserted against a real directory rather than a mock, because the
+    /// bug being prevented is not "the logic is wrong" but "we asked the wrong
+    /// environment": a probe that consults the target user's login `PATH`
+    /// would pass every unit test and still disagree with the spawn.
+    #[test]
+    fn on_path_answers_about_the_daemons_own_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("roomler-p5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("roomler-p5-probe");
+        std::fs::write(&exe, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plain = dir.join("roomler-p5-notexec");
+        std::fs::write(&plain, b"not executable").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let restore = std::env::var_os("PATH");
+        // SAFETY: single-threaded within this test; PATH is restored below.
+        unsafe { std::env::set_var("PATH", &dir) };
+        let exec_hit = on_path("roomler-p5-probe");
+        let noexec_hit = on_path("roomler-p5-notexec");
+        let absent_hit = on_path("roomler-p5-does-not-exist");
+        // SAFETY: as above.
+        unsafe {
+            match restore {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(exec_hit, "an executable file on PATH must be found");
+        assert!(
+            !noexec_hit,
+            "a NON-executable file must not count: `Command::spawn` would fail on it, \
+             so reporting it as present would restore the very lie this probe removes"
+        );
+        assert!(!absent_hit, "an absent binary must not be found");
+    }
+
+    /// FR-56 P5. The reply must name a missing helper, because `supported:
+    /// true` was measured to be a lie: on a GNOME Wayland host with no `tmux`
+    /// the panel reported the feature supported, offered the button, and only
+    /// failed once somebody clicked it.
+    ///
+    /// ⚠️ The assertion is on the SHAPE of every entry, not just that the list
+    /// is non-empty. A `MissingTool` whose `install` were blank would still
+    /// satisfy "we reported something" while telling the operator nothing they
+    /// can act on — and an unactionable warning beside a broken button is
+    /// barely better than the silence it replaced.
+    #[test]
+    fn coverage_names_helpers_this_host_does_not_have() {
+        let restore = std::env::var_os("PATH");
+        // SAFETY: single-threaded within this test; PATH is restored below.
+        unsafe { std::env::set_var("PATH", "/nonexistent-roomler-p5") };
+        let cov = LinuxWm::new(Target::Daemon {
+            display: ":99".into(),
+        })
+        .coverage();
+        // SAFETY: as above.
+        unsafe {
+            match restore {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(
+            cov.missing_tools.len(),
+            HELPERS.len(),
+            "with an empty PATH every helper is missing"
+        );
+        for t in &cov.missing_tools {
+            assert!(!t.tool.is_empty());
+            assert!(
+                !t.blocks.is_empty(),
+                "{}: must say what stops working, or the operator cannot judge whether \
+                 to care",
+                t.tool
+            );
+            assert!(
+                t.install.contains("install"),
+                "{}: must say how to fix it — an unactionable warning beside a broken \
+                 button is barely better than the silence it replaced",
+                t.tool
+            );
+        }
+    }
 
     #[test]
     fn parse_hex_accepts_x11_ids() {
