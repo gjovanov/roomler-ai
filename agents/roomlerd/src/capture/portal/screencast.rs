@@ -83,6 +83,15 @@ const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
 /// explicit choice, never a default that silently rearranges someone's screen.
 const SOURCE_MONITOR: u32 = 1;
 
+/// `SelectSources.types` — a single application window (FR-56 P4).
+///
+/// ⚠️ There is no way to say WHICH window: the portal shows the user its own
+/// picker and hands back whatever they choose. That is not a limitation we can
+/// engineer around — `org.gnome.Shell.Introspect`, the only API that could name
+/// a window, answers `GetWindows is not allowed` on GNOME (measured, Shell
+/// 48.8), so mutter's `RecordWindow` has no id to take either.
+const SOURCE_WINDOW: u32 = 2;
+
 /// `SelectSources.cursor_mode` values.
 const CURSOR_HIDDEN: u32 = 1;
 const CURSOR_EMBEDDED: u32 = 2;
@@ -104,6 +113,30 @@ const PERSIST_UNTIL_REVOKED: u32 = 2;
 /// Portal response codes.
 const RESPONSE_OK: u32 = 0;
 const RESPONSE_CANCELLED: u32 = 1;
+
+/// What the session records: a whole monitor, or one application window.
+///
+/// FR-56 P4 — the RAIL-shaped half of Remote Apps. WSLg has been doing this on
+/// the same machines all along (`rdprail-shell`), one Linux window per Windows
+/// window; here it means the viewer sees ONE app instead of the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    Monitor,
+    /// ⚠️ Attended by construction: the portal shows a WINDOW PICKER and the
+    /// person at the screen chooses. Nothing on this side selects the window,
+    /// and on an unattended host nobody answers the picker — which is why the
+    /// switch defaults off.
+    Window,
+}
+
+impl SourceKind {
+    fn types_mask(self) -> u32 {
+        match self {
+            SourceKind::Monitor => SOURCE_MONITOR,
+            SourceKind::Window => SOURCE_WINDOW,
+        }
+    }
+}
 
 /// What kind of session to open. It changes which portal interface OWNS the
 /// session — and therefore what the consent dialog asks for and which token
@@ -220,18 +253,18 @@ impl OpenError {
 /// *"Cannot start a runtime from within a runtime"*, before any portal call
 /// was made. The guard belongs HERE rather than at each call site, so the next
 /// entry point cannot reintroduce it.
-pub fn open(kind: SessionKind) -> Result<Session, OpenError> {
-    std::thread::spawn(move || open_blocking(kind))
+pub fn open(kind: SessionKind, source: SourceKind) -> Result<Session, OpenError> {
+    std::thread::spawn(move || open_blocking(kind, source))
         .join()
         .unwrap_or_else(|_| Err(OpenError::failed("the portal handshake thread panicked")))
 }
 
-fn open_blocking(kind: SessionKind) -> Result<Session, OpenError> {
+fn open_blocking(kind: SessionKind, source: SourceKind) -> Result<Session, OpenError> {
     let started = Instant::now();
     // 🔑 The token is loaded and stored HERE, so it never leaves this module.
     // A caller that cannot hold the credential cannot leak it — which is a
     // stronger guarantee than a caller that holds it and is careful.
-    let store = TokenStore::for_current_user(kind);
+    let store = TokenStore::for_current_user(kind, source);
     let restore_token = store.load();
     let restore_token = restore_token.as_deref();
     let restore_token_sent = restore_token.is_some();
@@ -319,7 +352,7 @@ fn open_blocking(kind: SessionKind) -> Result<Session, OpenError> {
     let req_token = next_token("sel");
     let mut opts: HashMap<&str, Value> = HashMap::new();
     opts.insert("handle_token", Value::from(req_token.as_str()));
-    opts.insert("types", Value::from(SOURCE_MONITOR));
+    opts.insert("types", Value::from(source.types_mask()));
     opts.insert("multiple", Value::from(false));
     opts.insert("cursor_mode", Value::from(cursor_mode));
     if kind == SessionKind::CaptureOnly {
@@ -495,7 +528,7 @@ pub struct TokenStore {
 impl TokenStore {
     /// `$XDG_STATE_HOME/roomler/portal-restore-token[-rd]`, falling back to
     /// the spec's default of `$HOME/.local/state`.
-    pub fn for_current_user(kind: SessionKind) -> Self {
+    pub fn for_current_user(kind: SessionKind, source: SourceKind) -> Self {
         let base = std::env::var_os("XDG_STATE_HOME")
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_absolute())
@@ -504,9 +537,15 @@ impl TokenStore {
                     .map(|h| std::path::PathBuf::from(h).join(".local").join("state"))
             })
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        let file = match kind {
-            SessionKind::CaptureOnly => "portal-restore-token",
-            SessionKind::WithInput => "portal-restore-token-rd",
+        // ⚠️ A window grant and a monitor grant are DIFFERENT grants: the
+        // portal will not restore one from the other's token, and reusing the
+        // file would burn whichever was stored first — the same reason the
+        // input grant already lives apart.
+        let file = match (kind, source) {
+            (SessionKind::CaptureOnly, SourceKind::Monitor) => "portal-restore-token",
+            (SessionKind::WithInput, SourceKind::Monitor) => "portal-restore-token-rd",
+            (SessionKind::CaptureOnly, SourceKind::Window) => "portal-restore-token-win",
+            (SessionKind::WithInput, SourceKind::Window) => "portal-restore-token-rd-win",
         };
         Self {
             path: base.join("roomler").join(file),
@@ -884,19 +923,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The two grants live in DIFFERENT files: an input token attests more
-    /// than a capture token, and sharing the file would burn whichever grant
-    /// was stored first.
+    /// Every distinct grant lives in its OWN file. An input token attests more
+    /// than a capture token, and a WINDOW grant is a different grant from a
+    /// MONITOR one — the portal will not restore either from the other's
+    /// token, so sharing a file would silently burn whichever was stored
+    /// first and cost a surprise dialog.
+    ///
+    /// ⚠️ All four must be pairwise distinct; asserting only that two differ
+    /// would pass with three of them colliding.
     #[test]
-    fn token_stores_are_separated_by_session_kind() {
-        let cap = TokenStore::for_current_user(SessionKind::CaptureOnly);
-        let inp = TokenStore::for_current_user(SessionKind::WithInput);
-        assert_ne!(cap.path, inp.path);
+    fn token_stores_are_separated_by_every_grant_dimension() {
+        use std::collections::HashSet;
+        let all = [
+            (SessionKind::CaptureOnly, SourceKind::Monitor),
+            (SessionKind::WithInput, SourceKind::Monitor),
+            (SessionKind::CaptureOnly, SourceKind::Window),
+            (SessionKind::WithInput, SourceKind::Window),
+        ]
+        .map(|(k, s)| TokenStore::for_current_user(k, s).path);
+
+        let unique: HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "every grant needs its own file");
+
+        let name = |p: &std::path::PathBuf| p.file_name().unwrap().to_string_lossy().to_string();
         assert!(
-            inp.path
-                .file_name()
-                .is_some_and(|f| f.to_string_lossy().ends_with("-rd")),
-            "the input store is the -rd file"
+            name(&all[1]).ends_with("-rd"),
+            "input store is the -rd file"
+        );
+        assert!(
+            name(&all[2]).ends_with("-win"),
+            "window store is the -win file"
+        );
+        assert!(
+            name(&all[3]).ends_with("-rd-win"),
+            "input+window is -rd-win"
         );
     }
 

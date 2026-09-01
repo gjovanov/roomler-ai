@@ -300,9 +300,9 @@ pub mod helper {
     /// The human-readable line goes to **stderr**, which the parent inherits,
     /// so the daemon's log carries the child's own account of what it saw next
     /// to the parent's verdict. Same reasoning as the caps probe.
-    pub fn run(screencast: bool, stream: bool, input: bool, mutter: bool) {
+    pub fn run(screencast: bool, stream: bool, input: bool, mutter: bool, window: bool) {
         if stream {
-            run_stream(input, mutter);
+            run_stream(input, mutter, window);
             return;
         }
         if screencast {
@@ -356,8 +356,19 @@ pub mod helper {
     /// ⚠️ **stdout is binary after the handshake line.** Everything
     /// diagnostic goes to stderr, which the parent inherits: a stray
     /// `println!` here does not add a log line, it corrupts a frame.
-    fn run_stream(with_input: bool, use_mutter: bool) {
-        use super::screencast::SessionKind;
+    fn run_stream(with_input: bool, use_mutter: bool, window: bool) {
+        use super::screencast::{SessionKind, SourceKind};
+        // FR-56 P4 — one application window instead of the whole screen.
+        // ⚠️ The portal picks it, not us: `SelectSources(types=WINDOW)`
+        // shows the person at the screen a window picker. There is no
+        // API to name a window — GNOME refuses `Introspect.GetWindows`
+        // outright (measured, Shell 48.8) — so this is attended by
+        // construction and useless on a host with nobody at it.
+        let source = if window {
+            SourceKind::Window
+        } else {
+            SourceKind::Monitor
+        };
         // FR-45 P5 — mutter's own ScreenCast API, no portal and NO CONSENT
         // DIALOG. Deliberately a separate branch rather than a fallback inside
         // the portal path: the two have different consent properties, and a
@@ -388,6 +399,13 @@ pub mod helper {
             SessionKind::CaptureOnly
         };
         eprintln!(
+            "portal-helper: recording {}",
+            match source {
+                SourceKind::Window => "ONE WINDOW (the portal will show a picker)",
+                SourceKind::Monitor => "a monitor",
+            }
+        );
+        eprintln!(
             "portal-helper: opening a {} session for streaming",
             match kind {
                 SessionKind::WithInput => "RemoteDesktop (capture + input)",
@@ -400,11 +418,11 @@ pub mod helper {
         // where capture-only works is never left with no capture just because
         // the input half was refused. (The kill switch already defaults input
         // OFF; this is the belt to that braces.)
-        let mut session = match super::screencast::open(kind) {
+        let mut session = match super::screencast::open(kind, source) {
             Ok(s) => s,
             Err(e) if kind == SessionKind::WithInput => {
                 eprintln!("portal-helper: the input session failed ({e}) — retrying capture-only");
-                match super::screencast::open(SessionKind::CaptureOnly) {
+                match super::screencast::open(SessionKind::CaptureOnly, source) {
                     Ok(s) => s,
                     Err(e2) => {
                         eprintln!("portal-helper: {e2}");
@@ -614,19 +632,23 @@ pub mod helper {
         _target_fps: u32,
         with_input: bool,
         use_mutter: bool,
+        window: bool,
     ) -> anyhow::Result<std::process::Child> {
-        let args: &[&str] = match (with_input, use_mutter) {
+        let mut args: Vec<&str> = match (with_input, use_mutter) {
             // ⚠️ No --input with --mutter: mutter's ScreenCast API carries no
             // input, and its RemoteDesktop sibling is a separate interface not
             // wired here. Asking for both would silently give capture only.
-            (_, true) => &["--stream", "--mutter"],
-            (true, false) => &["--stream", "--input"],
-            (false, false) => &["--stream"],
+            (_, true) => vec!["--stream", "--mutter"],
+            (true, false) => vec!["--stream", "--input"],
+            (false, false) => vec!["--stream"],
         };
+        if window {
+            args.push("--window");
+        }
         // stdin is the input wire, piped exactly when input is wanted — a
         // helper that will never read it should see EOF, not a pipe nothing
         // writes to.
-        spawn_child(args, with_input && !use_mutter).map_err(|e| match e {
+        spawn_child(&args, with_input && !use_mutter).map_err(|e| match e {
             SpawnError::NoSession => {
                 anyhow::anyhow!("nobody is at this machine's screen — the portal is attended-only")
             }
@@ -652,25 +674,28 @@ pub mod helper {
 
     fn run_screencast() {
         eprintln!("portal-helper: opening a ScreenCast session");
-        let outcome =
-            super::screencast::open(super::screencast::SessionKind::CaptureOnly).map(|session| {
-                let mut report = session.report;
-                // P3b-ii — the fd goes to PipeWire, a stream is connected to the
-                // node the portal named, and the compositor's chosen format is
-                // reported. ⚠️ Still no frames: buffer delivery is P3c.
-                report.pipewire = match (session.pipewire_fd, report.streams.first()) {
-                    (Some(fd), Some(s)) => super::pipewire::negotiate_status(
-                        super::pipewire::PwSource::Fd(fd),
-                        s.node_id,
-                        DEFAULT_MAX_FPS,
-                        WANT_FRAMES,
-                    ),
-                    // A session with no stream cannot be negotiated against, and
-                    // saying "not attempted" is the truth rather than a failure.
-                    _ => super::pipewire::PipeWireStatus::NotAttempted,
-                };
-                report
-            });
+        let outcome = super::screencast::open(
+            super::screencast::SessionKind::CaptureOnly,
+            super::screencast::SourceKind::Monitor,
+        )
+        .map(|session| {
+            let mut report = session.report;
+            // P3b-ii — the fd goes to PipeWire, a stream is connected to the
+            // node the portal named, and the compositor's chosen format is
+            // reported. ⚠️ Still no frames: buffer delivery is P3c.
+            report.pipewire = match (session.pipewire_fd, report.streams.first()) {
+                (Some(fd), Some(s)) => super::pipewire::negotiate_status(
+                    super::pipewire::PwSource::Fd(fd),
+                    s.node_id,
+                    DEFAULT_MAX_FPS,
+                    WANT_FRAMES,
+                ),
+                // A session with no stream cannot be negotiated against, and
+                // saying "not attempted" is the truth rather than a failure.
+                _ => super::pipewire::PipeWireStatus::NotAttempted,
+            };
+            report
+        });
         match &outcome {
             Ok(r) => eprintln!(
                 "portal-helper: {} stream(s), node_id={:?}, fd_ok={}, {} ms; pipewire: {}",

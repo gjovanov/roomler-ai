@@ -489,9 +489,24 @@ export interface RcLaunchable {
  *  native Wayland ones. Without this the panel shows a SHORTER list that looks
  *  exactly like a quiet desktop. `unlisted` is the half that matters — it names
  *  the source that exists but could not be enumerated, and why. */
+export interface RcAppsMissingTool {
+  tool: string
+  blocks: string
+  install: string
+}
 export interface RcAppsCoverage {
   sources: string[]
   unlisted?: string
+  /** FR-56 P5 — helper binaries the agent host does not have.
+   *
+   *  `supported: true` was measured to be a lie on a host with no `tmux`: the
+   *  panel offered the button and only failed once somebody clicked it. This
+   *  names what is missing BEFORE the click.
+   *
+   *  ⚠️ Absent stays absent — an older agent sends no such field, and
+   *  inventing an empty array here would claim we checked and found nothing,
+   *  which is exactly the lie this field exists to remove. */
+  missing_tools?: RcAppsMissingTool[]
 }
 export interface RcAppsListReply {
   ok: boolean
