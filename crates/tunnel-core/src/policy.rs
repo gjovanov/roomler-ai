@@ -946,6 +946,10 @@ mod tests {
             tags: Vec::new(),
             name_admin_set: false,
             machine_id: "m".into(),
+            // FR-51 — a permanent fixture device; the ephemeral shape has its
+            // own tests in `crates/tests/src/ephemeral_tests.rs`.
+            ephemeral: false,
+            ephemeral_ttl_secs: None,
             os: OsKind::Linux,
             agent_version: "0".into(),
             companion_version: None,
