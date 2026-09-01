@@ -662,11 +662,12 @@ pub struct AgentConfig {
     #[serde(default)]
     pub portal_capture: Option<bool>,
     /// FR-45 P4 — inject input through the portal's RemoteDesktop interface,
-    /// riding the SAME session as `portal_capture`
-    /// (`ROOMLERD_PORTAL_INPUT`). Built-in default: **ON** while a portal
-    /// capture is live — on those hosts the portal is the only input path
-    /// with a reader behind it — and inert otherwise. Off = the portal
-    /// session is view-only. Restart required.
+    /// riding the SAME session as `portal_capture` (`ROOMLERD_PORTAL_INPUT`).
+    /// Built-in default: **OFF** — an input session needs its own see+touch
+    /// consent grant, so enabling it turns every portal capture into one that
+    /// prompts (and blocks or falls through if unanswered), regressing capture
+    /// on hosts where capture-only works. On = the portal session can also be
+    /// controlled; inert unless `portal_capture` is on. Restart required.
     #[serde(default)]
     pub portal_input: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
