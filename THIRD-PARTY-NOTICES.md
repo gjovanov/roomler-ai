@@ -87,13 +87,36 @@ oversight.
 
 ## HEVC / H.265
 
-The agent can encode HEVC via `hevc_nvenc`, `hevc_qsv` and `hevc_amf` — wrappers
-around the encoder block in the GPU vendor's own driver, which the vendor
-licenses. This is a materially narrower exposure than distributing a software
-HEVC encoder, but patent-pool licensing for HEVC distribution (Access Advance,
-MPEG LA/Via, Velos) has **not** been reviewed. Recorded as a known, unpriced
-business risk.
+**Decision: HEVC is enabled by default.** It has been since rc.107, and the
+reasoning is recorded here rather than left as an open risk.
 
+The agent encodes HEVC only through `hevc_nvenc`, `hevc_qsv`, `hevc_amf` and
+`hevc_videotoolbox` — thin wrappers around the **encoder block in the GPU
+vendor's own driver and silicon**. We ship no HEVC encoder implementation: the
+vendor does, and the vendor licenses it. Invoking hardware the user already owns,
+through a driver its manufacturer already licensed, is materially different from
+distributing a software codec, and it is the same position RustDesk and the wider
+remote-desktop field take.
+
+Three things keep it that way, and each is load-bearing:
+
+1. **No software HEVC encoder ships.** The dispatch table is a fixed list of
+   `*_nvenc` / `*_qsv` / `*_amf` / `*_videotoolbox` names, locked by unit tests.
+   ⚠️ Adding a software HEVC encoder — `libx265`, or any CPU fallback — would
+   change this analysis completely and must not be done casually.
+2. **FFmpeg is built `--disable-everything`** plus exactly those hardware
+   encoders, with no `--enable-gpl` and no `--enable-nonfree`; CI fails the build
+   if an x264/x265 library appears.
+3. **Advertisement is probe-gated.** A host whose hardware cannot actually open
+   an HEVC encoder never advertises `h265`, and falls back to H.264.
+
+⚠️ This is a reasoned position, not a legal opinion, and pool licensors do not
+always agree with it. It is recorded so that it is a decision someone made on
+stated grounds — and can revisit — rather than a question nobody asked.
+
+*Superseded text, kept so the change is visible: this section previously read
+"patent-pool licensing for HEVC distribution … has not been reviewed. Recorded
+as a known, unpriced business risk."*
 ---
 
 ## Vendored upstream forks
