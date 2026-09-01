@@ -39,6 +39,11 @@ pub enum TokenType {
     Refresh,
     /// Single-use, short-lived token used to enroll a remote-control agent.
     Enrollment,
+    /// FR-51 P2 — REUSABLE key that enrolls EPHEMERAL agents. Its own
+    /// audience so a leaked one can never pass a gate expecting the
+    /// single-use kind (or vice versa); the `jti` is checked against the
+    /// `enrollment_keys` row on every use — the JWT alone grants nothing.
+    EphemeralEnrollment,
     /// Long-lived token carried by an enrolled remote-control agent.
     Agent,
     /// Single-use, short-lived bootstrap token an admin issues to the
@@ -385,6 +390,48 @@ impl AuthService {
         Ok(claims)
     }
 
+    /// FR-51 P2 — mint the JWT half of an ephemeral enrollment key. `exp` is
+    /// passed as an absolute timestamp so it EQUALS the key row's
+    /// `expires_at`: the row is the authority (it is what revocation and the
+    /// use ceiling live on), the JWT expiry is the belt to that braces.
+    pub fn issue_ephemeral_enroll_key_token(
+        &self,
+        admin_user_id: ObjectId,
+        tenant_id: ObjectId,
+        jti: &str,
+        expires_at_ts: i64,
+    ) -> Result<String, AuthError> {
+        let claims = EnrollmentClaims {
+            sub: admin_user_id.to_hex(),
+            tenant_id: tenant_id.to_hex(),
+            iat: Utc::now().timestamp(),
+            exp: expires_at_ts,
+            iss: self.jwt_settings.issuer.clone(),
+            token_type: TokenType::EphemeralEnrollment,
+            jti: jti.to_string(),
+        };
+        encode(&self.header(), &claims, &self.signing.encoding)
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))
+    }
+
+    /// Accept EITHER enrollment credential on the public enroll route and say
+    /// which arrived (`true` = the FR-51 ephemeral key). Everything else —
+    /// agent, user, tunnel audiences — is refused exactly as before; the two
+    /// enrollment kinds stay separate audiences everywhere else.
+    pub fn verify_enrollment_token_any(
+        &self,
+        token: &str,
+    ) -> Result<(EnrollmentClaims, bool), AuthError> {
+        let claims = self.decode_any::<EnrollmentClaims>(token, &self.validation())?;
+        match claims.token_type {
+            TokenType::Enrollment => Ok((claims, false)),
+            TokenType::EphemeralEnrollment => Ok((claims, true)),
+            _ => Err(AuthError::InvalidToken(
+                "Not an enrollment token".to_string(),
+            )),
+        }
+    }
+
     /// Mint a long-lived agent token (default TTL from settings.refresh_token_ttl_secs
     /// unless `override_ttl_secs` is provided).
     pub fn issue_agent_token(
@@ -561,6 +608,42 @@ mod tests {
         let token = s.issue_agent_token(agent_id, tenant, Some(60)).unwrap();
         let err = s.verify_enrollment_token(&token).unwrap_err();
         matches!(err, AuthError::InvalidToken(_));
+    }
+
+    /// FR-51 P2 — the ephemeral key roundtrips through `_any`, is refused by
+    /// the single-use verifier, and `_any` still refuses non-enrollment
+    /// audiences. The audience separation is what stops a leaked credential
+    /// of one kind passing a gate built for the other.
+    #[test]
+    fn ephemeral_key_token_audiences() {
+        let s = svc();
+        let admin = ObjectId::new();
+        let tenant = ObjectId::new();
+        let exp = Utc::now().timestamp() + 600;
+        let token = s
+            .issue_ephemeral_enroll_key_token(admin, tenant, "jti-eph-1", exp)
+            .unwrap();
+
+        // _any accepts it and says which kind arrived.
+        let (claims, is_ephemeral) = s.verify_enrollment_token_any(&token).unwrap();
+        assert!(is_ephemeral);
+        assert_eq!(claims.jti, "jti-eph-1");
+        assert_eq!(claims.token_type, TokenType::EphemeralEnrollment);
+
+        // The single-use verifier refuses it (it is not that kind).
+        assert!(s.verify_enrollment_token(&token).is_err());
+
+        // A standard enrollment token through _any reads as NOT ephemeral.
+        let (std_token, _) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
+        let (_, is_ephemeral) = s.verify_enrollment_token_any(&std_token).unwrap();
+        assert!(!is_ephemeral);
+
+        // And _any refuses every other audience — an agent token here would
+        // mean any enrolled device could mint sibling devices.
+        let agent_token = s
+            .issue_agent_token(ObjectId::new(), tenant, Some(60))
+            .unwrap();
+        assert!(s.verify_enrollment_token_any(&agent_token).is_err());
     }
 
     #[test]

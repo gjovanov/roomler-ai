@@ -127,6 +127,19 @@ pub struct TenantSettings {
     #[serde(default)]
     pub remote_ssh_enabled: bool,
 
+    /// FR-51 — org-wide switch for EPHEMERAL ENROLLMENT KEYS (gate 1 of the
+    /// key path). `false` (the default, and what every pre-feature row
+    /// deserialises to) means the mint route refuses and — deliberately —
+    /// every already-minted key stops working too: the gate is checked on
+    /// each USE, ahead of the key's own use-claim, so flipping this off is
+    /// an org-wide revocation that burns nothing.
+    ///
+    /// A separate switch from the exec/SSH pair for the same reason they are
+    /// separate from each other: a standing credential that mints device
+    /// identities is its own grant, not an implication of any other.
+    #[serde(default)]
+    pub ephemeral_keys_enabled: bool,
+
     /// FR-32 — how far plan-limit checks may go for this tenant. Defaults to
     /// `Warn`, so a pre-FR-32 tenant document deserialises into observe mode:
     /// every newly wired gate is measured and logged, and none of them refuse.
@@ -151,6 +164,7 @@ impl Default for TenantSettings {
             magic_dns_nameservers: Vec::new(),
             remote_exec_enabled: false,
             remote_ssh_enabled: false,
+            ephemeral_keys_enabled: false,
             plan_enforcement: PlanEnforcement::default(),
         }
     }

@@ -337,6 +337,20 @@ pub fn build_router(state: AppState) -> Router {
             "/enroll-token",
             post(routes::remote_control::issue_enrollment_token),
         )
+        // FR-51 P2 — reusable ephemeral enrollment keys (static segments win
+        // over the `{agent_id}` param below, same as `/enroll-token`).
+        .route(
+            "/enroll-key",
+            get(routes::enroll_key::list_keys).post(routes::enroll_key::mint_key),
+        )
+        .route(
+            "/enroll-key/{key_id}",
+            delete(routes::enroll_key::revoke_key),
+        )
+        .route(
+            "/enroll-key/{key_id}/uses",
+            get(routes::enroll_key::list_key_uses),
+        )
         // S1a — operator-forced self-update: bulk (static segment wins over
         // the `{agent_id}` param below) + per-agent.
         .route(
@@ -547,6 +561,14 @@ pub fn build_router(state: AppState) -> Router {
     let exec_settings_routes = Router::new().route(
         "/",
         get(routes::agent_exec::get_org_settings).put(routes::agent_exec::set_org_settings),
+    );
+
+    // FR-51 P2 — the ephemeral-key class switch (MANAGE_TENANT, the exec/ssh
+    // twins' shape): whether reusable device-minting credentials exist in
+    // this org at all.
+    let ephemeral_key_settings_routes = Router::new().route(
+        "/",
+        get(routes::enroll_key::get_org_settings).put(routes::enroll_key::set_org_settings),
     );
 
     // Roomler SSH — its own org kill-switch (gate 1). A separate switch from
@@ -773,6 +795,10 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity_routes)
         .nest("/tenant/{tenant_id}/exec-settings", exec_settings_routes)
         .nest("/tenant/{tenant_id}/ssh-settings", ssh_settings_routes)
+        .nest(
+            "/tenant/{tenant_id}/ephemeral-key-settings",
+            ephemeral_key_settings_routes,
+        )
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check. `/health` stays a cheap process-alive 200 (liveness /

@@ -106,16 +106,28 @@ pub struct EnrollResponse {
     pub agent_id: String,
     pub tenant_id: String,
     pub agent_token: String,
+    /// FR-51 — true when this enrollment arrived on an ephemeral key: the
+    /// row will be reaped after its inactivity TTL, and re-enrolling later
+    /// creates a NEW device rather than reviving this one.
+    pub ephemeral: bool,
 }
 
 /// POST /api/agent/enroll — public (no user JWT); authenticates via the
 /// enrollment token instead. Creates or rehydrates the Agent row and returns
 /// a long-lived agent JWT.
+///
+/// FR-51 P2 — the SAME route also accepts an ephemeral enrollment KEY
+/// (`TokenType::EphemeralEnrollment`); which path runs is decided by the
+/// CREDENTIAL's audience, never by anything in the request body (a body that
+/// could pick would let a device declare itself permanent and evade the
+/// reaper, or schedule a permanent device for silent deletion).
 pub async fn enroll_agent(
     State(state): State<AppState>,
     Json(body): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, ApiError> {
-    let claims = state.auth.verify_enrollment_token(&body.enrollment_token)?;
+    let (claims, is_ephemeral) = state
+        .auth
+        .verify_enrollment_token_any(&body.enrollment_token)?;
     let tid = ObjectId::parse_str(&claims.tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id claim".to_string()))?;
     let admin_uid = ObjectId::parse_str(&claims.sub)
@@ -136,6 +148,10 @@ pub async fn enroll_agent(
         return Err(ApiError::Forbidden(
             "This organization is archived and accepts no device enrollments".to_string(),
         ));
+    }
+
+    if is_ephemeral {
+        return enroll_agent_ephemeral(&state, tid, admin_uid, &claims.jti, body).await;
     }
 
     // If a row already exists for (tenant_id, machine_id), rehydrate it —
@@ -229,6 +245,128 @@ pub async fn enroll_agent(
         agent_id: agent_id.to_hex(),
         tenant_id: tid.to_hex(),
         agent_token,
+        ephemeral: false,
+    }))
+}
+
+/// FR-51 P2 — the ephemeral-key enrollment path. Differs from the standard
+/// one in exactly the ways the spec derives:
+///
+/// * **create-only, never rehydrate** (F1): an ephemeral enrollment supplies
+///   a fresh random machine_id per process, and a rehydrate affordance here
+///   would let a key-holder TAKE OVER an existing device row by posting its
+///   machine_id — so a duplicate is a final 409, not a revival.
+/// * the org switch is re-checked on every use, AHEAD of the key's own
+///   claim, so flipping it off revokes the whole class immediately and
+///   burns no uses;
+/// * the device cap runs BEFORE the use-claim, mirroring the single-use
+///   path's order for the field-taught reason: a use burnt on a rejection
+///   the operator must fix elsewhere would fail their retry a second time.
+///   (A use IS burnt on the duplicate-machine_id 409 below — that one is
+///   caller error, and claiming after create would let racing enrollments
+///   overshoot the ceiling.)
+async fn enroll_agent_ephemeral(
+    state: &AppState,
+    tid: ObjectId,
+    admin_uid: ObjectId,
+    jti: &str,
+    body: EnrollRequest,
+) -> Result<Json<EnrollResponse>, ApiError> {
+    // Gate 1 — the class switch (FR-51 §4). Default off; off = every
+    // outstanding key stops working, on its next use, burning nothing.
+    let tenant = state.tenants.base.find_by_id(tid).await?;
+    if !tenant.settings.ephemeral_keys_enabled {
+        return Err(ApiError::Forbidden(
+            "Ephemeral enrollment keys are disabled for this organization".to_string(),
+        ));
+    }
+
+    // Device cap — an ephemeral device consumes a slot while it exists
+    // (FR-51 F5, the simple reading; the reaper is what gives them back).
+    let used = state.agents.count_active_for_tenant(tid).await?;
+    if let Err(d) = quota::check(
+        tenant.plan.clone(),
+        tenant.settings.plan_enforcement,
+        quota::Limit::MaxDevices,
+        used,
+    ) {
+        return Err(ApiError::Forbidden(format!(
+            "Device limit reached for the {:?} plan ({} of {} devices used). \
+             Upgrade the plan or remove a device first.",
+            d.plan, d.used, d.max
+        )));
+    }
+
+    // The atomic use-claim: not revoked, not expired, ceiling not reached,
+    // counter bumped — one operation, so racing replicas cannot overshoot
+    // and a revocation lands on the very next use.
+    let Some(key) = state.enrollment_keys.claim_use(tid, jti).await? else {
+        let reason = state
+            .enrollment_keys
+            .refusal_reason(tid, jti)
+            .await
+            .unwrap_or(roomler_ai_services::dao::enrollment_key::KeyRefusal::Unknown);
+        tracing::warn!(tenant_id = %tid, jti, reason = reason.as_str(),
+            "fr-51: ephemeral enrollment key refused");
+        return Err(ApiError::Unauthorized(format!(
+            "This enrollment key was refused ({})",
+            reason.as_str()
+        )));
+    };
+    let key_id = key
+        .id
+        .ok_or_else(|| ApiError::Internal("enrollment key missing _id".to_string()))?;
+
+    let agent = match state
+        .agents
+        .create_ephemeral(
+            tid,
+            admin_uid,
+            body.machine_name,
+            body.machine_id,
+            body.os,
+            body.agent_version,
+            key_id,
+            key.ephemeral_ttl_secs,
+        )
+        .await
+    {
+        Ok(a) => a,
+        Err(roomler_ai_services::dao::base::DaoError::DuplicateKey(_)) => {
+            return Err(ApiError::Conflict(
+                "A device with this machine_id is already enrolled in this organization; \
+                 an ephemeral enrollment never revives or replaces an existing device"
+                    .to_string(),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let agent_id = agent
+        .id
+        .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+
+    // Control 4 — the per-use audit row: the record that outlives the device
+    // row (which will hard-delete). Best-effort — the atomic claim above is
+    // the enforcement; losing the record is logged, never a refusal.
+    if let Err(e) = state
+        .enrollment_keys
+        .record_use(tid, key_id, agent_id, &agent.machine_id, &agent.name)
+        .await
+    {
+        tracing::warn!(%agent_id, %key_id, %e, "fr-51: enrollment key use-record failed");
+    }
+    tracing::info!(
+        tenant_id = %tid, %agent_id, %key_id, name = %agent.name,
+        uses = key.uses, max_uses = key.max_uses,
+        "fr-51: ephemeral device enrolled"
+    );
+
+    let agent_token = state.auth.issue_agent_token(agent_id, tid, None)?;
+    Ok(Json(EnrollResponse {
+        agent_id: agent_id.to_hex(),
+        tenant_id: tid.to_hex(),
+        agent_token,
+        ephemeral: true,
     }))
 }
 
