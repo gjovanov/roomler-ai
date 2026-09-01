@@ -1,7 +1,7 @@
 # FR-57: An arm64 self-host image
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
-Status: **P0 — spec** (2026-09-01) · Follows
+**Issue:** [#1161](https://github.com/gjovanov/roomler-ai/issues/1161) ·
+Status: **P1 proven; P2/P3 in this PR** (2026-09-01) · Follows
 [FR-42](FR-42-selfhost-verified-on-a-clean-box.md) (#967), which shipped the
 amd64 image and put arm64 explicitly out of scope.
 
@@ -70,7 +70,7 @@ recorded result rather than a silent gap.
 
 | # | Phase | Kill switch | Status |
 |---|-------|-------------|--------|
-| P1 | Matrix the publish workflow by arch; smoke-test natively; join by manifest | drop the arm64 matrix entry — amd64 publishes exactly as today | planned |
+| P1 | Matrix the publish workflow by arch; smoke-test natively; join by manifest | drop the arm64 matrix entry — amd64 publishes exactly as today | **shipped, dry-run proven** |
 | P2 | Publish a real multi-arch tag and pull it on an arm64 host | do not move `latest` | planned |
 | P3 | Docs stop saying amd64-only | n/a | planned |
 
@@ -101,5 +101,28 @@ recorded result rather than a silent gap.
   the manifest be the single name anyone uses.
 
 ## Field-verification log
+### 2026-09-01 — the experiment ran, and arm64 was never the hard part
 
-_(appended as it happens)_
+Dispatched as a **dry run from the branch**, so an unproven workflow never
+reached master. Both architectures built and both smoke-tested on their own
+native runner:
+
+| arch | build + smoke | health | SPA |
+|---|---|---|---|
+| amd64 | 20m23s | healthy after 20s | `GET / -> 200` |
+| **arm64** | **15m33s** | healthy after 20s | `GET / -> 200` |
+
+🔑 **arm64 built FASTER than amd64** on GitHub's `ubuntu-24.04-arm` runners.
+Every reason to defer this was about QEMU, and none of them survived contact
+with a native runner: `mediasoup-sys`, the vendored webrtc tree and `ring` —
+the three dependencies this spec named as the risk — all built on aarch64
+with no change at all. The risk was zero, and the only way to find that out
+was to run it.
+
+⚠️ The `Manifest` job correctly **skipped** on the dry run. It is gated on
+`!inputs.dry_run`, so a verification pass cannot move a published tag.
+
+⚠️ The tag-vs-binary drift fired again, and is now a routine observation
+rather than a surprise: dispatched `v0.4.43`, built a binary reporting
+**0.4.45**, because master moved twice during the run.
+
