@@ -393,6 +393,18 @@ impl LocalApiState for DaemonState {
             }),
             #[cfg(not(feature = "overlay-l3"))]
             lan_captures: None,
+            // FR-47 — the last join the server refused, if any. Read from the
+            // process-wide slot rather than the overlay view: a refusal means
+            // the runtime never came up, so there is no view to carry it.
+            //
+            // Feature-gated like `lan_captures` above, because `crate::overlay`
+            // itself is: a signalling-only build has no overlay module and can
+            // never be refused a join it does not attempt, so `None` there is
+            // the truth rather than a stub.
+            #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+            join_refusal: crate::overlay::last_join_refusal(),
+            #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+            join_refusal: None,
             // C4 stage 1 — the warm TURN/UDP allocation's state.
             warm_relay: self.overlay.borrow().warm_relay.clone(),
             // B4 — the measured capability vector, read straight from the
