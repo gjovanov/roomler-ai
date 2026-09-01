@@ -762,5 +762,38 @@ jobs:
           fi
           exit "$vite_rc"
 
+      - name: Build the docs site (FR-60)
+        # `bun run build` chains `vue-tsc && vite build && bun docs/build.ts`,
+        # but this job deliberately runs the first two separately so each
+        # failure gets its own annotation. Without this step the docs
+        # generator's BUILD GATES — dangling internal links, missing or
+        # over-length descriptions, duplicate slugs, unclosed containers, a
+        # search index over budget — would never run in CI, which is exactly
+        # the "a job that silently runs nothing is indistinguishable from a
+        # passing one" failure the integration lane already learned.
+        # ⚠️ It must run AFTER `vite build`: vite empties `dist/`.
+        shell: bash --noprofile --norc {0}
+        run: |
+          cd ui
+          echo "::group::docs build"
+          bun docs/build.ts 2>&1 | tee /tmp/docs.log
+          docs_rc=${PIPESTATUS[0]}
+          echo "::endgroup::"
+          if [ "$docs_rc" != 0 ]; then
+            {
+              echo "### docs build (exit $docs_rc)"
+              echo '```'
+              cat /tmp/docs.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            tail -30 /tmp/docs.log | awk 'BEGIN{ORS="%0A"}{print}' | sed 's/^/::error::docs: /'
+          fi
+          # The SEO files land at the site root, next to the SPA — assert
+          # they exist rather than trusting the generator's own log line.
+          test -f dist/sitemap.xml || { echo "::error::docs: dist/sitemap.xml missing"; exit 1; }
+          test -f dist/robots.txt || { echo "::error::docs: dist/robots.txt missing"; exit 1; }
+          test -f dist/docs/index.html || { echo "::error::docs: dist/docs/index.html missing"; exit 1; }
+          exit "$docs_rc"
+
       - name: Run unit tests
         run: cd ui && bun run test:unit
