@@ -52,8 +52,25 @@ type Shot = {
   grab: [number, number]
   /** Optional click before the drag (fraction): play a video, focus a shell. */
   poke?: [number, number]
-  /** Optional line typed after `poke` — kept short, it is read at a glance. */
+  /**
+   * Optional line typed after `poke` — kept short, it is read at a glance.
+   * `{PEER}` is substituted with `peer`'s CURRENT overlay address (see
+   * `overlayIp`); write the address literally and it goes stale on the next
+   * renumber with nothing failing.
+   */
   type?: string
+  /** The node `{PEER}` resolves to, by name. */
+  peer?: string
+  /**
+   * Pause between the focus click and typing.
+   *
+   * WARNING: not cosmetic. On the Mac the remote input pipeline needs a beat
+   * after a click before it accepts keystrokes: at 700 ms it swallowed the
+   * first NINETEEN characters of the ping command, leaving the shell with
+   * `0.65.12.3` and a `command not found`. Filmed clean, reported ok, and
+   * completely wrong - the same class as every other take lost here.
+   */
+  settleMs?: number
   /**
    * Per-machine connect wait. ⚠️ Not cosmetic: the Mac answers a CONSENT prompt
    * before the session starts ("Waiting for the agent to allow the
@@ -62,6 +79,50 @@ type Shot = {
    * reported fine. Machines that prompt need the longer wait.
    */
   waitMs?: number
+}
+
+/**
+ * The overlay addresses the two machines ping, RESOLVED FROM THE SERVER at
+ * record time rather than hardcoded.
+ *
+ * ⚠️ **They change under you, silently.** The first take shot `100.64.0.2` /
+ * `100.64.0.3`; FR-47 then carved the demo org its own block and they became
+ * `100.65.12.2` / `100.65.12.3`. Nothing failed anywhere — the harness would
+ * have typed the old addresses, filmed two *unreachable* pings, and reported
+ * every scene `ok`, because a scene is "no exception and no hang", never "the
+ * content is right". That is the trap that cost eleven takes the first time.
+ *
+ * ⚠️ It cannot be checked by pinging from the recording box, which was the
+ * first thing tried: this box drives a BROWSER and is not on the demo mesh at
+ * all, so that check refuses every valid run. The two machines ping each
+ * other, not us.
+ *
+ * ⚠️ Nor can the spec verify the ping SUCCEEDED — the terminal is pixels
+ * inside a remote-desktop video stream, so there is no text to read. Deriving
+ * the address is therefore not a nicety; it is the only place correctness can
+ * be established at all.
+ *
+ * The env vars stay as an override for a machine that is not in the mesh yet.
+ */
+const MAC_NODE = process.env.E2E_MAC_NODE || 'macbook-daemon'
+const WIN_NODE = process.env.E2E_WIN_NODE || 'windows-11'
+
+/** Resolve a node's current overlay IPv4 by name, or fail loudly. */
+async function overlayIp(page: Page, nodeName: string): Promise<string> {
+  const res = await page.request.get(`/api/tenant/${TENANT_ID}/overlay-node`)
+  expect(res.ok(), `overlay-node list failed: ${res.status()}`).toBeTruthy()
+  const body = await res.json()
+  const items: Array<Record<string, unknown>> = body.items ?? body ?? []
+  const hit = items.find(
+    (n) => String(n.name ?? n.machine_name ?? '').toLowerCase() === nodeName.toLowerCase(),
+  )
+  const ip = String(hit?.overlay_ip ?? hit?.ip ?? '')
+  // A wrong-but-plausible address is the failure this whole function exists to
+  // prevent, so an unresolved name stops the take instead of filming a miss.
+  expect(ip, `no overlay IPv4 for node ${nodeName} — names: ${items
+    .map((n) => n.name ?? n.machine_name)
+    .join(', ')}`).toMatch(/^\d+\.\d+\.\d+\.\d+$/)
+  return ip
 }
 
 /**
@@ -80,19 +141,22 @@ const SHOTS: Shot[] = [
     //    the Mac that is the per-USER daemon, which has no overlay — the
     //    privileged one does. The OS ping just uses the TUN, so it works from
     //    any account with no sudo.
-    //  · The target is `.2`, NOT `.1`. `macbook-pro` (100.64.0.1) is the
-    //    per-user node and reads `offline` in the mesh; `macbook-daemon`
-    //    (100.64.0.2) is the one actually on the overlay. Pinging .1 fails.
-    type: 'clear; ping -n 4 100.64.0.2',      // → the MacBook. Verified 4/4, avg 64 ms.
+    //  · The target is the DAEMON node, not the GUI worker. `macbook-pro` is
+    //    the per-user node and reads `offline` in the mesh; `macbook-daemon`
+    //    is the one actually on the overlay. Pinging the worker fails.
+    type: 'clear; ping -n 4 {PEER}', // → the MacBook
+    peer: MAC_NODE,
   },
   {
     id: process.env.E2E_MACOS_ID || '6a95b6a13d54d39b773c5366',
     name: 'macbook-pro',
     caption: 'A MacBook — same tab, nothing installed here',
-    grab: [0.543, 0.243],
-    poke: [0.543, 0.452],
-    type: 'clear; ping -c 4 100.64.0.3',      // → the Windows box. Verified 4/4, avg 5.8 ms.
-    waitMs: 24_000,                           // consent gate — see waitMs above
+    grab: [0.641, 0.463],
+    poke: [0.641, 0.667],
+    type: 'clear; ping -c 4 {PEER}', // → the Windows box
+    peer: WIN_NODE,
+    settleMs: 2500,
+    waitMs: 24_000, // consent gate — see waitMs above
   },
 ]
 
@@ -226,6 +290,19 @@ test.describe('Roomler demo recording', () => {
     await page.getByRole('button', { name: /sign in|log in|login/i }).click()
     await page.waitForTimeout(3000)
 
+    // Resolve every ping target NOW, while the page still answers and before
+    // any stream starts. A stale address is the one defect this take cannot
+    // detect for itself — the terminal is pixels in a video, so there is no
+    // text to assert on — which is why it is established here instead.
+    const peerIp: Record<string, string> = {}
+    for (const shot of SHOTS) {
+      if (shot.peer) {
+        peerIp[shot.name] = await overlayIp(page, shot.peer)
+        // eslint-disable-next-line no-console
+        console.log(`  ping target for ${shot.name}: ${shot.peer} = ${peerIp[shot.name]}`)
+      }
+    }
+
     // --- the fleet ---------------------------------------------------------
     ran.devices = await scene('devices', async () => {
       await page.goto(`/tenant/${TENANT_ID}/devices`)
@@ -265,10 +342,20 @@ test.describe('Roomler demo recording', () => {
         if (shot.poke) {
           const [px, py] = at(shot.poke)
           await page.mouse.click(px, py)
-          await page.waitForTimeout(700)
+          await page.waitForTimeout(shot.settleMs ?? 700)
+          // A throwaway Enter: harmless at any shell prompt, and it proves
+          // the session is taking input before the line that matters is
+          // typed.
+          await page.keyboard.press('Enter')
+          await page.waitForTimeout(500)
         }
         if (shot.type) {
-          await page.keyboard.type(shot.type, { delay: 45 })
+          // `{PEER}` was resolved before the stream started — nothing may query
+          // the page from here on (see the header note on the saturated main
+          // thread), so the lookup cannot happen at this point.
+          await page.keyboard.type(shot.type.replace('{PEER}', peerIp[shot.name] ?? ''), {
+            delay: 45,
+          })
           await page.keyboard.press('Enter')
           await page.waitForTimeout(6500)
         }
