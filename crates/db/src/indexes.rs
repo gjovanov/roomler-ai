@@ -245,6 +245,11 @@ pub async fn ensure_indexes(db: &Database, multi_block: bool) -> Result<(), mong
             index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
             index(bson::doc! { "tenant_id": 1, "status": 1 }),
             index(bson::doc! { "owner_user_id": 1 }),
+            // FR-51 — the reaper's candidate scan (equality, equality, range:
+            // ESR). Tiny today; what it buys is that a large ephemeral churn
+            // (the CI-fleet case this feature exists for) never turns the
+            // 60 s reap cycle into a collection scan.
+            index(bson::doc! { "ephemeral": 1, "deleted_at": 1, "last_seen_at": 1 }),
         ],
     )
     .await?;
