@@ -39,11 +39,6 @@
   bootstraps only when not yet loaded; a CHANGED plist therefore takes
   effect at next boot, which is acceptable for a file that rarely changes.
 -->
-<!-- RETIRED-NAME-ANCHOR-BEGIN
-     Frozen macOS layout (FR-21 D5). The .app bundle name keys this host's
-     Screen Recording and Accessibility TCC grants, and the log and config
-     paths below are pinned to it by launchd. A rename voids the grants
-     silently: the daemon runs and captures a black screen. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -51,9 +46,6 @@
 
     <key>ProgramArguments</key>
     <array>
-    <!-- RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS; renaming
-         it silently drops Screen Recording + Accessibility on every Mac. FR-21 D5
-         freezes it. docs/fr/FR-21 -->
         <string>/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd</string>
         <string>update-helper</string>
     </array>
@@ -85,5 +77,4 @@
         <string>info</string>
     </dict>
 </dict>
-  <!-- RETIRED-NAME-ANCHOR-END -->
 </plist>

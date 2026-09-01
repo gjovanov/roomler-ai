@@ -716,8 +716,6 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
 /// Administrators.
 fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
     let roomler_dir = config_path
-        // RETIRED-NAME-ANCHOR(2): names the PRE-RENAME appdirs segment a host installed
-        // before P4b still has; appdirs::app_segment resolves it, so it is an input.
         .parent() // …\roomler\<segment>
         .and_then(|p| p.parent()) // …\roomler
         .ok_or_else(|| {

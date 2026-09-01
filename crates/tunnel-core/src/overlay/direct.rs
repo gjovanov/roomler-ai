@@ -25,11 +25,7 @@ use std::time::Duration;
 
 use tokio::net::{UdpSocket, lookup_host};
 
-// RETIRED-NAME-ANCHOR(5): the legacy env prefix is spelled out ONCE in this
-// file so an operator with `ROOMLER_AGENT_OVERLAY_*` in a script can still
-// grep for it. The alias is real and read by `env::node_env`; the other
-// gates in this file point at that function rather than restate it. FR-21 D1.
-/// `ROOMLERD_OVERLAY_DIRECT` (legacy `ROOMLER_AGENT_OVERLAY_DIRECT` still
+/// `ROOMLERD_OVERLAY_DIRECT` (the older `ROOMLER_NODE_OVERLAY_DIRECT` still
 /// honoured — see [`crate::env::node_env`]) — default **ON**. Set
 /// `0`/`false`/`no`/`off` to disable the direct LAN path and force pure relay
 /// (the pre-rc.131 behaviour) if a field host misbehaves. Matches the node's
