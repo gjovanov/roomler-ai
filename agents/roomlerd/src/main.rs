@@ -3089,17 +3089,17 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     // Default `never`, so on a device that has not opted in this task holds
     // nothing and the behaviour is byte-for-byte what it was before.
     //
-    // The session hint is separate from the registry because the registry is
-    // rc-only: an SSH session or a long `exec` deserves the same protection and
-    // has no row there. Nothing sets it yet — that is FR-55 P1's second half.
-    let power_session_hint = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Separate from the rc registry because that registry is rc-only: an SSH
+    // session or a long `exec` deserves the same protection and has no row
+    // there. Handed to both, which take an RAII guard for their lifetime.
+    let power_activity = roomlerd::power::shared_activity().clone();
     let power_policy = roomlerd::power::PowerPolicy::parse(&cfg.power_policy);
     // Not aborted at shutdown: it exits on the watch, and its exit is what
     // RELEASES the assertion. An abort would leave the machine unable to sleep.
     let _power_task = tokio::spawn(roomlerd::power::run(
         power_policy,
         Some(rc_sessions.clone()),
-        power_session_hint.clone(),
+        power_activity.clone(),
         shutdown_rx.clone(),
     ));
 
