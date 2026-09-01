@@ -13,6 +13,7 @@ pub mod invite;
 pub mod key_rotation_audit;
 pub mod message;
 pub mod newsletter_issue;
+pub mod newsletter_send;
 pub mod notification;
 pub mod overlay_block;
 pub mod overlay_network;
