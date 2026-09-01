@@ -62,6 +62,7 @@ on a machine with no scanout. The backend priority stays
 | **P3c-i** ✅ | `process` → `pw_stream_dequeue_buffer` → inspect → queue back. **A picture exists.** Field-verified as root: 3 frames, **MemFd**, stride 7680 (= 1920x4), 8 294 400 bytes (= a full frame), **8291/8320 sampled bytes non-zero**, and the checksum CHANGES between runs — live pixels, not a constant. | same |
 | **P3c-ii** ✅ | Frames to the daemon and the **sixth `ScreenCapture` backend**, picked after DRM and before X11. ⚠️ A pipe and a copy, **not** `SCM_RIGHTS` — see the corrected decision below. Field-verified through `capture-smoke` as root: `backend=portal`, **delivered=5 empty=0**, 1920x1080 Bgra, `mean_ms=27.70`, and the dumped frame is a correct picture. | `ROOMLERD_PORTAL_CAPTURE=1` |
 | **P4** ✅ (2026-09-01, field-verified on Asahi/GNOME) | Input via the portal's **RemoteDesktop** interface, riding the SAME session as capture — `CreateSession`/`Start` move to RemoteDesktop, `SelectDevices` (keyboard+pointer, persist on v2+) slots in before the unchanged `SelectSources`, so ONE consent dialog covers see+touch and one restore token covers both (stored apart from the capture-only token: `portal-restore-token-rd`). The daemon's input arbiter forwards `InputMsg` JSON lines to the helper's stdin; the helper maps them to `Notify*` (evdev keycodes via the shared FR-36 table; typed text as Unicode keysyms, layout-proof; absolute motion in the stream's LOGICAL size). Falls back to capture-only where the portal has no RemoteDesktop (wlr, measured). Motivation measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. | `ROOMLERD_PORTAL_INPUT=0` (config `portal_input`) |
+| **P5** ✅ (2026-09-01, field-verified on BOTH hosts) | **`org.gnome.Mutter.ScreenCast` DIRECT — the unattended sibling, for hosts the portal cannot serve.** Mutter's own API needs no portal backend and shows no consent dialog, which is exactly what blocks WSL2 (where `xdg-desktop-portal-gnome` exits without a GNOME session, while `mutter --headless` runs fine and exposes ScreenCast v4). Same PipeWire consumption, same POD negotiation, same wire format and `ScreenCapture` backend — only the *session broker* changes. ⚠️⚠️ **This is NOT a portal variant and must never be described as one: it does not ask.** Its peer is FR-36's DRM backend (also unattended, also opt-in), not P2b. | `ROOMLERD_MUTTER_CAPTURE` (config `mutter_capture`), default **OFF** |
 
 ### The seam is unchanged
 
@@ -95,6 +96,41 @@ Three options, in the order they should be evaluated:
 ⚠️ Whichever is chosen, **prove it by starting the daemon on a host without
 PipeWire installed**, not by reasoning about it.
 
+
+## P5 — the mutter-direct path, and the property it trades away
+
+P4 finished the ATTENDED story. P5 exists because the attended story cannot
+reach the host this FR was opened for: on WSL2 `xdg-desktop-portal-gnome` exits
+immediately without a real GNOME session, so `CreateSession` fails with
+`StartServiceByName … Timeout was reached` — while **`mutter --headless` runs
+there perfectly and exposes `org.gnome.Mutter.ScreenCast` v4** (measured
+2026-09-01). The portal is the obstacle, not the compositor.
+
+**What changes:** only the session broker. `CreateSession` → `RecordMonitor` →
+`Start`, and the node id arrives on the stream object's `PipeWireStreamAdded`
+signal. Everything downstream — the SPA POD negotiation, buffer handling, the
+frame wire format, the `ScreenCapture` backend — is the P3 code unchanged.
+
+**What it trades away, and why that is acceptable here:**
+
+- ⚠️⚠️ **There is no consent dialog.** `org.gnome.Mutter.ScreenCast` is a
+  privileged session API: anything on the user's session bus may call it. So
+  this path captures **without asking**, and the spec's "ATTENDED only" warning
+  does **not** apply to it — that warning is about P2b and must not be quietly
+  transferred onto a path that behaves differently.
+- It is not a privilege escalation. Anything that can reach that bus is already
+  running as the session user and can screenshot at will; the daemon is root and
+  could read the framebuffer regardless. The honest framing is that this is the
+  **unattended sibling of FR-36's DRM backend** — same bargain, different
+  mechanism — and it is gated the same way: opt-in, default OFF.
+- ⚠️ It is **GNOME-specific**. No KDE or wlroots equivalent is implied; those
+  hosts keep the portal path.
+
+**Why it could not be prototyped in a shell**: a mutter screencast session is
+owned by the D-Bus connection that created it and dies when that connection
+closes, so `busctl` (a fresh connection per call) can never hold one open — the
+same rule `screencast::Session::_conn` exists for. Proving it needed code, which
+is what this phase is.
 
 ## ⚠️⚠️ P1 found the thing that shapes P2, and it is not PipeWire
 
@@ -285,14 +321,17 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 
 ## Acceptance criteria
 
-- [ ] ⛔ **BLOCKED — cause CORRECTED 2026-09-01.** Not "no renderer": software
-      EGL (llvmpipe) works fine in WSL2 with no `/dev/dri`, and
-      `mutter --headless` runs there with a real virtual monitor and exposes
-      `org.gnome.Mutter.ScreenCast` v4. What blocks the PORTAL path is that
-      `xdg-desktop-portal-gnome` cannot run without a real GNOME session, and a
-      nested GNOME is unreachable because WSLg's compositor is too old
-      (`xdg_wm_base` v1, no `zwp_linux_dmabuf_v1`). The way in is mutter's own
-      ScreenCast API — see the field log. A
+- [x] ✅ **MET by P5, 2026-09-01 — a Wayland desktop IS captured in WSL2.**
+      Not through the portal, which cannot work there
+      (`xdg-desktop-portal-gnome` exits without a GNOME session), but through
+      `org.gnome.Mutter.ScreenCast` directly against a headless mutter:
+      **node 32 on `Meta-0`, ScreenCast v4, session open in 28 ms, BGRx
+      1920×1080, 4.92 GB of frames, 2025/2025 sampled bytes non-zero and frame
+      2 ≠ frame 1** — with NO portal backend on the bus at all. ⚠️ It is
+      UNATTENDED (no consent dialog) and GNOME-specific. The original wording
+      of this criterion — a nested GNOME session in the browser — is NOT what
+      was achieved and is not reachable: `mutter --nested` hangs on WSLg's
+      ancient compositor. A
       **nested GNOME Wayland session in WSL2** (per the WSLg + `gnome-shell
       --nested` recipe) is captured and rendered in the browser
 - [ ] That session encodes with **`*_nvenc`**, and `avg_encode_ms` is within
@@ -431,3 +470,7 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-09-01 | 🏆 **`mutter --headless` RUNS in WSL2 and exposes a screencast API** | `mutter --headless --wayland --virtual-monitor 1920x1080` with software EGL: `Created surfaceless renderer without GPU`, `Added virtual monitor Meta-0`, `Using Wayland display name 'wayland-1'` — a real compositor with a real 1920×1080 output on the host FR-45 was opened for. It exposes **`org.gnome.Mutter.ScreenCast` v4 and `org.gnome.Mutter.RemoteDesktop` v1**, and with the GNOME portal backend up our own detector reported **`available (screencast v5, remote_desktop=true)` in WSL2**. |
 | 2026-09-01 | ⛔ **…but the PORTAL path still cannot complete there — for a DIFFERENT reason, higher up the stack** | `xdg-desktop-portal-gnome` **exits immediately** without a real GNOME session (its only log line is `Failed to associate portal window with parent window`), so it never owns `org.freedesktop.impl.portal.desktop.gnome`; the frontend then D-Bus-activates it and times out, and our client reports it exactly: `CreateSession: … StartServiceByName for org.freedesktop.impl.portal.desktop.gnome: Timeout was reached`. ⚠️ Note the P1 lesson recurring: the frontend ADVERTISED ScreenCast+RemoteDesktop the whole time (backends declare interfaces in `.portal` files), so "the interface is exposed" again proved nothing. ⚠️ And a full nested GNOME is not the way out: `mutter --nested` HANGS before creating its socket — WSLg's compositor offers only `xdg_wm_base` v1 / `wl_compositor` v4 and **no `zwp_linux_dmabuf_v1`** (that protocol gap is the likely cause — inferred, not proven). |
 | 2026-09-01 | 🔑 **The identified path forward for WSL2 (NOT attempted)** | Talk to **`org.gnome.Mutter.ScreenCast` directly**, which is what gnome-remote-desktop does — it needs no portal backend and no consent dialog, both of which are what actually block WSL2. That is a new, GNOME-specific code path, so it is a phase, not a tweak. ⚠️ It could not be probed with `busctl`: a mutter screencast session dies with the D-Bus connection that created it (the same rule our own `Session::_conn` field exists for), so per-call shell tools cannot hold one open — proving it needs code. |
+| 2026-09-01 | ✅ **P5 field-verified on Asahi (real GNOME)** | `portal-helper --stream --mutter`: **`mutter node 82 on HDMI-1 (ScreenCast v4)` in 10 ms, NO consent dialog**, BGRx 1920×1080 negotiated. Frames are **damage-driven**: 85 bytes (the handshake alone) while the desktop sat idle, then **904 MB** once the pointer was swept across it. |
+| 2026-09-01 | 🏆🏆 **P5 PAYOFF — a Wayland desktop is CAPTURED IN WSL2, the host this FR was opened for** | Headless mutter (`Created surfaceless renderer without GPU` / `Added virtual monitor Meta-0`), **no portal backend owning a name on the bus at all** — so the portal path provably could not have served this — and `portal-helper --stream --mutter` gave **node 32 on `Meta-0`, ScreenCast v4, open in 28 ms**, BGRx 1920×1080. 85 bytes idle → **4.92 GB** once a client mapped. Pixels checked to the P3c-i standard: magic `RPWF`, stride 7680 = 1920×4, len 8294400 = a full frame, **2025/2025 sampled bytes non-zero**, and **frame 2 ≠ frame 1** — live pixels, not a still and not black. |
+| 2026-09-01 | ⚠️ **A unit test at the WRONG LEVEL passed while the code was broken** | The first `mutter.rs` test pinned `MonitorEntry`'s signature — correct — while `first_connector` deserialised `GetCurrentState`'s reply as a **2-tuple**, and the real reply has **four** fields. Every live call failed `Signature mismatch: got (ua(…)a(…)a{sv}), expected (ua(…))`. 🔑 zvariant matches the WHOLE body: reading "just the fields we want" is a type error, not a partial read. The test now pins the entire reply signature. A test at the wrong level is worse than none — it reports the shape as locked while the shape that actually broke was never looked at. |
+| 2026-09-01 | ⚠️ **clippy caught a bound that did not bind** | The first draft wrapped the `PipeWireStreamAdded` wait in a `loop` with a deadline check — but every arm broke or returned on the first pass, so `STREAM_WAIT` was dead code and the wait was actually UNBOUNDED (`this loop never actually loops`). zbus's blocking signal iterator has no timed `next`, so the bound now wraps the whole handshake in [`open`] via a thread + `recv_timeout`, the same shape `pipewire::negotiate` already uses. |
