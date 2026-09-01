@@ -107,6 +107,35 @@ pub fn derived_ceiling_bps(goodput_bps: u32) -> u32 {
     (((goodput_bps as u64) * MEASURED_CEILING_PCT / 100) as u32).max(1_000_000)
 }
 
+/// FR-59 P1 — the bitrate FLOOR a measured pipe justifies.
+///
+/// `MIN_BITRATE_BPS` (1.5 Mbps) is a legibility floor calibrated for the
+/// 2–9 Mbps band every measured relay had sat in. It is also the AIMD's
+/// `floor_bps`, so on a slower pipe it is not a floor but a **pin**: the
+/// multiplicative decrease bottoms out there and the encoder keeps
+/// emitting multiples of what the link carries. Field 2026-09-01
+/// (CORPLAP-3 → neo16 over a phone hotspot): a measured 395 kbps pipe met
+/// a 1.5 Mbps floor — 3.8× — and the excess became 2.3–7.1 s of viewer
+/// paint age queued below every agent counter.
+///
+/// So the floor descends, but **only on evidence**: `goodput_bps` is a
+/// held measurement, and this returns the nominal floor unchanged unless
+/// the measurement is actually below it. `hard_min_bps` is the absolute
+/// stop — below roughly that, a full-resolution frame is illegible at any
+/// QP and the honest lever is fewer pixels, not fewer bits.
+///
+/// ⚠ Deliberately the same `MEASURED_CEILING_PCT` margin the ceiling
+/// uses: the floor is "what the pipe carries", and if it were set AT the
+/// measurement the AIMD could not converge below the drain rate it is
+/// trying to sit under.
+pub fn measured_floor_bps(goodput_bps: u32, nominal_floor_bps: u32, hard_min_bps: u32) -> u32 {
+    let derived = ((goodput_bps as u64) * MEASURED_CEILING_PCT / 100) as u32;
+    if derived >= nominal_floor_bps {
+        return nominal_floor_bps;
+    }
+    derived.max(hard_min_bps).min(nominal_floor_bps)
+}
+
 /// One qualifying blocked send: how many bytes, serialised over how long
 /// with SCTP flow control engaged the whole way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +395,30 @@ mod tests {
         assert_eq!(derived_ceiling_bps(10_000_000), 8_500_000);
         assert_eq!(derived_ceiling_bps(2_000_000), 1_700_000);
         assert_eq!(derived_ceiling_bps(300_000), 1_000_000, "floored at 1M");
+    }
+
+    /// FR-59 P1 — the floor descends ONLY on evidence, and never past the
+    /// hard minimum. The three cases that matter: a pipe wider than the
+    /// nominal floor leaves it alone (no behaviour change on a healthy
+    /// relay), a slow pipe lowers it to 85 % of the measurement, and a
+    /// pathological pipe stops at the hard minimum instead of reaching 0.
+    #[test]
+    fn measured_floor_descends_only_on_evidence() {
+        const NOMINAL: u32 = 1_500_000;
+        const HARD: u32 = 200_000;
+        // A healthy relay: measurement is above the floor ⇒ untouched.
+        assert_eq!(measured_floor_bps(9_000_000, NOMINAL, HARD), NOMINAL);
+        // Exactly at the boundary (85 % of 1.765 M ≈ the floor) ⇒ untouched.
+        assert_eq!(measured_floor_bps(1_800_000, NOMINAL, HARD), NOMINAL);
+        // The field case: 395 kbps measured ⇒ 335,853, well under the floor.
+        assert_eq!(measured_floor_bps(395_122, NOMINAL, HARD), 335_853);
+        // The worst field window: 64,850 ⇒ 55,122, clamped up to the hard min.
+        assert_eq!(measured_floor_bps(64_850, NOMINAL, HARD), HARD);
+        // A zero measurement can never drive the floor to zero.
+        assert_eq!(measured_floor_bps(0, NOMINAL, HARD), HARD);
+        // A hard minimum above the nominal floor can never RAISE it — the
+        // relief is one-directional by construction.
+        assert_eq!(measured_floor_bps(100_000, NOMINAL, 9_000_000), NOMINAL);
     }
 
     #[test]

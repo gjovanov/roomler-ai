@@ -260,17 +260,47 @@ pub fn unpack_age(raw: u64) -> Option<(u16, u16, u16)> {
     ))
 }
 
+/// FR-59 P3 — pack the viewer's LINK report: the bytes/s it actually
+/// received this window, and how much the transit queue GREW during it
+/// (ms, signed — negative means it drained).
+///
+/// Neither quantity needs the `rc:clock` probe, which is the point.
+/// `rx_bps` is a byte count over a local interval. `queue_ms` is
+/// `Σ(Δarrival − Δwire)`: the *difference* of two intervals, so the
+/// unknown clock offset cancels exactly, and it stays meaningful in the
+/// windows where FR-15's age is `None` or rejected as implausible —
+/// which, on the link this exists for, is most of them (field
+/// 2026-09-01: `viewer_age_ms=None` in 8 of 14 windows,
+/// `viewer_age_implausible=60`).
+///
+/// `0` is the swap-reset / no-report sentinel, so bit 0 is a presence
+/// marker rather than data — `rx_bps` of 0 with a 0 ms drift is a
+/// legitimate report (a window that received nothing) and must not read
+/// as silence.
+pub fn pack_link(rx_bps: u32, queue_ms: i16) -> u64 {
+    1 | ((queue_ms as u16 as u64) << 16) | ((rx_bps as u64) << 32)
+}
+
+/// Inverse of [`pack_link`] → `(rx_bps, queue_ms)`; `0` (no report) → `None`.
+pub fn unpack_link(raw: u64) -> Option<(u32, i16)> {
+    if raw == 0 {
+        return None;
+    }
+    Some(((raw >> 32) as u32, ((raw >> 16) & 0xFFFF) as u16 as i16))
+}
+
 /// Everything one viewer tells the agent about how the stream is actually
-/// landing: the rc.188 decode report (fps + struggling) and the FR-15 paint
-/// age. ONE shared cell per session — the control handler writes, the DC
-/// pump swaps once a viewer window, and a follower's is read by the shared
-/// pipeline's fold. Both slots use `0` as "nothing reported this window",
-/// so a viewer that goes quiet decays to no-signal instead of pinning a
-/// stale value.
+/// landing: the rc.188 decode report (fps + struggling), the FR-15 paint
+/// age, and the FR-59 P3 link report. ONE shared cell per session — the
+/// control handler writes, the DC pump swaps once a viewer window, and a
+/// follower's is read by the shared pipeline's fold. Every slot uses `0`
+/// as "nothing reported this window", so a viewer that goes quiet decays
+/// to no-signal instead of pinning a stale value.
 #[derive(Debug, Default)]
 pub struct ViewerFeedback {
     report: std::sync::atomic::AtomicU32,
     age: std::sync::atomic::AtomicU64,
+    link: std::sync::atomic::AtomicU64,
 }
 
 impl ViewerFeedback {
@@ -305,6 +335,17 @@ impl ViewerFeedback {
     pub fn take_age(&self) -> u64 {
         self.age.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// FR-59 P3 — overwrite the link report (see [`pack_link`]).
+    pub fn store_link(&self, packed: u64) {
+        self.link
+            .store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// FR-59 P3 — consume the link report.
+    pub fn take_link(&self) -> u64 {
+        self.link.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Age excess over the learned floor that counts a window as over-rate.
@@ -319,6 +360,87 @@ const AGE_OVER_WINDOWS: u8 = 2;
 /// path change (VPN re-route raising the floor) re-baselines in half a
 /// minute instead of over-triggering forever.
 const AGE_FLOOR_RING: usize = 30;
+
+/// FR-59 P3 — a window whose transit queue grew by at least this many ms
+/// is over-rate. Deliberately well above zero: frame-interval jitter and
+/// the ±1 ms of timestamp rounding both land in the drift sum, and a
+/// window that grew 20 ms is not a session in trouble.
+pub const QUEUE_GROWTH_MS: i16 = 100;
+/// Consecutive growing windows before the loop acts — the same
+/// one-bad-window-is-a-blip fold FR-15's age loop uses.
+const QUEUE_OVER_WINDOWS: u8 = 2;
+/// Safety margin on the arrival-rate ceiling, matching the measured
+/// ceiling's own 85–90 % convention: converge just UNDER the pipe.
+pub const LINK_CEILING_PCT: u64 = 90;
+
+/// What the FR-59 P3 link loop concluded from one viewer window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkVerdict {
+    /// The transit queue has grown for [`QUEUE_OVER_WINDOWS`] consecutive
+    /// windows — the session is putting bits in faster than they come out.
+    pub congested: bool,
+    /// The ceiling the viewer's measured ARRIVAL rate justifies. `None`
+    /// unless `congested`; see the type docs for why that gate is not
+    /// optional.
+    pub ceiling_bps: Option<u32>,
+}
+
+/// FR-59 P3 — the loop that reads congestion from where the queue actually
+/// is: the viewer.
+///
+/// The agent's AIMD watches its own send-channel occupancy, which on a
+/// relayed path is empty while seconds of video sit in the relay and the
+/// carrier (field 2026-09-01: `bytes_inflight` 1–4 KB and
+/// `send_wait_max_ms` 0.1 ms in the very windows the viewer reported
+/// 2,284 ms of paint age). Only the receiver can see that queue.
+///
+/// ⚠ **`rx_bps` is a LOWER BOUND on capacity, not capacity** — it is
+/// whatever the agent happened to send, which on a static desktop is a
+/// few KB/s of keepalive deltas. Clamping the ceiling to it
+/// unconditionally would ratchet a healthy session down to nothing and
+/// never recover. So the arrival rate may bound the ceiling ONLY while
+/// the queue is growing, because that is the one condition under which we
+/// know the agent is overdriving the pipe and therefore that what arrived
+/// is what the pipe carries. When the queue is flat or draining the
+/// arrival rate says nothing about capacity, and the AIMD's normal
+/// additive increase is left free to probe upward.
+#[derive(Debug, Default)]
+pub struct LinkLoop {
+    growth_streak: u8,
+    /// Windows judged congested — heartbeat telemetry, so "the loop never
+    /// fired" and "the viewer never reported" are distinguishable.
+    congested_windows: u32,
+}
+
+impl LinkLoop {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one viewer window. `rx_bps` = bytes/s the viewer actually
+    /// received; `queue_ms` = how much the transit queue grew during it.
+    pub fn observe(&mut self, rx_bps: u32, queue_ms: i16) -> LinkVerdict {
+        self.growth_streak = if queue_ms >= QUEUE_GROWTH_MS {
+            self.growth_streak.saturating_add(1)
+        } else {
+            0
+        };
+        let congested = self.growth_streak >= QUEUE_OVER_WINDOWS;
+        if congested {
+            self.congested_windows = self.congested_windows.saturating_add(1);
+        }
+        LinkVerdict {
+            congested,
+            ceiling_bps: (congested && rx_bps > 0)
+                .then(|| ((rx_bps as u64) * LINK_CEILING_PCT / 100) as u32),
+        }
+    }
+
+    /// Windows this loop judged congested (heartbeat).
+    pub fn congested_windows(&self) -> u32 {
+        self.congested_windows
+    }
+}
 
 /// P2 — a session sitting at this multiple of its own one-way delay is
 /// over-queued no matter what floor it managed to learn. Without an
@@ -636,6 +758,65 @@ mod tests {
             unpack_age(pack_age(u16::MAX, u16::MAX, u16::MAX)),
             Some((u16::MAX, u16::MAX, u16::MAX))
         );
+    }
+
+    /// FR-59 P3 — the link report round-trips, including a NEGATIVE drift
+    /// (the queue drained) and a genuinely-zero window, neither of which
+    /// may be confused with the swap-reset sentinel.
+    #[test]
+    fn link_pack_roundtrips_including_a_draining_queue() {
+        assert_eq!(unpack_link(pack_link(395_122, 240)), Some((395_122, 240)));
+        assert_eq!(unpack_link(0), None);
+        // A window that received nothing and drifted not at all is a real
+        // report — it says the stream stopped, which is not silence.
+        assert_eq!(unpack_link(pack_link(0, 0)), Some((0, 0)));
+        // The queue DRAINED: the sign has to survive the round trip, or a
+        // recovering session reads as the worst congestion representable.
+        assert_eq!(unpack_link(pack_link(1_000, -350)), Some((1_000, -350)));
+        assert_eq!(
+            unpack_link(pack_link(u32::MAX, i16::MIN)),
+            Some((u32::MAX, i16::MIN))
+        );
+    }
+
+    /// FR-59 P3 — the loop acts on a SUSTAINED growing queue, and the
+    /// arrival-rate ceiling appears only then.
+    #[test]
+    fn link_loop_needs_two_growing_windows_and_gates_the_ceiling() {
+        let mut l = LinkLoop::new();
+        // One growing window is a blip — no verdict, and crucially no
+        // ceiling, because `rx_bps` alone is not evidence of capacity.
+        let v = l.observe(400_000, 250);
+        assert!(!v.congested);
+        assert_eq!(v.ceiling_bps, None);
+        // Two in a row: now we know the agent is overdriving, so what
+        // arrived IS what the pipe carries.
+        let v = l.observe(400_000, 250);
+        assert!(v.congested);
+        assert_eq!(v.ceiling_bps, Some(360_000), "90 % of the arrival rate");
+        assert_eq!(l.congested_windows(), 1);
+        // A flat window breaks the streak immediately (down fast, up slow
+        // is the AIMD's job; this loop only reports).
+        let v = l.observe(400_000, 10);
+        assert!(!v.congested);
+        assert_eq!(v.ceiling_bps, None);
+        // A DRAINING queue is emphatically not congestion.
+        assert!(!l.observe(400_000, -300).congested);
+    }
+
+    /// The invariant that keeps this loop from ratcheting a healthy
+    /// session to nothing: a static desktop sends a few KB/s of keepalive
+    /// deltas, so `rx_bps` is tiny — and must NOT become the ceiling while
+    /// the queue is flat.
+    #[test]
+    fn a_quiet_stream_never_becomes_the_ceiling() {
+        let mut l = LinkLoop::new();
+        for _ in 0..50 {
+            let v = l.observe(20_000, 0);
+            assert!(!v.congested);
+            assert_eq!(v.ceiling_bps, None, "an idle window is not a measurement");
+        }
+        assert_eq!(l.congested_windows(), 0);
     }
 
     #[test]
