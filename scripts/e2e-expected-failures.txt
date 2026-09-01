@@ -13,8 +13,22 @@
 # 5/5, conference-chat 2/2, conference-list green — 19/19.
 # ⚠️ An entry here is a claim you understand the failure. These three were a
 # claim nobody had re-tested since July, and they hid a product bug.
-# rc-vp9-444 needs an agent built with the vp9-444 feature lane attached to
-# the stack — not part of the nightly topology.
+# rc-vp9-444 — ⚠️ the reason recorded here was WRONG (it said "needs an agent
+# built with the vp9-444 feature lane attached to the stack"). The spec's own
+# header says the harness is self-contained and needs NO agent. Measured
+# 2026-09-01, two stacked defects, neither of them an agent:
+#   1. the harness ran its code from an INLINE <script>, which the app's own
+#      CSP (`script-src 'self'`) forbids — so it never initialised at all
+#      against a built image. Fixed: the script is an external sibling file.
+#   2. it loads the worker from the Vite DEV path
+#      `/src/workers/rc-vp9-444-worker.ts`. A built image answers that with the
+#      SPA fallback — index.html, HTTP **200**, text/html — so `new Worker`
+#      would parse HTML as a module. The harness now says exactly that instead
+#      of dying obscurely; the real built worker is a hashed asset.
+# So these two specs have never run in ANY lane, only against `bun run dev`.
+# Making them run means building the harness as a Vite entry so the worker URL
+# is real and hashed — a production-build change, deliberately not smuggled in
+# here. Until then the entry is honest about why.
 e2e/rc-vp9-444.spec.ts
 # Containerized Chromium intercepts accounts.google.com navigations before
 # Playwright routing sees them (the identical GitHub-redirect test passes;
