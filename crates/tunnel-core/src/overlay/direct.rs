@@ -1103,6 +1103,75 @@ pub async fn gather_srflx(
 /// taken (v4-only, CC7). Tries each URL in order; `None` if none resolve to an
 /// IPv4 endpoint. Any single reachable STUN worker suffices — srflx doesn't need
 /// the coturn worker-pinning that the relay hairpin does.
+/// FR-48 — how long a resolved STUN/TURN vantage stays cached.
+///
+/// The three `resolve_stun_*` fns below run on the periodic carrier/srflx probe
+/// cycle and used to resolve their `stun:` hostnames FRESH on every pass. Each
+/// `lookup_host` is a blocking `getaddrinfo` dispatched to tokio's blocking
+/// pool, and glibc keeps the nameserver socket in *that thread's* `_res` state
+/// — so spread across the pool's threads the resolver sockets accumulate for
+/// the life of the process. Field-traced on 0.4.42 with bpftrace
+/// (`__socket ← __res_context_send ← getaddrinfo ← to_socket_addrs`): a settled
+/// overlay node grew **~+6.5 UDP sockets/hour** with no remote-control traffic
+/// at all, on every host in the fleet. Region endpoints change on a timescale
+/// of days, so a short TTL removes essentially all of those lookups while still
+/// following a real DNS change within one TTL.
+const STUN_DNS_TTL: Duration = Duration::from_secs(300);
+
+type StunDnsCache =
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<SocketAddr>)>>;
+static STUN_DNS_CACHE: std::sync::OnceLock<StunDnsCache> = std::sync::OnceLock::new();
+
+/// The `host:port` a `stun:`/`turn:` URL resolves through — scheme stripped,
+/// `?transport=` / `#frag` removed.
+///
+/// Shared by all three resolvers so the cache key and the thing actually looked
+/// up can never drift apart (they were three copies of this before).
+fn stun_hostport(url: &str) -> &str {
+    let s = url.trim();
+    let s = s
+        .strip_prefix("stun:")
+        .or_else(|| s.strip_prefix("stuns:"))
+        .or_else(|| s.strip_prefix("turn:"))
+        .or_else(|| s.strip_prefix("turns:"))
+        .unwrap_or(s);
+    s.split(['?', '#']).next().unwrap_or(s)
+}
+
+/// `lookup_host` behind a [`STUN_DNS_TTL`] cache. Returns an empty vec when
+/// resolution fails, matching the old `if let Ok(..)` call sites.
+///
+/// ⚠️ Only **successful, non-empty** results are cached: a DNS failure must be
+/// retried on the next probe pass, not remembered for the whole TTL — a node
+/// that lost DNS for one pass would otherwise stay vantage-less for 5 minutes.
+async fn lookup_host_cached(hostport: &str) -> Vec<SocketAddr> {
+    let cache = STUN_DNS_CACHE.get_or_init(StunDnsCache::default);
+    // Scoped so the guard is dropped before the await below.
+    let hit = {
+        cache.lock().ok().and_then(|map| {
+            map.get(hostport)
+                .filter(|(at, _)| at.elapsed() < STUN_DNS_TTL)
+                .map(|(_, addrs)| addrs.clone())
+        })
+    };
+    if let Some(addrs) = hit {
+        return addrs;
+    }
+    let addrs: Vec<SocketAddr> = match lookup_host(hostport).await {
+        Ok(it) => it.collect(),
+        Err(_) => return Vec::new(),
+    };
+    if !addrs.is_empty()
+        && let Ok(mut map) = cache.lock()
+    {
+        map.insert(
+            hostport.to_string(),
+            (std::time::Instant::now(), addrs.clone()),
+        );
+    }
+    addrs
+}
+
 pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> Option<SocketAddr> {
     // Never STUN a coturn worker that is one of THIS host's own IPs: on the
     // fleet the coturn workers ARE the hosts (buildhost `.74`, fleet-host-1 `.221`, fleet-host-2
@@ -1119,18 +1188,12 @@ pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> 
             }
             continue;
         }
-        // Hostname → DNS. Strip the scheme + any `?transport` / `#frag`, keep
-        // the `host:port` `lookup_host` needs.
-        let s = url.trim();
-        let s = s
-            .strip_prefix("stun:")
-            .or_else(|| s.strip_prefix("stuns:"))
-            .or_else(|| s.strip_prefix("turn:"))
-            .or_else(|| s.strip_prefix("turns:"))
-            .unwrap_or(s);
-        let hostport = s.split(['?', '#']).next().unwrap_or(s);
-        if let Ok(addrs) = lookup_host(hostport).await
-            && let Some(v4) = addrs.into_iter().filter(SocketAddr::is_ipv4).find(usable)
+        // Hostname → DNS, through the FR-48 TTL cache.
+        if let Some(v4) = lookup_host_cached(stun_hostport(url))
+            .await
+            .into_iter()
+            .filter(SocketAddr::is_ipv4)
+            .find(usable)
         {
             return Some(v4);
         }
@@ -1309,19 +1372,13 @@ pub async fn resolve_stun_targets(stun_urls: &[String], exclude: &[Ipv4Addr]) ->
             }
             continue;
         }
-        let s = url.trim();
-        let s = s
-            .strip_prefix("stun:")
-            .or_else(|| s.strip_prefix("stuns:"))
-            .or_else(|| s.strip_prefix("turn:"))
-            .or_else(|| s.strip_prefix("turns:"))
-            .unwrap_or(s);
-        let hostport = s.split(['?', '#']).next().unwrap_or(s);
-        if let Ok(addrs) = lookup_host(hostport).await {
-            for a in addrs.filter(SocketAddr::is_ipv4) {
-                if usable(&a) && !all.contains(&a) {
-                    all.push(a);
-                }
+        for a in lookup_host_cached(stun_hostport(url))
+            .await
+            .into_iter()
+            .filter(SocketAddr::is_ipv4)
+        {
+            if usable(&a) && !all.contains(&a) {
+                all.push(a);
             }
         }
     }
@@ -1384,19 +1441,13 @@ pub async fn resolve_stun_worker_ips(stun_urls: &[String]) -> Vec<std::net::IpAd
             }
             continue;
         }
-        let s = url.trim();
-        let s = s
-            .strip_prefix("stun:")
-            .or_else(|| s.strip_prefix("stuns:"))
-            .or_else(|| s.strip_prefix("turn:"))
-            .or_else(|| s.strip_prefix("turns:"))
-            .unwrap_or(s);
-        let hostport = s.split(['?', '#']).next().unwrap_or(s);
-        if let Ok(addrs) = lookup_host(hostport).await {
-            for a in addrs.filter(SocketAddr::is_ipv4) {
-                if !out.contains(&a.ip()) {
-                    out.push(a.ip());
-                }
+        for a in lookup_host_cached(stun_hostport(url))
+            .await
+            .into_iter()
+            .filter(SocketAddr::is_ipv4)
+        {
+            if !out.contains(&a.ip()) {
+                out.push(a.ip());
             }
         }
     }
@@ -2360,6 +2411,47 @@ mod tests {
         // IPv6 is out of scope (v4-only cascade).
         assert_eq!(parse_stun_url("stun:[2a01:4f8::2]:3478"), None);
         assert_eq!(parse_stun_url("garbage"), None);
+    }
+
+    /// FR-48 — `stun_hostport` is now the SINGLE scheme-stripper behind all
+    /// three `resolve_stun_*` fns and behind the DNS cache key. If it drifts,
+    /// every vantage resolver drifts with it and the cache keys stop matching
+    /// what is actually looked up, so lock the shape here.
+    #[test]
+    fn stun_hostport_strips_scheme_and_query_for_every_form() {
+        for url in [
+            "stun:coturn-us-east.roomler.ai:3478",
+            "stuns:coturn-us-east.roomler.ai:3478",
+            "turn:coturn-us-east.roomler.ai:3478",
+            "turns:coturn-us-east.roomler.ai:3478",
+            "turn:coturn-us-east.roomler.ai:3478?transport=udp",
+            "turns:coturn-us-east.roomler.ai:3478#frag",
+            "  stun:coturn-us-east.roomler.ai:3478  ",
+            "coturn-us-east.roomler.ai:3478",
+        ] {
+            assert_eq!(
+                stun_hostport(url),
+                "coturn-us-east.roomler.ai:3478",
+                "hostport for {url:?}"
+            );
+        }
+    }
+
+    /// The cache must NOT remember a failed lookup: a node that loses DNS for
+    /// one probe pass would otherwise stay vantage-less for a whole TTL.
+    #[tokio::test]
+    async fn a_failed_lookup_is_not_cached() {
+        // `.invalid` is reserved by RFC 2606 and never resolves.
+        let host = "fr48-cache-test.invalid:3478";
+        assert!(lookup_host_cached(host).await.is_empty());
+        let cached_anything = STUN_DNS_CACHE
+            .get()
+            .and_then(|c| c.lock().ok().map(|m| m.contains_key(host)))
+            .unwrap_or(false);
+        assert!(
+            !cached_anything,
+            "a failed resolution must not be inserted into the cache"
+        );
     }
 
     /// Minimal STUN Binding Success carrying an XOR-MAPPED-ADDRESS (IPv4), so
