@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 340" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-labelledby="cdp-t cdp-d">
+  <title id="cdp-t">The control plane coordinates; the data planes do not pass through it</title>
+  <desc id="cdp-d">The Roomler server exchanges only control messages with a browser and an agent. Video, input, mesh traffic, tunnels and SSH flow directly between the browser and the agent, or through a relay that carries only ciphertext. Conference media is the one exception and passes through the server.</desc>
+
+  <defs>
+    <marker id="cdp-arrow-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#009688"/>
+    </marker>
+    <marker id="cdp-arrow-coral" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#ef5350"/>
+    </marker>
+    <marker id="cdp-arrow-grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8a939c"/>
+    </marker>
+  </defs>
+
+  <!-- ── the server ─────────────────────────────────────────────── -->
+  <rect x="278" y="16" width="204" height="76" rx="10" fill="#ffffff" stroke="rgba(0,150,136,0.45)" stroke-width="1.5"/>
+  <rect x="278" y="16" width="204" height="26" rx="10" fill="rgba(0,150,136,0.12)"/>
+  <rect x="278" y="32" width="204" height="10" fill="rgba(0,150,136,0.12)"/>
+  <text x="380" y="34" font-size="12" font-weight="700" fill="#00796b" text-anchor="middle">Roomler server</text>
+  <text x="380" y="60" font-size="10.5" fill="rgba(26,26,46,0.72)" text-anchor="middle">accounts · permissions · device registry</text>
+  <text x="380" y="76" font-size="10.5" fill="rgba(26,26,46,0.72)" text-anchor="middle">signalling · coordination</text>
+  <text x="380" y="106" font-size="10" font-weight="700" fill="#009688" text-anchor="middle" letter-spacing="0.08em">CONTROL PLANE</text>
+
+  <!-- ── browser ────────────────────────────────────────────────── -->
+  <rect x="26" y="150" width="188" height="118" rx="9" fill="#ffffff" stroke="rgba(0,150,136,0.45)" stroke-width="1.5"/>
+  <rect x="26" y="150" width="188" height="18" rx="9" fill="rgba(0,150,136,0.12)"/>
+  <rect x="26" y="161" width="188" height="7" fill="rgba(0,150,136,0.12)"/>
+  <circle cx="39" cy="159" r="2.8" fill="#ef5350"/>
+  <circle cx="49" cy="159" r="2.8" fill="#ffb74d"/>
+  <circle cx="59" cy="159" r="2.8" fill="#4caf50"/>
+  <text x="72" y="162.5" font-size="7.5" fill="rgba(26,26,46,0.6)">roomler.ai</text>
+  <rect x="38" y="180" width="164" height="76" rx="5" fill="#e0f2f1" stroke="rgba(0,150,136,0.28)"/>
+  <rect x="48" y="190" width="66" height="7" rx="3.5" fill="rgba(0,121,107,0.35)"/>
+  <rect x="48" y="203" width="94" height="7" rx="3.5" fill="rgba(0,121,107,0.22)"/>
+  <rect x="48" y="216" width="78" height="7" rx="3.5" fill="rgba(0,121,107,0.22)"/>
+  <rect x="48" y="229" width="110" height="7" rx="3.5" fill="rgba(0,121,107,0.16)"/>
+  <text x="120" y="288" font-size="12" font-weight="700" fill="#1a1a2e" text-anchor="middle">Your browser</text>
+  <text x="120" y="304" font-size="10" fill="rgba(26,26,46,0.6)" text-anchor="middle">nothing installed</text>
+
+  <!-- ── agent ──────────────────────────────────────────────────── -->
+  <rect x="546" y="150" width="188" height="118" rx="9" fill="#ffffff" stroke="rgba(239,83,80,0.45)" stroke-width="1.5"/>
+  <rect x="546" y="150" width="188" height="18" rx="9" fill="rgba(239,83,80,0.10)"/>
+  <rect x="546" y="161" width="188" height="7" fill="rgba(239,83,80,0.10)"/>
+  <text x="640" y="162.5" font-size="7.5" fill="rgba(26,26,46,0.6)" text-anchor="middle">roomlerd</text>
+  <g font-size="9.5" fill="rgba(26,26,46,0.78)">
+    <rect x="558" y="180" width="164" height="17" rx="4" fill="#fff4f3" stroke="rgba(239,83,80,0.22)"/>
+    <text x="640" y="192" text-anchor="middle">remote-desktop target</text>
+    <rect x="558" y="200" width="164" height="17" rx="4" fill="#fff4f3" stroke="rgba(239,83,80,0.22)"/>
+    <text x="640" y="212" text-anchor="middle">mesh node</text>
+    <rect x="558" y="220" width="164" height="17" rx="4" fill="#fff4f3" stroke="rgba(239,83,80,0.22)"/>
+    <text x="640" y="232" text-anchor="middle">tunnel endpoint</text>
+    <rect x="558" y="240" width="164" height="17" rx="4" fill="#fff4f3" stroke="rgba(239,83,80,0.22)"/>
+    <text x="640" y="252" text-anchor="middle">SSH server</text>
+  </g>
+  <text x="640" y="288" font-size="12" font-weight="700" fill="#1a1a2e" text-anchor="middle">One agent per machine</text>
+  <text x="640" y="304" font-size="10" fill="rgba(26,26,46,0.6)" text-anchor="middle">not four services</text>
+
+  <!-- ── control links (thin, dashed) ───────────────────────────── -->
+  <path d="M214 176 C 250 176 250 60 274 56" fill="none" stroke="#8a939c" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cdp-arrow-grey)"/>
+  <path d="M546 176 C 510 176 510 60 486 56" fill="none" stroke="#8a939c" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cdp-arrow-grey)"/>
+  <text x="196" y="120" font-size="9.5" fill="#5b6570" text-anchor="middle">who are you,</text>
+  <text x="196" y="133" font-size="9.5" fill="#5b6570" text-anchor="middle">may you, where is it</text>
+  <text x="566" y="120" font-size="9.5" fill="#5b6570" text-anchor="middle">control connection</text>
+  <text x="566" y="133" font-size="9.5" fill="#5b6570" text-anchor="middle">(signalling only)</text>
+
+  <!-- ── data plane (thick, direct) ─────────────────────────────── -->
+  <path d="M222 212 L 538 212" fill="none" stroke="#009688" stroke-width="3.4" marker-start="url(#cdp-arrow-teal)" marker-end="url(#cdp-arrow-teal)"/>
+  <rect x="286" y="192" width="188" height="19" rx="9.5" fill="#e0f2f1" stroke="rgba(0,150,136,0.35)"/>
+  <text x="380" y="205.5" font-size="10" font-weight="700" fill="#00796b" text-anchor="middle">pixels · input · mesh · tunnels · SSH</text>
+  <text x="380" y="234" font-size="10.5" font-weight="700" fill="#009688" text-anchor="middle" letter-spacing="0.06em">DATA PLANE — PEER-TO-PEER, END-TO-END ENCRYPTED</text>
+  <text x="380" y="250" font-size="9.5" fill="rgba(26,26,46,0.6)" text-anchor="middle">falls back to a relay that carries only ciphertext</text>
+
+  <!-- ── the exception ──────────────────────────────────────────── -->
+  <rect x="242" y="300" width="276" height="30" rx="7" fill="#ffebee" stroke="rgba(239,83,80,0.35)"/>
+  <path d="M380 92 L 380 296" fill="none" stroke="#ef5350" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#cdp-arrow-coral)" opacity="0.75"/>
+  <text x="380" y="319" font-size="10" font-weight="700" fill="#c62828" text-anchor="middle">Exception: conference media passes through the server</text>
+</svg>
