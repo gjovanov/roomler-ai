@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 // Extracted from an inline <script> in rc-vp9-444-harness.html.
 //
 // The app's own CSP is `script-src 'self' https://purestat.ai` (see
