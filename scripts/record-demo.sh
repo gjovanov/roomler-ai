@@ -88,6 +88,25 @@ if ! curl -fsS -o /dev/null "$BASE_URL/health"; then
   exit 1
 fi
 
+# ⚠️ The demo's payoff is two pings SUCCEEDING on camera, and a stale target is
+# a wasted take that reports success: the spec types the command, the remote
+# terminal prints 100% loss, and every scene still comes back `ok`, because a
+# scene is "no exception and no hang", never "the content is right".
+#
+# Not hypothetical - the addresses were 100.64.0.{2,3} for the first take and
+# FR-47's block carving moved the demo org to 100.65.12.{2,3} with nothing
+# failing anywhere.
+#
+# The fix is in the SPEC, not here: it resolves each target from
+# GET /api/tenant/<tid>/overlay-node by node NAME at record time, so a renumber
+# cannot go unnoticed and an unresolvable name stops the take. Two things ruled
+# a check out at THIS layer, both worth writing down so they are not retried:
+#   - pinging from here refuses every valid run: this box drives a browser and
+#     is not on the demo mesh at all; the two machines ping each other, not us;
+#   - the spec cannot assert the ping's OUTPUT either, because the terminal is
+#     pixels inside a remote-desktop video stream - there is no text to read.
+# Override the node names with E2E_MAC_NODE / E2E_WIN_NODE if they are renamed.
+
 echo "[2/4] Recording…"
 cd "$UI_DIR"
 E2E_BASE_URL="$BASE_URL" \
@@ -96,6 +115,8 @@ E2E_PASSWORD="$ROOMLER_DEMO_PASS" \
 E2E_TENANT_ID="$ROOMLER_DEMO_TENANT" \
 E2E_AGENT_ID="${ROOMLER_DEMO_AGENT:-}" \
 E2E_AGENT_NAME="${ROOMLER_DEMO_AGENT_NAME:-}" \
+E2E_MAC_NODE="${E2E_MAC_NODE:-}" \
+E2E_WIN_NODE="${E2E_WIN_NODE:-}" \
   bunx playwright test e2e/video/record-demo.spec.ts \
     --config=playwright.video.config.ts --reporter=list
 RC=$?
