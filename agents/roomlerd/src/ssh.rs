@@ -77,6 +77,19 @@ use tracing::{debug, warn};
 /// the known candidate — is one field here, not another parameter cascade.
 #[derive(Clone)]
 pub struct SessionServices {
+    /// FR-55 — the activity counter, so a live SSH session holds the machine
+    /// awake for as long as it lasts. Threaded here for the same reason the
+    /// consent broker is: the server is built inside the overlay's TUN
+    /// factory, far from where the keeper lives, and "the session was cut by
+    /// an idle timer" must not be a state a server can be constructed into.
+    ///
+    /// `None` where no keeper exists, in which case nothing is held and
+    /// behaviour is unchanged.
+    ///
+    /// ⚠️ Named `power_activity`, not `activity`: that name is already taken
+    /// by the P8 [`ActivitySink`] which REPORTS what a session did. Two
+    /// different meanings under one name is a trap.
+    pub power_activity: Option<crate::power::ActivityCounter>,
     /// The operator-consent broker — the same instance the tray and the
     /// LocalAPI decide through, so an SSH prompt resolves from any of them.
     pub consent: crate::consent::ConsentBroker,
@@ -737,10 +750,24 @@ mod sshd {
         channel_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         /// Resize half of the live terminal.
         pty_handle: Option<crate::pty::PtyHandle>,
+        /// FR-55 — holds the machine awake for as long as this session lives.
+        ///
+        /// A field rather than a call pair, for the same reason `Drop` below
+        /// carries the activity report: a session ends in many ways and only
+        /// one of them is a path anyone would remember to annotate. Dropping
+        /// the handler is the event they all share, so the guard rides along
+        /// with it and cannot be leaked.
+        _awake: Option<crate::power::ActivityGuard>,
     }
 
     impl Handler {
         pub fn new(ctx: Arc<Ctx>, peer: std::net::SocketAddr) -> Self {
+            // Taken before `ctx` moves into the struct below.
+            let awake = ctx
+                .services
+                .power_activity
+                .as_ref()
+                .map(crate::power::ActivityGuard::new);
             Self {
                 ctx,
                 peer,
@@ -749,6 +776,7 @@ mod sshd {
                 pty_req: None,
                 channel_input: None,
                 pty_handle: None,
+                _awake: awake,
             }
         }
 
@@ -2173,6 +2201,9 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("roomler-ssh-consent-{nanos}"));
         super::SessionServices {
+            // FR-55 — tests hold nothing awake. `None` is the real production
+            // value anywhere no power keeper exists, not a stub.
+            power_activity: None,
             consent: crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
                 .expect("a temp sentinel dir"),
             indicator: crate::indicator::ViewerIndicator::disabled(),

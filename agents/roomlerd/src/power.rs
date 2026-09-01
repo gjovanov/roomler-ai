@@ -38,7 +38,7 @@
 //! the MacBook and the overlay already knows which peers share a LAN.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// How often the keeper re-reads the world. A poll rather than an event
@@ -114,6 +114,55 @@ pub fn should_stay_awake(i: Inputs) -> bool {
         PowerPolicy::Always => true,
         // Unknown power source behaves as "on battery": see `Inputs::on_ac`.
         PowerPolicy::OnAc => i.on_ac.unwrap_or(false),
+    }
+}
+
+/// Live work that must not be interrupted by an idle timer.
+///
+/// A COUNT, not a flag: two concurrent SSH sessions must not have the first one
+/// to end clear the second one's protection. Shared as an `Arc` because the
+/// things that hold it — an SSH handler, an `exec` run — are created all over
+/// the daemon and have no other reason to know about each other.
+pub type ActivityCounter = Arc<AtomicUsize>;
+
+pub fn new_activity_counter() -> ActivityCounter {
+    Arc::new(AtomicUsize::new(0))
+}
+
+/// The device-wide counter.
+///
+/// ⚠️ A process global, unlike the consent broker which this codebase
+/// deliberately un-globalised. The difference is what absence MEANS: a missing
+/// broker would have to fail one way or the other on a security question, so
+/// "no broker" had to be unrepresentable. A missing counter can only mean "the
+/// machine may sleep", which is the safe direction — and a machine has exactly
+/// ONE power state, so a per-connection instance would be wrong rather than
+/// merely inconvenient.
+pub fn shared_activity() -> &'static ActivityCounter {
+    static ACTIVITY: std::sync::OnceLock<ActivityCounter> = std::sync::OnceLock::new();
+    ACTIVITY.get_or_init(new_activity_counter)
+}
+
+/// Holds the machine awake for as long as it lives.
+///
+/// RAII rather than paired calls, for the reason `ssh::Handler`'s own `Drop`
+/// gives: a session ends in many ways — clean exit, the client vanishing, a
+/// deadline firing, a consent refusal — and only one of them is a path someone
+/// would remember to annotate. Dropping the guard is the event they all share,
+/// and a missed decrement would pin the machine awake until the daemon
+/// restarted.
+pub struct ActivityGuard(ActivityCounter);
+
+impl ActivityGuard {
+    pub fn new(counter: &ActivityCounter) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -206,22 +255,24 @@ impl Drop for PowerKeeper {
 pub async fn run(
     policy: PowerPolicy,
     sessions: Option<crate::rc_sessions::RcSessionRegistry>,
-    active_hint: Arc<AtomicBool>,
+    activity: ActivityCounter,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    if policy == PowerPolicy::Never && sessions.is_none() {
-        // Nothing to do and nothing to watch.
-        tracing::debug!("power: policy=never and no session registry; keeper idle");
-        return;
-    }
+    // NOTE: no early return for `Never`. That policy means "do not keep this
+    // machine awake FOR THE MESH" — a live session must still hold it, and
+    // returning here would have made `never` silently mean "let sessions die
+    // too". The keeper is cheap: one `load` and one platform call every 5 s.
     tracing::info!(policy = policy.as_str(), "power: keeper started (FR-55)");
     let mut keeper = PowerKeeper::new(policy);
     loop {
+        // Two independent sources, because they cover different work: the
+        // registry knows about rc sessions, and the counter about SSH sessions
+        // and `exec` runs, which have no row there.
         let session_active = sessions
             .as_ref()
             .map(|s| !s.list().is_empty())
             .unwrap_or(false)
-            || active_hint.load(Ordering::Relaxed);
+            || activity.load(Ordering::Relaxed) > 0;
         keeper.reconcile(session_active);
         tokio::select! {
             _ = tokio::time::sleep(POLL) => {}
@@ -599,5 +650,49 @@ mod tests {
         for p in [PowerPolicy::Never, PowerPolicy::OnAc, PowerPolicy::Always] {
             assert_eq!(PowerPolicy::parse(p.as_str()), p);
         }
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    /// A count, not a flag. Two overlapping sessions, the first ending, and the
+    /// machine must still be held — the bug a `bool` would have.
+    #[test]
+    fn overlapping_work_keeps_the_machine_held() {
+        let c = new_activity_counter();
+        assert_eq!(c.load(Ordering::Relaxed), 0);
+        let a = ActivityGuard::new(&c);
+        let b = ActivityGuard::new(&c);
+        assert_eq!(c.load(Ordering::Relaxed), 2);
+        drop(a);
+        assert_eq!(
+            c.load(Ordering::Relaxed),
+            1,
+            "one session ending must not release another's hold"
+        );
+        drop(b);
+        assert_eq!(c.load(Ordering::Relaxed), 0);
+    }
+
+    /// The guard must survive being moved into a struct that is dropped on an
+    /// unusual path — which is every path an SSH session actually takes.
+    #[test]
+    fn a_guard_released_by_unwinding_still_decrements() {
+        let c = new_activity_counter();
+        let res = std::panic::catch_unwind({
+            let c = c.clone();
+            move || {
+                let _g = ActivityGuard::new(&c);
+                panic!("session died the ugly way");
+            }
+        });
+        assert!(res.is_err());
+        assert_eq!(
+            c.load(Ordering::Relaxed),
+            0,
+            "a guard dropped by unwinding must still release"
+        );
     }
 }

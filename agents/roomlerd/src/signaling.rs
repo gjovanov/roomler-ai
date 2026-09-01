@@ -1115,6 +1115,7 @@ async fn connect_once(
         overlay_view_tx.clone(),
         derp_ticket_slot.clone(),
         crate::ssh::SessionServices {
+            power_activity: Some(crate::power::shared_activity().clone()),
             consent: consent_broker.clone(),
             indicator: indicator.clone(),
             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
@@ -1319,7 +1320,8 @@ async fn connect_once(
                         overlay_view_tx.clone(),
                         derp_ticket_slot.clone(),
                         crate::ssh::SessionServices {
-                            consent: consent_broker.clone(),
+                            power_activity: Some(crate::power::shared_activity().clone()),
+            consent: consent_broker.clone(),
                             indicator: indicator.clone(),
                             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
                         },
