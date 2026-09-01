@@ -248,6 +248,16 @@ enum Command {
     /// encode, transport and the browser. FR-36 needs it to field-verify a
     /// DRM/KMS backend on a host with no session at all.
     #[command(hide = true, name = "capture-smoke")]
+    /// Report whether Remote Apps can manage a desktop on THIS host, and list
+    /// what it sees — without opening a remote-control session.
+    ///
+    /// FR-56 P1. Exists for the same reason `capture-smoke` does: "does Remote
+    /// Apps work here" was previously answerable only by driving the feature
+    /// over a WebRTC data channel from a browser, which conflates the backend
+    /// with signalling, transport and the UI. It also makes the Wayland/X11
+    /// asymmetry inspectable on a host instead of inferred.
+    #[command(name = "apps-probe")]
+    AppsProbe,
     CaptureSmoke {
         /// How many frames to pull before reporting.
         #[arg(long, default_value_t = 10)]
@@ -1166,6 +1176,7 @@ async fn daemon_main() -> Result<()> {
             }
         }
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
+        Command::AppsProbe => apps_probe_cmd(),
         Command::CaptureSmoke {
             frames,
             dump,
@@ -4151,6 +4162,52 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
 /// right size, at the right rate, with perfect geometry — and completely wrong
 /// colours. Every counter here would be green for that frame. Only looking at
 /// the image catches it, which is how FR-36's 10-bit scanout was found.
+/// FR-56 P1 — answer "can Remote Apps manage a desktop here, and what does it
+/// see", on the host, with no session.
+fn apps_probe_cmd() -> anyhow::Result<()> {
+    use roomlerd::apps;
+
+    let supported = apps::apps_supported();
+    println!("apps supported: {supported}");
+    if !supported {
+        println!(
+            "  no manageable desktop found. Either apps are disabled in the config, or there \
+             is no X display: a virtual-desktop host sets one, and on a real session the \
+             compositor's Xwayland provides it. ⚠️ A Wayland compositor with NO Xwayland \
+             cannot be managed by this backend at all."
+        );
+        return Ok(());
+    }
+
+    let Some(be) = apps::backend() else {
+        println!("  supported, but no backend could be constructed (a race, or a config change)");
+        return Ok(());
+    };
+    match be.list() {
+        Ok(windows) => {
+            println!("windows: {}", windows.len());
+            for w in &windows {
+                let marks = match (&w.app_key, &w.session, w.focused) {
+                    (_, Some(t), _) => format!(" [tmux:{t}]"),
+                    (Some(k), _, _) => format!(" [app:{k}]"),
+                    _ => String::new(),
+                };
+                let focus = if w.focused { " *focused" } else { "" };
+                println!("  {:<12} {}{marks}{focus}", w.window_id, w.title);
+            }
+            if windows.is_empty() {
+                println!(
+                    "  (an EMPTY list is not the same as unsupported — the desktop answered \
+                     and has no windows. ⚠️ Native Wayland windows are invisible to this X11 \
+                     backend and would not appear here even if present.)"
+                );
+            }
+        }
+        Err(e) => println!("list failed: {e:#}"),
+    }
+    Ok(())
+}
+
 async fn capture_smoke_cmd(
     frames: u32,
     dump: Option<&str>,
