@@ -180,6 +180,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         portal_capture: None,
         portal_input: None,
         mutter_capture: None,
+        window_capture: None,
         x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
