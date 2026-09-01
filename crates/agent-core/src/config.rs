@@ -668,6 +668,11 @@ pub struct AgentConfig {
     /// prompts (and blocks or falls through if unanswered), regressing capture
     /// on hosts where capture-only works. On = the portal session can also be
     /// controlled; inert unless `portal_capture` is on. Restart required.
+    ///
+    /// ⚠️ Measured 2026-09-01: on GNOME this key is NOT sufficient on its own. The
+    /// consent dialog carries a SEPARATE "Allow Remote Interaction" switch
+    /// that is OFF by default, and a human who just clicks "Share" grants
+    /// capture only — the session then reports no input and runs view-only.
     #[serde(default)]
     pub portal_input: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
