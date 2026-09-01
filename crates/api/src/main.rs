@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
     let db = connect(&settings).await?;
 
     // Ensure indexes
-    ensure_indexes(&db).await?;
+    ensure_indexes(&db, settings.overlay.multi_block_enabled).await?;
 
     // Build app state (async: spawns mediasoup workers)
     let app_state = AppState::new(db.clone(), settings.clone()).await?;

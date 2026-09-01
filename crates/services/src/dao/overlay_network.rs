@@ -254,6 +254,66 @@ impl OverlayNetworkDao {
             .await
     }
 
+    /// FR-47 P5c — claim a host ordinal, **growing the address space** rather
+    /// than refusing when it is full.
+    ///
+    /// The ordinal space is the network's blocks concatenated in allocation
+    /// order, so appending a block at the tail adds ordinals above everything
+    /// already leased and moves nothing. That is what makes growth free: no
+    /// device changes address, no WS is cycled, no version floor applies —
+    /// none of the things that make a *renumber* disruptive.
+    ///
+    /// ⚠️ Only a network that already HAS a block can grow. A legacy network
+    /// on the shared `/10` is deliberately excluded: appending to it would be
+    /// its first registry row and would re-base its addresses, which is the
+    /// renumber endpoint's job. It also cannot need this — a `/10` holds 4.19
+    /// million ordinals.
+    ///
+    /// Returns the same `Validation` exhaustion error as
+    /// [`Self::allocate_host`] when growth is impossible, so the caller's
+    /// refusal path is unchanged.
+    pub async fn allocate_host_or_grow(&self, net: &OverlayNetwork, prefix: u8) -> DaoResult<u32> {
+        let Some(network_id) = net.id else {
+            return Err(DaoError::NotFound);
+        };
+        let blocks = self.block_list(net).await;
+        match self.allocate_host(network_id, blocks.capacity()).await {
+            Ok(h) => return Ok(h),
+            // Only exhaustion is worth growing for. A store fault must
+            // propagate: carving a block because Mongo hiccuped would spend a
+            // globally-unique range on a retryable error.
+            Err(DaoError::Validation(_)) => {}
+            Err(e) => return Err(e),
+        }
+
+        let assigned = self
+            .blocks
+            .find_assigned_for_network_ordered(network_id)
+            .await?;
+        if assigned.is_empty() {
+            // Legacy network — see the note above. Report exhaustion as-is.
+            return self.allocate_host(network_id, blocks.capacity()).await;
+        }
+        let seq = assigned.len() as u32;
+        let block = self
+            .blocks
+            .allocate(net.tenant_id, network_id, prefix, seq)
+            .await?;
+        tracing::warn!(
+            tenant_id = %net.tenant_id, %network_id, cidr = %block.cidr, seq,
+            alert = "overlay_block_grown",
+            "overlay blocks: address space GREW — the network filled its previous \
+             block(s) and was appended a new range; no existing device changed address"
+        );
+
+        // Re-read the space WITH the new block and allocate from the extended
+        // ceiling. Deliberately a fresh read rather than arithmetic on the old
+        // capacity: the registry is the authority on what this network holds,
+        // and a concurrent grow would make a computed ceiling wrong.
+        let grown = self.block_list(net).await;
+        self.allocate_host(network_id, grown.capacity()).await
+    }
+
     /// FR-19 gate 1 — set the tenant's peer-relay posture (`off` | `warn` |
     /// `on`). Same shape as [`Self::set_acl_mode`], including creating the
     /// row, so an admin can stage the posture before the first node joins.
