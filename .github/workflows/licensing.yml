@@ -23,6 +23,15 @@ on:
       - 'crates/**'
       - 'agents/**'
       - 'ui/src/**'
+      # ⚠️ `ui/public/**` is not decoration. `apply-spdx.sh` classifies every
+      # file that is not excluded, and `ui/public/` is not excluded — so it
+      # CHECKS this directory while, until now, nothing here made it RUN for
+      # one. That is how #1194 merged a headerless `rc-vp9-444-harness.js`:
+      # its PR touched only `ui/public/`, this job never fired, and master
+      # went red on the next push — failing every unrelated PR after it.
+      # A gate that cannot see the files it grades is worse than no gate,
+      # because it reports success.
+      - 'ui/public/**'
       - 'LICENSE*'
       - 'LICENSING.md'
   push:
