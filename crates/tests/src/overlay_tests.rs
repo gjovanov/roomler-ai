@@ -1707,3 +1707,121 @@ async fn a_networks_block_list_is_its_assigned_blocks_in_allocation_order() {
     assert_eq!(lbl.cidrs(), &[OverlayNetwork::DEFAULT_CIDR.to_string()]);
     assert_eq!(lbl.ordinal_for_ip("100.64.0.7"), Some(7));
 }
+
+/// FR-47 P5c — a network that fills its block is APPENDED another, and every
+/// address already leased is untouched.
+///
+/// This is the claim multi-block rests on, at the DAO level rather than the
+/// pure-model level `BlockList`'s own tests cover: growth must cost no device
+/// its address, which is what makes it free where a renumber is disruptive.
+#[tokio::test]
+async fn a_full_network_grows_instead_of_refusing_and_moves_no_address() {
+    // A /30-wide first block: 2 leasable ordinals, so exhaustion is 3 allocs
+    // away instead of 1023.
+    let app = TestApp::spawn_with_settings(|s| {
+        s.overlay.blocks_enabled = true;
+        s.overlay.block_prefix = 22;
+        s.overlay.multi_block_enabled = true;
+    })
+    .await;
+    let seeded = app.seed_tenant("ovgrow").await;
+    let dao = OverlayNetworkDao::new(&app.db).with_block_prefix(Some(22));
+    let net = dao.get_or_create(tid(&seeded.tenant_id)).await.unwrap();
+    let network_id = net.id.unwrap();
+    let first_cidr = net.cidr.clone();
+
+    // Fill the block right up to its ceiling by driving the cursor there.
+    dao.base
+        .update_one(
+            doc! { "_id": network_id },
+            doc! { "$set": { "next_host": 1023_i64 } },
+        )
+        .await
+        .unwrap();
+    let net = dao.base.find_by_id(network_id).await.unwrap();
+
+    // Before: one block, and ordinal 1 resolves inside it.
+    let before = dao.block_list(&net).await;
+    assert_eq!(before.cidrs().len(), 1);
+    let ip_1_before = before.ip_for_ordinal(1).unwrap();
+
+    // The allocation that would previously have been refused.
+    let host = dao
+        .allocate_host_or_grow(&net, 22)
+        .await
+        .expect("a full network must GROW, not refuse");
+    assert_eq!(
+        host, 1023,
+        "the next ordinal continues past the first block"
+    );
+
+    let net = dao.base.find_by_id(network_id).await.unwrap();
+    let after = dao.block_list(&net).await;
+    assert_eq!(after.cidrs().len(), 2, "a second block was appended");
+    assert_eq!(after.cidrs()[0], first_cidr, "the FIRST block did not move");
+
+    // The point of the whole design: nothing already leased changed address.
+    assert_eq!(
+        after.ip_for_ordinal(1).unwrap(),
+        ip_1_before,
+        "growth must not move an existing device's address"
+    );
+    for o in 1..=1022 {
+        assert_eq!(before.ip_for_ordinal(o), after.ip_for_ordinal(o));
+    }
+
+    // And the new ordinal lands in the SECOND block, round-tripping.
+    //
+    // Checked structurally with `overlay_host`, not by comparing address
+    // prefixes: `trim_end_matches` strips EVERY trailing occurrence, so
+    // "100.65.0.0" reduces to "100.65" and a prefix test then matches the
+    // second block too — which is how the first version of this assertion
+    // failed against perfectly correct behaviour.
+    use roomler_ai_remote_control::models::overlay_host;
+    let ip_new = after.ip_for_ordinal(host).unwrap();
+    assert!(
+        overlay_host(&first_cidr, &ip_new).is_none(),
+        "ordinal {host} ({ip_new}) must fall OUTSIDE the first block {first_cidr}"
+    );
+    assert!(
+        overlay_host(&after.cidrs()[1], &ip_new).is_some(),
+        "ordinal {host} ({ip_new}) must fall inside the appended block {}",
+        after.cidrs()[1]
+    );
+    assert_eq!(after.ordinal_for_ip(&ip_new), Some(host));
+}
+
+/// With the flag OFF a full network still REFUSES — the pre-P5c behaviour,
+/// which is what makes the flag a real kill switch rather than a label.
+#[tokio::test]
+async fn with_multi_block_off_a_full_network_still_refuses() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.overlay.blocks_enabled = true;
+        s.overlay.block_prefix = 22;
+        s.overlay.multi_block_enabled = false;
+    })
+    .await;
+    let seeded = app.seed_tenant("ovnogrow").await;
+    let dao = OverlayNetworkDao::new(&app.db).with_block_prefix(Some(22));
+    let net = dao.get_or_create(tid(&seeded.tenant_id)).await.unwrap();
+    let network_id = net.id.unwrap();
+    dao.base
+        .update_one(
+            doc! { "_id": network_id },
+            doc! { "$set": { "next_host": 1023_i64 } },
+        )
+        .await
+        .unwrap();
+
+    let err = dao
+        .allocate_host(network_id, 1022)
+        .await
+        .expect_err("a full block must refuse when growth is off");
+    assert!(matches!(&err, DaoError::Validation(m) if m.contains("exhausted")));
+    let net = dao.base.find_by_id(network_id).await.unwrap();
+    assert_eq!(
+        dao.block_list(&net).await.cidrs().len(),
+        1,
+        "no block may be appended with the flag off"
+    );
+}

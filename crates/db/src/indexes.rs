@@ -3,7 +3,23 @@
 use mongodb::{Database, IndexModel, options::IndexOptions};
 use tracing::info;
 
-pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> {
+/// Create every index the app relies on.
+///
+/// `multi_block` (FR-47 P5c) selects between two mutually exclusive schemas
+/// for `overlay_blocks`:
+///
+/// * `false` — the partial-unique index on `network_id` is created, enforcing
+///   **one assigned block per network**. This is the shipped default and the
+///   pre-P5c behaviour.
+/// * `true` — that index is **dropped** if present and never created, because
+///   it *is* the invariant multi-block removes.
+///
+/// ⚠️ Passing `true` is a one-way door in practice. Once a network holds two
+/// assigned blocks, going back to `false` cannot recreate the index — Mongo
+/// refuses it on the duplicate `network_id` — and the boot would fail loudly
+/// rather than silently run without the guard. That is the intended failure:
+/// a uniqueness guard that quietly gives up is worse than one that stops you.
+pub async fn ensure_indexes(db: &Database, multi_block: bool) -> Result<(), mongodb::error::Error> {
     // Tenants
     create_indexes(
         db,
@@ -320,21 +336,53 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     // `network_id` unique is scoped to ASSIGNED rows: a renumbered tenant
     // keeps its quarantined predecessors forever (they hold their slots out
     // of circulation), and only one of its blocks may be live at a time.
-    create_indexes(
-        db,
-        "overlay_blocks",
-        vec![
-            index_unique(bson::doc! { "slot": 1 }),
-            index_unique_partial(
-                bson::doc! { "network_id": 1 },
-                bson::doc! { "state": "assigned" },
-            ),
-            // The allocator's "highest end" probe — one indexed sort+limit.
-            index(bson::doc! { "end_slot": -1 }),
-            index(bson::doc! { "tenant_id": 1 }),
-        ],
-    )
-    .await?;
+    // FR-47 P5c — `slot` unique is what makes overlap unrepresentable and is
+    // ALWAYS present. The `network_id` partial-unique is the separate
+    // "one assigned block per network" rule, which multi-block removes.
+    let mut overlay_block_indexes = vec![
+        index_unique(bson::doc! { "slot": 1 }),
+        // The allocator's "highest end" probe — one indexed sort+limit.
+        index(bson::doc! { "end_slot": -1 }),
+        index(bson::doc! { "tenant_id": 1 }),
+        // Multi-block reads a network's blocks in allocation order.
+        index(bson::doc! { "network_id": 1, "seq": 1 }),
+    ];
+    if multi_block {
+        // Drop the guard rather than merely stop creating it: a deployment
+        // that ran single-block already HAS the index, and an existing index
+        // would refuse the second block with a duplicate key — which the
+        // allocator's retry loop would then misreport as "lost too many
+        // races" rather than as the schema problem it is.
+        //
+        // Two "nothing to drop" outcomes, and BOTH are normal — tolerating
+        // only one of them is a bug this cost a test run to find:
+        //
+        //   * IndexNotFound (27)     — the collection exists without the index
+        //     (a deployment that already ran with multi-block on).
+        //   * NamespaceNotFound (26) — the collection does not exist AT ALL,
+        //     which is every fresh database, including every test database.
+        //
+        // 26 is the one that is easy to miss, because it never happens on the
+        // deployment you are looking at while developing.
+        if let Err(e) = db
+            .collection::<bson::Document>("overlay_blocks")
+            .drop_index("network_id_1")
+            .await
+            && !matches!(
+                &*e.kind,
+                mongodb::error::ErrorKind::Command(c) if c.code == 27 || c.code == 26
+            )
+        {
+            return Err(e);
+        }
+        info!("overlay_blocks: multi-block schema — one-block-per-network guard removed");
+    } else {
+        overlay_block_indexes.push(index_unique_partial(
+            bson::doc! { "network_id": 1 },
+            bson::doc! { "state": "assigned" },
+        ));
+    }
+    create_indexes(db, "overlay_blocks", overlay_block_indexes).await?;
 
     // Overlay nodes — virtual-LAN membership above agents/tunnel_clients.
     //
