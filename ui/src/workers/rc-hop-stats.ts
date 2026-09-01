@@ -69,6 +69,82 @@ export class HopStats {
   }
 }
 
+/** FR-59 P3 — the largest per-frame drift the accumulator will believe, µs.
+ *  A pair astride an encoder rebuild, a resync or an idle gap can produce
+ *  an arbitrary delta in either direction; clamping keeps one such glitch
+ *  from deciding the whole window. */
+const DRIFT_CLAMP_US = 1_000_000
+/** Frame intervals longer than this are not a cadence — the stream paused,
+ *  or the timestamps were reset — so the pair is dropped rather than
+ *  clamped. */
+const DRIFT_MAX_INTERVAL_US = 5_000_000
+
+/** FR-59 P3 — how much the transit queue GREW over a window, in ms.
+ *
+ *  The measurement is `Σ(Δarrival − Δwire)`: how much longer the frames
+ *  took to *arrive* than they took to be *produced*. If the agent frames
+ *  every 33 ms and they land every 50 ms, the queue between them is
+ *  growing 17 ms per frame, and the sum over a window is how far the
+ *  viewer fell behind during it.
+ *
+ *  Why this and not the paint age (FR-15): both terms are DIFFERENCES of
+ *  timestamps from a single clock, so the unknown agent↔browser offset
+ *  cancels exactly. No `rc:clock` probe, no plausibility bound, nothing to
+ *  reject. That matters because on a jittery mobile link the probe is
+ *  biased by the very congestion it measures — field 2026-09-01 had the
+ *  age absent in 8 of 14 windows and 60 samples rejected as impossible,
+ *  in a session running 2.3–7.1 s behind.
+ *
+ *  It reports the DERIVATIVE, not the level: a positive number means the
+ *  queue is growing right now, which is what a latency-first controller
+ *  wants to act on — before the queue is seconds deep, and regardless of
+ *  how deep it already is. */
+export class QueueDrift {
+  private lastWireUs: number | null = null
+  private lastArrivalUs = 0
+  private driftUs = 0
+  private n = 0
+
+  /** One frame. `wireTsUs` is the agent-clock framing timestamp carried in
+   *  the frame header; `arrivalUs` is any consistent local clock — the
+   *  point in the pipeline does not matter, only that it is the same point
+   *  every frame, because a constant offset cancels in the delta. */
+  add(wireTsUs: number, arrivalUs: number): void {
+    if (!Number.isFinite(wireTsUs) || !Number.isFinite(arrivalUs)) return
+    const prevWire = this.lastWireUs
+    const prevArrival = this.lastArrivalUs
+    this.lastWireUs = wireTsUs
+    this.lastArrivalUs = arrivalUs
+    if (prevWire === null) return
+    const dWire = wireTsUs - prevWire
+    const dArrival = arrivalUs - prevArrival
+    // A non-advancing or absurd wire interval is a reset, not a cadence.
+    if (dWire <= 0 || dWire > DRIFT_MAX_INTERVAL_US) return
+    if (dArrival < 0 || dArrival > DRIFT_MAX_INTERVAL_US) return
+    const drift = dArrival - dWire
+    this.driftUs += Math.max(-DRIFT_CLAMP_US, Math.min(DRIFT_CLAMP_US, drift))
+    this.n++
+  }
+
+  /** Window total in ms, or `null` when fewer than two frames arrived —
+   *  which is "no signal", NOT a 0 ms drift. The agent must be able to
+   *  tell those apart: one says the queue is stable, the other says
+   *  nothing at all. */
+  snapshotAndReset(): number | null {
+    const ms = this.n > 0 ? Math.round(this.driftUs / 1000) : null
+    this.driftUs = 0
+    this.n = 0
+    return ms
+  }
+
+  /** Drop the cadence history without emitting — for a decoder reset,
+   *  where the next pair would straddle the discontinuity. */
+  reset(): void {
+    this.lastWireUs = null
+    this.lastArrivalUs = 0
+  }
+}
+
 /** Epoch-absolute milliseconds, comparable across window/worker contexts
  *  (each context's `performance.now()` is relative to its own
  *  `timeOrigin`; adding them re-bases onto the shared epoch). */

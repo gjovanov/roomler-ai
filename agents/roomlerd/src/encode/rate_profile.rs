@@ -323,12 +323,50 @@ pub fn constrained_queue_ms() -> u64 {
 /// [`constrained_queue_ms`] resolved against a link ceiling into a byte
 /// budget for the pump's backpressure gate. `0` ms disables the gate
 /// (`usize::MAX`).
+///
+/// FR-59 P2 — floored at [`CONSTRAINED_QUEUE_MIN_BYTES`] so a momentarily
+/// absurd reference rate cannot gate every single frame.
 pub fn constrained_queue_budget_bytes(ceiling_bps: u32) -> usize {
     let ms = constrained_queue_ms();
     if ms == 0 {
         return usize::MAX;
     }
-    ((ceiling_bps as u64).saturating_mul(ms) / 8000) as usize
+    (((ceiling_bps as u64).saturating_mul(ms) / 8000) as usize).max(CONSTRAINED_QUEUE_MIN_BYTES)
+}
+
+/// FR-59 P2 — the smallest constrained queue budget, one SCTP chunk. The
+/// gate compares whole FRAMES in flight, so a budget under one chunk
+/// would gate before anything could be in flight at all; this keeps the
+/// pump able to have one frame on the wire while still being, at
+/// 400 kbps, only ~330 ms of queue.
+pub const CONSTRAINED_QUEUE_MIN_BYTES: usize = 16 * 1024;
+
+/// FR-59 P2 — the reference rate [`constrained_queue_budget_bytes`] is
+/// denominated in.
+///
+/// The budget used to be resolved ONCE at pump start against
+/// `relay_max_bps()`, which makes "450 ms of queue" a claim about a
+/// nominal 3 Mbps band rather than about this session's pipe. Field
+/// 2026-09-01 (CORPLAP-3 → neo16 over a phone hotspot): 168 750 bytes of
+/// budget against a MEASURED 395 kbps link is **3.4 seconds** of standing
+/// queue, so `frames_dropped_backpressure` stayed 0 while viewer paint age
+/// ran 2.3–7.1 s.
+///
+/// A held measurement may only ever LOWER the reference — the same
+/// one-directional rule the measured CEILING clamp uses, and the reason
+/// this is safe to consume where the ceiling is not: an under-estimate
+/// makes the budget smaller, which sheds more and lowers latency, while
+/// an under-estimated ceiling collapses quality. `enabled` false returns
+/// the ceiling verbatim (the pre-FR-59 posture).
+pub fn constrained_queue_reference_bps(
+    ceiling_bps: u32,
+    measured_bps: Option<u32>,
+    enabled: bool,
+) -> u32 {
+    match measured_bps {
+        Some(g) if enabled && g > 0 => ceiling_bps.min(g),
+        _ => ceiling_bps,
+    }
 }
 
 /// HRD/VBV window for CONSTRAINED sessions, as a percent of `maxrate`.
@@ -1141,6 +1179,39 @@ mod tests {
         assert_eq!(apply_cq_bias(22, 0), 22);
     }
 
+    /// FR-59 P2 — the reference rate is one-directional: a measurement may
+    /// LOWER what the budget is denominated in, never raise it, and the
+    /// kill switch restores the nominal ceiling verbatim.
+    #[test]
+    fn constrained_queue_reference_only_ever_lowers() {
+        // The field case: a 3 Mbps nominal against a measured 395 kbps.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, Some(395_122), true),
+            395_122
+        );
+        // A measurement ABOVE the ceiling never widens the budget — the
+        // ceiling is still the rate the encoder is allowed to produce at.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, Some(9_000_000), true),
+            3_000_000
+        );
+        // No estimate held (early session, idle link) ⇒ nominal.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, None, true),
+            3_000_000
+        );
+        // A zero measurement is not evidence, it is the absence of it.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, Some(0), true),
+            3_000_000
+        );
+        // Kill switch: the pre-FR-59 posture, ignoring a real measurement.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, Some(395_122), false),
+            3_000_000
+        );
+    }
+
     #[test]
     fn constrained_queue_budget_resolves_ms_of_ceiling() {
         let _guard = crate::encode::RELAY_ENV_LOCK
@@ -1150,6 +1221,15 @@ mod tests {
         assert_eq!(constrained_queue_budget_bytes(3_000_000), 168_750);
         // Scales with the ceiling.
         assert_eq!(constrained_queue_budget_bytes(1_000_000), 56_250);
+        // FR-59 P2 — the field reference: 450 ms of a MEASURED 395 kbps
+        // pipe is 22,225 bytes, not the 168,750 the nominal band claimed.
+        assert_eq!(constrained_queue_budget_bytes(395_122), 22_225);
+        // …and an absurd reference stops at one SCTP chunk rather than
+        // gating before a single frame can be in flight.
+        assert_eq!(
+            constrained_queue_budget_bytes(50_000),
+            CONSTRAINED_QUEUE_MIN_BYTES
+        );
         // Default knobs (env-free): relief 4 softening steps; HRD default
         // 200 (rc.443 — a sub-1× window killed av1_qsv on its settle IDR,
         // see `constrained_hrd_pct`).

@@ -602,6 +602,31 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLERD_MEASURED_CEILING. Restart required.",
     ),
     (
+        "slow_link_floor",
+        "tribool",
+        "Slow-link floor relief (2026-09-01, FR-59 P1). Default ON: on a CONSTRAINED transport the AIMD legibility floor descends toward the session MEASURED drain rate instead of pinning at the flat 1.5 Mbps MIN_BITRATE_BPS. That flat floor is calibrated for the 2-9 Mbps band every measured relay sat in; on a slower link it is not a floor but a PIN, because it is also where the multiplicative decrease bottoms out - field 2026-09-01 measured a 395 kbps pipe met by a 1.5 Mbps floor, 3.8x over, with the excess landing as 2.3-7.1 s of viewer paint age. Evidence-gated: with no held goodput estimate the nominal floor stands, so a session that never measures is byte-for-byte unchanged. Never descends below slow_link_min_bitrate. false = flat floor (pre-FR-59). Env: ROOMLERD_SLOW_LINK_FLOOR. Restart required.",
+    ),
+    (
+        "slow_link_min_bitrate",
+        "number",
+        "Absolute stop for the FR-59 P1 floor relief, bps (50000-1500000). Empty = built-in 200000. Below roughly this a full-resolution frame is illegible at any QP, so the honest lever is fewer PIXELS rather than fewer bits; the relief exists to let the AIMD converge onto a slow pipe, not to chase it to zero. A value at or above the nominal 1.5 Mbps floor is inert by construction. Env: ROOMLERD_SLOW_LINK_MIN_BITRATE. Restart required.",
+    ),
+    (
+        "constrained_queue_measured",
+        "tribool",
+        "Constrained queue budget denominated in the MEASURED rate (2026-09-01, FR-59 P2). Default ON: the constrained send-queue byte budget is re-derived each iteration from the session measured drain rate instead of being resolved once against the nominal relay ceiling. A budget expressed in MILLISECONDS is a lie unless the bits-per-second it divides by is the pipe: constrained_queue_ms 450 against a nominal 3 Mbps is 168750 bytes, which on a measured 395 kbps link is 3.4 SECONDS of standing queue - and the gate never fired while the viewer sat seconds behind. A held measurement may only ever LOWER the reference. Note this consumes the same lumpy TURN-TCP estimate measured_ceiling deliberately refuses for the CEILING; the asymmetry is the point, since an under-estimate here shrinks the budget (more shedding, LOWER latency) where an under-estimated ceiling collapses quality. false = pre-FR-59. Env: ROOMLERD_CONSTRAINED_QUEUE_MEASURED. Restart required.",
+    ),
+    (
+        "seed_contradiction",
+        "tribool",
+        "Abandon a contradicted rate-memory seed (2026-09-01, FR-59 P6). Default ON: a held goodput measurement more than 2x below the FR-35 learned or seeded ceiling abandons it back to the nominal band. The rate memory keys on the nominated ICE pair remote address, which on a RELAYED session is the relay address rather than the viewer - so one fast day writes a number every later session through that relay inherits for the memory 7-day TTL, whatever network the client is on today (field 2026-09-01: a 5069353 bps seed opened a session on a hotspot measured at 395122 bps, 12.8x under it). Applies to an in-session learned ceiling too, since a measurement is evidence either way and re-climbing is something the learner already does. false = keep the seed until the AIMD walks it down. Env: ROOMLERD_SEED_CONTRADICTION. Restart required.",
+    ),
+    (
+        "viewer_rate_clamp",
+        "tribool",
+        "Viewer-reported link clamp (2026-09-01, FR-59 P3). Default ON: the VIEWER reports the bytes/s it actually received and how much its transit queue GREW this window, and on a constrained transport a sustained growing queue caps send-fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90% of the measured arrival rate. It exists because the agent structurally cannot see this: on a relayed path its own send channel reads empty (field 2026-09-01: bytes_inflight 1-4 KB, send_wait_max_ms 0.1 ms) while seconds of video sit in the relay and the carrier. Unlike the FR-15 age report it needs NO clock probe - a byte count is local and the queue drift is a difference of two intervals, so the unknown offset cancels - which matters because on exactly these links the age is absent or rejected in most windows. The arrival rate may bound the ceiling ONLY while the queue is growing, since otherwise it is merely whatever the agent happened to send. false = observe-and-report only. Env: ROOMLERD_VIEWER_RATE_CLAMP. Restart required.",
+    ),
+    (
         "area_min_bitrate",
         "tribool",
         "Area-scaled AIMD bitrate floor (2026-08-26). Default ON: the flat 1.5 Mbps floor was a 1080p legibility tuning and is unreadable mush at 5+ MPix; the scaled floor is ~3.1 Mbps at 2880x1800, capped 4 Mbps, unconstrained sessions only (a relay's 3 Mbps clamp keeps the flat floor so the MD keeps room). false = flat 1.5 Mbps floor. Env: ROOMLERD_AREA_MIN_BITRATE. Restart required.",
@@ -824,6 +849,11 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "direct_hrd_pct" => cfg.direct_hrd_pct.map(|p| p.to_string()),
         "area_min_bitrate" => cfg.area_min_bitrate.map(fmt_bool),
         "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
+        "slow_link_floor" => cfg.slow_link_floor.map(fmt_bool),
+        "slow_link_min_bitrate" => cfg.slow_link_min_bitrate.map(|p| p.to_string()),
+        "constrained_queue_measured" => cfg.constrained_queue_measured.map(fmt_bool),
+        "seed_contradiction" => cfg.seed_contradiction.map(fmt_bool),
+        "viewer_rate_clamp" => cfg.viewer_rate_clamp.map(fmt_bool),
         "bg_rebuild" => cfg.bg_rebuild.map(fmt_bool),
         "par_convert" => cfg.par_convert.map(fmt_bool),
         "fps_pace" => cfg.fps_pace.map(fmt_bool),
@@ -1226,6 +1256,13 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "direct_hrd_pct" => cfg.direct_hrd_pct = parse_u32_range(key, value, 25, 200)?,
         "area_min_bitrate" => cfg.area_min_bitrate = parse_tribool(value)?,
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
+        "slow_link_floor" => cfg.slow_link_floor = parse_tribool(value)?,
+        "slow_link_min_bitrate" => {
+            cfg.slow_link_min_bitrate = parse_u32_range(key, value, 50_000, 1_500_000)?
+        }
+        "constrained_queue_measured" => cfg.constrained_queue_measured = parse_tribool(value)?,
+        "seed_contradiction" => cfg.seed_contradiction = parse_tribool(value)?,
+        "viewer_rate_clamp" => cfg.viewer_rate_clamp = parse_tribool(value)?,
         "bg_rebuild" => cfg.bg_rebuild = parse_tribool(value)?,
         "par_convert" => cfg.par_convert = parse_tribool(value)?,
         "fps_pace" => cfg.fps_pace = parse_tribool(value)?,
