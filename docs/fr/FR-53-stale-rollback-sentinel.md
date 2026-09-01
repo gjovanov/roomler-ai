@@ -1,7 +1,7 @@
 # FR-53: A recovered device warns about a crash loop forever
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
-Status: **P0 — spec** (2026-09-01) · Found while shooting FR-41's demo: the
+**Issue:** [#1123](https://github.com/gjovanov/roomler-ai/issues/1123) ·
+Status: **P1 implemented; P2 needs a release** (2026-09-01) · Found while shooting FR-41's demo: the
 device on camera was displaying this.
 
 ## Goal
@@ -110,8 +110,8 @@ from *never* to *not while the accused version is the one running*.
 
 | # | Phase | Kill switch | Status |
 |---|-------|-------------|--------|
-| P1 | `Failed-version:` in the sentinel + version-aware clear (incl. the legacy arm) | the sentinel is advisory UI; reverting restores today's never-clear behaviour | planned |
-| P2 | Field-verify on the device that showed it | n/a | planned |
+| P1 | `Failed-version:` in the sentinel + version-aware clear (incl. the legacy arm) | the sentinel is advisory UI; reverting restores today's never-clear behaviour | **shipped** |
+| P2 | Field-verify on the device that showed it | n/a | **blocked on a release** — the fix has to be running on that Mac before its sentinel can clear |
 
 ## Acceptance criteria
 
@@ -147,5 +147,36 @@ from *never* to *not while the accused version is the one running*.
   machinery guarding a message.
 
 ## Field-verification log
+### 2026-09-01 — implemented, and the one thing it cannot prove yet
 
-_(appended as it happens)_
+P1 is in and locked by 13 unit tests, five of them new. The decision is
+extracted as `should_clear_on_healthy_connect` because
+`clear_attention_on_healthy_connect_from` walks `all_attention_paths()`,
+which resolves REAL profile directories — a test of the loop would write to
+the developer's own sentinel.
+
+**The lock is falsifiable.** Restoring the old `return false` for
+`rollback_failed` makes
+`a_rollback_sentinel_clears_only_when_the_accused_build_is_gone` fail. Checked
+by making the edit, not by reading the assertion.
+
+⚠️ **A stale build artifact briefly showed that same test failing after the
+source was restored.** Worth knowing: `cargo test` reused the binary compiled
+from the reverted file, so a green source read red. `touch` on the file fixed
+it. A failing test immediately after an edit-revert cycle deserves a rebuild
+before it is believed.
+
+### What P2 must actually check, and why it is not a formality
+
+The clear runs in whichever process owns the sentinel path:
+`project_dirs()` resolves the CALLING process's home, and
+`machine_attention_path()` is `None` off Windows. So on the macOS host that
+prompted this, the file at `/Users/<user>/Library/Application Support/…` can
+only be removed by the user-context agent, not by the root daemon.
+
+That agent does hold its own server link — its Overview panel reports
+`Server link: connected` — so it should reach the clear on its next healthy
+connect once it is running a build with this change. **Should**, from
+reading; the point of P2 is to look rather than to assume, because the
+FR-43 split enrollment is actively changing which process connects.
+
