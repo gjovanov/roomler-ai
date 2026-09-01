@@ -167,6 +167,26 @@ impl EnrollmentKeyDao {
             .await
     }
 
+    /// P4 — stamp the device's use-row with its removal, closing the
+    /// lifecycle record (born → removed) in the one place that survives the
+    /// hard delete. Keyed by `agent_id`: ObjectIds are unique across the
+    /// deployment, so a device has at most one birth row. Best-effort like
+    /// [`Self::record_use`] — `false` (no matching row) is a device that was
+    /// never key-minted (DAO-marked in tests, or pre-P2), and that is fine.
+    pub async fn record_removal(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        reason: &str,
+    ) -> DaoResult<bool> {
+        self.uses
+            .update_one(
+                doc! { "tenant_id": tenant_id, "agent_id": agent_id, "removed_at": null },
+                doc! { "$set": { "removed_at": DateTime::now(), "removal": reason } },
+            )
+            .await
+    }
+
     /// Control 4 — one audit row per successful use. Best-effort in the
     /// caller (a failed insert is logged, never a refused enrollment: the
     /// atomic claim is the ENFORCEMENT, this row is the RECORD).
@@ -187,6 +207,9 @@ impl EnrollmentKeyDao {
                 machine_id: machine_id.to_string(),
                 machine_name: machine_name.to_string(),
                 created_at: DateTime::now(),
+                // Born now; `record_removal` closes the lifecycle later.
+                removed_at: None,
+                removal: None,
             })
             .await
     }

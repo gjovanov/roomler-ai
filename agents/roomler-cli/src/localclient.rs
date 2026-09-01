@@ -1232,6 +1232,10 @@ fn print_status(s: &NodeStatus) {
     println!("  node id     {}", short_id(&s.node_id));
     println!("  version     {}", s.version);
     println!("  mode        {mode}");
+    // FR-51 — only when true: a permanent device's output stays byte-stable.
+    if s.ephemeral {
+        println!("  ephemeral   yes — removes itself after inactivity, or on clean stop");
+    }
     println!("  tenant      {}", opt(s.tenant_id.as_deref()));
     println!("  overlay ip  {}", opt(s.overlay_ip.as_deref()));
     println!("  overlay ip6 {}", opt(s.overlay_ip6.as_deref()));

@@ -435,6 +435,33 @@ async fn self_unenroll_removes_ephemeral_and_refuses_permanent() {
         "ephemeral row hard-deleted by self-unenroll"
     );
 
+    // P4 — the birth row now carries the whole lifecycle: the use-trail
+    // (which survives the hard delete) says when and by which path the
+    // device left.
+    let uses: Value = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/agent/enroll-key/{}/uses",
+                t.tenant_id,
+                minted["id"].as_str().unwrap()
+            ),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = uses["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|u| u["agent_id"] == json!(eph_id))
+        .expect("the reaped device's birth row survives");
+    assert_eq!(row["removal"], json!("ephemeral_self_unenroll"));
+    assert!(row["removed_at"].as_str().is_some_and(|s| !s.is_empty()));
+
     // Second call: the row is gone, so the extractor refuses — 401, the
     // status the agent deliberately reads as success ("already gone").
     let resp = app
