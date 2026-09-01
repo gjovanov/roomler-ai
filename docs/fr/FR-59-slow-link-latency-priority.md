@@ -109,7 +109,38 @@ Aside, and load-bearing for P6: FR-35's rate memory keys on `nominated_remote_ip
 | **P3** | A signal that can't be fooled | Viewer reports `rx_bps` + queue **growth**, the latter as `Σ(Δarrival − Δwire)` — a difference of intervals, so the clock offset cancels and no probe is needed. Sustained growth caps fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90 % of the arrival rate | `ROOMLERD_VIEWER_RATE_CLAMP=0` | **implemented** (#1169) |
 | **P4** | Drain, don't wait | P3's drift INTEGRATED into a depth estimate; past `DRAIN_THRESHOLD_MS` the pump stops producing for a bounded sub-second pause | `ROOMLERD_QUEUE_DRAIN=0` | **implemented** (#1169) |
 | **P5** | Slow-link profile, engaged once | Below a measured threshold: resolution + fps capped **at pump start** (never as a mid-session rung — that is why `PRIORITY_RES_CAP` is off by default: an 865 ms blocking QSV rebuild), with a viewer badge | `ROOMLERD_SLOW_LINK_PROFILE=0` | planned |
-| **P7** | Unordered video on constrained | Default FR-17 stage B on when constrained; needs the loss-tolerant assembler (FR-17 stage C) — a frame missing any chunk is dropped and an IDR requested | existing `roomler-rc-unordered-video` | planned |
+| **P7** | Unordered video — the reorder buffer | **FR-17 stage C**: chunks assemble into slots in ANY order and the frame emits whole; a frame overtaken by a newer completed one is abandoned with a gap (→ IDR); partials bounded at 3 | existing `roomler-rc-unordered-video` | **buffer implemented** (#1169); **default flip deliberately NOT taken — see below** |
+
+## P7 — why the default flip is not in this PR
+
+The reorder buffer (FR-17 stage C) is done, and it is the half that was
+*blocking*: with the strict in-order assembler, turning `{ordered:false}` on made
+things **worse**, because chunk 2 arriving before chunk 1 is the common case on an
+unordered channel and every such frame read as a break — a keyframe request per
+frame, on the thinnest pipe. So the existing opt-in was, in practice, unusable.
+It now works, which is what makes a field test of the flip possible at all.
+
+The flip itself is deliberately still opt-in
+(`localStorage['roomler-rc-unordered-video'] = '1'`), for three reasons:
+
+1. **It cannot be scoped to slow links.** A DataChannel's ordering is fixed at
+   creation, before ICE nominates a pair, so neither side knows yet whether the
+   path will be constrained — FR-17 already recorded "constrained-only" as
+   un-implementable for exactly this reason. Flipping the default means flipping
+   it for every session, direct included.
+2. **This FR's own AC4 is still outstanding.** Changing the transport for the
+   whole fleet on the strength of unit tests is the "CI green ≠ done" mistake this
+   repo has a standing rule against.
+3. **The failure mode is silent-ish.** An unordered channel that mis-assembles
+   does not error; it produces a keyframe storm, which on a slow link looks like
+   the very problem this FR is fixing.
+
+**The flip is one line** — `useRemoteControl.ts`'s `storedUnorderedVideo()` default
+— and the criterion for taking it: an airport-class session with the opt-in ON
+showing `chunkStragglers` climbing while `chunkGaps` stays flat and fps holds
+(stragglers rising with steady fps is the transport working; gaps rising is real
+loss costing an IDR each — FR-18's lesson that a counter nothing reads is not
+evidence is why both are already in the stats).
 
 ## Acceptance criteria
 
