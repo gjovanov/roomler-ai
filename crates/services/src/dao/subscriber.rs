@@ -186,4 +186,75 @@ impl SubscriberDao {
             )
             .await
     }
+
+    /// Whether this address is currently subscribed (confirmed, not
+    /// withdrawn). Read path — so it normalizes, like every read path must.
+    pub async fn is_subscribed(&self, email: &str) -> DaoResult<bool> {
+        let email = Subscriber::normalize_email(email);
+        Ok(self
+            .base
+            .find_one(doc! { "email": &email, "confirmed": true, "unsubscribed_at": null })
+            .await?
+            .is_some())
+    }
+
+    /// FR-58 — the signed-in toggle. The caller has already proven ownership
+    /// of `email` (a VERIFIED account address), so subscribing here is
+    /// pre-confirmed — no confirmation mail, no oracle concerns (the caller
+    /// is asking about their own address). Unsubscribing stamps the row like
+    /// every other withdrawal; re-toggling on is fresh consent and flips it
+    /// straight back to confirmed for the same ownership reason.
+    pub async fn set_account_subscription(&self, email: &str, subscribed: bool) -> DaoResult<bool> {
+        let email = Subscriber::normalize_email(email);
+        let existing = self.base.find_one(doc! { "email": &email }).await?;
+        match (existing, subscribed) {
+            (None, false) => Ok(false),
+            (None, true) => {
+                let sub = Subscriber {
+                    id: None,
+                    email,
+                    source: "account".to_string(),
+                    confirmed: true,
+                    confirm_token: None,
+                    confirm_sent_at: None,
+                    unsubscribe_token: random_token(),
+                    created_at: DateTime::now(),
+                    confirmed_at: Some(DateTime::now()),
+                    unsubscribed_at: None,
+                };
+                self.base.insert_one(&sub).await?;
+                Ok(true)
+            }
+            (Some(row), true) => {
+                let id = row.id.expect("stored subscriber has an id");
+                self.base
+                    .update_by_id(
+                        id,
+                        doc! {
+                            "$set": {
+                                "confirmed": true,
+                                "confirmed_at": DateTime::now(),
+                                "source": "account",
+                            },
+                            "$unset": { "unsubscribed_at": "", "confirm_token": "" },
+                        },
+                    )
+                    .await?;
+                Ok(true)
+            }
+            (Some(row), false) => {
+                let id = row.id.expect("stored subscriber has an id");
+                self.base
+                    .update_by_id(
+                        id,
+                        doc! {
+                            "$set": { "confirmed": false, "unsubscribed_at": DateTime::now() },
+                            "$unset": { "confirm_token": "" },
+                        },
+                    )
+                    .await?;
+                Ok(false)
+            }
+        }
+    }
 }
