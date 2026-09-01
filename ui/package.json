@@ -6,7 +6,8 @@
   "license": "AGPL-3.0-only",
   "scripts": {
     "dev": "vite",
-    "build": "vue-tsc --noEmit && vite build",
+    "build": "vue-tsc --noEmit && vite build && bun docs/build.ts",
+    "docs:build": "bun docs/build.ts",
     "preview": "vite preview",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest",
