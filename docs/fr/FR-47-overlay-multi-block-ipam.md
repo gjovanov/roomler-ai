@@ -181,15 +181,21 @@ leak is purely historical or still active.
 
 ## 4. Phases
 
-| # | Phase | Kill switch |
-|---|---|---|
-| **P0** | Spec + ledger row + issue | — |
-| **P1** | Carving on by default; configmap key; carve-failure alert + `headroom` threshold | `overlay.blocks_enabled` |
-| **P2** | `OverlayJoinRefused` frame; agent surfaces it; per-network utilization in `GET …/overlay-block` | additive; frame is ignorable |
-| **P3** | `reconcile-hosts` admin route | dry-run default |
-| **P4** | Migrate `demo` (5 nodes); clean up the orphaned network — see §1d | existing renumber runbook |
-| **P5** | Multi-block per org (a–e) | `overlay.multi_block_enabled`, default off |
-| **P6** | Docs: `multi-org.md` §4/§10/§11/§12, `data-model.md` | — |
+| # | Phase | State | Kill switch |
+|---|---|---|---|
+| **P0** | Spec + ledger row + issue | ✅ shipped | — |
+| **P1** | Carving on by default; configmap key; carve-failure alert + `headroom` threshold | ✅ shipped + **field-verified** | `overlay.blocks_enabled` |
+| **P2** | `OverlayJoinRefused` frame | ✅ shipped — daemon log only; the `roomler status` surface is **not built** | additive; frame is ignorable |
+| **P3** | `reconcile-hosts` admin route | ✅ shipped + **run against prod** (17 ordinals reclaimed) | dry-run default |
+| **P4** | Migrate `demo`; clean up the orphaned network | ✅ done — the legacy `/10` holds no live node | existing renumber runbook |
+| **P5a** | `BlockList` — the ordinal↔address model | ✅ shipped | — |
+| **P5b** | Block list ordered by an explicit `seq` | ✅ shipped | — |
+| **P5c** | A full network grows instead of refusing | ✅ shipped, **dark** | `overlay.multi_block_enabled`, default off |
+| **P5d** | The wire: `cidrs` + per-recipient `cidr` | ⬜ not started | — |
+| **P5e** | `plan_renumber` N→M; union scope for RPF and NAT | ⬜ not started | — |
+| **P6** | Docs | 🟡 partial — `multi-org.md` §4.2 updated in P1 | — |
+
+⚠️ **P5d is the riskiest remaining piece and is deliberately unstarted.** It changes what an existing wire field *means* (per-recipient rather than per-network), and a mistake there mis-sizes the TUN netmask fleet-wide. Its compatibility claim — that a pre-P5 agent meshes correctly against a multi-block org — has to be tested against a **real old binary**, not just a pinned decoder. There is also no pressure: the largest org in production holds 17 devices against a 1 022 ceiling, so multi-block is capability built ahead of need.
 
 ## 5. Acceptance criteria
 
@@ -225,3 +231,27 @@ leak is purely historical or still active.
 | date | version | what was verified | result |
 |---|---|---|---|
 | 2026-08-31 | prod | Carving off; 2 of 4 networks on the shared `/10` with overlapping addresses; ~17 orphaned ordinals in the oldest carved org | recorded in §1 |
+
+### The state this FR opened on, and the state now
+
+| | before | after |
+|---|---|---|
+| networks on the shared `100.64.0.0/10` | **2, holding overlapping addresses** | **0** |
+| live nodes on `100.64.x` | 7 | **0** |
+| orgs with a disjoint block | 2 (both hand-migrated) | **all of them** |
+| carving for a new org | off; nobody opted in | **on by default, field-proven** |
+| leaked host ordinals in the oldest org | ~17, unreachable | **0** |
+
+`mbb-mars` and `macbook-pro` both held `100.64.0.1`. That is gone, and so is the
+mechanism that allowed it.
+
+Two bugs the work surfaced that were not in the original plan, both fixed:
+
+- **A tenant row can be deleted outside the owner-only `archive` path**, leaving
+  its overlay network, nodes and agents behind — that orphan is what produced
+  one of the two overlapping networks. The instance is cleaned up; the CAUSE is
+  not, and deserves its own FR.
+- **`ensure_indexes` tolerated only `IndexNotFound` (27)** when dropping the
+  one-block guard, not `NamespaceNotFound` (26). 26 is every fresh database, so
+  multi-block would have worked on every environment it was developed against
+  and broken the first clean production install.
