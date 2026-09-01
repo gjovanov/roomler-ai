@@ -1,5 +1,7 @@
 # FR-37 — The e2e suite runs outside the cluster, so it cannot test media (and keeps breaking on the seam)
 
+> **CLOSED 2026-08-29** — issue #928 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
+
 **Issue:** [#928](https://github.com/gjovanov/roomler-ai/issues/928)
 > **Renumbered from FR-36.** #929 (Wayland capture) landed that number on
 > master first, and the shared ledger caught the clash **in the rebase —
