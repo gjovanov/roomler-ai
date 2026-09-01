@@ -12,6 +12,10 @@
       <v-btn variant="text" href="#features" class="d-none d-sm-inline-flex">Features</v-btn>
       <v-btn variant="text" href="#download" class="d-none d-sm-inline-flex">Download</v-btn>
       <v-btn variant="text" href="#pricing" class="d-none d-sm-inline-flex">Pricing</v-btn>
+      <!-- FR-58: `href`, not `:to` — /docs is statically generated HTML served
+           by nginx, not a route in this SPA's router. A router-link would
+           resolve to the 404 view. -->
+      <v-btn variant="text" href="/docs/" class="d-none d-md-inline-flex">Docs</v-btn>
       <v-btn variant="outlined" color="primary" :to="{ name: 'login' }" class="mx-2">Log In</v-btn>
       <v-btn color="primary" :to="{ name: 'register' }" class="d-none d-sm-inline-flex">Get Started Free</v-btn>
       <v-btn color="primary" :to="{ name: 'register' }" class="d-sm-none" size="small">Sign Up</v-btn>
@@ -163,12 +167,14 @@
             <a href="#features" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Features</a>
             <a href="#download" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Download</a>
             <a href="#pricing" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Pricing</a>
+            <a href="/docs/" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Documentation</a>
           </v-col>
           <v-col cols="6" sm="2">
             <div class="text-subtitle-2 font-weight-bold mb-2">Install</div>
-            <a href="/api/setup/windows" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Windows</a>
-            <a href="/api/setup/macos" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">macOS</a>
-            <a href="/api/setup/linux" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Linux</a>
+            <a href="/docs/start/install/windows/" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Windows</a>
+            <a href="/docs/start/install/macos/" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">macOS</a>
+            <a href="/docs/start/install/linux/" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Linux</a>
+            <a href="/docs/start/self-hosting/" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Self-hosting</a>
           </v-col>
           <v-col cols="12" sm="4">
             <div class="text-subtitle-2 font-weight-bold mb-2">Legal</div>
