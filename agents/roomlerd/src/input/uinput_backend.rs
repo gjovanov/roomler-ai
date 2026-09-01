@@ -42,7 +42,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use super::hid_evdev::{KEYMAP, hid_to_evdev};
-use super::{Button, InputInjector, InputMsg, WheelMode};
+use super::{InputInjector, InputMsg, WheelMode, button_code};
 
 const UINPUT_PATH: &str = "/dev/uinput";
 
@@ -353,16 +353,6 @@ fn ck(rc: libc::c_int, what: &str) -> Result<()> {
         bail!("uinput {what}: {}", std::io::Error::last_os_error());
     }
     Ok(())
-}
-
-fn button_code(b: Button) -> u16 {
-    match b {
-        Button::Left => BTN_LEFT,
-        Button::Right => BTN_RIGHT,
-        Button::Middle => BTN_MIDDLE,
-        Button::Back => BTN_SIDE,
-        Button::Forward => BTN_EXTRA,
-    }
 }
 
 impl InputInjector for UinputInjector {
