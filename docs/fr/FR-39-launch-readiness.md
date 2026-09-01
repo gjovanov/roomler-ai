@@ -1,5 +1,7 @@
 # FR-39: The product is unfindable — repository metadata, README, comparison docs, and a way for a visitor to stay in touch
 
+> **CLOSED 2026-09-01** — issue #951 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
+
 Status: **P1–P6 implemented; field-verification pending** (2026-08-29). Tracking issue: `FR-39` (#951).
 Spec on master up front; the work is known and mostly mechanical.
 
