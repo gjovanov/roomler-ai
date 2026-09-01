@@ -2980,12 +2980,42 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     // needs no separate branch.
     #[cfg(target_os = "macos")]
     let delegate_host = roomlerd::delegate::DelegateHost::new();
-    // Only macOS has a GUI worker to delegate to; everywhere else this is
-    // `None` and the delegation branch in `handle_server_msg` is unreachable.
-    #[cfg(target_os = "macos")]
-    let delegate_for_signaling = Some(delegate_host.clone());
-    #[cfg(not(target_os = "macos"))]
-    let delegate_for_signaling: Option<roomlerd::delegate::DelegateHost> = None;
+
+    // FR-43 P2b-2 — which side of delegation this process is on. A process is
+    // the supervising DAEMON or the supervised WORKER, never both, so this is
+    // one value and the third case ("neither") is the ordinary one.
+    //
+    // `--supervised` is the discriminator, and it is the SAME flag the worker
+    // uses to look for its attach secret on stdin: a process that was told it
+    // is supervised is the worker, and anything else on macOS is the daemon.
+    #[cfg(unix)]
+    let (delegation_role, worker_channels) = if supervised {
+        // Two ordinary channels rather than the socket: the socket outlives a
+        // WS reconnect and the signalling loop does not.
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel(64);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
+        (
+            roomlerd::delegate::Delegation::Worker(roomlerd::delegate::WorkerLink {
+                inbound: in_rx,
+                outbound: out_tx,
+            }),
+            Some((in_tx, out_rx)),
+        )
+    } else {
+        #[cfg(target_os = "macos")]
+        {
+            (
+                roomlerd::delegate::Delegation::Daemon(delegate_host.clone()),
+                None,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            (roomlerd::delegate::Delegation::Off, None)
+        }
+    };
+    #[cfg(not(unix))]
+    let delegation_role = roomlerd::delegate::Delegation::Off;
 
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(
@@ -3068,6 +3098,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     // Same: exits on the shutdown watch, so no abort.
     let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(
         supervised,
+        worker_channels,
         shutdown_rx.clone(),
     ));
     #[cfg(not(unix))]
@@ -3128,7 +3159,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                     org_ctx,
                     // FR-43 P2b — secondary orgs never drive the host-global
                     // GUI worker (see `handle_server_msg`'s primary gate).
-                    None,
+                    roomlerd::delegate::Delegation::Off,
                     org_cfg,
                     encoder_preference,
                     rx,
@@ -3292,7 +3323,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                         match signaling::run(
                             org_ctx,
                             // Secondary org — see above.
-                            None,
+                            roomlerd::delegate::Delegation::Off,
                             org_cfg,
                             enc,
                             rx,
@@ -3361,8 +3392,8 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
             signaling::run(
                 primary_ctx,
                 // FR-43 P2b — the PRIMARY loop is the only one that may hand a
-                // session to the GUI worker.
-                delegate_for_signaling,
+                // session to the GUI worker, and the only one a worker serves.
+                delegation_role,
                 cfg,
                 encoder_preference,
                 rx,

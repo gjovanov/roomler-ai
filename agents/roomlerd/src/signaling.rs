@@ -444,13 +444,12 @@ pub async fn run(
     // for the config's scalar identity; `run_cmd` synthesizes a per-org
     // `AgentConfig` via `AgentConfig::for_org` for secondaries).
     ctx: OrgCtx,
-    // FR-43 P2b — the macOS GUI-worker delegation channel. Owned so the
-    // reconnect loop can lend it per attempt; `None` on every platform and
-    // configuration that does not supervise a worker. Only the PRIMARY org's
-    // loop ever uses it (`handle_server_msg` gates on `ctx.is_primary`), but it
-    // is passed to all of them so the gate lives in one place rather than at
-    // three call sites that could each forget it.
-    delegate: Option<crate::delegate::DelegateHost>,
+    // FR-43 P2b — this process's part in delegation. Owned so the reconnect
+    // loop can lend it per attempt. Only the PRIMARY org's loop ever acts on it
+    // (`handle_server_msg` gates on `ctx.is_primary`), but it is passed to all
+    // of them so the gate lives in one place rather than at three call sites
+    // that could each forget it.
+    mut delegation: crate::delegate::Delegation,
     // `mut` for exactly one reason: FR-40 key rotation swaps the overlay
     // secret in this snapshot between two connections (see
     // `ConnectError::KeyRotated`). Nothing else writes it after start.
@@ -577,7 +576,7 @@ pub async fn run(
             derp_ticket_slot.clone(),
             tunnel_hub.clone(),
             &mut slowness_cycles,
-            delegate.as_ref(),
+            &mut delegation,
             &mut kill_rx,
             &mut consent_rx,
         )
@@ -947,9 +946,9 @@ async fn connect_once(
     // lives in `run`'s loop so it spans reconnects; reset on a clean close
     // and on a netstate Major (new network = new regime).
     slowness_cycles: &mut u32,
-    // FR-43 P2b — the macOS GUI-worker channel when one is attached. `None`
-    // everywhere else, and the delegation branch is then unreachable.
-    delegate: Option<&crate::delegate::DelegateHost>,
+    // FR-43 P2b — this process's part in delegation: the daemon's channel, the
+    // worker's two ends, or neither.
+    delegation: &mut crate::delegate::Delegation,
     // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
     // (not owned) so the same receiver survives across reconnects.
     kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
@@ -1083,11 +1082,21 @@ async fn connect_once(
     // up is dropped rather than queued, because a session without a control
     // plane is a session the server has already forgotten — queueing it would
     // deliver an answer to a question nobody is still asking.
-    if let Some(delegate) = delegate
+    // Cloned FIRST so its borrow of `delegation` ends here — the worker's
+    // receiver below is borrowed for the whole connection, and a process is
+    // one role or the other, so only one of these is ever `Some`.
+    let delegate = delegation.host().cloned();
+    if let Some(delegate) = delegate.as_ref()
         && ctx.is_primary
     {
         delegate.set_outbound(outbound_tx.clone());
     }
+    // FR-43 P2b-2 — the WORKER's ends. The receiver is borrowed for this
+    // connection; the sender is cloned so a delegated session can hold it.
+    let (mut delegated_in, delegated_out) = match delegation.worker_mut() {
+        Some((rx, tx)) => (Some(rx), Some(tx.clone())),
+        None => (None, None),
+    };
     // Phase 3b: if overlay is enabled, start the node runtime (relay mode)
     // and capture the channel its `rc:overlay.*` events flow into. The
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
@@ -1631,6 +1640,49 @@ async fn connect_once(
                 indicator.hide_session(sid.to_hex());
                 watchdog::tick(ctx.pump);
             }
+            // FR-43 P2b-2 — an rc message the root daemon delegated to us.
+            //
+            // It runs through the SAME `handle_server_msg` with the SAME
+            // session state as our own sessions: the session ids come from the
+            // daemon's device row and cannot collide with ours, and everything
+            // downstream differs only in the sender the peer is built with.
+            //
+            // The argument list is duplicated from the `ws.next()` arm below
+            // rather than hoisted, because hoisting it would mean restructuring
+            // that arm's nested parse/intercept chain — a bigger change than
+            // this feature. Divergence is a compile error, so the duplication
+            // cannot rot silently.
+            Some(delegated_msg) = next_delegated(&mut delegated_in) => {
+                watchdog::tick(ctx.pump);
+                handle_server_msg(
+                    ctx,
+                    &cfg.tenant_id,
+                    &mut ws,
+                    delegated_msg,
+                    &mut peers,
+                    &mut pending_codecs,
+                    &mut pending_transports,
+                    &mut pending_chroma,
+                    &mut pending_chunk_framing,
+                    &mut pending_audio,
+                    &mut pending_permissions,
+                    &mut pending_session_meta,
+                    &mut tunnel_peers,
+                    &mut tunnel_quic_peers,
+                    &outbound_tx,
+                    encoder_preference,
+                    &indicator,
+                    &consent_broker,
+                    &cfg.forward_acl,
+                    &relay_regions_slot,
+                    &derp_ticket_slot,
+                    cfg,
+                    remote_cfg,
+                    delegate.as_ref(),
+                    delegated_out.as_ref(),
+                )
+                .await?;
+            }
             maybe_msg = ws.next() => match maybe_msg {
                 Some(Ok(Message::Text(text))) => {
                     last_rx = std::time::Instant::now();
@@ -1683,7 +1735,10 @@ async fn connect_once(
                                 &derp_ticket_slot,
                                 cfg,
                                 remote_cfg,
-                                delegate,
+                                delegate.as_ref(),
+                                // A message off our OWN control WS is never a
+                                // delegated one — its replies belong here.
+                                None,
                             )
                             .await?;
                         }
@@ -1962,6 +2017,10 @@ async fn handle_server_msg(
     // on every other platform and whenever no worker has attached, and the
     // delegation branch below is then unreachable.
     delegate: Option<&crate::delegate::DelegateHost>,
+    // FR-43 P2b-2 — set when THIS message was delegated to us by the root
+    // daemon, in which case the session's replies belong on the delegation
+    // channel and not on our own control WS. `None` is every ordinary session.
+    delegated: Option<&mpsc::Sender<ClientMsg>>,
 ) -> Result<(), ConnectError> {
     // FR-43 P2b — hand a remote-desktop session to the GUI worker, if there is
     // one. This sits ahead of the whole dispatch rather than inside each of
@@ -2406,7 +2465,12 @@ async fn handle_server_msg(
             let peer = match AgentPeer::new(
                 session_id,
                 &ice_servers,
-                outbound_tx.clone(),
+                // FR-43 P2b-2 — THE seam. Everything this peer later emits
+                // (ICE, `SessionStats`, its own `Terminate`) leaves through
+                // the sender it is constructed with, so a delegated session
+                // needs exactly one decision, taken once, here. Nothing
+                // downstream has to know it is delegated.
+                delegated.unwrap_or(outbound_tx).clone(),
                 encoder_preference,
                 chosen_codec,
                 negotiated_transport,
@@ -2428,8 +2492,9 @@ async fn handle_server_msg(
                 Ok(p) => p,
                 Err(e) => {
                     warn!(%session_id, %e, "AgentPeer::new failed; terminating");
-                    let _ = send_msg(
+                    let _ = reply_for_session(
                         ws,
+                        delegated,
                         &ClientMsg::Terminate {
                             session_id,
                             reason: EndReason::Error,
@@ -2445,8 +2510,9 @@ async fn handle_server_msg(
                 Err(e) => {
                     warn!(%session_id, chain = ?e, "handle_offer failed; terminating");
                     let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
-                    let _ = send_msg(
+                    let _ = reply_for_session(
                         ws,
+                        delegated,
                         &ClientMsg::Terminate {
                             session_id,
                             reason: EndReason::Error,
@@ -2470,8 +2536,9 @@ async fn handle_server_msg(
                 banner_org,
             );
 
-            send_msg(
+            reply_for_session(
                 ws,
+                delegated,
                 &ClientMsg::SdpAnswer {
                     session_id,
                     sdp: answer_sdp,
@@ -3821,6 +3888,46 @@ async fn send_frame(ws: &mut Ws, frame: Message) -> Result<()> {
             "ws send wedged for {} s (route captured mid-flight?) — cycling the connection",
             WS_SEND_TIMEOUT.as_secs()
         )),
+    }
+}
+
+/// The next rc message the daemon delegated to us, or never if this process is
+/// not a supervised worker.
+///
+/// `pending()` rather than an `Option` arm with a guard: a `select!` branch
+/// that is simply never ready is the honest encoding of "this process is not a
+/// worker", and it keeps the arm's body identical in both cases.
+async fn next_delegated(rx: &mut Option<&mut mpsc::Receiver<ServerMsg>>) -> Option<ServerMsg> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Send one reply for a session, to wherever that session's replies go.
+///
+/// The WS path keeps its DIRECT write. That is not incidental: the outbound
+/// queue is drained by an arm of the same `select!` that calls
+/// `handle_server_msg`, so while that function runs — holding `&mut ws` — no
+/// queued message can be written, and the SDP answer has therefore always
+/// preceded the peer's first ICE candidate. A queued answer would lose that.
+///
+/// A DELEGATED session has one ordered queue for everything, so the answer may
+/// follow the first candidates. Safe, and verified rather than assumed: the
+/// controller buffers early ICE in `pendingRemoteIce` (`useRemoteControl.ts`)
+/// exactly because `addIceCandidate` throws before `setRemoteDescription`, and
+/// flushes it when the answer lands.
+async fn reply_for_session(
+    ws: &mut Ws,
+    delegated: Option<&mpsc::Sender<ClientMsg>>,
+    msg: &ClientMsg,
+) -> Result<()> {
+    match delegated {
+        Some(tx) => tx
+            .send(msg.clone())
+            .await
+            .map_err(|_| anyhow::anyhow!("delegation queue closed")),
+        None => send_msg(ws, msg).await,
     }
 }
 
