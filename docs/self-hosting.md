@@ -56,15 +56,34 @@ resulting failure looks like a wrong password rather than a quoting problem.
 Then bring it up:
 
 ```bash
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost pull
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
+```
+
+⚠️ **Run `pull` first.** `up -d` on its own will *build* rather than fetch —
+Compose treats a service with a `build:` section as buildable, so a missing
+image is compiled from source instead of downloaded. Skipping the `pull` costs
+you the twenty minutes the published image exists to save, and it does it
+silently.
+
+> Images are published at
+> [`ghcr.io/gjovanov/roomler-ai`](https://github.com/gjovanov/roomler-ai/pkgs/container/roomler-ai)
+> for **linux/amd64**. On arm64 (an Apple Silicon Mac, a Raspberry Pi, an ARM
+> VPS) there is no published image yet — build from source with the command
+> below.
+
+### Or build it from source
+
+Always available, and never merely a fallback: the server is AGPL-3.0, and a
+published image must never be the only way to run it.
+
+```bash
 docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build
 ```
 
-> **The first build compiles the Rust server and mediasoup from source.**
-> Measured **6 minutes** on a 2024 laptop (16 cores, Docker Desktop + WSL2);
-> budget 15–20 on a small VPS or 2–4 cores. Subsequent starts are seconds.
-> A prebuilt image — which would make this a 60-second pull instead — is tracked
-> in [FR-42](fr/FR-42-selfhost-verified-on-a-clean-box.md); until it ships,
-> `--build` is the only path.
+> **The build compiles the Rust server and mediasoup from source.** Measured
+> **6 minutes** on a 2024 laptop (16 cores, Docker Desktop + WSL2); budget
+> 15–20 on a small VPS or 2–4 cores. Subsequent starts are seconds.
 
 Watch it come up:
 
