@@ -632,6 +632,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Queue drain (2026-09-01, FR-59 P4). Default ON: when the viewer reports a transit queue deeper than a rate cut can clear in reasonable time, the pump STOPS producing for a bounded sub-second pause so the queue drains. A rate cut alone drains at capacity minus inflow, which is the slowest possible way - converging to 90% of a 400 kbps pipe clears a 2 s backlog at 40 kbps, i.e. over ~20 s, which is why a field session stayed seconds behind even after it stopped growing. Pausing sets inflow to zero so the same backlog clears in the ~2 s it represents. Deliberately no forced keyframe on resume: a pause loses no frames so the delta chain survives, and an IDR at these rates is itself seconds of transit. Skipping production rather than discarding the agent queue is the only lever that reaches a queue living in the relay and the carrier - those bytes are already sent and cannot be recalled. false = rate control only. Env: ROOMLERD_QUEUE_DRAIN. Restart required.",
     ),
     (
+        "slow_link_profile",
+        "tribool",
+        "Slow-link opening profile (2026-09-01, FR-59 P5). Default ON: a CONSTRAINED session whose pair the rate memory remembers at or below slow_link_profile_bps opens with a 1280 long-edge cap and 15 fps instead of native. The bitrate levers (FR-59 P1-P4) can make the encoder TRACK a 400 kbps pipe but cannot make 1920x1200 at 30 fps legible through it - that is about 1.7 KB per frame; halving the long edge quarters the pixels and halving the rate doubles the per-frame budget, together about 8x the bits per pixel. Resolved ONCE at pump start and never as a mid-session rung, because every rung flip pays a BLOCKING encoder open (0.65-0.87 s measured on Iris Xe) plus a fresh IDR - which is why priority_res_cap is off by default. A pair with NO memory never engages it: an unknown link is not a slow one, and guessing soft would degrade the first session on every healthy relay. false = open at the normal size. Env: ROOMLERD_SLOW_LINK_PROFILE. Restart required.",
+    ),
+    (
+        "slow_link_profile_bps",
+        "number",
+        "Remembered rate at or below which the FR-59 P5 slow-link profile engages, bps. Empty = built-in 1000000; 0 = never engage. Env: ROOMLERD_SLOW_LINK_PROFILE_BPS. Restart required.",
+    ),
+    (
         "area_min_bitrate",
         "tribool",
         "Area-scaled AIMD bitrate floor (2026-08-26). Default ON: the flat 1.5 Mbps floor was a 1080p legibility tuning and is unreadable mush at 5+ MPix; the scaled floor is ~3.1 Mbps at 2880x1800, capped 4 Mbps, unconstrained sessions only (a relay's 3 Mbps clamp keeps the flat floor so the MD keeps room). false = flat 1.5 Mbps floor. Env: ROOMLERD_AREA_MIN_BITRATE. Restart required.",
@@ -860,6 +870,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "seed_contradiction" => cfg.seed_contradiction.map(fmt_bool),
         "viewer_rate_clamp" => cfg.viewer_rate_clamp.map(fmt_bool),
         "queue_drain" => cfg.queue_drain.map(fmt_bool),
+        "slow_link_profile" => cfg.slow_link_profile.map(fmt_bool),
+        "slow_link_profile_bps" => cfg.slow_link_profile_bps.map(|p| p.to_string()),
         "bg_rebuild" => cfg.bg_rebuild.map(fmt_bool),
         "par_convert" => cfg.par_convert.map(fmt_bool),
         "fps_pace" => cfg.fps_pace.map(fmt_bool),
@@ -1270,6 +1282,10 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "seed_contradiction" => cfg.seed_contradiction = parse_tribool(value)?,
         "viewer_rate_clamp" => cfg.viewer_rate_clamp = parse_tribool(value)?,
         "queue_drain" => cfg.queue_drain = parse_tribool(value)?,
+        "slow_link_profile" => cfg.slow_link_profile = parse_tribool(value)?,
+        "slow_link_profile_bps" => {
+            cfg.slow_link_profile_bps = parse_u32_range(key, value, 0, 100_000_000)?
+        }
         "bg_rebuild" => cfg.bg_rebuild = parse_tribool(value)?,
         "par_convert" => cfg.par_convert = parse_tribool(value)?,
         "fps_pace" => cfg.fps_pace = parse_tribool(value)?,
