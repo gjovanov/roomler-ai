@@ -165,9 +165,6 @@ replace_launchd_service() {
 }
 
 LAUNCH_AGENTS_DIR="$CONSOLE_HOME/Library/LaunchAgents"
-# RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS -- renaming it
-# silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it.
-# docs/fr/FR-21
 PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.agent.plist"
 PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.agent.plist"
 
@@ -198,9 +195,6 @@ rm -f /tmp/roomler-bootstrap.err
 # not a service: it holds no session and captures nothing, so a failure to
 # start it must never fail the install — but it IS the only place that tells
 # the user which macOS permission is missing, which the OS never does.
-# RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS -- renaming it
-# silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it.
-# docs/fr/FR-21
 DESKTOP_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.desktop.plist"
 DESKTOP_PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.desktop.plist"
 if [ -f "$DESKTOP_PLIST_SOURCE" ] && [ -d /Applications/Roomler.app ]; then
@@ -251,9 +245,6 @@ echo "(the Roomler menu-bar app shows which of the two is missing, with a button
 # over the control WS (the hub keys on agent_id — the second connection
 # displaces the first), so they are separate enrollments by construction.
 # ---------------------------------------------------------------------------
-# RETIRED-NAME-ANCHOR: the .app bundle name KEYS THE macOS TCC GRANTS -- renaming it
-# silently drops Screen Recording + Accessibility on every Mac. FR-21 D5 freezes it.
-# docs/fr/FR-21
 DAEMON_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.daemon.plist"
 DAEMON_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.daemon.plist"
 
