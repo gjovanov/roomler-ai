@@ -243,6 +243,130 @@ pub fn measured_ceiling_enabled() -> bool {
     tunnel_core::env::node_env("MEASURED_CEILING").as_deref() != Some("0")
 }
 
+/// FR-59 P1 kill switch (2026-09-01): when on (default), the AIMD's
+/// legibility floor descends toward a MEASURED pipe on a constrained
+/// transport, so a link slower than the 1.5 Mbps `MIN_BITRATE_BPS` band
+/// can actually be converged onto instead of pinning the encoder at a
+/// multiple of what it carries. Evidence-gated — with no held goodput
+/// estimate the nominal floor stands. `0` restores the flat floor.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn slow_link_floor_enabled() -> bool {
+    tunnel_core::env::node_env("SLOW_LINK_FLOOR").as_deref() != Some("0")
+}
+
+/// FR-59 P1 — the absolute stop for the floor relief above (bps). Below
+/// roughly this a full-resolution frame is illegible at any QP and the
+/// honest lever is fewer PIXELS, not fewer bits; the relief exists to let
+/// the AIMD converge, not to chase a pipe to zero. Env
+/// `ROOMLERD_SLOW_LINK_MIN_BITRATE` / config `slow_link_min_bitrate`
+/// (default 200 000, clamped to [50 000, `MIN_BITRATE_BPS`] — a value
+/// above the nominal floor is inert by construction, see
+/// `goodput::measured_floor_bps`).
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn slow_link_min_bitrate_bps() -> u32 {
+    tunnel_core::env::node_env("SLOW_LINK_MIN_BITRATE")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(200_000)
+        .clamp(50_000, MIN_BITRATE_BPS)
+}
+
+/// FR-59 P2 kill switch (2026-09-01): when on (default), the CONSTRAINED
+/// send-queue byte budget is denominated in the MEASURED drain rate
+/// rather than the nominal relay ceiling. A budget expressed in
+/// milliseconds is a lie unless the bits-per-second it divides by is the
+/// pipe's: field 2026-09-01, `constrained_queue_ms` 450 against a 3 Mbps
+/// nominal produced 168 750 bytes, which on the measured 395 kbps link
+/// was **3.4 seconds** of standing queue — and the gate never fired.
+///
+/// ⚠ This consumes the same lumpy TURN-TCP estimate that `governor`
+/// deliberately refuses for the CEILING, and the asymmetry is the whole
+/// justification: an under-estimate shrinks the budget ⇒ more shedding ⇒
+/// LOWER latency, whereas an under-estimated ceiling collapses quality.
+/// A measurement may only ever LOWER the reference, never raise it.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn constrained_queue_measured_enabled() -> bool {
+    tunnel_core::env::node_env("CONSTRAINED_QUEUE_MEASURED").as_deref() != Some("0")
+}
+
+/// FR-59 P6 kill switch (2026-09-01): when on (default), a held goodput
+/// measurement far below the FR-35 learned/seeded ceiling ABANDONS it
+/// back to the nominal band. The rate memory keys on the nominated pair's
+/// remote address, which on a relay is the RELAY's — so one fast office
+/// day writes a number every later session through that relay inherits
+/// for the memory's 7-day TTL, regardless of the client's own network
+/// (field 2026-09-01: a 5 069 353 bps seed opened a session on a measured
+/// 395 kbps hotspot). `0` keeps the seed until the AIMD walks it down.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn seed_contradiction_enabled() -> bool {
+    tunnel_core::env::node_env("SEED_CONTRADICTION").as_deref() != Some("0")
+}
+
+/// FR-59 P3 kill switch (2026-09-01): when on (default), the VIEWER's own
+/// report of what is arriving — bytes/s received, and how much its transit
+/// queue grew — drives the constrained rate loop.
+///
+/// This is the signal the agent structurally cannot produce for itself: on
+/// a relayed path its send channel is empty while seconds of video sit in
+/// the relay and the carrier (field 2026-09-01: `bytes_inflight` 1–4 KB
+/// and `send_wait_max_ms` 0.1 ms in the windows the viewer reported
+/// 2 284 ms of paint age). Unlike FR-15's age it needs no clock probe —
+/// a byte count is local, and the queue drift is a DIFFERENCE of two
+/// intervals, so the unknown offset cancels — which matters because on
+/// exactly this kind of link the age report is absent or rejected in most
+/// windows. `0` = observe-and-report only.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn viewer_rate_clamp_enabled() -> bool {
+    tunnel_core::env::node_env("VIEWER_RATE_CLAMP").as_deref() != Some("0")
+}
+
+/// FR-59 P4 kill switch (2026-09-01): when on (default), a transit queue
+/// the viewer reports as too deep to cut our way out of is DRAINED — the
+/// pump stops producing for a bounded, sub-second pause.
+///
+/// A rate cut alone drains a queue at `capacity − inflow`, the slowest
+/// possible way: converging to 90 % of a 400 kbps pipe clears a 2 s
+/// backlog at 40 kbps, i.e. over ~20 s, which is why the field session
+/// stayed seconds behind even once it had stopped growing. Pausing sets
+/// inflow to zero, so the backlog clears in the ~2 s it represents.
+/// `0` = rate control only.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn queue_drain_enabled() -> bool {
+    tunnel_core::env::node_env("QUEUE_DRAIN").as_deref() != Some("0")
+}
+
+/// FR-59 P5 kill switch (2026-09-01): when on (default), a constrained
+/// session whose pair the rate memory remembers as SLOW opens with fewer
+/// pixels and fewer frames (see `rate_profile::slow_link_profile`).
+///
+/// The bitrate levers can make the encoder track a 400 kbps pipe; they
+/// cannot make 1920×1200 at 30 fps legible through it — that is ~1.7 KB
+/// per frame. `0` = open at the session's normal size regardless.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn slow_link_profile_enabled() -> bool {
+    tunnel_core::env::node_env("SLOW_LINK_PROFILE").as_deref() != Some("0")
+}
+
 /// Drag-latency P3 kill switch (2026-08-27): when on (default), a
 /// rebuild-bound bitrate apply (QSV/AMF — no in-place reconfigure)
 /// opens the replacement encoder on a BLOCKING THREAD while the current

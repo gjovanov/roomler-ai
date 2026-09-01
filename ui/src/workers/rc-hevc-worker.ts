@@ -37,6 +37,7 @@
 
 import {
   HopStats,
+  QueueDrift,
   ctxOptionsFor,
   epochNowMs,
   epochNowUs,
@@ -267,6 +268,10 @@ const decodeStats = new HopStats()
 // rc:clock probe; until the first echo it stays null and the stats
 // message reports `age: null` (HUD shows nothing rather than garbage).
 const ageStats = new HopStats()
+// FR-59 P3 — how much the transit queue grew this window. Needs NO clock
+// probe (it is a difference of intervals), so unlike `ageStats` it keeps
+// reporting on exactly the links where the probe is biased or absent.
+const queueDrift = new QueueDrift()
 let clockOffsetUs: number | null = null
 let outGapMaxMs = 0
 const pendingDecodeAt = new Map<number, number>()
@@ -324,6 +329,9 @@ function maybeEmitStats(): void {
     decode: decodeStats.snapshotAndReset(),
     // FR-1 P7 — end-to-end frame age; null until the clock probe lands.
     age: clockOffsetUs !== null ? ageStats.snapshotAndReset() : null,
+    // FR-59 P3 — window queue growth in ms (null = fewer than two frames
+    // arrived, which is no-signal rather than a stable queue).
+    queueMs: queueDrift.snapshotAndReset(),
     outGapMaxMs: round1(outGapMaxMs),
     ctxMode,
     // P7 — the active render path + actual backing size, for the stats
@@ -519,9 +527,12 @@ function initDecoder() {
       paintStats.add(performance.now() - paintT0)
       // Age at paint on the agent's clock (mapped via the rc:clock probe):
       // framing → send queue → network → decode → paint, end to end.
+      const arrivalUs = epochNowUs()
       if (clockOffsetUs !== null) {
-        ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, epochNowUs()))
+        ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivalUs))
       }
+      // FR-59 P3 — unconditional: the drift needs no probe lock.
+      queueDrift.add(wireTsUs, arrivalUs)
       if (rewrapped) frame.close() // paintFrame closed `render`; close the original too
       if (firstFrameMsg) {
         workerScope.postMessage(firstFrameMsg)
@@ -797,6 +808,8 @@ function teardown(): void {
   fwdStats.snapshotAndReset()
   decodeStats.snapshotAndReset()
   ageStats.snapshotAndReset()
+  queueDrift.snapshotAndReset()
+  queueDrift.reset()
   clockOffsetUs = null
   outGapMaxMs = 0
   // P7 — release the GL renderer; a fresh session re-creates lazily and
