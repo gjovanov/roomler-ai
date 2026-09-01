@@ -473,7 +473,13 @@ pub fn build_router(state: AppState) -> Router {
         // `/ws?role=agent` upgrade applies. Until #667 this handler read the
         // claims and nothing else, so a deleted device kept writing for the
         // remaining year of its token.
-        .route("/crash", post(routes::agent_crash::ingest));
+        .route("/crash", post(routes::agent_crash::ingest))
+        // FR-51 P3 — an ephemeral device removes itself on clean shutdown.
+        // Agent-JWT authenticated (`AuthAgent`); a permanent row is refused.
+        .route(
+            "/self/unenroll",
+            post(routes::remote_control::self_unenroll),
+        );
 
     // Public owner-consent routes (Phase 4). No auth extractor — the unguessable
     // token IS the capability; the handler validates it, single-uses it, and

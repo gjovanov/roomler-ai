@@ -349,3 +349,100 @@ async fn mint_requires_manage_agents() {
         .unwrap();
     assert_eq!(resp.status(), 403);
 }
+
+/// FR-51 P3 — the self-unenroll route: an ephemeral device removes itself
+/// with its own agent JWT; a permanent device is refused; a second call
+/// after success is a 401 (the row is gone, which `AuthAgent` enforces) —
+/// the exact status the agent treats as "already gone".
+#[tokio::test]
+async fn self_unenroll_removes_ephemeral_and_refuses_permanent() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("ekey6").await;
+    enable_keys(&app, &t.tenant_id, &t.admin.access_token).await;
+
+    // Ephemeral device, via the real key path.
+    let minted = mint_key(&app, &t.tenant_id, &t.admin.access_token, json!({})).await;
+    let resp = enroll_raw(
+        &app,
+        minted["key"].as_str().unwrap(),
+        "ekey6-eph",
+        json!({}),
+    )
+    .await;
+    assert!(resp.status().is_success());
+    let v: Value = resp.json().await.unwrap();
+    let eph_id = v["agent_id"].as_str().unwrap().to_string();
+    let eph_token = v["agent_token"].as_str().unwrap().to_string();
+
+    // Permanent device, via a standard token.
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = enroll_raw(
+        &app,
+        et["enrollment_token"].as_str().unwrap(),
+        "ekey6-perm",
+        json!({}),
+    )
+    .await;
+    let v: Value = resp.json().await.unwrap();
+    let perm_id = v["agent_id"].as_str().unwrap().to_string();
+    let perm_token = v["agent_token"].as_str().unwrap().to_string();
+
+    // No credential at all: refused before anything else.
+    let resp = app
+        .client
+        .post(app.url("/api/agent/self/unenroll"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // A PERMANENT device may not remove itself — a compromised host must not
+    // be able to erase its own fleet record.
+    let resp = app
+        .client
+        .post(app.url("/api/agent/self/unenroll"))
+        .bearer_auth(&perm_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    assert!(
+        agent_row(&app, &perm_id).await.is_some(),
+        "permanent row untouched"
+    );
+
+    // The ephemeral device removes itself — outright, not a tombstone.
+    let resp = app
+        .client
+        .post(app.url("/api/agent/self/unenroll"))
+        .bearer_auth(&eph_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert!(
+        agent_row(&app, &eph_id).await.is_none(),
+        "ephemeral row hard-deleted by self-unenroll"
+    );
+
+    // Second call: the row is gone, so the extractor refuses — 401, the
+    // status the agent deliberately reads as success ("already gone").
+    let resp = app
+        .client
+        .post(app.url("/api/agent/self/unenroll"))
+        .bearer_auth(&eph_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
