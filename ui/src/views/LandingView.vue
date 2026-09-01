@@ -158,7 +158,7 @@
     <v-footer class="landing-footer py-4 py-md-8">
       <v-container>
         <v-row>
-          <v-col cols="12" sm="4">
+          <v-col cols="12" sm="3">
             <div class="text-h6 font-weight-bold mb-2">Roomler</div>
             <p class="text-body-2 landing-muted">Remote access, private networking, and collaboration for your devices and your team.</p>
           </v-col>
@@ -176,17 +176,27 @@
             <a href="/docs/start/install/linux/" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Linux</a>
             <a href="/docs/start/self-hosting/" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Self-hosting</a>
           </v-col>
-          <v-col cols="12" sm="4">
+          <v-col cols="6" sm="2">
             <div class="text-subtitle-2 font-weight-bold mb-2">Legal</div>
             <router-link to="/privacy" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Privacy Policy</router-link>
             <router-link to="/terms" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Terms of Service</router-link>
             <router-link to="/imprint" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Imprint</router-link>
+          </v-col>
+          <v-col cols="12" sm="3">
+            <!-- FR-58: the footer door into the same list — light variant,
+                 its own source tag. -->
+            <div class="text-subtitle-2 font-weight-bold mb-2">Stay in touch</div>
+            <StayInTouch variant="light" source="landing-footer" />
           </v-col>
         </v-row>
         <v-divider class="my-4" />
         <div class="text-body-2 landing-muted text-center">&copy; {{ new Date().getFullYear() }} G ROX EOOD &mdash; Roomler. All rights reserved.</div>
       </v-container>
     </v-footer>
+
+    <!-- FR-58: the deferred auto-ask — once ever, after real engagement,
+         never a blocking modal. -->
+    <NewsletterPrompt />
   </div>
   </v-theme-provider>
 </template>
@@ -195,6 +205,7 @@
 import { onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
+import NewsletterPrompt from '@/components/landing/NewsletterPrompt.vue'
 import StayInTouch from '@/components/landing/StayInTouch.vue'
 import { enrollCommands } from '@/utils/enrollCommands'
 

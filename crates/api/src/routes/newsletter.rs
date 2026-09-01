@@ -582,3 +582,53 @@ pub async fn status(
         sent_at: issue.sent_at.map(rfc3339),
     }))
 }
+
+// ── P4: the signed-in surface (user-scoped, NOT admin) ──────────────────
+//
+// `subscribers` stays the ONLY membership store — this is a different DOOR
+// into it, not a second list. Ownership of the address is the account's
+// email verification, so subscribing here is pre-confirmed: no confirmation
+// mail, and no oracle concern (the caller asks about their own address).
+
+#[derive(Debug, Serialize)]
+pub struct NewsletterPref {
+    pub subscribed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetNewsletterPref {
+    pub subscribed: bool,
+}
+
+/// `GET /api/user/newsletter`
+pub async fn user_get(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<NewsletterPref>, ApiError> {
+    // The user row, not the JWT claim — the row is what activation verified.
+    let user = state.users.base.find_by_id(auth.user_id).await?;
+    let subscribed = state.subscribers.is_subscribed(&user.email).await?;
+    Ok(Json(NewsletterPref { subscribed }))
+}
+
+/// `PUT /api/user/newsletter` `{subscribed}`
+pub async fn user_set(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<SetNewsletterPref>,
+) -> Result<Json<NewsletterPref>, ApiError> {
+    let user = state.users.base.find_by_id(auth.user_id).await?;
+    if body.subscribed && !user.is_verified {
+        // Pre-confirmed subscription rides on PROVEN ownership; an unverified
+        // account hasn't proven it, and the public double-opt-in form is the
+        // right door for them.
+        return Err(ApiError::Validation(
+            "verify your account email first — or use the subscribe form, which sends a confirmation link".into(),
+        ));
+    }
+    let subscribed = state
+        .subscribers
+        .set_account_subscription(&user.email, body.subscribed)
+        .await?;
+    Ok(Json(NewsletterPref { subscribed }))
+}
