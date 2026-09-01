@@ -373,6 +373,20 @@ const QUEUE_OVER_WINDOWS: u8 = 2;
 /// ceiling's own 85–90 % convention: converge just UNDER the pipe.
 pub const LINK_CEILING_PCT: u64 = 90;
 
+/// FR-59 P4 — estimated queue depth (ms) at which the session stops
+/// waiting for the queue to drain and DRAINS it, by pausing production.
+/// Well above `QUEUE_GROWTH_MS`: a growing queue wants a rate cut, and
+/// only a queue that a rate cut cannot clear in reasonable time wants a
+/// pause.
+pub const DRAIN_THRESHOLD_MS: i32 = 700;
+/// Longest pause the drain may take. A deliberate freeze that restores
+/// liveness beats a permanent lag, but only while it stays sub-second —
+/// past that the cure reads as the disease.
+pub const DRAIN_MAX_MS: u32 = 600;
+/// Shortest useful pause: below this the queue was not deep enough to be
+/// worth a visible hitch.
+pub const DRAIN_MIN_MS: u32 = 150;
+
 /// What the FR-59 P3 link loop concluded from one viewer window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LinkVerdict {
@@ -383,6 +397,17 @@ pub struct LinkVerdict {
     /// unless `congested`; see the type docs for why that gate is not
     /// optional.
     pub ceiling_bps: Option<u32>,
+    /// FR-59 P4 — how long to STOP producing so the transit queue can
+    /// drain, if it has grown past [`DRAIN_THRESHOLD_MS`]. `None` = keep
+    /// producing.
+    ///
+    /// A rate cut alone drains a queue at `capacity − inflow`, which is
+    /// the slowest possible way to do it: converging to 90 % of a 400 kbps
+    /// pipe drains a 2 s backlog at 40 kbps, i.e. over ~20 s. Pausing sets
+    /// inflow to zero, so the same backlog clears in the ~2 s it
+    /// represents. On a session already seconds behind, one deliberate
+    /// sub-second freeze that restores liveness is the better trade.
+    pub drain_for_ms: Option<u32>,
 }
 
 /// FR-59 P3 — the loop that reads congestion from where the queue actually
@@ -410,6 +435,17 @@ pub struct LinkLoop {
     /// Windows judged congested — heartbeat telemetry, so "the loop never
     /// fired" and "the viewer never reported" are distinguishable.
     congested_windows: u32,
+    /// FR-59 P4 — the running INTEGRAL of the per-window drift: an
+    /// estimate of how deep the transit queue currently is, in ms. Floored
+    /// at 0 (a link that delivers faster than it is fed has no queue, not
+    /// a negative one) and reset when a drain is ordered, because after a
+    /// pause the estimate is spent.
+    depth_ms: i32,
+    /// Drains ordered — heartbeat telemetry.
+    drains: u32,
+    /// Whether a drain is already outstanding, so consecutive windows
+    /// cannot each order one before the first has been served.
+    drain_pending: bool,
 }
 
 impl LinkLoop {
@@ -429,16 +465,43 @@ impl LinkLoop {
         if congested {
             self.congested_windows = self.congested_windows.saturating_add(1);
         }
+        // P4 — integrate the derivative into a depth estimate. A draining
+        // window subtracts, so a session that recovers on the rate cut
+        // alone never reaches the drain threshold.
+        self.depth_ms = (self.depth_ms + queue_ms as i32).max(0);
+        let drain_for_ms = if !self.drain_pending && self.depth_ms >= DRAIN_THRESHOLD_MS {
+            self.drain_pending = true;
+            self.drains = self.drains.saturating_add(1);
+            let ms = (self.depth_ms as u32).clamp(DRAIN_MIN_MS, DRAIN_MAX_MS);
+            // The estimate is SPENT: whatever the pause actually clears,
+            // the next windows re-measure it. Carrying it forward would
+            // order a second drain immediately after the first.
+            self.depth_ms = 0;
+            Some(ms)
+        } else {
+            None
+        };
         LinkVerdict {
             congested,
             ceiling_bps: (congested && rx_bps > 0)
                 .then(|| ((rx_bps as u64) * LINK_CEILING_PCT / 100) as u32),
+            drain_for_ms,
         }
+    }
+
+    /// FR-59 P4 — the pump has served the drain it was told to take.
+    pub fn drain_served(&mut self) {
+        self.drain_pending = false;
     }
 
     /// Windows this loop judged congested (heartbeat).
     pub fn congested_windows(&self) -> u32 {
         self.congested_windows
+    }
+
+    /// FR-59 P4 — drains ordered, and the live depth estimate (heartbeat).
+    pub fn drain_stats(&self) -> (u32, i32) {
+        (self.drains, self.depth_ms)
     }
 }
 
@@ -802,6 +865,61 @@ mod tests {
         assert_eq!(v.ceiling_bps, None);
         // A DRAINING queue is emphatically not congestion.
         assert!(!l.observe(400_000, -300).congested);
+    }
+
+    /// FR-59 P4 — the depth INTEGRAL orders a drain, once, and the pump
+    /// handing it back is what re-arms the next one.
+    #[test]
+    fn a_deep_queue_orders_one_drain_until_it_is_served() {
+        let mut l = LinkLoop::new();
+        // 300 ms of growth per window: over threshold on the third.
+        assert_eq!(l.observe(400_000, 300).drain_for_ms, None);
+        assert_eq!(l.observe(400_000, 300).drain_for_ms, None);
+        let v = l.observe(400_000, 300);
+        assert_eq!(v.drain_for_ms, Some(DRAIN_MAX_MS), "900 ms deep, capped");
+        // Depth is SPENT — carrying it forward would order a second drain
+        // on the very next window, before the first had any effect.
+        assert_eq!(l.drain_stats().0, 1);
+        // …and while the first is outstanding, no second is ordered even
+        // as the estimate rebuilds past the threshold.
+        for _ in 0..5 {
+            assert_eq!(l.observe(400_000, 300).drain_for_ms, None);
+        }
+        assert_eq!(l.drain_stats().0, 1, "still exactly one drain ordered");
+        // The pump served it; now the (already deep again) queue may order
+        // another.
+        l.drain_served();
+        assert!(l.observe(400_000, 300).drain_for_ms.is_some());
+        assert_eq!(l.drain_stats().0, 2);
+    }
+
+    /// A session that recovers on the rate cut alone must never reach the
+    /// drain: the integral has to come back DOWN on a draining window, or
+    /// every long session would eventually accumulate its way into a
+    /// pause it never needed.
+    #[test]
+    fn a_recovering_queue_never_reaches_the_drain() {
+        let mut l = LinkLoop::new();
+        for _ in 0..200 {
+            l.observe(400_000, 150);
+            let v = l.observe(400_000, -150);
+            assert_eq!(v.drain_for_ms, None);
+        }
+        assert_eq!(l.drain_stats().0, 0, "no drain in 400 windows");
+        // And the depth estimate is floored at 0 — a link delivering
+        // faster than it is fed has no queue, not a negative one.
+        for _ in 0..50 {
+            l.observe(400_000, -300);
+        }
+        assert_eq!(l.drain_stats().1, 0, "depth floored at zero");
+        // Proof the floor held: one deep window alone cannot now trigger,
+        // but it would if the estimate had gone arbitrarily negative and
+        // needed climbing back.
+        assert_eq!(
+            l.observe(400_000, 800).drain_for_ms,
+            Some(DRAIN_MAX_MS),
+            "800 ms deep, capped at the bound"
+        );
     }
 
     /// The invariant that keeps this loop from ratcheting a healthy

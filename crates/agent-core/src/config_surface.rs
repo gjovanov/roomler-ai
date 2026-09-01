@@ -627,6 +627,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Viewer-reported link clamp (2026-09-01, FR-59 P3). Default ON: the VIEWER reports the bytes/s it actually received and how much its transit queue GREW this window, and on a constrained transport a sustained growing queue caps send-fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90% of the measured arrival rate. It exists because the agent structurally cannot see this: on a relayed path its own send channel reads empty (field 2026-09-01: bytes_inflight 1-4 KB, send_wait_max_ms 0.1 ms) while seconds of video sit in the relay and the carrier. Unlike the FR-15 age report it needs NO clock probe - a byte count is local and the queue drift is a difference of two intervals, so the unknown offset cancels - which matters because on exactly these links the age is absent or rejected in most windows. The arrival rate may bound the ceiling ONLY while the queue is growing, since otherwise it is merely whatever the agent happened to send. false = observe-and-report only. Env: ROOMLERD_VIEWER_RATE_CLAMP. Restart required.",
     ),
     (
+        "queue_drain",
+        "tribool",
+        "Queue drain (2026-09-01, FR-59 P4). Default ON: when the viewer reports a transit queue deeper than a rate cut can clear in reasonable time, the pump STOPS producing for a bounded sub-second pause so the queue drains. A rate cut alone drains at capacity minus inflow, which is the slowest possible way - converging to 90% of a 400 kbps pipe clears a 2 s backlog at 40 kbps, i.e. over ~20 s, which is why a field session stayed seconds behind even after it stopped growing. Pausing sets inflow to zero so the same backlog clears in the ~2 s it represents. Deliberately no forced keyframe on resume: a pause loses no frames so the delta chain survives, and an IDR at these rates is itself seconds of transit. Skipping production rather than discarding the agent queue is the only lever that reaches a queue living in the relay and the carrier - those bytes are already sent and cannot be recalled. false = rate control only. Env: ROOMLERD_QUEUE_DRAIN. Restart required.",
+    ),
+    (
         "area_min_bitrate",
         "tribool",
         "Area-scaled AIMD bitrate floor (2026-08-26). Default ON: the flat 1.5 Mbps floor was a 1080p legibility tuning and is unreadable mush at 5+ MPix; the scaled floor is ~3.1 Mbps at 2880x1800, capped 4 Mbps, unconstrained sessions only (a relay's 3 Mbps clamp keeps the flat floor so the MD keeps room). false = flat 1.5 Mbps floor. Env: ROOMLERD_AREA_MIN_BITRATE. Restart required.",
@@ -854,6 +859,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "constrained_queue_measured" => cfg.constrained_queue_measured.map(fmt_bool),
         "seed_contradiction" => cfg.seed_contradiction.map(fmt_bool),
         "viewer_rate_clamp" => cfg.viewer_rate_clamp.map(fmt_bool),
+        "queue_drain" => cfg.queue_drain.map(fmt_bool),
         "bg_rebuild" => cfg.bg_rebuild.map(fmt_bool),
         "par_convert" => cfg.par_convert.map(fmt_bool),
         "fps_pace" => cfg.fps_pace.map(fmt_bool),
@@ -1263,6 +1269,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "constrained_queue_measured" => cfg.constrained_queue_measured = parse_tribool(value)?,
         "seed_contradiction" => cfg.seed_contradiction = parse_tribool(value)?,
         "viewer_rate_clamp" => cfg.viewer_rate_clamp = parse_tribool(value)?,
+        "queue_drain" => cfg.queue_drain = parse_tribool(value)?,
         "bg_rebuild" => cfg.bg_rebuild = parse_tribool(value)?,
         "par_convert" => cfg.par_convert = parse_tribool(value)?,
         "fps_pace" => cfg.fps_pace = parse_tribool(value)?,

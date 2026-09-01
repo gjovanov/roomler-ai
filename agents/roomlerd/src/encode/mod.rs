@@ -334,6 +334,24 @@ pub fn viewer_rate_clamp_enabled() -> bool {
     tunnel_core::env::node_env("VIEWER_RATE_CLAMP").as_deref() != Some("0")
 }
 
+/// FR-59 P4 kill switch (2026-09-01): when on (default), a transit queue
+/// the viewer reports as too deep to cut our way out of is DRAINED — the
+/// pump stops producing for a bounded, sub-second pause.
+///
+/// A rate cut alone drains a queue at `capacity − inflow`, the slowest
+/// possible way: converging to 90 % of a 400 kbps pipe clears a 2 s
+/// backlog at 40 kbps, i.e. over ~20 s, which is why the field session
+/// stayed seconds behind even once it had stopped growing. Pausing sets
+/// inflow to zero, so the backlog clears in the ~2 s it represents.
+/// `0` = rate control only.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn queue_drain_enabled() -> bool {
+    tunnel_core::env::node_env("QUEUE_DRAIN").as_deref() != Some("0")
+}
+
 /// Drag-latency P3 kill switch (2026-08-27): when on (default), a
 /// rebuild-bound bitrate apply (QSV/AMF — no in-place reconfigure)
 /// opens the replacement encoder on a BLOCKING THREAD while the current
