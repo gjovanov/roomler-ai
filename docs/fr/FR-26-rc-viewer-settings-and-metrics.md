@@ -27,8 +27,14 @@ admin-set `display_name` since FR-11. The viewer was the last surface that
 disagreed, which is jarring precisely when you are looking at the machine.
 
 Title is now `display_name || name`, and when they differ the machine name
-moves into the existing subtitle (`CORP-LAPTOP-1` · `CORPLAP-1 · windows · 0.4.11`),
-so the mapping stays visible rather than hidden.
+moves into the existing subtitle — title `CORPLAP-1`, subtitle
+`<machine-name> · windows · 0.4.11` — so the mapping stays visible rather than
+hidden.
+
+⚠️ `<machine-name>` is a placeholder on purpose: on the device this was checked
+against, that field is a **corporate asset tag**, and it does not belong in a
+public repo. The point of the criterion is only that the two strings DIFFER and
+that both remain on screen.
 
 ### 2. Quality metrics are per-pill checkboxes
 
@@ -109,9 +115,15 @@ sections except the new Metrics pane; FSR stays in **Display**, where it belongs
 - **2026-08-29 — field-verified in a real browser against prod.** Driven
   through the operator's own signed-in Chrome, so this is the product as they
   meet it, not a harness:
-  - **Title**: `/agent/6a6bd070…/remote` renders **CORPLAP-1** with
-    `CORPLAP-1 · windows · 0.4.15` in the subtitle — display name wins, machine
-    name stays visible.
+  - **Title**: the viewer renders the admin-set display name **CORPLAP-1**,
+    with the device's raw machine name — a corporate asset tag, redacted here —
+    kept in the subtitle beside OS and version. The two are genuinely different
+    strings on that device, which is the whole criterion: display name wins the
+    title, machine name stays visible underneath.
+    ⚠️ Do not "fix" this passage by writing the asset tag back in. An earlier
+    revision printed it, hostname sanitisation rewrote it to the display name,
+    and the sentence then read "renders CORPLAP-1 with CORPLAP-1" — evidence
+    that had quietly stopped saying anything.
   - **Tabs**: the dialog opens on `VIDEO · DISPLAY · METRICS · SESSION`.
   - **Metrics**: all six checkboxes present. `Pipeline diagnostics` read
     CHECKED, which looked wrong for one beat and is exactly right: stored
