@@ -18,9 +18,14 @@ ends and enforces policy, and never sees your pixels, keystrokes, files or
 tunnelled bytes.
 
 <p align="center">
-  <img src="docs/assets/hero-mesh.svg" alt="Your devices, one encrypted mesh — a laptop, a GPU workstation, a home server and a cloud cluster connected directly, coordinated by roomler.ai" width="640">
+  <a href="roomler-demo.mp4">
+    <img src="docs/assets/demo-preview.gif" alt="A Windows 11 desktop running inside a browser tab, pinging a MacBook across the encrypted mesh — four replies, no packet loss" width="800">
+  </a>
 </p>
-<p align="center"><i>Your devices, one encrypted mesh — coordinated from the cloud, connected directly.<br>The server never sees your screens, keystrokes, files, or traffic.</i></p>
+<p align="center">
+  <i>A Windows 11 laptop, live in a browser tab, pinging a MacBook across the mesh.</i><br>
+  <a href="roomler-demo.mp4"><b>▶ Watch the full 90-second demo</b></a> — two machines, two operating systems, one tab.
+</p>
 
 ## Run it
 
@@ -178,6 +183,11 @@ your team already lives here to reach its machines, meetings and chat come free.
 | **Notifications** | Real-time WebSocket + Web Push (VAPID), unread counts, mark-read flows |
 
 ## How it all fits together
+
+<p align="center">
+  <img src="docs/assets/hero-mesh.svg" alt="Your devices, one encrypted mesh — a laptop, a GPU workstation, a home server and a cloud cluster connected directly, coordinated by roomler.ai" width="640">
+</p>
+<p align="center"><i>Your devices, one encrypted mesh — coordinated from the cloud, connected directly.<br>The server never sees your screens, keystrokes, files, or traffic.</i></p>
 
 For the technically curious — the control plane coordinates; your data takes its
 own encrypted paths:
