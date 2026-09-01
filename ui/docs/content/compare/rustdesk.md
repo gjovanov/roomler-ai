@@ -55,7 +55,7 @@ independent default-deny gates on the powerful ones and every decision audited.
 
 ## Side by side
 
-| | Roomler | RustDesk |
+| Capability | Roomler | RustDesk |
 |---|---|---|
 | Remote desktop | Yes | Yes |
 | Viewer install needed | **No — a browser** | Yes |
