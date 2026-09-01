@@ -64,6 +64,16 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/remote/ConsentView.vue'),
   },
   {
+    // FR-58 follow-up — the confirm PAGE: the email links here and the
+    // button's POST is what confirms. A confirming GET is prefetch-bait:
+    // Gmail's link scanner burned the first field subscriber's single-use
+    // token before any human clicked. No meta.auth AND no meta.guest — the
+    // token in the path is the capability (the consent-route shape).
+    path: '/newsletter/confirm/:token',
+    name: 'newsletter-confirm',
+    component: () => import('@/views/newsletter/NewsletterConfirmView.vue'),
+  },
+  {
     // FR-58 — where the subscribe confirm link lands (the API 303s here with
     // ?status=ok|invalid). No meta.auth AND no meta.guest: the page must render
     // identically for signed-in and signed-out — `meta.guest` would bounce a
