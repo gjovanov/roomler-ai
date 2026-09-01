@@ -865,6 +865,16 @@ pub struct AgentConfig {
     /// absent or rejected. `false` = observe-and-report only.
     #[serde(default)]
     pub viewer_rate_clamp: Option<bool>,
+    /// FR-59 P4 — a transit queue too deep to cut our way out of is
+    /// DRAINED by pausing production for a bounded, sub-second window
+    /// (`ROOMLERD_QUEUE_DRAIN`). Built-in default: on. A rate cut alone
+    /// drains a queue at capacity minus inflow, the slowest possible way:
+    /// converging to 90% of a 400 kbps pipe clears a 2 s backlog at
+    /// 40 kbps, i.e. over ~20 s. Pausing sets inflow to zero, so it
+    /// clears in the ~2 s it represents. No forced keyframe on resume - a
+    /// pause loses no frames. `false` = rate control only.
+    #[serde(default)]
+    pub queue_drain: Option<bool>,
     /// 2026-08-27 drag-latency P3 — background encoder rebuild
     /// (`ROOMLERD_BG_REBUILD`). Default ON: on encoders with no
     /// in-place bitrate reconfigure (QSV/AMF), a bitrate change opens
@@ -1955,6 +1965,7 @@ pub fn test_fixture() -> AgentConfig {
         constrained_queue_measured: None,
         seed_contradiction: None,
         viewer_rate_clamp: None,
+        queue_drain: None,
         bg_rebuild: None,
         par_convert: None,
         fps_pace: None,
@@ -2077,7 +2088,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 69] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 70] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2086,6 +2097,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 69]
         ("CONSTRAINED_QUEUE_MEASURED", cfg.constrained_queue_measured),
         ("SEED_CONTRADICTION", cfg.seed_contradiction),
         ("VIEWER_RATE_CLAMP", cfg.viewer_rate_clamp),
+        ("QUEUE_DRAIN", cfg.queue_drain),
         ("BG_REBUILD", cfg.bg_rebuild),
         ("PAR_CONVERT", cfg.par_convert),
         ("FPS_PACE", cfg.fps_pace),

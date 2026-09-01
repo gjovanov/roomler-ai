@@ -103,11 +103,11 @@ Aside, and load-bearing for P6: FR-35's rate memory keys on `nominated_remote_ip
 
 | # | Phase | What | Kill switch | Status |
 |---|---|---|---|---|
-| **P1** | Evidence-gated floor relief | The AIMD floor descends toward the measured pipe on constrained paths, clamped at `slow_link_min_bitrate_bps` | `ROOMLERD_SLOW_LINK_FLOOR=0` / `slow_link_floor` | in progress |
-| **P2** | Budgets in measured rate | `constrained_queue_budget_bytes` re-derived per iteration from `min(applied target, measured goodput)` | `ROOMLERD_CONSTRAINED_QUEUE_MEASURED=0` | in progress |
-| **P6** | Abandon a contradicted seed | A held goodput below `learned_bps / N` resets the FR-35 learner to nominal | `ROOMLERD_SEED_CONTRADICTION=0` | in progress |
-| **P3** | A signal that can't be fooled | Viewer reports `received_bps` + age **trend**; agent clamps the constrained ceiling to `0.9 × received_bps` and MDs on a rising trend regardless of occupancy | `ROOMLERD_VIEWER_RATE_CLAMP=0` | planned |
-| **P4** | Drain, don't wait | Above a hard age threshold: stop producing, discard the queue via the existing `send_epoch` stale-drop, resume on a fresh IDR | `ROOMLERD_AGE_DRAIN=0` | planned |
+| **P1** | Evidence-gated floor relief | The AIMD floor descends toward the measured pipe on constrained paths, clamped at `slow_link_min_bitrate_bps`. Evidence = the agent's goodput estimate OR the viewer's arrival rate, whichever is lower | `ROOMLERD_SLOW_LINK_FLOOR=0` / `slow_link_floor` | **implemented** (#1169) |
+| **P2** | Budgets in measured rate | `constrained_queue_budget_bytes` re-derived per iteration; a measurement may only ever LOWER the reference | `ROOMLERD_CONSTRAINED_QUEUE_MEASURED=0` | **implemented** (#1169) |
+| **P6** | Abandon a contradicted seed | A held measurement more than 2× below `learned_bps` resets the FR-35 learner to nominal | `ROOMLERD_SEED_CONTRADICTION=0` | **implemented** (#1169) |
+| **P3** | A signal that can't be fooled | Viewer reports `rx_bps` + queue **growth**, the latter as `Σ(Δarrival − Δwire)` — a difference of intervals, so the clock offset cancels and no probe is needed. Sustained growth caps fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90 % of the arrival rate | `ROOMLERD_VIEWER_RATE_CLAMP=0` | **implemented** (#1169) |
+| **P4** | Drain, don't wait | P3's drift INTEGRATED into a depth estimate; past `DRAIN_THRESHOLD_MS` the pump stops producing for a bounded sub-second pause | `ROOMLERD_QUEUE_DRAIN=0` | **implemented** (#1169) |
 | **P5** | Slow-link profile, engaged once | Below a measured threshold: resolution + fps capped **at pump start** (never as a mid-session rung — that is why `PRIORITY_RES_CAP` is off by default: an 865 ms blocking QSV rebuild), with a viewer badge | `ROOMLERD_SLOW_LINK_PROFILE=0` | planned |
 | **P7** | Unordered video on constrained | Default FR-17 stage B on when constrained; needs the loss-tolerant assembler (FR-17 stage C) — a frame missing any chunk is dropped and an IDR requested | existing `roomler-rc-unordered-video` | planned |
 
@@ -124,6 +124,32 @@ Aside, and load-bearing for P6: FR-35's rate memory keys on `nominated_remote_ip
 - [ ] **AC5** — No regression on a healthy relay (CORPLAP-3 from the office LAN) or a direct
       path: `target_bps`, age and `frames_skipped_backpressure` unchanged within noise.
 - [ ] **AC6** — Every phase's kill switch restores the prior behaviour, verified by unit test.
+
+## What building P1–P4 + P6 changed about the design
+
+Four things the plan did not anticipate, all now load-bearing:
+
+1. **P3 is inert without P1.** `AimdController::set_ceiling` raises any ceiling back up to
+   `floor_bps`, so the arrival-rate clamp would have been silently undone at 1.5 Mbps — on
+   exactly the links it exists for. The two ship together, and the coupling is asserted.
+
+2. **The age *trend* became a queue-growth measurement instead.** The plan said "slope of
+   frame age". What shipped is `Σ(Δarrival − Δwire)` — the difference between how fast
+   frames were produced and how fast they landed. Same intent, but it needs no `frameAgeMs`
+   at all, so it works when the clock probe never locks; and being a difference of two
+   intervals, the offset cancels rather than being estimated and bounded.
+
+3. **P1's evidence had to widen.** The goodput estimator needs the agent's own sends to
+   BLOCK, and on this link they do not (`send_wait_max_ms` 0.1 ms) — the queue is
+   downstream. The floor now takes the LOWER of the agent's estimate and the viewer's
+   arrival rate; either alone leaves a real case uncovered.
+
+4. **P4 could not discard anything.** The plan said "discard the queue via `send_epoch`".
+   The agent-side queue on this path is 1–4 KB; the queue that matters is in the relay and
+   the carrier, already sent and unrecallable. So P4 is a production PAUSE, and — because a
+   pause loses no frames — it deliberately does NOT force a keyframe on resume, which at
+   these rates would itself be seconds of transit. The kill switch is therefore
+   `ROOMLERD_QUEUE_DRAIN`, not the planned `ROOMLERD_AGE_DRAIN`.
 
 ## Open decisions
 
