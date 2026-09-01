@@ -941,6 +941,10 @@ impl AppState {
         // out so tests driving `run_presence_sweep` directly stay
         // deterministic).
         crate::ws::device_presence::spawn_sweeper(state.clone());
+        // FR-51 — the ephemeral-node reaper (cluster-singleton per cycle via
+        // the same DB-name-scoped claim pattern). Spawns NOTHING unless
+        // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.
+        crate::ws::ephemeral::spawn_reaper(state.clone());
         // Stats PR-1 — the rollup compactor (raw → _1h → _1d), cluster-
         // singleton per cycle via the same DB-name-scoped claim pattern.
         // No-op task when `stats.enabled=false`.

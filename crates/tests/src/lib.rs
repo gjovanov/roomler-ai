@@ -50,6 +50,8 @@ mod device_list_tests;
 #[cfg(test)]
 mod device_naming_tests;
 #[cfg(test)]
+mod ephemeral_tests;
+#[cfg(test)]
 mod invite_tests;
 #[cfg(test)]
 mod key_rotation_tests;

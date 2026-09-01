@@ -268,6 +268,24 @@ pub struct RcSettings {
     /// rides out a corp-VPN control-WS blip instead of being re-opened.
     /// Env: `ROOMLER__RC__TUNNEL_GRACE_SECS`.
     pub tunnel_grace_secs: u64,
+    /// FR-51 — master switch for the ephemeral-node reaper. Default **false**:
+    /// zero queries, zero deletes, byte-for-byte pre-FR-51 behaviour. Flipping
+    /// it on only ever affects rows that were enrolled `ephemeral: true` —
+    /// every pre-FR-51 row deserialises permanent and the reap predicate
+    /// cannot match it. Env: `ROOMLER__RC__EPHEMERAL_REAPER_ENABLED`.
+    pub ephemeral_reaper_enabled: bool,
+    /// FR-51 — reap cycle interval. Like the presence sweep, the cycle is a
+    /// cluster singleton (DB-name-scoped Redis NX claim), so this is the
+    /// deployment's cadence, not a per-pod one.
+    /// Env: `ROOMLER__RC__EPHEMERAL_REAP_INTERVAL_SECS`.
+    pub ephemeral_reap_interval_secs: u64,
+    /// FR-51 — inactivity deadline for an ephemeral device whose enrollment
+    /// key set no per-device override. 900 s (15 min): long enough that a
+    /// network blip or a pod roll is not a deleted device, short enough that
+    /// a finished CI runner does not linger as quota. The reaper clamps every
+    /// effective TTL (this one included) to a 60 s floor at read time.
+    /// Env: `ROOMLER__RC__EPHEMERAL_DEFAULT_TTL_SECS`.
+    pub ephemeral_default_ttl_secs: u64,
 }
 
 impl Default for RcSettings {
@@ -283,6 +301,9 @@ impl Default for RcSettings {
             nudge_attempts_reset_secs: 600,
             nudge_requester_throttle_ms: 5000,
             tunnel_grace_secs: 0,
+            ephemeral_reaper_enabled: false,
+            ephemeral_reap_interval_secs: 60,
+            ephemeral_default_ttl_secs: 900,
         }
     }
 }
@@ -648,6 +669,9 @@ impl Settings {
             .set_default("rc.nudge_attempts_reset_secs", 600)?
             .set_default("rc.nudge_requester_throttle_ms", 5000)?
             .set_default("rc.tunnel_grace_secs", 0)?
+            .set_default("rc.ephemeral_reaper_enabled", false)?
+            .set_default("rc.ephemeral_reap_interval_secs", 60)?
+            .set_default("rc.ephemeral_default_ttl_secs", 900)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?
