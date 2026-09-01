@@ -50,7 +50,7 @@ ExecStart=/usr/bin/roomlerd --config ${ROOMLERD_CONFIG} run
 # RETIRED-NAME-ANCHOR: `roomler_agent` is the pre-FR-21 tracing target. Kept
 # alongside the new one so this unit reads correctly on a daemon from either
 # side of the rename; agent-core::logging mirrors it for units already on disk.
-Environment=RUST_LOG=roomler_agent=info,roomlerd=info,warn
+Environment=RUST_LOG=roomlerd=info,warn
 
 # `always`, not `on-failure`: a self-update exits 0 on purpose (the agent
 # hands off to the installer and shuts down cleanly), and `on-failure` would
