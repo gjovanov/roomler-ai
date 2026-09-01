@@ -322,6 +322,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/unread-summary", get(routes::user::unread_summary))
         // FR-12 P3 — likewise static, likewise above the capture.
         .route("/tutorial", put(routes::user::update_tutorial))
+        // FR-58 P4 — the signed-in newsletter toggle (static, above the
+        // capture). A different door into `subscribers`, not a second list.
+        .route(
+            "/newsletter",
+            get(routes::newsletter::user_get).put(routes::newsletter::user_set),
+        )
         .route("/{user_id}", get(routes::user::get_profile));
 
     // rc.58 — browser console log batch ingest. User-authed (the
