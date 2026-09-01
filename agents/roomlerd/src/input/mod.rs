@@ -99,6 +99,16 @@ pub mod uinput_backend;
 #[cfg(all(target_os = "linux", feature = "uinput-input"))]
 pub mod keylayout;
 
+/// FR-36 P4 / FR-45 P4 — the HID usage → evdev keycode table. Shared: the
+/// uinput injector writes these codes to `/dev/uinput`, the portal input path
+/// sends them through `RemoteDesktop.NotifyKeyboardKeycode` — and the two
+/// consumers sit behind different features.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "uinput-input", feature = "portal-capture")
+))]
+pub(crate) mod hid_evdev;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Button {
@@ -107,6 +117,23 @@ pub enum Button {
     Middle,
     Back,
     Forward,
+}
+
+/// Linux `BTN_*` code for a mouse button. Shared by the uinput backend (evdev,
+/// FR-36) and the portal input path (RemoteDesktop `NotifyPointerButton`,
+/// FR-45) — the same 0x110–0x114 codes, previously duplicated in both.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "uinput-input", feature = "portal-capture")
+))]
+pub(crate) fn button_code(btn: Button) -> u16 {
+    match btn {
+        Button::Left => 0x110,
+        Button::Right => 0x111,
+        Button::Middle => 0x112,
+        Button::Back => 0x113,
+        Button::Forward => 0x114,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
