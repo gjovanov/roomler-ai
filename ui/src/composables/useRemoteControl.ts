@@ -1160,6 +1160,7 @@ export function decodeStatWireMessage(
   struggling: boolean,
   age?: { avgMs: number; minMs: number } | null,
   probeRttMs?: number | null,
+  link?: { rxBps: number; queueMs: number | null } | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -1181,6 +1182,25 @@ export function decodeStatWireMessage(
     if (typeof probeRttMs === 'number' && Number.isFinite(probeRttMs) && probeRttMs >= 0) {
       msg.probe_rtt_ms = clamp(probeRttMs)
     }
+  }
+  // FR-59 P3 — the link report: what actually arrived this window, and how
+  // much the transit queue grew. Sent as a PAIR and only when both are
+  // real: `rx_bps` on its own is a lower bound on capacity (a static
+  // desktop sends a few KB/s), so the agent may only read it as a ceiling
+  // while the queue is also growing — see `viewer_rate::LinkLoop`. Sent
+  // independently of `age`, deliberately: neither value needs the clock
+  // probe, which is the whole reason this exists.
+  if (
+    link &&
+    Number.isFinite(link.rxBps) &&
+    link.rxBps >= 0 &&
+    typeof link.queueMs === 'number' &&
+    Number.isFinite(link.queueMs)
+  ) {
+    msg.rx_bps = Math.min(Math.max(Math.round(link.rxBps), 0), 4_294_967_295)
+    // The agent packs this into an i16; clamp here so a pathological
+    // window cannot wrap into its own sign.
+    msg.queue_ms = Math.min(Math.max(Math.round(link.queueMs), -32768), 32767)
   }
   return msg
 }
@@ -4885,11 +4905,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     struggling: boolean,
     age?: { avgMs: number; minMs: number } | null,
     probeRttMs?: number | null,
+    link?: { rxBps: number; queueMs: number | null } | null,
   ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
-      ch.send(JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs)))
+      ch.send(JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link)))
     } catch {
       /* channel closed between check and send Ã¢ÂÂ drop */
     }
@@ -4905,6 +4926,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     framesDroppedBacklog?: number
     decodeQueueSize?: number
     age?: HopWindow | null
+    /** FR-59 P3 — bytes/s the worker actually received this window. */
+    bitrateBps?: number
+    /** FR-59 P3 — ms the transit queue grew this window; `null`/absent =
+     *  fewer than two frames arrived, which is no-signal, not stability. */
+    queueMs?: number | null
   }) {
     const drops = typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0
     const delta = Math.max(0, drops - lastBacklogDrops)
@@ -4922,11 +4948,21 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // clock probe has locked and frames actually painted (n > 0); the
     // agent treats its absence as "no signal", not as a 0 ms age.
     const age = m.age && m.age.n > 0 ? { avgMs: m.age.avgMs, minMs: m.age.minMs } : null
+    // FR-59 P3 — the link report. `bitrateBps` is the worker's own count of
+    // bytes it RECEIVED this window (it already computed it for the stats
+    // pill), and `queueMs` is how much the transit queue grew. Both come
+    // from the worker's local clock, so unlike `age` they survive a link
+    // whose congestion biases the clock probe.
+    const link =
+      typeof m.queueMs === 'number'
+        ? { rxBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0, queueMs: m.queueMs }
+        : null
     sendDecodeStat(
       typeof m.fps === 'number' ? m.fps : 0,
       struggleWindow.observe(bad),
       age,
       clockBest?.rttMs ?? null,
+      link,
     )
   }
 
