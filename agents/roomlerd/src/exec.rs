@@ -347,8 +347,9 @@ pub fn redactor() -> Redactor {
 /// The process-wide engine. Concurrency is a property of the DEVICE, not of
 /// an org's WS connection, so a multi-org daemon must not multiply its own
 /// exec cap by the number of orgs it has joined.
+static ENGINE: std::sync::OnceLock<ExecEngine> = std::sync::OnceLock::new();
+
 pub fn shared() -> &'static ExecEngine {
-    static ENGINE: std::sync::OnceLock<ExecEngine> = std::sync::OnceLock::new();
     ENGINE.get_or_init(ExecEngine::new)
 }
 
@@ -837,6 +838,10 @@ impl ExecEngine {
 
     /// Run one command to completion (or timeout / cancel).
     pub async fn run(&self, req: ExecRequest, redactor: &Redactor) -> ExecOutcome {
+        // FR-55 — hold the machine awake for as long as this command runs.
+        // Dropped on EVERY return below (timeout, refusal, spawn failure, a
+        // clean exit), which is why it is a guard and not a pair of calls.
+        let _awake = crate::power::ActivityGuard::new(crate::power::shared_activity());
         // Re-clamp rather than trust the wire: the server clamps too, but a
         // forged frame reaching a compromised control plane must not be able
         // to ask for an unbounded run.
