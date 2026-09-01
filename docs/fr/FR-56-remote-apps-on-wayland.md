@@ -1,6 +1,6 @@
 # FR-56 — Remote Apps on Wayland: per-app streaming, and the RAIL circle
 
-**Issue:** [#1157](https://github.com/gjovanov/roomler-ai/issues/1157) · **Status:** **P1 + P2 shipped and field-verified**; P3–P5 proposed · **Owner:** agent / remote-control
+**Issue:** [#1157](https://github.com/gjovanov/roomler-ai/issues/1157) · **Status:** **P1 + P2 shipped and field-verified**; **P3 REFUTED — GNOME refuses it**; P4–P5 proposed · **Owner:** agent / remote-control
 
 > ⚠️ **Renumbered from FR-55**, which [#1155](https://github.com/gjovanov/roomler-ai/pull/1155)
 > landed on master while this claim was in flight. The **ledger arbitrated**: a claim that
@@ -57,7 +57,7 @@ it per host.
 |---|---|---|
 | **P1** ✅ | **Make the existing feature engage on Wayland.** Replace the daemon-`DISPLAY` gate with **session discovery** — FR-45 already built `companion::graphical_session()` (uid, `DISPLAY`, `WAYLAND_DISPLAY`) for exactly this — and pass **`XAUTHORITY`** with `DISPLAY` into every `wmctrl`/`xterm` call. Result: list/focus/launch for Xwayland windows on GNOME/KDE/wlroots. ⚠️ Must be a **byte-for-byte no-op for the Xvfb path**, which is the only population using this today. | existing `[virtual_desktop_apps] enabled` |
 | **P2** ✅ | **Say what is actually visible.** `supported: bool` cannot express "X11 windows only" — the exact `Some([])` vs `None` mistake this project has now made on three surfaces (overlay ACL, `ssh_activity`, FR-49's dark org). Add a `sources` field (`x11` / `wayland` / both) plus a human reason, so the panel can say *"showing X11 (Xwayland) windows; this compositor does not let us enumerate native Wayland windows"* instead of showing a short list that looks like the truth. | n/a (wire additive) |
-| **P3** | **Native enumeration where the compositor allows it.** `zwlr_foreign_toplevel_management_v1` on wlroots (list + **activate** + close — full parity, and the only tier where focus works) and `org.gnome.Shell.Introspect.GetWindows` on a full GNOME (list **only**; there is no activate). Detected **at session time, never cached** — FR-45's rule, learned from a host that had every package and still offered nothing depending on start order. | `apps_wayland_enum` (default off until field-proven) |
+| **P3** ⛔ **REFUTED on GNOME (2026-09-01), not built** | **Native enumeration where the compositor allows it.** `zwlr_foreign_toplevel_management_v1` on wlroots (list + **activate** + close — full parity, and the only tier where focus works) and `org.gnome.Shell.Introspect.GetWindows` on a full GNOME (list **only**; there is no activate). Detected **at session time, never cached** — FR-45's rule, learned from a host that had every package and still offered nothing depending on start order. | `apps_wayland_enum` (default off until field-proven) |
 | **P4** | **Per-window capture — the RAIL payoff.** Portal `SelectSources(types = WINDOW)` (the *host* picks; no enumeration needed, works wherever a portal backend runs) and `org.gnome.Mutter.ScreenCast.RecordWindow` (needs a window id from P3). Reuses the whole FR-45 P3 pipeline — POD negotiation, buffers, wire format, `ScreenCapture` — with only the source selection changed, exactly as P5 did. | `ROOMLERD_WINDOW_CAPTURE` (default off) |
 | **P5** | **Wayland-native launch.** The tmux/xterm session model assumes X11. Keep tmux (surviving an agent restart is the whole point) but pick a **Wayland** terminal where there is no Xwayland. | same as P1 |
 
@@ -93,8 +93,16 @@ one video surface, and changing that is a much larger UI program than this.
       compositor exposes no protocol to enumerate them`. An empty list and an
       unenumerable source are now distinguishable — including on the ERROR
       arm, which is where an empty list is most likely to be read as calm
-- [ ] On a wlroots host, a **native** Wayland window is listed **and focused**
-      through `zwlr_foreign_toplevel_management_v1`
+- [~] ⛔ **Not attempted — refuted on GNOME and unfalsifiable elsewhere.**
+      `org.gnome.Shell.Introspect.GetWindows` exists but answers **`Access
+      denied` / "GetWindows is not allowed"** (GNOME Shell 48.8, two different
+      D-Bus clients, running AS the session user), and the interface exposes no
+      activate method at all — so GNOME is not "list-only", it is **refused**.
+      wlroots' `zwlr_foreign_toplevel_management_v1` would give list + activate,
+      but **no host in this fleet runs wlroots**, so building it now could only
+      be verified in a synthetic sway-in-WSL2 rig — which is the kind of "CI
+      green ≠ done" claim this project rejects. Revisit when a wlroots host
+      exists
 - [ ] A single application window is streamed to the browser, and switching
       between two windows is shown to change what the viewer sees
 - [ ] Launch works on a Wayland host with no Xwayland at all
@@ -106,9 +114,14 @@ one video surface, and changing that is a much larger UI program than this.
 - **Does P4 reuse the FR-45 helper process or spawn its own?** Reuse is
   tempting (one session, one consent) but the helper currently owns exactly one
   stream; per-window capture may want a second concurrent one.
-- **Is GNOME enumeration worth it at list-only?** Without activate, the panel
-  can show native windows but not focus them — arguably worse than saying
-  nothing. Decide against a real GNOME session, not in the abstract.
+- ✅ ~~**Is GNOME enumeration worth it at list-only?**~~ **ANSWERED 2026-09-01,
+  and the premise was wrong: it is not list-only, it is DENIED.** Measured
+  against a real GNOME session (Shell 48.8) as the session user, via both
+  `busctl` and `gdbus`: `GetWindows` → `Access denied: GetWindows is not
+  allowed`; `GetRunningApplications` → likewise. The refusal is silent on the
+  shell side too (nothing in its journal). GNOME gates Introspect to callers it
+  trusts, and a fleet agent is not one. 🔑 So the question "is a list without
+  focus worth shipping" never arises — there is no list.
 - **Portal WINDOW capture shows a host-side picker.** That is a *second* consent
   surface after FR-45's, and on an unattended host nobody answers it. It may be
   wlroots/mutter-direct only in practice.
@@ -123,3 +136,4 @@ one video surface, and changing that is a much larger UI program than this.
 | 2026-09-01 | ⚠️ **rustc 1.95 ICEs while RENDERING a real error here** | A `tracing::info!(%display, …)` whose local was named `display` collides with tracing's own `field::display` helper, and rustc panicked (`slice/index.rs`, empty query stack) instead of printing the error — `cargo check` reported only *the compiler unexpectedly panicked*. 🔑 `--message-format=short` bypasses the renderer and showed both real errors immediately. A/B'd against clean master first (it compiles), per the standing rule. |
 | 2026-09-01 | 🔧 **`roomlerd apps-probe` added** | Remote Apps was answerable only by driving it over a WebRTC data channel from a browser, which conflates the backend with signalling, transport and the UI — the same argument `capture-smoke` was built on. It prints whether a desktop was found, as whom, with which cookie, and what it sees; and it says explicitly that an EMPTY list is not the same as unsupported, and that native Wayland windows would not appear even if present. |
 | 2026-09-01 | ✅ **P2 shipped and field-verified** | The list reply carries `coverage` (`sources` + `unlisted`) end to end: agent → wire → composable → panel. On the real GNOME Wayland session the daemon reports `sources: x11` and `NOT listed: native Wayland windows: this compositor exposes no protocol to enumerate them`, beside the one Xwayland window it CAN see. 🔑 The trait method (rather than a field set at construction) means **the compiler forces every backend to answer** — it caught the test fake immediately. ⚠️ Coverage rides the ERROR arm too: a failed listing is exactly where an empty list reads as a calm desktop. ⚠️ The UI parses it defensively and an absent `coverage` stays absent — inventing an empty one would claim the listing was complete, which is the bug this phase exists to fix. |
+| 2026-09-01 | ⛔ **P3 REFUTED — GNOME does not merely lack window enumeration, it REFUSES it** | `org.gnome.Shell.Introspect.GetWindows` is present and correctly typed (`a{ta{sv}}`), and calling it as the session user returns **`Access denied` — "GetWindows is not allowed"**. Reproduced with **two independent clients** (`busctl` and `gdbus`) on **GNOME Shell 48.8**; `GetRunningApplications` is refused identically, and gnome-shell logs nothing about either. The interface also has **no activate/focus/raise method at all** (0 matches on introspection), so even a granted listing could never drive the panel's one action. 🔑 The spec's open question — *is a list without focus worth shipping?* — is therefore moot: there is no list. ⚠️ wlroots' `zwlr_foreign_toplevel_management_v1` WOULD give list+activate, but **no fleet host runs wlroots**, so building that tier now could only be "verified" in a synthetic rig. Not built; recorded instead. |
