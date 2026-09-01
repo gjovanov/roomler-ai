@@ -306,6 +306,20 @@
                 {{ rowPresenceIcon(item) }}
               </v-icon>
               <span class="font-weight-medium">{{ item.display_name || item.name }}</span>
+              <!-- FR-51 — the vanishing must never be a surprise: this device
+                   removes itself (reaped after silence; immediately on a clean
+                   stop), and a later enrollment is a NEW device. -->
+              <v-chip
+                v-if="item.ephemeral"
+                size="x-small"
+                color="warning"
+                variant="tonal"
+                class="ml-2"
+                prepend-icon="mdi-clock-fast"
+                title="Ephemeral device — removes itself after inactivity or on clean shutdown; removal is final"
+              >
+                ephemeral
+              </v-chip>
               <v-btn
                 :icon="copiedAgentId === item.id ? 'mdi-check' : 'mdi-content-copy'"
                 size="x-small"

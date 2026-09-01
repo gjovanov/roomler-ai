@@ -108,6 +108,51 @@
       </v-card-text>
     </v-card>
 
+    <!-- FR-51 gate 1. Its own card and its own server-side switch, like the
+         two above: a standing credential that mints device identities is its
+         own grant, not an implication of exec or SSH. -->
+    <v-card>
+      <v-card-title class="d-flex align-center">
+        <v-icon icon="mdi-clock-fast" color="primary" class="mr-2" />
+        Ephemeral enrollment keys
+      </v-card-title>
+      <v-card-text>
+        <v-alert
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mb-4"
+          icon="mdi-shield-alert-outline"
+        >
+          When enabled, fleet admins can mint <strong>reusable</strong>
+          enrollment keys that create <strong>self-removing</strong> devices
+          (CI runners, containers). A key is a standing credential: anyone
+          holding it can enroll devices into this organization until it is
+          revoked, exhausted, or expired.
+        </v-alert>
+
+        <v-switch
+          :model-value="agentStore.orgEphemeralKeysEnabled === true"
+          :loading="savingKeys"
+          :disabled="savingKeys || agentStore.orgEphemeralKeysEnabled === null"
+          color="primary"
+          density="compact"
+          hide-details
+          label="Allow ephemeral enrollment keys in this organization"
+          @update:model-value="onToggleKeys"
+        />
+        <div class="text-caption text-medium-emphasis mt-1">
+          Off by default. Turning it OFF is an org-wide revocation: every
+          outstanding key stops working on its next use. Devices already
+          minted are untouched — they remove themselves by their own deadline.
+        </div>
+
+        <v-alert v-if="keysError" type="error" variant="tonal" density="compact" class="mt-3">
+          {{ keysError }}
+        </v-alert>
+      </v-card-text>
+    </v-card>
+
     <!-- The exec/SSH audit + activity sections moved to /tenant/{id}/audit
          (2026-08-26) — history review is its own nav destination now. -->
   </div>
@@ -154,8 +199,25 @@ async function onToggleSsh(v: boolean | null) {
   }
 }
 
+// FR-51 — its own pair, same isolation rule as exec vs SSH above.
+const savingKeys = ref(false)
+const keysError = ref<string | null>(null)
+
+async function onToggleKeys(v: boolean | null) {
+  savingKeys.value = true
+  keysError.value = null
+  try {
+    await agentStore.setOrgEphemeralKeysEnabled(props.tenantId, v === true)
+  } catch (e) {
+    keysError.value = (e as Error).message
+  } finally {
+    savingKeys.value = false
+  }
+}
+
 onMounted(() => {
   void agentStore.fetchOrgExecEnabled(props.tenantId)
   void agentStore.fetchOrgSshEnabled(props.tenantId)
+  void agentStore.fetchOrgEphemeralKeysEnabled(props.tenantId)
 })
 </script>

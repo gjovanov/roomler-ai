@@ -339,6 +339,10 @@ pub async fn list_key_uses(
                 "machine_id": u.machine_id,
                 "machine_name": u.machine_name,
                 "created_at": u.created_at.try_to_rfc3339_string().unwrap_or_default(),
+                // P4 — the whole lifecycle on one row: null = still alive
+                // (or removed before P4 shipped; the row cannot tell).
+                "removed_at": u.removed_at.map(|d| d.try_to_rfc3339_string().unwrap_or_default()),
+                "removal": u.removal,
             })
         })
         .collect();

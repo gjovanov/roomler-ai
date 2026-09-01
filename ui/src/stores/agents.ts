@@ -162,6 +162,14 @@ export interface Agent {
    *  mechanisms on every platform, so `agent_version` moving says nothing
    *  about this one. */
   companion_version?: string
+  /** FR-51 — enrolled as temporary: the server reaps it after silence, and a
+   *  clean stop removes it immediately. Removal is FINAL (hard delete) — a
+   *  later enrollment is a NEW device. The grid badges it so nobody is
+   *  surprised by the vanishing. Absent on pre-FR-51 bodies = permanent. */
+  ephemeral?: boolean
+  /** FR-51 P4 — the device's own inactivity deadline override (seconds);
+   *  absent = the server default applies. */
+  ephemeral_ttl_secs?: number
   status: AgentStatusValue
   /** Phase A-1 three-state truth: `online` = an rc socket is registered
    *  somewhere (Connect will work); `stale` = heartbeat trail fresh but no
@@ -533,6 +541,39 @@ export interface EnrollmentToken {
   enrollment_token: string
   expires_in: number
   jti: string
+}
+
+/** FR-51 — one ephemeral enrollment key, as listed (no secret here). */
+export interface EnrollmentKeyRow {
+  id: string
+  jti: string
+  label: string
+  created_by: string
+  max_uses: number
+  uses: number
+  expires_at: string
+  revoked_at?: string
+  ephemeral_ttl_secs?: number
+  last_used_at?: string
+  created_at: string
+}
+
+export interface MintEnrollKeyRequest {
+  label?: string
+  max_uses?: number
+  expires_in_secs?: number
+  ephemeral_ttl_secs?: number
+}
+
+/** The mint response — `key` is the credential itself, shown exactly once. */
+export interface MintEnrollKeyResponse {
+  key: string
+  id: string
+  jti: string
+  label: string
+  max_uses: number
+  expires_at: string
+  ephemeral_ttl_secs?: number
 }
 
 interface AgentListResponse {
@@ -918,6 +959,60 @@ export const useAgentStore = defineStore('agents', () => {
     orgSshEnabled.value = resp.remote_ssh_enabled
   }
 
+  // ── FR-51 — ephemeral enrollment keys ────────────────────────────
+  //
+  // A reusable credential that mints self-removing devices (CI runners,
+  // containers). The org switch is its own grant, separate from exec/SSH,
+  // and flipping it off revokes every outstanding key immediately.
+
+  /** Whether the ORG allows ephemeral enrollment keys at all. `null` until
+   *  fetched / on a 403 — same "not an admin ≠ disabled" rule as the exec
+   *  and SSH switches. */
+  const orgEphemeralKeysEnabled = ref<boolean | null>(null)
+
+  async function fetchOrgEphemeralKeysEnabled(tenantId: string) {
+    try {
+      const resp = await api.get<{ ephemeral_keys_enabled: boolean }>(
+        `/tenant/${tenantId}/ephemeral-key-settings`,
+      )
+      orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
+    } catch {
+      orgEphemeralKeysEnabled.value = null
+    }
+  }
+
+  /** Flip the class switch. MANAGE_TENANT server-side; off = an org-wide
+   *  revocation of every outstanding key that burns nothing. */
+  async function setOrgEphemeralKeysEnabled(tenantId: string, enabled: boolean) {
+    const resp = await api.put<{ ephemeral_keys_enabled: boolean }>(
+      `/tenant/${tenantId}/ephemeral-key-settings`,
+      { ephemeral_keys_enabled: enabled },
+    )
+    orgEphemeralKeysEnabled.value = resp.ephemeral_keys_enabled
+  }
+
+  /** List the org's keys (secrets are never in the list — mint-once only). */
+  async function listEnrollKeys(tenantId: string): Promise<EnrollmentKeyRow[]> {
+    const resp = await api.get<{ items: EnrollmentKeyRow[] }>(
+      `/tenant/${tenantId}/agent/enroll-key`,
+    )
+    return resp.items
+  }
+
+  /** Mint a key. The returned `key` is shown ONCE and cannot be re-fetched. */
+  async function mintEnrollKey(
+    tenantId: string,
+    req: MintEnrollKeyRequest,
+  ): Promise<MintEnrollKeyResponse> {
+    return api.post<MintEnrollKeyResponse>(`/tenant/${tenantId}/agent/enroll-key`, req)
+  }
+
+  /** Revoke — dead from the next use onward; devices it minted are untouched
+   *  (they die by their own TTL). */
+  async function revokeEnrollKey(tenantId: string, keyId: string): Promise<void> {
+    await api.delete(`/tenant/${tenantId}/agent/enroll-key/${keyId}`)
+  }
+
   /** Replace a device's SSH policy (gate 3). MANAGE_AGENTS server-side.
    *
    *  The server REFUSES a non-auto `consent_mode` for a device whose agent
@@ -1085,6 +1180,12 @@ export const useAgentStore = defineStore('agents', () => {
     orgSshEnabled,
     fetchOrgSshEnabled,
     setOrgSshEnabled,
+    orgEphemeralKeysEnabled,
+    fetchOrgEphemeralKeysEnabled,
+    setOrgEphemeralKeysEnabled,
+    listEnrollKeys,
+    mintEnrollKey,
+    revokeEnrollKey,
     updateSshPolicy,
     updateDesiredConfig,
     fetchSshAudit,

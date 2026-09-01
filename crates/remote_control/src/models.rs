@@ -926,6 +926,21 @@ pub struct EnrollmentKeyUse {
     pub machine_id: String,
     pub machine_name: String,
     pub created_at: DateTime,
+    /// P4 — when the device this use minted was REMOVED, making the row the
+    /// device's whole lifecycle record (born → removed) in one place that
+    /// survives both ends: the device row hard-deletes, and `audit_logs` is
+    /// a dead collection nothing writes (checked before "the reap in
+    /// audit_logs" was implemented as spec'd — recording into a surface
+    /// nothing reads would be paperwork, not audit). `None` = still alive,
+    /// or removed before P4 shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<DateTime>,
+    /// P4 — which path removed it: `ephemeral_expired` (the reaper) /
+    /// `ephemeral_self_unenroll` (clean stop) / `agent_delete` (admin).
+    /// The same `reason` string every removal path already threads through
+    /// `release_overlay_node`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal: Option<String>,
 }
 
 impl EnrollmentKeyUse {

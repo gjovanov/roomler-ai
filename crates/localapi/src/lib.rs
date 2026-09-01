@@ -101,6 +101,12 @@ pub struct NodeStatus {
     pub overlay_ip6: Option<String>,
     /// Connected to the coordination server.
     pub connected: bool,
+    /// FR-51 P4 — this daemon's PRIMARY enrollment is ephemeral: the server
+    /// reaps the device after silence, and the daemon de-enrolls itself on a
+    /// clean stop. Additive both ways: an older daemon omits it (⇒ false),
+    /// an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
     /// P5 exit-node routing status. `None` unless this node is configured as an
     /// exit-node CLIENT (`overlay_exit_node`). Backward-compatible (older CLIs
     /// ignore the extra field; a v4-only / non-exit daemon omits it).
@@ -2442,6 +2448,7 @@ mod tests {
                 overlay_ip: Some("100.64.0.2".into()),
                 overlay_ip6: None,
                 connected: true,
+                ephemeral: false,
                 exit_node: None,
                 config_path: None,
                 dns: None,

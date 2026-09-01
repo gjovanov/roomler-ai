@@ -4,6 +4,9 @@
   <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
     <h1 class="text-h5 text-md-h4 mb-2 mb-md-4">{{ $t('nav.devices') }}</h1>
     <agents-section :tenant-id="tenantId" />
+    <!-- FR-51 P4 — renders only when the org's ephemeral-key switch is ON
+         (the component fetches the switch itself and stays empty otherwise). -->
+    <enroll-keys-section :tenant-id="tenantId" />
   </v-container>
 </template>
 
@@ -11,6 +14,7 @@
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import AgentsSection from '@/components/admin/AgentsSection.vue'
+import EnrollKeysSection from '@/components/admin/EnrollKeysSection.vue'
 
 const route = useRoute()
 const tenantId = computed(() => route.params.tenantId as string)

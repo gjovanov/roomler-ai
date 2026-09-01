@@ -143,6 +143,10 @@ pub struct DaemonState {
     /// the broker's own sentinel dir, rather than a throwaway broker over a
     /// re-resolved path.
     consent: crate::consent::ConsentBroker,
+    /// FR-51 P4 — the primary enrollment is ephemeral (from the loaded
+    /// config). Surfaces in `status()` so `roomler status` can say the device
+    /// removes itself.
+    ephemeral: bool,
     /// FR-27 — live remote-control sessions, written by every signalling
     /// loop through its `ViewerIndicator`. `None` in tests and in any daemon
     /// shape that never runs signalling.
@@ -252,7 +256,15 @@ impl DaemonState {
             orgs: None,
             org_views: None,
             remote_config: None,
+            ephemeral: false,
         }
+    }
+
+    /// FR-51 P4 — stamp the primary enrollment's ephemeral nature (builder
+    /// style like `with_config_persist`, so `new()`'s arg list stays put).
+    pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
+        self.ephemeral = ephemeral;
+        self
     }
 
     /// FR-27 — attach the live remote-control session registry, so a thin
@@ -362,6 +374,8 @@ impl LocalApiState for DaemonState {
             overlay_ip: self.overlay.borrow().self_ip.clone(),
             overlay_ip6: self.overlay.borrow().self_ip6.clone(),
             connected: self.connected.load(Ordering::Relaxed),
+            // FR-51 P4 — the primary enrollment's nature, stamped at startup.
+            ephemeral: self.ephemeral,
             // P5/S4 — exit-node routing status the overlay runtime published.
             exit_node: self.overlay.borrow().exit_node.clone(),
             // S1b — the config file this daemon actually loaded, so the

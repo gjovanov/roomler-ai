@@ -104,6 +104,11 @@ pub struct DeviceRow {
     pub overlay_public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay_key_epoch: Option<u32>,
+    /// FR-51 — enrolled as temporary; the grid badges it so the vanishing is
+    /// never a surprise. Serialised only when true (tunnel clients and every
+    /// permanent device omit it).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
 }
 
 /// GET /api/tenant/{tenant_id}/device — membership-gated like every other
@@ -297,6 +302,7 @@ fn agent_row(
         magic_dns_fqdn,
         overlay_public_key: node.map(|n| n.wg_public_key.clone()),
         overlay_key_epoch: node.map(|n| n.key_epoch),
+        ephemeral: a.ephemeral,
     }
 }
 
@@ -332,6 +338,8 @@ fn client_row(
         magic_dns_fqdn,
         overlay_public_key: node.map(|n| n.wg_public_key.clone()),
         overlay_key_epoch: node.map(|n| n.key_epoch),
+        // Tunnel clients have no ephemeral kind (FR-51 P5 decides theirs).
+        ephemeral: false,
     }
 }
 
