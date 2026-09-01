@@ -106,7 +106,7 @@ Every release asset ships a SHA-256 sidecar, a **detached GPG signature**
 (`.asc`, against a published release key) and **SLSA build provenance**:
 
 ```bash
-gh attestation verify roomler-agent-<version>-x86_64-unknown-linux-gnu.deb \
+gh attestation verify roomlerd-<version>-x86_64-unknown-linux-gnu.deb \
   --repo gjovanov/roomler-ai
 ```
 

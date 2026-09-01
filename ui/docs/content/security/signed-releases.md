@@ -78,8 +78,8 @@ Get-AuthenticodeSignature "C:\Program Files\Roomler\roomlerd.exe" |
 **Linux and macOS:**
 
 ```bash
-gpg --verify roomler-agent-<version>.deb.asc roomler-agent-<version>.deb
-gh attestation verify roomler-agent-<version>.deb --repo gjovanov/roomler-ai
+gpg --verify roomlerd-<version>-x86_64-unknown-linux-gnu.deb.asc roomlerd-<version>-x86_64-unknown-linux-gnu.deb
+gh attestation verify roomlerd-<version>-x86_64-unknown-linux-gnu.deb --repo gjovanov/roomler-ai
 ```
 
 ## Where downloads come from

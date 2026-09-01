@@ -70,9 +70,9 @@ Every release asset ships a detached `.asc` signature against a published
 release key, plus a SHA-256 sidecar and SLSA build provenance:
 
 ```bash
-gpg --verify roomler-agent-<version>.deb.asc roomler-agent-<version>.deb
+gpg --verify roomlerd-<version>-x86_64-unknown-linux-gnu.deb.asc roomlerd-<version>-x86_64-unknown-linux-gnu.deb
 
-gh attestation verify roomler-agent-<version>.deb --repo gjovanov/roomler-ai
+gh attestation verify roomlerd-<version>-x86_64-unknown-linux-gnu.deb --repo gjovanov/roomler-ai
 ```
 
 The updater verifies that signature against a key **pinned inside the binary**,

@@ -52,6 +52,7 @@
     "@types/d3-time": "^3",
     "@types/d3-time-format": "^4",
     "@types/markdown-it": "^14.1.2",
+    "@types/node": "25.2.1",
     "@vitejs/plugin-vue": "^6.0.8",
     "@vitest/coverage-v8": "^4.1.10",
     "@vue/test-utils": "^2.4.11",
