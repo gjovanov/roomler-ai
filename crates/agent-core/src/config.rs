@@ -124,6 +124,21 @@ pub struct AgentConfig {
     #[serde(default)]
     pub macos_supervise_gui_worker: bool,
 
+    /// FR-55 — whether this device asks the OS to stay awake so it remains
+    /// reachable: `never` (default) | `on-ac` | `always`.
+    ///
+    /// ⚠️ Device-owned and default OFF, the same last-word rule as
+    /// `exec_enabled` and `ssh_enabled`: a remote-access tool that silently
+    /// drains a laptop battery earns the reputation it gets. An unrecognised
+    /// value parses to `never`, so a typo costs reachability rather than a
+    /// battery.
+    ///
+    /// ⚠️ This does NOT govern a live session — an rc or SSH session always
+    /// holds the machine awake, whatever this says, because cutting a session
+    /// someone is watching with an idle timer is never what was wanted.
+    #[serde(default)]
+    pub power_policy: String,
+
     /// Whether this device accepts configuration pushed from its control
     /// plane (see `docs/remote-config.md`).
     ///
@@ -1803,6 +1818,7 @@ pub fn test_fixture() -> AgentConfig {
         auto_grant_session: true,
         exec_enabled: false,
         macos_supervise_gui_worker: false,
+        power_policy: String::new(),
         remote_config_enabled: false,
         ssh_enabled: false,
         ssh_port: None,
