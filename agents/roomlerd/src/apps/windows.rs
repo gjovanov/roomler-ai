@@ -30,7 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     IsIconic, IsWindowVisible, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
 };
 
-use super::{LaunchOutcome, ResolvedApp, WindowInfo, WindowManager};
+use super::{Coverage, LaunchOutcome, ResolvedApp, WindowInfo, WindowManager};
 
 /// BOOL is `i32`; use literals to avoid depending on the `TRUE`/`FALSE`
 /// re-exports moving between windows-sys versions.
@@ -83,6 +83,15 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
 }
 
 impl WindowManager for WindowsWm {
+    /// FR-56 P2 — `EnumWindows` sees every top-level window on the desktop,
+    /// so a Windows listing has no second source hiding behind it.
+    fn coverage(&self) -> Coverage {
+        Coverage {
+            sources: vec!["win32"],
+            unlisted: None,
+        }
+    }
+
     fn list(&self) -> Result<Vec<WindowInfo>> {
         let mut raw: Vec<RawWin> = Vec::new();
         // SAFETY: enum_proc only dereferences this pointer during the

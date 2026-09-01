@@ -106,10 +106,34 @@ pub struct ResolvedApp {
 /// Platform window-manager backend. All methods block (shell-out / FFI),
 /// so [`crate::peer`] invokes [`handle_control_message`] from
 /// `tokio::task::spawn_blocking`.
+/// What a listing actually covers — FR-56 P2.
+///
+/// `supported: bool` cannot express **"X11 windows only"**, and on a Wayland
+/// host that is the truth: `wmctrl` sees Xwayland clients and is blind to
+/// native Wayland ones, so a short list looks exactly like a quiet desktop.
+/// This is the `Some([])` vs `None` distinction — an empty list and an
+/// unenumerable source are different facts — on its fourth surface in this
+/// codebase (overlay ACL ingress rules, `ssh_activity`, FR-49's dark org).
+///
+/// ⚠️ `unlisted` is the load-bearing half. Without it the reply is *shorter*
+/// than reality and says nothing about the gap, which is the failure mode the
+/// other three taught: silence reads as absence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Coverage {
+    /// Window sources this listing enumerated: `x11`, `wayland`.
+    pub sources: Vec<&'static str>,
+    /// A source that exists on this host but could NOT be enumerated, with
+    /// the reason. `None` when the listing is complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlisted: Option<String>,
+}
+
 pub trait WindowManager: Send + Sync {
     /// Enumerate the desktop's windows (already classified against the
     /// title convention / allowlist).
     fn list(&self) -> Result<Vec<WindowInfo>>;
+    /// What [`Self::list`] can and cannot see on this host.
+    fn coverage(&self) -> Coverage;
     /// Raise + focus a previously-enumerated window by its opaque id.
     fn focus(&self, window_id: &str) -> Result<()>;
     /// Launch (or, for a tmux entry, create+attach) an allowlisted app.
@@ -259,11 +283,13 @@ fn build_list_reply(
             json!({
                 "t": "rc:apps.list.reply", "id": id, "ok": true, "supported": true,
                 "windows": windows, "launchable": launchable_list(cfg),
+                "coverage": backend.coverage(),
             })
         }
         Err(e) => json!({
             "t": "rc:apps.list.reply", "id": id, "ok": false, "supported": true,
             "windows": [], "launchable": launchable_list(cfg), "error": format!("{e:#}"),
+            "coverage": backend.coverage(),
         }),
     }
 }
@@ -493,6 +519,12 @@ mod tests {
         fail: bool,
     }
     impl WindowManager for FakeWm {
+        fn coverage(&self) -> Coverage {
+            Coverage {
+                sources: vec!["x11"],
+                unlisted: Some("native Wayland windows: fake backend".to_string()),
+            }
+        }
         fn list(&self) -> Result<Vec<WindowInfo>> {
             if self.fail {
                 anyhow::bail!("no display");
@@ -674,6 +706,34 @@ mod tests {
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["supported"], true);
         assert!(reply["error"].as_str().unwrap().contains("no display"));
+        // FR-56 P2: coverage rides the ERROR arm too. A failed listing is the
+        // case most likely to be read as "nothing there", so dropping the
+        // caveat here would be dropping it exactly where it matters most.
+        assert_eq!(reply["coverage"]["sources"][0], "x11");
+        assert!(reply["coverage"]["unlisted"].is_string());
+    }
+
+    /// FR-56 P2 — the reply must distinguish "the desktop has no windows" from
+    /// "there is a whole class of window we cannot see".
+    ///
+    /// ⚠️ `supported: true` + `windows: []` is ambiguous on a Wayland host and
+    /// reads as the reassuring one. `coverage` is what makes the two
+    /// distinguishable — the `Some([])` vs `None` lesson, fourth surface.
+    #[test]
+    fn an_empty_list_still_declares_what_it_could_not_enumerate() {
+        let cfg = cfg_with(&[("bash", true)]);
+        let wm = FakeWm {
+            windows: vec![],
+            fail: false,
+        };
+        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a4"}), &cfg, Some(&wm));
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["windows"].as_array().unwrap().len(), 0);
+        assert_eq!(reply["coverage"]["sources"][0], "x11");
+        assert!(
+            reply["coverage"]["unlisted"].is_string(),
+            "an empty list must still say which source went unenumerated"
+        );
     }
 
     #[test]
