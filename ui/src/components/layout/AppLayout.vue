@@ -488,6 +488,18 @@
               :title="$t('nav.tutorial')"
               :to="{ name: 'tutorial', params: { tenantId } }"
             />
+            <!-- FR-60 — the public docs. `href`, not `:to`: /docs is static
+                 HTML served by nginx, not a route in this router, so a
+                 router-link would land on the 404 view. New tab, because
+                 leaving the app mid-task to read a reference page is not
+                 what someone opening docs wants. -->
+            <v-list-item
+              prepend-icon="mdi-book-open-variant"
+              title="Documentation"
+              href="/docs/"
+              target="_blank"
+              rel="noopener"
+            />
             <v-list-item prepend-icon="mdi-logout" title="Logout" @click="handleLogout" />
           </v-list>
         </v-menu>
