@@ -1,4 +1,4 @@
-# FR-42 P3 (#967) — publish the self-host container image.
+# FR-42 P3 (#967) + FR-57 (#1161) — publish the self-host container image.
 #
 # Turns the documented self-host path from a 6-20 minute source build into a
 # pull. That is the difference between "I tried it" and "I gave up" for the
@@ -10,17 +10,19 @@
 # Nothing is published without someone deciding to publish it — there is no
 # push trigger and no schedule, and that is the phase's kill switch.
 #
-# ⚠️ amd64 only. arm64 is explicitly out of scope for FR-42: cross-building
-# mediasoup and the Rust tree under QEMU takes hours, and an arm64 image nobody
-# has run is a worse promise than no arm64 image. Publishing one is its own
-# piece of work with its own validation.
+# ⚠️ FR-57: one job per ARCHITECTURE, each on its own NATIVE runner, joined by a
+# manifest. Not QEMU: cross-building mediasoup and the Rust tree under emulation
+# takes hours, and an arm64 image checked under emulation proves the bytes exist
+# rather than that they run. Each arch smoke-tests on the architecture it was
+# built for, which is the whole reason arm64 is now defensible when FR-42 ruled
+# it out.
 name: Publish self-host image
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g. v0.4.41). Required — there is no implicit tag.'
+        description: 'Image tag (e.g. v0.4.43). Required — there is no implicit tag.'
         required: true
         type: string
       also_latest:
@@ -33,6 +35,11 @@ on:
         required: false
         default: false
         type: boolean
+      arm64:
+        description: 'Also build linux/arm64 (adds a second native job)'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -43,20 +50,44 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  publish:
-    name: Build + publish (amd64)
-    runs-on: ubuntu-latest
+  # ── one job per architecture ────────────────────────────────────────────────
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     # The Rust tree and mediasoup both build from source on a 4-core runner.
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
       packages: write
-      attestations: write # actions/attest-build-provenance
-      id-token: write
+    strategy:
+      # ⚠️ amd64 is PUBLISHED, DOCUMENTED and MEASURED at 88 s. arm64 is new and
+      # unproven. One must never take the other down, so the matrix does not
+      # cancel siblings and the merge below tolerates a missing arch.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
+      - name: Skip arm64 when not requested
+        id: gate
+        run: |
+          if [ '${{ matrix.arch }}' = 'arm64' ] && [ '${{ inputs.arm64 }}' != 'true' ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "arm64 not requested — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.skip != 'true'
 
       - name: Reject a tag that is not a tag
+        if: steps.gate.outputs.skip != 'true'
         run: |
           TAG='${{ inputs.tag }}'
           # A tag with a slash or a space produces a reference nobody can pull
@@ -68,10 +99,11 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_ENV"
 
       - name: Set up Buildx
+        if: steps.gate.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to ghcr.io
-        if: ${{ !inputs.dry_run }}
+        if: steps.gate.outputs.skip != 'true' && !inputs.dry_run
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -79,36 +111,38 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
-        id: build
+        if: steps.gate.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: ${{ matrix.platform }}
           # Load into the local daemon so the smoke test below runs against the
           # EXACT image that would be pushed, rather than a rebuild of it.
           load: true
           push: false
-          tags: ${{ env.IMAGE }}:${{ env.tag }}
+          tags: ${{ env.IMAGE }}:${{ env.tag }}-${{ matrix.arch }}
           build-args: |
             VERSION=${{ env.tag }}
             GIT_SHA=${{ github.sha }}
-          # GitHub's cache makes a re-run after a failed smoke test cheap; a
-          # cold build is the 60-90 minute case this budget is sized for.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Cache is PER-ARCH: a shared scope would have each architecture
+          # evicting the other's layers on every run.
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
       # ⚠️ The point of publishing is that someone else runs this without
       # reading the source. An image that builds but does not start is worse
-      # than no image, so it has to answer before it is pushed. `/health` is
-      # what the compose healthcheck uses, so this is the same bar.
+      # than no image, so it has to answer before it is pushed — and it answers
+      # HERE, on its own architecture, which is what makes the arm64 leg mean
+      # something.
       - name: Smoke test — the image must actually serve
+        if: steps.gate.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          IMG='${{ env.IMAGE }}:${{ env.tag }}'
+          IMG='${{ env.IMAGE }}:${{ env.tag }}-${{ matrix.arch }}'
           # Generated per run, never written down. A literal here would be a
           # credential-shaped string in a public repo — inert, but secret
           # scanners cannot know that and neither can a reader skimming the
-          # file. These live for the length of one job and are then destroyed
-          # with the runner.
+          # file. These live for one job and die with the runner.
           DBPW="$(openssl rand -hex 16)"
           JWT="$(openssl rand -hex 32)"
           docker network create roomler-smoke
@@ -124,7 +158,7 @@ jobs:
             "$IMG"
           for i in $(seq 1 60); do
             if curl -fsS -m 3 http://localhost:8080/health >/dev/null 2>&1; then
-              echo "healthy after ${i}0s"
+              echo "healthy after ${i}0s on ${{ matrix.arch }}"
               curl -fsS http://localhost:8080/health; echo
               # The SPA must be served too — an API-only container would pass a
               # /health check and still be useless as "the whole product".
@@ -133,17 +167,18 @@ jobs:
             fi
             sleep 10
           done
-          echo "::error::image did not answer /health within 600s"
+          echo "::error::${{ matrix.arch }} image did not answer /health within 600s"
           docker logs roomler 2>&1 | tail -60
           exit 1
 
       - name: Report the version the image reports about ITSELF
+        if: steps.gate.outputs.skip != 'true'
         run: |
           set -uo pipefail
-          IMG='${{ env.IMAGE }}:${{ env.tag }}'
+          IMG='${{ env.IMAGE }}:${{ env.tag }}-${{ matrix.arch }}'
           docker image inspect "$IMG" \
             --format '  labels: version={{index .Config.Labels "org.opencontainers.image.version"}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
-          docker image inspect "$IMG" --format '  size: {{.Size}} bytes'
+          docker image inspect "$IMG" --format '  arch: {{.Architecture}}  size: {{.Size}} bytes'
 
           # ⚠️ The tag and the binary's own version are DIFFERENT CLAIMS, and
           # they drift silently: master moves while a 20-minute build runs, so
@@ -167,40 +202,115 @@ jobs:
             echo "  ✓ tag matches the version the binary reports"
           fi
 
-      # ⚠️ Pushes the image that was just SMOKE-TESTED, rather than asking
+      # ⚠️ Pushes BY DIGEST, not by tag. Two architecture jobs cannot both push
+      # `:<tag>` — the second silently wins and the published manifest names one
+      # architecture while claiming to be the release. The digests are collected
+      # by the merge job below and assembled into a manifest list, which is what
+      # makes `:<tag>` resolve per-architecture for whoever pulls it.
+      #
+      # It also pushes the image that was just SMOKE-TESTED rather than asking
       # build-push-action to build again with `push: true`. A second build is
-      # near-instant off the cache and would almost certainly be identical —
-      # but "almost certainly" is not what testing-before-publishing is for,
-      # and the whole point of the step above is that these exact bytes
-      # answered /health.
-      - name: Push the tested image
-        if: ${{ !inputs.dry_run }}
+      # near-instant off the cache and would almost certainly be identical — but
+      # "almost certainly" is not what testing-before-publishing is for.
+      - name: Push by digest
+        if: steps.gate.outputs.skip != 'true' && !inputs.dry_run
         id: push
         run: |
           set -euo pipefail
-          SRC='${{ env.IMAGE }}:${{ env.tag }}'
+          SRC='${{ env.IMAGE }}:${{ env.tag }}-${{ matrix.arch }}'
           docker push "$SRC"
-          DIGEST=$(docker image inspect "$SRC" \
-            --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
-          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
-          echo "pushed $SRC@$DIGEST"
-          if [ '${{ inputs.also_latest }}' = 'true' ]; then
-            # Retag rather than rebuild, so `latest` and the version tag are
-            # the same bytes and resolve to the same digest.
-            docker tag "$SRC" '${{ env.IMAGE }}:latest'
-            docker push '${{ env.IMAGE }}:latest'
-            echo "moved latest -> $DIGEST"
+          DIGEST=$(docker image inspect "$SRC" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
+          echo "  ${{ matrix.arch }} -> $DIGEST"
+          mkdir -p /tmp/digests
+          echo "$DIGEST" > "/tmp/digests/${{ matrix.arch }}"
+
+      - name: Carry the digest to the merge job
+        if: steps.gate.outputs.skip != 'true' && !inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # ── assemble one tag from whatever succeeded ────────────────────────────────
+  merge:
+    name: Manifest
+    needs: build
+    # `always()` so a failed arm64 leg does not withhold the amd64 publish:
+    # amd64 is published, documented and measured, and arm64 is the new thing.
+    if: ${{ always() && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write # actions/attest-build-provenance
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Assemble the manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          TAG='${{ inputs.tag }}'
+          REFS=""
+          FOUND=""
+          for a in amd64 arm64; do
+            if [ -f "/tmp/digests/$a" ]; then
+              D=$(cat "/tmp/digests/$a")
+              REFS="$REFS ${{ env.IMAGE }}@$D"
+              FOUND="$FOUND $a"
+            fi
+          done
+          if [ -z "$REFS" ]; then
+            echo "::error::no architecture produced a digest — nothing to publish"
+            exit 1
           fi
+          # Say what is NOT in the tag. A manifest quietly missing an arch is
+          # indistinguishable from one that never wanted it, and the person who
+          # finds out is a Pi owner whose pull fails.
+          case "$FOUND" in
+            *amd64*arm64*) echo "  both architectures present" ;;
+            *) echo "::warning title=Publishing a single-architecture image::\
+          only[$FOUND ] succeeded. The tag will publish, but hosts on the missing \
+          architecture cannot pull it." ;;
+          esac
+          # shellcheck disable=SC2086
+          docker buildx imagetools create --tag "${{ env.IMAGE }}:$TAG" $REFS
+          if [ '${{ inputs.also_latest }}' = 'true' ]; then
+            # shellcheck disable=SC2086
+            docker buildx imagetools create --tag "${{ env.IMAGE }}:latest" $REFS
+            echo "  moved latest"
+          fi
+          LIST=$(docker buildx imagetools inspect "${{ env.IMAGE }}:$TAG" \
+            --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}' 2>/dev/null || true)
+          echo "  published platforms: $LIST"
+          D=$(docker buildx imagetools inspect "${{ env.IMAGE }}:$TAG" --format '{{.Manifest.Digest}}')
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+          echo "platforms=$LIST" >> "$GITHUB_OUTPUT"
 
       # The image runs a privileged product on someone else's machine. Signing
       # its provenance costs one step and lets them verify where it came from,
       # matching what release-agent.yml already does for the agent artifacts.
       - name: Attest build provenance
-        if: ${{ !inputs.dry_run }}
         uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.push.outputs.digest }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
       - name: Summary
@@ -209,15 +319,13 @@ jobs:
           {
             echo "### Self-host image"
             echo
-            if [ '${{ inputs.dry_run }}' = 'true' ]; then
-              echo "**Dry run — nothing was pushed.**"
-            else
-              echo '```'
-              echo 'docker pull ${{ env.IMAGE }}:${{ env.tag }}'
-              echo '```'
-              echo
-              echo "\`latest\` moved: \`${{ inputs.also_latest }}\`"
-              echo
-              echo "Digest: \`${{ steps.push.outputs.digest }}\`"
-            fi
+            echo '```'
+            echo 'docker pull ${{ env.IMAGE }}:${{ inputs.tag }}'
+            echo '```'
+            echo
+            echo "Platforms: \`${{ steps.manifest.outputs.platforms }}\`"
+            echo
+            echo "\`latest\` moved: \`${{ inputs.also_latest }}\`"
+            echo
+            echo "Digest: \`${{ steps.manifest.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
