@@ -642,10 +642,7 @@ mod linux {
              ExecStart={exe_str} run\n\
              Restart=on-failure\n\
              RestartSec=5\n\
-            // RETIRED-NAME-ANCHOR(2): renaming a lib renames its TRACING TARGET.
-            // Units already on disk in the field carry the old target, so the
-            // spec names BOTH — dropping either silences a fleet, with no error.
-             Environment=RUST_LOG=roomler_agent=info,roomlerd=info,tunnel_core=info,warn\n\
+             Environment=RUST_LOG=roomlerd=info,tunnel_core=info,warn\n\
              \n\
              [Install]\n\
              WantedBy=default.target\n"
@@ -740,9 +737,7 @@ mod macos {
              \t<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
              \t<key>ProcessType</key><string>Interactive</string>\n\
              \t<key>EnvironmentVariables</key>\n\
-            // RETIRED-NAME-ANCHOR(2): same dual tracing target as the systemd
-            // unit above, for the macOS LaunchAgent plist.
-             \t<dict><key>RUST_LOG</key><string>roomler_agent=info,roomlerd=info,tunnel_core=info,warn</string></dict>\n\
+             \t<dict><key>RUST_LOG</key><string>roomlerd=info,tunnel_core=info,warn</string></dict>\n\
              </dict>\n\
              </plist>\n"
         );
