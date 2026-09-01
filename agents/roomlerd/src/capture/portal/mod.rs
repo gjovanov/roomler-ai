@@ -33,6 +33,10 @@
 
 /// FR-45 P3c-ii — the sixth `ScreenCapture` backend.
 pub mod backend;
+/// FR-45 P4 — wire input events onto RemoteDesktop `Notify*` calls (helper side).
+pub mod input;
+/// FR-45 P4 — the arbiter→helper input seam (daemon side).
+pub mod input_route;
 /// FR-45 P3a — reaching `libpipewire` through `dlopen`, never a link.
 pub mod pipewire;
 /// FR-45 P3b — SPA POD serialisation, so a format can be negotiated.
@@ -294,9 +298,9 @@ pub mod helper {
     /// The human-readable line goes to **stderr**, which the parent inherits,
     /// so the daemon's log carries the child's own account of what it saw next
     /// to the parent's verdict. Same reasoning as the caps probe.
-    pub fn run(screencast: bool, stream: bool) {
+    pub fn run(screencast: bool, stream: bool, input: bool) {
         if stream {
-            run_stream();
+            run_stream(input);
             return;
         }
         if screencast {
@@ -332,6 +336,11 @@ pub mod helper {
         pub width: u32,
         pub height: u32,
         pub video_format: u32,
+        /// P4 — whether this helper consumes `InputMsg` JSON lines on stdin.
+        /// `serde(default)` so a handshake from an older helper reads as
+        /// "no input", never as a parse failure.
+        #[serde(default)]
+        pub input_ok: bool,
     }
 
     /// Marks the streaming handshake line. A THIRD marker, distinct from the
@@ -345,20 +354,71 @@ pub mod helper {
     /// ⚠️ **stdout is binary after the handshake line.** Everything
     /// diagnostic goes to stderr, which the parent inherits: a stray
     /// `println!` here does not add a log line, it corrupts a frame.
-    fn run_stream() {
-        eprintln!("portal-helper: opening a ScreenCast session for streaming");
-        let session = match super::screencast::open() {
+    fn run_stream(with_input: bool) {
+        use super::screencast::SessionKind;
+        // The session shape is decided by what the portal OFFERS, not by
+        // failing and retrying: a wlr backend has ScreenCast and no
+        // RemoteDesktop (measured — the WSL2 field runs), and asking it for
+        // input would fail the whole session where capture alone works.
+        let kind = if with_input {
+            match super::detect() {
+                PortalStatus::Available {
+                    remote_desktop: true,
+                    ..
+                } => SessionKind::WithInput,
+                st => {
+                    eprintln!(
+                        "portal-helper: input requested but not available ({st}) — capture only"
+                    );
+                    SessionKind::CaptureOnly
+                }
+            }
+        } else {
+            SessionKind::CaptureOnly
+        };
+        eprintln!(
+            "portal-helper: opening a {} session for streaming",
+            match kind {
+                SessionKind::WithInput => "RemoteDesktop (capture + input)",
+                SessionKind::CaptureOnly => "ScreenCast (capture only)",
+            }
+        );
+        // ⚠️ An input session that fails — a declined dialog, a timeout, a
+        // compositor that offered RemoteDesktop but would not grant it — must
+        // NOT cost CAPTURE. Retry capture-only rather than exiting, so a host
+        // where capture-only works is never left with no capture just because
+        // the input half was refused. (The kill switch already defaults input
+        // OFF; this is the belt to that braces.)
+        let mut session = match super::screencast::open(kind) {
             Ok(s) => s,
+            Err(e) if kind == SessionKind::WithInput => {
+                eprintln!("portal-helper: the input session failed ({e}) — retrying capture-only");
+                match super::screencast::open(SessionKind::CaptureOnly) {
+                    Ok(s) => s,
+                    Err(e2) => {
+                        eprintln!("portal-helper: {e2}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("portal-helper: {e}");
                 std::process::exit(1);
             }
         };
-        let (Some(fd), Some(first)) = (session.pipewire_fd, session.report.streams.first()) else {
+        // `take`, not destructure: the session must stay WHOLE — its D-Bus
+        // connection keeps the portal session (and so the PipeWire node and
+        // the input grant) alive, and the input context still needs it.
+        let Some(fd) = session.pipewire_fd.take() else {
+            eprintln!("portal-helper: the portal gave no PipeWire fd");
+            std::process::exit(1);
+        };
+        let Some(first) = session.report.streams.first() else {
             eprintln!("portal-helper: the portal gave no stream to attach to");
             std::process::exit(1);
         };
         let node_id = first.node_id;
+        let advertised = (first.width, first.height);
 
         let handle = match super::pipewire::stream(fd, node_id, DEFAULT_MAX_FPS) {
             Ok(h) => h,
@@ -372,10 +432,59 @@ pub mod helper {
             handle.format.width, handle.format.height, handle.format.video_format
         );
 
+        // P4 — the input pump, spawned before the frame loop takes this
+        // thread. The portal's advertised stream size is the LOGICAL space
+        // absolute motion is addressed in; the negotiated PIXEL size is only
+        // a fallback for a portal that advertised none (correct wherever the
+        // scale factor is 1, and the best available answer elsewhere).
+        let mut input_ok = false;
+        if let Some(sess_path) = session.input_session.clone() {
+            let logical = match advertised {
+                (Some(w), Some(h)) if w > 0 && h > 0 => (f64::from(w), f64::from(h)),
+                _ => (
+                    f64::from(handle.format.width),
+                    f64::from(handle.format.height),
+                ),
+            };
+            // ⚠️⚠️ The `InputContext` (a `zbus::blocking::Proxy`) MUST be built
+            // OFF the tokio runtime thread. `run_stream` runs synchronously
+            // inside the `#[tokio::main]` daemon, and zbus's blocking API does
+            // a fresh `Runtime::block_on` internally — which panics "Cannot
+            // start a runtime from within a runtime" on a runtime thread. This
+            // is the exact hazard `screencast::open` documents and guards with
+            // its own thread; the first cut of P4 rebuilt the proxy here on the
+            // tokio thread and would have panicked the instant input was
+            // granted (masked in the field run because consent blocked first).
+            // Build it on a joined thread so `input_ok` stays honest, then run
+            // the pump — also off-runtime — on its own thread.
+            let conn = session.connection().clone();
+            let built = std::thread::spawn(move || {
+                super::input::InputContext::new(&conn, sess_path, node_id, logical)
+            })
+            .join();
+            match built {
+                Ok(Ok(ctx)) => {
+                    std::thread::spawn(move || super::input::run_pump(ctx, std::io::stdin()));
+                    input_ok = true;
+                    eprintln!(
+                        "portal-helper: input pump ready (logical {}x{})",
+                        logical.0, logical.1
+                    );
+                }
+                Ok(Err(e)) => {
+                    eprintln!("portal-helper: input context failed: {e} — capture only");
+                }
+                Err(_) => {
+                    eprintln!("portal-helper: input context thread panicked — capture only");
+                }
+            }
+        }
+
         let started = StreamStarted {
             width: handle.format.width,
             height: handle.format.height,
             video_format: handle.format.video_format,
+            input_ok,
         };
         match serde_json::to_string(&started) {
             Ok(j) => println!("{STREAM_MARKER}{j}"),
@@ -408,8 +517,19 @@ pub mod helper {
     ///
     /// Unlike [`spawn_in_session`], this does NOT wait: the child lives as
     /// long as the capture does.
-    pub fn spawn_streaming(_target_fps: u32) -> anyhow::Result<std::process::Child> {
-        spawn_child(&["--stream"]).map_err(|e| match e {
+    pub fn spawn_streaming(
+        _target_fps: u32,
+        with_input: bool,
+    ) -> anyhow::Result<std::process::Child> {
+        let args: &[&str] = if with_input {
+            &["--stream", "--input"]
+        } else {
+            &["--stream"]
+        };
+        // stdin is the input wire, piped exactly when input is wanted — a
+        // helper that will never read it should see EOF, not a pipe nothing
+        // writes to.
+        spawn_child(args, with_input).map_err(|e| match e {
             SpawnError::NoSession => {
                 anyhow::anyhow!("nobody is at this machine's screen — the portal is attended-only")
             }
@@ -435,21 +555,25 @@ pub mod helper {
 
     fn run_screencast() {
         eprintln!("portal-helper: opening a ScreenCast session");
-        let outcome = super::screencast::open().map(|session| {
-            let mut report = session.report;
-            // P3b-ii — the fd goes to PipeWire, a stream is connected to the
-            // node the portal named, and the compositor's chosen format is
-            // reported. ⚠️ Still no frames: buffer delivery is P3c.
-            report.pipewire = match (session.pipewire_fd, report.streams.first()) {
-                (Some(fd), Some(s)) => {
-                    super::pipewire::negotiate_status(fd, s.node_id, DEFAULT_MAX_FPS, WANT_FRAMES)
-                }
-                // A session with no stream cannot be negotiated against, and
-                // saying "not attempted" is the truth rather than a failure.
-                _ => super::pipewire::PipeWireStatus::NotAttempted,
-            };
-            report
-        });
+        let outcome =
+            super::screencast::open(super::screencast::SessionKind::CaptureOnly).map(|session| {
+                let mut report = session.report;
+                // P3b-ii — the fd goes to PipeWire, a stream is connected to the
+                // node the portal named, and the compositor's chosen format is
+                // reported. ⚠️ Still no frames: buffer delivery is P3c.
+                report.pipewire = match (session.pipewire_fd, report.streams.first()) {
+                    (Some(fd), Some(s)) => super::pipewire::negotiate_status(
+                        fd,
+                        s.node_id,
+                        DEFAULT_MAX_FPS,
+                        WANT_FRAMES,
+                    ),
+                    // A session with no stream cannot be negotiated against, and
+                    // saying "not attempted" is the truth rather than a failure.
+                    _ => super::pipewire::PipeWireStatus::NotAttempted,
+                };
+                report
+            });
         match &outcome {
             Ok(r) => eprintln!(
                 "portal-helper: {} stream(s), node_id={:?}, fd_ok={}, {} ms; pipewire: {}",
@@ -506,7 +630,10 @@ pub mod helper {
     /// session environment and the privilege drop exist exactly once — the
     /// three things that must not drift between two ways of running the same
     /// child.
-    fn spawn_child(extra_args: &[&str]) -> Result<std::process::Child, SpawnError> {
+    fn spawn_child(
+        extra_args: &[&str],
+        piped_stdin: bool,
+    ) -> Result<std::process::Child, SpawnError> {
         let sess = match crate::companion::graphical_session() {
             Ok(s) => s,
             Err(e) => {
@@ -530,7 +657,11 @@ pub mod helper {
                 "DBUS_SESSION_BUS_ADDRESS",
                 format!("unix:path=/run/user/{}/bus", sess.uid),
             )
-            .stdin(std::process::Stdio::null())
+            .stdin(if piped_stdin {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::piped())
             // Inherited on purpose: the child's own account of what it saw
             // belongs in the daemon log, and stdout is reserved for the
@@ -559,7 +690,7 @@ pub mod helper {
         extra_args: &[&str],
         timeout: std::time::Duration,
     ) -> Result<String, SpawnError> {
-        let mut child = spawn_child(extra_args)?;
+        let mut child = spawn_child(extra_args, false)?;
 
         // Drain stdout on another thread while waiting: a child that filled
         // the pipe would otherwise deadlock against our own wait.
