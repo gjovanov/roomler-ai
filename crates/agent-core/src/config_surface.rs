@@ -98,6 +98,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "macOS only. Let the root daemon spawn and babysit the GUI-session worker (FR-43 P1). Stands down whenever the LaunchAgent is loaded, so one enrollment is never served twice. Default: OFF.",
     ),
     (
+        "power_policy",
+        "never|on-ac|always",
+        "Ask the OS to stay awake so this device stays reachable (FR-55). `on-ac` is the setting a laptop usually wants. A live remote-control or SSH session ALWAYS holds the machine awake regardless of this. ⚠️ macOS clamshell sleep (lid closed, no external display) ignores it — an OS limit, not a setting. Default: never.",
+    ),
+    (
         "remote_config_enabled",
         "bool",
         "Accept configuration pushed by the control plane. NEVER settable by the server — it is what keeps exec_enabled/ssh_enabled refusable by a compromised one. Turning it ON delegates that last refusal. Default: OFF.",
@@ -712,6 +717,11 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "enable_remote_browse" => Some(fmt_bool(cfg.enable_remote_browse)),
         "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
         "macos_supervise_gui_worker" => Some(fmt_bool(cfg.macos_supervise_gui_worker)),
+        "power_policy" => Some(if cfg.power_policy.is_empty() {
+            "never".to_string()
+        } else {
+            cfg.power_policy.clone()
+        }),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
@@ -865,6 +875,18 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "exec_enabled" => cfg.exec_enabled = parse_bool_or(value, false)?,
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
+        }
+        // FR-55 — validated HERE rather than at read time, so a typo is
+        // refused when it is made instead of silently becoming `never` weeks
+        // later on a device nobody is looking at.
+        "power_policy" => {
+            let v = value.unwrap_or("never").trim().to_ascii_lowercase();
+            if !matches!(v.as_str(), "never" | "on-ac" | "on_ac" | "ac" | "always") {
+                return Err(format!(
+                    "power_policy must be one of never | on-ac | always (got {v:?})"
+                ));
+            }
+            cfg.power_policy = v;
         }
         // Same fail-safe direction, and note WHERE this is settable from:
         // locally (this surface — CLI, desktop companion), never from a
