@@ -44,6 +44,11 @@ impl AgentDao {
             tags: Vec::new(),
             name_admin_set: false,
             machine_id,
+            // FR-51 — permanent unless the ENROLLMENT CREDENTIAL said
+            // otherwise (P2 threads it through from the key; the request
+            // body must never be able to set it).
+            ephemeral: false,
+            ephemeral_ttl_secs: None,
             os,
             agent_version,
             // FR-27 — unknown until the device's first heartbeat, for the same
@@ -682,6 +687,79 @@ impl AgentDao {
 
     pub async fn soft_delete(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<bool> {
         self.base.soft_delete_in_tenant(tenant_id, agent_id).await
+    }
+
+    /// FR-51 — remove an EPHEMERAL row outright. The `(tenant_id, machine_id)`
+    /// unique index is not partial on `deleted_at`, so a tombstoned ephemeral
+    /// row would reserve its random, never-reused machine_id forever — every
+    /// reaped CI run would permanently burn an index entry. Guarded on
+    /// `ephemeral: true` in the filter so this can never hard-delete a
+    /// permanent device, whatever the caller believed about the row.
+    pub async fn hard_delete_ephemeral(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+    ) -> DaoResult<bool> {
+        let n = self
+            .base
+            .hard_delete(doc! {
+                "_id": agent_id,
+                "tenant_id": tenant_id,
+                "ephemeral": true,
+            })
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// FR-51 — rows the reaper should LOOK AT: live, ephemeral, and silent for
+    /// at least the floor TTL. Deliberately its own query, never the presence
+    /// sweep's scan set — `run_presence_sweep` settles an absent row to
+    /// `last_presence: "offline"`, after which it matches neither branch of
+    /// `find_presence_scan_set` and is never scanned again, so a reaper hung
+    /// off that loop would see each row exactly once and any deadline longer
+    /// than one sweep interval would silently never fire.
+    ///
+    /// This is only the CANDIDATE set (pre-filtered by the 60 s floor so the
+    /// fetch stays tiny); the reaper re-checks each row against its own
+    /// effective TTL and against live presence before removing anything.
+    pub async fn find_ephemeral_reap_candidates(
+        &self,
+        min_silence_ms: i64,
+    ) -> DaoResult<Vec<Agent>> {
+        let cutoff = DateTime::from_millis(DateTime::now().timestamp_millis() - min_silence_ms);
+        self.base
+            .find_many(
+                doc! {
+                    "ephemeral": true,
+                    "deleted_at": null,
+                    "last_seen_at": { "$lt": cutoff },
+                },
+                None,
+            )
+            .await
+    }
+
+    /// FR-51 — stamp a row ephemeral (with an optional per-device TTL
+    /// override). P2's enrollment path sets this at CREATE time from the
+    /// enrollment key; this setter exists for the reaper's tests and for
+    /// backfilling a row minted before its key's flag was honoured. There is
+    /// deliberately no inverse: a device never becomes permanent again — the
+    /// two directions must not be crossable after the fact.
+    pub async fn set_ephemeral(
+        &self,
+        agent_id: ObjectId,
+        ttl_secs: Option<u64>,
+    ) -> DaoResult<bool> {
+        let ttl_bson = match ttl_secs {
+            Some(t) => bson::Bson::Int64(t as i64),
+            None => bson::Bson::Null,
+        };
+        self.base
+            .update_by_id(
+                agent_id,
+                doc! { "$set": { "ephemeral": true, "ephemeral_ttl_secs": ttl_bson } },
+            )
+            .await
     }
 
     /// Reassign the device owner (a `MANAGE_AGENTS` admin action). Leaves
