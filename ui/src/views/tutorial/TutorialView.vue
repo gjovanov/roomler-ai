@@ -185,6 +185,20 @@
             </tbody>
           </v-table>
 
+          <!-- FR-12 P2 — take the reader to the real control, spotlighted.
+               Only rendered for chapters that declare a tour. -->
+          <div v-if="active.tour" class="mb-4">
+            <v-btn
+              color="primary"
+              variant="tonal"
+              size="small"
+              prepend-icon="mdi-target"
+              @click="startTour(active.tour)"
+            >
+              {{ active.tour.label }}
+            </v-btn>
+          </div>
+
           <v-divider class="mb-4" />
 
           <div class="d-flex align-center flex-wrap ga-2">
@@ -239,6 +253,17 @@ import {
 
 const route = useRoute()
 const router = useRouter()
+
+// FR-12 P2 — hand off to the live page. The tour id travels as a query param
+// because the overlay is mounted by the LAYOUT, not by this view: by the time
+// the tour runs, this component is gone.
+function startTour(tour: { id: string; routeName: string }) {
+  router.push({
+    name: tour.routeName,
+    params: { tenantId: route.params.tenantId },
+    query: { tour: tour.id },
+  })
+}
 const auth = useAuthStore()
 const { showSuccess } = useSnackbar()
 

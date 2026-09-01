@@ -238,6 +238,7 @@
            Settings panel (Video / Display / Session). Replaces the old
            mobile-only bottom-sheet trigger + the desktop inline Row 2. -->
       <v-btn
+        data-tour="viewer-settings"
         icon="mdi-tune-variant"
         variant="text"
         size="small"
@@ -429,6 +430,7 @@
       </v-btn>
       <v-btn
         v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed' || rc.phase.value === 'error'"
+        data-tour="viewer-connect"
         color="primary"
         variant="flat"
         prepend-icon="mdi-play"
