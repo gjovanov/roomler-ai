@@ -150,6 +150,10 @@ reqwest = { version = "0.12", features = ["json", "multipart", "cookies", "strea
 # wants direct SMTP delivery, flip on `tokio1-rustls-tls` and switch
 # to `starttls_relay`.
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "builder", "hostname"] }
+# FR-58 — newsletter issue bodies are authored as markdown (the same file is
+# the Medium post) and rendered server-side; raw-HTML events are filtered out
+# before push_html, so the only HTML in an email body is renderer-emitted.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
