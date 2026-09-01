@@ -115,6 +115,59 @@ pub enum DelegateFrame {
     ToWorker { msg: Box<ServerMsg> },
     /// Worker → daemon: an rc-session message to put on the control WS.
     FromWorker { msg: Box<ClientMsg> },
+    /// Daemon → worker: everything the daemon resolved while answering
+    /// `rc:session.request`, which the worker's `rc:sdp.offer` handler needs.
+    SessionParams(Box<SessionParams>),
+}
+
+/// Everything the daemon resolved for a session while answering
+/// `rc:session.request`.
+///
+/// ⚠️ This type exists because the five "rc-session" messages are NOT
+/// independent: `Request` RESOLVES a session's parameters and stashes them, and
+/// `SdpOffer` CONSUMES them. Delegating only the latter left the worker
+/// defaulting all seven — field-measured on 0.4.42, where the browser had
+/// negotiated `data-channel-h264` while the worker, defaulting `transport` to
+/// `None`, wrote 13 MB to the legacy RTP TRACK the browser was not reading.
+/// Input kept working (a separate data channel), so the session looked alive
+/// and showed nothing.
+///
+/// ⚠️ The RESOLVED values travel, not the `Request` itself. The daemon has
+/// already told the SERVER what it chose, so its resolution is authoritative;
+/// re-resolving in the worker would let the two disagree whenever their
+/// capability probes differ — and they are different processes in different
+/// sessions, so they can.
+///
+/// ⚠️ Adding a field here means adding it to the `Request` handler that fills
+/// it AND the `SdpOffer` handler that reads it. A seventh parallel map keyed by
+/// session id is the smell that made this bug possible; consolidating them is
+/// the real cleanup, and this struct is the shape it should take.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SessionParams {
+    /// Hex, like every other id this channel carries.
+    pub session_id: String,
+    pub codec: String,
+    pub transport: Option<String>,
+    pub chroma: Option<String>,
+    pub chunk_framing: bool,
+    pub audio: bool,
+    pub permissions: roomler_ai_remote_control::permissions::Permissions,
+    pub controller_name: String,
+    pub input_mode: Option<roomler_ai_remote_control::models::InputMode>,
+    pub asking_org: Option<String>,
+}
+
+/// What the worker's signalling loop receives over the delegation channel.
+///
+/// Two shapes, and the ORDER between them is load-bearing: params must land
+/// before the offer that consumes them. They do, because both travel one
+/// ordered channel and the server always sends `Request` before `SdpOffer`.
+#[derive(Debug)]
+pub enum WorkerInbound {
+    /// Parameters for a session that is about to be offered.
+    Params(Box<SessionParams>),
+    /// An rc message to serve.
+    Msg(Box<ServerMsg>),
 }
 
 /// The socket a worker running as `uid` dials.
@@ -135,7 +188,7 @@ pub fn socket_path(uid: u32) -> std::path::PathBuf {
 /// sees messages arrive and replies leave.
 pub struct WorkerLink {
     /// rc messages the daemon delegated, waiting for the signalling loop.
-    pub inbound: tokio::sync::mpsc::Receiver<ServerMsg>,
+    pub inbound: tokio::sync::mpsc::Receiver<WorkerInbound>,
     /// Replies from a delegated session — the answer, its peer's ICE, its
     /// stats, its terminate — drained by the attach loop into `FromWorker`
     /// frames.
@@ -183,7 +236,7 @@ impl Delegation {
     pub fn worker_mut(
         &mut self,
     ) -> Option<(
-        &mut tokio::sync::mpsc::Receiver<ServerMsg>,
+        &mut tokio::sync::mpsc::Receiver<WorkerInbound>,
         &tokio::sync::mpsc::Sender<ClientMsg>,
     )> {
         match self {
@@ -432,6 +485,22 @@ impl DelegateHost {
         .is_ok()
     }
 
+    /// Hand the worker the parameters the daemon resolved for a session.
+    ///
+    /// Must reach the worker BEFORE the `SdpOffer` that consumes them. It does,
+    /// because both travel the same ordered channel and the daemon resolves
+    /// them while handling `Request`, which the server always sends first.
+    pub fn send_params(&self, frame: DelegateFrame) -> bool {
+        let tx = self
+            .inner
+            .to_worker
+            .lock()
+            .expect("to_worker mutex")
+            .clone();
+        let Some(tx) = tx else { return false };
+        tx.try_send(frame).is_ok()
+    }
+
     /// Forget the current secret — the worker it belonged to is gone.
     ///
     /// [`crate::macos_supervisor`] calls this from `stop_worker`, which takes a
@@ -545,10 +614,10 @@ impl DelegateHost {
                     tracing::warn!("delegation: worker sent an `attached` frame; ignoring");
                 }
                 Ok(DelegateFrame::FromWorker { msg }) => self.relay_upstream(*msg),
-                Ok(DelegateFrame::ToWorker { .. }) => {
+                Ok(DelegateFrame::ToWorker { .. } | DelegateFrame::SessionParams { .. }) => {
                     // Daemon → worker only. A worker sending one is confused
                     // about which end it is.
-                    tracing::warn!("delegation: worker sent a `to_worker` frame; ignoring");
+                    tracing::warn!("delegation: worker sent a daemon-only frame; ignoring");
                 }
                 Err(e) => {
                     // Do NOT close on an unknown frame: a NEWER worker may send
@@ -999,15 +1068,18 @@ mod role_tests {
         });
         let sid = bson::oid::ObjectId::new();
         in_tx
-            .send(ServerMsg::Ice {
+            .send(WorkerInbound::Msg(Box::new(ServerMsg::Ice {
                 session_id: sid,
                 candidate: serde_json::Value::Null,
-            })
+            })))
             .await
             .unwrap();
 
         let (rx, tx) = role.worker_mut().expect("worker");
-        let got = rx.recv().await.expect("inbound");
+        let got = match rx.recv().await.expect("inbound") {
+            WorkerInbound::Msg(m) => *m,
+            other => panic!("expected a message, got {other:?}"),
+        };
         assert!(
             delegable_inbound(&got),
             "only delegable kinds should arrive"
@@ -1023,5 +1095,78 @@ mod role_tests {
             delegable_outbound(&back),
             "a reply must be one the daemon will relay"
         );
+    }
+}
+
+#[cfg(test)]
+mod params_tests {
+    use super::*;
+
+    /// The bug this frame exists for, stated as a test.
+    ///
+    /// `Request` resolves a session's parameters; `SdpOffer` consumes them.
+    /// Delegating only the latter left the worker defaulting `transport` to
+    /// `None` — the legacy RTP track — while the browser read the
+    /// `video-bytes` data channel it had negotiated. 13 MB encoded, nothing
+    /// rendered, and input still working because it rides its own channel.
+    ///
+    /// So the value that must survive the crossing is `Some("data-channel-…")`
+    /// staying `Some`, distinct from a session that genuinely negotiated the
+    /// track path.
+    #[test]
+    fn the_negotiated_transport_survives_the_crossing() {
+        let params = SessionParams {
+            session_id: bson::oid::ObjectId::new().to_hex(),
+            codec: "h264".into(),
+            transport: Some("data-channel-h264".into()),
+            chroma: None,
+            chunk_framing: false,
+            audio: true,
+            permissions: roomler_ai_remote_control::permissions::Permissions::all(),
+            controller_name: "someone".into(),
+            input_mode: None,
+            asking_org: None,
+        };
+        let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(params)))
+            .expect("serialises");
+        let back: DelegateFrame = serde_json::from_str(&wire).expect("round-trips");
+        match back {
+            DelegateFrame::SessionParams(p) => {
+                assert_eq!(
+                    p.transport.as_deref(),
+                    Some("data-channel-h264"),
+                    "a dropped transport is a black screen with a healthy log"
+                );
+                assert!(p.audio, "audio negotiation must not silently default off");
+                assert!(
+                    p.permissions
+                        .contains(roomler_ai_remote_control::permissions::Permissions::FILES),
+                    "permissions must not silently default: the FILES denial is                      how this bug first showed"
+                );
+            }
+            other => panic!("expected SessionParams, got {other:?}"),
+        }
+    }
+
+    /// `None` is a real negotiated value (the legacy track), not "unset" — so a
+    /// future refactor must not collapse it with a missing field.
+    #[test]
+    fn an_absent_transport_is_distinguishable_from_a_present_one() {
+        let mut p = SessionParams {
+            session_id: bson::oid::ObjectId::new().to_hex(),
+            codec: "h264".into(),
+            transport: None,
+            chroma: None,
+            chunk_framing: false,
+            audio: false,
+            permissions: roomler_ai_remote_control::permissions::Permissions::empty(),
+            controller_name: String::new(),
+            input_mode: None,
+            asking_org: None,
+        };
+        let track = serde_json::to_string(&p).unwrap();
+        p.transport = Some("data-channel-h264".into());
+        let dc = serde_json::to_string(&p).unwrap();
+        assert_ne!(track, dc, "the two transports must not serialise alike");
     }
 }
