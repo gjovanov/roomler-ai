@@ -2087,9 +2087,22 @@ impl OverlayRuntime {
         // device with no OS surface (mock, netstack) falls back to the
         // historical per-platform singleton name, exactly as before.
         let nat_if = tun.os_name();
+        // FR-47 P5e — NAT every block of the org, not just the one this node
+        // is addressed in: a peer in another block is equally overlay-sourced,
+        // and masquerading only our own would let its packets out un-NATed.
+        //
+        // `cidrs` is empty from a pre-P5d server, and then this is exactly the
+        // single `network.cidr` it always was. It is also a one-element list
+        // for every org that has not grown — so the commands issued are
+        // byte-identical on every deployment that exists today.
+        let nat_cidrs: Vec<String> = if network.cidrs.is_empty() {
+            vec![network.cidr.clone()]
+        } else {
+            network.cidrs.clone()
+        };
         let _subnet_router = super::nat::enable(
             nat_if.as_deref().unwrap_or(super::tun::IF_NAME),
-            &network.cidr,
+            &nat_cidrs,
             &self.advertised_routes,
         )
         .await;
@@ -7113,6 +7126,7 @@ mod tests {
     fn net() -> OverlayNetworkInfo {
         OverlayNetworkInfo {
             cidr: "100.64.0.0/10".into(),
+            cidrs: vec![],
             mtu: 1280,
             magic_domain: None,
             nameservers: vec![],
