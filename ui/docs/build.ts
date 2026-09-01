@@ -61,12 +61,20 @@ const DIST = join(UI_ROOT, 'dist')
 const OUT = join(DIST, 'docs')
 const OUT_ASSETS = join(OUT, 'assets')
 
-/** Where a frontmatter `hero:` / inline image name is looked up, in order.
- *  Reusing the tutorial's artwork is the point — it is the same product. */
+/**
+ * Where a frontmatter `hero:` / inline image name is looked up, in order.
+ * Reusing the tutorial's artwork is the point — it is the same product.
+ *
+ * ⚠️ EVERY path must be inside `ui/`. The Dockerfile's UI stage is
+ * `COPY ui/ .` and nothing else, so an asset resolved from the repo root
+ * exists on a dev box and is ABSENT in the production image. The repo's
+ * `docs/assets/` used to be searched here; it is deliberately gone,
+ * because a hero added from there would build green locally and fail — or
+ * worse, 404 — in the image. Put shared artwork in `ui/docs/assets/`.
+ */
 const ASSET_SEARCH_PATHS = [
   join(DOCS_ROOT, 'assets'),
   join(UI_ROOT, 'src', 'assets', 'tutorial'),
-  join(REPO_ROOT, 'docs', 'assets'),
 ]
 
 const errors: string[] = []
