@@ -58,7 +58,7 @@ it per host.
 | **P1** ✅ | **Make the existing feature engage on Wayland.** Replace the daemon-`DISPLAY` gate with **session discovery** — FR-45 already built `companion::graphical_session()` (uid, `DISPLAY`, `WAYLAND_DISPLAY`) for exactly this — and pass **`XAUTHORITY`** with `DISPLAY` into every `wmctrl`/`xterm` call. Result: list/focus/launch for Xwayland windows on GNOME/KDE/wlroots. ⚠️ Must be a **byte-for-byte no-op for the Xvfb path**, which is the only population using this today. | existing `[virtual_desktop_apps] enabled` |
 | **P2** ✅ | **Say what is actually visible.** `supported: bool` cannot express "X11 windows only" — the exact `Some([])` vs `None` mistake this project has now made on three surfaces (overlay ACL, `ssh_activity`, FR-49's dark org). Add a `sources` field (`x11` / `wayland` / both) plus a human reason, so the panel can say *"showing X11 (Xwayland) windows; this compositor does not let us enumerate native Wayland windows"* instead of showing a short list that looks like the truth. | n/a (wire additive) |
 | **P3** ⛔ **REFUTED on GNOME (2026-09-01), not built** | **Native enumeration where the compositor allows it.** `zwlr_foreign_toplevel_management_v1` on wlroots (list + **activate** + close — full parity, and the only tier where focus works) and `org.gnome.Shell.Introspect.GetWindows` on a full GNOME (list **only**; there is no activate). Detected **at session time, never cached** — FR-45's rule, learned from a host that had every package and still offered nothing depending on start order. | `apps_wayland_enum` (default off until field-proven) |
-| **P4** | **Per-window capture — the RAIL payoff.** Portal `SelectSources(types = WINDOW)` (the *host* picks; no enumeration needed, works wherever a portal backend runs) and `org.gnome.Mutter.ScreenCast.RecordWindow` (needs a window id from P3). Reuses the whole FR-45 P3 pipeline — POD negotiation, buffers, wire format, `ScreenCapture` — with only the source selection changed, exactly as P5 did. | `ROOMLERD_WINDOW_CAPTURE` (default off) |
+| **P4** ✅ **portal-picker half shipped; `RecordWindow` half unreachable** | **Per-window capture — the RAIL payoff.** Portal `SelectSources(types = WINDOW)`: the *host* picks, so no enumeration is needed and it works wherever a portal backend runs. Reuses the whole FR-45 P3 pipeline — POD negotiation, buffers, wire format, `ScreenCapture` — with only the source mask changed, exactly as P5 did. ⛔ The `org.gnome.Mutter.ScreenCast.RecordWindow` route is **not buildable**: it takes a window id and P3 measured that GNOME refuses the only API that could supply one. 🔑 That leaves per-window capture **attended by construction** — the portal answers by showing a picker, so on a host with nobody at it the capture never starts, which is why the switch defaults off and says so in its own config description. | `ROOMLERD_WINDOW_CAPTURE` (default off) |
 | **P5** | **Wayland-native launch.** The tmux/xterm session model assumes X11. Keep tmux (surviving an agent restart is the whole point) but pick a **Wayland** terminal where there is no Xwayland. | same as P1 |
 
 ### What this does NOT try to be
@@ -103,8 +103,19 @@ one video surface, and changing that is a much larger UI program than this.
       be verified in a synthetic sway-in-WSL2 rig — which is the kind of "CI
       green ≠ done" claim this project rejects. Revisit when a wlroots host
       exists
+- [x] Asking for a window **reaches the portal as a window request**, and the
+      grant is kept apart from the monitor grant. Verified on Asahi (GNOME
+      Wayland): that portal advertises `AvailableSourceTypes = 7`
+      (`MONITOR|WINDOW|VIRTUAL`), the helper announces *recording ONE WINDOW*
+      and then **blocks on the picker** with nobody at the screen — the
+      attended-by-construction property observed rather than assumed. Four
+      token files now exist (`portal-restore-token{,-rd,-win,-rd-win}`) because
+      a window grant and a monitor grant are different grants and reusing one
+      file would burn whichever was stored first
 - [ ] A single application window is streamed to the browser, and switching
-      between two windows is shown to change what the viewer sees
+      between two windows is shown to change what the viewer sees. ⚠️ **Needs a
+      human at the host** to answer the picker — it is not something this
+      agent can complete unattended, and a synthetic pass would prove nothing
 - [ ] Launch works on a Wayland host with no Xwayland at all
 - [ ] Every tier degrades honestly: no host reports a capability it does not
       have, and the reason is in the reply rather than only in the daemon log
@@ -122,9 +133,12 @@ one video surface, and changing that is a much larger UI program than this.
   shell side too (nothing in its journal). GNOME gates Introspect to callers it
   trusts, and a fleet agent is not one. 🔑 So the question "is a list without
   focus worth shipping" never arises — there is no list.
-- **Portal WINDOW capture shows a host-side picker.** That is a *second* consent
-  surface after FR-45's, and on an unattended host nobody answers it. It may be
-  wlroots/mutter-direct only in practice.
+- ~~**Portal WINDOW capture shows a host-side picker.**~~ **Settled by
+  measurement (P4).** It is a second consent surface, nobody answers it on an
+  unattended host, and the mutter-direct escape hatch turned out not to exist
+  (P3: `RecordWindow` needs an id GNOME will not give). So per-window capture
+  is attended-only on every host in this fleet — shipped behind a default-off
+  switch that states this in its own description, rather than left unbuilt.
 
 ## Field-verification log
 
@@ -137,3 +151,4 @@ one video surface, and changing that is a much larger UI program than this.
 | 2026-09-01 | 🔧 **`roomlerd apps-probe` added** | Remote Apps was answerable only by driving it over a WebRTC data channel from a browser, which conflates the backend with signalling, transport and the UI — the same argument `capture-smoke` was built on. It prints whether a desktop was found, as whom, with which cookie, and what it sees; and it says explicitly that an EMPTY list is not the same as unsupported, and that native Wayland windows would not appear even if present. |
 | 2026-09-01 | ✅ **P2 shipped and field-verified** | The list reply carries `coverage` (`sources` + `unlisted`) end to end: agent → wire → composable → panel. On the real GNOME Wayland session the daemon reports `sources: x11` and `NOT listed: native Wayland windows: this compositor exposes no protocol to enumerate them`, beside the one Xwayland window it CAN see. 🔑 The trait method (rather than a field set at construction) means **the compiler forces every backend to answer** — it caught the test fake immediately. ⚠️ Coverage rides the ERROR arm too: a failed listing is exactly where an empty list reads as a calm desktop. ⚠️ The UI parses it defensively and an absent `coverage` stays absent — inventing an empty one would claim the listing was complete, which is the bug this phase exists to fix. |
 | 2026-09-01 | ⛔ **P3 REFUTED — GNOME does not merely lack window enumeration, it REFUSES it** | `org.gnome.Shell.Introspect.GetWindows` is present and correctly typed (`a{ta{sv}}`), and calling it as the session user returns **`Access denied` — "GetWindows is not allowed"**. Reproduced with **two independent clients** (`busctl` and `gdbus`) on **GNOME Shell 48.8**; `GetRunningApplications` is refused identically, and gnome-shell logs nothing about either. The interface also has **no activate/focus/raise method at all** (0 matches on introspection), so even a granted listing could never drive the panel's one action. 🔑 The spec's open question — *is a list without focus worth shipping?* — is therefore moot: there is no list. ⚠️ wlroots' `zwlr_foreign_toplevel_management_v1` WOULD give list+activate, but **no fleet host runs wlroots**, so building that tier now could only be "verified" in a synthetic rig. Not built; recorded instead. |
+| 2026-09-01 | ✅ **P4 shipped (portal-picker route) and field-measured on Asahi** | `SelectSources(types=WINDOW)` behind `ROOMLERD_WINDOW_CAPTURE` (default off). That host's portal advertises `AvailableSourceTypes = 7` (`MONITOR\|WINDOW\|VIRTUAL`), so the picker route is available; the helper logged *recording ONE WINDOW (the portal will show a picker)* and then **blocked until the 20 s timeout** with nobody at the screen. 🔑 That timeout **is the result**, not a failure: it is the attended-by-construction property observed instead of assumed, and it is why the switch defaults off and says so in its own config-surface description. ⛔ The mutter-direct half (`RecordWindow`) is **unreachable, not unimplemented** — it takes a window id and P3 measured that GNOME refuses the only API that could supply one, so there is no unattended per-window path on GNOME at all. ⚠️ The restore token had to split **four** ways (`portal-restore-token{,-rd,-win,-rd-win}`): a window grant and a monitor grant are different grants, and sharing the file would burn whichever was stored first — the same reason the input grant already lived apart. The test asserts all four differ **as a set**, because asserting only that two differ would pass with three of them colliding. |
