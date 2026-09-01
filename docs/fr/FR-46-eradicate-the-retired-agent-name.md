@@ -226,7 +226,7 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | P4 | wire values (QUIC ALPN, WebRTC stream id) — dual-accept window, then cleanup | dual-accept stays until cleanup | |
 | P5a | macOS config + log paths off the retired name (no TCC risk) | dual-read gates; migration is dest-absent-only and never deletes | **✅ proven by the macOS pkg smoke** |
 | P5b | macOS BUNDLE rename — `roomlerd.app` / `roomlerd` / CFBundleName `Roomler Daemon`; CFBundleIdentifier deliberately UNCHANGED | postinstall sweeps the old bundle; revert = one release | **✅ FIELD-VERIFIED on 0.4.41** |
-| P6 | retire the machinery: `anchors=0`, guard flips to record-only | — | |
+| P6 | retire the machinery: `anchors=0`, guard flips to record-only | — | gated on fleet turnover, not effort — see the endgame table |
 
 
 ⚠️ **Check each anchor's stated reason before paying its price.** Two of them have now been
@@ -248,6 +248,35 @@ were free. An anchor is a *claim*, and FR-21 wrote them under time pressure acro
 - [x] macOS: Screen Recording + Accessibility granted in the agent log — **field-verified
       2026-09-01 on 0.4.41** after the operator re-approved (`macOS permissions: Screen
       Recording + Accessibility both granted`, user-session agent, fresh start)
+
+
+## What `anchors = 0` actually costs — measured 2026-09-01 at 635
+
+The criterion above says `anchors = 0`, and that number is still the right target. What was
+not stated, and needed to be, is that **most of what remains is gated on the fleet turning
+over, not on effort**. Classified by each anchor's own stated reason (137 carry one; the rest
+are region markers):
+
+| class | markers | removable by writing code? |
+|---|---|---|
+| appdirs / pre-rename trees | **24** | **yes — P3** |
+| already-published release assets | 13 | no — the files exist; only the *matching* can stop |
+| log filenames / tracing target | **10** | **yes — P2c** |
+| sweeps that delete the old thing | 8 | no — a sweep must NAME what it removes |
+| MSI installer identity (ARP, FileKey, ProductName) | 6 | renaming breaks upgrade detection — its own program |
+| wire values (QUIC ALPN, WebRTC stream id) | **5** | **yes — P4, behind a dual-accept window** |
+| env fallbacks / opt-out markers | 5 | only once no host can still have one |
+| docker registry image | **2** | **yes — P2c** |
+
+⇒ roughly **41 markers are work**, and the rest are waiting on a condition rather than on
+someone doing something. None is permanently impossible: a sweep is deletable once no host can
+have the thing it sweeps, a published-asset fixture becomes `RECORD` the moment no picker
+matches it, and the installer identity is a major-upgrade decision rather than a rename.
+
+⚠️ **This is a statement about sequencing, not a lowered bar.** The temptation at this point is
+to redefine the criterion down to whatever is currently true; the honest version keeps
+`anchors = 0` and says plainly that reaching it needs the pre-rename population to age out.
+Every class above has a named condition, so "how would we know?" has an answer for each.
 
 ## Open decisions
 
