@@ -36,14 +36,18 @@ build.
 ```bash
 git clone https://github.com/gjovanov/roomler-ai.git && cd roomler-ai
 cp .env.selfhost.example .env.selfhost      # fill in 4 values; 2 are `openssl rand -hex 32`
-docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost pull
+docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
 ```
 
-Then open <http://localhost:8080>. The first build compiles Rust and mediasoup
-from source — measured 6 minutes on a 16-core laptop, budget 15–20 on a small
-VPS; after that, startup is seconds. Full
-walkthrough — TLS, reverse proxy, media ports, backups —
-in **[`docs/self-hosting.md`](docs/self-hosting.md)**.
+Then open <http://localhost:8080>. Full walkthrough — TLS, reverse proxy, media
+ports, backups — in **[`docs/self-hosting.md`](docs/self-hosting.md)**.
+
+Images are published at
+[`ghcr.io/gjovanov/roomler-ai`](https://github.com/gjovanov/roomler-ai/pkgs/container/roomler-ai)
+for linux/amd64. To build from source instead — always supported, and on arm64
+the only path — swap the last two lines for `up -d --build`; that compiles Rust
+and mediasoup, measured 6 minutes on a 16-core laptop, 15–20 on a small VPS.
 
 **Hosted** — create a workspace at [roomler.ai](https://roomler.ai) and skip to
 the next step. Free for 3 devices.
