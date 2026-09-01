@@ -3137,7 +3137,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
             // every signalling loop through its ViewerIndicator.
             .with_rc_sessions(rc_sessions.clone())
             .with_orgs(org_registry.clone())
-            .with_org_views(org_views.clone()),
+            .with_org_views(org_views.clone())
+            // FR-51 P4 — surface the enrollment's nature in `roomler status`.
+            .with_ephemeral(cfg.ephemeral),
         );
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every
     // RTT_PROBE_INTERVAL into rtt_cache; exits on shutdown. A fresh
