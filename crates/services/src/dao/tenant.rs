@@ -108,6 +108,26 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
+    /// FR-51 — the ephemeral-key org switch (gate 1 of the key path). Checked
+    /// on every key USE as well as at mint, so flipping it off is an org-wide
+    /// revocation of all outstanding keys, immediately, burning nothing.
+    pub async fn set_ephemeral_keys_enabled(
+        &self,
+        tenant_id: ObjectId,
+        enabled: bool,
+    ) -> DaoResult<Tenant> {
+        self.base
+            .update_by_id(
+                tenant_id,
+                doc! { "$set": {
+                    "settings.ephemeral_keys_enabled": enabled,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
     pub async fn create(
         &self,
         name: String,

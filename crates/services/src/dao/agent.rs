@@ -33,8 +33,66 @@ impl AgentDao {
         agent_version: String,
         agent_token_hash: String,
     ) -> DaoResult<Agent> {
+        let agent = Self::new_row(
+            tenant_id,
+            owner_user_id,
+            name,
+            machine_id,
+            os,
+            agent_version,
+            agent_token_hash,
+        );
+        let id = self.base.insert_one(&agent).await?;
+        self.base.find_by_id(id).await
+    }
+
+    /// FR-51 P2 — create a device that arrived on an EPHEMERAL enrollment
+    /// key: same fresh row as [`Self::create`], stamped ephemeral with the
+    /// key's TTL and the key's id. There is deliberately no rehydrate
+    /// counterpart — an ephemeral enrollment must never revive or take over
+    /// an existing row (FR-51 F1), so its caller treats a duplicate-key
+    /// refusal as final.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_ephemeral(
+        &self,
+        tenant_id: ObjectId,
+        owner_user_id: ObjectId,
+        name: String,
+        machine_id: String,
+        os: OsKind,
+        agent_version: String,
+        key_id: ObjectId,
+        ttl_secs: Option<u64>,
+    ) -> DaoResult<Agent> {
+        let mut agent = Self::new_row(
+            tenant_id,
+            owner_user_id,
+            name,
+            machine_id,
+            os,
+            agent_version,
+            String::new(),
+        );
+        agent.ephemeral = true;
+        agent.ephemeral_ttl_secs = ttl_secs;
+        agent.enroll_key_id = Some(key_id);
+        let id = self.base.insert_one(&agent).await?;
+        self.base.find_by_id(id).await
+    }
+
+    /// The one place a fresh device row is shaped — both `create` paths call
+    /// it, so a new `Agent` field is decided here exactly once.
+    fn new_row(
+        tenant_id: ObjectId,
+        owner_user_id: ObjectId,
+        name: String,
+        machine_id: String,
+        os: OsKind,
+        agent_version: String,
+        agent_token_hash: String,
+    ) -> Agent {
         let now = DateTime::now();
-        let agent = Agent {
+        Agent {
             id: None,
             tenant_id,
             owner_user_id,
@@ -45,10 +103,11 @@ impl AgentDao {
             name_admin_set: false,
             machine_id,
             // FR-51 — permanent unless the ENROLLMENT CREDENTIAL said
-            // otherwise (P2 threads it through from the key; the request
-            // body must never be able to set it).
+            // otherwise (`create_ephemeral` overrides these three from the
+            // key; the request body must never be able to set them).
             ephemeral: false,
             ephemeral_ttl_secs: None,
+            enroll_key_id: None,
             os,
             agent_version,
             // FR-27 — unknown until the device's first heartbeat, for the same
@@ -87,9 +146,7 @@ impl AgentDao {
             created_at: now,
             updated_at: now,
             deleted_at: None,
-        };
-        let id = self.base.insert_one(&agent).await?;
-        self.base.find_by_id(id).await
+        }
     }
 
     /// Locate an agent by `(tenant_id, machine_id)` regardless of soft-delete
