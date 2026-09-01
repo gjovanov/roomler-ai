@@ -68,9 +68,10 @@ silently.
 
 > Images are published at
 > [`ghcr.io/gjovanov/roomler-ai`](https://github.com/gjovanov/roomler-ai/pkgs/container/roomler-ai)
-> for **linux/amd64**. On arm64 (an Apple Silicon Mac, a Raspberry Pi, an ARM
-> VPS) there is no published image yet — build from source with the command
-> below.
+> for **linux/amd64 and linux/arm64**. The tag is a manifest list, so a
+> Raspberry Pi, an Apple Silicon Mac and an x86 VPS all pull the same name and
+> get the right image. Each architecture is built on its own native runner and
+> smoke-tested there before publication — neither is emulated.
 
 ### Or build it from source
 
