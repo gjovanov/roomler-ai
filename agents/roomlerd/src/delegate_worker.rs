@@ -62,8 +62,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::delegate::DelegateFrame;
+use crate::delegate::WorkerInbound;
 use crate::delegate::write_frame;
-use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
+use roomler_ai_remote_control::signaling::ClientMsg;
 
 /// How often the worker proves the channel is alive.
 ///
@@ -91,7 +92,7 @@ pub async fn run(
     // a delegated session's replies come OUT. `None` when this process is not
     // a worker, in which case `supervised` is false too and we return at once.
     channels: Option<(
-        tokio::sync::mpsc::Sender<ServerMsg>,
+        tokio::sync::mpsc::Sender<WorkerInbound>,
         tokio::sync::mpsc::Receiver<ClientMsg>,
     )>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -154,7 +155,7 @@ pub async fn run(
 /// One attach attempt: connect, authorise, then pump until the channel ends.
 async fn attach_once(
     secret: &str,
-    to_signaling: &tokio::sync::mpsc::Sender<ServerMsg>,
+    to_signaling: &tokio::sync::mpsc::Sender<WorkerInbound>,
     from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
@@ -230,6 +231,18 @@ async fn attach_once(
                         Ok(DelegateFrame::Attached { .. }) => {
                             tracing::debug!("delegation: a second `attached` frame; ignoring");
                         }
+                        // Params must reach the signalling loop BEFORE the
+                        // offer that consumes them; one ordered channel both
+                        // ways is what guarantees it.
+                        Ok(DelegateFrame::SessionParams(p)) => {
+                            let sid = p.session_id.clone();
+                            if to_signaling.try_send(WorkerInbound::Params(p)).is_err() {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    "delegation: signalling queue full or closed; dropped session params"
+                                );
+                            }
+                        }
                         Ok(DelegateFrame::ToWorker { msg }) => {
                             let kind = crate::delegate::server_msg_kind(&msg);
                             // A full queue means the signalling loop is wedged,
@@ -237,7 +250,7 @@ async fn attach_once(
                             // blocking this loop, which would also stop the
                             // liveness ping and make the daemon think the
                             // channel died when it is the loop that is stuck.
-                            if to_signaling.try_send(*msg).is_err() {
+                            if to_signaling.try_send(WorkerInbound::Msg(msg)).is_err() {
                                 tracing::warn!(
                                     kind,
                                     "delegation: signalling queue full or closed; dropped a message"
