@@ -4384,18 +4384,24 @@ mod tests {
 
     use super::*;
     /// FR-21 P3 (D1) — the acceptance case taken from the LIVE fleet, not invented.
-    ///
-    /// mars, jupiter and zeus each carry these exact four entries in an
+    /// The three cluster nodes each carried these exact four entries in an
     /// operator-authored `/etc/systemd/system/roomlerd.service.d/virtual-desktop.conf`,
-    /// which a package upgrade never rewrites. If the prefix migration ever stops
-    /// honouring the original spelling, the daemon starts perfectly and quietly
-    /// ignores every one of them — the virtual desktop simply never comes up.
-    // RETIRED-NAME-ANCHOR(30): this test EXISTS to prove the legacy
-    // `ROOMLER_AGENT_*` spelling still works — it is taken from the drop-in live on
-    // mars/jupiter/zeus. Rewriting these names would delete the coverage.
-    // docs/fr/FR-21
+    /// which a package upgrade never rewrites. While the read chain honoured
+    /// the original spelling, this test proved it did — because if it ever
+    /// stopped, the daemon would start perfectly and quietly ignore every one
+    /// of them, and the virtual desktop would simply never come up.
+    ///
+    /// FR-46 P2b inverted it. The hosts were migrated FIRST (both spellings
+    /// side by side, then the legacy half removed once `systemctl show`
+    /// confirmed the current one was in effect), and only then did the arm come
+    /// out. So the assertion is now the opposite one, and it is the assertion
+    /// that matters from here: the retired spelling must be INERT, and must be
+    /// REPORTED rather than silently dropped.
+    // RETIRED-NAME-ANCHOR(30): the retired spelling is the INPUT this test
+    // feeds in order to prove it does nothing. Rewriting these names would
+    // delete the coverage. docs/fr/FR-46
     #[test]
-    fn the_live_drop_in_still_configures_the_virtual_desktop() {
+    fn the_retired_drop_in_spelling_is_inert_and_reported() {
         const KEYS: [&str; 4] = [
             "ROOMLER_AGENT_VIRTUAL_DESKTOP",
             "ROOMLER_AGENT_VIRTUAL_DESKTOP_RESOLUTION",
@@ -4407,19 +4413,28 @@ mod tests {
             for k in KEYS {
                 std::env::remove_var(k);
             }
+            tunnel_core::env::test_env::clear("VIRTUAL_DESKTOP");
         }
         assert!(
             !virtual_desktop_requested(),
             "unset must not request the virtual desktop"
         );
 
+        // RAW-ENV-DELIBERATE: `test_env::set_as` refuses a prefix outside the
+        // read chain, and this needs the retired one set on its own.
         unsafe { std::env::set_var(KEYS[0], "1") };
         assert!(
-            virtual_desktop_requested(),
-            "the legacy ROOMLER_AGENT_ spelling in the live drop-in MUST still be honoured"
+            !virtual_desktop_requested(),
+            "the retired spelling must be IGNORED — the arm was removed once \
+             every host that set one had been migrated"
+        );
+        assert!(
+            tunnel_core::env::retired_env_present().contains(&KEYS[0].to_string()),
+            "...and being ignored must be REPORTED, or a host that still sets \
+             one loses the setting with nothing said"
         );
 
-        // And the current spelling works too, so a migrated host behaves the same.
+        // The current spelling works, so a migrated host behaves as before.
         unsafe { std::env::remove_var(KEYS[0]) };
         unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "VIRTUAL_DESKTOP", "1") };
         assert!(virtual_desktop_requested());

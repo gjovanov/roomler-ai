@@ -197,8 +197,9 @@ pub struct NodeStatus {
     // It is live compatibility, not history: delete the legacy arm in `node_env` and
     // this field has nothing left to report, so it goes with it. docs/fr/FR-46
     /// FR-46 (#1051) — full env-var names this daemon has actually READ through
-    /// a RETIRED prefix since it started (`ROOMLER_AGENT_*`, `ROOMLER_NODE_*`),
-    /// sorted and deduped. `None` from a daemon predating the field.
+    /// a RETIRED prefix since it started (`ROOMLER_NODE_*`), sorted and deduped.
+    /// `None` from a daemon predating the field. Since FR-46 P2b `ROOMLER_AGENT_*`
+    /// can never appear here — it is not read at all; see `retired_env_present`.
     ///
     /// This exists because the warning was write-only. `env::note_legacy_use`
     /// logs once per variable near startup, so a `roomler logs` tail on a

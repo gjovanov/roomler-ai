@@ -48,6 +48,16 @@ arriving far too late to help.) Swept the tree for the shape — exactly one ins
 here. The lesson is the sanitize skill's own: *the tool keeps working and only its
 explanation rots, which is the failure mode that lasts, because nothing fails.*
 
+⚠️⚠️ **And the audit had a blind spot of exactly the same shape, now closed.** A file was
+selected for scanning only by `git grep -l "$TOKENS"`, so it dropped OUT the moment its **last**
+retired name was migrated — taking any marker it still held with it. The marker was then
+orphaned and *structurally unreportable*: covering nothing, widening no exemption today, and
+silently ready to widen one if a retired name ever reappeared under it. **Seven accumulated
+across six files in a single phase** before anyone noticed, and the audit could not have said
+so. `scan()` now selects the UNION of token-bearing and marker-bearing files, which found three
+more immediately. Mutation-checked: an orphan in a token-free file reads `stale markers: 1` with
+the union and `0` without.
+
 ## Root finding: the published-asset freeze is much narrower than FR-21 recorded
 
 FR-21's D6 froze anchors on "already-published asset filenames are immutable and the updater
