@@ -96,13 +96,13 @@ pub(super) struct Inner {
     alive: Arc<AtomicBool>,
 }
 
-// RETIRED-NAME-ANCHOR(24): `ROOMLER_AGENT_VIRTUAL_DESKTOP` is the LEGACY
-// spelling FR-21 P3 (D1) deliberately kept working — mars, jupiter and the WSL
-// node all carry it verbatim in operator-authored systemd drop-ins that no
-// package upgrade rewrites. Reading only `ROOMLERD_*` here would silently make
-// the guard below a no-op on every host that needs it.
+// RETIRED-NAME-ANCHOR(24): `ROOMLER_AGENT_VIRTUAL_DESKTOP` is the RETIRED
+// spelling. FR-21 P3 kept it working; FR-46 P2b stopped, after every host that
+// set one had been migrated. It is still named here because the guard below is
+// what a virtual-desktop host depends on, and the tests feed the retired name
+// in to prove it now does nothing.
 /// ⚠️ FR-27, field-measured on `mars` + `jupiter` 2026-08-29: a
-/// `ROOMLER_AGENT_VIRTUAL_DESKTOP=1` host is NOT an attended host, even though
+/// virtual-desktop host is NOT an attended host, even though
 /// it has a perfectly good X display.
 ///
 /// The daemon starts that Xvfb itself so a headless server can be
@@ -489,17 +489,20 @@ mod tests {
     /// ⚠️ Serial and self-restoring: these are process-wide env vars.
     #[test]
     fn a_virtual_desktop_host_is_not_a_consent_surface() {
-        // RETIRED-NAME-ANCHOR(4): all three arms of `node_env`'s chain, so the
-        // accessor cannot silently drop one. The middle arm is the regression
-        // this array exists to catch: the hand-rolled version this replaced
-        // read only the first and last, so `ROOMLER_NODE_*` — and the config
-        // fallback behind it — were invisible here while `main.rs` saw them.
-        const KEYS: [&str; 3] = [
-            "ROOMLERD_VIRTUAL_DESKTOP",
-            "ROOMLER_NODE_VIRTUAL_DESKTOP",
-            "ROOMLER_AGENT_VIRTUAL_DESKTOP",
-        ];
-        let saved: Vec<_> = KEYS.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        // RETIRED-NAME-ANCHOR(9): both arms of `node_env`'s chain plus the
+        // retired one, so the accessor can neither silently drop a live arm nor
+        // silently start honouring the dead one. The MIDDLE arm is the
+        // regression this array exists to catch: the hand-rolled version this
+        // replaced read only the first and last, so `ROOMLER_NODE_*` — and the
+        // config fallback behind it — were invisible here while `main.rs` saw
+        // them. docs/fr/FR-46
+        const KEYS: [&str; 2] = ["ROOMLERD_VIRTUAL_DESKTOP", "ROOMLER_NODE_VIRTUAL_DESKTOP"];
+        const RETIRED: &str = "ROOMLER_AGENT_VIRTUAL_DESKTOP";
+        let saved: Vec<_> = KEYS
+            .iter()
+            .chain([RETIRED].iter())
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
         // SAFETY (edition 2024): no other test in this crate touches these.
         unsafe {
             for k in KEYS {
@@ -524,6 +527,19 @@ mod tests {
                 );
                 std::env::remove_var(k);
             }
+
+            // FR-46 P2b: the retired arm must now DECLINE to suppress the
+            // panel, because nothing reads it any more. Asserted rather than
+            // dropped from the loop — a virtual-desktop host that stopped
+            // being recognised would put a consent prompt back on a display
+            // only the remote controller can see, which is the exact FR-27
+            // finding this test was written for.
+            std::env::set_var(RETIRED, "1");
+            assert!(
+                !display_is_our_own_virtual_desktop(),
+                "{RETIRED}=1 must be IGNORED — it is retired, not an alias"
+            );
+            std::env::remove_var(RETIRED);
             for (k, v) in saved {
                 match v {
                     Some(v) => std::env::set_var(k, v),

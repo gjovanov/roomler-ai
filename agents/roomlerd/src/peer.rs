@@ -1632,9 +1632,7 @@ async fn current_pair_is_relay(
 async fn overlay_remote_is_relay_tier(remote_addr: &str, session_id: bson::oid::ObjectId) -> bool {
     use tunnel_core::localapi::ConnectionType;
 
-    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours;
-    // an operator with it in a script needs to be able to grep for it.
-    // node_env: accepts ROOMLERD_/ROOMLER_NODE_/ROOMLER_AGENT_ prefixes + the
+    // node_env: accepts ROOMLERD_/ROOMLER_NODE_ prefixes + the
     // `overlay_tier_detect` config key via the S2 fallback map.
     if tunnel_core::env::node_env("OVERLAY_TIER_DETECT").as_deref() == Some("0") {
         return false;

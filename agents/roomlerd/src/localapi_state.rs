@@ -479,6 +479,7 @@ impl LocalApiState for DaemonState {
             // field", and reporting it for an empty set would make an answered
             // question indistinguishable from an unanswerable one.
             legacy_env_uses: Some(tunnel_core::env::legacy_env_uses()),
+            retired_env_present: Some(tunnel_core::env::retired_env_present()),
         }
     }
 

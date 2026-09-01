@@ -172,7 +172,22 @@ is_excluded() {
 # where kind is UNCLASSIFIED, ANCHORED, or STALEMARKER.
 scan() {
     local files
-    files=$(git grep -I -l -E "$TOKENS" -- . || true)
+    # Files with a retired name, UNION files carrying a marker.
+    #
+    # The union half closes a blind spot found the hard way (FR-46 P5b/P2b): a
+    # file selected only by `git grep -l "$TOKENS"` drops OUT of the scan the
+    # moment its LAST retired name is migrated — taking any marker it still
+    # holds with it. The marker is then orphaned and structurally unreportable:
+    # it covers nothing, widens no exemption today, and silently would if a
+    # retired name ever reappeared under it. Seven of them accumulated across
+    # six files in one phase before anyone noticed, and the audit could not
+    # have said so.
+    files=$(
+        {
+            git grep -I -l -E "$TOKENS" -- . || true
+            git grep -I -l -E 'RETIRED-NAME-(ANCHOR|RECORD)' -- . || true
+        } | sort -u
+    )
 
     local f
     for f in $files; do

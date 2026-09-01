@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-// RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours; an
-// operator with it in a script needs to be able to grep for it.
 //! Windows keyboard-layout awareness + auto-switch (rc.227).
 //!
 //! The field symptom this fixes: viewer keyboard = German, remote =
@@ -42,7 +40,7 @@
 //! preamble.
 //!
 //! Kill switch: `ROOMLERD_AUTO_LAYOUT=0` (the older `ROOMLER_NODE_` and
-//! `ROOMLER_AGENT_` prefixes are still honoured) disables the per-char
+//! prefix is still honoured) disables the per-char
 //! auto-switch without a redeploy;
 //! status reporting + manual set stay active.
 
