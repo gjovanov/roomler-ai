@@ -90,6 +90,16 @@ enum Command {
         /// flavour passes this automatically.
         #[arg(long)]
         machine_global: bool,
+        /// FR-51 — enroll as an EPHEMERAL device: a fresh RANDOM machine
+        /// fingerprint (so N replicas of one image are N devices, and a
+        /// restart is a NEW device), and the daemon de-enrolls itself on
+        /// SIGTERM/SIGINT. Requires an ephemeral enrollment KEY from the
+        /// dashboard — with a standard token the server enrolls a normal
+        /// permanent device and this flag warns loudly. Refused when a
+        /// config already exists at the target path: an ephemeral identity
+        /// must never be folded into a real device's config.
+        #[arg(long)]
+        ephemeral: bool,
         /// Join the overlay mesh from the first start, instead of leaving
         /// `overlay_enabled` off for the operator to flip afterwards.
         ///
@@ -1046,6 +1056,7 @@ async fn daemon_main() -> Result<()> {
             machine_global,
             label,
             replace,
+            ephemeral,
             overlay,
         } => {
             enroll_cmd(
@@ -1057,6 +1068,7 @@ async fn daemon_main() -> Result<()> {
                     machine_global,
                     label: label.as_deref(),
                     replace,
+                    ephemeral,
                     overlay,
                 },
             )
@@ -1609,6 +1621,9 @@ struct EnrollOptions<'a> {
     machine_global: bool,
     label: Option<&'a str>,
     replace: bool,
+    /// FR-51 P3 — random machine fingerprint + refuse-if-config-exists; the
+    /// server's response (not this flag) decides what the CONFIG records.
+    ephemeral: bool,
     overlay: bool,
 }
 
@@ -1620,6 +1635,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         machine_global,
         label,
         replace,
+        ephemeral,
         overlay,
     } = opts;
     // rc.52: --machine-global retargets the write to
@@ -1652,6 +1668,20 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // key recognises the box across orgs (and across the %PROGRAMDATA% vs
     // %APPDATA% path drift that re-enroll's rc.52 BLOCKER-6 guards against).
     let existing = config::load(&target_path).ok();
+    // FR-51 P3 — an ephemeral enrollment is a FRESH identity by definition:
+    // folding it into an existing config would either hand this machine's
+    // real device row a random fingerprint or hand the ephemeral row the
+    // machine's stable one, and both directions are the F1 trap. Refuse
+    // rather than guess.
+    if ephemeral && existing.is_some() {
+        bail!(
+            "--ephemeral needs a fresh config, but one already exists at {} — \
+             an ephemeral identity must never be folded into a real device's \
+             enrollment. Point --config at an empty path (containers get this \
+             for free) or remove the existing enrollment first.",
+            target_path.display()
+        );
+    }
     let machine_id = match &existing {
         Some(cfg) => {
             tracing::info!(
@@ -1659,6 +1689,15 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
                 "existing config found — reusing its machine fingerprint"
             );
             cfg.machine_id.clone()
+        }
+        None if ephemeral => {
+            // Random per enrollment, never derived: N replicas of one image
+            // share hostname+OS+arch+path, so the derived fingerprint would
+            // collapse them onto ONE server row displacing each other
+            // (FR-51 F1). Same 64-hex shape as the derived id.
+            let random = hex::encode(rand::random::<[u8; 32]>());
+            tracing::info!(machine_id = %random, "minted RANDOM machine fingerprint (--ephemeral)");
+            random
         }
         None => {
             let derived = machine::derive_machine_id(&target_path);
@@ -1682,6 +1721,25 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // secondary org (with its own freshly minted WG key); `--replace` →
     // legacy whole-primary rebind.
     let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, label, replace)?;
+
+    // FR-51 P3 — the CREDENTIAL decided what was minted; say so when it
+    // disagrees with the flag. `--ephemeral` with a standard token has
+    // already created a PERMANENT row under a random fingerprint — that row
+    // will never rehydrate naturally, so the operator must be told now, not
+    // discover an orphan later.
+    if ephemeral && !cfg.ephemeral {
+        tracing::warn!(
+            "--ephemeral was passed but the credential was a standard enrollment \
+             token: the server enrolled a PERMANENT device under a RANDOM machine \
+             fingerprint. If unintended, delete it from the dashboard and re-enroll \
+             with an ephemeral enrollment key."
+        );
+        println!(
+            "WARNING: the credential was not an ephemeral key — this device enrolled \
+             as PERMANENT (with a random machine id). Mint an ephemeral enrollment \
+             key in the dashboard for a self-removing device."
+        );
+    }
 
     // rc.52: a machine-global write needs admin (%PROGRAMDATA% +, on
     // the installer path, an ACL-restricted parent dir). On a
@@ -1740,7 +1798,15 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     );
     match &outcome {
         EnrollOutcome::FreshPrimary => {
-            println!("Enrollment successful. Agent id: {enrolled_agent_id}");
+            if cfg.ephemeral {
+                println!(
+                    "Enrollment successful (EPHEMERAL). Agent id: {enrolled_agent_id}\n\
+                     This device removes itself: on clean shutdown immediately, or after \
+                     its inactivity deadline. A restart enrolls a NEW device."
+                );
+            } else {
+                println!("Enrollment successful. Agent id: {enrolled_agent_id}");
+            }
         }
         EnrollOutcome::RefreshedPrimary => {
             println!(
@@ -3510,6 +3576,10 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
 
     // Wait for an internal shutdown, Ctrl-C (SIGINT), or SIGTERM.
     let mut graceful_shutdown = false;
+    // FR-51 P3 — true only on the two OS-initiated arms below. The internal
+    // arm is the auto-updater restarting the daemon, and de-enrolling there
+    // would delete the device on every update.
+    let mut os_initiated_stop = false;
     tokio::select! {
         res = sig_task => {
             if let Ok(Err(e)) = res {
@@ -3532,6 +3602,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutdown requested");
             graceful_shutdown = true;
+            os_initiated_stop = true;
             let _ = shutdown_tx.send(true);
             // Give the signaling task a short window to flush.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -3541,6 +3612,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         _ = terminate_signal() => {
             tracing::info!("SIGTERM received; shutting down gracefully");
             graceful_shutdown = true;
+            os_initiated_stop = true;
             let _ = shutdown_tx.send(true);
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -3568,6 +3640,18 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         // clean-run promotion task may still be mid-save.
         let _write_guard = cfg_write_lock.lock().await;
         if let Ok(mut current) = config::load(config_path) {
+            // FR-51 P3 — an EPHEMERAL device leaving on an OS stop removes
+            // itself NOW instead of waiting out the reap deadline. Bounded
+            // and best-effort (the fn caps at 3 s; the reaper is the backstop
+            // for every exit that never reaches this line), and only on the
+            // signal arms — the internal arm is the updater restarting us.
+            if current.ephemeral && os_initiated_stop {
+                match enrollment::self_unenroll(&current.server_url, &current.agent_token).await {
+                    Ok(()) => tracing::info!("ephemeral device unenrolled itself on shutdown"),
+                    Err(e) => tracing::warn!(error = %e,
+                        "ephemeral self-unenroll failed; the server-side reaper will collect this device"),
+                }
+            }
             config::mark_clean_shutdown(&mut current);
             if let Err(e) = config::save(config_path, &current) {
                 tracing::warn!(error = %e, "could not mark clean shutdown");
