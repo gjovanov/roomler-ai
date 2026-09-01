@@ -37,6 +37,8 @@ pub mod backend;
 pub mod input;
 /// FR-45 P4 — the arbiter→helper input seam (daemon side).
 pub mod input_route;
+/// FR-45 P5 — `org.gnome.Mutter.ScreenCast` direct, no portal. ⚠️ UNATTENDED.
+pub mod mutter;
 /// FR-45 P3a — reaching `libpipewire` through `dlopen`, never a link.
 pub mod pipewire;
 /// FR-45 P3b — SPA POD serialisation, so a format can be negotiated.
@@ -298,9 +300,9 @@ pub mod helper {
     /// The human-readable line goes to **stderr**, which the parent inherits,
     /// so the daemon's log carries the child's own account of what it saw next
     /// to the parent's verdict. Same reasoning as the caps probe.
-    pub fn run(screencast: bool, stream: bool, input: bool) {
+    pub fn run(screencast: bool, stream: bool, input: bool, mutter: bool) {
         if stream {
-            run_stream(input);
+            run_stream(input, mutter);
             return;
         }
         if screencast {
@@ -354,8 +356,17 @@ pub mod helper {
     /// ⚠️ **stdout is binary after the handshake line.** Everything
     /// diagnostic goes to stderr, which the parent inherits: a stray
     /// `println!` here does not add a log line, it corrupts a frame.
-    fn run_stream(with_input: bool) {
+    fn run_stream(with_input: bool, use_mutter: bool) {
         use super::screencast::SessionKind;
+        // FR-45 P5 — mutter's own ScreenCast API, no portal and NO CONSENT
+        // DIALOG. Deliberately a separate branch rather than a fallback inside
+        // the portal path: the two have different consent properties, and a
+        // silent fallback from "asks" to "does not ask" is precisely the kind
+        // of thing that must never happen by accident.
+        if use_mutter {
+            run_stream_mutter();
+            return;
+        }
         // The session shape is decided by what the portal OFFERS, not by
         // failing and retrying: a wlr backend has ScreenCast and no
         // RemoteDesktop (measured — the WSL2 field runs), and asking it for
@@ -420,7 +431,11 @@ pub mod helper {
         let node_id = first.node_id;
         let advertised = (first.width, first.height);
 
-        let handle = match super::pipewire::stream(fd, node_id, DEFAULT_MAX_FPS) {
+        let handle = match super::pipewire::stream(
+            super::pipewire::PwSource::Fd(fd),
+            node_id,
+            DEFAULT_MAX_FPS,
+        ) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("portal-helper: {e}");
@@ -513,6 +528,84 @@ pub mod helper {
         }
     }
 
+    /// FR-45 P5, child side — the same streaming loop, but the node id comes
+    /// from `org.gnome.Mutter.ScreenCast` instead of the portal.
+    ///
+    /// ⚠️⚠️ **No consent dialog is shown on this path.** See
+    /// [`super::mutter`] for why that is acceptable and why it is NOT a portal
+    /// variant. It exists for hosts where no portal backend can run at all —
+    /// measured on WSL2, where `xdg-desktop-portal-gnome` exits immediately
+    /// without a GNOME session while mutter itself works fine.
+    fn run_stream_mutter() {
+        eprintln!("portal-helper: opening an org.gnome.Mutter.ScreenCast session (UNATTENDED)");
+        let session = match super::mutter::open() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("portal-helper: {e}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "portal-helper: mutter node {} on {} (ScreenCast v{:?}, {} ms)",
+            session.report.node_id,
+            session.report.connector,
+            session.report.version,
+            session.report.elapsed_ms
+        );
+
+        // 🔑 `PwSource::Session`, not a portal fd: mutter hands out a node id
+        // and expects us to reach the session's own PipeWire — which is right,
+        // because this helper already runs AS the session user.
+        let handle = match super::pipewire::stream(
+            super::pipewire::PwSource::Session,
+            session.report.node_id,
+            DEFAULT_MAX_FPS,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("portal-helper: {e}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "portal-helper: streaming {}x{} (spa format {})",
+            handle.format.width, handle.format.height, handle.format.video_format
+        );
+
+        let started = StreamStarted {
+            width: handle.format.width,
+            height: handle.format.height,
+            video_format: handle.format.video_format,
+            // Mutter's ScreenCast carries no input; its RemoteDesktop sibling
+            // is a separate interface and is not wired here.
+            input_ok: false,
+        };
+        match serde_json::to_string(&started) {
+            Ok(j) => println!("{STREAM_MARKER}{j}"),
+            Err(e) => {
+                eprintln!("portal-helper: could not encode the handshake: {e}");
+                std::process::exit(1);
+            }
+        }
+        use std::io::Write;
+        if std::io::stdout().flush().is_err() {
+            std::process::exit(1);
+        }
+
+        // ⚠️ `session` must stay alive for the whole loop — mutter tears the
+        // session down with the D-Bus connection inside it, taking the node.
+        let mut out = std::io::stdout().lock();
+        while let Ok((h, bytes)) = handle.frames.recv() {
+            if out.write_all(&h.encode()).is_err() || out.write_all(&bytes).is_err() {
+                break;
+            }
+            if out.flush().is_err() {
+                break;
+            }
+        }
+        drop(session);
+    }
+
     /// Parent side — spawn the helper for streaming and hand back the child.
     ///
     /// Unlike [`spawn_in_session`], this does NOT wait: the child lives as
@@ -520,16 +613,20 @@ pub mod helper {
     pub fn spawn_streaming(
         _target_fps: u32,
         with_input: bool,
+        use_mutter: bool,
     ) -> anyhow::Result<std::process::Child> {
-        let args: &[&str] = if with_input {
-            &["--stream", "--input"]
-        } else {
-            &["--stream"]
+        let args: &[&str] = match (with_input, use_mutter) {
+            // ⚠️ No --input with --mutter: mutter's ScreenCast API carries no
+            // input, and its RemoteDesktop sibling is a separate interface not
+            // wired here. Asking for both would silently give capture only.
+            (_, true) => &["--stream", "--mutter"],
+            (true, false) => &["--stream", "--input"],
+            (false, false) => &["--stream"],
         };
         // stdin is the input wire, piped exactly when input is wanted — a
         // helper that will never read it should see EOF, not a pipe nothing
         // writes to.
-        spawn_child(args, with_input).map_err(|e| match e {
+        spawn_child(args, with_input && !use_mutter).map_err(|e| match e {
             SpawnError::NoSession => {
                 anyhow::anyhow!("nobody is at this machine's screen — the portal is attended-only")
             }
@@ -563,7 +660,7 @@ pub mod helper {
                 // reported. ⚠️ Still no frames: buffer delivery is P3c.
                 report.pipewire = match (session.pipewire_fd, report.streams.first()) {
                     (Some(fd), Some(s)) => super::pipewire::negotiate_status(
-                        fd,
+                        super::pipewire::PwSource::Fd(fd),
                         s.node_id,
                         DEFAULT_MAX_FPS,
                         WANT_FRAMES,
