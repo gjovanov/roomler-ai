@@ -2622,7 +2622,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                 if let Err(e) = updater::spawn_installer_with_watch(&installer_path, Some(&latest))
                 {
                     tracing::error!(error = %e, "rollback installer spawn failed");
-                    let _ = notify::raise_attention_with_reason(
+                    let _ = notify::raise_attention_with_reason_for_version(
                         notify::REASON_ROLLBACK,
                         &rollback_attention_msg(
                             current_pkg,
@@ -2630,6 +2630,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                             cfg.crash_count,
                             Some(&format!("automatic install failed: {e}")),
                         ),
+                        // FR-53: the build being accused, so a later
+                        // healthy connect from a different one can clear this.
+                        Some(current_pkg),
                     );
                 } else {
                     // Installer is running, agent is about to exit.
@@ -2642,16 +2645,17 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
             }
             updater::CheckOutcome::Skipped(reason) => {
                 tracing::error!(%reason, "rollback fetch skipped — operator action required");
-                let _ = notify::raise_attention_with_reason(
+                let _ = notify::raise_attention_with_reason_for_version(
                     notify::REASON_ROLLBACK,
                     &rollback_attention_msg(current_pkg, &target, cfg.crash_count, Some(&reason)),
+                    Some(current_pkg),
                 );
             }
             updater::CheckOutcome::UpToDate { .. } => {
                 tracing::warn!(
                     "rollback target reports as up-to-date — odd state, raising sentinel"
                 );
-                let _ = notify::raise_attention_with_reason(
+                let _ = notify::raise_attention_with_reason_for_version(
                     notify::REASON_ROLLBACK,
                     &rollback_attention_msg(
                         current_pkg,
@@ -2659,6 +2663,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
                         cfg.crash_count,
                         Some("target version reports as up-to-date — manual investigation needed"),
                     ),
+                    Some(current_pkg),
                 );
             }
         }
