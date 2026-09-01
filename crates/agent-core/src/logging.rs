@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
 // RETIRED-NAME-ANCHOR-BEGIN
-// Every retired name in this module is the legacy half of a dual-read: the
-// `roomler-agent.log*` rolling-file prefix that upgraded hosts still carry (read
-// and pruned alongside `roomlerd.log*`), and the `roomler_agent` tracing target
-// that `mirror_legacy_log_target` keeps honouring for units already on disk in
-// the field — plus the tests that set exactly those to prove the field keeps
-// working.
+// Two survivors, both narrowed by FR-46 P2c. The `roomler-agent.log*` prefix is no
+// longer READ — measured first: no such file exists on any reachable host, against a
+// control of 5-30 current log files each — but RETENTION still matches it, so a host
+// that turns one up ages it out instead of leaking it forever. The `roomler_agent`
+// tracing target is gone from all four SHIPPED specs (they already carried
+// `roomlerd=info` beside it, so dropping it changed nothing), and
+// `mirror_legacy_log_target` now serves only units ALREADY on disk in the field.
 // INVARIANT: a retired name here must be one the daemon must still READ. If you
 // add one that is not, that is a bug, not a new exemption. docs/fr/FR-21
 //! Persistent file logging + panic hook.
@@ -305,9 +306,11 @@ pub fn active_log_path() -> Option<PathBuf> {
     // Own basename first so the Host process's crash sidecars attach the
     // Host log tail; then the standard + legacy names.
     let mut bases = vec![log_basename()];
-    // RETIRED-NAME-ANCHOR: legacy rolled logs on an upgraded host. Dropping the old
-    // prefix makes them invisible to crash sidecars. See docs/fr/FR-21.
-    for b in ["roomlerd.log", "roomlerd-service.log", "roomler-agent.log"] {
+    // FR-46 P2c: the legacy rolled-log name is gone from the READ paths. Measured
+    // first — no `roomler-agent.log*` exists on any reachable host, against a control
+    // of 5-30 current log files per host. Retention below still matches it, so a host
+    // that turns one up ages it out rather than leaking it forever.
+    for b in ["roomlerd.log", "roomlerd-service.log"] {
         if !bases.contains(&b) {
             bases.push(b);
         }
@@ -373,10 +376,7 @@ pub fn tail_source_path(source: &str) -> Option<PathBuf> {
         // default dir for the newest daemon rolling file instead.
         "daemon" => active_log_path().or_else(|| {
             let dir = resolve_log_dir()?;
-            newest_file_matching(&[dir], |name| {
-                // RETIRED-NAME-ANCHOR: see above -- legacy rolled logs stay findable.
-                name.starts_with("roomlerd.log") || name.starts_with("roomler-agent.log")
-            })
+            newest_file_matching(&[dir], |name| name.starts_with("roomlerd.log"))
         }),
         "service" => {
             #[cfg(target_os = "windows")]

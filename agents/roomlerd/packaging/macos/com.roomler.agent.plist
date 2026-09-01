@@ -1,10 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- RETIRED-NAME-ANCHOR-BEGIN
-     Frozen macOS layout (FR-21 D5). The .app bundle name keys this host's
-     Screen Recording and Accessibility TCC grants, and the log and config
-     paths below are pinned to it by launchd. A rename voids the grants
-     silently: the daemon runs and captures a black screen. -->
 <!--
   LaunchAgent for roomlerd. Installed to ~/Library/LaunchAgents/ by
   the .pkg's post-install script. Runs in the user's session (required for
@@ -47,9 +42,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
-        <!-- RETIRED-NAME-ANCHOR: pre-FR-21 tracing target, kept beside the new one. -->
-        <string>roomler_agent=info,roomlerd=info,warn</string>
+        <string>roomlerd=info,warn</string>
     </dict>
 </dict>
-  <!-- RETIRED-NAME-ANCHOR-END -->
 </plist>
