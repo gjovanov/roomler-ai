@@ -120,6 +120,16 @@ capability URLs, webhook signatures).
 | GET | `/api/notification` · `/unread` · `/unread-count` | Notification feeds |
 | PUT | `/api/notification/{id}/read` | Mark one read |
 | POST | `/api/notification/read-all` | Mark all read |
+| GET/PUT | `/api/user/newsletter` | FR-58: the signed-in newsletter toggle — a door into the same `subscribers` store the public form writes; subscribing pre-confirms only on a verified account email |
+
+### Public newsletter list (FR-39/FR-58 — no auth; see [newsletter.md](newsletter.md))
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/subscribe` | Always **202** (membership-oracle control); double-opt-in confirmation mail, 15-min per-address resend cooldown |
+| GET | `/api/subscribe/confirm/{token}` | Single-use confirm; 303 → `/newsletter/confirmed?status=…` |
+| GET | `/api/subscribe/unsubscribe/{token}` | Idempotent; 303 → `/newsletter/unsubscribed?status=…`; the token never expires |
+| POST | `/api/subscribe/unsubscribe/{token}` | RFC 8058 one-click target — plain 200 for every outcome, body unread |
 
 ### Platform-admin (`platform_admins` ObjectId allowlist; 404 on miss)
 
@@ -129,6 +139,12 @@ capability URLs, webhook signatures).
 | GET | `/api/admin/stats/orgs` · `/users` · `/machines` · `/calls` | Platform-wide inventories |
 | GET | `/api/admin/stats/usage` · `/usage/{user_id}` | Per-user usage across every org |
 | POST | `/api/admin/overlay-block/reclaim` | Reclaim quarantined overlay address blocks (dry-run by default) |
+| POST/GET | `/api/admin/newsletter/issues` | FR-58: create draft / list issues |
+| PUT/GET | `/api/admin/newsletter/issues/{slug}` | Edit while draft (409 after) / read back |
+| GET | `/api/admin/newsletter/issues/{slug}/preview` | The exact send-path bytes (sample unsubscribe link substituted) |
+| POST | `/api/admin/newsletter/issues/{slug}/test-send` | Render + send to one address, real headers, honest failures |
+| POST | `/api/admin/newsletter/issues/{slug}/send` | Claim + fan out; re-POST = resume; `{"retry_stale":true}` re-attempts stuck rows |
+| GET | `/api/admin/newsletter/issues/{slug}/status` | Live ledger counts while sending; stored snapshot once completed |
 
 ## Tenant-scoped routes — `/api/tenant/{tenant_id}/…`
 
