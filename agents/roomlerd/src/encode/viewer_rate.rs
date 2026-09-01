@@ -499,6 +499,12 @@ impl LinkLoop {
         self.congested_windows
     }
 
+    /// FR-59 — the live queue-depth estimate (ms). The clamp-release
+    /// rule reads it: growth STOPPING is not the queue going away.
+    pub fn depth_ms(&self) -> i32 {
+        self.depth_ms
+    }
+
     /// FR-59 P4 — drains ordered, and the live depth estimate (heartbeat).
     pub fn drain_stats(&self) -> (u32, i32) {
         (self.drains, self.depth_ms)
