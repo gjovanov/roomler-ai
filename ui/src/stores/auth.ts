@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { defineStore } from 'pinia'
+import type { ServerTutorialState } from '@/composables/useTutorialProgress'
 import { ref, computed } from 'vue'
 import { api } from '@/api/client'
 import router from '@/plugins/router'
@@ -16,6 +17,9 @@ interface User {
   /** Platform-operator allowlist member (stats PR-4) — gates the
    *  Observability nav/view; the server re-checks every request. */
   is_platform_admin?: boolean
+  /** FR-12 P3 — the account's tutorial state, so progress follows the person
+   *  and not the browser profile. Absent against an older server. */
+  tutorial?: ServerTutorialState
 }
 
 export const useAuthStore = defineStore('auth', () => {
