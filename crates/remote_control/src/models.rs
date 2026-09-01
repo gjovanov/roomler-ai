@@ -676,6 +676,28 @@ pub struct Agent {
     #[serde(default)]
     pub name_admin_set: bool,
     pub machine_id: String,
+    /// FR-51 — this device declared AT ENROLLMENT that it is temporary: the
+    /// reaper may remove it (row, overlay lease, address, MagicDNS name) once
+    /// it has been silent past its TTL, and removal is a HARD delete — an
+    /// ephemeral row must not tombstone, because the `(tenant_id, machine_id)`
+    /// unique index is not partial on `deleted_at`, so a tombstone would
+    /// reserve its (random, never-reused) machine_id forever.
+    ///
+    /// Set only from the enrollment credential (FR-51 P2), never from the
+    /// enrollment request body and never editable afterwards: a device that
+    /// could declare itself permanent would evade the reaper, and a permanent
+    /// device that could be flipped ephemeral would be scheduled for silent
+    /// deletion. `#[serde(default)]` → every pre-FR-51 row deserialises to
+    /// permanent, so enabling the reaper can never touch an existing fleet.
+    #[serde(default)]
+    pub ephemeral: bool,
+    /// FR-51 — per-device inactivity deadline override, in seconds. `None` =
+    /// the server default (`rc.ephemeral_default_ttl_secs`). Clamped to the
+    /// 60 s floor at READ time by the reaper, not at write time, so a bad
+    /// stored value can never disable the clamp. Meaningless (and absent)
+    /// on a permanent row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ttl_secs: Option<u64>,
     pub os: OsKind,
     pub agent_version: String,
     /// FR-27 — the version of the `roomler-desktop` companion INSTALLED on this
@@ -3395,6 +3417,35 @@ impl BlockList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-51 — a device row written before the ephemeral fields existed must
+    /// deserialise PERMANENT. This is the property that makes enabling the
+    /// reaper safe against the existing fleet: every pre-FR-51 row reads
+    /// `ephemeral: false`, so the reaper's predicate can never match it.
+    #[test]
+    fn pre_fr51_agent_row_deserialises_permanent() {
+        let now = bson::DateTime::now();
+        // The minimal shape of a fielded row: none of the serde-defaulted
+        // fields present, and in particular neither `ephemeral` nor
+        // `ephemeral_ttl_secs`.
+        let doc = bson::doc! {
+            "tenant_id": ObjectId::new(),
+            "owner_user_id": ObjectId::new(),
+            "name": "old-host",
+            "machine_id": "m-1",
+            "os": "linux",
+            "agent_version": "0.4.0",
+            "agent_token_hash": "",
+            "status": "offline",
+            "last_seen_at": now,
+            "created_at": now,
+            "updated_at": now,
+            "deleted_at": bson::Bson::Null,
+        };
+        let a: Agent = bson::from_document(doc).expect("pre-FR-51 row must deserialise");
+        assert!(!a.ephemeral, "an old row must never read as ephemeral");
+        assert_eq!(a.ephemeral_ttl_secs, None);
+    }
 
     /// FR-19 — the `relay-server` verb: spelling locked (a rename silently
     /// un-advertises the feature fleet-wide), and only ever equality-matched —
