@@ -56,10 +56,8 @@ images:
   # Dockerfile.agent-e2e. Pinned to `latest` for the first iteration
   # while the bootstrap flow stabilises; switch to a sha-tagged
   # image once the runbook is locked.
-  # RETIRED-NAME-ANCHOR(3): docker image name already in the registry;
-  # see scripts/e2e-k8s/AGENT-E2E.md. Renaming needs a coordinated re-push.
-  - name: gjovanov/roomler-agent-e2e
-    newName: <internal-registry>/roomler-agent-e2e
+  - name: gjovanov/roomlerd-e2e
+    newName: <internal-registry>/roomlerd-e2e
     newTag: latest
 
 commonLabels:
