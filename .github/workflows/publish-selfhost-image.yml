@@ -1,0 +1,198 @@
+# FR-42 P3 (#967) — publish the self-host container image.
+#
+# Turns the documented self-host path from a 6-20 minute source build into a
+# pull. That is the difference between "I tried it" and "I gave up" for the
+# audience this was written for (r/selfhosted, awesome-selfhosted), and the
+# source build stays available for anyone who wants it.
+#
+# ⚠️ DISPATCH-ONLY, on purpose. Publishing puts a PUBLIC package under the
+# operator's account, and the tag and retention policy are theirs to decide.
+# Nothing is published without someone deciding to publish it — there is no
+# push trigger and no schedule, and that is the phase's kill switch.
+#
+# ⚠️ amd64 only. arm64 is explicitly out of scope for FR-42: cross-building
+# mediasoup and the Rust tree under QEMU takes hours, and an arm64 image nobody
+# has run is a worse promise than no arm64 image. Publishing one is its own
+# piece of work with its own validation.
+name: Publish self-host image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g. v0.4.41). Required — there is no implicit tag.'
+        required: true
+        type: string
+      also_latest:
+        description: 'Also move `latest` to this image'
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Build and verify, but do NOT push'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  # ghcr.io needs no extra secret (GITHUB_TOKEN suffices) and is where a
+  # self-hoster looks first for an image belonging to a GitHub project.
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  publish:
+    name: Build + publish (amd64)
+    runs-on: ubuntu-latest
+    # The Rust tree and mediasoup both build from source on a 4-core runner.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      attestations: write # actions/attest-build-provenance
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject a tag that is not a tag
+        run: |
+          TAG='${{ inputs.tag }}'
+          # A tag with a slash or a space produces a reference nobody can pull
+          # and, worse, one that looks fine in the run log.
+          if ! printf '%s' "$TAG" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]{0,126}$'; then
+            echo "::error::tag '$TAG' is not a valid OCI tag (alnum start, then [A-Za-z0-9._-], <=127 chars)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: ${{ !inputs.dry_run }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Load into the local daemon so the smoke test below runs against the
+          # EXACT image that would be pushed, rather than a rebuild of it.
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ env.tag }}
+          build-args: |
+            VERSION=${{ env.tag }}
+            GIT_SHA=${{ github.sha }}
+          # GitHub's cache makes a re-run after a failed smoke test cheap; a
+          # cold build is the 60-90 minute case this budget is sized for.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ⚠️ The point of publishing is that someone else runs this without
+      # reading the source. An image that builds but does not start is worse
+      # than no image, so it has to answer before it is pushed. `/health` is
+      # what the compose healthcheck uses, so this is the same bar.
+      - name: Smoke test — the image must actually serve
+        run: |
+          set -euo pipefail
+          IMG='${{ env.IMAGE }}:${{ env.tag }}'
+          docker network create roomler-smoke
+          docker run -d --name mongo --network roomler-smoke \
+            -e MONGO_INITDB_ROOT_USERNAME=smoke -e MONGO_INITDB_ROOT_PASSWORD=smokepw mongo:7
+          docker run -d --name redis --network roomler-smoke redis:7-alpine
+          docker run -d --name roomler --network roomler-smoke -p 8080:80 \
+            -e ROOMLER__APP__ENVIRONMENT=development \
+            -e ROOMLER__JWT__SECRET=smoke-only-not-a-real-secret \
+            -e ROOMLER__DATABASE__URL='mongodb://smoke:smokepw@mongo:27017/?authSource=admin' \
+            -e ROOMLER__REDIS__URL=redis://redis:6379 \
+            -e ROOMLER__MEDIASOUP__NUM_WORKERS=1 \
+            "$IMG"
+          for i in $(seq 1 60); do
+            if curl -fsS -m 3 http://localhost:8080/health >/dev/null 2>&1; then
+              echo "healthy after ${i}0s"
+              curl -fsS http://localhost:8080/health; echo
+              # The SPA must be served too — an API-only container would pass a
+              # /health check and still be useless as "the whole product".
+              curl -fsS -o /dev/null -w '  GET / -> %{http_code}\n' http://localhost:8080/
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::image did not answer /health within 600s"
+          docker logs roomler 2>&1 | tail -60
+          exit 1
+
+      - name: Report the version the image reports about ITSELF
+        run: |
+          # The manifest tag and the binary's own version are different claims.
+          # A mismatch here means the build args did not reach the binary, and
+          # every operator would then be told a version the image is not.
+          docker run --rm --entrypoint /usr/local/bin/roomler-ai-api \
+            '${{ env.IMAGE }}:${{ env.tag }}' --version 2>/dev/null || true
+          docker image inspect '${{ env.IMAGE }}:${{ env.tag }}' \
+            --format '  labels: version={{index .Config.Labels "org.opencontainers.image.version"}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
+          docker image inspect '${{ env.IMAGE }}:${{ env.tag }}' \
+            --format '  size: {{.Size}} bytes'
+
+      # ⚠️ Pushes the image that was just SMOKE-TESTED, rather than asking
+      # build-push-action to build again with `push: true`. A second build is
+      # near-instant off the cache and would almost certainly be identical —
+      # but "almost certainly" is not what testing-before-publishing is for,
+      # and the whole point of the step above is that these exact bytes
+      # answered /health.
+      - name: Push the tested image
+        if: ${{ !inputs.dry_run }}
+        id: push
+        run: |
+          set -euo pipefail
+          SRC='${{ env.IMAGE }}:${{ env.tag }}'
+          docker push "$SRC"
+          DIGEST=$(docker image inspect "$SRC" \
+            --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "pushed $SRC@$DIGEST"
+          if [ '${{ inputs.also_latest }}' = 'true' ]; then
+            # Retag rather than rebuild, so `latest` and the version tag are
+            # the same bytes and resolve to the same digest.
+            docker tag "$SRC" '${{ env.IMAGE }}:latest'
+            docker push '${{ env.IMAGE }}:latest'
+            echo "moved latest -> $DIGEST"
+          fi
+
+      # The image runs a privileged product on someone else's machine. Signing
+      # its provenance costs one step and lets them verify where it came from,
+      # matching what release-agent.yml already does for the agent artifacts.
+      - name: Attest build provenance
+        if: ${{ !inputs.dry_run }}
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Self-host image"
+            echo
+            if [ '${{ inputs.dry_run }}' = 'true' ]; then
+              echo "**Dry run — nothing was pushed.**"
+            else
+              echo '```'
+              echo 'docker pull ${{ env.IMAGE }}:${{ env.tag }}'
+              echo '```'
+              echo
+              echo "\`latest\` moved: \`${{ inputs.also_latest }}\`"
+              echo
+              echo "Digest: \`${{ steps.push.outputs.digest }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
