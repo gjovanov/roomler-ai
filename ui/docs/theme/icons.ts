@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-59 (#1165) — inline SVG icons.
+ * FR-60 (#1165) — inline SVG icons.
  *
  * The app uses the MDI webfont (`@mdi/font`, ~1.2 MB of woff2 + CSS). A
  * static docs page must not pay that to draw a dozen glyphs, and an icon

@@ -1,4 +1,4 @@
-# FR-59: Public documentation site at roomler.ai/docs
+# FR-60: Public documentation site at roomler.ai/docs
 
 **Issue:** [#1165](https://github.com/gjovanov/roomler-ai/issues/1165) ·
 **Status:** proposed · **Owner:** web/docs
@@ -283,10 +283,11 @@ Every phase is additive static output; nothing outside `dist/docs` reads it.
 - Versioned docs (`/docs/v0.4/…`).
 - Dark mode (see §5).
 
-## 7. Number note — claimed 58, **renumbered to 59**
+## 7. Number note — claimed 58, **renumbered twice, landed at 60**
 
-Two number events, recorded because the ledger's rules were exercised twice in
-one session and the second one is the interesting case.
+Three number events in one session. Recorded in full because the arc is the
+strongest evidence the ledger has for its own central rule, and because it kept
+happening for exactly the reason the rule names.
 
 **First, at claim time**, `FR-57` was carried by **two** open issues —
 [#1161](https://github.com/gjovanov/roomler-ai/issues/1161) and
@@ -307,9 +308,25 @@ it existed on a branch, which is invisible to every other session, exactly as a
 memory file would be. A claim that never reached master moves — the same
 resolution FR-50 recorded when #1086 took its number mid-flight.
 
-So: renumbered **FR-58 → FR-59** in one commit — spec filename, title, ledger
-row, and all 22 in-body and in-code references. Never into a vacated number, and
-nothing already settled was disturbed.
+**Then FR-59 was taken too** — while the FR-58 → FR-59 repair was being made,
+master gained [#1163](https://github.com/gjovanov/roomler-ai/issues/1163)
+(*slow-link latency priority*), which had itself just renumbered off FR-57 for
+the same reason. So this renumbered again, to **FR-60**.
+
+⚠️ **A near-miss worth recording.** Resolving the ledger conflict by line index
+was wrong, and the next rebase would have made it dangerous: `git diff
+origin/master HEAD -- docs/fr/README.md` was read specifically to check whether
+the resolution had clobbered anyone, and it appeared to have deleted master's
+FR-59 row. It had not — master had gained that row *after* the rebase — but the
+resolution technique could not have told the difference. **Resolve a shared
+append-only table by re-appending onto the other side's version, never by line
+number**, and diff against master afterwards. That check is cheap and it is the
+only thing that distinguishes a merge from a silent revert.
+
+So: renumbered **FR-58 → FR-59 → FR-60** — spec filename, title, ledger row, and
+all 22 in-body and in-code references each time, verified mechanically as 20
+insertions against 20 deletions so the sweep touched FR references and nothing
+else. Never into a vacated number, and nothing already settled was disturbed.
 
 🔑 The lesson this adds to the ledger's own: **the claim protocol only protects
 you once the row is on master.** Pushing a branch is not claiming. On a long

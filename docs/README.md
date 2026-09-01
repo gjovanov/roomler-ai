@@ -10,7 +10,7 @@ every document with its audience.
 > **[roomler.ai/docs](https://roomler.ai/docs/)** — per-OS install guides,
 > getting started, security and access control, troubleshooting and an FAQ,
 > written for people using the product. Source lives in
-> [`ui/docs/content/`](../ui/docs/content/) (FR-59, #1165).
+> [`ui/docs/content/`](../ui/docs/content/) (FR-60, #1165).
 >
 > **This tree is the ENGINEERING record**: design decisions, field evidence and
 > the reasoning behind them, written for whoever maintains the daemon. The two

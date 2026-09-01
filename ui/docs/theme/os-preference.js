@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 G ROX EOOD
  *
- * FR-59 (#1165) — the ONLY render-blocking script on a docs page, and it
+ * FR-60 (#1165) — the ONLY render-blocking script on a docs page, and it
  * is ~300 bytes.
  *
  * OS tabs are CSS-only (radio + :checked), so the first panel in DOM order
