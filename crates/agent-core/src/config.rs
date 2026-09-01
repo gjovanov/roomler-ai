@@ -35,9 +35,24 @@ pub struct AgentConfig {
     pub tenant_id: String,
     /// Stable machine fingerprint. Persisted so re-enrollment maps to the
     /// same `agents` row.
+    ///
+    /// ⚠️ For an [`ephemeral`](Self::ephemeral) enrollment this is NOT the
+    /// derived fingerprint — it is random per enrollment (FR-51 F1), which is
+    /// exactly why a restart of an ephemeral device is a NEW device.
     pub machine_id: String,
     /// User-friendly name shown in the admin UI.
     pub machine_name: String,
+    /// FR-51 P3 — this enrollment declared itself temporary (it arrived on an
+    /// ephemeral enrollment key): the server reaps the row after silence, and
+    /// the daemon de-enrolls itself on SIGTERM/SIGINT so a clean stop removes
+    /// the device in seconds instead of on the deadline.
+    ///
+    /// Recorded FROM THE SERVER'S ENROLL RESPONSE, never from a local flag
+    /// alone — the credential decides what was minted, and the config must
+    /// not disagree with the row. Absent (every pre-FR-51 config) = a normal
+    /// permanent device, byte-for-byte today's behaviour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
     /// Encoder preference: `auto` (default), `hardware`, or `software`.
     /// Can be overridden at launch by `ROOMLERD_ENCODER` env var or
     /// `--encoder` CLI flag.
@@ -1769,6 +1784,7 @@ pub fn test_fixture() -> AgentConfig {
         tenant_id: "tid".into(),
         machine_id: "mid".into(),
         machine_name: "host".into(),
+        ephemeral: false,
         encoder_preference: EncoderPreferenceChoice::Auto,
         update_check_interval_h: None,
         enable_remote_browse: true,

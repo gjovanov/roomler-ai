@@ -27,6 +27,10 @@ struct EnrollResponse {
     agent_id: String,
     tenant_id: String,
     agent_token: String,
+    /// FR-51 — the server says what it minted. `#[serde(default)]` so a
+    /// pre-FR-51 server (which omits the field) reads as permanent.
+    #[serde(default)]
+    ephemeral: bool,
 }
 
 pub struct EnrollInputs<'a> {
@@ -80,6 +84,9 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         tenant_id: body.tenant_id,
         machine_id: inputs.machine_id.to_string(),
         machine_name: inputs.machine_name.to_string(),
+        // FR-51 — the server's answer, not the caller's flag: the credential
+        // decides what was minted, and the config must not disagree.
+        ephemeral: body.ephemeral,
         encoder_preference: crate::config::EncoderPreferenceChoice::default(),
         update_check_interval_h: None,
         enable_remote_browse: true,
@@ -240,6 +247,33 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         tunnel_routes: Vec::new(),
         orgs: Vec::new(),
     })
+}
+
+/// FR-51 P3 — tell the server this EPHEMERAL device is leaving, so a clean
+/// stop removes it in seconds instead of on the reap deadline.
+///
+/// Best-effort by design: the caller is mid-shutdown, so this is bounded (one
+/// short attempt) and every failure is merely logged — the reaper is the
+/// backstop for exactly the exits that never reach this call. A 401/404 back
+/// counts as SUCCESS: the row is already gone (reaped, or admin-deleted),
+/// which is the state this call exists to reach.
+pub async fn self_unenroll(server_url: &str, agent_token: &str) -> Result<()> {
+    let server_url = normalize_server_url(server_url);
+    let url = format!("{server_url}/api/agent/self/unenroll");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(agent_token)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .context("POST /api/agent/self/unenroll")?;
+    let status = resp.status();
+    if status.is_success() || status.as_u16() == 401 || status.as_u16() == 404 {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("self-unenroll rejected (status {status}): {body}");
+    }
 }
 
 /// Multi-org P1 — how [`apply_enrollment`] folded a fresh enrollment into

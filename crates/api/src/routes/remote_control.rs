@@ -370,6 +370,44 @@ async fn enroll_agent_ephemeral(
     }))
 }
 
+/// POST /api/agent/self/unenroll — an EPHEMERAL device removes itself
+/// (FR-51 P3): the daemon calls this on SIGTERM/SIGINT so a clean stop
+/// reaps in seconds instead of on the inactivity deadline.
+///
+/// Authenticated by the agent's own JWT via [`AuthAgent`], which also
+/// enforces that the row still exists — so the second call after a
+/// successful first one is a 401, which the agent deliberately treats as
+/// "already gone".
+///
+/// ⚠️ ONLY an ephemeral row may take this path. A permanent device removing
+/// itself would let a compromised host erase its own fleet record (and its
+/// tombstone is the thing that lets it revive in place); a permanent
+/// device's removal stays an admin decision. The refusal is 403, loudly.
+pub async fn self_unenroll(
+    State(state): State<AppState>,
+    agent: crate::extractors::agent::AuthAgent,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !agent.agent.ephemeral {
+        return Err(ApiError::Forbidden(
+            "Only an ephemeral device may unenroll itself; removal of a permanent \
+             device is an admin action"
+                .to_string(),
+        ));
+    }
+    let released =
+        crate::ws::ephemeral::remove_agent_device(&state, &agent.agent, "ephemeral_self_unenroll")
+            .await?;
+    tracing::info!(
+        tenant_id = %agent.tenant_id, agent_id = %agent.agent_id, name = %agent.agent.name,
+        overlay_released = released.is_some(),
+        "fr-51: ephemeral device unenrolled itself"
+    );
+    Ok(Json(serde_json::json!({
+        "removed": true,
+        "overlay_released": released.is_some(),
+    })))
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Agent CRUD
 // ────────────────────────────────────────────────────────────────────────────
