@@ -1,5 +1,7 @@
 # FR-11 — Server-side grids: members / files / invites, devices default sort, mesh display names
 
+> **CLOSED 2026-08-27** — issue #784 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
+
 **Issue:** [#784](https://github.com/gjovanov/roomler-ai/issues/784)
 **Status:** implementation in progress (P1 backend → P2 UI)
 

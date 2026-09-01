@@ -1,5 +1,7 @@
 # FR-41: A 90-second demo of the product actually working
 
+> **CLOSED 2026-09-01** — issue #965 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
+
 Status: **P0 in progress** (2026-08-30). Tracking issue: `FR-41` (#965).
 Child of FR-39 (#951), which shipped everything else in launch phase 0 and left this
 as the one asset nobody else can substitute for.
