@@ -147,16 +147,23 @@ pub fn apps_config() -> VirtualDesktopAppsConfig {
 
 /// True when this process can actually manage a desktop AND apps are
 /// enabled — the signal the caps builder advertises to the browser.
-/// Linux: only in virtual-desktop mode (a `DISPLAY` is set). Windows:
-/// Phase 2 (no backend yet) → false.
+/// Linux: virtual-desktop mode, **or** a logged-in user's session whose X
+/// display answers (FR-56 P1 — including a Wayland session, because its
+/// compositor runs Xwayland). Windows: the agent always drives the active
+/// user's desktop.
 pub fn apps_supported() -> bool {
     if !apps_config().enabled {
         return false;
     }
     #[cfg(target_os = "linux")]
     {
-        // Linux: only in virtual-desktop mode (a DISPLAY is set).
-        std::env::var_os("DISPLAY").is_some()
+        // ⚠️ NOT `env::var_os("DISPLAY").is_some()` any more. That asked
+        // whether the DAEMON has a display, which is true only in
+        // virtual-desktop mode — so every Wayland host answered
+        // `supported:false` and the feature never engaged. `discover()` keeps
+        // that path first and unchanged, then looks for whoever is at the
+        // screen.
+        linux::discover().is_some()
     }
     #[cfg(target_os = "windows")]
     {
@@ -169,22 +176,23 @@ pub fn apps_supported() -> bool {
     }
 }
 
-/// Construct the platform backend for the given X11 `display` (Linux),
-/// or `None` when apps can't be managed on this host/build. Windows lands
-/// in Phase 2.
-pub fn backend(display: Option<&str>) -> Option<Box<dyn WindowManager>> {
+/// Construct the platform backend, or `None` when apps can't be managed on
+/// this host/build.
+///
+/// FR-56 P1: the Linux arm now takes a discovered [`linux::Target`] rather
+/// than a display string, because "which display" and "as whom" are two
+/// answers and only the first was being carried.
+pub fn backend() -> Option<Box<dyn WindowManager>> {
     #[cfg(target_os = "linux")]
     {
-        display.map(|d| Box::new(linux::LinuxWm::new(d.to_string())) as Box<dyn WindowManager>)
+        linux::discover().map(|t| Box::new(linux::LinuxWm::new(t)) as Box<dyn WindowManager>)
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = display;
         Some(Box::new(windows::WindowsWm) as Box<dyn WindowManager>)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = display;
         None
     }
 }
@@ -199,15 +207,11 @@ pub fn backend(display: Option<&str>) -> Option<Box<dyn WindowManager>> {
 /// `*.reply`.
 pub fn handle_control_message(val: &Value) -> Value {
     let cfg = apps_config();
-    // The VD display is set process-global by `virtual_desktop` at
-    // startup (`main.rs`); the backend dials it. When apps are disabled
-    // we build no backend → replies say `supported:false`.
-    let display = std::env::var("DISPLAY").ok();
-    let be = if cfg.enabled {
-        backend(display.as_deref())
-    } else {
-        None
-    };
+    // FR-56 P1: the backend discovers its own target — the daemon's `DISPLAY`
+    // (virtual-desktop mode, unchanged and still first) or the display of
+    // whoever is at the screen. When apps are disabled we build no backend →
+    // replies say `supported:false`.
+    let be = if cfg.enabled { backend() } else { None };
     dispatch(val, &cfg, be.as_deref())
 }
 
