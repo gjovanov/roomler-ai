@@ -66,6 +66,13 @@ export interface TutorialChapter {
   steps: TutorialStep[]
   /** Landing pillar features — the "gems", as cards. */
   highlights?: TutorialBadge[]
+  /** FR-12 P2 — a spotlight tour that runs on the real page for this chapter.
+   *  ⚠️ Only for chapters whose route needs no id beyond the tenant: the
+   *  viewer tour exists (`TOURS.viewer`) but its route wants an agentId, so it
+   *  has no entry here — it starts from `?tour=viewer` once you are on a
+   *  device. Giving it a fake entry would land people on a page with nothing
+   *  to point at. */
+  tour?: { id: string; routeName: string; label: string }
   detail: Array<{ label: string; text: string }>
 }
 
@@ -177,6 +184,7 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
   {
     id: 'devices',
     title: 'Devices',
+    tour: { id: 'enroll', routeName: 'devices', label: 'Show me on the Devices page' },
     icon: 'mdi-monitor-multiple',
     blurb: 'Enroll machines and keep them current',
     hero: heroMesh,

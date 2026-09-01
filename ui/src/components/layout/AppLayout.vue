@@ -519,6 +519,12 @@
       <router-view />
     </v-main>
 
+    <!-- FR-12 P2 — one mount point for spotlight tours. It lives here rather
+         than in each page because a tour is STARTED from somewhere else (the
+         Tutorial, via `?tour=`), and a component cannot mount itself into a
+         page it is navigating to. -->
+    <spotlight-tour />
+
     <!-- Global search dialog -->
     <search-dialog v-model="showSearch" />
 
@@ -567,6 +573,8 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTheme, useDisplay } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
+import SpotlightTour from '@/components/tutorial/SpotlightTour.vue'
+import { useSpotlightTour } from '@/composables/useSpotlightTour'
 import { usePageViews } from '@/composables/usePageViews'
 import { useTenantStore } from '@/stores/tenant'
 import {
@@ -607,6 +615,23 @@ const orgBadges = useOrgBadgesStore()
 const conferenceStore = useConferenceStore()
 const wsStore = useWsStore()
 const route = useRoute()
+// FR-12 P2 — `?tour=<id>` starts a spotlight tour on arrival. The param is
+// stripped immediately: a tour is a one-time nudge, and leaving it in the URL
+// would replay on every refresh and follow a shared link to someone who never
+// asked for it.
+const spotlight = useSpotlightTour()
+watch(
+  () => route.query.tour,
+  (id) => {
+    if (typeof id !== 'string' || !id) return
+    if (spotlight.start(id)) {
+      const q = { ...route.query }
+      delete q.tour
+      router.replace({ path: route.path, query: q, hash: route.hash })
+    }
+  },
+  { immediate: true },
+)
 const router = useRouter()
 const theme = useTheme()
 
