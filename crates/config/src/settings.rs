@@ -25,6 +25,10 @@ pub struct Settings {
     pub stripe: StripeSettings,
     pub giphy: GiphySettings,
     pub email: EmailSettings,
+    /// FR-58 — the newsletter From identity. `#[serde(default)]` so existing
+    /// config files and env sets stay valid; unset falls back to `email.from_*`.
+    #[serde(default)]
+    pub newsletter: NewsletterSettings,
     pub push: PushSettings,
     pub auth: AuthSettings,
     pub rc: RcSettings,
@@ -582,6 +586,19 @@ pub struct EmailSettings {
     /// listens on 1025).
     #[serde(default)]
     pub smtp_port: Option<u16>,
+}
+
+/// FR-58 — the newsletter's own From mailbox, separate from the transactional
+/// one so campaign reputation is isolated from the From that activation and
+/// invite mail depend on. Both optional: unset ⇒ fall back to `email.from_*`,
+/// so a self-hosted instance needs no extra configuration.
+/// Env: `ROOMLER__NEWSLETTER__FROM_EMAIL` / `ROOMLER__NEWSLETTER__FROM_NAME`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct NewsletterSettings {
+    #[serde(default)]
+    pub from_email: Option<String>,
+    #[serde(default)]
+    pub from_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
