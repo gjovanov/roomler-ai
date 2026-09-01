@@ -1,7 +1,7 @@
 # FR-12 — Onboarding tutorial ("Welcome tour")
 
 **Issue:** [#788](https://github.com/gjovanov/roomler-ai/issues/788)
-**Status:** P1 IMPLEMENTED (view + entry points + auto-open + progress); P2/P3 planned
+**Status:** P1 + **P2 shipped**; P3 (extra artwork + server-side progress) planned
 
 ## Goal
 
@@ -76,8 +76,44 @@ devices.
 | Phase | Content | Kill switch | Status |
 |-------|---------|-------------|--------|
 | P1 | Tutorial view (8 chapters, 4 reused SVGs), app-bar `?` + user-menu entries, first-login auto-open, localStorage progress | auto-open reads one localStorage flag; the route/nav entries are plain UI | **shipped** — PR #797 |
-| P2 | Spotlight micro-tours for enroll/connect/forward on the live pages (dependency-free, ~100-line helper) | per-tour "skip"; entry only from the Tutorial | planned |
+| P2 | Spotlight micro-tours on the live pages (dependency-free): module-scoped step machine + ONE overlay in `AppLayout` + a `?tour=` entry | per-tour "skip", and the only Tutorial entry is one button | **shipped** — PR #1117 |
 | P3 | New same-style SVGs for ACL/rooms/calls/chat chapters; server-side progress | none needed (additive) | planned |
+
+## P2 as built — two deviations from this spec, both deliberate
+
+**"forward" is dropped, not deferred.** The phase named three tours —
+enroll / connect / forward — but tunnel forwards are created from the CLI and
+the desktop app. There is no web surface to spotlight, so a "forward" tour
+could only have pointed at a page that does not do the thing. Recorded here
+rather than left as a permanently-unstarted bullet.
+
+**Only `enroll` gets a Tutorial button.** The `viewer` tour exists and works,
+but its route needs an `agentId`; an entry in the Tutorial would land a reader
+on a page with nothing to point at. It starts from `?tour=viewer` once you are
+on a device, and the honest follow-up is a device-row action.
+
+### Shape, and why it is not simpler
+
+A module-scoped step machine, ONE overlay mounted in `AppLayout`, and a
+`?tour=<id>` query the Tutorial navigates with. Neither half can live where you
+would first put it: the state cannot live in the starter, because the Tutorial
+view is unmounted by the time the tour runs; the overlay cannot live in each
+page, because a page cannot mount itself into the page it is navigating to.
+
+🔑 **Anchors are `data-tour` attributes, never CSS shapes.** A tour selecting
+`.v-btn:nth-child(2)` breaks the first time someone adds a button — and breaks
+SILENTLY, highlighting the wrong control instead of failing. The e2e suite lost
+hours to exactly that class of locator in the same week
+(`getByText('Chat')` matching four elements; `locator('input').first()`
+resolving to a hidden nav field), which is why the guard test asserts every
+anchor still EXISTS in the source: a renamed anchor otherwise just makes the
+overlay flicker and skip a step, and nothing anywhere fails.
+
+⚠️ Three behaviours worth keeping: the dimming is four plain divs rather than an
+SVG mask (a mask can be clipped by a stacking context; the highlighted control
+also stays interactive), a step whose anchor never renders advances after 1.5 s
+rather than stranding the reader on a dimmed page, and the query param is
+stripped on arrival so a refresh or a shared link cannot replay the tour.
 
 ## Acceptance criteria
 
