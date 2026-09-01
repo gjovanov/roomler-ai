@@ -134,6 +134,7 @@ import {
   bestClockSample,
   clockSample,
   frameAgeMs,
+  QueueDrift,
   DEFAULT_MAX_DECODE_QUEUE,
   DEFAULT_STRUGGLE_QUEUE,
   DEFAULT_STRUGGLE_WINDOWS,
@@ -2653,6 +2654,79 @@ describe('AV1_CODEC_STRING (rc.190)', () => {
   })
 })
 
+describe('QueueDrift (FR-59 P3 — transit-queue growth)', () => {
+  // µs helpers: the wire timestamp is the agent's clock, the arrival is
+  // ours. The two origins are deliberately FAR apart in these tests —
+  // that offset is exactly what must cancel.
+  const AGENT_EPOCH = 1_000_000
+  const LOCAL_EPOCH = 987_654_321
+
+  it('reports zero drift when frames arrive at the cadence they were framed', () => {
+    const d = new QueueDrift()
+    for (let i = 0; i < 10; i++) {
+      d.add(AGENT_EPOCH + i * 33_000, LOCAL_EPOCH + i * 33_000)
+    }
+    expect(d.snapshotAndReset()).toBe(0)
+  })
+
+  it('sums the growth when frames land slower than they were framed', () => {
+    // Framed every 33 ms, arriving every 50 ms ⇒ 17 ms behind per frame.
+    const d = new QueueDrift()
+    for (let i = 0; i < 10; i++) {
+      d.add(AGENT_EPOCH + i * 33_000, LOCAL_EPOCH + i * 50_000)
+    }
+    // 9 intervals × 17 ms — the first frame only establishes the cadence.
+    expect(d.snapshotAndReset()).toBe(153)
+  })
+
+  it('goes NEGATIVE while the queue drains — a recovering session is not congested', () => {
+    const d = new QueueDrift()
+    for (let i = 0; i < 5; i++) {
+      d.add(AGENT_EPOCH + i * 50_000, LOCAL_EPOCH + i * 33_000)
+    }
+    expect(d.snapshotAndReset()).toBe(-68)
+  })
+
+  it('distinguishes "no frames" from "a stable queue"', () => {
+    const d = new QueueDrift()
+    // Nothing at all.
+    expect(d.snapshotAndReset()).toBeNull()
+    // Exactly one frame establishes a cadence but measures no interval.
+    d.add(AGENT_EPOCH, LOCAL_EPOCH)
+    expect(d.snapshotAndReset()).toBeNull()
+  })
+
+  it('drops a pair that straddles a reset or a pause instead of believing it', () => {
+    const d = new QueueDrift()
+    d.add(AGENT_EPOCH, LOCAL_EPOCH)
+    // Wire timestamp went BACKWARDS (encoder rebuild / resync).
+    d.add(AGENT_EPOCH - 500_000, LOCAL_EPOCH + 33_000)
+    expect(d.snapshotAndReset()).toBeNull()
+    // A 30 s idle gap is not a cadence either.
+    d.reset()
+    d.add(AGENT_EPOCH, LOCAL_EPOCH)
+    d.add(AGENT_EPOCH + 30_000_000, LOCAL_EPOCH + 30_000_000)
+    expect(d.snapshotAndReset()).toBeNull()
+  })
+
+  it('clamps one glitchy pair so it cannot decide the window', () => {
+    const d = new QueueDrift()
+    d.add(AGENT_EPOCH, LOCAL_EPOCH)
+    // Framed 1 ms apart, arrived 4 s apart — real, but a single stall must
+    // not read as 4 s of sustained queue growth.
+    d.add(AGENT_EPOCH + 1_000, LOCAL_EPOCH + 4_000_000)
+    expect(d.snapshotAndReset()).toBe(1000)
+  })
+
+  it('reset() drops the cadence so the next pair is not measured across it', () => {
+    const d = new QueueDrift()
+    d.add(AGENT_EPOCH, LOCAL_EPOCH)
+    d.reset()
+    d.add(AGENT_EPOCH + 33_000, LOCAL_EPOCH + 999_000)
+    expect(d.snapshotAndReset()).toBeNull()
+  })
+})
+
 describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
   it('rounds + clamps the reported fps and carries the struggling bit', () => {
     expect(decodeStatWireMessage(58.7, true)).toEqual({
@@ -2686,6 +2760,42 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
       expect(m.age_ms).toBeUndefined()
       expect(m.age_min_ms).toBeUndefined()
     }
+  })
+
+  it('FR-59 P3: carries the link report as a pair, independently of the age', () => {
+    // No age at all — the whole point is that this signal does not need
+    // the clock probe, so it must not be gated behind one.
+    expect(decodeStatWireMessage(30, false, null, null, { rxBps: 395_122, queueMs: 240 })).toEqual({
+      t: 'rc:decodestat',
+      fps: 30,
+      struggling: false,
+      rx_bps: 395_122,
+      queue_ms: 240,
+    })
+    // A DRAINING queue must survive as a negative number; clamping it at 0
+    // would make recovery indistinguishable from stability.
+    const m = decodeStatWireMessage(30, false, null, null, { rxBps: 1_000, queueMs: -350 })
+    expect(m.queue_ms).toBe(-350)
+  })
+
+  it('FR-59 P3: omits the link report when the drift is no-signal', () => {
+    // `queueMs: null` = fewer than two frames arrived. Sending rx_bps
+    // alone would hand the agent a lower bound it could mistake for
+    // capacity, so the pair is all-or-nothing.
+    for (const link of [undefined, null, { rxBps: 400_000, queueMs: null }]) {
+      const m = decodeStatWireMessage(30, false, null, null, link as never)
+      expect(m.rx_bps).toBeUndefined()
+      expect(m.queue_ms).toBeUndefined()
+    }
+  })
+
+  it('FR-59 P3: clamps queue_ms into the i16 the agent packs it into', () => {
+    expect(decodeStatWireMessage(30, false, null, null, { rxBps: 1, queueMs: 99_999 }).queue_ms).toBe(
+      32767,
+    )
+    expect(
+      decodeStatWireMessage(30, false, null, null, { rxBps: 1, queueMs: -99_999 }).queue_ms,
+    ).toBe(-32768)
   })
 
   it('FR-15 P2: the probe round trip rides along with the age', () => {

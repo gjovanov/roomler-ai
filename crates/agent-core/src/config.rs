@@ -820,6 +820,77 @@ pub struct AgentConfig {
     /// = observe-and-report only (the pre-P2 posture).
     #[serde(default)]
     pub measured_ceiling: Option<bool>,
+    /// FR-59 P1 — the AIMD's legibility floor descends toward a MEASURED
+    /// pipe on a constrained transport (`ROOMLERD_SLOW_LINK_FLOOR`).
+    /// Built-in default: on. The flat 1.5 Mbps floor is calibrated for
+    /// the 2-9 Mbps band every measured relay sat in; on a slower link it
+    /// is not a floor but a PIN, because it is also where the
+    /// multiplicative decrease bottoms out. Evidence-gated: with no held
+    /// goodput estimate the nominal floor stands. `false` = flat floor.
+    #[serde(default)]
+    pub slow_link_floor: Option<bool>,
+    /// FR-59 P1 — absolute stop for that relief, bps
+    /// (`ROOMLERD_SLOW_LINK_MIN_BITRATE`). Built-in default: 200000;
+    /// clamped 50000-1500000. Below roughly this a full-resolution frame
+    /// is illegible at any QP and the honest lever is fewer PIXELS.
+    #[serde(default)]
+    pub slow_link_min_bitrate: Option<u32>,
+    /// FR-59 P2 — denominate the CONSTRAINED send-queue byte budget in
+    /// the MEASURED drain rate rather than the nominal relay ceiling
+    /// (`ROOMLERD_CONSTRAINED_QUEUE_MEASURED`). Built-in default: on. A
+    /// budget in milliseconds is a lie unless the bits-per-second it
+    /// divides by is the pipe's: 450 ms of a nominal 3 Mbps is 168750
+    /// bytes, which on a measured 395 kbps link is 3.4 SECONDS of queue.
+    /// A measurement may only ever LOWER the reference. `false` =
+    /// pre-FR-59 (once-resolved nominal budget).
+    #[serde(default)]
+    pub constrained_queue_measured: Option<bool>,
+    /// FR-59 P6 — a held goodput measurement far below the FR-35
+    /// learned/seeded ceiling abandons it back to the nominal band
+    /// (`ROOMLERD_SEED_CONTRADICTION`). Built-in default: on. The rate
+    /// memory keys on the nominated pair's remote address, which on a
+    /// relayed session is the RELAY's — so one fast day writes a number
+    /// later sessions through that relay inherit for 7 days regardless of
+    /// the client's own network. `false` = keep the seed until the AIMD
+    /// walks it down.
+    #[serde(default)]
+    pub seed_contradiction: Option<bool>,
+    /// FR-59 P3 — the VIEWER's own report of what is arriving (bytes/s
+    /// received, and how much its transit queue grew) drives the
+    /// constrained rate loop (`ROOMLERD_VIEWER_RATE_CLAMP`). Built-in
+    /// default: on. This is the signal the agent cannot produce for
+    /// itself: on a relayed path its send channel reads empty while
+    /// seconds of video sit in the relay and the carrier. Needs no clock
+    /// probe, so it survives the links where FR-15's age report is
+    /// absent or rejected. `false` = observe-and-report only.
+    #[serde(default)]
+    pub viewer_rate_clamp: Option<bool>,
+    /// FR-59 P4 — a transit queue too deep to cut our way out of is
+    /// DRAINED by pausing production for a bounded, sub-second window
+    /// (`ROOMLERD_QUEUE_DRAIN`). Built-in default: on. A rate cut alone
+    /// drains a queue at capacity minus inflow, the slowest possible way:
+    /// converging to 90% of a 400 kbps pipe clears a 2 s backlog at
+    /// 40 kbps, i.e. over ~20 s. Pausing sets inflow to zero, so it
+    /// clears in the ~2 s it represents. No forced keyframe on resume - a
+    /// pause loses no frames. `false` = rate control only.
+    #[serde(default)]
+    pub queue_drain: Option<bool>,
+    /// FR-59 P5 — a constrained session whose pair the rate memory
+    /// remembers as SLOW opens with fewer pixels and fewer frames
+    /// (`ROOMLERD_SLOW_LINK_PROFILE`). Built-in default: on. The bitrate
+    /// levers can make the encoder track a 400 kbps pipe; they cannot make
+    /// 1920x1200 at 30 fps legible through it (~1.7 KB per frame).
+    /// Resolved ONCE at pump start, never as a mid-session rung, because
+    /// every rung flip pays a blocking encoder open. `false` = open at the
+    /// normal size regardless.
+    #[serde(default)]
+    pub slow_link_profile: Option<bool>,
+    /// FR-59 P5 — remembered rate at or below which that profile engages,
+    /// bps (`ROOMLERD_SLOW_LINK_PROFILE_BPS`). Built-in default: 1000000;
+    /// 0 = never engage. A pair with NO memory never engages it: an
+    /// unknown link is not a slow one.
+    #[serde(default)]
+    pub slow_link_profile_bps: Option<u32>,
     /// 2026-08-27 drag-latency P3 — background encoder rebuild
     /// (`ROOMLERD_BG_REBUILD`). Default ON: on encoders with no
     /// in-place bitrate reconfigure (QSV/AMF), a bitrate change opens
@@ -1905,6 +1976,14 @@ pub fn test_fixture() -> AgentConfig {
         direct_hrd_pct: None,
         area_min_bitrate: None,
         measured_ceiling: None,
+        slow_link_floor: None,
+        slow_link_min_bitrate: None,
+        constrained_queue_measured: None,
+        seed_contradiction: None,
+        viewer_rate_clamp: None,
+        queue_drain: None,
+        slow_link_profile: None,
+        slow_link_profile_bps: None,
         bg_rebuild: None,
         par_convert: None,
         fps_pace: None,
@@ -2027,11 +2106,17 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 65] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 71] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
         ("MEASURED_CEILING", cfg.measured_ceiling),
+        ("SLOW_LINK_FLOOR", cfg.slow_link_floor),
+        ("CONSTRAINED_QUEUE_MEASURED", cfg.constrained_queue_measured),
+        ("SEED_CONTRADICTION", cfg.seed_contradiction),
+        ("VIEWER_RATE_CLAMP", cfg.viewer_rate_clamp),
+        ("QUEUE_DRAIN", cfg.queue_drain),
+        ("SLOW_LINK_PROFILE", cfg.slow_link_profile),
         ("BG_REBUILD", cfg.bg_rebuild),
         ("PAR_CONVERT", cfg.par_convert),
         ("FPS_PACE", cfg.fps_pace),
@@ -2108,7 +2193,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 65]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 25] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 27] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -2131,6 +2216,8 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ),
         ("CONSTRAINED_CQ_RELIEF", cfg.constrained_cq_relief),
         ("CONSTRAINED_QUEUE_MS", cfg.constrained_queue_ms),
+        ("SLOW_LINK_MIN_BITRATE", cfg.slow_link_min_bitrate),
+        ("SLOW_LINK_PROFILE_BPS", cfg.slow_link_profile_bps),
         ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),
         ("DIRECT_QUEUE_MS", cfg.direct_queue_ms),
         ("DIRECT_HRD_PCT", cfg.direct_hrd_pct),
