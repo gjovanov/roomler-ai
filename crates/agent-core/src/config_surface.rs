@@ -489,7 +489,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "portal_input",
         "tribool",
-        "FR-45 P4 - inject input through the portal RemoteDesktop interface, riding the SAME portal session (one consent dialog covers see+touch). Built-in default: OFF - a WithInput session needs its own see+touch consent + restore token, so enabling it makes every portal capture prompt afresh (and block or fall through if unanswered), regressing capture where capture-only works; it has also not yet been field-proven to land input. On = the portal session can be controlled; inert unless portal_capture is on. Env: ROOMLERD_PORTAL_INPUT. Restart required.",
+        "FR-45 P4 - inject input through the portal RemoteDesktop interface, riding the SAME portal session (one consent dialog covers see+touch). Built-in default: OFF - a WithInput session needs its own see+touch consent + restore token, so enabling it makes every portal capture prompt afresh (and block or fall through if unanswered), regressing capture where capture-only works; it has also not yet been field-proven to land input. On = the portal session can be controlled; inert unless portal_capture is on. NOTE (measured on GNOME): this key alone is not enough - the portal's consent dialog carries a SEPARATE 'Allow Remote Interaction' switch that defaults OFF, so a human who only clicks Share grants capture and the session runs view-only. Env: ROOMLERD_PORTAL_INPUT. Restart required.",
     ),
     (
         "x11_damage",
