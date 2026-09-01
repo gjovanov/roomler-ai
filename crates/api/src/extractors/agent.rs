@@ -123,11 +123,26 @@ where
         // The row is the revocation list. A lookup FAILURE is a 500, not a
         // 401: a Mongo blip must not tell a healthy fleet its credentials were
         // revoked, which would turn a database wobble into an enrollment storm.
+        //
+        // `NotFound` is the one exception, and FR-51 is what made it real: a
+        // REAPED ephemeral row is hard-deleted, so "no row" is Mongo's
+        // AUTHORITATIVE answer, not a wobble — pre-FR-51 a gone device always
+        // still had a tombstone and took the 401 below. Mapping NotFound to
+        // 500 would have a reaped-but-still-running device retrying forever
+        // against what reads as server trouble, instead of hearing that its
+        // credential is dead (and the agent's self-unenroll deliberately
+        // treats 401 as "already gone").
         let agent = app_state
             .agents
             .find_in_tenant(tenant_id, agent_id)
             .await
-            .map_err(|e| ApiError::Internal(format!("agent lookup: {e}")))?;
+            .map_err(|e| match e {
+                roomler_ai_services::dao::base::DaoError::NotFound => {
+                    tracing::info!(%agent_id, %tenant_id, "refusing agent-authed request: row gone");
+                    ApiError::Unauthorized("no such device".to_string())
+                }
+                other => ApiError::Internal(format!("agent lookup: {other}")),
+            })?;
 
         if let Some(reason) = refusal_reason(&agent) {
             tracing::info!(%agent_id, %tenant_id, reason, "refusing agent-authed request");
