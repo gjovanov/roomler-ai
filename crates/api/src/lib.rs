@@ -783,9 +783,12 @@ pub fn build_router(state: AppState) -> Router {
         // ⚠️ `subscribe` answers 202 for every outcome, including failure — the
         // uniform response is a membership-oracle control, not error handling.
         .route("/subscribe", post(routes::subscribe::subscribe))
+        // FR-58 follow-up: the GET is a pure redirect to the confirm PAGE —
+        // Gmail's link scanner burned the first field subscriber's single-use
+        // token via the old confirming GET. The POST is the deliberate click.
         .route(
             "/subscribe/confirm/{token}",
-            get(routes::subscribe::confirm),
+            get(routes::subscribe::confirm_redirect).post(routes::subscribe::confirm),
         )
         // FR-58: the POST leg is the RFC 8058 one-click target — same path,
         // same token capability, plain 200 (providers follow no redirects).

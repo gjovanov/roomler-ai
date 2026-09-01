@@ -3,7 +3,7 @@
 # Copyright (C) 2026 G ROX EOOD
 """FR-58 — drive the newsletter admin API from an issue's canonical .md source.
 
-The .md lives in the private annex (roomler-ai-docs:gtm/newsletter/NN-slug.md)
+The .md lives in the private annex (roomler-ai-news:news/NN-slug.md; war stories in fixes/)
 with YAML-ish frontmatter (slug, subject, preheader, hero, hero_alt, cta_text,
 cta_url) followed by the markdown body. This script is deliberately
 stdlib-only (urllib, json, re, getpass) so it runs anywhere python3 exists —
@@ -24,7 +24,7 @@ never echoed, nothing persisted).
 Server: --server (default https://roomler.ai).
 
 Examples:
-  ./scripts/newsletter-send.py push  ../roomler-ai-docs/gtm/newsletter/01-three-products-one-daemon.md
+  ./scripts/newsletter-send.py push  ../roomler-ai-news/news/01-three-products-one-daemon.md
   ./scripts/newsletter-send.py preview three-products-one-daemon
   ./scripts/newsletter-send.py test-send three-products-one-daemon --to me@example.com
   ./scripts/newsletter-send.py send three-products-one-daemon
