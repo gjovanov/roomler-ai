@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 G ROX EOOD
  *
- * FR-58 (#1165) — page behaviour: OS-tab persistence, copy buttons, the
+ * FR-59 (#1165) — page behaviour: OS-tab persistence, copy buttons, the
  * mobile nav, and TOC scroll-spy.
  *
  * Every one of these is a PROGRESSIVE ENHANCEMENT. With JavaScript off:

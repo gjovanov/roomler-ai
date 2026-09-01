@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-58 (#1165) — the CONTENT contract.
+ * FR-59 (#1165) — the CONTENT contract.
  *
  * The generator already fails the build on each of these. Asserting them
  * here too is not redundant: `bun run build` is the slow path, and these

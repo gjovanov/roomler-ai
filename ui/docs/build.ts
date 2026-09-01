@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-58 (#1165) — the static documentation generator.
+ * FR-59 (#1165) — the static documentation generator.
  *
  *   bun docs/build.ts            (from ui/, after `vite build`)
  *

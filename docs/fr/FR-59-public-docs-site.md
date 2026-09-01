@@ -1,4 +1,4 @@
-# FR-58: Public documentation site at roomler.ai/docs
+# FR-59: Public documentation site at roomler.ai/docs
 
 **Issue:** [#1165](https://github.com/gjovanov/roomler-ai/issues/1165) ·
 **Status:** proposed · **Owner:** web/docs
@@ -283,15 +283,38 @@ Every phase is additive static output; nothing outside `dist/docs` reads it.
 - Versioned docs (`/docs/v0.4/…`).
 - Dark mode (see §5).
 
-## 7. Number note
+## 7. Number note — claimed 58, **renumbered to 59**
 
-Claimed **FR-58**, not FR-57. At claim time `FR-57` was carried by **two** open
-issues — [#1161](https://github.com/gjovanov/roomler-ai/issues/1161) and
+Two number events, recorded because the ledger's rules were exercised twice in
+one session and the second one is the interesting case.
+
+**First, at claim time**, `FR-57` was carried by **two** open issues —
+[#1161](https://github.com/gjovanov/roomler-ai/issues/1161) and
 [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) — neither of which
 had reached this ledger. Taking a number already contested by two in-flight
-claims would have manufactured a three-way collision rather than resolving
-anything, so FR-57 is left for #1161, which keeps it under the
-lower-issue-id repair rule. This is a fresh claim, not a renumber.
+claims would have manufactured a three-way collision rather than resolving one,
+so this claimed **FR-58** and left 57 to settle between them.
+
+**Then FR-58 was taken anyway.** While this work was on a branch, master
+absorbed nine commits, among them
+[#1170](https://github.com/gjovanov/roomler-ai/issues/1170) — *newsletter
+sending* — carrying a `FR-58` ledger row and `docs/fr/FR-58-newsletter-sending.md`.
+
+⚠️ **The LEDGER arbitrated, and it moved this claim rather than theirs, even
+though this issue id is LOWER** (#1165 vs #1170). The lower-issue-id repair rule
+applies only when two claims have **both landed on master**. This one had not:
+it existed on a branch, which is invisible to every other session, exactly as a
+memory file would be. A claim that never reached master moves — the same
+resolution FR-50 recorded when #1086 took its number mid-flight.
+
+So: renumbered **FR-58 → FR-59** in one commit — spec filename, title, ledger
+row, and all 22 in-body and in-code references. Never into a vacated number, and
+nothing already settled was disturbed.
+
+🔑 The lesson this adds to the ledger's own: **the claim protocol only protects
+you once the row is on master.** Pushing a branch is not claiming. On a long
+piece of work, land the spec-and-row commit early rather than carrying it
+alongside the implementation.
 
 ## 8. Field-verification log
 

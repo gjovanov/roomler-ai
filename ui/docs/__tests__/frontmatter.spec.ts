@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-58 (#1165) — the frontmatter parser's contract.
+ * FR-59 (#1165) — the frontmatter parser's contract.
  *
  * This parser is deliberately a YAML SUBSET rather than a YAML engine, so
  * what it refuses matters as much as what it accepts: a key that quietly

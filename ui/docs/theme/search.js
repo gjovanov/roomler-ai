@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (C) 2026 G ROX EOOD
  *
- * FR-58 (#1165) — client-side documentation search.
+ * FR-59 (#1165) — client-side documentation search.
  *
  * A prebuilt section-level index plus prefix scoring. Deliberately NOT
  * Pagefind: Pagefind is the better ranker at scale, but it is WASM, and

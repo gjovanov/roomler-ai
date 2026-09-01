@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-58 (#1165) — a deliberately tiny YAML-subset frontmatter parser.
+ * FR-59 (#1165) — a deliberately tiny YAML-subset frontmatter parser.
  *
  * Adding `gray-matter` + `js-yaml` to ship a docs site would pull a YAML
  * engine into the repo for ten keys, none of which needs anchors, flow

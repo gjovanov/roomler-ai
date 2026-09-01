@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-58 (#1165) — markdown -> HTML.
+ * FR-59 (#1165) — markdown -> HTML.
  *
  * Built on `markdown-it@14`, which is ALREADY a `ui` dependency (the chat
  * composer uses it), so the renderer costs no new package.

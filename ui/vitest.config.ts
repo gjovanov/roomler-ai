@@ -19,7 +19,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
-    // `docs/**` is FR-58's static documentation generator. Its specs live
+    // `docs/**` is FR-59's static documentation generator. Its specs live
     // next to it rather than under src/, because it is a build-time tool
     // and not part of the SPA bundle.
     include: ['src/**/*.spec.ts', 'src/**/*.test.ts', 'docs/**/*.spec.ts'],

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-58 (#1165) — the renderer's contract.
+ * FR-59 (#1165) — the renderer's contract.
  *
  * The load-bearing cases are the ones that fail SILENTLY if they regress:
  * a container that swallows the rest of the page, a nested callout that

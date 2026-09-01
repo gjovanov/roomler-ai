@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-58 (#1165) — site-wide configuration for the static docs generator.
+ * FR-59 (#1165) — site-wide configuration for the static docs generator.
  *
  * The nav is NOT a hand-maintained list of pages. Sections are declared
  * here (order, title, blurb, icon); the pages inside them are DISCOVERED

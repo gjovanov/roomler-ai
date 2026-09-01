@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 /**
- * FR-58 (#1165) — the page shell.
+ * FR-59 (#1165) — the page shell.
  *
  * Everything a crawler reads is emitted here, statically, per page: a
  * unique <title>, a real <meta name="description">, an ABSOLUTE canonical,
