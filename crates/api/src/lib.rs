@@ -438,6 +438,19 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{agent_id}/peer-relay-policy",
             put(routes::peer_relay::set_policy),
+        )
+        // FR-52 gate 2 — approve a device for control by someone OUTSIDE the
+        // org. MANAGE_AGENTS + REMOTE_CONTROL to grant, MANAGE_AGENTS alone to
+        // clear (routes/external_access.rs says why); audited on both arms.
+        .route(
+            "/{agent_id}/external-access-policy",
+            put(routes::external_access::set_policy),
+        )
+        // FR-52 §5 — mint or rotate the connect code an outsider names this
+        // device by. Rotation IS the revocation story for a leaked code.
+        .route(
+            "/{agent_id}/connect-code",
+            post(routes::external_access::rotate_connect_code),
         );
 
     // Remote-control session routes (tenant-scoped)
@@ -571,6 +584,14 @@ pub fn build_router(state: AppState) -> Router {
         get(routes::peer_relay::get_settings).put(routes::peer_relay::set_mode),
     );
     let peer_relay_audit_routes = Router::new().route("/", get(routes::peer_relay::audit));
+    // FR-52 — cross-org remote access: the org switch (gate 1) + the list of
+    // approved devices, and the decision log. Approval itself is on the agent
+    // router, since gate 2 is per device.
+    let external_access_routes = Router::new().route(
+        "/",
+        get(routes::external_access::get_settings).put(routes::external_access::set_enabled),
+    );
+    let external_rc_audit_routes = Router::new().route("/", get(routes::external_access::audit));
     let ssh_audit_routes = Router::new().route("/", get(routes::agent_ssh::audit));
     let ssh_activity_routes = Router::new().route("/", get(routes::agent_ssh::activity));
     let exec_settings_routes = Router::new().route(
@@ -826,6 +847,14 @@ pub fn build_router(state: AppState) -> Router {
         .nest(
             "/tenant/{tenant_id}/peer-relay-audit",
             peer_relay_audit_routes,
+        )
+        .nest(
+            "/tenant/{tenant_id}/external-access",
+            external_access_routes,
+        )
+        .nest(
+            "/tenant/{tenant_id}/external-rc-audit",
+            external_rc_audit_routes,
         )
         .nest("/tenant/{tenant_id}/ssh-audit", ssh_audit_routes)
         .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity_routes)

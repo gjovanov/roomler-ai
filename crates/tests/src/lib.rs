@@ -54,6 +54,8 @@ mod enroll_key_tests;
 #[cfg(test)]
 mod ephemeral_tests;
 #[cfg(test)]
+mod external_access_tests;
+#[cfg(test)]
 mod invite_tests;
 #[cfg(test)]
 mod key_rotation_tests;
