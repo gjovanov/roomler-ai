@@ -875,6 +875,22 @@ pub struct AgentConfig {
     /// pause loses no frames. `false` = rate control only.
     #[serde(default)]
     pub queue_drain: Option<bool>,
+    /// FR-59 P5 — a constrained session whose pair the rate memory
+    /// remembers as SLOW opens with fewer pixels and fewer frames
+    /// (`ROOMLERD_SLOW_LINK_PROFILE`). Built-in default: on. The bitrate
+    /// levers can make the encoder track a 400 kbps pipe; they cannot make
+    /// 1920x1200 at 30 fps legible through it (~1.7 KB per frame).
+    /// Resolved ONCE at pump start, never as a mid-session rung, because
+    /// every rung flip pays a blocking encoder open. `false` = open at the
+    /// normal size regardless.
+    #[serde(default)]
+    pub slow_link_profile: Option<bool>,
+    /// FR-59 P5 — remembered rate at or below which that profile engages,
+    /// bps (`ROOMLERD_SLOW_LINK_PROFILE_BPS`). Built-in default: 1000000;
+    /// 0 = never engage. A pair with NO memory never engages it: an
+    /// unknown link is not a slow one.
+    #[serde(default)]
+    pub slow_link_profile_bps: Option<u32>,
     /// 2026-08-27 drag-latency P3 — background encoder rebuild
     /// (`ROOMLERD_BG_REBUILD`). Default ON: on encoders with no
     /// in-place bitrate reconfigure (QSV/AMF), a bitrate change opens
@@ -1966,6 +1982,8 @@ pub fn test_fixture() -> AgentConfig {
         seed_contradiction: None,
         viewer_rate_clamp: None,
         queue_drain: None,
+        slow_link_profile: None,
+        slow_link_profile_bps: None,
         bg_rebuild: None,
         par_convert: None,
         fps_pace: None,
@@ -2088,7 +2106,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 70] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 71] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2098,6 +2116,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 70]
         ("SEED_CONTRADICTION", cfg.seed_contradiction),
         ("VIEWER_RATE_CLAMP", cfg.viewer_rate_clamp),
         ("QUEUE_DRAIN", cfg.queue_drain),
+        ("SLOW_LINK_PROFILE", cfg.slow_link_profile),
         ("BG_REBUILD", cfg.bg_rebuild),
         ("PAR_CONVERT", cfg.par_convert),
         ("FPS_PACE", cfg.fps_pace),
@@ -2174,7 +2193,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 70]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 26] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 27] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -2198,6 +2217,7 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("CONSTRAINED_CQ_RELIEF", cfg.constrained_cq_relief),
         ("CONSTRAINED_QUEUE_MS", cfg.constrained_queue_ms),
         ("SLOW_LINK_MIN_BITRATE", cfg.slow_link_min_bitrate),
+        ("SLOW_LINK_PROFILE_BPS", cfg.slow_link_profile_bps),
         ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),
         ("DIRECT_QUEUE_MS", cfg.direct_queue_ms),
         ("DIRECT_HRD_PCT", cfg.direct_hrd_pct),
