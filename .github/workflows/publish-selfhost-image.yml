@@ -104,14 +104,21 @@ jobs:
         run: |
           set -euo pipefail
           IMG='${{ env.IMAGE }}:${{ env.tag }}'
+          # Generated per run, never written down. A literal here would be a
+          # credential-shaped string in a public repo — inert, but secret
+          # scanners cannot know that and neither can a reader skimming the
+          # file. These live for the length of one job and are then destroyed
+          # with the runner.
+          DBPW="$(openssl rand -hex 16)"
+          JWT="$(openssl rand -hex 32)"
           docker network create roomler-smoke
           docker run -d --name mongo --network roomler-smoke \
-            -e MONGO_INITDB_ROOT_USERNAME=smoke -e MONGO_INITDB_ROOT_PASSWORD=smokepw mongo:7
+            -e MONGO_INITDB_ROOT_USERNAME=smoke -e MONGO_INITDB_ROOT_PASSWORD="$DBPW" mongo:7
           docker run -d --name redis --network roomler-smoke redis:7-alpine
           docker run -d --name roomler --network roomler-smoke -p 8080:80 \
             -e ROOMLER__APP__ENVIRONMENT=development \
-            -e ROOMLER__JWT__SECRET=smoke-only-not-a-real-secret \
-            -e ROOMLER__DATABASE__URL='mongodb://smoke:smokepw@mongo:27017/?authSource=admin' \
+            -e ROOMLER__JWT__SECRET="$JWT" \
+            -e ROOMLER__DATABASE__URL="mongodb://smoke:${DBPW}@mongo:27017/?authSource=admin" \
             -e ROOMLER__REDIS__URL=redis://redis:6379 \
             -e ROOMLER__MEDIASOUP__NUM_WORKERS=1 \
             "$IMG"
