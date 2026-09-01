@@ -635,6 +635,31 @@ jobs:
         # They need the library present, not a GPU.
         run: cargo test -p roomlerd --features ffmpeg-encoder --lib
 
+  fr-registry:
+    name: FR registry integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The FR registry is not documentation -- it is the mechanism that
+    # ARBITRATES FR-number collisions between parallel sessions. The standing
+    # rule is "claim the number by adding your row to docs/fr/README.md in the
+    # SAME commit as the spec", precisely so git rejects the loser's push
+    # instead of two sessions discovering the clash after both have published.
+    # That only holds while the row and the spec travel together.
+    #
+    # They stopped, and nothing noticed. Master carried an FR-52 row whose spec
+    # had NEVER been on master -- carried in as a passenger by a PR about FR-49
+    # and FR-50 -- so the registry advertised a claimed number, linked to a 404,
+    # and documented nothing for two days. It also made the real FR-52 PR
+    # unmergeable (both sides added the row), so that stalled silently with
+    # every check green.
+    #
+    # A spec with no row is the worse half: it fails no build and no test, and
+    # simply leaves the next session free to take the same number.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit the FR registry
+        run: bash scripts/fr-registry-audit.sh
+
   name-audit:
     name: Retired-name audit (FR-21)
     runs-on: ubuntu-latest
