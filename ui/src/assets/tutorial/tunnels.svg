@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" aria-labelledby="tun-title tun-desc">
+  <!-- Sibling of private-network.svg — that image is the mesh; this one is the
+       tunnel, so the two chapters stopped sharing it. -->
+  <title id="tun-title">A tunnel to a service that has no public address</title>
+  <desc id="tun-desc">
+    A laptop forwards a local port through an encrypted tunnel to an agent
+    inside a private network, which reaches a database that is not exposed to
+    the internet. The public internet path to that database is shown blocked.
+  </desc>
+  <style>
+    .pkt { animation: tn-pkt 2.6s linear infinite; }
+    .pkt:nth-of-type(2) { animation-delay: .85s; }
+    .pkt:nth-of-type(3) { animation-delay: 1.7s; }
+    @keyframes tn-pkt { 0% { offset-distance: 0%; } 100% { offset-distance: 100%; } }
+    .lock { transform-box: fill-box; transform-origin: center; animation: tn-lock 2.6s ease-in-out infinite; }
+    @keyframes tn-lock { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .pkt { animation: none; offset-distance: 55%; }
+      .lock { animation: none; opacity: 1; }
+    }
+  </style>
+
+  <rect width="760" height="400" fill="none" />
+
+  <!-- laptop -->
+  <rect x="40" y="150" width="132" height="86" rx="10" fill="#009688" opacity=".16" />
+  <rect x="58" y="168" width="96" height="50" rx="5" fill="#00796B" opacity=".45" />
+  <text x="106" y="256" text-anchor="middle" font-size="13.5" fill="#00796B" font-weight="600">your laptop</text>
+  <text x="106" y="276" text-anchor="middle" font-size="12" fill="#00796B" opacity=".8">localhost:5432</text>
+
+  <!-- the private network -->
+  <rect x="470" y="86" width="250" height="228" rx="14" fill="#00796B" opacity=".08" />
+  <rect x="470" y="86" width="250" height="228" rx="14" fill="none" stroke="#00796B" stroke-width="2" stroke-dasharray="6 6" opacity=".6" />
+  <text x="595" y="112" text-anchor="middle" font-size="13" fill="#00796B" font-weight="600">private network</text>
+
+  <rect x="500" y="134" width="86" height="60" rx="8" fill="#009688" opacity=".2" />
+  <text x="543" y="169" text-anchor="middle" font-size="12.5" fill="#00796B">agent</text>
+
+  <rect x="606" y="212" width="92" height="64" rx="8" fill="#009688" opacity=".2" />
+  <text x="652" y="242" text-anchor="middle" font-size="12.5" fill="#00796B">database</text>
+  <text x="652" y="260" text-anchor="middle" font-size="11.5" fill="#00796B" opacity=".75">no public IP</text>
+
+  <!-- the tunnel itself -->
+  <path id="tunnel" d="M172 193 C 280 193, 330 164, 500 164" fill="none" stroke="#009688" stroke-width="10" opacity=".22" stroke-linecap="round" />
+  <path d="M172 193 C 280 193, 330 164, 500 164" fill="none" stroke="#009688" stroke-width="2" opacity=".6" stroke-linecap="round" />
+  <g fill="#009688">
+    <circle class="pkt" r="5" style="offset-path: path('M172 193 C 280 193, 330 164, 500 164');" />
+    <circle class="pkt" r="5" style="offset-path: path('M172 193 C 280 193, 330 164, 500 164');" />
+    <circle class="pkt" r="5" style="offset-path: path('M172 193 C 280 193, 330 164, 500 164');" />
+  </g>
+
+  <!-- encrypted, and the server is not in the path -->
+  <g class="lock" transform="translate(320,120)">
+    <rect x="-13" y="0" width="26" height="20" rx="4" fill="#00796B" />
+    <path d="M-7 0 v-7 a7 7 0 0 1 14 0 v7" fill="none" stroke="#00796B" stroke-width="3" />
+    <text x="0" y="40" text-anchor="middle" font-size="12" fill="#00796B">end-to-end encrypted</text>
+  </g>
+
+  <!-- agent reaches the database locally -->
+  <path d="M586 176 C 640 186, 652 196, 652 212" fill="none" stroke="#009688" stroke-width="2" stroke-dasharray="5 5" opacity=".8" />
+
+  <!-- the internet cannot -->
+  <g opacity=".9">
+    <text x="200" y="330" font-size="12.5" fill="#00796B" opacity=".7">public internet</text>
+    <path d="M290 324 H430" stroke="#ef5350" stroke-width="2.5" stroke-dasharray="4 7" fill="none" opacity=".6" stroke-linecap="round" />
+    <g stroke="#ef5350" stroke-width="3" stroke-linecap="round">
+      <path d="M436 312 L460 336" />
+      <path d="M460 312 L436 336" />
+    </g>
+    <text x="476" y="329" font-size="12.5" fill="#ef5350">refused</text>
+  </g>
+</svg>

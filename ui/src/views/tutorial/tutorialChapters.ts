@@ -3,7 +3,11 @@
 import heroMesh from '@/assets/tutorial/hero-mesh.svg'
 import heroRemoteDesktop from '@/assets/tutorial/remote-desktop.svg'
 import heroPrivateNetwork from '@/assets/tutorial/private-network.svg'
-import heroCollaboration from '@/assets/tutorial/collaboration.svg'
+import heroDevices from '@/assets/tutorial/devices.svg'
+import heroTunnels from '@/assets/tutorial/tunnels.svg'
+import heroAcl from '@/assets/tutorial/acl.svg'
+import heroRooms from '@/assets/tutorial/rooms.svg'
+import heroCalls from '@/assets/tutorial/calls.svg'
 import stepEnroll from '@/assets/tutorial/step-enroll.svg'
 import stepConnect from '@/assets/tutorial/step-connect.svg'
 import stepForward from '@/assets/tutorial/step-forward.svg'
@@ -187,8 +191,9 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     tour: { id: 'enroll', routeName: 'devices', label: 'Show me on the Devices page' },
     icon: 'mdi-monitor-multiple',
     blurb: 'Enroll machines and keep them current',
-    hero: heroMesh,
-    heroAlt: 'A fleet of machines enrolled into one organization',
+    hero: heroDevices,
+    heroAlt:
+      'A single-use enrollment token turning into a new row in the device list, beside three machines already enrolled',
     lead:
       'Devices is the **home page of your fleet**. Every enrolled machine shows up with its live status, operating system, overlay address, MagicDNS name and agent version. Two kinds share the grid: **full daemons** (remote desktop + network + tunnels) and **tunnel-only clients**. Enrolling is one command on the target machine — there is no manual key exchange.',
     badges: [
@@ -410,8 +415,8 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     title: 'Tunnels',
     icon: 'mdi-transit-connection-variant',
     blurb: 'Reach a service without exposing it',
-    hero: heroPrivateNetwork,
-    heroAlt: 'A local port tunnelled to a service reachable only by a remote machine',
+    hero: heroTunnels,
+    heroAlt: 'A local port tunnelled to a service reachable only by a remote machine, with the public internet refused',
     lead:
       'A tunnel turns **anything one of your machines can reach** into a local port on yours — a database on a private subnet, an internal web app, a printer. **Nothing is published to the internet**, the payload stays encrypted end to end, and access is default-deny: a tunnel only works where you allowed it.',
     badges: [
@@ -480,8 +485,9 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     title: 'Access control',
     icon: 'mdi-shield-lock-outline',
     blurb: 'Who may reach what — default deny',
-    hero: heroPrivateNetwork,
-    heroAlt: 'Policy gates between machines on the private network',
+    hero: heroAcl,
+    heroAlt:
+      'Two machines allowed through a policy gate to the ports they were granted, and a third denied, with every decision recorded in an audit line',
     lead:
       'Membership of your organization is **not** the same as permission to reach a machine. Tunnel and overlay policies say which people and devices may reach which destinations, and both **start closed**: nothing is permitted until you write a rule. Every decision is recorded, and the device itself keeps a **local veto** that survives even a compromised control plane.',
     badges: [
@@ -552,8 +558,9 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     title: 'Rooms & chat',
     icon: 'mdi-forum-outline',
     blurb: 'Conversations, files and threads',
-    hero: heroCollaboration,
-    heroAlt: 'A team chatting, sharing files and meeting in rooms',
+    hero: heroRooms,
+    heroAlt:
+      'A channel list with one unread channel next to a threaded conversation where someone is mentioned and a colleague is typing',
     lead:
       'Rooms are where the people side lives: **threaded chat** with mentions and reactions, **files shared in context**, and a call one click away. Rooms nest, so a team can keep a general room with focused children under it, and each room can be **open to the org** or **private to its members**.',
     badges: [
@@ -624,8 +631,9 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     title: 'Calls',
     icon: 'mdi-video-outline',
     blurb: 'Video, audio and screen sharing',
-    hero: heroCollaboration,
-    heroAlt: 'A video call with several participants and a shared screen',
+    hero: heroCalls,
+    heroAlt:
+      'A shared screen filling the call, with a filmstrip of participants showing who is speaking, whose camera is off and who is muted',
     lead:
       'Any room can become a call. Video and audio run through a **media server built for group calls**, so a dozen people in one room is routine, and you can **share a screen** while you talk. A call in progress is visible from the app bar, so nobody has to be told twice that it started.',
     badges: [

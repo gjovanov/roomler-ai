@@ -2,7 +2,10 @@
 // Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_db::models::{NotificationPrefs, OAuthProvider, Presence, User, UserStatusInfo};
+use roomler_ai_db::models::{
+    MAX_TUTORIAL_CHAPTER_ID_LEN, MAX_TUTORIAL_CHAPTERS, NotificationPrefs, OAuthProvider, Presence,
+    TutorialState, User, UserStatusInfo,
+};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
@@ -85,6 +88,7 @@ impl UserDao {
             last_active_at: None,
             oauth_providers: Vec::new(),
             notification_preferences: NotificationPrefs::default(),
+            tutorial: TutorialState::default(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -327,6 +331,7 @@ impl UserDao {
                 refresh_token: None,
             }],
             notification_preferences: NotificationPrefs::default(),
+            tutorial: TutorialState::default(),
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -478,6 +483,57 @@ impl UserDao {
         }
         if let Some(tz) = timezone {
             update.insert("timezone", tz);
+        }
+
+        if update.is_empty() {
+            return Ok(false);
+        }
+
+        update.insert("updated_at", DateTime::now());
+
+        self.base
+            .update_by_id(user_id, doc! { "$set": update })
+            .await
+    }
+
+    /// FR-12 P3 — write the caller's tutorial state.
+    ///
+    /// Deliberately NOT folded into `update_profile`: that route is the
+    /// user-editable profile (name, bio, avatar, locale), and this is app
+    /// state the tutorial owns. Keeping them apart also keeps
+    /// `update_profile`'s already-long positional signature from growing.
+    ///
+    /// `done` REPLACES rather than unions, because the checkboxes can be
+    /// un-ticked and a union would make un-ticking impossible to express.
+    /// The client seeds itself with the union on first load, so a device
+    /// that ticked a chapter offline does not lose it.
+    ///
+    /// `seen` only ever SETS the timestamp — it is the "do not ambush this
+    /// person again" flag, and nothing in normal use should be able to clear
+    /// it. Passing `Some(false)` is therefore a no-op, not a reset.
+    pub async fn set_tutorial_state(
+        &self,
+        user_id: ObjectId,
+        done: Option<Vec<String>>,
+        seen: Option<bool>,
+    ) -> DaoResult<bool> {
+        let mut update = bson::Document::new();
+
+        if let Some(list) = done {
+            // Bound what a client can write onto its own document. Truncating
+            // rather than rejecting: this is a checklist, and a request that
+            // is merely too long should not fail a user's tutorial.
+            let mut clean: Vec<String> = list
+                .into_iter()
+                .filter(|c| !c.is_empty() && c.len() <= MAX_TUTORIAL_CHAPTER_ID_LEN)
+                .collect();
+            clean.dedup();
+            clean.truncate(MAX_TUTORIAL_CHAPTERS);
+            update.insert("tutorial.done", clean);
+        }
+
+        if seen == Some(true) {
+            update.insert("tutorial.seen_at", DateTime::now());
         }
 
         if update.is_empty() {
