@@ -598,7 +598,13 @@ import MiniConference from '@/components/conference/MiniConference.vue'
 import SearchDialog from '@/components/layout/SearchDialog.vue'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useValidation } from '@/composables/useValidation'
-import { hasSeenTour, markTourSeen, shouldAutoOpenTour } from '@/composables/useTutorialProgress'
+import {
+  hasSeenTour,
+  markTourSeen,
+  pushTutorialState,
+  seedTutorialFromServer,
+  shouldAutoOpenTour,
+} from '@/composables/useTutorialProgress'
 
 const { mobile } = useDisplay()
 const { showError: showCreateOrgError } = useSnackbar()
@@ -912,6 +918,11 @@ async function maybeAutoOpenTour() {
   const uid = auth.user?.id
   if (!tid || !uid) return
   if (route.name === 'tutorial') return
+  // FR-12 P3 — fold the account's stored state in BEFORE the seen-flag read,
+  // so a person who did the tour on another machine is not walked through it
+  // again here. Seeding is local-only and costs no request: the state rode in
+  // on the /auth/me response this session already made.
+  seedTutorialFromServer(uid, auth.user?.tutorial)
   if (hasSeenTour(uid)) {
     tourChecked = true
     return
@@ -938,6 +949,7 @@ async function maybeAutoOpenTour() {
     return
   }
   markTourSeen(uid)
+  pushTutorialState({ seen: true })
   router.replace({ name: 'tutorial', params: { tenantId: tid } })
 }
 watch([tenantId, showFleetNav] as const, () => void maybeAutoOpenTour(), { immediate: true })

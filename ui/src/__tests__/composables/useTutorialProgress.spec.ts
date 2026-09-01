@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { api } from '@/api/client'
 import {
   hasSeenTour,
   markTourSeen,
   readTourProgress,
   writeTourProgress,
+  seedTutorialFromServer,
+  pushTutorialState,
   shouldAutoOpenTour,
   tourProgressKey,
   tourSeenKey,
@@ -16,6 +19,8 @@ import {
   chapterById,
   richSegments,
 } from '@/views/tutorial/tutorialChapters'
+
+vi.mock('@/api/client', () => ({ api: { put: vi.fn(() => Promise.resolve({})) } }))
 
 const USER = 'u-123'
 
@@ -214,6 +219,43 @@ describe('tutorial chapters (FR-12 content contract)', () => {
     const withGraphics = TUTORIAL_CHAPTERS.filter((c) => c.steps.some((s) => s.graphic))
     expect(withGraphics.length).toBeGreaterThanOrEqual(6)
   })
+
+  // P3 exists because eight chapters shared four images: the ACL chapter showed
+  // the same picture as the network one, calls the same as rooms. A reader who
+  // sees a familiar illustration reasonably concludes they are back where they
+  // started. Sharing regresses SILENTLY -- the page still renders -- so the only
+  // thing that keeps it fixed is an assertion that no two chapters point at one
+  // asset.
+  it('no two chapters share a hero image', () => {
+    const heroes = TUTORIAL_CHAPTERS.map((c) => c.hero)
+    expect(new Set(heroes).size, `heroes reused: ${heroes.join(', ')}`).toBe(
+      TUTORIAL_CHAPTERS.length,
+    )
+  })
+
+  // Read the assets themselves rather than the imported URLs: what matters is
+  // what ships. An animated illustration that ignores prefers-reduced-motion is
+  // an accessibility defect nobody on this team would notice, because the
+  // motion is pleasant on the machines we develop on.
+  it('every tutorial illustration is titled, and animated ones are describable and stoppable', () => {
+    const svgs = import.meta.glob('../../assets/tutorial/*.svg', {
+      eager: true,
+      query: '?raw',
+      import: 'default',
+    }) as Record<string, string>
+
+    const names = Object.keys(svgs)
+    expect(names.length, 'no tutorial SVGs found -- the glob path is wrong').toBeGreaterThan(10)
+
+    for (const [path, src] of Object.entries(svgs)) {
+      expect(src, `${path}: no <title> for screen readers`).toContain('<title')
+      if (!src.includes('animation:')) continue
+      expect(src, `${path}: animated but has no <desc>`).toContain('<desc')
+      expect(src, `${path}: animated with no prefers-reduced-motion guard`).toContain(
+        'prefers-reduced-motion',
+      )
+    }
+  })
 })
 
 describe('richSegments (bold without v-html)', () => {
@@ -248,5 +290,51 @@ describe('richSegments (bold without v-html)', () => {
         expect(richSegments(text).map((s) => s.text).join('')).toBe(text.replace(/\*\*/g, ''))
       }
     }
+  })
+})
+
+describe('server-side mirror (FR-12 P3)', () => {
+  it('unions the server list into local progress instead of replacing it', () => {
+    writeTourProgress(USER, ['devices', 'tunnels'])
+    seedTutorialFromServer(USER, { done: ['acl', 'devices'] })
+    // A tick made on THIS device while the PUT was failing must survive the
+    // first sync from another device -- that is why the seed is a union.
+    expect(readTourProgress(USER).sort()).toEqual(['acl', 'devices', 'tunnels'])
+  })
+
+  it('an absent or empty server state changes nothing', () => {
+    writeTourProgress(USER, ['rooms'])
+    seedTutorialFromServer(USER, undefined)
+    seedTutorialFromServer(USER, {})
+    seedTutorialFromServer(USER, { done: [] })
+    expect(readTourProgress(USER)).toEqual(['rooms'])
+    expect(hasSeenTour(USER)).toBe(false)
+  })
+
+  it('seen_at sets the local flag, and its absence never clears one', () => {
+    seedTutorialFromServer(USER, { seen_at: '2026-09-01T10:00:00Z' })
+    expect(hasSeenTour(USER)).toBe(true)
+    // "no opinion" is not "never seen": a server that has not heard about
+    // this user yet must not re-arm an ambush the browser already knows about.
+    seedTutorialFromServer(USER, { done: ['acl'] })
+    expect(hasSeenTour(USER)).toBe(true)
+  })
+
+  it('a failing push is swallowed -- the tutorial never breaks the shell', async () => {
+    vi.mocked(api.put).mockRejectedValueOnce(new Error('offline'))
+    expect(() => pushTutorialState({ done: ['acl'] })).not.toThrow()
+    await Promise.resolve()
+    expect(api.put).toHaveBeenCalledWith('/user/tutorial', { done: ['acl'] })
+  })
+
+  it('ticking a chapter writes through to the account', () => {
+    vi.mocked(api.put).mockClear()
+    const { toggle } = useTutorialProgress(() => USER)
+    toggle('devices', true)
+    expect(api.put).toHaveBeenCalledWith('/user/tutorial', { done: ['devices'] })
+    toggle('devices', false)
+    // Un-ticking must send the SHORTER list: if the write unioned server-side
+    // there would be no way to express it at all.
+    expect(api.put).toHaveBeenLastCalledWith('/user/tutorial', { done: [] })
   })
 })
