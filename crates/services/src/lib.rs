@@ -8,6 +8,7 @@ pub mod email;
 pub mod export;
 pub mod giphy;
 pub mod media;
+pub mod newsletter;
 pub mod oauth;
 pub mod push;
 pub mod quota;
