@@ -22,11 +22,13 @@
 
 use std::sync::Arc;
 
+use roomler_ai_remote_control::signaling;
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use tunnel_core::env::node_env;
+use tunnel_core::localapi;
 use tunnel_core::localapi::OverlayView;
 use tunnel_core::overlay::WgKeypair;
 use tunnel_core::overlay::runtime::{
@@ -935,6 +937,7 @@ pub fn intercept(
                 "overlay: the server REFUSED our join — this node has no overlay \
                  address and will not appear in the mesh"
             );
+            record_join_refusal(reason, &detail);
             return None;
         }
         ServerMsg::OverlayRelayGrant {
@@ -1193,4 +1196,43 @@ mod netstack_claim_tests {
         release_netstack("org-a");
         release_netstack("org-c");
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// FR-47 — the last join the server refused
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The most recent [`ServerMsg::OverlayJoinRefused`], for `roomler status`.
+///
+/// A process-global rather than runtime state, and deliberately so: a refusal
+/// means the overlay runtime never came up, so there is no runtime to hold it.
+/// Same shape as the netcheck and netstate slots the status assembly already
+/// reads for HOST-level facts.
+static LAST_JOIN_REFUSAL: std::sync::Mutex<Option<localapi::JoinRefusalStatus>> =
+    std::sync::Mutex::new(None);
+
+/// Record a refusal. Last-writer-wins: the newest reason is the actionable one.
+pub fn record_join_refusal(reason: signaling::OverlayJoinRefusal, detail: &str) {
+    let status = localapi::JoinRefusalStatus {
+        reason: serde_json::to_value(reason)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            // A tag that will not serialise is not worth losing the whole
+            // report over — the detail string still carries the specifics.
+            .unwrap_or_else(|| "unknown".to_string()),
+        detail: detail.to_string(),
+        at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        retryable: reason.is_retryable(),
+    };
+    if let Ok(mut slot) = LAST_JOIN_REFUSAL.lock() {
+        *slot = Some(status);
+    }
+}
+
+/// The last refusal, if this daemon has seen one.
+pub fn last_join_refusal() -> Option<localapi::JoinRefusalStatus> {
+    LAST_JOIN_REFUSAL.lock().ok().and_then(|s| s.clone())
 }
