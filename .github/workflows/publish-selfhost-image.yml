@@ -139,15 +139,33 @@ jobs:
 
       - name: Report the version the image reports about ITSELF
         run: |
-          # The manifest tag and the binary's own version are different claims.
-          # A mismatch here means the build args did not reach the binary, and
-          # every operator would then be told a version the image is not.
-          docker run --rm --entrypoint /usr/local/bin/roomler-ai-api \
-            '${{ env.IMAGE }}:${{ env.tag }}' --version 2>/dev/null || true
-          docker image inspect '${{ env.IMAGE }}:${{ env.tag }}' \
+          set -uo pipefail
+          IMG='${{ env.IMAGE }}:${{ env.tag }}'
+          docker image inspect "$IMG" \
             --format '  labels: version={{index .Config.Labels "org.opencontainers.image.version"}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
-          docker image inspect '${{ env.IMAGE }}:${{ env.tag }}' \
-            --format '  size: {{.Size}} bytes'
+          docker image inspect "$IMG" --format '  size: {{.Size}} bytes'
+
+          # ⚠️ The tag and the binary's own version are DIFFERENT CLAIMS, and
+          # they drift silently: master moves while a 20-minute build runs, so
+          # a tag chosen when the dispatch was typed can already name a version
+          # this image is not. The first dry run produced exactly that —
+          # `version=v0.4.44` on a binary reporting `0.4.42`.
+          #
+          # A warning rather than a failure: `v1.0.0-rc1` and other deliberate
+          # names are legitimate, and refusing them would make the workflow
+          # unusable for the one case where a human has thought hardest about
+          # the tag. Being unmissable is what this needs to be.
+          WS=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          TAG='${{ env.tag }}'
+          echo "  workspace version: $WS"
+          if [ "${TAG#v}" != "$WS" ]; then
+            echo "::warning title=Tag does not match the workspace version::\
+          tag '$TAG' vs Cargo.toml '$WS'. The image will report $WS about itself \
+          while the registry calls it $TAG. Intended for a release candidate; \
+          a mistake if you meant v$WS."
+          else
+            echo "  ✓ tag matches the version the binary reports"
+          fi
 
       # ⚠️ Pushes the image that was just SMOKE-TESTED, rather than asking
       # build-push-action to build again with `push: true`. A second build is
