@@ -4183,6 +4183,14 @@ fn apps_probe_cmd() -> anyhow::Result<()> {
         println!("  supported, but no backend could be constructed (a race, or a config change)");
         return Ok(());
     };
+    // FR-56 P2 — what this listing covers, and what it structurally cannot.
+    let cov = be.coverage();
+    println!("sources: {}", cov.sources.join(", "));
+    match &cov.unlisted {
+        Some(why) => println!("NOT listed: {why}"),
+        None => println!("NOT listed: (nothing — this source is the whole desktop)"),
+    }
+
     match be.list() {
         Ok(windows) => {
             println!("windows: {}", windows.len());
