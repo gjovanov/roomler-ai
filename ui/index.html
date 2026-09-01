@@ -6,7 +6,39 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Roomler</title>
+    <title>Roomler — remote desktop, private mesh network, chat &amp; video</title>
+    <!--
+      FR-58 (#1165) — this file had NO metadata beyond `<title>Roomler</title>`,
+      so every public route (/landing, /pricing, /privacy, /terms, /imprint)
+      shared one title and no shared link rendered a card.
+
+      The app is client-rendered, so these are static defaults for the whole
+      SPA rather than per-route values. Per-page metadata that a crawler can
+      rely on lives in the statically-generated docs site under /docs, which is
+      real HTML per URL — see ui/docs/theme/layout.ts.
+    -->
+    <meta
+      name="description"
+      content="Remote desktop in a browser tab and a private WireGuard-style mesh between your machines, with team chat and video included. Self-hostable, end-to-end encrypted."
+    />
+    <link rel="canonical" href="https://roomler.ai/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Roomler" />
+    <meta property="og:title" content="Roomler — remote desktop, private mesh network, chat &amp; video" />
+    <meta
+      property="og:description"
+      content="Remote desktop in a browser tab and a private WireGuard-style mesh between your machines, with team chat and video included. Self-hostable, end-to-end encrypted."
+    />
+    <meta property="og:url" content="https://roomler.ai/" />
+    <meta property="og:image" content="https://roomler.ai/docs/assets/social-preview.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Roomler — remote desktop, private mesh network, chat &amp; video" />
+    <meta
+      name="twitter:description"
+      content="Remote desktop in a browser tab and a private WireGuard-style mesh between your machines, with team chat and video included."
+    />
+    <meta name="twitter:image" content="https://roomler.ai/docs/assets/social-preview.png" />
+    <meta name="theme-color" content="#009688" />
     <script defer data-domain="roomler.ai" src="https://purestat.ai/js/purestat.js"></script>
   </head>
   <body>
