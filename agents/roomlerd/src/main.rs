@@ -203,6 +203,11 @@ enum Command {
         /// hosts where no portal backend can run.
         #[arg(long)]
         mutter: bool,
+        /// FR-56 P4 — with --stream: record ONE application window instead of
+        /// the whole monitor. ⚠️ The portal shows the person at the screen a
+        /// window PICKER; nothing here chooses the window.
+        #[arg(long)]
+        window: bool,
     },
     /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
     /// the session helper and print what came back.
@@ -1143,10 +1148,11 @@ async fn daemon_main() -> Result<()> {
             stream,
             input,
             mutter,
+            window,
         } => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                roomlerd::capture::portal::helper::run(screencast, stream, input, mutter);
+                roomlerd::capture::portal::helper::run(screencast, stream, input, mutter, window);
                 Ok(())
             }
             // A build without the feature must say so rather than exit 0 with
@@ -1155,7 +1161,7 @@ async fn daemon_main() -> Result<()> {
             // answer from "this binary cannot ask".
             #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
             {
-                let _ = (screencast, stream, input, mutter);
+                let _ = (screencast, stream, input, mutter, window);
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \
                      build cannot query the desktop portal"
