@@ -21,14 +21,15 @@ use roomler_ai_services::{
         activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
         consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
         invite::InviteDao, key_rotation_audit::KeyRotationAuditDao, message::MessageDao,
-        newsletter_issue::NewsletterIssueDao, notification::NotificationDao,
-        overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
-        overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
-        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
-        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
-        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao,
-        subscriber::SubscriberDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
-        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
+        newsletter_issue::NewsletterIssueDao, newsletter_send::NewsletterSendDao,
+        notification::NotificationDao, overlay_network::OverlayNetworkDao,
+        overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
+        peer_relay_audit::PeerRelayAuditDao, push_subscription::PushSubscriptionDao,
+        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
+        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao,
+        ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, subscriber::SubscriberDao,
+        tenant::TenantDao, tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
+        tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -83,6 +84,9 @@ pub struct AppState {
     pub subscribers: Arc<SubscriberDao>,
     /// FR-58 — newsletter issues (platform-admin surface).
     pub newsletter_issues: Arc<NewsletterIssueDao>,
+    /// FR-58 — the per-recipient delivery ledger; its unique index is the
+    /// send program's at-most-once invariant.
+    pub newsletter_sends: Arc<NewsletterSendDao>,
     pub redis_pubsub: Option<Arc<RedisPubSub>>,
     /// True while the Redis pub/sub subscriber holds a live subscription —
     /// flipped by `RedisPubSub::subscribe_with_reconnect` (started in
@@ -328,6 +332,7 @@ impl AppState {
         let push_subscriptions = Arc::new(PushSubscriptionDao::new(&db));
         let subscribers = Arc::new(SubscriberDao::new(&db));
         let newsletter_issues = Arc::new(NewsletterIssueDao::new(&db));
+        let newsletter_sends = Arc::new(NewsletterSendDao::new(&db));
         let push = if !settings.push.vapid_private_key.is_empty() {
             match PushService::new(
                 &settings.push.vapid_private_key,
@@ -877,6 +882,7 @@ impl AppState {
             push_subscriptions,
             subscribers,
             newsletter_issues,
+            newsletter_sends,
             redis_pubsub,
             redis_sub_alive,
             storage,
