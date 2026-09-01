@@ -761,9 +761,11 @@ pub fn build_router(state: AppState) -> Router {
             "/subscribe/confirm/{token}",
             get(routes::subscribe::confirm),
         )
+        // FR-58: the POST leg is the RFC 8058 one-click target — same path,
+        // same token capability, plain 200 (providers follow no redirects).
         .route(
             "/subscribe/unsubscribe/{token}",
-            get(routes::subscribe::unsubscribe),
+            get(routes::subscribe::unsubscribe).post(routes::subscribe::unsubscribe_oneclick),
         )
         .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)
