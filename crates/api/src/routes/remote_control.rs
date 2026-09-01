@@ -13,7 +13,7 @@ use axum::{
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
-    models::{AccessPolicy, AgentStatus, NodeRef, OsKind, RemoteAuditEvent, RemoteSession},
+    models::{AccessPolicy, AgentStatus, OsKind, RemoteAuditEvent, RemoteSession},
     permissions::Permissions,
     signaling::IceServer,
     turn_creds::ice_servers_for,
@@ -270,6 +270,10 @@ pub struct AgentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub companion_version: Option<String>,
     pub status: AgentStatus,
+    /// FR-51 — this device enrolled as temporary: the reaper removes it after
+    /// its inactivity TTL, and removal is final (hard delete, no tombstone).
+    /// The grid badges it so an operator is never surprised by the vanishing.
+    pub ephemeral: bool,
     /// Three-state truth: `online` | `stale` | `offline` (Phase A-1).
     pub presence: AgentPresence,
     /// Back-compat bool = `presence == online` (a socket is actually
@@ -885,33 +889,14 @@ pub async fn delete_agent(
     // is keyed by.
     let agent = state.agents.find_in_tenant(tid, aid).await?;
 
-    // Release the overlay lease BEFORE the soft-delete and BEFORE the kick. The
-    // kick tears down the WS, whose teardown calls `handle_overlay_leave` — with
-    // the node already tombstoned that is a clean no-op instead of a second
-    // `removes` fan racing the release's compare-and-swap.
-    let released = crate::ws::overlay::release_overlay_node_for(
-        &state,
-        tid,
-        &agent.machine_id,
-        &NodeRef::Agent { agent_id: aid },
-        "agent_delete",
-    )
-    .await;
-
-    state.agents.soft_delete(tid, aid).await?;
-    // rc.53: admin-driven kick — no tx identity to thread through;
-    // pass None to force unconditional removal (the identity gate is
-    // only for the displaced-handler unregister race, not for
-    // operator kicks).
-    state.rc_hub.unregister_agent(aid, None); // kick any live WS
-    // C-2 — the agent's WS may be homed on another pod; broadcast the
-    // kick so every hub drops it (idempotent no-op where absent).
-    crate::ws::remote_control::publish_rc_ctrl(
-        &state,
-        "kick",
-        serde_json::json!({ "agent_id": aid.to_hex() }),
-    )
-    .await;
+    // FR-51 — ONE removal sequence, shared with the ephemeral reaper
+    // (overlay release before the row delete before the kick; the ordering
+    // rationale lives on `remove_agent_device`). An EPHEMERAL row is
+    // hard-deleted here too — its tombstone would reserve a random,
+    // never-reused machine_id forever — while a permanent row tombstones
+    // exactly as before.
+    let released =
+        crate::ws::ephemeral::remove_agent_device(&state, &agent, "agent_delete").await?;
     Ok(Json(serde_json::json!({
         "deleted": true,
         "overlay_released": released.is_some(),
@@ -1503,6 +1488,7 @@ fn to_agent_response(
         agent_version: a.agent_version,
         companion_version: a.companion_version,
         status: a.status,
+        ephemeral: a.ephemeral,
         is_online,
         last_seen_at: fmt_dt(a.last_seen_at),
         access_policy: a.access_policy,
