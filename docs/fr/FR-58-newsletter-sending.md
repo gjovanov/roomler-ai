@@ -156,7 +156,7 @@ config flag guarding the same door would be a second switch to forget.
 ### Content (the ten issues)
 
 Drafts, editorial calendar and hero sources live in the **private annex**
-(`roomler-ai-docs:gtm/newsletter/`), per the FR-39 scope rule — post copy is not an
+(`roomler-ai-news`: `news/` = the campaign queue, `fixes/` = engineering war stories on their own schedule), per the FR-39 scope rule — post copy is not an
 engineering artifact and does not live in a public repo. What is engineering and stays
 here: heroes follow the tutorial artwork contract (locked landing palette, flat vector,
 light-surface — stated in `ui/src/assets/tutorial/*.svg`), are **rendered headless to
@@ -220,15 +220,15 @@ immutable cache, so **filenames are versioned and never edited in place**.
 
 ## Open decisions
 
-- ⚠️ **Field finding (2026-09-02): GET-confirm is prefetch-confirmable.** The very first
-  real confirmation was performed by **Gmail's link scanner**, not a human — the row
-  flipped and the single-use token burned before anyone clicked. The consent flow already
-  avoids this exact class by linking to a page whose approve is a POST
-  (`email.rs`'s prefetcher note); the subscribe confirm chose a GET and the field test
-  demonstrated the consequence on its first outing. Follow-up: point the mail link at a
-  confirm PAGE whose button POSTs the token — one more click, prefetch-proof, and the
-  page already exists. Until then, double-opt-in evidence is "the mailbox followed the
-  link", which is weaker than "a human clicked".
+- ✅ **RESOLVED — field finding (2026-09-02): GET-confirm was prefetch-confirmable.** The
+  very first real confirmation was performed by **Gmail's link scanner**, not a human —
+  the row flipped and the single-use token burned before anyone clicked. Fixed the same
+  night: the mail now links to `/newsletter/confirm/{token}` (a page whose **button
+  POSTs** — merely loading it performs no request at all, unit-pinned), the GET became a
+  pure redirect to that page (old in-flight links keep working at the cost of one
+  deliberate click, and the handler doesn't even read the DB), and
+  `a_prefetched_get_confirms_nothing_and_the_post_is_the_click` pins the whole shape.
+  The consent flow's prefetcher note now has its second confirmed field case.
 - Whether the one-click POST should move beside the governor-exempt webhook mounts:
   provider IPs are few and a 429'd unsubscribe is a deliverability black mark. Accepted
   behind the per-IP governor at current scale; recorded here so the move is a one-liner
