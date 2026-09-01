@@ -18,7 +18,7 @@
 -->
 <template>
   <div class="stay-in-touch" :class="variant === 'light' ? 'stay-light' : 'stay-dark'">
-    <p class="text-body-2 mb-3 stay-sub">
+    <p v-if="!hideLede" class="text-body-2 mb-3 stay-sub">
       Not ready to sign up? Get an email when something notable ships.
     </p>
 
@@ -66,10 +66,14 @@ import { ref } from 'vue'
 import { api } from '@/api/client'
 import { useSnackbar } from '@/composables/useSnackbar'
 
-const props = withDefaults(defineProps<{ source?: string; variant?: 'dark' | 'light' }>(), {
-  source: 'landing',
-  variant: 'dark',
-})
+const props = withDefaults(
+  defineProps<{ source?: string; variant?: 'dark' | 'light'; hideLede?: boolean }>(),
+  {
+    source: 'landing',
+    variant: 'dark',
+    hideLede: false,
+  },
+)
 const emit = defineEmits<{ subscribed: [] }>()
 
 const email = ref('')
