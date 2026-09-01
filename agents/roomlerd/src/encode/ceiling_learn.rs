@@ -70,6 +70,13 @@ pub const GROW_DIVISOR: u32 = 16;
 pub const GROW_MIN_STEP_BPS: u32 = 150_000;
 /// A remembered stable rate seeds the next session at this fraction.
 pub const SEED_PCT: u64 = 85;
+/// FR-59 P6 — a learned/seeded ceiling more than this multiple above the
+/// session's MEASURED drain rate is contradicted by it and is abandoned.
+/// 2× is deliberately loose: the learner's whole job is to sit ABOVE a
+/// conservative nominal, and a measurement is lumpy on the TURN-TCP paths
+/// this runs on, so the test must catch "12.8× wrong" (the field case)
+/// without firing on ordinary headroom.
+pub const CONTRADICTION_FACTOR: u32 = 2;
 
 /// One growth step, for the pump's log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +136,45 @@ impl CeilingLearner {
 
     fn current_ceiling(&self) -> u32 {
         self.nominal_bps.max(self.learned_bps.min(self.hi_bps))
+    }
+
+    /// FR-59 P6 — a held goodput measurement this far below the learned
+    /// ceiling ABANDONS it back to the nominal band, returning what was
+    /// dropped (exactly once — a second call with nothing learned is a
+    /// no-op, so the caller may drive this every frame and still log once).
+    ///
+    /// The rate memory keys on the nominated pair's REMOTE address
+    /// (`peer.rs::nominated_remote_ip`), which on a relayed session is the
+    /// relay's, not the viewer's. One fast day therefore writes a number
+    /// every later session through that relay inherits for the memory's
+    /// 7-day TTL — regardless of what network the client is on today.
+    /// Field 2026-09-01: a 5 069 353 bps seed opened a session on a phone
+    /// hotspot measured at 395 122 bps, 12.8× under it.
+    ///
+    /// ⚠ Compared against the RAW measurement, not `derived_ceiling_bps`:
+    /// the question is "is the learned ceiling wildly above what this pipe
+    /// carries", and folding the 85 % safety margin in would make the test
+    /// fire slightly sooner for a reason that has nothing to do with the
+    /// contradiction.
+    ///
+    /// ⚠ Applies to an in-session LEARNED ceiling too, not just a seed —
+    /// a measurement that contradicts it is evidence either way, and
+    /// resetting to nominal only costs a re-climb the learner already
+    /// knows how to do.
+    pub fn on_measurement(&mut self, measured_bps: u32, enabled: bool) -> Option<u32> {
+        if !enabled || self.learned_bps == 0 || measured_bps == 0 {
+            return None;
+        }
+        let contradicts = (self.learned_bps as u64)
+            > (measured_bps as u64).saturating_mul(CONTRADICTION_FACTOR as u64);
+        if !contradicts {
+            return None;
+        }
+        let abandoned = self.learned_bps;
+        self.learned_bps = 0;
+        self.stable_bps = 0;
+        self.stable_candidate = None;
+        Some(abandoned)
     }
 
     /// Once per viewer window. `desired_bps` = the AIMD's current target,
@@ -268,6 +314,41 @@ mod tests {
     fn seed_opens_at_85_percent_of_the_remembered_rate() {
         let mut l = CeilingLearner::new(HI, Some(6_000_000));
         assert_eq!(l.effective_ceiling(NOMINAL), 5_100_000);
+    }
+
+    /// FR-59 P6 — the field case: a seed learned through a relay on a fast
+    /// day, met by a measurement 12.8× under it, is abandoned back to the
+    /// nominal band; and it is abandoned exactly ONCE, so the caller can
+    /// drive this per frame and still log a single line.
+    #[test]
+    fn a_measurement_that_contradicts_the_seed_abandons_it() {
+        let mut l = CeilingLearner::new(HI, Some(5_964_000));
+        // 85 % of the remembered rate — the seeded ceiling.
+        assert_eq!(l.effective_ceiling(NOMINAL), 5_069_400);
+        // The measured hotspot: 395 kbps, far under seed / 2.
+        assert_eq!(l.on_measurement(395_122, true), Some(5_069_400));
+        assert_eq!(l.effective_ceiling(NOMINAL), NOMINAL, "back to nominal");
+        // Idempotent: nothing left to abandon ⇒ no second log line.
+        assert_eq!(l.on_measurement(395_122, true), None);
+    }
+
+    /// The same call must be inert in every way that is not a
+    /// contradiction — ordinary headroom, no evidence, and the kill switch.
+    #[test]
+    fn on_measurement_is_inert_without_a_contradiction() {
+        // Ordinary headroom: a 5.1 M ceiling over a 3 M pipe is 1.7×, under
+        // the 2× factor — exactly the case the learner exists to hold.
+        let mut l = CeilingLearner::new(HI, Some(6_000_000));
+        assert_eq!(l.on_measurement(3_000_000, true), None);
+        assert_eq!(l.effective_ceiling(NOMINAL), 5_100_000);
+        // A zero measurement is the absence of evidence, not evidence.
+        assert_eq!(l.on_measurement(0, true), None);
+        // Kill switch: the contradiction is real and still ignored.
+        assert_eq!(l.on_measurement(395_122, false), None);
+        assert_eq!(l.effective_ceiling(NOMINAL), 5_100_000);
+        // Nothing learned or seeded ⇒ nothing to abandon.
+        let mut bare = CeilingLearner::new(HI, None);
+        assert_eq!(bare.on_measurement(1, true), None);
     }
 
     #[test]
