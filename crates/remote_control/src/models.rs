@@ -698,6 +698,11 @@ pub struct Agent {
     /// on a permanent row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ephemeral_ttl_secs: Option<u64>,
+    /// FR-51 P2 — the [`EnrollmentKey`] this device was minted by, when it
+    /// was. Half of the "which key created this device" chain; the half that
+    /// survives the reap is the [`EnrollmentKeyUse`] row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_key_id: Option<ObjectId>,
     pub os: OsKind,
     pub agent_version: String,
     /// FR-27 — the version of the `roomler-desktop` companion INSTALLED on this
@@ -850,6 +855,81 @@ pub struct Agent {
 
 impl Agent {
     pub const COLLECTION: &'static str = "agents";
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// FR-51 P2 — ephemeral enrollment keys
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A REUSABLE enrollment credential that mints EPHEMERAL devices (FR-51 §4).
+///
+/// The single-use `enroll-token` is deliberately unusable for autoscaling
+/// (ten minutes, once, minted by a human), so this is a second credential
+/// kind with an explicitly different risk profile: a standing secret that
+/// creates device identities inside an org for as long as it lives. The four
+/// controls that make that acceptable are ALL FOUR structural here — a use
+/// ceiling (`max_uses`, claimed atomically), an absolute expiry
+/// (`expires_at`, enforced on the row as well as in the JWT), revocability
+/// (`revoked_at`, checked inside the same atomic claim — expiry alone would
+/// mean a leaked key can only be waited out, never stopped), and a per-use
+/// audit row ([`EnrollmentKeyUse`]).
+///
+/// The ephemeral property RIDES THIS CREDENTIAL, never the enrollment
+/// request body: a device that could declare itself would either evade the
+/// reaper or schedule a permanent device for silent deletion.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EnrollmentKey {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// The JWT's `jti`, and the value the use-claim is keyed by. Unique.
+    pub jti: String,
+    /// Operator label ("ci-runners", "preview-envs"), display only.
+    pub label: String,
+    /// Admin who minted it — every device it creates records this chain:
+    /// key → `created_by`, device → `enroll_key_id`.
+    pub created_by: ObjectId,
+    /// Use ceiling. `uses` is `$inc`'d inside the same atomic
+    /// `find_one_and_update` that checks it, so N racing enrollments can
+    /// never mint more than `max_uses` devices between them.
+    pub max_uses: i64,
+    pub uses: i64,
+    pub expires_at: DateTime,
+    /// Set = the key is dead, whatever its expiry says. Checked inside the
+    /// atomic claim, so revocation takes effect on the very next use.
+    pub revoked_at: Option<DateTime>,
+    /// Per-device reap TTL this key stamps onto every device it mints
+    /// (`Agent::ephemeral_ttl_secs`). `None` = the server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub last_used_at: Option<DateTime>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+impl EnrollmentKey {
+    pub const COLLECTION: &'static str = "enrollment_keys";
+}
+
+/// One successful use of an [`EnrollmentKey`] — control 4 of FR-51 §4:
+/// "which key created this device" stays answerable AFTER the device row is
+/// reaped (ephemeral rows hard-delete, so the device row cannot be the
+/// audit trail). 90-day TTL like the other audit collections.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EnrollmentKeyUse {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub key_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub machine_id: String,
+    pub machine_name: String,
+    pub created_at: DateTime,
+}
+
+impl EnrollmentKeyUse {
+    pub const COLLECTION: &'static str = "enrollment_key_uses";
 }
 
 // ────────────────────────────────────────────────────────────────────────────

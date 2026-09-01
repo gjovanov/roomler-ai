@@ -96,6 +96,8 @@ pub struct AppState {
     /// Single-use ledger for enrollment-token jtis. See
     /// [`roomler_ai_services::dao::used_token`].
     pub used_tokens: Arc<roomler_ai_services::dao::used_token::UsedTokenDao>,
+    /// FR-51 P2 — reusable ephemeral enrollment keys + their per-use audit.
+    pub enrollment_keys: Arc<roomler_ai_services::dao::enrollment_key::EnrollmentKeyDao>,
     pub remote_sessions: Arc<RemoteSessionDao>,
     pub remote_audit: Arc<RemoteAuditDao>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
@@ -386,6 +388,8 @@ impl AppState {
         // Remote-control subsystem
         let agents = Arc::new(AgentDao::new(&db));
         let used_tokens = Arc::new(roomler_ai_services::dao::used_token::UsedTokenDao::new(&db));
+        let enrollment_keys =
+            Arc::new(roomler_ai_services::dao::enrollment_key::EnrollmentKeyDao::new(&db));
         let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
         let exec_audit = Arc::new(ExecAuditDao::new(&db));
@@ -874,6 +878,7 @@ impl AppState {
             storage,
             agents,
             used_tokens,
+            enrollment_keys,
             remote_sessions,
             remote_audit,
             exec_audit,
