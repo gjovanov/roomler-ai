@@ -1280,6 +1280,22 @@
             class="text-medium-emphasis"
             title="No windows reported"
           />
+          <!-- FR-56 P2 — say what this list could NOT see. On a Wayland host
+               the agent enumerates Xwayland windows and is blind to native
+               Wayland ones, so a short list looks exactly like a quiet
+               desktop. Rendered right under the list (and under the empty
+               state, where the misreading actually happens) rather than in a
+               tooltip, because the whole point is that it is not hidden. -->
+          <v-list-item v-if="rc.appsCoverage.value?.unlisted" class="pt-0">
+            <v-alert
+              type="info"
+              density="compact"
+              variant="tonal"
+              class="text-caption"
+            >
+              Not listed — {{ rc.appsCoverage.value.unlisted }}
+            </v-alert>
+          </v-list-item>
           <template v-if="rc.launchableApps.value.length">
             <v-divider />
             <v-list-subheader>Launch new</v-list-subheader>

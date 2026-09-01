@@ -29,8 +29,8 @@ use std::process::{Command, Output, Stdio};
 use anyhow::{Context, Result, bail};
 
 use super::{
-    LaunchOutcome, ResolvedApp, WindowInfo, WindowManager, classify_title, next_tmux_session_name,
-    parse_tmux_sessions, parse_wmctrl_list,
+    Coverage, LaunchOutcome, ResolvedApp, WindowInfo, WindowManager, classify_title,
+    next_tmux_session_name, parse_tmux_sessions, parse_wmctrl_list,
 };
 
 /// Synthetic window-id prefix for a detached tmux session (no live X
@@ -67,6 +67,10 @@ pub enum Target {
     /// running as the daemon is the right answer.
     Session {
         display: String,
+        /// Whether the login session is Wayland — i.e. whether there are
+        /// native Wayland windows that `wmctrl` structurally cannot see.
+        /// Reported to the browser (FR-56 P2), never used to gate anything.
+        wayland: bool,
         /// `None` is legal: an X server started without auth accepts anyone.
         /// ⚠️ But on a compositor-started Xwayland it is effectively required —
         /// without it every call dies `Authorization required, but no
@@ -103,6 +107,7 @@ impl LinuxWm {
                 display,
                 xauthority,
                 user,
+                ..
             } => {
                 c.env("DISPLAY", display);
                 if let Some(xa) = xauthority {
@@ -187,6 +192,30 @@ impl LinuxWm {
 }
 
 impl WindowManager for LinuxWm {
+    /// FR-56 P2 — what this listing covers.
+    ///
+    /// The X11 backend sees Xwayland clients and is **structurally blind** to
+    /// native Wayland windows: measured on a GNOME Wayland session, `foot` and
+    /// `gnome-text-editor` were running and simply absent from `wmctrl -l`.
+    ///
+    /// ⚠️ Reporting that is the whole point. Without it the browser gets a
+    /// SHORTER list that looks exactly like a quiet desktop, and there is
+    /// nothing anywhere saying a second source exists. Enumerating native
+    /// Wayland windows needs a compositor protocol (`zwlr_foreign_toplevel_
+    /// management_v1` on wlroots) that GNOME/mutter deliberately does not
+    /// expose — so on GNOME this gap is permanent, not a TODO.
+    fn coverage(&self) -> Coverage {
+        let wayland = matches!(&self.target, Target::Session { wayland: true, .. });
+        Coverage {
+            sources: vec!["x11"],
+            unlisted: wayland.then(|| {
+                "native Wayland windows: this compositor exposes no protocol to enumerate \
+                 them (X11/Xwayland windows are listed)"
+                    .to_string()
+            }),
+        }
+    }
+
     fn list(&self) -> Result<Vec<WindowInfo>> {
         // Live X windows.
         let out = self.run_capture("wmctrl", &["-l"], "wmctrl")?;
@@ -413,6 +442,7 @@ pub fn discover() -> Option<Target> {
     for candidate in candidates {
         let target = Target::Session {
             display: candidate.clone(),
+            wayland: sess.wayland_display.is_some(),
             xauthority: xauthority.clone(),
             user: sess.name.clone(),
         };
@@ -466,10 +496,12 @@ fn probe(target: &Target) -> Probe {
         },
         Target::Session {
             display,
+            wayland,
             xauthority,
             user,
         } => Target::Session {
             display: display.clone(),
+            wayland: *wayland,
             xauthority: xauthority.clone(),
             user: user.clone(),
         },
@@ -538,6 +570,50 @@ mod tests {
         assert!(parse_hex("0x").is_none());
         assert!(parse_hex("0xZZ").is_none());
         assert!(parse_hex("garbage").is_none());
+    }
+
+    /// FR-56 P2. A Wayland session MUST declare that native Wayland windows
+    /// were not enumerated; an X11/Xvfb one must not, because there X11 is
+    /// everything and a caveat would be noise.
+    ///
+    /// ⚠️ This is the `Some([])` vs `None` distinction on its fourth surface
+    /// here: an empty list and an unenumerable source are different facts, and
+    /// only the reply can tell them apart. Without `unlisted` the browser
+    /// receives a shorter list that looks exactly like a quiet desktop.
+    #[test]
+    fn coverage_declares_what_x11_cannot_see() {
+        let wayland = LinuxWm::new(Target::Session {
+            display: ":0".into(),
+            wayland: true,
+            xauthority: None,
+            user: "someone".into(),
+        });
+        let cov = wayland.coverage();
+        assert_eq!(cov.sources, vec!["x11"]);
+        let why = cov
+            .unlisted
+            .expect("a Wayland session must name the source it could not enumerate");
+        assert!(why.contains("native Wayland"), "{why}");
+
+        // Xvfb / a real X11 session: X11 IS the whole desktop.
+        for t in [
+            Target::Daemon {
+                display: ":99".into(),
+            },
+            Target::Session {
+                display: ":0".into(),
+                wayland: false,
+                xauthority: None,
+                user: "someone".into(),
+            },
+        ] {
+            let cov = LinuxWm::new(t).coverage();
+            assert_eq!(cov.sources, vec!["x11"]);
+            assert!(
+                cov.unlisted.is_none(),
+                "an X11 desktop has no second source to caveat"
+            );
+        }
     }
 
     #[test]

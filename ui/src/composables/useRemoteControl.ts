@@ -482,11 +482,25 @@ export interface RcLaunchable {
   key: string
   label: string
 }
+/** What a listing actually covered (FR-56 P2).
+ *
+ *  `supported` is a bool and cannot express "X11 windows only", which on a
+ *  Wayland host is the truth: the agent sees Xwayland clients and is blind to
+ *  native Wayland ones. Without this the panel shows a SHORTER list that looks
+ *  exactly like a quiet desktop. `unlisted` is the half that matters — it names
+ *  the source that exists but could not be enumerated, and why. */
+export interface RcAppsCoverage {
+  sources: string[]
+  unlisted?: string
+}
 export interface RcAppsListReply {
   ok: boolean
   supported: boolean
   windows: RcWindowEntry[]
   launchable: RcLaunchable[]
+  /** Absent from agents older than FR-56 P2 — treat as "no caveat known", not
+   *  as "the listing is complete". */
+  coverage?: RcAppsCoverage
   error?: string
 }
 /** focus + launch share this shape. `window_id` is the new window on a
@@ -706,6 +720,19 @@ export function parseAppsListReply(obj: Record<string, unknown>): RcAppsListRepl
     supported: obj.supported === true,
     windows,
     launchable,
+  }
+  // FR-56 P2. Parsed defensively like everything else here: an older agent
+  // sends no `coverage`, and a malformed one must cost the caveat, never the
+  // whole reply.
+  const cov = obj.coverage
+  if (typeof cov === 'object' && cov !== null) {
+    const c = cov as Record<string, unknown>
+    const sources = Array.isArray(c.sources)
+      ? c.sources.filter((s): s is string => typeof s === 'string')
+      : []
+    const parsed: RcAppsCoverage = { sources }
+    if (typeof c.unlisted === 'string' && c.unlisted !== '') parsed.unlisted = c.unlisted
+    reply.coverage = parsed
   }
   if (typeof obj.error === 'string') reply.error = obj.error
   return reply
@@ -3369,6 +3396,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // rc.NEXT Ã¢ÂÂ remote app selection & launch (virtual-desktop hosts).
   const remoteWindows = ref<RcWindowEntry[]>([])
   const launchableApps = ref<RcLaunchable[]>([])
+  // FR-56 P2 - what the last listing could and could not enumerate. `null`
+  // means the agent predates P2, which is NOT the same as "nothing unlisted".
+  const appsCoverage = ref<RcAppsCoverage | null>(null)
   const appsLoading = ref(false)
   const appsError = ref<string | null>(null)
   /** Capability truth: null = unknown (never asked); set from the first
@@ -7648,6 +7678,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // promise resolution is skipped in that case.
         appsLoading.value = false
         appsSupported.value = parsed.reply.supported
+        appsCoverage.value = parsed.reply.coverage ?? null
         if (parsed.reply.ok) {
           remoteWindows.value = parsed.reply.windows
           launchableApps.value = parsed.reply.launchable
@@ -9973,6 +10004,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // rc.NEXT Ã¢ÂÂ remote app selection & launch (virtual-desktop hosts).
     remoteWindows,
     launchableApps,
+    appsCoverage,
     appsSupported,
     appsLoading,
     appsError,
