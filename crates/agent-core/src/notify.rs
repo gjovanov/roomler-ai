@@ -48,6 +48,15 @@ pub struct AttentionInfo {
     pub message: String,
     /// `Reason:` code; `None` for pre-S1b sentinels.
     pub reason: Option<String>,
+    /// FR-53 — for `rollback_failed`, the version that actually crashed.
+    ///
+    /// Without it the sentinel could not tell "the device is still running the
+    /// build that failed" from "the device updated past it and is fine", so it
+    /// assumed the first forever and a recovered host told its owner to
+    /// reinstall by hand. `None` for every sentinel written before this field
+    /// existed — see [`clear_attention_on_healthy_connect`], where an absent
+    /// value is not a gap but proof in its own right.
+    pub failed_version: Option<String>,
 }
 
 /// Resolve the per-user attention sentinel path. Returns `None` on
@@ -68,9 +77,20 @@ pub fn raise_attention(message: &str) -> Result<PathBuf> {
 
 /// S1b — reasoned variant of [`raise_attention`].
 pub fn raise_attention_with_reason(reason: &str, message: &str) -> Result<PathBuf> {
+    raise_attention_with_reason_for_version(reason, message, None)
+}
+
+/// FR-53 — reasoned variant that also records the version being accused, so a
+/// `rollback_failed` sentinel can be cleared once the device is demonstrably
+/// running a different build.
+pub fn raise_attention_with_reason_for_version(
+    reason: &str,
+    message: &str,
+    failed_version: Option<&str>,
+) -> Result<PathBuf> {
     let path = attention_path().context("no per-user config dir resolvable")?;
     let parent = path.parent().context("attention path has no parent")?;
-    raise_attention_at_with_reason(parent, reason, message)
+    raise_attention_at_full(parent, reason, message, failed_version)
 }
 
 /// Same as [`raise_attention`] but takes an explicit directory.
@@ -81,6 +101,21 @@ pub fn raise_attention_at(dir: &Path, message: &str) -> Result<PathBuf> {
 
 /// S1b — the one real writer: message + structured footer.
 pub fn raise_attention_at_with_reason(dir: &Path, reason: &str, message: &str) -> Result<PathBuf> {
+    raise_attention_at_full(dir, reason, message, None)
+}
+
+/// FR-53 — as [`raise_attention_at_with_reason`], plus the version this
+/// sentinel is accusing.
+///
+/// Only `rollback_failed` needs it: it is the one reason that survives a
+/// healthy connect, so it is the one that has to say WHICH build it survived
+/// on behalf of. Everything else clears on the next connect regardless.
+pub fn raise_attention_at_full(
+    dir: &Path,
+    reason: &str,
+    message: &str,
+    failed_version: Option<&str>,
+) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating attention dir {}", dir.display()))?;
     let path = dir.join(ATTENTION_FILENAME);
@@ -88,7 +123,15 @@ pub fn raise_attention_at_with_reason(dir: &Path, reason: &str, message: &str) -
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let body = format!("{message}\n\nReason: {reason}\nGenerated at: {ts} (unix seconds)\n");
+    // The version line is omitted rather than written empty: absent has a
+    // specific meaning to the reader (see `clear_attention_on_healthy_connect`)
+    // and an empty string would muddy it.
+    let version_line = match failed_version {
+        Some(v) if !v.trim().is_empty() => format!("Failed-version: {}\n", v.trim()),
+        _ => String::new(),
+    };
+    let body =
+        format!("{message}\n\nReason: {reason}\n{version_line}Generated at: {ts} (unix seconds)\n");
     std::fs::write(&path, body)
         .with_context(|| format!("writing attention sentinel {}", path.display()))?;
     Ok(path)
@@ -100,10 +143,13 @@ pub fn raise_attention_at_with_reason(dir: &Path, reason: &str, message: &str) -
 pub fn read_attention_at(path: &Path) -> Option<AttentionInfo> {
     let raw = std::fs::read_to_string(path).ok()?;
     let mut reason = None;
+    let mut failed_version = None;
     let mut message_lines: Vec<&str> = Vec::new();
     for line in raw.lines() {
         if let Some(code) = line.strip_prefix("Reason: ") {
             reason = Some(code.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Failed-version: ") {
+            failed_version = Some(v.trim().to_string());
         } else if !line.starts_with("Generated at:") {
             message_lines.push(line);
         }
@@ -113,6 +159,7 @@ pub fn read_attention_at(path: &Path) -> Option<AttentionInfo> {
         path: path.to_path_buf(),
         message,
         reason,
+        failed_version,
     })
 }
 
@@ -170,17 +217,74 @@ pub fn clear_all_attention() {
 /// reason except `rollback_failed` is, by definition, resolved once the
 /// agent is connected + authenticated (auth works, no goodbye, no live
 /// duel); legacy reason-less sentinels — mostly test artifacts like the
-/// infamous "rc.53 smoke" — are cleared too. `rollback_failed` persists
-/// until an operator acts (the broken-binary state isn't disproven by a
-/// successful connect of the rolled-back binary).
-pub fn clear_attention_on_healthy_connect() {
+/// infamous "rc.53 smoke" — are cleared too.
+///
+/// `rollback_failed` is the exception, and FR-53 narrows it from *never
+/// clears* to *does not clear while the accused build is the one running*.
+/// The original reasoning — "the broken-binary state isn't disproven by a
+/// successful connect of the rolled-back binary" — is sound about the case it
+/// describes, and is not the case that occurs: the device updates again, the
+/// bad build is gone, and the sentinel goes on asserting a crash loop in a
+/// version no longer installed. Measured on a real device, which claimed
+/// "0.4.34 has crashed 3 times — reinstall manually" while running 0.4.41 and
+/// answering the mesh; nobody had reported it in seven releases.
+///
+/// `running_version` is the binary that just connected, so it is a fact rather
+/// than a claim.
+pub fn clear_attention_on_healthy_connect_from(running_version: &str) {
     for path in all_attention_paths() {
-        match read_attention_at(&path) {
-            Some(info) if info.reason.as_deref() == Some(REASON_ROLLBACK) => {}
-            Some(_) => {
-                let _ = std::fs::remove_file(&path);
-            }
-            None => {}
+        let Some(info) = read_attention_at(&path) else {
+            continue;
+        };
+        if !should_clear_on_healthy_connect(&info, running_version) {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Back-compat shim for callers with no version to hand: keeps the pre-FR-53
+/// behaviour of never clearing `rollback_failed`.
+pub fn clear_attention_on_healthy_connect() {
+    clear_attention_on_healthy_connect_from("")
+}
+
+/// The whole per-sentinel decision, extracted so it can be tested.
+///
+/// `clear_attention_on_healthy_connect_from` walks `all_attention_paths()`,
+/// which resolves REAL profile directories — so a test of the loop would write
+/// to the developer's own sentinel. Everything worth asserting is here instead.
+pub(crate) fn should_clear_on_healthy_connect(info: &AttentionInfo, running_version: &str) -> bool {
+    if info.reason.as_deref() == Some(REASON_ROLLBACK) {
+        return rollback_is_stale(info, running_version);
+    }
+    // Every other reason — and a legacy sentinel with no `Reason:` line at all
+    // — is resolved by the fact of a healthy authenticated connect.
+    true
+}
+
+/// FR-53 — is this `rollback_failed` sentinel about a build we are no longer
+/// running?
+///
+/// ⚠️ The legacy arm is the load-bearing one, because EVERY sentinel in the
+/// field today predates `Failed-version:`. It is not a guess and it needs no
+/// parsing of the message: a sentinel with no version line can only have been
+/// written by a binary older than the one that introduced the field, and the
+/// binary evaluating this *has* the field — so the writer is provably not the
+/// runner, which is precisely the fact the clear requires.
+///
+/// ⚠️ Difference, not ordering. A device running something other than the
+/// accused build is no longer running the accused build, whichever way it
+/// moved; comparing semantically would add version-parsing to the trust path
+/// of a UI message, and a downgrade past the bad build is just as much a
+/// resolution as an upgrade.
+fn rollback_is_stale(info: &AttentionInfo, running_version: &str) -> bool {
+    match info.failed_version.as_deref() {
+        // Legacy sentinel: absent is evidence, not a gap.
+        None => !running_version.trim().is_empty(),
+        Some(failed) => {
+            let running = running_version.trim();
+            !running.is_empty() && running != failed.trim()
         }
     }
 }
@@ -209,6 +313,120 @@ pub fn has_attention() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── FR-53: a recovered device must stop warning about a crash loop ──
+
+    fn info(reason: Option<&str>, failed: Option<&str>) -> AttentionInfo {
+        AttentionInfo {
+            path: PathBuf::from("x"),
+            message: String::new(),
+            reason: reason.map(str::to_string),
+            failed_version: failed.map(str::to_string),
+        }
+    }
+
+    /// The defect: a sentinel accusing 0.4.34 kept warning while the device
+    /// ran 0.4.41, telling its owner to reinstall a build it had already
+    /// moved past. Measured in the field before this existed.
+    #[test]
+    fn a_rollback_sentinel_is_stale_once_a_different_build_connects() {
+        let i = info(Some(REASON_ROLLBACK), Some("0.4.34"));
+        assert!(rollback_is_stale(&i, "0.4.41"), "newer build ⇒ stale");
+        assert!(
+            rollback_is_stale(&i, "0.4.33"),
+            "a downgrade past it resolves it too"
+        );
+    }
+
+    /// The case the exemption was WRITTEN for, and it must survive: the
+    /// device rolled back and is running the build that failed, so a healthy
+    /// connect disproves nothing.
+    #[test]
+    fn a_rollback_sentinel_is_kept_when_the_accused_build_is_the_one_running() {
+        let i = info(Some(REASON_ROLLBACK), Some("0.4.34"));
+        assert!(!rollback_is_stale(&i, "0.4.34"));
+        // Whitespace must not smuggle a mismatch past the comparison.
+        assert!(!rollback_is_stale(&i, " 0.4.34 "));
+        // No version to compare ⇒ no claim ⇒ keep it.
+        assert!(!rollback_is_stale(&i, ""));
+    }
+
+    /// The load-bearing arm: EVERY sentinel in the field today predates the
+    /// `Failed-version:` line. An absent value is not a gap — such a file can
+    /// only have been written by a binary older than the one that introduced
+    /// the field, and the binary evaluating this HAS the field, so the writer
+    /// is provably not the runner.
+    #[test]
+    fn a_legacy_rollback_sentinel_with_no_version_is_stale() {
+        let i = info(Some(REASON_ROLLBACK), None);
+        assert!(rollback_is_stale(&i, "0.4.41"));
+        // …but still not on a caller that has no version to offer.
+        assert!(!rollback_is_stale(&i, ""));
+    }
+
+    #[test]
+    fn the_failing_version_round_trips_through_the_sentinel_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path =
+            raise_attention_at_full(tmp.path(), REASON_ROLLBACK, "boom", Some("0.4.34")).unwrap();
+        let read = read_attention_at(&path).unwrap();
+        assert_eq!(read.reason.as_deref(), Some(REASON_ROLLBACK));
+        assert_eq!(read.failed_version.as_deref(), Some("0.4.34"));
+        // ⚠️ The footer is machine-parsed AND grepped by fleet scripts, so the
+        // new line must not leak into the human message.
+        assert_eq!(read.message, "boom");
+
+        // Omitted rather than empty when there is nothing to record: absent
+        // has a specific meaning to the reader.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let p2 = raise_attention_at_full(tmp2.path(), REASON_AUTH, "nope", None).unwrap();
+        assert!(
+            !std::fs::read_to_string(&p2)
+                .unwrap()
+                .contains("Failed-version")
+        );
+        assert_eq!(read_attention_at(&p2).unwrap().failed_version, None);
+        let p3 = raise_attention_at_full(tmp2.path(), REASON_AUTH, "nope", Some("   ")).unwrap();
+        assert!(
+            !std::fs::read_to_string(&p3)
+                .unwrap()
+                .contains("Failed-version")
+        );
+    }
+
+    /// Everything that already cleared must go on clearing, including a
+    /// sentinel with no `Reason:` line at all.
+    /// Everything that already cleared must go on clearing, including a
+    /// sentinel with no `Reason:` line at all — asserted through the real
+    /// decision rather than by re-checking that a reason is what we set it to.
+    #[test]
+    fn every_other_reason_still_clears_on_a_healthy_connect() {
+        for r in [
+            Some(REASON_AUTH),
+            Some(REASON_GOODBYE),
+            Some(REASON_DUPLICATE),
+            Some(REASON_GENERIC),
+            None,
+        ] {
+            assert!(
+                should_clear_on_healthy_connect(&info(r, None), "0.4.41"),
+                "reason {r:?} must still clear"
+            );
+            // ⚠️ and it must not start depending on a version being supplied.
+            assert!(should_clear_on_healthy_connect(&info(r, None), ""));
+        }
+    }
+
+    /// The decision the loop actually makes, both ways.
+    #[test]
+    fn a_rollback_sentinel_clears_only_when_the_accused_build_is_gone() {
+        let accused = info(Some(REASON_ROLLBACK), Some("0.4.34"));
+        assert!(should_clear_on_healthy_connect(&accused, "0.4.41"));
+        assert!(!should_clear_on_healthy_connect(&accused, "0.4.34"));
+        let legacy = info(Some(REASON_ROLLBACK), None);
+        assert!(should_clear_on_healthy_connect(&legacy, "0.4.41"));
+        assert!(!should_clear_on_healthy_connect(&legacy, ""));
+    }
 
     #[test]
     fn raise_writes_message_and_timestamp() {

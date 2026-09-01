@@ -407,14 +407,21 @@ impl ConnectedGuard {
         // duel. Clear stale sentinels in BOTH locations so the desktop's
         // "Attention required" banner can't outlive the condition (the old
         // code cleared only after a same-process auth-failure streak, so
-        // e.g. test-artifact sentinels stuck forever). `rollback_failed`
-        // is deliberately spared — see `clear_attention_on_healthy_connect`.
+        // e.g. test-artifact sentinels stuck forever).
+        //
+        // FR-53: `rollback_failed` used to be spared unconditionally, which
+        // left a recovered device claiming a crash loop in a build it no
+        // longer runs — measured on a host asserting "0.4.34 has crashed 3
+        // times, reinstall manually" while running 0.4.41. It is now spared
+        // only while the accused build is the one connecting, which is the
+        // case the exemption was actually written for. The version passed
+        // here is this binary's own, so it is a fact and not a claim.
         //
         // Multi-org P1: PRIMARY-only. The notify subsystem has no per-org
         // sentinel files, so a healthy SECONDARY connect must not clear a
         // sentinel the (possibly still-broken) primary raised.
         if clear_attention {
-            crate::notify::clear_attention_on_healthy_connect();
+            crate::notify::clear_attention_on_healthy_connect_from(env!("CARGO_PKG_VERSION"));
         }
         Self(flag)
     }
