@@ -48,6 +48,16 @@ arriving far too late to help.) Swept the tree for the shape — exactly one ins
 here. The lesson is the sanitize skill's own: *the tool keeps working and only its
 explanation rots, which is the failure mode that lasts, because nothing fails.*
 
+⚠️⚠️ **And the audit had a blind spot of exactly the same shape, now closed.** A file was
+selected for scanning only by `git grep -l "$TOKENS"`, so it dropped OUT the moment its **last**
+retired name was migrated — taking any marker it still held with it. The marker was then
+orphaned and *structurally unreportable*: covering nothing, widening no exemption today, and
+silently ready to widen one if a retired name ever reappeared under it. **Seven accumulated
+across six files in a single phase** before anyone noticed, and the audit could not have said
+so. `scan()` now selects the UNION of token-bearing and marker-bearing files, which found three
+more immediately. Mutation-checked: an orphan in a token-free file reads `stale markers: 1` with
+the union and `0` without.
+
 ## Root finding: the published-asset freeze is much narrower than FR-21 recorded
 
 FR-21's D6 froze anchors on "already-published asset filenames are immutable and the updater
@@ -210,7 +220,7 @@ rewrite is possible but **every SHA changes** and old commits stay reachable thr
 | P1a | split the marker into ANCHOR (live) / `RETIRED-NAME-RECORD` (history); `records` pinned exactly so nothing can be laundered | revert the audit script | **shipped** |
 | P1b | publish daemon assets as `roomlerd-*`; guard rewritten as a companion denylist | revert the workflow; published assets are immutable and additive | **✅ FIELD-PROVEN on 0.4.40** |
 | P2a | env prefix: rewrite every host that sets the retired spelling (make-before-break) | both spellings kept; `.bak` / additive reg key | **4 hosts done** (3 Linux + 1 Windows) |
-| P2b | env prefix: delete the legacy arm | restore the arm | **blocked on 4 OFFLINE devices only** — every online device is now measured and migrated |
+| P2b | env prefix: retire the read arm; a retired variable is now IGNORED **and reported**, never silently dropped | restore the arm | **shipped** |
 | P2c | remaining cheap classes: log filenames, install/staging paths, e2e image, wizard PATH | per-item revert | **`TermsView` done**; the rest open |
 | P3 | re-enrollment classes: appdirs trees, Windows service + task, install folder, systemd `ReadWritePaths` | staged rollout + rollback build | **unblocked; Linux measured CLEAN, macOS is NOT** (below) |
 | P4 | wire values (QUIC ALPN, WebRTC stream id) — dual-accept window, then cleanup | dual-accept stays until cleanup | |
@@ -258,6 +268,7 @@ were free. An anchor is a *claim*, and FR-21 wrote them under time pressure acro
 
 | date | build | what was proven |
 |---|---|---|
+| 2026-09-01 | 0.4.41 fleet | **P2b unblocked by the telemetry it shipped with.** `NodeStatus.legacy_env_uses` landed in 0.4.41, so the question stopped being a manual sweep: of the devices reachable on that build, **none reads a `ROOMLER_AGENT_*` variable**. One reads `ROOMLER_NODE_OVERLAY_VPN_BYPASS` — the middle prefix, which is not a retired *name* and stays. The Windows host that carried two values now reports nothing, confirming the make-before-break took: `ROOMLERD_*` wins at arm 1 and the legacy pair was inert, so it was deleted; the three cluster drop-ins likewise lost their legacy half after `systemctl show` proved 0 legacy / 4 current. ⚠️ **Four devices are still offline and were never measured**, which is why the arm was not simply deleted — see the phase note |
 | 2026-08-31 | CI (`installer-smoke`, macOS) | **P5a proven by a real `.pkg` install, and it found a defect first.** The job installs the package on a macOS runner, so it exercises the migration rather than reasoning about it: the daemon marker is seeded at the LEGACY path, the install migrates it, and the test then asserts it arrived at `/etc/roomler` **and that the legacy directory is gone**. ⚠️ The first run **FAILED** — `helper job still loaded after opt-out` — against 11 consecutive passes on master, so it was a real regression, not a flake. Root cause was not the rename: postinstall decided whether to `bootout` the update helper from **one sample** of `launchctl print … state = running`, and the previous install re-cycles the helper, so the opt-out install lands ~1 s later and samples it mid-startup. P5a only shifted the timing by adding the migration to the top of the script. The consequence was real — an operator who set the opt-out marker had the plist removed but the **job left loaded "until next boot"**, i.e. a Mac told to stop self-updating keeps a live updater. Fixed by waiting up to 10 s for idle instead of deciding on one sample; the ancestor protection is unchanged (a genuine in-flight update stays busy far longer and still takes the announce path, which now says "still running after 10s" instead of asserting an ancestry it never checked). Re-run: **SUCCESS** |
 | 2026-08-31 | **0.4.40** | **P1b FIELD-PROVEN — the fleet updated ACROSS the rename.** `agent-v0.4.38/39/40` all post-date the P1b merge and publish every daemon artifact as `roomlerd-<v>-…` (both `.deb` arches, both tarballs, both MSI flavours, the `.pkg`), with the companion correctly still `roomler-desktop-…` and the release titled `roomlerd 0.4.40`. Agents on **all three OSes** are running 0.4.40 — two Linux, one Windows, one macOS — and every one of them came from a **pre-rename** build, since 0.4.37 was the last release before the change. The mechanism is visible rather than inferred: a Linux host's journal reads `new release available — spawning installer and exiting current=0.4.37 latest=agent-v0.4.40 path=/tmp/roomlerd-update/roomlerd-0.4.40-x86_64-unknown-linux-gnu.deb`, i.e. the picker chose the RENAMED asset, and `installer .asc verified against the pinned release signing key asset=roomlerd-0.4.40-…deb` — so the GPG sidecar naming followed the rename too. That last line is the one worth noting: the pinned-key verify is **fail-closed**, so a sidecar whose name had not tracked the asset would have frozen every Linux and macOS update instead of failing loudly |
 | 2026-08-31 | fleet, live | **Sweep 1 (systemd):** `ROOMLER_AGENT_VIRTUAL_DESKTOP*` is STILL SET on all three cluster hosts (4 entries each, operator-authored drop-in) — so the arm is load-bearing today and the handover's "cheap class" framing was wrong. Migrated all three make-before-break: both spellings, identical values, `.bak` kept, `systemctl show` resolves 8 of which 4 are `ROOMLERD_`, daemons untouched and still `active` |

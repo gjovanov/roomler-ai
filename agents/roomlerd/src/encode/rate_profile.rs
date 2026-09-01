@@ -110,9 +110,6 @@ impl FlipTracker {
     }
 }
 
-// RETIRED-NAME-ANCHOR(14): the doc below names the legacy env prefix that
-// env::node_env still honours. An operator with it in a script needs to be
-// able to grep for it.
 /// Per-codec maxrate ceiling factor, in percent. Keyed by the pump's
 /// `FfmpegDcCodec::label()` vocabulary ("HEVC" / "VP9" / "AV1" / "H264").
 ///
@@ -125,7 +122,7 @@ impl FlipTracker {
 /// encode times were fine for both).
 ///
 /// Operator override per codec: `ROOMLERD_RATE_FACTOR_<LABEL>` (legacy
-/// `ROOMLER_AGENT_` prefix + the `rate_factor_*` config keys accepted via
+/// `ROOMLER_NODE_` prefix + the `rate_factor_*` config keys accepted via
 /// [`tunnel_core::env::node_env`]). Clamped to 50–400; garbage falls back
 /// to the built-in. The pump re-reads per frame, so a REAL env var applies
 /// live; config-key changes need a service restart (set-once fallback map).

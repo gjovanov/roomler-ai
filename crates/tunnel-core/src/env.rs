@@ -88,7 +88,7 @@ pub fn config_fallbacks_for_child() -> Vec<(String, String)> {
 /// only the current name and would have read a stale alias.
 #[doc(hidden)]
 pub mod test_env {
-    use super::PREFIXES;
+    use super::{PREFIXES, RETIRED_PREFIXES};
 
     /// Remove EVERY spelling of `suffix` from the environment.
     ///
@@ -96,7 +96,7 @@ pub mod test_env {
     /// `remove_var` is unsafe in Rust 2024: a concurrent read in another thread
     /// races it. Callers must serialise tests touching the same suffix.
     pub unsafe fn clear(suffix: &str) {
-        for p in PREFIXES {
+        for p in PREFIXES.iter().chain(RETIRED_PREFIXES.iter()) {
             unsafe { std::env::remove_var(format!("{p}{suffix}")) };
         }
     }
@@ -187,14 +187,69 @@ pub mod test_env {
 /// an edit at 166 call sites.
 ///
 /// See docs/fr/FR-21.
-/// The env-var prefixes [`node_env`] reads, MOST CURRENT FIRST.
+/// The env-var prefixes [`node_env`] READS, most current first.
 ///
 /// One list, because three things must agree about it: both readers below and
 /// every test that clears a variable. A test that clears one spelling and
-/// asserts a default is not hermetic — an inherited value under either other
-/// spelling silently decides the assertion — so `test_env` clears them from
-/// this same list. Adding a fourth prefix is one edit.
-pub const PREFIXES: [&str; 3] = ["ROOMLERD_", "ROOMLER_NODE_", "ROOMLER_AGENT_"];
+/// asserts a default is not hermetic — an inherited value under another
+/// spelling silently decides the assertion — so `test_env` clears from this
+/// list AND from [`RETIRED_PREFIXES`].
+pub const PREFIXES: [&str; 2] = ["ROOMLERD_", "ROOMLER_NODE_"];
+
+/// Prefixes that are no longer READ, but are still LOOKED FOR.
+///
+/// FR-46 P2b removed `ROOMLER_AGENT_` from the read chain. Dropping it outright
+/// would have made a host that still sets one start fine and silently ignore
+/// what it was told — the exact failure this program spent two sweeps proving
+/// is real (three cluster nodes in operator-authored systemd drop-ins, and a
+/// Windows host with two values machine-wide in the registry, none of it in any
+/// runbook).
+///
+/// So the prefix is retired from the chain and kept in the SEARCH: every host
+/// that sets one is told, loudly, at startup and on `roomler status`, naming
+/// the current spelling to use. A dormant device that wakes up months from now
+/// announces itself instead of quietly losing a setting.
+///
+/// ⚠️ This is not a compatibility arm and must never grow into one. Nothing
+/// here is ever returned to a caller.
+pub const RETIRED_PREFIXES: [&str; 1] = ["ROOMLER_AGENT_"];
+
+/// Full names of retired-prefix variables PRESENT in this process's
+/// environment, sorted. Ignored by every reader — reported so that being
+/// ignored is visible rather than silent.
+///
+/// ⚠️ Distinct from [`legacy_env_uses`], and the two must not be folded
+/// together: that one is "a non-current prefix was READ", this one is "a
+/// retired prefix EXISTS and was not". They lead to different actions —
+/// rename the variable, versus nothing at all.
+pub fn retired_env_present() -> Vec<String> {
+    let mut out: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| RETIRED_PREFIXES.iter().any(|p| k.starts_with(p)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Warn once per retired variable found in the environment.
+///
+/// Called at daemon startup. The message names the CURRENT spelling, because
+/// "this is ignored" without "set that instead" leaves the operator to work out
+/// the mapping from a prefix they cannot see.
+pub fn warn_on_retired_env() {
+    for name in retired_env_present() {
+        let current = RETIRED_PREFIXES
+            .iter()
+            .find(|p| name.starts_with(*p))
+            .map(|p| format!("{}{}", PREFIXES[0], &name[p.len()..]))
+            .unwrap_or_else(|| name.clone());
+        tracing::warn!(
+            var = %name,
+            current = %current,
+            "env: a RETIRED variable name is set and is NOT read — rename it to the current one"
+        );
+    }
+}
 
 pub fn node_env(suffix: &str) -> Option<String> {
     PREFIXES
@@ -375,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn roomlerd_prefix_wins_but_both_legacy_spellings_still_work() {
+    fn roomlerd_prefix_wins_and_the_retired_spelling_is_ignored_but_reported() {
         // SAFETY (edition 2024): suffix is unique to this test, no concurrency.
         unsafe {
             std::env::remove_var(dk());
@@ -384,28 +439,51 @@ mod tests {
         }
         assert_eq!(node_env(S3), None, "none set -> None");
 
-        // The ORIGINAL spelling alone must still be honoured. This is the case
-        // that is live on mars/jupiter/zeus right now, in a drop-in no package
-        // upgrade rewrites.
+        // FR-46 P2b: the ORIGINAL spelling is no longer read. It used to be —
+        // this test asserted the opposite until every host that set one had
+        // been migrated, which took two sweeps to establish (systemd drop-ins
+        // on three cluster nodes, and two values machine-wide in a Windows
+        // registry that no unit-file search would ever have found).
         unsafe { std::env::set_var(ak3(), "from-agent") };
-        assert_eq!(node_env(S3).as_deref(), Some("from-agent"));
+        assert_eq!(
+            node_env(S3),
+            None,
+            "the retired prefix must NOT be read any more"
+        );
 
-        // The interim spelling outranks it.
+        // ...but it must not vanish silently either. Being ignored is only safe
+        // because it is REPORTED: a host that still sets one says so instead of
+        // quietly losing the setting.
+        assert!(
+            super::retired_env_present().contains(&ak3()),
+            "a retired variable that is set must be reported as present"
+        );
+
+        // The interim spelling is still read.
         unsafe { std::env::set_var(nk3(), "from-node") };
         assert_eq!(node_env(S3).as_deref(), Some("from-node"));
 
-        // And the current spelling outranks both.
+        // And the current spelling outranks it.
         unsafe { std::env::set_var(dk(), "from-roomlerd") };
         assert_eq!(node_env(S3).as_deref(), Some("from-roomlerd"));
 
-        // Removing the winner falls back down the chain rather than to None.
+        // Removing the winner falls back one step — and then to None, NOT to
+        // the retired spelling, which is still set at this point.
         unsafe { std::env::remove_var(dk()) };
         assert_eq!(node_env(S3).as_deref(), Some("from-node"));
         unsafe { std::env::remove_var(nk3()) };
-        assert_eq!(node_env(S3).as_deref(), Some("from-agent"));
+        assert_eq!(
+            node_env(S3),
+            None,
+            "the chain must end above the retired prefix, not fall into it"
+        );
 
         unsafe { std::env::remove_var(ak3()) };
         assert_eq!(node_env(S3), None);
+        assert!(
+            !super::retired_env_present().contains(&ak3()),
+            "an unset retired variable must not be reported"
+        );
     }
 
     #[test]
@@ -448,8 +526,8 @@ mod tests {
     fn nk() -> String {
         format!("ROOMLER_NODE_{S}")
     }
-    fn ak() -> String {
-        format!("ROOMLER_AGENT_{S}")
+    fn dks() -> String {
+        format!("ROOMLERD_{S}")
     }
 
     // Unique suffix for the S2 config-fallback test (no other code touches it).
@@ -468,11 +546,11 @@ mod tests {
             Some(std::ffi::OsStr::new("from-config"))
         );
 
-        // Env (legacy prefix) beats the registered fallback.
+        // Env (the older prefix) beats the registered fallback.
         // SAFETY (edition 2024): unique suffix, no concurrent access.
-        unsafe { std::env::set_var(format!("ROOMLER_AGENT_{S_CFG}"), "from-env") };
+        unsafe { std::env::set_var(format!("ROOMLER_NODE_{S_CFG}"), "from-env") };
         assert_eq!(node_env(S_CFG).as_deref(), Some("from-env"));
-        unsafe { std::env::remove_var(format!("ROOMLER_AGENT_{S_CFG}")) };
+        unsafe { std::env::remove_var(format!("ROOMLER_NODE_{S_CFG}")) };
         assert_eq!(node_env(S_CFG).as_deref(), Some("from-config"));
 
         // A suffix in neither env nor the map stays None.
@@ -480,39 +558,43 @@ mod tests {
     }
 
     #[test]
-    fn prefers_node_then_falls_back_to_agent_then_none() {
+    fn prefers_roomlerd_then_falls_back_to_node_then_none() {
+        // FR-46 P2b: the chain is two prefixes now, so the dual-read this
+        // asserts is ROOMLERD_ over ROOMLER_NODE_. The retired third arm has
+        // its own test, which checks it is IGNORED and REPORTED.
+        //
         // SAFETY (edition 2024): set/remove_var are `unsafe`; safe here because
         // the suffix is unique to this test and there is no concurrent access.
         unsafe {
             std::env::remove_var(nk());
-            std::env::remove_var(ak());
+            std::env::remove_var(dks());
         }
         assert_eq!(node_env(S), None, "unset → None");
 
-        unsafe { std::env::set_var(ak(), "legacy") };
+        unsafe { std::env::set_var(nk(), "legacy") };
         assert_eq!(
             node_env(S).as_deref(),
             Some("legacy"),
-            "legacy ROOMLER_AGENT_* is still honoured"
+            "ROOMLER_NODE_* is still honoured"
         );
 
-        unsafe { std::env::set_var(nk(), "new") };
+        unsafe { std::env::set_var(dks(), "new") };
         assert_eq!(
             node_env(S).as_deref(),
             Some("new"),
-            "ROOMLER_NODE_* wins when both are set"
+            "ROOMLERD_* wins when both are set"
         );
 
-        unsafe { std::env::remove_var(nk()) };
+        unsafe { std::env::remove_var(dks()) };
         assert_eq!(
             node_env(S).as_deref(),
             Some("legacy"),
-            "falls back to legacy after the new var is removed"
+            "falls back to the older spelling after the new var is removed"
         );
 
         unsafe {
             std::env::remove_var(nk());
-            std::env::remove_var(ak());
+            std::env::remove_var(dks());
         }
     }
 
@@ -535,16 +617,16 @@ mod tests {
         unsafe { std::env::remove_var(format!("ROOMLER_NODE_{ON}")) };
 
         // opt-in: unset → false; only an explicit truthy turns it on (the
-        // legacy ROOMLER_AGENT_ prefix must work too).
+        // the older ROOMLER_NODE_ prefix must work too).
         assert!(!flag(OPT, false));
-        unsafe { std::env::set_var(format!("ROOMLER_AGENT_{OPT}"), "YES") };
+        unsafe { std::env::set_var(format!("ROOMLER_NODE_{OPT}"), "YES") };
         assert!(flag(OPT, false));
-        unsafe { std::env::set_var(format!("ROOMLER_AGENT_{OPT}"), "weird") };
+        unsafe { std::env::set_var(format!("ROOMLER_NODE_{OPT}"), "weird") };
         assert!(
             !flag(OPT, false),
             "unrecognised value keeps an opt-in gate off"
         );
-        unsafe { std::env::remove_var(format!("ROOMLER_AGENT_{OPT}")) };
+        unsafe { std::env::remove_var(format!("ROOMLER_NODE_{OPT}")) };
     }
 
     // A distinct unique suffix so this test can't race the String-variant one.
@@ -553,44 +635,49 @@ mod tests {
     fn nk_os() -> String {
         format!("ROOMLER_NODE_{S_OS}")
     }
-    fn ak_os() -> String {
-        format!("ROOMLER_AGENT_{S_OS}")
+    fn dks_os() -> String {
+        format!("ROOMLERD_{S_OS}")
     }
 
     #[test]
-    fn os_prefers_node_then_falls_back_to_agent_then_none() {
+    fn os_prefers_roomlerd_then_falls_back_to_node_then_none() {
+        // The OsString twin of the string reader, on the two prefixes the chain
+        // still has after FR-46 P2b. Kept in lockstep deliberately: two readers
+        // of one knob that disagree about precedence is a bug nobody would
+        // think to look for.
+        //
         // SAFETY (edition 2024): set/remove_var are `unsafe`; safe here because
         // the suffix is unique to this test and there is no concurrent access.
         unsafe {
             std::env::remove_var(nk_os());
-            std::env::remove_var(ak_os());
+            std::env::remove_var(dks_os());
         }
         assert_eq!(node_env_os(S_OS), None, "unset → None");
 
-        unsafe { std::env::set_var(ak_os(), "legacy") };
+        unsafe { std::env::set_var(nk_os(), "legacy") };
         assert_eq!(
             node_env_os(S_OS).as_deref(),
             Some(std::ffi::OsStr::new("legacy")),
-            "legacy ROOMLER_AGENT_* is still honoured"
+            "ROOMLER_NODE_* is still honoured"
         );
 
-        unsafe { std::env::set_var(nk_os(), "new") };
+        unsafe { std::env::set_var(dks_os(), "new") };
         assert_eq!(
             node_env_os(S_OS).as_deref(),
             Some(std::ffi::OsStr::new("new")),
-            "ROOMLER_NODE_* wins when both are set"
+            "ROOMLERD_* wins when both are set"
         );
 
-        unsafe { std::env::remove_var(nk_os()) };
+        unsafe { std::env::remove_var(dks_os()) };
         assert_eq!(
             node_env_os(S_OS).as_deref(),
             Some(std::ffi::OsStr::new("legacy")),
-            "falls back to legacy after the new var is removed"
+            "falls back to the older spelling after the new var is removed"
         );
 
         unsafe {
             std::env::remove_var(nk_os());
-            std::env::remove_var(ak_os());
+            std::env::remove_var(dks_os());
         }
     }
 

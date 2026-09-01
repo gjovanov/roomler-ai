@@ -1644,11 +1644,9 @@ mod system {
         }
     }
 
-    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours;
-    // an operator with it in a script needs to be able to grep for it.
     /// rc.279 — kill-switch for the stable adapter identity (constant
     /// requested GUID + boot stray-adapter sweep):
-    /// `ROOMLERD_OVERLAY_TUN_STABLE_GUID` (legacy `ROOMLER_AGENT_…`
+    /// `ROOMLERD_OVERLAY_TUN_STABLE_GUID` (the older `ROOMLER_NODE_…`
     /// honoured; config key `overlay_tun_stable_guid`). Default **ON**;
     /// `0`/`false`/`no`/`off` reverts to the pre-rc.279 random-GUID
     /// adapters if the undocumented requested-GUID path ever misbehaves on
@@ -1658,11 +1656,9 @@ mod system {
         crate::env::flag("OVERLAY_TUN_STABLE_GUID", true)
     }
 
-    // RETIRED-NAME-ANCHOR(4): names the legacy env prefix env::node_env still honours;
-    // an operator with it in a script needs to be able to grep for it.
     /// rc.279 — kill-switch for the route-war eviction (peer `/32`s since
     /// rc.208, our own `/32` since rc.278): `ROOMLERD_OVERLAY_ROUTE_EVICT`
-    /// (legacy `ROOMLER_AGENT_…` honoured; config key `overlay_route_evict`).
+    /// (the older `ROOMLER_NODE_…` honoured; config key `overlay_route_evict`).
     /// Default **ON** — without it the overlay is unusable under a hostile
     /// full-tunnel VPN — but managed sites whose security tooling alarms on
     /// route deletion can turn it off and accept that trade.
