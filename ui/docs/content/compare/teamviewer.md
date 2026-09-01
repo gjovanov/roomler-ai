@@ -60,7 +60,7 @@ managed-service provider can ship it.
 
 ## Side by side
 
-| | Roomler | TeamViewer / AnyDesk |
+| Capability | Roomler | TeamViewer / AnyDesk |
 |---|---|---|
 | Remote desktop | Yes | Yes |
 | Viewer install needed | **No — a browser** | Usually |

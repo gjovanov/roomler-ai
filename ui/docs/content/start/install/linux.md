@@ -88,7 +88,7 @@ see [per-OS permissions](/docs/remote-desktop/per-os-permissions/).
 
 ## Where things live
 
-| | Path |
+| Item | Path |
 |---|---|
 | System config | `/etc/roomler/config.toml` |
 | Per-user config | `~/.config/roomler/config.toml` |
