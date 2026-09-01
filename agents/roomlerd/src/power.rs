@@ -1,0 +1,603 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! FR-55 — keep the device reachable instead of letting it quietly sleep.
+//!
+//! A device that sleeps is a device that is offline, and until this module there
+//! was nothing in the product with any opinion about power at all:
+//! `IOPMAssertion`, `SetThreadExecutionState`, `PowerCreateRequest` and
+//! `systemd-inhibit` had zero occurrences across the tree.
+//!
+//! Measured on the operator's MacBook (2026-09-01): the idle timer is **one
+//! minute** (`pmset -g`: `sleep 1`), and it really sleeps on AC —
+//! `Entering Sleep state due to 'Idle Sleep'` and `'Clamshell Sleep'`.
+//!
+//! ## Two rules, and the first is not a policy
+//!
+//! 1. **An active session always holds the machine awake.** A remote-desktop or
+//!    SSH session must not be cut by an idle timer, and that is true whatever
+//!    the standing policy says. ⚠️ Today this happens on macOS only BY
+//!    ACCIDENT: injecting input tickles `IOHIDSystem`, which registers as user
+//!    activity. So a session where someone is *typing* is protected and a
+//!    **view-only** one is not — and watching a long build is exactly the case
+//!    that most wants to stay up.
+//! 2. **Everything else is opt-in, default off.** A remote-access tool that
+//!    silently drains a laptop battery earns the reputation it gets, so
+//!    [`PowerPolicy`] is device-owned with the same last-word rule as
+//!    `exec_enabled` and `ssh_enabled` (`docs/remote-config.md`).
+//!
+//! ## What this cannot do
+//!
+//! ⚠️ **macOS clamshell sleep ignores idle-sleep assertions** on a laptop with
+//! no external display. Closing the lid puts the machine to sleep no matter
+//! what we hold. That is an OS limit, not a bug here, and the UI that offers
+//! the policy has to say so — otherwise the feature looks broken to exactly the
+//! person who enabled it.
+//!
+//! ⚠️ Nothing here wakes a machine that is already asleep. That needs a magic
+//! packet from a peer on the same L2 (FR-55 P5); `womp` is already enabled on
+//! the MacBook and the overlay already knows which peers share a LAN.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+/// How often the keeper re-reads the world. A poll rather than an event
+/// subscription: AC transitions and session start/stop are both cheap to
+/// observe and neither is latency-critical — being five seconds late to release
+/// an assertion costs nothing.
+pub const POLL: Duration = Duration::from_secs(5);
+
+/// The device-owned standing policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PowerPolicy {
+    /// Never ask the OS to stay awake for the mesh. The default, and
+    /// byte-for-byte the behaviour before FR-55.
+    #[default]
+    Never,
+    /// Stay awake only while on mains power. The setting most laptops want:
+    /// reachable at a desk, and not a dead battery in a bag.
+    OnAc,
+    /// Always stay awake.
+    Always,
+}
+
+impl PowerPolicy {
+    /// Parse the config value.
+    ///
+    /// ⚠️ An unrecognised value is [`PowerPolicy::Never`], never `Always`: the
+    /// cost of a wrong "off" is a device that sleeps, and the cost of a wrong
+    /// "on" is someone's battery. Same direction as every other gate here.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "always" => PowerPolicy::Always,
+            "on-ac" | "on_ac" | "ac" => PowerPolicy::OnAc,
+            _ => PowerPolicy::Never,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PowerPolicy::Never => "never",
+            PowerPolicy::OnAc => "on-ac",
+            PowerPolicy::Always => "always",
+        }
+    }
+}
+
+/// What the keeper knows when it decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Inputs {
+    pub policy: PowerPolicy,
+    /// `None` when this platform could not tell. Deliberately three-valued:
+    /// "on battery" and "we do not know" must not be collapsed, or `on-ac`
+    /// silently becomes `always` on a host whose power source we cannot read.
+    pub on_ac: Option<bool>,
+    /// Any live remote-control or SSH session.
+    pub session_active: bool,
+}
+
+/// The whole policy, in one testable place.
+///
+/// Pure and NOT behind a `cfg`, because the platform backends below compile
+/// only on their own OS — and logic that only compiles on one platform is logic
+/// the other lanes never verify. Same reasoning as
+/// [`crate::macos_supervisor::decide`].
+pub fn should_stay_awake(i: Inputs) -> bool {
+    // Rule 1: a session outranks the policy. Cutting a live session with an
+    // idle timer is never what anyone wanted, and this is the case that needs
+    // no configuration to be correct.
+    if i.session_active {
+        return true;
+    }
+    match i.policy {
+        PowerPolicy::Never => false,
+        PowerPolicy::Always => true,
+        // Unknown power source behaves as "on battery": see `Inputs::on_ac`.
+        PowerPolicy::OnAc => i.on_ac.unwrap_or(false),
+    }
+}
+
+/// Why the OS is being asked to stay awake — shown in `pmset -g assertions` and
+/// `powercfg /requests`, so an operator inspecting the machine finds a sentence
+/// rather than a process name.
+const REASON: &str = "roomler: keeping this device reachable";
+
+/// Holds (and releases) the platform's stay-awake request.
+///
+/// Reconciling rather than toggling: the keeper computes what SHOULD be held
+/// and makes reality match, so a missed transition self-heals on the next poll
+/// instead of leaving an assertion pinned forever.
+pub struct PowerKeeper {
+    policy: PowerPolicy,
+    held: Option<imp::Handle>,
+    /// Logged once, not per poll: a platform that cannot do this would
+    /// otherwise print a line every five seconds for the daemon's whole life.
+    warned_unsupported: bool,
+}
+
+impl PowerKeeper {
+    pub fn new(policy: PowerPolicy) -> Self {
+        Self {
+            policy,
+            held: None,
+            warned_unsupported: false,
+        }
+    }
+
+    /// Make the OS state match the decision. Idempotent.
+    pub fn reconcile(&mut self, session_active: bool) {
+        let on_ac = imp::on_ac();
+        let want = should_stay_awake(Inputs {
+            policy: self.policy,
+            on_ac,
+            session_active,
+        });
+        match (want, self.held.is_some()) {
+            (true, false) => match imp::acquire(REASON) {
+                Ok(h) => {
+                    tracing::info!(
+                        policy = self.policy.as_str(),
+                        on_ac = ?on_ac,
+                        session_active,
+                        "power: holding the device awake"
+                    );
+                    self.held = Some(h);
+                }
+                Err(e) => {
+                    if !self.warned_unsupported {
+                        self.warned_unsupported = true;
+                        tracing::warn!(
+                            error = %e,
+                            "power: cannot ask this OS to stay awake — the device may sleep and go offline"
+                        );
+                    }
+                }
+            },
+            (false, true) => {
+                if let Some(h) = self.held.take() {
+                    imp::release(h);
+                    tracing::info!(
+                        policy = self.policy.as_str(),
+                        "power: released the device to sleep normally"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for PowerKeeper {
+    /// Release on the way out. An assertion that outlives the daemon would be a
+    /// machine that never sleeps again until reboot — the exact
+    /// "worse than the bug it fixes" shape FR-43's orphan taught.
+    fn drop(&mut self) {
+        if let Some(h) = self.held.take() {
+            imp::release(h);
+        }
+    }
+}
+
+/// Run the keeper for the process lifetime.
+///
+/// `sessions` reports whether any rc session is live; it is polled rather than
+/// subscribed to, so a session that ends in any of the several ways a session
+/// can end still releases the assertion.
+pub async fn run(
+    policy: PowerPolicy,
+    sessions: Option<crate::rc_sessions::RcSessionRegistry>,
+    active_hint: Arc<AtomicBool>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    if policy == PowerPolicy::Never && sessions.is_none() {
+        // Nothing to do and nothing to watch.
+        tracing::debug!("power: policy=never and no session registry; keeper idle");
+        return;
+    }
+    tracing::info!(policy = policy.as_str(), "power: keeper started (FR-55)");
+    let mut keeper = PowerKeeper::new(policy);
+    loop {
+        let session_active = sessions
+            .as_ref()
+            .map(|s| !s.list().is_empty())
+            .unwrap_or(false)
+            || active_hint.load(Ordering::Relaxed);
+        keeper.reconcile(session_active);
+        tokio::select! {
+            _ = tokio::time::sleep(POLL) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    // `keeper` drops here, releasing the assertion.
+                    tracing::info!("power: keeper stopping");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS — IOKit power assertions
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::ffi::c_void;
+
+    pub struct Handle(u32);
+
+    type CFStringRef = *const c_void;
+    type CFAllocatorRef = *const c_void;
+    const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    /// `kIOPMAssertionLevelOn`.
+    const ASSERTION_LEVEL_ON: u32 = 255;
+
+    /// `kIOPMAssertionTypePreventUserIdleSystemSleep` — what `caffeinate -i`
+    /// takes, and the predictable choice.
+    ///
+    /// ⚠️ The alternative is `NetworkClientActive`, which is semantically
+    /// exact for "this machine serves the network" and may interact better
+    /// with Power Nap. FR-55 lists picking between them as an open decision to
+    /// MEASURE; this one is chosen because its behaviour is well understood,
+    /// not because it is known to be better.
+    const ASSERTION_TYPE: &str = "PreventUserIdleSystemSleep";
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithBytes(
+            alloc: CFAllocatorRef,
+            bytes: *const u8,
+            num_bytes: isize,
+            encoding: u32,
+            is_external_representation: u8,
+        ) -> CFStringRef;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOPMAssertionCreateWithName(
+            assertion_type: CFStringRef,
+            assertion_level: u32,
+            assertion_name: CFStringRef,
+            assertion_id: *mut u32,
+        ) -> i32;
+        fn IOPMAssertionRelease(assertion_id: u32) -> i32;
+        /// Returns `kIOPSTimeRemainingUnlimited` (-2.0) on mains power,
+        /// `kIOPSTimeRemainingUnknown` (-1.0) while it is still working it out,
+        /// and a positive number of seconds on battery. One call, a plain
+        /// `f64` return, and no CoreFoundation objects to own — which is why
+        /// it is used here rather than `IOPSCopyPowerSourcesInfo`.
+        fn IOPSGetTimeRemainingEstimate() -> f64;
+    }
+
+    /// Wrap a Rust `&str` as a CFString. Caller owns the result.
+    ///
+    /// SAFETY: the bytes outlive the call, and CoreFoundation copies them.
+    fn cfstr(s: &str) -> CFStringRef {
+        unsafe {
+            CFStringCreateWithBytes(
+                std::ptr::null(),
+                s.as_ptr(),
+                s.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+                0,
+            )
+        }
+    }
+
+    pub fn acquire(reason: &str) -> std::io::Result<Handle> {
+        let ty = cfstr(super::ASSERTION_TYPE_OVERRIDE.unwrap_or(ASSERTION_TYPE));
+        let name = cfstr(reason);
+        if ty.is_null() || name.is_null() {
+            // SAFETY: CFRelease tolerates only non-null; guarded.
+            unsafe {
+                if !ty.is_null() {
+                    CFRelease(ty);
+                }
+                if !name.is_null() {
+                    CFRelease(name);
+                }
+            }
+            return Err(std::io::Error::other("could not build CFStrings"));
+        }
+        let mut id: u32 = 0;
+        // SAFETY: both CFStrings are valid and non-null for the call; `id` is a
+        // valid out-pointer. IOKit copies what it needs.
+        let rc = unsafe { IOPMAssertionCreateWithName(ty, ASSERTION_LEVEL_ON, name, &mut id) };
+        // SAFETY: we own both strings and IOKit does not retain them past the
+        // call in a way that requires us to hold them.
+        unsafe {
+            CFRelease(ty);
+            CFRelease(name);
+        }
+        if rc == 0 {
+            Ok(Handle(id))
+        } else {
+            Err(std::io::Error::other(format!(
+                "IOPMAssertionCreateWithName failed: {rc}"
+            )))
+        }
+    }
+
+    pub fn release(h: Handle) {
+        // SAFETY: `h.0` is an id IOKit gave us and we have not released yet —
+        // `Handle` is not `Copy`, so it cannot be released twice.
+        unsafe {
+            IOPMAssertionRelease(h.0);
+        }
+    }
+
+    pub fn on_ac() -> Option<bool> {
+        /// `kIOPSTimeRemainingUnlimited`.
+        const UNLIMITED: f64 = -2.0;
+        /// `kIOPSTimeRemainingUnknown`.
+        const UNKNOWN: f64 = -1.0;
+        // SAFETY: takes no arguments and cannot fail.
+        let t = unsafe { IOPSGetTimeRemainingEstimate() };
+        if t == UNLIMITED {
+            Some(true)
+        } else if t == UNKNOWN {
+            None
+        } else {
+            Some(false)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows — a power request, not SetThreadExecutionState
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+mod imp {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    // ⚠️ These live in TWO modules, not one: the request APIs and the request
+    // TYPE are under `System::Power`, while the reason CONTEXT that describes
+    // them is under `System::Threading`.
+    use windows_sys::Win32::System::Power::{
+        GetSystemPowerStatus, PowerClearRequest, PowerCreateRequest, PowerRequestSystemRequired,
+        PowerSetRequest, SYSTEM_POWER_STATUS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
+    };
+
+    pub struct Handle(HANDLE);
+    // SAFETY: a power-request HANDLE is just a kernel handle; it is not bound
+    // to the creating thread, and we only ever touch it from the keeper.
+    unsafe impl Send for Handle {}
+
+    pub fn acquire(reason: &str) -> std::io::Result<Handle> {
+        // ⚠️ `PowerCreateRequest`, NOT `SetThreadExecutionState`: the latter is
+        // per-THREAD, so it is tied to whichever tokio worker happened to run
+        // the call and is documented as unreliable from a service — which is
+        // exactly how `roomlerd` runs on a fleet host.
+        let mut wide: Vec<u16> = reason.encode_utf16().collect();
+        wide.push(0);
+        let ctx = REASON_CONTEXT {
+            Version: 0,
+            Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+            Reason: REASON_CONTEXT_0 {
+                SimpleReasonString: wide.as_mut_ptr(),
+            },
+        };
+        // SAFETY: `ctx` and the string it points at are alive for the call, and
+        // Windows copies the reason string into the request object.
+        let h = unsafe { PowerCreateRequest(&ctx) };
+        if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `h` is the handle just created.
+        let ok = unsafe { PowerSetRequest(h, PowerRequestSystemRequired) };
+        if ok == 0 {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: closing the handle we just created.
+            unsafe {
+                CloseHandle(h);
+            }
+            return Err(e);
+        }
+        Ok(Handle(h))
+    }
+
+    pub fn release(h: Handle) {
+        // SAFETY: `h.0` was created by `acquire` and set once; clearing an
+        // already-clear request is harmless, and `Handle` is not `Copy`.
+        unsafe {
+            PowerClearRequest(h.0, PowerRequestSystemRequired);
+            CloseHandle(h.0);
+        }
+    }
+
+    pub fn on_ac() -> Option<bool> {
+        let mut st: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a valid out-pointer for the call.
+        let ok = unsafe { GetSystemPowerStatus(&mut st) };
+        if ok == 0 {
+            return None;
+        }
+        match st.ACLineStatus {
+            0 => Some(false),
+            1 => Some(true),
+            // 255 = "unknown", which must NOT be read as mains.
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Everything else — Linux and the rest
+// ---------------------------------------------------------------------------
+#[cfg(not(any(target_os = "macos", windows)))]
+mod imp {
+    pub struct Handle;
+
+    /// ⚠️ Not implemented yet, and it fails LOUDLY once rather than pretending.
+    ///
+    /// logind's `Inhibit()` is D-Bus-only — there is no file or sysctl that
+    /// takes a sleep lock — and `zbus` is behind the `portal-capture` feature,
+    /// which is in NO shipped Linux feature set (`release-agent.yml`). Adding
+    /// it unconditionally would put a D-Bus stack into every Linux agent for a
+    /// setting that matters mainly on desktops, since servers do not idle-sleep.
+    ///
+    /// FR-55 P3 decides that trade with a measurement rather than here.
+    pub fn acquire(_reason: &str) -> std::io::Result<Handle> {
+        Err(std::io::Error::other(
+            "no sleep-inhibit backend on this platform (FR-55 P3: logind needs D-Bus)",
+        ))
+    }
+
+    pub fn release(_h: Handle) {}
+
+    /// Readable without D-Bus, so the policy can at least be REPORTED
+    /// correctly even where it cannot yet be enforced.
+    pub fn on_ac() -> Option<bool> {
+        let dir = std::fs::read_dir("/sys/class/power_supply").ok()?;
+        let mut saw_mains = false;
+        for e in dir.flatten() {
+            let p = e.path();
+            let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
+            if kind.trim() != "Mains" {
+                continue;
+            }
+            saw_mains = true;
+            if std::fs::read_to_string(p.join("online"))
+                .map(|s| s.trim() == "1")
+                .unwrap_or(false)
+            {
+                return Some(true);
+            }
+        }
+        // A machine with a mains supply that reports offline is on battery; a
+        // machine with NO mains supply at all (a server, a VM) tells us nothing
+        // about a battery, so say so rather than guess.
+        saw_mains.then_some(false)
+    }
+}
+
+/// Escape hatch for the macOS assertion type, so the open decision in FR-55 can
+/// be measured on a real host without a rebuild. `None` everywhere else.
+#[cfg(target_os = "macos")]
+static ASSERTION_TYPE_OVERRIDE: Option<&str> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base() -> Inputs {
+        Inputs {
+            policy: PowerPolicy::Never,
+            on_ac: Some(true),
+            session_active: false,
+        }
+    }
+
+    /// The rule that needs no configuration to be correct: a live session is
+    /// never cut by an idle timer.
+    ///
+    /// ⚠️ It must hold under `Never` too — that policy means "do not keep this
+    /// machine awake FOR THE MESH", not "let a session you are watching die".
+    #[test]
+    fn an_active_session_outranks_every_policy() {
+        for policy in [PowerPolicy::Never, PowerPolicy::OnAc, PowerPolicy::Always] {
+            for on_ac in [Some(true), Some(false), None] {
+                assert!(
+                    should_stay_awake(Inputs {
+                        policy,
+                        on_ac,
+                        session_active: true,
+                    }),
+                    "a live session must win over {policy:?} / on_ac={on_ac:?}"
+                );
+            }
+        }
+    }
+
+    /// The default must be byte-for-byte the pre-FR-55 world.
+    #[test]
+    fn never_is_the_default_and_holds_nothing() {
+        assert_eq!(PowerPolicy::default(), PowerPolicy::Never);
+        assert!(!should_stay_awake(base()));
+        assert!(!should_stay_awake(Inputs {
+            on_ac: Some(false),
+            ..base()
+        }));
+    }
+
+    /// `on-ac` is the setting a laptop wants, so the battery case is the one
+    /// that must not regress.
+    #[test]
+    fn on_ac_follows_the_power_source() {
+        assert!(should_stay_awake(Inputs {
+            policy: PowerPolicy::OnAc,
+            on_ac: Some(true),
+            ..base()
+        }));
+        assert!(!should_stay_awake(Inputs {
+            policy: PowerPolicy::OnAc,
+            on_ac: Some(false),
+            ..base()
+        }));
+    }
+
+    /// ⚠️ "On battery" and "we could not tell" must not be collapsed: reading
+    /// an unknown power source as mains would turn `on-ac` into `always` on
+    /// every host whose supply we cannot see, which is the failure mode that
+    /// drains a battery in a bag.
+    #[test]
+    fn an_unknown_power_source_is_treated_as_battery() {
+        assert!(!should_stay_awake(Inputs {
+            policy: PowerPolicy::OnAc,
+            on_ac: None,
+            ..base()
+        }));
+        // …but `always` still means always: the operator said so explicitly.
+        assert!(should_stay_awake(Inputs {
+            policy: PowerPolicy::Always,
+            on_ac: None,
+            ..base()
+        }));
+    }
+
+    /// An unrecognised config value must fail SAFE. A typo'd `power_policy`
+    /// should cost reachability, never someone's battery.
+    #[test]
+    fn an_unparseable_policy_is_never() {
+        assert_eq!(PowerPolicy::parse("always"), PowerPolicy::Always);
+        assert_eq!(PowerPolicy::parse("on-ac"), PowerPolicy::OnAc);
+        assert_eq!(PowerPolicy::parse("on_ac"), PowerPolicy::OnAc);
+        assert_eq!(PowerPolicy::parse("  ALWAYS  "), PowerPolicy::Always);
+        assert_eq!(PowerPolicy::parse("never"), PowerPolicy::Never);
+        assert_eq!(PowerPolicy::parse(""), PowerPolicy::Never);
+        assert_eq!(PowerPolicy::parse("alwyas"), PowerPolicy::Never);
+        assert_eq!(PowerPolicy::parse("yes"), PowerPolicy::Never);
+    }
+
+    /// The config value round-trips, so `roomler config get` shows back what
+    /// was set rather than a normalised surprise.
+    #[test]
+    fn the_policy_round_trips_through_its_config_string() {
+        for p in [PowerPolicy::Never, PowerPolicy::OnAc, PowerPolicy::Always] {
+            assert_eq!(PowerPolicy::parse(p.as_str()), p);
+        }
+    }
+}
