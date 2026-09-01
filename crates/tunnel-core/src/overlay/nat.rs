@@ -41,7 +41,18 @@ pub struct SubnetRouterGuard {
     /// Multi-org v2 — the overlay adapter these rules were scoped to (the
     /// `Drop` revert must name the SAME device the setup did).
     if_name: String,
-    overlay_cidr: String,
+    /// FR-47 P5e — EVERY block of the org's address space, not just the one
+    /// this node is addressed in.
+    ///
+    /// A subnet router masquerades traffic *sourced from the overlay* out its
+    /// uplink. Under multi-block a peer in block 1 reaching a LAN behind a
+    /// router in block 0 is still overlay-sourced, and NATing only block 0
+    /// would let its packets out un-masqueraded — the far side would reply to
+    /// an address it cannot route to, and the flow would black-hole one way.
+    ///
+    /// One entry for every network that has not grown, which issues exactly
+    /// the commands the single-CIDR version did.
+    overlay_cidrs: Vec<String>,
     active: bool,
 }
 
@@ -56,17 +67,17 @@ pub struct SubnetRouterGuard {
 /// [`tun::IF_NAME`](crate::overlay::tun::IF_NAME).
 pub async fn enable(
     if_name: &str,
-    overlay_cidr: &str,
+    overlay_cidrs: &[String],
     advertised_routes: &[String],
 ) -> SubnetRouterGuard {
     if advertised_routes.is_empty() {
         return SubnetRouterGuard {
             if_name: if_name.to_string(),
-            overlay_cidr: overlay_cidr.to_string(),
+            overlay_cidrs: overlay_cidrs.to_vec(),
             active: false,
         };
     }
-    let fully_ok = setup(if_name, overlay_cidr, advertised_routes).await;
+    let fully_ok = setup(if_name, overlay_cidrs, advertised_routes).await;
     // Arm the guard on any platform where `setup` installs rules, so `Drop`
     // reverts even a PARTIALLY-applied ruleset (each `-D` / `Remove-NetNat` is
     // idempotent — reverting an absent rule is a harmless no-op). `fully_ok`
@@ -75,21 +86,21 @@ pub async fn enable(
     // failed.
     let active = cfg!(any(target_os = "linux", target_os = "windows"));
     if active && fully_ok {
-        info!(%if_name, %overlay_cidr, routes = ?advertised_routes,
+        info!(%if_name, cidrs = ?overlay_cidrs, routes = ?advertised_routes,
             "overlay: subnet-router forwarding + NAT enabled");
     } else if active {
-        warn!(%if_name, %overlay_cidr,
+        warn!(%if_name, cidrs = ?overlay_cidrs,
             "overlay: subnet-router forwarding/NAT not fully enabled (see prior errors)");
     }
     SubnetRouterGuard {
         if_name: if_name.to_string(),
-        overlay_cidr: overlay_cidr.to_string(),
+        overlay_cidrs: overlay_cidrs.to_vec(),
         active,
     }
 }
 
 #[cfg(target_os = "linux")]
-async fn setup(if_name: &str, overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
+async fn setup(if_name: &str, overlay_cidrs: &[String], _advertised_routes: &[String]) -> bool {
     // Global forwarding (leave it on at teardown — another service may rely on
     // it; we only remove our own rules).
     let _ = run(vec![
@@ -100,18 +111,26 @@ async fn setup(if_name: &str, overlay_cidr: &str, _advertised_routes: &[String])
     .await;
     // NAT: masquerade overlay-sourced traffic out the host's uplink so the far
     // side replies to the router itself (zero peer-side config).
-    let nat_ok = run(vec![
-        "iptables".into(),
-        "-t".into(),
-        "nat".into(),
-        "-A".into(),
-        "POSTROUTING".into(),
-        "-s".into(),
-        overlay_cidr.into(),
-        "-j".into(),
-        "MASQUERADE".into(),
-    ])
-    .await;
+    //
+    // FR-47 P5e — one rule per BLOCK. A single-block org issues exactly the one
+    // command this used to, so the live subnet-router path is unchanged; a
+    // grown org gets a rule for each of its ranges, because a peer in block 1
+    // is just as overlay-sourced as one in block 0.
+    let mut nat_ok = true;
+    for cidr in overlay_cidrs {
+        nat_ok &= run(vec![
+            "iptables".into(),
+            "-t".into(),
+            "nat".into(),
+            "-A".into(),
+            "POSTROUTING".into(),
+            "-s".into(),
+            cidr.into(),
+            "-j".into(),
+            "MASQUERADE".into(),
+        ])
+        .await;
+    }
     // filter/FORWARD ACCEPT (P5/A4): container hosts (Docker/containerd — the
     // k8s fleet buildhost/fleet-host-1/fleet-host-2) default the FORWARD chain policy to DROP, so
     // `ip_forward=1` + NAT alone silently drop forwarded packets. Explicitly
@@ -222,7 +241,7 @@ async fn setup_v6(if_name: &str) {
 }
 
 #[cfg(target_os = "windows")]
-async fn setup(if_name: &str, overlay_cidr: &str, advertised_routes: &[String]) -> bool {
+async fn setup(if_name: &str, overlay_cidrs: &[String], advertised_routes: &[String]) -> bool {
     // P5/S3b — WinNAT (`New-NetNat`) has NO IPv6 API, so a Windows exit node
     // cannot NAT v6. Clients routing through a Windows exit stay v6-fail-closed
     // (their global v6 is encapsulated but dropped here — never leaked). v6 exit
@@ -300,23 +319,38 @@ async fn setup(if_name: &str, overlay_cidr: &str, advertised_routes: &[String]) 
     }
     // Create the NAT only if no existing WinNAT covers this prefix (Docker
     // Desktop / WSL2 also use WinNAT and overlapping prefixes are rejected).
-    run(vec![
-        "powershell".into(),
-        "-NoProfile".into(),
-        "-Command".into(),
-        format!(
-            "if (-not (Get-NetNat -ErrorAction SilentlyContinue | \
-             Where-Object {{ $_.InternalIPInterfaceAddressPrefix -eq '{overlay_cidr}' }})) {{ \
-             New-NetNat -Name {NAT_NAME} \
-             -InternalIPInterfaceAddressPrefix '{overlay_cidr}' \
-             -ErrorAction SilentlyContinue }}"
-        ),
-    ])
-    .await
+    //
+    // FR-47 P5e — one WinNAT per BLOCK, because a WinNAT instance carries
+    // exactly one internal prefix. The FIRST block keeps the historical
+    // unsuffixed name, so a single-block org creates the identical instance it
+    // always did (and an upgrade finds its own NAT rather than orphaning one);
+    // later blocks are suffixed by index.
+    let mut ok = true;
+    for (i, cidr) in overlay_cidrs.iter().enumerate() {
+        let name = if i == 0 {
+            NAT_NAME.to_string()
+        } else {
+            format!("{NAT_NAME}-{i}")
+        };
+        ok &= run(vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!(
+                "if (-not (Get-NetNat -ErrorAction SilentlyContinue | \
+                 Where-Object {{ $_.InternalIPInterfaceAddressPrefix -eq '{cidr}' }})) {{ \
+                 New-NetNat -Name {name} \
+                 -InternalIPInterfaceAddressPrefix '{cidr}' \
+                 -ErrorAction SilentlyContinue }}"
+            ),
+        ])
+        .await;
+    }
+    ok
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-async fn setup(_if_name: &str, _overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
+async fn setup(_if_name: &str, _overlay_cidrs: &[String], _advertised_routes: &[String]) -> bool {
     false
 }
 
@@ -328,18 +362,23 @@ impl Drop for SubnetRouterGuard {
         // `Drop` can't await — revert synchronously via blocking `Command`.
         #[cfg(target_os = "linux")]
         {
-            let _ = std::process::Command::new("iptables")
-                .args([
-                    "-t",
-                    "nat",
-                    "-D",
-                    "POSTROUTING",
-                    "-s",
-                    &self.overlay_cidr,
-                    "-j",
-                    "MASQUERADE",
-                ])
-                .output();
+            // FR-47 P5e — one `-D` per block, mirroring `setup`'s one `-A` per
+            // block. Deleting a rule that is not there is a harmless no-op, so
+            // a partially-applied ruleset still reverts cleanly.
+            for cidr in &self.overlay_cidrs {
+                let _ = std::process::Command::new("iptables")
+                    .args([
+                        "-t",
+                        "nat",
+                        "-D",
+                        "POSTROUTING",
+                        "-s",
+                        cidr,
+                        "-j",
+                        "MASQUERADE",
+                    ])
+                    .output();
+            }
             // Mirror the P5/A4 FORWARD ACCEPT rules from `setup`.
             let _ = std::process::Command::new("iptables")
                 .args(["-D", "FORWARD", "-i", &self.if_name, "-j", "ACCEPT"])
@@ -393,20 +432,30 @@ impl Drop for SubnetRouterGuard {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    &format!(
-                        "Remove-NetNat -Name {NAT_NAME} -Confirm:$false \
-                         -ErrorAction SilentlyContinue"
-                    ),
-                ])
-                .output();
+            // FR-47 P5e — remove one instance per block, matching `setup`'s
+            // naming (first unsuffixed, later ones `-1`, `-2`, …). Removing an
+            // absent NAT is a no-op, so a partial setup still reverts.
+            for i in 0..self.overlay_cidrs.len().max(1) {
+                let name = if i == 0 {
+                    NAT_NAME.to_string()
+                } else {
+                    format!("{NAT_NAME}-{i}")
+                };
+                let _ = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-Command",
+                        &format!(
+                            "Remove-NetNat -Name {name} -Confirm:$false \
+                             -ErrorAction SilentlyContinue"
+                        ),
+                    ])
+                    .output();
+            }
         }
         info!(
             if_name = %self.if_name,
-            overlay_cidr = %self.overlay_cidr,
+            overlay_cidrs = ?self.overlay_cidrs,
             "overlay: subnet-router forwarding/NAT reverted"
         );
     }

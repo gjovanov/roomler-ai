@@ -596,6 +596,12 @@ async fn handle_overlay_join(
         }
     };
 
+    // FR-47 P5d — the network's address space, read once for the netmap. Not
+    // reused from the allocation path above: a node that REHYDRATED never went
+    // near it, and a node that grew the space during its own join would hold a
+    // list captured before the block it caused.
+    let join_blocks = state.overlay_networks.block_list(&network).await;
+
     // Full netmap → joiner.
     send_to_node(
         state,
@@ -603,7 +609,22 @@ async fn handle_overlay_join(
         ServerMsg::OverlayNetmap {
             self_ip: self_node.overlay_ip.clone(),
             network: OverlayNetworkInfo {
-                cidr: network.cidr.clone(),
+                // FR-47 P5d — the block containing THIS node's own address,
+                // because that is what its TUN netmask and NAT scope must be
+                // derived from. `cidr_for_ip` returns the network's only block
+                // for every network that has not grown, so this is byte-for-
+                // byte the previous value there — which is every network until
+                // `multi_block_enabled` is turned on.
+                //
+                // Falls back to the network's own cidr if the node's address
+                // somehow inverts under no block (a row leased under a
+                // since-changed range): the old value is a better answer than
+                // an empty string.
+                cidr: join_blocks
+                    .cidr_for_ip(&self_node.overlay_ip)
+                    .unwrap_or(&network.cidr)
+                    .to_string(),
+                cidrs: join_blocks.cidrs().to_vec(),
                 mtu: network.mtu,
                 magic_domain,
                 nameservers,

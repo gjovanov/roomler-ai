@@ -2543,7 +2543,31 @@ pub struct NetmapPeer {
 /// its TUN/MTU and validate its own address against the range.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct OverlayNetworkInfo {
+    /// The block containing **this recipient's own** overlay address.
+    ///
+    /// FR-47 P5d — this used to be the network's single CIDR, and for every
+    /// network that has not grown it still is exactly that value: a one-block
+    /// address space has one block, and it is the one the node lives in. The
+    /// field only becomes recipient-specific once a network holds more than
+    /// one block, which requires `overlay.multi_block_enabled`.
+    ///
+    /// ⚠️ Why per-recipient rather than "the first block": a fielded agent
+    /// derives its TUN netmask and its subnet-router NAT source scope from
+    /// this string. Both are correct only for the block its OWN address lives
+    /// in — sending block 0 to a node addressed in block 1 would mis-size its
+    /// netmask, which is a fleet-wide failure mode, not a cosmetic one. Peers
+    /// in *other* blocks stay reachable through the per-peer `/32`s the agent
+    /// already installs, so a pre-P5d agent needs nothing else.
     pub cidr: String,
+    /// FR-47 P5d — every block in the network's address space, in allocation
+    /// order. `#[serde(default)]` so a pre-P5d server (which sends none) and a
+    /// pre-P5d agent (which reads none) both behave exactly as before.
+    ///
+    /// A node that understands this uses the union — for RPF scope and for
+    /// knowing the full extent of its own org. A node that does not still has
+    /// `cidr`, which is correct for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cidrs: Vec<String>,
     pub mtu: u16,
     /// Phase 2 MagicDNS — the tenant's overlay DNS suffix (e.g.
     /// `"myorg.roomler.net"`), or `None` when MagicDNS is off. A node with a
@@ -4005,6 +4029,46 @@ mod tests {
 
     // ─── rc:overlay.* wire-format locks ───────────────────────────────
 
+    /// FR-47 P5d — a netmap from a pre-P5d server decodes, and carries no
+    /// block list rather than an invented one.
+    #[test]
+    fn a_pre_p5d_netmap_still_decodes_and_carries_no_block_list() {
+        // FR-47 P5d — the compatibility property the whole phase rests on: a
+        // netmap from a server that has never heard of `cidrs` must decode, and
+        // must leave the field EMPTY rather than inventing a list. An agent
+        // then falls back to `cidr`, which is what it always used.
+        let old = r#"{"t":"rc:overlay.netmap","self_ip":"100.65.0.7",
+            "network":{"cidr":"100.65.0.0/22","mtu":1280},"peers":[],"epoch":1}"#;
+        match serde_json::from_str::<ServerMsg>(old).unwrap() {
+            ServerMsg::OverlayNetmap { network, .. } => {
+                assert_eq!(network.cidr, "100.65.0.0/22");
+                assert!(
+                    network.cidrs.is_empty(),
+                    "a pre-P5d server sends no block list; inventing one would make \
+                     the agent trust a space the server never described"
+                );
+            }
+            other => panic!("expected OverlayNetmap, got {other:?}"),
+        }
+
+        // And the reverse direction: a P5d server's netmap for a network that
+        // has NOT grown carries a one-element list whose only entry equals
+        // `cidr`. That equality is what makes multi-block inert on every
+        // deployment that exists today.
+        let net = OverlayNetworkInfo {
+            cidr: "100.65.0.0/22".into(),
+            cidrs: vec!["100.65.0.0/22".into()],
+            mtu: 1280,
+            magic_domain: None,
+            nameservers: vec![],
+            self_name: None,
+            stun_urls: vec![],
+        };
+        let s = serde_json::to_string(&net).unwrap();
+        let back: OverlayNetworkInfo = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.cidrs, vec![back.cidr.clone()]);
+    }
+
     /// FR-47 — the refusal frame round-trips, and an OLD node that omits
     /// `supports_join_refusal` decodes as `false` so the server withholds it.
     #[test]
@@ -4668,6 +4732,7 @@ mod tests {
             self_ip: "100.64.0.3".into(),
             network: OverlayNetworkInfo {
                 cidr: "100.64.0.0/10".into(),
+                cidrs: vec![],
                 mtu: 1280,
                 magic_domain: Some("myorg.roomler.net".into()),
                 nameservers: vec!["1.1.1.1".into()],
