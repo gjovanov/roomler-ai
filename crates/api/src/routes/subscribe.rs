@@ -155,13 +155,18 @@ async fn send_confirmation(state: &AppState, email: &str, token: &str) {
         return;
     };
     let base = state.settings.app.frontend_url.trim_end_matches('/');
-    let link = format!("{base}/api/subscribe/confirm/{token}");
+    // The link goes to a PAGE whose button POSTs the token — never to a
+    // confirming GET. Field-proven necessity (FR-58 P6): Gmail's link scanner
+    // followed the old GET and confirmed the very first real subscriber
+    // before any human clicked. Same shape as the consent mail, which linked
+    // to a page "so an email prefetcher can't auto-approve via a GET".
+    let link = format!("{base}/newsletter/confirm/{token}");
     let html = format!(
         "<p>Please confirm you want product updates about Roomler.</p>\
          <p><a href=\"{link}\">Confirm my address</a></p>\
          <p style=\"color:#666;font-size:13px\">If you did not ask for this, ignore this \
-         message — nothing is sent to an address that never confirms, and this link \
-         expires the first time it is used.</p>"
+         message — nothing is sent to an address that never confirms, and the link \
+         stops working once the confirmation is used.</p>"
     );
     if let Err(e) = mailer
         .send(email, "Confirm your Roomler updates", &html)
@@ -171,18 +176,32 @@ async fn send_confirmation(state: &AppState, email: &str, token: &str) {
     }
 }
 
-/// `GET /api/subscribe/confirm/{token}` — followed from an email client, so it
-/// redirects to a page a human can read rather than answering JSON.
+/// `GET /api/subscribe/confirm/{token}` — a pure redirect to the confirm
+/// PAGE. ⚠️ It must never confirm: mailbox link scanners follow GETs, and on
+/// FR-58's very first field subscriber Gmail's scanner burned the single-use
+/// token before any human clicked. The GET keeps working for links already in
+/// old emails (they now cost one extra, deliberate click); the DB is not even
+/// read here, so a prefetcher achieves nothing.
+pub async fn confirm_redirect(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Redirect {
+    let base = state.settings.app.frontend_url.trim_end_matches('/');
+    Redirect::to(&format!("{base}/newsletter/confirm/{token}"))
+}
+
+/// `POST /api/subscribe/confirm/{token}` — the deliberate click. Called by
+/// the confirm page's button; answers JSON so the page can render the
+/// outcome in place. Token-as-capability, single-use (the DAO clears it) —
+/// `{"confirmed": false}` for an unknown or already-used token is a statement
+/// to the token HOLDER, not a membership oracle.
 pub async fn confirm(
     State(state): State<AppState>,
     Path(token): Path<String>,
-) -> Result<Redirect, ApiError> {
+) -> Json<serde_json::Value> {
     let ok = state.subscribers.confirm(&token).await.unwrap_or(false);
-    Ok(Redirect::to(&outcome_page(
-        &state,
-        "confirmed",
-        if ok { "ok" } else { "invalid" },
-    )))
+    info!(ok, "subscribe confirm (deliberate POST) handled");
+    Json(serde_json::json!({ "confirmed": ok }))
 }
 
 /// `GET /api/subscribe/unsubscribe/{token}`

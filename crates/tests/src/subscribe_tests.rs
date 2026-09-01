@@ -160,8 +160,12 @@ async fn addresses_are_normalized_to_a_single_row() {
     assert_eq!(n, 1, "casing and whitespace must not create a second row");
 }
 
+/// The FR-58 P6 field finding, pinned: Gmail's link scanner followed the old
+/// confirming GET and burned the very first real subscriber's token before
+/// any human clicked. The GET is therefore a PURE redirect to the confirm
+/// page, and only the page button's POST — the deliberate click — confirms.
 #[tokio::test]
-async fn confirming_flips_the_row_and_burns_the_token() {
+async fn a_prefetched_get_confirms_nothing_and_the_post_is_the_click() {
     let app = TestApp::spawn().await;
     post_subscribe(&app, "confirm@example.com").await;
 
@@ -172,13 +176,35 @@ async fn confirming_flips_the_row_and_burns_the_token() {
         .unwrap()
         .to_string();
 
+    // The prefetcher's move: GET the link. It must redirect to the page and
+    // change NOTHING — the row stays unconfirmed, the token stays alive.
     let (status, location) = visit(&app, &format!("/api/subscribe/confirm/{token}")).await;
     assert!(status.is_redirection(), "expected a redirect, got {status}");
     assert!(
-        location.contains("/newsletter/confirmed?status=ok"),
-        "the link must land on the PUBLIC outcome page — `/?subscribe=…` was \
-         auth-gated and no human ever saw it (FR-58); got {location:?}"
+        location.contains(&format!("/newsletter/confirm/{token}")),
+        "the GET must hand the human to the confirm PAGE; got {location:?}"
     );
+    let doc = row(&app, "confirm@example.com").await.unwrap();
+    assert!(
+        !doc.get_bool("confirmed").unwrap(),
+        "a GET must never confirm — that is the prefetch hole, field-hit on day one"
+    );
+    assert!(
+        doc.get_str("confirm_token").is_ok(),
+        "the token must survive any number of prefetches"
+    );
+
+    // The human's move: the page button POSTs. That flips the row and burns
+    // the token, single-use.
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/subscribe/confirm/{token}")))
+        .send()
+        .await
+        .expect("confirm POST failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["confirmed"], true);
 
     let doc = row(&app, "confirm@example.com").await.unwrap();
     assert!(doc.get_bool("confirmed").unwrap());
@@ -186,6 +212,16 @@ async fn confirming_flips_the_row_and_burns_the_token() {
         doc.get_str("confirm_token").is_err(),
         "the confirm token must be single-use"
     );
+
+    // A second POST of the burned token says so, plainly, to the holder.
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/subscribe/confirm/{token}")))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["confirmed"], false, "burned means burned");
 }
 
 /// One click, no session, no account — and idempotent, because mail clients
@@ -233,7 +269,12 @@ async fn resubscribing_after_a_withdrawal_requires_confirming_again() {
     let confirm = doc.get_str("confirm_token").unwrap().to_string();
     let unsub = doc.get_str("unsubscribe_token").unwrap().to_string();
 
-    visit(&app, &format!("/api/subscribe/confirm/{confirm}")).await;
+    // Confirm is a deliberate POST now (the GET is a pure page redirect).
+    app.client
+        .post(app.url(&format!("/api/subscribe/confirm/{confirm}")))
+        .send()
+        .await
+        .expect("confirm POST failed");
     visit(&app, &format!("/api/subscribe/unsubscribe/{unsub}")).await;
 
     post_subscribe(&app, "again@example.com").await;
@@ -256,17 +297,38 @@ async fn an_unknown_token_changes_nothing() {
     let app = TestApp::spawn().await;
     post_subscribe(&app, "untouched@example.com").await;
 
-    for path in [
+    // Unknown confirm token: the GET redirects to the page regardless (it
+    // reads nothing), and the POST — the only thing that could act — reports
+    // false and changes nothing.
+    let (status, location) = visit(
+        &app,
         "/api/subscribe/confirm/0000000000000000000000000000000000000000000000",
+    )
+    .await;
+    assert!(status.is_redirection());
+    assert!(
+        location.contains("/newsletter/confirm/"),
+        "got {location:?}"
+    );
+    let resp = app
+        .client
+        .post(app.url("/api/subscribe/confirm/0000000000000000000000000000000000000000000000"))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["confirmed"], false);
+
+    let (status, location) = visit(
+        &app,
         "/api/subscribe/unsubscribe/0000000000000000000000000000000000000000000000",
-    ] {
-        let (status, location) = visit(&app, path).await;
-        assert!(status.is_redirection(), "{path} should still redirect");
-        assert!(
-            location.contains("status=invalid"),
-            "an unknown token must say so rather than claim success; got {location:?}"
-        );
-    }
+    )
+    .await;
+    assert!(status.is_redirection(), "unsubscribe should still redirect");
+    assert!(
+        location.contains("status=invalid"),
+        "an unknown token must say so rather than claim success; got {location:?}"
+    );
 
     let doc = row(&app, "untouched@example.com").await.unwrap();
     assert!(!doc.get_bool("confirmed").unwrap());

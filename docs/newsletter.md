@@ -9,7 +9,7 @@ Spec: [`docs/fr/FR-58-newsletter-sending.md`](fr/FR-58-newsletter-sending.md).
 | Route | What it does |
 |---|---|
 | `POST /api/subscribe` `{email, source?}` | Always **202**, every outcome — a response that distinguished "new" from "already subscribed" would be a membership oracle for addresses that are usually also `users.email`. Stores the row unconfirmed, mails a confirm link (15-min per-address resend cooldown — the mail-bomb guard). |
-| `GET /api/subscribe/confirm/{token}` | Single-use. 303 → `/newsletter/confirmed?status=ok\|invalid`. |
+| `GET /api/subscribe/confirm/{token}` | **Pure redirect** to `/newsletter/confirm/{token}` — never confirms. Mailbox link scanners follow GETs (Gmail's burned the first field subscriber's token before any human clicked), so the page button's **POST** is the deliberate click: single-use, `{confirmed: bool}`. |
 | `GET /api/subscribe/unsubscribe/{token}` | Idempotent (mail clients prefetch). 303 → `/newsletter/unsubscribed?status=…`. The token never expires — a two-year-old email's link must still work. |
 | `POST /api/subscribe/unsubscribe/{token}` | The RFC 8058 one-click target (`List-Unsubscribe-Post`). Plain 200 for every outcome, body unread. |
 
