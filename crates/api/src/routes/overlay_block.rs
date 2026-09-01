@@ -1228,3 +1228,160 @@ mod reconcile_tests {
         assert!(orphaned_ordinals(5, &live, &pooled).is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// FR-54 — orphaned overlay networks (a tenant that vanished)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+pub struct OrphanRequest {
+    /// Plan only (the default). Nothing is released unless this is `false`.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrphanNode {
+    pub name: String,
+    pub overlay_ip: String,
+    pub kind: &'static str,
+    /// The backing agent's reported version, when there is still an agent row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrphanNetwork {
+    pub tenant_id: String,
+    pub cidr: String,
+    pub network_id: String,
+    /// Live nodes still attached to a network whose org no longer exists.
+    pub nodes: Vec<OrphanNode>,
+    /// The newest `updated_at` across those nodes — how stale this is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_node_write: Option<String>,
+    /// Nodes actually released (empty on a dry run).
+    pub released: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OrphanResponse {
+    pub dry_run: bool,
+    /// Networks scanned.
+    pub networks: u32,
+    /// Networks whose tenant row does not exist.
+    pub orphans: Vec<OrphanNetwork>,
+}
+
+/// POST /api/admin/overlay-network/orphans — find overlay networks whose
+/// organization no longer exists. Platform operator only; dry-run by default.
+///
+/// FR-54. Found on production 2026-08-31 during the FR-47 audit: a tenant row
+/// was gone while its network, 2 nodes and 2 agents lived on — holding
+/// `100.64.0.1` and `.2`, the same addresses a LIVE org's first two devices
+/// held. The collision FR-47 opened on was caused by an orphan nobody could
+/// see. Nothing in the system notices this today.
+///
+/// ⚠️ There is no tenant-delete code path — `roles` and `rooms` have deletes,
+/// the tenant DAO has only `set_archived` — so an orphan means somebody edited
+/// MongoDB by hand. This route exists to make that DETECTABLE, not supported:
+/// it deliberately does not offer to delete a tenant.
+///
+/// ⚠️ An ARCHIVED org is not an orphan. Its tenant row exists, it is simply
+/// retired, and offering to release a live org's mesh because someone archived
+/// it would be a far worse bug than the one this fixes. The test asserts it.
+///
+/// Applying releases each node through
+/// [`crate::ws::overlay::release_overlay_node`] — never by deleting rows —
+/// because that path tombstones under a CAS, pools the host ordinal, and fans
+/// `netmap_delta{removes}` to peers. Bypassing it to tidy up would be the same
+/// class of act that created the mess.
+pub async fn orphans(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<OrphanRequest>,
+) -> Result<Json<OrphanResponse>, ApiError> {
+    if !state.platform_admins.contains(&auth.user_id) {
+        return Err(ApiError::NotFound("Not found".to_string()));
+    }
+
+    let networks = state.overlay_networks.base.find_many(doc! {}, None).await?;
+    let scanned = networks.len() as u32;
+    let mut orphans = Vec::new();
+
+    for net in networks {
+        let Some(network_id) = net.id else { continue };
+        // The ONLY test for an orphan: does the tenant row exist? Archived
+        // tenants have a row and are deliberately not orphans.
+        if state.tenants.base.find_by_id(net.tenant_id).await.is_ok() {
+            continue;
+        }
+
+        let nodes = state
+            .overlay_nodes
+            .list_active_in_network(net.tenant_id, network_id)
+            .await
+            .unwrap_or_default();
+
+        let mut rows = Vec::new();
+        let mut newest: Option<bson::DateTime> = None;
+        for n in &nodes {
+            let agent_version = match &n.node_ref {
+                NodeRef::Agent { agent_id } => state
+                    .agents
+                    .base
+                    .find_by_id(*agent_id)
+                    .await
+                    .ok()
+                    .map(|a| a.agent_version),
+                _ => None,
+            };
+            rows.push(OrphanNode {
+                name: n.name.clone(),
+                overlay_ip: n.overlay_ip.clone(),
+                kind: match n.node_ref {
+                    NodeRef::Agent { .. } => "agent",
+                    _ => "tunnel-client",
+                },
+                agent_version,
+            });
+            newest = Some(newest.map_or(n.updated_at, |c| c.max(n.updated_at)));
+        }
+
+        let mut released = Vec::new();
+        if !body.dry_run {
+            for n in &nodes {
+                if crate::ws::overlay::release_overlay_node(
+                    &state,
+                    n,
+                    "orphaned network: the tenant row no longer exists (FR-54)",
+                )
+                .await
+                .is_some()
+                {
+                    released.push(n.name.clone());
+                }
+            }
+            warn!(
+                admin = %auth.user_id, tenant = %net.tenant_id, cidr = %net.cidr,
+                released = released.len(),
+                "overlay: operator released an orphaned network's nodes"
+            );
+        }
+
+        orphans.push(OrphanNetwork {
+            tenant_id: net.tenant_id.to_hex(),
+            cidr: net.cidr.clone(),
+            network_id: network_id.to_hex(),
+            nodes: rows,
+            last_node_write: newest.map(|d| d.try_to_rfc3339_string().unwrap_or_default()),
+            released,
+        });
+    }
+
+    Ok(Json(OrphanResponse {
+        dry_run: body.dry_run,
+        networks: scanned,
+        orphans,
+    }))
+}

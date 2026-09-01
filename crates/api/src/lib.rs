@@ -710,6 +710,12 @@ pub fn build_router(state: AppState) -> Router {
             "/admin/overlay-block/reclaim",
             post(routes::overlay_block::reclaim),
         )
+        // FR-54 — overlay networks whose organization no longer exists.
+        // Platform-operator only (checked in-handler), dry-run by default.
+        .route(
+            "/admin/overlay-network/orphans",
+            post(routes::overlay_block::orphans),
+        )
         // Wave 2 — the SPA's route-change beacon (authenticated, paths
         // normalised server-side). User-scoped, not tenant-scoped: a
         // user navigates across orgs within one session.
