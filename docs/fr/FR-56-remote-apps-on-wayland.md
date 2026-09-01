@@ -1,6 +1,6 @@
 # FR-56 — Remote Apps on Wayland: per-app streaming, and the RAIL circle
 
-**Issue:** [#1157](https://github.com/gjovanov/roomler-ai/issues/1157) · **Status:** **P1 shipped and field-verified**; P2–P5 proposed · **Owner:** agent / remote-control
+**Issue:** [#1157](https://github.com/gjovanov/roomler-ai/issues/1157) · **Status:** **P1 + P2 shipped and field-verified**; P3–P5 proposed · **Owner:** agent / remote-control
 
 > ⚠️ **Renumbered from FR-55**, which [#1155](https://github.com/gjovanov/roomler-ai/pull/1155)
 > landed on master while this claim was in flight. The **ledger arbitrated**: a claim that
@@ -56,7 +56,7 @@ it per host.
 | Phase | What | Kill switch |
 |---|---|---|
 | **P1** ✅ | **Make the existing feature engage on Wayland.** Replace the daemon-`DISPLAY` gate with **session discovery** — FR-45 already built `companion::graphical_session()` (uid, `DISPLAY`, `WAYLAND_DISPLAY`) for exactly this — and pass **`XAUTHORITY`** with `DISPLAY` into every `wmctrl`/`xterm` call. Result: list/focus/launch for Xwayland windows on GNOME/KDE/wlroots. ⚠️ Must be a **byte-for-byte no-op for the Xvfb path**, which is the only population using this today. | existing `[virtual_desktop_apps] enabled` |
-| **P2** | **Say what is actually visible.** `supported: bool` cannot express "X11 windows only" — the exact `Some([])` vs `None` mistake this project has now made on three surfaces (overlay ACL, `ssh_activity`, FR-49's dark org). Add a `sources` field (`x11` / `wayland` / both) plus a human reason, so the panel can say *"showing X11 (Xwayland) windows; this compositor does not let us enumerate native Wayland windows"* instead of showing a short list that looks like the truth. | n/a (wire additive) |
+| **P2** ✅ | **Say what is actually visible.** `supported: bool` cannot express "X11 windows only" — the exact `Some([])` vs `None` mistake this project has now made on three surfaces (overlay ACL, `ssh_activity`, FR-49's dark org). Add a `sources` field (`x11` / `wayland` / both) plus a human reason, so the panel can say *"showing X11 (Xwayland) windows; this compositor does not let us enumerate native Wayland windows"* instead of showing a short list that looks like the truth. | n/a (wire additive) |
 | **P3** | **Native enumeration where the compositor allows it.** `zwlr_foreign_toplevel_management_v1` on wlroots (list + **activate** + close — full parity, and the only tier where focus works) and `org.gnome.Shell.Introspect.GetWindows` on a full GNOME (list **only**; there is no activate). Detected **at session time, never cached** — FR-45's rule, learned from a host that had every package and still offered nothing depending on start order. | `apps_wayland_enum` (default off until field-proven) |
 | **P4** | **Per-window capture — the RAIL payoff.** Portal `SelectSources(types = WINDOW)` (the *host* picks; no enumeration needed, works wherever a portal backend runs) and `org.gnome.Mutter.ScreenCast.RecordWindow` (needs a window id from P3). Reuses the whole FR-45 P3 pipeline — POD negotiation, buffers, wire format, `ScreenCapture` — with only the source selection changed, exactly as P5 did. | `ROOMLERD_WINDOW_CAPTURE` (default off) |
 | **P5** | **Wayland-native launch.** The tmux/xterm session model assumes X11. Keep tmux (surviving an agent restart is the whole point) but pick a **Wayland** terminal where there is no Xwayland. | same as P1 |
@@ -87,9 +87,12 @@ one video surface, and changing that is a much larger UI program than this.
       takes that arm first and runs as the daemon (no discovery, no privilege
       drop). Shown by pointing it at `:99` — it used the daemon's display
       rather than discovering the live session beside it
-- [ ] The panel **names what it cannot see**: on GNOME it says native Wayland
-      windows are not enumerable, rather than silently listing only Xwayland
-      ones. An empty list and an unsupported compositor are distinguishable
+- [x] The panel **names what it cannot see**: the reply carries a `coverage`
+      object (`sources` + `unlisted`), and on a real GNOME Wayland session the
+      agent reports `sources: x11` / `NOT listed: native Wayland windows: this
+      compositor exposes no protocol to enumerate them`. An empty list and an
+      unenumerable source are now distinguishable — including on the ERROR
+      arm, which is where an empty list is most likely to be read as calm
 - [ ] On a wlroots host, a **native** Wayland window is listed **and focused**
       through `zwlr_foreign_toplevel_management_v1`
 - [ ] A single application window is streamed to the browser, and switching
@@ -119,3 +122,4 @@ one video surface, and changing that is a much larger UI program than this.
 | 2026-09-01 | 🚨 **Found a PRE-EXISTING silent failure while field-testing P1** | `list()` parsed `wmctrl -l`'s stdout **without checking its exit status**, so a display it could not open — empty stdout, non-zero exit — returned `Ok(vec![])`: *no windows*, which is a different and far more reassuring claim than *I could not reach the desktop*. Measured by pointing the daemon at `:99` (no X server): it reported `windows: 0`. `focus` and `tmux new-session` already checked; only this one did not. 🔑 P1 makes it matter: the display is now **discovered** rather than owned, so it can go stale (a compositor restart invalidates the cookie) where a daemon-started Xvfb could not. Now: `list failed: wmctrl could not read the window list from :99: Cannot open display.` |
 | 2026-09-01 | ⚠️ **rustc 1.95 ICEs while RENDERING a real error here** | A `tracing::info!(%display, …)` whose local was named `display` collides with tracing's own `field::display` helper, and rustc panicked (`slice/index.rs`, empty query stack) instead of printing the error — `cargo check` reported only *the compiler unexpectedly panicked*. 🔑 `--message-format=short` bypasses the renderer and showed both real errors immediately. A/B'd against clean master first (it compiles), per the standing rule. |
 | 2026-09-01 | 🔧 **`roomlerd apps-probe` added** | Remote Apps was answerable only by driving it over a WebRTC data channel from a browser, which conflates the backend with signalling, transport and the UI — the same argument `capture-smoke` was built on. It prints whether a desktop was found, as whom, with which cookie, and what it sees; and it says explicitly that an EMPTY list is not the same as unsupported, and that native Wayland windows would not appear even if present. |
+| 2026-09-01 | ✅ **P2 shipped and field-verified** | The list reply carries `coverage` (`sources` + `unlisted`) end to end: agent → wire → composable → panel. On the real GNOME Wayland session the daemon reports `sources: x11` and `NOT listed: native Wayland windows: this compositor exposes no protocol to enumerate them`, beside the one Xwayland window it CAN see. 🔑 The trait method (rather than a field set at construction) means **the compiler forces every backend to answer** — it caught the test fake immediately. ⚠️ Coverage rides the ERROR arm too: a failed listing is exactly where an empty list reads as a calm desktop. ⚠️ The UI parses it defensively and an absent `coverage` stays absent — inventing an empty one would claim the listing was complete, which is the bug this phase exists to fix. |
