@@ -506,6 +506,7 @@ fn test_settings() -> Settings {
             smtp_host: None,
             smtp_port: None,
         },
+        newsletter: Default::default(),
         push: roomler_ai_config::PushSettings {
             vapid_public_key: String::new(),
             vapid_private_key: String::new(),
