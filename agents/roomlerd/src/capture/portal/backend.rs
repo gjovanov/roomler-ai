@@ -68,7 +68,21 @@ impl PortalCapture {
                  (ROOMLERD_MUTTER_CAPTURE=1) — this captures WITHOUT a consent dialog"
             );
         }
-        let mut child = super::helper::spawn_streaming(target_fps, want_input, use_mutter)?;
+        // FR-56 P4 — record one application window rather than the desktop.
+        // ⚠️ Default OFF and it must stay that way: the portal answers this by
+        // showing a WINDOW PICKER, so on an unattended host the capture simply
+        // never starts. There is no way to name the window from here — GNOME
+        // refuses `Introspect.GetWindows` (measured), so mutter's
+        // `RecordWindow` has no id to take either.
+        let window_capture = tunnel_core::env::flag("WINDOW_CAPTURE", false);
+        if window_capture {
+            tracing::info!(
+                "portal capture: asking for ONE WINDOW (ROOMLERD_WINDOW_CAPTURE=1) — the portal \
+                 will show a picker, so somebody has to be at the screen"
+            );
+        }
+        let mut child =
+            super::helper::spawn_streaming(target_fps, want_input, use_mutter, window_capture)?;
         let stdout = child
             .stdout
             .take()

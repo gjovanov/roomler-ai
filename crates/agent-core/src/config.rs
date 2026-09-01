@@ -717,6 +717,18 @@ pub struct AgentConfig {
     /// `drm_capture`, not `portal_capture`. Restart required.
     #[serde(default)]
     pub mutter_capture: Option<bool>,
+    /// FR-56 P4 - capture ONE application window instead of the whole monitor
+    /// (`ROOMLERD_WINDOW_CAPTURE`). Built-in default: **OFF**.
+    ///
+    /// The RAIL-shaped half of Remote Apps: the viewer sees one app rather
+    /// than the desktop.
+    ///
+    /// **Attended by construction** - the portal answers this by showing the
+    /// person at the screen a WINDOW PICKER, and nothing on the agent side can
+    /// name a window (GNOME refuses `Introspect.GetWindows`). On a host with
+    /// nobody at it the capture simply never starts. Restart required.
+    #[serde(default)]
+    pub window_capture: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
     /// unchanged (`ROOMLERD_X11_DAMAGE`). Built-in default: ON; took a Linux
     /// host's idle capture from 45.8 % of a core to 2.8 %. Restart required.
@@ -1961,6 +1973,7 @@ pub fn test_fixture() -> AgentConfig {
         portal_capture: None,
         portal_input: None,
         mutter_capture: None,
+        window_capture: None,
         x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
@@ -2106,7 +2119,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 71] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 72] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2134,6 +2147,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 71]
         ("PORTAL_CAPTURE", cfg.portal_capture),
         ("PORTAL_INPUT", cfg.portal_input),
         ("MUTTER_CAPTURE", cfg.mutter_capture),
+        ("WINDOW_CAPTURE", cfg.window_capture),
         ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),
         ("OVERLAY_QUIC", cfg.overlay_quic),

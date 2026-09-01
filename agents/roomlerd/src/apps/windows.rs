@@ -89,6 +89,11 @@ impl WindowManager for WindowsWm {
         Coverage {
             sources: vec!["win32"],
             unlisted: None,
+            // FR-56 P5 — nothing to miss: this backend calls Win32 directly
+            // rather than shelling out, so there is no helper binary whose
+            // absence could silently remove a button. Empty here is a
+            // measured "nothing missing", not "not checked".
+            missing_tools: Vec::new(),
         }
     }
 

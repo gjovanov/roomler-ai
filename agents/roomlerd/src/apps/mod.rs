@@ -126,6 +126,30 @@ pub struct Coverage {
     /// the reason. `None` when the listing is complete.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unlisted: Option<String>,
+    /// FR-56 P5 — helper binaries this backend shells out to that are **not
+    /// installed here**, each with what stops working without it.
+    ///
+    /// ⚠️ This exists because `supported: true` was measured to be a lie:
+    /// on a GNOME Wayland host with no `tmux`, the panel reported the feature
+    /// supported, offered the button, and only failed once somebody clicked
+    /// it. A capability is not "supported" because the desktop was found; it
+    /// is supported because the thing behind the button can actually run.
+    ///
+    /// ⚠️ Empty means "nothing missing", NOT "not checked" — the same
+    /// `Some([])`-vs-`None` distinction [`Self::unlisted`] exists for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_tools: Vec<MissingTool>,
+}
+
+/// One helper binary this host does not have (FR-56 P5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissingTool {
+    /// The binary that could not be found on `PATH`.
+    pub tool: &'static str,
+    /// What stops working without it, in the operator's terms.
+    pub blocks: &'static str,
+    /// How to get it, so the reply is actionable and not just a complaint.
+    pub install: &'static str,
 }
 
 pub trait WindowManager: Send + Sync {
@@ -523,6 +547,11 @@ mod tests {
             Coverage {
                 sources: vec!["x11"],
                 unlisted: Some("native Wayland windows: fake backend".to_string()),
+                missing_tools: vec![MissingTool {
+                    tool: "tmux",
+                    blocks: "persistent shell sessions",
+                    install: "apt install tmux",
+                }],
             }
         }
         fn list(&self) -> Result<Vec<WindowInfo>> {
