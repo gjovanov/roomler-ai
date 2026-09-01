@@ -191,7 +191,7 @@ function renderCards(ctx: PrePassCtx, body: string): string {
     const text = rest.replace(/\s*\bicon:[a-zA-Z]+\b\s*/, ' ').trim()
     return (
       `<div class="card"><span class="card__icon">${icon(glyph, { size: 22 })}</span>` +
-      `<h3 class="card__title">${ctx.md.renderInline(title)}</h3>` +
+      `<h2 class="card__title">${ctx.md.renderInline(title)}</h3>` +
       `<p class="card__text">${ctx.md.renderInline(text)}</p></div>`
     )
   })

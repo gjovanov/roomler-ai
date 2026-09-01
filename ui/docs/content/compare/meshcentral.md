@@ -55,7 +55,7 @@ On the same server and accounts.
 
 ## Side by side
 
-| | Roomler | MeshCentral |
+| Capability | Roomler | MeshCentral |
 |---|---|---|
 | Self-hosted | Yes | Yes |
 | Browser-based control | Yes | Yes |
