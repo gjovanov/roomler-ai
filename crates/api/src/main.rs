@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 use roomler_ai_api::{build_router, state, state::AppState};
-use roomler_ai_config::Settings;
+use roomler_ai_config::{DEFAULT_FRONTEND_URL, Settings};
 use roomler_ai_db::{connect, indexes::ensure_indexes};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -63,6 +63,32 @@ async fn main() -> anyhow::Result<()> {
         error!(
             "The built-in default secret is listed in ROOMLER__JWT__PREVIOUS_SECRETS — \
              tokens signed with it are still accepted."
+        );
+    }
+
+    // FR-50 P3 - `app.frontend_url` left at the built-in development default
+    // on a production deployment.
+    //
+    // It was always load-bearing (OAuth returns, invitation and activation
+    // links, the CORS origin policy), but FR-50 gave it a failure mode that
+    // points away from itself: the route serving `install.{sh,ps1}` substitutes
+    // this value, so a self-hoster who never set it downloads the installer
+    // from their own server and then watches the agent enrol against
+    // `http://localhost:5000`. Nothing in that error names `frontend_url`.
+    //
+    // A warning, not a refusal. A wrong `frontend_url` degrades links; it does
+    // not compromise anything, and refusing to boot over it would take a live
+    // deployment offline for a config value that looks cosmetic - which is not
+    // the trade the JWT-secret refusals above are making.
+    if settings.app.environment == "production" && settings.app.frontend_url == DEFAULT_FRONTEND_URL
+    {
+        error!(
+            frontend_url = %settings.app.frontend_url,
+            "app.environment=production but app.frontend_url is still the built-in \
+             development default. OAuth returns, invitation and activation links, the \
+             CORS origin policy and the SERVER baked into /api/setup/install.{{sh,ps1}} \
+             all resolve from it - set ROOMLER__APP__FRONTEND_URL to this deployment's \
+             public URL."
         );
     }
 
