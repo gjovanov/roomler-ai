@@ -3074,6 +3074,24 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     #[cfg(target_os = "macos")]
     let delegate_host = roomlerd::delegate::DelegateHost::new();
 
+    // FR-55 — keep the device reachable instead of letting it quietly sleep.
+    // Default `never`, so on a device that has not opted in this task holds
+    // nothing and the behaviour is byte-for-byte what it was before.
+    //
+    // The session hint is separate from the registry because the registry is
+    // rc-only: an SSH session or a long `exec` deserves the same protection and
+    // has no row there. Nothing sets it yet — that is FR-55 P1's second half.
+    let power_session_hint = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let power_policy = roomlerd::power::PowerPolicy::parse(&cfg.power_policy);
+    // Not aborted at shutdown: it exits on the watch, and its exit is what
+    // RELEASES the assertion. An abort would leave the machine unable to sleep.
+    let _power_task = tokio::spawn(roomlerd::power::run(
+        power_policy,
+        Some(rc_sessions.clone()),
+        power_session_hint.clone(),
+        shutdown_rx.clone(),
+    ));
+
     // FR-43 P2b-2 — which side of delegation this process is on. A process is
     // the supervising DAEMON or the supervised WORKER, never both, so this is
     // one value and the third case ("neither") is the ordinary one.
