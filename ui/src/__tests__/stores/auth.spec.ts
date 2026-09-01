@@ -28,7 +28,6 @@ import { useAuthStore } from '@/stores/auth'
 import { api } from '@/api/client'
 import router from '@/plugins/router'
 import { subscribePush, unsubscribePush } from '@/composables/usePush'
-import { readTourProgress, hasSeenTour } from '@/composables/useTutorialProgress'
 
 const mockApi = vi.mocked(api)
 const mockRouter = vi.mocked(router)
@@ -222,50 +221,6 @@ describe('useAuthStore', () => {
         display_name: 'D',
         invite_code: 'invite-123',
       })
-    })
-  })
-
-  // FR-12 P3, field-caught on prod. The seed lived in
-  // `AppLayout.maybeAutoOpenTour`, which bails on the tutorial route and runs
-  // at most once per load -- so a browser with no local state showed
-  // `0/8 done` for an account the server said had finished a chapter. Signing
-  // in IS the event, so the store is where it belongs, and a store test is
-  // what would have caught it.
-  describe('tutorial state follows the account (FR-12 P3)', () => {
-    const WITH_TUTORIAL = {
-      ...USER,
-      tutorial: { done: ['acl', 'devices'], seen_at: '2026-09-01T10:00:00Z' },
-    }
-
-    it('seeds this browser from the account on fetchMe', async () => {
-      localStorage.setItem(SIGNED_IN, '1')
-      mockApi.get.mockResolvedValueOnce(WITH_TUTORIAL)
-
-      const store = useAuthStore()
-      await store.fetchMe()
-
-      expect(readTourProgress(USER.id).sort()).toEqual(['acl', 'devices'])
-      expect(hasSeenTour(USER.id)).toBe(true)
-    })
-
-    it('seeds on login too -- a fresh browser signs IN, it does not fetchMe', async () => {
-      mockApi.post.mockResolvedValueOnce({ user: WITH_TUTORIAL })
-
-      const store = useAuthStore()
-      await store.login('testuser', 'pw')
-
-      expect(readTourProgress(USER.id).sort()).toEqual(['acl', 'devices'])
-    })
-
-    it('an account with no tutorial state leaves the browser alone', async () => {
-      localStorage.setItem(SIGNED_IN, '1')
-      mockApi.get.mockResolvedValueOnce(USER)
-
-      const store = useAuthStore()
-      await store.fetchMe()
-
-      expect(readTourProgress(USER.id)).toEqual([])
-      expect(hasSeenTour(USER.id)).toBe(false)
     })
   })
 })

@@ -112,12 +112,12 @@ impl std::fmt::Display for PipeWireStatus {
 /// it isolates one question: is the fd live PipeWire at all? When negotiation
 /// fails, running this says whether the problem is the connection or the
 /// format.
-pub fn probe(fd: std::os::fd::OwnedFd) -> PipeWireStatus {
+pub fn probe(source: PwSource) -> PipeWireStatus {
     let lib = match Lib::load() {
         Ok(l) => l,
         Err(e) => return PipeWireStatus::Failed(e.to_string()),
     };
-    match Connection::open(lib, fd) {
+    match Connection::open(lib, source) {
         Ok(conn) => PipeWireStatus::Connected {
             library_version: conn.library_version(),
         },
@@ -128,18 +128,18 @@ pub fn probe(fd: std::os::fd::OwnedFd) -> PipeWireStatus {
 /// P3b-ii — connect a stream to the portal's node and report what the
 /// compositor agreed to.
 pub fn negotiate_status(
-    fd: std::os::fd::OwnedFd,
+    source: PwSource,
     node_id: u32,
     max_fps: u32,
     want_frames: u32,
 ) -> PipeWireStatus {
-    // Read before the fd moves: the version is worth reporting on both arms,
+    // Read before the source moves: the version is worth reporting on both arms,
     // and by the time negotiation fails the library handle is gone.
     let library_version = match Lib::load() {
         Ok(l) => l.version(),
         Err(e) => return PipeWireStatus::Failed(e.to_string()),
     };
-    match negotiate(fd, node_id, max_fps, want_frames) {
+    match negotiate(source, node_id, max_fps, want_frames) {
         Ok((format, frames)) => PipeWireStatus::Negotiated {
             library_version,
             format,
@@ -241,6 +241,10 @@ pw_syms! {
     pw_context_destroy: unsafe extern "C" fn(*mut c_void),
     pw_context_connect_fd:
         unsafe extern "C" fn(*mut c_void, c_int, *mut c_void, usize) -> *mut c_void,
+    // FR-45 P5 — mutter's own ScreenCast API hands out a NODE ID, not a remote
+    // fd, so that path connects to the session's own PipeWire the ordinary
+    // way. Same core afterwards; only the way in differs.
+    pw_context_connect: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void,
     pw_core_disconnect: unsafe extern "C" fn(*mut c_void) -> c_int,
     // ⚠️ `_new_string`, not `pw_properties_new` — the latter is VARARGS, which
     // cannot be called through a plain `dlsym`'d function pointer without
@@ -349,15 +353,30 @@ pub struct Connection {
     core: *mut c_void,
 }
 
+/// Where a PipeWire connection comes from.
+///
+/// The portal hands out a **remote fd** (`OpenPipeWireRemote`); mutter's own
+/// ScreenCast API (FR-45 P5) hands out only a node id and expects us to reach
+/// the session's PipeWire the ordinary way. Everything after the connect is
+/// identical, so the difference is confined to this enum.
+pub enum PwSource {
+    /// The portal's fd. ⚠️ Ownership transfers to PipeWire on success.
+    Fd(std::os::fd::OwnedFd),
+    /// The session's own PipeWire, via `PIPEWIRE_REMOTE`/`XDG_RUNTIME_DIR` —
+    /// which is correct here because the helper already runs AS the session
+    /// user, whose PipeWire this is.
+    Session,
+}
+
 impl Connection {
-    /// Connect the portal's fd to PipeWire.
+    /// Connect to PipeWire, from either source.
     ///
     /// ⚠️ **`pw_context_connect_fd` takes ownership of the fd** and closes it
     /// on disconnect, so the fd is handed over as a raw descriptor and must
     /// not be closed here. Passing a borrowed fd and letting Rust close it too
     /// is a double close — which on a busy process closes *somebody else's*
     /// descriptor, the ugliest class of bug to chase.
-    pub fn open(lib: Arc<Lib>, fd: std::os::fd::OwnedFd) -> Result<Self, PwError> {
+    pub fn open(lib: Arc<Lib>, source: PwSource) -> Result<Self, PwError> {
         use std::os::fd::IntoRawFd;
 
         // `pw_init` is process-global and must run once. Running it per
@@ -379,13 +398,26 @@ impl Connection {
             return Err(PwError::NoContext);
         }
 
-        let raw = fd.into_raw_fd();
-        let core =
-            unsafe { (lib.syms.pw_context_connect_fd)(context, raw, std::ptr::null_mut(), 0) };
+        let (core, raw_fd) = match source {
+            PwSource::Fd(fd) => {
+                let raw = fd.into_raw_fd();
+                let core = unsafe {
+                    (lib.syms.pw_context_connect_fd)(context, raw, std::ptr::null_mut(), 0)
+                };
+                (core, Some(raw))
+            }
+            PwSource::Session => {
+                let core =
+                    unsafe { (lib.syms.pw_context_connect)(context, std::ptr::null_mut(), 0) };
+                (core, None)
+            }
+        };
         if core.is_null() {
             let why = std::io::Error::last_os_error().to_string();
             // The fd's ownership only transfers on success, so close it here.
-            unsafe { libc::close(raw) };
+            if let Some(raw) = raw_fd {
+                unsafe { libc::close(raw) };
+            }
             unsafe { (lib.syms.pw_context_destroy)(context) };
             unsafe { (lib.syms.pw_main_loop_destroy)(main_loop) };
             return Err(PwError::ConnectFailed(why));
@@ -981,14 +1013,14 @@ fn parse_format(bytes: &[u8]) -> Result<NegotiatedFormat, String> {
 /// precisely because this is a short-lived helper; it would not be in the
 /// daemon, which is one more reason the daemon does not do this.
 pub fn negotiate(
-    fd: std::os::fd::OwnedFd,
+    source: PwSource,
     node_id: u32,
     max_fps: u32,
     want_frames: u32,
 ) -> Result<(NegotiatedFormat, Option<FrameReport>), PwError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let r = negotiate_blocking(fd, node_id, max_fps, want_frames, None);
+        let r = negotiate_blocking(source, node_id, max_fps, want_frames, None);
         // The receiver may already have timed out; nothing to do about that.
         let _ = tx.send(r);
     });
@@ -1000,14 +1032,14 @@ const NEGOTIATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 
 #[allow(clippy::type_complexity)]
 fn negotiate_blocking(
-    fd: std::os::fd::OwnedFd,
+    source: PwSource,
     node_id: u32,
     max_fps: u32,
     want_frames: u32,
     frame_tx: Option<std::sync::mpsc::SyncSender<(super::wire::FrameHeader, Vec<u8>)>>,
 ) -> Result<(NegotiatedFormat, Option<FrameReport>), PwError> {
     let lib = Lib::load()?;
-    let conn = Connection::open(lib.clone(), fd)?;
+    let conn = Connection::open(lib.clone(), source)?;
 
     let props_str = CString::new("media.type=Video media.category=Capture media.role=Screen")
         .map_err(|e| PwError::Other(e.to_string()))?;
@@ -1121,11 +1153,7 @@ pub struct StreamHandle {
 /// the life of the helper process, which ends when the daemon closes its pipe.
 /// Acceptable for the same reason the negotiation timeout was — this is a
 /// short-lived helper, not the daemon.
-pub fn stream(
-    fd: std::os::fd::OwnedFd,
-    node_id: u32,
-    max_fps: u32,
-) -> Result<StreamHandle, PwError> {
+pub fn stream(source: PwSource, node_id: u32, max_fps: u32) -> Result<StreamHandle, PwError> {
     // Depth 2: enough that a brief hiccup in the writer costs no frame, small
     // enough that what arrives is always nearly current.
     let (frame_tx, frames) = std::sync::mpsc::sync_channel(2);
@@ -1134,7 +1162,7 @@ pub fn stream(
     std::thread::spawn(move || {
         // u32::MAX so the loop never satisfies its finish condition and runs
         // until the process ends.
-        let r = negotiate_blocking(fd, node_id, max_fps, u32::MAX, Some(frame_tx));
+        let r = negotiate_blocking(source, node_id, max_fps, u32::MAX, Some(frame_tx));
         // Only reached once the loop has ended, which for a stream is a fault.
         let _ = err_tx.send(r.err());
     });

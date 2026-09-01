@@ -57,7 +57,18 @@ impl PortalCapture {
         // land. Off by default keeps capture byte-for-byte P3c; a host that
         // wants input turns it on.
         let want_input = tunnel_core::env::flag("PORTAL_INPUT", false);
-        let mut child = super::helper::spawn_streaming(target_fps, want_input)?;
+        // FR-45 P5 — take frames from mutter's own ScreenCast API instead of
+        // the portal. ⚠️⚠️ UNATTENDED: it shows no consent dialog. Default OFF
+        // and loud when it engages, exactly like FR-36's DRM backend, which is
+        // its real peer — NOT the portal, whose whole point is that it asks.
+        let use_mutter = tunnel_core::env::flag("MUTTER_CAPTURE", false);
+        if use_mutter {
+            tracing::warn!(
+                "portal capture: using org.gnome.Mutter.ScreenCast DIRECTLY \
+                 (ROOMLERD_MUTTER_CAPTURE=1) — this captures WITHOUT a consent dialog"
+            );
+        }
+        let mut child = super::helper::spawn_streaming(target_fps, want_input, use_mutter)?;
         let stdout = child
             .stdout
             .take()

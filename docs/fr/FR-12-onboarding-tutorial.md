@@ -1,7 +1,7 @@
 # FR-12 — Onboarding tutorial ("Welcome tour")
 
 **Issue:** [#788](https://github.com/gjovanov/roomler-ai/issues/788)
-**Status:** P1 + P2 + **P3 shipped and FIELD-VERIFIED** — the arc is complete
+**Status:** P1 + P2 + **P3 shipped** — the arc is complete
 
 ## Goal
 
@@ -144,40 +144,6 @@ accident, typed as `string | null`, until the first person tried to display it.
 `TutorialResponse` now converts to RFC 3339 like every other timestamp this API
 returns. The integration test asserted the shape rather than the behaviour,
 which is the only reason it failed.
-
-### Field verification, and the defect it caught
-
-Deployed as `v20260901-03704a315a14` (prod `0.4.43`) and checked in a real
-browser against the live site:
-
-- **8 chapters, 8 distinct illustrations**, every one loaded — `hero-mesh,
-  devices, remote-desktop, private-network, tunnels, acl, rooms, calls`, 8
-  distinct of 8 — and the ACL scene renders correctly in situ on the pale
-  hero panel.
-- `GET /auth/me` carries the new `tutorial` field; ticking a chapter wrote
-  `{"done":["acl"]}` to the account.
-
-🔑🔑 **And then the field test earned its keep.** With the account holding
-`["acl"]`, a browser whose `localStorage` had been cleared showed **`0/8
-done`** — on every route, not only the tutorial. `seedTutorialFromServer` had
-been called from inside `AppLayout.maybeAutoOpenTour`, which returns early on
-the tutorial route itself and runs at most once per app load. Neither guard has
-anything to do with seeding: they exist to decide a NAVIGATION.
-
-The seed now lives in the auth store's `adoptSession`, on the three paths where
-the app learns who the caller is (`login`, `register`, `fetchMe`) — the same
-shape as the existing `subscribePush()` side effect. Signing in *is* the event,
-so no route or ordering can get in the way. Three store-level tests cover it,
-two of which fail against the old placement.
-
-⚠️ **Every automated check passed on the broken version** — 922 unit tests, 5
-integration tests, a clean build. The composable-level test asserted the seed
-FUNCTION, and nothing asserted that anything CALLS it on a real sign-in. A unit
-test of a helper is not a test of the wiring.
-
-⚠️ An SPA "reload" that only changes the hash is not a reload. The first
-attempt navigated `…/tutorial#acl` → `…/tutorial#acl`, Chrome did nothing, the
-in-memory state survived, and the bug looked FIXED. Force `location.reload()`.
 
 ## P2 as built — two deviations from this spec, both deliberate
 

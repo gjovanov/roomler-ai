@@ -492,6 +492,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "FR-45 P4 - inject input through the portal RemoteDesktop interface, riding the SAME portal session (one consent dialog covers see+touch). Built-in default: OFF - a WithInput session needs its own see+touch consent + restore token, so enabling it makes every portal capture prompt afresh (and block or fall through if unanswered), regressing capture where capture-only works; it has also not yet been field-proven to land input. On = the portal session can be controlled; inert unless portal_capture is on. NOTE (measured on GNOME): this key alone is not enough - the portal's consent dialog carries a SEPARATE 'Allow Remote Interaction' switch that defaults OFF, so a human who only clicks Share grants capture and the session runs view-only. Env: ROOMLERD_PORTAL_INPUT. Restart required.",
     ),
     (
+        "mutter_capture",
+        "tribool",
+        "FR-45 P5 - take screencast frames from org.gnome.Mutter.ScreenCast DIRECTLY instead of the desktop portal. For hosts where no portal backend can run at all (measured on WSL2: xdg-desktop-portal-gnome exits without a GNOME session, while mutter itself works). GNOME-only. Built-in default: OFF. ** UNATTENDED - this shows NO consent dialog; its peer is drm_capture, not portal_capture.** Env: ROOMLERD_MUTTER_CAPTURE. Restart required.",
+    ),
+    (
         "x11_damage",
         "tribool",
         "FR-29 - skip the XShm readback when XDAMAGE proves the screen is unchanged. Built-in default: on; took a Linux host's idle capture from 45.8% of a core to 2.8%. Env: ROOMLERD_X11_DAMAGE. Restart required.",
@@ -789,6 +794,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "uinput" => cfg.uinput.map(fmt_bool),
         "portal_capture" => cfg.portal_capture.map(fmt_bool),
         "portal_input" => cfg.portal_input.map(fmt_bool),
+        "mutter_capture" => cfg.mutter_capture.map(fmt_bool),
         "x11_damage" => cfg.x11_damage.map(fmt_bool),
         "overlay_key_rotation" => cfg.overlay_key_rotation.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
@@ -1174,6 +1180,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "uinput" => cfg.uinput = parse_tribool(value)?,
         "portal_capture" => cfg.portal_capture = parse_tribool(value)?,
         "portal_input" => cfg.portal_input = parse_tribool(value)?,
+        "mutter_capture" => cfg.mutter_capture = parse_tribool(value)?,
         "x11_damage" => cfg.x11_damage = parse_tribool(value)?,
         "overlay_key_rotation" => cfg.overlay_key_rotation = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
@@ -1409,6 +1416,7 @@ mod tests {
             "x11_damage",
             "portal_capture",
             "portal_input",
+            "mutter_capture",
         ] {
             apply(&mut cfg, key, Some("on")).unwrap();
             assert_eq!(
@@ -1445,6 +1453,7 @@ mod tests {
         cfg.x11_damage = Some(false);
         cfg.portal_capture = Some(true);
         cfg.portal_input = Some(false);
+        cfg.mutter_capture = Some(true);
         let bridged = crate::config::env_bridge_bools(&cfg);
         for (name, want) in [
             ("DRM_CAPTURE", Some(true)),
@@ -1452,6 +1461,7 @@ mod tests {
             ("X11_DAMAGE", Some(false)),
             ("PORTAL_CAPTURE", Some(true)),
             ("PORTAL_INPUT", Some(false)),
+            ("MUTTER_CAPTURE", Some(true)),
         ] {
             let got = bridged
                 .iter()

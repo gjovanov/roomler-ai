@@ -675,6 +675,18 @@ pub struct AgentConfig {
     /// capture only — the session then reports no input and runs view-only.
     #[serde(default)]
     pub portal_input: Option<bool>,
+    /// FR-45 P5 - take screencast frames from `org.gnome.Mutter.ScreenCast`
+    /// DIRECTLY instead of the desktop portal (`ROOMLERD_MUTTER_CAPTURE`).
+    /// Built-in default: **OFF**.
+    ///
+    /// For hosts where no portal backend can run at all - measured on WSL2,
+    /// where `xdg-desktop-portal-gnome` exits without a GNOME session while
+    /// mutter itself works. GNOME-only.
+    ///
+    /// **UNATTENDED: this shows NO consent dialog.** Its peer is
+    /// `drm_capture`, not `portal_capture`. Restart required.
+    #[serde(default)]
+    pub mutter_capture: Option<bool>,
     /// FR-29 — skip the XShm readback when XDAMAGE proves the screen is
     /// unchanged (`ROOMLERD_X11_DAMAGE`). Built-in default: ON; took a Linux
     /// host's idle capture from 45.8 % of a core to 2.8 %. Restart required.
@@ -1845,6 +1857,7 @@ pub fn test_fixture() -> AgentConfig {
         uinput: None,
         portal_capture: None,
         portal_input: None,
+        mutter_capture: None,
         x11_damage: None,
         overlay_key_rotation: None,
         idle_refine_max_edge: None,
@@ -1982,7 +1995,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 64] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 65] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2003,6 +2016,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 64]
         ("UINPUT", cfg.uinput),
         ("PORTAL_CAPTURE", cfg.portal_capture),
         ("PORTAL_INPUT", cfg.portal_input),
+        ("MUTTER_CAPTURE", cfg.mutter_capture),
         ("X11_DAMAGE", cfg.x11_damage),
         ("OVERLAY_KEY_ROTATION", cfg.overlay_key_rotation),
         ("OVERLAY_QUIC", cfg.overlay_quic),
