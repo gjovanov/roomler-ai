@@ -88,7 +88,7 @@ roomler status
 
 ## Where things live
 
-| | Path |
+| Item | Path |
 |---|---|
 | Program files | `C:\Program Files\Roomler\` (per-machine) or `%LOCALAPPDATA%\Programs\Roomler\` (per-user) |
 | Per-user config | `%APPDATA%\roomler\config.toml` |

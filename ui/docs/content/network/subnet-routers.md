@@ -28,7 +28,7 @@ takes two parties.
 
 They are often confused, and the difference is simple:
 
-| | Subnet router | [Exit node](/docs/network/exit-nodes/) |
+| Property | Subnet router | [Exit node](/docs/network/exit-nodes/) |
 |---|---|---|
 | Routes | **One specific network range** | **All** internet traffic |
 | Client-side effect | Extra routes | The default route changes |

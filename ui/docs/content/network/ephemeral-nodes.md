@@ -45,7 +45,7 @@ asserts.
 
 ## What "ephemeral" changes
 
-| | Normal device | Ephemeral device |
+| Behaviour | Normal device | Ephemeral device |
 |---|---|---|
 | Machine identity | Stable, derived from hardware | Random per enrollment |
 | Restarting the agent | The same device comes back | A **new** device |
