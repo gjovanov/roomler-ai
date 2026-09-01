@@ -399,11 +399,16 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
 
     // rc.77 — FFmpeg HEVC over DataChannel.
     //
-    // Gated behind `ROOMLERD_USE_FFMPEG=1` env var so that an
-    // accidental FFmpeg dep in the build doesn't change negotiation
-    // for existing field sessions. When the env var IS set, probe
-    // `FfmpegEncoder::new_hevc` at the standard probe resolution; on
-    // success advertise both the `h265` codec (additive to whatever
+    // **DEFAULT ON** since rc.107 — `ffmpeg_backend_enabled()` is an explicit
+    // opt-OUT (`ROOMLERD_USE_FFMPEG=0`), not the rc.77 opt-IN this comment
+    // used to describe. The flip was forced in the field: an MSI
+    // MajorUpgrade WIPES the service env block, so the dropped `=1`
+    // silently disabled HEVC fleet-wide (black canvas, rc.105→rc.106).
+    //
+    // Advertisement is still gated on a REAL `FfmpegEncoder::new_hevc`
+    // probe at the standard resolution, so a host without working HW
+    // HEVC falls back cleanly regardless of the flag. On success
+    // advertise both the `h265` codec (additive to whatever
     // MF found) and the `data-channel-hevc` transport. The browser's
     // rc:session.request can then ask for codec=h265 + transport=
     // data-channel-hevc and `peer.rs::media_pump` will route to the
