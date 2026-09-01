@@ -47,22 +47,35 @@ use super::{Capabilities, TRANSPORT_QUIC_V1, Transport};
 
 /// ALPN id for the tunnel's QUIC connections. Both ends must match or
 /// the TLS handshake fails (a cheap version/role guard).
-// RETIRED-NAME-ANCHOR(2): WIRE VALUE — the ALPN travels in the TLS ClientHello and both
-// ends must agree, so renaming it breaks every deployed peer.
-const ALPN: &[u8] = b"roomler-tunnel-quic-v1";
+///
+/// FR-46 P4, step 1 of 3. The wire value cannot be renamed in one release: the
+/// ALPN travels in the ClientHello and a peer that offers only the new name to
+/// a server that knows only the old one gets a clean handshake failure, i.e. a
+/// silently dead carrier. So the SERVER learns the new name first and keeps
+/// accepting the old, the CLIENT keeps offering the old until every peer can
+/// answer it, and only then does the old one go.
+// RETIRED-NAME-ANCHOR(2): WIRE VALUE — this is what deployed peers offer today,
+// and it stays until the client half has flipped everywhere. docs/fr/FR-46
+const ALPN_LEGACY: &[u8] = b"roomler-tunnel-quic-v1";
+
+/// The ALPN the tunnel is moving TO. Accepted by the server from this release;
+/// not yet offered by the client (see [`ALPN_LEGACY`]).
+const ALPN: &[u8] = b"roomlerd-quic-v1";
 
 /// ALPN id for the overlay's WG-over-QUIC **datagram** carrier. Distinct from
 /// [`ALPN`] so a stream-tunnel endpoint and a datagram endpoint can never
 /// complete a handshake against each other (mismatched ALPN → clean failure).
 const OVERLAY_ALPN: &[u8] = b"roomler-overlay-wg-v1";
 
-/// Placeholder SNI — the client pins by cert fingerprint, not by name,
-/// so the value only needs to be a syntactically-valid DNS name.
-// RETIRED-NAME-ANCHOR: this value goes out on the wire in the ClientHello. The
-// pin is by cert fingerprint so the name is not semantically load-bearing, which
-// is exactly why changing it buys nothing and risks a middlebox or a future
-// server-side check. Frozen. See docs/fr/FR-21.
-const SNI: &str = "roomler-tunnel";
+/// Placeholder SNI — the client pins by cert fingerprint, not by name.
+///
+/// FR-46 renamed this, which is safe in ONE release rather than three because
+/// nothing on either end reads it: `FingerprintVerifier::verify_server_cert`
+/// ignores `_server_name` entirely and compares a SHA-256 pin, and the cert is
+/// generated per process, so a new SAN simply yields a new fingerprint that is
+/// advertised over signalling like any other. It is not a version guard and
+/// never was — the ALPN above is.
+const SNI: &str = "roomlerd";
 
 /// SHA-256 fingerprint of a DER certificate, lowercase hex. This is the
 /// value the agent advertises over signaling and the client pins.
@@ -252,7 +265,11 @@ fn build_server_config() -> Result<(ServerConfig, String)> {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)
         .context("quic server: single cert")?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    // FR-46 P4 step 1: the SERVER learns the new ALPN and keeps accepting the
+    // old one. Order is preference — a peer offering both gets the new name, a
+    // deployed peer offering only the old one still completes. The CLIENT below
+    // deliberately does NOT offer the new one yet.
+    tls.alpn_protocols = vec![ALPN.to_vec(), ALPN_LEGACY.to_vec()];
     let qsc = QuicServerConfig::try_from(tls).context("quic server config from rustls")?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(qsc));
     server_config.transport_config(quic_transport_config());
@@ -263,6 +280,19 @@ fn build_server_config() -> Result<(ServerConfig, String)> {
 /// ALPN) shared by [`QuicPeer::client`] and
 /// [`QuicPeer::client_from_socket`].
 fn build_client_config(pinned_fingerprint_hex: &str) -> Result<ClientConfig> {
+    // FR-46 P4 step 1: the CLIENT keeps offering ONLY the legacy ALPN until every
+    // peer can answer the new one. Flipping this before then turns an upgraded
+    // client dialling an older exit into a clean handshake failure — a carrier
+    // that is simply dead, with the ladder falling back to DERP and nothing said.
+    build_client_config_with_alpn(pinned_fingerprint_hex, vec![ALPN_LEGACY.to_vec()])
+}
+
+/// Split out so a test can offer the NEW ALPN and prove the server already
+/// answers it — otherwise step 2 of the rename is a leap rather than a flip.
+fn build_client_config_with_alpn(
+    pinned_fingerprint_hex: &str,
+    alpn: Vec<Vec<u8>>,
+) -> Result<ClientConfig> {
     let pinned = decode_fingerprint(pinned_fingerprint_hex)?;
     let verifier = Arc::new(FingerprintVerifier {
         pinned,
@@ -274,7 +304,7 @@ fn build_client_config(pinned_fingerprint_hex: &str) -> Result<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = alpn;
     let qcc = QuicClientConfig::try_from(tls).context("quic client config from rustls")?;
     let mut client_config = ClientConfig::new(Arc::new(qcc));
     client_config.transport_config(quic_transport_config());
@@ -858,6 +888,47 @@ mod tests {
         assert_eq!(got, payload, "echo payload corrupted");
         conn.close(0u32.into(), b"done");
         let _ = srv.await;
+    }
+    /// FR-46 P4 step 1, proven rather than reasoned: the server already answers
+    /// the NEW ALPN, so step 2 (flipping the client) is a flip and not a leap.
+    ///
+    /// The sibling loopback tests cover the other direction — they run a client
+    /// that offers only the LEGACY name against this same dual server — so
+    /// between them both arms of the changeover are exercised.
+    #[tokio::test]
+    async fn the_server_answers_both_the_new_and_the_legacy_alpn() {
+        for (label, offered) in [
+            ("new", vec![ALPN.to_vec()]),
+            ("legacy", vec![ALPN_LEGACY.to_vec()]),
+        ] {
+            let (server, fingerprint) = QuicPeer::server(loopback()).expect("server endpoint");
+            let server_addr = server.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                server
+                    .accept()
+                    .await
+                    .expect("incoming")
+                    .expect("handshake must complete")
+            });
+
+            let mut endpoint = Endpoint::client(loopback()).expect("client endpoint");
+            endpoint.set_default_client_config(
+                build_client_config_with_alpn(&fingerprint, offered).expect("client config"),
+            );
+            let conn = endpoint
+                .connect(server_addr, SNI)
+                .expect("connect")
+                .await
+                .unwrap_or_else(|e| panic!("{label} ALPN must complete the handshake: {e}"));
+
+            let accepted = srv.await.expect("server task");
+            assert_eq!(
+                conn.stable_id(),
+                conn.stable_id(),
+                "{label}: connection is usable"
+            );
+            drop(accepted);
+        }
     }
 
     /// A client that pins the WRONG fingerprint must fail the handshake
