@@ -45,3 +45,6 @@ pub use consent_request::*;
 
 pub mod subscriber;
 pub use subscriber::*;
+
+pub mod newsletter_issue;
+pub use newsletter_issue::*;

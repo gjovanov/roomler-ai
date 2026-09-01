@@ -20,6 +20,7 @@ pub(crate) mod helpers;
 pub mod integration;
 pub mod invite;
 pub mod message;
+pub mod newsletter;
 pub mod notification;
 pub mod oauth;
 pub mod overlay_block;

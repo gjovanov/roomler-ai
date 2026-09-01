@@ -217,6 +217,19 @@ pub async fn ensure_indexes(db: &Database, multi_block: bool) -> Result<(), mong
     )
     .await?;
 
+    // Newsletter issues (FR-58). `slug` is unique because create is explicit
+    // (a typo'd slug on update must 404, never upsert a second issue), and the
+    // unique index is what arbitrates two concurrent creates.
+    create_indexes(
+        db,
+        "newsletter_issues",
+        vec![
+            index_unique(bson::doc! { "slug": 1 }),
+            index(bson::doc! { "created_at": -1 }),
+        ],
+    )
+    .await?;
+
     // Custom Emojis
     create_indexes(
         db,

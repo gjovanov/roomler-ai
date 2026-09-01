@@ -691,6 +691,22 @@ pub fn build_router(state: AppState) -> Router {
         // what makes "in which org did this happen" answerable.
         .route("/usage", get(routes::usage::admin_usage))
         .route("/usage/{user_id}", get(routes::usage::admin_usage_detail));
+    // FR-58 — the newsletter sending program's admin surface. Same gate,
+    // same 404-on-miss; `platform_admins` unset ⇒ the whole family 404s.
+    let admin_newsletter_routes = Router::new()
+        .route(
+            "/issues",
+            post(routes::newsletter::create).get(routes::newsletter::list),
+        )
+        .route(
+            "/issues/{slug}",
+            put(routes::newsletter::update).get(routes::newsletter::get_one),
+        )
+        .route("/issues/{slug}/preview", get(routes::newsletter::preview))
+        .route(
+            "/issues/{slug}/test-send",
+            post(routes::newsletter::test_send),
+        );
     let tenant_stats_routes = Router::new()
         .route("/overview", get(routes::stats::tenant_overview))
         .route("/mesh", get(routes::stats::tenant_mesh))
@@ -728,6 +744,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
         .nest("/admin/stats", admin_stats_routes)
+        .nest("/admin/newsletter", admin_newsletter_routes)
         // FR-32 P1c — "who would break if enforcement were turned on?".
         // Platform-admin only (404 on miss, like the rest of /admin).
         .route(
