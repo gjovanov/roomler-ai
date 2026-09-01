@@ -406,6 +406,59 @@ describe('useAgentStore', () => {
     expect(s.orgSshEnabled).toBeNull()
   })
 
+  // ── FR-51 — ephemeral enrollment keys ──────────────────────────────
+
+  it('the ephemeral-keys org switch is its own flag and its own route', async () => {
+    mockApi.get.mockResolvedValueOnce({ ephemeral_keys_enabled: true })
+    const s = useAgentStore()
+    await s.fetchOrgEphemeralKeysEnabled(TENANT_ID)
+    expect(s.orgEphemeralKeysEnabled).toBe(true)
+    // The other two switches must stay untouched — three separate grants.
+    expect(s.orgExecEnabled).toBeNull()
+    expect(s.orgSshEnabled).toBeNull()
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/ephemeral-key-settings`)
+  })
+
+  it('a 403 on the ephemeral-keys switch leaves it UNKNOWN, not "off"', async () => {
+    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    const s = useAgentStore()
+    await s.fetchOrgEphemeralKeysEnabled(TENANT_ID)
+    expect(s.orgEphemeralKeysEnabled).toBeNull()
+  })
+
+  it('mintEnrollKey POSTs the enroll-key path and hands back the one-time key', async () => {
+    mockApi.post.mockResolvedValueOnce({
+      key: 'jwt.shown.once',
+      id: 'k1',
+      jti: 'j1',
+      label: 'ci',
+      max_uses: 100,
+      expires_at: '2026-10-01T00:00:00Z',
+    })
+    const s = useAgentStore()
+    const resp = await s.mintEnrollKey(TENANT_ID, { label: 'ci' })
+    expect(mockApi.post.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/agent/enroll-key`)
+    expect(resp.key).toBe('jwt.shown.once')
+  })
+
+  it('listEnrollKeys GETs the list (which never carries the secret)', async () => {
+    mockApi.get.mockResolvedValueOnce({
+      items: [{ id: 'k1', jti: 'j1', label: 'ci', created_by: 'u1', max_uses: 100, uses: 3, expires_at: '2026-10-01T00:00:00Z', created_at: '2026-09-01T00:00:00Z' }],
+    })
+    const s = useAgentStore()
+    const rows = await s.listEnrollKeys(TENANT_ID)
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/agent/enroll-key`)
+    expect(rows).toHaveLength(1)
+    expect(Object.keys(rows[0]!)).not.toContain('key')
+  })
+
+  it('revokeEnrollKey DELETEs by key id', async () => {
+    mockApi.delete.mockResolvedValueOnce({})
+    const s = useAgentStore()
+    await s.revokeEnrollKey(TENANT_ID, 'k1')
+    expect(mockApi.delete.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/agent/enroll-key/k1`)
+  })
+
   it('fetchSshAudit passes the narrowing filters through', async () => {
     mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
     const s = useAgentStore()

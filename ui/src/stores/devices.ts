@@ -40,6 +40,9 @@ export interface DeviceRow {
    *  can SEE a rotation land. */
   overlay_public_key?: string
   overlay_key_epoch?: number
+  /** FR-51 — enrolled as temporary: reaped after silence, removed outright on
+   *  a clean stop; a later enrollment is a NEW device. Present only when true. */
+  ephemeral?: boolean
 }
 
 interface DeviceListResponse {

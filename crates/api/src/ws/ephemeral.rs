@@ -98,6 +98,19 @@ pub(crate) async fn remove_agent_device(
             .agents
             .hard_delete_ephemeral(agent.tenant_id, aid)
             .await?;
+        // P4 — close the lifecycle on the birth row (the record that
+        // survives the hard delete). Best-effort: a device with no key-use
+        // row (DAO-marked, pre-P2) simply has nothing to stamp.
+        match state
+            .enrollment_keys
+            .record_removal(agent.tenant_id, aid, reason)
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(agent_id = %aid, %e, "ephemeral removal stamp failed")
+            }
+        }
     } else {
         state.agents.soft_delete(agent.tenant_id, aid).await?;
     }
