@@ -59,6 +59,16 @@ impl Ipam {
             .unwrap()
     }
 
+    /// Live (non-tombstoned) nodes in this network.
+    async fn nodes_alive(&self) -> u64 {
+        self.nodes
+            .base
+            .collection()
+            .count_documents(doc! { "network_id": self.network_id, "deleted_at": null })
+            .await
+            .unwrap()
+    }
+
     /// Allocate a host bounded by the default `/10` ceiling — what
     /// `handle_overlay_join` passes for an unmigrated tenant (P2a).
     async fn alloc(&self) -> Result<u32, DaoError> {
@@ -1824,4 +1834,138 @@ async fn with_multi_block_off_a_full_network_still_refuses() {
         1,
         "no block may be appended with the flag off"
     );
+}
+
+/// FR-54 — an overlay network whose tenant row is gone is reported; one whose
+/// tenant EXISTS is not, archived or otherwise.
+///
+/// The second half is the one that keeps this route from being dangerous. An
+/// archived org is retired, not orphaned — its tenant row is right there — and
+/// a detector that conflated the two would offer to release a live
+/// organization's whole mesh because somebody archived it. That is a far worse
+/// bug than the one this route exists to find.
+#[tokio::test]
+async fn the_orphan_detector_finds_a_vanished_tenant_and_spares_an_archived_one() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(admin_id.to_hex());
+    })
+    .await;
+    let tokens = app
+        .state
+        .auth
+        .generate_tokens(admin_id, "padmin@test.io", "padmin")
+        .unwrap();
+
+    // Org A — will be orphaned by removing its tenant row, exactly as the
+    // production incident was created.
+    let a = app.seed_tenant("orph-gone").await;
+    let a_ipam = Ipam::new(&app, tid(&a.tenant_id)).await;
+    a_ipam.alloc().await.unwrap();
+    a_ipam
+        .create_node("orph-mach", "ghost-box", "100.64.0.1")
+        .await
+        .unwrap();
+
+    // Org B — alive, and then ARCHIVED. It must never be reported.
+    let b = app.seed_tenant("orph-archived").await;
+    let b_ipam = Ipam::new(&app, tid(&b.tenant_id)).await;
+    b_ipam.alloc().await.unwrap();
+    b_ipam
+        .create_node("live-mach", "live-box", "100.64.0.1")
+        .await
+        .unwrap();
+    roomler_ai_services::dao::tenant::TenantDao::new(&app.db)
+        .set_archived(tid(&b.tenant_id), true)
+        .await
+        .unwrap();
+
+    // Vanish A's tenant row — the manual surgery this route exists to detect.
+    app.db
+        .collection::<bson::Document>("tenants")
+        .delete_one(doc! { "_id": tid(&a.tenant_id) })
+        .await
+        .unwrap();
+
+    // Dry run: A is reported with its node, B is not, and nothing is written.
+    let body: Value = app
+        .auth_post("/api/admin/overlay-network/orphans", &tokens.access_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["dry_run"], true);
+    let orphans = body["orphans"].as_array().unwrap();
+    assert_eq!(orphans.len(), 1, "exactly one orphan: {orphans:?}");
+    assert_eq!(orphans[0]["tenant_id"], a.tenant_id);
+    assert_eq!(orphans[0]["nodes"][0]["name"], "ghost-box");
+    assert!(
+        orphans[0]["released"].as_array().unwrap().is_empty(),
+        "a dry run releases nothing"
+    );
+    assert_eq!(
+        b_ipam.nodes_alive().await,
+        1,
+        "the ARCHIVED org's node must be untouched"
+    );
+
+    // Apply: A's node is released through the real teardown.
+    let applied: Value = app
+        .auth_post("/api/admin/overlay-network/orphans", &tokens.access_token)
+        .json(&serde_json::json!({ "dry_run": false }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(applied["orphans"][0]["released"][0], "ghost-box");
+    assert_eq!(
+        a_ipam.nodes_alive().await,
+        0,
+        "the orphaned node is released"
+    );
+    assert_eq!(
+        b_ipam.nodes_alive().await,
+        1,
+        "and the archived org is STILL untouched"
+    );
+
+    // A second run has nothing left to report for A.
+    let again: Value = app
+        .auth_post("/api/admin/overlay-network/orphans", &tokens.access_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let still = again["orphans"].as_array().unwrap();
+    assert_eq!(still.len(), 1, "the network row itself remains, by design");
+    assert!(
+        still[0]["nodes"].as_array().unwrap().is_empty(),
+        "but it holds no nodes now"
+    );
+}
+
+/// A non-platform-admin gets 404, not 403 — the route must not confirm it
+/// exists to someone who may not use it.
+#[tokio::test]
+async fn the_orphan_detector_is_platform_operator_only() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("orph-authz").await;
+    let resp = app
+        .auth_post(
+            "/api/admin/overlay-network/orphans",
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
 }
