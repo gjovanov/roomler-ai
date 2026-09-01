@@ -354,7 +354,17 @@ n_files=$(printf '%s\n' "$RESULTS" | grep '^UNCLASSIFIED' | cut -f2 | sort -u | 
 
 case "$MODE" in
 report)
-    printf '%s\n' "$RESULTS" | grep '^UNCLASSIFIED' | \
+    # ⚠ The `|| true` is load-bearing and reads like noise, so it invites deletion.
+    # Under `set -euo pipefail` a `grep` that matches NOTHING exits 1 and takes the
+    # whole script with it. That meant this audit died SILENTLY, printing no summary
+    # at all, at exactly the moment the repo became FULLY CLASSIFIED -- the success
+    # case was indistinguishable from a crash. It stayed latent for the entire
+    # program because there was always one unclassified line left to keep grep happy.
+    # Every sibling grep above already carries this guard; this one alone did not.
+    #
+    # Scoped as `{ ...; }` rather than trailing the pipeline: `a | b || true` binds to
+    # the WHOLE pipeline and would mask a real awk failure downstream too.
+    printf '%s\n' "$RESULTS" | { grep '^UNCLASSIFIED' || true; } | \
         awk -F'\t' '{ if ($2 != last) { print ""; print "── " $2; last = $2 } printf "  %6s  %s\n", $3, substr($4, 1, 120) }'
     if [ "$n_stale" -gt 0 ]; then
         echo; echo "── stale anchor markers (cover no retired name)"
