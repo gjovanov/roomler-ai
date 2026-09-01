@@ -45,9 +45,11 @@ ports, backups — in **[`docs/self-hosting.md`](docs/self-hosting.md)**.
 
 Images are published at
 [`ghcr.io/gjovanov/roomler-ai`](https://github.com/gjovanov/roomler-ai/pkgs/container/roomler-ai)
-for linux/amd64. To build from source instead — always supported, and on arm64
-the only path — swap the last two lines for `up -d --build`; that compiles Rust
-and mediasoup, measured 6 minutes on a 16-core laptop, 15–20 on a small VPS.
+for **linux/amd64 and linux/arm64** — a Raspberry Pi, an Apple Silicon Mac or an
+ARM VPS pulls the same tag. To build from source instead — always supported, and
+never merely a fallback — swap the last two lines for `up -d --build`; that
+compiles Rust and mediasoup, measured 6 minutes on a 16-core laptop, 15–20 on a
+small VPS.
 
 **Hosted** — create a workspace at [roomler.ai](https://roomler.ai) and skip to
 the next step. Free for 3 devices.
