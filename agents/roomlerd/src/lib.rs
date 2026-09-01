@@ -58,6 +58,7 @@ pub mod lock_state;
 pub mod logs_fetch;
 pub mod macos_supervisor;
 pub mod mdns_resolve;
+pub mod power;
 pub mod remote_config;
 // P5 — crate-private: its surface leans on `peer::TargetResolution`
 // (pub(crate)) and nothing outside the agent consumes it. Compiled on
