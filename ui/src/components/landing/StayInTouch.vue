@@ -10,9 +10,14 @@
   previously unsubscribed — so this component deliberately shows ONE message and
   cannot report "you are already subscribed". That is the point: telling them
   apart here would leak list membership for an address the visitor may not own.
+
+  FR-58: `variant` — the original styling assumed the teal CTA parent ("dark");
+  "light" makes it reusable on white/pale surfaces (footer, the deferred
+  prompt). Emits `subscribed` on the one success path so a host surface can
+  latch "never ask again".
 -->
 <template>
-  <div class="stay-in-touch">
+  <div class="stay-in-touch" :class="variant === 'light' ? 'stay-light' : 'stay-dark'">
     <p class="text-body-2 mb-3 stay-sub">
       Not ready to sign up? Get an email when something notable ships.
     </p>
@@ -34,9 +39,9 @@
       />
       <v-btn
         type="submit"
-        color="white"
+        :color="variant === 'light' ? 'primary' : 'white'"
         variant="flat"
-        class="text-primary"
+        :class="variant === 'light' ? '' : 'text-primary'"
         :loading="busy"
         :disabled="!email.trim()"
       >
@@ -61,7 +66,11 @@ import { ref } from 'vue'
 import { api } from '@/api/client'
 import { useSnackbar } from '@/composables/useSnackbar'
 
-const props = withDefaults(defineProps<{ source?: string }>(), { source: 'landing' })
+const props = withDefaults(defineProps<{ source?: string; variant?: 'dark' | 'light' }>(), {
+  source: 'landing',
+  variant: 'dark',
+})
+const emit = defineEmits<{ subscribed: [] }>()
 
 const email = ref('')
 const busy = ref(false)
@@ -80,6 +89,7 @@ async function submit() {
     // this file. The server does not tell us which outcome occurred.
     done.value = true
     email.value = ''
+    emit('subscribed')
   } catch {
     // Only a transport or server failure lands here; a rejected address does
     // not, because the endpoint accepts everything that parses.
@@ -99,17 +109,34 @@ async function submit() {
   flex: 1 1 240px;
   min-width: 0;
 }
-.stay-sub,
-.stay-fine,
-.stay-done {
+/* The original look: white-on-teal, for the landing CTA parent. */
+.stay-dark .stay-sub,
+.stay-dark .stay-done {
   color: rgba(255, 255, 255, 0.86);
 }
-.stay-fine {
+.stay-dark .stay-fine {
   color: rgba(255, 255, 255, 0.68);
   line-height: 1.5;
 }
-.stay-link {
+.stay-dark .stay-link {
   color: rgba(255, 255, 255, 0.92);
   text-underline-offset: 2px;
+}
+/* Light surfaces: footer, the deferred prompt card. */
+.stay-light .stay-sub,
+.stay-light .stay-done {
+  color: rgba(26, 26, 46, 0.78);
+}
+.stay-light .stay-fine {
+  color: rgba(26, 26, 46, 0.6);
+  line-height: 1.5;
+}
+.stay-light .stay-link {
+  color: #00796b;
+  text-underline-offset: 2px;
+}
+.stay-light .stay-field :deep(.v-field) {
+  border: 1px solid rgba(0, 150, 136, 0.35);
+  box-shadow: none;
 }
 </style>

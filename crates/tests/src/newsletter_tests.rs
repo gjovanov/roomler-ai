@@ -627,3 +627,137 @@ async fn stale_rows_are_reported_live_and_retried_only_on_request() {
     );
     assert_eq!(st["counts"]["stale"], 0);
 }
+
+// ── P4: the signed-in toggle — a different door into the SAME list ──────
+
+#[tokio::test]
+async fn signed_in_toggle_is_a_door_into_the_same_list() {
+    let app = TestApp::spawn().await;
+    let user = app
+        .register_user(
+            "member@test.io",
+            "member",
+            "Member",
+            "correct-horse-battery",
+            None,
+            None,
+        )
+        .await;
+
+    // Fresh account: not subscribed.
+    let r = app
+        .auth_get("/api/user/newsletter", &user.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let pref: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(pref["subscribed"], false);
+
+    // An UNVERIFIED account must not pre-confirm — ownership is the whole
+    // basis for skipping the confirmation mail. (register_user auto-verifies
+    // for tests, so un-verify first.)
+    app.db
+        .collection::<bson::Document>("users")
+        .update_one(
+            doc! { "email": "member@test.io" },
+            doc! { "$set": { "is_verified": false } },
+        )
+        .await
+        .unwrap();
+    let r = app
+        .auth_put("/api/user/newsletter", &user.access_token)
+        .json(&serde_json::json!({ "subscribed": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        422,
+        "unverified ⇒ the public form's job"
+    );
+    app.db
+        .collection::<bson::Document>("users")
+        .update_one(
+            doc! { "email": "member@test.io" },
+            doc! { "$set": { "is_verified": true } },
+        )
+        .await
+        .unwrap();
+
+    // Verified: subscribing is pre-confirmed, source `account`, and the exit
+    // is built with the entrance (an unsubscribe token exists immediately).
+    let r = app
+        .auth_put("/api/user/newsletter", &user.access_token)
+        .json(&serde_json::json!({ "subscribed": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let row = app
+        .db
+        .collection::<bson::Document>("subscribers")
+        .find_one(doc! { "email": "member@test.io" })
+        .await
+        .unwrap()
+        .expect("the toggle writes the subscribers store — the same list");
+    assert!(row.get_bool("confirmed").unwrap());
+    assert_eq!(row.get_str("source").unwrap(), "account");
+    let unsub_token = row.get_str("unsubscribe_token").unwrap().to_string();
+    assert!(!unsub_token.is_empty());
+
+    // Toggling off stamps the row like every other withdrawal…
+    let r = app
+        .auth_put("/api/user/newsletter", &user.access_token)
+        .json(&serde_json::json!({ "subscribed": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let row = app
+        .db
+        .collection::<bson::Document>("subscribers")
+        .find_one(doc! { "email": "member@test.io" })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.get("unsubscribed_at").is_some(), "kept and stamped");
+
+    // …and toggling back on is fresh consent on proven ownership.
+    let r = app
+        .auth_put("/api/user/newsletter", &user.access_token)
+        .json(&serde_json::json!({ "subscribed": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let r = app
+        .auth_get("/api/user/newsletter", &user.access_token)
+        .send()
+        .await
+        .unwrap();
+    let pref: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(pref["subscribed"], true);
+
+    // The public one-click unsubscribe still covers this row — one list,
+    // every exit door works on it.
+    let r = app
+        .client
+        .post(app.url(&format!("/api/subscribe/unsubscribe/{unsub_token}")))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("List-Unsubscribe=One-Click")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let r = app
+        .auth_get("/api/user/newsletter", &user.access_token)
+        .send()
+        .await
+        .unwrap();
+    let pref: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        pref["subscribed"], false,
+        "the toggle reads the same store the public unsubscribe wrote"
+    );
+}
