@@ -187,6 +187,12 @@ enum Command {
         /// RemoteDesktop backend.
         #[arg(long)]
         input: bool,
+        /// FR-45 P5 — with --stream: take the frames from
+        /// `org.gnome.Mutter.ScreenCast` DIRECTLY instead of the portal. ⚠️
+        /// This shows NO consent dialog; it is the unattended sibling, for
+        /// hosts where no portal backend can run.
+        #[arg(long)]
+        mutter: bool,
     },
     /// (internal, Linux) FR-45 P2b — open a portal ScreenCast session THROUGH
     /// the session helper and print what came back.
@@ -1114,10 +1120,11 @@ async fn daemon_main() -> Result<()> {
             screencast,
             stream,
             input,
+            mutter,
         } => {
             #[cfg(all(target_os = "linux", feature = "portal-capture"))]
             {
-                roomlerd::capture::portal::helper::run(screencast, stream, input);
+                roomlerd::capture::portal::helper::run(screencast, stream, input, mutter);
                 Ok(())
             }
             // A build without the feature must say so rather than exit 0 with
@@ -1126,7 +1133,7 @@ async fn daemon_main() -> Result<()> {
             // answer from "this binary cannot ask".
             #[cfg(not(all(target_os = "linux", feature = "portal-capture")))]
             {
-                let _ = (screencast, stream, input);
+                let _ = (screencast, stream, input, mutter);
                 anyhow::bail!(
                     "portal-helper is Linux-only and needs the `portal-capture` feature; this \
                      build cannot query the desktop portal"
