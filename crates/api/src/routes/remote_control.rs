@@ -450,6 +450,11 @@ pub struct AgentResponse {
     /// its inactivity TTL, and removal is final (hard delete, no tombstone).
     /// The grid badges it so an operator is never surprised by the vanishing.
     pub ephemeral: bool,
+    /// FR-51 P4 — the per-device inactivity deadline override, for the badge
+    /// tooltip. Absent = the server default applies (and on a permanent
+    /// device the field is meaningless and always absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_ttl_secs: Option<u64>,
     /// Three-state truth: `online` | `stale` | `offline` (Phase A-1).
     pub presence: AgentPresence,
     /// Back-compat bool = `presence == online` (a socket is actually
@@ -1665,6 +1670,7 @@ fn to_agent_response(
         companion_version: a.companion_version,
         status: a.status,
         ephemeral: a.ephemeral,
+        ephemeral_ttl_secs: a.ephemeral_ttl_secs,
         is_online,
         last_seen_at: fmt_dt(a.last_seen_at),
         access_policy: a.access_policy,
