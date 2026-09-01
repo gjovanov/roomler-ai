@@ -329,6 +329,34 @@ pub async fn ensure_indexes(db: &Database, multi_block: bool) -> Result<(), mong
     )
     .await?;
 
+    // FR-51 P2 — reusable ephemeral enrollment keys. `jti` is the value the
+    // atomic use-claim is keyed by; unique GLOBALLY (jtis are uuid4, and a
+    // cross-tenant collision would let one org's claim decrement another's
+    // ceiling). No TTL: a dead key is a record until pruning is decided
+    // explicitly (P4).
+    create_indexes(
+        db,
+        "enrollment_keys",
+        vec![
+            index_unique(bson::doc! { "jti": 1 }),
+            index(bson::doc! { "tenant_id": 1, "created_at": -1 }),
+        ],
+    )
+    .await?;
+
+    // FR-51 P2 — one row per successful key use: the trail that survives the
+    // reap (ephemeral device rows hard-delete). 90-day TTL like the other
+    // audit collections.
+    create_indexes(
+        db,
+        "enrollment_key_uses",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "key_id": 1, "created_at": -1 }),
+            index_ttl(bson::doc! { "created_at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Multi-org P2b — the GLOBAL overlay block registry. Deliberately NOT
     // tenant-scoped: its entire job is guaranteeing that two tenants can
     // never hold overlapping slices of 100.64.0.0/10.
