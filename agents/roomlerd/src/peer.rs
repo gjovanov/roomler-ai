@@ -3306,8 +3306,7 @@ async fn media_pump_vp9_444_dc(
     let mut governor = crate::encode::governor::RateGovernor::new(
         target_fps,
         send_depth,
-        crate::encode::measured_ceiling_enabled(),
-        crate::encode::relay_age_feedback_enabled(),
+        crate::encode::governor::GovernorFlags::from_env(),
         // FR-35 — the ceiling learner is field-verified on the FFmpeg pump
         // only; this pump keeps today's fixed ceiling in P1.
         0,
@@ -3784,16 +3783,27 @@ async fn media_pump_vp9_444_dc(
             // ceiling + byte gate), learned always so the heartbeat can
             // report it on every transport.
             || viewer_report.take_age(),
+            // FR-59 P3 — the viewer's link report (arrival rate + how much
+            // its transit queue grew). Needs no clock probe, so it speaks
+            // in the windows the age above cannot.
+            || viewer_report.take_link(),
             constrained_transport,
             |own_div| pipeline.step_viewer_windows(own_div, target_fps),
             bytes_written.load(std::sync::atomic::Ordering::Relaxed),
-        ) && (vw.changed || vw.struggling || vw.age_over)
+        ) && (vw.changed
+            || vw.struggling
+            || vw.age_over
+            || vw.link_congested
+            || vw.drain_for_ms.is_some())
         {
             info!(
                 %session_id,
                 reported_fps = vw.reported_fps,
                 struggling = vw.struggling,
                 age_over = vw.age_over,
+                link_congested = vw.link_congested,
+                link_ceiling_bps = ?vw.link_ceiling_bps,
+                drain_for_ms = ?vw.drain_for_ms,
                 age_ms = vw.age_ms.map(|(a, _)| a),
                 age_floor_ms = vw.age_ms.and(governor.viewer_age().map(|(_, f)| f)),
                 cap_fps = vw.cap_fps,
@@ -3801,6 +3811,17 @@ async fn media_pump_vp9_444_dc(
                 frames_skipped_decode = governor.frames_skipped_decode(),
                 "VP9-444 DC pump: viewer-rate fps cap"
             );
+        }
+        // FR-59 P4 — the transit queue is deeper than a rate cut can clear
+        // in reasonable time, so stop feeding it and let it drain. Skipping
+        // production (rather than discarding what is already queued) is the
+        // only lever that reaches a queue living in the relay and the
+        // carrier: those bytes are already gone and cannot be recalled.
+        // Bounded sub-second, and NO forced keyframe on resume — a pause
+        // loses no frames, so the delta chain survives it intact.
+        if governor.draining(std::time::Instant::now()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
         }
         if governor.should_skip_delta_frame(force_keyframe_this_iter) {
             continue;
@@ -4136,6 +4157,11 @@ async fn media_pump_vp9_444_dc(
                 viewer_age_ms = ?governor.viewer_age().map(|(a, _)| a),
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 viewer_age_implausible = governor.viewer_age_implausible(),
+                // FR-59 P1 — see the FFmpeg pump's heartbeat.
+                slow_link_floor_bps = ?governor.relieved_floor_bps(),
+                // FR-59 P3/P4 — (congested windows, drains ordered, live
+                // queue-depth estimate in ms) from the viewer-side loop.
+                link_stats = ?governor.link_stats(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
             qp_sum = 0;
@@ -4505,11 +4531,41 @@ async fn media_pump_ffmpeg_dc(
     // an explicit env override wins either way. P3 — `mut`: the persisted-flip
     // rebuild retargets it mid-session.
     let mut target_fps: u32 = ffmpeg_target_fps(constrained);
+    // FR-59 P5 — a pair the rate memory remembers as slow opens with fewer
+    // pixels and fewer frames. The bitrate levers (P1-P4) can make the
+    // encoder TRACK a 400 kbps pipe but cannot make 1920x1200 at 30 fps
+    // legible through it — that is ~1.7 KB per frame. Resolved ONCE here,
+    // never as a mid-session rung: every rung flip pays a blocking encoder
+    // open (0.65-0.87 s measured on Iris Xe) plus a fresh IDR, which is why
+    // `priority_relay_cap`'s dims-caps are off by default. Opening at the
+    // right size costs neither.
+    let slow_link_profile = if constrained {
+        crate::encode::rate_profile::slow_link_profile(
+            rate_seed,
+            crate::encode::slow_link_profile_enabled(),
+        )
+    } else {
+        None
+    };
+    if let Some(p) = slow_link_profile {
+        target_fps = target_fps.min(p.max_fps);
+        info!(
+            %session_id,
+            codec_label,
+            remembered_bps = ?rate_seed,
+            max_long_edge = p.max_long_edge,
+            max_fps = p.max_fps,
+            target_fps,
+            "FR-59 P5 slow-link profile engaged — the pair is remembered as slow, \
+             opening with fewer pixels and fewer frames"
+        );
+    }
     let downscale = crate::capture::DownscalePolicy::Never;
     info!(
         %session_id,
         codec_label,
         target_fps,
+        slow_link = slow_link_profile.is_some(),
         "FFmpeg DC pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
@@ -4669,6 +4725,10 @@ async fn media_pump_ffmpeg_dc(
     let inflight_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let constrained_queue_budget =
         crate::encode::rate_profile::constrained_queue_budget_bytes(crate::encode::relay_max_bps());
+    // FR-59 P2 — process-stable kill switch for denominating that budget in
+    // the MEASURED rate instead of the nominal relay ceiling. Resolved once
+    // (env/config are process-stable) and read at the gate every iteration.
+    let constrained_queue_measured = crate::encode::constrained_queue_measured_enabled();
     // 2026-08-26 — queue-wait telemetry (P7 of the drag-latency design):
     // enqueue→wire-complete per frame, accumulated by the send task and
     // drained by the heartbeat. Sent frames only — a stale-dropped frame
@@ -4762,8 +4822,7 @@ async fn media_pump_ffmpeg_dc(
     let mut governor = crate::encode::governor::RateGovernor::new(
         target_fps,
         ffmpeg_send_depth,
-        crate::encode::measured_ceiling_enabled(),
-        crate::encode::relay_age_feedback_enabled(),
+        crate::encode::governor::GovernorFlags::from_env(),
         // FR-35 — the constrained ceiling learns the pair (0 = off).
         rate_hi_bps,
         rate_seed,
@@ -5160,13 +5219,31 @@ async fn media_pump_ffmpeg_dc(
             );
             return;
         }
-        // 2026-08-26 — the byte budget now bounds BOTH paths. Constrained
-        // keeps its once-resolved 450 ms-of-relay-ceiling budget; direct
+        // 2026-08-26 — the byte budget now bounds BOTH paths; direct
         // re-derives 150 ms of the AIMD's live applied target each
         // iteration (fallback: the last policy ceiling before the first
         // apply; unbounded until either exists).
+        //
+        // FR-59 P2 (2026-09-01) — constrained re-derives too. Its budget
+        // used to be resolved ONCE against `relay_max_bps()`, which makes
+        // "450 ms of queue" a claim about a nominal 3 Mbps band rather than
+        // about this session's pipe: field CORPLAP-3 → neo16 over a phone
+        // hotspot, 168 750 bytes of budget against a MEASURED 395 kbps link
+        // is 3.4 SECONDS of standing queue, and the gate never fired while
+        // viewer paint age ran 2.3-7.1 s. A held goodput estimate may only
+        // ever LOWER the reference rate.
         let queue_budget = if constrained {
-            constrained_queue_budget
+            let measured = governor.measured_goodput_bps(std::time::Instant::now());
+            let reference = crate::encode::rate_profile::constrained_queue_reference_bps(
+                crate::encode::relay_max_bps(),
+                measured,
+                constrained_queue_measured,
+            );
+            if reference == crate::encode::relay_max_bps() {
+                constrained_queue_budget
+            } else {
+                crate::encode::rate_profile::constrained_queue_budget_bytes(reference)
+            }
         } else {
             let rate = match governor.applied_bps() {
                 0 => last_ceiling_bps,
@@ -5509,10 +5586,22 @@ async fn media_pump_ffmpeg_dc(
             native_h: cap_native_h,
             merged_target: user_target,
             merged_priority_cap: pipeline.merged_priority_cap(
-                crate::encode::priority_relay_cap(
-                    priority.load(std::sync::atomic::Ordering::Relaxed),
-                    constrained,
-                ),
+                // FR-59 P5 — the slow-link profile's long-edge cap rides the
+                // SAME slot as the Priority dial's, so it flows through
+                // `plan_dims` unchanged and an explicit operator pick still
+                // wins by the existing merge rules. `min` rather than
+                // replace: a dial that already asked for fewer pixels than
+                // the profile keeps them.
+                match (
+                    crate::encode::priority_relay_cap(
+                        priority.load(std::sync::atomic::Ordering::Relaxed),
+                        constrained,
+                    ),
+                    slow_link_profile.map(|p| p.max_long_edge),
+                ) {
+                    (Some(dial), Some(slow)) => Some(dial.min(slow)),
+                    (dial, slow) => dial.or(slow),
+                },
                 constrained,
             ),
             refined: idle_refine.refined(),
@@ -5782,10 +5871,28 @@ async fn media_pump_ffmpeg_dc(
             // FR-15 — see the VP9 pump: acted on only when constrained,
             // learned on every transport.
             || viewer_report.take_age(),
+            // FR-59 P3 — the viewer's link report (arrival rate + how much
+            // its transit queue grew). Needs no clock probe, so it speaks
+            // in the windows the age above cannot.
+            || viewer_report.take_link(),
             constrained,
             |own_div| pipeline.step_viewer_windows(own_div, target_fps),
             bytes_written.load(std::sync::atomic::Ordering::Relaxed),
         );
+        // FR-59 P6 — drained unconditionally (not inside the viewer-window
+        // arm): the abandonment is a one-shot from the learner, so a window
+        // that does not tick must not swallow the only line that explains
+        // why the ceiling moved.
+        if let Some(dropped) = governor.take_seed_abandoned() {
+            info!(
+                %session_id,
+                codec_label,
+                abandoned_bps = dropped,
+                measured_bps = ?governor.measured_goodput_bps(std::time::Instant::now()),
+                "FR-59 P6: the measured pipe contradicts the learned ceiling — abandoning it \
+                 (relay-keyed rate memory can carry a fast day onto a slow one)"
+            );
+        }
         if let Some(vw) = viewer_window {
             // FR-35 — one line per ceiling step, and the session's stable
             // rate handed to the memory guard for persistence at pump end.
@@ -5815,7 +5922,11 @@ async fn media_pump_ffmpeg_dc(
                 .store(governor.decreases(), std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(vw) = viewer_window
-            && (vw.changed || vw.struggling || vw.age_over)
+            && (vw.changed
+                || vw.struggling
+                || vw.age_over
+                || vw.link_congested
+                || vw.drain_for_ms.is_some())
         {
             info!(
                 %session_id,
@@ -5823,6 +5934,9 @@ async fn media_pump_ffmpeg_dc(
                 reported_fps = vw.reported_fps,
                 struggling = vw.struggling,
                 age_over = vw.age_over,
+                link_congested = vw.link_congested,
+                link_ceiling_bps = ?vw.link_ceiling_bps,
+                drain_for_ms = ?vw.drain_for_ms,
                 age_ms = vw.age_ms.map(|(a, _)| a),
                 age_floor_ms = vw.age_ms.and(governor.viewer_age().map(|(_, f)| f)),
                 cap_fps = vw.cap_fps,
@@ -5830,6 +5944,17 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_decode = governor.frames_skipped_decode(),
                 "FFmpeg DC pump: viewer-rate fps cap"
             );
+        }
+        // FR-59 P4 — the transit queue is deeper than a rate cut can clear
+        // in reasonable time, so stop feeding it and let it drain. Skipping
+        // production (rather than discarding what is already queued) is the
+        // only lever that reaches a queue living in the relay and the
+        // carrier: those bytes are already gone and cannot be recalled.
+        // Bounded sub-second, and NO forced keyframe on resume — a pause
+        // loses no frames, so the delta chain survives it intact.
+        if governor.draining(std::time::Instant::now()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
         }
         if governor.should_skip_delta_frame(force_keyframe_this_iter) {
             continue;
@@ -6427,6 +6552,16 @@ async fn media_pump_ffmpeg_dc(
                 viewer_age_ms = ?governor.viewer_age().map(|(a, _)| a),
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 viewer_age_implausible = governor.viewer_age_implausible(),
+                // FR-59 P1 — the floor actually in force once the measured
+                // pipe has been shown to sit under the nominal legibility
+                // minimum. None = the flat floor stands, which on a slow
+                // link is the thing to notice: without this field, "the
+                // relief let go" and "nothing was ever measured" read the
+                // same, and they need opposite fixes.
+                slow_link_floor_bps = ?governor.relieved_floor_bps(),
+                // FR-59 P3/P4 — (congested windows, drains ordered, live
+                // queue-depth estimate in ms) from the viewer-side loop.
+                link_stats = ?governor.link_stats(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
@@ -7003,6 +7138,23 @@ fn attach_control_handler(
                             a.min(u16::MAX as u64) as u16,
                             m.min(u16::MAX as u64) as u16,
                             rtt.min(u16::MAX as u64) as u16,
+                        ));
+                    }
+                    // FR-59 P3 — the viewer's LINK report: bytes/s it
+                    // actually received this window, and how much its
+                    // transit queue grew (signed ms). Needs no clock
+                    // probe, so it survives exactly the conditions that
+                    // silence the age above. Both must be present:
+                    // `rx_bps` alone says nothing about capacity (see
+                    // `viewer_rate::LinkLoop`), and a drift without a
+                    // rate cannot bound a ceiling.
+                    if let (Some(rx), Some(q)) = (
+                        val.get("rx_bps").and_then(|v| v.as_u64()),
+                        val.get("queue_ms").and_then(|v| v.as_i64()),
+                    ) {
+                        viewer_report.store_link(crate::encode::viewer_rate::pack_link(
+                            rx.min(u32::MAX as u64) as u32,
+                            q.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
                         ));
                     }
                 }

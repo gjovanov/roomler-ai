@@ -323,12 +323,113 @@ pub fn constrained_queue_ms() -> u64 {
 /// [`constrained_queue_ms`] resolved against a link ceiling into a byte
 /// budget for the pump's backpressure gate. `0` ms disables the gate
 /// (`usize::MAX`).
+///
+/// FR-59 P2 — floored at [`CONSTRAINED_QUEUE_MIN_BYTES`] so a momentarily
+/// absurd reference rate cannot gate every single frame.
 pub fn constrained_queue_budget_bytes(ceiling_bps: u32) -> usize {
     let ms = constrained_queue_ms();
     if ms == 0 {
         return usize::MAX;
     }
-    ((ceiling_bps as u64).saturating_mul(ms) / 8000) as usize
+    (((ceiling_bps as u64).saturating_mul(ms) / 8000) as usize).max(CONSTRAINED_QUEUE_MIN_BYTES)
+}
+
+/// FR-59 P5 — a link at or below this remembered rate opens in the
+/// slow-link profile (bps). Env `ROOMLERD_SLOW_LINK_PROFILE_BPS` /
+/// config `slow_link_profile_bps` (default 1 000 000, 0 = never).
+pub fn slow_link_profile_bps() -> u32 {
+    tunnel_core::env::node_env("SLOW_LINK_PROFILE_BPS")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(1_000_000)
+}
+
+/// FR-59 P5 — what a session opens with when the pair is remembered as
+/// slow: fewer pixels and fewer frames, resolved ONCE at pump start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowLinkProfile {
+    /// Long-edge resolution cap, px.
+    pub max_long_edge: u32,
+    /// Capture/send frame rate cap.
+    pub max_fps: u32,
+}
+
+/// FR-59 P5 — resolve the opening profile from the rate the memory holds
+/// for this pair.
+///
+/// The bitrate levers (P1–P4) can make the encoder TRACK a slow pipe, but
+/// they cannot make 1920×1200 at 30 fps legible through it: at 400 kbps
+/// that is ~1 700 bytes per frame, below what any encoder can do
+/// something with. Halving the long edge quarters the pixel count and
+/// halving the frame rate doubles the per-frame budget — together ~8× the
+/// bits per pixel. That is the lever a bitrate floor cannot provide, and
+/// it is why `slow_link_min_bitrate_bps` stops where it does rather than
+/// chasing the pipe to zero.
+///
+/// ⚠ Resolved ONCE, at pump start, deliberately. `priority_relay_cap`'s
+/// dims-caps are off by default because every mid-motion rung flip pays a
+/// BLOCKING encoder open — field-measured 0.65–0.87 s on Iris Xe — plus a
+/// fresh IDR behind the queued frames, and the user-felt result was worse
+/// than never flipping. Opening at the right size costs neither.
+///
+/// ⚠ The input is the REMEMBERED rate, not a live measurement, because at
+/// pump start there is no measurement yet and waiting for one would make
+/// this a mid-session rung. That inherits FR-35's relay-keyed staleness
+/// (see P6) — but the failure mode is benign and asymmetric: a fast link
+/// misremembered as slow opens soft and stays usable, where a slow link
+/// opened at native is the defect this FR exists for.
+pub fn slow_link_profile(remembered_bps: Option<u32>, enabled: bool) -> Option<SlowLinkProfile> {
+    if !enabled {
+        return None;
+    }
+    let threshold = slow_link_profile_bps();
+    if threshold == 0 {
+        return None;
+    }
+    match remembered_bps {
+        // A pair with no memory opens as it always has: an unknown link is
+        // not a slow one, and guessing soft would degrade every FIRST
+        // session on every healthy relay.
+        Some(bps) if bps > 0 && bps <= threshold => Some(SlowLinkProfile {
+            max_long_edge: 1280,
+            max_fps: 15,
+        }),
+        _ => None,
+    }
+}
+
+/// FR-59 P2 — the smallest constrained queue budget, one SCTP chunk. The
+/// gate compares whole FRAMES in flight, so a budget under one chunk
+/// would gate before anything could be in flight at all; this keeps the
+/// pump able to have one frame on the wire while still being, at
+/// 400 kbps, only ~330 ms of queue.
+pub const CONSTRAINED_QUEUE_MIN_BYTES: usize = 16 * 1024;
+
+/// FR-59 P2 — the reference rate [`constrained_queue_budget_bytes`] is
+/// denominated in.
+///
+/// The budget used to be resolved ONCE at pump start against
+/// `relay_max_bps()`, which makes "450 ms of queue" a claim about a
+/// nominal 3 Mbps band rather than about this session's pipe. Field
+/// 2026-09-01 (CORPLAP-3 → neo16 over a phone hotspot): 168 750 bytes of
+/// budget against a MEASURED 395 kbps link is **3.4 seconds** of standing
+/// queue, so `frames_dropped_backpressure` stayed 0 while viewer paint age
+/// ran 2.3–7.1 s.
+///
+/// A held measurement may only ever LOWER the reference — the same
+/// one-directional rule the measured CEILING clamp uses, and the reason
+/// this is safe to consume where the ceiling is not: an under-estimate
+/// makes the budget smaller, which sheds more and lowers latency, while
+/// an under-estimated ceiling collapses quality. `enabled` false returns
+/// the ceiling verbatim (the pre-FR-59 posture).
+pub fn constrained_queue_reference_bps(
+    ceiling_bps: u32,
+    measured_bps: Option<u32>,
+    enabled: bool,
+) -> u32 {
+    match measured_bps {
+        Some(g) if enabled && g > 0 => ceiling_bps.min(g),
+        _ => ceiling_bps,
+    }
 }
 
 /// HRD/VBV window for CONSTRAINED sessions, as a percent of `maxrate`.
@@ -1141,6 +1242,60 @@ mod tests {
         assert_eq!(apply_cq_bias(22, 0), 22);
     }
 
+    /// FR-59 P5 — the profile engages only on REMEMBERED evidence that the
+    /// pair is slow, and a pair with no memory opens exactly as before.
+    #[test]
+    fn the_slow_link_profile_engages_only_on_a_remembered_slow_pair() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The field pair: 395 kbps remembered ⇒ fewer pixels, fewer frames.
+        let p = slow_link_profile(Some(395_122), true).expect("engages");
+        assert_eq!(p.max_long_edge, 1280);
+        assert_eq!(p.max_fps, 15);
+        // A healthy relay is untouched.
+        assert_eq!(slow_link_profile(Some(3_000_000), true), None);
+        // ⚠ No memory is NOT evidence of a slow link — guessing soft would
+        // degrade the FIRST session on every healthy relay.
+        assert_eq!(slow_link_profile(None, true), None);
+        assert_eq!(slow_link_profile(Some(0), true), None);
+        // Kill switch.
+        assert_eq!(slow_link_profile(Some(395_122), false), None);
+    }
+
+    /// FR-59 P2 — the reference rate is one-directional: a measurement may
+    /// LOWER what the budget is denominated in, never raise it, and the
+    /// kill switch restores the nominal ceiling verbatim.
+    #[test]
+    fn constrained_queue_reference_only_ever_lowers() {
+        // The field case: a 3 Mbps nominal against a measured 395 kbps.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, Some(395_122), true),
+            395_122
+        );
+        // A measurement ABOVE the ceiling never widens the budget — the
+        // ceiling is still the rate the encoder is allowed to produce at.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, Some(9_000_000), true),
+            3_000_000
+        );
+        // No estimate held (early session, idle link) ⇒ nominal.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, None, true),
+            3_000_000
+        );
+        // A zero measurement is not evidence, it is the absence of it.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, Some(0), true),
+            3_000_000
+        );
+        // Kill switch: the pre-FR-59 posture, ignoring a real measurement.
+        assert_eq!(
+            constrained_queue_reference_bps(3_000_000, Some(395_122), false),
+            3_000_000
+        );
+    }
+
     #[test]
     fn constrained_queue_budget_resolves_ms_of_ceiling() {
         let _guard = crate::encode::RELAY_ENV_LOCK
@@ -1150,6 +1305,15 @@ mod tests {
         assert_eq!(constrained_queue_budget_bytes(3_000_000), 168_750);
         // Scales with the ceiling.
         assert_eq!(constrained_queue_budget_bytes(1_000_000), 56_250);
+        // FR-59 P2 — the field reference: 450 ms of a MEASURED 395 kbps
+        // pipe is 22,225 bytes, not the 168,750 the nominal band claimed.
+        assert_eq!(constrained_queue_budget_bytes(395_122), 22_225);
+        // …and an absurd reference stops at one SCTP chunk rather than
+        // gating before a single frame can be in flight.
+        assert_eq!(
+            constrained_queue_budget_bytes(50_000),
+            CONSTRAINED_QUEUE_MIN_BYTES
+        );
         // Default knobs (env-free): relief 4 softening steps; HRD default
         // 200 (rc.443 — a sub-1× window killed av1_qsv on its settle IDR,
         // see `constrained_hrd_pct`).

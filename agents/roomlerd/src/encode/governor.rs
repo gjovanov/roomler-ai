@@ -84,6 +84,16 @@ pub struct ViewerWindow {
     /// FR-35 — the ceiling learner stepped the constrained ceiling up this
     /// window (for the pump's log line).
     pub ceiling_grown: Option<super::ceiling_learn::Grow>,
+    /// FR-59 P3 — the viewer's transit queue has grown for two
+    /// consecutive windows: the agent is putting bits in faster than they
+    /// come out, whatever its own send queue says.
+    pub link_congested: bool,
+    /// FR-59 P3 — the ceiling that window's ARRIVAL rate justifies.
+    /// `None` unless `link_congested` — see `viewer_rate::LinkLoop`.
+    pub link_ceiling_bps: Option<u32>,
+    /// FR-59 P4 — production is pausing this long so the transit queue
+    /// can drain. `None` = no drain ordered this window.
+    pub drain_for_ms: Option<u32>,
 }
 
 /// Outcome of a heartbeat tier step, emitted only when the
@@ -93,6 +103,71 @@ pub struct ViewerWindow {
 pub struct TierChange {
     pub cap_long_edge: Option<u32>,
     pub ewma_encode_ms: f32,
+}
+
+/// Every rate kill switch the governor honours, resolved ONCE by the pump
+/// from env/config so the governor itself stays pure.
+///
+/// A struct rather than a row of positional `bool`s: FR-59 added two more
+/// to the two that were already there, and four adjacent bools at a call
+/// site is a transposition waiting to happen — one that no test would
+/// catch, because every one of them is a legal value in every position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GovernorFlags {
+    /// Measured-rate stage 1 — a held goodput estimate clamps the nominal
+    /// ceiling (`encode::measured_ceiling_enabled`). DIRECT paths only;
+    /// see `pre_encode_tick`. False = observe-and-report only.
+    pub measured_ceiling: bool,
+    /// FR-15 — the constrained-transport age loop may ACT, not merely
+    /// learn and report (`encode::relay_age_feedback_enabled`).
+    pub age_feedback: bool,
+    /// FR-59 P1 — the AIMD floor may descend toward a MEASURED pipe on a
+    /// constrained transport (`encode::slow_link_floor_enabled`).
+    pub floor_relief: bool,
+    /// FR-59 P6 — a measurement that contradicts the FR-35 learned/seeded
+    /// ceiling abandons it (`encode::seed_contradiction_enabled`).
+    pub seed_contradiction: bool,
+    /// FR-59 P3 — the viewer's own arrival rate may clamp the constrained
+    /// ceiling while its transit queue is growing
+    /// (`encode::viewer_rate_clamp_enabled`).
+    pub viewer_rate_clamp: bool,
+    /// FR-59 P4 — a transit queue too deep to cut our way out of is
+    /// DRAINED by pausing production (`encode::queue_drain_enabled`).
+    pub queue_drain: bool,
+}
+
+impl Default for GovernorFlags {
+    /// All on — the shipped posture. Tests that care flip one field BY
+    /// NAME; tests that do not get the production behaviour.
+    fn default() -> Self {
+        Self {
+            measured_ceiling: true,
+            age_feedback: true,
+            floor_relief: true,
+            seed_contradiction: true,
+            viewer_rate_clamp: true,
+            queue_drain: true,
+        }
+    }
+}
+
+impl GovernorFlags {
+    /// The shipped posture, read from env/config. The pumps call this;
+    /// tests construct the struct literally.
+    #[cfg_attr(
+        not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+        allow(dead_code)
+    )]
+    pub fn from_env() -> Self {
+        Self {
+            measured_ceiling: super::measured_ceiling_enabled(),
+            age_feedback: super::relay_age_feedback_enabled(),
+            floor_relief: super::slow_link_floor_enabled(),
+            seed_contradiction: super::seed_contradiction_enabled(),
+            viewer_rate_clamp: super::viewer_rate_clamp_enabled(),
+            queue_drain: super::queue_drain_enabled(),
+        }
+    }
 }
 
 /// One `RateGovernor` per pump instance. See the module docs for
@@ -150,21 +225,50 @@ pub struct RateGovernor {
     /// Send-task byte total at the last viewer window, for the window's
     /// delivered rate (the learner's "carried" evidence).
     last_sent_bytes: u64,
+
+    /// FR-59 — the slow-link kill switches.
+    slow_link: GovernorFlags,
+    /// FR-59 P6 — the ceiling a measurement contradicted, parked here for
+    /// the pump to log. Drained by `take_seed_abandoned`; the learner only
+    /// ever reports an abandonment once, so this cannot spam.
+    seed_abandoned_bps: Option<u32>,
+    /// FR-59 P1 — the floor actually in force after the evidence-gated
+    /// relief, for the heartbeat. `None` = the nominal floor stands.
+    relieved_floor_bps: Option<u32>,
+    /// FR-59 P3 — the viewer-side congestion loop.
+    link_loop: viewer_rate::LinkLoop,
+    /// FR-59 P3 — the viewer's ARRIVAL rate and when it was reported.
+    /// Held only while its queue is growing (see `viewer_rate::LinkLoop`
+    /// for why that gate is not optional), and expired by
+    /// [`LINK_CEILING_TTL`] so a viewer that goes SILENT cannot pin the
+    /// session forever — silence is not evidence of congestion. Stored
+    /// RAW rather than pre-discounted, because it feeds two consumers
+    /// with different margins: the P3 ceiling clamp and the P1 floor.
+    link_rx_bps: Option<(u32, Instant)>,
+    /// FR-59 P4 — production is paused until this instant so the transit
+    /// queue can drain. An INSTANT rather than a countdown, because the
+    /// pump polls it from a loop that may not tick at all while paused.
+    drain_until: Option<Instant>,
 }
 
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
 const VIEWER_WINDOW: Duration = Duration::from_secs(1);
 
+/// FR-59 P3 — how long an arrival-rate ceiling outlives the window that
+/// produced it. Generous enough to bridge a viewer that skips a report,
+/// short enough that a viewer which goes away entirely cannot leave the
+/// session clamped: silence is not evidence of congestion, and the loop
+/// clears the clamp on the first non-congested window anyway.
+const LINK_CEILING_TTL: Duration = Duration::from_secs(15);
+
 impl RateGovernor {
-    /// `measured_ceiling` gates stage-1 consumption of the goodput
-    /// estimate; `age_feedback` gates the FR-15 constrained age loop.
-    /// The pumps resolve both once from env/config; tests pass them
-    /// explicitly so the governor stays pure.
+    /// `flags` carries every kill switch (see [`GovernorFlags`]); the
+    /// pumps resolve them once from env/config, tests pass them
+    /// explicitly, so the governor stays pure.
     pub fn new(
         target_fps: u32,
         send_depth: usize,
-        measured_ceiling: bool,
-        age_feedback: bool,
+        flags: GovernorFlags,
         ceiling_hi_bps: u32,
         ceiling_seed_bps: Option<u32>,
         now: Instant,
@@ -180,7 +284,7 @@ impl RateGovernor {
             frames_skipped_decode: 0,
             age_loop: viewer_rate::AgeLoop::new(),
             last_viewer_age: None,
-            age_feedback,
+            age_feedback: flags.age_feedback,
             pressure: EncodePressure::new(),
             encode_factor: 1.0,
             tier: DownscaleTier::new(),
@@ -188,11 +292,56 @@ impl RateGovernor {
             goodput: GoodputEstimator::new(),
             goodput_sink: GoodputSink::new(),
             pace: super::encode_pressure::FpsPace::new(),
-            measured_ceiling,
+            measured_ceiling: flags.measured_ceiling,
             learner: super::ceiling_learn::CeilingLearner::new(ceiling_hi_bps, ceiling_seed_bps),
             last_decreases: 0,
             last_sent_bytes: 0,
+            slow_link: flags,
+            seed_abandoned_bps: None,
+            relieved_floor_bps: None,
+            link_loop: viewer_rate::LinkLoop::new(),
+            link_rx_bps: None,
+            drain_until: None,
         }
+    }
+
+    /// FR-59 P4 — is production paused for a queue drain right now?
+    ///
+    /// Polled by the pump every iteration. Clearing the deadline here
+    /// (rather than on a timer) is what tells the link loop the drain was
+    /// SERVED, so the next deep window can order another one — without
+    /// that hand-back a single drain would suppress every later one.
+    pub fn draining(&mut self, now: Instant) -> bool {
+        match self.drain_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                self.drain_until = None;
+                self.link_loop.drain_served();
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// FR-59 P3/P4 — link-loop telemetry: congested windows, drains
+    /// ordered, and the live queue-depth estimate (ms).
+    pub fn link_stats(&self) -> (u32, u32, i32) {
+        let (drains, depth) = self.link_loop.drain_stats();
+        (self.link_loop.congested_windows(), drains, depth)
+    }
+
+    /// FR-59 P6 — take the ceiling a measurement contradicted, if one was
+    /// abandoned since the last call, so the pump can log it once.
+    pub fn take_seed_abandoned(&mut self) -> Option<u32> {
+        self.seed_abandoned_bps.take()
+    }
+
+    /// FR-59 P1 — the floor currently in force when the evidence-gated
+    /// relief has lowered it; `None` while the nominal floor stands.
+    /// Heartbeat telemetry: without it, "the floor let go" and "the pipe
+    /// was never measured" look identical from a log.
+    pub fn relieved_floor_bps(&self) -> Option<u32> {
+        self.relieved_floor_bps
     }
 
     /// FR-35 — the ceiling the AIMD runs under: the plan's, lifted by what the
@@ -304,21 +453,105 @@ impl RateGovernor {
         } else {
             ceiling_bps
         };
+        // FR-59 P3 — the viewer's arrival rate, while it is still live.
+        // Expired here rather than at the window fold because a viewer that
+        // goes SILENT is silent, not congested, and the fold only runs when
+        // a report arrives.
+        let link_rx_bps = match self.link_rx_bps {
+            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
+            Some(_) => {
+                self.link_rx_bps = None;
+                None
+            }
+            None => None,
+        };
+        // FR-59 — what this session believes the pipe carries, on a
+        // constrained transport: the agent's own blocked-send goodput, the
+        // viewer's arrival rate while its queue is growing, or the LOWER of
+        // the two. P1, P3 and P6 all key off this one number.
+        //
+        // Deliberately consumed here even though stage 1 above refuses to
+        // clamp the CEILING with the goodput half on relay: the uses have
+        // opposite risk. Lowering a FLOOR, bounding a ceiling the receiver
+        // says it cannot keep up with, and abandoning an over-ambitious
+        // learned ceiling all SHED bits and cut latency; an under-estimated
+        // nominal ceiling collapses quality, which is why stage 1 stays
+        // direct-only.
+        //
+        // ⚠ The two halves are not redundant. The goodput estimate needs
+        // the agent's own sends to BLOCK, and on the link this program
+        // exists for they do not (field: `send_wait_max_ms` 0.1 ms while
+        // the viewer ran 2.3 s behind) — the queue is downstream. The
+        // viewer's half needs a viewer that reports. Either alone leaves a
+        // real case uncovered.
+        let measured_bps = if constrained {
+            match (self.goodput.estimate_bps(now), link_rx_bps) {
+                (Some(g), Some(rx)) => Some(g.min(rx)),
+                (g, rx) => g.or(rx),
+            }
+        } else {
+            None
+        };
+        // FR-59 P6 — a measurement far under the learned/seeded ceiling
+        // contradicts it. Must run BEFORE `effective_ceiling`, or this
+        // frame is still planned at the ceiling the evidence just refuted.
+        if let Some(g) = measured_bps
+            && let Some(dropped) = self
+                .learner
+                .on_measurement(g, self.slow_link.seed_contradiction)
+        {
+            self.seed_abandoned_bps = Some(dropped);
+        }
         // FR-35 — lift the constrained ceiling by what the learner has proven.
         let ceiling_bps = if constrained {
             self.learner.effective_ceiling(ceiling_bps)
         } else {
             ceiling_bps
         };
+        // FR-59 P3 — and then bound it by what the VIEWER says is actually
+        // arriving, while its transit queue is growing. Applied AFTER the
+        // learner deliberately: the learner's evidence is what the pipe
+        // carried in the past, and a live report that the receiver is
+        // falling behind outranks it.
+        let ceiling_bps = match link_rx_bps {
+            Some(rx) if constrained => ceiling_bps
+                .min(((rx as u64) * viewer_rate::LINK_CEILING_PCT / 100) as u32)
+                .max(1),
+            _ => ceiling_bps,
+        };
+        // FR-59 P1 — the legibility floor descends toward a measured pipe.
+        // `MIN_BITRATE_BPS` is calibrated for the 2–9 Mbps band every
+        // measured relay sat in; below it the floor is not a floor but a
+        // PIN, because it is also the AIMD's `floor_bps` and the
+        // multiplicative decrease bottoms out there.
+        //
+        // ⚠ Load-bearing for P3, not only for P1: `set_ceiling` raises any
+        // ceiling back up to the floor, so without the relief the arrival-
+        // rate clamp above would be silently undone on exactly the links it
+        // exists for. Evidence-gated, so a session with no measurement at
+        // all is byte-for-byte unchanged.
+        let floor_bps = match measured_bps {
+            Some(g) if self.slow_link.floor_relief => {
+                let relieved = super::goodput::measured_floor_bps(
+                    g,
+                    floor_bps,
+                    super::slow_link_min_bitrate_bps(),
+                );
+                self.relieved_floor_bps = (relieved < floor_bps).then_some(relieved);
+                relieved
+            }
+            _ => {
+                self.relieved_floor_bps = None;
+                floor_bps
+            }
+        };
         let depth = self.send_depth;
         let ctrl = self.aimd.get_or_insert_with(|| {
-            AimdController::new(
-                ceiling_bps,
-                super::MIN_BITRATE_BPS,
-                ceiling_bps,
-                depth as u32,
-                now,
-            )
+            // FR-59 P1 — construct at the floor already in force rather
+            // than the flat `MIN_BITRATE_BPS`, so the constructor's own
+            // `initial.clamp(floor, ceiling)` and the `set_floor` on the
+            // next line cannot momentarily disagree.
+            AimdController::new(ceiling_bps, floor_bps, ceiling_bps, depth as u32, now)
         });
         ctrl.set_floor(floor_bps);
         ctrl.set_ceiling(ceiling_bps);
@@ -412,6 +645,7 @@ impl RateGovernor {
         target_fps: u32,
         take_report: impl FnOnce() -> u32,
         take_age: impl FnOnce() -> u64,
+        take_link: impl FnOnce() -> u64,
         constrained: bool,
         fold_followers: impl FnOnce(u32) -> u32,
         sent_bytes_total: u64,
@@ -458,9 +692,53 @@ impl RateGovernor {
         let age_ms = report.map(|(avg, min, _)| (avg, min));
         self.last_viewer_age =
             report.map(|(avg, _, _)| (avg, self.age_loop.floor_ms().unwrap_or(0)));
-        let own_div = self
-            .viewer_rate
-            .observe(reported_fps, struggling || age_over, target_fps);
+        // FR-59 P3 — the viewer's own view of the link. Unlike the age
+        // report above, neither quantity needs the clock probe, so this
+        // still speaks in the windows where the age is absent or was
+        // rejected as implausible — which on a jittery mobile path is most
+        // of them. Learned on every transport, ACTED on when constrained
+        // (a direct path has the measured-ceiling clamp for this job).
+        let link = viewer_rate::unpack_link(take_link());
+        let verdict = link
+            .map(|(rx_bps, queue_ms)| self.link_loop.observe(rx_bps, queue_ms))
+            .unwrap_or_default();
+        let link_acts = constrained && self.slow_link.viewer_rate_clamp;
+        // FR-59 P4 — a queue too deep to cut our way out of. A rate cut
+        // drains at `capacity − inflow`, which on a converged session is
+        // nearly nothing: at 90 % of a 400 kbps pipe a 2 s backlog clears
+        // at 40 kbps, i.e. over ~20 s. Stopping production sets inflow to
+        // zero, so the same backlog clears in the ~2 s it represents.
+        //
+        // ⚠ Deliberately NO forced keyframe on resume: a pause loses no
+        // frames, so the delta chain is intact, and an IDR at these rates
+        // is itself seconds of transit — the cure would re-create the
+        // disease. This is why P4 pauses rather than discarding the
+        // agent-side queue (which is, on this path, 1–4 KB anyway: the
+        // queue that matters is downstream and cannot be recalled).
+        let drain_for_ms = verdict
+            .drain_for_ms
+            .filter(|_| constrained && self.slow_link.queue_drain);
+        if let Some(ms) = drain_for_ms {
+            self.drain_until = Some(now + Duration::from_millis(ms as u64));
+        }
+        if link_acts {
+            match (verdict.congested, link) {
+                (true, Some((rx_bps, _))) => self.link_rx_bps = Some((rx_bps, now)),
+                // Cleared the moment a window is NOT congested: the clamp
+                // describes a live overload, not a remembered one.
+                (false, Some(_)) => self.link_rx_bps = None,
+                _ => {}
+            }
+        }
+        // FR-59 P3 — a growing transit queue folds into `struggling` exactly
+        // as FR-15's age excess does: an instant, re-open-free byte cut
+        // through machinery that already exists.
+        let link_over = link_acts && verdict.congested;
+        let own_div = self.viewer_rate.observe(
+            reported_fps,
+            struggling || age_over || link_over,
+            target_fps,
+        );
         let new_div = own_div.max(fold_followers(own_div));
         let changed = new_div != self.skip_divisor;
         self.skip_divisor = new_div;
@@ -469,7 +747,12 @@ impl RateGovernor {
         // while the encoder never heard about it. The pump's own
         // `pre_encode_tick` picks it up one frame later (≤33 ms) and
         // routes it through the existing apply arms.
-        if age_over && let Some(ctrl) = self.aimd.as_mut() {
+        // FR-59 P3 — same treatment for a growing transit queue. This is
+        // the arm the field case needed: the send channel was never full,
+        // so nothing else in the loop could produce a decrease.
+        if (age_over || link_over)
+            && let Some(ctrl) = self.aimd.as_mut()
+        {
             ctrl.note_buffer_overflow(now);
         }
         // FR-35 — hand the learner this window's evidence.
@@ -489,6 +772,9 @@ impl RateGovernor {
             age_ms,
             age_over,
             ceiling_grown,
+            link_congested: link_over,
+            link_ceiling_bps: verdict.ceiling_bps,
+            drain_for_ms,
         })
     }
 
@@ -605,7 +891,18 @@ mod tests {
     const CEILING: u32 = 12_000_000;
 
     fn gov(now: Instant) -> RateGovernor {
-        RateGovernor::new(30, DEPTH, true, true, 0, None, now)
+        RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                measured_ceiling: true,
+                age_feedback: true,
+                ..GovernorFlags::default()
+            },
+            0,
+            None,
+            now,
+        )
     }
 
     /// FR-35 — on a constrained session the learner lifts the ceiling above
@@ -614,7 +911,18 @@ mod tests {
     #[test]
     fn ceiling_learner_lifts_the_constrained_ceiling_on_carried_windows() {
         let start = Instant::now();
-        let mut g = RateGovernor::new(30, DEPTH, false, false, 8_000_000, None, start);
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                measured_ceiling: false,
+                age_feedback: false,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            None,
+            start,
+        );
         let a = g
             .pre_encode_tick(
                 3_000_000,
@@ -634,7 +942,7 @@ mod tests {
             bytes += 3_000_000 / 8; // the window carried 3 Mbps
             let now = start + Duration::from_secs(i);
             let w = g
-                .tick_viewer_window(now, 30, || 0, || 0, true, |o| o, bytes)
+                .tick_viewer_window(now, 30, || 0, || 0, || 0, true, |o| o, bytes)
                 .expect("window due");
             if w.ceiling_grown.is_some() {
                 grown += 1;
@@ -650,7 +958,18 @@ mod tests {
             "direct is untouched"
         );
         // A quiet session (nothing carried) never lifts.
-        let mut q = RateGovernor::new(30, DEPTH, false, false, 8_000_000, None, start);
+        let mut q = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                measured_ceiling: false,
+                age_feedback: false,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            None,
+            start,
+        );
         let _ = q.pre_encode_tick(
             3_000_000,
             crate::encode::MIN_BITRATE_BPS,
@@ -661,13 +980,24 @@ mod tests {
         for i in 1..=30u64 {
             let now = start + Duration::from_secs(i);
             let w = q
-                .tick_viewer_window(now, 30, || 0, || 0, true, |o| o, i * 100_000)
+                .tick_viewer_window(now, 30, || 0, || 0, || 0, true, |o| o, i * 100_000)
                 .expect("window due");
             assert!(w.ceiling_grown.is_none());
         }
         assert_eq!(q.effective_ceiling(3_000_000, true), 3_000_000);
         // Learning off (hi = 0): the plan verbatim, seed ignored.
-        let mut off = RateGovernor::new(30, DEPTH, false, false, 0, Some(20_000_000), start);
+        let mut off = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                measured_ceiling: false,
+                age_feedback: false,
+                ..GovernorFlags::default()
+            },
+            0,
+            Some(20_000_000),
+            start,
+        );
         assert_eq!(off.effective_ceiling(3_000_000, true), 3_000_000);
     }
 
@@ -686,7 +1016,7 @@ mod tests {
         }
         let t1 = start + Duration::from_secs(2);
         assert!(
-            g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o, 0)
+            g.tick_viewer_window(t1, 30, || 0, || 0, || 0, false, |o| o, 0)
                 .is_some()
         );
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
@@ -699,17 +1029,394 @@ mod tests {
         );
     }
 
+    /// FR-59 P1 — the whole point, end to end: on a CONSTRAINED transport
+    /// with a measured pipe far under the legibility floor, the AIMD is
+    /// actually allowed to converge below `MIN_BITRATE_BPS`.
+    ///
+    /// The pre-FR-59 arm is the regression this exists to prevent: with
+    /// the relief off, the same congestion sequence bottoms out AT the
+    /// floor — 3.8× the pipe — which is what pinned the field session at
+    /// 1.5 Mbps on a 395 kbps hotspot while the viewer ran seconds behind.
+    #[test]
+    fn a_measured_slow_pipe_lets_the_floor_and_the_target_descend() {
+        // 395 kbps measured: 12 × 1 KB frames each taking ~20 ms.
+        fn feed_slow_pipe(g: &mut RateGovernor, start: Instant) -> Instant {
+            let sink = g.goodput_sink();
+            for _ in 0..12 {
+                sink.record(1_000, Duration::from_micros(20_248));
+            }
+            let t1 = start + Duration::from_secs(2);
+            assert!(
+                g.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0)
+                    .is_some()
+            );
+            t1
+        }
+
+        // Relief ON (shipped posture).
+        let start = Instant::now();
+        let mut g = gov(start);
+        let t1 = feed_slow_pipe(&mut g, start);
+        // Pinned exactly, so a drift in either the fixture or the
+        // derivation shows up as its own failure rather than as a
+        // confusing one in the floor assert below.
+        let measured = g.measured_goodput_bps(t1).expect("a held estimate");
+        assert_eq!(measured, 395_100, "the field-class pipe, ~395 kbps");
+        // Drive the AIMD down with a saturated channel. The MD is rate
+        // limited to one per 500 ms, so walk the clock.
+        let mut t = t1;
+        for _ in 0..40 {
+            t += Duration::from_millis(600);
+            g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, 0, t);
+        }
+        let floor = g.relieved_floor_bps().expect("the relief engaged");
+        assert_eq!(floor, 335_835, "85 % of the measured pipe");
+        assert!(
+            g.applied_bps() < crate::encode::MIN_BITRATE_BPS,
+            "target {} must be free to fall below the 1.5 Mbps pin",
+            g.applied_bps()
+        );
+        assert!(
+            g.applied_bps() >= floor,
+            "…but never below the relieved floor"
+        );
+
+        // Relief OFF — the pre-FR-59 pin.
+        let start = Instant::now();
+        let mut off = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                floor_relief: false,
+                ..GovernorFlags::default()
+            },
+            0,
+            None,
+            start,
+        );
+        let t1 = feed_slow_pipe(&mut off, start);
+        let mut t = t1;
+        for _ in 0..40 {
+            t += Duration::from_millis(600);
+            off.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, 0, t);
+        }
+        assert_eq!(off.relieved_floor_bps(), None, "kill switch: no relief");
+        assert_eq!(
+            off.applied_bps(),
+            crate::encode::MIN_BITRATE_BPS,
+            "pinned at the floor, 3.8× the measured pipe"
+        );
+    }
+
+    /// FR-59 P1 — a DIRECT session is untouched: the relief reads the
+    /// constrained-only measurement, so nothing about a direct path can
+    /// lower its floor (AC5).
+    #[test]
+    fn the_floor_relief_never_touches_a_direct_session() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let sink = g.goodput_sink();
+        for _ in 0..12 {
+            sink.record(1_000, Duration::from_micros(20_248));
+        }
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, false, |o| o, 0);
+        let mut t = t1;
+        for _ in 0..40 {
+            t += Duration::from_millis(600);
+            g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, 0, t);
+        }
+        assert_eq!(g.relieved_floor_bps(), None);
+        assert_eq!(g.applied_bps(), crate::encode::MIN_BITRATE_BPS);
+    }
+
+    /// FR-59 P3 — the case the whole program exists for: the agent's own
+    /// send NEVER blocks (so there is no goodput estimate at all), while
+    /// the viewer reports its transit queue growing. Nothing else in the
+    /// loop can see this — and the response has to reach the encoder.
+    #[test]
+    fn a_growing_viewer_queue_drives_the_rate_with_no_agent_side_evidence() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        // Not one blocked send: the queue is downstream of the agent.
+        assert_eq!(g.measured_goodput_bps(start), None);
+
+        let mut t = start;
+        let mut congested_seen = false;
+        for i in 0..8 {
+            t += Duration::from_millis(1100);
+            let w = g
+                .tick_viewer_window(
+                    t,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || 0, // no age: the clock probe never locked
+                    || viewer_rate::pack_link(400_000, 250),
+                    true,
+                    |o| o,
+                    0,
+                )
+                .expect("window due");
+            if i >= 1 {
+                assert!(w.link_congested, "window {i} should read congested");
+                congested_seen = true;
+            }
+            // Walk the AIMD forward past its MD spacing.
+            for _ in 0..4 {
+                t += Duration::from_millis(200);
+                g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+            }
+        }
+        assert!(congested_seen);
+        // 90 % of the 400 kbps that actually arrived.
+        assert!(
+            g.applied_bps() <= 360_000,
+            "target {} must be bounded by the arrival rate",
+            g.applied_bps()
+        );
+        // …and the floor relief is what let it get there: without it
+        // `set_ceiling` would have raised the clamp back to 1.5 Mbps.
+        assert!(g.relieved_floor_bps().is_some());
+
+        // A window that reports a DRAINING queue releases the clamp, and
+        // the AIMD is free to climb again — recovery is not one-way.
+        t += Duration::from_millis(1100);
+        let w = g
+            .tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || 0,
+                || viewer_rate::pack_link(400_000, -200),
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due");
+        assert!(!w.link_congested);
+        for _ in 0..40 {
+            t += Duration::from_secs(6);
+            g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        }
+        assert!(
+            g.applied_bps() > 360_000,
+            "the clamp must not outlive the congestion (got {})",
+            g.applied_bps()
+        );
+    }
+
+    /// FR-59 P4 — a queue deep enough that a rate cut cannot clear it
+    /// pauses production, the pause EXPIRES on its own, and expiring is
+    /// what re-arms the next drain.
+    #[test]
+    fn a_deep_queue_pauses_production_and_the_pause_expires() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        assert!(!g.draining(start), "nothing to drain yet");
+
+        let mut t = start;
+        let mut ordered = None;
+        for _ in 0..6 {
+            t += Duration::from_millis(1100);
+            let w = g
+                .tick_viewer_window(
+                    t,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || 0,
+                    || viewer_rate::pack_link(400_000, 300),
+                    true,
+                    |o| o,
+                    0,
+                )
+                .expect("window due");
+            if let Some(ms) = w.drain_for_ms {
+                ordered = Some(ms);
+                break;
+            }
+        }
+        let ms = ordered.expect("a 900 ms-deep queue must order a drain");
+        assert_eq!(ms, viewer_rate::DRAIN_MAX_MS, "bounded sub-second");
+        // The pump is paused for exactly that long, and not a tick longer.
+        assert!(g.draining(t));
+        assert!(g.draining(t + Duration::from_millis(ms as u64 - 1)));
+        assert!(!g.draining(t + Duration::from_millis(ms as u64)));
+        // Expiry handed the drain back, so the loop may order another.
+        let (_, drains, _) = g.link_stats();
+        assert_eq!(drains, 1);
+        let mut t2 = t + Duration::from_secs(1);
+        let mut second = None;
+        for _ in 0..6 {
+            t2 += Duration::from_millis(1100);
+            let w = g
+                .tick_viewer_window(
+                    t2,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || 0,
+                    || viewer_rate::pack_link(400_000, 300),
+                    true,
+                    |o| o,
+                    0,
+                )
+                .expect("window due");
+            if w.drain_for_ms.is_some() {
+                second = Some(());
+                break;
+            }
+        }
+        assert!(second.is_some(), "a served drain must re-arm");
+    }
+
+    /// FR-59 P4 kill switch, and the direct-path guarantee: a drain is a
+    /// visible freeze, so it must be impossible to get one where it was
+    /// not asked for.
+    #[test]
+    fn the_drain_is_off_by_switch_and_on_direct() {
+        for (label, flags, constrained) in [
+            (
+                "kill switch",
+                GovernorFlags {
+                    queue_drain: false,
+                    ..GovernorFlags::default()
+                },
+                true,
+            ),
+            ("direct path", GovernorFlags::default(), false),
+        ] {
+            let start = Instant::now();
+            let mut g = RateGovernor::new(30, DEPTH, flags, 0, None, start);
+            let mut t = start;
+            for _ in 0..10 {
+                t += Duration::from_millis(1100);
+                let w = g
+                    .tick_viewer_window(
+                        t,
+                        30,
+                        || viewer_rate::pack_report(30, false),
+                        || 0,
+                        || viewer_rate::pack_link(400_000, 400),
+                        constrained,
+                        |o| o,
+                        0,
+                    )
+                    .expect("window due");
+                assert_eq!(w.drain_for_ms, None, "{label}: must not order a drain");
+                assert!(!g.draining(t), "{label}: must never pause");
+            }
+        }
+    }
+
+    /// FR-59 P3 kill switch, and the direct-path guarantee (AC5).
+    #[test]
+    fn the_viewer_link_clamp_is_off_by_switch_and_on_direct() {
+        for (label, flags, constrained) in [
+            (
+                "kill switch",
+                GovernorFlags {
+                    viewer_rate_clamp: false,
+                    ..GovernorFlags::default()
+                },
+                true,
+            ),
+            ("direct path", GovernorFlags::default(), false),
+        ] {
+            let start = Instant::now();
+            let mut g = RateGovernor::new(30, DEPTH, flags, 0, None, start);
+            let mut t = start;
+            for _ in 0..8 {
+                t += Duration::from_millis(1100);
+                let w = g
+                    .tick_viewer_window(
+                        t,
+                        30,
+                        || viewer_rate::pack_report(30, false),
+                        || 0,
+                        || viewer_rate::pack_link(400_000, 250),
+                        constrained,
+                        |o| o,
+                        0,
+                    )
+                    .expect("window due");
+                assert!(!w.link_congested, "{label}: must not act");
+                for _ in 0..4 {
+                    t += Duration::from_millis(200);
+                    g.pre_encode_tick(
+                        CEILING,
+                        crate::encode::MIN_BITRATE_BPS,
+                        constrained,
+                        DEPTH,
+                        t,
+                    );
+                }
+            }
+            assert_eq!(
+                g.applied_bps(),
+                CEILING,
+                "{label}: the target must be untouched"
+            );
+            assert_eq!(g.relieved_floor_bps(), None, "{label}");
+        }
+    }
+
+    /// FR-59 P6 — a seeded ceiling that the first measured window
+    /// contradicts is abandoned, reported ONCE, and the session plans at
+    /// the nominal band instead.
+    #[test]
+    fn a_contradicted_seed_is_abandoned_and_reported_once() {
+        let start = Instant::now();
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                measured_ceiling: true,
+                age_feedback: true,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            Some(5_964_000),
+            start,
+        );
+        // Before any measurement the seed rules: 85 % of 5.964 M.
+        assert_eq!(g.effective_ceiling(3_000_000, true), 5_069_400);
+        let sink = g.goodput_sink();
+        for _ in 0..12 {
+            sink.record(1_000, Duration::from_micros(20_248));
+        }
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, true, |o| o, 0);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, 0, t1);
+        assert_eq!(g.take_seed_abandoned(), Some(5_069_400));
+        assert_eq!(g.take_seed_abandoned(), None, "reported exactly once");
+        assert_eq!(
+            g.effective_ceiling(3_000_000, true),
+            3_000_000,
+            "back to the nominal band"
+        );
+    }
+
     /// The kill switch keeps stage 1 observe-and-report only.
     #[test]
     fn measured_ceiling_disabled_keeps_nominal() {
         let start = Instant::now();
-        let mut g = RateGovernor::new(30, DEPTH, false, true, 0, None, start);
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                measured_ceiling: false,
+                age_feedback: true,
+                ..GovernorFlags::default()
+            },
+            0,
+            None,
+            start,
+        );
         let sink = g.goodput_sink();
         for _ in 0..40 {
             sink.record(30_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o, 0);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, false, |o| o, 0);
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
@@ -730,7 +1437,7 @@ mod tests {
             sink.record(30_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o, 0);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, false, |o| o, 0);
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t1)
@@ -753,7 +1460,7 @@ mod tests {
             sink.record(60_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o, 0);
+        g.tick_viewer_window(t1, 30, || 0, || 0, || 0, false, |o| o, 0);
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
             .expect("initial apply");
@@ -891,6 +1598,7 @@ mod tests {
                 0
             },
             || 0,
+            || 0,
             false,
             |own| own,
             0,
@@ -904,6 +1612,7 @@ mod tests {
                 consumed += 1;
                 0
             },
+            || 0,
             || 0,
             false,
             |own| own,
@@ -923,6 +1632,7 @@ mod tests {
             .tick_viewer_window(
                 start + Duration::from_secs(2),
                 30,
+                || 0,
                 || 0,
                 || 0,
                 false,
@@ -959,6 +1669,7 @@ mod tests {
                 now,
                 30,
                 || viewer_rate::pack_report(1, true),
+                || 0,
                 || 0,
                 false,
                 |own| own,
@@ -1018,6 +1729,7 @@ mod tests {
                     30,
                     || viewer_rate::pack_report(30, false),
                     || viewer_rate::pack_age(avg, min, 100),
+                    || 0,
                     true,
                     |o| o,
                     0,
@@ -1048,7 +1760,18 @@ mod tests {
             [("direct", false, true), ("kill switch", true, false)]
         {
             let start = Instant::now();
-            let mut g = RateGovernor::new(30, DEPTH, false, feedback, 0, None, start);
+            let mut g = RateGovernor::new(
+                30,
+                DEPTH,
+                GovernorFlags {
+                    measured_ceiling: false,
+                    age_feedback: feedback,
+                    ..GovernorFlags::default()
+                },
+                0,
+                None,
+                start,
+            );
             let mut applied = g
                 .pre_encode_tick(
                     ceiling,
@@ -1067,6 +1790,7 @@ mod tests {
                         30,
                         || viewer_rate::pack_report(30, false),
                         || viewer_rate::pack_age(avg, min, 100),
+                        || 0,
                         constrained,
                         |o| o,
                         0,
@@ -1109,6 +1833,7 @@ mod tests {
                     30,
                     || viewer_rate::pack_report(30, false),
                     || 0, // no age slot written this window
+                    || 0, // no link slot written this window
                     true,
                     |o| o,
                     0,
