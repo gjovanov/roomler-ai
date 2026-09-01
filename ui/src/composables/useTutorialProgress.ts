@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { computed, ref, watch } from 'vue'
+import { api } from '@/api/client'
 
 /**
  * FR-12 (#788) — per-user tutorial state, entirely client-side.
@@ -88,6 +89,48 @@ export function shouldAutoOpenTour(opts: {
   return opts.devices === 0 && opts.rooms <= 1
 }
 
+/**
+ * FR-12 P3 — the server-side mirror.
+ *
+ * The tutorial is a convenience and must never be the thing that breaks the
+ * app shell, so every call here is fire-and-forget: a failed PUT loses a
+ * checkbox tick, nothing more, and localStorage remains the source the UI
+ * actually reads.
+ */
+export interface ServerTutorialState {
+  done?: string[]
+  /** ISO timestamp, or absent. Presence is the whole signal. */
+  seen_at?: string | null
+}
+
+/**
+ * Seed this browser from the account's stored state.
+ *
+ * `done` is UNIONED rather than overwritten: a device that ticked a chapter
+ * while the PUT failed should not lose it the moment another device syncs.
+ * The union is only ever applied on load — writes replace, so un-ticking
+ * still works (it just needs the write to land).
+ *
+ * `seen_at` only ever sets the local flag, never clears it: its whole job is
+ * to stop the tour ambushing someone a second time, and a missing server
+ * value means "no opinion", not "never seen".
+ */
+export function seedTutorialFromServer(userId: string, remote: ServerTutorialState | undefined) {
+  if (!remote) return
+  if (Array.isArray(remote.done) && remote.done.length) {
+    const merged = [...new Set([...readTourProgress(userId), ...remote.done])]
+    writeTourProgress(userId, merged)
+  }
+  if (remote.seen_at) markTourSeen(userId)
+}
+
+/** Push a change up. Never throws, never awaited by the caller's UI path. */
+export function pushTutorialState(patch: { done?: string[]; seen?: boolean }): void {
+  void api.put('/user/tutorial', patch).catch(() => {
+    /* offline, logged out, route absent on an older server — all survivable */
+  })
+}
+
 /** Reactive per-user chapter checklist for the Tutorial view. */
 export function useTutorialProgress(userId: () => string | undefined) {
   const done = ref<string[]>(readTourProgress(userId() ?? ''))
@@ -110,11 +153,13 @@ export function useTutorialProgress(userId: () => string | undefined) {
       ? [...new Set([...done.value, chapterId])]
       : done.value.filter((c) => c !== chapterId)
     writeTourProgress(userId() ?? '', done.value)
+    pushTutorialState({ done: done.value })
   }
 
   function reset(): void {
     done.value = []
     writeTourProgress(userId() ?? '', [])
+    pushTutorialState({ done: [] })
   }
 
   const doneCount = computed(() => done.value.length)

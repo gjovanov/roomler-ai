@@ -1,7 +1,7 @@
 # FR-12 — Onboarding tutorial ("Welcome tour")
 
 **Issue:** [#788](https://github.com/gjovanov/roomler-ai/issues/788)
-**Status:** P1 + **P2 shipped**; P3 (extra artwork + server-side progress) planned
+**Status:** P1 + P2 + **P3 shipped** — the arc is complete
 
 ## Goal
 
@@ -77,7 +77,73 @@ devices.
 |-------|---------|-------------|--------|
 | P1 | Tutorial view (8 chapters, 4 reused SVGs), app-bar `?` + user-menu entries, first-login auto-open, localStorage progress | auto-open reads one localStorage flag; the route/nav entries are plain UI | **shipped** — PR #797 |
 | P2 | Spotlight micro-tours on the live pages (dependency-free): module-scoped step machine + ONE overlay in `AppLayout` + a `?tour=` entry | per-tour "skip", and the only Tutorial entry is one button | **shipped** — PR #1117 |
-| P3 | New same-style SVGs for ACL/rooms/calls/chat chapters; server-side progress | none needed (additive) | planned |
+| P3 | Five new same-style SVGs (devices/tunnels/acl/rooms/calls) so no two chapters share artwork; server-side progress mirror | none needed (additive); the mirror is fire-and-forget, so the tutorial still works with the route unreachable | **shipped** — PR #1138 |
+
+## P3 as built
+
+### Artwork: eight chapters, eight illustrations
+
+P1 deliberately reused the four README heroes, which meant Access control and
+Private network showed the SAME picture, and so did Rooms and Calls. A reader
+who sees a familiar illustration reasonably concludes they are back where they
+started, so the sharing was not merely unpolished — it misinformed.
+
+Five new SVGs in the same house style (760x400, `<title>` + `<desc>`, a
+`prefers-reduced-motion` guard, no external assets):
+`devices.svg` (a single-use token becoming a row in the device list, beside one
+row that is offline so the list reads as a liveness view), `tunnels.svg`,
+`acl.svg` (two flows allowed through a policy gate, one denied, with the audit
+line underneath), `rooms.svg` (threads, mention, typing) and `calls.svg`
+(shared screen + a filmstrip showing speaking / camera-off / muted).
+`ui/src/assets/tutorial/collaboration.svg` was deleted with its last reference;
+`docs/assets/collaboration.svg` is untouched and still serves the README.
+
+Each was RENDERED and looked at rather than reasoned about, which is the only
+reason four real defects were caught: the ACL deny row was invisible for most
+of its animation cycle, its third service sat unconnected to anything, the call
+filmstrip's speaking ring bled outside its tile and its level bars collided
+with the name label, and `calls.svg`'s `<desc>` described four tiles where
+three are drawn. None of those is visible in the source.
+
+**Two guards, both shown to fail before being trusted**: no two chapters may
+point at one asset (the message names the reused files), and every animated
+illustration must carry a `<desc>` and a `prefers-reduced-motion` guard. The
+second reads the SVG SOURCES via `import.meta.glob(..., '?raw')` rather than
+the imported URLs, because what ships is what matters, and it asserts the glob
+found something -- a glob whose path is wrong passes vacuously.
+
+### Progress mirror: `PUT /api/user/tutorial`, read back on `/auth/me`
+
+`users.tutorial` (`TutorialState { done, seen_at }`, `#[serde(default)]` so
+every existing document deserialises), written by one dedicated route and read
+on the boot response the client already fetches -- no second round trip.
+
+Four decisions worth keeping:
+
+- **Not folded into `update_profile`.** That route is the user-editable
+  profile; this is app state the tutorial owns, and the DAO's positional
+  signature was already at six arguments.
+- **`done` REPLACES; the client UNIONS on seed.** A union on write would make
+  un-ticking a chapter inexpressible -- the client sends a shorter list and the
+  server keeps the longer one, silently. The union belongs on load, where its
+  job is to stop a device losing a tick it made while a PUT was failing.
+- **`seen` is a one-way latch**: `seen: false` is a no-op, not a reset. Its
+  entire purpose is that nobody is walked through the tour twice.
+- **Bounded on write** (64 ids, 64 chars each, truncated not rejected): the
+  list is client-supplied and lands on the caller's own document. Small, but
+  there is no reason to leave an unbounded write primitive open.
+
+The client treats all of it as a convenience -- `pushTutorialState` is
+fire-and-forget and `localStorage` stays the thing the UI reads -- so an
+unreachable route costs a checkbox tick and nothing else.
+
+**What the tests caught before it shipped**: `bson::DateTime` serialises as
+`{"$date":{"$numberLong":"..."}}`, not a string. The client only tests
+`seen_at` for presence, and that object is TRUTHY -- so it would have worked by
+accident, typed as `string | null`, until the first person tried to display it.
+`TutorialResponse` now converts to RFC 3339 like every other timestamp this API
+returns. The integration test asserted the shape rather than the behaviour,
+which is the only reason it failed.
 
 ## P2 as built — two deviations from this spec, both deliberate
 
