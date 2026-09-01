@@ -48,3 +48,6 @@ pub use subscriber::*;
 
 pub mod newsletter_issue;
 pub use newsletter_issue::*;
+
+pub mod newsletter_send;
+pub use newsletter_send::*;

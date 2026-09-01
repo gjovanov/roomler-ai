@@ -7,6 +7,7 @@ pub mod extractors;
 pub mod media_stats;
 pub mod media_type;
 pub mod middleware;
+pub mod newsletter_send;
 pub mod origin;
 pub mod rate_limit;
 pub mod relay_load;
@@ -706,7 +707,9 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/issues/{slug}/test-send",
             post(routes::newsletter::test_send),
-        );
+        )
+        .route("/issues/{slug}/send", post(routes::newsletter::send))
+        .route("/issues/{slug}/status", get(routes::newsletter::status));
     let tenant_stats_routes = Router::new()
         .route("/overview", get(routes::stats::tenant_overview))
         .route("/mesh", get(routes::stats::tenant_mesh))
