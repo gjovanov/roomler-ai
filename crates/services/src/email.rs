@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
-    message::{Mailbox, header::ContentType},
+    message::{
+        Mailbox,
+        header::{ContentType, HeaderName, HeaderValue},
+    },
 };
 use roomler_ai_config::EmailSettings;
 use serde::Serialize;
@@ -40,12 +43,32 @@ enum EmailBackend {
     },
 }
 
+/// Per-message options for [`EmailService::send_ext`]. `Default` is inert —
+/// [`EmailService::send`] delegates with it, so the transactional helpers are
+/// byte-for-byte unchanged by its existence.
+#[derive(Debug, Clone, Default)]
+pub struct SendOptions {
+    /// Extra top-level headers as (name, value) — e.g. `List-Unsubscribe` +
+    /// `List-Unsubscribe-Post` on newsletter mail (FR-58). A name that is not
+    /// a valid ASCII header name fails the send rather than being silently
+    /// dropped: a newsletter without its unsubscribe header must not go out.
+    pub headers: Vec<(String, String)>,
+    /// Override the From mailbox (email, display name) for this message, so
+    /// campaign mail carries the newsletter identity without touching the
+    /// transactional From that activation/invite mail depends on.
+    pub from: Option<(String, String)>,
+}
+
 #[derive(Debug, Serialize)]
 struct SendGridRequest {
     personalizations: Vec<Personalization>,
     from: EmailAddress,
     subject: String,
     content: Vec<Content>,
+    /// Top-level custom headers, applied by SendGrid to the message verbatim.
+    /// Omitted entirely when empty — the v3 API rejects an empty object here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,25 +130,24 @@ impl EmailService {
     /// Low-level send — used by every `send_*` helper below. Routes
     /// through whichever backend was selected at construction.
     pub async fn send(&self, to_email: &str, subject: &str, html_body: &str) -> anyhow::Result<()> {
+        self.send_ext(to_email, subject, html_body, &SendOptions::default())
+            .await
+    }
+
+    /// [`send`](Self::send) with per-message headers and an optional From
+    /// override — the newsletter path (FR-58). Kept separate so the
+    /// transactional callers never grow an options argument they would always
+    /// default.
+    pub async fn send_ext(
+        &self,
+        to_email: &str,
+        subject: &str,
+        html_body: &str,
+        opts: &SendOptions,
+    ) -> anyhow::Result<()> {
         match &self.backend {
             EmailBackend::SendGrid { client, api_key } => {
-                let request = SendGridRequest {
-                    personalizations: vec![Personalization {
-                        to: vec![EmailAddress {
-                            email: to_email.to_string(),
-                            name: None,
-                        }],
-                    }],
-                    from: EmailAddress {
-                        email: self.from_email.clone(),
-                        name: Some(self.from_name.clone()),
-                    },
-                    subject: subject.to_string(),
-                    content: vec![Content {
-                        content_type: "text/html".to_string(),
-                        value: html_body.to_string(),
-                    }],
-                };
+                let request = self.sendgrid_request(to_email, subject, html_body, opts);
 
                 let resp = client
                     .post("https://api.sendgrid.com/v3/mail/send")
@@ -148,30 +170,7 @@ impl EmailService {
                 transport,
                 endpoint,
             } => {
-                let from_addr: lettre::Address = self.from_email.parse().map_err(|e| {
-                    anyhow::anyhow!("Invalid from_email '{}': {}", self.from_email, e)
-                })?;
-                let from_mb = Mailbox::new(
-                    if self.from_name.is_empty() {
-                        None
-                    } else {
-                        Some(self.from_name.clone())
-                    },
-                    from_addr,
-                );
-
-                let to_addr: lettre::Address = to_email
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("Invalid to_email '{}': {}", to_email, e))?;
-                let to_mb = Mailbox::new(None, to_addr);
-
-                let email = lettre::Message::builder()
-                    .from(from_mb)
-                    .to(to_mb)
-                    .subject(subject)
-                    .header(ContentType::TEXT_HTML)
-                    .body(html_body.to_string())
-                    .map_err(|e| anyhow::anyhow!("Failed to build SMTP message: {}", e))?;
+                let email = self.smtp_message(to_email, subject, html_body, opts)?;
 
                 transport
                     .send(email)
@@ -181,6 +180,91 @@ impl EmailService {
                 Ok(())
             }
         }
+    }
+
+    /// The exact JSON body a SendGrid send POSTs — split out so tests can pin
+    /// the header/From plumbing without a network.
+    fn sendgrid_request(
+        &self,
+        to_email: &str,
+        subject: &str,
+        html_body: &str,
+        opts: &SendOptions,
+    ) -> SendGridRequest {
+        let (from_email, from_name) = match &opts.from {
+            Some((email, name)) => (email.clone(), name.clone()),
+            None => (self.from_email.clone(), self.from_name.clone()),
+        };
+        SendGridRequest {
+            personalizations: vec![Personalization {
+                to: vec![EmailAddress {
+                    email: to_email.to_string(),
+                    name: None,
+                }],
+            }],
+            from: EmailAddress {
+                email: from_email,
+                name: Some(from_name),
+            },
+            subject: subject.to_string(),
+            content: vec![Content {
+                content_type: "text/html".to_string(),
+                value: html_body.to_string(),
+            }],
+            headers: if opts.headers.is_empty() {
+                None
+            } else {
+                Some(opts.headers.iter().cloned().collect())
+            },
+        }
+    }
+
+    /// The exact RFC 5322 message an SMTP send submits — split out for the
+    /// same reason as `sendgrid_request`.
+    fn smtp_message(
+        &self,
+        to_email: &str,
+        subject: &str,
+        html_body: &str,
+        opts: &SendOptions,
+    ) -> anyhow::Result<lettre::Message> {
+        let (from_email, from_name) = match &opts.from {
+            Some((email, name)) => (email.as_str(), name.as_str()),
+            None => (self.from_email.as_str(), self.from_name.as_str()),
+        };
+        let from_addr: lettre::Address = from_email
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid from_email '{}': {}", from_email, e))?;
+        let from_mb = Mailbox::new(
+            if from_name.is_empty() {
+                None
+            } else {
+                Some(from_name.to_string())
+            },
+            from_addr,
+        );
+
+        let to_addr: lettre::Address = to_email
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid to_email '{}': {}", to_email, e))?;
+        let to_mb = Mailbox::new(None, to_addr);
+
+        let mut email = lettre::Message::builder()
+            .from(from_mb)
+            .to(to_mb)
+            .subject(subject)
+            .header(ContentType::TEXT_HTML)
+            .body(html_body.to_string())
+            .map_err(|e| anyhow::anyhow!("Failed to build SMTP message: {}", e))?;
+
+        for (name, value) in &opts.headers {
+            let header_name = HeaderName::new_from_ascii(name.clone())
+                .map_err(|e| anyhow::anyhow!("Invalid header name '{name}': {e:?}"))?;
+            email
+                .headers_mut()
+                .insert_raw(HeaderValue::new(header_name, value.clone()));
+        }
+        Ok(email)
     }
 
     /// Send an invite email with a link to accept the invitation.
@@ -443,5 +527,99 @@ mod tests {
 
         let port_only = settings("", None, Some(1025));
         assert!(EmailService::from_settings(&port_only).is_none());
+    }
+
+    // ── send_ext plumbing (FR-58) ────────────────────────────────────────────
+    // These pin the constructed request/message, not the network: the JSON a
+    // SendGrid send would POST and the RFC 5322 bytes an SMTP send would
+    // submit. Default options must be inert — `send` delegates through them,
+    // so any drift here silently rewrites every transactional mail.
+
+    fn unsub_headers() -> Vec<(String, String)> {
+        vec![
+            (
+                "List-Unsubscribe".to_string(),
+                "<https://roomler.test/api/subscribe/unsubscribe/tok>".to_string(),
+            ),
+            (
+                "List-Unsubscribe-Post".to_string(),
+                "List-Unsubscribe=One-Click".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn sendgrid_request_with_default_options_is_unchanged() {
+        let svc = EmailService::from_settings(&settings("sg.key", None, None)).unwrap();
+        let req = svc.sendgrid_request(
+            "to@example.com",
+            "Subj",
+            "<p>hi</p>",
+            &SendOptions::default(),
+        );
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(
+            json.get("headers").is_none(),
+            "no options ⇒ no `headers` key at all (the v3 API rejects an empty object)"
+        );
+        assert_eq!(json["from"]["email"], "noreply@test.local");
+        assert_eq!(json["from"]["name"], "Test");
+    }
+
+    #[test]
+    fn sendgrid_request_carries_headers_and_from_override() {
+        let svc = EmailService::from_settings(&settings("sg.key", None, None)).unwrap();
+        let opts = SendOptions {
+            headers: unsub_headers(),
+            from: Some(("news@test.local".to_string(), "Field Notes".to_string())),
+        };
+        let req = svc.sendgrid_request("to@example.com", "Subj", "<p>hi</p>", &opts);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            json["headers"]["List-Unsubscribe-Post"],
+            "List-Unsubscribe=One-Click"
+        );
+        assert_eq!(
+            json["headers"]["List-Unsubscribe"],
+            "<https://roomler.test/api/subscribe/unsubscribe/tok>"
+        );
+        assert_eq!(json["from"]["email"], "news@test.local");
+        assert_eq!(json["from"]["name"], "Field Notes");
+    }
+
+    #[test]
+    fn smtp_message_carries_headers_and_from_override() {
+        let svc =
+            EmailService::from_settings(&settings("", Some("mailpit.local"), Some(1025))).unwrap();
+        let opts = SendOptions {
+            headers: unsub_headers(),
+            from: Some(("news@test.local".to_string(), "Field Notes".to_string())),
+        };
+        let msg = svc
+            .smtp_message("to@example.com", "Subj", "<p>hi</p>", &opts)
+            .expect("message should build");
+        let wire = String::from_utf8_lossy(&msg.formatted()).to_string();
+        assert!(
+            wire.contains("List-Unsubscribe: <https://roomler.test/api/subscribe/unsubscribe/tok>"),
+            "unsubscribe header missing from the wire form:\n{wire}"
+        );
+        assert!(wire.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click"));
+        assert!(
+            wire.contains("news@test.local"),
+            "the From override must reach the wire form"
+        );
+    }
+
+    #[test]
+    fn smtp_message_refuses_an_invalid_header_name() {
+        // Fail closed: a newsletter whose unsubscribe header cannot be built
+        // must not be sent without it.
+        let svc =
+            EmailService::from_settings(&settings("", Some("mailpit.local"), Some(1025))).unwrap();
+        let opts = SendOptions {
+            headers: vec![("Bad Name:".to_string(), "v".to_string())],
+            from: None,
+        };
+        assert!(svc.smtp_message("to@example.com", "S", "b", &opts).is_err());
     }
 }

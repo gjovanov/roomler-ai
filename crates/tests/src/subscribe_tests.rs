@@ -175,8 +175,9 @@ async fn confirming_flips_the_row_and_burns_the_token() {
     let (status, location) = visit(&app, &format!("/api/subscribe/confirm/{token}")).await;
     assert!(status.is_redirection(), "expected a redirect, got {status}");
     assert!(
-        location.contains("subscribe=confirmed"),
-        "the link must send a human somewhere that says it worked; got {location:?}"
+        location.contains("/newsletter/confirmed?status=ok"),
+        "the link must land on the PUBLIC outcome page — `/?subscribe=…` was \
+         auth-gated and no human ever saw it (FR-58); got {location:?}"
     );
 
     let doc = row(&app, "confirm@example.com").await.unwrap();
@@ -208,8 +209,9 @@ async fn unsubscribing_needs_no_session_and_is_idempotent() {
             "attempt {attempt} expected a redirect, got {status}"
         );
         assert!(
-            location.contains("subscribe=unsubscribed"),
-            "attempt {attempt}: a prefetched link must still report success, got {location:?}"
+            location.contains("/newsletter/unsubscribed?status=ok"),
+            "attempt {attempt}: a prefetched link must still report success on the \
+             public outcome page, got {location:?}"
         );
     }
 
@@ -261,7 +263,7 @@ async fn an_unknown_token_changes_nothing() {
         let (status, location) = visit(&app, path).await;
         assert!(status.is_redirection(), "{path} should still redirect");
         assert!(
-            location.contains("subscribe=invalid"),
+            location.contains("status=invalid"),
             "an unknown token must say so rather than claim success; got {location:?}"
         );
     }
@@ -269,4 +271,61 @@ async fn an_unknown_token_changes_nothing() {
     let doc = row(&app, "untouched@example.com").await.unwrap();
     assert!(!doc.get_bool("confirmed").unwrap());
     assert!(doc.get("unsubscribed_at").is_none());
+}
+
+/// The RFC 8058 one-click leg (FR-58): a mailbox provider POSTs the
+/// unsubscribe URL with a urlencoded body and expects a plain 2xx. No
+/// redirect (providers follow none), no oracle (hit, repeat and miss are
+/// indistinguishable), body unread (the token in the path is the input).
+#[tokio::test]
+async fn one_click_post_unsubscribes_with_a_uniform_200() {
+    let app = TestApp::spawn().await;
+    post_subscribe(&app, "oneclick@example.com").await;
+
+    let token = row(&app, "oneclick@example.com")
+        .await
+        .unwrap()
+        .get_str("unsubscribe_token")
+        .unwrap()
+        .to_string();
+
+    async fn one_click(app: &TestApp, path: &str) -> reqwest::Response {
+        app.client
+            .post(app.url(path))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body("List-Unsubscribe=One-Click")
+            .send()
+            .await
+            .expect("one-click request failed")
+    }
+
+    for attempt in 1..=2 {
+        let resp = one_click(&app, &format!("/api/subscribe/unsubscribe/{token}")).await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "attempt {attempt}: prefetch/repeat must answer the same plain 200"
+        );
+        assert!(
+            resp.headers().get(reqwest::header::LOCATION).is_none(),
+            "providers follow no redirects — the answer must be a plain 200"
+        );
+    }
+
+    let miss = one_click(
+        &app,
+        "/api/subscribe/unsubscribe/0000000000000000000000000000000000000000000000",
+    )
+    .await;
+    assert_eq!(
+        miss.status(),
+        200,
+        "an unknown token must be indistinguishable from a hit"
+    );
+
+    let doc = row(&app, "oneclick@example.com").await.unwrap();
+    assert!(
+        doc.get("unsubscribed_at").is_some(),
+        "the one-click POST must stamp the row"
+    );
 }
