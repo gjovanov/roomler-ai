@@ -2111,6 +2111,37 @@ describe('parseAppsListReply', () => {
   it('defaults ok/supported to false and arrays to empty when missing (version skew)', () => {
     const reply = parseAppsListReply({ t: 'rc:apps.list.reply' })
     expect(reply).toEqual({ ok: false, supported: false, windows: [], launchable: [] })
+    // FR-56 P2: an agent older than P2 sends no coverage. Absent must stay
+    // absent — inventing an empty one would claim the listing was complete.
+    expect(reply.coverage).toBeUndefined()
+  })
+
+  it('carries coverage so an empty list is distinguishable from an unenumerable source', () => {
+    const reply = parseAppsListReply({
+      ok: true,
+      supported: true,
+      windows: [],
+      launchable: [],
+      coverage: { sources: ['x11'], unlisted: 'native Wayland windows: no protocol' },
+    })
+    expect(reply.windows).toEqual([])
+    expect(reply.coverage?.sources).toEqual(['x11'])
+    expect(reply.coverage?.unlisted).toContain('native Wayland')
+  })
+
+  it('parses coverage defensively — a malformed one costs the caveat, not the reply', () => {
+    const reply = parseAppsListReply({
+      ok: true,
+      supported: true,
+      windows: [{ window_id: '0x1', title: 'ok', focused: false }],
+      launchable: [],
+      coverage: { sources: ['x11', 7, null], unlisted: '' },
+    })
+    expect(reply.ok).toBe(true)
+    expect(reply.windows).toHaveLength(1)
+    expect(reply.coverage?.sources).toEqual(['x11'])
+    // An empty `unlisted` is not a caveat; it must not render as one.
+    expect(reply.coverage?.unlisted).toBeUndefined()
   })
 
   it('filters malformed window + launchable entries', () => {
