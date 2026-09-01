@@ -67,6 +67,23 @@ pub struct OverlaySettings {
     /// a fleet that hasn't caught up. `--force` on the endpoint overrides.
     /// Env: `ROOMLER__OVERLAY__BLOCK_VERSION_FLOOR`.
     pub block_version_floor: String,
+    /// FR-47 P5c — let a network hold MORE THAN ONE block, so an org that
+    /// fills its first one is given another instead of being refused. The
+    /// ordinal space is the blocks concatenated in allocation order, so
+    /// growth costs no device its address.
+    ///
+    /// Default OFF, and off is exactly today's behaviour: `allocate_host`
+    /// refuses at the single block's ceiling.
+    ///
+    /// ⚠️ Turning this on is a **one-way door for the schema**. The registry's
+    /// partial-unique index on `overlay_blocks.network_id` IS the
+    /// one-block-per-network invariant, so it has to be dropped before a
+    /// second block can be inserted — and once a network holds two, putting
+    /// the index back would fail. The drop happens at startup and only when
+    /// this flag is on, so a deployment that never enables it keeps the guard.
+    ///
+    /// Env: `ROOMLER__OVERLAY__MULTI_BLOCK_ENABLED`.
+    pub multi_block_enabled: bool,
 }
 
 impl Default for OverlaySettings {
@@ -77,6 +94,7 @@ impl Default for OverlaySettings {
             // rc.301 shipped the P2a forward-compat set (prefix-aware
             // keep-set, bounded IPAM, remove-before-upsert deltas, gated DNS).
             block_version_floor: "0.3.0-rc.301".to_string(),
+            multi_block_enabled: false,
         }
     }
 }
@@ -660,6 +678,7 @@ impl Settings {
             .set_default("stats.geoip_mmdb", None::<String>)?
             .set_default("overlay.blocks_enabled", true)?
             .set_default("overlay.block_prefix", 22)?
+            .set_default("overlay.multi_block_enabled", false)?
             .set_default("overlay.block_version_floor", "0.3.0-rc.301")?
             .set_default("oauth.base_url", "http://localhost:5001")?
             .set_default("oauth.google.client_id", "")?

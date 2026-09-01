@@ -104,7 +104,9 @@ impl TestApp {
             Client::with_options(client_options).expect("Failed to create MongoDB client");
         let db = mongo_client.database(&db_name);
 
-        ensure_indexes(&db).await.expect("Failed to create indexes");
+        ensure_indexes(&db, settings.overlay.multi_block_enabled)
+            .await
+            .expect("Failed to create indexes");
 
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
@@ -203,7 +205,9 @@ impl TestApp {
         // `db_name`, silently ignoring the override.
         let db = mongo_client.database(&settings.database.name);
 
-        ensure_indexes(&db).await.expect("Failed to create indexes");
+        ensure_indexes(&db, settings.overlay.multi_block_enabled)
+            .await
+            .expect("Failed to create indexes");
 
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
@@ -274,7 +278,9 @@ impl TestApp {
             Client::with_options(client_options).expect("Failed to create MongoDB client");
         let db = mongo_client.database(&db_name);
 
-        ensure_indexes(&db).await.expect("Failed to create indexes");
+        ensure_indexes(&db, settings.overlay.multi_block_enabled)
+            .await
+            .expect("Failed to create indexes");
 
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
