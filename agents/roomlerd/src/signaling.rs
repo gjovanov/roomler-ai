@@ -1659,8 +1659,40 @@ async fn connect_once(
             // that arm's nested parse/intercept chain — a bigger change than
             // this feature. Divergence is a compile error, so the duplication
             // cannot rot silently.
-            Some(delegated_msg) = next_delegated(&mut delegated_in) => {
+            Some(inbound) = next_delegated(&mut delegated_in) => {
                 watchdog::tick(ctx.pump);
+                let delegated_msg = match inbound {
+                    // The parameters the daemon resolved, arriving ahead of the
+                    // offer that consumes them. Populating the SAME maps the
+                    // `Request` arm would have means the `SdpOffer` handler
+                    // needs no delegation-specific branch at all.
+                    crate::delegate::WorkerInbound::Params(p) => {
+                        match bson::oid::ObjectId::parse_str(&p.session_id) {
+                            Ok(sid) => {
+                                pending_codecs.insert(sid, p.codec);
+                                pending_transports.insert(sid, p.transport);
+                                pending_chroma.insert(sid, p.chroma);
+                                pending_chunk_framing.insert(sid, p.chunk_framing);
+                                pending_audio.insert(sid, p.audio);
+                                pending_permissions.insert(sid, p.permissions);
+                                pending_session_meta.insert(
+                                    sid,
+                                    (p.controller_name, p.input_mode, p.asking_org),
+                                );
+                                info!(session_id = %sid, "delegation: session params received");
+                            }
+                            Err(e) => {
+                                warn!(%e, sid = %p.session_id, "delegation: unparseable session id");
+                            }
+                        }
+                        continue;
+                    }
+                    crate::delegate::WorkerInbound::Msg(m) => *m,
+                };
+                info!(
+                    kind = crate::delegate::server_msg_kind(&delegated_msg),
+                    "delegation: serving a delegated rc message"
+                );
                 handle_server_msg(
                     ctx,
                     &cfg.tenant_id,
@@ -2150,6 +2182,39 @@ async fn handle_server_msg(
                 session_id,
                 (controller_name.clone(), input_mode, asking_org.clone()),
             );
+            // FR-43 P2b-3 — hand the SAME resolved values to the GUI worker, if
+            // one is attached. `Request` is not delegated (consent and the
+            // upstream reply belong to the daemon, which is the enrolled
+            // identity), but everything it resolves here is consumed by the
+            // `SdpOffer` handler — which IS delegated. Without this the worker
+            // defaults all seven, and the one that matters silently is
+            // `transport`: `None` means the legacy RTP track, so a browser that
+            // negotiated `data-channel-h264` gets a black screen while the
+            // agent happily encodes into a pipe nobody reads.
+            if let Some(delegate) = delegate
+                && ctx.is_primary
+            {
+                let sent = delegate.send_params(crate::delegate::DelegateFrame::SessionParams(
+                    Box::new(crate::delegate::SessionParams {
+                        session_id: session_id.to_hex(),
+                        codec: chosen.clone(),
+                        transport: negotiated_transport.clone(),
+                        chroma: chroma_pref.clone(),
+                        chunk_framing: chunk_framing.unwrap_or(false),
+                        audio: audio_negotiated,
+                        permissions,
+                        controller_name: controller_name.clone(),
+                        input_mode,
+                        asking_org: asking_org.clone(),
+                    }),
+                ));
+                if !sent {
+                    // No worker, or its queue is full. Not fatal — the daemon
+                    // still serves the session itself, which on macOS means a
+                    // blank screen but a working, terminable session.
+                    tracing::debug!(%session_id, "no worker to hand session params to");
+                }
+            }
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -3904,7 +3969,9 @@ async fn send_frame(ws: &mut Ws, frame: Message) -> Result<()> {
 /// `pending()` rather than an `Option` arm with a guard: a `select!` branch
 /// that is simply never ready is the honest encoding of "this process is not a
 /// worker", and it keeps the arm's body identical in both cases.
-async fn next_delegated(rx: &mut Option<&mut mpsc::Receiver<ServerMsg>>) -> Option<ServerMsg> {
+async fn next_delegated(
+    rx: &mut Option<&mut mpsc::Receiver<crate::delegate::WorkerInbound>>,
+) -> Option<crate::delegate::WorkerInbound> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
