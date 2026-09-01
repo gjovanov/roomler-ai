@@ -1296,6 +1296,30 @@
               Not listed — {{ rc.appsCoverage.value.unlisted }}
             </v-alert>
           </v-list-item>
+          <!-- FR-56 P5 — a reachable desktop does not make the buttons work.
+               Measured on a GNOME Wayland host with no tmux: the panel said
+               supported, offered the button, and failed only once somebody
+               clicked it. `warning` rather than `info` because unlike the
+               unlisted-source note above, this one predicts a FAILURE. -->
+          <v-list-item
+            v-if="rc.appsCoverage.value?.missing_tools?.length"
+            class="pt-0"
+          >
+            <v-alert
+              type="warning"
+              density="compact"
+              variant="tonal"
+              class="text-caption"
+            >
+              <div
+                v-for="t in rc.appsCoverage.value.missing_tools"
+                :key="t.tool"
+              >
+                <strong>{{ t.tool }}</strong> is not installed on the agent
+                host — {{ t.blocks }} ({{ t.install }})
+              </div>
+            </v-alert>
+          </v-list-item>
           <template v-if="rc.launchableApps.value.length">
             <v-divider />
             <v-list-subheader>Launch new</v-list-subheader>
