@@ -230,6 +230,20 @@ pub async fn ensure_indexes(db: &Database, multi_block: bool) -> Result<(), mong
     )
     .await?;
 
+    // Newsletter delivery ledger (FR-58). 🔑 The unique pair IS the send
+    // program's at-most-once invariant: rows are claimed (inserted) before the
+    // send attempt, so a resume — or even two pods fanning out concurrently —
+    // resolves each recipient to exactly one winner.
+    create_indexes(
+        db,
+        "newsletter_sends",
+        vec![
+            index_unique(bson::doc! { "issue_id": 1, "subscriber_id": 1 }),
+            index(bson::doc! { "issue_id": 1, "status": 1 }),
+        ],
+    )
+    .await?;
+
     // Custom Emojis
     create_indexes(
         db,
