@@ -57,10 +57,7 @@ pub fn current_log_path() -> Result<PathBuf> {
     let mut best: Option<(String, PathBuf)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // RETIRED-NAME-ANCHOR: without the legacy prefix `rc:logs-fetch` answers "no
-        // log
-        // file" on an upgraded host that has not rolled yet. See docs/fr/FR-21.
-        if !name.starts_with("roomlerd.log") && !name.starts_with("roomler-agent.log") {
+        if !name.starts_with("roomlerd.log") {
             continue;
         }
         // Prefer the lexicographically-latest filename. tracing's
