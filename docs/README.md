@@ -122,6 +122,7 @@ same accounts and server.*
 | [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md) | Operator checklist: verifying Windows SystemContext (pre-logon control) on a field host |
 | [testing.md](testing.md) | Test suites and harnesses: integration, unit, E2E, capture smoke, k8s E2E lane |
 | [business-model.md](business-model.md) | How the project earns: the three revenue mechanisms, what actually costs money (and what deliberately does not), the tier ladder and the measure-then-price sequence |
+| [newsletter.md](newsletter.md) | The subscriber list and the sending program (FR-39/FR-58): public subscribe/confirm/unsubscribe + RFC-8058 one-click, the platform-admin issue pipeline (claim-first ledger, preview = the sent bytes), and the ops prerequisites for a real campaign |
 | [api.md](api.md) | Every HTTP route (method + path + purpose) and the auth model |
 | [data-model.md](data-model.md) | Every MongoDB collection with ER diagrams, indexes, TTLs |
 

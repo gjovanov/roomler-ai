@@ -1,8 +1,10 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # FR-58: Newsletter sending — the list exists, and nothing can mail it
 
-**Status:** proposed (2026-09-01). Tracking issue: [#1170](https://github.com/gjovanov/roomler-ai/issues/1170).
-Anchors verified against master `fc1ab18d`.
+**Status:** implemented — P0–P5 merged 2026-09-01 (#1171 #1176 #1185 #1188 #1189 + the P5
+content/housekeeping PR); **field verification (P6) pending.** Tracking issue:
+[#1170](https://github.com/gjovanov/roomler-ai/issues/1170).
+Anchors verified against master `fc1ab18d` at claim time.
 
 ## Goal
 
@@ -178,25 +180,30 @@ immutable cache, so **filenames are versioned and never edited in place**.
 
 ## Acceptance criteria
 
-- [ ] P0 produced numbers: prod subscriber counts by status and a mailer-health verdict,
-      recorded on the issue before P1 merges.
+- [x] P0 produced numbers: prod subscriber counts by status (**0 rows ever** — the 404
+      bug measured at population level) and a mailer-health verdict (SendGrid configured,
+      delivering), recorded on the issue before P1 merged.
 - [ ] A visitor can subscribe on the live landing page — shown to **fail** on the
-      pre-fix deploy first — receive the confirmation mail, and land on a page that says
-      confirmed.
+      pre-fix deploy first (the prod zero IS that measurement) — receive the confirmation
+      mail, and land on a page that says confirmed.
 - [ ] Issue #1 sent to the real list from its `.md` source; ledger counts match the
       status payload; preview bytes equal sent bytes (modulo the unsubscribe URL).
 - [ ] One-click unsubscribe from a real Gmail account works via the RFC-8058 POST, and a
       second send provably skips the address (no ledger row for it).
-- [ ] Re-POSTing send never double-sends — integration-tested with a dead-port mailer
-      (ledger rows prove the skip), and a concurrent second claim answers 409.
-- [ ] Every admin newsletter route answers 404 to a non-platform-admin caller and to an
-      unset allowlist.
-- [ ] Raw HTML in a body `.md` never reaches the rendered email (structural; unit-tested
-      with `<script>`, `<img onerror>`, and inline tags).
-- [ ] All four subscribe surfaces are live; the landing prompt never re-appears after
-      dismissal, including when localStorage throws.
-- [ ] The stale-claim path is exercised: a manufactured stuck row is *reported*, survives
-      a plain resume untouched, and is re-attempted only under `{retry_stale: true}`.
+- [x] Re-POSTing send never double-sends — integration-tested with an NXDOMAIN mailer
+      (ledger rows prove the skip; completed is terminal), and a live second claim
+      answers 409 naming the holder.
+- [x] Every admin newsletter route answers 404 to a non-platform-admin caller and to an
+      unset allowlist (both arms integration-tested; the allowlisted id passes).
+- [x] Raw HTML in a body `.md` never reaches the rendered email (structural; unit-tested
+      with `<script>`, `<img onerror>`, and inline tags; re-asserted on the preview
+      route).
+- [ ] All four subscribe surfaces are live **on prod**; the landing prompt never
+      re-appears after dismissal, including when localStorage throws (the latch behavior
+      is unit-tested; the prod half is P6).
+- [x] The stale-claim path is exercised: a manufactured stuck row is *reported*, survives
+      a plain resume untouched, and is re-attempted only under `{retry_stale: true}` —
+      whose re-check honors a withdrawal that happened while the row sat stuck.
 
 ## Open decisions
 
