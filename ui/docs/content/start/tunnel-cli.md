@@ -12,7 +12,7 @@ capture and no mesh membership.
 
 ## Agent or tunnel client?
 
-| | Agent (`roomlerd`) | Tunnel client (`roomler`) |
+| Capability | Agent (`roomlerd`) | Tunnel client (`roomler`) |
 |---|---|---|
 | Reach **this** machine remotely | Yes | No |
 | Open tunnels **from** this machine | Yes | Yes |
