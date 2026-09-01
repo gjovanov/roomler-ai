@@ -23,6 +23,7 @@
         <template #activator="{ props: menuProps }">
           <v-btn
             v-bind="menuProps"
+            data-tour="enroll-button"
             prepend-icon="mdi-key-plus"
             append-icon="mdi-menu-down"
             color="primary"
@@ -86,6 +87,7 @@
         <div class="d-flex align-center mb-2 flex-wrap">
           <v-text-field
             v-model="gridSearch"
+            data-tour="device-search"
             density="compact"
             variant="outlined"
             hide-details
@@ -126,6 +128,7 @@
           />
         </div>
         <v-data-table-server
+          data-tour="device-grid"
           v-model:page="gridPage"
           v-model:items-per-page="gridPerPage"
           :headers="effectiveHeaders"
