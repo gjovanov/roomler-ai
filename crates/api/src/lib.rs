@@ -319,6 +319,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/me", put(routes::user::update_profile))
         // P4 — static segment; wins over the `{user_id}` capture below.
         .route("/unread-summary", get(routes::user::unread_summary))
+        // FR-12 P3 — likewise static, likewise above the capture.
+        .route("/tutorial", put(routes::user::update_tutorial))
         .route("/{user_id}", get(routes::user::get_profile));
 
     // rc.58 — browser console log batch ingest. User-authed (the
