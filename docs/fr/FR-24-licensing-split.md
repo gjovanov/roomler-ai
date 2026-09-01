@@ -244,9 +244,12 @@ CI run and this landing is not. The fix is the same one command.
 
 1. **P4b**: shared FFmpeg on Windows vs. per-release object archive. Needs the
    installer-size delta measured before choosing.
-2. Whether to pursue an HEVC pool licence or ship HEVC off by default in
-   commercial builds.
-3. Whether P5 is ever worth doing, or MPL on the cascade is simply permanent.
+2. ~~Whether to pursue an HEVC pool licence~~ — **decided 2026-09-01: HEVC stays
+   ON by default.** Only vendor *hardware* encoders ship, so we distribute no
+   HEVC implementation and the licence sits with the silicon vendor — the
+   position RustDesk and the wider field take. Recorded with its three
+   load-bearing conditions in `THIRD-PARTY-NOTICES.md`; ⚠️ adding any SOFTWARE
+   HEVC encoder would invalidate it.
 
 ## Out of scope
 
