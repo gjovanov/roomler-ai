@@ -98,6 +98,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // FR-43 P1 — macOS root-daemon supervision of the GUI worker; off at
         // enrollment like every other posture switch.
         macos_supervise_gui_worker: false,
+        power_policy: String::new(),
         // Same rule, one level up: accepting PUSHED config is the opt-in that
         // makes the two flags above refusable by a compromised control plane
         // (`docs/remote-config.md`). Joining an org must never turn it on —
