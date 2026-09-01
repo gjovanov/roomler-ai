@@ -126,6 +126,73 @@ pub fn socket_path(uid: u32) -> std::path::PathBuf {
     std::path::Path::new(DELEGATE_DIR).join(format!("{uid}.sock"))
 }
 
+/// The GUI worker's end of delegation: what the signalling loop reads and
+/// writes while [`crate::delegate_worker`] owns the socket.
+///
+/// Two ordinary channels rather than the socket itself, because the socket
+/// outlives a WS reconnect and the signalling loop does not. The attach loop
+/// keeps the socket and reconnects it independently; the signalling loop just
+/// sees messages arrive and replies leave.
+pub struct WorkerLink {
+    /// rc messages the daemon delegated, waiting for the signalling loop.
+    pub inbound: tokio::sync::mpsc::Receiver<ServerMsg>,
+    /// Replies from a delegated session — the answer, its peer's ICE, its
+    /// stats, its terminate — drained by the attach loop into `FromWorker`
+    /// frames.
+    ///
+    /// ⚠️ ONE queue for all of them, deliberately. On the WS path the
+    /// synchronous answer jumps the outbound queue (`handle_server_msg` holds
+    /// `&mut ws` for its whole duration), so it always precedes the peer's
+    /// first candidates. Here it does not, and that is safe because the
+    /// CONTROLLER already buffers early ICE — `useRemoteControl.ts` keeps a
+    /// `pendingRemoteIce` list precisely because `addIceCandidate` throws
+    /// before `setRemoteDescription`, and flushes it once the answer lands.
+    /// Checked rather than assumed; a priority queue here would be machinery
+    /// for a guarantee nothing needs.
+    pub outbound: tokio::sync::mpsc::Sender<ClientMsg>,
+}
+
+/// How this process takes part in delegation.
+///
+/// A process is the supervising DAEMON or the supervised WORKER, never both —
+/// so this is one value rather than two options that could disagree, and
+/// "neither" is the ordinary case on every platform.
+pub enum Delegation {
+    /// Not supervising and not supervised. Every platform but macOS, and macOS
+    /// too until `macos_supervise_gui_worker` is on.
+    Off,
+    /// The root daemon: hands delegable rc messages to an attached worker, and
+    /// puts the worker's replies on its own control WS.
+    Daemon(DelegateHost),
+    /// The GUI worker: serves what the daemon hands it, using the session
+    /// state it already has.
+    Worker(WorkerLink),
+}
+
+impl Delegation {
+    /// The daemon's channel, when this process is the daemon.
+    pub fn host(&self) -> Option<&DelegateHost> {
+        match self {
+            Delegation::Daemon(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// The worker's two ends, when this process is the worker. Split so the
+    /// receiver can be polled while the sender is lent to a session.
+    pub fn worker_mut(
+        &mut self,
+    ) -> Option<(
+        &mut tokio::sync::mpsc::Receiver<ServerMsg>,
+        &tokio::sync::mpsc::Sender<ClientMsg>,
+    )> {
+        match self {
+            Delegation::Worker(link) => Some((&mut link.inbound, &link.outbound)),
+            _ => None,
+        }
+    }
+}
+
 /// May this server message be handed to the GUI worker?
 ///
 /// A **whitelist**: five variants in, everything else stays with the daemon.
@@ -879,5 +946,82 @@ mod routing_tests {
             reason: EndReason::AgentHangup,
         });
         assert!(!k.is_empty() && k != "?", "got {k}");
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    fn worker() -> Delegation {
+        let (_in_tx, in_rx) = tokio::sync::mpsc::channel(4);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(4);
+        Delegation::Worker(WorkerLink {
+            inbound: in_rx,
+            outbound: out_tx,
+        })
+    }
+
+    /// A process is the supervising DAEMON or the supervised WORKER, never
+    /// both. The enum makes "both" unrepresentable; these assert that the
+    /// accessors agree, so a future refactor cannot quietly hand a worker the
+    /// daemon's channel — which would let it delegate rc messages to itself.
+    #[test]
+    fn a_process_is_one_role_or_neither() {
+        let mut off = Delegation::Off;
+        assert!(off.host().is_none());
+        assert!(off.worker_mut().is_none());
+
+        let mut daemon = Delegation::Daemon(DelegateHost::new());
+        assert!(daemon.host().is_some());
+        assert!(
+            daemon.worker_mut().is_none(),
+            "the daemon must never look like a worker"
+        );
+
+        let mut w = worker();
+        assert!(
+            w.host().is_none(),
+            "a worker must never hold the daemon's channel"
+        );
+        assert!(w.worker_mut().is_some());
+    }
+
+    /// The worker's two ends are split so the receiver can be polled while the
+    /// sender is lent to a session — the borrow shape `connect_once` needs.
+    #[tokio::test]
+    async fn the_worker_ends_carry_messages_in_both_directions() {
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel(4);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
+        let mut role = Delegation::Worker(WorkerLink {
+            inbound: in_rx,
+            outbound: out_tx,
+        });
+        let sid = bson::oid::ObjectId::new();
+        in_tx
+            .send(ServerMsg::Ice {
+                session_id: sid,
+                candidate: serde_json::Value::Null,
+            })
+            .await
+            .unwrap();
+
+        let (rx, tx) = role.worker_mut().expect("worker");
+        let got = rx.recv().await.expect("inbound");
+        assert!(
+            delegable_inbound(&got),
+            "only delegable kinds should arrive"
+        );
+        tx.send(ClientMsg::SdpAnswer {
+            session_id: sid,
+            sdp: "v=0".into(),
+        })
+        .await
+        .unwrap();
+        let back = out_rx.recv().await.expect("outbound");
+        assert!(
+            delegable_outbound(&back),
+            "a reply must be one the daemon will relay"
+        );
     }
 }
