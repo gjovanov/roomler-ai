@@ -562,6 +562,30 @@ pub(crate) fn resolve_rate_mode(name: &str, inplace_rate: bool) -> RateReconfig 
     }
 }
 
+/// FR-62 A2 — does our vendored FFmpeg force an IDR on an NVENC bitrate-only
+/// reconfigure? **No.** `.github/ffmpeg-patches/0001-nvenc-no-idr-on-bitrate-reconfig`
+/// drops `resetEncoder = forceIDR = 1` from `nvenc.c`'s `reconfig_encoder`, and
+/// the A0 sweep measured 0/20 rate-caused IDRs on the RTX (both the default and
+/// the constrained/relay HRD window). The const and the FFmpeg it describes ship
+/// in the SAME binary — the release-agent drift gate makes an unpatched build
+/// unshippable — so this can never be out of sync with the linked encoder. The
+/// single flip point if a future FFmpeg revision restores the forced IDR.
+const NVENC_RECONFIG_FORCES_IDR: bool = false;
+
+/// FR-62 A2 — does a live rate move on this backend emit a keyframe the pump
+/// must ration (defer / coalesce), given the NVENC escape-hatch state? Pure, so
+/// the matrix is unit-tested without constructing an encoder. NVENC's in-place
+/// VBR reconfigure does not (see [`NVENC_RECONFIG_FORCES_IDR`]); QSV's in-place
+/// CBR path runs `MFXVideoENCODE_Reset`, whose new-sequence behaviour is
+/// UNVALIDATED on real Intel silicon, so it is conservatively assumed to force
+/// one until A0-QSV says otherwise; a rebuild always ships a fresh IDR.
+pub(crate) fn reconfig_forces_idr_for(mode: RateReconfig, assume_nvenc_idr: bool) -> bool {
+    match mode {
+        RateReconfig::InPlaceVbr => NVENC_RECONFIG_FORCES_IDR || assume_nvenc_idr,
+        RateReconfig::InPlaceCbr | RateReconfig::Rebuild => true,
+    }
+}
+
 /// FR-62 A1 — per-encoder rate-apply counters, surfaced through
 /// [`VideoEncoder::rate_stats`] into the DC pump heartbeat.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1561,6 +1585,16 @@ impl FfmpegEncoder {
         !matches!(self.rate_mode, RateReconfig::Rebuild)
     }
 
+    /// FR-62 A2 — does a live rate move on THIS encoder emit a keyframe the pump
+    /// must ration? Delegates to [`reconfig_forces_idr_for`] with this session's
+    /// resolved mode and the NVENC escape hatch. The pump's `held_increase` arm
+    /// keys on this: NVENC (patched) applies a constrained increase LIVE, while
+    /// QSV-CBR / rebuild-bound backends keep deferring until their reset cost is
+    /// measured away. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` reverts NVENC.
+    pub fn reconfig_forces_idr(&self) -> bool {
+        reconfig_forces_idr_for(self.rate_mode, crate::encode::nvenc_assume_reconfig_idr())
+    }
+
     /// FR-62 A1 — rate-apply counters for the heartbeat.
     pub fn rate_stats(&self) -> RateStats {
         RateStats {
@@ -1881,6 +1915,23 @@ mod tests {
             resolve_rate_mode("hevc_videotoolbox", true),
             RateReconfig::Rebuild
         );
+    }
+
+    // FR-62 A2 — the pump rations a rate move only when the apply still costs an
+    // IDR. NVENC (patched FFmpeg) does not; QSV-CBR (unmeasured reset) and every
+    // rebuild do; and the escape hatch reverts NVENC to the rationing path.
+    #[test]
+    fn reconfig_forces_idr_per_backend() {
+        // NVENC in-place: the A2 patch removed the forced IDR (measured 0/20).
+        assert!(!reconfig_forces_idr_for(RateReconfig::InPlaceVbr, false));
+        // …unless the escape hatch says to assume one anyway.
+        assert!(reconfig_forces_idr_for(RateReconfig::InPlaceVbr, true));
+        // QSV in-place CBR runs MFXVideoENCODE_Reset — conservatively an IDR
+        // until A0-QSV clears it; the hatch is NVENC-only, so it can't relax QSV.
+        assert!(reconfig_forces_idr_for(RateReconfig::InPlaceCbr, false));
+        assert!(reconfig_forces_idr_for(RateReconfig::InPlaceCbr, true));
+        // A rebuild always ships a fresh IDR.
+        assert!(reconfig_forces_idr_for(RateReconfig::Rebuild, false));
     }
 
     // FR-62 A1 — the HRD window is the single source for open AND in-place
