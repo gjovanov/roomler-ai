@@ -6547,6 +6547,11 @@ async fn media_pump_ffmpeg_dc(
             // honest gap, deliberately distinct from a zero QP.
             let avg_qp = (qp_n > 0).then(|| (qp_sum / qp_n) as u32);
             let max_qp = (qp_n > 0).then_some(qp_max);
+            // FR-62 A1 — rate-apply counters (in-place writes vs rebuilds) and
+            // the IDR total, so the before/after of `encoder_inplace_rate` is
+            // one grep; read `idr_count` against `keyframe_requests` to isolate
+            // rate-caused IDRs.
+            let rate_stats = enc.rate_stats();
             info!(
                 %session_id,
                 codec_label,
@@ -6598,6 +6603,13 @@ async fn media_pump_ffmpeg_dc(
                 // FR-59 P3/P4 — (congested windows, drains ordered, live
                 // queue-depth estimate in ms) from the viewer-side loop.
                 link_stats = ?governor.link_stats(),
+                // FR-62 A1 — rate-apply accounting (in-place writes / rebuilds
+                // / IDRs emitted). `inplace_rate` off ⇒ QSV rebuilds, so
+                // `rebuilds` tracks rate moves; on ⇒ `rate_moves` does.
+                inplace_rate = enc.supports_dynamic_bitrate(),
+                rate_moves = rate_stats.rate_moves,
+                rebuilds = rate_stats.rebuilds,
+                idr_count = rate_stats.idr_count,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
