@@ -4654,6 +4654,37 @@ async fn media_pump_ffmpeg_dc(
     // averaged over REAL resamples (scale_ops), not window frames.
     let mut scale_us: u64 = 0;
     let mut scale_ops: u64 = 0;
+    // FR-65 P0 — the APPLY phase (rate/dims set_bitrate, swap start, adoption).
+    // The stage that was never timed, and therefore the stage a 1.3-2.0 s QSV
+    // encoder open hid in for months. `apply_us_max` matters more than the sum:
+    // an average over a 2 s heartbeat cannot represent a single 2 s outlier.
+    let mut apply_us: u64 = 0;
+    let mut apply_us_max: u64 = 0;
+    // FR-65 P0 — worst single loop pass in the window, and how many overran.
+    let mut iter_us_max: u64 = 0;
+    let mut pump_stalls: u32 = 0;
+    let stall_watch = crate::encode::pump_stall_watch_enabled();
+    let stall_warn = Duration::from_millis(crate::encode::pump_stall_warn_ms());
+    // Measured at the TOP of the NEXT pass, so every `continue` path in this
+    // loop is covered without an RAII guard fighting the borrow checker.
+    let mut iter_mark: Option<(std::time::Instant, u64, u64, u64, u64, u64)> = None;
+    // ⚠️ Rate-limited: a stall storm that floods its own log is a second
+    // performance problem.
+    let mut last_stall_log = crate::clock::instant_before(Duration::from_secs(60));
+    // FR-65 P0 — time an apply in place. A macro rather than a closure because
+    // it expands textually, so the body keeps its own `enc` mutable borrow.
+    macro_rules! timed_apply {
+        ($body:expr) => {{
+            let __t = std::time::Instant::now();
+            let __r = $body;
+            let __us = __t.elapsed().as_micros() as u64;
+            apply_us += __us;
+            if __us > apply_us_max {
+                apply_us_max = __us;
+            }
+            __r
+        }};
+    }
     // Phase A — pump-local resampler (cached taps + pooled intermediate);
     // see encode::resample module docs.
     let mut resampler = crate::encode::resample::Resampler::new();
@@ -5011,6 +5042,48 @@ async fn media_pump_ffmpeg_dc(
     }
 
     loop {
+        // FR-65 P0 — close out the PREVIOUS pass. Measuring here rather than at
+        // the tail is what makes every `continue` path in this loop count.
+        if stall_watch && let Some((started, c0, s0, e0, d0, a0)) = iter_mark.take() {
+            let took = started.elapsed();
+            let took_us = took.as_micros() as u64;
+            if took_us > iter_us_max {
+                iter_us_max = took_us;
+            }
+            if took >= stall_warn {
+                pump_stalls += 1;
+                if last_stall_log.elapsed() >= Duration::from_secs(2) {
+                    last_stall_log = std::time::Instant::now();
+                    // Phase deltas come from the accumulators the pump already
+                    // keeps, so the breakdown costs nothing extra. An overrun
+                    // whose phases all read ~0 is itself the finding: the time
+                    // went somewhere still untimed.
+                    warn!(
+                        %session_id,
+                        codec_label,
+                        constrained,
+                        iter_ms = took.as_secs_f64() * 1000.0,
+                        capture_ms = capture_us.saturating_sub(c0) as f64 / 1000.0,
+                        scale_ms = scale_us.saturating_sub(s0) as f64 / 1000.0,
+                        encode_ms = encode_us.saturating_sub(e0) as f64 / 1000.0,
+                        send_ms = send_us.saturating_sub(d0) as f64 / 1000.0,
+                        apply_ms = apply_us.saturating_sub(a0) as f64 / 1000.0,
+                        target_bps = governor.applied_bps(),
+                        "FFmpeg DC pump STALL — one pass exceeded the budget"
+                    );
+                }
+            }
+        }
+        if stall_watch {
+            iter_mark = Some((
+                std::time::Instant::now(),
+                capture_us,
+                scale_us,
+                encode_us,
+                send_us,
+                apply_us,
+            ));
+        }
         // rc.443 — owner-liveness beat, FIRST statement of the loop (see
         // the vp9 twin): a wedged blocking encode is the one failure this
         // task cannot log or clean up itself; the beat's absence is how
@@ -5048,7 +5121,7 @@ async fn media_pump_ffmpeg_dc(
                     Ok(Ok(rebuilt)) => {
                         let maxrate = rebuilt.maxrate_bps();
                         if let Some(enc) = encoder.as_mut() {
-                            if enc.adopt_rebuilt(rebuilt) {
+                            if timed_apply!(enc.adopt_rebuilt(rebuilt)) {
                                 // Stale pre-swap frames yield to the fresh
                                 // IDR, exactly like the sync rebuild path.
                                 send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5355,7 +5428,7 @@ async fn media_pump_ffmpeg_dc(
                 // lump through the thin pipe; field 2026-08-27, CORPLAP-3 +
                 // CORPLAP-2 got WORSE) or defer (see `deferred_bps`).
                 if enc.supports_dynamic_bitrate() {
-                    enc.set_bitrate(applied.bps);
+                    timed_apply!(enc.set_bitrate(applied.bps));
                 } else if bg_rebuild && !constrained {
                     swap_wanted = Some(applied.bps);
                 } else {
@@ -6124,7 +6197,7 @@ async fn media_pump_ffmpeg_dc(
                 if constrained && relay_idr_thrift {
                     last_deferred_apply_at = Some(std::time::Instant::now());
                 }
-                enc.set_bitrate(applied.bps);
+                timed_apply!(enc.set_bitrate(applied.bps));
             } else if bg_rebuild && !constrained {
                 swap_wanted = Some(applied.bps);
             } else if last_motion_at.elapsed() >= DEFER_QUIET {
@@ -6162,7 +6235,7 @@ async fn media_pump_ffmpeg_dc(
                     if bg_rebuild && bg_rebuild_constrained && !enc.supports_dynamic_bitrate() {
                         swap_wanted = Some(applied.bps);
                     } else {
-                        enc.set_bitrate(applied.bps);
+                        timed_apply!(enc.set_bitrate(applied.bps));
                     }
                 } else {
                     deferred_bps = Some(applied.bps);
@@ -6225,7 +6298,7 @@ async fn media_pump_ffmpeg_dc(
                     if !enc.supports_dynamic_bitrate() {
                         send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    enc.set_bitrate(bps);
+                    timed_apply!(enc.set_bitrate(bps));
                     info!(
                         %session_id,
                         codec_label,
@@ -6476,7 +6549,7 @@ async fn media_pump_ffmpeg_dc(
                     // or defer.
                     if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
                         if enc.supports_dynamic_bitrate() {
-                            enc.set_bitrate(applied.bps);
+                            timed_apply!(enc.set_bitrate(applied.bps));
                         } else if bg_rebuild && !constrained {
                             swap_wanted = Some(applied.bps);
                         } else {
@@ -6658,6 +6731,15 @@ async fn media_pump_ffmpeg_dc(
                 // patched); pair it with a flat `idr_count` to confirm the apply
                 // shipped no keyframe, or a rising one to justify the hatch.
                 reconfig_forces_idr = enc.reconfig_forces_idr(),
+                // FR-65 P0 — the APPLY stage (previously untimed, and therefore
+                // where a 1.3-2.0 s QSV open hid), plus the worst single pass in
+                // the window and how many passes overran. ⚠️ Read the MAXes, not
+                // the mean: one 2 s stall inside a 2 s window is invisible in an
+                // average and is exactly the event worth finding.
+                apply_ms = apply_us as f64 / 1000.0,
+                apply_ms_max = apply_us_max as f64 / 1000.0,
+                iter_ms_max = iter_us_max as f64 / 1000.0,
+                pump_stalls,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
@@ -6666,6 +6748,12 @@ async fn media_pump_ffmpeg_dc(
             scale_ops = 0;
             encode_us = 0;
             send_us = 0;
+            // FR-65 P0 — the window's apply/stall stats reset with the rest, so
+            // every heartbeat's maxes describe that window alone.
+            apply_us = 0;
+            apply_us_max = 0;
+            iter_us_max = 0;
+            pump_stalls = 0;
             qp_sum = 0;
             qp_max = 0;
             qp_n = 0;
