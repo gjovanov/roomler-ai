@@ -36,6 +36,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
+      # FR-62 A2 — the roomler FFmpeg source patches live in the repo.
+      - uses: actions/checkout@v4
       - name: Build minimal FFmpeg via vcpkg overlay port (x64-windows-static-md, LGPL)
         shell: pwsh
         run: |
@@ -92,6 +94,34 @@ jobs:
           # hwaccels exist in this build.
           $inject = 'string(APPEND OPTIONS " --disable-everything --disable-network --disable-protocols --disable-devices --disable-filters --disable-bsfs --disable-parsers --disable-demuxers --disable-muxers --disable-decoders --disable-encoders --disable-hwaccels --enable-encoder=h264_nvenc --enable-encoder=hevc_nvenc --enable-encoder=av1_nvenc --enable-encoder=h264_qsv --enable-encoder=hevc_qsv --enable-encoder=av1_qsv --enable-encoder=vp9_qsv --enable-encoder=h264_amf --enable-encoder=hevc_amf --enable-encoder=av1_amf --enable-nvenc --enable-amf --enable-libvpl --enable-d3d11va")' + "`n" + $anchor
           $content = $content.Replace($anchor, $inject)
+
+          # ── FR-62 A2: apply the roomler FFmpeg source patches via the port's
+          #    own PATCHES list (vcpkg applies them with -p1 after extract, the
+          #    level the diffs were cut at). Copy each patch into the overlay
+          #    port dir and inject its filename after the portfile's `PATCHES`
+          #    keyword. Fail loudly if the anchor moved — never ship unpatched.
+          $patchDir = "$env:GITHUB_WORKSPACE\.github\ffmpeg-patches"
+          $patchFiles = Get-ChildItem "$patchDir\*.patch" -ErrorAction SilentlyContinue
+          if ($patchFiles) {
+            if ($content -notmatch '(?m)^(\s*)PATCHES\s*\r?$') {
+              Write-Host "::error::baseline ffmpeg portfile has no standalone PATCHES anchor — re-derive the injection before building"
+              exit 1
+            }
+            foreach ($pf2 in $patchFiles) {
+              Copy-Item $pf2.FullName "$overlayPorts\ffmpeg\$($pf2.Name)" -Force
+            }
+            $names = ($patchFiles | ForEach-Object { $_.Name } | Sort-Object)
+            $inject2 = ($names | ForEach-Object { "        $_" }) -join "`n"
+            $content = [regex]::Replace($content, '(?m)^(\s*)PATCHES\s*\r?$', "`${1}PATCHES`n$inject2")
+            Write-Host "ffmpeg patches injected into the port PATCHES list: $($names -join ', ')"
+            # Manifest (sha256 per patch) carried into the zip below.
+            $manifestLines = $patchFiles | Sort-Object Name | ForEach-Object {
+              "$((Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower())  $($_.Name)"
+            }
+            $manifestLines -join "`n" | Set-Content -Path "$env:RUNNER_TEMP\ROOMLER-PATCHES.txt" -Encoding ascii -NoNewline
+            Write-Host "roomler patch manifest:"; Get-Content "$env:RUNNER_TEMP\ROOMLER-PATCHES.txt"
+          }
+
           Set-Content -Path $pf -Value $content -Encoding utf8
           Write-Host "portfile injection applied"
 
@@ -152,7 +182,16 @@ jobs:
           # filename, so rollback = flip the pattern back to the non-minimal
           # zip (kept on the release untouched).
           $zip = "$env:RUNNER_TEMP\ffmpeg-8.1.2-win64-msvc-static-md-lgpl-minimal.zip"
-          Compress-Archive -Path "$root\lib","$root\include" -DestinationPath $zip -CompressionLevel Optimal
+          # FR-62 A2 — carry the patch manifest inside the asset so
+          # release-agent can prove the vendored libs match the committed
+          # patches (see the build step). Present iff the build applied patches.
+          $paths = @("$root\lib", "$root\include")
+          $manifest = "$env:RUNNER_TEMP\ROOMLER-PATCHES.txt"
+          if (Test-Path $manifest) {
+            Copy-Item $manifest "$root\ROOMLER-PATCHES.txt" -Force
+            $paths += "$root\ROOMLER-PATCHES.txt"
+          }
+          Compress-Archive -Path $paths -DestinationPath $zip -CompressionLevel Optimal
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           "$hash  $(Split-Path $zip -Leaf)" | Out-File -Encoding ascii "$zip.sha256"
           Write-Host "zip: $([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB  sha256=$hash"
@@ -174,6 +213,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
+      # FR-62 A2 — the repo carries the FFmpeg source patches
+      # (.github/ffmpeg-patches/); check it out so the build can apply them.
+      - uses: actions/checkout@v4
       - name: Build minimal FFmpeg (shared, encoders-only)
         run: |
           set -euo pipefail
@@ -198,6 +240,20 @@ jobs:
           curl -sL -o /tmp/ffmpeg.tar.gz https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n8.1.2.tar.gz
           mkdir -p /tmp/ffsrc && tar xf /tmp/ffmpeg.tar.gz -C /tmp/ffsrc --strip-components=1
           cd /tmp/ffsrc
+          # FR-62 A2 — apply every roomler FFmpeg source patch (patch -p1 from
+          # the source root, the same level the diffs were cut at) BEFORE
+          # configure, and record a manifest (sha256 per patch) that
+          # release-agent asserts against the committed patches so a stale
+          # vendored asset can never ship. `patch --fatal-on-nonmatch` via the
+          # `|| exit 1` — a patch that does not apply cleanly must FAIL the
+          # build, never silently ship an unpatched lib.
+          shopt -s nullglob
+          for p in "$GITHUB_WORKSPACE"/.github/ffmpeg-patches/*.patch; do
+            echo "ffmpeg patch: applying $(basename "$p")"
+            patch -p1 --no-backup-if-mismatch < "$p" || { echo "::error::patch $(basename "$p") failed to apply to n8.1.2"; exit 1; }
+          done
+          ( cd "$GITHUB_WORKSPACE" && sha256sum .github/ffmpeg-patches/*.patch 2>/dev/null | sed 's#\.github/ffmpeg-patches/##' ) > /tmp/ROOMLER-PATCHES.txt || true
+          echo "roomler patch manifest:"; cat /tmp/ROOMLER-PATCHES.txt
           export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}
           # Same trim as the Windows overlay port: --disable-everything wipes
           # every component; the explicit enables restore exactly the ten HW
@@ -270,6 +326,10 @@ jobs:
           # Belt-and-braces: every DT_NEEDED of the staged avcodec must
           # resolve from the staging dir or glibc-family alone.
           LD_LIBRARY_PATH="$staging/lib" ldd "$staging"/lib/libavcodec.so | grep "not found" && { echo "::error::unresolvable DT_NEEDED in staged libavcodec"; exit 1; } || true
+          # FR-62 A2 — carry the patch manifest inside the asset so
+          # release-agent can prove the vendored libs match the committed
+          # patches before it ships them.
+          cp /tmp/ROOMLER-PATCHES.txt "$staging/ROOMLER-PATCHES.txt"
           tar cJf /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz -C /tmp/stage ffmpeg-minimal
           sha256sum /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz | tee /tmp/min.sha256
           ls -la /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz
