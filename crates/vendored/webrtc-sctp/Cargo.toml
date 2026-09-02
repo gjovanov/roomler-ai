@@ -1,0 +1,115 @@
+# Vendored copy of webrtc-sctp 0.11.0 from crates.io.
+# Upstream is verbatim EXCEPT (the delta IS
+# `crates/vendored/webrtc-sctp.patch`; re-derive with
+# `scripts/revendor-webrtc-sctp.sh`, drift-checked in CI):
+#   - src/chunk/chunk_forward_tsn.rs: `unmarshal` bounds the stream-entry
+#     loop by the CHUNK's declared length instead of the packet buffer.
+#     Upstream counted every byte to the end of the packet as stream
+#     entries, so a FORWARD-TSN with any chunk bundled after it — what
+#     Chrome's dcSCTP sends (FORWARD-TSN + SACK) whenever it abandons a
+#     message on an unreliable DataChannel — failed with `chunk too
+#     short` and the WHOLE packet, the SACK included, was discarded.
+#     Field 2026-09-02: 549 such drops in one day on one host, each a
+#     lost acknowledgement that stalled the outbound video on an RTO.
+#   - src/chunk/chunk_test.rs: the regression tests for that shape.
+
+[package]
+edition = "2021"
+name = "webrtc-sctp"
+version = "0.11.0"
+authors = ["Rain Liu <yliu@webrtc.rs>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A pure Rust implementation of SCTP"
+homepage = "https://webrtc.rs"
+documentation = "https://docs.rs/webrtc-sctp"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/webrtc-rs/webrtc/tree/master/sctp"
+
+[lib]
+name = "webrtc_sctp"
+path = "src/lib.rs"
+
+[[example]]
+name = "ping"
+path = "examples/ping.rs"
+bench = false
+
+[[example]]
+name = "pong"
+path = "examples/pong.rs"
+bench = false
+
+[[example]]
+name = "throughput"
+path = "examples/throughput.rs"
+
+[dependencies.arc-swap]
+version = "1"
+
+[dependencies.async-trait]
+version = "0.1"
+
+[dependencies.bytes]
+version = "1"
+
+[dependencies.crc]
+version = "3.2.1"
+
+[dependencies.log]
+version = "0.4"
+
+[dependencies.portable-atomic]
+version = "1.6"
+
+[dependencies.rand]
+version = "0.8"
+
+[dependencies.thiserror]
+version = "1"
+
+[dependencies.tokio]
+version = "1.32.0"
+features = [
+    "fs",
+    "io-util",
+    "io-std",
+    "macros",
+    "net",
+    "parking_lot",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+]
+
+[dependencies.util]
+version = "0.10.0"
+features = ["conn"]
+default-features = false
+package = "webrtc-util"
+
+[dev-dependencies.chrono]
+version = "0.4.28"
+
+[dev-dependencies.clap]
+version = "3"
+
+[dev-dependencies.env_logger]
+version = "0.11.3"
+
+[dev-dependencies.lazy_static]
+version = "1"
+
+[dev-dependencies.tokio-test]
+version = "0.4"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(fuzzing)"]
