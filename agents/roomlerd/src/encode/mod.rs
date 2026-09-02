@@ -422,6 +422,30 @@ pub fn bg_rebuild_constrained_enabled() -> bool {
     tunnel_core::env::node_env("BG_REBUILD_CONSTRAINED").as_deref() != Some("0")
 }
 
+/// FR-65 P0 — the pump stall watch. Default **on**: it costs two `Instant::now()`
+/// per loop iteration (~20-40 ns each against a 16.7 ms frame budget at 60 fps)
+/// and logs nothing until an iteration actually overruns.
+///
+/// 🔑 Its absence is why a 2 s encoder open hid for months. The pump already
+/// measured `capture`/`scale`/`encode`/`send`, and the stall appeared in NONE of
+/// them: the apply/rebuild phase was untimed, and a per-heartbeat AVERAGE cannot
+/// represent a single outlier even where it is counted. `ROOMLERD_PUMP_STALL_WATCH=0`
+/// disables.
+pub fn pump_stall_watch_enabled() -> bool {
+    tunnel_core::env::node_env("PUMP_STALL_WATCH").as_deref() != Some("0")
+}
+
+/// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase
+/// breakdown. 250 ms default: ~15 frames at 60 fps, far past anything the pump
+/// should ever spend in one pass, and well under the 1.3-2.0 s encoder opens this
+/// exists to catch. `ROOMLERD_PUMP_STALL_WARN_MS`.
+pub fn pump_stall_warn_ms() -> u64 {
+    tunnel_core::env::node_env("PUMP_STALL_WARN_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(250)
+}
+
 /// Drag-latency P5 kill switch (FR-1, 2026-08-27): when on (default), big
 /// frames run the BGRA→NV12/I444 conversion in row bands across scoped
 /// threads (byte-identical output; ~25→~15 ms of "encode" time at
