@@ -840,6 +840,10 @@ pub struct AgentConfig {
     /// multiplicative decrease bottoms out. Evidence-gated: with no held
     /// goodput estimate the nominal floor stands. `false` = flat floor.
     #[serde(default)]
+    /// FR-62 A1 — in-place encoder rate changes (QSV) + corrected NVENC HRD
+    /// sizing. Default OFF; ships inert. See `encoder_inplace_rate` in the
+    /// config surface.
+    pub encoder_inplace_rate: Option<bool>,
     pub slow_link_floor: Option<bool>,
     /// FR-59 P1 — absolute stop for that relief, bps
     /// (`ROOMLERD_SLOW_LINK_MIN_BITRATE`). Built-in default: 200000;
@@ -1989,6 +1993,7 @@ pub fn test_fixture() -> AgentConfig {
         direct_hrd_pct: None,
         area_min_bitrate: None,
         measured_ceiling: None,
+        encoder_inplace_rate: None,
         slow_link_floor: None,
         slow_link_min_bitrate: None,
         constrained_queue_measured: None,
@@ -2119,11 +2124,12 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 72] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 73] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
         ("MEASURED_CEILING", cfg.measured_ceiling),
+        ("ENCODER_INPLACE_RATE", cfg.encoder_inplace_rate),
         ("SLOW_LINK_FLOOR", cfg.slow_link_floor),
         ("CONSTRAINED_QUEUE_MEASURED", cfg.constrained_queue_measured),
         ("SEED_CONTRADICTION", cfg.seed_contradiction),

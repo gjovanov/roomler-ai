@@ -249,16 +249,7 @@ fn encoder_options(
     // Intel's AV1 VDENC ERRORS (then hangs the driver) on a forced IDR
     // that exceeds the reservoir instead of QP-clamping — the rc.443
     // incident; H.264/HEVC clamp gracefully.
-    let hrd_pct: usize = if constrained {
-        crate::encode::rate_profile::constrained_hrd_pct()
-    } else {
-        crate::encode::rate_profile::direct_hrd_pct()
-    };
-    let hrd_pct = if name.starts_with("av1_") {
-        hrd_pct.max(200)
-    } else {
-        hrd_pct
-    };
+    let hrd_pct = open_hrd_pct(name, constrained);
     let buf = (maxrate_bps.saturating_mul(hrd_pct) / 100).to_string();
     let cq_s = cq.to_string();
     let preset = node_env("FFMPEG_PRESET");
@@ -510,15 +501,92 @@ pub struct FfmpegEncoder {
     /// in place on an NVENC reconfigure and on a QSV/AMF rebuild — `set_bitrate`
     /// consults it (coarsened) to decide whether a change is even needed.
     maxrate_bps: usize,
-    /// True when this backend honours an in-place `rc_max_rate` reconfigure
-    /// mid-stream. NVENC does (FFmpeg's `reconfig_encoder` reads the field on
-    /// the next `send_frame` and calls `nvEncReconfigureEncoder`); QSV/AMF do
-    /// NOT reliably, so they go through a full encoder rebuild instead.
-    supports_dynamic_bitrate: bool,
+    /// FR-62 A1 — how a rate move is applied on this backend (resolved at
+    /// open from the encoder name + the `encoder_inplace_rate` flag).
+    /// `supports_dynamic_bitrate()` = "not a rebuild", so the pump routes an
+    /// in-place move through its immediate-apply arm.
+    rate_mode: RateReconfig,
+    /// FR-62 A1 — the HRD/VBV buffer window as a percent of maxrate, captured
+    /// at open so an in-place move sizes `rc_buffer_size` exactly as the open
+    /// did (the pre-A1 NVENC arm wrote `rc_buffer_size = target`, i.e. a 1×
+    /// window, silently resizing the reservoir on every move — the bug this
+    /// field fixes).
+    hrd_pct: usize,
+    /// FR-62 A1 — the `encoder_inplace_rate` flag captured at open. Gates the
+    /// corrected `hrd_pct` sizing so a flag-OFF session is byte-for-byte the
+    /// pre-A1 behaviour (NVENC wrote a 1× buffer; that is preserved when off).
+    inplace_rate: bool,
     /// This session's transport verdict at open time, stored so the QSV/AMF
     /// `set_bitrate` rebuild reuses the same HRD sizing the session opened
     /// with (constrained ⇒ the trimmed `constrained_hrd_pct` window).
     constrained: bool,
+    /// FR-62 A1 counters (heartbeat): in-place rate writes, encoder rebuilds,
+    /// and IDRs emitted — so the before/after of the in-place flag is one grep.
+    rate_moves: u32,
+    rebuilds: u32,
+    idr_count: u64,
+}
+
+/// FR-62 A1 — how `set_bitrate` applies a rate move on a given backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RateReconfig {
+    /// NVENC: write `rc_max_rate` + `rc_buffer_size` on the `AVCodecContext`;
+    /// `bit_rate` stays 0 (cq-driven VBR). FFmpeg's `reconfig_encoder` picks
+    /// it up on the next `send_frame`.
+    InPlaceVbr,
+    /// QSV (CBR — our `rc_max_rate == bit_rate` config): write `bit_rate` +
+    /// `rc_max_rate` + `rc_buffer_size` together; `qsvenc.c`'s per-frame
+    /// `update_bitrate` re-reads them and resets the encoder's BRC.
+    InPlaceCbr,
+    /// QSV/AMF/VideoToolbox when in-place is off or unsupported — rebuild.
+    Rebuild,
+}
+
+/// FR-62 A1 — resolve the apply path for a backend. NVENC is always in-place
+/// (that is the pre-A1 behaviour); QSV goes in-place only when the flag is on,
+/// else it rebuilds as before; AMF/VideoToolbox always rebuild (unmeasured /
+/// no runtime path in FFmpeg n8.1.2).
+pub(crate) fn resolve_rate_mode(name: &str, inplace_rate: bool) -> RateReconfig {
+    if name.contains("nvenc") {
+        RateReconfig::InPlaceVbr
+    } else if inplace_rate && (name.contains("qsv") || name.contains("_amf")) {
+        // AMF is unmeasured (no host); keep it Rebuild until A0 covers it —
+        // only QSV opts in here.
+        if name.contains("qsv") {
+            RateReconfig::InPlaceCbr
+        } else {
+            RateReconfig::Rebuild
+        }
+    } else {
+        RateReconfig::Rebuild
+    }
+}
+
+/// FR-62 A1 — per-encoder rate-apply counters, surfaced through
+/// [`VideoEncoder::rate_stats`] into the DC pump heartbeat.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateStats {
+    pub rate_moves: u32,
+    pub rebuilds: u32,
+    pub idr_count: u64,
+}
+
+/// FR-62 A1 — the HRD/VBV window (percent of maxrate) this backend opens with:
+/// `constrained_hrd_pct` on a relay session, `direct_hrd_pct` otherwise, floored
+/// at 200 for `av1_*` (Intel's AV1 VDENC errors, then hangs, on a forced IDR
+/// larger than the reservoir — the rc.443 incident). The single source of the
+/// sizing so an open and an in-place move never disagree.
+pub(crate) fn open_hrd_pct(name: &str, constrained: bool) -> usize {
+    let base = if constrained {
+        crate::encode::rate_profile::constrained_hrd_pct()
+    } else {
+        crate::encode::rate_profile::direct_hrd_pct()
+    };
+    if name.starts_with("av1_") {
+        base.max(200)
+    } else {
+        base
+    }
 }
 
 impl FfmpegEncoder {
@@ -804,8 +872,13 @@ impl FfmpegEncoder {
             fps: 30,
             cq,
             maxrate_bps: 3_000_000,
-            supports_dynamic_bitrate: false,
+            rate_mode: resolve_rate_mode("vp9_qsv", crate::encode::encoder_inplace_rate_enabled()),
+            hrd_pct: open_hrd_pct("vp9_qsv", false),
+            inplace_rate: crate::encode::encoder_inplace_rate_enabled(),
             constrained: false,
+            rate_moves: 0,
+            rebuilds: 0,
+            idr_count: 0,
         })
     }
 
@@ -975,8 +1048,16 @@ impl FfmpegEncoder {
                         fps,
                         cq,
                         maxrate_bps,
-                        supports_dynamic_bitrate: name.contains("nvenc"),
+                        rate_mode: resolve_rate_mode(
+                            name,
+                            crate::encode::encoder_inplace_rate_enabled(),
+                        ),
+                        hrd_pct: open_hrd_pct(name, constrained),
+                        inplace_rate: crate::encode::encoder_inplace_rate_enabled(),
                         constrained,
+                        rate_moves: 0,
+                        rebuilds: 0,
+                        idr_count: 0,
                     });
                 }
                 Err(e) => {
@@ -1404,6 +1485,11 @@ impl FfmpegEncoder {
                 Ok(()) => {
                     let data = packet.data().unwrap_or(&[]).to_vec();
                     let is_keyframe = packet.is_key();
+                    // FR-62 A1 — count every IDR emitted (heartbeat); read
+                    // against `keyframe_requests` to isolate rate-caused ones.
+                    if is_keyframe {
+                        self.idr_count += 1;
+                    }
                     // duration is in time_base units (1/1000 == ms); convert to us.
                     let duration_us = (packet.duration().max(0) as u64) * 1000;
                     // P8 Phase 5 — NVENC/QSV report the frame's average
@@ -1469,7 +1555,19 @@ impl FfmpegEncoder {
     /// routes them through the background swap (`rebuild_spec` /
     /// `open_rebuilt` / `adopt_rebuilt`).
     pub fn supports_dynamic_bitrate(&self) -> bool {
-        self.supports_dynamic_bitrate
+        // FR-62 A1 — "the pump may apply a rate move immediately" = any
+        // in-place mode. A rebuild-bound backend still returns false so the
+        // pump defers/swaps it (unchanged). QSV flips true only with the flag.
+        !matches!(self.rate_mode, RateReconfig::Rebuild)
+    }
+
+    /// FR-62 A1 — rate-apply counters for the heartbeat.
+    pub fn rate_stats(&self) -> RateStats {
+        RateStats {
+            rate_moves: self.rate_moves,
+            rebuilds: self.rebuilds,
+            idr_count: self.idr_count,
+        }
     }
 
     /// FR-10 — the maxrate the encoder is CURRENTLY running with, for the
@@ -1593,79 +1691,118 @@ impl VideoEncoder for FfmpegEncoder {
             return;
         }
 
-        if self.supports_dynamic_bitrate {
-            // NVENC: move the ceiling IN PLACE. FFmpeg's `reconfig_encoder`
-            // (libavcodec/nvenc.c) reads `avctx->rc_max_rate` / `rc_buffer_size`
-            // on the NEXT `send_frame` and calls `nvEncReconfigureEncoder`
-            // (with `forceIDR`) when they change — but ONLY while
-            // `rc != NV_ENC_PARAMS_RC_CONSTQP && support_dyn_bitrate`. Our
-            // NVENC config is `rc=vbr` with `bit_rate=0` (cq-driven), so the
-            // maxBitRate branch fires and the burst cap moves without a full
-            // encoder rebuild. `bit_rate` stays 0, so the averageBitRate branch
-            // is skipped — we modulate only the ceiling, which is the right
-            // lever for a constant-quality stream.
-            //
-            // SAFETY: `self.encoder` owns the `AVCodecContext` and we hold
-            // `&mut self`, so nothing reads/writes it concurrently. Writing
-            // these two RC fields between `send_frame` calls is exactly the
-            // reconfigure contract FFmpeg's nvenc implements.
-            unsafe {
-                let ctx = self.encoder.as_mut_ptr();
-                (*ctx).rc_max_rate = target as i64;
-                (*ctx).rc_buffer_size = target as std::os::raw::c_int;
-            }
-            self.maxrate_bps = target;
-            tracing::debug!(
-                encoder = self.encoder_name,
-                maxrate_bps = target,
-                "ffmpeg set_bitrate: NVENC in-place maxrate reconfigure"
-            );
+        // FR-62 A1 — the HRD/VBV reservoir this move should size to. Pre-A1 the
+        // NVENC arm wrote `rc_buffer_size = target` (a 1× window, silently
+        // resizing the reservoir on every move); with the flag ON both in-place
+        // arms size it to the window the session opened with. Flag OFF keeps the
+        // 1× write so a flag-OFF session is byte-for-byte the pre-A1 behaviour.
+        let bufsize = if self.inplace_rate {
+            // Exactly the open sizing (`open_hrd_pct`), which on a constrained
+            // session is deliberately < 1× — matching it is the point; a
+            // `.max(target)` floor here would re-create the pre-A1 divergence.
+            (target.saturating_mul(self.hrd_pct) / 100).max(1)
         } else {
-            // QSV / AMF: no dependable in-place bitrate reconfigure via a field
-            // write (the driver reads RC params only at init), so REBUILD the
-            // encoder with the new maxrate. The coarsen ladder above + the
-            // AIMD's own rate-limiting (MD ≤ 1/500 ms, AI ≤ 1/5 s, monotonic per
-            // direction) bound how often the bucket — and thus this rebuild —
-            // actually changes, so no extra time-debounce is needed (and a
-            // debounce here would silently drop a target the AIMD already
-            // marked applied). The fresh encoder's first frame is an IDR
-            // (`frame_count == 0` path in `build_av_frame`), so the browser
-            // resyncs cleanly across the swap.
-            // P4 — re-resolve the vp9_qsv gop/low_power for the rebuild. The
-            // verdict is a process-stable OnceLock, so this reproduces exactly
-            // the config the encoder was originally built with (and it's what
-            // the P4 release build's E0061 caught this call site missing).
-            let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
-            match Self::build_encoder(
-                self.encoder_name,
-                self.width,
-                self.height,
-                self.fps,
-                target,
-                self.cq,
-                qsv_low_power,
-                qsv_gop,
-                self.chroma444,
-                self.constrained,
-            ) {
-                Ok(enc) => {
-                    self.encoder = enc;
-                    self.maxrate_bps = target;
-                    self.frame_count = 0;
-                    self.force_keyframe = true;
-                    tracing::info!(
-                        encoder = self.encoder_name,
-                        maxrate_bps = target,
-                        "ffmpeg set_bitrate: QSV/AMF encoder rebuilt for new maxrate"
-                    );
+            target
+        };
+
+        match self.rate_mode {
+            RateReconfig::InPlaceVbr => {
+                // NVENC: move the ceiling IN PLACE. FFmpeg's `reconfig_encoder`
+                // (libavcodec/nvenc.c) reads `avctx->rc_max_rate` /
+                // `rc_buffer_size` on the NEXT `send_frame` and calls
+                // `nvEncReconfigureEncoder` when they change. Our NVENC config
+                // is `rc=vbr` with `bit_rate=0` (cq-driven), so `bit_rate` stays
+                // 0 and we modulate only the ceiling — the right lever for a
+                // constant-quality stream. (FR-62 A0 measured this apply at
+                // ~0.005 ms; the forced IDR it still triggers is what the A2
+                // nvenc patch removes.)
+                //
+                // SAFETY: `self.encoder` owns the `AVCodecContext` and we hold
+                // `&mut self`, so nothing reads/writes it concurrently. Writing
+                // these RC fields between `send_frame` calls is exactly the
+                // reconfigure contract FFmpeg's nvenc implements.
+                unsafe {
+                    let ctx = self.encoder.as_mut_ptr();
+                    (*ctx).rc_max_rate = target as i64;
+                    (*ctx).rc_buffer_size = bufsize as std::os::raw::c_int;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        encoder = self.encoder_name,
-                        maxrate_bps = target,
-                        %e,
-                        "ffmpeg set_bitrate: rebuild failed — keeping current encoder"
-                    );
+                self.maxrate_bps = target;
+                self.rate_moves += 1;
+                tracing::debug!(
+                    encoder = self.encoder_name,
+                    maxrate_bps = target,
+                    bufsize,
+                    "ffmpeg set_bitrate: NVENC in-place maxrate reconfigure"
+                );
+            }
+            RateReconfig::InPlaceCbr => {
+                // FR-62 A1 — QSV in place. Our QSV runs CBR (`select_rc_mode`
+                // picks CBR because we open with `rc_max_rate == bit_rate`), so
+                // TargetKbps must move WITH MaxKbps: write all three RC fields.
+                // `qsvenc.c`'s per-frame `update_parameters` → `update_bitrate`
+                // re-reads them and calls `MFXVideoENCODE_Reset`, so no blocking
+                // encoder rebuild (which is 0.65-0.87 s on Iris-Xe-class and the
+                // reason the whole defer/swap machinery exists). Whether that
+                // Reset also starts a new sequence (an IDR) is the field
+                // measurement A0 takes on CORPLAP-1's Iris Xe; either way this
+                // removes the multi-second rebuild stall.
+                //
+                // SAFETY: as InPlaceVbr — `&mut self` is exclusive.
+                unsafe {
+                    let ctx = self.encoder.as_mut_ptr();
+                    (*ctx).bit_rate = target as i64;
+                    (*ctx).rc_max_rate = target as i64;
+                    (*ctx).rc_buffer_size = bufsize as std::os::raw::c_int;
+                }
+                self.maxrate_bps = target;
+                self.rate_moves += 1;
+                tracing::debug!(
+                    encoder = self.encoder_name,
+                    maxrate_bps = target,
+                    bufsize,
+                    "ffmpeg set_bitrate: QSV in-place CBR reconfigure"
+                );
+            }
+            RateReconfig::Rebuild => {
+                // QSV / AMF / VideoToolbox with the in-place flag off (or
+                // unsupported): the driver reads RC params only at init, so
+                // REBUILD with the new maxrate. The coarsen ladder + the AIMD's
+                // rate limits bound how often the bucket — and thus this
+                // rebuild — changes. P4 — re-resolve the vp9_qsv gop/low_power
+                // (process-stable OnceLock, reproduces the original config).
+                let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
+                match Self::build_encoder(
+                    self.encoder_name,
+                    self.width,
+                    self.height,
+                    self.fps,
+                    target,
+                    self.cq,
+                    qsv_low_power,
+                    qsv_gop,
+                    self.chroma444,
+                    self.constrained,
+                ) {
+                    Ok(enc) => {
+                        self.encoder = enc;
+                        self.maxrate_bps = target;
+                        self.frame_count = 0;
+                        self.force_keyframe = true;
+                        self.rebuilds += 1;
+                        tracing::info!(
+                            encoder = self.encoder_name,
+                            maxrate_bps = target,
+                            "ffmpeg set_bitrate: QSV/AMF encoder rebuilt for new maxrate"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            encoder = self.encoder_name,
+                            maxrate_bps = target,
+                            %e,
+                            "ffmpeg set_bitrate: rebuild failed — keeping current encoder"
+                        );
+                    }
                 }
             }
         }
@@ -1718,6 +1855,44 @@ fn copy_plane_into_av(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FR-62 A1 — the apply path is resolved from the backend name + the flag.
+    #[test]
+    fn rate_mode_resolves_per_backend_and_flag() {
+        // NVENC is always in-place (the pre-A1 behaviour), flag or not.
+        assert_eq!(
+            resolve_rate_mode("hevc_nvenc", false),
+            RateReconfig::InPlaceVbr
+        );
+        assert_eq!(
+            resolve_rate_mode("av1_nvenc", true),
+            RateReconfig::InPlaceVbr
+        );
+        // QSV goes in-place ONLY with the flag; otherwise it rebuilds as before.
+        assert_eq!(resolve_rate_mode("hevc_qsv", false), RateReconfig::Rebuild);
+        assert_eq!(
+            resolve_rate_mode("hevc_qsv", true),
+            RateReconfig::InPlaceCbr
+        );
+        assert_eq!(resolve_rate_mode("vp9_qsv", true), RateReconfig::InPlaceCbr);
+        // AMF is unmeasured — Rebuild even with the flag; so is VideoToolbox.
+        assert_eq!(resolve_rate_mode("hevc_amf", true), RateReconfig::Rebuild);
+        assert_eq!(
+            resolve_rate_mode("hevc_videotoolbox", true),
+            RateReconfig::Rebuild
+        );
+    }
+
+    // FR-62 A1 — the HRD window is the single source for open AND in-place
+    // sizing; av1 is floored at 200 % (the rc.443 VDENC hang guard).
+    #[test]
+    fn open_hrd_pct_floors_av1_at_200() {
+        assert!(open_hrd_pct("av1_qsv", false) >= 200);
+        assert!(open_hrd_pct("av1_nvenc", true) >= 200);
+        // non-av1 uses the direct/constrained knob (a plain positive percent).
+        assert!(open_hrd_pct("hevc_qsv", false) > 0);
+        assert!(open_hrd_pct("hevc_qsv", true) > 0);
+    }
 
     /// Verify the encoder construction probe handles the all-failed case
     /// without panicking — important because the dispatch happens before
