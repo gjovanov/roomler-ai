@@ -1,6 +1,21 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** proposed · **Plan:** `immutable-doodling-neumann` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 tool shipped (#1247); A0 NVENC measured; A1 in-place path landing (inert, `encoder_inplace_rate` OFF) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+
+## Progress
+
+- **A0 — the sweep** (`encoder-smoke --reconfigure-sweep`) shipped in #1247.
+- **A0 — NVENC measured on the RTX 5090** (2026-09-02): `hevc_nvenc` forces a rate-caused IDR on
+  **20/20** rungs, but the apply is **0.001–0.008 ms** (an in-place `AVCodecContext` field write).
+  So the entire cost of a NVENC rate move is the forced keyframe — exactly what patch
+  `0001-nvenc-no-idr` removes. Codec-independent (shared `reconfig_encoder`). Full table on #1242.
+- **A1 — the in-place path** ships behind `encoder_inplace_rate` (**default OFF, inert**): QSV writes
+  `bit_rate + rc_max_rate + rc_buffer_size` (CBR) so `qsvenc`'s per-frame `update_bitrate` resets the
+  BRC with no rebuild; NVENC's in-place buffer is sized to the open window (fixing the pre-A1 1×
+  write). `supports_dynamic_bitrate()` = "not a rebuild" so the pump immediate-applies QSV when on.
+  Heartbeat gains `inplace_rate / rate_moves / rebuilds / idr_count`. Flips ON after **A0 clears the
+  QSV `MFXVideoENCODE_Reset`** on CORPLAP-1's Iris Xe (the encoder A1 targets first — not measurable
+  on neo16, which has no Intel iGPU; it rides A1's first release).
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
