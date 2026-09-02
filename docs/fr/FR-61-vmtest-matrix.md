@@ -156,32 +156,32 @@ COW-clone golden image → boot → SSH in
 
 ## Acceptance criteria
 
-- [ ] AC1 — `vmtest.sh run --lane ubuntu` boots a throwaway Ubuntu GUI (Wayland session
-  verified: `XDG_SESSION_TYPE=wayland`), installs via **script** and via **.deb**, for
-  **system** and **per-user** types, and all three checks pass in every cell.
-- [ ] AC2 — Win11: `install.ps1` × 3 roles AND silent MSI × 3 types all install, enroll
-  ephemeral, and pass all three checks.
-- [ ] AC3 — the Windows wizard smoke walks Welcome→…→Done over CDP, produces a working
-  install, and its (non-ephemeral) row is deleted afterwards.
-- [ ] AC4 — ARM Linux: script + aarch64 `.deb` system installs pass install/enroll/overlay
-  checks; RD on TCG is either green or an `expected-failures.txt` entry linking an issue that
-  explains why.
-- [ ] AC5 — macOS: script and pkg installs pass for agent-only AND agent+daemon (two rows,
-  `-daemon` on the overlay); lane skips cleanly when the Mac host is unreachable.
-- [ ] AC6 — RD check asserts `framesDecoded > 0` AND `currentTime` advances (not merely
-  "connected"), via the name-filtered spec, for every cell that claims RD green.
-- [ ] AC7 — desktop check walks all 5 views; on Windows it asserts real DOM per view over CDP;
-  elsewhere per-view screenshots differ from each other and from blank.
-- [ ] AC8 — teardown leaves the vmtest org at its baseline device count (graceful-shutdown
-  self-unenroll observed; reaper backstop observed at least once), and the k8s cluster is
-  untouched (`kubectl get nodes` + prod `/health` green across a full run).
-- [ ] AC9 — a regression (a cell that was green failing later) files a GitHub issue with the
-  cell name and log excerpt, e2e-nightly-style, after an isolated re-run confirms it.
-- [ ] AC10 — fail-first evidence recorded for at least: Linux `.deb` install, perMachine
-  SystemContext install, Wayland RD, ARM install, wizard walk — the cells no CI lane ever
-  covered.
-- [ ] AC11 — the whole flow is invocable as one command from the dev box (the P8 skill), with
-  `--lane/--method/--type` filters and a `--keep` debug mode.
+- [x] AC1 — Ubuntu 4/4 GREEN (script + `.deb` × system + per-user; Wayland session verified
+  `seat0 ... wayland`; per-user via netstack). Field-verified prod 0.4.48, 2026-09-02.
+- [x] AC2 — Win11 6/6 GREEN (`install.ps1` daemon-system/machine/user AND silent perMachine/
+  perUser MSI incl. `ENABLE_SYSTEM_CONTEXT=1`; SystemContext overlay = two roomlerd, session-0
+  supervisor + session-1 worker; per-user via netstack). Field-verified 0.4.48, 2026-09-02.
+- [~] AC3 — the wizard smoke is coded and drives WebView2 CDP, but is BLOCKED externally: no
+  `roomler-setup` (`setup-v*`) release exists for `/api/setup/windows` to serve. Recorded in
+  `expected-failures.txt`; unblocks when a wizard release is cut.
+- [ ] AC4 — ARM Linux: bake in progress (aarch64 under QEMU TCG). RD carried in
+  `expected-failures.txt` (TCG SW-encode).
+- [ ] AC5 — macOS: coded; needs an Apple-silicon `tart` host (`VMTEST_MACOS_SSH`); lane
+  auto-skips cleanly when unset.
+- [x] AC6 — RD asserts frames FLOW and ADVANCE (getStats `framesDecoded` / the composable's live
+  fps hook, with a transport-agnostic canvas-pixel-change fallback for the DataChannel/VP9-444
+  path that has no `<video>`). Verified on Ubuntu + Windows (VP9-444, direct, 29 fps).
+- [x] AC7 — all 5 roomler-desktop views walked; Windows asserts real DOM per view over WebView2
+  CDP; Linux uses `virsh screendump` per view (pairwise-distinct). Verified.
+- [x] AC8 — teardown leaves the org at baseline (graceful self-unenroll + reaper backstop
+  observed; `count ≤ baseline` accepts the reaper cleaning older leftovers); k8s untouched
+  (`kubectl get nodes` + prod `/health` green across every run).
+- [ ] AC9 — the regression-issue mechanism (isolated re-run + `gh issue create`) is coded; not
+  yet observed firing (no green-then-red regression occurred).
+- [~] AC10 — fail-first evidence recorded for Linux `.deb` install, perMachine SystemContext,
+  Wayland RD, wizard (all shown failing before their fix/expectation); ARM pending its bake.
+- [x] AC11 — invocable as one command from the dev box via mars (`vmtest.sh run --lane/--method/
+  --type`, `--keep`); the `vmtest` skill documents it.
 
 ## Open decisions
 
@@ -204,5 +204,36 @@ COW-clone golden image → boot → SSH in
 
 ## Field-verification log
 
-*(appended as phases land — each cell class shown failing before its first green, per the FR
-workflow)*
+**2026-09-02, prod 0.4.48, zeus KVM — 10 cells GREEN (Ubuntu 4/4, Win11 6/6).** The harness was
+built and driven to green on the live fleet; the run-and-tweak phase found and fixed **27 field
+bugs**, each shown failing before its fix. Highlights (full detail in the memory + the issue's
+step-log comments):
+
+- **Ubuntu** (script + `.deb` × system + per-user): install / enroll / overlay (`roomler ping`
+  anchor round-trip ~1–2 ms) / Wayland (`seat0 ... wayland`) / RD (VP9-444 direct 29 fps, real
+  GNOME desktop — DRM capture in a virtio-gpu KVM guest) / roomler-desktop (5 views).
+- **Win11** (install.ps1 + MSI × system/attended/user): install / enroll / SystemContext overlay
+  (two roomlerd — session-0 SYSTEM supervisor + session-1 worker) / RD / desktop (5 views over
+  WebView2 CDP). Golden image bakes unattended (autounattend + OVMF + swtpm + virtio).
+
+Load-bearing bugs (each cost a real debug cycle): an ephemeral daemon **unenrolls itself on
+SIGTERM** so a post-enroll restart deleted the device; the configless crash-loop trips systemd's
+**start rate-limit**; libvirt's default IP source is unreliable (needs `--source arp`); a bash
+`${2:-{}}` default **corrupted every JSON API body**; `roomler status` overlay address is
+top-level `.overlay_ip`; a multi-cell run **ran only the first cell** (ssh ate the loop pipe);
+sessions are **cookie-only** (RD spec landed on /login); a SW-encode agent streams **VP9-444 over
+a DataChannel → a canvas, not `<video>`** (transport-agnostic frame oracle); on Windows,
+`$ErrorActionPreference='Stop'` turns native stderr into a terminating error, `wait_guest_ssh`'s
+`true` probe doesn't exist in PowerShell, and non-ASCII in a `.ps1` breaks the parse.
+
+**Two product findings surfaced by the harness (each worth its own FR):**
+1. **The test org was on the FREE plan — a 3-device cap** (`crates/db/src/models/tenant.rs`).
+   Anchor + un-reaped orphans hit it and every new enroll got `403 "Device limit reached"` — a
+   *silent* matrix-killer that reads like an overlay bug.
+2. **Per-user overlay is broken out of the box on BOTH OSes** — an unprivileged per-user daemon
+   can't create a WireGuard TUN, and a vanilla per-user install doesn't auto-configure the
+   userspace netstack (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`), so `overlay_mode=tun` never gets an
+   address. The installer should set netstack up for a per-user role.
+
+Remaining: ARM (baking), macOS (needs an Apple-silicon `tart` host), and the wizard smoke (needs
+a `roomler-setup` release).
