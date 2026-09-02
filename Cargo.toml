@@ -44,6 +44,9 @@ exclude = [
     # Vendored upstream plus an accessor for the macOS IOSurface row pitch —
     # see the scrap patch note below [patch.crates-io].
     "crates/vendored/scrap",
+    # Vendored upstream with the FORWARD-TSN bundled-chunk parse fix —
+    # see the webrtc-sctp patch note below [patch.crates-io].
+    "crates/vendored/webrtc-sctp",
 ]
 
 # Patch webrtc-rs's rtp-0.12.0 dependency with our local vendored copy
@@ -95,15 +98,29 @@ exclude = [
 # it survived this long. Our vendored copy binds `IOSurfaceGetBytesPerRow` and
 # exposes `Frame::bytes_per_row()`. One canonical diff:
 # crates/vendored/scrap.patch (scripts/revendor-scrap.sh).
+#
+# webrtc-sctp-0.11.0: upstream `ChunkForwardTsn::unmarshal` bounds its
+# stream-entry loop by the PACKET buffer instead of the chunk's declared
+# length, so a FORWARD-TSN with any chunk bundled after it fails with
+# `chunk too short` and the whole packet is dropped — SACK included.
+# Chrome's dcSCTP bundles exactly that (FORWARD-TSN + SACK) whenever it
+# abandons a message on an unreliable stream, i.e. on every loss in the
+# viewer→agent direction while the input channel is busy; each dropped
+# packet is a lost acknowledgement and the outbound video stalls on an
+# RTO. Field 2026-09-02: 549 drops on one host in a day, 523 of them in
+# one 4-minute LAN session that ran 3-4 s behind. Our vendored copy
+# bounds the loop by the chunk. One canonical diff:
+# crates/vendored/webrtc-sctp.patch (scripts/revendor-webrtc-sctp.sh).
 [patch.crates-io]
 rtp = { path = "crates/vendored/rtp" }
 webrtc-ice = { path = "crates/vendored/webrtc-ice" }
 webrtc = { path = "crates/vendored/webrtc" }
+webrtc-sctp = { path = "crates/vendored/webrtc-sctp" }
 wintun-bindings = { path = "crates/vendored/wintun-bindings" }
 scrap = { path = "crates/vendored/scrap" }
 
 [workspace.package]
-version = "0.4.49"
+version = "0.4.50"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 

@@ -4828,6 +4828,15 @@ async fn media_pump_ffmpeg_dc(
         rate_seed,
         std::time::Instant::now(),
     );
+    if let Some(seed_bps) = governor.open_seed_bps() {
+        info!(
+            %session_id,
+            codec_label,
+            seed_bps,
+            "FR-59 P8 — the pair is remembered slower than the nominal floor: opening at the \
+             remembered rate, floor relief seeded from it, refine lift held while the profile is on"
+        );
+    }
     // rc.443 — consecutive-encode-error escalation (retry → rebuild →
     // clean pump exit); see `encode::EncodeErrorLadder`.
     let mut err_ladder = crate::encode::EncodeErrorLadder::default();
@@ -5505,10 +5514,17 @@ async fn media_pump_ffmpeg_dc(
                                 refined_cap: crate::encode::idle_refine_cap_long_edge(),
                                 soft_cap: governor.auto_res_cap(),
                             });
+                        // FR-59 P8 — never while the slow-link profile is
+                        // in force: a lift to native IS the mid-session
+                        // rung flip P5 was resolved once to avoid, and on
+                        // the pipe that engaged it the native IDR is 1-2 s
+                        // of link time (field 2026-09-02: 1280×800 ↔
+                        // 1920×1200 on every heartbeat, one IDR each way).
                         let eligible = nw > 0
                             && plan.capped_below_native
                             && plan.user_native
-                            && pipeline.merged_refine_eligible(prio, constrained);
+                            && pipeline.merged_refine_eligible(prio, constrained)
+                            && slow_link_profile.is_none();
                         if let Some(flip) = idle_refine.on_keepalive(eligible, constrained, now) {
                             info!(
                                 %session_id,
@@ -5635,7 +5651,10 @@ async fn media_pump_ffmpeg_dc(
             && pipeline.merged_refine_eligible(
                 priority.load(std::sync::atomic::Ordering::Relaxed),
                 constrained,
-            );
+            )
+            // FR-59 P8 — same gate as the keepalive arm: no refine lift
+            // while the slow-link profile is in force.
+            && slow_link_profile.is_none();
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
             info!(
                 %session_id,
@@ -5732,7 +5751,12 @@ async fn media_pump_ffmpeg_dc(
             // rebuilt AGAIN one frame later by the governor's forced
             // reapply (two QSV rebuilds back-to-back at a rung flip).
             let open_rate = match governor.applied_bps() {
-                0 => ceiling,
+                // FR-59 P8 — a remembered-slow pair's FIRST open lands at
+                // the remembered rate: the governor's first tick applies it
+                // one frame later, and an encoder opened at the ceiling
+                // would be rebuilt right there (a second blocking QSV open
+                // before the first frame).
+                0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
                 applied => ceiling.min(applied),
             };
             match codec.open(

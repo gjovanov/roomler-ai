@@ -134,6 +134,11 @@ jobs:
       - name: Vendored scrap drift check
         run: bash scripts/revendor-scrap.sh --check
 
+      # Same invariant for the webrtc-sctp fork (the FORWARD-TSN bundled-
+      # chunk parse fix; see crates/vendored/webrtc-sctp/Cargo.toml).
+      - name: Vendored webrtc-sctp drift check
+        run: bash scripts/revendor-webrtc-sctp.sh --check
+
       # Belt for the cold path of the cached-apt steps below: apt retries
       # transient mirror failures instead of stalling into the job timeout.
       - name: Configure apt retries
