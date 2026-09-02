@@ -1766,7 +1766,10 @@ mod system {
     /// `/(96+block_plen)` for a per-org adapter). `connected_v4 == None` (the
     /// v4 mask was unknown at bring-up) falls back to the whole
     /// `fd72:6f6f:6d6c::/96` — the pre-#1237 behaviour. Pure, so the golden
-    /// vectors below test it on every platform.
+    /// vectors below test it on every platform. Its only non-test caller
+    /// (`defend_self_route`) is Windows-only, so it reads as dead code on
+    /// other targets while the tests still exercise it.
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn defended_ula_prefix(
         connected_v4: Option<(Ipv4Addr, u8)>,
         v6_onlink_plen: u8,
@@ -1788,6 +1791,7 @@ mod system {
     }
 
     /// Zero every bit of `ip` below prefix length `plen`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn mask_v6(ip: std::net::Ipv6Addr, plen: u8) -> std::net::Ipv6Addr {
         let bits = u128::from(ip);
         let plen = plen.min(128);
