@@ -23,10 +23,13 @@
 //! deliberately NOT pooled — it moves into an `Arc<Frame>` that
 //! `last_good_frame`/the encoder/the send path may hold arbitrarily long.
 //!
-//! `ROOMLERD_SCALE_THREADS` (config key `scale_threads`, default 1)
-//! row-bands both passes across N scoped threads — both are
-//! embarrassingly parallel, and on HW-encode hosts the cores are idle
-//! during motion. Off by default; a lever for the field, not a policy.
+//! `ROOMLERD_SCALE_THREADS` (config key `scale_threads`, default
+//! `min(available_parallelism, 4)` since FR-65 — it was 1) row-bands both
+//! passes across N scoped threads — both are embarrassingly parallel, and on
+//! HW-encode hosts the cores are idle during motion. It shipped as "a lever
+//! for the field, not a policy", and the field then measured what leaving it
+//! off costs: `avg_scale_ms = 23.6` on a constrained CORPLAP-1 session, and
+//! 18.15 → 5.91 ms/frame going 1 → 4 threads in the bench. It is now policy.
 //!
 //! Phase B (GPU scale before readback, D3D11 VideoProcessor) makes this
 //! whole module the FALLBACK on Windows GPU-capture backends; this stays
@@ -79,11 +82,38 @@ fn use_lanczos_for_scale(scale: f32, min_scale: f32, enabled: bool) -> bool {
 /// [`Resampler`] (per pump instance), clamped 1..=8; 1 = inline, no
 /// threads spawned. Env `ROOMLERD_SCALE_THREADS` / config key
 /// `scale_threads`.
+///
+/// **FR-65: the default is now `min(available_parallelism, 4)`, was 1.** The
+/// row-banding was implemented, correctness-tested
+/// (`threaded_bands_match_single_thread`) — and switched off, so every
+/// downscale ran single-threaded. Measured by `lanczos_cost_by_thread_count`
+/// (release, 1920×1200 → 1280×800): **18.15 ms at 1 thread, 5.91 at 4
+/// (3.07×), 4.00 at 8 (4.54×)** — near-linear to 4, then diminishing. The
+/// field number it explains: CORPLAP-1 reported `avg_scale_ms = 23.6` on a
+/// slower laptop CPU, and `0.0` at native resolution.
+///
+/// 🔑 Why this matters more than the raw milliseconds: the downscale engages
+/// **only once the session has already downscaled** — i.e. only when the host
+/// is already constrained — so the old default spent ~24 ms/frame of CPU
+/// precisely where there was none to spare, capping the frame rate on the
+/// sessions least able to afford it.
+///
+/// ⚠️ Capped at 4 rather than 8 on purpose: the gain from 4→8 is 1.5× while
+/// the cost is doubling the cores taken from the encoder and the rest of the
+/// daemon on a laptop. ⚠️ `available_parallelism` is honoured so a 2-core box
+/// does not oversubscribe itself.
 fn scale_threads() -> usize {
     node_env("SCALE_THREADS")
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(1)
+        .unwrap_or_else(default_scale_threads)
         .clamp(1, 8)
+}
+
+fn default_scale_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(4)
 }
 
 /// rc.191 — per-output-pixel Lanczos-3 tap table for one axis, in Q12
@@ -597,5 +627,48 @@ mod tests {
             single.lanczos3(&src, 192, 120, 192 * 4, 102, 64),
             banded.lanczos3(&src, 192, 120, 192 * 4, 102, 64),
         );
+    }
+
+    /// FR-65 — what the downscale actually costs, at the shape the field hit.
+    /// `#[ignore]`d because it is a MEASUREMENT, not an assertion: thread
+    /// scaling is hardware-dependent, so asserting a number here would only
+    /// produce a test that fails on somebody else's laptop.
+    ///
+    /// Run: `cargo test -p roomlerd --lib -- --ignored --nocapture lanczos_cost`
+    ///
+    /// Context: CORPLAP-1 on the corp VPN reported `avg_scale_ms = 23.6` while
+    /// downscaling its native panel to the constrained rung — and `0.0` at
+    /// native resolution, so this path engages exactly when the host is already
+    /// struggling. `scale_threads` defaults to **1**, so the row-banding below
+    /// is implemented, correctness-tested (`threaded_bands_match_single_thread`)
+    /// and switched off.
+    #[test]
+    #[ignore]
+    fn lanczos_cost_by_thread_count() {
+        const SW: u32 = 1920;
+        const SH: u32 = 1200;
+        const DW: u32 = 1280;
+        const DH: u32 = 800;
+        let src = noise_frame(SW, SH);
+        println!(
+            "available_parallelism = {:?}",
+            std::thread::available_parallelism()
+        );
+        for threads in [1usize, 2, 4, 8] {
+            let mut rs = Resampler {
+                threads,
+                ..Resampler::default()
+            };
+            // Warm the tap tables and the pooled intermediate so the numbers
+            // describe steady state, not the first-frame build.
+            let _ = rs.lanczos3(&src, SW, SH, SW * 4, DW, DH);
+            const N: u32 = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                let _ = rs.lanczos3(&src, SW, SH, SW * 4, DW, DH);
+            }
+            let per_ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(N);
+            println!("lanczos3 {SW}x{SH} -> {DW}x{DH}  threads={threads}  {per_ms:.2} ms/frame");
+        }
     }
 }
