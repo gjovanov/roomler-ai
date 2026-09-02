@@ -61,6 +61,16 @@ on:
         description: 'Fail the job if artifacts end up unsigned (rehearses the release-tag gate)'
         type: boolean
         default: false
+      skip_macos:
+        description: >-
+          Publish WITHOUT the macOS wizard. The macOS job REQUIRES real Apple
+          credentials on a release (an unsigned .app is Gatekeeper-blocked), and
+          the Apple org enrolment is still pending (FR-7) — so today it fails
+          and takes Linux + Windows down with it. This opt-in lets the platforms
+          that CAN be signed ship, instead of blocking every wizard release on
+          Apple. Remove it once the Apple credentials land.
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -194,6 +204,9 @@ jobs:
   build-macos:
     name: Build wizard (macOS universal)
     needs: validate-version
+    # Skipped only when the operator explicitly asked to ship without macOS
+    # (see the `skip_macos` input). A tag push always builds it.
+    if: github.event.inputs.skip_macos != 'true'
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -412,7 +425,15 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     needs: [validate-version, build-linux, build-macos, build-windows]
-    if: needs.validate-version.outputs.is_release == 'true'
+    # `always()` so a DELIBERATELY skipped macOS build (skip_macos) still
+    # publishes — but every platform that actually ran must have SUCCEEDED, so
+    # a genuine build failure still blocks the release.
+    if: >-
+      always()
+      && needs.validate-version.outputs.is_release == 'true'
+      && needs.build-linux.result == 'success'
+      && needs.build-windows.result == 'success'
+      && (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write      # create the release
