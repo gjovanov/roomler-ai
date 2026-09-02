@@ -164,8 +164,10 @@ COW-clone golden image → boot → SSH in
 - [~] AC3 — the wizard smoke is coded and drives WebView2 CDP, but is BLOCKED externally: no
   `roomler-setup` (`setup-v*`) release exists for `/api/setup/windows` to serve. Recorded in
   `expected-failures.txt`; unblocks when a wizard release is cut.
-- [ ] AC4 — ARM Linux: bake in progress (aarch64 under QEMU TCG). RD carried in
-  `expected-failures.txt` (TCG SW-encode).
+- [x] AC4 — ARM Linux GREEN 2/2 (script + aarch64 `.deb`, system): install / enroll / overlay
+  (`ping anchor ~4 ms`); RD even PASSES under TCG (virtual-desktop Xvfb + SW encode). Desktop is
+  N/A (no aarch64 companion) and the graceful skip is asserted. Field-verified 0.4.48, 2026-09-02.
+
 - [ ] AC5 — macOS: coded; needs an Apple-silicon `tart` host (`VMTEST_MACOS_SSH`); lane
   auto-skips cleanly when unset.
 - [x] AC6 — RD asserts frames FLOW and ADVANCE (getStats `framesDecoded` / the composable's live
@@ -179,7 +181,7 @@ COW-clone golden image → boot → SSH in
 - [ ] AC9 — the regression-issue mechanism (isolated re-run + `gh issue create`) is coded; not
   yet observed firing (no green-then-red regression occurred).
 - [~] AC10 — fail-first evidence recorded for Linux `.deb` install, perMachine SystemContext,
-  Wayland RD, wizard (all shown failing before their fix/expectation); ARM pending its bake.
+  Wayland RD, ARM install (ALSA runtime-lib symbol), wizard — all shown failing before their fix/expectation.
 - [x] AC11 — invocable as one command from the dev box via mars (`vmtest.sh run --lane/--method/
   --type`, `--keep`); the `vmtest` skill documents it.
 
@@ -204,7 +206,7 @@ COW-clone golden image → boot → SSH in
 
 ## Field-verification log
 
-**2026-09-02, prod 0.4.48, zeus KVM — 10 cells GREEN (Ubuntu 4/4, Win11 6/6).** The harness was
+**2026-09-02, prod 0.4.48, zeus KVM — 12 cells GREEN (Ubuntu 4/4, Win11 6/6, ARM 2/2).** The harness was
 built and driven to green on the live fleet; the run-and-tweak phase found and fixed **27 field
 bugs**, each shown failing before its fix. Highlights (full detail in the memory + the issue's
 step-log comments):
@@ -235,5 +237,5 @@ a DataChannel → a canvas, not `<video>`** (transport-agnostic frame oracle); o
    userspace netstack (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`), so `overlay_mode=tun` never gets an
    address. The installer should set netstack up for a per-user role.
 
-Remaining: ARM (baking), macOS (needs an Apple-silicon `tart` host), and the wizard smoke (needs
+Remaining: macOS (needs an Apple-silicon `tart` host) and the wizard smoke (needs
 a `roomler-setup` release).
