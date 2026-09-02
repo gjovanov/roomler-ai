@@ -44,6 +44,9 @@ exclude = [
     # Vendored upstream plus an accessor for the macOS IOSurface row pitch —
     # see the scrap patch note below [patch.crates-io].
     "crates/vendored/scrap",
+    # Vendored upstream with the FORWARD-TSN bundled-chunk parse fix —
+    # see the webrtc-sctp patch note below [patch.crates-io].
+    "crates/vendored/webrtc-sctp",
 ]
 
 # Patch webrtc-rs's rtp-0.12.0 dependency with our local vendored copy
