@@ -257,6 +257,15 @@ pub fn slow_link_floor_enabled() -> bool {
     tunnel_core::env::node_env("SLOW_LINK_FLOOR").as_deref() != Some("0")
 }
 
+/// FR-62 A1 — apply a rate move IN PLACE on QSV (and keep NVENC's corrected
+/// HRD sizing) instead of rebuilding the encoder. Default **OFF**: the PR
+/// ships inert and this flips on only after A0 clears the QSV `MFXVideoENCODE_Reset`
+/// on real Iris-Xe silicon. Env `ROOMLERD_ENCODER_INPLACE_RATE` / config
+/// `encoder_inplace_rate`. OFF = the pre-A1 behaviour byte-for-byte.
+pub fn encoder_inplace_rate_enabled() -> bool {
+    tunnel_core::env::node_env("ENCODER_INPLACE_RATE").as_deref() == Some("1")
+}
+
 /// FR-59 P1 — the absolute stop for the floor relief above (bps). Below
 /// roughly this a full-resolution frame is illegible at any QP and the
 /// honest lever is fewer PIXELS, not fewer bits; the relief exists to let
