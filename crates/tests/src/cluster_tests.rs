@@ -1141,32 +1141,46 @@ async fn overlay_removes_reach_peers_homed_on_another_pod() {
     ws_a.send(Message::Text(join(11).into())).await.unwrap();
     ws_b.send(Message::Text(join(12).into())).await.unwrap();
 
-    // Drain until B holds its netmap; A's node id comes from the DB (the
-    // netmap's own id field names the RECIPIENT'S node).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut b_has_netmap = false;
-    while std::time::Instant::now() < deadline && !b_has_netmap {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), ws_b.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => {
-                if t.contains("rc:overlay.netmap") {
-                    b_has_netmap = true;
-                }
+    // Drain BOTH joins to their netmaps — reading only B's left A's join
+    // possibly unprocessed when the DB read below ran (the two WSs are
+    // independent server tasks with no ordering between them), which is the
+    // `None`-node race the first CI run hit. A netmap on a socket proves the
+    // server finished THAT node's join + allocation.
+    async fn drain_to_netmap(
+        ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+        who: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) if t.contains("rc:overlay.netmap") => return,
+                Ok(Some(Ok(_))) => {}
+                _ => break,
             }
-            Ok(Some(Ok(_))) => {}
-            _ => break,
         }
+        panic!("{who} must receive a netmap for its join");
     }
-    assert!(b_has_netmap, "B must receive a netmap for its join");
+    drain_to_netmap(&mut ws_a, "A").await;
+    drain_to_netmap(&mut ws_b, "B").await;
 
     let a_oid = ObjectId::parse_str(&aid_a).unwrap();
     let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
-    let node_a = app1
-        .state
-        .overlay_nodes
-        .find_live_by_tenant_and_machine(tid, "ovrm-a")
-        .await
-        .unwrap()
-        .expect("A holds a live overlay node");
+    // Belt-and-suspenders: the netmap send and the row commit are ordered
+    // server-side, but poll briefly rather than assume the read observes it.
+    let mut node_a = None;
+    for _ in 0..20 {
+        node_a = app1
+            .state
+            .overlay_nodes
+            .find_live_by_tenant_and_machine(tid, "ovrm-a")
+            .await
+            .unwrap();
+        if node_a.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let node_a = node_a.expect("A holds a live overlay node");
     let node_a_hex = node_a.id.unwrap().to_hex();
 
     // The removal, initiated on the pod that homes NEITHER socket.
