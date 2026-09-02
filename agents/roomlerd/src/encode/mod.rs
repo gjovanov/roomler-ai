@@ -401,6 +401,27 @@ pub fn bg_rebuild_enabled() -> bool {
     tunnel_core::env::node_env("BG_REBUILD").as_deref() != Some("0")
 }
 
+/// FR-62 — run a rebuild-bound rate apply OFF-THREAD on CONSTRAINED sessions
+/// too. Default **on**; `ROOMLERD_BG_REBUILD_CONSTRAINED=0` restores the inline
+/// rebuild.
+///
+/// Measured on Iris Xe (CORPLAP-1, 2026-09-02): a QSV encoder open costs
+/// ~340-390 ms at maxrate >= 1.5 Mbps but **1.3-2.0 s at <= 1 Mbps**, in BOTH
+/// `low_power` modes — and a constrained session is exactly where those targets
+/// live. The inline apply therefore froze the whole pump for ~2 s. The old
+/// rationale ("the rebuild stalls a frozen image nobody can see") holds only
+/// while the scene stays static for the entire open; resume motion inside that
+/// window and the session is dead air until it finishes.
+///
+/// ⚠️ This changes only WHERE the open runs, never WHEN the change lands: the
+/// adoption stays gated on the same quiet window the defer policy already uses,
+/// so the swap's IDR still arrives on a static scene. That distinction is the
+/// whole point — adopting mid-motion on a thin pipe is the 2026-08-27 relay
+/// regression that put the `!constrained` guard there in the first place.
+pub fn bg_rebuild_constrained_enabled() -> bool {
+    tunnel_core::env::node_env("BG_REBUILD_CONSTRAINED").as_deref() != Some("0")
+}
+
 /// Drag-latency P5 kill switch (FR-1, 2026-08-27): when on (default), big
 /// frames run the BGRA→NV12/I444 conversion in row bands across scoped
 /// threads (byte-identical output; ~25→~15 ms of "encode" time at

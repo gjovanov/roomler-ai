@@ -4878,6 +4878,10 @@ async fn media_pump_ffmpeg_dc(
     // IDR rate adoptions can demand (each adoption ships a fresh IDR —
     // the biggest frame in the stream).
     let bg_rebuild = crate::encode::bg_rebuild_enabled();
+    // FR-62 — also take rebuild-bound applies off the pump thread on a
+    // CONSTRAINED session (a QSV open at <=1 Mbps blocks 1.3-2.0 s, measured).
+    // Adoption stays quiet-gated below, so the IDR timing is unchanged.
+    let bg_rebuild_constrained = crate::encode::bg_rebuild_constrained_enabled();
     let mut pending_swap: Option<
         tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
     > = None;
@@ -5030,6 +5034,13 @@ async fn media_pump_ffmpeg_dc(
         if bg_rebuild {
             if let Some(handle) = pending_swap.as_ref()
                 && handle.is_finished()
+                // FR-62 — on a CONSTRAINED session HOLD a finished rebuild
+                // until the scene is quiet. Adoption ships an IDR, and a
+                // mid-motion IDR through a thin pipe is precisely the
+                // 2026-08-27 relay regression that gated swaps off here. The
+                // open already ran off-thread, so holding costs only memory —
+                // and the current encoder keeps producing meanwhile.
+                && (!constrained || last_motion_at.elapsed() >= DEFER_QUIET)
             {
                 let handle = pending_swap.take().unwrap();
                 last_swap_at = std::time::Instant::now();
@@ -5072,7 +5083,7 @@ async fn media_pump_ffmpeg_dc(
             // IDR is a multi-second lump through the thin pipe; the apply
             // arms route relay rate moves through the rc.445 defer instead.
             // A transport flip mid-flight also drops any stale wanted value.
-            if constrained {
+            if constrained && !bg_rebuild_constrained {
                 swap_wanted = None;
             } else if pending_swap.is_none()
                 && let Some(bps) = swap_wanted
@@ -6143,7 +6154,16 @@ async fn media_pump_ffmpeg_dc(
                 if allow {
                     deferred_bps = None;
                     last_deferred_apply_at = Some(std::time::Instant::now());
-                    enc.set_bitrate(applied.bps);
+                    // FR-62 — the defer policy has AUTHORISED this apply, so
+                    // WHEN it lands is already decided. Run the rebuild
+                    // off-thread anyway: the open blocks 1.3-2.0 s on QSV at
+                    // <=1 Mbps, and the pump must keep encoding through it. The
+                    // IDR rides the quiet-gated adoption above, unchanged.
+                    if bg_rebuild && bg_rebuild_constrained && !enc.supports_dynamic_bitrate() {
+                        swap_wanted = Some(applied.bps);
+                    } else {
+                        enc.set_bitrate(applied.bps);
+                    }
                 } else {
                     deferred_bps = Some(applied.bps);
                 }
@@ -6183,18 +6203,36 @@ async fn media_pump_ffmpeg_dc(
                 // refresh. Jump the (stale) queue for it.
                 deferred_bps = None;
                 last_deferred_apply_at = Some(std::time::Instant::now());
-                // The epoch discard exists for a REBUILD's stale queue; an
-                // in-place (NVENC) apply keeps the same encoder and stream.
-                if !enc.supports_dynamic_bitrate() {
-                    send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if bg_rebuild && bg_rebuild_constrained && !enc.supports_dynamic_bitrate() {
+                    // FR-62 — schedule the rebuild off-thread instead of
+                    // stalling here. The rationale above ("the rebuild stalls a
+                    // frozen image nobody can see") holds only while the scene
+                    // stays static for the WHOLE open — and that open is up to
+                    // 2 s on QSV at a relay's bitrates, so motion resuming
+                    // inside the window is dead air. The quiet-gated adoption
+                    // still bumps `send_epoch` and still ships the IDR on a
+                    // static scene; only the freeze goes away.
+                    swap_wanted = Some(bps);
+                    info!(
+                        %session_id,
+                        codec_label,
+                        target_bps = bps,
+                        "FFmpeg DC pump: deferred bitrate scheduled (background rebuild)"
+                    );
+                } else {
+                    // The epoch discard exists for a REBUILD's stale queue; an
+                    // in-place (NVENC) apply keeps the same encoder and stream.
+                    if !enc.supports_dynamic_bitrate() {
+                        send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    enc.set_bitrate(bps);
+                    info!(
+                        %session_id,
+                        codec_label,
+                        target_bps = bps,
+                        "FFmpeg DC pump: deferred bitrate applied at quiet"
+                    );
                 }
-                enc.set_bitrate(bps);
-                info!(
-                    %session_id,
-                    codec_label,
-                    target_bps = bps,
-                    "FFmpeg DC pump: deferred bitrate applied at quiet"
-                );
             }
         }
 
