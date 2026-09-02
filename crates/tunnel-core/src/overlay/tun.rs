@@ -631,11 +631,15 @@ mod system {
                 last: std::collections::HashMap::new(),
             });
             match t.note((dest, plen), std::time::Instant::now()) {
+                // #1237 — carry the competitor's alias so a reader (and the
+                // acceptance grep) can tell a real foreign product from a
+                // sibling roomler adapter that slipped the exemption.
                 Some(suppressed) => tracing::warn!(
                     dest = %dest,
                     plen,
                     competitor_ifindex = ifindex,
                     competitor_luid = format_args!("{:#x}", luid_val),
+                    competitor_alias = alias_for_luid(luid_val).as_deref().unwrap_or("?"),
                     suppressed_since_last = suppressed,
                     "overlay: evicted a competing route installed by another product"
                 ),
@@ -674,7 +678,7 @@ mod system {
                     if r.DestinationPrefix.PrefixLength == plen
                         && r.DestinationPrefix.Prefix.si_family == AF_INET
                         && r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr == want
-                        && r.InterfaceLuid.Value != ours
+                        && !super::route_belongs_to_us(r.InterfaceLuid.Value, ours)
                     {
                         // rc.279 — the route war used to be completely
                         // silent: an operator could not tell "healthy" from
@@ -748,7 +752,7 @@ mod system {
                 let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
                 for r in rows {
                     if r.DestinationPrefix.Prefix.si_family == AF_INET
-                        && r.InterfaceLuid.Value != ours
+                        && !super::route_belongs_to_us(r.InterfaceLuid.Value, ours)
                         && row_in_block(
                             u32::from_be(r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr),
                             r.DestinationPrefix.PrefixLength,
@@ -860,7 +864,7 @@ mod system {
                     if r.DestinationPrefix.PrefixLength == plen
                         && r.DestinationPrefix.Prefix.si_family == AF_INET6
                         && r.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte == want
-                        && r.InterfaceLuid.Value != ours
+                        && !super::route_belongs_to_us(r.InterfaceLuid.Value, ours)
                         && DeleteIpForwardEntry2(r) == NO_ERROR
                     {
                         evict_warn(
@@ -910,6 +914,27 @@ mod system {
                 (ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) == NO_ERROR)
                     .then_some(luid.Value)
             }
+        }
+
+        /// #1237 — the friendly interface alias for a LUID (`roomler`,
+        /// `roomler-6a712a5`, `Ethernet 2`, …). The cross-process belt for the
+        /// sibling-exemption: a second co-tenant daemon's adapters are not in
+        /// this process's own-LUID registry, but their alias carries our
+        /// naming. `None` when the LUID has no alias (a gone adapter).
+        pub fn alias_for_luid(luid: u64) -> Option<String> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToAlias;
+            use windows_sys::Win32::NetworkManagement::Ndis::IF_MAX_STRING_SIZE;
+            let l = NET_LUID_LH { Value: luid };
+            let mut buf = [0u16; IF_MAX_STRING_SIZE as usize + 1];
+            // SAFETY: `buf` is a fixed NUL-terminatable buffer of the size the
+            // API documents; it writes a wide string on success only.
+            unsafe {
+                if ConvertInterfaceLuidToAlias(&l, buf.as_mut_ptr(), buf.len()) != NO_ERROR {
+                    return None;
+                }
+            }
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Some(String::from_utf16_lossy(&buf[..end]))
         }
 
         /// N3 — every route prefix currently on `luid`, both families, as
@@ -1667,6 +1692,189 @@ mod system {
         crate::env::flag("OVERLAY_ROUTE_EVICT", true)
     }
 
+    /// #1237 — a multi-org host runs ONE daemon with N overlay adapters
+    /// (`roomler`, `roomler-<org>`, …). The route-eviction helpers below were
+    /// written for one adapter per host (the corp-VPN route war) and delete
+    /// any competing row on "an interface other than ours" — so on a multi-org
+    /// host each org runtime's guard wave deletes the OTHER org's derived-ULA
+    /// `/96` (and block on-link) routes, the other re-asserts them, and the two
+    /// ping-pong ~40×/min per prefix. Every deletion is a route-change
+    /// notification that force-rekeys every peer (neo16 2026-09-02: 718
+    /// evictions/day → ~100 revalidations/min). Default ON = exempt sibling
+    /// roomler adapters (this process's own LUIDs, plus any adapter whose alias
+    /// matches our naming — the belt for a second co-tenant process). OFF =
+    /// the pre-#1237 "only the exact `ours` LUID is spared" behaviour.
+    #[cfg(windows)]
+    fn sibling_exempt_enabled() -> bool {
+        crate::env::flag("OVERLAY_SIBLING_EXEMPT", true)
+    }
+
+    /// #1237 — default ON: `defend_self_route` asserts/evicts only THIS
+    /// adapter's narrowed derived-ULA prefix (`v6_onlink_plen`: `/96` for the
+    /// legacy single-org identity, `/(96+block_plen)` for a per-org adapter),
+    /// so two orgs defend DISJOINT v6 prefixes instead of both fighting over
+    /// the whole `fd72:6f6f:6d6c::/96`. OFF = the pre-#1237 whole-`/96`
+    /// assertion (byte-identical for a single-org host either way).
+    #[cfg(windows)]
+    fn v6_defend_narrow_enabled() -> bool {
+        crate::env::flag("OVERLAY_V6_DEFEND_NARROW", true)
+    }
+
+    /// #1237 — process-wide registry of the daemon's OWN overlay TUN adapters,
+    /// so the eviction helpers never delete a sibling org adapter's route and
+    /// the block-floor gate never counts a sibling's overlay address as a
+    /// foreign CGNAT address. Keyed by interface name (unique per adapter:
+    /// `roomler`, `roomler-<org>`, `utunN`); the value is the Windows LUID
+    /// (`0` off-Windows, where the registry is populated but unconsumed). An
+    /// entry is added at the end of [`SystemTun::up_with`] and removed by
+    /// [`SystemTun`]'s `Drop`; the Windows caches hold each `Arc<SystemTun>`
+    /// for the process lifetime, so the registry stays populated exactly while
+    /// the adapter is live.
+    mod own_adapters {
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        static OWN: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+        pub(super) fn register(if_name: &str, luid: u64) {
+            if let Ok(mut g) = OWN.lock() {
+                g.insert(if_name.to_string(), luid);
+            }
+        }
+
+        pub(super) fn deregister(if_name: &str) {
+            if let Ok(mut g) = OWN.lock() {
+                g.remove(if_name);
+            }
+        }
+
+        /// Is `luid` one of our own live adapters? (Never matches `0`, the
+        /// off-Windows placeholder, so a stray `0`-LUID row is not exempted.)
+        #[cfg(windows)]
+        pub(super) fn is_own_luid(luid: u64) -> bool {
+            luid != 0
+                && OWN
+                    .lock()
+                    .map(|g| g.values().any(|&v| v == luid))
+                    .unwrap_or(false)
+        }
+    }
+
+    /// #1237 — the derived-ULA v6 prefix THIS adapter should defend/evict for:
+    /// the connected v4 block mapped into the ULA and masked to
+    /// `v6_onlink_plen` (`/96` for the legacy single-org identity,
+    /// `/(96+block_plen)` for a per-org adapter). `connected_v4 == None` (the
+    /// v4 mask was unknown at bring-up) falls back to the whole
+    /// `fd72:6f6f:6d6c::/96` — the pre-#1237 behaviour. Pure, so the golden
+    /// vectors below test it on every platform.
+    fn defended_ula_prefix(
+        connected_v4: Option<(Ipv4Addr, u8)>,
+        v6_onlink_plen: u8,
+    ) -> (std::net::Ipv6Addr, u8) {
+        let whole = || {
+            (
+                crate::overlay::router::derive_overlay_v6(Ipv4Addr::UNSPECIFIED),
+                96u8,
+            )
+        };
+        let Some((net, _)) = connected_v4 else {
+            return whole();
+        };
+        let plen = v6_onlink_plen.min(128);
+        (
+            mask_v6(crate::overlay::router::derive_overlay_v6(net), plen),
+            plen,
+        )
+    }
+
+    /// Zero every bit of `ip` below prefix length `plen`.
+    fn mask_v6(ip: std::net::Ipv6Addr, plen: u8) -> std::net::Ipv6Addr {
+        let bits = u128::from(ip);
+        let plen = plen.min(128);
+        let mask = if plen == 0 {
+            0
+        } else {
+            u128::MAX << (128 - plen as u32)
+        };
+        std::net::Ipv6Addr::from(bits & mask)
+    }
+
+    #[cfg(test)]
+    mod sibling_route_tests {
+        use super::{defended_ula_prefix, mask_v6};
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        #[test]
+        fn mask_v6_edges() {
+            let ip: Ipv6Addr = "fd72:6f6f:6d6c::6441:400".parse().unwrap();
+            assert_eq!(mask_v6(ip, 0), Ipv6Addr::UNSPECIFIED);
+            assert_eq!(mask_v6(ip, 128), ip);
+            assert_eq!(
+                mask_v6(ip, 96),
+                "fd72:6f6f:6d6c::".parse::<Ipv6Addr>().unwrap()
+            );
+        }
+
+        #[test]
+        fn legacy_single_org_defends_the_whole_96() {
+            // (100.64.0.0/10, plen 96) — byte-identical to the pre-#1237 whole
+            // `fd72:6f6f:6d6c::/96` assertion, so a single-org host is unchanged.
+            let (net, plen) = defended_ula_prefix(Some((Ipv4Addr::new(100, 64, 0, 0), 10)), 96);
+            assert_eq!(net, "fd72:6f6f:6d6c::".parse::<Ipv6Addr>().unwrap());
+            assert_eq!(plen, 96);
+        }
+
+        #[test]
+        fn per_org_defends_its_own_disjoint_block() {
+            // A carved /22 block at 100.65.4.0 → v6_onlink_plen 118; two orgs
+            // then defend DISJOINT prefixes instead of both fighting the /96.
+            let (net_a, plen_a) =
+                defended_ula_prefix(Some((Ipv4Addr::new(100, 65, 4, 0), 22)), 118);
+            let (net_b, plen_b) =
+                defended_ula_prefix(Some((Ipv4Addr::new(100, 65, 8, 0), 22)), 118);
+            assert_eq!(plen_a, 118);
+            assert_eq!(plen_b, 118);
+            assert_ne!(net_a, net_b, "each org's v6 block is distinct");
+            // ...and neither is the whole /96.
+            assert_ne!(net_a, "fd72:6f6f:6d6c::".parse::<Ipv6Addr>().unwrap());
+        }
+
+        #[test]
+        fn unknown_mask_falls_back_to_the_whole_96() {
+            let (net, plen) = defended_ula_prefix(None, 118);
+            assert_eq!(net, "fd72:6f6f:6d6c::".parse::<Ipv6Addr>().unwrap());
+            assert_eq!(plen, 96);
+        }
+    }
+
+    /// #1237 — an interface name that belongs to a roomler overlay adapter:
+    /// the primary [`IF_NAME`] or a `roomler-<org>` sibling. Used as the
+    /// cross-process belt (a second co-tenant daemon's adapters are not in
+    /// THIS process's [`own_adapters`] registry, but they carry our naming)
+    /// and by the block-floor gate.
+    #[cfg(windows)]
+    fn is_roomler_adapter_name(name: &str) -> bool {
+        let n = name.trim();
+        n == IF_NAME || n.starts_with(&format!("{IF_NAME}-"))
+    }
+
+    /// #1237 — may an eviction helper delete a competing row on `row_luid`
+    /// while defending `ours`? A row is spared when it is our own adapter, a
+    /// sibling org adapter in this process, or (the belt) any adapter whose
+    /// alias matches our naming. The kill switch collapses this to the
+    /// pre-#1237 exact-LUID test.
+    #[cfg(windows)]
+    fn route_belongs_to_us(row_luid: u64, ours: u64) -> bool {
+        if row_luid == ours {
+            return true;
+        }
+        if !sibling_exempt_enabled() {
+            return false;
+        }
+        own_adapters::is_own_luid(row_luid)
+            || winroute::alias_for_luid(row_luid).is_some_and(|a| is_roomler_adapter_name(&a))
+    }
+
     /// corplap route war v3 (#23) — gate for the stolen-path reclaim (detect →
     /// targeted evict → pin, [`TunIo::reclaim_stolen_peer_paths`]) AND the
     /// in-block eviction debounce that rides on it (blind per-wave eviction
@@ -2250,6 +2458,12 @@ mod system {
                 d
             };
 
+            // #1237 — record this adapter as one of ours so the eviction
+            // helpers and the block-floor gate never mistake a sibling org
+            // adapter for a foreign product. `Drop` removes it. (`tun_luid`
+            // is `0` off-Windows, where the registry is unconsumed.)
+            own_adapters::register(&if_name, tun_luid);
+
             Ok(Self {
                 dev,
                 if_name,
@@ -2286,13 +2500,19 @@ mod system {
     #[cfg(windows)]
     fn non_overlay_v4_addrs(overlay_if: &str) -> Option<Vec<Ipv4Addr>> {
         let addrs = if_addrs::get_if_addrs().ok()?;
+        // #1237 — a per-org SIBLING adapter (`roomler-<org>`) carries an
+        // overlay address on a DIFFERENT interface than `overlay_if`, so the
+        // old single-name filter counted it as a foreign CGNAT address and
+        // WITHHELD the primary's block floor on every multi-org host. Treat
+        // any roomler adapter as ours.
+        let is_ours = |name: &str| name == overlay_if || is_roomler_adapter_name(name);
         if !addrs.iter().any(|a| a.name == overlay_if) {
             return None;
         }
         Some(
             addrs
                 .into_iter()
-                .filter(|a| a.name != overlay_if)
+                .filter(|a| !is_ours(&a.name))
                 .filter_map(|a| match a.ip() {
                     std::net::IpAddr::V4(v) if !v.is_loopback() => Some(v),
                     _ => None,
@@ -2300,6 +2520,18 @@ mod system {
                 .collect(),
         )
     }
+
+    // #1237 — drop this adapter from the own-adapter registry when the device
+    // is torn down (a genuine reap or an `is_alive`-false recreate). The
+    // Windows caches hold each `Arc<SystemTun>` for the process lifetime, so
+    // in practice this fires at process exit or when an adapter is replaced —
+    // exactly when the LUID stops being ours.
+    impl Drop for SystemTun {
+        fn drop(&mut self) {
+            own_adapters::deregister(&self.if_name);
+        }
+    }
+
     #[async_trait]
     impl TunIo for SystemTun {
         async fn read_packet(&self) -> std::io::Result<Vec<u8>> {
@@ -2438,8 +2670,19 @@ mod system {
                 // routes — the `/96` IS the peer path).
                 let self_v6 = crate::overlay::router::derive_overlay_v6(self_ip);
                 winroute::evict_competing_v6(luid, self_v6, 128);
-                let ula_net = crate::overlay::router::derive_overlay_v6(Ipv4Addr::UNSPECIFIED);
-                winroute::evict_competing_v6(luid, ula_net, 96);
+                // #1237 — defend only THIS adapter's narrowed derived-ULA
+                // prefix, so two orgs' guard waves no longer fight over the
+                // whole `/96`. Legacy single-org resolves to the same
+                // `fd72:6f6f:6d6c::/96` it always used.
+                let (ula_net, ula_plen) = if v6_defend_narrow_enabled() {
+                    defended_ula_prefix(self.connected_v4, self.v6_onlink_plen)
+                } else {
+                    (
+                        crate::overlay::router::derive_overlay_v6(Ipv4Addr::UNSPECIFIED),
+                        96,
+                    )
+                };
+                winroute::evict_competing_v6(luid, ula_net, ula_plen);
                 // rc.287 — ASSERT the ULA /96 at metric 0, don't just evict
                 // competitors for it. AnyConnect mirrors the /96 on its
                 // miniport at effective metric 2; our auto CONNECTED route
@@ -2453,7 +2696,7 @@ mod system {
                 // and kill v6 entirely; metric-256 restores stock
                 // precedence without that risk.
                 let ula_metric = if route_metric0_enabled() { 0 } else { 256 };
-                winroute::ensure(luid, std::net::IpAddr::V6(ula_net), 96, ula_metric).ok();
+                winroute::ensure(luid, std::net::IpAddr::V6(ula_net), ula_plen, ula_metric).ok();
                 // rc.288 — defend the CONNECTED v4 prefix (100.64.0.0/10) the
                 // same way. A peer /32 that is momentarily absent (install
                 // order, a reap, a failed reconcile) falls through to this
