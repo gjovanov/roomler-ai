@@ -35,19 +35,6 @@ const EMAIL = process.env.E2E_VMTEST_EMAIL || ''
 const PASSWORD = process.env.E2E_VMTEST_PASSWORD || ''
 const AGENT_NAME = process.env.E2E_AGENT_NAME || ''
 
-async function adminLogin(): Promise<string> {
-  const resp = await fetch(`${API_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
-  })
-  if (!resp.ok) {
-    throw new Error(`vmtest admin login failed: ${resp.status} ${await resp.text().catch(() => '')}`)
-  }
-  const body = (await resp.json()) as { access_token: string }
-  return body.access_token
-}
-
 /** The named agent's id once it reports online. Polls up to ~2 min — the VM
  *  enrolled moments before this spec started. Exact-name match only. */
 async function findNamedOnlineAgent(token: string): Promise<string | null> {
@@ -129,14 +116,27 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
   test.setTimeout(5 * 60 * 1000)
 
   test('named throwaway agent streams decoded, advancing frames', async ({ page, context }) => {
-    const token = await adminLogin()
+    // Sessions are COOKIE-ONLY since #680/#690 — seeding localStorage
+    // access/refresh tokens does NOTHING and the SPA shows the login form.
+    // Log in through the context's request API so the HttpOnly session cookie
+    // lands in the jar shared with this context's pages, and set the
+    // `roomler-signed-in` hint so the SPA renders its shell and refreshes via
+    // the cookie instead of bouncing to /login.
+    const loginResp = await context.request.post(`${API_URL}/api/auth/login`, {
+      data: { email: EMAIL, password: PASSWORD },
+    })
+    expect(loginResp.ok(), `browser login failed: ${loginResp.status()}`).toBeTruthy()
+    const token = ((await loginResp.json()) as { access_token: string }).access_token
+    await context.addInitScript(() => {
+      try {
+        window.localStorage.setItem('roomler-signed-in', '1')
+      } catch {
+        /* private mode / storage blocked — the cookie still authenticates */
+      }
+    })
+
     const agentId = await findNamedOnlineAgent(token)
     expect(agentId, `agent "${AGENT_NAME}" never reported online in tenant ${TENANT_ID}`).toBeTruthy()
-
-    await context.addInitScript((tok) => {
-      window.localStorage.setItem('access_token', tok)
-      window.localStorage.setItem('refresh_token', tok)
-    }, token)
 
     const consoleErrors: string[] = []
     page.on('console', (msg) => {
