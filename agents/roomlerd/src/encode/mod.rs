@@ -436,14 +436,25 @@ pub fn pump_stall_watch_enabled() -> bool {
 }
 
 /// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase
-/// breakdown. 250 ms default: ~15 frames at 60 fps, far past anything the pump
-/// should ever spend in one pass, and well under the 1.3-2.0 s encoder opens this
-/// exists to catch. `ROOMLERD_PUMP_STALL_WARN_MS`.
+/// breakdown. `ROOMLERD_PUMP_STALL_WARN_MS`.
+///
+/// **100 ms, lowered from the 250 ms this shipped with**, because the first field
+/// data said 250 was blind to the class that actually hurts: CORPLAP-1 on the
+/// corp VPN reported `iter_ms_max = 107.6` — real 100 ms+ passes, matching the
+/// operator's own ">100 ms" and ">148 ms" age spikes — while `pump_stalls` stayed
+/// **0**. Only the separately-logged max saw them, which is exactly why the max
+/// is logged separately from the mean.
+///
+/// ⚠️ Deliberately a FLAT threshold, not a multiple of the frame budget. Scaling
+/// it by `target_fps` is self-defeating: the pump lowers `target_fps` BECAUSE it
+/// is already struggling, so a budget-relative bar RISES as the session degrades
+/// and stops reporting precisely when the trouble starts. A pass is either fast
+/// in wall-clock terms or it is worth a line.
 pub fn pump_stall_warn_ms() -> u64 {
     tunnel_core::env::node_env("PUMP_STALL_WARN_MS")
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(250)
+        .unwrap_or(100)
 }
 
 /// Drag-latency P5 kill switch (FR-1, 2026-08-27): when on (default), big
