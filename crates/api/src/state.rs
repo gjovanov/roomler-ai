@@ -541,6 +541,14 @@ impl AppState {
         // presence, and the new rc ctrl events). Same reconnect-and-backoff
         // subscription; the forwarder gains the ctrl lane.
         let redis_sub_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // #1186 — `overlay_removes` ctrl envelopes need the FULL state to
+        // re-fan (a Mongo peer read + the overlay send paths), which this
+        // subscriber closure cannot capture (it is spawned mid-construction;
+        // `apply_rc_ctrl` is hub-only for the same reason). Ferry them to an
+        // applier task spawned once the state exists. Bounded + try_send:
+        // losing one under pressure costs a push the peer's rejoin heals.
+        let (overlay_ctrl_tx, overlay_ctrl_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(256);
         if let Some(pubsub) = &redis_pubsub {
             let (redis_tx, _) = tokio::sync::broadcast::channel::<String>(1024);
             let mut redis_rx = redis_tx.subscribe();
@@ -569,6 +577,15 @@ impl AppState {
                             // kicks): idempotent hub operations every pod
                             // applies locally; the one holding the entity acts.
                             if let Some(ctrl) = envelope.get("ctrl") {
+                                // #1186 — the one state-needing ctrl event
+                                // rides its own channel to the post-
+                                // construction applier.
+                                if ctrl.get("evt").and_then(|v| v.as_str())
+                                    == Some("overlay_removes")
+                                {
+                                    let _ = overlay_ctrl_tx.try_send(ctrl.clone());
+                                    continue;
+                                }
                                 crate::ws::remote_control::apply_rc_ctrl(&ctrl_hub, ctrl);
                                 continue;
                             }
@@ -960,6 +977,10 @@ impl AppState {
         // the same DB-name-scoped claim pattern). Spawns NOTHING unless
         // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.
         crate::ws::ephemeral::spawn_reaper(state.clone());
+        // #1186 — apply cross-pod `overlay_removes` envelopes (the channel is
+        // fed by the redis ctrl subscriber above; with no Redis the sender
+        // side never fires and this task just parks).
+        crate::ws::overlay::spawn_removes_applier(state.clone(), overlay_ctrl_rx);
         // Stats PR-1 — the rollup compactor (raw → _1h → _1d), cluster-
         // singleton per cycle via the same DB-name-scoped claim pattern.
         // No-op task when `stats.enabled=false`.
