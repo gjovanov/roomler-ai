@@ -1434,6 +1434,28 @@ pub(crate) async fn release_overlay_node(
         },
     )
     .await;
+    // #1186 — the two sends above reach only sockets homed on THIS pod, and
+    // two removal initiators are not tenant-affine: `self/unenroll` has no
+    // tenant in its path (IP-hashed by the LB) and the FR-51 reaper runs on
+    // the NX-claim winner. Field-measured 2026-09-01: a live peer with a
+    // stable WS on the affine pod never heard a self-unenroll's removes and
+    // kept WG-handshaking at the dead peer until its next rejoin. Broadcast
+    // the event so every OTHER pod re-fans to the sockets it holds — the
+    // self-echo is filtered at the subscriber, a duplicate removes at a
+    // client is an idempotent no-op, and a pod with no sockets fans to
+    // nobody. Joins never need this: an upsert rides the joiner's own
+    // tenant-affine WS.
+    crate::ws::remote_control::publish_rc_ctrl(
+        state,
+        "overlay_removes",
+        serde_json::json!({
+            "tenant_id": before.tenant_id.to_hex(),
+            "network_id": before.network_id.to_hex(),
+            "node_id": node_id.to_hex(),
+            "epoch": epoch,
+        }),
+    )
+    .await;
 
     // Drop any DERP registration this node holds. Already inert (it is keyed by
     // pubkey and no peer carries this node's key any more, and `handle_derp_socket`
@@ -1461,6 +1483,70 @@ pub(crate) async fn release_overlay_node(
         overlay_ip: before.overlay_ip,
         host_recycled,
     })
+}
+
+/// #1186 — re-fan a removal that was initiated on ANOTHER pod to the sockets
+/// THIS pod holds. The counterpart of the `overlay_removes` publish in
+/// [`release_overlay_node`]; parsing is deliberately fail-silent (a malformed
+/// envelope is a bug at the publisher, and dropping it costs one push that
+/// the peer's next rejoin heals — the pre-#1186 status quo).
+///
+/// The removed node's row is already tombstoned when this runs, so the peer
+/// list cannot contain it; the tombstone is still read so the released node
+/// ITSELF also hears the delta when its socket is homed here (mirroring the
+/// local path's second send).
+pub(crate) async fn apply_removes_ctrl(state: &AppState, ctrl: &serde_json::Value) {
+    let (Some(tid), Some(net), Some(node_id)) = (
+        ctrl.get("tenant_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| ObjectId::parse_str(s).ok()),
+        ctrl.get("network_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| ObjectId::parse_str(s).ok()),
+        ctrl.get("node_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| ObjectId::parse_str(s).ok()),
+    ) else {
+        return;
+    };
+    let epoch = ctrl.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let peers = state
+        .overlay_nodes
+        .list_active_in_network(tid, net)
+        .await
+        .unwrap_or_default();
+    fan_delta_to(state, &peers, Some(node_id), epoch, vec![], vec![node_id]).await;
+    if let Ok(tombstone) = state.overlay_nodes.base.find_by_id(node_id).await {
+        send_to_node(
+            state,
+            &tombstone,
+            ServerMsg::OverlayNetmapDelta {
+                epoch,
+                upserts: vec![],
+                removes: vec![node_id],
+            },
+        )
+        .await;
+    }
+    debug!(%tid, %node_id, peers = peers.len(),
+        "overlay: removes re-fanned from another pod's removal");
+}
+
+/// #1186 — drain the channel the redis ctrl subscriber feeds `overlay_removes`
+/// envelopes into. A channel + late spawn rather than handling inline because
+/// the subscriber loop is spawned mid-`AppState::new` and cannot capture the
+/// full state the re-fan needs (`apply_rc_ctrl` is hub-only by the same
+/// constraint).
+pub(crate) fn spawn_removes_applier(
+    state: AppState,
+    mut rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
+) {
+    tokio::spawn(async move {
+        while let Some(ctrl) = rx.recv().await {
+            apply_removes_ctrl(&state, &ctrl).await;
+        }
+    });
 }
 
 /// Release the live overlay node backing `expect` on `machine_id`, if any.
