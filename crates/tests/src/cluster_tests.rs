@@ -1129,58 +1129,54 @@ async fn overlay_removes_reach_peers_homed_on_another_pod() {
     let mut ws_a = crate::agent_presence_tests::connect_agent(&app1, &tok_a).await;
     let mut ws_b = crate::agent_presence_tests::connect_agent(&app1, &tok_b).await;
 
-    let join = |seed: u8| {
-        serde_json::json!({
+    // Join A, receive A's netmap, THEN join B — strictly sequential per
+    // socket, the overlay_growth_tests pattern. Sending both joins at once
+    // raced the FR-47 carve-on-first-join (both are the tenant's *first*
+    // join until one commits the network), and the loser errored — which is
+    // why the first two CI runs failed nondeterministically on DIFFERENT
+    // members (A's node absent, then B's netmap absent).
+    async fn join_and_await_netmap(
+        ws: &mut (
+                 impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+                 + SinkExt<Message>
+                 + Unpin
+             ),
+        seed: u8,
+        who: &str,
+    ) {
+        let msg = serde_json::json!({
             "t": "rc:overlay.join",
             "wg_public_key": B64.encode([seed; 32]),
             "mtu": 1280,
             "endpoints": ["203.0.113.9:51820"],
         })
-        .to_string()
-    };
-    ws_a.send(Message::Text(join(11).into())).await.unwrap();
-    ws_b.send(Message::Text(join(12).into())).await.unwrap();
-
-    // Drain BOTH joins to their netmaps — reading only B's left A's join
-    // possibly unprocessed when the DB read below ran (the two WSs are
-    // independent server tasks with no ordering between them), which is the
-    // `None`-node race the first CI run hit. A netmap on a socket proves the
-    // server finished THAT node's join + allocation.
-    async fn drain_to_netmap(
-        ws: &mut (impl StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
-        who: &str,
-    ) {
+        .to_string();
+        let _ = ws.send(Message::Text(msg.into())).await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
-                Ok(Some(Ok(Message::Text(t)))) if t.contains("rc:overlay.netmap") => return,
+                // Match the full netmap, not a `_delta`: the closing quote
+                // after the type name distinguishes `"rc:overlay.netmap"`
+                // from `"rc:overlay.netmap_delta"`.
+                Ok(Some(Ok(Message::Text(t)))) if t.contains("\"rc:overlay.netmap\"") => return,
                 Ok(Some(Ok(_))) => {}
                 _ => break,
             }
         }
         panic!("{who} must receive a netmap for its join");
     }
-    drain_to_netmap(&mut ws_a, "A").await;
-    drain_to_netmap(&mut ws_b, "B").await;
+    join_and_await_netmap(&mut ws_a, 11, "A").await;
+    join_and_await_netmap(&mut ws_b, 12, "B").await;
 
     let a_oid = ObjectId::parse_str(&aid_a).unwrap();
     let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
-    // Belt-and-suspenders: the netmap send and the row commit are ordered
-    // server-side, but poll briefly rather than assume the read observes it.
-    let mut node_a = None;
-    for _ in 0..20 {
-        node_a = app1
-            .state
-            .overlay_nodes
-            .find_live_by_tenant_and_machine(tid, "ovrm-a")
-            .await
-            .unwrap();
-        if node_a.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    let node_a = node_a.expect("A holds a live overlay node");
+    let node_a = app1
+        .state
+        .overlay_nodes
+        .find_live_by_tenant_and_machine(tid, "ovrm-a")
+        .await
+        .unwrap()
+        .expect("A holds a live overlay node");
     let node_a_hex = node_a.id.unwrap().to_hex();
 
     // The removal, initiated on the pod that homes NEITHER socket.
