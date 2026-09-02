@@ -157,28 +157,47 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
     })
     if (!hooks.pc && !hooks.stats) {
       // Viewer build predates the FR-61 hooks (e.g. prod not yet redeployed).
-      // Degrade to the <video> geometry+time oracle (remote-session-smoke's
-      // approach). Weaker — a DataChannel/canvas session has no currentTime —
-      // but never a false FAIL against a hook-less build; the hooks strengthen
-      // this automatically once they ship.
-      console.warn('[vmtest-remote] FR-61 hooks absent — using the <video> currentTime fallback')
+      // Degrade to a TRANSPORT-AGNOSTIC surface oracle: the RTP path paints a
+      // <video> (advancing currentTime), the DataChannel paths (VP9-444 /
+      // HEVC-over-DC — what a SW-encode agent actually negotiates) paint a
+      // <canvas> via WebCodecs with NO <video> at all. Sample whichever surface
+      // is live and require it to CHANGE across a 3 s window while the pointer
+      // wiggles — a frozen or absent stream fails, a live one passes on any
+      // transport. The hooks strengthen this automatically once they ship.
+      console.warn('[vmtest-remote] FR-61 hooks absent — using the surface pixel-change fallback')
+      const surfaceSig = async (): Promise<string> =>
+        await page.evaluate(() => {
+          const v = document.querySelector('video') as HTMLVideoElement | null
+          if (v && v.videoWidth > 0) return 'v:' + v.currentTime
+          const c = (Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[])
+            .filter((x) => x.width > 100 && x.height > 100)
+            .sort((a, b) => b.width * b.height - a.width * a.height)[0]
+          if (!c) return 'none'
+          try {
+            const s = document.createElement('canvas')
+            s.width = 32
+            s.height = 20
+            s.getContext('2d')!.drawImage(c, 0, 0, 32, 20)
+            return 'c:' + s.toDataURL().slice(-96)
+          } catch {
+            return 'tainted'
+          }
+        })
       await expect
         .poll(
           async () => {
             await wiggle(page)
-            return await page.evaluate(() => {
-              const v = document.querySelector('video') as HTMLVideoElement | null
-              return v ? v.videoWidth : -1
-            })
+            return await surfaceSig()
           },
-          { timeout: 60_000, message: 'no <video> geometry and no frame hooks — cannot confirm frames' },
+          { timeout: 60_000, message: 'no live remote surface (video/canvas) appeared' },
         )
-        .toBeGreaterThan(0)
-      const t0 = await page.evaluate(() => (document.querySelector('video') as HTMLVideoElement | null)?.currentTime ?? 0)
+        .not.toBe('none')
+      const s0 = await surfaceSig()
       await wiggle(page)
       await page.waitForTimeout(3_000)
-      const t1 = await page.evaluate(() => (document.querySelector('video') as HTMLVideoElement | null)?.currentTime ?? 0)
-      expect(t1, `video stream froze (currentTime ${t0} → ${t1})`).toBeGreaterThan(t0)
+      const s1 = await surfaceSig()
+      expect(s0, 'remote surface pixels unreadable (tainted) — deploy the FR-61 hooks to verify').not.toBe('tainted')
+      expect(s1 !== s0, `remote surface static over 3s — stream frozen or not painting (${s0.slice(0, 24)} → ${s1.slice(0, 24)})`).toBe(true)
       return
     }
 
