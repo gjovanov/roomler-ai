@@ -360,6 +360,35 @@ jobs:
             echo "PKG_CONFIG_PATH=/opt/roomler-ffmpeg/lib/pkgconfig"
             echo "LD_LIBRARY_PATH=/opt/roomler-ffmpeg/lib"
           } >> "$GITHUB_ENV"
+          # ── FR-62 A2 drift gate: the vendored libs must have been built from
+          #    the FFmpeg source patches committed in this checkout. The vendor
+          #    build wrote ROOMLER-PATCHES.txt (sha256 per patch) into the
+          #    tarball; assert it equals the committed set. A mismatch or an
+          #    absent manifest while patches exist means the vendored asset is
+          #    STALE — re-run vendor-ffmpeg-windows.yml (Linux + Windows jobs)
+          #    before tagging. Fail closed: never ship an agent whose FFmpeg
+          #    lacks the source patches the code assumes.
+          shopt -s nullglob
+          committed=( "$GITHUB_WORKSPACE"/.github/ffmpeg-patches/*.patch )
+          if [ ${#committed[@]} -gt 0 ]; then
+            # Normalise both sides to `<sha256-lowercase> <basename>` (one
+            # space), sorted — robust to the manifest's two-space sha256sum
+            # format and to the absolute paths in `committed`. (A greedy
+            # `sed 's#.*/##'` on the sha256sum output would strip the HASH too,
+            # since `.` matches the spaces before the path — the bug this
+            # replaces.)
+            want=$(for f in "${committed[@]}"; do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"; done | sort)
+            got_file=/opt/roomler-ffmpeg/ROOMLER-PATCHES.txt
+            if [ ! -f "$got_file" ]; then
+              echo "::error::vendored FFmpeg carries no ROOMLER-PATCHES.txt but ${#committed[@]} patch(es) are committed — re-vendor before tagging (see .github/ffmpeg-patches/)"; exit 1
+            fi
+            got=$(awk 'NF{print tolower($1), $NF}' "$got_file" | sort)
+            if [ "$want" != "$got" ]; then
+              echo "::error::vendored FFmpeg patch manifest != committed .github/ffmpeg-patches/ — re-run vendor-ffmpeg-windows.yml"
+              echo "--- committed ---"; echo "$want"; echo "--- in asset ---"; echo "$got"; exit 1
+            fi
+            echo "FR-62 A2 gate OK: vendored FFmpeg built from ${#committed[@]} committed patch(es)"
+          fi
 
       - name: Build agent (release, full + vp9-444 + vp9-444-bindgen)
         # `vp9-444` adds the libvpx VP9 profile-1 (8-bit 4:4:4) software
@@ -1018,6 +1047,33 @@ jobs:
             if (-not (Test-Path "$root\lib\pkgconfig\$pc")) { Write-Host "::error::$pc missing after extract"; exit 1 }
           }
           Write-Host "FFmpeg pkg-config files present at $root\lib\pkgconfig\"
+          # ── FR-62 A2 drift gate (Windows twin — see the Linux job): assert
+          #    the vendored libs were built from the committed FFmpeg source
+          #    patches. The vcpkg overlay build wrote ROOMLER-PATCHES.txt
+          #    (sha256 per patch) into the zip root. Fail closed on mismatch or
+          #    an absent manifest while patches exist — a stale vendored asset
+          #    must never ship. Fix = re-run vendor-ffmpeg-windows.yml.
+          $committed = Get-ChildItem "$env:GITHUB_WORKSPACE\.github\ffmpeg-patches\*.patch" -ErrorAction SilentlyContinue
+          if ($committed) {
+            $want = $committed | ForEach-Object {
+              "{0} {1}" -f (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower(), $_.Name
+            } | Sort-Object
+            $manifestPath = "$root\ROOMLER-PATCHES.txt"
+            if (-not (Test-Path $manifestPath)) {
+              Write-Host "::error::vendored FFmpeg carries no ROOMLER-PATCHES.txt but $($committed.Count) patch(es) are committed — re-vendor before tagging"; exit 1
+            }
+            $got = Get-Content $manifestPath | Where-Object { $_.Trim() -ne '' } | ForEach-Object {
+              $parts = $_ -split '\s+', 2
+              "{0} {1}" -f $parts[0].ToLower(), $parts[1].Trim()
+            } | Sort-Object
+            if (($want -join "`n") -ne ($got -join "`n")) {
+              Write-Host "::error::vendored FFmpeg patch manifest != committed .github/ffmpeg-patches/ — re-run vendor-ffmpeg-windows.yml"
+              Write-Host "--- committed ---"; $want | ForEach-Object { Write-Host $_ }
+              Write-Host "--- in asset ---"; $got | ForEach-Object { Write-Host $_ }
+              exit 1
+            }
+            Write-Host "FR-62 A2 gate OK: vendored FFmpeg built from $($committed.Count) committed patch(es)"
+          }
 
       - name: Append FFmpeg to PKG_CONFIG_PATH + DLL PATH
         shell: pwsh
@@ -1912,6 +1968,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # NOTE (FR-62 A2): NO patch drift gate here, deliberately. This
+          # macOS build is --disable-everything + the three *_videotoolbox
+          # encoders only, so libavcodec/nvenc.c (what 0001 patches) is never
+          # compiled in — the nvenc patch does not apply to what ships on a
+          # Mac. When 0002-videotoolbox-runtime-bitrate lands (FR-62 A3), wire
+          # vendor-ffmpeg-macos.yml to apply patches + emit ROOMLER-PATCHES.txt
+          # and add the Linux/Windows-twin gate below.
           # Built once by vendor-ffmpeg-macos.yml and reused here, same
           # prebuild-once model as the Linux lane. That workflow configures
           # --disable-autodetect --disable-xlib --disable-libxcb, so this
