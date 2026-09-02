@@ -371,12 +371,18 @@ jobs:
           shopt -s nullglob
           committed=( "$GITHUB_WORKSPACE"/.github/ffmpeg-patches/*.patch )
           if [ ${#committed[@]} -gt 0 ]; then
-            want=$(sha256sum "${committed[@]}" | sed 's#.*/##' | sort)
+            # Normalise both sides to `<sha256-lowercase> <basename>` (one
+            # space), sorted — robust to the manifest's two-space sha256sum
+            # format and to the absolute paths in `committed`. (A greedy
+            # `sed 's#.*/##'` on the sha256sum output would strip the HASH too,
+            # since `.` matches the spaces before the path — the bug this
+            # replaces.)
+            want=$(for f in "${committed[@]}"; do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"; done | sort)
             got_file=/opt/roomler-ffmpeg/ROOMLER-PATCHES.txt
             if [ ! -f "$got_file" ]; then
               echo "::error::vendored FFmpeg carries no ROOMLER-PATCHES.txt but ${#committed[@]} patch(es) are committed — re-vendor before tagging (see .github/ffmpeg-patches/)"; exit 1
             fi
-            got=$(sort "$got_file")
+            got=$(awk 'NF{print tolower($1), $NF}' "$got_file" | sort)
             if [ "$want" != "$got" ]; then
               echo "::error::vendored FFmpeg patch manifest != committed .github/ffmpeg-patches/ — re-run vendor-ffmpeg-windows.yml"
               echo "--- committed ---"; echo "$want"; echo "--- in asset ---"; echo "$got"; exit 1
