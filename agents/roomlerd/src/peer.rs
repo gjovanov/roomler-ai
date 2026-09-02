@@ -6090,16 +6090,21 @@ async fn media_pump_ffmpeg_dc(
             // defer) — relay keeps the rc.445 motion-defer below, the
             // posture that was field-proven there. Also the fallback
             // with the hatch off.
-            // FR-35 P3 — an INCREASE on a constrained NVENC session is held
-            // like a rebuild: the in-place reconfigure is a starved IDR
-            // (FR-31) — a visible blur pulse on a static screen — and the
-            // seeded field run (2026-08-30) showed one per 5-s AIMD step. It
-            // flushes through the spaced quiet arm below, coalesced to the
-            // latest target. Decreases still land at once, and anchor the
-            // spacing so the climb back cannot start on the very next step.
+            // FR-35 P3 / FR-62 A2 — defer a constrained INCREASE only when the
+            // in-place apply still costs an IDR. Historically every in-place
+            // increase was a starved IDR (FR-31) — a blur pulse on a static
+            // screen, one per 5-s AIMD step (field 2026-08-30) — so all of them
+            // were held and flushed through the spaced quiet arm below. Since A2
+            // the NVENC reconfigure ships NO IDR (measured 0/20 on the RTX,
+            // default + constrained), so `reconfig_forces_idr()` is false for it
+            // and the increase lands LIVE; QSV-CBR (unmeasured `MFXVideoENCODE_Reset`)
+            // and every rebuild-bound backend still defer. Decreases always land
+            // at once and anchor the spacing so the climb back cannot start on
+            // the very next step.
             let held_increase = constrained
                 && relay_idr_thrift
                 && enc.supports_dynamic_bitrate()
+                && enc.reconfig_forces_idr()
                 && applied.bps > enc.current_maxrate_bps();
             if held_increase {
                 deferred_bps = Some(applied.bps);
@@ -6610,6 +6615,11 @@ async fn media_pump_ffmpeg_dc(
                 rate_moves = rate_stats.rate_moves,
                 rebuilds = rate_stats.rebuilds,
                 idr_count = rate_stats.idr_count,
+                // FR-62 A2 — whether the pump is still rationing this encoder's
+                // constrained increases. false ⇒ moves land live (NVENC,
+                // patched); pair it with a flat `idr_count` to confirm the apply
+                // shipped no keyframe, or a rising one to justify the hatch.
+                reconfig_forces_idr = enc.reconfig_forces_idr(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
