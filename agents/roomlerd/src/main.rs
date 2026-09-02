@@ -241,6 +241,29 @@ enum Command {
         /// Accepts `hevc` as an alias.
         #[arg(long, default_value = "h264")]
         codec: String,
+        /// FR-62 A0 — instead of the 10-frame smoke, open once and sweep the
+        /// maxrate down (6M → 200k) and back up via `set_bitrate`, reporting
+        /// per rung whether the change forced an IDR, how long the apply took,
+        /// and how closely the encoder tracked the target. Measures, on real
+        /// silicon, the cost the whole rate-control patch-work exists to
+        /// ration. Best with `--codec hevc`/`av1` and `--encoder hardware`.
+        #[arg(long)]
+        reconfigure_sweep: bool,
+        /// Sweep frame geometry (A0). Corp-laptop default.
+        #[arg(long, default_value_t = 1280)]
+        width: u32,
+        #[arg(long, default_value_t = 800)]
+        height: u32,
+        /// Frames encoded at each rung before moving to the next (A0).
+        #[arg(long, default_value_t = 30)]
+        frames_per_rung: u32,
+        /// Open the encoder in constrained (relay) mode — the tighter HRD
+        /// window a slow-link session runs with (A0).
+        #[arg(long)]
+        constrained: bool,
+        /// Emit the sweep result as one JSON line for the FR doc (A0).
+        #[arg(long)]
+        json: bool,
     },
     /// Smoke-test the screen-capture cascade on THIS host: run
     /// `open_default`, pull N frames, and report which backend answered,
@@ -1181,7 +1204,31 @@ async fn daemon_main() -> Result<()> {
                 )
             }
         }
-        Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
+        Command::EncoderSmoke {
+            encoder,
+            codec,
+            reconfigure_sweep,
+            width,
+            height,
+            frames_per_rung,
+            constrained,
+            json,
+        } => {
+            if reconfigure_sweep {
+                encoder_reconfigure_sweep_cmd(
+                    &encoder,
+                    &codec,
+                    width,
+                    height,
+                    frames_per_rung,
+                    constrained,
+                    json,
+                )
+                .await
+            } else {
+                encoder_smoke_cmd(&encoder, &codec).await
+            }
+        }
         Command::AppsProbe => apps_probe_cmd(),
         Command::CaptureSmoke {
             frames,
@@ -4153,6 +4200,247 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
     println!(
         "encoder smoke PASSED: backend={backend} keyframes={keyframes} total_bytes={total_bytes}"
     );
+    Ok(())
+}
+
+/// FR-62 A0 — measure, on THIS host's real encoder, what a `set_bitrate`
+/// move actually costs: does it force an IDR, how long does the apply take,
+/// and does the encoder track the new maxrate? This is the linchpin of the
+/// whole FR-62 decision (the ~9 rate-rationing heuristics exist only because
+/// today the answer is "an IDR every time"), so it is measured per host/codec
+/// rather than read from a driver table.
+///
+/// The content is a moving block over a high-frequency stripe band so P-frames
+/// carry real residual and the maxrate genuinely clamps quality (solid colours
+/// — the plain smoke's content — encode to ~0 bytes and hide the effect).
+async fn encoder_reconfigure_sweep_cmd(
+    pref_raw: &str,
+    codec_raw: &str,
+    w: u32,
+    h: u32,
+    frames_per_rung: u32,
+    constrained: bool,
+    json: bool,
+) -> Result<()> {
+    use roomlerd::encode::{open_default, open_for_codec};
+    use std::time::Instant;
+
+    let pref = encode::EncoderPreference::from_str(pref_raw)
+        .map_err(|e| anyhow::anyhow!("bad encoder preference {pref_raw:?}: {e}"))?;
+    let codec = codec_raw.to_ascii_lowercase();
+    if constrained {
+        tracing::info!(
+            "reconfigure-sweep: --constrained noted; A0 opens the encoder's default HRD window \
+             (the IDR-on-reconfigure question is independent of HRD %; burst sizes may differ)"
+        );
+    }
+    let (mut enc, actual_codec) = if codec == "h264" {
+        (open_default(w, h, pref), "h264".to_string())
+    } else {
+        let (e, actual) = open_for_codec(&codec, w, h, pref);
+        (e, actual.to_string())
+    };
+    let backend = enc.name();
+    tracing::info!(
+        backend,
+        actual_codec = %actual_codec,
+        width = w, height = h, frames_per_rung,
+        "reconfigure-sweep: backend selected"
+    );
+    if backend == "noop" {
+        bail!("reconfigure-sweep: fell through to NoopEncoder — no HW/SW backend on this host");
+    }
+
+    // Deterministic moving-block-over-stripes frame. `n` advances the block.
+    let make_frame = |n: u32| -> std::sync::Arc<roomlerd::capture::Frame> {
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        let bx = ((n * 11) % (w.saturating_sub(200)).max(1)) as usize;
+        let by = ((n * 7) % (h.saturating_sub(200)).max(1)) as usize;
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let i = (y * w as usize + x) * 4;
+                let in_block = x >= bx && x < bx + 200 && y >= by && y < by + 200;
+                // High-frequency vertical stripes everywhere (spatial detail
+                // the encoder must spend bits on), inverted inside the block.
+                let stripe = ((x / 3) & 1) == 0;
+                let lum: u8 = if in_block ^ stripe { 235 } else { 32 };
+                data[i] = lum;
+                data[i + 1] = lum;
+                data[i + 2] = lum;
+                data[i + 3] = 255;
+            }
+        }
+        std::sync::Arc::new(roomlerd::capture::Frame {
+            width: w,
+            height: h,
+            stride: w * 4,
+            pixel_format: roomlerd::capture::PixelFormat::Bgra,
+            data,
+            monotonic_us: (n as u64) * 33_333,
+            monitor: 0,
+            damage: roomlerd::capture::Damage::Unknown,
+            source: None,
+        })
+    };
+
+    // Rungs: down from 6 Mbps to 200 kbps and back, every value an exact
+    // `coarsen_bitrate` ladder rung so coarsening is a no-op and each entry is
+    // a genuine reconfigure.
+    let down: [u32; 11] = [
+        6_000_000, 4_500_000, 3_000_000, 2_000_000, 1_500_000, 1_000_000, 750_000, 550_000,
+        400_000, 300_000, 200_000,
+    ];
+    let rungs: Vec<u32> = down
+        .iter()
+        .copied()
+        .chain(down.iter().rev().copied().skip(1))
+        .collect();
+    let fps = 60u32; // the ratio's denominator; content is fps-agnostic here.
+
+    let mut frame_n = 0u32;
+    struct RungRow {
+        target: u32,
+        set_ms: f64,
+        /// Rate-caused IDR: a keyframe on the FIRST frame after `set_bitrate`.
+        key_on_change: u32,
+        /// Periodic GOP IDR: a keyframe mid-rung (frame ≥ 1), which is the
+        /// encoder's own keyint, not the rate change — reported so it is not
+        /// mistaken for one (openh264/vp9_qsv have a short-ish keyint).
+        key_periodic: u32,
+        mean_bytes: f64,
+        first3_max: usize,
+        trailing_mean: f64,
+        ratio: f64,
+    }
+    let mut rows: Vec<RungRow> = Vec::new();
+
+    // Warm-up at the top rung: the genuine opening IDR lives here and is not
+    // counted as a rate-caused one.
+    enc.set_bitrate(rungs[0]);
+    for _ in 0..frames_per_rung {
+        let _ = enc.encode(make_frame(frame_n)).await?;
+        frame_n += 1;
+    }
+
+    for (ri, &target) in rungs.iter().enumerate() {
+        let t = Instant::now();
+        enc.set_bitrate(target);
+        let set_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let mut key_on_change = 0u32;
+        let mut key_periodic = 0u32;
+        let mut sizes: Vec<usize> = Vec::with_capacity(frames_per_rung as usize);
+        for f in 0..frames_per_rung {
+            let packets = enc.encode(make_frame(frame_n)).await?;
+            frame_n += 1;
+            let mut frame_bytes = 0usize;
+            let mut frame_is_key = false;
+            for p in &packets {
+                frame_bytes += p.data.len();
+                frame_is_key |= p.is_keyframe;
+            }
+            if frame_is_key {
+                // Frame 0 of a rung right after `set_bitrate` = the rate change
+                // forced it; any later keyframe is the encoder's periodic GOP.
+                // (The warm-up rung's frame 0 is the genuine opening IDR.)
+                if f == 0 {
+                    if ri != 0 {
+                        key_on_change += 1;
+                    }
+                } else {
+                    key_periodic += 1;
+                }
+            }
+            sizes.push(frame_bytes);
+        }
+        let mean_bytes = sizes.iter().sum::<usize>() as f64 / sizes.len().max(1) as f64;
+        let first3_max = sizes.iter().take(3).copied().max().unwrap_or(0);
+        // Mean of the last few frames of the rung — the settled size the burst
+        // is judged against.
+        let tail = &sizes[sizes.len().saturating_sub(5)..];
+        let trailing_mean = tail.iter().sum::<usize>() as f64 / tail.len().max(1) as f64;
+        let expected = target as f64 / fps as f64 / 8.0;
+        let ratio = if expected > 0.0 {
+            mean_bytes / expected
+        } else {
+            0.0
+        };
+        rows.push(RungRow {
+            target,
+            set_ms,
+            key_on_change,
+            key_periodic,
+            mean_bytes,
+            first3_max,
+            trailing_mean,
+            ratio,
+        });
+    }
+
+    // Verdict: an in-place-capable backend emits 0 rate-caused IDRs, applies
+    // fast, tracks within ±25 %, and does not burst > 2× on the change.
+    let total_idr: u32 = rows.iter().map(|r| r.key_on_change).sum();
+    let total_periodic: u32 = rows.iter().map(|r| r.key_periodic).sum();
+    let max_set_ms = rows.iter().map(|r| r.set_ms).fold(0.0, f64::max);
+    let worst_ratio_dev = rows
+        .iter()
+        .map(|r| (r.ratio - 1.0).abs())
+        .fold(0.0, f64::max);
+    let worst_burst = rows
+        .iter()
+        .map(|r| {
+            if r.trailing_mean > 0.0 {
+                r.first3_max as f64 / r.trailing_mean
+            } else {
+                0.0
+            }
+        })
+        .fold(0.0, f64::max);
+    let pass = total_idr == 0 && max_set_ms < 5.0 && worst_ratio_dev <= 0.25 && worst_burst <= 2.0;
+
+    if json {
+        let rungs_json: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{{\"target\":{},\"set_ms\":{:.3},\"rate_idr\":{},\"periodic_idr\":{},\"mean_bytes\":{:.0},\"ratio\":{:.3},\"first3_max\":{},\"trailing_mean\":{:.0}}}",
+                    r.target, r.set_ms, r.key_on_change, r.key_periodic, r.mean_bytes, r.ratio, r.first3_max, r.trailing_mean
+                )
+            })
+            .collect();
+        println!(
+            "ROOMLER_A0_JSON:{{\"backend\":\"{backend}\",\"codec\":\"{actual_codec}\",\"w\":{w},\"h\":{h},\"fpr\":{frames_per_rung},\"constrained\":{constrained},\"total_rate_idr\":{total_idr},\"total_periodic_idr\":{total_periodic},\"max_set_ms\":{max_set_ms:.3},\"worst_ratio_dev\":{worst_ratio_dev:.3},\"worst_burst\":{worst_burst:.3},\"pass\":{pass},\"rungs\":[{}]}}",
+            rungs_json.join(",")
+        );
+    } else {
+        println!(
+            "reconfigure-sweep: backend={backend} codec={actual_codec} {w}x{h} frames/rung={frames_per_rung}"
+        );
+        println!(
+            "  target_bps  set_ms  rate_IDR  gop_IDR  mean_bytes  ratio  first3_max  trailing_mean"
+        );
+        for r in &rows {
+            println!(
+                "  {:>9}  {:>6.2}  {:>7}  {:>7}  {:>10.0}  {:>5.2}  {:>10}  {:>13.0}",
+                r.target,
+                r.set_ms,
+                r.key_on_change,
+                r.key_periodic,
+                r.mean_bytes,
+                r.ratio,
+                r.first3_max,
+                r.trailing_mean
+            );
+        }
+        println!(
+            "VERDICT: {} — rate-caused IDRs={total_idr} (want 0), periodic GOP IDRs={total_periodic} (informational), max set_ms={max_set_ms:.2} (want <5), worst |ratio-1|={worst_ratio_dev:.2} (want ≤0.25), worst burst={worst_burst:.2} (want ≤2)",
+            if pass {
+                "PASS (in-place capable)"
+            } else {
+                "FAIL (rate change costs an IDR/rebuild)"
+            }
+        );
+    }
     Ok(())
 }
 
