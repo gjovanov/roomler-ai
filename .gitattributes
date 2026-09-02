@@ -16,3 +16,12 @@ scripts/*.sh text eol=lf
 # The sanitisation guard runs on Linux CI; a CRLF shebang would break it.
 .claude/skills/sanitize-hostnames/*.sh text eol=lf
 .claude/skills/sanitize-hostnames/*.py text eol=lf
+
+# FR-62 A2: the vendored-FFmpeg source patches in .github/ffmpeg-patches/ are
+# applied verbatim by the vendor builders (`git apply -p1` on the Linux/Windows
+# runners, the vcpkg overlay port's PATCHES on Windows) against LF-normalised
+# FFmpeg sources. They MUST stay LF — a CRLF-converted patch fails to apply and
+# would inject CR into nvenc.c — and a unified diff's context line for a blank
+# source line is legitimately a single space, so the trailing-whitespace check
+# must not fire on them.
+.github/ffmpeg-patches/*.patch text eol=lf whitespace=-blank-at-eol
