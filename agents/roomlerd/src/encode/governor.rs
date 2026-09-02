@@ -249,6 +249,17 @@ pub struct RateGovernor {
     /// queue can drain. An INSTANT rather than a countdown, because the
     /// pump polls it from a loop that may not tick at all while paused.
     drain_until: Option<Instant>,
+    /// FR-59 P8 — a pair the rate memory remembers BELOW the nominal floor
+    /// (the same seed P5 reads). The session OPENS at it, and until live
+    /// evidence arrives it stands in as the pipe measurement, so the P1
+    /// floor relief, the P2 queue budget and the P6 contradiction check all
+    /// see the remembered rate rather than the 1.5 M fleet constant. `None`
+    /// for an unremembered or a fast pair, and with the relief switched off
+    /// — then nothing here changes. Field 2026-09-02: `seed_bps=387500` was
+    /// logged and the session still opened at the 2.55 M relay cap (the
+    /// FR-35 learner only ever RAISES the ceiling), a 372 KB opener into a
+    /// ~300 kbps pipe — ten seconds of queue before any measurement spoke.
+    open_seed_bps: Option<u32>,
 }
 
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
@@ -309,7 +320,18 @@ impl RateGovernor {
             link_loop: viewer_rate::LinkLoop::new(),
             link_rx_bps: None,
             drain_until: None,
+            open_seed_bps: ceiling_seed_bps
+                .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
         }
+    }
+
+    /// FR-59 P8 — the remembered rate this session opened at, when the pair
+    /// is remembered slower than the nominal floor (see `open_seed_bps`).
+    /// The pump opens its FIRST encoder at this rate so the governor's
+    /// first tick does not rebuild an encoder it just opened at the ceiling.
+    #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+    pub fn open_seed_bps(&self) -> Option<u32> {
+        self.open_seed_bps
     }
 
     /// FR-59 P4 — is production paused for a queue drain right now?
@@ -420,7 +442,9 @@ impl RateGovernor {
         };
         match (self.goodput.estimate_bps(now), link) {
             (Some(g), Some(rx)) => Some(g.min(rx)),
-            (g, rx) => g.or(rx),
+            // FR-59 P8 — with no live evidence at all, the remembered rate
+            // (lowest priority: any measurement outranks it).
+            (g, rx) => g.or(rx).or(self.open_seed_bps),
         }
     }
 
@@ -521,7 +545,9 @@ impl RateGovernor {
         let measured_bps = if constrained {
             match (self.goodput.estimate_bps(now), link_rx_bps) {
                 (Some(g), Some(rx)) => Some(g.min(rx)),
-                (g, rx) => g.or(rx),
+                // FR-59 P8 — before any live evidence, the remembered rate
+                // stands in (see `open_seed_bps`); a measurement outranks it.
+                (g, rx) => g.or(rx).or(self.open_seed_bps),
             }
         } else {
             None
@@ -580,12 +606,18 @@ impl RateGovernor {
             }
         };
         let depth = self.send_depth;
+        let open_seed_bps = self.open_seed_bps;
         let ctrl = self.aimd.get_or_insert_with(|| {
             // FR-59 P1 — construct at the floor already in force rather
             // than the flat `MIN_BITRATE_BPS`, so the constructor's own
             // `initial.clamp(floor, ceiling)` and the `set_floor` on the
             // next line cannot momentarily disagree.
-            AimdController::new(ceiling_bps, floor_bps, ceiling_bps, depth as u32, now)
+            // FR-59 P8 — and OPEN at the remembered rate when the pair is
+            // remembered slower than the nominal floor: the ceiling is the
+            // relay cap, and an opener sized by it is the burst this program
+            // exists to prevent. The additive increase climbs from here.
+            let initial = open_seed_bps.map_or(ceiling_bps, |s| s.min(ceiling_bps));
+            AimdController::new(initial, floor_bps, ceiling_bps, depth as u32, now)
         });
         ctrl.set_floor(floor_bps);
         ctrl.set_ceiling(ceiling_bps);
@@ -985,6 +1017,93 @@ mod tests {
             None,
             now,
         )
+    }
+
+    /// FR-59 P8 — a constrained governor with the FR-35 rate memory seeded.
+    fn seeded(seed: Option<u32>, floor_relief: bool, now: Instant) -> RateGovernor {
+        RateGovernor::new(
+            15,
+            DEPTH,
+            GovernorFlags {
+                floor_relief,
+                viewer_rate_clamp: true,
+                seed_contradiction: true,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            seed,
+            now,
+        )
+    }
+
+    /// FR-59 P8 — a pair remembered BELOW the nominal floor opens AT the
+    /// remembered rate, with the floor relief seeded from it. Field
+    /// 2026-09-02: `seed_bps=387500` logged, then the encoder opened at the
+    /// 2.55 M relay cap anyway (the FR-35 learner only ever RAISES the
+    /// ceiling), a 372 KB opener burst into a ~300 kbps pipe — ten seconds
+    /// of queue before the first measurement could say a word.
+    #[test]
+    fn remembered_slow_pair_opens_at_the_remembered_rate() {
+        let now = Instant::now();
+        let mut g = seeded(Some(387_500), true, now);
+        let applied = g
+            .pre_encode_tick(2_550_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, now)
+            .expect("the first tick applies");
+        assert_eq!(applied.bps, 387_500, "opens at the seed, not the ceiling");
+        assert_eq!(
+            g.relieved_floor_bps(),
+            Some(super::super::goodput::measured_floor_bps(
+                387_500,
+                crate::encode::MIN_BITRATE_BPS,
+                crate::encode::slow_link_min_bitrate_bps(),
+            )),
+            "the floor relief is seeded too, so the AIMD can hold the target there"
+        );
+        assert_eq!(g.open_seed_bps(), Some(387_500));
+        assert_eq!(
+            g.measured_pipe_bps(now, true),
+            Some(387_500),
+            "P2's queue budget sees the seed until live evidence lands"
+        );
+        assert_eq!(
+            g.measured_pipe_bps(now, false),
+            None,
+            "a direct session never reads it"
+        );
+    }
+
+    /// FR-59 P8 — kill switch: with the floor relief off the opener is the
+    /// pre-P8 one, byte for byte.
+    #[test]
+    fn seed_opening_is_inert_without_the_floor_relief() {
+        let now = Instant::now();
+        let mut g = seeded(Some(387_500), false, now);
+        let applied = g
+            .pre_encode_tick(2_550_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, now)
+            .expect("applies");
+        assert_eq!(applied.bps, 2_550_000);
+        assert_eq!(g.open_seed_bps(), None);
+        assert_eq!(g.measured_pipe_bps(now, true), None);
+        assert_eq!(g.relieved_floor_bps(), None);
+    }
+
+    /// FR-59 P8 — a pair remembered FASTER than the nominal floor is the
+    /// FR-35 learner's business (it lifts the ceiling), not P8's.
+    #[test]
+    fn a_fast_memory_still_opens_at_the_ceiling() {
+        let now = Instant::now();
+        let mut g = seeded(Some(4_677_606), true, now);
+        let applied = g
+            .pre_encode_tick(2_550_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, now)
+            .expect("applies");
+        assert!(
+            applied.bps >= 2_550_000,
+            "a seed above the nominal floor never lowers the opener: {}",
+            applied.bps
+        );
+        assert_eq!(g.open_seed_bps(), None);
+        assert_eq!(g.relieved_floor_bps(), None);
+        assert_eq!(g.measured_pipe_bps(now, true), None);
     }
 
     /// FR-35 — on a constrained session the learner lifts the ceiling above

@@ -68,6 +68,17 @@ const MD_DEN: u32 = 100;
 /// (LAN) bitrates.
 const AI_STEP_DIVISOR: u32 = 16;
 const AI_MIN_STEP_BPS: u32 = 150_000;
+/// FR-59 P8 — the additive step while `desired` sits BELOW the nominal floor
+/// (`encode::MIN_BITRATE_BPS`), which only happens once the FR-59 floor
+/// relief has let the controller follow a measured slow pipe:
+/// `max(desired / AI_SLOW_BAND_DIVISOR, AI_SLOW_MIN_STEP_BPS)`. The nominal
+/// step above is sized for the 2–9 Mbps band — at 350 kbps a +150 kbps step
+/// is +43 %, a guaranteed overshoot on the very pipe that put the controller
+/// there, and on a rebuild-bound HW encoder every such step is also an IDR
+/// (~1 s of a 300 kbps link). +12.5 % per settle crosses a ladder rung every
+/// 2–3 steps instead of on every one.
+const AI_SLOW_BAND_DIVISOR: u32 = 8;
+const AI_SLOW_MIN_STEP_BPS: u32 = 25_000;
 /// At most one multiplicative decrease per this interval — avoids
 /// free-falling the bitrate on a transient burst.
 const MD_MIN_INTERVAL: Duration = Duration::from_millis(500);
@@ -255,7 +266,12 @@ impl AimdController {
     }
 
     fn apply_ai(&mut self, now: Instant) {
-        let step = (self.ceiling_bps / AI_STEP_DIVISOR).max(AI_MIN_STEP_BPS);
+        let step = if self.desired_bps < super::MIN_BITRATE_BPS {
+            // FR-59 P8 — see `AI_SLOW_BAND_DIVISOR`.
+            (self.desired_bps / AI_SLOW_BAND_DIVISOR).max(AI_SLOW_MIN_STEP_BPS)
+        } else {
+            (self.ceiling_bps / AI_STEP_DIVISOR).max(AI_MIN_STEP_BPS)
+        };
         let next = self.desired_bps.saturating_add(step).min(self.ceiling_bps);
         if next > self.desired_bps {
             self.desired_bps = next;
@@ -269,9 +285,18 @@ impl AimdController {
 /// Bitrate ladder for [`coarsen_bitrate`]. ~1.33–1.5× spacing across the DC
 /// pump's operating band, extending past the 12 Mbps FFmpeg maxrate cap so a
 /// raised ceiling (direct/LAN, high resolution) still has rungs to climb.
+///
+/// FR-59 P8 — it also extends BELOW `encode::MIN_BITRATE_BPS`, down to the
+/// lowest floor the `slow_link_min_bitrate` config allows. The ladder used to
+/// bottom out at 1.5 M, which made it a second copy of the floor pin P1
+/// removed from the AIMD: every relieved target between 200 k and 1.4 M
+/// coarsened to the rung the encoder was already on, and `set_bitrate`
+/// returned without touching it. Field 2026-09-02 (CORPLAP-1 over a ~300 kbps
+/// relay): 4½ minutes of `target_bps=200000` in the heartbeat while every
+/// frame on the wire was exactly 12 513 bytes — 1.5 M ÷ 15 fps ÷ 8.
 const BITRATE_LADDER_BPS: &[u32] = &[
-    1_500_000, 2_000_000, 3_000_000, 4_500_000, 6_000_000, 8_000_000, 12_000_000, 16_000_000,
-    20_000_000, 25_000_000,
+    100_000, 150_000, 200_000, 300_000, 400_000, 550_000, 750_000, 1_000_000, 1_500_000, 2_000_000,
+    3_000_000, 4_500_000, 6_000_000, 8_000_000, 12_000_000, 16_000_000, 20_000_000, 25_000_000,
 ];
 
 /// Snap a continuous AIMD bitrate to the nearest [`BITRATE_LADDER_BPS`] rung.
@@ -560,9 +585,9 @@ mod tests {
     #[test]
     fn coarsen_clamps_and_fixes_rungs() {
         assert_eq!(
-            coarsen_bitrate(1_000_000),
-            1_500_000,
-            "below floor → floor rung"
+            coarsen_bitrate(50_000),
+            100_000,
+            "below the bottom rung → bottom rung"
         );
         assert_eq!(
             coarsen_bitrate(30_000_000),
@@ -613,7 +638,7 @@ mod tests {
     #[test]
     fn coarsen_is_monotonic() {
         let mut prev = 0u32;
-        for bps in (1_000_000..=26_000_000).step_by(100_000) {
+        for bps in (50_000..=26_000_000).step_by(50_000) {
             let c = coarsen_bitrate(bps);
             assert!(
                 c >= prev,
@@ -621,5 +646,55 @@ mod tests {
             );
             prev = c;
         }
+    }
+
+    // (12) FR-59 P8 — the ladder reaches the slow-link band. Field
+    // 2026-09-02: it bottomed at 1.5 M, so every relieved target between
+    // 200 k and 1.1 M coarsened to the rung the encoder already ran at and
+    // `set_bitrate` returned without touching it — 4½ minutes of
+    // `target_bps=200000` with 12 513-byte frames (= 1.5 M ÷ 15 fps ÷ 8).
+    #[test]
+    fn ladder_reaches_the_slow_link_band() {
+        assert_eq!(coarsen_bitrate(387_500), 400_000);
+        assert_eq!(coarsen_bitrate(254_930), 300_000);
+        assert_eq!(coarsen_bitrate(200_000), 200_000);
+        assert_ne!(
+            coarsen_bitrate(200_000),
+            coarsen_bitrate(super::super::MIN_BITRATE_BPS),
+            "a relieved target must land on a different rung than the nominal floor"
+        );
+        // The bottom rung is at or below the lowest floor the config
+        // permits (`slow_link_min_bitrate_bps` clamps at 50 k), so no
+        // relieved floor can ever coarsen UP past itself by more than the
+        // ladder's own spacing.
+        assert!(BITRATE_LADDER_BPS[0] <= 100_000);
+    }
+
+    // (13) FR-59 P8 — below the nominal floor the additive step is relative
+    // to `desired`, not to the (nominal) ceiling; above it, unchanged.
+    #[test]
+    fn ai_step_is_relative_below_the_nominal_floor() {
+        let t0 = Instant::now();
+        let mut slow = AimdController::new(348_000, 200_000, 2_550_000, 8, t0);
+        slow.take_pending();
+        let mut fast =
+            AimdController::new(2_000_000, super::super::MIN_BITRATE_BPS, 2_550_000, 8, t0);
+        fast.take_pending();
+        let mut t = t0;
+        for _ in 0..30 {
+            t += Duration::from_millis(200); // 6 s of an idle channel → one AI
+            slow.observe(0, false, t);
+            fast.observe(0, false, t);
+        }
+        assert_eq!(
+            slow.desired(),
+            348_000 + 348_000 / AI_SLOW_BAND_DIVISOR,
+            "+12.5 % in the slow band, not +150 k"
+        );
+        assert_eq!(
+            fast.desired(),
+            2_000_000 + 2_550_000 / AI_STEP_DIVISOR,
+            "the nominal step above the floor is unchanged"
+        );
     }
 }
