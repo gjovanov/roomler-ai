@@ -1797,6 +1797,28 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
     Ok(pid)
 }
 
+/// The real install path, when `exe` is the outgoing binary the installer
+/// has just renamed aside.
+///
+/// The Unix tarball installer keeps the previous image for rollback with
+/// `rename(dst, dst.with_extension("prev"))`, and only *then* is the watcher
+/// spawned — so `current_exe()` resolves through `/proc/self/exe` to
+/// `<name>.prev`, the OLD binary. A watcher that verifies its own path
+/// therefore reads the pre-update version and reports a mismatch for a
+/// perfectly good install.
+///
+/// Stripping the suffix is the exact inverse of the rename above, so the two
+/// cannot drift apart without this function's test failing.
+///
+/// Returns `None` when `exe` is not a `.prev` path — there is then nothing to
+/// correct and the caller keeps its existing behaviour.
+fn install_path_before_rename(exe: &std::path::Path) -> Option<PathBuf> {
+    if exe.extension().and_then(|e| e.to_str()) != Some("prev") {
+        return None;
+    }
+    Some(exe.with_extension(""))
+}
+
 fn spawn_watcher(
     installer_pid: u32,
     installer_path: &std::path::Path,
@@ -1828,6 +1850,18 @@ fn spawn_watcher(
         // PerUser) and probes the wrong binary; hand it the real
         // install path explicitly.
         cmd.arg("--origin-exe").arg(&exe);
+    }
+    // Unix has the SAME problem for a different reason (#1206): the tarball
+    // installer renames the outgoing binary to `<name>.prev` BEFORE spawning
+    // the watcher, so the watcher's own path is the old image. Without this
+    // the verdict is always `SucceededUnverified` — which is worse than
+    // useless, because a genuinely broken install then looks exactly like a
+    // healthy one.
+    #[cfg(not(target_os = "windows"))]
+    if !staged {
+        if let Some(origin) = install_path_before_rename(&exe) {
+            cmd.arg("--origin-exe").arg(&origin);
+        }
     }
     let _child = cmd
         .spawn()
@@ -2361,6 +2395,50 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
 // docs/fr/FR-21
 #[cfg(test)]
 mod tests {
+    /// #1206 — the post-install watcher must verify the INSTALL path, never
+    /// its own path.
+    ///
+    /// The Unix tarball installer renames the outgoing binary to `<name>.prev`
+    /// for rollback and only then spawns the watcher, so `current_exe()`
+    /// resolves to the OLD image. Verifying that path made every healthy
+    /// tarball update record `SucceededUnverified` — and a verdict that is
+    /// always the same cannot distinguish a broken install from a good one,
+    /// which is the entire reason the check exists.
+    ///
+    /// ⚠️ The first assertion is the load-bearing one: it is the exact input
+    /// observed in the field (`/usr/bin/roomlerd.prev`, expected 0.4.48,
+    /// reported 0.4.45). The second guards the inverse — a path that was NOT
+    /// renamed must yield `None` so the caller's existing behaviour is
+    /// untouched on every other platform and flow.
+    #[test]
+    fn watcher_verifies_the_install_path_not_its_own_renamed_path() {
+        use super::install_path_before_rename;
+        use std::path::{Path, PathBuf};
+
+        // The field case.
+        assert_eq!(
+            install_path_before_rename(Path::new("/usr/bin/roomlerd.prev")),
+            Some(PathBuf::from("/usr/bin/roomlerd")),
+            "a `.prev` watcher path must resolve to the binary the installer wrote"
+        );
+
+        // Not renamed => nothing to correct.
+        assert_eq!(
+            install_path_before_rename(Path::new("/usr/bin/roomlerd")),
+            None,
+            "a non-`.prev` path must be left alone rather than mangled"
+        );
+
+        // The inverse of the installer's own rename, so the two cannot drift.
+        let dst = Path::new("/usr/bin/roomlerd");
+        let renamed = dst.with_extension("prev");
+        assert_eq!(
+            install_path_before_rename(&renamed).as_deref(),
+            Some(dst),
+            "must be the exact inverse of the installer's with_extension(\"prev\")"
+        );
+    }
+
     use super::*;
 
     /// A non-root macOS agent must FAIL the spawn rather than report a
