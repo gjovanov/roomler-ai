@@ -161,15 +161,17 @@ COW-clone golden image → boot → SSH in
 - [x] AC2 — Win11 6/6 GREEN (`install.ps1` daemon-system/machine/user AND silent perMachine/
   perUser MSI incl. `ENABLE_SYSTEM_CONTEXT=1`; SystemContext overlay = two roomlerd, session-0
   supervisor + session-1 worker; per-user via netstack). Field-verified 0.4.48, 2026-09-02.
-- [~] AC3 — the wizard smoke is coded and drives WebView2 CDP, but is BLOCKED externally: no
-  `roomler-setup` (`setup-v*`) release exists for `/api/setup/windows` to serve. Recorded in
-  `expected-failures.txt`; unblocks when a wizard release is cut.
+- [x] AC3 — the wizard smoke walks Welcome→Server→Token→Install→**Done** over WebView2 CDP,
+  enrols a real device and deletes its (non-ephemeral) row. Unblocked by publishing
+  `setup-v0.4.48` — see the field log for why no wizard release could be cut before.
 - [x] AC4 — ARM Linux GREEN 2/2 (script + aarch64 `.deb`, system): install / enroll / overlay
   (`ping anchor ~4 ms`); RD even PASSES under TCG (virtual-desktop Xvfb + SW encode). Desktop is
   N/A (no aarch64 companion) and the graceful skip is asserted. Field-verified 0.4.48, 2026-09-02.
 
-- [ ] AC5 — macOS: coded; needs an Apple-silicon `tart` host (`VMTEST_MACOS_SSH`); lane
-  auto-skips cleanly when unset.
+- [x] AC5 — macOS GREEN 4/4 on throwaway **tart** VMs (Apple-silicon MacBook, reached from mars
+  over roomler's OWN mesh): served `install.sh` AND `.pkg`, agent-only AND agent+daemon
+  (marker on/off). The `system` cells MESH from the VM (`self=100.65.20.x`, anchor ping ok).
+  RD + the per-user row's liveness are N/A-by-construction headlessly (Aqua session + TCC).
 - [x] AC6 — RD asserts frames FLOW and ADVANCE (getStats `framesDecoded` / the composable's live
   fps hook, with a transport-agnostic canvas-pixel-change fallback for the DataChannel/VP9-444
   path that has no `<video>`). Verified on Ubuntu + Windows (VP9-444, direct, 29 fps).
@@ -206,7 +208,8 @@ COW-clone golden image → boot → SSH in
 
 ## Field-verification log
 
-**2026-09-02, prod 0.4.48, zeus KVM — 12 cells GREEN (Ubuntu 4/4, Win11 6/6, ARM 2/2).** The harness was
+**2026-09-02, prod 0.4.48 — ALL FIVE LANES GREEN: 18 cells (Ubuntu 4/4, Win11 6/6 + the wizard
+smoke, ARM 2/2, macOS 4/4).** The harness was
 built and driven to green on the live fleet; the run-and-tweak phase found and fixed **27 field
 bugs**, each shown failing before its fix. Highlights (full detail in the memory + the issue's
 step-log comments):
@@ -237,5 +240,28 @@ a DataChannel → a canvas, not `<video>`** (transport-agnostic frame oracle); o
    userspace netstack (`ROOMLERD_OVERLAY_NETSTACK_SOCKS`), so `overlay_mode=tun` never gets an
    address. The installer should set netstack up for a per-user role.
 
-Remaining: macOS (needs an Apple-silicon `tart` host) and the wizard smoke (needs
-a `roomler-setup` release).
+**The last two lanes, and what they cost:**
+
+- **Win11 wizard.** No `setup-v*` release existed, so `/api/setup/windows` 404'd. The cause was
+  structural rather than a missing tag: the wizard release is all-or-nothing and its macOS job
+  REQUIRES Apple credentials that do not exist yet (FR-7 enrolment pending), so it failed and
+  took Linux + Windows down with it. Fixed with an explicit default-false `skip_macos` input
+  (#1222), published `setup-v0.4.48`, and the cell now walks the wizard to **Done**, enrols a
+  real device and deletes its row. Two harness bugs fell out: the walker guessed selectors (it
+  now drives the wizard's own stable ids), and a cloned Win11 guest boots **~3 h ahead of UTC**,
+  so a freshly minted 10-minute enrollment token was rejected as "already expired" — a clock bug
+  wearing an auth error's clothes.
+- **macOS.** Runs on **throwaway `tart` VMs on the operator's Apple-silicon Mac**, driven from
+  mars over **roomler's own mesh** (`roomler ssh` — the Mac has Remote Login off and no public
+  IP, so the harness dogfoods the product). It cannot move to the fleet: all three hosts are AMD,
+  macOS may only be virtualised on Apple silicon, and roomler ships **no x86_64 macOS artifact**,
+  so an x86 VM would have nothing to install even if it booted. Four environment defects were
+  found and fixed — `tart stop` loses the injected SSH key (shut down from inside), the vmnet
+  resolver times out (pin DNS in the golden), the daemon bundle was renamed (resolve it), and the
+  cell asked the server about a VM it had already destroyed. Remote desktop and the per-user
+  row's liveness stay N/A headlessly: both need an Aqua session plus a TCC grant, which one human
+  action in the golden unlocks — the same "attended by design" shape as the Wayland portal.
+
+Also fixed here, and worth carrying: **`curl … | bash` reports BASH's status**, so a failed fetch
+(no DNS) still read as `install PASS` having installed nothing — the standing "never branch on a
+piped exit status" rule, recurring in a new place.
