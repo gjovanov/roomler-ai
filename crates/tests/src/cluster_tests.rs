@@ -1096,3 +1096,123 @@ async fn shutdown_releases_tunnel_and_derp_records() {
     );
     ws.close(None).await.ok();
 }
+
+/// #1186 — a removal initiated on a pod that homes NO sockets must still
+/// reach the peers' pod: the `overlay_removes` ctrl broadcast re-fans on
+/// every other pod. Field shape (2026-09-01): both members' WSs on the
+/// tenant-affine pod, the FR-51 self-unenroll (tenant-less path, IP-hashed)
+/// landing on the other — the peer never heard the removes and kept
+/// WG-handshaking at a dead peer until its next rejoin.
+///
+/// Here the removal runs through the admin DELETE aimed at app2 on purpose:
+/// in prod that route is tenant-affine by the LB, but the test drives it at
+/// the WRONG pod to stand in for every non-affine initiator (self-unenroll,
+/// the reaper) — they all share `release_overlay_node`, which is where the
+/// broadcast lives. FAILED before the fix (10 s timeout, no delta).
+#[tokio::test]
+async fn overlay_removes_reach_peers_homed_on_another_pod() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use bson::oid::ObjectId;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::Value;
+    use tokio_tungstenite::tungstenite::Message;
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.redis_pubsub.is_none() || app2.state.redis_pubsub.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let seeded = app1.seed_tenant("ovremoves").await;
+
+    // Two members, both sockets on app1 (the "affine" pod).
+    let (aid_a, tok_a) = crate::agent_presence_tests::enroll(&app1, &seeded, "ovrm-a").await;
+    let (_aid_b, tok_b) = crate::agent_presence_tests::enroll(&app1, &seeded, "ovrm-b").await;
+    let mut ws_a = crate::agent_presence_tests::connect_agent(&app1, &tok_a).await;
+    let mut ws_b = crate::agent_presence_tests::connect_agent(&app1, &tok_b).await;
+
+    let join = |seed: u8| {
+        serde_json::json!({
+            "t": "rc:overlay.join",
+            "wg_public_key": B64.encode([seed; 32]),
+            "mtu": 1280,
+            "endpoints": ["203.0.113.9:51820"],
+        })
+        .to_string()
+    };
+    ws_a.send(Message::Text(join(11).into())).await.unwrap();
+    ws_b.send(Message::Text(join(12).into())).await.unwrap();
+
+    // Drain until B holds its netmap; A's node id comes from the DB (the
+    // netmap's own id field names the RECIPIENT'S node).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut b_has_netmap = false;
+    while std::time::Instant::now() < deadline && !b_has_netmap {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), ws_b.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if t.contains("rc:overlay.netmap") {
+                    b_has_netmap = true;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    assert!(b_has_netmap, "B must receive a netmap for its join");
+
+    let a_oid = ObjectId::parse_str(&aid_a).unwrap();
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let node_a = app1
+        .state
+        .overlay_nodes
+        .find_live_by_tenant_and_machine(tid, "ovrm-a")
+        .await
+        .unwrap()
+        .expect("A holds a live overlay node");
+    let node_a_hex = node_a.id.unwrap().to_hex();
+
+    // The removal, initiated on the pod that homes NEITHER socket.
+    let del: Value = app2
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, a_oid.to_hex()),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(del["deleted"], serde_json::json!(true));
+    assert_eq!(
+        del["overlay_released"],
+        serde_json::json!(true),
+        "the lease release itself is pod-agnostic (Mongo) and must succeed"
+    );
+
+    // B — whose socket lives on app1 — must hear the removes anyway.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut heard = false;
+    while std::time::Instant::now() < deadline && !heard {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), ws_b.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if t.contains("rc:overlay.netmap_delta") && t.contains(&node_a_hex) {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    if v["removes"]
+                        .as_array()
+                        .is_some_and(|r| r.iter().any(|x| x == &Value::from(node_a_hex.clone())))
+                    {
+                        heard = true;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    assert!(
+        heard,
+        "the peer's pod must re-fan a foreign-pod removal (#1186) — \
+         before the fix this timed out exactly like the field run"
+    );
+    ws_a.close(None).await.ok();
+    ws_b.close(None).await.ok();
+}
