@@ -715,6 +715,19 @@ impl RateGovernor {
         // ages on every transport.
         let report = viewer_rate::unpack_age(take_age());
         let mut age_over = false;
+        // FR-59 — is the queue still DEEP right now? This is the LEVEL, not
+        // the streak `age_over` needs, and it is what holds the P3 clamp.
+        //
+        // ⚠ The clamp cannot be held by the queue-growth integral, which is
+        // what the first two attempts tried. `Σ(Δarrival − Δwire)` is a
+        // DERIVATIVE: it sees the queue grow and falls silent the moment
+        // growth stops — and growth stops as soon as the sender's cadence
+        // stretches to match the drained rate, which is exactly what the
+        // viewer-rate fps cap makes happen. Field 2026-09-02, adjacent
+        // windows: paint age 505 ms while the depth integral read 10. The
+        // age is an absolute measure against a learned floor and does not
+        // vanish when growth does.
+        let mut age_elevated = false;
         if let Some((avg, min, rtt)) = report {
             // P2 — half the viewer's own measured round trip is the smallest
             // age this path can physically produce; the loop uses it both to
@@ -722,6 +735,11 @@ impl RateGovernor {
             // congested from its first window.
             let triggered = self.age_loop.observe(avg, min, rtt / 2);
             age_over = triggered && constrained && self.age_feedback;
+            // Same floor the age loop learned, falling back to the path's
+            // physical minimum so a session with nothing learned yet still
+            // has a bound rather than treating every age as elevated.
+            let floor = self.age_loop.floor_ms().unwrap_or((rtt / 2).max(1));
+            age_elevated = avg.saturating_sub(floor) >= viewer_rate::AGE_SLACK_MS;
         }
         let age_ms = report.map(|(avg, min, _)| (avg, min));
         self.last_viewer_age =
@@ -758,24 +776,37 @@ impl RateGovernor {
         if link_acts {
             match (verdict.congested, link) {
                 (true, Some((rx_bps, _))) => self.link_rx_bps = Some((rx_bps, now)),
-                // FR-59 — released only once the queue has actually DRAINED,
-                // not the moment it stops growing.
+                // FR-59 — ONSET and HOLD read different sensors, because
+                // they ask different questions.
                 //
-                // ⚠ The first version cleared on any non-congested window,
-                // reasoning that the clamp "describes a live overload".
-                // Field 2026-09-02, 150 kbit, 47 windows: congestion is
-                // detected in bursts (2 consecutive growing windows), so the
-                // clamp engaged and released repeatedly — the relief held in
-                // only 5 of 47 windows while the depth estimate sat at
-                // 119-651 ms and paint age reached 4,656 ms. Growth stopping
-                // is not the queue going away; a session that has converged
-                // ONTO the pipe has zero growth and a full queue, which is
-                // exactly when releasing the clamp re-opens the overshoot.
+                // Onset (above) is "is the queue growing?" — the drift
+                // derivative, which needs no clock probe and so speaks on
+                // the links where the age report is absent or rejected.
                 //
-                // So hold while the integral says the queue is still there,
-                // and let the AIMD's own additive increase do the climbing
-                // back — down fast, up slow.
-                (false, Some(_)) if self.link_loop.depth_ms() <= LINK_RELEASE_DEPTH_MS => {
+                // Release is "is the queue still DEEP?" — and the derivative
+                // cannot answer that. Two attempts got this wrong the same
+                // way: v1 released when growth stopped, v2 released when the
+                // growth INTEGRAL drained. Both are made of growth, and
+                // growth stops as soon as the sender's cadence stretches to
+                // match the drained rate — which the viewer-rate fps cap
+                // guarantees. Field 2026-09-02, adjacent windows: paint age
+                // 505 ms while the integral read 10; the relief held in 2 of
+                // 58 windows and peak age stayed at 2.5 s.
+                //
+                // So release only when BOTH say the queue is gone: the age
+                // level is back near its learned floor AND the integral has
+                // drained. Either one still reading deep holds the clamp,
+                // and the AIMD's additive increase does the climbing back —
+                // down fast, up slow.
+                //
+                // ⚠ `age_elevated` is false when the viewer reported no age
+                // at all, so a session with no clock lock degrades to the
+                // integral-only rule rather than holding the clamp forever.
+                // The `LINK_CEILING_TTL` is the backstop for a viewer that
+                // goes silent entirely.
+                (false, Some(_))
+                    if !age_elevated && self.link_loop.depth_ms() <= LINK_RELEASE_DEPTH_MS =>
+                {
                     self.link_rx_bps = None
                 }
                 _ => {}
@@ -1408,6 +1439,110 @@ mod tests {
         assert!(
             g.relieved_floor_bps().is_none(),
             "…and release once the queue is actually gone"
+        );
+    }
+
+    /// FR-59 — the clamp must survive the exact field shape that defeated
+    /// both earlier release rules: **growth has stopped, and the queue is
+    /// still deep**.
+    ///
+    /// Measured 2026-09-02 on adjacent windows: paint age 505 ms while the
+    /// growth integral read 10. v1 released when growth stopped; v2
+    /// released when the integral drained. Both are made of growth, and
+    /// growth stops the moment the sender's cadence stretches to match the
+    /// drained rate — which the viewer-rate fps cap guarantees. Only the
+    /// age LEVEL sees a queue that has stopped growing.
+    #[test]
+    fn the_clamp_holds_on_a_deep_queue_that_stopped_growing() {
+        const FLOOR: u16 = 110;
+        let start = Instant::now();
+        let mut g = gov(start);
+        let mut t = start;
+        // `rtt/2` is the physical bound; a floor sample at it is plausible.
+        let win = |g: &mut RateGovernor, t: &mut Instant, q: i16, age: u16| {
+            *t += Duration::from_millis(1100);
+            g.tick_viewer_window(
+                *t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || viewer_rate::pack_age(age, FLOOR, FLOOR * 2),
+                || viewer_rate::pack_link(400_000, q),
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due")
+        };
+        // Two growing windows arm the clamp.
+        win(&mut g, &mut t, 300, 400);
+        assert!(win(&mut g, &mut t, 300, 500).link_congested);
+        t += Duration::from_millis(10);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert!(g.relieved_floor_bps().is_some(), "clamp armed");
+
+        // THE FIELD SHAPE: growth has stopped and the integral DRAINS —
+        // field 2026-09-02 saw it fall 484 -> 10 across adjacent windows,
+        // i.e. slightly negative drift as the cadence caught up — while
+        // the standing queue stayed 505 ms deep.
+        for _ in 0..10 {
+            win(&mut g, &mut t, -80, 505);
+        }
+        assert!(
+            g.link_stats().2 <= LINK_RELEASE_DEPTH_MS,
+            "the integral has drained — this is what fooled v2"
+        );
+        t += Duration::from_millis(10);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert!(
+            g.relieved_floor_bps().is_some(),
+            "…but the queue is still 505 ms deep, so the clamp must HOLD"
+        );
+
+        // Now the queue genuinely clears: age returns to its floor.
+        for _ in 0..3 {
+            win(&mut g, &mut t, 0, FLOOR + 5);
+        }
+        t += Duration::from_millis(10);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert!(
+            g.relieved_floor_bps().is_none(),
+            "…and releases once the age is back at the floor"
+        );
+    }
+
+    /// A viewer that reports NO age must not pin the clamp forever — it
+    /// degrades to the integral-only rule.
+    #[test]
+    fn a_viewer_with_no_age_report_still_releases() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let mut t = start;
+        let win = |g: &mut RateGovernor, t: &mut Instant, q: i16| {
+            *t += Duration::from_millis(1100);
+            g.tick_viewer_window(
+                *t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || 0, // no age at all — the clock probe never locked
+                || viewer_rate::pack_link(400_000, q),
+                true,
+                |o| o,
+                0,
+            )
+        };
+        win(&mut g, &mut t, 300);
+        win(&mut g, &mut t, 300);
+        t += Duration::from_millis(10);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert!(g.relieved_floor_bps().is_some());
+        for _ in 0..10 {
+            win(&mut g, &mut t, -300);
+        }
+        t += Duration::from_millis(10);
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert!(
+            g.relieved_floor_bps().is_none(),
+            "no age signal ⇒ the integral decides, as before"
         );
     }
 
