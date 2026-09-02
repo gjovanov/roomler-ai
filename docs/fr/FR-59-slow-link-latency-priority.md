@@ -157,14 +157,19 @@ evidence is why both are already in the stats).
 - [ ] **AC5** — No regression on a healthy relay (CORPLAP-3 from the office LAN) or a direct
       path: `target_bps`, age and `frames_skipped_backpressure` unchanged within noise.
 - [ ] **AC6** — Every phase's kill switch restores the prior behaviour, verified by unit test.
-- [ ] **AC7** (P8) — On a constrained session whose `target_bps` sits below 1.5 M, the encoder
+- [x] **AC7** (P8) — On a constrained session whose `target_bps` sits below 1.5 M, the encoder
       FOLLOWS it: `bytes_written` per encoded frame ≤ 1.5 × `target_bps` ÷ `target_fps` ÷ 8
       over any 10-window span (the 0.4.49 signature was exactly 1.5 M ÷ fps ÷ 8 per frame
       regardless of target), and a pair remembered below 1 Mbps opens with
       `opener_maxrate_bps` ≤ its remembered rate, not the 2.55 M relay cap.
-- [ ] **AC8** (T1) — A session with continuous mouse input over a lossy link logs zero
+      **Field-verified 2026-09-02 on 0.4.50** (CORPLAP-1 over the corp-VPN relay): ratio
+      p50 0.90 / p90 1.01 against 4.88 / 7.51 on 0.4.49 the same hour; opened at 200 kbps
+      from the remembered rate, no opener burst (0.4.49: 457 KB).
+- [x] **AC8** (T1) — A session with continuous mouse input over a lossy link logs zero
       `unable to parse SCTP packet chunk too short` (0.4.49 field: 523 in one 4-minute
       LAN session on CORPLAP-3, 171 in a day on CORPLAP-1).
+      **Field-verified 2026-09-02 on 0.4.50**: 0 in the AFTER session at 25 mouse events/s,
+      against 24 in 2 minutes at 1.7 events/s on 0.4.49 the same hour, same path.
 
 ## What building P1–P4 + P6 changed about the design
 
@@ -288,3 +293,7 @@ it was the one configuration the A/B never ran on.
 | 2026-09-01 | 0.4.45 | CORPLAP-3 → neo16, phone hotspot (Sofia airport) | **BEFORE**: goodput 65–395 kbps, `target_bps` 1.5–2.13 M climbing, age 597–7,095 ms, `bytes_inflight` 1–4 KB, `frames_dropped_backpressure=0`. The measurement this FR exists for. |
 | 2026-09-02 | 0.4.49 | CORPLAP-1 → neo16, WebRTC over the overlay host pair (`100.65.0.5 ↔ 100.65.0.6`), carrier DERP through the corp VPN, `hevc_qsv` | **REGRESSION**: 8 sessions, p90 2.3–11.2 s, max 11.6–22.4 s. Encoder rebuilt once to 1.5 M then pinned (ladder floor); every frame 12,513 B at 15 fps; `target_bps` 200 k–1.1 M ignored; opener 372–580 KB at the 2.55–4.68 M cap; 1280×800 ↔ 1920×1200 refine flap with an IDR each way. |
 | 2026-09-02 | 0.4.49 | CORPLAP-3 → neo16, LAN host pair (`192.168.0.24 ↔ 192.168.0.241`), `av1_qsv`, unconstrained | 14 sessions, p50 26–1,791 ms, max 32.6 s. Not an FR-59 path: 523 `chunk too short` (FORWARD-TSN parse, T1) in the worst session, 44 bitrate-swap IDRs of 120–190 KB, the viewer host in a route-eviction storm. Baseline the evening before: p50 4 ms over 244 windows. |
+| 2026-09-02 13:24 | 0.4.49 | **BEFORE arm, controlled**: CORPLAP-1 → neo16 over the overlay host pair (carrier DERP through the corp VPN), `hevc_qsv`, ~1.7 synthetic mouse events/s, 60 windows (session `6a98238c`) | `seed_bps=200000` logged, opener at 2.55 M anyway: **457 KB burst**. Refine flap 1280↔1920 at :58, :00, :04, :06. Bytes-per-frame ÷ (target/fps/8): **p50 1.18, p90 5.21, max 7.51**, 26/58 windows over 1.5×. Age p50 102 / p90 1,074 / max 3,522 ms. **24 `chunk too short`** in 2 min. Viewer badge: `292 kbps · 3 fps`. |
+| 2026-09-02 14:09 | **0.4.50** | **AFTER arm, same procedure**: CORPLAP-1 → neo16, same pair type, `hevc_qsv`, 25 synthetic mouse events/s (Worker-driven), 33 windows (session `6a982e0f`) | **Opened at 200 kbps** from the remembered rate (no burst). Bytes-per-frame ratio **p50 0.90, p90 1.01, max 2.09**, 2/32 over 1.5× — the encoder follows the target (**AC7 ✓**). Targets 200 k → 320 k by the relative additive step, MD back to 200 k on a path stall. No gate skips, no send stalls. Age p50 86 / **p90 851** / max 3,938 ms — the two spikes are DERP-path stalls (one per drain), not a standing queue. **0 `chunk too short`** with 15× the mouse traffic (**AC8 ✓** on this session). ⚠️ The session ended at 66 s because the laptop hard-rebooted (see below), not by the pump. |
+| 2026-09-02 14:11 | 0.4.50 | CORPLAP-1, first 60 s after an unclean reboot | **Latent boot-window panic** (pre-existing, not P8): `Instant::now() - 60 s` at the pump's `last_motion_at` seed underflows on a host up for < 60 s — three sessions started 34–52 s after boot by the viewer's auto-reconnect all died with `overflow when subtracting duration from instant`; the one at +66 s ran. The crash recorder counted them with four 0.4.49 worker aborts and attempted a rollback (GitHub unreachable from the laptop, so it did not run); at +5 min 0.4.50 was promoted to last-known-good. Fixed by `clock::instant_before` at all six seed sites. |
+| 2026-09-02 14:13–14:17 | 0.4.50 | CORPLAP-1 → neo16 on a LAN **direct** pair (the overlay latched LAN after the reboot), `hevc_qsv` 1920×1200@60 | Operator's own session: 114 windows, age p50 44 / p90 159 / max 886 ms, bytes-per-frame ratio p50 0.92 — 0.4.50 healthy on the direct path. |
