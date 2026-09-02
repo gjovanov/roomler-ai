@@ -607,6 +607,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLERD_MEASURED_CEILING. Restart required.",
     ),
     (
+        "encoder_inplace_rate",
+        "tribool",
+        "In-place encoder rate changes (2026-09-02, FR-62 A1). Default OFF: a QSV rate move REBUILDS the encoder (a 0.65-0.87 s blocking open on Iris-Xe-class, the reason the defer/swap machinery exists), and the NVENC in-place move writes a 1x HRD buffer. ON: QSV writes bit_rate + rc_max_rate + rc_buffer_size on the AVCodecContext (qsvenc's per-frame update_bitrate resets the BRC, no rebuild) and NVENC sizes the buffer to the window the session opened with. Ships OFF and inert until A0 clears the QSV MFXVideoENCODE_Reset on real Iris-Xe silicon; OFF is byte-for-byte the pre-A1 behaviour. Env: ROOMLERD_ENCODER_INPLACE_RATE. Restart required.",
+    ),
+    (
         "slow_link_floor",
         "tribool",
         "Slow-link floor relief (2026-09-01, FR-59 P1). Default ON: on a CONSTRAINED transport the AIMD legibility floor descends toward the session MEASURED drain rate instead of pinning at the flat 1.5 Mbps MIN_BITRATE_BPS. That flat floor is calibrated for the 2-9 Mbps band every measured relay sat in; on a slower link it is not a floor but a PIN, because it is also where the multiplicative decrease bottoms out - field 2026-09-01 measured a 395 kbps pipe met by a 1.5 Mbps floor, 3.8x over, with the excess landing as 2.3-7.1 s of viewer paint age. Evidence-gated: with no held goodput estimate the nominal floor stands, so a session that never measures is byte-for-byte unchanged. Never descends below slow_link_min_bitrate. false = flat floor (pre-FR-59). Env: ROOMLERD_SLOW_LINK_FLOOR. Restart required.",
@@ -870,6 +875,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "direct_hrd_pct" => cfg.direct_hrd_pct.map(|p| p.to_string()),
         "area_min_bitrate" => cfg.area_min_bitrate.map(fmt_bool),
         "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
+        "encoder_inplace_rate" => cfg.encoder_inplace_rate.map(fmt_bool),
         "slow_link_floor" => cfg.slow_link_floor.map(fmt_bool),
         "slow_link_min_bitrate" => cfg.slow_link_min_bitrate.map(|p| p.to_string()),
         "constrained_queue_measured" => cfg.constrained_queue_measured.map(fmt_bool),
@@ -1281,6 +1287,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "direct_hrd_pct" => cfg.direct_hrd_pct = parse_u32_range(key, value, 25, 200)?,
         "area_min_bitrate" => cfg.area_min_bitrate = parse_tribool(value)?,
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
+        "encoder_inplace_rate" => cfg.encoder_inplace_rate = parse_tribool(value)?,
         "slow_link_floor" => cfg.slow_link_floor = parse_tribool(value)?,
         "slow_link_min_bitrate" => {
             cfg.slow_link_min_bitrate = parse_u32_range(key, value, 50_000, 1_500_000)?
