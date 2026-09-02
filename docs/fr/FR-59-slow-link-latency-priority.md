@@ -1,6 +1,6 @@
 # FR-59 — Slow-link latency priority: make delay the controlled variable
 
-**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** P1/P2/P6 in progress ·
+**Issue:** [#1163](https://github.com/gjovanov/roomler-ai/issues/1163) · **Status:** P1–P8 shipped (0.4.47 → 0.4.50); **0.4.47–0.4.49 regressed the fleet** — see "What the field regression taught"; AC4 open ·
 **Parent/siblings:** FR-1 (drag smoothness), FR-14 (direct jitter), FR-15 (age feedback),
 FR-17 (partial-reliability video), FR-35 (relay ceiling learns the pair)
 
@@ -108,8 +108,10 @@ Aside, and load-bearing for P6: FR-35's rate memory keys on `nominated_remote_ip
 | **P6** | Abandon a contradicted seed | A held measurement more than 2× below `learned_bps` resets the FR-35 learner to nominal | `ROOMLERD_SEED_CONTRADICTION=0` | **implemented** (#1169) |
 | **P3** | A signal that can't be fooled | Viewer reports `rx_bps` + queue **growth**, the latter as `Σ(Δarrival − Δwire)` — a difference of intervals, so the clock offset cancels and no probe is needed. Sustained growth caps fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90 % of the arrival rate | `ROOMLERD_VIEWER_RATE_CLAMP=0` | **implemented** (#1169) |
 | **P4** | Drain, don't wait | P3's drift INTEGRATED into a depth estimate; past `DRAIN_THRESHOLD_MS` the pump stops producing for a bounded sub-second pause | `ROOMLERD_QUEUE_DRAIN=0` | **implemented** (#1169) |
-| **P5** | Slow-link profile, engaged once | Below a measured threshold: resolution + fps capped **at pump start** (never as a mid-session rung — that is why `PRIORITY_RES_CAP` is off by default: an 865 ms blocking QSV rebuild), with a viewer badge | `ROOMLERD_SLOW_LINK_PROFILE=0` | planned |
+| **P5** | Slow-link profile, engaged once | Below a measured threshold: resolution + fps capped **at pump start** (never as a mid-session rung — that is why `PRIORITY_RES_CAP` is off by default: an 865 ms blocking QSV rebuild), with a viewer badge | `ROOMLERD_SLOW_LINK_PROFILE=0` | **implemented** (#1169); ⚠️ without P8 it made things WORSE — see below |
 | **P7** | Unordered video — the reorder buffer | **FR-17 stage C**: chunks assemble into slots in ANY order and the frame emits whole; a frame overtaken by a newer completed one is abandoned with a gap (→ IDR); partials bounded at 3 | existing `roomler-rc-unordered-video` | **buffer implemented** (#1169); **default flip deliberately NOT taken — see below** |
+| **P8** | Reach the encoder | The `coarsen_bitrate` ladder extends below 1.5 M (it was a second copy of the pin P1 removed: every relieved target snapped back to the 1.5 M rung and `set_bitrate` returned without touching the encoder); the additive step is relative (`desired/8`) below the nominal floor so a probe does not overshoot a 300 kbps pipe by 43 % and pay an IDR for it; a pair remembered BELOW the nominal floor **opens at the remembered rate** (the FR-35 learner only ever RAISES the ceiling, so a slow memory never reached the opener) and seeds the floor relief; the idle-refine lift is held while the P5 profile is in force (it was the mid-session rung flip P5 exists to avoid — one native IDR each way, on every heartbeat) | `slow_link_floor` (the opener + the relative step ride on it); the ladder itself has none — it is a table | **implemented** (0.4.50) |
+| **T1** | webrtc-sctp FORWARD-TSN parse | Found alongside, not an FR-59 phase: upstream `ChunkForwardTsn::unmarshal` bounded its stream loop by the PACKET buffer, so any chunk bundled after a FORWARD-TSN failed the whole packet — Chrome bundles FORWARD-TSN + SACK whenever it abandons a message on the unreliable `input` channel, i.e. on every viewer→agent loss while the mouse moves; each drop is a lost acknowledgement and the video stalls on an RTO. Vendored (`crates/vendored/webrtc-sctp`, canonical `.patch`, CI drift gate) | none — a parse fix | **implemented** (0.4.50) |
 
 ## P7 — why the default flip is not in this PR
 
@@ -155,6 +157,14 @@ evidence is why both are already in the stats).
 - [ ] **AC5** — No regression on a healthy relay (CORPLAP-3 from the office LAN) or a direct
       path: `target_bps`, age and `frames_skipped_backpressure` unchanged within noise.
 - [ ] **AC6** — Every phase's kill switch restores the prior behaviour, verified by unit test.
+- [ ] **AC7** (P8) — On a constrained session whose `target_bps` sits below 1.5 M, the encoder
+      FOLLOWS it: `bytes_written` per encoded frame ≤ 1.5 × `target_bps` ÷ `target_fps` ÷ 8
+      over any 10-window span (the 0.4.49 signature was exactly 1.5 M ÷ fps ÷ 8 per frame
+      regardless of target), and a pair remembered below 1 Mbps opens with
+      `opener_maxrate_bps` ≤ its remembered rate, not the 2.55 M relay cap.
+- [ ] **AC8** (T1) — A session with continuous mouse input over a lossy link logs zero
+      `unable to parse SCTP packet chunk too short` (0.4.49 field: 523 in one 4-minute
+      LAN session on CORPLAP-3, 171 in a day on CORPLAP-1).
 
 ## What building P1–P4 + P6 changed about the design
 
@@ -182,6 +192,78 @@ Four things the plan did not anticipate, all now load-bearing:
    these rates would itself be seconds of transit. The kill switch is therefore
    `ROOMLERD_QUEUE_DRAIN`, not the planned `ROOMLERD_AGE_DRAIN`.
 
+## What the field regression taught (2026-09-02, 0.4.47 → 0.4.49)
+
+The operator's report: viewing **CORPLAP-3 went over 3,000 ms** frame age and **CORPLAP-1 over
+26,000 ms**. Both hosts were on 0.4.49; both were being viewed from neo16 at home. Read
+against the per-session baseline pulled from the same hosts' own logs (p50 / p90 / max of
+`viewer_age_ms`, every session since 08-27):
+
+| host · path | before (08-27 → 09-01) | 09-02 on 0.4.49 |
+|---|---|---|
+| CORPLAP-1, `constrained=true` | p50 **51–95 ms**, p90 58–124 ms across 15 sessions (one 2-h session: p50 62 / p90 72 / max 3,602) | p50 114–542, p90 **2,314–11,220**, max **11,553–22,381** across 8 sessions |
+| CORPLAP-3, `constrained=false` (LAN) | p50 **4–8 ms**, p90 16–42 (244 windows, 09-01 19:00 UTC) | p50 26–1,791, p90 1,026–7,450, max **32,584** across 14 sessions |
+
+Two different failures, one per host, and neither was the clamp the handover suspected.
+
+1. **The ladder was a second copy of the pin.** `BITRATE_LADDER_BPS` bottomed at 1,500,000.
+   P1 lowered the AIMD floor and the heartbeat dutifully logged `target_bps=200000`, but every
+   `set_bitrate` coarsened the target to the rung the encoder already ran at and returned. The
+   11:58 session rebuilt its encoder **once**, to 1.5 M, then never again in 4½ minutes while
+   the AIMD wandered between 200 k and 1.1 M with `deferred=false` on every line. On the wire:
+   **every frame exactly 12,513 bytes** = 1.5 M ÷ 15 fps ÷ 8, into a pipe measuring 20–400
+   kbps. ⚠️ This is the same class as design lesson 3 above ("a widening applied to one call
+   site and not the other") one level down: the *AIMD* floor was relieved, the *encoder's* was
+   not.
+
+2. **P5 multiplied the damage by four.** At the pinned 1.5 M, halving the frame rate from 30 to
+   15 fps doubled the bytes per frame; the profile's whole premise ("halving the frame rate
+   doubles the per-frame budget") assumed the budget followed the target. 12.5 KB frames at
+   8 fps = 800 kbps of 12.5 KB lumps into 300 kbps.
+
+3. **P5 fought the idle refine.** The 11:55 session flipped **1280×800 ↔ 1920×1200 on every
+   heartbeat**: the refine lifted the cap for "a crisp native IDR" whenever the scene went
+   quiet, motion re-capped it, and on QSV each side of that is an encoder rebuild — one IDR
+   each way, 40–78 KB apiece, 1–2 s of link time each. P5's own doc says the mid-session rung
+   flip is the thing it was resolved once to avoid; the refine is exactly that flip.
+
+4. **A slow memory never reached the opener.** `seed_bps=387500` was logged and the encoder
+   still opened at the 2.55 M relay cap: `CeilingLearner::effective_ceiling` is
+   `plan.max(learned)` — it only ever RAISES. So the opener burst 372 KB in 3 s into a ~300 kbps
+   pipe (ten seconds of queue) before the first measurement existed, and the 11:53 session's
+   4.68 M memory (a fast day carried onto a slow one) did 580 KB — the 26-second age.
+
+5. **The LAN host was a different bug entirely — and it is not FR-59's.** CORPLAP-3's sessions
+   were all `constrained=false`, where none of P1–P6 run. Its worst window logged
+   `unable to parse SCTP packet chunk too short` **twice a second** while 189 KB sat unacked
+   for 3 s on a LAN pair; 523 of them in that one session, 549 in the day, and the count on
+   quiet days was 0. That error is webrtc-sctp 0.11.0's FORWARD-TSN parser reading past its
+   own chunk (T1 above). The trigger is loss in the viewer→agent direction with mouse input in
+   flight; the loss came from the viewer host, which spent the whole morning in an overlay
+   net-change storm (below). The IDRs that each stall then had to push were the direct path's
+   own: 44 bitrate-swap rebuilds that day against 4 the day before.
+
+6. **The viewer host was not healthy, and that is a separate issue.** neo16's daemon logged
+   ~100 overlay carrier revalidations per minute from 10:10 UTC on, triggered by 718 route
+   evictions of `fd72:6f6f:6d6c::/96` (the derived-ULA v6 prefix) — 630 of them naming the
+   PRIMARY `roomler` adapter as the "competing product", 88 naming `roomler-<org>`: the two org
+   runtimes inside one multi-org daemon evicting each other's route, and every eviction a
+   Windows route-change notification that pokes every peer. Both corp laptops show the same
+   fight (filed as #1237). Chrome on neo16 also auto-updated 151 → 152 at 02:12 UTC that day.
+   Neither is FR-59; both are recorded so the next reader does not attribute their effects to it.
+
+What did **not** cause it: the P3 clamp. It latched onto stall-depressed `rx_bps` values
+(51 kbps, 87 kbps) exactly as the handover feared, and it did not matter, because nothing below
+1.5 M reached the encoder anyway. With P8 it will matter; the 200 kbps hard minimum bounds it,
+and the release-on-age rule lets go within a window or two.
+
+⚠️ **Why the harness missed all of it.** `tc netem` shapes downstream of the WSL agent's
+socket: the byte gate never saw pressure, no QSV encoder was involved (the WSL agent runs
+software), no FR-35 memory existed for the pair, and no packet was ever lost in the
+viewer→agent direction. Every mechanism above needs at least one of those. The corp-VPN relay
+with an Intel QSV encoder and a remembered pair is the configuration this FR exists for, and
+it was the one configuration the A/B never ran on.
+
 ## Open decisions
 
 - **Absolute hard minimum for P1.** 200 kbps is the working default. Below roughly this a
@@ -204,3 +286,5 @@ Four things the plan did not anticipate, all now load-bearing:
 | date | version | host / path | result |
 |---|---|---|---|
 | 2026-09-01 | 0.4.45 | CORPLAP-3 → neo16, phone hotspot (Sofia airport) | **BEFORE**: goodput 65–395 kbps, `target_bps` 1.5–2.13 M climbing, age 597–7,095 ms, `bytes_inflight` 1–4 KB, `frames_dropped_backpressure=0`. The measurement this FR exists for. |
+| 2026-09-02 | 0.4.49 | CORPLAP-1 → neo16, WebRTC over the overlay host pair (`100.65.0.5 ↔ 100.65.0.6`), carrier DERP through the corp VPN, `hevc_qsv` | **REGRESSION**: 8 sessions, p90 2.3–11.2 s, max 11.6–22.4 s. Encoder rebuilt once to 1.5 M then pinned (ladder floor); every frame 12,513 B at 15 fps; `target_bps` 200 k–1.1 M ignored; opener 372–580 KB at the 2.55–4.68 M cap; 1280×800 ↔ 1920×1200 refine flap with an IDR each way. |
+| 2026-09-02 | 0.4.49 | CORPLAP-3 → neo16, LAN host pair (`192.168.0.24 ↔ 192.168.0.241`), `av1_qsv`, unconstrained | 14 sessions, p50 26–1,791 ms, max 32.6 s. Not an FR-59 path: 523 `chunk too short` (FORWARD-TSN parse, T1) in the worst session, 44 bitrate-swap IDRs of 120–190 KB, the viewer host in a route-eviction storm. Baseline the evening before: p50 4 ms over 244 windows. |
