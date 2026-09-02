@@ -139,7 +139,7 @@ impl DamageTracker {
             conn,
             damage,
             // Start due, so the very first tick always captures.
-            last_capture: Instant::now() - max_skip,
+            last_capture: crate::clock::instant_before(max_skip),
             max_skip,
             rects: Vec::new(),
             overflowed: false,
