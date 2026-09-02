@@ -667,7 +667,7 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                     Sinks {
                         control,
                         cursor,
-                        last_ghost: Instant::now() - GHOST_MIN_INTERVAL,
+                        last_ghost: crate::clock::instant_before(GHOST_MIN_INTERVAL),
                     },
                 );
                 tracing::info!(

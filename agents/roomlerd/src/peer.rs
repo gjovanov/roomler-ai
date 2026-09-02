@@ -583,8 +583,9 @@ impl AgentPeer {
                 // sensitive triggers thrashing on edge networks.
                 const NACK_BURST_THRESHOLD: u32 = 8;
                 const NACK_WINDOW: Duration = Duration::from_secs(1);
-                let mut last_keyframe = std::time::Instant::now() - MIN_KEYFRAME_GAP;
-                let mut last_invalidation = std::time::Instant::now() - MIN_INVALIDATION_GAP;
+                // Boot-safe seeds — see `crate::clock::instant_before`.
+                let mut last_keyframe = crate::clock::instant_before(MIN_KEYFRAME_GAP);
+                let mut last_invalidation = crate::clock::instant_before(MIN_INVALIDATION_GAP);
                 let mut nack_count_in_window: u32 = 0;
                 let mut nack_window_started = std::time::Instant::now();
                 loop {
@@ -4853,7 +4854,12 @@ async fn media_pump_ffmpeg_dc(
     // time, so heartbeat `target_bps` shows the target while the encoder
     // briefly runs the old maxrate — an accepted, bounded skew.
     let mut deferred_bps: Option<u32> = None;
-    let mut last_motion_at = std::time::Instant::now() - Duration::from_secs(60);
+    // Seeded "a minute ago" so the first apply lands at once — through the
+    // boot-safe helper: `Instant::now() - 60 s` panics on a host up for less
+    // than a minute, and a session that starts that early is exactly what a
+    // viewer's auto-reconnect produces after a reboot (field 2026-09-02,
+    // CORPLAP-1: three dead sessions in the first minute after boot).
+    let mut last_motion_at = crate::clock::instant_before(Duration::from_secs(60));
     const DEFER_QUIET: Duration = Duration::from_millis(1200);
     // rc.445 — send-queue epoch: bumped on every encoder rebuild so the
     // send task discards frames from the OLD encoder still sitting in the
@@ -4876,7 +4882,7 @@ async fn media_pump_ffmpeg_dc(
         tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
     > = None;
     let mut swap_wanted: Option<u32> = None;
-    let mut last_swap_at = std::time::Instant::now() - Duration::from_secs(60);
+    let mut last_swap_at = crate::clock::instant_before(Duration::from_secs(60));
     const SWAP_MIN_INTERVAL: Duration = Duration::from_secs(3);
     {
         let video_bytes_dc = video_bytes_dc.clone();
