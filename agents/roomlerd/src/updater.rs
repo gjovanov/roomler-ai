@@ -1812,6 +1812,7 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
 ///
 /// Returns `None` when `exe` is not a `.prev` path — there is then nothing to
 /// correct and the caller keeps its existing behaviour.
+#[cfg(not(target_os = "windows"))]
 fn install_path_before_rename(exe: &std::path::Path) -> Option<PathBuf> {
     if exe.extension().and_then(|e| e.to_str()) != Some("prev") {
         return None;
@@ -1858,10 +1859,8 @@ fn spawn_watcher(
     // useless, because a genuinely broken install then looks exactly like a
     // healthy one.
     #[cfg(not(target_os = "windows"))]
-    if !staged {
-        if let Some(origin) = install_path_before_rename(&exe) {
-            cmd.arg("--origin-exe").arg(&origin);
-        }
+    if let Some(origin) = install_path_before_rename(&exe).filter(|_| !staged) {
+        cmd.arg("--origin-exe").arg(&origin);
     }
     let _child = cmd
         .spawn()
@@ -2410,6 +2409,7 @@ mod tests {
     /// reported 0.4.45). The second guards the inverse — a path that was NOT
     /// renamed must yield `None` so the caller's existing behaviour is
     /// untouched on every other platform and flow.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn watcher_verifies_the_install_path_not_its_own_renamed_path() {
         use super::install_path_before_rename;
