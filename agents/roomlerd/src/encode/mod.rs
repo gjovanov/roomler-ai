@@ -266,6 +266,18 @@ pub fn encoder_inplace_rate_enabled() -> bool {
     tunnel_core::env::node_env("ENCODER_INPLACE_RATE").as_deref() == Some("1")
 }
 
+/// FR-62 A2 — escape hatch: force NVENC rate moves back onto the pre-A2
+/// IDR-rationing path (the pump defers a constrained increase instead of
+/// applying it live) if some driver ever emits a keyframe on an in-place
+/// reconfigure DESPITE the vendored-FFmpeg patch. Default **OFF** — the patch
+/// dropped `resetEncoder=forceIDR=1` from `nvenc.c` and A0 measured 0/20
+/// rate-caused IDRs on the RTX (default AND constrained). Env-only, like
+/// `ROOMLERD_HW_AUTO`; the tell that would justify flipping it is a rising
+/// `idr_count` on a constrained NVENC heartbeat.
+pub fn nvenc_assume_reconfig_idr() -> bool {
+    tunnel_core::env::node_env("ENCODER_NVENC_ASSUME_IDR").as_deref() == Some("1")
+}
+
 /// FR-59 P1 — the absolute stop for the floor relief above (bps). Below
 /// roughly this a full-resolution frame is illegible at any QP and the
 /// honest lever is fewer PIXELS, not fewer bits; the relief exists to let
