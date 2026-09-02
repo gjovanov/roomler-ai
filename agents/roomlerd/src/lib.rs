@@ -24,6 +24,7 @@ pub mod audio;
 pub mod capture;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
+pub mod clock;
 pub mod code_signature;
 pub mod companion;
 pub mod consent;
