@@ -54,6 +54,8 @@ pub mod aimd;
 pub mod ceiling_learn;
 /// FR-35 P2 — per-peer rate memory (one JSON file in the data dir).
 pub mod rate_memory;
+/// FR-63 — slow-start for the session opener (pure; no clock, no I/O).
+pub mod slow_start;
 
 // Viewer-rate controller (rc.188) — folds the browser's measured `rc:decodestat`
 // (decoded fps + struggling) into a send-fps cap for the DC pumps, so the agent
@@ -433,6 +435,20 @@ pub fn bg_rebuild_constrained_enabled() -> bool {
 /// disables.
 pub fn pump_stall_watch_enabled() -> bool {
     tunnel_core::env::node_env("PUMP_STALL_WATCH").as_deref() != Some("0")
+}
+
+/// FR-63 — open a session with [`slow_start`] instead of committing to a
+/// constant. **Default OFF**: this is a controller change, and the FR's own
+/// rule is that none ships live without a release of field evidence first.
+/// `ROOMLERD_RATE_SLOW_START=1` enables it per host for that measurement.
+///
+/// The evidence it exists to answer (CORPLAP-1 over a corp VPN): a session
+/// opened at the nominal `2_550_000` into a path measured at `213_180` and
+/// paid a 1550 ms paint, while another opened at a remembered `6_134_627` and
+/// paid 6287 ms. Both directions of the same mistake — committing before
+/// measuring.
+pub fn rate_slow_start_enabled() -> bool {
+    tunnel_core::env::node_env("RATE_SLOW_START").as_deref() == Some("1")
 }
 
 /// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase
