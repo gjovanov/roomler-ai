@@ -21,7 +21,7 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| **B-opener** | Slow-start for the session opener — `encode::slow_start` (pure law) + the governor cap on the opening ceiling | `rate_slow_start` (default **OFF**) | **shipped inert** in 0.4.55 (#1262, #1265); A/B not yet run |
+| **B-opener** | Slow-start for the session opener — `encode::slow_start` (pure law) + the governor cap on the opening ceiling **and floor** | `rate_slow_start` (default **OFF**) | shipped **inert** in 0.4.55 (#1262, #1265 capped only the ceiling, which `set_ceiling` raised back to the flat 1.5 M floor); fixed in 0.4.56 (#1275) and **field-verified engaging** — AC0a done, AC0b open |
 | B0 | `encode/sim.rs` + CSV trace replay, four fixtures | n/a (test-only) | not started |
 | B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ratectl = shadow` (default) | not started |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
@@ -52,9 +52,39 @@ already used. Both arms of an A/B then run on **one host, one build, one
 encoder, minutes apart**, differing in exactly one flag. It is a test pin and
 must be cleared afterwards.
 
+### The cell must be able to FAIL, not merely be constrained
+
+Field-measured 2026-09-03, and the reason AC0b is still open. With
+`ice_relay_tcp` alone the cell was genuinely constrained — `host=0 srflx=0
+prflx=0 relay=4 relay_tcp=true`, `c=true` in every heartbeat, and the relays
+were the **public coturn** (`relay_addr_is_fast_local` was never in play, so
+`local_turn` is not the lever) — and arm A still could not be made to fail:
+
+```
+13:09:32 tgt=2550000 c=true age=Some(37)      <- the field constant, opening
+13:09:36 tgt=2737500 c=true age=Some(30)      <- the AIMD CLIMBS
+...      tgt=3000000                          <- reaches the cap and stays
+```
+
+Flat age, no queue growth, no coarsening, no skips. A 2.55 Mbps opener into a
+relay carrying ~3 Mbps is not an over-drive; the original field case needed a
+~213 kbps pipe.
+
+🔑 **An arm that cannot fail is not a baseline.** A constrained *posture* is
+necessary and nowhere near sufficient — the pipe has to be thin enough that
+the opening commitment is actually wrong.
+
+`relay_max_kbps` (a config key since #1276; default 3000) is `bitrate_cap` on
+a constrained path. Raising it to `12000` against the same real coturn gives a
+genuine ~4× over-drive, because a 1920×1200 pair resolves ~12 Mbps: the pipe,
+the encoder and the relay are all real, and the only thing changed is **what
+the encoder believes it may use** — which is exactly the mistake this phase
+exists to stop. Clear both pins when the measurement is done.
+
 ## Acceptance criteria
 
-- [ ] AC0 — **B-opener A/B**, both arms on one host/build behind `ice_relay_tcp`: with `rate_slow_start=false` the opener over-drives the measured pipe and the first-10-s paint age spikes; with it `true` the opening `target_bps` reads ~300 k (verified live in the heartbeat *before* the result is read) and the spike is gone, with steady state reached in ≤ 6 windows. Arm A failing first is part of the criterion, not a formality.
+- [x] AC0a — **the ramp engages and opens where it says.** Field-verified 2026-09-03 on 0.4.56, CORPLAP-1: `FR-63 slow-start armed open_bps=300000 ceiling_bps=2550000`, against an arm-A opener of `2_550_000` on the same host and build — an 8.5× smaller opening commitment. `slf=Some(600000)` on the first window with `gp=None` proves the **floor descent** did it, since the P1 relief cannot fire without a measurement; on 0.4.55, which capped only the ceiling, the opener was pinned at the flat 1.5 M and the ramp was inert.
+- [ ] AC0b — **the ramp removes the harm.** Not yet measured: it needs an arm A that actually fails. See "the cell must be able to fail" below.
 - [ ] AC1 — All four fixtures green in `cargo test -p roomlerd --lib` on the default build.
 - [ ] AC2 — One release of shadow logs across the fleet meets the flip criterion, report attached.
 - [ ] AC3 — Field A/B (`scripts/rc-ab.sh`) on CORPLAP-1 (QSV, corp VPN) and CORPLAP-2 (real relay): paint age p90 ≤ 0.4.50's and no window with a standing queue while the encoder tracks (FR-62).
