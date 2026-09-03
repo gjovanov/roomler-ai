@@ -1755,6 +1755,11 @@ mod system {
         /// One live adapter of ours: its LUID, and the connected v4 block it
         /// serves (`None` when the mask was unknown at bring-up).
         struct Own {
+            /// Read only by [`is_own_luid`], which is Windows-only — so on
+            /// every other target this reads as dead code while still being
+            /// written on both. Same shape (and same reason) as
+            /// `defended_ula_prefix`'s `cfg_attr` below.
+            #[cfg_attr(not(windows), allow(dead_code))]
             luid: u64,
             block: Option<(Ipv4Addr, u8)>,
         }
