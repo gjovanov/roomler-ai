@@ -4660,6 +4660,13 @@ async fn media_pump_ffmpeg_dc(
     // an average over a 2 s heartbeat cannot represent a single 2 s outlier.
     let mut apply_us: u64 = 0;
     let mut apply_us_max: u64 = 0;
+    // FR-65 P0 — the encoder OPEN phase, separate from `apply`. `apply` times a
+    // change to an encoder that already exists; the first pass of a session has
+    // none to change, so a 0.5-1 s open landed in no phase at all (field
+    // 2026-09-03, four sessions on CORPLAP-1: `iter_ms` 513-1006 against named
+    // phases summing to 33-52). Rebuilds come through the same site.
+    let mut open_us: u64 = 0;
+    let mut open_us_max: u64 = 0;
     // FR-65 P0 — worst single loop pass in the window, and how many overran.
     let mut iter_us_max: u64 = 0;
     let mut pump_stalls: u32 = 0;
@@ -4667,7 +4674,7 @@ async fn media_pump_ffmpeg_dc(
     let stall_warn = Duration::from_millis(crate::encode::pump_stall_warn_ms());
     // Measured at the TOP of the NEXT pass, so every `continue` path in this
     // loop is covered without an RAII guard fighting the borrow checker.
-    let mut iter_mark: Option<(std::time::Instant, u64, u64, u64, u64, u64)> = None;
+    let mut iter_mark: Option<(std::time::Instant, u64, u64, u64, u64, u64, u64)> = None;
     // ⚠️ Rate-limited: a stall storm that floods its own log is a second
     // performance problem.
     let mut last_stall_log = crate::clock::instant_before(Duration::from_secs(60));
@@ -5044,7 +5051,7 @@ async fn media_pump_ffmpeg_dc(
     loop {
         // FR-65 P0 — close out the PREVIOUS pass. Measuring here rather than at
         // the tail is what makes every `continue` path in this loop count.
-        if stall_watch && let Some((started, c0, s0, e0, d0, a0)) = iter_mark.take() {
+        if stall_watch && let Some((started, c0, s0, e0, d0, a0, o0)) = iter_mark.take() {
             let took = started.elapsed();
             let took_us = took.as_micros() as u64;
             if took_us > iter_us_max {
@@ -5058,6 +5065,24 @@ async fn media_pump_ffmpeg_dc(
                     // keeps, so the breakdown costs nothing extra. An overrun
                     // whose phases all read ~0 is itself the finding: the time
                     // went somewhere still untimed.
+                    //
+                    // ⚠️ `other_ms` is that finding, COMPUTED rather than left
+                    // for a reader to subtract by hand. Field 2026-09-03: four
+                    // stalls on CORPLAP-1, one on the first pass of every
+                    // session, `iter_ms` 513–1006 while the named phases summed
+                    // to 33–52 — i.e. 0.46–0.96 s in no phase at all, almost
+                    // certainly the INITIAL encoder open (`apply_ms` times a
+                    // change to an encoder that already exists; the first pass
+                    // has none). It was spotted by eye on the fourth
+                    // occurrence. A breakdown that does not sum to its total is
+                    // the most useful number in the line, so it should not
+                    // depend on somebody noticing.
+                    let phases_us = capture_us.saturating_sub(c0)
+                        + scale_us.saturating_sub(s0)
+                        + encode_us.saturating_sub(e0)
+                        + send_us.saturating_sub(d0)
+                        + apply_us.saturating_sub(a0)
+                        + open_us.saturating_sub(o0);
                     warn!(
                         %session_id,
                         codec_label,
@@ -5068,6 +5093,8 @@ async fn media_pump_ffmpeg_dc(
                         encode_ms = encode_us.saturating_sub(e0) as f64 / 1000.0,
                         send_ms = send_us.saturating_sub(d0) as f64 / 1000.0,
                         apply_ms = apply_us.saturating_sub(a0) as f64 / 1000.0,
+                        open_ms = open_us.saturating_sub(o0) as f64 / 1000.0,
+                        other_ms = took_us.saturating_sub(phases_us) as f64 / 1000.0,
                         target_bps = governor.applied_bps(),
                         "FFmpeg DC pump STALL — one pass exceeded the budget"
                     );
@@ -5082,6 +5109,7 @@ async fn media_pump_ffmpeg_dc(
                 encode_us,
                 send_us,
                 apply_us,
+                open_us,
             ));
         }
         // rc.443 — owner-liveness beat, FIRST statement of the loop (see
@@ -5849,7 +5877,13 @@ async fn media_pump_ffmpeg_dc(
                 0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
                 applied => ceiling.min(applied),
             };
-            match codec.open(
+            // FR-65 P0 — the open is BLOCKING and lands on this thread. Timed
+            // as its own phase because `apply` cannot cover it: `apply` times a
+            // change to an encoder that already exists, and the first pass of a
+            // session has none. Before this it fell into the stall line's
+            // residual — 0.46-0.96 s attributable to nothing.
+            let __open_t = std::time::Instant::now();
+            let __opened = codec.open(
                 w,
                 h,
                 target_fps,
@@ -5858,7 +5892,15 @@ async fn media_pump_ffmpeg_dc(
                 hevc_444,
                 constrained,
                 last_encoder_name,
-            ) {
+            );
+            {
+                let __us = __open_t.elapsed().as_micros() as u64;
+                open_us += __us;
+                if __us > open_us_max {
+                    open_us_max = __us;
+                }
+            }
+            match __opened {
                 Ok(enc) => {
                     let encoder_name = enc.name();
                     // rc.445 — the proven backend skips the dead cascade
@@ -6738,6 +6780,8 @@ async fn media_pump_ffmpeg_dc(
                 // average and is exactly the event worth finding.
                 apply_ms = apply_us as f64 / 1000.0,
                 apply_ms_max = apply_us_max as f64 / 1000.0,
+                open_ms = open_us as f64 / 1000.0,
+                open_ms_max = open_us_max as f64 / 1000.0,
                 iter_ms_max = iter_us_max as f64 / 1000.0,
                 pump_stalls,
                 "FFmpeg DC pump heartbeat (≈2s window)"
@@ -6752,6 +6796,8 @@ async fn media_pump_ffmpeg_dc(
             // every heartbeat's maxes describe that window alone.
             apply_us = 0;
             apply_us_max = 0;
+            open_us = 0;
+            open_us_max = 0;
             iter_us_max = 0;
             pump_stalls = 0;
             qp_sum = 0;
