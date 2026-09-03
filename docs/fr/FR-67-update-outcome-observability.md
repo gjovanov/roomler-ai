@@ -74,8 +74,8 @@ With the wait gone the watcher's life is: write `InProgress` → settle 2 s → 
 
 ⚠️ **This is a race, not a guarantee**, and the spec should say so rather than
 claim a fix it does not deliver: if the daemon's teardown completes in under ~2 s,
-the cgroup kill still lands mid-probe. P3 closes that, and only if measurement
-shows it is actually being lost.
+the cgroup kill still lands mid-probe. **P6** closes that, and is deliberately
+gated on measuring that the race is actually being lost.
 
 ### Why not go straight to a systemd transient unit
 
