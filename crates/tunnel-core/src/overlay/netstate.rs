@@ -154,6 +154,24 @@ pub struct LanCapture {
     pub via_name: Option<String>,
 }
 
+impl LanCapture {
+    /// Does `ip` fall inside the captured prefix? The runtime asks this per
+    /// peer LAN candidate to feed the path monitor's FR-33 P2 gate; the
+    /// prefix is kept as the string `status` prints, so parse here. An
+    /// unparseable prefix (impossible from `detect_lan_captures`, but this is
+    /// a public struct) reads as "not captured" — the gate fails OPEN, the
+    /// direction in which a wrong answer only costs a futile probe.
+    pub fn contains_v4(&self, ip: std::net::Ipv4Addr) -> bool {
+        let Some((net, plen)) = self.prefix.split_once('/') else {
+            return false;
+        };
+        let (Ok(net), Ok(plen)) = (net.parse::<std::net::Ipv4Addr>(), plen.parse::<u8>()) else {
+            return false;
+        };
+        plen <= 32 && network_of(ip, plen) == network_of(net, plen)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NetSnapshot {
     pub ifaces: BTreeMap<String, IfaceSnap>,
@@ -541,6 +559,15 @@ fn detect_lan_captures(
         if hit.ifref == owner_ref {
             continue;
         }
+        // A SIBLING is not a capture: a docked laptop with Wi-Fi and Ethernet
+        // on the same LAN routes the neighbour through whichever the OS
+        // prefers, and that interface reaches the LAN just as well. What
+        // makes a capture is the selected interface holding NO address in
+        // the prefix — a VPN adapter's tunnel address never does. Load-
+        // bearing since P2 turned the verdict into an eligibility gate.
+        if selected_holds_prefix(&hit.ifref, *ip, *plen, lan_v4) {
+            continue;
+        }
         let prefix = format!("{}/{}", network_of(*ip, *plen), plen);
         if out.iter().any(|c| c.prefix == prefix && &c.owner == name) {
             continue;
@@ -554,6 +581,23 @@ fn detect_lan_captures(
         });
     }
     out
+}
+
+/// Does the interface [`route_lookup`] selected (`ifref`) itself hold an
+/// address inside `ip/plen`? True for a same-LAN sibling (Wi-Fi + Ethernet on
+/// one switch); false for a VPN adapter, whose address lives in the corporate
+/// pool — the discriminator between "the OS prefers the other NIC" and "the
+/// tunnel swallowed the LAN".
+fn selected_holds_prefix(
+    ifref: &str,
+    ip: std::net::Ipv4Addr,
+    plen: u8,
+    lan_v4: &[(String, Option<u32>, std::net::Ipv4Addr, u8)],
+) -> bool {
+    let net = network_of(ip, plen);
+    lan_v4
+        .iter()
+        .any(|(n, i, a, _)| owner_ifref(n, *i) == ifref && network_of(*a, plen) == net)
 }
 
 /// The identity [`route_lookup`] reports for an interface: ifindex on Windows
@@ -1043,6 +1087,65 @@ mod tests {
             diff(&captured, &captured, false, false).is_none(),
             "unchanged = no delta"
         );
+    }
+
+    /// FR-33 P2 — `contains_v4` is the gate's membership test; the prefix
+    /// travels as the string `status` prints, so it must parse both the /24
+    /// and the split-/25 shapes the two VPN vendors produce, and fail OPEN on
+    /// anything else.
+    #[test]
+    fn lan_capture_contains_v4_matches_prefix_membership() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let cap = |prefix: &str| LanCapture {
+            prefix: prefix.into(),
+            owner: "WLAN".into(),
+            via_ifref: "10".into(),
+            via_name: Some("Ethernet 2".into()),
+        };
+        let c = cap("192.168.43.0/24");
+        assert!(c.contains_v4(ip("192.168.43.221")));
+        assert!(c.contains_v4(ip("192.168.43.1")));
+        assert!(!c.contains_v4(ip("192.168.0.241")));
+        let half = cap("192.168.68.128/25");
+        assert!(half.contains_v4(ip("192.168.68.132")));
+        assert!(
+            !half.contains_v4(ip("192.168.68.126")),
+            "the other half is a different capture"
+        );
+        assert!(
+            !cap("garbage").contains_v4(ip("192.168.43.221")),
+            "unparseable = fail OPEN"
+        );
+        assert!(!cap("192.168.43.0/33").contains_v4(ip("192.168.43.221")));
+    }
+
+    /// FR-33 P2 — a same-LAN SIBLING interface is not a capture: the selected
+    /// interface holds an address in the prefix, so it reaches the LAN. A VPN
+    /// adapter never does, so the capture verdict stands.
+    #[test]
+    fn selected_interface_holding_the_prefix_is_a_sibling_not_a_capture() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let lan_v4 = vec![
+            ("WLAN".to_string(), Some(6), ip("192.168.0.24"), 24),
+            ("Ethernet".to_string(), Some(5), ip("192.168.0.50"), 24),
+            ("Ethernet 2".to_string(), Some(10), ip("10.138.80.59"), 20),
+        ];
+        let eth = owner_ifref("Ethernet", Some(5));
+        let vpn = owner_ifref("Ethernet 2", Some(10));
+        assert!(
+            selected_holds_prefix(&eth, ip("192.168.0.24"), 24, &lan_v4),
+            "docked laptop: Ethernet reaches the same LAN"
+        );
+        assert!(
+            !selected_holds_prefix(&vpn, ip("192.168.0.24"), 24, &lan_v4),
+            "AnyConnect miniport: its address is in the corporate pool"
+        );
+        assert!(!selected_holds_prefix(
+            "nope",
+            ip("192.168.0.24"),
+            24,
+            &lan_v4
+        ));
     }
 
     /// FR-33 — the probe target is a host inside our own prefix that is

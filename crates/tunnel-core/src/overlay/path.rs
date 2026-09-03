@@ -384,6 +384,17 @@ struct PeerPath {
     relayed_instead_at: Option<Instant>,
     /// Voluntary-switch hysteresis bookkeeping (disabled-at-flip machinery).
     hysteresis: Hysteresis,
+    /// FR-33 P2 — the peer's LAN candidate lies inside a prefix that THIS
+    /// host's own routing table hands to another interface (a corporate VPN
+    /// client's split-prefix capture, `netstate::LanCapture`). A LAN dial
+    /// cannot work while it holds: the OS routes our packets into the tunnel
+    /// (Check Point) and the client's filters drop the peer's (AnyConnect,
+    /// measured with pktmon 2026-09-03). Like #30 this is a FACT, not a
+    /// quality judgement — it gates eligibility outright and books no
+    /// penalty, so the tier is back the moment the capture clears. Refreshed
+    /// on every `install_peers` walk by the runtime, the only party holding
+    /// both the candidate and the snapshot ([`PathMonitor::on_lan_capture`]).
+    lan_captured: bool,
 }
 
 fn tier_idx(tier: DirectTier) -> Option<usize> {
@@ -813,6 +824,24 @@ impl PathMonitor {
         p.relay_q = Ewma::default();
     }
 
+    /// FR-33 P2 — the runtime's verdict on whether THIS host can reach the
+    /// peer's LAN candidate at all: `true` while the candidate sits in a
+    /// prefix the host's own route lookup hands to another interface. A hard
+    /// eligibility gate on the LAN tier only (public/srflx ride other sockets
+    /// and are unaffected); no penalty, no Q event — nothing about the path
+    /// was measured, the OS was asked where the packet would go. Cleared the
+    /// same way (`false`) on the first walk after the capture lifts;
+    /// `on_peer_removed` drops it with the rest of the peer's state.
+    pub(crate) fn on_lan_capture(&mut self, peer: &ObjectId, captured: bool) {
+        match self.peers.get_mut(peer) {
+            Some(p) => p.lan_captured = captured,
+            // Don't materialise state for a peer that is NOT captured: a
+            // fresh peer's "no state" already means "no gates".
+            None if captured => self.peers.entry(*peer).or_default().lan_captured = true,
+            None => {}
+        }
+    }
+
     /// PR-E — the current strike count on a direct tier. The sweep's sticky-
     /// pin log line keys off this now that the legacy fail maps are gone.
     pub(crate) fn strikes(&self, peer: &ObjectId, tier: DirectTier) -> u32 {
@@ -863,6 +892,12 @@ impl PathMonitor {
         // through the penalty plane (which cannot hold long enough — see
         // `on_peer_relayed_instead`).
         if p.relayed_instead_until.is_some_and(|until| now < until) {
+            return false;
+        }
+        // FR-33 P2 — this host's route to the peer's LAN candidate leaves
+        // through another interface (a VPN split-prefix capture): a fact
+        // about THIS host, gating the LAN tier outright — `on_lan_capture`.
+        if tier == DirectTier::Lan && p.lan_captured {
             return false;
         }
         let penalty = p.tiers[idx]
@@ -933,6 +968,8 @@ impl PathMonitor {
                     None
                 } else if relayed_instead_s.is_some() {
                     Some(BlockedBy::PeerRelaysInstead)
+                } else if tier == DirectTier::Lan && p.is_some_and(|p| p.lan_captured) {
+                    Some(BlockedBy::LanCaptured)
                 } else {
                     Some(BlockedBy::Penalty)
                 };
@@ -1313,6 +1350,12 @@ pub(crate) enum BlockedBy {
     /// passes. This is a fact about the PEER, not a quality judgement about
     /// the path, which is why it reads differently from a penalty.
     PeerRelaysInstead,
+    /// FR-33 P2 — THIS host's own routing hands the peer's LAN prefix to
+    /// another interface (a corporate VPN client's split-prefix capture), so
+    /// a LAN dial cannot work whatever the path's history says. A fact about
+    /// this host, not the path: `roomler status` names the capturing
+    /// adapter, and the fix lives in the VPN profile.
+    LanCaptured,
     /// The tier's own penalty has pushed `base − penalty` below the relay
     /// floor: this path misbehaved recently and is decaying back.
     Penalty,
@@ -1322,6 +1365,7 @@ impl BlockedBy {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             BlockedBy::PeerRelaysInstead => "peer-relays-instead",
+            BlockedBy::LanCaptured => "lan-captured",
             BlockedBy::Penalty => "penalty",
         }
     }
@@ -1619,6 +1663,93 @@ mod tests {
             "the penalty must be reported, not just named"
         );
         assert!(e.relayed_instead_s.is_none(), "no peer window is open here");
+    }
+
+    /// FR-33 P2 — a LAN capture on THIS host refuses the LAN tier outright,
+    /// `explain` names it (never "penalty" — an operator would go tuning
+    /// path quality for a problem that lives in a VPN profile), the other
+    /// tiers are untouched, nothing is booked against the path, no selector
+    /// proposes the tier, and it is back the instant the capture clears.
+    #[test]
+    fn lan_capture_refuses_only_the_lan_tier_and_explain_names_it() {
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        let t0 = Instant::now();
+
+        m.on_lan_capture(&a, true);
+        assert!(!m.eligible(&a, DirectTier::Lan, t0));
+        for tier in [DirectTier::Public, DirectTier::Srflx, DirectTier::Relay] {
+            assert!(m.eligible(&a, tier, t0), "{tier:?} is not a LAN matter");
+        }
+        let e = m.explain(&a, t0);
+        let lan = e.tiers.iter().find(|t| t.tier == DirectTier::Lan).unwrap();
+        assert!(!lan.eligible);
+        assert_eq!(lan.blocked_by.map(|b| b.as_str()), Some("lan-captured"));
+        assert_eq!(lan.penalty, 0.0, "a capture is a fact, not a strike");
+        assert_eq!(lan.fails, 0);
+        for t in e.tiers.iter().filter(|t| t.tier != DirectTier::Lan) {
+            assert!(t.eligible, "{:?} untouched", t.tier);
+            assert!(t.blocked_by.is_none());
+        }
+        for t in &e.tiers {
+            assert_eq!(
+                t.eligible,
+                m.eligible(&a, t.tier, t0),
+                "explain agrees with the selector"
+            );
+        }
+
+        // No selector proposes the captured tier: a relay incumbent with
+        // every candidate present climbs to PUBLIC, not LAN ...
+        assert_eq!(
+            m.decide(&a, Incumbent::Relay, all_avail(), true, t0, false),
+            PathAction::Probe(DirectTier::Public)
+        );
+        // ... and the mid-tier upward prober skips it the same way.
+        let mut up = PathMonitor::default();
+        up.on_lan_capture(&a, true);
+        assert_eq!(
+            up.upward_candidate(&a, DirectTier::Srflx, all_avail(), t0),
+            Some(DirectTier::Public)
+        );
+
+        // Cleared: eligible again with nothing to decay, and the ladder
+        // resumes at the top.
+        m.on_lan_capture(&a, false);
+        assert!(m.eligible(&a, DirectTier::Lan, t0));
+        let e = m.explain(&a, t0);
+        let lan = e.tiers.iter().find(|t| t.tier == DirectTier::Lan).unwrap();
+        assert!(lan.eligible && lan.blocked_by.is_none());
+        assert_eq!(
+            m.decide(&a, Incumbent::Relay, all_avail(), true, t0, false),
+            PathAction::Probe(DirectTier::Lan)
+        );
+
+        // Clearing a peer the monitor never met materialises no state.
+        let b = oid(2);
+        m.on_lan_capture(&b, false);
+        assert!(!m.peers.contains_key(&b));
+    }
+
+    /// FR-33 P2 — the host fact and the peer fact compose in the order
+    /// `eligible` tests them: an open demote-follow window is named ahead of
+    /// a capture, exactly as it refuses ahead of it.
+    #[test]
+    fn lan_capture_yields_to_the_peer_window_in_explain() {
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        let t0 = Instant::now();
+        m.on_lan_capture(&a, true);
+        m.on_peer_relayed_instead(&a, DirectTier::Lan, true, t0);
+        let t1 = t0 + Duration::from_secs(1);
+        let e = m.explain(&a, t1);
+        let lan = e.tiers.iter().find(|t| t.tier == DirectTier::Lan).unwrap();
+        assert!(!lan.eligible);
+        assert_eq!(
+            lan.blocked_by.map(|b| b.as_str()),
+            Some("peer-relays-instead")
+        );
+        assert_eq!(lan.eligible, m.eligible(&a, DirectTier::Lan, t1));
     }
     /// #29 — a peer relaying to us instead of using the direct tier we hold it
     /// on suppresses that tier (a decaying penalty, so it comes back), but
