@@ -1,6 +1,6 @@
 # FR-67 — An update's outcome is written, and nothing ever reads it
 
-**Issue:** TBD · **Status:** proposed · **Found:** field-testing `agent-v0.4.48`, 2026-09-02
+**Issue:** [#1267](https://github.com/gjovanov/roomler-ai/issues/1267) · **Status:** proposed · **Found:** field-testing `agent-v0.4.48`, 2026-09-02
 
 ## Goal
 
