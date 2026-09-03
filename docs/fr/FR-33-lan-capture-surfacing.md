@@ -1,7 +1,7 @@
 # FR-33: A VPN that captures the LAN prefix should say so — surface LAN capture in `status`, `why` and the RC path pill
 
-Status: **P1 field-verified on 0.4.20 (2026-08-29); P2 implemented 2026-09-03, field check
-pending the next agent release; P3 open.** Tracking issue: `FR-33` (#905).
+Status: **P1 field-verified on 0.4.20 (2026-08-29); P2 field-verified on 0.4.59
+(2026-09-04); P3 open.** Tracking issue: `FR-33` (#905).
 Sibling of FR-9 (LAN relay diagnosis) and FR-31 (opening keyframe). Spec on master up front; the
 design is known.
 
@@ -83,12 +83,13 @@ stays out of scope (operator's standing rule).
 
 - [ ] `roomler exec CORPLAP-2 -- roomler status` prints the `CAPTURED` line naming `Ethernet 3`
       while its VPN is up; `roomler status` on neo16 prints `lan         clear`
-- [ ] a captured host's `roomler peers --json` for a same-LAN peer reads `blocked_by:
+- [x] a captured host's `roomler peers --json` for a same-LAN peer reads `blocked_by:
       lan-captured` with `penalty: 0` on the LAN tier (CORPLAP-3 on a non-excluded subnet, or
-      CORPLAP-2 anywhere)
-- [ ] the captured host stops probing the LAN tier: no `probing direct upgrade … tier=Lan`
-      lines toward that peer while the capture holds, and the first walk after the VPN drops
-      resumes them
+      CORPLAP-2 anywhere) — **0.4.59, 2026-09-04**: CORPLAP-3 → neo16 on `192.168.68.0/24`
+- [x] the captured host stops probing the LAN tier: no `probing direct upgrade … tier=Lan`
+      lines toward that peer while the capture holds — **0.4.59**: 0 in the 7 min after the
+      restart (117 that day before it); the "resumes after the VPN drops" half is the
+      existing capture-clear path and was not exercised on this pass
 - [ ] the RC pill on `neo16 → CORPLAP-2` reads `relay · VPN captures the host's LAN`
 - [ ] the daemon log carries ONE onset line and ONE clear line across a VPN connect/disconnect
       cycle on CORPLAP-2 (no per-snapshot spam)
@@ -118,3 +119,4 @@ Bypassing the capture; the relay ceiling; FR-31's encoder work.
 | 2026-08-29 | 0.4.17/0.4.18 (CORPLAP-2), 0.4.16 (neo16) | Motivating case above; `Find-NetRoute -RemoteIPAddress 192.168.68.126` on CORPLAP-2 → `Ethernet 3`, `NextHop 172.30.245.30`, `DestinationPrefix 192.168.68.0/25`; `Get-NetAdapter` names the Check Point adapter. |
 | 2026-08-29 | 0.4.20 | **P1 field-verified** on both corp laptops (#905 comment): CORPLAP-2 (Check Point) and CORPLAP-3 (AnyConnect) each print `lan CAPTURED — … leaves via "<VPN adapter>" (owned by WLAN)`; neo16 prints `clear`. |
 | 2026-09-03 | 0.4.57 both ends | **The gap P2 closes, measured.** neo16 and CORPLAP-3 on one phone hotspot (`192.168.43.0/24`, outside AnyConnect's fixed split-exclude list `10.0.0.0/24`, `192.168.0.0/23`, `192.168.8.0/24`, `192.168.178.0/24`): CORPLAP-3 `status` says `CAPTURED — 192.168.43.0/24 leaves via "Ethernet 2"`, but its `peers --json why` for neo16 said `lan blocked_by: penalty, fails 5` and neo16 kept probing `192.168.43.10:43664` every ~80 s (`saw_inbound=false`). pktmon on CORPLAP-3: neo16's initiations reach the Wi-Fi NIC and die in tcpip (`INET: receive inspection`); CORPLAP-3's replies die on Tx (`Inspection drop`) — the capture is routing AND filtering, so no probe can ever pass. Same host was `direct lan 9 ms` at home that morning (`192.168.0.0/24`, inside the `/23`). |
+| 2026-09-04 | 0.4.59 both ends (#1281 via #1285) | **P2 field-verified.** Sofia home LAN `192.168.68.0/24` (also outside the exclude list; CORPLAP-3 `status`: `CAPTURED — 192.168.68.0/24 leaves via "Ethernet 2"`). Before, on 0.4.58: CORPLAP-3's `why` for neo16 `lan eligible: true, penalty 199.99, fails 10`, 117 `tier=Lan` probes toward neo16 that day (~80 s cadence). After a pinned push (`POST …/agent/{id}/update {"pin":"agent-v0.4.59"}`, installed in 4 min): `lan eligible: false, blocked_by: lan-captured, penalty: 0`; `roomler why 100.65.4.2` prints `lan-captured` in the tier table + the CAPTURED paragraph; **0 LAN probes in the 7 min after the 22:38:41Z restart** while 3 other-tier probes ran. neo16 (`lan clear`) unchanged: its `why` for CORPLAP-3 still `penalty`, and it still probes the LAN candidate every ~80 s — the capture is known only to the captured host (a netmap-advertised capture would be a P2b). |
