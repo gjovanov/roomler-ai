@@ -1,6 +1,6 @@
 # FR-68: Stress cells for multi-org guard contention and IPAM growth
 
-**Status**: proposed · **Owner**: overlay/networking · **Issue**: TBD
+**Status**: proposed · **Owner**: overlay/networking · **Issue**: [#1272](https://github.com/gjovanov/roomler-ai/issues/1272)
 
 ## Goal
 
