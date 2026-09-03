@@ -1957,11 +1957,36 @@ jobs:
 
       - name: Install system deps
         # libvpx for the `vp9-444` feature; pkg-config for the
-        # env-libvpx-sys build script. brew's libvpx is currently 1.15
-        # which has the same well-formed header layout as 1.14 (the
-        # libvpx 1.16 forward-decl regression that breaks bindgen on
-        # Windows is upstream-only-on-1.16, so brew's 1.15 works).
+        # env-libvpx-sys build script.
+        #
+        # ⚠️ Do NOT encode brew's libvpx version in a comment and rely on it —
+        # this said "currently 1.15" and brew served 1.16.0 on 2026-09-03,
+        # having served 1.17.0 earlier. The version is not ours to pin and it
+        # moves without notice; the step below is what makes that survivable.
         run: brew install cmake libvpx pkg-config
+
+      - name: Drop cached libvpx build artefacts (brew version drifts)
+        # 🔑 The seed cache carries `env-libvpx-sys`'s build-script OUTPUT,
+        # which bakes an ABSOLUTE, VERSIONED library path
+        # (`-L /opt/homebrew/Cellar/libvpx/<version>/lib`). When brew's version
+        # moves under a restored cache, the linker is handed a Cellar path that
+        # no longer exists and the build dies at the very end:
+        #
+        #   ld: warning: search path '/opt/homebrew/Cellar/libvpx/1.17.0/lib' not found
+        #   ld: library 'vpx' not found
+        #
+        # Measured on `agent-v0.4.54`: brew poured 1.16.0 while the cache
+        # insisted on 1.17.0, the macOS .pkg failed, and because Publish is
+        # gated on every platform the WHOLE RELEASE was skipped — a tag with no
+        # artifacts. Dropping just this crate's build dir forces its script to
+        # re-run against whatever brew actually installed; everything else in
+        # the cache (the expensive part) is kept.
+        run: |
+          set -euo pipefail
+          echo "brew libvpx: $(brew --prefix libvpx 2>/dev/null || echo '(none)')"
+          rm -rfv target/aarch64-apple-darwin/release/build/*libvpx* \
+                  target/aarch64-apple-darwin/release/build/*vpx_sys* 2>/dev/null || true
+          echo "stale libvpx build artefacts cleared"
 
       - name: Fetch vendored FFmpeg 8.1.2 (macOS arm64 — VideoToolbox)
         env:
