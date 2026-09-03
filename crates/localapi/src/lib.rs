@@ -626,8 +626,10 @@ pub struct TierWhy {
     /// May this tier be attempted at all right now?
     pub eligible: bool,
     /// When not eligible, which gate refused: `peer-relays-instead` |
-    /// `penalty`. Resolved in the same order the selector tests them, so it
-    /// cannot contradict `eligible`.
+    /// `lan-captured` (FR-33 — this host's route to the peer's LAN prefix
+    /// leaves via another adapter, a VPN split-prefix capture) | `penalty`.
+    /// Resolved in the same order the selector tests them, so it cannot
+    /// contradict `eligible`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<String>,
     /// The tier's fixed prior.

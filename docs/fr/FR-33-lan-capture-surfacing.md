@@ -1,6 +1,7 @@
 # FR-33: A VPN that captures the LAN prefix should say so — surface LAN capture in `status`, `why` and the RC path pill
 
-Status: **P1 implemented, not yet field-verified** (2026-08-29). Tracking issue: `FR-33` (#905).
+Status: **P1 field-verified on 0.4.20 (2026-08-29); P2 implemented 2026-09-03, field check
+pending the next agent release; P3 open.** Tracking issue: `FR-33` (#905).
 Sibling of FR-9 (LAN relay diagnosis) and FR-31 (opening keyframe). Spec on master up front; the
 design is known.
 
@@ -52,6 +53,18 @@ stays out of scope (operator's standing rule).
    while a capture is active on *this* host — a fact about this host, the way
    `PeerRelaysInstead` is a fact about the peer. `explain` (`path.rs:913`) resolves it in the
    same order `eligible` tests, so the text can never disagree with the verdict.
+   **As built (2026-09-03):** the runtime reads the snapshot's captures once per
+   `install_peers` walk and tells the monitor, per peer, whether that peer's LAN candidate lies
+   inside a captured prefix (`LanCapture::contains_v4` → `PathMonitor::on_lan_capture`). The
+   monitor refuses the LAN tier outright — an eligibility gate like #30, no penalty, no Q
+   event — so `decide` and the upward prober never propose it and the ~45 futile probes/hour
+   stop; the flag clears on the first walk after the capture lifts. Wire label `lan-captured`
+   (kebab, like `peer-relays-instead`). Two guards make the gate safe: it is scoped to the
+   captured PREFIX (a multi-homed host keeps LAN-dialling neighbours on its other, clear LAN),
+   and the detector now exempts a same-LAN **sibling** (a docked laptop whose Wi-Fi and
+   Ethernet share one switch: the selected interface holds an address in the prefix, so it
+   reaches the LAN — a VPN adapter's tunnel address never does). `roomler peers <node>` adds a
+   `CAPTURED` hold-down line pointing at `roomler status` and the VPN profile.
 4. **RC path pill**: `rc:video-info` (`agents/roomlerd/src/peer.rs` ~3043, `video_info_sent`)
    carries an optional `transport_reason` string set by the *agent* from its own capture state;
    the viewer renders `relay · VPN captures the host's LAN`. Optional field — old viewers ignore
@@ -63,14 +76,19 @@ stays out of scope (operator's standing rule).
 | phase | scope | kill switch |
 |---|---|---|
 | P1 | detection + `NetDelta` onset/clear lines + `roomler status` line (Windows first; Linux/macOS via the existing `ip route get` / `route get` backends) | `overlay_lan_capture_probe=false` |
-| P2 | `BlockedBy::LanCaptured` in `peers --json why` | same |
+| P2 | `BlockedBy::LanCaptured` in `peers --json why` — **implemented 2026-09-03**: LAN-tier eligibility gate per captured prefix + `lan-captured` label + CLI hold-down line + sibling exemption in the detector | same (no captures ⇒ no gate) |
 | P3 | `rc:video-info.transport_reason` + the viewer pill | same (agent side omits the field) |
 
 ## Acceptance criteria
 
 - [ ] `roomler exec CORPLAP-2 -- roomler status` prints the `CAPTURED` line naming `Ethernet 3`
       while its VPN is up; `roomler status` on neo16 prints `lan         clear`
-- [ ] CORPLAP-2's `roomler peers --json` for neo16 reads `blocked_by: lan_captured`
+- [ ] a captured host's `roomler peers --json` for a same-LAN peer reads `blocked_by:
+      lan-captured` with `penalty: 0` on the LAN tier (CORPLAP-3 on a non-excluded subnet, or
+      CORPLAP-2 anywhere)
+- [ ] the captured host stops probing the LAN tier: no `probing direct upgrade … tier=Lan`
+      lines toward that peer while the capture holds, and the first walk after the VPN drops
+      resumes them
 - [ ] the RC pill on `neo16 → CORPLAP-2` reads `relay · VPN captures the host's LAN`
 - [ ] the daemon log carries ONE onset line and ONE clear line across a VPN connect/disconnect
       cycle on CORPLAP-2 (no per-snapshot spam)
@@ -80,10 +98,14 @@ stays out of scope (operator's standing rule).
 
 ## Open decisions
 
-- Whether a detected capture should also **pause the LAN probe cadence** (today ~45 failed
-  probes/hour, each a zero-disruption shadow probe — cheap, and P8 deliberately never escalates
-  the LAN penalty under make-before-break). Default: no — "heuristics may detect; they never
-  decide". Revisit only with a cost measurement.
+- ~~Whether a detected capture should also **pause the LAN probe cadence**~~ — **decided
+  2026-09-03 (P2): yes.** The verdict is not a heuristic but the OS's own route lookup, i.e. a
+  measurement of where the packet WILL go; and the 2026-09-03 pktmon capture on CORPLAP-3
+  showed both directions dead at the stack (the peer's initiations dropped by `INET: receive
+  inspection`, our replies by `Inspection drop`), so a LAN probe under a capture cannot
+  succeed by construction. The one false-positive class found — a same-LAN sibling interface
+  on a docked laptop — is exempted in the detector rather than tolerated in the gate. Cost:
+  none measured; benefit: ~45 futile probes/hour/pair gone and `why` truthful.
 
 ## Out of scope
 
@@ -94,3 +116,5 @@ Bypassing the capture; the relay ceiling; FR-31's encoder work.
 | date | build | note |
 |---|---|---|
 | 2026-08-29 | 0.4.17/0.4.18 (CORPLAP-2), 0.4.16 (neo16) | Motivating case above; `Find-NetRoute -RemoteIPAddress 192.168.68.126` on CORPLAP-2 → `Ethernet 3`, `NextHop 172.30.245.30`, `DestinationPrefix 192.168.68.0/25`; `Get-NetAdapter` names the Check Point adapter. |
+| 2026-08-29 | 0.4.20 | **P1 field-verified** on both corp laptops (#905 comment): CORPLAP-2 (Check Point) and CORPLAP-3 (AnyConnect) each print `lan CAPTURED — … leaves via "<VPN adapter>" (owned by WLAN)`; neo16 prints `clear`. |
+| 2026-09-03 | 0.4.57 both ends | **The gap P2 closes, measured.** neo16 and CORPLAP-3 on one phone hotspot (`192.168.43.0/24`, outside AnyConnect's fixed split-exclude list `10.0.0.0/24`, `192.168.0.0/23`, `192.168.8.0/24`, `192.168.178.0/24`): CORPLAP-3 `status` says `CAPTURED — 192.168.43.0/24 leaves via "Ethernet 2"`, but its `peers --json why` for neo16 said `lan blocked_by: penalty, fails 5` and neo16 kept probing `192.168.43.10:43664` every ~80 s (`saw_inbound=false`). pktmon on CORPLAP-3: neo16's initiations reach the Wi-Fi NIC and die in tcpip (`INET: receive inspection`); CORPLAP-3's replies die on Tx (`Inspection drop`) — the capture is routing AND filtering, so no probe can ever pass. Same host was `direct lan 9 ms` at home that morning (`192.168.0.0/24`, inside the `/23`). |
