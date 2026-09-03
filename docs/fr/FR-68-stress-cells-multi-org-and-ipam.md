@@ -208,6 +208,32 @@ proves nothing that `a35720b6`/`182a4121` do not already prove.
 
 ### What is left, in order
 
+### ⚠️⚠️ The IPAM cell CANNOT run against production — verified, not assumed
+
+Growth is gated server-side on `overlay.multi_block_enabled`
+(`crates/api/src/ws/overlay.rs:393`). The prod configmap
+(`k8s/base/configmap-roomler2-config.yaml:62`) sets
+`ROOMLER__OVERLAY__BLOCKS_ENABLED: "true"` and **sets `MULTI_BLOCK` nowhere**, so
+production runs the code default `false`. Turning it on is a **one-way door for
+that database**: once any network holds two assigned blocks the
+one-block-per-network index cannot be recreated and the boot fails loudly —
+which `044f08f2` now proves rather than assumes.
+
+So the plan as approved was circular: it wanted to verify growth on the org
+whose server has growth switched off, and the switch is the thing the
+verification exists to license.
+
+**Resolution — the `e2e` overlay.** `k8s/overlays/e2e` is a complete, separate
+stack (own configmap, own mongo/minio secrets, own deployment) and is
+deliberately NOT ArgoCD-managed. Adding
+`ROOMLER__OVERLAY__MULTI_BLOCK_ENABLED: "true"` there confines the one-way door
+to a throwaway database, and the IPAM cell points its VM at that server instead
+of `https://roomler.ai`. ⚠️ That means the cell needs `VMTEST_SERVER` to be
+per-cell rather than global — currently it is one value in `lib.sh:18`.
+
+The multi-org cell has no such problem: it needs two orgs, not a server flag,
+and can run against prod.
+
 **P5 — the two cells.** Blocked on nothing but work + a harness run.
 - `guest/win-lane.ps1`: extend `[ValidateSet('system','attended','user')]` with
   `multiorg`; `lanes/win11/cell.sh:110` lifting loop gains `multiorg-mesh`,
