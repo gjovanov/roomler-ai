@@ -1731,7 +1731,12 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // present the SAME fingerprint so the server's `(tenant_id, machine_id)`
     // key recognises the box across orgs (and across the %PROGRAMDATA% vs
     // %APPDATA% path drift that re-enroll's rc.52 BLOCKER-6 guards against).
-    let existing = config::load(&target_path).ok();
+    // FR-66: `read_if_present`, NOT `load(..).ok()`. A FIRST enrollment has no
+    // config by definition, and `load` announces a missing one as `the host
+    // must be re-enrolled` at ERROR — so enrolling a clean machine told the
+    // operator to re-enroll it, mid-enrollment. Behaviour is unchanged: absent
+    // still means "no machine_id to reuse".
+    let existing = config::read_if_present(&target_path);
     // FR-51 P3 — an ephemeral enrollment is a FRESH identity by definition:
     // folding it into an existing config would either hand this machine's
     // real device row a random fingerprint or hand the ephemeral row the
