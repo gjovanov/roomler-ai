@@ -500,6 +500,11 @@ impl OverlayRuntime {
                         at: now,
                         from_major,
                     });
+                    // FR-68 — each poke re-keys a peer and can demote a healthy
+                    // direct carrier, so this is what turns "the mesh feels
+                    // unstable" into a number. ~100/min was #1237's signature.
+                    crate::evidence::FORCED_REVALIDATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     info!(
                         peer = %nid, tier = ?e.tier,
                         silent_s = since_last_rx.as_secs(),
