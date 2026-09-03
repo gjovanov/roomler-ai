@@ -153,7 +153,7 @@ the next reader does not assume back-off exists.
 - [ ] **AC3** A cross-tenant carve racing a grow does not silently refuse the joiner.
 - [ ] **AC4** Renumber against a grown org does not duplicate a `seq`.
 - [ ] **AC5** `ensure_indexes(db, false)` after growth fails loudly.
-- [ ] **AC6** `ROUTE_EVICTIONS` / `ROUTE_WAVES` / `FORCED_REVALIDATIONS` are live and were
+- [~] **AC6** (half — counters live and read on 3 hosts; the `spared` half needs a multi-org host) `ROUTE_EVICTIONS` / `ROUTE_WAVES` / `FORCED_REVALIDATIONS` are live and were
       read on two real multi-org hosts, **as a diff of two readings**.
 - [ ] **AC7** With C2(a)+C2(b), a two-org Windows guest shows **zero sibling evictions**
       over a sustained window.
@@ -294,4 +294,48 @@ is a multi-org host again. CORPLAP-3 is the other.
 
 ## Field-verification log
 
-_(empty — nothing field-verified yet. AC6 and AC7–AC9 all require a real host.)_
+### 2026-09-03 — C1 counters live on the fleet (0.4.58). **AC6 half-met.**
+
+Released `agent-v0.4.58`; three Windows hosts self-updated and were read:
+
+| host | `route guard` line |
+|---|---|
+| neo16 | `evicted=0 spared=0 waves=8 revalidations=0` |
+| CORPLAP-1 `CORPLAP-1` | `evicted=0 spared=0 waves=112 revalidations=10` |
+| CORPLAP-3 `CORPLAP-3` | `evicted=0 spared=0 waves=56 revalidations=9` |
+
+✅ The `evidence` → `localapi` → CLI path works end to end, and `waves` differs
+per host by uptime, so these are measurements rather than a constant.
+
+⚠️ **`spared=0` everywhere is a STRUCTURAL zero, not a pass.** No fleet host is
+multi-org: neo16 **and** CORPLAP-1 both report `jovanov … disconnected: server
+goodbye (AgentDeleted)`, and CORPLAP-3 has no second org. With no sibling
+adapter there is nothing to spare, so **AC7 and the `spared` half of AC6 remain
+unverified** — reading that zero as "no sibling war" would be mistaking absence
+of the feature for absence of the fault. Closing it needs one host's second org
+re-enrolled.
+
+🔑 Notable: CORPLAP-3 runs AnyConnect — the client our guard historically fought
+**25,197 → 33,294 evictions in one day** — and reads `evicted=0`. First time that
+war has been measurable rather than inferred from a WARN throttled to
+1/min/prefix. Not over-read: metric-0 defence is default-off and these daemons
+had restarted.
+
+### 2026-09-03 — the counter found something on its first day → #1282
+
+neo16, idle, 0.4.58, three readings five minutes apart:
+`waves 95 → 195 → 295` = **19.9/min then 20.0/min**, sustained.
+
+The intended steady state is a 30 s heartbeat (~2/min); 20/min is *exactly* the
+`ROUTE_WAVE_MIN_INTERVAL = 3 s` event-arm ceiling. CORPLAP-3 measured ~41/min.
+`evicted=0` and `revalidations=0` throughout, so it is neither an eviction war
+nor a cause of carrier churn — apparently pure wasted work, which is why nothing
+ever surfaced it. No log line exists for it either. Filed as **#1282**.
+
+### ⚠️ Method note — a cumulative counter that DECREASES means a restart
+
+CORPLAP-1 read `waves=112 revalidations=10`, then `waves=56 revalidations=0`
+minutes later: its daemon had restarted, and counters reset at process start.
+"Diff two readings" is necessary but not sufficient — **a decrease invalidates
+the diff**, and computing it anyway yields a confident negative rate. Check for
+a decrease before trusting any delta.
