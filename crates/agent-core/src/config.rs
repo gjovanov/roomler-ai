@@ -840,11 +840,34 @@ pub struct AgentConfig {
     /// multiplicative decrease bottoms out. Evidence-gated: with no held
     /// goodput estimate the nominal floor stands. `false` = flat floor.
     #[serde(default)]
+    pub slow_link_floor: Option<bool>,
     /// FR-62 A1 — in-place encoder rate changes (QSV) + corrected NVENC HRD
     /// sizing. Default OFF; ships inert. See `encoder_inplace_rate` in the
     /// config surface.
+    #[serde(default)]
     pub encoder_inplace_rate: Option<bool>,
-    pub slow_link_floor: Option<bool>,
+    /// Pin remote-control's ICE to a TURN relay so the encoder runs its
+    /// CONSTRAINED posture on demand. Default OFF. A diagnostic pin that
+    /// degrades an otherwise-direct session — see `ice_relay_tcp` in the
+    /// config surface.
+    #[serde(default)]
+    pub ice_relay_tcp: Option<bool>,
+    /// FR-63 — open a session with slow-start instead of committing to a
+    /// constant rate. Default OFF (a controller change ships behind evidence).
+    /// See `rate_slow_start` in the config surface.
+    #[serde(default)]
+    pub rate_slow_start: Option<bool>,
+    /// FR-65 P0 — the pump stall watch. Default ON. See `pump_stall_watch`.
+    #[serde(default)]
+    pub pump_stall_watch: Option<bool>,
+    /// FR-65 P0 — the stall threshold in ms. Built-in default 100; clamped
+    /// 10-5000. See `pump_stall_warn_ms` in the config surface.
+    #[serde(default)]
+    pub pump_stall_warn_ms: Option<u32>,
+    /// FR-65 — run a CONSTRAINED encoder rebuild off the pump thread too.
+    /// Default ON. See `bg_rebuild_constrained` in the config surface.
+    #[serde(default)]
+    pub bg_rebuild_constrained: Option<bool>,
     /// FR-59 P1 — absolute stop for that relief, bps
     /// (`ROOMLERD_SLOW_LINK_MIN_BITRATE`). Built-in default: 200000;
     /// clamped 50000-1500000. Below roughly this a full-resolution frame
@@ -1994,6 +2017,11 @@ pub fn test_fixture() -> AgentConfig {
         area_min_bitrate: None,
         measured_ceiling: None,
         encoder_inplace_rate: None,
+        ice_relay_tcp: None,
+        rate_slow_start: None,
+        pump_stall_watch: None,
+        pump_stall_warn_ms: None,
+        bg_rebuild_constrained: None,
         slow_link_floor: None,
         slow_link_min_bitrate: None,
         constrained_queue_measured: None,
@@ -2124,12 +2152,16 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 73] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 77] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
         ("MEASURED_CEILING", cfg.measured_ceiling),
         ("ENCODER_INPLACE_RATE", cfg.encoder_inplace_rate),
+        ("ICE_RELAY_TCP", cfg.ice_relay_tcp),
+        ("RATE_SLOW_START", cfg.rate_slow_start),
+        ("PUMP_STALL_WATCH", cfg.pump_stall_watch),
+        ("BG_REBUILD_CONSTRAINED", cfg.bg_rebuild_constrained),
         ("SLOW_LINK_FLOOR", cfg.slow_link_floor),
         ("CONSTRAINED_QUEUE_MEASURED", cfg.constrained_queue_measured),
         ("SEED_CONTRADICTION", cfg.seed_contradiction),
@@ -2213,7 +2245,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 73]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 27] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 28] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -2237,6 +2269,7 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("CONSTRAINED_CQ_RELIEF", cfg.constrained_cq_relief),
         ("CONSTRAINED_QUEUE_MS", cfg.constrained_queue_ms),
         ("SLOW_LINK_MIN_BITRATE", cfg.slow_link_min_bitrate),
+        ("PUMP_STALL_WARN_MS", cfg.pump_stall_warn_ms),
         ("SLOW_LINK_PROFILE_BPS", cfg.slow_link_profile_bps),
         ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),
         ("DIRECT_QUEUE_MS", cfg.direct_queue_ms),
