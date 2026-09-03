@@ -106,6 +106,11 @@ pub(super) fn defended_routes(
 /// delete-then-add on the same prefix, and awaiting it inline would stall
 /// the outbound TUN arm).
 pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
+    // FR-68 — the wave is the unit of work a route war multiplies: every
+    // eviction is a FIB change, which feeds our own route-change subscription,
+    // which arms the next wave. Waves/min far above the 30 s heartbeat means
+    // the guard is driving itself rather than reacting to the network.
+    crate::evidence::ROUTE_WAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // v3 (#23) — the peer list doubles as the reclaim step's target set.
     let peers: Vec<Ipv4Addr> = set
         .iter()
