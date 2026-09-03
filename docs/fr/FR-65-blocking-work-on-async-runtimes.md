@@ -64,6 +64,12 @@ loop), rather than three wraps.
 
 ### P0 — the stall watch (blocks every other phase)
 
+> **Status 2026-09-04 — shipped and field-read.** The watch (0.4.55), the
+> 100 ms bar, `open_ms`/`other_ms` (#1279, 0.4.59) and the `work_us` decision
+> (#1284, 0.4.60) are all live on CORPLAP-1; the field log below shows the
+> breakdown summing to its total on two builds. Still open under P0: **AC1**
+> (the overhead A/B) and **AC2** (a synthetic stall attributed to its phase).
+
 A per-iteration wall-clock watch on the pump loop, threshold-gated.
 
 - Two `Instant::now()` per iteration (~20–40 ns each) against a 16.7 ms frame
@@ -96,7 +102,9 @@ speculatively.
 > P1's actual goal is **make-before-break**, and that needs `rebuild_spec` to
 > carry GEOMETRY so the swap machinery can hold the old encoder live — today it
 > carries only a bitrate and `adopt_rebuilt` discards a dims change. Do not read
-> #1284 as closing P1.
+> #1284 as closing P1. (Field read on 0.4.60: the first open is **789 ms** on
+> `hevc_qsv` at 1920×1200 against 748 ms one build earlier — unchanged, as
+> predicted; see the field-verification log.)
 
 The direct twin of #1254, and the largest remaining known win.
 
@@ -232,4 +240,46 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 
 ## Field-verification log
 
-_(empty — every entry must carry a before/after from the stall watch.)_
+_(every entry must carry a before/after from the stall watch.)_
+
+- **2026-09-04 — P0's instrument and #1284, read one build apart on CORPLAP-1**
+  (Iris Xe, `hevc_qsv`, 1920×1200, direct host↔host path, host **LOCKED**). Same
+  viewer (neo16 Chrome), same procedure (Connect → ~40 s idle → three cursor
+  drags → Disconnect), the two sessions eleven minutes apart with the 0.4.60
+  roll in between (`rc:agent.update` 23:40:01 UTC → daemon up on 0.4.60 at
+  23:40:13).
+  - **Before — 0.4.59 (#1279, no #1284), session `6a9a0343`, 23:31 UTC:**
+    `START` 23:31:16.931 → `encoder (re)built hevc_qsv` +798 ms →
+    `STALL iter_ms=773.1 capture_ms=8.8 encode_ms=15.8 apply_ms=0.0 open_ms=748.1 other_ms=0.29`.
+    First heartbeat `open_ms=748.1 open_ms_max=748.1 pump_stalls=1 iter_ms_max=773.1`;
+    the 78 heartbeats after it: `pump_stalls=0`, `iter_ms_max` 14.7–16.9 ms,
+    `avg_capture_ms` 3.3–4.5, `avg_encode_ms` 10.7–11.3, viewer age 6–29 ms.
+  - **After — 0.4.60 (#1279 + #1284), session `6a9a0602`, 23:42 UTC:**
+    `START` 23:42:59.253 → `encoder (re)built hevc_qsv` +850 ms →
+    `STALL iter_ms=815.7 capture_ms=10.0 encode_ms=16.1 apply_ms=0.0 open_ms=789.0 other_ms=0.57 work_ms=805.7`.
+    First heartbeat `open_ms=789.0 open_ms_max=789.0 pump_stalls=1 iter_ms_max=815.7`;
+    the 80 heartbeats after it: `pump_stalls=0`, `iter_ms_max` ≤ 25.6 ms
+    (the drags), `avg_capture_ms` 3.5–4.4, `avg_encode_ms` 10.7–12.0, viewer
+    age 9–12 ms.
+  - **Read.** (1) The breakdown now **sums to its total** on both builds
+    (0.4.59: 8.8 + 15.8 + 748.1 + 0.29 = 773.0 vs `iter_ms` 773.1; 0.4.60:
+    10.0 + 16.1 + 789.0 + 0.57 = 815.7 vs 815.7). The 0.46–0.96 s that the
+    0.4.55–0.4.58 lines left in no phase is gone from the log because it is
+    *named*: it is the open. (2) `open_ms` is **unchanged across #1284** (748 →
+    789 ms, run-to-run spread on a cold QSV open) — exactly what #1288 said to
+    expect: the open did not get cheaper, the worker stopped waiting for it.
+    (3) `hevc_qsv` opened on a `spawn_blocking` thread and encoded on runtime
+    workers for the whole session without an error, so the thread-affinity
+    risk did not bite for a QSV *open* (P2 stays per-session-thread, not
+    per-frame `spawn_blocking`). (4) `work_ms` (new in 0.4.60) = `iter − capture`
+    and is what the stall decision now runs on.
+  - ⚠️ **What this cell could NOT show: the idle-capture storm.** On the lock
+    screen the system-context capture returns in ~4 ms on every pass
+    (`iter_ms_max` 15 ms across 2.7 min of a static screen), so the
+    `iter≈105 / capture≈93` shape that made up the majority of 0.4.55/0.4.56
+    warnings on an **attended** desktop (2026-09-03 13:30–13:42, 55 lines)
+    never occurred on either build here. The "storm gone" half of #1284 — the
+    decision on `work_us` — is unverified until an attended-desktop session on
+    ≥ 0.4.60 is read. Likewise the runtime-side claim (a worker no longer
+    blocked ~0.8 s during session establish) is unobservable in this log by
+    construction; that is the P2 canary's job.
