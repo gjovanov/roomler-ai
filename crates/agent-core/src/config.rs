@@ -852,6 +852,11 @@ pub struct AgentConfig {
     /// config surface.
     #[serde(default)]
     pub ice_relay_tcp: Option<bool>,
+    /// Bitrate ceiling for a CONSTRAINED (relay) remote-control transport,
+    /// kbps. Built-in default 3000; clamped 100-100000. See `relay_max_kbps`
+    /// in the config surface.
+    #[serde(default)]
+    pub relay_max_kbps: Option<u32>,
     /// FR-63 — open a session with slow-start instead of committing to a
     /// constant rate. Default OFF (a controller change ships behind evidence).
     /// See `rate_slow_start` in the config surface.
@@ -2018,6 +2023,7 @@ pub fn test_fixture() -> AgentConfig {
         measured_ceiling: None,
         encoder_inplace_rate: None,
         ice_relay_tcp: None,
+        relay_max_kbps: None,
         rate_slow_start: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
@@ -2245,7 +2251,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 77]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 28] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 29] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -2269,6 +2275,7 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("CONSTRAINED_CQ_RELIEF", cfg.constrained_cq_relief),
         ("CONSTRAINED_QUEUE_MS", cfg.constrained_queue_ms),
         ("SLOW_LINK_MIN_BITRATE", cfg.slow_link_min_bitrate),
+        ("RELAY_MAX_KBPS", cfg.relay_max_kbps),
         ("PUMP_STALL_WARN_MS", cfg.pump_stall_warn_ms),
         ("SLOW_LINK_PROFILE_BPS", cfg.slow_link_profile_bps),
         ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),

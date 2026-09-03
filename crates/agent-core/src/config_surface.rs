@@ -617,6 +617,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Pin remote-control's ICE to a TURN relay (diagnostic). Default OFF: the session takes whatever pair ICE nominates, and `constrained` is MEASURED from that pair (a public relay candidate = constrained; the loopback-TURN does not count). ON forces the relay path, which is bandwidth- and head-of-line-limited, so the encoder runs its constrained posture. ⚠️ This DEGRADES a session that would otherwise be direct - it is a test pin, not a tuning knob, and a device left with it set will be slow for no visible reason. It exists as a key because the constrained posture is otherwise only reproducible when a corporate VPN happens to be up, which makes every constrained-path acceptance test hostage to one laptop's network state; virtual-desktop mode sets the same flag for the same reason. Clear it (empty = default) when the measurement is done. WARNING: on a VIRTUAL-DESKTOP host with a hostile NAT the vd startup auto-pins this to 1, and its check for an explicit operator override reads the OS env var ONLY - so setting this key to false there does not defeat the auto-pin; use a real ROOMLERD_ICE_RELAY_TCP=0 for that one case. Env: ROOMLERD_ICE_RELAY_TCP. Restart required.",
     ),
     (
+        "relay_max_kbps",
+        "number",
+        "Bitrate ceiling for a CONSTRAINED (relay) remote-control transport, kbps. Built-in default: 3000; clamped 100-100000. A single TURN relay carries roughly 1-4 Mbps and head-of-line blocks on TCP, so a ceiling sized for a direct pair (a 1920x1200 pair resolves ~12 Mbps) collapses it. LOWER it on a relay population that is thinner than the default assumes. RAISE it only to build a deliberate over-drive for a rate-control measurement: field 2026-09-03, a forced-relay cell on CORPLAP-1 opened at the 2.55 Mbps plan rate into a coturn carrying ~3 Mbps, which is NOT an over-drive - the AIMD simply climbed to the cap and viewer age stayed at 30-49 ms, so the FR-63 A/B had nothing to measure. At 12000 the same real pipe and real encoder give a genuine 4x over-drive on demand, instead of waiting for a corporate VPN to produce one. Pairs with ice_relay_tcp. Env: ROOMLERD_RELAY_MAX_KBPS. Restart required.",
+    ),
+    (
         "rate_slow_start",
         "tribool",
         "Slow-start the session opener (2026-09-03, FR-63). Default OFF. A session commits to a bitrate before it has any evidence about the pipe, and the same host over-drove from BOTH directions on one day: opened at a REMEMBERED 6134627 -> 6287ms of viewer paint age; opened at the NOMINAL relay cap 2550000 into a path measured at ~213000 -> 444ms of queue, 1550ms paint, and six windows collapsing back down. No constant is safe, because a constant is an assumption about a band. ON: open at 300000 (lifted by any PROVEN floor, e.g. the FR-59 P8 remembered-slow-pair open) and DOUBLE per clean window until the ceiling; the first congestion evidence ends the ramp and hands control back to the normal controller. A fast pair reaches a 6.1 Mbps ceiling in 5 windows. Only ever LOWERS the opening commitment - it can never raise a rate above what the controller already allows. Env: ROOMLERD_RATE_SLOW_START. Restart required.",
@@ -902,6 +907,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
         "encoder_inplace_rate" => cfg.encoder_inplace_rate.map(fmt_bool),
         "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
+        "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
         "pump_stall_watch" => cfg.pump_stall_watch.map(fmt_bool),
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms.map(|p| p.to_string()),
@@ -1319,6 +1325,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
         "encoder_inplace_rate" => cfg.encoder_inplace_rate = parse_tribool(value)?,
         "ice_relay_tcp" => cfg.ice_relay_tcp = parse_tribool(value)?,
+        "relay_max_kbps" => cfg.relay_max_kbps = parse_u32_range(key, value, 100, 100_000)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
         "pump_stall_watch" => cfg.pump_stall_watch = parse_tribool(value)?,
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms = parse_u32_range(key, value, 10, 5000)?,
