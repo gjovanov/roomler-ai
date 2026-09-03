@@ -14,6 +14,7 @@
 //! rather than the allocator.
 
 use bson::{doc, oid::ObjectId};
+use roomler_ai_db::indexes::ensure_indexes;
 use roomler_ai_remote_control::models::{NodeRef, OverlayNetwork, OverlayNode};
 use roomler_ai_services::dao::base::DaoError;
 use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
@@ -1968,4 +1969,69 @@ async fn the_orphan_detector_is_platform_operator_only() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 404);
+}
+
+/// FR-68 P1 — `multi_block_enabled` is a ONE-WAY DOOR, and the boot must say so.
+///
+/// Once a network holds two assigned blocks the `network_id` partial-unique
+/// index can no longer be created: Mongo refuses on the duplicate. `ensure_indexes`
+/// is documented to fail LOUDLY there rather than skip, because "a uniqueness
+/// guard that quietly gives up is worse than one that stops you"
+/// (`crates/db/src/indexes.rs`). Nothing tested it, so the door's safety was a
+/// comment — and the failure mode it guards is a server running with the
+/// one-block-per-network invariant silently unenforced.
+#[tokio::test]
+async fn turning_multi_block_off_after_a_grow_fails_the_boot_loudly() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.overlay.blocks_enabled = true;
+        s.overlay.block_prefix = 22;
+        s.overlay.multi_block_enabled = true;
+    })
+    .await;
+    let seeded = app.seed_tenant("ovoneway").await;
+    let dao = OverlayNetworkDao::new(&app.db).with_block_prefix(Some(22));
+    let net = dao.get_or_create(tid(&seeded.tenant_id)).await.unwrap();
+    let network_id = net.id.unwrap();
+
+    // Drive the cursor to the ceiling so the next allocation must grow.
+    dao.base
+        .update_one(
+            doc! { "_id": network_id },
+            doc! { "$set": { "next_host": 1023_i64 } },
+        )
+        .await
+        .unwrap();
+    let net = dao.base.find_by_id(network_id).await.unwrap();
+    dao.allocate_host_or_grow(&net, 22)
+        .await
+        .expect("a full network grows");
+
+    // ⚠️ Load-bearing precondition. Without it a database that never grew would
+    // satisfy the post-condition and this test would pass proving nothing —
+    // the same trap the `harness` test exists to close.
+    let grown = dao.base.find_by_id(network_id).await.unwrap();
+    assert_eq!(
+        dao.block_list(&grown).await.cidrs().len(),
+        2,
+        "precondition: the network must actually hold two assigned blocks"
+    );
+
+    // The door. Booting with the flag back OFF must REFUSE.
+    let err = ensure_indexes(&app.db, false).await.expect_err(
+        "a boot that cannot recreate the one-block-per-network guard must fail; \
+         running on without it leaves the invariant silently unenforced",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("duplicate")
+            || msg.to_lowercase().contains("index")
+            || msg.to_lowercase().contains("e11000"),
+        "the refusal must name the index conflict so an operator can act on it, got: {msg}"
+    );
+
+    // And the flag still ON is fine — the same database boots cleanly, so the
+    // failure above is the DOOR, not a broken fixture.
+    ensure_indexes(&app.db, true)
+        .await
+        .expect("multi-block schema still applies to a grown network");
 }

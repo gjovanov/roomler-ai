@@ -626,6 +626,11 @@ mod system {
         /// Emit the eviction WARN (or a throttled `debug!`) for one actual
         /// deletion of a competing route.
         fn evict_warn(dest: IpAddr, plen: u8, ifindex: u32, luid_val: u64) {
+            // FR-68 — counted BEFORE the throttle, because the throttle is a
+            // logging decision (1 WARN/min/prefix) and a rate that only shows
+            // up in suppressed-line arithmetic is not measurable. Every
+            // successful delete reaches here, so this is the one site.
+            crate::evidence::ROUTE_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut g = EVICT_THROTTLE.lock().unwrap();
             let t = g.get_or_insert_with(|| EvictThrottle {
                 last: std::collections::HashMap::new(),
@@ -813,8 +818,20 @@ mod system {
                 let n = (*table).NumEntries as usize;
                 let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
                 for r in rows {
+                    // FR-68 C2(a) — #1246 converted the three EVICTION helpers
+                    // to `route_belongs_to_us` but left this raw `== ours`
+                    // behind (its commit message says all four). The result on
+                    // a multi-org host: a sibling org's peer churn changes this
+                    // fingerprint, the debounce reads "something moved", and a
+                    // full FIB walk runs every wave. It deletes nothing — the
+                    // eviction itself is correctly exempted — so it is not a
+                    // war, but the anti-flap guard is defeated on exactly the
+                    // host it was written for.
+                    //
+                    // `adapter_is_ours` and not `route_belongs_to_us`: this is
+                    // a read-only scan and must not move the spare counter.
                     if r.DestinationPrefix.Prefix.si_family != AF_INET
-                        || r.InterfaceLuid.Value == ours
+                        || super::adapter_is_ours(r.InterfaceLuid.Value, ours)
                     {
                         continue;
                     }
@@ -1732,13 +1749,75 @@ mod system {
     /// the adapter is live.
     mod own_adapters {
         use std::collections::BTreeMap;
+        use std::net::Ipv4Addr;
         use std::sync::Mutex;
 
-        static OWN: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+        /// One live adapter of ours: its LUID, and the connected v4 block it
+        /// serves (`None` when the mask was unknown at bring-up).
+        struct Own {
+            /// Read only by [`is_own_luid`], which is Windows-only — so on
+            /// every other target this reads as dead code while still being
+            /// written on both. Same shape (and same reason) as
+            /// `defended_ula_prefix`'s `cfg_attr` below.
+            #[cfg_attr(not(windows), allow(dead_code))]
+            luid: u64,
+            block: Option<(Ipv4Addr, u8)>,
+        }
 
-        pub(super) fn register(if_name: &str, luid: u64) {
+        static OWN: Mutex<BTreeMap<String, Own>> = Mutex::new(BTreeMap::new());
+
+        /// Do two v4 blocks overlap? True when either contains the other —
+        /// mask both to the SHORTER prefix and compare. Nesting counts: a
+        /// legacy `/10` org and a carved `/22` inside it are "disjoint" under
+        /// no useful definition.
+        fn blocks_overlap(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
+            let p = a.1.min(b.1);
+            if p == 0 {
+                return true;
+            }
+            if p > 32 {
+                return false;
+            }
+            let mask = u32::MAX << (32 - u32::from(p));
+            (u32::from(a.0) & mask) == (u32::from(b.0) & mask)
+        }
+
+        pub(super) fn register(if_name: &str, luid: u64, block: Option<(Ipv4Addr, u8)>) {
             if let Ok(mut g) = OWN.lock() {
-                g.insert(if_name.to_string(), luid);
+                // FR-68 C2(b) — FR-64 C2 asked for a WARN when two orgs' blocks
+                // overlap and it was never implemented. It matters because
+                // `defended_ula_prefix` derives each adapter's defended v6
+                // prefix FROM this block: disjoint blocks give disjoint
+                // prefixes and the #1237 sibling war stays closed, but NESTED
+                // blocks (a legacy /10 org beside a carved /22) give nested
+                // prefixes and it can silently re-open.
+                //
+                // ⚠️ This is a detector, not a fix — the prefixes are still
+                // nested afterwards. It makes the condition attributable
+                // instead of silent, which is the whole reason the CORPLAP-3
+                // diagnosis was cheap and this one was not.
+                if let Some(mine) = block {
+                    for (other_name, other) in g.iter() {
+                        if other_name == if_name {
+                            continue;
+                        }
+                        if let Some(theirs) = other.block
+                            && blocks_overlap(mine, theirs)
+                        {
+                            tracing::warn!(
+                                adapter = %if_name,
+                                block = %format_args!("{}/{}", mine.0, mine.1),
+                                sibling = %other_name,
+                                sibling_block = %format_args!("{}/{}", theirs.0, theirs.1),
+                                "overlay: two of our adapters serve OVERLAPPING v4 blocks — \
+                                 their derived-ULA v6 prefixes nest instead of being disjoint, \
+                                 so the per-adapter route defense can fight itself (#1237). \
+                                 Renumber one org onto its own block."
+                            );
+                        }
+                    }
+                }
+                g.insert(if_name.to_string(), Own { luid, block });
             }
         }
 
@@ -1755,8 +1834,39 @@ mod system {
             luid != 0
                 && OWN
                     .lock()
-                    .map(|g| g.values().any(|&v| v == luid))
+                    .map(|g| g.values().any(|v| v.luid == luid))
                     .unwrap_or(false)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn nested_blocks_count_as_overlapping() {
+                let legacy = (Ipv4Addr::new(100, 64, 0, 0), 10);
+                let carved = (Ipv4Addr::new(100, 65, 4, 0), 22);
+                assert!(
+                    blocks_overlap(legacy, carved),
+                    "a carved /22 sits INSIDE the legacy /10 — the case that \
+                     re-opens #1237, and the reason this is not an equality test"
+                );
+                assert!(blocks_overlap(carved, legacy), "and symmetrically");
+            }
+
+            #[test]
+            fn disjoint_carved_blocks_do_not_warn() {
+                let a = (Ipv4Addr::new(100, 65, 4, 0), 22);
+                let b = (Ipv4Addr::new(100, 65, 8, 0), 22);
+                assert!(!blocks_overlap(a, b));
+                assert!(!blocks_overlap(b, a));
+            }
+
+            #[test]
+            fn a_block_overlaps_itself() {
+                let a = (Ipv4Addr::new(100, 65, 4, 0), 22);
+                assert!(blocks_overlap(a, a));
+            }
         }
     }
 
@@ -1869,6 +1979,28 @@ mod system {
     /// pre-#1237 exact-LUID test.
     #[cfg(windows)]
     fn route_belongs_to_us(row_luid: u64, ours: u64) -> bool {
+        let belongs = adapter_is_ours(row_luid, ours);
+        if belongs && row_luid != ours {
+            // FR-68 — the exemption FIRING is the observable, not a sibling
+            // eviction: after #1246 that row is spared, so an eviction counter
+            // reads zero whether the fix works or was reverted. Paired with
+            // ROUTE_EVICTIONS this is falsifiable — spares climb while
+            // evictions stay flat, and OVERLAY_SIBLING_EXEMPT=0 inverts it.
+            //
+            // ⚠️ Counted HERE and not in `adapter_is_ours`, because only the
+            // eviction path turns a spare into a route that survives. The
+            // read-only fingerprint scan asks the same question many times per
+            // wave and must not inflate the number.
+            crate::evidence::ROUTE_SIBLING_SPARES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        belongs
+    }
+
+    /// The same question, with no side effects — for read-only scans that must
+    /// not move [`crate::evidence::ROUTE_SIBLING_SPARES`].
+    #[cfg(windows)]
+    fn adapter_is_ours(row_luid: u64, ours: u64) -> bool {
         if row_luid == ours {
             return true;
         }
@@ -2466,18 +2598,27 @@ mod system {
             // helpers and the block-floor gate never mistake a sibling org
             // adapter for a foreign product. `Drop` removes it. (`tun_luid`
             // is `0` off-Windows, where the registry is unconsumed.)
-            own_adapters::register(&if_name, tun_luid);
+            // FR-68 C2(b) — computed BEFORE registering so the registry can
+            // compare this adapter's block against its siblings' and warn on
+            // an overlap. Off-Windows there is no mask helper and no route
+            // guard, so it is honestly `None`.
+            #[cfg(windows)]
+            let connected_v4_block = prefix_len_of_mask(opts.netmask).map(|plen| {
+                let net = u32::from_be_bytes(opts.ip.octets())
+                    & u32::from_be_bytes(opts.netmask.octets());
+                (Ipv4Addr::from(net), plen)
+            });
+            #[cfg(not(windows))]
+            let connected_v4_block: Option<(Ipv4Addr, u8)> = None;
+
+            own_adapters::register(&if_name, tun_luid, connected_v4_block);
 
             Ok(Self {
                 dev,
                 if_name,
                 v6_onlink_plen: opts.v6_onlink_plen,
                 #[cfg(windows)]
-                connected_v4: prefix_len_of_mask(opts.netmask).map(|plen| {
-                    let net = u32::from_be_bytes(opts.ip.octets())
-                        & u32::from_be_bytes(opts.netmask.octets());
-                    (Ipv4Addr::from(net), plen)
-                }),
+                connected_v4: connected_v4_block,
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 orig_default,
                 #[cfg(any(target_os = "linux", target_os = "windows"))]

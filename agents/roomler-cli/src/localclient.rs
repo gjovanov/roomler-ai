@@ -1386,6 +1386,19 @@ fn print_status(s: &NodeStatus) {
         );
     }
 
+    // FR-68 — route-guard evidence. Printed only when something actually
+    // happened, like every other counter line here. The pair worth reading is
+    // evicted vs spared: on a healthy multi-org host `spared` climbs while
+    // `evicted` stays flat. `evicted` climbing steadily is a route war — we
+    // delete, a competitor re-adds, neither side holds the FIB.
+    if let Some((evicted, spared, waves, revalidations)) = s.route_guard
+        && (evicted > 0 || spared > 0 || waves > 0 || revalidations > 0)
+    {
+        println!(
+            "  route guard evicted={evicted} spared={spared} waves={waves} revalidations={revalidations} \n             (cumulative — DIFF two readings, never judge the absolute)"
+        );
+    }
+
     // C4 stage 1 — the warm TURN/UDP allocation. The line the Monday-morning
     // VPN check reads: "live" with a fresh probe while srflx is NONE means
     // the relay flow was grandfathered across the VPN connect.

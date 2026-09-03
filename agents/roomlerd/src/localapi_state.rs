@@ -479,6 +479,16 @@ impl LocalApiState for DaemonState {
                 tunnel_core::evidence::DIRECT_BIND_WALKS.load(Ordering::Relaxed),
             ),
             roam_adoptions: Some(tunnel_core::evidence::ROAM_ADOPTIONS.load(Ordering::Relaxed)),
+            // FR-68 — route-guard evidence, read together so two snapshots can
+            // be diffed as one reading. Always Some: a zero here is a real
+            // measurement (a quiet host, or a platform whose guard is a no-op),
+            // not an absence.
+            route_guard: Some((
+                tunnel_core::evidence::ROUTE_EVICTIONS.load(Ordering::Relaxed),
+                tunnel_core::evidence::ROUTE_SIBLING_SPARES.load(Ordering::Relaxed),
+                tunnel_core::evidence::ROUTE_WAVES.load(Ordering::Relaxed),
+                tunnel_core::evidence::FORCED_REVALIDATIONS.load(Ordering::Relaxed),
+            )),
             disco_answered: Some(tunnel_core::evidence::DISCO_ANSWERED.load(Ordering::Relaxed)),
             // FR-19 — present ONLY when the responder actually bound, so a
             // failed bind reads as "no relay here" rather than a phantom one.

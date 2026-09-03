@@ -190,6 +190,20 @@ pub struct NodeStatus {
     /// from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roam_adoptions: Option<u64>,
+    /// FR-68 — route-guard evidence, all cumulative since daemon start:
+    /// `(evictions, sibling_spares, waves, forced_revalidations)`.
+    ///
+    /// Grouped because no single one of them means anything alone. The pair
+    /// that carries the #1237 signal is evictions vs sibling spares: on a
+    /// healthy multi-org host spares climb while evictions stay flat, and with
+    /// `OVERLAY_SIBLING_EXEMPT=0` that inverts. ⚠️ There is deliberately no
+    /// "sibling evictions" number — after #1246 such a row is spared, so the
+    /// count would read zero whether the fix works or was reverted.
+    ///
+    /// `None` from daemons predating FR-68; on a non-Windows host the route
+    /// guard is a no-op, so evictions and spares stay 0 honestly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_guard: Option<(u64, u64, u64, u64)>,
     /// C1 (disco) — out-of-tunnel carrier echoes this node ANSWERED
     /// (`tunnel_core::evidence::DISCO_ANSWERED`). Nonzero on every node is the C1
     /// field gate: the fleet can answer, so a prober may ship next. `None`
@@ -2460,6 +2474,7 @@ mod tests {
                 direct_socks: Vec::new(),
                 direct_bind_walks: None,
                 roam_adoptions: None,
+                route_guard: None,
                 disco_answered: None,
                 org_relay: None,
                 legacy_env_uses: Some(Vec::new()),
