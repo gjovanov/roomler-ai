@@ -204,6 +204,47 @@ async fn a_device_past_the_block_ceiling_joins_into_an_appended_block() {
         "{crosser_ip} must NOT fall inside the first block"
     );
 
+    // FR-68 — the P5d compatibility claim, against a netmap the SERVER actually
+    // produced rather than one a test hand-built. `PinnedNetworkInfo` is copied
+    // verbatim from `agent-v0.4.42`, the last release before P5d: no `cidrs`, no
+    // `deny_unknown_fields`. ⚠️ Do not add fields to it — it is frozen on
+    // purpose, and its whole value is being the decoder a fielded agent has.
+    #[derive(serde::Deserialize)]
+    struct PinnedNetworkInfo {
+        cidr: String,
+        #[allow(dead_code)]
+        mtu: u16,
+    }
+    let pinned: PinnedNetworkInfo = serde_json::from_value(nm2["network"].clone()).expect(
+        "a pre-P5d agent must decode the netmap a grown org sends it; if this \
+         fails, every agent below 0.4.43 is stranded the moment an org grows",
+    );
+
+    // The netmask that agent derives is computed HERE, the way the agent does
+    // it (`prefix_of_cidr` -> `netmask_for_prefix`), and must put the crosser
+    // on-link while excluding block 0. This is the property that makes growth
+    // safe for the installed base; nothing else in the suite checks it.
+    let (base, plen) = pinned.cidr.split_once('/').expect("cidr has a prefix");
+    let base: std::net::Ipv4Addr = base.parse().expect("cidr base parses");
+    let plen: u32 = plen.parse().expect("cidr prefix parses");
+    let mask = u32::MAX << (32 - plen);
+    let on_link = |ip: &str| {
+        let ip: std::net::Ipv4Addr = ip.parse().expect("ip parses");
+        u32::from(ip) & mask == u32::from(base) & mask
+    };
+    assert!(
+        on_link(&crosser_ip),
+        "a pre-P5d agent at {crosser_ip} would size its TUN from {}, which must \
+         contain its own address",
+        pinned.cidr
+    );
+    assert!(
+        !on_link(&first_ip),
+        "block 0's device ({first_ip}) must NOT be on-link for the block-1 node \
+         — it is reached by its per-peer /32, and an on-link claim here would \
+         mean the old agent black-holes it"
+    );
+
     // The point of growth: the first device did not move.
     let still = app
         .db
