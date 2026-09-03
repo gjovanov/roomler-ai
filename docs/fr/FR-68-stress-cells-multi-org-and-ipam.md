@@ -1,0 +1,297 @@
+# FR-68: Stress cells for multi-org guard contention and IPAM growth
+
+**Status**: P0–P4 shipped (unmerged); P5–P7 open · **Owner**: overlay/networking ·
+**Issue**: [#1272](https://github.com/gjovanov/roomler-ai/issues/1272) ·
+**PRs**: roomler-ai [#1273](https://github.com/gjovanov/roomler-ai/pull/1273), deploy `fr68-vmtest-cells`
+
+## Goal
+
+Turn two overlay properties from **promises into properties**:
+
+1. **FR-47's growth half can come out of the dark.** `overlay.multi_block_enabled` is
+   `false` because its P5d wire-compatibility claim was never tested. FR-47's own spec says
+   it "must be tested against a pinned old-agent decoder, not argued"
+   (`docs/fr/FR-47-overlay-multi-block-ipam.md:169`). Until that exists, an org that reaches
+   1 022 devices is refused an address.
+2. **A #1237-class multi-org route war becomes catchable before the field.** It is fixed
+   (`57cc7223` / #1246, shipped 0.4.51), but nothing in CI or the VM matrix would catch the
+   next one — FR-61's matrix is single-tenant by construction.
+
+## Evidence (why this exists)
+
+- **#1237 ran for weeks in the field.** Two per-org runtimes evicted each other's
+  `fd72:6f6f:6d6c::/96` on every guard wave: ~100 carrier revalidations/min, **718
+  evictions/day on neo16**, CORPLAP-3 the v4 twin. Nothing failed; it was pure waste plus
+  demoted real carriers.
+- **The same shape against a third party is unbounded.** Our guard evicted Cisco
+  AnyConnect's route mirrors **25,197 → 33,294 in one day** while Cisco re-added within
+  milliseconds. Neither side holds the FIB and nothing yields (§ auto-yield below).
+- **The matrix cannot see either.** FR-61 has one `VMTEST_TENANT_ID` and one
+  `VMTEST_EPHEMERAL_KEY`; every guest driver performs exactly one enrollment. There is no
+  multi-org cell and no IPAM cell — verified by exhaustive grep, not assumed.
+- **`multi_block_enabled` has never run anywhere but a unit test.** Its one e2e
+  (`crates/tests/src/overlay_growth_tests.rs`) fakes the scale with a cursor jump and says
+  so in its own header; it cannot prove an *old daemon* sizes its netmask and NAT scope
+  correctly from the string the server sends.
+
+## Key design (anchors verified against `origin/master` @ `b91a7404`)
+
+### Three layers, cheapest first
+
+**L1 — in-repo tests.** Most of the IPAM risk is closable without a VM:
+
+- **The decoder pin.** No test feeds a P5d netmap *containing* `cidrs` into a pre-P5d
+  decoder. `a_pre_p5d_netmap_still_decodes_and_carries_no_block_list`
+  (`crates/remote_control/src/signaling.rs:4099`) only tests old-server → new-decoder.
+  Copy `agent-v0.4.42`'s `OverlayNetworkInfo` verbatim as a local struct and decode a real
+  grown-org netmap into it.
+- **Cross-tenant carve racing a grow.** `allocate`'s `DuplicateKey` arm
+  (`crates/services/src/dao/overlay_block.rs:216`) is single-block-shaped: with multi-block
+  the `network_id_1` index is dropped, so a `DuplicateKey` can only mean *another tenant
+  took the slot* — yet the arm returns the network's existing block, the grow is a silent
+  no-op, and the joiner is refused `AddressSpaceExhausted`.
+- **Renumber-after-grow `seq` collision.** The renumber route
+  (`crates/api/src/routes/overlay_block.rs:538-552`) uses the **singular**
+  `find_assigned_for_network` and stamps `seq: 0`; `crates/db/src/indexes.rs:408` is a
+  plain, non-unique `{network_id, seq}`. A tie on the sort key silently re-points every
+  ordinal above it — the exact failure `seq` exists to prevent.
+- **The one-way door.** `ensure_indexes(db, false)` after a network holds two assigned
+  blocks must fail loudly (`crates/db/src/indexes.rs:17-21`). Untested.
+- **Grow-while-live.** `OverlayNetmapDelta` carries no network info
+  (`crates/api/src/ws/overlay.rs:652-674`), so a live subnet router never learns the space
+  grew; its NAT scope stays block-0-only until the runtime restarts. Assert the bound.
+
+**L2 — two VM cells** (FR-61 matrix, dedicated vmtest orgs, destructive).
+
+**L3 — fleet, read-only.** Two `roomler peers --json` + `roomler status` snapshots ≥30 s
+apart on the real multi-org Windows hosts (neo16, CORPLAP-3). No mutation, no VPN cycling,
+nothing on prod cluster nodes.
+
+### Why each cell lands on the lane it does
+
+- **Multi-org ⇒ win11.** `defend_self_route` is **Windows-only**
+  (`crates/tunnel-core/src/overlay/tun.rs:2663-2719`; no-op default at `tun.rs:95`). An
+  Ubuntu cell would pass vacuously.
+- **IPAM ⇒ ubuntu.** The pre-P5d degradation is in NAT *scope* — which CIDRs get a
+  MASQUERADE rule (`crates/tunnel-core/src/overlay/nat.rs:119-133`) — which is
+  platform-independent, and the ubuntu lane is the cheaper driver.
+
+### What actually breaks on a pre-P5d agent (narrower than assumed)
+
+A pinned old agent receives its **own** block in the per-recipient `cidr`
+(`crates/api/src/ws/overlay.rs:623-626`), so netmask, per-peer `/32` routes and
+`set_local_scope` are all **correct**. Unknown *fields* are silently ignored — there is no
+`deny_unknown_fields` anywhere in `crates/remote_control` or `crates/tunnel-core`. Unknown
+*variants* are fatal to the whole `ServerMsg` parse, but `agent-v0.4.42` already carries
+`OverlayJoinRefused`, and the server gates that send on `supports_join_refusal` anyway.
+
+The one real degradation: **a pre-P5d subnet router masquerades only its own block**, so
+traffic from block 1 to a LAN behind a block-0 router black-holes one-way, silently.
+
+⚠️ The genuinely catastrophic shape is a **pre-P5d SERVER** against a grown org with
+**mixed prefixes** (`/16` block 0 + `/22` block 1): the node computes a connected prefix
+that swallows other tenants' blocks. Uniform `/22` survives a rollback by accident.
+
+### The two gaps in #1246's shipped fix, closed here
+
+**C2(a)** `foreign_in_block_fp` (`tun.rs:816-820`) still reads
+`r.InterfaceLuid.Value == ours` where its three siblings were converted to
+`route_belongs_to_us` (`tun.rs:681`, `:755`, `:867`). #1246's commit message claims all four
+were converted; three were. A sibling org's peer churn therefore flips the in-block debounce
+fingerprint and triggers a full FIB walk that deletes nothing — the anti-flap guard defeated
+on exactly the multi-org host it was written for.
+
+**C2(b)** FR-64 C2 specifies "a WARN when two orgs' blocks overlap". It was never
+implemented (`grep -i overlap` over `tun.rs` and `agents/roomlerd/src/overlay.rs` finds
+nothing). With nested blocks — a legacy `/10` primary beside a carved `/22` secondary —
+`defended_ula_prefix` (`tun.rs:1773-1791`) produces **nested, not disjoint** v6 prefixes and
+the war can silently re-open.
+
+⚠️ A WARN is a detector, not a fix. It makes the condition attributable instead of silent —
+the argument FR-33's `lan` line won on. The structural fix (refuse to carve a block nested
+inside a live one) belongs to FR-47's reconciler, not here.
+
+### The assertion surface does not exist yet (C1)
+
+There is **no counter** for route evictions or carrier revalidations. Both are log-only,
+throttled to **1 WARN/min/prefix** carrying `suppressed_since_last` — a naive `grep -c`
+under-reports by up to 40×. Three cumulative counters, following the canonical path
+`crates/tunnel-core/src/evidence.rs:36-37` → `crates/localapi/src/lib.rs:180` →
+`agents/roomler-cli/src/localclient.rs:1381-1387`:
+
+`ROUTE_EVICTIONS` (split `sibling` / `foreign`) · `ROUTE_WAVES` · `FORCED_REVALIDATIONS`
+
+Cumulative, printed only when non-zero, carrying the "DIFF two readings" note.
+
+### Auto-yield is still gated to metric-0 — noted, not fixed here
+
+The per-prefix strike counter and the `keeps DISAPPEARING` WARN are generalised to every
+metric (`tun.rs:488-528`), but the **yield latch is hard-gated on `metric == 0`**
+(`tun.rs:517-527`) and metric-0 is default-OFF, so on the fleet the latch is dead code.
+A metric-1 war — Cisco's, or #1237's — can never self-limit. Out of scope here; recorded so
+the next reader does not assume back-off exists.
+
+## Phases
+
+| # | Phase | Kill switch |
+|---|---|---|
+| P0 | Claim FR-68 (spec + ledger row, same commit) + issue | — |
+| P1 | L1 in-repo tests | n/a (tests only) |
+| P2 | C1 — three cumulative counters; field-verify on neo16 + CORPLAP-3 | read-only instrumentation |
+| P3 | C2(a) predicate swap · C2(b) overlap WARN | `OVERLAY_SIBLING_EXEMPT` (a); WARN-only (b) |
+| P4 | Harness two-tenant plumbing + full 18-cell regression run | `VMTEST_TENANT_ID_B` absent ⇒ cells NA |
+| P5 | The two cells, incl. the `multiorg-control` negative control | the cell tuples |
+| P6 | L3 fleet read-only arm | — |
+| P7 | Handover; decide on `multi_block_enabled` | the flag itself |
+
+## Acceptance criteria
+
+- [ ] **AC1** A pre-P5d `OverlayNetworkInfo` decodes a real grown-org netmap without error
+      and ignores `cidrs` — proven with the struct copied verbatim from `agent-v0.4.42`.
+- [ ] **AC2** A real `agent-v0.4.42` daemon meshes in a grown org, and its **subnet-router**
+      limitation is demonstrated rather than assumed (block-1 → block-0-router LAN).
+- [ ] **AC3** A cross-tenant carve racing a grow does not silently refuse the joiner.
+- [ ] **AC4** Renumber against a grown org does not duplicate a `seq`.
+- [ ] **AC5** `ensure_indexes(db, false)` after growth fails loudly.
+- [ ] **AC6** `ROUTE_EVICTIONS` / `ROUTE_WAVES` / `FORCED_REVALIDATIONS` are live and were
+      read on two real multi-org hosts, **as a diff of two readings**.
+- [ ] **AC7** With C2(a)+C2(b), a two-org Windows guest shows **zero sibling evictions**
+      over a sustained window.
+- [ ] **AC8** The negative control (`OVERLAY_SIBLING_EXEMPT=0`) **reproduces** the war —
+      i.e. AC7 is not passing vacuously.
+- [ ] **AC9** A nested-block pair (legacy `/10` primary + carved `/22` secondary) emits the
+      overlap WARN.
+- [ ] **AC10** The 18 pre-existing vmtest cells are unchanged by the two-tenant plumbing.
+
+## Open decisions
+
+- Whether `multi_block_enabled` flips on after P5, or waits for a real org to approach its
+  ceiling. Largest org today is 17 devices against 1 022.
+- Whether the mixed-prefix (`/16` + `/22`) shape should be **refused at grow time** rather
+  than merely tested — it is the only shape where a server rollback is catastrophic.
+
+## Out of scope
+
+- Generalising auto-yield beyond metric-0 (its own FR — see above).
+- The structural fix for nested blocks (FR-47 reconciler).
+- The pump-loop stall detector and the other items from the blocking-work analysis.
+- Anything that mutates grox / demo / jovanov: the fleet arm is **read-only**.
+
+## Where this stands — handover, 2026-09-03
+
+### Shipped (branch `fr68-stress-cells`, PR #1273 — not merged)
+
+| Commit | What |
+|---|---|
+| `a604490c` `325b2f2a` | FR claimed (spec + ledger row in one commit), issue linked |
+| `a35720b6` | P1 — pinned pre-P5d decoder test (unit) |
+| `182a4121` | P1 — same claim against a **server-produced** netmap (e2e) |
+| `044f08f2` | P1 — one-way door: `multi_block` off after a grow fails the boot |
+| `293d35a0` | C1 — four route-guard evidence counters |
+| `dbf548b9` | C2 — `foreign_in_block_fp` predicate + the overlap WARN |
+
+Deploy repo, branch `fr68-vmtest-cells` (pushed, no PR yet): `129c33e` — the
+two-tenant plumbing.
+
+### The finding that should change how the rest is scoped
+
+**The pre-P5d blast radius is much smaller than FR-47 assumed.** An old agent is
+sent its OWN block in the per-recipient `cidr`, so its netmask, its per-peer
+`/32`s and `set_local_scope` are all correct, and unknown *fields* are ignored
+(no `deny_unknown_fields` anywhere in `remote_control`/`tunnel-core`). The only
+real degradation is a pre-P5d **subnet router**: it masquerades one block, so
+traffic from block 1 to a LAN behind a block-0 router black-holes one-way,
+silently. Ordinary peer-to-peer overlay traffic in a grown org is unaffected.
+
+⇒ The IPAM cell only needs to cover the **subnet-router** role. A plain node
+proves nothing that `a35720b6`/`182a4121` do not already prove.
+
+### What is left, in order
+
+### ⚠️⚠️ The IPAM cell CANNOT run against production — verified, not assumed
+
+Growth is gated server-side on `overlay.multi_block_enabled`
+(`crates/api/src/ws/overlay.rs:393`). The prod configmap
+(`k8s/base/configmap-roomler2-config.yaml:62`) sets
+`ROOMLER__OVERLAY__BLOCKS_ENABLED: "true"` and **sets `MULTI_BLOCK` nowhere**, so
+production runs the code default `false`. Turning it on is a **one-way door for
+that database**: once any network holds two assigned blocks the
+one-block-per-network index cannot be recreated and the boot fails loudly —
+which `044f08f2` now proves rather than assumes.
+
+So the plan as approved was circular: it wanted to verify growth on the org
+whose server has growth switched off, and the switch is the thing the
+verification exists to license.
+
+**Resolution — the `e2e` overlay.** `k8s/overlays/e2e` is a complete, separate
+stack (own configmap, own mongo/minio secrets, own deployment) and is
+deliberately NOT ArgoCD-managed. Adding
+`ROOMLER__OVERLAY__MULTI_BLOCK_ENABLED: "true"` there confines the one-way door
+to a throwaway database, and the IPAM cell points its VM at that server instead
+of `https://roomler.ai`. ⚠️ That means the cell needs `VMTEST_SERVER` to be
+per-cell rather than global — currently it is one value in `lib.sh:18`.
+
+The multi-org cell has no such problem: it needs two orgs, not a server flag,
+and can run against prod.
+
+**P5 — the two cells.** Blocked on nothing but work + a harness run.
+- `guest/win-lane.ps1`: extend `[ValidateSet('system','attended','user')]` with
+  `multiorg`; `lanes/win11/cell.sh:110` lifting loop gains `multiorg-mesh`,
+  `multiorg-noevict`, `multiorg-control`.
+- `guest/linux-lane.sh`: an `ipam` branch; `lanes/ubuntu/cell.sh:79` gains
+  `ipam-grown`, `ipam-router`, `ipam-pinned`.
+- Add the tuples to `vmtest.sh` `default_cells` **last** — they were
+  deliberately withheld from `129c33e` because the lane scripts reject an
+  unknown `--type`, and advertising a cell with no driver breaks a matrix run.
+
+⚠️ **The guest sequence must resolve two rules that collide.** Flipping
+`overlay_multi_org` requires a daemon restart (`org_join.rs:98-102,191-216`),
+while FR-51 says never SIGTERM an ephemeral daemon — it self-unenrolls and its
+row is deleted. Resolution: write the FULL config (both enrollments + the flag)
+*before* the daemon's single clean start. install → stop the auto-started
+configless service → enroll primary → enroll `--label b` → set flag +
+`org overlay b tun` → **one** clean start.
+
+⚠️ **The negative control is a PASS, not an expected failure.**
+`expected-failures.txt` is an exact result-id match; putting an intentionally
+inverted cell in it would rot the ledger. `multiorg-control` re-runs with
+`OVERLAY_SIBLING_EXEMPT=0` / `OVERLAY_V6_DEFEND_NARROW=0` and passes **when the
+eviction counter climbs**. A cell whose control does not reproduce the war is
+not measuring anything.
+
+⚠️ `roomler status --json` has **no per-org address field** — the overlay
+address is top-level `.overlay_ip`. A multi-org cell needs a per-org assertion
+surface that does not exist yet; the `route guard` counters (C1) are the
+substitute.
+
+**P6 — fleet arm (AC6).** Needs the C1 counters actually deployed; numbers that
+have never moved are not evidence. ⚠️ **neo16's `jovanov` enrollment is DOWN**
+(`server goodbye (AgentDeleted)`) — it needs a fresh enrollment token before it
+is a multi-org host again. CORPLAP-3 is the other.
+
+**Remaining P1 tests** (optional, lower value):
+- Cross-tenant carve racing a grow. ⚠️ Resists a deterministic test: the bug
+  needs an interleaving between `allocate`'s slot read and its insert, and
+  there is no hook. The fix looks narrow — the `DuplicateKey` early return is
+  only correct when `seq == 0` (a network's FIRST block); on a grow (`seq > 0`)
+  a duplicate can only mean a slot race, so it must retry. That is a
+  discriminator using a parameter the function already takes.
+- Renumber-after-grow `seq` collision (deterministic, straightforward).
+
+### Environment notes for the next session
+
+- ⚠️ **WSL and Windows cargo share `target/` and thrash** — every switch forces
+  a full ~11–13 min rebuild. Use a WSL-local `CARGO_TARGET_DIR` on ext4: 4m34s
+  cold, seconds incremental.
+- Integration tests need BOTH `ROOMLER__DATABASE__URL` and
+  `ROOMLER__REDIS__URL` on this box; without mongo auth every test dies in
+  ~0.03 s with `Command createIndexes requires authentication`.
+- `roomler ssh mars` is refused (policy off); `roomler exec` works but
+  re-splits argv, so multi-word commands need care.
+- The deploy repo stores **LF** (`git ls-files --eol` → `i/lf w/crlf`); the
+  Windows worktree is CRLF via `autocrlf`. `git cat-file -p` applies the smudge
+  filter and will mislead you — use `git ls-files --eol`.
+
+## Field-verification log
+
+_(empty — nothing field-verified yet. AC6 and AC7–AC9 all require a real host.)_
