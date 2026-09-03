@@ -5070,10 +5070,18 @@ async fn media_pump_ffmpeg_dc(
             // 🔑 That is not a stall, and a watch that cries about idling is
             // one people learn to ignore — which costs exactly the signal the
             // watch exists for. The instrument's purpose is BLOCKING WORK on a
-            // shared runtime; waiting for a frame is the loop idling by design.
-            // Both numbers are still logged, so a genuinely expensive capture
-            // is still visible in `capture_ms` (and in `avg_capture_ms` on the
-            // heartbeat) — only the stall DECISION excludes the wait.
+            // shared runtime; waiting for a frame is the loop idling by design,
+            // and it genuinely IS idling: every capture backend hands the work
+            // to a thread that owns the `!Send` device and returns a future —
+            // oneshot-to-worker for scrap/drm/system-context, `Notify` for wgc.
+            //
+            // ⚠️ THE COST OF THIS RULE: a pathological capture — a wedged DXGI
+            // duplication, an EDR filter stalling the desktop, a driver hang —
+            // now CANNOT trip the stall watch, and `pump_stalls` under-counts
+            // by construction. `capture_ms` is still logged here and
+            // `avg_capture_ms` on the heartbeat, so it is visible to a reader,
+            // but nothing ALERTS on it any more. If capture ever needs its own
+            // alarm it needs its own threshold, not this one back.
             let work_us = took_us.saturating_sub(capture_us.saturating_sub(c0));
             if work_us >= stall_warn.as_micros() as u64 {
                 pump_stalls += 1;
@@ -5896,21 +5904,42 @@ async fn media_pump_ffmpeg_dc(
                 0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
                 applied => ceiling.min(applied),
             };
-            // FR-65 P0/P1 — the open is BLOCKING (0.62-0.73 s measured on
-            // Iris Xe at session start, 2026-09-03) and this pump runs under
+            // FR-65 — the open is BLOCKING (0.62-0.73 s measured on Iris Xe at
+            // session start, 2026-09-03) and this pump runs under
             // `tokio::spawn`, i.e. on a SHARED runtime worker. `roomlerd` is one
             // process: overlay, DERP, tunnels and the WS control plane are on
             // those same workers, so a synchronous open here is not merely a
-            // late first frame — it is a runtime-wide tax at the exact moment a
-            // session is establishing.
+            // late first frame.
             //
-            // `spawn_blocking` + await keeps the wall-clock identical (the loop
-            // is sequential either way; it had nothing to do meanwhile) while
-            // freeing the worker. Every open goes through here — the first one
-            // AND the dims/chroma/backend rebuilds — so this covers P1 without
-            // the swap machinery, which structurally cannot: `rebuild_spec`
-            // carries only a bitrate and `adopt_rebuilt` discards a geometry
-            // change.
+            // ⚠️ SIZE THE CLAIM HONESTLY. The runtime is `new_multi_thread()`
+            // with no `worker_threads` (main.rs), so it defaults to the core
+            // count and blocking one worker is a 1/N capacity hit that
+            // work-stealing routes around — severe on a 2-core VM, a cluster
+            // node or WSL, modest on a 16-core desktop. It is NOT a whole-
+            // runtime stall (that would need a `current_thread` runtime), and
+            // the size of the win here is UNMEASURED.
+            //
+            // `spawn_blocking` + await frees the worker at the same wall-clock
+            // TO WITHIN SCHEDULING JITTER — the loop is sequential and had
+            // nothing else to do, but it now has to be rescheduled, which is
+            // noise against 700 ms and not literally identical.
+            //
+            // ⚠️ This covers P1's RUNTIME half ONLY. Every open goes through
+            // here — the first one and the dims/chroma/backend rebuilds — but
+            // the session is still WITHOUT AN ENCODER for the whole open,
+            // because the old one is torn down before the new one is built.
+            // P1's actual goal is make-before-break, and that needs
+            // `rebuild_spec` to carry GEOMETRY so the swap machinery can hold
+            // the old encoder live; today it carries only a bitrate and
+            // `adopt_rebuilt` discards a dims change. The runtime tax is fixed
+            // here; the session-visible stall is not.
+            //
+            // ⚠️ `spawn_blocking` tasks are UNCANCELLABLE. If the session tears
+            // down mid-open the open still runs to completion and the encoder
+            // is built and immediately dropped — so a rapid connect/disconnect
+            // cycle briefly holds a HW encoder session for a dead session.
+            // Harmless today; it would stop being harmless if a host ever runs
+            // near the per-adapter encode-session limit.
             //
             // ⚠️ Timed around the AWAIT, not the call, so `open_ms` stays the
             // honest wall-clock cost of getting an encoder.
