@@ -4133,6 +4133,89 @@ mod tests {
         assert_eq!(back.cidrs, vec![back.cidr.clone()]);
     }
 
+    /// FR-68 / FR-47 P5d — the half of the compatibility claim that was missing.
+    ///
+    /// The test above proves OLD-server → NEW-decoder. This proves the direction
+    /// that actually carries risk, and the one FR-47 flagged as unargued: a P5d
+    /// server's netmap **for a GROWN org**, decoded by an agent that has never
+    /// heard of `cidrs`.
+    ///
+    /// The decoder below is copied VERBATIM from `agent-v0.4.42` — the last
+    /// release before P5d (`agent-v0.4.43` is the first with it). ⚠️ Do not
+    /// "modernise" it or share it with the real types: its entire value is that
+    /// it is frozen. It has no `cidrs` and no `deny_unknown_fields`, and that
+    /// pairing is the property under test — serde ignores an unknown FIELD,
+    /// while an unknown internally-tagged VARIANT would fail the whole frame
+    /// (locked separately by
+    /// `pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fires`).
+    ///
+    /// ⚠️ What this does NOT prove: that the SERVER picks the right block. The
+    /// netmap here is hand-built, so `cidr` is whatever this test wrote. The
+    /// server's per-recipient choice is asserted end-to-end in
+    /// `overlay_growth_tests`, against a netmap the server actually sent.
+    #[test]
+    fn a_grown_org_netmap_decodes_on_a_pinned_pre_p5d_agent() {
+        #[derive(Deserialize)]
+        struct PinnedNetworkInfo {
+            cidr: String,
+            #[allow(dead_code)]
+            mtu: u16,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "t")]
+        enum PinnedServerMsg {
+            #[serde(rename = "rc:overlay.netmap")]
+            OverlayNetmap {
+                self_ip: String,
+                network: PinnedNetworkInfo,
+            },
+        }
+
+        // A GROWN org: block 0 is full, block 1 was appended. This node holds an
+        // ordinal in block 1, so P5d sends it block 1 as its own `cidr`.
+        let grown = ServerMsg::OverlayNetmap {
+            self_ip: "100.65.8.1".into(),
+            network: OverlayNetworkInfo {
+                cidr: "100.65.8.0/22".into(),
+                cidrs: vec!["100.65.4.0/22".into(), "100.65.8.0/22".into()],
+                mtu: 1280,
+                magic_domain: None,
+                nameservers: vec![],
+                self_name: None,
+                stun_urls: vec![],
+            },
+            peers: vec![],
+            epoch: 7,
+        };
+        let wire = serde_json::to_string(&grown).unwrap();
+
+        let decoded: PinnedServerMsg = serde_json::from_str(&wire).expect(
+            "a pre-P5d agent must still decode a grown-org netmap; if this fails, \
+             every agent below 0.4.43 is stranded the moment an org grows",
+        );
+        let PinnedServerMsg::OverlayNetmap { self_ip, network } = decoded;
+
+        // The on-link prefix the old agent derives contains its own address and
+        // excludes the other block — checked structurally, never by string
+        // prefix. FR-47 recorded that trap: a `starts_with` test passed against
+        // wrong behaviour.
+        let (base, plen) = network.cidr.split_once('/').unwrap();
+        let base: std::net::Ipv4Addr = base.parse().unwrap();
+        let plen: u32 = plen.parse().unwrap();
+        let mask = u32::MAX << (32 - plen);
+        let contains = |ip: &str| {
+            let ip: std::net::Ipv4Addr = ip.parse().unwrap();
+            u32::from(ip) & mask == u32::from(base) & mask
+        };
+        assert!(contains(&self_ip), "the node's own address must be on-link");
+        assert!(
+            !contains("100.65.4.7"),
+            "a block-0 address must NOT fall inside block 1's on-link prefix — \
+             cross-block peers are reached by their per-peer /32s"
+        );
+    }
+
     /// FR-47 — the refusal frame round-trips, and an OLD node that omits
     /// `supports_join_refusal` decodes as `false` so the server withholds it.
     #[test]

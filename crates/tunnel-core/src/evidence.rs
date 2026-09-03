@@ -61,3 +61,39 @@ pub static DISCO_PONG_DROPS: AtomicU64 = AtomicU64::new(0);
 /// costs the initiating peer a ~5 s retransmit; a burst here during a
 /// churn storm explains "slow re-establish" without blaming the network.
 pub static DIRECT_INBOUND_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// FR-68 — competing routes this node DELETED from the FIB.
+///
+/// #1237 ran for weeks and #1246 fixed it with nothing to measure either by:
+/// an eviction has only ever been a WARN, and that WARN is throttled to
+/// **1/min/prefix**, so counting log lines under-reports the true rate by up
+/// to 40×. On a settled host this should be flat. Climbing steadily means a
+/// route war — we delete, the competitor re-adds, neither side holds the FIB
+/// (measured against AnyConnect: 25,197 → 33,294 in one day).
+pub static ROUTE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// FR-68 — rows we declined to evict **because they belong to a sibling
+/// roomler adapter** (another org's per-org TUN in this process, or a
+/// co-tenant daemon's, matched by adapter alias).
+///
+/// ⚠️ This is deliberately NOT "sibling evictions". After #1246 a sibling row
+/// is SPARED, so a sibling eviction is unreachable by construction — a counter
+/// for it would read zero whether the fix works or has been reverted, and
+/// would prove nothing either way. What is observable is the sparing itself:
+/// on a multi-org host this climbs while [`ROUTE_EVICTIONS`] stays flat, and
+/// with `OVERLAY_SIBLING_EXEMPT=0` that inverts. The pair is the assertion;
+/// neither half means much alone.
+pub static ROUTE_SIBLING_SPARES: AtomicU64 = AtomicU64::new(0);
+
+/// FR-68 — route-defense waves run. The wave re-asserts every peer route, so
+/// it is the unit of work a route war multiplies: each eviction is a FIB
+/// change, which feeds our own route-change subscription, which arms the next
+/// wave (rate-limited to 1 per 3 s). Waves/min far above the 30 s heartbeat
+/// cadence means the guard is driving itself.
+pub static ROUTE_WAVES: AtomicU64 = AtomicU64::new(0);
+
+/// FR-68 — carrier revalidations forced by a network change ("forced rekey
+/// poke"). Each one re-keys every peer and can demote a healthy direct
+/// carrier, so this is the counter that turns "the mesh feels unstable" into
+/// a number. ~100/min was the #1237 signature on a two-org host.
+pub static FORCED_REVALIDATIONS: AtomicU64 = AtomicU64::new(0);
