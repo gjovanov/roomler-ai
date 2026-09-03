@@ -3028,6 +3028,25 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
     }
   })
 
+  it('parses the FR-33 P3 transport_reason and leaves it absent otherwise', () => {
+    const named = parseControlInbound(
+      '{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600,"viewers":1,"transport_reason":"lan-captured"}',
+    )
+    expect(named?.kind).toBe('video_info')
+    if (named?.kind === 'video_info') {
+      expect(named.info.transport_reason).toBe('lan-captured')
+    }
+    // Pre-P3 agents (and every relay with another cause) omit the key: the
+    // parsed object must not carry it at all, so the pill stays plain.
+    const plain = parseControlInbound(
+      '{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay"}',
+    )
+    expect(plain?.kind).toBe('video_info')
+    if (plain?.kind === 'video_info') {
+      expect('transport_reason' in plain.info).toBe(false)
+    }
+  })
+
   it('parses the P6 arbiter state broadcast (rc:control.state)', () => {
     const parsed = parseControlInbound(
       '{"t":"rc:control.state","mode":"exclusive","holder":"aabbccdd00112233aabbccdd","participants":[{"session":"aabbccdd00112233aabbccdd","name":"Goran","input":true},{"session":"ffeeddcc00112233aabbccdd","name":"Ana","input":false}]}',
