@@ -134,6 +134,14 @@ pub struct GovernorFlags {
     /// FR-59 P4 — a transit queue too deep to cut our way out of is
     /// DRAINED by pausing production (`encode::queue_drain_enabled`).
     pub queue_drain: bool,
+    /// FR-63 — the opener ramps instead of committing to a constant
+    /// (`encode::rate_slow_start_enabled`).
+    ///
+    /// ⚠️ The ONE flag here that is **not** the shipped posture: it defaults
+    /// OFF, in `Default` too, because this FR's rule is that no controller
+    /// change ships live without field evidence. Every other field defaults
+    /// on because it already earned that.
+    pub slow_start: bool,
 }
 
 impl Default for GovernorFlags {
@@ -147,6 +155,8 @@ impl Default for GovernorFlags {
             seed_contradiction: true,
             viewer_rate_clamp: true,
             queue_drain: true,
+            // FR-63 — see the field doc: OFF even here, until field evidence.
+            slow_start: false,
         }
     }
 }
@@ -166,6 +176,7 @@ impl GovernorFlags {
             seed_contradiction: super::seed_contradiction_enabled(),
             viewer_rate_clamp: super::viewer_rate_clamp_enabled(),
             queue_drain: super::queue_drain_enabled(),
+            slow_start: super::rate_slow_start_enabled(),
         }
     }
 }
@@ -260,6 +271,16 @@ pub struct RateGovernor {
     /// FR-35 learner only ever RAISES the ceiling), a 372 KB opener into a
     /// ~300 kbps pipe — ten seconds of queue before any measurement spoke.
     open_seed_bps: Option<u32>,
+    /// FR-63 — the opener's ramp. Lazily built at the first CONSTRAINED tick
+    /// because it needs that tick's RESOLVED ceiling, exactly as the AIMD is.
+    /// `None` while the flag is off, on a direct transport, or once the ramp
+    /// has finished — the three cases where the normal controller is already
+    /// the right answer.
+    slow_start: Option<super::slow_start::SlowStart>,
+    /// FR-63 — did any congestion signal arrive since the last viewer window?
+    /// The ramp doubles on a clean window and ENDS on a dirty one, so this is
+    /// the one bit of state that decides which.
+    slow_start_congested: bool,
 }
 
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
@@ -322,6 +343,8 @@ impl RateGovernor {
             drain_until: None,
             open_seed_bps: ceiling_seed_bps
                 .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
+            slow_start: None,
+            slow_start_congested: false,
         }
     }
 
@@ -463,6 +486,10 @@ impl RateGovernor {
     /// starvation fix) — no-op until the AIMD exists (first frame not
     /// yet encoded).
     pub fn on_backpressure_skip(&mut self, now: Instant) -> Option<AppliedBitrate> {
+        // FR-63 — congestion for the opener's ramp, recorded BEFORE the `?`
+        // below so it is not lost when the AIMD has not been built yet. The
+        // first frames of a session are exactly when that happens.
+        self.slow_start_congested = true;
         let ctrl = self.aimd.as_mut()?;
         ctrl.observe(self.send_depth as u32, true, now);
         let bps = ctrl.take_pending()?;
@@ -579,6 +606,29 @@ impl RateGovernor {
                 .max(1),
             _ => ceiling_bps,
         };
+        // FR-63 — the opener has no evidence yet, so it must not commit to
+        // whatever constant the chain above produced. Build the ramp from THIS
+        // tick's RESOLVED ceiling (the AIMD below is built the same way) and
+        // cap the ceiling by it until the ramp finishes.
+        //
+        // Field 2026-09-03: this ceiling was 2_550_000 on a path measured at
+        // 213_180 — 12× over, 444 ms of queue, a 1550 ms paint, then six
+        // windows collapsing to the truth. The same host over-drove from the
+        // OPPOSITE direction a day earlier with a remembered 6_134_627 and a
+        // 6287 ms paint. No constant was safe; only measuring is.
+        //
+        // ⚠️ Constructed once and kept once `done` — dropping it would let
+        // `get_or_insert_with` restart the ramp on the next tick and re-open a
+        // session that had already earned its rate.
+        if self.slow_link.slow_start && constrained {
+            let _ = self
+                .slow_start
+                .get_or_insert_with(|| super::slow_start::SlowStart::new(floor_bps, ceiling_bps));
+        }
+        let ceiling_bps = match self.slow_start.as_ref() {
+            Some(ss) if !ss.done() => ceiling_bps.min(ss.target_bps()).max(1),
+            _ => ceiling_bps,
+        };
         // FR-59 P1 — the legibility floor descends toward a measured pipe.
         // `MIN_BITRATE_BPS` is calibrated for the 2–9 Mbps band every
         // measured relay sat in; below it the floor is not a floor but a
@@ -643,6 +693,9 @@ impl RateGovernor {
     /// (a big IDR / motion frame the link can't drain) — a secondary
     /// congestion signal (rate-limited MD internally).
     pub fn on_send_overflow(&mut self, now: Instant) -> Option<AppliedBitrate> {
+        // FR-63 — congestion for the opener's ramp; see `on_backpressure_skip`
+        // for why this precedes the `?`.
+        self.slow_start_congested = true;
         let ctrl = self.aimd.as_mut()?;
         ctrl.note_buffer_overflow(now);
         let bps = ctrl.take_pending()?;
@@ -665,6 +718,8 @@ impl RateGovernor {
     /// routes it through the normal apply arms — the same discipline the
     /// FR-15 age loop follows.
     pub fn note_send_stall(&mut self, wait: Duration, now: Instant) {
+        // FR-63 — a blocked send is congestion for the opener's ramp.
+        self.slow_start_congested = true;
         // FR-35 — a send blocked ≥ 1 s is a HARD stall: ×0.5 at once.
         let hard = self.learner.on_stall(wait, now);
         if let Some(ctrl) = self.aimd.as_mut() {
@@ -721,6 +776,19 @@ impl RateGovernor {
             return None;
         }
         self.viewer_window_at = now;
+        // FR-63 — one verdict per window for the opener's ramp: double if
+        // nothing congested since the last one, otherwise END it. Taking the
+        // flag first keeps the borrow of `self.slow_start` clean.
+        let congested = std::mem::take(&mut self.slow_start_congested);
+        if let Some(ss) = self.slow_start.as_mut()
+            && !ss.done()
+        {
+            if congested {
+                ss.on_congestion();
+            } else {
+                ss.on_clean_window();
+            }
+        }
         // FR-35 — the window's delivered rate, from the send task's running
         // byte total (bits per second over the actual elapsed window).
         let sent_bps: u32 = {
@@ -1017,6 +1085,60 @@ mod tests {
             None,
             now,
         )
+    }
+
+    /// FR-63 — the WIRING, not the law (the law is unit-tested in
+    /// `encode::slow_start`). A constrained session must not open at whatever
+    /// constant the ceiling chain resolved.
+    ///
+    /// Field 2026-09-03 (CORPLAP-1 over a corp VPN): it opened at 2_550_000
+    /// into a path measured at 213_180 — 444 ms of queue, a 1550 ms paint,
+    /// then six windows collapsing to the truth.
+    #[test]
+    fn slow_start_caps_the_opening_ceiling_only_when_enabled_and_constrained() {
+        const PLAN_CEILING: u32 = 2_550_000;
+        const FLOOR: u32 = 200_000;
+        let open = crate::encode::slow_start::OPEN_BPS;
+        let t0 = Instant::now();
+        let mk = |slow_start: bool| {
+            RateGovernor::new(
+                30,
+                DEPTH,
+                GovernorFlags {
+                    slow_start,
+                    ..GovernorFlags::default()
+                },
+                0,
+                None,
+                t0,
+            )
+        };
+
+        // ON + constrained: capped at the ramp's opening rate.
+        let mut on = mk(true);
+        on.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, t0);
+        assert!(
+            on.applied_bps() <= open,
+            "opened at {} — slow-start must cap it at {open}",
+            on.applied_bps()
+        );
+
+        // OFF: byte-for-byte the old behaviour — the session opens high.
+        let mut off = mk(false);
+        off.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, t0);
+        assert!(
+            off.applied_bps() > open,
+            "the kill switch must restore the old opener"
+        );
+
+        // ON but DIRECT: untouched. The over-drive this fixes was measured on
+        // constrained transports, and a direct pair usually has the headroom.
+        let mut direct = mk(true);
+        direct.pre_encode_tick(PLAN_CEILING, FLOOR, false, DEPTH, t0);
+        assert!(
+            direct.applied_bps() > open,
+            "slow-start must not touch a direct session"
+        );
     }
 
     /// FR-59 P8 — a constrained governor with the FR-35 rate memory seeded.
