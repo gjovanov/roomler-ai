@@ -612,6 +612,31 @@ const KEYS: &[(&str, &str, &str)] = &[
         "In-place encoder rate changes (2026-09-02, FR-62 A1). Default OFF: a QSV rate move REBUILDS the encoder (a 0.65-0.87 s blocking open on Iris-Xe-class, the reason the defer/swap machinery exists), and the NVENC in-place move writes a 1x HRD buffer. ON: QSV writes bit_rate + rc_max_rate + rc_buffer_size on the AVCodecContext (qsvenc's per-frame update_bitrate resets the BRC, no rebuild) and NVENC sizes the buffer to the window the session opened with. Ships OFF and inert until A0 clears the QSV MFXVideoENCODE_Reset on real Iris-Xe silicon; OFF is byte-for-byte the pre-A1 behaviour. Env: ROOMLERD_ENCODER_INPLACE_RATE. Restart required.",
     ),
     (
+        "ice_relay_tcp",
+        "tribool",
+        "Pin remote-control's ICE to a TURN relay (diagnostic). Default OFF: the session takes whatever pair ICE nominates, and `constrained` is MEASURED from that pair (a public relay candidate = constrained; the loopback-TURN does not count). ON forces the relay path, which is bandwidth- and head-of-line-limited, so the encoder runs its constrained posture. ⚠️ This DEGRADES a session that would otherwise be direct - it is a test pin, not a tuning knob, and a device left with it set will be slow for no visible reason. It exists as a key because the constrained posture is otherwise only reproducible when a corporate VPN happens to be up, which makes every constrained-path acceptance test hostage to one laptop's network state; virtual-desktop mode sets the same flag for the same reason. Clear it (empty = default) when the measurement is done. WARNING: on a VIRTUAL-DESKTOP host with a hostile NAT the vd startup auto-pins this to 1, and its check for an explicit operator override reads the OS env var ONLY - so setting this key to false there does not defeat the auto-pin; use a real ROOMLERD_ICE_RELAY_TCP=0 for that one case. Env: ROOMLERD_ICE_RELAY_TCP. Restart required.",
+    ),
+    (
+        "rate_slow_start",
+        "tribool",
+        "Slow-start the session opener (2026-09-03, FR-63). Default OFF. A session commits to a bitrate before it has any evidence about the pipe, and the same host over-drove from BOTH directions on one day: opened at a REMEMBERED 6134627 -> 6287ms of viewer paint age; opened at the NOMINAL relay cap 2550000 into a path measured at ~213000 -> 444ms of queue, 1550ms paint, and six windows collapsing back down. No constant is safe, because a constant is an assumption about a band. ON: open at 300000 (lifted by any PROVEN floor, e.g. the FR-59 P8 remembered-slow-pair open) and DOUBLE per clean window until the ceiling; the first congestion evidence ends the ramp and hands control back to the normal controller. A fast pair reaches a 6.1 Mbps ceiling in 5 windows. Only ever LOWERS the opening commitment - it can never raise a rate above what the controller already allows. Env: ROOMLERD_RATE_SLOW_START. Restart required.",
+    ),
+    (
+        "pump_stall_watch",
+        "tribool",
+        "Pump stall watch (2026-09-03, FR-65 P0). Default ON: a send-pump iteration slower than pump_stall_warn_ms is logged once with its phase breakdown (capture/scale/encode/apply/send), and the per-heartbeat apply_us / apply_us_max / iter_us_max / pump_stalls counters are published. Costs two Instant::now() per iteration (~20-40ns against a 16.7ms budget at 60fps) and logs nothing until an iteration actually overruns. It exists because a 2s blocking encoder open hid for months: the pump measured capture/scale/encode/send and the stall appeared in NONE of them - the apply/rebuild phase was untimed, and a per-heartbeat AVERAGE cannot represent a single outlier even where it is counted. false = no timing, no counters. Env: ROOMLERD_PUMP_STALL_WATCH. Restart required.",
+    ),
+    (
+        "pump_stall_warn_ms",
+        "number",
+        "Pump stall threshold in ms (2026-09-03, FR-65 P0). Built-in default: 100; clamped 10-5000. Lowered from the 250 this shipped with, because the first field data said 250 was blind to the class that actually hurts: a corp-VPN host reported iter_ms_max=107.6 - real 100ms+ passes, matching the operator's own '>100ms' and '>148ms' age reports - while pump_stalls stayed 0. Deliberately a FLAT wall-clock threshold, NOT a multiple of the frame budget: the pump lowers target_fps BECAUSE it is already struggling, so a budget-relative bar RISES as the session degrades and stops reporting precisely when the trouble starts. Env: ROOMLERD_PUMP_STALL_WARN_MS. Restart required.",
+    ),
+    (
+        "bg_rebuild_constrained",
+        "tribool",
+        "Off-thread encoder rebuild on CONSTRAINED transports too (2026-09-03, FR-65). Default ON: a rebuild-mode encoder open is 0.65-0.87s of BLOCKING work on Iris-Xe-class silicon, and running it on the send pump stalls capture, encode and send together - measured as a ~2s hole. The open now runs on spawn_blocking for constrained paths as it already did for direct ones. Changes only WHERE the open runs, never WHEN the change lands: adoption stays gated on the same quiet window the defer policy uses, so the swap's IDR still arrives on a static scene - adopting mid-motion on a thin pipe is the 2026-08-27 relay regression that put the !constrained guard there originally. false = rebuild inline on constrained paths (pre-FR-65). Env: ROOMLERD_BG_REBUILD_CONSTRAINED. Restart required.",
+    ),
+    (
         "slow_link_floor",
         "tribool",
         "Slow-link floor relief (2026-09-01, FR-59 P1). Default ON: on a CONSTRAINED transport the AIMD legibility floor descends toward the session MEASURED drain rate instead of pinning at the flat 1.5 Mbps MIN_BITRATE_BPS. That flat floor is calibrated for the 2-9 Mbps band every measured relay sat in; on a slower link it is not a floor but a PIN, because it is also where the multiplicative decrease bottoms out - field 2026-09-01 measured a 395 kbps pipe met by a 1.5 Mbps floor, 3.8x over, with the excess landing as 2.3-7.1 s of viewer paint age. Evidence-gated: with no held goodput estimate the nominal floor stands, so a session that never measures is byte-for-byte unchanged. Never descends below slow_link_min_bitrate. false = flat floor (pre-FR-59). Env: ROOMLERD_SLOW_LINK_FLOOR. Restart required.",
@@ -876,6 +901,11 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "area_min_bitrate" => cfg.area_min_bitrate.map(fmt_bool),
         "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
         "encoder_inplace_rate" => cfg.encoder_inplace_rate.map(fmt_bool),
+        "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
+        "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
+        "pump_stall_watch" => cfg.pump_stall_watch.map(fmt_bool),
+        "pump_stall_warn_ms" => cfg.pump_stall_warn_ms.map(|p| p.to_string()),
+        "bg_rebuild_constrained" => cfg.bg_rebuild_constrained.map(fmt_bool),
         "slow_link_floor" => cfg.slow_link_floor.map(fmt_bool),
         "slow_link_min_bitrate" => cfg.slow_link_min_bitrate.map(|p| p.to_string()),
         "constrained_queue_measured" => cfg.constrained_queue_measured.map(fmt_bool),
@@ -1288,6 +1318,11 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "area_min_bitrate" => cfg.area_min_bitrate = parse_tribool(value)?,
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
         "encoder_inplace_rate" => cfg.encoder_inplace_rate = parse_tribool(value)?,
+        "ice_relay_tcp" => cfg.ice_relay_tcp = parse_tribool(value)?,
+        "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
+        "pump_stall_watch" => cfg.pump_stall_watch = parse_tribool(value)?,
+        "pump_stall_warn_ms" => cfg.pump_stall_warn_ms = parse_u32_range(key, value, 10, 5000)?,
+        "bg_rebuild_constrained" => cfg.bg_rebuild_constrained = parse_tribool(value)?,
         "slow_link_floor" => cfg.slow_link_floor = parse_tribool(value)?,
         "slow_link_min_bitrate" => {
             cfg.slow_link_min_bitrate = parse_u32_range(key, value, 50_000, 1_500_000)?
