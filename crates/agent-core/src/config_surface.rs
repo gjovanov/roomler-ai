@@ -612,6 +612,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "In-place encoder rate changes (2026-09-02, FR-62 A1). Default OFF: a QSV rate move REBUILDS the encoder (a 0.65-0.87 s blocking open on Iris-Xe-class, the reason the defer/swap machinery exists), and the NVENC in-place move writes a 1x HRD buffer. ON: QSV writes bit_rate + rc_max_rate + rc_buffer_size on the AVCodecContext (qsvenc's per-frame update_bitrate resets the BRC, no rebuild) and NVENC sizes the buffer to the window the session opened with. Ships OFF and inert until A0 clears the QSV MFXVideoENCODE_Reset on real Iris-Xe silicon; OFF is byte-for-byte the pre-A1 behaviour. Env: ROOMLERD_ENCODER_INPLACE_RATE. Restart required.",
     ),
     (
+        "ice_relay_tcp",
+        "tribool",
+        "Pin remote-control's ICE to a TURN relay (diagnostic). Default OFF: the session takes whatever pair ICE nominates, and `constrained` is MEASURED from that pair (a public relay candidate = constrained; the loopback-TURN does not count). ON forces the relay path, which is bandwidth- and head-of-line-limited, so the encoder runs its constrained posture. ⚠️ This DEGRADES a session that would otherwise be direct - it is a test pin, not a tuning knob, and a device left with it set will be slow for no visible reason. It exists as a key because the constrained posture is otherwise only reproducible when a corporate VPN happens to be up, which makes every constrained-path acceptance test hostage to one laptop's network state; virtual-desktop mode sets the same flag for the same reason. Clear it (empty = default) when the measurement is done. Env: ROOMLERD_ICE_RELAY_TCP. Restart required.",
+    ),
+    (
         "rate_slow_start",
         "tribool",
         "Slow-start the session opener (2026-09-03, FR-63). Default OFF. A session commits to a bitrate before it has any evidence about the pipe, and the same host over-drove from BOTH directions on one day: opened at a REMEMBERED 6134627 -> 6287ms of viewer paint age; opened at the NOMINAL relay cap 2550000 into a path measured at ~213000 -> 444ms of queue, 1550ms paint, and six windows collapsing back down. No constant is safe, because a constant is an assumption about a band. ON: open at 300000 (lifted by any PROVEN floor, e.g. the FR-59 P8 remembered-slow-pair open) and DOUBLE per clean window until the ceiling; the first congestion evidence ends the ramp and hands control back to the normal controller. A fast pair reaches a 6.1 Mbps ceiling in 5 windows. Only ever LOWERS the opening commitment - it can never raise a rate above what the controller already allows. Env: ROOMLERD_RATE_SLOW_START. Restart required.",
@@ -896,6 +901,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "area_min_bitrate" => cfg.area_min_bitrate.map(fmt_bool),
         "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
         "encoder_inplace_rate" => cfg.encoder_inplace_rate.map(fmt_bool),
+        "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
         "pump_stall_watch" => cfg.pump_stall_watch.map(fmt_bool),
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms.map(|p| p.to_string()),
@@ -1312,6 +1318,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "area_min_bitrate" => cfg.area_min_bitrate = parse_tribool(value)?,
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
         "encoder_inplace_rate" => cfg.encoder_inplace_rate = parse_tribool(value)?,
+        "ice_relay_tcp" => cfg.ice_relay_tcp = parse_tribool(value)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
         "pump_stall_watch" => cfg.pump_stall_watch = parse_tribool(value)?,
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms = parse_u32_range(key, value, 10, 5000)?,

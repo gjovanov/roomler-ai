@@ -846,6 +846,12 @@ pub struct AgentConfig {
     /// config surface.
     #[serde(default)]
     pub encoder_inplace_rate: Option<bool>,
+    /// Pin remote-control's ICE to a TURN relay so the encoder runs its
+    /// CONSTRAINED posture on demand. Default OFF. A diagnostic pin that
+    /// degrades an otherwise-direct session — see `ice_relay_tcp` in the
+    /// config surface.
+    #[serde(default)]
+    pub ice_relay_tcp: Option<bool>,
     /// FR-63 — open a session with slow-start instead of committing to a
     /// constant rate. Default OFF (a controller change ships behind evidence).
     /// See `rate_slow_start` in the config surface.
@@ -2011,6 +2017,7 @@ pub fn test_fixture() -> AgentConfig {
         area_min_bitrate: None,
         measured_ceiling: None,
         encoder_inplace_rate: None,
+        ice_relay_tcp: None,
         rate_slow_start: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
@@ -2145,12 +2152,13 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 76] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 77] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
         ("MEASURED_CEILING", cfg.measured_ceiling),
         ("ENCODER_INPLACE_RATE", cfg.encoder_inplace_rate),
+        ("ICE_RELAY_TCP", cfg.ice_relay_tcp),
         ("RATE_SLOW_START", cfg.rate_slow_start),
         ("PUMP_STALL_WATCH", cfg.pump_stall_watch),
         ("BG_REBUILD_CONSTRAINED", cfg.bg_rebuild_constrained),
