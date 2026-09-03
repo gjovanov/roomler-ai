@@ -424,6 +424,13 @@ export interface RcVideoInfo {
    *  `>1` = the stream's rate/dials are floor-merged across viewers and
    *  the stats badge shows "shared ×N" to explain a capped stream. */
   viewers: number
+  /** FR-33 P3 — WHY the transport is `relay`, when the agent can name it.
+   *  `'lan-captured'` = a VPN on the agent's host captures its LAN prefix and
+   *  this viewer sits inside that prefix, so the LAN pair could never form;
+   *  the pill reads `relay · VPN captures the host's LAN`. Absent from older
+   *  agents and whenever the relay has another cause (e.g. a symmetric NAT
+   *  toward an off-LAN viewer) — then the pill stays plain `relay`. */
+  transport_reason?: string
 }
 
 /** P6 — one participant on the agent's InputArbiter rail. */
@@ -590,6 +597,10 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         native_w: typeof obj.native_w === 'number' ? obj.native_w : 0,
         native_h: typeof obj.native_h === 'number' ? obj.native_h : 0,
         viewers: typeof obj.viewers === 'number' && obj.viewers > 0 ? obj.viewers : 1,
+        // FR-33 P3 — optional; only ever present when the agent can name it.
+        ...(typeof obj.transport_reason === 'string'
+          ? { transport_reason: obj.transport_reason }
+          : {}),
       },
     }
   }
