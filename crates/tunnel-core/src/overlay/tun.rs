@@ -626,6 +626,11 @@ mod system {
         /// Emit the eviction WARN (or a throttled `debug!`) for one actual
         /// deletion of a competing route.
         fn evict_warn(dest: IpAddr, plen: u8, ifindex: u32, luid_val: u64) {
+            // FR-68 — counted BEFORE the throttle, because the throttle is a
+            // logging decision (1 WARN/min/prefix) and a rate that only shows
+            // up in suppressed-line arithmetic is not measurable. Every
+            // successful delete reaches here, so this is the one site.
+            crate::evidence::ROUTE_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut g = EVICT_THROTTLE.lock().unwrap();
             let t = g.get_or_insert_with(|| EvictThrottle {
                 last: std::collections::HashMap::new(),
@@ -1875,8 +1880,18 @@ mod system {
         if !sibling_exempt_enabled() {
             return false;
         }
-        own_adapters::is_own_luid(row_luid)
-            || winroute::alias_for_luid(row_luid).is_some_and(|a| is_roomler_adapter_name(&a))
+        let sibling = own_adapters::is_own_luid(row_luid)
+            || winroute::alias_for_luid(row_luid).is_some_and(|a| is_roomler_adapter_name(&a));
+        if sibling {
+            // FR-68 — the exemption FIRING is the observable, not a sibling
+            // eviction: after #1246 that row is spared, so an eviction counter
+            // reads zero whether the fix works or was reverted. Paired with
+            // ROUTE_EVICTIONS this is falsifiable — spares climb while
+            // evictions stay flat, and OVERLAY_SIBLING_EXEMPT=0 inverts it.
+            crate::evidence::ROUTE_SIBLING_SPARES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        sibling
     }
 
     /// corplap route war v3 (#23) — gate for the stolen-path reclaim (detect →
