@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy, OsKind,
-    PeerRelayPolicy, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy,
+    ExternalAccessPolicy, OsKind, PeerRelayPolicy, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -129,6 +129,13 @@ impl AgentDao {
             exec_policy: ExecPolicy::default(),
             ssh_policy: SshPolicy::default(),
             peer_relay_policy: Default::default(),
+            // FR-52 gate 2 closed, and NO connect code. A code is minted on
+            // demand rather than at enrollment, so a fleet that never uses
+            // this feature carries nothing for it — and until one exists the
+            // device is simply unaddressable from outside the org.
+            external_access_policy: Default::default(),
+            connect_code: None,
+            connect_code_rotated_at: None,
             // Nothing requested until an operator asks for something
             // (docs/remote-config.md). A freshly enrolled device must not
             // arrive carrying a config intent nobody wrote.
@@ -544,6 +551,88 @@ impl AgentDao {
                     "tenant_id": tenant_id,
                     "deleted_at": null,
                     "peer_relay_policy.serve": true,
+                },
+                Some(doc! { "name": 1 }),
+            )
+            .await
+    }
+
+    /// FR-52 gate 2 — replace the device's cross-org access approval. A
+    /// `MANAGE_AGENTS` + `REMOTE_CONTROL` admin action
+    /// (`routes::external_access`), kept separate from the exec / SSH /
+    /// peer-relay setters for the same reason those are separate from each
+    /// other: approving one power must never be a side effect of approving
+    /// another, and this one admits a stranger.
+    pub async fn update_external_access_policy(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        policy: &ExternalAccessPolicy,
+    ) -> DaoResult<bool> {
+        let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "external_access_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// FR-52 — mint or rotate the device's connect code.
+    ///
+    /// Rotation IS the revocation story for a leaked code, so the previous
+    /// value is overwritten rather than kept: a code that still resolved after
+    /// being rotated away would make rotation cosmetic.
+    ///
+    /// ⚠️ The unique index on `connect_code` is global and covers tombstones,
+    /// so a collision here is a genuine (astronomically unlikely) 60-bit
+    /// birthday hit, not a soft-deleted row in the way. The caller retries;
+    /// see `routes::external_access::rotate_connect_code`.
+    pub async fn set_connect_code(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        code: &str,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": {
+                    "connect_code": code,
+                    "connect_code_rotated_at": DateTime::now(),
+                } },
+            )
+            .await
+    }
+
+    /// FR-52 — resolve a canonical connect code to its device.
+    ///
+    /// ⚠️ **Live rows only.** The unique index deliberately covers tombstones
+    /// so a code can never be recycled onto a different machine, but a removed
+    /// device must not answer: `deleted_at: null` here is what makes removal
+    /// final for external callers too, exactly as
+    /// `find_live_by_tenant_and_machine` does for re-enrollment.
+    ///
+    /// ⚠️ Not tenant-scoped, because a stranger types a code with no org
+    /// context. That is safe only because the code is not the authorization —
+    /// every gate is still evaluated against the row this returns.
+    pub async fn find_by_connect_code(&self, code: &str) -> DaoResult<Option<Agent>> {
+        self.base
+            .find_one(doc! { "connect_code": code, "deleted_at": null })
+            .await
+    }
+
+    /// Every live device the tenant has approved for cross-org access. Gate 2
+    /// only: whether the device itself opted in is gate 3 and lives on the
+    /// host, and whether a password is set is gate 4 — neither is this row's
+    /// to answer.
+    pub async fn list_external_approved(&self, tenant_id: ObjectId) -> DaoResult<Vec<Agent>> {
+        self.base
+            .find_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "deleted_at": null,
+                    "external_access_policy.approved": true,
                 },
                 Some(doc! { "name": 1 }),
             )

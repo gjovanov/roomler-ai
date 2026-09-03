@@ -219,6 +219,14 @@
                     title="SSH policy"
                     @click="openSshPolicy(agentFor(item)!)"
                   />
+                  <!-- FR-52 gate 2. Distinct from every policy above
+                       it: those decide what a COLLEAGUE may do, this
+                       one admits someone outside the organization. -->
+                  <v-list-item
+                    prepend-icon="mdi-account-arrow-right-outline"
+                    title="External access"
+                    @click="openExternalAccess(agentFor(item)!)"
+                  />
                   <!-- Writes an INTENT the device may refuse (step 5 of
                        docs/remote-config.md) — unlike the two policies above,
                        which take effect the moment they save. The dialog leads
@@ -829,6 +837,14 @@
                     title="SSH policy"
                     @click="openSshPolicy(a)"
                   />
+                  <!-- FR-52 gate 2. Distinct from every policy above
+                       it: those decide what a COLLEAGUE may do, this
+                       one admits someone outside the organization. -->
+                  <v-list-item
+                    prepend-icon="mdi-account-arrow-right-outline"
+                    title="External access"
+                    @click="openExternalAccess(a)"
+                  />
                   <!-- Writes an INTENT the device may refuse (step 5 of
                        docs/remote-config.md) — unlike the two policies above,
                        which take effect the moment they save. The dialog leads
@@ -1153,6 +1169,13 @@
     :tenant-id="tenantId"
     :agent="sshPolicyTarget"
   />
+  <ExternalAccessDialog
+    v-if="externalAccessTarget"
+    v-model="externalAccessDialogOpen"
+    :tenant-id="tenantId"
+    :agent="externalAccessTarget"
+    @saved="agentStore.fetchAgents(tenantId); fetchGrid()"
+  />
   <RemoteConfigDialog
     v-if="remoteConfigTarget"
     v-model="remoteConfigDialogOpen"
@@ -1476,6 +1499,7 @@ import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
 import ExecPolicyDialog from './ExecPolicyDialog.vue'
 import SshPolicyDialog from './SshPolicyDialog.vue'
+import ExternalAccessDialog from './ExternalAccessDialog.vue'
 import RemoteConfigDialog from './RemoteConfigDialog.vue'
 import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
 import {
@@ -2118,6 +2142,14 @@ const sshPolicyTarget = ref<Agent | null>(null)
 function openSshPolicy(a: Agent) {
   sshPolicyTarget.value = a
   sshPolicyDialogOpen.value = true
+}
+
+const externalAccessDialogOpen = ref(false)
+const externalAccessTarget = ref<Agent | null>(null)
+
+function openExternalAccess(a: Agent) {
+  externalAccessTarget.value = a
+  externalAccessDialogOpen.value = true
 }
 
 const remoteConfigDialogOpen = ref(false)
