@@ -3025,8 +3025,18 @@ const statsCodecLabel = computed(() => {
     // TURN-relayed → bitrate-clamped + extra RTT; "direct" = P2P). The
     // agent re-sends video-info when the path changes mid-session, so
     // this suffix flips live. Empty from agents older than the field.
+    // FR-33 P3 — when the agent can NAME the relay's cause (a VPN captures
+    // its host's LAN and this viewer sits inside that prefix), say so on
+    // the pill: the whole point is that a relay on a same-LAN pair is never
+    // again hunted as an encoder regression.
     const path =
-      vi.transport === 'relay' ? ' · relay' : vi.transport === 'direct' ? ' · direct' : ''
+      vi.transport === 'relay'
+        ? vi.transport_reason === 'lan-captured'
+          ? " · relay · VPN captures the host's LAN"
+          : ' · relay'
+        : vi.transport === 'direct'
+          ? ' · direct'
+          : ''
     // rc.190 — the VIEWER half of the HW×HW story: whether THIS browser
     // decodes the session's codec on fixed-function silicon
     // (MediaCapabilities smooth+powerEfficient at transport-pick time).
