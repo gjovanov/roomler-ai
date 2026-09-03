@@ -1080,6 +1080,14 @@ impl OverlayRuntime {
         // rc.208 — make-before-break: probe a relay→direct upgrade instead of
         // tearing the relay down speculatively. Read once per call.
         let make_before_break = crate::overlay::direct::make_before_break_enabled();
+        // FR-33 P2 — the host's captured LAN prefixes, read once per walk: a
+        // peer whose LAN candidate lies in one is reported to the monitor
+        // below, which refuses the LAN tier outright (`on_lan_capture`). No
+        // handle (monitor off / platform without one) = no captures = no gate.
+        let lan_captures: Vec<crate::overlay::netstate::LanCapture> =
+            crate::overlay::netstate::handle()
+                .map(|h| h.snapshot().lan_captures.clone())
+                .unwrap_or_default();
         for np in peers {
             // P9 — presence: never dial / probe / relay-request a peer the
             // server marked unreachable (ghost enrollment, stale heartbeat,
@@ -1110,6 +1118,16 @@ impl OverlayRuntime {
                 })
                 .unwrap_or_default();
             let cands = resolve_direct_candidates(direct_ctx, &cfg, rot);
+            // FR-33 P2 — a LAN candidate inside a captured prefix is a dial
+            // the OS has already said it will misroute; hand the verdict to
+            // the monitor so `decide` never proposes it and `why` names it.
+            let lan_captured = cands.lan.is_some_and(|(_, dst)| match dst {
+                std::net::SocketAddr::V4(sa) => {
+                    lan_captures.iter().any(|c| c.contains_v4(*sa.ip()))
+                }
+                std::net::SocketAddr::V6(_) => false,
+            });
+            self.shadow(|s| s.mon.on_lan_capture(&np.node_id, lan_captured));
             let direct_dst = cands.lan;
             let phase_a_dst = cands.public;
             let srflx_dst = cands.srflx;

@@ -421,6 +421,19 @@ fn print_why(p: &PeerInfo) {
              \x20           relay, look above for the reason, not here."
         );
     }
+    if w.tiers
+        .iter()
+        .any(|t| t.blocked_by.as_deref() == Some("lan-captured"))
+    {
+        // FR-33 P2 — a fact about THIS host, not the path: spelled out so the
+        // operator goes to the VPN profile, not to path tuning.
+        println!(
+            "  CAPTURED  this host's own LAN prefix is routed through another adapter (a\n\
+             \x20           VPN client's split-prefix capture), so a LAN dial cannot work and\n\
+             \x20           is not attempted — `roomler status` names the adapter. The fix is\n\
+             \x20           in the VPN profile (local-LAN access / split-exclude), not here."
+        );
+    }
     if let Some(t) = &w.probing {
         println!("  PROBING   a direct upgrade on {t} is in flight right now.");
     }
