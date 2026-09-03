@@ -31,6 +31,37 @@ encoder stall is not only an RC problem.
 
 ## Key design
 
+### The shape of the answer (revised 2026-09-04, after P0 shipped)
+
+P1–P5 as originally written are **a list of call sites to wrap in
+`spawn_blocking`**. That is the patch-work version of this FR — including the
+encoder-open fix (#1284) that shipped under it. Each wrap is individually
+correct and collectively unsatisfying, because "is this call blocking?" stays a
+question somebody has to re-ask at every site, forever.
+
+The structural answer: **the media pipeline should not live on the async runtime
+at all.** One dedicated thread per session owning `capture → scale → encode`,
+communicating by channel, with the async side handling only signalling and send.
+
+🔑 **This is not a new pattern here — capture already does exactly it**, on
+every backend, and that is why capture turned out not to be a blocking problem
+(measured 2026-09-04): `scrap`, `drm` and `system-context` hand the work to a
+thread that owns the `!Send` device and return a oneshot; `wgc` uses a `Notify`
+with a mutex held only for a `take()`. So the encoder thread is a
+*precedent-following* change, and capture is the reference implementation.
+
+It also **respects encoder thread-affinity instead of fighting it**: Windows MF
+needs per-thread COM/`MFStartup`, and QSV/MFT sessions can be thread-affine.
+⚠️ That is the concrete reason **P2 must NOT be per-frame `spawn_blocking`** —
+handing frames to arbitrary pool threads risks breaking hardware encode outright.
+A thread that owns the encoder for the session's lifetime is both the safer and
+the simpler shape.
+
+Sequencing is unchanged in spirit — measure, then move — but the target is one
+move that removes P1, P2 and the capture-open (`capture::open_default`, still
+synchronous at pump start and invisible to `open_ms` because it precedes the
+loop), rather than three wraps.
+
 ### P0 — the stall watch (blocks every other phase)
 
 A per-iteration wall-clock watch on the pump loop, threshold-gated.
@@ -56,6 +87,16 @@ same primitive for the overlay loops it moves to a shared crate then — not
 speculatively.
 
 ### P1 — dims / chroma / backend rebuilds off-thread
+
+> **Status 2026-09-04 — HALF done, and the half that shipped is the lesser one.**
+> #1284 wrapped the single encoder-open call site in `spawn_blocking`, which
+> every open flows through (first open *and* every rebuild), so the **runtime
+> tax** is gone. But the session is still **without an encoder for the whole
+> 0.62–0.73 s**, because the old encoder is torn down before the new one opens.
+> P1's actual goal is **make-before-break**, and that needs `rebuild_spec` to
+> carry GEOMETRY so the swap machinery can hold the old encoder live — today it
+> carries only a bitrate and `adopt_rebuilt` discards a dims change. Do not read
+> #1284 as closing P1.
 
 The direct twin of #1254, and the largest remaining known win.
 
@@ -130,9 +171,18 @@ reachable hosts) — say so rather than generalising.
 
 ### P5 — the remaining synchronous calls, triaged by measurement
 
-Inventory (`config::save`'s fsync under the daemon-wide write lock, WFP rule
-application, any `Command::new(..).output()` on a runtime thread), ranked by what
-the canary says actually hurts. Fix only what measures.
+Ranked by expected value, not by ease. Each is **unmeasured** until the canary or
+the stall watch says otherwise; the ordering is a hypothesis, and the first job
+of each is to produce a number.
+
+| # | Site | Why it might matter | Status |
+|---|---|---|---|
+| ~~0~~ | ~~`capturer.next_frame()`~~ | ~~a ~100 ms block on every idle pass would dwarf the one-shot open~~ | **REFUTED 2026-09-04** — every backend already yields (oneshot-to-worker, or `Notify`). Not a blocking problem, and it is the reference architecture. |
+| 1 | `capture::open_default()` at pump start | DXGI/WGC init, synchronous, at the same session-start moment as the encoder open — same class. `open_ms` does **not** catch it: it runs before the loop. | **bounded ≲50 ms on the system-context backend** (2026-09-03 trace: `pump starting` 07.716 → stalled pass start 07.766 = everything before the loop, capture open included). WGC / scrap / drm unmeasured — do not generalise from one backend. |
+| 2 | Route-table work on the overlay guard cadence | `GetIpForwardTable2`/netlink enumeration + eviction every 2 s; #1237 measured ~40 evictions/min per prefix and ~100 carrier revalidations/min. A corp laptop whose VPN pushes hundreds of routes makes that enumeration expensive. ⚠️ **Debounce, never disable** — the guard is what stops a hostile VPN self-wedging the host. | unmeasured |
+| 3 | WFP filter operations | `FwpmFilterAdd0` and friends are synchronous RPC to the BFE service — tens of ms, slower under EDR. | unmeasured |
+| 4 | `config::save` | atomic write + fsync + `.prev` rotation **under a daemon-wide write lock**, so it is a block *and* a contention point. fsync on a corp laptop behind filter drivers is routinely 100 ms+. | unmeasured |
+| 5 | The updater's `WinVerifyTrust` | can trigger CRL/OCSP fetches — a multi-second hang on a blocked corporate network, on the daemon's identity. | unmeasured |
 
 ## Explicitly NOT in scope
 
