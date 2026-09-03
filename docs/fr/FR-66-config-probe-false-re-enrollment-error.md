@@ -186,12 +186,19 @@ enrollment, whereas the supervisor's fires on every start forever.
   06:06 on 2026-09-02, one worker exiting `code=2`). Same log, unrelated cause,
   and folding them together would make both harder to reason about. Worth its own
   FR once the cadence is characterised.
-- The `C:\ProgramData\roomler-agent\peer-connected.lock` marker path in the same
-  log block. That is a correctly-frozen FR-46 anchor, not a defect.
+- The peer-presence marker path in the same log block
+  (`system_context::peer_presence::marker_path()`, under `%PROGRAMDATA%`). That
+  is a correctly-frozen FR-46 anchor, not a defect. ⚠️ Named by its code location
+  rather than spelled out, deliberately: writing the literal path here would add
+  an unclassified retired-name occurrence, and the FR-21/FR-46 audit refuses it —
+  correctly, since a new document is exactly where the old spelling should stop
+  spreading. This paragraph is that guard working, recorded rather than
+  suppressed.
 
 ## Field-verification log
 
 | date | build | what was proven |
 |---|---|---|
+| 2026-09-03 | CI | **FR-46's guard caught this FR's own spec, on the first push.** The out-of-scope paragraph originally spelled the peer-presence marker path out in full, which is an unclassified retired-name occurrence; `Retired-name audit (FR-21)` failed the PR with `unclassified rose 0 -> 1` and named the file and line. Reworded to point at `peer_presence::marker_path()` instead — a new document is exactly where the old spelling should stop spreading, and there is no "current name" to substitute because the path is a deliberately frozen anchor. ⚠️ Recorded rather than silently fixed: this is the first time that guard has fired on a document nobody was thinking about it in, which is the only kind of evidence that it works |
 | 2026-09-03 | P1+P2, local | **The test is mutation-checked, so its pass means something.** Reverting `read_if_present` to `load` fails it with the production defect quoted back: `ERROR … the host must be re-enrolled path=/tmp/…/config.toml`. Both halves live in one test on purpose — without the *load must still shout* half, "make it quiet" passes by softening `load`'s ERROR to `warn!`, which trades a false alarm for a missed one; without the *probe must be silent* half the defect is unobservable, since `netd_enabled()` already returned the correct boolean while telling every healthy host to re-enroll. ⚠️ Nothing weaker than reading the emitted tracing events can lock this: the bug is entirely in SEVERITY, and every return value involved was already right |
 | 2026-09-02 | 0.4.48, neo16 | The ERROR fires on every service start of a fully healthy host. Established that the worker runs `session_id=1 elevated=true` and uses `%APPDATA%\roomler\roomler\config\config.toml` (live, rewritten same day, healthy `.prev`), so the machine-global path it names is legitimately absent rather than lost. Traced to `netd_enabled()` probing that path for one optional flag through `config::load`, which logs the re-enroll ERROR on the both-copies-missing arm |
