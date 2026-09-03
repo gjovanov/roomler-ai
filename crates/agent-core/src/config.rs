@@ -2395,6 +2395,43 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
     }
 }
 
+/// Read a config that is EXPECTED to be absent — a probe, not a load.
+///
+/// FR-66. [`load`] is deliberately **not** a neutral reader: on the
+/// both-copies-missing arm it logs `the host must be re-enrolled` at ERROR.
+/// That is correct for the config a process RUNS ON — it is the 2026-08-12
+/// all-NUL self-heal, where the worker really was exit-1'ing every 60 s and
+/// re-enrollment really was the remedy — and wrong for a caller merely asking
+/// whether an optional file happens to exist.
+///
+/// The distinction is not academic: `netd_enabled()` probed the machine-global
+/// path through `load` for one optional boolean, so every healthy user-context
+/// install (worker in session 1, config under `%APPDATA%`) was told to
+/// re-enroll on **every service start**, about a host with both enrollments
+/// connected. The prescribed remedy is destructive — removal is final and a
+/// re-enrolled device never gets its old overlay address back — and the noise
+/// also buried the genuine all-NUL case, which emits the identical line.
+///
+/// Absent, unreadable and unparseable all collapse to `None`: a probe has no
+/// recovery path and no opinion about which it hit. Details go to `debug!`.
+///
+/// ⚠️ Never use this for the config the process runs on. Silently returning
+/// `None` there is precisely the "running on an older config must never look
+/// like a normal boot" failure that [`load`]'s ERROR exists to prevent.
+pub fn read_if_present(path: &PathBuf) -> Option<AgentConfig> {
+    match try_load(path) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %format!("{e:#}"),
+                "optional config not readable — treating as absent"
+            );
+            None
+        }
+    }
+}
+
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
@@ -3153,5 +3190,93 @@ machine_name = "devbox"
         assert_eq!(cfg.last_crash_unix, 0);
         assert!(!cfg.rollback_attempted);
         assert!(cfg.last_known_good_version.is_none());
+    }
+
+    /// Collects formatted tracing output so a test can assert on what was
+    /// logged. FR-66 is a defect about SEVERITY, not about a return value, so
+    /// nothing weaker than reading the emitted events can lock it.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// FR-66. Probing an absent optional config must be SILENT, while loading
+    /// the config a process runs on must still shout — both halves in one test,
+    /// because either alone permits the wrong fix.
+    ///
+    /// Without the second half, "make it quiet" passes by softening `load`'s
+    /// ERROR to `warn!` — which trades a false alarm for a missed one, the
+    /// explicit non-goal in `docs/fr/FR-66-*`. Without the first, the defect
+    /// itself is unobservable: `netd_enabled()` already returned the right
+    /// BOOLEAN while telling every healthy host to re-enroll.
+    #[test]
+    fn a_probe_is_silent_but_load_still_demands_re_enrollment() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let cap = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(cap.clone())
+                .with_ansi(false),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("config.toml");
+        assert!(
+            !missing.exists(),
+            "precondition: the probe target is absent"
+        );
+
+        // 1) The probe: absent means absent. No ERROR, no re-enroll advice.
+        assert!(
+            read_if_present(&missing).is_none(),
+            "an absent optional config must read as None"
+        );
+        let probe_log = cap.text();
+        assert!(
+            !probe_log.contains("re-enrolled"),
+            "probing an optional config must not advise re-enrollment; got: {probe_log}"
+        );
+        assert!(
+            !probe_log.contains("ERROR"),
+            "probing an optional config must not log at ERROR; got: {probe_log}"
+        );
+
+        // 2) The alarm still works. Same path, the loud reader.
+        assert!(
+            load(&missing).is_err(),
+            "load of an absent config must still fail"
+        );
+        let load_log = cap.text();
+        assert!(
+            load_log.contains("re-enrolled"),
+            "load must still say the host needs re-enrolling; got: {load_log}"
+        );
+        assert!(
+            load_log.contains("ERROR"),
+            "load must still report at ERROR; got: {load_log}"
+        );
     }
 }
