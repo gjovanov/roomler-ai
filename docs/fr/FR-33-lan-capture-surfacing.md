@@ -1,7 +1,8 @@
 # FR-33: A VPN that captures the LAN prefix should say so — surface LAN capture in `status`, `why` and the RC path pill
 
 Status: **P1 field-verified on 0.4.20 (2026-08-29); P2 field-verified on 0.4.59
-(2026-09-04); P3 open.** Tracking issue: `FR-33` (#905).
+(2026-09-04); P3 implemented 2026-09-04, field check pending the next agent release + UI
+deploy.** Tracking issue: `FR-33` (#905).
 Sibling of FR-9 (LAN relay diagnosis) and FR-31 (opening keyframe). Spec on master up front; the
 design is known.
 
@@ -69,6 +70,17 @@ stays out of scope (operator's standing rule).
    carries an optional `transport_reason` string set by the *agent* from its own capture state;
    the viewer renders `relay · VPN captures the host's LAN`. Optional field — old viewers ignore
    it, old agents omit it.
+   **As built (2026-09-04):** the reason is per-viewer, not per-host — the agent names the
+   capture only when the session is on a real relay AND one of the viewer's host / prflx
+   candidates (read from the peer connection's own stats at `rc:video-info` time) lies inside
+   a captured prefix (`lan_capture_reason` → `lan_capture_reason_for`, `peer.rs`). A viewer on
+   another network is relayed by the corp NAT and keeps a plain `relay` — the same per-prefix
+   scoping as the P2 gate, so the pill never blames the VPN for a relay it did not cause.
+   prflx is included because under Check Point the viewer's LAN packets ARRIVE (only our
+   replies die), so its LAN address reaches us as a peer-reflexive candidate. Both pumps (libvpx
+   and FFmpeg) emit it through the one `video_info_payload` builder; the key is appended last,
+   so every pre-P3 viewer parses the message unchanged. A non-`overlay-l3` build has no netstate
+   monitor and honestly never names it.
 5. Kill switch `overlay_lan_capture_probe` (default on; the probe is a read-only lookup).
 
 ## Phases
@@ -77,7 +89,7 @@ stays out of scope (operator's standing rule).
 |---|---|---|
 | P1 | detection + `NetDelta` onset/clear lines + `roomler status` line (Windows first; Linux/macOS via the existing `ip route get` / `route get` backends) | `overlay_lan_capture_probe=false` |
 | P2 | `BlockedBy::LanCaptured` in `peers --json why` — **implemented 2026-09-03**: LAN-tier eligibility gate per captured prefix + `lan-captured` label + CLI hold-down line + sibling exemption in the detector | same (no captures ⇒ no gate) |
-| P3 | `rc:video-info.transport_reason` + the viewer pill | same (agent side omits the field) |
+| P3 | `rc:video-info.transport_reason` + the viewer pill — **implemented 2026-09-04**: per-viewer reason from the session's remote candidates × the host's captures; pill suffix `· relay · VPN captures the host's LAN` | same (agent side omits the field) |
 
 ## Acceptance criteria
 
@@ -90,7 +102,9 @@ stays out of scope (operator's standing rule).
       lines toward that peer while the capture holds — **0.4.59**: 0 in the 7 min after the
       restart (117 that day before it); the "resumes after the VPN drops" half is the
       existing capture-clear path and was not exercised on this pass
-- [ ] the RC pill on `neo16 → CORPLAP-2` reads `relay · VPN captures the host's LAN`
+- [ ] the RC pill on a same-LAN pair whose agent host is captured (`neo16 → CORPLAP-3` at
+      home, or `→ CORPLAP-2`) reads `… · relay · VPN captures the host's LAN`, while a viewer
+      from another network sees plain `· relay` (the NAT, not the capture, is its reason)
 - [ ] the daemon log carries ONE onset line and ONE clear line across a VPN connect/disconnect
       cycle on CORPLAP-2 (no per-snapshot spam)
 - [ ] no change on hosts without a capture (neo16, rozalina-2, the cluster nodes): status line
