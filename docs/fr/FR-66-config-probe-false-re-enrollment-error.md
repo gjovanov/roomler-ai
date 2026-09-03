@@ -1,7 +1,8 @@
 # FR-66: A healthy host is told to re-enroll, on every single service start
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
-**Status:** P0 — spec · **Owner:** agent/windows-service
+**Issue:** [#1263](https://github.com/gjovanov/roomler-ai/issues/1263) ·
+**Status:** P1 + P2 implemented, mutation-checked; P3 field verification pending a
+release · **Owner:** agent/windows-service
 
 ## Goal
 
@@ -127,20 +128,46 @@ expected input to a boolean question.
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P1 | non-logging probe reader + `netd_enabled()` uses it; unit-lock that the probe path emits no ERROR | revert (one function) | **planned** |
-| P2 | audit every other `config::load` caller for the same shape — is the failure normal for that caller? | per-call-site | **planned** |
-| P3 | field-verify on the host that produced the evidence: a service restart logs no ERROR, and an induced unreadable config still does | — | **planned** |
+| P1 | `config::read_if_present` + `netd_enabled()` uses it; the no-ERROR property unit-locked and mutation-checked | revert (one function) | **shipped** |
+| P2 | audit all 37 `config::load` call sites — is the failure normal for that caller? | per-call-site | **shipped** — 1 more fixed, 6 correct as-is |
+| P3 | field-verify on the host that produced the evidence: a service restart logs no ERROR, and an induced unreadable config still does | — | **pending a release** |
+
+### P2 audit — all 37 call sites
+
+Seven swallow the error; the question asked of each was *is absence normal for
+this caller?*
+
+| call site | absent is normal? | verdict |
+|---|---|---|
+| `win_service/supervisor.rs` `netd_enabled()` | **yes** — an optional flag on a path most installs don't have | **fixed (P1)** |
+| `main.rs` enroll, reuse existing `machine_id` | **yes** — a first enrollment has no config *by definition* | **fixed** |
+| `roomler-desktop/commands.rs` `load_optional_config` | no — guarded by `path.exists()` first, so only *exists-but-corrupt* reaches `load` | leave: corruption is a real fault worth ERROR |
+| `localapi_state.rs` live config (cleanup) | no — this **is** the config the daemon runs on | leave: correct |
+| `localapi_state.rs` stale config | no — the caller named a specific file it expects | leave: correct |
+| `main.rs` per-org base after a join | no — its own comment says *"the join already wrote this file, so a failure here means something else broke it"* | leave: correct |
+| `main.rs` clean-run promotion reload | no — the daemon's own config | leave: correct |
+| `main.rs` graceful-shutdown reload | no — the daemon's own config | leave: correct |
+
+⚠️ The enroll site is arguably **worse than the one that started this FR**: it
+fires `the host must be re-enrolled` during the very operation that enrolls the
+machine. It had gone unnoticed because it is one line in a verbose successful
+enrollment, whereas the supervisor's fires on every start forever.
 
 ## Acceptance criteria
 
-- [ ] A service start on a host with no machine-global config logs **no** ERROR.
-- [ ] `netd_enabled()` still returns `false` in that case (behaviour unchanged).
-- [ ] The env lever `ROOMLERD_OVERLAY_NETD` still wins over the file.
-- [ ] An actually-unreadable **worker** config still logs `the host must be
-      re-enrolled` at ERROR — shown failing before the fix and passing after, so
-      the check is proven to still fire.
-- [ ] Every remaining `config::load` caller is either correct at ERROR severity
-      or moved to the probe reader, with the reason recorded per call site.
+- [x] A service start on a host with no machine-global config logs **no** ERROR.
+      *(unit-locked: `a_probe_is_silent_but_load_still_demands_re_enrollment`)*
+- [x] `netd_enabled()` still returns `false` in that case (behaviour unchanged) —
+      the change is `load(..).ok()` → `read_if_present(..)`, both `Option`.
+- [x] The env lever `ROOMLERD_OVERLAY_NETD` still wins over the file — untouched,
+      it returns before the file is consulted.
+- [x] An actually-unreadable config still logs `the host must be re-enrolled` at
+      ERROR. Both halves are in one test, and it is **mutation-checked**: with
+      `read_if_present` reverted to `load`, it fails with the production message
+      quoted back verbatim.
+- [x] Every remaining `config::load` caller is either correct at ERROR severity
+      or moved to the probe reader, with the reason recorded per call site — see
+      the P2 table above.
 - [ ] Field-verified on the originating host across a real service restart.
 
 ## Open decisions
@@ -166,4 +193,5 @@ expected input to a boolean question.
 
 | date | build | what was proven |
 |---|---|---|
+| 2026-09-03 | P1+P2, local | **The test is mutation-checked, so its pass means something.** Reverting `read_if_present` to `load` fails it with the production defect quoted back: `ERROR … the host must be re-enrolled path=/tmp/…/config.toml`. Both halves live in one test on purpose — without the *load must still shout* half, "make it quiet" passes by softening `load`'s ERROR to `warn!`, which trades a false alarm for a missed one; without the *probe must be silent* half the defect is unobservable, since `netd_enabled()` already returned the correct boolean while telling every healthy host to re-enroll. ⚠️ Nothing weaker than reading the emitted tracing events can lock this: the bug is entirely in SEVERITY, and every return value involved was already right |
 | 2026-09-02 | 0.4.48, neo16 | The ERROR fires on every service start of a fully healthy host. Established that the worker runs `session_id=1 elevated=true` and uses `%APPDATA%\roomler\roomler\config\config.toml` (live, rewritten same day, healthy `.prev`), so the machine-global path it names is legitimately absent rather than lost. Traced to `netd_enabled()` probing that path for one optional flag through `config::load`, which logs the re-enroll ERROR on the both-copies-missing arm |
