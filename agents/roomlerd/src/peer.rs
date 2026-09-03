@@ -5057,7 +5057,25 @@ async fn media_pump_ffmpeg_dc(
             if took_us > iter_us_max {
                 iter_us_max = took_us;
             }
-            if took >= stall_warn {
+            // FR-65 P0 — judge the stall on time NOT spent WAITING FOR INPUT.
+            //
+            // Capture is change-driven, so a quiet screen makes the pass sleep
+            // inside capture, and `capture_us` accumulates that wait. At the
+            // original 250 ms bar those passes stayed invisible; at the 100 ms
+            // bar #1259 introduced they became the majority of the warnings —
+            // field 2026-09-03, a direct session logged seven in 45 s, every
+            // one shaped `iter_ms=111 capture_ms=101.9`, i.e. 9 ms of work and
+            // 102 ms of idling.
+            //
+            // 🔑 That is not a stall, and a watch that cries about idling is
+            // one people learn to ignore — which costs exactly the signal the
+            // watch exists for. The instrument's purpose is BLOCKING WORK on a
+            // shared runtime; waiting for a frame is the loop idling by design.
+            // Both numbers are still logged, so a genuinely expensive capture
+            // is still visible in `capture_ms` (and in `avg_capture_ms` on the
+            // heartbeat) — only the stall DECISION excludes the wait.
+            let work_us = took_us.saturating_sub(capture_us.saturating_sub(c0));
+            if work_us >= stall_warn.as_micros() as u64 {
                 pump_stalls += 1;
                 if last_stall_log.elapsed() >= Duration::from_secs(2) {
                     last_stall_log = std::time::Instant::now();
@@ -5095,6 +5113,7 @@ async fn media_pump_ffmpeg_dc(
                         apply_ms = apply_us.saturating_sub(a0) as f64 / 1000.0,
                         open_ms = open_us.saturating_sub(o0) as f64 / 1000.0,
                         other_ms = took_us.saturating_sub(phases_us) as f64 / 1000.0,
+                        work_ms = work_us as f64 / 1000.0,
                         target_bps = governor.applied_bps(),
                         "FFmpeg DC pump STALL — one pass exceeded the budget"
                     );
@@ -5877,22 +5896,45 @@ async fn media_pump_ffmpeg_dc(
                 0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
                 applied => ceiling.min(applied),
             };
-            // FR-65 P0 — the open is BLOCKING and lands on this thread. Timed
-            // as its own phase because `apply` cannot cover it: `apply` times a
-            // change to an encoder that already exists, and the first pass of a
-            // session has none. Before this it fell into the stall line's
-            // residual — 0.46-0.96 s attributable to nothing.
+            // FR-65 P0/P1 — the open is BLOCKING (0.62-0.73 s measured on
+            // Iris Xe at session start, 2026-09-03) and this pump runs under
+            // `tokio::spawn`, i.e. on a SHARED runtime worker. `roomlerd` is one
+            // process: overlay, DERP, tunnels and the WS control plane are on
+            // those same workers, so a synchronous open here is not merely a
+            // late first frame — it is a runtime-wide tax at the exact moment a
+            // session is establishing.
+            //
+            // `spawn_blocking` + await keeps the wall-clock identical (the loop
+            // is sequential either way; it had nothing to do meanwhile) while
+            // freeing the worker. Every open goes through here — the first one
+            // AND the dims/chroma/backend rebuilds — so this covers P1 without
+            // the swap machinery, which structurally cannot: `rebuild_spec`
+            // carries only a bitrate and `adopt_rebuilt` discards a geometry
+            // change.
+            //
+            // ⚠️ Timed around the AWAIT, not the call, so `open_ms` stays the
+            // honest wall-clock cost of getting an encoder.
             let __open_t = std::time::Instant::now();
-            let __opened = codec.open(
-                w,
-                h,
-                target_fps,
-                open_rate as usize,
-                cq_bias,
-                hevc_444,
-                constrained,
-                last_encoder_name,
-            );
+            let __opened = match tokio::task::spawn_blocking(move || {
+                codec.open(
+                    w,
+                    h,
+                    target_fps,
+                    open_rate as usize,
+                    cq_bias,
+                    hevc_444,
+                    constrained,
+                    last_encoder_name,
+                )
+            })
+            .await
+            {
+                Ok(r) => r,
+                // The blocking pool panicked or was shut down. Treated as an
+                // open failure so the existing error ladder handles it, rather
+                // than as a new failure mode with its own untested path.
+                Err(e) => Err(anyhow::anyhow!("encoder open task failed: {e}")),
+            };
             {
                 let __us = __open_t.elapsed().as_micros() as u64;
                 open_us += __us;
