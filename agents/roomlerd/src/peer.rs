@@ -3442,6 +3442,9 @@ async fn media_pump_vp9_444_dc(
             let (native_w, native_h) =
                 unpack_dims(capture_native_dims.load(std::sync::atomic::Ordering::Relaxed));
             if native_w > 0 {
+                // FR-33 P3 — name the LAN capture when it is the reason THIS
+                // viewer is relayed (per-prefix, like the P2 gate).
+                let reason = lan_capture_reason(&pc, constrained_transport).await;
                 let payload = video_info_payload(
                     "vp9",
                     "libvpx",
@@ -3451,6 +3454,7 @@ async fn media_pump_vp9_444_dc(
                     native_w,
                     native_h,
                     viewers,
+                    reason,
                 );
                 let cdc = control_dc.lock().await.clone();
                 if let Some(cdc) = cdc
@@ -4323,11 +4327,116 @@ fn video_info_payload(
     // shared-floor pipeline). The browser badge shows "shared ×N" so a
     // capped/min-merged stream is explainable from the viewer side.
     viewers: usize,
+    // FR-33 P3 — WHY the transport is what it is, when the agent can name
+    // it: `Some("lan-captured")` = a VPN captures this host's LAN prefix and
+    // the viewer sits inside it, so the LAN pair could never form. Omitted
+    // from the wire when `None` (old viewers ignore it, old agents omit it).
+    transport_reason: Option<&str>,
 ) -> String {
+    let reason = transport_reason
+        .map(|r| format!(r#","transport_reason":"{r}""#))
+        .unwrap_or_default();
     format!(
-        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}}}"#,
+        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}{reason}}}"#,
         if constrained { "relay" } else { "direct" },
     )
+}
+
+/// FR-33 P3 — the pure half of [`lan_capture_reason`]: name the capture as
+/// the transport reason only when BOTH (a) this session runs on a real relay
+/// and (b) the viewer offered a host / peer-reflexive candidate whose
+/// address lies inside one of THIS host's captured LAN prefixes. (b) is what
+/// keeps the label honest: a viewer on another network is relayed by the
+/// corp NAT, and the LAN capture is not its reason — the same per-prefix
+/// scoping the P2 eligibility gate uses. `in_capture` answers "is this v4
+/// address inside a captured prefix" (the netstate snapshot's
+/// `LanCapture::contains_v4`, or a test closure).
+#[cfg_attr(not(feature = "overlay-l3"), allow(dead_code))]
+fn lan_capture_reason_for(
+    constrained: bool,
+    remote_lan_addrs: &[std::net::IpAddr],
+    in_capture: impl Fn(std::net::Ipv4Addr) -> bool,
+) -> Option<&'static str> {
+    if !constrained {
+        return None;
+    }
+    remote_lan_addrs
+        .iter()
+        .any(|a| match a {
+            std::net::IpAddr::V4(v4) => in_capture(*v4),
+            std::net::IpAddr::V6(_) => false,
+        })
+        .then_some("lan-captured")
+}
+
+/// FR-33 P3 — this session's `transport_reason`, from the peer connection's
+/// own remote-candidate stats (host AND prflx: under Check Point the viewer's
+/// LAN address shows up as prflx, because its packets ARRIVE and only our
+/// replies die) against the host's live capture set. `None` = nothing to
+/// name; the browser then shows plain `relay`. Read at `rc:video-info` time
+/// only (once per session or transport flip), so the stats walk is free.
+/// Without `overlay-l3` there is no netstate monitor in this binary, so the
+/// answer is honestly `None` (the stub below).
+///
+/// Gated on `overlay-l3` ALONE, with the pump features gating only the
+/// callers (the `video_info_payload` pattern): no per-PR lane compiles
+/// `overlay-l3` together with a pump feature — only the release builds do —
+/// so a body gated on both would first compile at release time. This way
+/// the per-PR `clippy --features overlay-l3` lane compiles the real body.
+#[cfg(feature = "overlay-l3")]
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+async fn lan_capture_reason(
+    pc: &Arc<RTCPeerConnection>,
+    constrained: bool,
+) -> Option<&'static str> {
+    use webrtc::ice::candidate::CandidateType;
+    use webrtc::stats::StatsReportType;
+    if !constrained {
+        return None;
+    }
+    let captures = tunnel_core::overlay::netstate::handle()
+        .map(|h| h.snapshot().lan_captures.clone())
+        .unwrap_or_default();
+    if captures.is_empty() {
+        return None;
+    }
+    let remote: Vec<std::net::IpAddr> = pc
+        .get_stats()
+        .await
+        .reports
+        .values()
+        .filter_map(|r| match r {
+            StatsReportType::RemoteCandidate(c)
+                if matches!(
+                    c.candidate_type,
+                    CandidateType::Host | CandidateType::PeerReflexive
+                ) =>
+            {
+                c.ip.parse().ok()
+            }
+            _ => None,
+        })
+        .collect();
+    lan_capture_reason_for(true, &remote, |ip| {
+        captures.iter().any(|c| c.contains_v4(ip))
+    })
+}
+
+/// FR-33 P3 — the non-`overlay-l3` stub: no netstate monitor, nothing to
+/// name. Same signature so the pumps compile identically under both builds.
+#[cfg(not(feature = "overlay-l3"))]
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+async fn lan_capture_reason(
+    _pc: &Arc<RTCPeerConnection>,
+    _constrained: bool,
+) -> Option<&'static str> {
+    None
 }
 
 /// Retry cadence for an undelivered `rc:video-info` — the control DC opens
@@ -5296,6 +5405,8 @@ async fn media_pump_ffmpeg_dc(
             let (native_w, native_h) =
                 unpack_dims(capture_native_dims.load(std::sync::atomic::Ordering::Relaxed));
             if native_w > 0 {
+                // FR-33 P3 — see the twin block in the VP9-444 pump.
+                let reason = lan_capture_reason(&pc, constrained).await;
                 let payload = video_info_payload(
                     codec.wire_codec(),
                     enc_name,
@@ -5311,6 +5422,7 @@ async fn media_pump_ffmpeg_dc(
                     native_w,
                     native_h,
                     viewers,
+                    reason,
                 );
                 let cdc = control_dc.lock().await.clone();
                 if let Some(cdc) = cdc
@@ -9962,12 +10074,69 @@ mod tests {
     #[test]
     fn video_info_payload_wire_shape() {
         assert_eq!(
-            super::video_info_payload("h265", "hevc_nvenc", true, "yuv420", false, 1920, 1080, 1),
+            super::video_info_payload(
+                "h265",
+                "hevc_nvenc",
+                true,
+                "yuv420",
+                false,
+                1920,
+                1080,
+                1,
+                None
+            ),
             r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":1}"#
         );
         assert_eq!(
-            super::video_info_payload("vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2),
+            super::video_info_payload("vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2, None),
             r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600,"viewers":2}"#
+        );
+        // FR-33 P3 — the reason rides as a trailing optional key, so every
+        // pre-P3 viewer keeps parsing the message exactly as before.
+        assert_eq!(
+            super::video_info_payload(
+                "vp9",
+                "libvpx",
+                false,
+                "yuv444",
+                true,
+                2560,
+                1600,
+                1,
+                Some("lan-captured")
+            ),
+            r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600,"viewers":1,"transport_reason":"lan-captured"}"#
+        );
+    }
+
+    // FR-33 P3 — the reason is named only when the session is relayed AND
+    // the viewer's LAN address lies inside a captured prefix; a remote viewer
+    // relayed by the corp NAT gets plain "relay".
+    #[test]
+    fn lan_capture_reason_needs_relay_and_a_viewer_inside_the_captured_prefix() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let captured = |a: std::net::Ipv4Addr| a.octets()[..3] == [192, 168, 68];
+        let on_lan = [ip("192.168.68.126")];
+        let remote = [ip("37.63.112.129"), ip("10.0.0.5")];
+        assert_eq!(
+            super::lan_capture_reason_for(true, &on_lan, captured),
+            Some("lan-captured")
+        );
+        assert_eq!(
+            super::lan_capture_reason_for(false, &on_lan, captured),
+            None,
+            "direct: nothing to explain"
+        );
+        assert_eq!(
+            super::lan_capture_reason_for(true, &remote, captured),
+            None,
+            "off-LAN viewer: the NAT is the reason, not the capture"
+        );
+        assert_eq!(super::lan_capture_reason_for(true, &[], captured), None);
+        assert_eq!(
+            super::lan_capture_reason_for(true, &[ip("fe80::1")], captured),
+            None,
+            "a v6 candidate never matches a v4 capture"
         );
     }
 
