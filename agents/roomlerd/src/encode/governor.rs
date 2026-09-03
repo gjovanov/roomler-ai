@@ -277,6 +277,10 @@ pub struct RateGovernor {
     /// has finished — the three cases where the normal controller is already
     /// the right answer.
     slow_start: Option<super::slow_start::SlowStart>,
+    /// FR-63 — has the "armed" line been logged for this session? The ramp is
+    /// the only rate decision with no other trace, so a session where it did
+    /// or did not engage would otherwise be indistinguishable in a log.
+    slow_start_logged: bool,
     /// FR-63 — did any congestion signal arrive since the last viewer window?
     /// The ramp doubles on a clean window and ENDS on a dirty one, so this is
     /// the one bit of state that decides which.
@@ -344,6 +348,7 @@ impl RateGovernor {
             open_seed_bps: ceiling_seed_bps
                 .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
             slow_start: None,
+            slow_start_logged: false,
             slow_start_congested: false,
         }
     }
@@ -620,10 +625,31 @@ impl RateGovernor {
         // ⚠️ Constructed once and kept once `done` — dropping it would let
         // `get_or_insert_with` restart the ramp on the next tick and re-open a
         // session that had already earned its rate.
+        //
+        // ⚠️ The floor passed here is `open_seed_bps` — the rate THIS PAIR was
+        // remembered at — and NOT `floor_bps`. `floor_bps` is
+        // `area_min_bitrate_bps`, a flat 1.5 M on every constrained transport:
+        // a fleet constant, which is precisely the thing this phase exists to
+        // stop trusting. Passing it made `SlowStart::new` resolve
+        // `300_000.max(1_500_000)` and open at 1.5 M — still 7× over the
+        // 213 kbps field path, and one doubling from the ceiling, i.e. no ramp
+        // at all. The floor parameter means "a rate already PROVEN", and only
+        // the remembered seed is that.
         if self.slow_link.slow_start && constrained {
-            let _ = self
-                .slow_start
-                .get_or_insert_with(|| super::slow_start::SlowStart::new(floor_bps, ceiling_bps));
+            let seeded = self.open_seed_bps;
+            let ss = self.slow_start.get_or_insert_with(|| {
+                super::slow_start::SlowStart::new(seeded.unwrap_or(0), ceiling_bps)
+            });
+            if !self.slow_start_logged {
+                self.slow_start_logged = true;
+                tracing::info!(
+                    open_bps = ss.target_bps(),
+                    ceiling_bps,
+                    seed_bps = seeded,
+                    "FR-63 slow-start armed — opening below the ceiling and \
+                     doubling per clean window"
+                );
+            }
         }
         let ceiling_bps = match self.slow_start.as_ref() {
             Some(ss) if !ss.done() => ceiling_bps.min(ss.target_bps()).max(1),
@@ -654,6 +680,31 @@ impl RateGovernor {
                 self.relieved_floor_bps = None;
                 floor_bps
             }
+        };
+        // FR-63 — and the floor has to descend WITH the ramp, or the ceiling
+        // cap above is silently undone: `set_ceiling` raises any ceiling back
+        // up to the floor. That is the same coupling the P1 comment above
+        // documents for the arrival clamp, and it bit this phase exactly as
+        // predicted — 0.4.55 shipped the cap alone, so on a constrained path
+        // the flat 1.5 M floor pinned the opener and slow-start was INERT
+        // while looking wired.
+        //
+        // Bounded by `slow_link_min_bitrate` — the existing absolute stop, not
+        // a new constant. Below roughly it a full-resolution frame is
+        // illegible at any QP and the honest lever is fewer PIXELS, which the
+        // relay resolution cap already applies. Only ever LOWERS the floor.
+        let floor_bps = match self.slow_start.as_ref() {
+            Some(ss) if !ss.done() => {
+                let ramped = floor_bps.min(ss.target_bps().max(super::slow_link_min_bitrate_bps()));
+                if ramped < floor_bps {
+                    // The heartbeat's contract is "the floor actually in
+                    // force"; leaving it None here would report that the
+                    // nominal floor stands when it does not.
+                    self.relieved_floor_bps = Some(ramped);
+                }
+                ramped
+            }
+            _ => floor_bps,
         };
         let depth = self.send_depth;
         let open_seed_bps = self.open_seed_bps;
@@ -1138,6 +1189,95 @@ mod tests {
         assert!(
             direct.applied_bps() > open,
             "slow-start must not touch a direct session"
+        );
+    }
+
+    /// FR-63 — the REAL constrained floor must not be read as evidence.
+    ///
+    /// The test above passes `FLOOR = 200_000`, which is below
+    /// [`slow_start::OPEN_BPS`] and therefore cannot detect the defect this
+    /// locks: the wiring used to hand `SlowStart::new` the governor's
+    /// `floor_bps`, which on every constrained transport is
+    /// `area_min_bitrate_bps` — a flat `MIN_BITRATE_BPS` (1.5 M) fleet
+    /// constant. `OPEN_BPS.max(1_500_000)` opened the session at 1.5 M: still
+    /// 7× over the 213 kbps field path, and one doubling from the 2.55 M
+    /// ceiling, i.e. no ramp at all while looking like one.
+    ///
+    /// The floor parameter means "a rate already PROVEN for this pair". A
+    /// constant proves nothing, so only `open_seed_bps` may fill it.
+    #[test]
+    fn the_nominal_1_5m_floor_is_not_evidence_and_cannot_lift_the_opener() {
+        const PLAN_CEILING: u32 = 2_550_000;
+        let open = crate::encode::slow_start::OPEN_BPS;
+        let t0 = Instant::now();
+
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                slow_start: true,
+                ..GovernorFlags::default()
+            },
+            0,
+            None, // no rate memory for this pair — nothing is proven
+            t0,
+        );
+        // The real constrained floor, not a convenient small one.
+        g.pre_encode_tick(
+            PLAN_CEILING,
+            crate::encode::MIN_BITRATE_BPS,
+            true,
+            DEPTH,
+            t0,
+        );
+        assert!(
+            g.applied_bps() <= open,
+            "opened at {} — the flat {} floor must not lift the opener",
+            g.applied_bps(),
+            crate::encode::MIN_BITRATE_BPS
+        );
+    }
+
+    /// FR-63 × FR-59 P8 — a rate the pair actually EARNED still wins.
+    ///
+    /// The counterpart to the test above: `open_seed_bps` is real evidence
+    /// (this pair was measured at this rate), so slow-start must not drag a
+    /// remembered-slow pair back down to `OPEN_BPS` and make it re-earn what
+    /// it already proved. Field value from 2026-09-02: `seed_bps=387500`.
+    #[test]
+    fn a_remembered_rate_still_opens_the_session_above_the_ramp_floor() {
+        const PLAN_CEILING: u32 = 2_550_000;
+        const REMEMBERED: u32 = 387_500;
+        let t0 = Instant::now();
+
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                slow_start: true,
+                floor_relief: true, // `open_seed_bps` is gated on it
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            Some(REMEMBERED),
+            t0,
+        );
+        g.pre_encode_tick(
+            PLAN_CEILING,
+            crate::encode::MIN_BITRATE_BPS,
+            true,
+            DEPTH,
+            t0,
+        );
+        assert!(
+            g.applied_bps() <= REMEMBERED,
+            "opened at {} — must not exceed the remembered {REMEMBERED}",
+            g.applied_bps()
+        );
+        assert!(
+            g.applied_bps() > crate::encode::slow_start::OPEN_BPS,
+            "opened at {} — a PROVEN rate must not be dragged down to the ramp floor",
+            g.applied_bps()
         );
     }
 
