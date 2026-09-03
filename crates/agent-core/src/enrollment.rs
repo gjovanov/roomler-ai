@@ -198,6 +198,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         measured_ceiling: None,
         encoder_inplace_rate: None,
         ice_relay_tcp: None,
+        relay_max_kbps: None,
         rate_slow_start: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
