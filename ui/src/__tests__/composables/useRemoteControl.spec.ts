@@ -110,6 +110,8 @@ import {
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
+  resolutionCapAnnotation,
+  resolutionOverrideHint,
 } from '@/composables/useRemoteControl'
 import {
   computeRenderTarget,
@@ -3045,6 +3047,87 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
     if (plain?.kind === 'video_info') {
       expect('transport_reason' in plain.info).toBe(false)
     }
+  })
+
+  // FR-70 P1 — the cap in force rides two trailing optional keys; the
+  // detail never rides without a reason.
+  it('parses the FR-70 P1 cap_reason/cap_detail and leaves them absent otherwise', () => {
+    const capped = parseControlInbound(
+      '{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1,"cap_reason":"slow-link-cap","cap_detail":"remembered 200 kbps"}',
+    )
+    expect(capped?.kind).toBe('video_info')
+    if (capped?.kind === 'video_info') {
+      expect(capped.info.cap_reason).toBe('slow-link-cap')
+      expect(capped.info.cap_detail).toBe('remembered 200 kbps')
+    }
+    // A detail with no reason is a stray string: dropped.
+    const stray = parseControlInbound(
+      '{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1,"cap_detail":"remembered 200 kbps"}',
+    )
+    expect(stray?.kind).toBe('video_info')
+    if (stray?.kind === 'video_info') {
+      expect('cap_reason' in stray.info).toBe(false)
+      expect('cap_detail' in stray.info).toBe(false)
+    }
+    // Pre-P1 agents omit both.
+    const plain = parseControlInbound(
+      '{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1}',
+    )
+    expect(plain?.kind).toBe('video_info')
+    if (plain?.kind === 'video_info') {
+      expect('cap_reason' in plain.info).toBe(false)
+    }
+  })
+
+  // FR-70 P1 — the pill names the cap from the agent's report; the old
+  // transport-only guess survives only for agents that report none.
+  it('annotates a below-native stream with the cap the agent names', () => {
+    const base = {
+      codec: 'h265',
+      encoder: 'hevc_qsv',
+      hardware: true,
+      chroma: 'yuv420',
+      transport: 'relay',
+      native_w: 1920,
+      native_h: 1200,
+      viewers: 1,
+    }
+    // The operator's 2026-09-04 session: Native selected, 1280×800 on screen.
+    expect(
+      resolutionCapAnnotation(
+        { ...base, cap_reason: 'slow-link-cap', cap_detail: 'remembered 200 kbps' },
+        1280,
+        800,
+      ),
+    ).toBe(' · slow link (remembered 200 kbps) · native 1920×1200')
+    expect(resolutionCapAnnotation({ ...base, cap_reason: 'priority-cap' }, 1280, 800)).toBe(
+      ' · Priority cap · native 1920×1200',
+    )
+    // A pre-P1 agent on a relay: the rc.199 guess, unchanged.
+    expect(resolutionCapAnnotation(base, 1280, 800)).toBe(' · relay-limited (native 1920×1200)')
+    // … and on a direct path it never guessed.
+    expect(resolutionCapAnnotation({ ...base, transport: 'direct' }, 1280, 800)).toBe('')
+    // At native there is nothing to annotate, whatever the agent says.
+    expect(resolutionCapAnnotation({ ...base, cap_reason: 'slow-link-cap' }, 1920, 1200)).toBe('')
+    // Unknown dims: nothing.
+    expect(resolutionCapAnnotation({ ...base, native_w: 0, native_h: 0 }, 1280, 800)).toBe('')
+    expect(resolutionCapAnnotation(null, 1280, 800)).toBe('')
+
+    // The setting's hint says what lifts it — and for the slow-link
+    // profile that is NOT the Priority dial.
+    const hint = resolutionOverrideHint(
+      { ...base, cap_reason: 'slow-link-cap', cap_detail: 'remembered 200 kbps' },
+      1280,
+      800,
+    )
+    expect(hint).toContain('capped at 1280×800')
+    expect(hint).toContain('remembered 200 kbps')
+    expect(hint).toContain('next session')
+    expect(hint).not.toContain('Sharper')
+    expect(resolutionOverrideHint({ ...base, cap_reason: 'priority-cap' }, 1280, 800)).toContain(
+      'Sharper',
+    )
+    expect(resolutionOverrideHint(base, 1280, 800)).toBe('')
   })
 
   it('parses the P6 arbiter state broadcast (rc:control.state)', () => {

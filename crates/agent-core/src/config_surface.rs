@@ -627,6 +627,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Slow-start the session opener (2026-09-03, FR-63). Default OFF. A session commits to a bitrate before it has any evidence about the pipe, and the same host over-drove from BOTH directions on one day: opened at a REMEMBERED 6134627 -> 6287ms of viewer paint age; opened at the NOMINAL relay cap 2550000 into a path measured at ~213000 -> 444ms of queue, 1550ms paint, and six windows collapsing back down. No constant is safe, because a constant is an assumption about a band. ON: open at 300000 (lifted by any PROVEN floor, e.g. the FR-59 P8 remembered-slow-pair open) and DOUBLE per clean window until the ceiling; the first congestion evidence ends the ramp and hands control back to the normal controller. A fast pair reaches a 6.1 Mbps ceiling in 5 windows. Only ever LOWERS the opening commitment - it can never raise a rate above what the controller already allows. Env: ROOMLERD_RATE_SLOW_START. Restart required.",
     ),
     (
+        "rate_prior_decay",
+        "tribool",
+        "A remembered rate is a prior, not a pin (2026-09-04, FR-70 P1). Default ON. The rate memory's number for a pair opens the session (FR-59 P8) and, until something measures the pipe, also stands in for the measurement: the legibility floor is relieved to 85% of it and the send-queue byte budget is denominated in it. Field 2026-09-04 (CORPLAP-1 -> neo16): a 200 kbps memory held a session at 200 kbps for four minutes with goodput=None, zero send stalls and zero viewer-congested windows - the queue budget (16 KB) tripped on every drag frame, each trip was an AIMD decrease, and a queue that never forms is a pipe that can never be measured, so nothing could ever contradict the memory. ON: while no live measurement exists the stand-in climbs x1.25 per 10 clean windows (+12.5% per 5 s, the AIMD's own slow-band step) toward the 1.5 Mbps band, the floor and the budget follow it up, and a live measurement (blocked-send goodput or the viewer's arrival rate while its queue grows) becomes the new base at once. A genuinely slow pipe is over-driven by no more than the AIMD would have and gets MEASURED within a window or two; a misremembered fast pair reaches the band in ~100 s. The session end records the measurement or the decayed prior instead of the last window's applied rate, which on a lumpy relay is wherever the last decrease left it. false = FR-59 P8 verbatim (the seed is a constant for the session). Env: ROOMLERD_RATE_PRIOR_DECAY. Restart required.",
+    ),
+    (
         "pump_stall_watch",
         "tribool",
         "Pump stall watch (2026-09-03, FR-65 P0). Default ON: a send-pump iteration slower than pump_stall_warn_ms is logged once with its phase breakdown (capture/scale/encode/apply/send), and the per-heartbeat apply_us / apply_us_max / iter_us_max / pump_stalls counters are published. Costs two Instant::now() per iteration (~20-40ns against a 16.7ms budget at 60fps) and logs nothing until an iteration actually overruns. It exists because a 2s blocking encoder open hid for months: the pump measured capture/scale/encode/send and the stall appeared in NONE of them - the apply/rebuild phase was untimed, and a per-heartbeat AVERAGE cannot represent a single outlier even where it is counted. false = no timing, no counters. Env: ROOMLERD_PUMP_STALL_WATCH. Restart required.",
@@ -909,6 +914,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
         "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
+        "rate_prior_decay" => cfg.rate_prior_decay.map(fmt_bool),
         "pump_stall_watch" => cfg.pump_stall_watch.map(fmt_bool),
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms.map(|p| p.to_string()),
         "bg_rebuild_constrained" => cfg.bg_rebuild_constrained.map(fmt_bool),
@@ -1327,6 +1333,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "ice_relay_tcp" => cfg.ice_relay_tcp = parse_tribool(value)?,
         "relay_max_kbps" => cfg.relay_max_kbps = parse_u32_range(key, value, 100, 100_000)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
+        "rate_prior_decay" => cfg.rate_prior_decay = parse_tribool(value)?,
         "pump_stall_watch" => cfg.pump_stall_watch = parse_tribool(value)?,
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms = parse_u32_range(key, value, 10, 5000)?,
         "bg_rebuild_constrained" => cfg.bg_rebuild_constrained = parse_tribool(value)?,

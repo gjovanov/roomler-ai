@@ -142,6 +142,11 @@ pub struct GovernorFlags {
     /// change ships live without field evidence. Every other field defaults
     /// on because it already earned that.
     pub slow_start: bool,
+    /// FR-70 P1 — a remembered rate standing in for a measurement DECAYS
+    /// toward the nominal band while nothing measures, instead of holding
+    /// the floor and the queue budget at the memory for the whole session
+    /// (`encode::rate_prior_decay_enabled`). False = FR-59 P8 verbatim.
+    pub prior_decay: bool,
 }
 
 impl Default for GovernorFlags {
@@ -157,6 +162,7 @@ impl Default for GovernorFlags {
             queue_drain: true,
             // FR-63 — see the field doc: OFF even here, until field evidence.
             slow_start: false,
+            prior_decay: true,
         }
     }
 }
@@ -177,6 +183,7 @@ impl GovernorFlags {
             viewer_rate_clamp: super::viewer_rate_clamp_enabled(),
             queue_drain: super::queue_drain_enabled(),
             slow_start: super::rate_slow_start_enabled(),
+            prior_decay: super::rate_prior_decay_enabled(),
         }
     }
 }
@@ -270,7 +277,21 @@ pub struct RateGovernor {
     /// logged and the session still opened at the 2.55 M relay cap (the
     /// FR-35 learner only ever RAISES the ceiling), a 372 KB opener into a
     /// ~300 kbps pipe — ten seconds of queue before any measurement spoke.
+    ///
+    /// ⚠️ FR-70 P1: this is what the session OPENS at, and nothing more. What
+    /// stands in for a measurement afterwards is `prior`, which starts here
+    /// and decays — the seed held a session at 200 kbps for four minutes
+    /// through the floor relief AND the queue budget while nothing measured
+    /// (field 2026-09-04, `6a9abc30`; see `encode::prior`).
     open_seed_bps: Option<u32>,
+    /// FR-70 P1 — the belief about the pipe while nothing measures it: the
+    /// seed, then the last live measurement, decaying toward the band on
+    /// clean windows. Read wherever `open_seed_bps` used to stand in.
+    prior: super::prior::RatePrior,
+    /// FR-70 P1 — did a send stall land since the last viewer window? The
+    /// prior's "clean" verdict needs the PIPE's push-back, and a stall is the
+    /// one push-back that reaches the governor between windows.
+    stall_seen: bool,
     /// FR-63 — the opener's ramp. Lazily built at the first CONSTRAINED tick
     /// because it needs that tick's RESOLVED ceiling, exactly as the AIMD is.
     /// `None` while the flag is off, on a direct transport, or once the ramp
@@ -347,6 +368,16 @@ impl RateGovernor {
             drain_until: None,
             open_seed_bps: ceiling_seed_bps
                 .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
+            // Seeded with the SAME filtered value: a seed at or above the
+            // band never stood in for anything (the relief is inert there
+            // and the P6 check would read it as a contradiction).
+            prior: super::prior::RatePrior::new(
+                ceiling_seed_bps
+                    .filter(|s| *s > 0 && *s < super::MIN_BITRATE_BPS && flags.floor_relief),
+                super::MIN_BITRATE_BPS,
+                flags.prior_decay,
+            ),
+            stall_seen: false,
             slow_start: None,
             slow_start_logged: false,
             slow_start_congested: false,
@@ -471,8 +502,53 @@ impl RateGovernor {
         match (self.goodput.estimate_bps(now), link) {
             (Some(g), Some(rx)) => Some(g.min(rx)),
             // FR-59 P8 — with no live evidence at all, the remembered rate
-            // (lowest priority: any measurement outranks it).
-            (g, rx) => g.or(rx).or(self.open_seed_bps),
+            // (lowest priority: any measurement outranks it). FR-70 P1: the
+            // rate as it DECAYS, so the queue budget denominated in it cannot
+            // seal the session against the measurement that would replace it.
+            (g, rx) => g.or(rx).or(self.prior.stand_in_bps()),
+        }
+    }
+
+    /// FR-59 P3 — is the viewer's arrival-rate clamp currently HELD (a live
+    /// `link_rx_bps` within its TTL)? Test seam: with FR-70 P1 the floor no
+    /// longer snaps to the constant on release, so "released" has to be
+    /// read from the clamp itself rather than inferred from the floor.
+    #[cfg(test)]
+    pub fn link_loop_holding(&self) -> bool {
+        self.link_rx_bps.is_some()
+    }
+
+    /// FR-70 P1 — what stands in for a pipe measurement right now, for the
+    /// heartbeat: the remembered seed, or the last live measurement, as it
+    /// decays toward the band on clean windows. `None` = no prior in force
+    /// (an unremembered pair, or one whose prior has decayed away). Read it
+    /// next to `slow_link_floor_bps` and `goodput_bps`: a relief that is
+    /// letting go while `goodput_bps` stays `None` is this, working.
+    pub fn prior_bps(&self) -> Option<u32> {
+        self.prior.stand_in_bps()
+    }
+
+    /// FR-70 P1 — what the rate memory should record for this pair at
+    /// session end, when the FR-35 learner has no above-nominal stable rate
+    /// to offer: a LIVE measurement if one is held, else the prior as it has
+    /// decayed. Before this the pump recorded the last window's applied
+    /// rate, which on a lumpy relay is wherever the last decrease left it —
+    /// biased low by the ×0.85-at-once / +12.5 %-per-5 s asymmetry — so the
+    /// memory drifted DOWN across sessions and 200 kbps was an attractor,
+    /// not a stale day. `None` = nothing this phase knows better than the
+    /// applied rate (decay off, or an unremembered pair that measured
+    /// nothing and whose prior never existed).
+    pub fn remembered_candidate_bps(&self, now: Instant, constrained: bool) -> Option<u32> {
+        if !self.slow_link.prior_decay || !constrained {
+            return None;
+        }
+        let link = match self.link_rx_bps {
+            Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
+            _ => None,
+        };
+        match (self.goodput.estimate_bps(now), link) {
+            (Some(g), Some(rx)) => Some(g.min(rx)),
+            (g, rx) => g.or(rx).or(self.prior.stand_in_bps()),
         }
     }
 
@@ -579,7 +655,10 @@ impl RateGovernor {
                 (Some(g), Some(rx)) => Some(g.min(rx)),
                 // FR-59 P8 — before any live evidence, the remembered rate
                 // stands in (see `open_seed_bps`); a measurement outranks it.
-                (g, rx) => g.or(rx).or(self.open_seed_bps),
+                // FR-70 P1 — and it DECAYS while nothing measures, so the
+                // floor it relieves rises back toward the band instead of
+                // holding the session at the memory (see `encode::prior`).
+                (g, rx) => g.or(rx).or(self.prior.stand_in_bps()),
             }
         } else {
             None
@@ -771,6 +850,8 @@ impl RateGovernor {
     pub fn note_send_stall(&mut self, wait: Duration, now: Instant) {
         // FR-63 — a blocked send is congestion for the opener's ramp.
         self.slow_start_congested = true;
+        // FR-70 P1 — and the pipe pushing back, for the prior's window verdict.
+        self.stall_seen = true;
         // FR-35 — a send blocked ≥ 1 s is a HARD stall: ×0.5 at once.
         let hard = self.learner.on_stall(wait, now);
         if let Some(ctrl) = self.aimd.as_mut() {
@@ -988,6 +1069,25 @@ impl RateGovernor {
         {
             ctrl.note_buffer_overflow(now);
         }
+        // FR-70 P1 — advance the prior. A LIVE measurement (blocked-send
+        // goodput, or the viewer's arrival rate while its queue grows)
+        // re-anchors it; a window in which the PIPE did not push back lets it
+        // decay toward the band. Push-back is a send stall, an age excess,
+        // a viewer-reported queue growth or a drain — deliberately NOT a
+        // byte-budget skip, which is the pump's own throttle and on the
+        // field session was the prior's own artefact (`encode::prior`).
+        // `age_elevated` rather than `age_over` alone: the LEVEL speaks even
+        // when the age loop is switched off from acting.
+        if constrained {
+            let stall_seen = std::mem::take(&mut self.stall_seen);
+            let live = self.goodput.estimate_bps(now).or(match self.link_rx_bps {
+                Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
+                _ => None,
+            });
+            let pushed_back =
+                age_over || age_elevated || link_over || drain_for_ms.is_some() || stall_seen;
+            self.prior.on_window(live, pushed_back);
+        }
         // FR-35 — hand the learner this window's evidence.
         let ceiling_grown = if constrained {
             let desired = self.aimd.as_ref().map(|c| c.desired()).unwrap_or(0);
@@ -1136,6 +1236,238 @@ mod tests {
             None,
             now,
         )
+    }
+
+    /// FR-70 P1 — a remembered-slow pair, constrained, as the field ran it.
+    fn remembered(seed_bps: u32, flags: GovernorFlags, now: Instant) -> RateGovernor {
+        RateGovernor::new(30, DEPTH, flags, 8_000_000, Some(seed_bps), now)
+    }
+
+    /// FR-70 P1 — the WIRING (the law is unit-tested in `encode::prior`).
+    ///
+    /// Field 2026-09-04, CORPLAP-1 → neo16 (`6a9abc30`): a pair remembered
+    /// at 200 kbps ran four minutes at `slow_link_floor_bps=Some(200000)`
+    /// with `goodput_bps=None`, zero send stalls and zero viewer-congested
+    /// windows. Nothing ever measured the pipe, and the memory held the
+    /// floor AND the queue budget for the whole session. With nothing
+    /// measuring, both must let go by themselves.
+    #[test]
+    fn an_unmeasured_prior_lets_the_floor_and_the_budget_go() {
+        const PLAN_CEILING: u32 = 2_550_000;
+        const FLOOR: u32 = crate::encode::MIN_BITRATE_BPS;
+        let t0 = Instant::now();
+        let mut g = remembered(200_000, GovernorFlags::default(), t0);
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, t0);
+        assert_eq!(
+            g.applied_bps(),
+            200_000,
+            "opens at the remembered rate (P8)"
+        );
+        assert_eq!(g.relieved_floor_bps(), Some(200_000));
+        assert_eq!(g.prior_bps(), Some(200_000));
+        assert_eq!(
+            g.measured_pipe_bps(t0, true),
+            Some(200_000),
+            "the queue budget reads the seed"
+        );
+
+        // Ten clean windows, nothing measured: one decay step, and the floor
+        // — and with it the AIMD's target — follows it up.
+        let mut now = t0;
+        for _ in 0..10 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(now, 30, || 0, || 0, || 0, true, |o| o, 0);
+        }
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, now);
+        assert_eq!(g.prior_bps(), Some(250_000));
+        assert_eq!(g.relieved_floor_bps(), Some(212_500));
+        assert!(g.applied_bps() >= 212_500, "applied={}", g.applied_bps());
+        assert_eq!(g.measured_pipe_bps(now, true), Some(250_000));
+
+        // Long enough, and the prior is gone: nominal floor, nominal budget —
+        // the unremembered session, byte for byte.
+        for _ in 0..110 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(now, 30, || 0, || 0, || 0, true, |o| o, 0);
+        }
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, now);
+        assert_eq!(g.prior_bps(), None);
+        assert_eq!(g.relieved_floor_bps(), None);
+        assert_eq!(g.measured_pipe_bps(now, true), None);
+        assert!(g.applied_bps() >= FLOOR, "applied={}", g.applied_bps());
+        // The memory has nothing better than the applied rate now, so the
+        // pair is recorded at ≥ the band and stops re-seeding slow.
+        assert_eq!(g.remembered_candidate_bps(now, true), None);
+    }
+
+    /// A probe that finds the pipe: the viewer reports its queue growing at
+    /// 300 kbps of arrival. That is a MEASUREMENT — the floor follows the
+    /// live value, the prior becomes it, and once the report releases the
+    /// decay resumes from 300 k rather than from the seed.
+    #[test]
+    fn a_live_measurement_re_anchors_the_prior() {
+        const PLAN_CEILING: u32 = 2_550_000;
+        const FLOOR: u32 = crate::encode::MIN_BITRATE_BPS;
+        let t0 = Instant::now();
+        let mut g = remembered(200_000, GovernorFlags::default(), t0);
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, t0);
+        let mut now = t0;
+        for _ in 0..20 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(now, 30, || 0, || 0, || 0, true, |o| o, 0);
+        }
+        assert_eq!(g.prior_bps(), Some(312_500));
+        // Four windows of a growing transit queue at 300 kbps of arrival.
+        for _ in 0..4 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(
+                now,
+                30,
+                || 0,
+                || 0,
+                || viewer_rate::pack_link(300_000, 200),
+                true,
+                |o| o,
+                0,
+            );
+        }
+        assert_eq!(
+            g.prior_bps(),
+            Some(300_000),
+            "re-anchored on the measurement"
+        );
+        assert_eq!(g.remembered_candidate_bps(now, true), Some(300_000));
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, now);
+        assert_eq!(
+            g.relieved_floor_bps(),
+            Some(255_000),
+            "the floor follows the LIVE value, not the prior"
+        );
+        // The queue drains and the clamp releases; then nothing measures.
+        for _ in 0..4 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(
+                now,
+                30,
+                || 0,
+                || 0,
+                || viewer_rate::pack_link(300_000, -300),
+                true,
+                |o| o,
+                0,
+            );
+        }
+        for _ in 0..10 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(now, 30, || 0, || 0, || 0, true, |o| o, 0);
+        }
+        assert_eq!(
+            g.prior_bps(),
+            Some(330_000),
+            "decays from the measurement, not from the seed — and gently (×1.1)"
+        );
+        assert_eq!(g.remembered_candidate_bps(now, true), Some(330_000));
+    }
+
+    /// The hazard the down-step closes: a prior a few percent ABOVE the pipe
+    /// grows a queue too slowly for the link loop to latch (it wants 100 ms
+    /// of growth per window) and the AIMD cannot decrease below the floor.
+    /// The age LEVEL is what sees it — two elevated windows walk the prior
+    /// back down until the queue drains.
+    #[test]
+    fn age_excess_without_a_measurement_walks_the_prior_down() {
+        const PLAN_CEILING: u32 = 2_550_000;
+        const FLOOR: u32 = crate::encode::MIN_BITRATE_BPS;
+        let t0 = Instant::now();
+        let mut g = remembered(200_000, GovernorFlags::default(), t0);
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, t0);
+        let mut now = t0;
+        for _ in 0..30 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(now, 30, || 0, || 0, || 0, true, |o| o, 0);
+        }
+        assert_eq!(g.prior_bps(), Some(390_625));
+        // The viewer's paint age sits 200 ms over a 100 ms floor, while its
+        // queue-growth report stays under the link loop's onset — the slow
+        // leak. No measurement exists; only the level speaks.
+        let elevated = |g: &mut RateGovernor, now: &mut Instant| {
+            *now += Duration::from_secs(1);
+            g.tick_viewer_window(
+                *now,
+                30,
+                || 0,
+                || viewer_rate::pack_age(300, 100, 200),
+                || viewer_rate::pack_link(380_000, 50),
+                true,
+                |o| o,
+                0,
+            );
+        };
+        elevated(&mut g, &mut now);
+        assert_eq!(
+            g.prior_bps(),
+            Some(390_625),
+            "one elevated window is a lump"
+        );
+        elevated(&mut g, &mut now);
+        assert_eq!(g.prior_bps(), Some(312_500), "two running: one step down");
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, now);
+        assert_eq!(g.relieved_floor_bps(), Some(265_625));
+        elevated(&mut g, &mut now);
+        elevated(&mut g, &mut now);
+        assert_eq!(g.prior_bps(), Some(250_000));
+        // The queue drains, the age returns to its floor: the climb resumes.
+        for _ in 0..12 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(
+                now,
+                30,
+                || 0,
+                || viewer_rate::pack_age(105, 100, 200),
+                || 0,
+                true,
+                |o| o,
+                0,
+            );
+        }
+        assert_eq!(g.prior_bps(), Some(312_500));
+    }
+
+    /// The kill switch is FR-59 P8 verbatim: the seed holds for the session
+    /// and the memory is left to the pump's applied-rate fallback.
+    #[test]
+    fn with_prior_decay_off_the_seed_holds_as_p8_shipped() {
+        const PLAN_CEILING: u32 = 2_550_000;
+        const FLOOR: u32 = crate::encode::MIN_BITRATE_BPS;
+        let t0 = Instant::now();
+        let flags = GovernorFlags {
+            prior_decay: false,
+            ..GovernorFlags::default()
+        };
+        let mut g = remembered(200_000, flags, t0);
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, t0);
+        let mut now = t0;
+        for _ in 0..150 {
+            now += Duration::from_secs(1);
+            g.tick_viewer_window(now, 30, || 0, || 0, || 0, true, |o| o, 0);
+        }
+        g.pre_encode_tick(PLAN_CEILING, FLOOR, true, DEPTH, now);
+        assert_eq!(g.prior_bps(), Some(200_000));
+        assert_eq!(g.relieved_floor_bps(), Some(200_000));
+        assert_eq!(g.measured_pipe_bps(now, true), Some(200_000));
+        assert_eq!(g.remembered_candidate_bps(now, true), None);
+    }
+
+    /// A direct transport has no prior in force at all — the relief, the
+    /// budget and the memory are constrained-only machinery.
+    #[test]
+    fn a_direct_session_has_no_prior() {
+        let t0 = Instant::now();
+        let mut g = remembered(200_000, GovernorFlags::default(), t0);
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t0);
+        assert_eq!(g.relieved_floor_bps(), None);
+        assert_eq!(g.measured_pipe_bps(t0, false), None);
+        assert_eq!(g.remembered_candidate_bps(t0, false), None);
     }
 
     /// FR-63 — the WIRING, not the law (the law is unit-tested in
@@ -1817,10 +2149,35 @@ mod tests {
         }
         t += Duration::from_millis(10);
         g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
-        assert!(
-            g.relieved_floor_bps().is_none(),
-            "…and release once the queue is actually gone"
+        // …and release once the queue is actually gone. FR-70 P1: releasing
+        // the CLAMP no longer snaps the floor back to the 1.5 M constant —
+        // that snap forced the target 4× over a pipe just measured at 400 k
+        // and re-created the queue the release had waited for. The last
+        // measurement stays as the prior (400 k ⇒ a floor of 340 k), and
+        // decays from there while nothing measures.
+        assert_eq!(
+            g.measured_pipe_bps(t, true),
+            Some(400_000),
+            "the clamp released ⇒ the prior is the last measurement"
         );
+        assert_eq!(
+            g.relieved_floor_bps(),
+            Some(340_000),
+            "the floor follows the last MEASURED rate, not the constant"
+        );
+        // Ten clean windows later the prior has taken one decay step.
+        let mut t2 = t;
+        for _ in 0..10 {
+            t2 += Duration::from_millis(1100);
+            g.tick_viewer_window(t2, 30, || 0, || 0, || 0, true, |o| o, 0);
+        }
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t2);
+        assert_eq!(
+            g.prior_bps(),
+            Some(440_000),
+            "×1.1 — a MEASURED base decays gently"
+        );
+        assert_eq!(g.relieved_floor_bps(), Some(374_000));
     }
 
     /// FR-59 — the clamp must survive the exact field shape that defeated
@@ -1885,10 +2242,15 @@ mod tests {
         }
         t += Duration::from_millis(10);
         g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        // …and releases once the age is back at the floor. The RELEASE is
+        // the clamp letting go of the ceiling; FR-70 P1 keeps the floor at
+        // the last measurement (400 k ⇒ 340 k) rather than the 1.5 M
+        // constant — see `the_arrival_clamp_holds_until_the_queue_has_drained`.
         assert!(
-            g.relieved_floor_bps().is_none(),
-            "…and releases once the age is back at the floor"
+            g.link_stats().2 <= LINK_RELEASE_DEPTH_MS && !g.link_loop_holding(),
+            "the clamp must have released"
         );
+        assert_eq!(g.relieved_floor_bps(), Some(340_000));
     }
 
     /// A viewer that reports NO age must not pin the clamp forever — it
@@ -1921,10 +2283,11 @@ mod tests {
         }
         t += Duration::from_millis(10);
         g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
-        assert!(
-            g.relieved_floor_bps().is_none(),
-            "no age signal ⇒ the integral decides, as before"
-        );
+        // No age signal ⇒ the integral decides the RELEASE, as before; and
+        // (FR-70 P1) the released clamp leaves the last measurement as the
+        // floor's prior instead of snapping to the constant.
+        assert!(!g.link_loop_holding(), "the clamp must have released");
+        assert_eq!(g.relieved_floor_bps(), Some(340_000));
     }
 
     /// FR-59 — `measured_pipe_bps` is the widened estimate every "how fast

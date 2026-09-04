@@ -52,6 +52,9 @@ pub mod ffmpeg;
 pub mod aimd;
 /// FR-35 — the constrained ceiling learns the pair (pure controller).
 pub mod ceiling_learn;
+/// FR-70 P1 — the remembered rate as a PRIOR that decays while nothing
+/// measures (pure; no clock, no I/O).
+pub mod prior;
 /// FR-35 P2 — per-peer rate memory (one JSON file in the data dir).
 pub mod rate_memory;
 /// FR-63 B0 — the deterministic rate-law simulator. TEST-ONLY: it ships zero
@@ -460,6 +463,20 @@ pub fn pump_stall_watch_enabled() -> bool {
 /// measuring.
 pub fn rate_slow_start_enabled() -> bool {
     tunnel_core::env::node_env("RATE_SLOW_START").as_deref() == Some("1")
+}
+
+/// FR-70 P1 kill switch (2026-09-04): when on (default), a remembered rate
+/// standing in for a pipe measurement DECAYS toward the nominal band on
+/// clean windows (`encode::prior`) instead of holding the floor relief and
+/// the queue budget at the memory for the whole session. Field 2026-09-04
+/// (CORPLAP-1 → neo16, `6a9abc30`): a 200 kbps memory held a session at
+/// 200 kbps for four minutes while nothing ever measured the pipe — the
+/// queue budget denominated in the memory tripped on every drag frame, and
+/// a queue that never forms is a pipe that can never be measured. Env
+/// `ROOMLERD_RATE_PRIOR_DECAY` / config `rate_prior_decay`. `0` = FR-59 P8
+/// verbatim (the seed is a constant for the session).
+pub fn rate_prior_decay_enabled() -> bool {
+    tunnel_core::env::flag("RATE_PRIOR_DECAY", true)
 }
 
 /// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase

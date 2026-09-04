@@ -42,6 +42,14 @@ pub(crate) struct DimsInputs {
     /// Post-P5-merge Priority cap (`priority_relay_cap` through
     /// `merged_priority_cap`). `None` = no dial caps this stream.
     pub merged_priority_cap: Option<u32>,
+    /// FR-59 P5 — the slow-link profile's long-edge cap, resolved once at
+    /// pump start from the pair's REMEMBERED rate. Merged with the dial cap
+    /// by `min` (a dial that already asked for fewer pixels keeps them), but
+    /// carried SEPARATELY so the rung can be attributed: before FR-70 P1 the
+    /// two rode one slot and a profile cap logged as `priority-cap` — and
+    /// the viewer, told "relay-limited", advised switching Priority to
+    /// Sharper, which lifts a dial cap and does nothing against this one.
+    pub slow_link_cap: Option<u32>,
     /// Idle-refine state: while refined the Priority cap is REPLACED by
     /// the refined rung (default `None` = full native).
     pub refined: bool,
@@ -67,6 +75,11 @@ pub(crate) enum RungReason {
     SoftCap,
     /// The (merged) Priority dial's relay/smoother cap.
     PriorityCap,
+    /// FR-59 P5 — the slow-link profile's cap (the pair was REMEMBERED as
+    /// slow at pump start). Named apart from `PriorityCap` because the
+    /// remedies differ: a dial cap lifts with Priority → Sharper; this one
+    /// lifts only on a later session, once the memory no longer says slow.
+    SlowLinkCap,
     /// The refined rung's own long-edge bound
     /// (`idle_refine_max_edge` — refined, but not to full native).
     RefinedCap,
@@ -80,6 +93,7 @@ impl RungReason {
             RungReason::UserPick => "user-pick",
             RungReason::SoftCap => "soft-cap",
             RungReason::PriorityCap => "priority-cap",
+            RungReason::SlowLinkCap => "slow-link-cap",
             RungReason::RefinedCap => "refined-cap",
         }
     }
@@ -102,10 +116,26 @@ pub(crate) struct DimsPlan {
 }
 
 pub(crate) fn plan_dims(inp: &DimsInputs) -> DimsPlan {
+    // FR-59 P5 / FR-70 P1 — the dial cap and the slow-link cap merge by
+    // `min` exactly as they did when the caller pre-merged them into one
+    // slot; they are only kept apart here so the winner can be NAMED.
+    let merged_cap = match (inp.merged_priority_cap, inp.slow_link_cap) {
+        (Some(dial), Some(slow)) => Some(dial.min(slow)),
+        (dial, slow) => dial.or(slow),
+    };
+    // The slow-link cap is the binding one when it is the smaller (a tie
+    // reads as the profile's: the dial's remedy would not lift it).
+    let slow_link_binds = matches!(
+        (inp.merged_priority_cap, inp.slow_link_cap),
+        (None, Some(_))
+    ) || matches!(
+        (inp.merged_priority_cap, inp.slow_link_cap),
+        (Some(dial), Some(slow)) if slow <= dial
+    );
     let hard_cap = if inp.refined {
         inp.refined_cap
     } else {
-        inp.merged_priority_cap
+        merged_cap
     };
     let effective = effective_target_resolution(
         inp.merged_target,
@@ -114,9 +144,7 @@ pub(crate) fn plan_dims(inp: &DimsInputs) -> DimsPlan {
         hard_cap,
         inp.soft_cap,
     );
-    let capped_below_native = inp
-        .merged_priority_cap
-        .is_some_and(|c| inp.native_w.max(inp.native_h) > c);
+    let capped_below_native = merged_cap.is_some_and(|c| inp.native_w.max(inp.native_h) > c);
     let user_boxed = resolve_user_box(inp.merged_target, inp.native_w, inp.native_h);
     let user_native = matches!(user_boxed, TargetResolution::Native);
 
@@ -141,6 +169,8 @@ pub(crate) fn plan_dims(inp: &DimsInputs) -> DimsPlan {
                 if hard_dims == Some(fixed) {
                     if inp.refined {
                         RungReason::RefinedCap
+                    } else if slow_link_binds {
+                        RungReason::SlowLinkCap
                     } else {
                         RungReason::PriorityCap
                     }
@@ -260,6 +290,7 @@ mod tests {
             native_h: NH,
             merged_target: TargetResolution::Native,
             merged_priority_cap: None,
+            slow_link_cap: None,
             refined: false,
             refined_cap: None,
             soft_cap: None,
@@ -267,6 +298,85 @@ mod tests {
     }
 
     // ── plan_dims: the decision table ──────────────────────────────────
+
+    /// FR-70 P1 — the field case (CORPLAP-1, 2026-09-04): the dial caps are
+    /// off by default, so the ONLY cap was the slow-link profile's 1280,
+    /// and it logged as `priority-cap`. It must name itself.
+    #[test]
+    fn slow_link_cap_clamps_and_names_itself() {
+        let p = plan_dims(&DimsInputs {
+            slow_link_cap: Some(1280),
+            ..base()
+        });
+        let TargetResolution::Fixed { width, height } = p.effective_target else {
+            panic!("must clamp");
+        };
+        assert_eq!((width, height), aspect_preserved_target(NW, NH, 1280));
+        assert_eq!(p.reason, RungReason::SlowLinkCap);
+        assert_eq!(p.reason.as_str(), "slow-link-cap");
+        assert!(p.capped_below_native, "there is a cap worth lifting");
+        assert!(p.user_native);
+    }
+
+    /// The two caps merge by `min`, as they did in one slot — and the
+    /// SMALLER one is the one named, because that is the one whose remedy
+    /// the operator needs.
+    #[test]
+    fn the_smaller_of_dial_and_slow_link_cap_binds_and_is_named() {
+        let dial_wins = plan_dims(&DimsInputs {
+            merged_priority_cap: Some(1024),
+            slow_link_cap: Some(1280),
+            ..base()
+        });
+        let TargetResolution::Fixed { width, .. } = dial_wins.effective_target else {
+            panic!()
+        };
+        assert_eq!(width, aspect_preserved_target(NW, NH, 1024).0);
+        assert_eq!(dial_wins.reason, RungReason::PriorityCap);
+
+        let slow_wins = plan_dims(&DimsInputs {
+            merged_priority_cap: Some(1600),
+            slow_link_cap: Some(1280),
+            ..base()
+        });
+        let TargetResolution::Fixed { width, .. } = slow_wins.effective_target else {
+            panic!()
+        };
+        assert_eq!(width, aspect_preserved_target(NW, NH, 1280).0);
+        assert_eq!(slow_wins.reason, RungReason::SlowLinkCap);
+
+        // A tie is the profile's: Sharper would not lift it.
+        let tie = plan_dims(&DimsInputs {
+            merged_priority_cap: Some(1280),
+            slow_link_cap: Some(1280),
+            ..base()
+        });
+        assert_eq!(tie.reason, RungReason::SlowLinkCap);
+    }
+
+    /// An explicit pick still wins over the profile cap (the P5 promise),
+    /// and a profile cap at or above native clamps nothing.
+    #[test]
+    fn slow_link_cap_respects_a_user_pick_and_never_upscales() {
+        let pick = plan_dims(&DimsInputs {
+            merged_target: TargetResolution::Fixed {
+                width: 960,
+                height: 600,
+            },
+            slow_link_cap: Some(1280),
+            ..base()
+        });
+        assert_eq!(pick.reason, RungReason::UserPick);
+        assert!(!pick.user_native);
+
+        let wide = plan_dims(&DimsInputs {
+            slow_link_cap: Some(1920),
+            ..base()
+        });
+        assert_eq!(wide.effective_target, TargetResolution::Native);
+        assert_eq!(wide.reason, RungReason::Native);
+        assert!(!wide.capped_below_native);
+    }
 
     #[test]
     fn unconstrained_native_is_native() {
