@@ -1558,12 +1558,11 @@ async fn handle_play_audio(
         }
     };
 
-    let file = match state
-        .files
-        .base
-        .find_by_id_in_tenant(room.tenant_id, fid)
-        .await
-    {
+    // FR-69 P3 — `files` is the `chat` module's; a DAO is a stateless handle
+    // on the collection, so this playback path builds its own until the
+    // media handlers move with conference (P4).
+    let files = roomler_ai_services::dao::file::FileDao::new(&state.db);
+    let file = match files.base.find_by_id_in_tenant(room.tenant_id, fid).await {
         Ok(f) => f,
         Err(e) => {
             warn!(%e, "Failed to find file for playback");

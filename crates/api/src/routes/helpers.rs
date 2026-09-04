@@ -14,7 +14,7 @@ use roomler_ai_db::models::Room;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-pub use roomler_core::notify::{NotifyParams, notify_call_started, notify_mentions};
+pub use roomler_core::notify::notify_call_started;
 
 /// Tenant membership + the room resolved WITHIN that tenant, and nothing else.
 ///
