@@ -2337,9 +2337,23 @@ mod system {
         if route_metric0_enabled() { 0 } else { 1 }
     }
 
-    /// #1342 — give IPv6 the lever IPv4 has had since rc.410:
-    /// `ROOMLERD_OVERLAY_V6_WIN` (config key `overlay_v6_win`), default
-    /// **OFF**.
+    /// #1342 — WIN the contested prefixes outright instead of evicting a
+    /// competitor off them forever: `ROOMLERD_OVERLAY_ROUTE_WIN` (config key
+    /// `overlay_route_win`), default **OFF**.
+    ///
+    /// ⚠️ It is named `route`, not `v6`, because it moves BOTH prefixes that
+    /// share [`ula_route_metric`] — the derived-ULA `/96` **and the CONNECTED
+    /// v4 prefix** (the carved block, or the legacy `/10`).
+    ///
+    /// The v4 half is rc.288's unfinished business. That comment already
+    /// records the failure — *"AnyConnect mirrors the whole /10 at effective
+    /// metric 2 while our connected route sits at 257, so the fall-through
+    /// lands in the corp tunnel"* — and reached for metric 0, which rc.289
+    /// then had to revert. Measured on a corp laptop today: the VPN holds
+    /// `100.65.4.0/22` at effective 2 while ours sits at 256, so any block
+    /// address outside the `/24`s separately defended (`100.65.7.x`, which
+    /// this tenant has simply not grown into yet) resolves into the corp
+    /// tunnel. Latent rather than biting, and closed by the same line.
     ///
     /// Windows ranks by `route metric + INTERFACE metric`. v4 pins the overlay
     /// adapter's interface metric to 0 and asserts its prefixes at route
@@ -2371,8 +2385,8 @@ mod system {
     /// out-ranks it" does not generalise. Prove that per host before flipping
     /// the default: `evicted` must go flat and stay flat.
     #[cfg(windows)]
-    fn v6_win_enabled() -> bool {
-        crate::env::flag("OVERLAY_V6_WIN", false)
+    fn route_win_enabled() -> bool {
+        crate::env::flag("OVERLAY_ROUTE_WIN", false)
     }
 
     /// The metric the ULA `/96` (and the connected v4 prefix) is asserted at.
@@ -2385,7 +2399,7 @@ mod system {
     fn ula_route_metric() -> u32 {
         if route_metric0_enabled() {
             0
-        } else if v6_win_enabled() {
+        } else if route_win_enabled() {
             defended_route_metric()
         } else {
             256
@@ -2825,7 +2839,7 @@ mod system {
                 // miniport's 25, and the ULA's route metric 256 then put us at
                 // 261 vs 26: lost outright, hence the endless eviction of the
                 // VPN's mirrored `/96`. Best-effort like its v4 twin.
-                if v6_win_enabled()
+                if route_win_enabled()
                     && let Err(e) = winroute::set_iface_metric_v6(dev.tun_luid(), m)
                 {
                     tracing::warn!(%e, metric = m, "overlay: IPv6 interface metric pin failed; keeping the automatic metric");
@@ -3468,7 +3482,7 @@ mod system {
                 // reverted by the same events (a network-profile change, an
                 // adapter reset), and a pin that is only ever set at startup
                 // is a pin that is quietly gone by the time it matters.
-                if v6_win_enabled() {
+                if route_win_enabled() {
                     let _ = winroute::set_iface_metric_v6(ours, want);
                 }
                 let still: Vec<Ipv4Addr> = stolen
@@ -4475,8 +4489,8 @@ mod system {
             // No env override in the test process ⇒ every gate reads its
             // built-in default.
             assert!(
-                !super::v6_win_enabled(),
-                "OVERLAY_V6_WIN must default OFF: it re-metrics the auto CONNECTED \
+                !super::route_win_enabled(),
+                "OVERLAY_ROUTE_WIN must default OFF: it re-metrics the auto CONNECTED \
                  route on every Windows host, and it has not been field-proven"
             );
             assert!(!super::route_metric0_enabled(), "rc.289 left metric-0 OFF");

@@ -568,20 +568,28 @@ pub struct AgentConfig {
     /// opt-in experiment, auto-yields to metric 1 when it doesn't stick.
     #[serde(default)]
     pub overlay_route_metric0: Option<bool>,
-    /// #1342 — give IPv6 the interface-metric lever IPv4 has had since
-    /// rc.410, and assert the ULA `/96` at the defended route metric (1)
-    /// instead of the stock connected-route 256. Windows only
-    /// (`ROOMLERD_OVERLAY_V6_WIN`). Built-in default: **off**.
+    /// #1342 — WIN the contested prefixes outright instead of evicting a
+    /// competitor off them forever. Windows only
+    /// (`ROOMLERD_OVERLAY_ROUTE_WIN`). Built-in default: **off**.
     ///
-    /// Without it the overlay adapter keeps Windows' AUTOMATIC v6 interface
-    /// metric while the ULA sits at route metric 256 — measured against a
-    /// corp VPN: **261 for us vs 26 for the VPN**, lost outright, which is
-    /// why the guard evicts the VPN's mirrored `/96` ~20/min forever on a
-    /// host whose IPv4 is perfectly quiet. ⚠️ NOT the rc.289 metric-0
-    /// variant that the VPN deletes: this uses the same metric 1 that IPv4
-    /// has run fleet-wide for months.
+    /// Two halves, and ⚠️ the second is NOT v6-only:
+    ///   * pin the overlay adapter's **IPv6** interface metric, the lever
+    ///     IPv4 has had since rc.410 and IPv6 never got;
+    ///   * assert the derived-ULA `/96` **and the CONNECTED v4 prefix** (the
+    ///     carved block / legacy `/10`) at the defended route metric 1
+    ///     instead of the stock connected-route 256.
+    ///
+    /// Measured against a corp VPN: v6 was **261 for us vs 26 for the VPN**,
+    /// lost outright — which is why the guard evicts the VPN's mirrored
+    /// `/96` ~20/min forever on a host whose IPv4 is perfectly quiet. The v4
+    /// half closes rc.288's unfinished business: the VPN holds the carved
+    /// `/22` at effective 2 against our 256, so a block address outside the
+    /// `/24`s separately defended falls through into the corp tunnel.
+    ///
+    /// ⚠️ NOT the rc.289 metric-0 variant that the VPN deletes outright:
+    /// this uses the same metric 1 IPv4 has run fleet-wide for months.
     #[serde(default)]
-    pub overlay_v6_win: Option<bool>,
+    pub overlay_route_win: Option<bool>,
     /// Stable UDP port for the overlay's direct sockets
     /// (`ROOMLERD_OVERLAY_DIRECT_PORT`). Built-in default: **derived
     /// per machine** — `43648 + (fnv1a(machine_id) % 16) × 8` (see
@@ -2001,7 +2009,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_route_reclaim: None,
         overlay_tun_persist: None,
         overlay_route_metric0: None,
-        overlay_v6_win: None,
+        overlay_route_win: None,
         overlay_direct_port: None,
         overlay_iface_metric: None,
         local_turn: None,
@@ -2259,7 +2267,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 79]
         ("OVERLAY_ROUTE_RECLAIM", cfg.overlay_route_reclaim),
         ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
         ("OVERLAY_ROUTE_METRIC0", cfg.overlay_route_metric0),
-        ("OVERLAY_V6_WIN", cfg.overlay_v6_win),
+        ("OVERLAY_ROUTE_WIN", cfg.overlay_route_win),
         ("LOCAL_TURN", cfg.local_turn),
         ("DNS_AAAA", cfg.dns_aaaa),
         ("AUTO_UPDATE", cfg.auto_update),
