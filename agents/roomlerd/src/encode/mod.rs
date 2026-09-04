@@ -462,6 +462,62 @@ pub fn rate_slow_start_enabled() -> bool {
     tunnel_core::env::node_env("RATE_SLOW_START").as_deref() == Some("1")
 }
 
+/// FR-62 A1 — does the QSV in-place rate move also write `rc_buffer_size`?
+///
+/// # Why this is a knob and not a constant
+///
+/// A0-QSV measured on CORPLAP-1's Iris Xe (0.4.51, 2026-09-02): with
+/// `encoder_inplace_rate=1` the first rate change fails
+/// `hevc_qsv Error during resetting: incompatible video parameters (-14)` =
+/// `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM`, and the encoder is left unusable. The
+/// flag has stayed OFF since, which is why QSV still pays a 0.34–2.0 s rebuild
+/// per move and why `coarsen_bitrate` is load-bearing for it.
+///
+/// ⚠️ **The hypothesis recorded on #1242 for that failure is refuted by our own
+/// code.** It supposed we open QSV *quality-driven* (`global_quality`, ICQ), so
+/// that `TargetKbps`/`MaxKbps` "aren't the governing params and MSDK rejects
+/// resetting them" — and proposed testing it with a sweep that omits
+/// `global_quality`. But `build_encoder` sets `bit_rate = maxrate_bps` for every
+/// non-NVENC backend and the option dict sets `maxrate` to the same value, so
+/// `qsvenc.c::select_rc_mode` takes its **CBR** branch (`rc_max_rate ==
+/// bit_rate`) before it ever considers ICQ. `global_quality` is inert in that
+/// mode. In CBR those two fields are precisely what governs, so the stated
+/// mechanism cannot be the cause — and the proposed test would have removed an
+/// already-inert option and produced a null result that looked like a
+/// refutation of the wrong thing.
+///
+/// # The mechanism this knob tests instead
+///
+/// The in-place arm writes **three** fields — `bit_rate`, `rc_max_rate` and
+/// `rc_buffer_size` — and `qsvenc` maps `rc_buffer_size` onto
+/// `mfxInfoMFX::BufferSizeInKB`, which sizes an internal bitstream buffer
+/// allocated at Init. Changing it across `MFXVideoENCODE_Reset` is the
+/// documented way to earn `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM`: the spec defines
+/// that code as "Reset requires additional memory allocation and cannot be
+/// executed". Our `bufsize` is `target × hrd_pct`, so it moves on **every**
+/// rate change. That also explains the one fact `low_power` ruled out: the
+/// failure is identical on VDENC and VME because an allocation constraint has
+/// nothing to do with which encode path runs.
+///
+/// **Default `false` — skip the write.** The measured behaviour of writing it
+/// is a broken encoder, so the burden of proof sits with the old path, not the
+/// new one. `ROOMLERD_QSV_INPLACE_BUFSIZE=1` restores it, which is the A-arm of
+/// the sweep that settles this.
+///
+/// ⚠️ Inert unless `encoder_inplace_rate` is on, which is default OFF. This
+/// changes no fleet behaviour; it only makes the experiment runnable from one
+/// released binary instead of two.
+///
+/// ⚠️ **Not free if it works.** Holding `BufferSizeInKB` at the open value while
+/// `TargetKbps` falls widens the HRD window in seconds — a buffer sized for
+/// 6 Mbps is a 30× reservoir at 200 kbps, i.e. more latency tolerance than a
+/// remote-desktop stream wants. If the Reset then succeeds, the follow-up
+/// question is whether the window should be re-established by an occasional
+/// rebuild rather than left to drift.
+pub fn qsv_inplace_writes_bufsize() -> bool {
+    tunnel_core::env::node_env("QSV_INPLACE_BUFSIZE").as_deref() == Some("1")
+}
+
 /// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase
 /// breakdown. `ROOMLERD_PUMP_STALL_WARN_MS`.
 ///
@@ -1509,6 +1565,52 @@ mod tests {
         assert_eq!(qp_from_quality_stats(&payload), Some(24));
         payload[..4].copy_from_slice(&(51u32 * 118).to_le_bytes());
         assert_eq!(qp_from_quality_stats(&payload), Some(51));
+    }
+
+    /// FR-62 — the QSV in-place `rc_buffer_size` write is OFF by default.
+    ///
+    /// 🔑 The default is the assertion that matters. Writing `BufferSizeInKB`
+    /// on every rate change is the suspected cause of the measured
+    /// `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM (-14)` that leaves a QSV encoder
+    /// unusable on the first move, so a future edit flipping this default back
+    /// to "always write" — which reads like restoring a dropped line — should
+    /// fail here rather than on somebody's Iris Xe.
+    #[test]
+    fn qsv_inplace_bufsize_write_is_off_unless_asked_for() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const NAME: &str = "ROOMLERD_QSV_INPLACE_BUFSIZE";
+        // SAFETY: as `hw_auto_disabled_reads_env` — this is the only test that
+        // touches this var and it clears it before every read.
+        let clear = || unsafe { std::env::remove_var(NAME) };
+
+        clear();
+        assert!(
+            !qsv_inplace_writes_bufsize(),
+            "unset must SKIP the write — the measured behaviour of writing it \
+             is a -14 and an unusable encoder"
+        );
+
+        clear();
+        unsafe { std::env::set_var(NAME, "1") };
+        assert!(
+            qsv_inplace_writes_bufsize(),
+            "=1 is the A-arm of the sweep and must restore the old write"
+        );
+
+        // Anything else is the default. The knob exists to opt INTO the
+        // suspect behaviour, so it takes an exact opt-in rather than the
+        // usual truthy set.
+        for other in ["0", "true", "yes", ""] {
+            clear();
+            unsafe { std::env::set_var(NAME, other) };
+            assert!(
+                !qsv_inplace_writes_bufsize(),
+                "{NAME}={other:?} must not enable the suspect write"
+            );
+        }
+        clear();
     }
 
     #[test]
