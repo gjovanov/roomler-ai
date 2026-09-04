@@ -15,7 +15,7 @@ jobs:
     # a cancelled attempt saves no cache — takes ~20 min 18 s on the 2-core
     # runner. The P5b rerun was cancelled by this ceiling at 20:18 with
     # every step green; warm runs finish in ~10.
-    timeout-minutes: 30
+    timeout-minutes: 50
     runs-on: ubuntu-latest
     # Warm baseline is 4-5 min; the only step that can blow past it is an
     # Ubuntu-mirror stall inside apt (2026-08-18 evening: 14/19/20/29-min
