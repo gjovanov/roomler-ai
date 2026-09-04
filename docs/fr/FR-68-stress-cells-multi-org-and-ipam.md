@@ -231,6 +231,26 @@ to a throwaway database, and the IPAM cell points its VM at that server instead
 of `https://roomler.ai`. ⚠️ That means the cell needs `VMTEST_SERVER` to be
 per-cell rather than global — currently it is one value in `lib.sh:18`.
 
+**The per-cell plumbing is smaller than it looks, with one trap** (checked
+2026-09-04, so the next session need not rediscover it):
+
+- Every consumer reads `VMTEST_SERVER` / `VMTEST_TENANT_ID` /
+  `VMTEST_EPHEMERAL_KEY` as plain shell variables, and each cell script is its
+  OWN process that sources `lib.sh`. So a cell that needs a different server
+  just re-assigns them at the top of its branch — **no `lib.sh` refactor**.
+- ⚠️ **`api_login` caches `API_TOKEN` and early-returns** (`lib.sh:146-148`).
+  Re-assigning `VMTEST_SERVER` without also clearing `API_TOKEN=""` sends the
+  OLD server's bearer to the new one — an auth failure that reads like a
+  permissions problem rather than a plumbing one.
+- ⚠️ The run-level teardown baseline in `vmtest.sh` is taken against the
+  ORIGINAL server, so it cannot see rows the IPAM cell creates elsewhere. That
+  cell must delete its own rows, the way the multi-org cell already deletes
+  org B's (`teardown-b`).
+
+Remaining cost is the stack itself, not the harness: an `e2e` deployment
+carrying `ROOMLER__OVERLAY__MULTI_BLOCK_ENABLED: "true"`, plus an org and an
+anchor on it.
+
 The multi-org cell has no such problem: it needs two orgs, not a server flag,
 and can run against prod.
 
