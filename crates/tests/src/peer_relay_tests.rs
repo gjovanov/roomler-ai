@@ -11,8 +11,8 @@
 
 use crate::fixtures::{seed::SeededTenant, test_app::TestApp};
 use bson::{doc, oid::ObjectId};
-use roomler_ai_api::ws::overlay::{PolicyLoad, load_acl, try_load_acl};
 use roomler_ai_db::models::role::permissions::{DEFAULT_ADMIN, EXEC_DEVICE};
+use roomler_ai_mod_network::overlay::{PolicyLoad, load_acl, try_load_acl};
 use roomler_ai_remote_control::models::OverlayAclMode;
 use roomlerd::{config::AgentConfig, enrollment};
 use serde_json::{Value, json};

@@ -201,7 +201,7 @@ pub fn local_rehome_close(state: &AppState, network_id: ObjectId, pks: &[String]
         if !rehome_allowed(&state.derp_rehome_cooldowns, network_id, member) {
             continue;
         }
-        if let Some(cancel) = state.derp_cancels.get(&(network_id, pk)) {
+        if let Some(cancel) = state.network().derp_cancels.get(&(network_id, pk)) {
             info!(%network_id, pubkey = %member, "derp: closing socket for cluster rehome");
             crate::cluster::metrics::bump(&crate::cluster::metrics::DERP_REHOME_CLOSE_TOTAL);
             cancel.notify_one();
@@ -286,6 +286,7 @@ pub fn remove_cancel_if_ours(
     ours: &std::sync::Arc<tokio::sync::Notify>,
 ) {
     state
+        .network()
         .derp_cancels
         .remove_if(key, |_, c| std::sync::Arc::ptr_eq(c, ours));
 }

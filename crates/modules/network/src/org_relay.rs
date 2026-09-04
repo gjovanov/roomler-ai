@@ -57,12 +57,12 @@ use roomler_ai_remote_control::{
 use tracing::{debug, info, warn};
 use tunnel_core::policy::{OverlayPeerRef, OverlaySource, evaluate_overlay};
 
-use crate::routes::push::is_global_unicast;
-use crate::state::AppState;
-use crate::ws::overlay::{
+use crate::NetworkState;
+use crate::overlay::{
     NodeIdentity, PolicyLoad, current_node, pair_key, send_to_node, send_to_node_ref, try_load_acl,
     try_overlay_source_of,
 };
+use roomler_core::net::is_global_unicast;
 
 /// How long a cached `peer_relay_mode` read stands. The org switch route
 /// invalidates on write (same pod, by tenant affinity), so this only bounds
@@ -298,7 +298,7 @@ impl OrgRelayState {
 /// the wrong answer here costs one un-minted relay session (the pair stays
 /// on TURN/DERP), while the wrong answer in the other direction would mint
 /// against a posture nobody set.
-pub async fn peer_relay_mode(state: &AppState, tenant_id: ObjectId) -> PeerRelayMode {
+pub async fn peer_relay_mode(state: &NetworkState, tenant_id: ObjectId) -> PeerRelayMode {
     let now = Instant::now();
     if let Some(e) = state.org_relay.mode_cache.get(&tenant_id)
         && now.duration_since(e.1) < MODE_CACHE_TTL
@@ -375,7 +375,7 @@ pub fn valid_static_endpoint(s: &str) -> bool {
 /// Gates 2–5 for one request. Pure over what it reads; the caller audits the
 /// verdict and, under `on`, mints.
 async fn plan_mint(
-    state: &AppState,
+    state: &NetworkState,
     requester: &OverlayNode,
     peer: &OverlayNode,
 ) -> Result<Plan, PeerRelayDenyReason> {
@@ -416,6 +416,7 @@ async fn plan_mint(
         D::PolicyUnreadable
     })?;
     let approved = state
+        .fleet
         .agents
         .list_relay_approved(tenant_id)
         .await
@@ -432,7 +433,7 @@ async fn plan_mint(
         let Some(agent_id) = agent.id else { continue };
         // Gate 4 as the device last advertised it, and liveness on this pod.
         if !agent.capabilities.has_rpc(RpcCap::RelayServer)
-            || !state.rc_hub.is_agent_online(agent_id)
+            || !state.fleet.rc_hub.is_agent_online(agent_id)
         {
             continue;
         }
@@ -540,7 +541,7 @@ fn random_secret() -> String {
 /// The entry point, called from `handle_overlay_relay_request` after its own
 /// cross-tenant and ACL-enforce checks. Never blocks the TURN grant: the
 /// client cascade (P4) picks Org over Turn/Derp when a session arrives.
-pub async fn maybe_mint(state: &AppState, requester: &OverlayNode, peer: &OverlayNode) {
+pub async fn maybe_mint(state: &NetworkState, requester: &OverlayNode, peer: &OverlayNode) {
     let tenant_id = requester.tenant_id;
     let mode = peer_relay_mode(state, tenant_id).await;
     if mode == PeerRelayMode::Off {
@@ -679,7 +680,7 @@ pub async fn maybe_mint(state: &AppState, requester: &OverlayNode, peer: &Overla
 
 /// `rc:overlay.relay_session` to member `i`, naming the OTHER member as its
 /// peer and carrying only its own secret.
-async fn push_member(state: &AppState, s: &OrgRelaySession, i: usize) {
+async fn push_member(state: &NetworkState, s: &OrgRelaySession, i: usize) {
     let me = &s.members[i];
     let other = &s.members[1 - i];
     send_to_node_ref(
@@ -701,7 +702,7 @@ async fn push_member(state: &AppState, s: &OrgRelaySession, i: usize) {
 
 #[allow(clippy::too_many_arguments)]
 async fn audit_mint(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     requester: ObjectId,
     peer: ObjectId,
@@ -739,7 +740,7 @@ async fn audit_mint(
 /// the relay and both members, the record dropped, one audit row per session
 /// naming the trigger. Returns how many were revoked.
 pub async fn revoke_where(
-    state: &AppState,
+    state: &NetworkState,
     reason: &str,
     pred: impl Fn(&OrgRelaySession) -> bool,
 ) -> usize {
@@ -782,13 +783,13 @@ pub async fn revoke_where(
 }
 
 /// Trigger 1 — the org switched peer relays off.
-pub async fn revoke_tenant(state: &AppState, tenant_id: ObjectId, reason: &str) -> usize {
+pub async fn revoke_tenant(state: &NetworkState, tenant_id: ObjectId, reason: &str) -> usize {
     revoke_where(state, reason, |s| s.tenant_id == tenant_id).await
 }
 
 /// Trigger 3 — a relay's approval was cleared.
 pub async fn revoke_relay_agent(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     agent_id: ObjectId,
     reason: &str,
@@ -800,7 +801,7 @@ pub async fn revoke_relay_agent(
 }
 
 /// Trigger 4 — a party (member or relay) was removed from the overlay.
-pub async fn revoke_node(state: &AppState, node_id: ObjectId, reason: &str) -> usize {
+pub async fn revoke_node(state: &NetworkState, node_id: ObjectId, reason: &str) -> usize {
     state.org_relay.forget_node(node_id);
     revoke_where(state, reason, |s| s.involves(node_id)).await
 }
@@ -811,7 +812,7 @@ pub async fn revoke_node(state: &AppState, node_id: ObjectId, reason: &str) -> u
 /// A read failure here does NOTHING, deliberately. Refusing a NEW mint on a
 /// blip costs one session; tearing down every LIVE session on a blip is the
 /// "spurious deny takes the mesh down" failure `load_acl` fails open to avoid.
-pub async fn reconcile_acl(state: &AppState, tenant_id: ObjectId) {
+pub async fn reconcile_acl(state: &NetworkState, tenant_id: ObjectId) {
     let acl = match try_load_acl(state, tenant_id, PolicyLoad::Always).await {
         Ok(a) => a,
         Err(e) => {
@@ -861,7 +862,7 @@ pub async fn reconcile_acl(state: &AppState, tenant_id: ObjectId) {
 /// server minted for it. Accepted only for (relay, endpoint) pairs that
 /// appear in one of its sessions.
 pub async fn handle_relay_probe(
-    state: &AppState,
+    state: &NetworkState,
     ident: NodeIdentity,
     relay_node_id: ObjectId,
     endpoint: String,

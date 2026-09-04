@@ -50,6 +50,7 @@ pub const EXTRACTED: &[&str] = &[
     "fleet",
     #[cfg(feature = "remote")]
     "remote",
+    "network",
 ];
 
 /// The modules this build links, initialised — `None` where the operator
@@ -69,6 +70,9 @@ pub struct Modules {
     /// absent, while the Hub — fleet's — keeps serving the agents).
     #[cfg(feature = "remote")]
     pub remote: Option<roomler_ai_mod_remote::RemoteState>,
+    /// P7a — built on `fleet`; always linked until the sockets move (P7b):
+    /// the host's tunnel, DERP and agent-socket code calls its engine.
+    pub network: Option<roomler_ai_mod_network::NetworkState>,
     /// Every mounted module's WebSocket namespace handlers, collected at
     /// init so the socket dispatch can look one up per message.
     ws: Vec<WsHandlerSpec>,
@@ -142,6 +146,15 @@ impl Modules {
                 }
             }
         }
+        // `network → fleet`, the same seam.
+        if let Some(fleet) = modules.fleet.clone() {
+            modules.network =
+                init_one::<roomler_ai_mod_network::NetworkState>(core.clone(), settings, fleet)
+                    .await?;
+            if let Some(m) = &modules.network {
+                modules.ws.extend(m.ws().handlers);
+            }
+        }
 
         let _ = core;
         Ok(modules)
@@ -169,6 +182,9 @@ impl Modules {
         #[cfg(feature = "remote")]
         if self.remote.is_some() {
             ids.push("remote");
+        }
+        if self.network.is_some() {
+            ids.push("network");
         }
         ids
     }
@@ -198,6 +214,9 @@ impl Modules {
         #[cfg(feature = "remote")]
         if let Some(remote) = &self.remote {
             api = api.merge(remote.routes().with_state(()));
+        }
+        if let Some(network) = &self.network {
+            api = api.merge(network.routes().with_state(()));
         }
         api
     }
@@ -229,11 +248,14 @@ impl Modules {
         if let Some(remote) = &self.remote {
             root = root.merge(remote.unlimited_routes().with_state(()));
         }
+        if let Some(network) = &self.network {
+            root = root.merge(network.unlimited_routes().with_state(()));
+        }
         root
     }
 
-    /// Every mounted module's index sets, in composition order. Applied by
-    /// the host after the core plan; snapshotted by the composition test.
+    /// Every mounted module's index sets, in composition order, for the
+    /// running deployment's settings. Applied by the host after the core plan.
     pub fn index_sets(&self) -> Vec<IndexSet> {
         #[allow(unused_mut)]
         let mut sets = Vec::new();
@@ -255,6 +277,40 @@ impl Modules {
         #[cfg(feature = "remote")]
         if let Some(remote) = &self.remote {
             sets.extend(remote.indexes());
+        }
+        if let Some(network) = &self.network {
+            sets.extend(network.indexes());
+        }
+        sets
+    }
+
+    /// The same sets for an explicit `multi_block` schema — what the
+    /// composition snapshot records, once per schema (P7a: the overlay block
+    /// registry's two plans are the network module's now).
+    pub fn index_sets_for(&self, multi_block: bool) -> Vec<IndexSet> {
+        #[allow(unused_mut)]
+        let mut sets = Vec::new();
+        #[cfg(feature = "saas")]
+        if let Some(saas) = &self.saas {
+            sets.extend(saas.indexes_for(multi_block));
+        }
+        #[cfg(feature = "chat")]
+        if let Some(chat) = &self.chat {
+            sets.extend(chat.indexes_for(multi_block));
+        }
+        #[cfg(feature = "conference")]
+        if let Some(conference) = &self.conference {
+            sets.extend(conference.indexes_for(multi_block));
+        }
+        if let Some(fleet) = &self.fleet {
+            sets.extend(fleet.indexes_for(multi_block));
+        }
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            sets.extend(remote.indexes_for(multi_block));
+        }
+        if let Some(network) = &self.network {
+            sets.extend(network.indexes_for(multi_block));
         }
         sets
     }
@@ -281,6 +337,9 @@ impl Modules {
         #[cfg(feature = "remote")]
         if let Some(remote) = &self.remote {
             jobs.extend(remote.jobs());
+        }
+        if let Some(network) = &self.network {
+            jobs.extend(network.jobs());
         }
         jobs
     }
@@ -314,6 +373,10 @@ impl Modules {
         if let Some(remote) = &self.remote {
             core.hooks
                 .register(roomler_ai_mod_remote::RemoteState::ID, remote.hooks());
+        }
+        if let Some(network) = &self.network {
+            core.hooks
+                .register(roomler_ai_mod_network::NetworkState::ID, network.hooks());
         }
     }
 
@@ -369,6 +432,9 @@ impl Modules {
     /// Orderly stop of every mounted module, in REVERSE composition order
     /// (a module stops before the ones it depends on).
     pub async fn shutdown(&self) {
+        if let Some(network) = &self.network {
+            network.shutdown().await;
+        }
         #[cfg(feature = "remote")]
         if let Some(remote) = &self.remote {
             remote.shutdown().await;

@@ -45,6 +45,10 @@ roomler-ai-mod-remote = { path = "../modules/remote", optional = true }
 # the fleet module's handles (the Hub, the agent row, presence). It becomes a
 # feature like the others when the socket moves into the module (P5b).
 roomler-ai-mod-fleet = { path = "../modules/fleet" }
+# FR-69 P7a — NOT optional yet either: the host's tunnel, DERP and agent-socket
+# code still calls the engine that moved here (`state.network()`). It becomes a
+# feature when the sockets move (P7b).
+roomler-ai-mod-network = { path = "../modules/network" }
 
 axum.workspace = true
 tokio.workspace = true

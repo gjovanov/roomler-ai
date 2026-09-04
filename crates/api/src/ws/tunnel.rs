@@ -102,6 +102,7 @@ pub async fn handle_tunnel_client_socket(
     // (client_version + client_os). Best-effort — audit rows still
     // get written if this fails, just with empty version/os.
     let (client_version, client_os) = match state
+        .network()
         .tunnel_clients
         .find_in_tenant(tenant_id, tunnel_client_id)
         .await
@@ -181,9 +182,9 @@ pub async fn handle_tunnel_client_socket(
         // Overlay `rc:overlay.*` variants are brokered separately (this
         // tunnel-client is an overlay node). Consumed messages return
         // None; everything else falls through to the tunnel match below.
-        let Some(parsed) = crate::ws::overlay::relay_overlay_msg_from_node(
-            &state,
-            crate::ws::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
+        let Some(parsed) = roomler_ai_mod_network::overlay::relay_overlay_msg_from_node(
+            state.network(),
+            roomler_ai_mod_network::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
             parsed,
         )
         .await
@@ -400,10 +401,13 @@ pub async fn handle_tunnel_client_socket(
     // Overlay teardown: drop this node from the registry + mark it
     // offline so peers' netmaps lose it. Best-effort; no-op if the
     // client never joined the overlay.
-    state.overlay_nodes_by_id.remove(&tunnel_client_id);
-    crate::ws::overlay::handle_overlay_leave(
-        &state,
-        crate::ws::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
+    state
+        .network()
+        .overlay_nodes_by_id
+        .remove(&tunnel_client_id);
+    roomler_ai_mod_network::overlay::handle_overlay_leave(
+        state.network(),
+        roomler_ai_mod_network::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
     )
     .await;
 
@@ -787,6 +791,7 @@ async fn handle_tunnel_open(
     // 5. Audit the open. RelayMode is "Direct" until ICE finishes —
     // T2.7 updates this after candidate selection.
     let _ = state
+        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1144,6 +1149,7 @@ async fn audit_tcp_accept(
     dst_port: u16,
 ) {
     let _ = state
+        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1184,6 +1190,7 @@ async fn audit_tcp_reject(
     reason: &str,
 ) {
     let _ = state
+        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1214,6 +1221,7 @@ async fn audit_tcp_reject(
 
 async fn audit_peer_close(state: &AppState, session: &TunnelSession, orig: &Originator) {
     let _ = state
+        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1478,6 +1486,7 @@ async fn audit_tcp_close(
     bytes: (u64, u64),
 ) {
     let _ = state
+        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1523,6 +1532,7 @@ fn spawn_revocation_check(
         loop {
             tick.tick().await;
             match state
+                .network()
                 .tunnel_clients
                 .find_in_tenant(tenant_id, tunnel_client_id)
                 .await
@@ -1531,7 +1541,11 @@ fn spawn_revocation_check(
                     if c.deleted_at.is_none()
                         && matches!(c.status, AgentStatus::Online | AgentStatus::Offline) =>
                 {
-                    let _ = state.tunnel_clients.touch_heartbeat(tunnel_client_id).await;
+                    let _ = state
+                        .network()
+                        .tunnel_clients
+                        .touch_heartbeat(tunnel_client_id)
+                        .await;
                 }
                 Ok(_) => {
                     info!(%tunnel_client_id, "tunnel-client revoked mid-session; closing WS");

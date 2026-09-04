@@ -20,6 +20,7 @@ roomler-core = { path = "../core" }
 # FR-69 P4 — the cluster + stats tests reach the conference module's state
 # (room manager, media claims) through `AppState::modules`.
 roomler-ai-mod-conference = { path = "../modules/conference" }
+roomler-ai-mod-network = { path = "../modules/network" }
 roomlerd = { path = "../../agents/roomlerd" }
 webrtc.workspace = true
 tokio.workspace = true

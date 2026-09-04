@@ -7974,6 +7974,7 @@ dependencies = [
  "roomler-ai-mod-chat",
  "roomler-ai-mod-conference",
  "roomler-ai-mod-fleet",
+ "roomler-ai-mod-network",
  "roomler-ai-mod-remote",
  "roomler-ai-mod-saas",
  "roomler-ai-remote-control",
@@ -8095,6 +8096,30 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "roomler-ai-mod-network"
+version = "0.4.64"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bson",
+ "dashmap",
+ "rand 0.9.4",
+ "roomler-ai-config",
+ "roomler-ai-db",
+ "roomler-ai-mod-fleet",
+ "roomler-ai-remote-control",
+ "roomler-ai-services",
+ "roomler-ai-tunnel-core",
+ "roomler-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8220,6 +8245,7 @@ dependencies = [
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-mod-conference",
+ "roomler-ai-mod-network",
  "roomler-ai-remote-control",
  "roomler-ai-services",
  "roomler-core",

@@ -20,10 +20,10 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OverlayNode};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::guards::require_permission;
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::NetworkState;
 
 #[derive(Debug, Serialize)]
 pub struct OverlayNodeResponse {
@@ -111,7 +111,7 @@ impl From<OverlayNode> for OverlayNodeResponse {
 /// Resolve `will_rejoin` for a batch of nodes in two queries: a node rejoins iff
 /// its backing agent / tunnel-client row is still live.
 async fn resolve_will_rejoin(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     nodes: &[OverlayNode],
 ) -> HashSet<ObjectId> {
@@ -126,6 +126,7 @@ async fn resolve_will_rejoin(
     let mut live = HashSet::new();
     if !agent_ids.is_empty()
         && let Ok(rows) = state
+            .fleet
             .agents
             .base
             .find_many(
@@ -168,7 +169,7 @@ pub struct SetApprovedRoutesRequest {
 /// GET /api/tenant/{tenant_id}/overlay-node — list the tenant's overlay nodes
 /// with their advertised + approved subnet routes (the subnet-router admin view).
 pub async fn list_overlay_nodes(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -200,7 +201,7 @@ pub async fn list_overlay_nodes(
 /// admin-approved subset of a node's advertised routes. Only routes the node
 /// actually advertised may be approved; the change is re-fanned to peers.
 pub async fn set_approved_routes(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, node_id)): Path<(String, String)>,
     Json(body): Json<SetApprovedRoutesRequest>,
@@ -297,7 +298,7 @@ pub async fn set_approved_routes(
         .set_approved_routes(nid, &approved)
         .await?;
     // Push the change to peers now, not on their next join.
-    crate::ws::overlay::refan_node(&state, &updated).await;
+    crate::overlay::refan_node(&state, &updated).await;
     Ok(Json(updated.into()))
 }
 
@@ -311,7 +312,7 @@ pub struct SetExitNodeRequest {
 /// advertised `0.0.0.0/0`; it sets `is_exit_node` and adds `/0` to the node's
 /// `approved_routes` (the data-plane signal). Re-fanned to peers immediately.
 pub async fn set_exit_node(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, node_id)): Path<(String, String)>,
     Json(body): Json<SetExitNodeRequest>,
@@ -371,7 +372,7 @@ pub async fn set_exit_node(
     }
 
     let updated = state.overlay_nodes.set_exit_node(nid, body.enabled).await?;
-    crate::ws::overlay::refan_node(&state, &updated).await;
+    crate::overlay::refan_node(&state, &updated).await;
     Ok(Json(updated.into()))
 }
 
@@ -397,7 +398,7 @@ pub struct EvictOverlayNodeResponse {
 /// a device for good, delete the agent or tunnel client. There is deliberately
 /// no per-machine overlay denylist today.
 pub async fn evict_overlay_node(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, node_id)): Path<(String, String)>,
 ) -> Result<Json<EvictOverlayNodeResponse>, ApiError> {
@@ -429,7 +430,7 @@ pub async fn evict_overlay_node(
         .find(|n| n.id == Some(nid))
         .ok_or_else(|| ApiError::NotFound("overlay node not found".into()))?;
 
-    let released = crate::ws::overlay::release_overlay_node(&state, &node, "admin_evict")
+    let released = crate::overlay::release_overlay_node(&state, &node, "admin_evict")
         .await
         .ok_or_else(|| ApiError::NotFound("overlay node not found".into()))?;
 
@@ -467,7 +468,7 @@ pub struct SetMagicDnsRequest {
 
 /// GET /api/tenant/{tenant_id}/magic-dns — the tenant's current MagicDNS config.
 pub async fn get_magic_dns(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<MagicDnsResponse>, ApiError> {
@@ -486,7 +487,7 @@ pub async fn get_magic_dns(
 /// PUT /api/tenant/{tenant_id}/magic-dns — set the MagicDNS domain + upstreams.
 /// An empty domain disables MagicDNS.
 pub async fn set_magic_dns(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<SetMagicDnsRequest>,

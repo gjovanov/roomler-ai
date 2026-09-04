@@ -76,10 +76,10 @@ use roomler_ai_services::dao::base::PaginationParams;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::guards::require_permission;
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::NetworkState;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Wire shapes
@@ -175,7 +175,7 @@ pub struct Caller {
 /// function cannot quietly ignore a policy field: the split routes every
 /// field, and the exhaustive destructure below has to bind every gate.
 pub async fn authorize(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     gates: &SshGates,
     caller: &Caller,
@@ -239,7 +239,7 @@ pub async fn authorize(
     // Without this, compromising any enrolled laptop would inherit its owner's
     // SSH rights across the whole fleet.
     if let Some(origin) = caller.origin_agent_id {
-        match state.agents.find_in_tenant(tenant_id, origin).await {
+        match state.fleet.agents.find_in_tenant(tenant_id, origin).await {
             Ok(a) if a.ssh_policy.can_originate => {}
             _ => return Err(SshDenyReason::OriginNotAllowed),
         }
@@ -276,7 +276,7 @@ struct Granted {
 /// that helper. Now the type system does it: `decide` can only return
 /// `Result<Granted, SshDenyReason>`, and both arms are recorded here.
 pub async fn dispatch(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     agent: &Agent,
     caller: &Caller,
@@ -322,7 +322,7 @@ pub async fn dispatch(
 /// device". Returns the refusal reason rather than a response body so it
 /// cannot answer the caller without [`dispatch`] auditing first.
 async fn decide(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     agent: &Agent,
     caller: &Caller,
@@ -392,7 +392,7 @@ async fn decide(
         consent_mode: Some(effective_wire_consent(consent_mode)),
     };
 
-    if let Err(e) = state.rc_hub.push_ssh_grant(agent_id, tenant_id, msg) {
+    if let Err(e) = state.fleet.rc_hub.push_ssh_grant(agent_id, tenant_id, msg) {
         // The hub distinguishes "not connected" from "connected but cannot
         // honour it", and the caller needs that difference: one is wait and
         // retry, the other is upgrade the agent.
@@ -424,7 +424,7 @@ async fn decide(
 /// — it is the record someone will come looking for — and the request
 /// proceeds.
 async fn record_audit(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     agent_id: ObjectId,
     caller: &Caller,
@@ -567,20 +567,21 @@ async fn tenant_of(tenant_id: &str) -> Result<ObjectId, ApiError> {
 }
 
 async fn load_agent(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     agent_id: &str,
 ) -> Result<Agent, ApiError> {
     let aid = ObjectId::parse_str(agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent id".into()))?;
     state
+        .fleet
         .agents
         .find_in_tenant(tenant_id, aid)
         .await
         .map_err(|_| ApiError::NotFound("Agent not found".into()))
 }
 
-async fn http_caller(state: &AppState, auth: &AuthUser) -> Caller {
+async fn http_caller(state: &NetworkState, auth: &AuthUser) -> Caller {
     let display = state
         .users
         .base
@@ -605,7 +606,7 @@ async fn http_caller(state: &AppState, auth: &AuthUser) -> Caller {
 /// attacker-timed rows into ANOTHER tenant's `ssh_audit`, and leaked whether
 /// that org had `remote_ssh_enabled`.
 async fn member_tenant(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: &str,
     auth: &AuthUser,
 ) -> Result<ObjectId, ApiError> {
@@ -625,7 +626,7 @@ async fn member_tenant(
 /// Answers 200 with either where to dial or why not: a refusal is a policy
 /// outcome, not a transport failure, and the caller needs to read the reason.
 pub async fn request_session(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<SshRequestBody>,
@@ -651,7 +652,7 @@ pub async fn request_session(
 /// `MANAGE_AGENTS`, not `SSH_DEVICE`: deciding a device may be SSHed into is a
 /// management act, distinct from being allowed to do it. Same split exec uses.
 pub async fn set_policy(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<SshPolicyBody>,
@@ -709,6 +710,7 @@ pub async fn set_policy(
         consent_mode: body.consent_mode,
     };
     state
+        .fleet
         .agents
         .update_ssh_policy(tid, agent.id.unwrap_or_default(), &policy)
         .await?;
@@ -724,7 +726,7 @@ pub async fn set_policy(
 /// device console can explain why every device is refusing before anyone
 /// starts editing per-device policy.
 pub async fn get_org_settings(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<OrgSshSettings>, ApiError> {
@@ -753,7 +755,7 @@ pub async fn get_org_settings(
 /// `MANAGE_TENANT`, the highest bar of the three, because this one switch
 /// governs the whole org.
 pub async fn set_org_settings(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<OrgSshSettings>,
@@ -900,7 +902,7 @@ impl SshAuditQuery {
 /// held a session is a different job from being able to open one, and an org
 /// should be able to staff them separately.
 pub async fn audit(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<SshAuditQuery>,
@@ -1021,7 +1023,7 @@ impl SshActivityQuery {
 /// [`SshActivityEvent`]. A quiet device produces an empty page whether it was
 /// idle, has reporting switched off (the default), or has been compromised.
 pub async fn activity(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<SshActivityQuery>,
