@@ -49,10 +49,12 @@ pub struct Snapshot {
 impl Snapshot {
     /// A one-line summary for logs and the FR's field log.
     pub fn summary(&self) -> String {
+        // Either shape: a plan object (`{ "sets": [...] }`) or the sorted
+        // array `index_sets_json` produces.
         let sets = |k: &str| {
             self.indexes
                 .get(k)
-                .and_then(|p| p.get("sets"))
+                .and_then(|p| p.get("sets").or(Some(p)))
                 .and_then(|s| s.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0)
