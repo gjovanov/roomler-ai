@@ -102,21 +102,65 @@ python3 "$GUARD" --root . --no-such-flag >/dev/null 2>&1; rc=$?
 # and it is the only way to assert the branch honestly -- what matters is that a
 # guard exiting 20 and a guard exiting 1 lead to opposite outcomes.
 HOOK="$PWD/.githooks/pre-commit"
-if [ -e "$HOOK" ] && [ ! -x "$HOOK" ]; then
-  # Git silently ignores a non-executable hook, so this is layer 1 disarmed
-  # with no error anywhere -- the failure mode this whole file exists to catch.
-  echo "hook: .githooks/pre-commit is not executable (git will skip it silently)"; fail=1
-fi
+
+# ⚠️ A skip must ANNOUNCE itself. Guarding these canaries with `if [ -x ... ]`
+# and nothing else reproduced, in this very file, the defect they exist to
+# lock: with the hook absent the block vanished and the run still printed
+# `selftest: ok` -- a pass that had asserted nothing about the hook. So the
+# three states are now distinguished explicitly, and only one of them is quiet.
+# ⚠️ `git ls-files` has THREE outcomes, not two: 0 tracked, 1 not tracked, and
+# anything else "git could not answer". Treating the third as "not tracked" is
+# the same conflation the hook was just fixed for, and it bites in exactly the
+# same place -- running this from WSL inside a Windows worktree, where `.git` is
+# a file holding a Windows path and git exits 128. Collapsing that into the
+# untracked branch made this file report a confident, wrong FAILURE.
+git ls-files --error-unmatch .githooks/pre-commit >/dev/null 2>&1; tracked=$?
+case "$tracked" in
+  0)
+    # Tracked HERE, so it must be present and executable. Git ignores a
+    # non-executable hook in silence: layer 1 disarmed with nothing to say so.
+    [ -e "$HOOK" ] || { echo "hook: tracked but missing from the working tree"; fail=1; }
+    [ ! -e "$HOOK" ] || [ -x "$HOOK" ] || {
+      echo "hook: .githooks/pre-commit is not executable (git will skip it silently)"; fail=1; }
+    ;;
+  1)
+    if [ -e "$HOOK" ]; then
+      # Present but untracked -- the pre-2026-09-04 arrangement, where the file
+      # lived in one clone and every worktree silently had no hook at all.
+      echo "hook: present but UNTRACKED -- other worktrees of this clone have none"; fail=1
+    else
+      echo "hook: not in this checkout (branch predates it) -- hook canaries skipped"
+    fi
+    ;;
+  *)
+    # Not a verdict. Say so instead of inventing one; the canaries below still
+    # run if the file is there, since they need no git of their own.
+    echo "hook: git could not report tracking (exit $tracked) -- tracking check skipped"
+    ;;
+esac
+
 if [ -x "$HOOK" ] && command -v python3 >/dev/null 2>&1; then
   hook_says() {   # $1 = status the stub guard exits with; echoes "<rc>|<output>"
-    t=$(mktemp -d); git init -q "$t"
-    mkdir -p "$t/.githooks" "$t/.claude/skills/sanitize-hostnames"
-    cp "$HOOK" "$t/.githooks/pre-commit"; chmod +x "$t/.githooks/pre-commit"
-    printf '#!/usr/bin/env python3\nimport sys\nsys.exit(%s)\n' "$1" \
-      > "$t/.claude/skills/sanitize-hostnames/check_shapes.py"
-    ( cd "$t" && echo ordinary-prose > a.txt && git add a.txt \
-      && o=$(.githooks/pre-commit 2>&1); printf '%s|%s' "$?" "$o" )
-    rm -rf "$t"
+    # ⚠️ The scratch repo must NOT inherit GIT_DIR/GIT_WORK_TREE. The hook
+    # exports both when it crosses into WSL, so a selftest run from such a
+    # context pointed every `git` here at the OUTER repo: `git add` failed, and
+    # under `set -u` the unassigned `o` aborted the function with `unbound
+    # variable` -- a canary that dies instead of reporting.
+    ( unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+      t=$(mktemp -d) || exit 1
+      git init -q "$t" || { rm -rf "$t"; exit 1; }
+      mkdir -p "$t/.githooks" "$t/.claude/skills/sanitize-hostnames"
+      cp "$HOOK" "$t/.githooks/pre-commit"; chmod +x "$t/.githooks/pre-commit"
+      printf '#!/usr/bin/env python3\nimport sys\nsys.exit(%s)\n' "$1" \
+        > "$t/.claude/skills/sanitize-hostnames/check_shapes.py"
+      cd "$t" || exit 1
+      echo ordinary-prose > a.txt
+      git add a.txt || { rm -rf "$t"; exit 1; }
+      # Assign unconditionally, then read $? from the assignment itself, so no
+      # path through this function can leave the output variable unset.
+      o=$(.githooks/pre-commit 2>&1); rc=$?
+      printf '%s|%s' "$rc" "$o"
+      cd / && rm -rf "$t" )
   }
 
   r=$(hook_says 20)
