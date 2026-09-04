@@ -8,7 +8,6 @@
 //! needs exactly these four.
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use futures::SinkExt;
 use serde::Deserialize;
 use tracing::{debug, warn};
 

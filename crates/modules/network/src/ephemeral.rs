@@ -79,6 +79,7 @@ pub async fn remove_agent_device(
 /// directory must not let this pod reap agents that are alive elsewhere.
 pub async fn run_ephemeral_reap(state: &NetworkState) -> usize {
     let rows = match state
+        .fleet
         .agents
         .find_ephemeral_reap_candidates(MIN_TTL_SECS as i64 * 1000)
         .await

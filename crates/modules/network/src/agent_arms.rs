@@ -116,6 +116,7 @@ pub async fn record_key_rotation_report(
         key_epoch, "overlay-key rotation reported by the device"
     );
     if let Err(e) = state
+        .fleet
         .agents
         .record_key_rotation_report(tenant_id, agent_id, &report)
         .await
@@ -158,6 +159,7 @@ pub async fn handle_agent_ssh_request(
     // device whose row vanished mid-flight has no principal, so it gets
     // nothing.
     let origin = match state
+        .fleet
         .agents
         .find_in_tenant(tenant_id, origin_agent_id)
         .await
@@ -307,6 +309,7 @@ pub async fn handle_relay_probe_report(
         }
     };
     state
+        .fleet
         .rc_hub
         .set_agent_relay_home(agent_id, new_home.clone(), prefs_from_rtt(results));
     let due = last_persist
@@ -317,6 +320,7 @@ pub async fn handle_relay_probe_report(
     }
     *last_persist = Some(std::time::Instant::now());
     if let Err(e) = state
+        .fleet
         .agents
         .set_relay_home(agent_id, new_home.as_deref(), results)
         .await

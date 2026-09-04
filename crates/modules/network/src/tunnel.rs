@@ -184,7 +184,7 @@ pub async fn handle_tunnel_client_socket(
         // tunnel-client is an overlay node). Consumed messages return
         // None; everything else falls through to the tunnel match below.
         let Some(parsed) = crate::overlay::relay_overlay_msg_from_node(
-            state,
+            &state,
             crate::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
             parsed,
         )
@@ -404,7 +404,7 @@ pub async fn handle_tunnel_client_socket(
     // client never joined the overlay.
     state.overlay_nodes_by_id.remove(&tunnel_client_id);
     crate::overlay::handle_overlay_leave(
-        state,
+        &state,
         crate::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
     )
     .await;

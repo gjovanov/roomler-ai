@@ -414,7 +414,7 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
     // Refusals log at INFO: the client marks its mux "up" after merely
     // SENDING the registration frame, so a silent server-side refusal is a
     // both-ends-look-healthy dark window (the split-brain class).
-    let node = match current_node(state, NodeIdentity::Agent(agent_id)).await {
+    let node = match current_node(&state, NodeIdentity::Agent(agent_id)).await {
         Some(n) => n,
         None => {
             info!(%agent_id, "derp: registration REFUSED — no overlay node for agent; closing");
