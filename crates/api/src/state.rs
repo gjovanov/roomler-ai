@@ -796,8 +796,6 @@ impl AppState {
             tunnel_sessions_by_origin_agent: tunnel_sessions_by_origin_agent.clone(),
             agent_nudge_cooldowns: fleet.agent_nudge_cooldowns.clone(),
             agent_nudge_throttle: fleet.agent_nudge_throttle.clone(),
-            rc_proxy_controllers: Arc::new(DashMap::new()),
-            remote_rc_conns: Arc::new(DashMap::new()),
             overlay_networks,
             overlay_nodes,
             overlay_policies,
