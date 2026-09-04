@@ -21,7 +21,7 @@ path = "src/main.rs"
 # quinn, turn, openh264-sys2, tokio-tungstenite, async_zip, …) into a GUI that
 # never opens a session. One deliberate loss: `win_service::default_log_dir`
 # — replaced by the same one-liner over `appdirs` (see commands.rs).
-roomler-core = { path = "../../crates/agent-core" }
+roomler-node-core = { path = "../../crates/agent-core" }
 
 # LocalAPI client (unification P2): the tray reads live node/peer state from
 # the running daemon over the LocalAPI. P3e lever E: the dep is the LEAF
