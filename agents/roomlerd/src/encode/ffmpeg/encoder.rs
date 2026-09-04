@@ -1772,21 +1772,31 @@ impl VideoEncoder for FfmpegEncoder {
             RateReconfig::InPlaceCbr => {
                 // FR-62 A1 — QSV in place. Our QSV runs CBR (`select_rc_mode`
                 // picks CBR because we open with `rc_max_rate == bit_rate`), so
-                // TargetKbps must move WITH MaxKbps: write all three RC fields.
+                // TargetKbps must move WITH MaxKbps: both are written.
                 // `qsvenc.c`'s per-frame `update_parameters` → `update_bitrate`
                 // re-reads them and calls `MFXVideoENCODE_Reset`, so no blocking
                 // encoder rebuild (which is 0.65-0.87 s on Iris-Xe-class and the
-                // reason the whole defer/swap machinery exists). Whether that
-                // Reset also starts a new sequence (an IDR) is the field
-                // measurement A0 takes on CORPLAP-1's Iris Xe; either way this
-                // removes the multi-second rebuild stall.
+                // reason the whole defer/swap machinery exists).
                 //
+                // ⚠️ A0 measured that Reset FAILING on real Iris Xe with
+                // `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM` (-14), leaving the encoder
+                // unusable — which is why `encoder_inplace_rate` is still OFF.
+                // The suspected cause is the THIRD field: `rc_buffer_size` maps
+                // to `BufferSizeInKB`, which sizes a buffer allocated at Init,
+                // and our value is `target × hrd_pct` so it moves on every rate
+                // change. `encode::qsv_inplace_writes_bufsize` documents the
+                // full reasoning (including why the hypothesis previously
+                // recorded on #1242 is refuted by our own open path) and gates
+                // the A/B; default is to LEAVE THE FIELD ALONE.
+                let write_bufsize = crate::encode::qsv_inplace_writes_bufsize();
                 // SAFETY: as InPlaceVbr — `&mut self` is exclusive.
                 unsafe {
                     let ctx = self.encoder.as_mut_ptr();
                     (*ctx).bit_rate = target as i64;
                     (*ctx).rc_max_rate = target as i64;
-                    (*ctx).rc_buffer_size = bufsize as std::os::raw::c_int;
+                    if write_bufsize {
+                        (*ctx).rc_buffer_size = bufsize as std::os::raw::c_int;
+                    }
                 }
                 self.maxrate_bps = target;
                 self.rate_moves += 1;
@@ -1794,6 +1804,7 @@ impl VideoEncoder for FfmpegEncoder {
                     encoder = self.encoder_name,
                     maxrate_bps = target,
                     bufsize,
+                    write_bufsize,
                     "ffmpeg set_bitrate: QSV in-place CBR reconfigure"
                 );
             }
