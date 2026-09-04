@@ -62,6 +62,11 @@ pub mod rate_memory;
 pub mod sim;
 /// FR-63 — slow-start for the session opener (pure; no clock, no I/O).
 pub mod slow_start;
+/// FR-65 P0 — the pump stall watch's verdict and phase attribution (pure).
+/// Extracted from the pump so it compiles and is tested on the DEFAULT feature
+/// set: the rule deciding whether an operator ever sees a stall used to live
+/// behind `ffmpeg-encoder`, i.e. unreachable in the lane everyone runs.
+pub mod stall;
 
 // Viewer-rate controller (rc.188) — folds the browser's measured `rc:decodestat`
 // (decoded fps + struggling) into a send-fps cap for the DC pumps, so the agent
