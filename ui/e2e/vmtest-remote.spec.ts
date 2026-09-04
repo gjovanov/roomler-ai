@@ -87,6 +87,54 @@ async function mediaProgress(page: Page): Promise<{ frames: number; fps: number 
   })
 }
 
+/** A signature of whatever surface is actually painting — `<video>` for the
+ *  RTP path, the largest `<canvas>` for the DataChannel paths (VP9-444 /
+ *  HEVC-over-DC, what a SW-encode agent negotiates, which has NO <video> and
+ *  NO inbound-rtp at all). 'none' = nothing live yet. */
+async function surfaceSig(page: Page): Promise<string> {
+  return await page.evaluate(() => {
+    const v = document.querySelector('video') as HTMLVideoElement | null
+    if (v && v.videoWidth > 0) return 'v:' + v.currentTime
+    const c = (Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[])
+      .filter((x) => x.width > 100 && x.height > 100)
+      .sort((a, b) => b.width * b.height - a.width * a.height)[0]
+    if (!c) return 'none'
+    try {
+      const s = document.createElement('canvas')
+      s.width = 32
+      s.height = 20
+      s.getContext('2d')!.drawImage(c, 0, 0, 32, 20)
+      return 'c:' + s.toDataURL().slice(-96)
+    } catch {
+      return 'tainted'
+    }
+  })
+}
+
+/** Ground truth for ANY transport: a live surface appears and its pixels
+ *  CHANGE across a 3 s window while the pointer wiggles. A frozen or absent
+ *  stream fails; a streaming one passes whether it rides RTP or a DataChannel. */
+async function proveSurfaceLive(page: Page): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        await wiggle(page)
+        return await surfaceSig(page)
+      },
+      { timeout: 60_000, message: 'no live remote surface (video/canvas) appeared' },
+    )
+    .not.toBe('none')
+  const s0 = await surfaceSig(page)
+  await wiggle(page)
+  await page.waitForTimeout(3_000)
+  const s1 = await surfaceSig(page)
+  expect(s0, 'remote surface pixels unreadable (tainted)').not.toBe('tainted')
+  expect(
+    s1 !== s0,
+    `remote surface static over 3s — stream frozen or not painting (${s0.slice(0, 24)} → ${s1.slice(0, 24)})`,
+  ).toBe(true)
+}
+
 /** Wiggle the pointer over the remote surface so input-capable agents
  *  produce real motion (and the input path gets a free smoke). Best-effort:
  *  a cell whose agent cannot inject still passes via keepalive frames. */
@@ -164,54 +212,38 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
       // is live and require it to CHANGE across a 3 s window while the pointer
       // wiggles — a frozen or absent stream fails, a live one passes on any
       // transport. The hooks strengthen this automatically once they ship.
-      console.warn('[vmtest-remote] FR-61 hooks absent — using the surface pixel-change fallback')
-      const surfaceSig = async (): Promise<string> =>
-        await page.evaluate(() => {
-          const v = document.querySelector('video') as HTMLVideoElement | null
-          if (v && v.videoWidth > 0) return 'v:' + v.currentTime
-          const c = (Array.from(document.querySelectorAll('canvas')) as HTMLCanvasElement[])
-            .filter((x) => x.width > 100 && x.height > 100)
-            .sort((a, b) => b.width * b.height - a.width * a.height)[0]
-          if (!c) return 'none'
-          try {
-            const s = document.createElement('canvas')
-            s.width = 32
-            s.height = 20
-            s.getContext('2d')!.drawImage(c, 0, 0, 32, 20)
-            return 'c:' + s.toDataURL().slice(-96)
-          } catch {
-            return 'tainted'
-          }
-        })
-      await expect
-        .poll(
-          async () => {
-            await wiggle(page)
-            return await surfaceSig()
-          },
-          { timeout: 60_000, message: 'no live remote surface (video/canvas) appeared' },
-        )
-        .not.toBe('none')
-      const s0 = await surfaceSig()
-      await wiggle(page)
-      await page.waitForTimeout(3_000)
-      const s1 = await surfaceSig()
-      expect(s0, 'remote surface pixels unreadable (tainted) — deploy the FR-61 hooks to verify').not.toBe('tainted')
-      expect(s1 !== s0, `remote surface static over 3s — stream frozen or not painting (${s0.slice(0, 24)} → ${s1.slice(0, 24)})`).toBe(true)
+      console.warn('[vmtest-remote] FR-61 hooks absent -- using the surface pixel-change fallback')
+      await proveSurfaceLive(page)
       return
     }
 
-    // ── first frames: either oracle goes positive within 60 s ──────────────
-    await expect
-      .poll(
-        async () => {
-          await wiggle(page)
-          const p = await mediaProgress(page)
-          return p.frames > 0 || p.fps > 0
-        },
-        { timeout: 60_000, message: 'no decoded frames on any path (getStats + stats ref both flat)' },
+    // ── first frames: prefer the counters, but NEVER fail on them alone ────
+    // ⚠️ Both counters are RTP-shaped: `getStats` has no inbound-rtp video and
+    // `__roomler_remote_stats` is the RTP stats ref, so BOTH read zero on the
+    // DataChannel transports even while the viewer paints a perfect stream.
+    // Measured 2026-09-04: every Ubuntu cell "failed" RD while the toolbar read
+    // `VP9 4:4:4 SW (libvpx) · direct · 28 fps · 9.1 Mbps` and the screenshot
+    // showed the live desktop. Counters are an optimisation; the SURFACE is
+    // ground truth — fall through to it rather than calling a working product
+    // broken.
+    const gateDeadline = Date.now() + 60_000
+    let countersLive = false
+    while (Date.now() < gateDeadline) {
+      await wiggle(page)
+      const p = await mediaProgress(page)
+      if (p.frames > 0 || p.fps > 0) {
+        countersLive = true
+        break
+      }
+      await page.waitForTimeout(1_000)
+    }
+    if (!countersLive) {
+      console.warn(
+        '[vmtest-remote] RTP counters flat (DataChannel transport?) — proving liveness on the SURFACE',
       )
-      .toBe(true)
+      await proveSurfaceLive(page)
+      return
+    }
 
     // ── liveness: progress across a 3 s window (not one painted frame) ─────
     const s0 = await mediaProgress(page)
