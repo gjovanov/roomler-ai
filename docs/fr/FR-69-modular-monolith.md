@@ -1,9 +1,10 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 + P1 + P2 + P3 + P4 + P5a + P5b shipped (#1309 · #1311 · #1312 · #1315 · #1317 ·
-#1318 · #1320 · #1323 · #1325 · #1329 · #1332) · P5c (the agent socket into `fleet`) in PR —
-merged when CI is green; its field gate (no dip in online agents across a prod roll) is still
-to be run · P6 (`remote`) next ·
+**Status**: P0 + P1 + P2 + P3 + P4 + P5a + P5b + P5c shipped (#1309 · #1311 · #1312 · #1315 ·
+#1317 · #1318 · #1320 · #1323 · #1325 · #1329 · #1332 · #1336) · P6 (`remote`) in PR — merged
+when CI is green · every phase's field gate (a prod roll watched from the fleet: no dip in
+online agents; for P6 one RC session per carrier class) is still to be run · P7 (`network`)
+next ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -456,7 +457,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P5a** ✅ | `fleet` module — #1329: the Hub out of `remote_control`, `AuthAgent`, every fleet HTTP path, presence, the nudge machinery, consent and its consumer, the removal sequence; `Core.hooks` (the D6 registry) with the host's transitional `network` hooks so the agent cascade already runs in `HOOK_ORDER`. The agent socket stays in the host on `Arc` aliases of the module's handles | baseline identical; integration lane; prod roll | none — `fleet` is a required dependency until the socket moves; `fleet = false` refuses to boot | high | 2–3 |
 | **P5b** ✅ | #1332 — `Owner { Fleet, Remote, Network }` + the exhaustive `ClientMsg::namespace()` and `wire_tag()` matches + the 44-entry `CLIENT_MSG_OWNERS` table in the wire crate, locked four ways (the enum's own renames, the match on buildable variants, the D7 placements, the module graph); the composition baseline gained a `namespaces` section | baseline re-recorded for the new section only — routes, index sets and wire names byte-identical | none (a pure function) | low | 1 |
 | **P5c** ✅ (CI) | the agent socket into `fleet` (`roomler_ai_mod_fleet::socket`) behind `Core::agent_socket` — per-owner message handlers + per-module lifecycles (`hello` / `heartbeat` / `closing` / `closed(removal_was_ours)`), dispatch by `ClientMsg::namespace()`; the host registers its `remote`/`network` halves transitionally (`ws/agent_socket_host.rs`). The `AppState` aliases and the required dependency STAY until the host code that reads them moves (P6/P7) | baseline identical; integration lane; **prod roll with no dip in online agents — not yet run** | redeploy previous tag | high | 3–4 |
-| **P6** | `remote` module | same + one RC session per carrier class | `remote = false` | medium | 2–3 |
+| **P6** ✅ (CI) | `remote` module (`crates/modules/remote`, feature `remote`, in `default`): the session routes + TURN credentials + relay regions, the controller's `rc:*` dispatch with its authz gate (`controller.rs`), the cross-pod RC relay (`relay.rs`), the session-stats agent-socket half. `Module::Deps` is born here: `remote`'s is `FleetState` (the Hub is one live object), supplied by the host in composition order. The host keeps the user socket and calls `Modules::remote_controller_frame` with the connection's Hub sender | baseline identical; integration lane; **one RC session per carrier class on a prod roll — not yet run** | `remote = false` | medium | 2–3 |
 | **P7** | `network` module, `/derp` included | same + overlay/tunnel field sweep | `network = false` | high | 5–7 |
 | **P8** | profiles, Docker args, CI matrix, publish axis, self-host docs | five checks green; `mesh` image boots (AC5) | `full` stays default | medium | 2–3 |
 | **P9** | UI module registry and runtime gating | Vitest + e2e nightly; full UI against a `mesh` server (AC7) | `VITE_MODULES` unset | medium | 3–5 |
@@ -852,3 +853,41 @@ cannot be unmounted under a fleet that is dialing it.
 - **The field gate is open.** CI proves the composition and the suite; only a prod roll
   watched from the fleet proves that no agent drops across it. That roll has not been run —
   for this phase or for P0–P5b — and it is the operator's action.
+
+### 2026-09-04 — P6: `remote`, the first module built on another
+
+- `crates/modules/remote` = `roomler-ai-mod-remote`, feature `remote` (in `default`), switch
+  `[modules] remote = false`. Moves: `routes/remote_session.rs` → `routes.rs` (session get /
+  terminate / audit, `/turn/credentials`, `/relay/regions` — the same three mounts);
+  `ws/rc_relay.rs` → `relay.rs` (the PR-2 cross-pod relay, its proxy controllers and the
+  janitor sweep, wired from the module's init); the controller half of
+  `ws/remote_control.rs` → `controller.rs` (`dispatch_controller_rc`, `resolve_session_authz`,
+  the wire error codes); the session-stats half of `ws/agent_socket_host.rs` →
+  `agent_socket.rs`, registered on `Core::agent_socket` by the module itself. The two
+  `remote_sessions` index sets and `remote_audit` leave the db plan for `Module::indexes`
+  (same specs, same order — baseline identical).
+- **`Module::Deps`.** `remote → fleet` is not a DAO it could re-create: the Hub is ONE live
+  object, and a module that built its own would dispatch into an empty registry. The trait
+  gained an associated type — `()` for the four modules that stand on core alone,
+  `FleetState` for `remote` — and `compose.rs` supplies it in composition order, so a
+  dependency is initialised before its dependant by construction. The graph edge became a
+  type; `network`'s edge to `fleet` will use the same seam (P7).
+- **What stayed in the host, and why.** The user socket mints the controller's Hub sender
+  (`register_controller`) and runs its pump; a `Module::ws` namespace handler receives a
+  `WsCtx` and a parsed value, not that sender. So the controller path is a call the host
+  makes — `Modules::remote_controller_frame(user, name, tx, text, dialed_tid, established,
+  conn)` → `controller::handle_controller_frame` (the authz gate, then the dispatch; `false` =
+  not an `rc:*` frame or no module mounted, and the socket's other arms get it) — and the
+  socket's close forwards to `Modules::remote_conn_closed`. Both are the host → module
+  direction (the P4 `media_gauges` shape), never the reverse.
+- **What moved DOWN rather than across.** `spawn_agent_nudge` and `note_agent_offline_evidence`
+  were in the controller half by file position but act on the AGENT's home (its directory
+  record, its presence claim), and the tunnel originator's forward + ICE relays call them
+  too: they are fleet's now (`nudge.rs`), taking `&FleetState` / `&Core`, and both `remote`
+  and the host's tunnel code call them there.
+- `AppState` lost `remote_sessions`, `remote_audit`, `rc_proxy_controllers` and
+  `remote_rc_conns`; the fleet aliases it still carries are the network code's (P7). The
+  cross-pillar readers stay in the host on the device-listing precedent: `routes/usage.rs`
+  reads the two collections by name (a per-user usage view across pillars), never a DAO.
+- **The field gate is open, as for every phase**: one RC session per carrier class (LAN /
+  direct / relay / DERP) on the new pods, on a prod roll the operator runs.

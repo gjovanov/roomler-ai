@@ -19,8 +19,7 @@ use roomler_ai_services::{
         key_rotation_audit::KeyRotationAuditDao, notification::NotificationDao,
         overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
         overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
-        push_subscription::PushSubscriptionDao, remote_audit::RemoteAuditDao,
-        remote_session::RemoteSessionDao, role::RoleDao, ssh_activity::SshActivityDao,
+        push_subscription::PushSubscriptionDao, role::RoleDao, ssh_activity::SshActivityDao,
         ssh_audit::SshAuditDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
         tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
@@ -68,8 +67,6 @@ pub struct AppState {
     pub agents: Arc<AgentDao>,
     /// FR-51 P2 — reusable ephemeral enrollment keys + their per-use audit.
     pub enrollment_keys: Arc<roomler_ai_services::dao::enrollment_key::EnrollmentKeyDao>,
-    pub remote_sessions: Arc<RemoteSessionDao>,
-    pub remote_audit: Arc<RemoteAuditDao>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
     /// Roomler-SSH grant log — every session request, granted or refused.
@@ -139,13 +136,6 @@ pub struct AppState {
     /// PR-1 rehome — requester-side per-agent throttle for
     /// `rc.agent_nudge` RPCs (click storms sent 11 in 15 s pre-PR-1).
     pub agent_nudge_throttle: Arc<crate::ws::rc_cluster::NudgeRequestThrottle>,
-    /// PR-2 relay — owner-side proxy controllers for cross-pod rc
-    /// sessions, keyed by the ORIGIN connection id. See `ws::rc_relay`.
-    pub rc_proxy_controllers: Arc<crate::ws::rc_relay::ProxyControllers>,
-    /// PR-2 relay — controller-side: conn id → owner pods hosting its
-    /// proxied rc sessions (WS close forwards `rc.conn_closed` there;
-    /// mirrors C-4's `remote_media_conns`).
-    pub remote_rc_conns: Arc<crate::ws::rc_relay::RemoteRcConns>,
 
     // Overlay-network subsystem (Tailscale-style L3 mesh)
     pub overlay_networks: Arc<OverlayNetworkDao>,
@@ -330,8 +320,6 @@ impl AppState {
 
         // Remote-control subsystem
         let used_tokens = Arc::new(roomler_ai_services::dao::used_token::UsedTokenDao::new(&db));
-        let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
-        let remote_audit = Arc::new(RemoteAuditDao::new(&db));
         let ssh_audit = Arc::new(SshAuditDao::new(&db));
         let key_rotation_audit = Arc::new(KeyRotationAuditDao::new(&db));
         let peer_relay_audit = Arc::new(PeerRelayAuditDao::new(&db));
@@ -783,11 +771,9 @@ impl AppState {
             // FR-69 P5a — ALIASES of the fleet module's handles (the same
             // `Arc`s; the module owns them) for the host code that still
             // serves the agent socket. Each alias leaves with the host file
-            // that reads it (P5b, P6, P7).
+            // that reads it (P7).
             agents: fleet.agents.clone(),
             enrollment_keys: fleet.enrollment_keys.clone(),
-            remote_sessions,
-            remote_audit,
             exec_audit: fleet.exec_audit.clone(),
             ssh_audit,
             config_audit: fleet.config_audit.clone(),
@@ -810,8 +796,6 @@ impl AppState {
             tunnel_sessions_by_origin_agent: tunnel_sessions_by_origin_agent.clone(),
             agent_nudge_cooldowns: fleet.agent_nudge_cooldowns.clone(),
             agent_nudge_throttle: fleet.agent_nudge_throttle.clone(),
-            rc_proxy_controllers: Arc::new(DashMap::new()),
-            remote_rc_conns: Arc::new(DashMap::new()),
             overlay_networks,
             overlay_nodes,
             overlay_policies,
@@ -836,9 +820,8 @@ impl AppState {
         crate::ws::derp_cluster::wire_derp_cluster(&state);
         // Split-brain observability: the per-pod DERP registry census.
         crate::ws::derp::spawn_registry_census(&state);
-        // PR-2 — cross-pod rc signalling relay: owner-side rc.cmd /
-        // rc.conn_closed / rc.conn_alive + the proxy janitor sweep.
-        crate::ws::rc_relay::wire_rc_relay(&state);
+        // PR-2 — the cross-pod rc signalling relay is wired by the `remote`
+        // module's init (FR-69 P6).
         // FR-51 — the ephemeral-node reaper (cluster-singleton per cycle via
         // the same DB-name-scoped claim pattern). Spawns NOTHING unless
         // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.
@@ -873,10 +856,10 @@ impl AppState {
             },
         );
         // FR-69 P5c — the agent socket is the fleet module's; the host
-        // registers its TRANSITIONAL `network` and `remote` halves (the
-        // tunnel/overlay relays with their per-connection state, SSH, key
-        // rotation, DERP tickets, probe reports; the session-stats merge) so
-        // the module dispatches by owner without naming the host.
+        // registers its TRANSITIONAL `network` half (the tunnel/overlay
+        // relays with their per-connection state, SSH, key rotation, DERP
+        // tickets, probe reports) so the module dispatches by owner without
+        // naming the host. The `remote` half registers itself (P6).
         let net = Arc::new(crate::ws::agent_socket_host::HostNetworkAgentSocket::new(
             state.clone(),
         ));
@@ -885,15 +868,6 @@ impl AppState {
             roomler_core::AgentSocketHooks {
                 handler: Some(net.clone()),
                 lifecycle: Some(net),
-            },
-        );
-        state.core.agent_socket.register(
-            "remote",
-            roomler_core::AgentSocketHooks {
-                handler: Some(Arc::new(
-                    crate::ws::agent_socket_host::HostRemoteAgentSocket::new(state.clone()),
-                )),
-                lifecycle: None,
             },
         );
 

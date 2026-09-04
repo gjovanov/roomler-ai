@@ -128,7 +128,9 @@ impl FromRef<FleetState> for Core {
 impl Module for FleetState {
     const ID: &'static str = "fleet";
 
-    async fn init(core: Core, settings: &Settings) -> anyhow::Result<Self> {
+    type Deps = ();
+
+    async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
         let db = &core.db;
         let agents = Arc::new(AgentDao::new(db));
         let enrollment_keys = Arc::new(EnrollmentKeyDao::new(db));

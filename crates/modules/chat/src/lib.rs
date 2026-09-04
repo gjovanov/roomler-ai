@@ -79,7 +79,9 @@ const UPLOAD_LIMIT: usize = 100 * 1024 * 1024;
 impl Module for ChatState {
     const ID: &'static str = "chat";
 
-    async fn init(core: Core, settings: &Settings) -> anyhow::Result<Self> {
+    type Deps = ();
+
+    async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
         let db = &core.db;
         let giphy = if !settings.giphy.api_key.is_empty() {
             Some(Arc::new(GiphyService::new(settings.giphy.api_key.clone())))

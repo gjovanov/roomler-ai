@@ -106,6 +106,7 @@ flowchart BT
     chat["crates/modules/chat → roomler-ai-mod-chat<br/>rooms · messages · files · search · typing"]
     conference["crates/modules/conference → roomler-ai-mod-conference<br/>mediasoup SFU · media:* · calls · recordings"]
     fleet["crates/modules/fleet → roomler-ai-mod-fleet<br/>agents · enrollment · presence · Hub · consent · exec · releases"]
+    remote["crates/modules/remote → roomler-ai-mod-remote<br/>RC sessions · controller rc:* dispatch · cross-pod rc relay · TURN creds"]
     rc["crates/remote_control<br/>signalling · consent · wire types¹ · ACL shapes"]
     services["crates/services<br/>DAOs · auth · billing · export"]
     api["crates/api<br/>Axum: REST + /ws + /derp"]
@@ -130,9 +131,10 @@ flowchart BT
     chat --> core
     conference --> core & chat
     fleet --> core & rc
+    remote --> fleet & core & rc
     rc --> db
     services --> rc
-    api --> services & core & saas & chat & conference & fleet
+    api --> services & core & saas & chat & conference & fleet & remote
     tests --> api & roomlerd & core
 
     tunnelcore --> localapi & tcpturn & rc
