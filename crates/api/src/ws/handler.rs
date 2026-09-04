@@ -411,8 +411,10 @@ fn ws_upgrade_agent(
                 send_goodbye_and_close(socket, &goodbye, 4003, "agent_deleted").await;
                 return;
             }
-            crate::ws::remote_control::handle_agent_socket(
-                state,
+            // FR-69 P5c — the socket is the fleet module's; the host keeps
+            // the upgrade and the role gate (D7), the module runs the loop.
+            roomler_ai_mod_fleet::socket::handle_agent_socket(
+                state.fleet().clone(),
                 socket,
                 agent_id,
                 tenant_id,

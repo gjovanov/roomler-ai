@@ -4306,3 +4306,54 @@ impl From<SshPolicy> for SshPolicyBody {
         }
     }
 }
+
+// FR-69 P5c — the key-rotation order predicates the agent socket evaluates on
+// connect. Here (the wire crate) because the socket is the fleet module`s and
+// the order is network`s: a pure judgement over two models belongs with them.
+/// P1b — how long a DELIVERED order is trusted to be in progress before the
+/// connect-time reconcile pushes it again. Found in the first field run: the
+/// device's `rotated` report rides the dying session and is written by a
+/// spawned task, while the device reconnects ~500 ms later — its register ran
+/// the reconcile before the report landed, re-pushed the SAME order, the
+/// device refused the duplicate under its own 60 s ceiling, and that refusal
+/// overwrote the `rotated` report. A freshly delivered order is being
+/// executed; its answer is seconds away. Past this window an unanswered order
+/// is assumed dropped (the device crashed mid-rotation, say) and re-sent.
+pub const REDELIVER_AFTER_SECS: i64 = 120;
+
+/// P1d — an order is SATISFIED once the device has joined under a key that
+/// differs from the one it held when the order was placed, whether or not a
+/// report ever arrived. Found in the third cycle: the run-2 order's report was
+/// lost, the P1b window expired, and every later reconnect (a pod roll, then
+/// the 0.4.26 restart) re-delivered the same order — the device rotated three
+/// times for one click. The join is the proof; a satisfied order is never
+/// pushed again. Orders placed before the snapshot existed (no
+/// `public_key_before`) cannot be judged this way and fall back to the report.
+pub fn order_is_satisfied(
+    request: &KeyRotationRequest,
+    identity: Option<&OverlayIdentity>,
+) -> bool {
+    match (request.public_key_before.as_deref(), identity) {
+        (Some(before), Some(id)) => {
+            id.public_key != before
+                && id.joined_at.timestamp_millis() >= request.requested_at.timestamp_millis()
+        }
+        _ => false,
+    }
+}
+
+/// Whether a standing order should be pushed again on THIS connect (the
+/// report-and-timing half; callers also check [`order_is_satisfied`]).
+pub fn should_redeliver(
+    request: &KeyRotationRequest,
+    report: Option<&KeyRotationReport>,
+    now: DateTime,
+) -> bool {
+    if report.is_some_and(|r| r.request_id == request.request_id) {
+        return false;
+    }
+    match request.delivered_at {
+        None => true,
+        Some(at) => (now.timestamp_millis() - at.timestamp_millis()) / 1000 >= REDELIVER_AFTER_SECS,
+    }
+}
