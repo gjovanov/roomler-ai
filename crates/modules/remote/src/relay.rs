@@ -35,14 +35,14 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use bson::oid::ObjectId;
 use dashmap::DashMap;
-use mongodb::bson::oid::ObjectId;
 use roomler_ai_mod_fleet::hub::DispatchCtx;
 use roomler_ai_remote_control::models::{ConsentMode, InputMode};
 use roomler_ai_remote_control::signaling::{ClientMsg, Role};
 use tracing::{debug, info, warn};
 
-use crate::state::AppState;
+use crate::RemoteState;
 
 /// One live proxy controller on the OWNER pod, keyed by the origin
 /// connection id.
@@ -69,9 +69,9 @@ const SWEEP_EVERY: Duration = Duration::from_secs(60);
 const PROBE_WHEN_QUIET_FOR: Duration = Duration::from_secs(120);
 
 /// Register the owner-side bus verbs + the janitor sweep. Called once
-/// after AppState is built (needs the full state), next to
+/// from the module's init (needs the full state), the way the host wires
 /// `wire_media_cluster` / `wire_derp_cluster`.
-pub fn wire_rc_relay(state: &AppState) {
+pub fn wire_rc_relay(state: &RemoteState) {
     let Some(bus) = state.cluster_bus.clone() else {
         return;
     };
@@ -144,7 +144,7 @@ pub fn wire_rc_relay(state: &AppState) {
                             o.get().tx.clone()
                         }
                         dashmap::mapref::entry::Entry::Vacant(v) => {
-                            let (tx, mut rx) = state.rc_hub.register_controller(user_id);
+                            let (tx, mut rx) = state.fleet.rc_hub.register_controller(user_id);
                             let pump_state = state.clone();
                             let pump_conn = conn.clone();
                             let pump = tokio::spawn(async move {
@@ -152,7 +152,7 @@ pub fn wire_rc_relay(state: &AppState) {
                                     let Ok(val) = serde_json::to_value(&msg) else {
                                         continue;
                                     };
-                                    crate::ws::dispatcher::send_to_connection_routed(
+                                    roomler_core::ws::dispatcher::send_to_connection_routed(
                                         &pump_state.ws_storage,
                                         &pump_state.redis_pubsub,
                                         &pump_conn,
@@ -185,11 +185,11 @@ pub fn wire_rc_relay(state: &AppState) {
                     input_mode,
                     tenant_name,
                 };
-                match state.rc_hub.dispatch(&ctx, frame) {
+                match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
                     Err(e) => Ok(serde_json::json!({
                         "dispatched": false,
-                        "code": crate::ws::remote_control::error_code(&e),
+                        "code": crate::controller::error_code(&e),
                         "message": e.to_string(),
                     })),
                 }
@@ -286,11 +286,14 @@ pub fn wire_rc_relay(state: &AppState) {
 
 /// Tear down one proxy: Hub unregister (terminates its sessions +
 /// notifies both sides) + pump abort. Returns whether it existed.
-pub fn remove_proxy(state: &AppState, conn: &str) -> bool {
+pub fn remove_proxy(state: &RemoteState, conn: &str) -> bool {
     let Some((_, proxy)) = state.rc_proxy_controllers.remove(conn) else {
         return false;
     };
-    state.rc_hub.unregister_controller(proxy.user_id, &proxy.tx);
+    state
+        .fleet
+        .rc_hub
+        .unregister_controller(proxy.user_id, &proxy.tx);
     proxy.pump.abort();
     debug!(conn = %conn, "rc relay: proxy controller removed");
     true
@@ -306,7 +309,7 @@ pub fn remove_proxy(state: &AppState, conn: &str) -> bool {
 ///   fall back to the PR-1 rehome path.
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_rc_frame(
-    state: &AppState,
+    state: &RemoteState,
     owner_pod: &str,
     conn: &str,
     user_id: ObjectId,
@@ -349,7 +352,9 @@ pub async fn relay_rc_frame(
                     .entry(conn.to_string())
                     .or_default()
                     .insert(owner_pod.to_string());
-                crate::cluster::metrics::bump(&crate::cluster::metrics::RC_RELAY_TOTAL);
+                roomler_core::cluster::metrics::bump(
+                    &roomler_core::cluster::metrics::RC_RELAY_TOTAL,
+                );
                 Ok(None)
             } else {
                 let code = rep
@@ -380,7 +385,7 @@ pub async fn relay_rc_frame(
 /// Controller-pod side: the browser socket closed - notify every owner
 /// pod that hosted proxied sessions for this conn (fire-and-forget;
 /// the janitor sweep is the belt if the notice is lost).
-pub fn forward_conn_closed(state: &AppState, conn: &str) {
+pub fn forward_conn_closed(state: &RemoteState, conn: &str) {
     let Some((_, owners)) = state.remote_rc_conns.remove(conn) else {
         return;
     };

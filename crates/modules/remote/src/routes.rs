@@ -22,7 +22,9 @@ use roomler_ai_services::dao::base::PaginationParams;
 use roomler_core::guards::require_permission;
 use serde::Serialize;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::RemoteState;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Sessions
@@ -42,7 +44,7 @@ pub struct SessionResponse {
 }
 
 pub async fn get_session(
-    State(state): State<AppState>,
+    State(state): State<RemoteState>,
     auth: AuthUser,
     Path((tenant_id, session_id)): Path<(String, String)>,
 ) -> Result<Json<SessionResponse>, ApiError> {
@@ -60,7 +62,7 @@ pub async fn get_session(
 }
 
 pub async fn terminate_session(
-    State(state): State<AppState>,
+    State(state): State<RemoteState>,
     auth: AuthUser,
     Path((tenant_id, session_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -81,7 +83,7 @@ pub async fn terminate_session(
     // permission check against the ROUTE tenant — the ctrl event below only
     // acts on a hub that actually holds the session, and its tenant is
     // re-checked there.
-    let live = state.rc_hub.session_snapshot(sid);
+    let live = state.fleet.rc_hub.session_snapshot(sid);
     if let Some((live_tid, _)) = live
         && live_tid != tid
     {
@@ -102,6 +104,7 @@ pub async fn terminate_session(
 
     // Force-close via Hub. The Hub pushes a Terminate to both peers and audits.
     let terminated_here = state
+        .fleet
         .rc_hub
         .terminate(
             sid,
@@ -113,7 +116,7 @@ pub async fn terminate_session(
     // returned `{"terminated": true}`. Broadcast an idempotent ctrl event so
     // the owning pod applies it; `terminated` now reports only what THIS
     // request could verify locally.
-    crate::ws::remote_control::publish_rc_ctrl(
+    roomler_ai_mod_fleet::ctrl::publish_rc_ctrl(
         &state,
         "terminate",
         serde_json::json!({
@@ -138,7 +141,7 @@ pub struct AuditListResponse {
 }
 
 pub async fn session_audit(
-    State(state): State<AppState>,
+    State(state): State<RemoteState>,
     auth: AuthUser,
     Path((tenant_id, session_id)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
@@ -201,7 +204,7 @@ pub struct RelayRegionSummary {
 /// endpoints; never secrets). Authed users only; the same hostnames every
 /// TURN grant already exposes to clients.
 pub async fn relay_regions(
-    State(state): State<AppState>,
+    State(state): State<RemoteState>,
     _auth: AuthUser,
 ) -> Result<Json<RelayRegionsResponse>, ApiError> {
     let regions = state
@@ -227,7 +230,7 @@ pub async fn relay_regions(
 /// creds plus a STUN fallback. Used by the browser controller and by the
 /// native agent when it needs to trickle ICE.
 pub async fn turn_credentials(
-    State(state): State<AppState>,
+    State(state): State<RemoteState>,
     auth: AuthUser,
 ) -> Result<Json<TurnCredentialsResponse>, ApiError> {
     // This route is session-less (a pre-fetch), so it issues the default
