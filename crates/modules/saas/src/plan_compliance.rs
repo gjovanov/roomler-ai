@@ -28,10 +28,7 @@ use roomler_ai_services::quota;
 use serde::Serialize;
 use std::collections::HashMap;
 
-use crate::{
-    core_state::Core, error::ApiError, extractors::auth::AuthUser,
-    routes::stats::require_platform_admin,
-};
+use roomler_core::{ApiError, Core, extractors::auth::AuthUser, guards::require_platform_admin};
 
 #[derive(Debug, Serialize)]
 pub struct LimitRow {

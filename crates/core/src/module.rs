@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 //! The [`Module`] contract and the [`Core`] every module is initialised with.
 
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
 use axum::Router;
 use roomler_ai_config::Settings;
@@ -28,11 +28,10 @@ pub trait Module: Sized + Send + Sync + 'static {
 
     /// Build the module's state. Runs once at boot, after `Core` is up and
     /// before any route is mounted; failure aborts the boot (a half-composed
-    /// server is worse than a stopped one).
-    fn init(
-        core: Arc<Core>,
-        settings: &Settings,
-    ) -> impl Future<Output = anyhow::Result<Self>> + Send;
+    /// server is worse than a stopped one). `Core` is a bundle of `Arc`s and
+    /// is passed by value: the module keeps its own clone as the first field
+    /// of its state and derefs to it.
+    fn init(core: Core, settings: &Settings) -> impl Future<Output = anyhow::Result<Self>> + Send;
 
     /// The runtime switch: `false` unmounts the module on a pod that still
     /// links it — routes not mounted, WS namespaces not registered, jobs not

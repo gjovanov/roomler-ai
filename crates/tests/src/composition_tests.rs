@@ -49,7 +49,7 @@
 use std::{collections::BTreeSet, path::PathBuf};
 
 use roomler_ai_api::build_router;
-use roomler_core::composition::{Snapshot, index_plan_json, routes_of, wire_names};
+use roomler_core::composition::{Snapshot, index_sets_json, routes_of, wire_names};
 
 use crate::fixtures::test_app::TestApp;
 
@@ -72,18 +72,25 @@ async fn snapshot() -> Snapshot {
     // A second router from the same state: the one `TestApp` serves is owned
     // by its listener task, and `build_router` is pure composition.
     let router = build_router(app.state.clone());
+    // The sets a host applies: the core plan (per `multi_block` schema) plus
+    // every mounted module's, sorted by collection — see `index_sets_json`.
+    let all_sets = |multi_block: bool| {
+        let mut sets = roomler_ai_db::indexes::index_plan(multi_block).sets;
+        sets.extend(app.state.modules.index_sets());
+        index_sets_json(sets)
+    };
     Snapshot {
         routes: routes_of(&router),
         indexes: serde_json::json!({
-            "single_block": index_plan_json(false),
-            "multi_block": index_plan_json(true),
+            "single_block": all_sets(false),
+            "multi_block": all_sets(true),
         }),
         wire: wire_names(SIGNALING_SOURCE),
     }
 }
 
 fn index_set_count(s: &Snapshot) -> usize {
-    s.indexes["single_block"]["sets"]
+    s.indexes["single_block"]
         .as_array()
         .map(|a| a.len())
         .unwrap_or(0)
