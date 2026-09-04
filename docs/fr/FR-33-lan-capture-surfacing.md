@@ -3,8 +3,8 @@
 Status: **P1 field-verified on 0.4.20 (2026-08-29); P2 field-verified on 0.4.59
 (2026-09-04); P3 field-verified on 0.4.61 + the 2026-09-04 UI deploy, from a Chrome profile
 (the first check ran from an Edge profile that gathers no host/srflx candidates at all — a
-per-profile browser setting, see the field log). All three phases shipped and verified.**
-Tracking issue: `FR-33` (#905).
+per-profile browser setting, see the field log). Every acceptance criterion field-verified,
+kill switch cycled on CORPLAP-3 — CLOSED 2026-09-04.** Tracking issue: `FR-33` (#905).
 Sibling of FR-9 (LAN relay diagnosis) and FR-31 (opening keyframe). Spec on master up front; the
 design is known.
 
@@ -95,8 +95,10 @@ stays out of scope (operator's standing rule).
 
 ## Acceptance criteria
 
-- [ ] `roomler exec CORPLAP-2 -- roomler status` prints the `CAPTURED` line naming `Ethernet 3`
-      while its VPN is up; `roomler status` on neo16 prints `lan         clear`
+- [x] `roomler exec CORPLAP-2 -- roomler status` prints the `CAPTURED` line naming `Ethernet 3`
+      while its VPN is up; `roomler status` on neo16 prints `lan         clear` — first on
+      0.4.20 (2026-08-29, #905), re-read on 0.4.61 (2026-09-04): CORPLAP-2
+      `CAPTURED — 192.168.68.0/24 leaves via "Ethernet 3" (owned by WLAN)`, neo16 `clear`
 - [x] a captured host's `roomler peers --json` for a same-LAN peer reads `blocked_by:
       lan-captured` with `penalty: 0` on the LAN tier (CORPLAP-3 on a non-excluded subnet, or
       CORPLAP-2 anywhere) — **0.4.59, 2026-09-04**: CORPLAP-3 → neo16 on `192.168.68.0/24`
@@ -110,11 +112,21 @@ stays out of scope (operator's standing rule).
       the other half — a viewer from another network sees plain `· relay` — holds by
       construction (no viewer candidate inside the prefix ⇒ no reason) and is locked by the
       unit test, not yet exercised in the field
-- [ ] the daemon log carries ONE onset line and ONE clear line across a VPN connect/disconnect
-      cycle on CORPLAP-2 (no per-snapshot spam)
-- [ ] no change on hosts without a capture (neo16, rozalina-2, the cluster nodes): status line
-      `clear`, `why` unchanged, pill unchanged
-- [ ] `overlay_lan_capture_probe=false` removes the line, the reason and the pill text
+- [x] the daemon log carries ONE onset line and ONE clear line across a VPN connect/disconnect
+      cycle on CORPLAP-2 (no per-snapshot spam) — 0.4.61, CORPLAP-2's log 2026-09-03/04: onset
+      22:02:39Z, clear 08:32:36Z, onset 08:33:12Z, one delta per transition (each delta is
+      echoed by up to three consumers — netstate, the route reconcile, the WS probe — which is
+      the same event, not per-snapshot spam); CORPLAP-3 shows the same shape
+- [x] no change on hosts without a capture (neo16, rozalina-2, the cluster nodes): status line
+      `clear`, `why` unchanged, pill unchanged — 0.4.61, 2026-09-04: neo16, rozalina-2, mars,
+      jupiter, zeus all print `lan clear`; neo16's `peers --json` carries no `lan-captured`
+      anywhere; the pill on an uncaptured host is by construction unchanged (no captures ⇒
+      the agent omits the key)
+- [x] `overlay_lan_capture_probe=false` removes the line, the reason and the pill text — 0.4.61,
+      2026-09-04 on CORPLAP-3 (see the field log): status `clear`, `why` back to `penalty`
+      with no CAPTURED paragraph, pill plain `· relay` with no `transport_reason`; restored
+      with `config clear` and everything returned. ⚠️ With the probe OFF the status line reads
+      `clear`, the same word as a genuinely clear host — a wording follow-up ("probe off")
 
 ## Open decisions
 
@@ -141,3 +153,4 @@ Bypassing the capture; the relay ceiling; FR-31's encoder work.
 | 2026-09-04 | 0.4.59 both ends (#1281 via #1285) | **P2 field-verified.** Sofia home LAN `192.168.68.0/24` (also outside the exclude list; CORPLAP-3 `status`: `CAPTURED — 192.168.68.0/24 leaves via "Ethernet 2"`). Before, on 0.4.58: CORPLAP-3's `why` for neo16 `lan eligible: true, penalty 199.99, fails 10`, 117 `tier=Lan` probes toward neo16 that day (~80 s cadence). After a pinned push (`POST …/agent/{id}/update {"pin":"agent-v0.4.59"}`, installed in 4 min): `lan eligible: false, blocked_by: lan-captured, penalty: 0`; `roomler why 100.65.4.2` prints `lan-captured` in the tier table + the CAPTURED paragraph; **0 LAN probes in the 7 min after the 22:38:41Z restart** while 3 other-tier probes ran. neo16 (`lan clear`) unchanged: its `why` for CORPLAP-3 still `penalty`, and it still probes the LAN candidate every ~80 s — the capture is known only to the captured host (a netmap-advertised capture would be a P2b). |
 | 2026-09-04 | 0.4.61 (#1289 via #1290) + UI `v20260904-97ac185eecf0` | **P3 field check — NOT passed, and the reason is the viewer, not the agent.** Before (0.4.59 agent, new UI): neo16 → CORPLAP-3 on the captured home LAN, pill `AV1 4:2:0 HW (av1_qsv) · relay · dec HW`, raw `rc:video-info` without `transport_reason`. After (0.4.61): identical — no key, plain `· relay`. Probing the viewer with the peer connection patched: the browser (Edge, Chromium 152) offered **only relay candidates** (eight `94.130.141.74:*` TURN entries, zero host, zero srflx) although the page constructed the connection with the default `iceTransportPolicy`; a bare `RTCPeerConnection` with just a public STUN server gathered **zero candidates** and reported gathering complete. That is Chromium's `disable_non_proxied_udp` WebRTC IP-handling mode (uBlock Origin's "prevent WebRTC from leaking local IP addresses", a privacy extension, or the `WebRtcIPHandling` browser policy): every RC session from that browser is TURN-relayed whatever the target, and the agent structurally never receives a LAN address to match against its captures. The agent side did its part (it offered its LAN host `192.168.68.119`, VPN, overlay, srflx and relay candidates; `roomler why` still says `lan-captured`). Second, independent limitation: under AnyConnect the viewer's LAN packets are dropped at the host (pktmon, 09-03), so the prflx path can never form there either — P3 as built can only fire for a Check Point-class capture or a viewer whose mDNS host candidate resolves. Consequences: (1) `lan_capture_reason` now logs its inputs + verdict (next release) so this is readable from the daemon log; (2) **P3b proposed**: attribute on the VIEWER side — the viewer asks its own local daemon over the existing loopback bridge whether the target's LAN prefix is captured for the LAN it sits on, which needs P2b (the capture advertised in the netmap); (3) for the operator: this browser setting is a second, sufficient cause of `· relay` on every RC session from that Edge profile (browser-wide: the same probe yields zero on a neutral origin, and again after the extension reconnected) — worth checking (`edge://webrtc-internals`, uBlock settings, `edge://policy`) before any RC quality work. ⚠️ It is a per-PROFILE property, not "neo16": the same night another extension-driven browser/profile on neo16 offered LAN host candidates and went `· direct` to CORPLAP-1 (agent log `remote_typ=Host remote_addr=192.168.68.126`). So: verify the path per session from the agent's `per-session ICE path detected` line, and re-run this P3 check from a profile that offers host candidates — the agent then receives the viewer's `192.168.68.x` host candidate via signalling and can name the capture without any packet needing to arrive. |
 | 2026-09-04 | 0.4.61 + UI `v20260904-97ac185eecf0`, viewer = Chrome 152 | **P3 field-verified.** Same pair, same LAN, same agent build as the failed check — only the viewer changed to a Chrome profile whose bare-STUN probe gathers the full set (host `192.168.68.126` as a plain IP, the overlay addresses, srflx). Pill: `AV1 4:2:0 HW (av1_qsv) · relay · VPN captures the host's LAN · dec HW · FSR`; raw `rc:video-info` ends `"viewers":1,"transport_reason":"lan-captured"`. Under AnyConnect no LAN packet reaches the host, so this proves the candidate arrives by signalling alone. Kept: the relay-only gathering was ONE Edge profile's setting, not the machine; verify the viewer's path per session from the agent's `per-session ICE path detected` line. P3b is no longer needed for correctness (optional, to stop the uncaptured side's LAN probes). |
+| 2026-09-04 | 0.4.61 | **Kill-switch cycle + the remaining boxes.** CORPLAP-2 (Check Point, now on the same home LAN): `CAPTURED — 192.168.68.0/24 leaves via "Ethernet 3"`, log onset 22:02:39Z / clear 08:32:36Z / onset 08:33:12Z, one delta per transition. neo16, rozalina-2, mars, jupiter, zeus: `lan clear`, no `lan-captured` anywhere in neo16's `why`. CORPLAP-3: `roomler config set overlay_lan_capture_probe false` + a detached one-shot restart (pids 23548,46932 → 2300,40548) ⇒ status `lan clear`, `why` → neo16 LAN tier back on `penalty` with no CAPTURED paragraph, RC pill from Chrome `AV1 4:2:0 HW (av1_qsv) · relay · dec HW · FSR` with no `transport_reason`; `config clear` + restart (→ 26124,32136) ⇒ `CAPTURED`, `lan-captured` and the paragraph all back. Two operational notes: with the probe off the status line says `clear`, indistinguishable from a clear host (wording follow-up); and the automation extension's synthetic Connect click was lost repeatedly after a page reload, while a programmatic `button.click()` connected first time. |
