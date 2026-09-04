@@ -48,7 +48,10 @@ runs, not what you run.
 
 > A profile does not reject configuration it does not use: a `mesh` image given MinIO
 > credentials simply never opens them. A web app built for `full` works against every
-> profile — the navigation follows `GET /api/capabilities`.
+> profile — the navigation follows `GET /api/capabilities`, so a `mesh` server shows no
+> chat or call surfaces even though the bundle carries them. Building your own bundle
+> with `VITE_MODULES=fleet,network bun run build` prunes those routes out of it; the
+> published image never needs that, the runtime answer alone decides.
 
 ---
 

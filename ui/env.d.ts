@@ -2,6 +2,13 @@
 // Copyright (C) 2026 G ROX EOOD
 /// <reference types="vite/client" />
 
+interface ImportMetaEnv {
+  /** FR-69 P9 — comma list of server modules this bundle is built for
+   *  (`chat,conference,fleet,remote,network,saas`); unset = all of them.
+   *  See `src/modules/registry.ts`. */
+  readonly VITE_MODULES?: string
+}
+
 declare module '*.vue' {
   import type { DefineComponent } from 'vue'
   const component: DefineComponent<object, object, unknown>

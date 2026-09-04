@@ -7,6 +7,7 @@ import pinia from '@/plugins/pinia'
 import router from '@/plugins/router'
 import App from '@/App.vue'
 import { clearLegacyTokens } from '@/api/session'
+import { useCapabilitiesStore } from '@/stores/capabilities'
 
 // Delete the tokens earlier versions kept in localStorage — an access token
 // (7 days) and, worse, a refresh token (30 days) that re-mints access tokens.
@@ -21,6 +22,11 @@ const app = createApp(App)
 app.use(i18n)
 app.use(vuetify)
 app.use(pinia)
+// FR-69 P9 — ask the server what it is composed of, once, before the first
+// navigation resolves: the router's module guard awaits this same request,
+// and the navigation hides the pillars the server does not mount. Never
+// blocks the mount and never throws — an unanswered server fails OPEN.
+void useCapabilitiesStore().load()
 app.use(router)
 
 app.mount('#app')
