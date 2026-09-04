@@ -868,3 +868,70 @@ jobs:
 
       - name: Run unit tests
         run: cd ui && bun run test:unit
+
+  # FR-69 P8 (D13) — the four reduced profiles must COMPILE, and the C++ SFU
+  # worker and the tunnel stack must be ABSENT from the graphs that do not
+  # sell them (AC3). `cargo clippy --workspace` above compiles the feature
+  # UNION, so it can never see a profile: these checks are per package, with
+  # `--no-default-features`, or they check nothing.
+  #
+  # One job, four sequential checks, not a 4-way matrix: every module crate
+  # is a shared artifact in the cache and only the api crate's own objects
+  # differ per set — a matrix would pay the cold cache four times for the
+  # same result.
+  profiles:
+    name: Build profiles (FR-69)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Rust cache
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: ci-profiles
+          cache-on-failure: true
+          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
+
+      - name: Configure apt retries
+        run: echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+
+      # `collab` is the only reduced profile that links mediasoup, whose
+      # worker build wants these; the others need nothing beyond the toolchain.
+      - name: Build deps for the SFU worker (collab)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev cmake python3-pip
+
+      - name: Check every reduced profile compiles
+        run: |
+          for p in collab remote mesh access; do
+            echo "::group::profile-$p"
+            cargo check -p roomler-ai-api --no-default-features --features "profile-$p"
+            echo "::endgroup::"
+          done
+
+      # AC3 — what a profile does NOT link is the product claim. Read the
+      # graph per profile and assert the absence; a `cargo tree` that lists
+      # nothing is also a failure (the assertion must be able to fail).
+      - name: Assert what each profile leaves out (AC3)
+        run: |
+          tree() { cargo tree -p roomler-ai-api --no-default-features --features "profile-$1" -e normal --prefix none 2>/dev/null | awk '{print $1}' | sort -u; }
+          fail=0
+          for p in remote mesh access; do
+            T=$(tree "$p"); N=$(printf '%s\n' "$T" | wc -l)
+            if [ "$N" -lt 100 ]; then echo "::error::profile-$p: cargo tree returned $N crates — the assertion cannot be trusted"; fail=1; fi
+            if printf '%s\n' "$T" | grep -qxE 'mediasoup(-sys)?'; then echo "::error::profile-$p links mediasoup"; fail=1; else echo "  profile-$p: no mediasoup ($N crates)"; fi
+          done
+          T=$(tree collab); N=$(printf '%s\n' "$T" | wc -l)
+          if [ "$N" -lt 100 ]; then echo "::error::profile-collab: cargo tree returned $N crates"; fail=1; fi
+          if printf '%s\n' "$T" | grep -qx 'roomler-ai-tunnel-core'; then echo "::error::profile-collab links roomler-ai-tunnel-core"; fail=1; else echo "  profile-collab: no tunnel-core ($N crates)"; fi
+          # And the positive control: the FULL graph must contain both, or
+          # the greps above prove nothing about the names they look for.
+          F=$(cargo tree -p roomler-ai-api -e normal --prefix none 2>/dev/null | awk '{print $1}' | sort -u)
+          printf '%s\n' "$F" | grep -qx 'mediasoup' || { echo "::error::positive control failed: full does not list mediasoup"; fail=1; }
+          printf '%s\n' "$F" | grep -qx 'roomler-ai-tunnel-core' || { echo "::error::positive control failed: full does not list roomler-ai-tunnel-core"; fail=1; }
+          exit $fail

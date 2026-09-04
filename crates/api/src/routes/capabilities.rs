@@ -8,25 +8,28 @@
 //! hides navigation from it, the daemon reads it before offering a pillar the
 //! server does not have.
 //!
-//! P1 ships the compiled-module list only. Per-tenant capabilities (plan
-//! limits, tenant settings, the module's own flags) arrive with each module
-//! (`roomler_core::Module::capabilities`) and are mirrored into
-//! `/api/auth/me`, so a signed-in client pays no extra request for them.
+//! `modules` is what THIS server mounts (P8: the profile it was built as,
+//! minus any `[modules]` switch); `compiled` is what the build linked. Per-
+//! tenant capabilities (plan limits, tenant settings, the module's own flags)
+//! arrive with each module (`roomler_core::Module::capabilities`) and are
+//! mirrored into `/api/auth/me`, so a signed-in client pays no extra request
+//! for them.
 //!
-//! ⚠️ `switched_off` is a config fact, not a routing fact, until the named
-//! module has been extracted: a switch turns off nothing before its module's
-//! own PR lands (see `docs/fr/FR-69-modular-monolith.md`, D4). The field is
-//! named for what it is so no client mistakes it for "absent".
+//! ⚠️ `switched_off` is a config fact: since P7b every switch is real (each
+//! module is extracted), so `modules` = `compiled` − `switched_off`. The field
+//! is named for what it is so no client mistakes it for "absent from the
+//! build" — a client that must tell the two apart reads `compiled`.
 
 use axum::{Json, extract::State};
 use serde_json::{Value, json};
 
-use crate::core_state::Core;
+use crate::{compose, state::AppState};
 
-pub async fn get(State(core): State<Core>) -> Json<Value> {
+pub async fn get(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "modules": roomler_core::graph::MODULES,
-        "switched_off": core.settings.modules.switched_off(),
+        "modules": state.modules.mounted(),
+        "compiled": compose::EXTRACTED,
+        "switched_off": state.settings.modules.switched_off(),
     }))
 }

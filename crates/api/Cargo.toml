@@ -14,14 +14,31 @@ name = "roomler-ai-api"
 path = "src/main.rs"
 
 [features]
-# FR-69 — one feature per module crate. `default` is the hosted build; the
-# named profiles (P8) will select subsets. `saas` is the add-on the published
-# self-host images never carry.
-default = ["saas", "chat", "conference", "fleet", "remote", "network"]
+# FR-69 — one feature per module crate, and five PROFILES that aggregate them
+# (D9): each profile is a product story, and what it leaves OUT is the claim
+# (`remote`/`mesh`/`access` never compile the C++ SFU worker; `collab` never
+# links the tunnel stack) — asserted by the `profiles` job in ci.yml (AC3).
+#
+# `default` is the HOSTED build: the full profile plus `saas`, the add-on the
+# published self-host images never carry. ⚠️ Deliberately not D9's bare
+# `["profile-full"]`: the hosted image is a manual `docker build` with no
+# feature argument and the integration suite builds this crate with `default`,
+# so a default without `saas` would drop billing from the next prod deploy
+# silently. The self-host publish workflow passes `SAAS=0` explicitly and its
+# boot smoke asserts the image does not mount it — enforced where the image is
+# made, not by a default a recipe would have to remember.
+default = ["profile-full", "saas"]
+profile-full = ["chat", "conference", "fleet", "remote", "network"]
+profile-collab = ["chat", "conference"]
+profile-remote = ["fleet", "remote"]
+profile-mesh = ["fleet", "network"]
+profile-access = ["fleet", "remote", "network"]
 saas = ["dep:roomler-ai-mod-saas"]
 chat = ["dep:roomler-ai-mod-chat"]
 # `conference` is the only feature that links mediasoup (the C++ worker build).
-conference = ["dep:roomler-ai-mod-conference"]
+# It is built ON `chat` (rooms are the container calls run in — the graph's
+# `conference → chat` edge), so the feature implies it.
+conference = ["dep:roomler-ai-mod-conference", "chat"]
 # `fleet` (P5a) is device management; `remote` (P6) and `network` (P7) are built
 # ON it, so their features imply it. Kill switches: `[modules] <id> = false`.
 fleet = ["dep:roomler-ai-mod-fleet"]
