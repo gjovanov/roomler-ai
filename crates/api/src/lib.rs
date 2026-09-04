@@ -286,17 +286,9 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::peer_relay::set_policy),
         );
 
-    // Remote-control session routes (tenant-scoped)
-    let remote_session_routes = Router::new()
-        .route("/{session_id}", get(routes::remote_session::get_session))
-        .route(
-            "/{session_id}/terminate",
-            post(routes::remote_session::terminate_session),
-        )
-        .route(
-            "/{session_id}/audit",
-            get(routes::remote_session::session_audit),
-        );
+    // `/tenant/{tenant_id}/session/*`, `/turn/credentials` and
+    // `/relay/regions` are the `remote` module's (FR-69 P6), merged in by
+    // `state.modules.mount` below.
 
     // roomler-cli routes — same enrollment two-step shape as the
     // agent, but a distinct audience (`TunnelClient` JWT) so a leaked
@@ -408,14 +400,6 @@ pub fn build_router(state: AppState) -> Router {
         // "public" (no user-JWT-middleware) tunnel router.
         .route("/agents", get(routes::tunnel::list_tenant_agents));
 
-    // TURN credentials (user-scoped, no tenant prefix)
-    let turn_routes = Router::new().route(
-        "/credentials",
-        get(routes::remote_session::turn_credentials),
-    );
-    // Multi-region relay PoP topology (user-scoped, read-only, no secrets).
-    let relay_routes = Router::new().route("/regions", get(routes::remote_session::relay_regions));
-
     // Stats PR-3 — observability queries. The /admin family is gated by
     // the platform_admins ObjectId allowlist (404 on miss); the tenant
     // family gates in-handler (member for overview, MANAGE_AGENTS for
@@ -467,8 +451,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/push", push_routes)
         .nest("/notification", notification_routes)
         .nest("/tunnel-client", public_tunnel_routes)
-        .nest("/turn", turn_routes)
-        .nest("/relay", relay_routes)
         .nest("/admin/stats", admin_stats_routes)
         // `/stripe/*`, `/admin/newsletter/*`, `/admin/plan-compliance`,
         // `/user/newsletter` and `/subscribe*` are the `saas` module's
@@ -516,8 +498,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .nest("/tenant/{tenant_id}/ssh-audit", ssh_audit_routes)
         .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity_routes)
-        .nest("/tenant/{tenant_id}/ssh-settings", ssh_settings_routes)
-        .nest("/tenant/{tenant_id}/session", remote_session_routes);
+        .nest("/tenant/{tenant_id}/ssh-settings", ssh_settings_routes);
 
     // Health check. `/health` stays a cheap process-alive 200 (liveness /
     // startup probes — must NOT flap on dependency blips or k8s restarts the

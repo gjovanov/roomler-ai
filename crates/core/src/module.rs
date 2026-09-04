@@ -26,12 +26,24 @@ pub trait Module: Sized + Send + Sync + 'static {
     /// host. Must be one of [`crate::graph::MODULES`].
     const ID: &'static str;
 
+    /// The other modules' state this module is built ON — the module edges
+    /// of [`crate::graph::EDGES`] as a type (P6). `()` for a module that
+    /// depends on core alone; `remote`'s is the fleet module's state, because
+    /// the Hub is ONE live object and a module that re-created it would
+    /// dispatch into an empty registry. The host supplies it in composition
+    /// order, so a dependency is always initialised before its dependant.
+    type Deps: Send + 'static;
+
     /// Build the module's state. Runs once at boot, after `Core` is up and
     /// before any route is mounted; failure aborts the boot (a half-composed
     /// server is worse than a stopped one). `Core` is a bundle of `Arc`s and
     /// is passed by value: the module keeps its own clone as the first field
     /// of its state and derefs to it.
-    fn init(core: Core, settings: &Settings) -> impl Future<Output = anyhow::Result<Self>> + Send;
+    fn init(
+        core: Core,
+        settings: &Settings,
+        deps: Self::Deps,
+    ) -> impl Future<Output = anyhow::Result<Self>> + Send;
 
     /// The runtime switch: `false` unmounts the module on a pod that still
     /// links it — routes not mounted, WS namespaces not registered, jobs not

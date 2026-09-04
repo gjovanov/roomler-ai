@@ -78,7 +78,9 @@ impl FromRef<SaasState> for Core {
 impl Module for SaasState {
     const ID: &'static str = "saas";
 
-    async fn init(core: Core, _settings: &Settings) -> anyhow::Result<Self> {
+    type Deps = ();
+
+    async fn init(core: Core, _settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
         let db = &core.db;
         Ok(Self {
             subscribers: Arc::new(SubscriberDao::new(db)),
