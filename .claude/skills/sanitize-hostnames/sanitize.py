@@ -94,11 +94,38 @@ def load_map(path):
     return pairs, keep
 
 
+def bounded(key):
+    r"""One key, wrapped in a whole-word rule that means the same thing to
+    `re` on TEXT and to git-filter-repo on BYTES.
+
+    ⚠️ `\b` does NOT survive that crossing for a key with an accented letter.
+    On str such a letter IS a word character, so the pattern matches. On bytes
+    -- which is what filter-repo feeds its patterns -- `\w` is ASCII-only, the
+    letter is two non-word bytes, and a leading `\b` can never fire: the
+    pattern matches NOTHING. Measured, not assumed. Used naively it would have
+    swept such a name from the working tree, reported success, and left every
+    occurrence in history -- the exact "reports success, leaves names behind"
+    failure this whole tool exists to prevent.
+
+    So a key carrying non-ASCII gets explicit ASCII lookarounds, which behave
+    identically in both modes. Pure-ASCII keys keep `\b`, so every rule already
+    proven in the field is untouched.
+    """
+    esc = re.escape(key)
+    if key.isascii():
+        return r"\b" + esc + r"\b"
+    return r"(?<![A-Za-z0-9_])" + esc + r"(?![A-Za-z0-9_])"
+
+
 def build_regex(pairs, flags=0):
     """One alternation, longest branch first, so Python's leftmost-first
     alternation semantics give longest-key-first for free in a single pass.
-    A per-key loop would re-scan text an already-applied rule had rewritten."""
-    return re.compile(r"\b(?:" + "|".join(re.escape(k) for k, _ in pairs) + r")\b", flags)
+    A per-key loop would re-scan text an already-applied rule had rewritten.
+
+    The boundary is per-BRANCH, not wrapped around the whole group: the group
+    mixes ASCII and non-ASCII keys, which need different boundary rules.
+    """
+    return re.compile("(?:" + "|".join(bounded(k) for k, _ in pairs) + ")", flags)
 
 
 def apply_text(text, pairs, rx):
@@ -227,7 +254,9 @@ def gen_filter_repo(pairs, out):
     `regex:` rather than a literal, so the same \\b whole-word rule the tree
     sweeper uses also governs the rewrite; the two must not be able to differ.
     """
-    lines = ["regex:\\b%s\\b==>%s" % (re.escape(real), repl) for real, repl in pairs]
+    # `bounded()` -- not a hand-rolled \b -- so the expression filter-repo
+    # applies to BYTES is the same rule the tree sweeper applies to TEXT.
+    lines = ["regex:%s==>%s" % (bounded(real), repl) for real, repl in pairs]
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("wrote %d replace-text expressions -> %s" % (len(lines), out))
 

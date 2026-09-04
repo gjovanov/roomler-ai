@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Refuse a commit that carries a real machine name.
+#
+# This is the FIRST of three layers, and the only one that stops a name before
+# it ever leaves the machine:
+#
+#   1. this hook          -- blocks the commit
+#   2. the CI check       -- blocks the merge (required status check on master)
+#   3. the periodic sweep -- cleans what the first two let through
+#
+# Layer 3 has now run three times. Each run force-pushes ~700 branches and ~660
+# tags with GitHub Actions disabled around it, and it STILL cannot remove
+# anything from GitHub: the pre-rewrite commits stay reachable by SHA through
+# refs/pull/* until GitHub Support runs GC. The only cheap place to fix this is
+# here, before the commit exists.
+#
+# Enable with:  git config core.hooksPath .githooks
+set -u
+
+REPO="$(git rev-parse --show-toplevel)"
+GUARD="$REPO/.claude/skills/sanitize-hostnames/check_shapes.py"
+[ -f "$GUARD" ] || exit 0          # tool absent (old checkout) -- do not block
+
+# Find an interpreter that actually RUNS. On Windows, `python3` and `python`
+# are usually Microsoft Store stubs: they are on PATH, they exit non-zero, and
+# they print "Python was not found". A `command -v` check passes on those, so
+# the hook "worked" by refusing every commit for the wrong reason -- which is
+# how a hook gets disabled within a day. Probe by execution, not by presence.
+PY=""
+for cand in python3 python py; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'pass' >/dev/null 2>&1; then
+    PY="$cand"; break
+  fi
+done
+
+# --staged reads the index, so the guard runs `git` itself. In a WORKTREE that
+# is not free: `.git` is a FILE holding `gitdir: C:/...`, a Windows path WSL's
+# git cannot follow, so every git call inside the fallback died with exit 128.
+#
+# ⚠️ This machine has no native python (Git-Bash), so the fallback is the ONLY
+# path here -- which means the hook was inert in all ~53 worktrees while working
+# fine in the main clone, where `.git` is a real directory. Before the exit-code
+# split above, that 128 arrived as a bare exit 1 and the hook announced a
+# machine name the author never wrote. Two unrelated causes, one bogus message.
+#
+# Resolving the git dir NATIVELY and handing it across fixes both clone shapes:
+# in a plain clone this is `<repo>/.git`, in a worktree it is the real
+# `.git/worktrees/<name>`, and `commondir` inside it is relative so it resolves
+# on its own from there.
+GITDIR="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+
+run_guard() {
+  if [ -n "$PY" ]; then
+    "$PY" "$GUARD" --root "$REPO" --staged 2>&1
+  else
+    # No native interpreter: fall back to WSL, which is how this repo is built
+    # on Windows anyway. Paths must cross the boundary too.
+    wsl -- bash -lc "
+      export GIT_DIR=\"\$(wslpath '$GITDIR')\"
+      export GIT_WORK_TREE=\"\$(wslpath '$REPO')\"
+      python3 \"\$(wslpath '$GUARD')\" --root \"\$(wslpath '$REPO')\" --staged" 2>&1
+  fi
+}
+
+if [ -z "$PY" ] && ! command -v wsl >/dev/null 2>&1; then
+  # Degrade to a LOUD warning rather than blocking every commit forever. The
+  # required CI check still refuses the merge, so this only loses the early
+  # signal -- whereas an unconditional block gets the hook switched off, which
+  # loses it permanently.
+  echo "WARNING: no working python3 and no wsl; machine-name pre-commit guard SKIPPED." >&2
+  echo "         CI will still refuse the merge. Install python3 to get the early check." >&2
+  exit 0
+fi
+
+# Capture the STATUS, not just success/failure. `if ! out=$(...)` collapses
+# every non-zero into one branch, and this hook then announced a hostname the
+# author never wrote whenever the guard merely failed to start.
+#
+# The contract with check_shapes.py (see its EXIT_* constants):
+#   0  clean            -> commit
+#   1  names found      -> REFUSE, this is the only blocking case
+#   2  bad arguments    -> the hook and the guard have drifted apart
+#   20 internal error   -> the guard crashed or git failed
+#   *  anything else    -> interpreter missing, killed, unknown
+out=$(run_guard); rc=$?
+
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
+  # Could not RUN. Warn loudly and let the commit through: the required CI
+  # check still refuses the merge, so this loses the early signal only, whereas
+  # blocking on a broken guard costs the layer permanently the first time
+  # someone works around it. Measured 2026-09-04: a checkout predating
+  # `--staged` made argparse exit 2, and every commit in that worktree was
+  # refused as carrying a machine name -- including provably clean ones.
+  printf '%s\n' "$out" >&2
+  cat >&2 <<EOF
+
+------------------------------------------------------------------------
+WARNING: the machine-name guard COULD NOT RUN (exit $rc) -- commit allowed.
+
+This is NOT a finding. Nothing was checked, so nothing was cleared either.
+
+  exit 2  -> this hook and check_shapes.py have drifted apart (a worktree on
+             an older branch is the usual cause; both files are tracked, so
+             they should move together -- check for a stray copy).
+  exit 20 -> the guard raised, or a git command inside it failed.
+
+The required CI check still refuses the merge, so a real name cannot reach
+master this way -- but fix the guard rather than living with this.
+------------------------------------------------------------------------
+EOF
+  exit 0
+fi
+
+if [ "$rc" -eq 1 ]; then
+  printf '%s\n' "$out"
+  cat <<'EOF'
+
+------------------------------------------------------------------------
+COMMIT REFUSED: this change carries what looks like a real machine name.
+
+This repo is PUBLIC. Committed hostnames are reconnaissance value -- they
+map the fleet and say which host runs what.
+
+Use the product display name instead (the map that pairs them lives OUTSIDE
+the repo, at the path recorded in the skill's SKILL.md), then re-stage:
+
+    python3 .claude/skills/sanitize-hostnames/sanitize.py \
+        --map <path-to-map> --root . --apply
+
+If this is a FALSE POSITIVE, fix the SHAPE or the ALLOW list in
+check_shapes.py and add a canary to selftest.sh -- never silence it by
+adding the real name, and never by reaching for --no-verify.
+------------------------------------------------------------------------
+EOF
+  exit 1
+fi
+exit 0

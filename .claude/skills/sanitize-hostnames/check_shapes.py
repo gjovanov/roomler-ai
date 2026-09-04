@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import re
 import sys
 from pathlib import Path
@@ -29,11 +30,56 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sanitize import SKIP_DIRS, SKIP_SUFFIXES, read_text, walk  # noqa: E402
 
+# Exit codes. These are a CONTRACT with .githooks/pre-commit, which blocks a
+# commit on EXIT_FOUND and on nothing else.
+#
+# ⚠️⚠️ The reason they exist: until 2026-09-04 "a real name is staged" and "the
+# guard could not run" were the SAME exit code, so the hook could not tell them
+# apart and reported every failure as `COMMIT REFUSED: this change carries what
+# looks like a real machine name`. Measured that day: a file containing nothing
+# but ordinary prose was refused, because the hook passed `--staged` to a
+# checkout of this script from before that flag existed and argparse exited
+# non-zero. A guard that says "I found a hostname" when it means "I crashed"
+# teaches people to reach for --no-verify, which removes the layer entirely.
+#
+# ⚠️ EXIT_ERROR is deliberately NOT 1 and NOT 2: an unhandled Python exception
+# exits 1 and argparse exits 2, so a distinct value is the only way the caller
+# can be sure the run actually completed. main() catches everything for the
+# same reason -- see the wrapper at the bottom of this file.
+EXIT_CLEAN = 0
+EXIT_FOUND = 1
+EXIT_ERROR = 20
+
 # Each shape, with why a match identifies a physical machine.
+#
+# ⚠️⚠️ MATCHED CASE-INSENSITIVELY (re.I, applied in scan()). This is the single
+# most important line in the file. The shapes were originally written
+# uppercase-only, which is how a leak got through on 2026-09-04: a field log
+# wrote the same two asset tags in LOWERCASE, the guard reported "none found",
+# CI went green, and the names reached a public repo and 15 GitHub items.
+#
+# That is the identical mistake the map made on 2026-08-28 -- listing only
+# uppercase spellings, passing, and leaving 60 real tags behind -- and it was
+# already written down in this very directory as the reason the residual scan
+# is case-insensitive. It got rebuilt anyway, one file over. People write a
+# hostname however it came out of their terminal; a guard that assumes a casing
+# is not a guard.
+#
+# ⚠️ The DESKTOP-/LAPTOP-/WIN- suffixes require AT LEAST ONE DIGIT. Windows
+# generates them from an alphanumeric charset, so a real one essentially always
+# carries a digit; an English word never does. Without that constraint,
+# case-insensitive matching flags `desktop-classic`, `desktop-content` and
+# `desktop-rebound` -- all real strings in this repo -- and a guard that cries
+# wolf on ordinary prose is a guard someone deletes. The map-based sweep is
+# what covers the ~10% of generated names that happen to be all letters; this
+# guard is for the class, not for completeness.
 SHAPES = [
-    (r"DESKTOP-[A-Z0-9]{7}\b", "Windows auto-generated desktop hostname"),
-    (r"LAPTOP-[A-Z0-9]{7,8}\b", "Windows auto-generated laptop hostname"),
-    (r"WIN-[A-Z0-9]{11}\b", "Windows Server auto-generated hostname"),
+    (r"DESKTOP-(?=[A-Z0-9]{7}\b)[A-Z]*[0-9][A-Z0-9]*\b",
+     "Windows auto-generated desktop hostname"),
+    (r"LAPTOP-(?=[A-Z0-9]{7,8}\b)[A-Z]*[0-9][A-Z0-9]*\b",
+     "Windows auto-generated laptop hostname"),
+    (r"WIN-(?=[A-Z0-9]{11}\b)[A-Z]*[0-9][A-Z0-9]*\b",
+     "Windows Server auto-generated hostname"),
     (r"\bPC[0-9]{4,6}\b", "corp asset tag, PC-prefixed"),
     (r"\bCLK[0-9]{5,}\b", "corp asset tag, three-letter prefix + 5-8 digits"),
     (r"\b[A-Za-z]{3,}-XMG-[A-Za-z0-9]+\b", "owner-name-prefixed laptop hostname"),
@@ -57,25 +103,53 @@ SHAPES = [
 # docstring doing exactly that. Keep the examples generic. (`DESKTOP-WINHOST`
 # below is an alias fragment, not a machine: the shape stops at 7 characters,
 # so a qualified alias arrives here with its trailing `-<letter>` clipped off.)
+#
+# ⚠️ Also case-insensitive, so it keeps exempting an alias written in prose as
+# `corplap-3` rather than only `CORPLAP-3` -- otherwise making SHAPES
+# case-insensitive would turn every lowercase alias into a false positive and
+# the guard would be switched off within a week.
 ALLOW = re.compile(
     r"WINHOST-[A-Z]|CORPLAP-[0-9]|DESKTOP-WINHOST|MacBook-1"  # our replacements
-    r"|ARGB2101010|XRGB8888|RGBA[0-9]+"                       # pixel formats
+    r"|ARGB2101010|XRGB8888|RGBA[0-9]+",                      # pixel formats
+    re.I,
 )
 
 
-def scan(root: Path):
+def staged_files(root):
+    """(path, content) for everything about to be committed.
+
+    A pre-commit hook must judge the STAGED blob, not the file on disk: those
+    differ under `git add -p`, and the working-tree copy can be clean while the
+    staged one is not. Reads content out of the index with `git show :<path>`.
+    """
+    names = subprocess.run(
+        ["git", "-C", str(root), "diff", "--cached", "--name-only",
+         "--diff-filter=ACMR", "-z"],
+        capture_output=True, check=True)
+    for name in names.stdout.decode("utf-8", "replace").split("\0"):
+        if not name or Path(name).suffix.lower() in SKIP_SUFFIXES:
+            continue
+        blob = subprocess.run(["git", "-C", str(root), "show", ":" + name],
+                              capture_output=True)
+        if blob.returncode == 0:
+            yield name, blob.stdout.decode("utf-8", "replace")
+
+
+def scan(root: Path, staged=False):
     findings = []
-    for p in walk(root):
-        text = read_text(p)
+    sources = (staged_files(root) if staged
+               else ((str(p.relative_to(root).as_posix()), read_text(p)) for p in walk(root)))
+    for name, text in sources:
+        p = Path(name)
         if text is None:
             continue
         for shape, why in SHAPES:
-            for m in re.finditer(shape, text):
+            for m in re.finditer(shape, text, re.I):
                 tok = m.group(0)
                 if ALLOW.fullmatch(tok):
                     continue
                 line = text.count("\n", 0, m.start()) + 1
-                findings.append((p.relative_to(root).as_posix(), line, tok, why))
+                findings.append((p.as_posix(), line, tok, why))
     return findings
 
 
@@ -83,12 +157,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, default=Path("."))
+    ap.add_argument("--staged", action="store_true",
+                    help="check the staged blobs only (for a pre-commit hook)")
     args = ap.parse_args()
 
-    findings = scan(args.root)
+    findings = scan(args.root, staged=args.staged)
     if not findings:
         print("machine-name shapes: none found")
-        return 0
+        return EXIT_CLEAN
 
     seen = set()
     print("Real machine names look like they are committed here:\n")
@@ -107,8 +183,25 @@ side -- then re-run the sweep:
         --map <path-to-map> --root . --apply
 
 Do NOT add a real machine name to this file's allowlist. See SKILL.md.""")
-    return 1
+    return EXIT_FOUND
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Any failure that is NOT "a name was found" must leave through EXIT_ERROR,
+    # so the hook can tell a verdict from a crash. Without this a git failure
+    # inside staged_files() (`subprocess.run(..., check=True)`) would surface as
+    # a bare exit 1 -- indistinguishable from a real finding, and reported to
+    # the author as a hostname they did not write.
+    #
+    # SystemExit passes through untouched: it carries main()'s own return value
+    # and argparse's exit 2, both of which already mean something specific.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        sys.exit(EXIT_ERROR)
+    except BaseException as exc:  # noqa: BLE001 - deliberate: see above
+        print("machine-name guard could not run: %s: %s"
+              % (type(exc).__name__, exc), file=sys.stderr)
+        sys.exit(EXIT_ERROR)
