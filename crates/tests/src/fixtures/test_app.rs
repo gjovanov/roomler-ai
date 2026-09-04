@@ -111,6 +111,11 @@ impl TestApp {
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
             .expect("Failed to create AppState");
+        // FR-69 — the module crates' index sets, after the core plan (the
+        // same two steps `main.rs` runs).
+        roomler_ai_db::indexes::apply_index_sets(&db, &app_state.modules.index_sets())
+            .await
+            .expect("Failed to create module indexes");
         let state = app_state.clone();
         let app = build_router(app_state);
 
@@ -212,6 +217,11 @@ impl TestApp {
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
             .expect("Failed to create AppState");
+        // FR-69 — the module crates' index sets, after the core plan (the
+        // same two steps `main.rs` runs).
+        roomler_ai_db::indexes::apply_index_sets(&db, &app_state.modules.index_sets())
+            .await
+            .expect("Failed to create module indexes");
         let state = app_state.clone();
         let app = build_router(app_state);
 
@@ -285,6 +295,11 @@ impl TestApp {
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
             .expect("Failed to create AppState");
+        // FR-69 — the module crates' index sets, after the core plan (the
+        // same two steps `main.rs` runs).
+        roomler_ai_db::indexes::apply_index_sets(&db, &app_state.modules.index_sets())
+            .await
+            .expect("Failed to create module indexes");
         let state = app_state.clone();
         let app = build_router(app_state);
 
