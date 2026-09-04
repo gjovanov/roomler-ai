@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//! `roomler-core` — the server's composition contract (FR-69).
+//!
+//! The server is becoming a **modular monolith**: one small core plus six
+//! pillar modules, each a crate behind the one [`Module`] contract defined
+//! here, composed by a thin host under `#[cfg(feature)]` into named build
+//! profiles. Same process, same container, same wire — what changes is where
+//! code lives and what a build links. The design, every decision's trade-off
+//! and the phase plan are in `docs/fr/FR-69-modular-monolith.md`.
+//!
+//! # What lives here
+//!
+//! * [`Module`] — the trait every pillar module implements: routes, WebSocket
+//!   namespaces, index specs, jobs, lifecycle hooks, capabilities.
+//! * [`Core`] — the server-wide services modules build on. **P0 ships it as a
+//!   placeholder**: the type exists so the contract's signatures are final; its
+//!   fields (identity, tenancy, plans, notifications, storage, the socket, the
+//!   cluster bus, TURN credentials, metering) arrive in P1.
+//! * [`graph`] — the module set and the allowed dependency edges, as data, with
+//!   a test that keeps them a DAG.
+//! * [`composition`] — the snapshot that gates every module move: the router's
+//!   paths with their allowed methods, the index plan, the wire names.
+//!
+//! # The rules, in one place
+//!
+//! * **Core membership.** Something lives in core only if at least two modules
+//!   need it *and* it is identity, tenancy or infrastructure. Everything else
+//!   belongs to a module.
+//! * **A DAG, not peers.** Any module may call core; `conference → chat`,
+//!   `remote → fleet`, `network → fleet`. Core never calls a module: the inverse
+//!   flows (tenant archive, agent removal) are [`hooks`] that core invokes in a
+//!   fixed order ([`hooks::HOOK_ORDER`]).
+//! * **Static composition.** The host composes concrete module types under
+//!   feature cfgs — no `Vec<Box<dyn Module>>`, no link-time registry. A module
+//!   that forgets its indexes, jobs or hooks does not compile.
+//! * **The wire and the documents do not move.** One `/ws` socket with an
+//!   exhaustive per-variant namespace map (P5); `/derp` unchanged; DAOs and
+//!   indexes change owner, never shape.
+//!
+//! # Naming
+//!
+//! Server-side crates are `roomler-ai-*`; this crate is the one exception by
+//! design, `roomler-core`. Module crates are `roomler-ai-mod-<name>`. The
+//! daemon's shared building blocks are `roomler-node-core`
+//! (`crates/agent-core`), which held the name `roomler-core` from FR-21 until
+//! FR-69.
+
+pub mod capabilities;
+pub mod composition;
+pub mod graph;
+pub mod hooks;
+pub mod job;
+pub mod module;
+pub mod ws;
+
+pub use capabilities::{Capabilities, TenantCtx};
+pub use hooks::{FleetLifecycle, Hooks, TenantLifecycle};
+pub use job::{Cadence, Job, JobFuture};
+pub use module::{Core, Module};
+pub use roomler_ai_db::indexes::{IndexOp, IndexPlan, IndexSet};
+pub use ws::{Role, UpgradeSpec, WsCtx, WsHandler, WsHandlerSpec, WsRegistration};

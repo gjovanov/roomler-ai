@@ -33,6 +33,7 @@ SERVER_PATHS=(
   crates/services
   crates/db
   crates/config
+  crates/core
   crates/derp-relay
   crates/tests
   ui
@@ -67,6 +68,7 @@ EXCLUDE_PATTERNS=(
 # ── Cargo package names, for the CI dependency-graph assertion ────────────────
 SERVER_CRATES=(
   roomler-ai-api
+  roomler-core
   roomler-ai-services
   roomler-ai-db
   roomler-ai-config

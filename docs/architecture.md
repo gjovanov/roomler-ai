@@ -101,6 +101,7 @@ agent stack layers on shared leaf crates so thin clients never link the world.
 flowchart BT
     config["crates/config<br/>settings (ROOMLER__ env)"]
     db["crates/db<br/>Mongo models + indexes"]
+    core["crates/core → roomler-core<br/>FR-69 module contract + composition snapshot"]
     rc["crates/remote_control<br/>signalling · consent · Hub¹ · ACL shapes"]
     services["crates/services<br/>DAOs · auth · media (mediasoup) · billing"]
     api["crates/api<br/>Axum: REST + /ws + /derp"]
@@ -120,10 +121,11 @@ flowchart BT
     setup["agents/roomler-setup<br/>install wizard (Tauri)"]
 
     db --> config
+    core --> db
     rc --> db
     services --> rc
     api --> services
-    tests --> api & roomlerd
+    tests --> api & roomlerd & core
 
     tunnelcore --> localapi & tcpturn & rc
     agentcore --> config

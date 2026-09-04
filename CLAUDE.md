@@ -244,6 +244,7 @@ crates/
   remote_control/   → TeamViewer-style remote-desktop subsystem: Hub, signalling, consent, audit, TURN creds (+ the canonical ACL rule shapes AND `dst_matches`/`host_matches`)
   localapi/         → LocalAPI protocol LEAF crate (wire types, client, dispatch) — re-exported as `tunnel_core::localapi`; thin clients dep it directly (P3e lever E)
   agent-core/       → package `roomler-node-core` (lib `roomler_node_core`; it was `roomler-core` from FR-21 until FR-69 — that name is now the SERVER core at `crates/core`): daemon-free agent building blocks: config, enrollment, machine-id, logging, sentinels, forward ACL — re-exported by `roomlerd` under the old `crate::` paths; the desktop companion deps THIS, never the full agent (P3e lever E)
+  core/             → package `roomler-core` (AGPL — SERVER side, never linked by an agent; the licensing lane's dependency-graph assertion enforces it): the FR-69 composition contract — the `Module` trait, hooks, jobs, capabilities, the module DAG — and the composition snapshot (`composition.rs`) whose baseline in `crates/tests/fixtures/` gates every module move. Types only until P1
   api/              → Axum HTTP/WS server: ~85 API routes + /ws + /health
   tests/            → Integration tests (24 test modules, 163+ tests)
 agents/
@@ -261,6 +262,16 @@ ui/
 scripts/
   dev-xvfb.sh       → Run the agent's capture path against a virtual X framebuffer (headless smoke test)
 ```
+
+### Modular monolith — the FR-69 program (in flight)
+
+The server is being decoupled into **`roomler-core` + six module crates** (`fleet`, `chat`, `conference`, `remote`, `network`, `saas`) behind ONE `Module` contract (`crates/core/src/module.rs`), statically composed under Cargo features into five profiles (`full` / `collab` / `remote` / `mesh` / `access`; `saas` is an add-on the self-host images never carry) and discovered at runtime via `GET /api/capabilities`. Spec with every decision's pros/cons: `docs/fr/FR-69-modular-monolith.md` (#1307). Rules while it is in flight:
+
+1. **The DAG is data**: `crates/core/src/graph.rs`. Any module → core; `conference → chat`, `remote → fleet`, `network → fleet`; core NEVER calls a module — the inverse flows (tenant archive, agent removal) are hooks core invokes in `hooks::HOOK_ORDER` (session holders → lease holders → the record owner).
+2. **A module PR is pure moves + signature changes.** `crates/tests/src/composition_tests.rs` asserts the composition (every route with its allowed methods, the index plan for both `multi_block` values, every wire name in `signaling.rs`) is byte-identical to `crates/tests/fixtures/composition.baseline.json`. Re-record ONLY with `COMPOSITION_UPDATE=1` and a commit message that says why — a reviewer diffs the JSON against the claim.
+3. **`ensure_indexes` is `index_plan(multi_block)` applied.** A new collection's indexes go into the plan (`crates/db/src/indexes.rs`), never as a side call — the baseline reads the plan, and a spec outside it is invisible to the gate.
+4. **The wire does not move.** `ClientMsg`/`ServerMsg` stay in `remote_control/src/signaling.rs`; P5 adds the exhaustive `namespace()` map that gives every variant an owning module.
+5. **Naming**: server crates `roomler-ai-*`; the core `roomler-core` (`crates/core`); modules `roomler-ai-mod-<name>` (`crates/modules/<name>`); the daemon's shared crate `roomler-node-core` (`crates/agent-core`, which held `roomler-core` from FR-21 until FR-69; its pre-FR-21 name is retired — never bring it back).
 
 ### Crate dependency flow
 `config` <- `db` <- `remote_control` <- `services` <- `api`
