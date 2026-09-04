@@ -223,13 +223,50 @@ So the plan as approved was circular: it wanted to verify growth on the org
 whose server has growth switched off, and the switch is the thing the
 verification exists to license.
 
-**Resolution — the `e2e` overlay.** `k8s/overlays/e2e` is a complete, separate
-stack (own configmap, own mongo/minio secrets, own deployment) and is
-deliberately NOT ArgoCD-managed. Adding
-`ROOMLER__OVERLAY__MULTI_BLOCK_ENABLED: "true"` there confines the one-way door
-to a throwaway database, and the IPAM cell points its VM at that server instead
-of `https://roomler.ai`. ⚠️ That means the cell needs `VMTEST_SERVER` to be
-per-cell rather than global — currently it is one value in `lib.sh:18`.
+**~~Resolution — the `e2e` overlay.~~ ⚠️ RETRACTED 2026-09-04 — do NOT use it.**
+`k8s/overlays/e2e` is a complete, separate, non-ArgoCD-managed stack, which is
+why it looked right. But measured on the cluster: the `roomler-ai-e2e`
+namespace is **live and 120 days old**, and a **cron job runs against it nightly
+at 03:30 UTC** (`e2e-nightly.sh` out of `~/wt-e2e-lane`, FR-37). It is a
+standing shared dependency, not a scratch stack.
+
+Putting a **one-way door** on someone else's nightly lane is a bad trade: if the
+flag is ever set back to `false`, `ensure_indexes` refuses the boot by design
+and the e2e stack simply stops starting, with a failure that reads as an
+unrelated boot error. (Its mongo is `emptyDir`, so the door resets on a pod
+recycle — that lowers the severity but does not make it someone else's stack to
+change.)
+
+**Use a separate disposable namespace instead** — `roomler-ai-ipam`, copied
+from the e2e overlay as a template (it already has ephemeral storage and
+plaintext secrets, both of which suit a throwaway). The door is then confined to
+a database that exists only for the test.
+
+⚠️ The cell also needs `VMTEST_SERVER` to be per-cell rather than global —
+currently one value in `lib.sh:18`.
+
+### ⚠️ Is AC2 worth its cost? An honest read before anyone builds it
+
+The IPAM VM cell uniquely proves ONE thing: that a real pre-P5d binary acting as
+a **subnet router** in a grown org black-holes block-1 traffic one-way. Note
+what is already closed without it — the pinned decoder accepts a real grown-org
+netmap (unit + e2e), the netmask it derives is correct, and the one-way door
+fails loudly. The remaining gap is NAT *scope* with real traffic, and the
+mechanism is not in doubt: `nat::enable` took a scalar `overlay_cidr`, so one
+MASQUERADE rule.
+
+Against that: a new k8s stack, an org, an anchor, a guest driver and a cell.
+
+And the population it protects is **currently zero** — `multi_block_enabled` is
+off everywhere, so no org has grown, so no pre-P5d subnet router can be in a
+grown org. The largest org today is **17 devices against a 1 022 ceiling**.
+
+⇒ Recommendation: **defer AC2 until an org actually approaches its ceiling**,
+and treat the L1 tests plus the documented mechanism as sufficient to enable
+`multi_block_enabled` for a single org that needs it. Build the cell when the
+first org gets close — the risk it covers does not exist until then. This is a
+judgement, not a blocker: the plumbing notes above make it a day's work whenever
+it IS wanted.
 
 **The per-cell plumbing is smaller than it looks, with one trap** (checked
 2026-09-04, so the next session need not rediscover it):
