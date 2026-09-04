@@ -49,10 +49,12 @@ pub struct Snapshot {
 impl Snapshot {
     /// A one-line summary for logs and the FR's field log.
     pub fn summary(&self) -> String {
+        // Either shape: a plan object (`{ "sets": [...] }`) or the sorted
+        // array `index_sets_json` produces.
         let sets = |k: &str| {
             self.indexes
                 .get(k)
-                .and_then(|p| p.get("sets"))
+                .and_then(|p| p.get("sets").or(Some(p)))
                 .and_then(|s| s.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0)
@@ -116,6 +118,16 @@ pub fn wire_names(source: &str) -> Vec<String> {
 pub fn index_plan_json(multi_block: bool) -> serde_json::Value {
     serde_json::to_value(roomler_ai_db::indexes::index_plan(multi_block))
         .expect("an index plan is plain data")
+}
+
+/// The full set of index sets a host applies — the core plan plus every
+/// mounted module's — as JSON, **sorted by collection** so the snapshot does
+/// not depend on which crate a set happens to live in. A module PR moves
+/// sets between crates; it must not change them, and this is what checks
+/// that.
+pub fn index_sets_json(mut sets: Vec<roomler_ai_db::indexes::IndexSet>) -> serde_json::Value {
+    sets.sort_by(|a, b| a.collection.cmp(b.collection));
+    serde_json::to_value(sets).expect("index sets are plain data")
 }
 
 fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {

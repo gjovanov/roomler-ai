@@ -25,8 +25,8 @@ use roomler_ai_db::models::{NewsletterIssue, Subscriber};
 use roomler_ai_services::email::SendOptions;
 use roomler_ai_services::newsletter::{render_issue_html, substitute_recipient};
 
-use crate::routes::newsletter::{newsletter_from, unsubscribe_headers, unsubscribe_url};
-use crate::state::AppState;
+use crate::SaasState;
+use crate::newsletter::{newsletter_from, unsubscribe_headers, unsubscribe_url};
 
 /// A ledger row still `claimed` after this long is STALE — the crash-window
 /// residue the status surface reports and `retry_stale` may re-attempt.
@@ -49,7 +49,7 @@ pub fn stale_cutoff() -> DateTime {
 /// The fan-out. Pre-renders once, then per recipient: claim (unique index
 /// arbitrates) → re-check consent → substitute → send with a hard timeout →
 /// mark. Finishes by stamping `completed` + the counts snapshot.
-pub async fn run_send(state: AppState, issue: NewsletterIssue, retry_stale: bool) {
+pub async fn run_send(state: SaasState, issue: NewsletterIssue, retry_stale: bool) {
     let slug = issue.slug.clone();
     let issue_id = issue.id.expect("a stored issue has an id");
     let Some(mailer) = state.email.clone() else {

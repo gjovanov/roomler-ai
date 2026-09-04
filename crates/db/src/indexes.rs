@@ -64,14 +64,25 @@ fn set(collection: &'static str, indexes: Vec<IndexModel>) -> IndexSet {
 /// rather than silently run without the guard. That is the intended failure:
 /// a uniqueness guard that quietly gives up is worse than one that stops you.
 pub async fn ensure_indexes(db: &Database, multi_block: bool) -> Result<(), mongodb::error::Error> {
-    for entry in index_plan(multi_block).sets {
+    apply_index_sets(db, &index_plan(multi_block).sets).await?;
+    info!("All indexes ensured");
+    Ok(())
+}
+
+/// Apply index sets in order: each set's pre-ops, then its indexes.
+///
+/// FR-69 — the host calls this a second time with the module crates' sets
+/// (`roomler_core::Module::indexes`), after the core plan above.
+pub async fn apply_index_sets(
+    db: &Database,
+    sets: &[IndexSet],
+) -> Result<(), mongodb::error::Error> {
+    for entry in sets {
         for op in &entry.pre_ops {
             apply_op(db, entry.collection, op).await?;
         }
-        create_indexes(db, entry.collection, entry.indexes).await?;
+        create_indexes(db, entry.collection, entry.indexes.clone()).await?;
     }
-
-    info!("All indexes ensured");
     Ok(())
 }
 
@@ -264,43 +275,10 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         ],
     ));
 
-    // Subscribers (FR-39). `email` is unique so a re-submission updates the
-    // existing row rather than creating a second one that the first row's
-    // unsubscribe link could never reach. The two token indexes are unique
-    // because each token is a capability resolved by lookup, and two rows
-    // sharing one would make the resolution ambiguous.
-    sets.push(set(
-        "subscribers",
-        vec![
-            index_unique(bson::doc! { "email": 1 }),
-            index_unique(bson::doc! { "unsubscribe_token": 1 }),
-            index(bson::doc! { "confirm_token": 1 }),
-            index(bson::doc! { "created_at": -1 }),
-        ],
-    ));
-
-    // Newsletter issues (FR-58). `slug` is unique because create is explicit
-    // (a typo'd slug on update must 404, never upsert a second issue), and the
-    // unique index is what arbitrates two concurrent creates.
-    sets.push(set(
-        "newsletter_issues",
-        vec![
-            index_unique(bson::doc! { "slug": 1 }),
-            index(bson::doc! { "created_at": -1 }),
-        ],
-    ));
-
-    // Newsletter delivery ledger (FR-58). 🔑 The unique pair IS the send
-    // program's at-most-once invariant: rows are claimed (inserted) before the
-    // send attempt, so a resume — or even two pods fanning out concurrently —
-    // resolves each recipient to exactly one winner.
-    sets.push(set(
-        "newsletter_sends",
-        vec![
-            index_unique(bson::doc! { "issue_id": 1, "subscriber_id": 1 }),
-            index(bson::doc! { "issue_id": 1, "status": 1 }),
-        ],
-    ));
+    // FR-69 P2 — `subscribers`, `newsletter_issues` and `newsletter_sends`
+    // are the `saas` module's: their sets live in
+    // `roomler_ai_mod_saas::SaasState::indexes` and the host applies them
+    // after this plan.
 
     // Custom Emojis
     sets.push(set(
@@ -825,18 +803,18 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     IndexPlan { multi_block, sets }
 }
 
-fn index(keys: bson::Document) -> IndexModel {
+pub fn index(keys: bson::Document) -> IndexModel {
     IndexModel::builder().keys(keys).build()
 }
 
-fn index_unique(keys: bson::Document) -> IndexModel {
+pub fn index_unique(keys: bson::Document) -> IndexModel {
     IndexModel::builder()
         .keys(keys)
         .options(IndexOptions::builder().unique(true).build())
         .build()
 }
 
-fn index_ttl(keys: bson::Document, expire_after_secs: u64) -> IndexModel {
+pub fn index_ttl(keys: bson::Document, expire_after_secs: u64) -> IndexModel {
     IndexModel::builder()
         .keys(keys)
         .options(
@@ -847,11 +825,11 @@ fn index_ttl(keys: bson::Document, expire_after_secs: u64) -> IndexModel {
         .build()
 }
 
-fn index_text(keys: bson::Document) -> IndexModel {
+pub fn index_text(keys: bson::Document) -> IndexModel {
     IndexModel::builder().keys(keys).build()
 }
 
-fn index_unique_sparse(keys: bson::Document) -> IndexModel {
+pub fn index_unique_sparse(keys: bson::Document) -> IndexModel {
     IndexModel::builder()
         .keys(keys)
         .options(IndexOptions::builder().unique(true).sparse(true).build())
@@ -861,7 +839,7 @@ fn index_unique_sparse(keys: bson::Document) -> IndexModel {
 /// Unique index scoped by a partial filter — uniqueness is enforced only for
 /// documents matching `filter` (e.g. non-empty `name`, so pre-Phase-0 rows with
 /// an empty name don't collide).
-fn index_unique_partial(keys: bson::Document, filter: bson::Document) -> IndexModel {
+pub fn index_unique_partial(keys: bson::Document, filter: bson::Document) -> IndexModel {
     IndexModel::builder()
         .keys(keys)
         .options(

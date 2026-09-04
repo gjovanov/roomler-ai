@@ -33,7 +33,9 @@ use roomler_ai_services::dao::subscriber::SubscribeOutcome;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::{error::ApiError, state::AppState};
+use roomler_core::ApiError;
+
+use crate::SaasState;
 
 /// Upper bound on a stored address. RFC 5321 caps a path at 256 octets; this is
 /// a storage guard, not a validator — the confirmation mail is the validator.
@@ -93,7 +95,7 @@ fn clean_source(raw: Option<String>) -> String {
 /// Always 202. See the module note — the uniform response is the control, not
 /// an accident of error handling.
 pub async fn subscribe(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     Json(body): Json<SubscribeRequest>,
 ) -> impl IntoResponse {
     let email = roomler_ai_db::models::Subscriber::normalize_email(&body.email);
@@ -146,7 +148,7 @@ pub async fn subscribe(
     )
 }
 
-async fn send_confirmation(state: &AppState, email: &str, token: &str) {
+async fn send_confirmation(state: &SaasState, email: &str, token: &str) {
     let Some(mailer) = state.email.as_ref() else {
         // Not an error. A self-hosted instance with no SMTP configured still
         // collects addresses; the row simply stays unconfirmed until a mailer
@@ -183,7 +185,7 @@ async fn send_confirmation(state: &AppState, email: &str, token: &str) {
 /// old emails (they now cost one extra, deliberate click); the DB is not even
 /// read here, so a prefetcher achieves nothing.
 pub async fn confirm_redirect(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     Path(token): Path<String>,
 ) -> Redirect {
     let base = state.settings.app.frontend_url.trim_end_matches('/');
@@ -196,7 +198,7 @@ pub async fn confirm_redirect(
 /// `{"confirmed": false}` for an unknown or already-used token is a statement
 /// to the token HOLDER, not a membership oracle.
 pub async fn confirm(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     Path(token): Path<String>,
 ) -> Json<serde_json::Value> {
     let ok = state.subscribers.confirm(&token).await.unwrap_or(false);
@@ -210,7 +212,7 @@ pub async fn confirm(
 /// person to log in first is not a working unsubscribe. Idempotent, because
 /// mail clients prefetch links.
 pub async fn unsubscribe(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     Path(token): Path<String>,
 ) -> Result<Redirect, ApiError> {
     let ok = state.subscribers.unsubscribe(&token).await.unwrap_or(false);
@@ -235,7 +237,7 @@ pub async fn unsubscribe(
 ///   route exists for. The token in the path is the whole input.
 /// - Idempotent, same as the GET — the DAO stamp is a no-op on repeat.
 pub async fn unsubscribe_oneclick(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     Path(token): Path<String>,
 ) -> StatusCode {
     let ok = state.subscribers.unsubscribe(&token).await.unwrap_or(false);
@@ -251,7 +253,7 @@ pub async fn unsubscribe_oneclick(
 /// `fullPath === '/'`, so a logged-out confirmer bounced to `/login` and a
 /// signed-in one rendered the dashboard — the landing handler for the query
 /// was dead code (FR-58 field evidence 2).
-fn outcome_page(state: &AppState, page: &str, status: &str) -> String {
+fn outcome_page(state: &SaasState, page: &str, status: &str) -> String {
     let base = state.settings.app.frontend_url.trim_end_matches('/');
     format!("{base}/newsletter/{page}?status={status}")
 }

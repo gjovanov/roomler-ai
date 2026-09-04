@@ -7972,6 +7972,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roomler-ai-config",
  "roomler-ai-db",
+ "roomler-ai-mod-saas",
  "roomler-ai-remote-control",
  "roomler-ai-services",
  "roomler-ai-tunnel-core",
@@ -8014,6 +8015,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "roomler-ai-mod-saas"
+version = "0.4.61"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bson",
+ "futures",
+ "reqwest 0.12.28",
+ "roomler-ai-config",
+ "roomler-ai-db",
+ "roomler-ai-services",
+ "roomler-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
