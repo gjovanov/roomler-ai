@@ -15,6 +15,9 @@
 /// day a fleet grows.
 pub const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
+// FR-69 P5c — the host's transitional `remote`/`network` halves of the agent
+// socket, registered on the core's `AgentSocketRegistry` under those ids.
+pub mod agent_socket_host;
 pub mod derp;
 pub mod derp_acl;
 pub mod derp_cluster;

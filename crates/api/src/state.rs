@@ -484,6 +484,7 @@ impl AppState {
             turn_map: turn_map.clone(),
             relay_load: relay_load.clone(),
             hooks: roomler_core::HookRegistry::default(),
+            agent_socket: roomler_core::AgentSocketRegistry::default(),
         };
         // FR-69 P2 — the module crates, after the core and before the host
         // state that mounts them.
@@ -869,6 +870,30 @@ impl AppState {
                     state: state.clone(),
                 })),
                 tenant: None,
+            },
+        );
+        // FR-69 P5c — the agent socket is the fleet module's; the host
+        // registers its TRANSITIONAL `network` and `remote` halves (the
+        // tunnel/overlay relays with their per-connection state, SSH, key
+        // rotation, DERP tickets, probe reports; the session-stats merge) so
+        // the module dispatches by owner without naming the host.
+        let net = Arc::new(crate::ws::agent_socket_host::HostNetworkAgentSocket::new(
+            state.clone(),
+        ));
+        state.core.agent_socket.register(
+            "network",
+            roomler_core::AgentSocketHooks {
+                handler: Some(net.clone()),
+                lifecycle: Some(net),
+            },
+        );
+        state.core.agent_socket.register(
+            "remote",
+            roomler_core::AgentSocketHooks {
+                handler: Some(Arc::new(
+                    crate::ws::agent_socket_host::HostRemoteAgentSocket::new(state.clone()),
+                )),
+                lifecycle: None,
             },
         );
 
