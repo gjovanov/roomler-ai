@@ -8,10 +8,10 @@
 //! Ok and rejects with the String on Err. The HTML/JS layer in
 //! `src/front/` consumes these via `window.__TAURI__.core.invoke`.
 
+use roomler_localapi::{self as localapi, ConsentRequest, FlowInfo, NodeStatus, PeerInfo};
 use roomler_node_core::config::{self, AgentConfig};
 use roomler_node_core::enrollment::{self, EnrollInputs};
 use roomler_node_core::{logging, notify};
-use roomler_localapi::{self as localapi, ConsentRequest, FlowInfo, NodeStatus, PeerInfo};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
