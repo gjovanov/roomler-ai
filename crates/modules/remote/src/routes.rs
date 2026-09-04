@@ -104,6 +104,7 @@ pub async fn terminate_session(
 
     // Force-close via Hub. The Hub pushes a Terminate to both peers and audits.
     let terminated_here = state
+        .fleet
         .rc_hub
         .terminate(
             sid,

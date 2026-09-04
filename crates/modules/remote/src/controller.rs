@@ -202,6 +202,7 @@ pub async fn dispatch_controller_rc(
             // falls back to controller-moves (never nudge on doubt).
             let agent_tenant_hex = match ObjectId::parse_str(agent_hex) {
                 Ok(aid) => state
+                    .fleet
                     .agents
                     .base
                     .find_by_id(aid)
