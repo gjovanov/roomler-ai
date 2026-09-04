@@ -34,7 +34,9 @@ use axum::{
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::{Agent, AgentStatus};
 
-use crate::{error::ApiError, extractors::auth::FromRef, state::AppState};
+use axum::extract::FromRef;
+
+use crate::{error::ApiError, state::AppState};
 
 /// An agent that authenticated with its own JWT **and** still has a row we
 /// accept. Carries the row so a handler that needs it does not re-read.
