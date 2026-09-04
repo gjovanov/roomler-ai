@@ -1,9 +1,11 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 – P8 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 · #1323 ·
-#1325 · #1329 · #1332 · #1336 · #1337 · #1339 · #1340 · #1347 · #1348) — **every pillar is a
-module, the five profiles build and are checked for what they leave out** · **P9 in PR** (the
-UI module registry + runtime gating on `/api/capabilities`) · every phase's field gate (a
+**Status**: P0 – P9 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 · #1323 ·
+#1325 · #1329 · #1332 · #1336 · #1337 · #1339 · #1340 · #1347 · #1348 · #1351) — **every
+pillar is a module, the five profiles build and are checked for what they leave out, the SPA
+gates on what the server mounts** · **a composition fix in PR** (the device listing returns
+to the host — a `remote` profile 404'd its devices page — with the publish smoke asserting
+the route per profile; AC4 measured, AC5's smoke half held) · every phase's field gate (a
 prod roll watched from the fleet: no dip in online agents; for P6 one RC session per carrier
 class; for P7 the overlay/tunnel sweep; for P8 the `mesh` image's daemon cell and the
 build-time measurement; for P9 the full UI against a `mesh` server) is still to be run ·
@@ -494,10 +496,14 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       `profiles` CI job on #1348: `profile-remote` 411 crates, `profile-mesh` 471,
       `profile-access` 472 (no `mediasoup`), `profile-collab` 433 (no tunnel-core); the
       positive controls found both crates in the full graph. Re-asserted on every PR.
-- [ ] **AC4** Docker build time for a non-conference profile is measured against `full`, before
-      and after, and recorded in the field log.
+- [x] **AC4** Docker build time for a non-conference profile is measured against `full`, before
+      and after, and recorded in the field log. — Publish dry-runs on master `618c763e`
+      (amd64, cold cache, one sample each): `full` 17 min 35 s / 204 MiB, `mesh` 13 min 39 s /
+      173 MiB — 22 % shorter, 15 % smaller. Field log: "after P9".
 - [ ] **AC5** A `mesh` image boots with Mongo, Redis and coturn only; `/health` lists `fleet`
-      and `network`; a daemon enrolls and joins the overlay against it (a vmtest cell).
+      and `network`; a daemon enrolls and joins the overlay against it (a vmtest cell). — The
+      smoke half held on the `mesh` dry-run (Mongo + Redis only, `/health` →
+      `modules: ["fleet","network"]` in 20 s, the SPA served); the daemon cell is still to run.
 - [x] **AC6** Every `ClientMsg` variant has an owner in the namespace map, enforced by an
       exhaustive match and a locked test. — P5b #1332: `ClientMsg::namespace()` is exhaustive
       (a new variant does not compile until it names an owner), `CLIENT_MSG_OWNERS` is checked
@@ -1118,3 +1124,40 @@ carrier class, a DERP-floor host, an SSH session — read from the fleet, not fr
   UI against a `mesh` server showing no chat or conference navigation and no console errors —
   needs a `mesh` image someone can reach; it is still to run**, and the e2e nightly against
   `full` is unchanged by construction (no path moved, no component changed its contract).
+
+### 2026-09-04 — after P9: the device listing returns to the host, and the profile numbers
+
+- **A composition gap the profiles exposed.** P7b moved `GET /tenant/{tenant_id}/device` into
+  `roomler-ai-mod-network` ("a view that reads two modules belongs to the one that depends on
+  the other") — correct for the DAG, wrong for the product: the `remote` profile (fleet +
+  remote, no network) has a devices page whose listing 404'd. The P7 plan had said "the
+  device listing STAYS in the host as the composition view it is: fleet rows always, tunnel-
+  client and overlay rows only when `network` is mounted", and the plan was right. It is the
+  host's again (`crates/api/src/routes/device.rs`, `State<AppState>`): the fleet module
+  required (503 with a reason when `[modules] fleet = false`), the network module optional
+  (`modules.network` absent ⇒ no tunnel rows, no overlay columns — the shape a tenant with no
+  overlay network already produced). The route set is unchanged, so the baseline is
+  byte-identical. The rule as corrected in CLAUDE.md: a two-module view where BOTH are
+  required belongs to the dependant; where one is OPTIONAL it is the host's.
+- **The boot smoke reads more than `/health` now.** It could not have caught the 404 — it
+  asserted the module list and nothing a module mounts. The publish smoke asks
+  `GET /api/tenant/…/device` unauthenticated on every profile: 401 proves the route is
+  mounted wherever `fleet` is, 404 is the answer `collab` must give.
+- **AC4 measured (2026-09-04, `publish-selfhost-image.yml` dry-runs on master `618c763e`,
+  amd64, `ubuntu-latest`, cold build cache — the profile scopes were new)**: the Docker
+  `Build` step took **17 min 35 s for `full`** (run 33918697491) and **13 min 39 s for
+  `mesh`** (run 33918699922) — 22 % shorter; images 213 858 029 bytes (204 MiB) vs
+  181 234 637 bytes (173 MiB) — 15 % smaller. One sample each. The SFU worker build is a
+  smaller share of the Docker build than D9 assumed on a 4-core runner, where the Rust
+  compile dominates; the work a `mesh` image skips is the worker AND the chat/conference
+  crates.
+- **AC5, the smoke half**: the `mesh` image booted with Mongo and Redis only (the smoke runs
+  no coturn), answered `/health` in 20 s with
+  `{"status":"ok","version":"0.4.64","modules":["fleet","network"],"compiled":["fleet","network"]}`,
+  served the SPA, and the module assertion held. The `full` dry-run listed the five pillars
+  and no `saas` — the first published-image build the `SAAS=0` guarantee was asserted on.
+  The daemon half — enrol a `roomlerd` against the `mesh` image and join its overlay — is a
+  vmtest cell still to run.
+- **The UI half of the same gap**: `AgentsSection.vue` offers the overlay-key rotation and the
+  SSH policy on every device — network's routes; on a `remote`
+  profile those menus led to 404s. They read `caps.has('network')` now.

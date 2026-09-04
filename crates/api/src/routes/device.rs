@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
-use crate::NetworkState;
+use crate::state::AppState;
 use roomler_ai_mod_fleet::agent::{AgentPresence, agent_presence_batch, derive_agent_presence};
 
 /// Fields are declared INLINE, deliberately not `#[serde(flatten)]
@@ -115,8 +115,18 @@ pub struct DeviceRow {
 
 /// GET /api/tenant/{tenant_id}/device — membership-gated like every other
 /// fleet list (mutations stay behind MANAGE_AGENTS on their own routes).
+///
+/// FR-69 — the HOST's composition view, deliberately: it joins the `fleet`
+/// module's agents (required — a pod without fleet has no devices to list
+/// and says so with 503) with the `network` module's tunnel clients and
+/// overlay nodes (optional — a `remote` profile, fleet + remote and no
+/// network, lists its agents with no tunnel rows and no overlay columns).
+/// P7b put this in the network crate on the strength of the `network →
+/// fleet` graph edge, which left every `remote` profile with a devices page
+/// whose listing 404'd; a view over two modules, one of them optional, is
+/// exactly what the host is for.
 pub async fn list_devices(
-    State(state): State<NetworkState>,
+    State(state): State<AppState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<DeviceListQuery>,
@@ -126,6 +136,11 @@ pub async fn list_devices(
     if !state.tenants.is_member(tid, auth.user_id).await? {
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
+    let Some(fleet) = state.modules.fleet.as_ref() else {
+        return Err(ApiError::ServiceUnavailable(
+            "the fleet module is not mounted on this server".to_string(),
+        ));
+    };
 
     // FR-11: NO sort param = the compound default — online first, then
     // name (the sidebar's exact order). An explicit `sort=name` stays a
@@ -166,37 +181,59 @@ pub async fn list_devices(
     let page = params.page.max(1);
 
     // ── Fetch + join ────────────────────────────────────────────
-    // FR-69 P7b — this listing joins fleet's agents with this module's tunnel
-    // clients and overlay nodes: a `network → fleet` read, which is why it
-    // lives here and not in the host.
+    // Fleet's agents always; the network module's tunnel clients and overlay
+    // nodes only when it is mounted — absent, the listing is exactly what a
+    // tenant with no overlay network sees (no client rows, no overlay
+    // columns), which every consumer already handles.
     let agents = if kind_filter.as_deref() == Some("tunnel_client") {
         Vec::new()
     } else {
-        state.fleet.agents.list_all_active_for_tenant(tid).await?
-    };
-    let clients = if kind_filter.as_deref() == Some("agent") {
-        Vec::new()
-    } else {
-        state.tunnel_clients.list_all_active_for_tenant(tid).await?
+        fleet.agents.list_all_active_for_tenant(tid).await?
     };
 
-    let (nodes, dns_domain) = match state.overlay_networks.find_for_tenant(tid).await? {
-        Some(net) => {
-            let nodes = match net.id {
-                Some(nid) => state.overlay_nodes.list_active_in_network(tid, nid).await?,
-                None => Vec::new(),
+    #[cfg(feature = "network")]
+    let (clients, nodes, dns_domain) = match state.modules.network.as_ref() {
+        Some(network) => {
+            let clients = if kind_filter.as_deref() == Some("agent") {
+                Vec::new()
+            } else {
+                network
+                    .tunnel_clients
+                    .list_all_active_for_tenant(tid)
+                    .await?
             };
-            let domain = state
-                .tenants
-                .base
-                .find_by_id(tid)
-                .await
-                .ok()
-                .and_then(|t| t.settings.magic_dns_domain);
-            (nodes, domain)
+            let (nodes, dns_domain) = match network.overlay_networks.find_for_tenant(tid).await? {
+                Some(net) => {
+                    let nodes = match net.id {
+                        Some(nid) => {
+                            network
+                                .overlay_nodes
+                                .list_active_in_network(tid, nid)
+                                .await?
+                        }
+                        None => Vec::new(),
+                    };
+                    let domain = state
+                        .tenants
+                        .base
+                        .find_by_id(tid)
+                        .await
+                        .ok()
+                        .and_then(|t| t.settings.magic_dns_domain);
+                    (nodes, domain)
+                }
+                None => (Vec::new(), None),
+            };
+            (clients, nodes, dns_domain)
         }
-        None => (Vec::new(), None),
+        None => (Vec::new(), Vec::new(), None),
     };
+    #[cfg(not(feature = "network"))]
+    let (clients, nodes, dns_domain): (
+        Vec<TunnelClient>,
+        Vec<roomler_ai_remote_control::models::OverlayNode>,
+        Option<String>,
+    ) = (Vec::new(), Vec::new(), None);
     let mut node_by_agent = std::collections::HashMap::new();
     let mut node_by_client = std::collections::HashMap::new();
     for n in &nodes {
@@ -210,12 +247,12 @@ pub async fn list_devices(
         }
     }
 
-    let fresh = agent_presence_batch(&state.fleet, &agents).await;
+    let fresh = agent_presence_batch(fleet, &agents).await;
 
     let mut rows: Vec<DeviceRow> = Vec::with_capacity(agents.len() + clients.len());
     for a in agents {
         let redis_fresh = a.id.map(|i| fresh.contains(&i)).unwrap_or(false);
-        let (presence, is_online) = derive_agent_presence(&state.fleet, &a, redis_fresh);
+        let (presence, is_online) = derive_agent_presence(fleet, &a, redis_fresh);
         let node = a.id.and_then(|i| node_by_agent.get(&i).copied());
         rows.push(agent_row(
             a,

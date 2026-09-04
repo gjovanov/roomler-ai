@@ -172,6 +172,7 @@
                     @click="triggerUpdate(agentFor(item)!)"
                   />
                   <v-list-item
+                    v-if="caps.has('network')"
                     prepend-icon="mdi-key-change"
                     title="Rotate overlay key…"
                     :disabled="rotateKeyBusy === item.id"
@@ -215,6 +216,7 @@
                     @click="openExecPolicy(agentFor(item)!)"
                   />
                   <v-list-item
+                    v-if="caps.has('network')"
                     prepend-icon="mdi-console-network-outline"
                     title="SSH policy"
                     @click="openSshPolicy(agentFor(item)!)"
@@ -787,6 +789,7 @@
                     @click="triggerUpdate(a)"
                   />
                   <v-list-item
+                    v-if="caps.has('network')"
                     prepend-icon="mdi-key-change"
                     title="Rotate overlay key…"
                     :disabled="rotateKeyBusy === a.id"
@@ -825,6 +828,7 @@
                     @click="openExecPolicy(a)"
                   />
                   <v-list-item
+                    v-if="caps.has('network')"
                     prepend-icon="mdi-console-network-outline"
                     title="SSH policy"
                     @click="openSshPolicy(a)"
@@ -1476,6 +1480,7 @@ import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
 import ExecPolicyDialog from './ExecPolicyDialog.vue'
 import SshPolicyDialog from './SshPolicyDialog.vue'
+import { useCapabilitiesStore } from '@/stores/capabilities'
 import RemoteConfigDialog from './RemoteConfigDialog.vue'
 import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
 import {
@@ -1500,6 +1505,10 @@ const agentStore = useAgentStore()
 const overlayStore = useOverlayRoutesStore()
 const tunnelClientStore = useTunnelClientStore()
 const deviceStore = useDeviceStore()
+// FR-69 P9 — the overlay-key rotation, the SSH policy and the peer-relay
+// policy are the network module's routes; a `remote` profile has no network
+// module, and a menu item that leads to a 404 is worse than none.
+const caps = useCapabilitiesStore()
 const auth = useAuthStore()
 // Declared before the grid state below — gridKind's initializer reads
 // route.query.
