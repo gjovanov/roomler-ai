@@ -4,11 +4,24 @@ RUN apt-get update && apt-get install -y libclang-dev cmake python3-pip && rm -r
 RUN rustup component add rustfmt
 WORKDIR /app
 COPY . .
+# FR-69 P8 (D9/D13) — which pillars this image carries. `full` | `collab` |
+# `remote` | `mesh` | `access`; every profile is the same server composed from
+# fewer modules, and `/health` lists the ones it mounts. `SAAS=1` adds the
+# hosted service's billing + newsletter module: the default HERE so the
+# operator's manual prod build (no build args) keeps it; the self-host publish
+# workflow passes `SAAS=0` and asserts the image does not mount it.
+ARG PROFILE=full
+ARG SAAS=1
 # `derp-relay` rides along so the SAME image can run as the central
 # coturn workers' `/stats` sidecar (stats follow-up): one image, two
 # binaries, no second build+push pipeline. A few MB, and it keeps the
 # stats producer byte-identical between the PoPs and the central fleet.
-RUN cargo build --release --bin roomler-ai-api --bin derp-relay
+# Package-qualified features are what let one build line serve both
+# packages: `derp-relay` has no features, so `--no-default-features` is
+# inert for it, and `roomler-ai-api/profile-…` names exactly the one crate
+# that composes the modules.
+RUN cargo build --release -p roomler-ai-api -p derp-relay --no-default-features \
+      --features "roomler-ai-api/profile-${PROFILE}$( [ "$SAAS" = "1" ] && printf ',roomler-ai-api/saas' )"
 
 # --- Stage 2: Vue SPA build ---
 FROM oven/bun:1 AS ui-builder

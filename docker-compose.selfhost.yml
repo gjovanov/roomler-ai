@@ -146,6 +146,13 @@ services:
       context: .
       args:
         VERSION: selfhost
+        # FR-69 P8 — which pillars a source build carries (`full` | `collab` |
+        # `remote` | `mesh` | `access`; docs/self-hosting.md "Choose a
+        # profile"). A pulled image picks its profile by TAG instead
+        # (`ROOMLER_IMAGE=…:<tag>-mesh`). `SAAS=0`: a self-host build never
+        # carries the hosted service's billing module.
+        PROFILE: ${ROOMLER_PROFILE:-full}
+        SAAS: "0"
     restart: unless-stopped
     depends_on:
       mongo: { condition: service_healthy }
