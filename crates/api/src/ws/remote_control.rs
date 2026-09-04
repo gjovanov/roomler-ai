@@ -4,11 +4,10 @@
 //!
 //! The `roomler-ai-remote-control` crate owns the state machine and the
 //! registry of agents/controllers ([`Hub`]). This module is the thin bridge
-//! between an Axum [`WebSocket`] and the Hub: it pumps [`ServerMsg`] values
+//! between an Axum `WebSocket` and the Hub: it pumps [`ServerMsg`] values
 //! from a per-connection [`mpsc::Receiver`] out to the socket, parses inbound
 //! [`ClientMsg`] values and forwards them to [`Hub::dispatch`].
 
-use axum::extract::ws::WebSocket;
 use bson::oid::ObjectId;
 use roomler_ai_mod_fleet::hub::DispatchCtx;
 use roomler_ai_remote_control::{
@@ -26,6 +25,10 @@ pub use roomler_ai_mod_fleet::ctrl::{apply_rc_ctrl, publish_rc_ctrl};
 // the tunnel socket and the controller socket share the pump, and the relay
 // probe report (network's, still here) reads the RTT ladder the hello uses.
 pub use roomler_ai_mod_fleet::socket::{prefs_from_rtt, pump_server_messages};
+
+/// Minimum spacing between Mongo persists of an agent's probe table. The
+/// Hub's live copy refreshes on EVERY report regardless.
+const PROBE_PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Persist one device-reported SSH activity row (P8).
 ///

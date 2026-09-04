@@ -886,10 +886,6 @@ pub fn prefs_from_rtt(results: &[RelayRegionRtt]) -> Vec<String> {
     measured.into_iter().map(|(_, r)| r.to_string()).collect()
 }
 
-/// Minimum spacing between Mongo persists of an agent's probe table. The
-/// Hub's live copy refreshes on EVERY report regardless.
-const PROBE_PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// Parse the next inbound WS text frame as [`ClientMsg`]. Skips non-text frames.
 async fn read_next_rc(
     socket_rx: &mut futures::stream::SplitStream<WebSocket>,
