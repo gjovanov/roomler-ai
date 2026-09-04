@@ -181,14 +181,8 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // Consent requests (Phase 4 — owner email/push consent). Unique capability
     // token; lookup by session; TTL-swept at `expires_at` (expireAfterSeconds=0
     // ⇒ the doc's own date is the expiry).
-    sets.push(set(
-        "consent_requests",
-        vec![
-            index_unique(bson::doc! { "token": 1 }),
-            index(bson::doc! { "session_id": 1 }),
-            index_ttl(bson::doc! { "expires_at": 1 }, 0),
-        ],
-    ));
+    // FR-69 P5a — `consent_requests` is the `fleet` module's
+    // (`roomler_ai_mod_fleet::FleetState::indexes`).
 
     // Background Tasks
     sets.push(set(
@@ -234,20 +228,10 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         ],
     ));
 
-    // Remote-control agents
-    sets.push(set(
-        "agents",
-        vec![
-            index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
-            index(bson::doc! { "tenant_id": 1, "status": 1 }),
-            index(bson::doc! { "owner_user_id": 1 }),
-            // FR-51 — the reaper's candidate scan (equality, equality, range:
-            // ESR). Tiny today; what it buys is that a large ephemeral churn
-            // (the CI-fleet case this feature exists for) never turns the
-            // 60 s reap cycle into a collection scan.
-            index(bson::doc! { "ephemeral": 1, "deleted_at": 1, "last_seen_at": 1 }),
-        ],
-    ));
+    // FR-69 P5a — `agents`, `agent_crashes`, `enrollment_keys`,
+    // `enrollment_key_uses`, `exec_audit`, `config_audit` and `agent_logs` are
+    // the `fleet` module's: their sets live in
+    // `roomler_ai_mod_fleet::FleetState::indexes`.
 
     // Remote-control sessions
     sets.push(set(
@@ -275,13 +259,6 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // sorted by client-supplied `crashed_at_unix` desc. See
     // `roomler_ai_remote_control::models::AgentCrashRecord` for the
     // shape (defined by the crash-report plan).
-    sets.push(set(
-        "agent_crashes",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "crashed_at_unix": -1 }),
-            index_ttl(bson::doc! { "reported_at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
 
     // tunnel clients — same uniqueness contract as agents
     // (re-enroll-on-same-machine rehydrates the soft-deleted row in
@@ -317,24 +294,6 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // cross-tenant collision would let one org's claim decrement another's
     // ceiling). No TTL: a dead key is a record until pruning is decided
     // explicitly (P4).
-    sets.push(set(
-        "enrollment_keys",
-        vec![
-            index_unique(bson::doc! { "jti": 1 }),
-            index(bson::doc! { "tenant_id": 1, "created_at": -1 }),
-        ],
-    ));
-
-    // FR-51 P2 — one row per successful key use: the trail that survives the
-    // reap (ephemeral device rows hard-delete). 90-day TTL like the other
-    // audit collections.
-    sets.push(set(
-        "enrollment_key_uses",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "key_id": 1, "created_at": -1 }),
-            index_ttl(bson::doc! { "created_at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
 
     // Multi-org P2b — the GLOBAL overlay block registry. Deliberately NOT
     // tenant-scoped: its entire job is guaranteeing that two tenants can
@@ -467,29 +426,6 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // and (agent_id, at) backs the per-device console history. The
     // (tenant_id, user_id, at) entry answers "what did this person run?" —
     // the question an incident review actually starts from.
-    sets.push(set(
-        "exec_audit",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "at": -1 }),
-            index(bson::doc! { "agent_id": 1, "at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
-            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
-
-    // Remote-config decisions (`docs/remote-config.md`) — who asked for what
-    // on which device, granted or refused. Same 90-day TTL as the other three
-    // audit logs: a config change that opens exec is the same class of event
-    // as using it, so it must not age out sooner.
-    sets.push(set(
-        "config_audit",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "at": -1 }),
-            index(bson::doc! { "agent_id": 1, "at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
-            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
 
     // FR-40 overlay-key rotation orders — who ordered which device to retire
     // its key, dispatched or refused. Same 90-day TTL as the other audit logs.
@@ -554,17 +490,6 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // batches for this agent". The text index on `lines.msg` powers
     // full-text search in the admin UI; without it a tenant with 10k
     // batches/day would hit a collection scan on every search.
-    sets.push(set(
-        "agent_logs",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "created_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "user_id": 1, "created_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "source": 1, "created_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "session_id": 1 }),
-            index_text(bson::doc! { "lines.msg": "text" }),
-            index_ttl(bson::doc! { "created_at": 1 }, 7 * 24 * 60 * 60),
-        ],
-    ));
 
     // ── Observability / analytics (stats PR-1) ────────────────────────────
     // Sample collections use deterministic string `_id`s ("{key}:{bucket}")

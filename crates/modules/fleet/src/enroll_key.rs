@@ -21,10 +21,9 @@ use roomler_ai_db::models::role::permissions;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::{ApiError, extractors::auth::AuthUser, guards::require_permission};
+
+use crate::FleetState;
 
 /// Ceiling clamps, stated once. The defaults serve the motivating CI case
 /// (one key in a secret store, replicas coming and going); the caps keep a
@@ -54,7 +53,7 @@ pub struct OrgEphemeralKeySettings {
 
 /// `GET /api/tenant/{tid}/ephemeral-key-settings`
 pub async fn get_org_settings(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<OrgEphemeralKeySettings>, ApiError> {
@@ -77,7 +76,7 @@ pub async fn get_org_settings(
 /// Off is an org-wide revocation that burns nothing: the gate is re-checked
 /// on every key USE, ahead of the key's own claim.
 pub async fn set_org_settings(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<OrgEphemeralKeySettings>,
@@ -142,7 +141,7 @@ pub struct MintKeyResponse {
 
 /// `POST /api/tenant/{tid}/agent/enroll-key` — mint a reusable ephemeral key.
 pub async fn mint_key(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<MintKeyRequest>,
@@ -251,7 +250,7 @@ pub struct KeyRow {
 /// `GET /api/tenant/{tid}/agent/enroll-key` — the operator's key list. The
 /// key SECRET is not here and cannot be: only mint ever returns it.
 pub async fn list_keys(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -289,7 +288,7 @@ pub async fn list_keys(
 /// effect on the very next use (the claim filter carries `revoked_at: null`);
 /// devices the key already minted are untouched — they die by their own TTL.
 pub async fn revoke_key(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, key_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -315,7 +314,7 @@ pub async fn revoke_key(
 /// `GET /api/tenant/{tid}/agent/enroll-key/{key_id}/uses` — control 4 made
 /// readable: every device this key minted, surviving the devices themselves.
 pub async fn list_key_uses(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, key_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
