@@ -4420,9 +4420,22 @@ async fn lan_capture_reason(
             _ => None,
         })
         .collect();
-    lan_capture_reason_for(true, &remote, |ip| {
+    let reason = lan_capture_reason_for(true, &remote, |ip| {
         captures.iter().any(|c| c.contains_v4(ip))
-    })
+    });
+    // LOG every silent drop: this branch runs only on a relayed session on a
+    // captured host, i.e. exactly when an operator will ask why the pill
+    // did or did not name the VPN. Field 2026-09-04: the first P3 check
+    // stayed unnamed and it took a browser-side probe to learn the viewer
+    // had offered NO host/srflx candidates at all (Chrome's non-proxied-UDP
+    // block); this line answers that from the daemon log next time.
+    info!(
+        reason = reason.unwrap_or("-"),
+        viewer_lan_candidates = ?remote,
+        captured = ?captures.iter().map(|c| c.prefix.as_str()).collect::<Vec<_>>(),
+        "rc: LAN-capture transport reason (FR-33 P3)"
+    );
+    reason
 }
 
 /// FR-33 P3 — the non-`overlay-l3` stub: no netstate monitor, nothing to
