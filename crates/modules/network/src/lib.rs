@@ -61,7 +61,6 @@ pub mod overlay;
 pub mod tunnel;
 pub mod routes {
     pub mod agent_ssh;
-    pub mod device;
     pub mod overlay_block;
     pub mod overlay_key;
     pub mod overlay_policy;
@@ -521,14 +520,16 @@ impl Module for NetworkState {
             .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
             .route("/agents", get(routes::tunnel::list_tenant_agents));
 
-        // The device listing joins agents (fleet's) with tunnel clients and
-        // overlay nodes (this module's) — a `network → fleet` read, which the
-        // graph allows and the host may not (P7b).
-        let device = Router::new().route("/", get(routes::device::list_devices));
+        // The unified device listing is NOT here. It joins fleet's agents
+        // with this module's tunnel clients and overlay nodes, and P7b put
+        // it in this crate on the strength of the graph edge — which left a
+        // `remote` profile (fleet + remote, no network) with a devices page
+        // whose listing 404s. It is the HOST's composition view
+        // (`crates/api/src/routes/device.rs`): fleet rows always, this
+        // module's rows only when it is mounted.
 
         Router::new()
             .nest("/tenant/{tenant_id}/agent", agent)
-            .nest("/tenant/{tenant_id}/device", device)
             .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client)
             .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy)
             .nest("/tenant/{tenant_id}/overlay-node", overlay_node)
