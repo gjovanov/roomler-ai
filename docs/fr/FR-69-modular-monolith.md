@@ -728,4 +728,12 @@ Rust job and exercised by the integration lane rather than locally.
 - The first push carried a parse error: a range deletion counted from a print took the
   heartbeat block's closing brace instead of the consent spawn's last line. `rustfmt --check`
   on the file finds that in a second; it runs before every push of a line-cut file now.
+- **The seven-server test overflowed its stack again** — the same
+  `peer_relay_mint_tests::every_refusal_is_audited_with_its_reason` P4 fixed by boxing the
+  construction future. Each module adds a `Core`-sized state to every server (`Settings` is
+  held by value), so the margin boxing bought was about 25 KB and fleet spent it. A debug-build
+  binary that constructs seven servers in one body does not fit the harness's default 2 MiB
+  test thread; the lane runs with `RUST_MIN_STACK=8388608` now, and the history is in the
+  workflow next to the variable. (The by-value `Settings` inside `Core` is the underlying
+  cost; turning it into an `Arc` is a later, separate change.)
 - Routes, index sets and wire names unchanged; the baseline holds as recorded.

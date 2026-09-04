@@ -467,7 +467,7 @@ impl Module for FleetState {
 
     /// Phase A-1 graceful shutdown: make this pod's death honest BEFORE the
     /// process exits, so a roll never strands `agents.status = 'Online'` rows
-    /// + stale presence claims (the green-but-dead badge class). Fire every
+    /// and stale presence claims (the green-but-dead badge class). Fire every
     /// registered agent's displacement-cancel notify — each read loop exits
     /// within milliseconds and runs its OWN teardown; the bulk writes are
     /// belt-and-braces for sockets that don't finish in time. Agents see a
