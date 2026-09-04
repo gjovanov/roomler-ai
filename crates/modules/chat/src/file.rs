@@ -11,7 +11,9 @@ use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::ChatState;
 use roomler_ai_db::models::{FileContext, FileContextType};
 use roomler_ai_services::dao::base::PaginationParams;
 
@@ -87,7 +89,7 @@ fn to_response(f: roomler_ai_db::models::File) -> FileResponse {
 
 /// List files for a room.
 pub async fn list(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     Query(params): Query<FileListQuery>,
@@ -125,7 +127,7 @@ pub async fn list(
 
 /// List all files across all rooms in a tenant.
 pub async fn list_tenant_files(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<FileListQuery>,
@@ -187,7 +189,7 @@ pub async fn list_tenant_files(
 
 /// Shared upload logic used by both `upload` and `upload_room`.
 async fn do_upload(
-    state: &AppState,
+    state: &ChatState,
     tid: ObjectId,
     rid: ObjectId,
     user_id: ObjectId,
@@ -248,7 +250,7 @@ async fn do_upload(
 /// Upload a file via multipart form data.
 /// Fields: `file` (binary), `room_id` (text)
 pub async fn upload(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     mut multipart: Multipart,
@@ -326,7 +328,7 @@ pub async fn upload(
 }
 
 pub async fn get(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, file_id)): Path<(String, String)>,
 ) -> Result<Json<FileResponse>, ApiError> {
@@ -344,7 +346,7 @@ pub async fn get(
 }
 
 pub async fn download(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, file_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -366,10 +368,10 @@ pub async fn download(
             // tolerate-404: records whose bytes were lost on a pre-S0
             // pod-ephemeral /tmp (wiped on every deploy) resolve to a clear
             // 404 rather than a 500.
-            crate::storage::StorageError::NotFound => {
+            roomler_core::storage::StorageError::NotFound => {
                 ApiError::NotFound("File content is no longer available on the server".to_string())
             }
-            crate::storage::StorageError::Other(msg) => {
+            roomler_core::storage::StorageError::Other(msg) => {
                 ApiError::Internal(format!("Failed to read file: {}", msg))
             }
         })?;
@@ -441,7 +443,7 @@ fn sanitize_content_disposition_filename(raw: &str) -> (String, String) {
 }
 
 pub async fn delete(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, file_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -460,7 +462,7 @@ pub async fn delete(
 
 /// Upload a file attached to a room (with 100MB body limit).
 pub async fn upload_room(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     mut multipart: Multipart,

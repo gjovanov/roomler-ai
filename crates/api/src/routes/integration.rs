@@ -45,7 +45,12 @@ pub async fn export_conversation_pdf(
         .await?;
 
     let task_id = task.id.unwrap();
-    let messages_dao = Arc::clone(&state.messages);
+    // FR-69 P3 — `messages` is the `chat` module's; a DAO is a stateless
+    // handle on the collection, so this export builds its own. (The PDF
+    // export itself belongs with the xlsx one in `chat`; a later move.)
+    let messages_dao = Arc::new(roomler_ai_services::dao::message::MessageDao::new(
+        &state.db,
+    ));
     let users_dao = Arc::clone(&state.users);
     let task_store = Arc::clone(state.tasks.store());
     let storage = Arc::clone(&state.storage);
