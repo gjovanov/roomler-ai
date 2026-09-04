@@ -100,6 +100,7 @@ All keys live in the agent config (`roomler config set …`) with
 | `gpu_scale` / `scale_threads` | on / 1 | HW-downscale Phase A/B levers (only active when something scales) |
 | `ROOMLERD_RELAY_MAX_KBPS` | 3000 | The constrained-transport ceiling clamp |
 | `ROOMLERD_SMOOTH_MAX_EDGE` / `RELAY_MAX_EDGE` | 1024 / 1280 | Rung sizes when `priority_res_cap` is on |
+| `rate_prior_decay` | on | FR-70 P1 — a remembered rate standing in for a pipe measurement DECAYS toward the band on clean windows (×1.25 per 10 s from a seed, ×1.1 from a measurement, one step down per two pushed-back windows) instead of holding the floor relief and the queue budget at the memory for the whole session; heartbeat `prior_bps`. Off = FR-59 P8 verbatim |
 
 ## Field history (why it is shaped this way)
 
@@ -170,7 +171,7 @@ converge under.
 
 | Consumer | Rule | Guard |
 |---|---|---|
-| FR-59 P1 — floor relief | the legibility floor descends toward `0.85 × measured`, floored at `slow_link_min_bitrate` | evidence-gated: with no measurement the session is byte-for-byte unchanged |
+| FR-59 P1 — floor relief | the legibility floor descends toward `0.85 × measured`, floored at `slow_link_min_bitrate` | evidence-gated for an UNREMEMBERED pair: with no measurement it is byte-for-byte unchanged. A remembered pair's seed stands in for the measurement (FR-59 P8) — and since FR-70 P1 it **decays** (`prior_bps`) instead of holding the floor AND the P2 queue budget at the memory for the session, which on 2026-09-04 kept a session at 200 kbps for four minutes while the budget it set prevented the very measurement that would have freed it |
 | FR-59 P3 — arrival clamp | the ceiling is bounded by what the VIEWER reports arriving while its transit queue grows | constrained paths only; applied AFTER the learner, because a live report outranks past evidence |
 
 ⚠️ The two are **coupled**, and the coupling is not obvious: `set_ceiling`
