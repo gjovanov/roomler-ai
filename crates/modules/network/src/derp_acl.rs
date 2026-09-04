@@ -67,9 +67,11 @@ impl DerpAllowTable {
         self.enforcing
     }
 
-    /// Test-only builder so `ws::derp`'s tests can exercise the gate without
+    /// Test builder so the DERP relay's tests can exercise the gate without
     /// standing up Mongo (the fields stay private to this module otherwise).
-    #[cfg(test)]
+    /// `pub` and NOT `cfg(test)`: the relay and its tests live in the host
+    /// crate until P7b, and `cfg(test)` does not cross crates (FR-69 P7a).
+    #[doc(hidden)]
     pub fn for_test(enforcing: bool, pairs: &[(DerpPubKey, DerpPubKey)]) -> Self {
         let mut allow: HashMap<DerpPubKey, HashSet<DerpPubKey>> = HashMap::new();
         for (s, d) in pairs {
