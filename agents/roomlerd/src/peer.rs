@@ -3165,7 +3165,15 @@ async fn media_pump_vp9_444_dc(
     let mut settle_kf_suppressed: u64 = 0;
     // rc.190 — one-shot (per value) log marker for the agent-side resolution
     // caps, so the field log explains WHY the stream is smaller than asked.
-    let mut res_cap_logged: Option<TargetResolution> = None;
+    // FR-70 P1 — the last resolution plan (user target, effective target,
+    // reason). Any change re-sends `rc:video-info` so the viewer's badge can
+    // name the cap in force; a change while the two targets differ is also
+    // logged (the rc.190 "cap engaged" line, now keyed on the reason too).
+    let mut last_dims_plan: Option<(
+        TargetResolution,
+        TargetResolution,
+        crate::encode::policy::RungReason,
+    )> = None;
     // P7 — downscale-stage timing (this pump has no per-stage accumulators
     // like the ffmpeg pump's rc.88 trio, so track ops explicitly). Phase A —
     // scale_ops counts REAL resamples only.
@@ -3445,6 +3453,10 @@ async fn media_pump_vp9_444_dc(
                 // FR-33 P3 — name the LAN capture when it is the reason THIS
                 // viewer is relayed (per-prefix, like the P2 gate).
                 let reason = lan_capture_reason(&pc, constrained_transport).await;
+                // FR-70 P1 — the cap in force and why (see the FFmpeg twin).
+                let cap_reason = last_dims_plan
+                    .filter(|(user, effective, _)| effective != user)
+                    .map(|(_, _, r)| r.as_str());
                 let payload = video_info_payload(
                     "vp9",
                     "libvpx",
@@ -3455,6 +3467,8 @@ async fn media_pump_vp9_444_dc(
                     native_h,
                     viewers,
                     reason,
+                    cap_reason,
+                    None,
                 );
                 let cdc = control_dc.lock().await.clone();
                 if let Some(cdc) = cdc
@@ -3596,6 +3610,9 @@ async fn media_pump_vp9_444_dc(
                 ),
                 constrained_transport,
             ),
+            // The VP9-444 pump has no slow-link profile (FR-59 P5 is the
+            // FFmpeg pump's); nothing to attribute here.
+            slow_link_cap: None,
             refined: false,
             refined_cap: None,
             soft_cap: crate::encode::sw_res_cap_long_edge(),
@@ -3612,18 +3629,23 @@ async fn media_pump_vp9_444_dc(
             last_output_cap = backend_cap;
             capturer.set_output_cap(backend_cap);
         }
-        if effective_target != user_target && res_cap_logged != Some(effective_target) {
-            info!(
-                %session_id,
-                ?user_target,
-                ?effective_target,
-                reason = dims_plan.reason.as_str(),
-                native_w = cap_native_w,
-                native_h = cap_native_h,
-                constrained = constrained_transport,
-                "VP9-444 DC pump: agent-side resolution cap engaged (relay/SW-encode)"
-            );
-            res_cap_logged = Some(effective_target);
+        let plan_key = (user_target, effective_target, dims_plan.reason);
+        if last_dims_plan != Some(plan_key) {
+            if effective_target != user_target {
+                info!(
+                    %session_id,
+                    ?user_target,
+                    ?effective_target,
+                    reason = dims_plan.reason.as_str(),
+                    native_w = cap_native_w,
+                    native_h = cap_native_h,
+                    constrained = constrained_transport,
+                    "VP9-444 DC pump: agent-side resolution cap engaged (relay/SW-encode)"
+                );
+            }
+            last_dims_plan = Some(plan_key);
+            // FR-70 P1 — the badge carries the cap and its reason; refresh it.
+            video_info_sent = false;
         }
         let scale_start = std::time::Instant::now();
         let pre_scale_dims = (frame.width, frame.height);
@@ -4164,6 +4186,15 @@ async fn media_pump_vp9_444_dc(
                 viewer_age_implausible = governor.viewer_age_implausible(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
+                // FR-70 P1 — what stands in for a pipe measurement while
+                // there is none: the remembered seed, or the last live
+                // measurement, DECAYING toward the band on clean windows.
+                // None = no prior in force. Read it against `goodput_bps`
+                // and `slow_link_floor_bps`: a relief letting go while the
+                // goodput stays None is the decay, working — and a session
+                // that sits at `prior_bps=Some(200000)` for minutes with
+                // both of those unchanged is the pin this phase removed.
+                prior_bps = ?governor.prior_bps(),
                 // FR-59 P3/P4 — (congested windows, drains ordered, live
                 // queue-depth estimate in ms) from the viewer-side loop.
                 link_stats = ?governor.link_stats(),
@@ -4332,12 +4363,30 @@ fn video_info_payload(
     // the viewer sits inside it, so the LAN pair could never form. Omitted
     // from the wire when `None` (old viewers ignore it, old agents omit it).
     transport_reason: Option<&str>,
+    // FR-70 P1 — WHY the stream is encoded below the operator's resolution
+    // choice, when it is: the `policy::RungReason` wire name of the cap in
+    // force (`"slow-link-cap"`, `"priority-cap"`, `"soft-cap"`, …), present
+    // ONLY while the effective target differs from the user's. Before this
+    // the viewer inferred "relay-limited" from `transport` alone and advised
+    // Priority → Sharper, which lifts a dial cap and does nothing against
+    // the slow-link profile — the operator's own report on 2026-09-04.
+    cap_reason: Option<&str>,
+    // FR-70 P1 — a short human detail for the cap, e.g. `"remembered
+    // 200 kbps"` for the slow-link profile (the rate the memory keyed it on).
+    cap_detail: Option<&str>,
 ) -> String {
     let reason = transport_reason
         .map(|r| format!(r#","transport_reason":"{r}""#))
         .unwrap_or_default();
+    let cap = cap_reason
+        .map(|r| format!(r#","cap_reason":"{r}""#))
+        .unwrap_or_default();
+    let detail = cap_detail
+        .filter(|_| cap_reason.is_some())
+        .map(|d| format!(r#","cap_detail":"{d}""#))
+        .unwrap_or_default();
     format!(
-        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}{reason}}}"#,
+        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}{reason}{cap}{detail}}}"#,
         if constrained { "relay" } else { "direct" },
     )
 }
@@ -4764,7 +4813,15 @@ async fn media_pump_ffmpeg_dc(
     // at the top of the loop.
     let mut frames_skipped_backpressure: u64 = 0;
     // rc.190 — one-shot (per value) log marker for the relay resolution cap.
-    let mut res_cap_logged: Option<TargetResolution> = None;
+    // FR-70 P1 — the last resolution plan (user target, effective target,
+    // reason). Any change re-sends `rc:video-info` so the viewer's badge can
+    // name the cap in force; a change while the two targets differ is also
+    // logged (the rc.190 "cap engaged" line, now keyed on the reason too).
+    let mut last_dims_plan: Option<(
+        TargetResolution,
+        TargetResolution,
+        crate::encode::policy::RungReason,
+    )> = None;
     // rc.88 — per-stage timing accumulators (µs since last heartbeat) so
     // the field log localises the bottleneck: capture vs encode vs send.
     let mut capture_us: u64 = 0;
@@ -5475,6 +5532,22 @@ async fn media_pump_ffmpeg_dc(
                 let stats_start = std::time::Instant::now();
                 let reason = lan_capture_reason(&pc, constrained).await;
                 stats_us += stats_start.elapsed().as_micros() as u64;
+                // FR-70 P1 — the cap in force and why, so the viewer can say
+                // "Native selected, capped at 1280×800: slow link" instead of
+                // a generic "relay-limited" whose advice (switch to Sharper)
+                // does nothing against the slow-link profile. Present only
+                // while the effective target differs from the user's; the
+                // plan-change site clears `video_info_sent` so this re-sends
+                // whenever the cap engages, moves or lifts.
+                let cap_reason = last_dims_plan
+                    .filter(|(user, effective, _)| effective != user)
+                    .map(|(_, _, r)| r.as_str());
+                let cap_detail = match cap_reason {
+                    Some("slow-link-cap") => {
+                        rate_seed.map(|s| format!("remembered {} kbps", s / 1000))
+                    }
+                    _ => None,
+                };
                 let payload = video_info_payload(
                     codec.wire_codec(),
                     enc_name,
@@ -5491,6 +5564,8 @@ async fn media_pump_ffmpeg_dc(
                     native_h,
                     viewers,
                     reason,
+                    cap_reason,
+                    cap_detail.as_deref(),
                 );
                 // FR-65 — the control-DC lock and send both await; the lock is
                 // shared with every other control-plane writer, and a congested
@@ -5851,6 +5926,7 @@ async fn media_pump_ffmpeg_dc(
                                     crate::encode::priority_relay_cap(prio, constrained),
                                     constrained,
                                 ),
+                                slow_link_cap: slow_link_profile.map(|p| p.max_long_edge),
                                 refined: idle_refine.refined(),
                                 refined_cap: crate::encode::idle_refine_cap_long_edge(),
                                 soft_cap: governor.auto_res_cap(),
@@ -5949,24 +6025,19 @@ async fn media_pump_ffmpeg_dc(
             native_h: cap_native_h,
             merged_target: user_target,
             merged_priority_cap: pipeline.merged_priority_cap(
-                // FR-59 P5 — the slow-link profile's long-edge cap rides the
-                // SAME slot as the Priority dial's, so it flows through
-                // `plan_dims` unchanged and an explicit operator pick still
-                // wins by the existing merge rules. `min` rather than
-                // replace: a dial that already asked for fewer pixels than
-                // the profile keeps them.
-                match (
-                    crate::encode::priority_relay_cap(
-                        priority.load(std::sync::atomic::Ordering::Relaxed),
-                        constrained,
-                    ),
-                    slow_link_profile.map(|p| p.max_long_edge),
-                ) {
-                    (Some(dial), Some(slow)) => Some(dial.min(slow)),
-                    (dial, slow) => dial.or(slow),
-                },
+                crate::encode::priority_relay_cap(
+                    priority.load(std::sync::atomic::Ordering::Relaxed),
+                    constrained,
+                ),
                 constrained,
             ),
+            // FR-59 P5 — the slow-link profile's long-edge cap. `plan_dims`
+            // merges it with the dial's by `min` (a dial that already asked
+            // for fewer pixels keeps them) and an explicit operator pick
+            // still wins by the existing rules; it is carried separately so
+            // the rung can be attributed (FR-70 P1 — before, a profile cap
+            // logged and displayed as the dial's).
+            slow_link_cap: slow_link_profile.map(|p| p.max_long_edge),
             refined: idle_refine.refined(),
             refined_cap: crate::encode::idle_refine_cap_long_edge(),
             soft_cap: governor.auto_res_cap(),
@@ -5996,18 +6067,23 @@ async fn media_pump_ffmpeg_dc(
             // FR-59 P8 — same gate as the keepalive arm: no refine lift
             // while the slow-link profile is in force.
             && slow_link_profile.is_none();
-        if effective_target != user_target && res_cap_logged != Some(effective_target) {
-            info!(
-                %session_id,
-                codec_label,
-                ?user_target,
-                ?effective_target,
-                reason = dims_plan.reason.as_str(),
-                native_w = cap_native_w,
-                native_h = cap_native_h,
-                "FFmpeg DC pump: agent-side relay resolution cap engaged"
-            );
-            res_cap_logged = Some(effective_target);
+        let plan_key = (user_target, effective_target, dims_plan.reason);
+        if last_dims_plan != Some(plan_key) {
+            if effective_target != user_target {
+                info!(
+                    %session_id,
+                    codec_label,
+                    ?user_target,
+                    ?effective_target,
+                    reason = dims_plan.reason.as_str(),
+                    native_w = cap_native_w,
+                    native_h = cap_native_h,
+                    "FFmpeg DC pump: agent-side relay resolution cap engaged"
+                );
+            }
+            last_dims_plan = Some(plan_key);
+            // FR-70 P1 — the badge carries the cap and its reason; refresh it.
+            video_info_sent = false;
         }
         // P7 — snapshot the native dims before the downscale shadows `frame`;
         // the CQ bias at the rebuild site is keyed on encode-vs-native area.
@@ -6340,9 +6416,18 @@ async fn media_pump_ffmpeg_dc(
             // back to the AIMD's live applied rate so a session whose seed was
             // too hot (the grace was cut short, the AIMD then cut) records the
             // converged rate as a decrease and the pair stops re-seeding hot.
+            // FR-70 P1 — between the learner's stable rate and the applied-
+            // rate fallback sits what the session actually KNOWS about the
+            // pipe: a live measurement, or the prior as it has decayed. The
+            // applied rate at the last window is wherever the last decrease
+            // left it, which on a lumpy relay drifts the memory DOWN across
+            // sessions (200 kbps was an attractor, not a stale day).
             rate_memory_guard.stable.store(
                 governor
                     .stable_bps()
+                    .or_else(|| {
+                        governor.remembered_candidate_bps(std::time::Instant::now(), constrained)
+                    })
                     .unwrap_or_else(|| governor.applied_bps()),
                 std::sync::atomic::Ordering::Relaxed,
             );
@@ -7025,6 +7110,15 @@ async fn media_pump_ffmpeg_dc(
                 // relief let go" and "nothing was ever measured" read the
                 // same, and they need opposite fixes.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
+                // FR-70 P1 — what stands in for a pipe measurement while
+                // there is none: the remembered seed, or the last live
+                // measurement, DECAYING toward the band on clean windows.
+                // None = no prior in force. Read it against `goodput_bps`
+                // and `slow_link_floor_bps`: a relief letting go while the
+                // goodput stays None is the decay, working — and a session
+                // that sits at `prior_bps=Some(200000)` for minutes with
+                // both of those unchanged is the pin this phase removed.
+                prior_bps = ?governor.prior_bps(),
                 // FR-59 P3/P4 — (congested windows, drains ordered, live
                 // queue-depth estimate in ms) from the viewer-side loop.
                 link_stats = ?governor.link_stats(),
@@ -10201,12 +10295,16 @@ mod tests {
                 1920,
                 1080,
                 1,
+                None,
+                None,
                 None
             ),
             r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":1}"#
         );
         assert_eq!(
-            super::video_info_payload("vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2, None),
+            super::video_info_payload(
+                "vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2, None, None, None
+            ),
             r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600,"viewers":2}"#
         );
         // FR-33 P3 — the reason rides as a trailing optional key, so every
@@ -10221,9 +10319,46 @@ mod tests {
                 2560,
                 1600,
                 1,
-                Some("lan-captured")
+                Some("lan-captured"),
+                None,
+                None
             ),
             r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600,"viewers":1,"transport_reason":"lan-captured"}"#
+        );
+        // FR-70 P1 — the cap and its detail ride as trailing optional keys
+        // too; the detail never appears without a reason (a detail with
+        // nothing to explain would be a stray string on the badge).
+        assert_eq!(
+            super::video_info_payload(
+                "h265",
+                "hevc_qsv",
+                true,
+                "yuv420",
+                true,
+                1920,
+                1200,
+                1,
+                None,
+                Some("slow-link-cap"),
+                Some("remembered 200 kbps")
+            ),
+            r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1,"cap_reason":"slow-link-cap","cap_detail":"remembered 200 kbps"}"#
+        );
+        assert_eq!(
+            super::video_info_payload(
+                "h265",
+                "hevc_qsv",
+                true,
+                "yuv420",
+                true,
+                1920,
+                1200,
+                1,
+                None,
+                None,
+                Some("remembered 200 kbps")
+            ),
+            r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_qsv","hardware":true,"chroma":"yuv420","transport":"relay","native_w":1920,"native_h":1200,"viewers":1}"#
         );
     }
 

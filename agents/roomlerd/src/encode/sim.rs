@@ -225,6 +225,19 @@ impl Pipe {
         self.queue.len() as u32
     }
 
+    /// FR-70 P1 — bytes handed to the transport and not yet delivered:
+    /// queued behind the token bucket PLUS in flight for the half-RTT. The
+    /// pump's `bytes_inflight` ledger, which the FR-59 P2 byte-budget gate
+    /// compares against its budget.
+    fn inflight_bytes(&self) -> usize {
+        self.queued_bytes as usize
+            + self
+                .in_flight
+                .iter()
+                .map(|a| a.bytes as usize)
+                .sum::<usize>()
+    }
+
     /// Is the channel refusing frames?
     ///
     /// ⚠️ **Both limits report through this one predicate, and that is
@@ -355,6 +368,13 @@ struct EncoderSim {
     /// A keyframe is this many times a delta frame.
     idr_factor: u32,
     frames: u64,
+    /// FR-70 P1 — a REBUILD-BOUND encoder (QSV: every rate move is a new
+    /// encoder, FR-62 A0 measured the in-place path dead): a target change
+    /// emits a keyframe. Off = the perfect CBR encoder B0 shipped with.
+    rebuild_idr: bool,
+    last_target_bps: u32,
+    /// Keyframes emitted after the opening one (the rebuild IDRs).
+    rebuild_idrs: u32,
 }
 
 impl EncoderSim {
@@ -363,6 +383,9 @@ impl EncoderSim {
             fps: fps.max(1),
             idr_factor: idr_factor.max(1),
             frames: 0,
+            rebuild_idr: false,
+            last_target_bps: 0,
+            rebuild_idrs: 0,
         }
     }
 
@@ -374,12 +397,18 @@ impl EncoderSim {
     fn produce(&mut self, target_bps: u32, motion: &Motion, t: Duration) -> u32 {
         let cbr = u64::from(target_bps) / u64::from(self.fps) / 8;
         let scaled = cbr * u64::from(motion.factor_at(t));
+        let rebuilt = self.rebuild_idr && self.frames > 0 && target_bps != self.last_target_bps;
         let bytes = if self.frames == 0 {
             // The opening keyframe.
+            cbr * u64::from(self.idr_factor)
+        } else if rebuilt {
+            // FR-70 P1 — the rebuild's keyframe, sized like the opener's.
+            self.rebuild_idrs += 1;
             cbr * u64::from(self.idr_factor)
         } else {
             scaled
         };
+        self.last_target_bps = target_bps;
         self.frames += 1;
         bytes.max(1).min(u64::from(u32::MAX)) as u32
     }
@@ -482,6 +511,62 @@ pub trait RateLaw {
     /// Once per viewer window, after folding.
     fn on_window(&mut self, w: &WindowStats, now: Instant);
     fn target_bps(&self) -> u32;
+    /// FR-70 P1 — the FR-59 P2 byte budget this law would hand the pump's
+    /// gate (`constrained_queue_budget_bytes` of the reference rate). Only
+    /// consulted when the harness runs with [`SimOptions::budget_gate`];
+    /// the default is "no budget", so every law that predates it is unchanged.
+    fn queue_budget_bytes(&self) -> usize {
+        usize::MAX
+    }
+    /// FR-70 P1 — what the law would hand the rate memory at session end
+    /// (`RateGovernor::remembered_candidate_bps`), when it models one.
+    fn remembered_candidate_bps(&self) -> Option<u32> {
+        None
+    }
+    /// FR-70 P1 — the pump skipped a frame at the FR-59 P2 byte-budget gate
+    /// (`on_backpressure_skip`): a congestion sample for the AIMD, but NOT a
+    /// blocked send — nothing was handed to the transport, so the goodput
+    /// estimator sees nothing and the pipe is not measured. Conflating the
+    /// two is exactly the sim error that made the first run of this cell
+    /// "measure" a 20 Mbps pipe from a gate skip and escape the pin in 30 s.
+    fn on_budget_skip(&mut self, now: Instant) {
+        let _ = now;
+    }
+}
+
+/// FR-70 P1 — how the law learns the pipe's rate from a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeasureRule {
+    /// B0 as shipped: every window that delivered anything is a measurement
+    /// (`measured = rx_bps`). ⚠️ More optimistic than the shipped governor,
+    /// which measures only on PUSH-BACK — blocked sends (goodput) or the
+    /// viewer's queue growing (the FR-59 P3 link loop). A law under this
+    /// rule can never be pinned by a stale prior, because every clean window
+    /// overwrites the prior with the truth; the field session of 2026-09-04
+    /// ran under the shipped rule and was pinned for four minutes. Kept as
+    /// the default so B0's recorded numbers stand; FR-63 should re-run its
+    /// fixtures under [`MeasureRule::OnPushBack`] before relying on them.
+    #[default]
+    EveryWindow,
+    /// The shipped governor's rule: the window's delivered rate counts only
+    /// when the channel was FULL at some point (a blocked send) or the
+    /// viewer reported its queue growing two windows running; released once
+    /// the queue stops growing. With nothing measured, the FR-59 P8
+    /// remembered rate stands in — decaying per [`super::prior`] when the
+    /// law's `prior_decay` is on.
+    OnPushBack,
+}
+
+/// FR-70 P1 — harness options that predate nothing: every default is B0 as
+/// shipped, so a fixture that does not opt in runs byte-for-byte as before.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SimOptions {
+    /// The pump's FR-59 P2 byte-budget gate: a frame is skipped (and the
+    /// law told the channel is full) while the bytes in flight exceed the
+    /// law's `queue_budget_bytes()`.
+    pub budget_gate: bool,
+    /// A rebuild-bound encoder — every target change emits a keyframe.
+    pub rebuild_idr: bool,
 }
 
 /// What a congested window does to the opener's ramp.
@@ -550,6 +635,23 @@ pub struct GovernorLaw {
     /// a run answers "where is the ramp now", not "where did it open" — the
     /// value the field log prints as `open_bps=`.
     ramp_open_bps: Option<u32>,
+    /// FR-70 P1 — see [`MeasureRule`].
+    measure: MeasureRule,
+    /// FR-70 P1 — the remembered rate as a decaying prior (`super::prior`).
+    prior: super::prior::RatePrior,
+    prior_decay: bool,
+    /// Did the channel report FULL at any frame since the last window?
+    full_seen: bool,
+    /// …and in the window before that (a saturated pipe, not a burst).
+    full_seen_prev: bool,
+    /// Consecutive windows with a growing viewer queue (the link loop's
+    /// onset streak, `viewer_rate::QUEUE_OVER_WINDOWS`).
+    growth_streak: u8,
+    /// The scenario's frame rate, for the steady-window test above.
+    fps: u32,
+    /// The smallest window-average paint age seen — the FR-15 age loop's
+    /// learned floor, for the prior's push-back verdict.
+    age_floor_ms: u32,
 }
 
 impl GovernorLaw {
@@ -560,6 +662,14 @@ impl GovernorLaw {
             nominal_floor_bps,
             nominal_ceiling_bps,
             seed_bps: None,
+            measure: MeasureRule::default(),
+            prior: super::prior::RatePrior::new(None, nominal_floor_bps, false),
+            prior_decay: false,
+            full_seen: false,
+            full_seen_prev: false,
+            growth_streak: 0,
+            fps: 30,
+            age_floor_ms: u32::MAX,
             depth: CONSTRAINED_DEPTH,
             aimd: None,
             ramp: None,
@@ -584,7 +694,47 @@ impl GovernorLaw {
     /// FR-59 P8 — this pair was remembered at `bps`.
     pub fn with_seed(mut self, bps: u32) -> Self {
         self.seed_bps = Some(bps);
+        self.prior = super::prior::RatePrior::new(
+            Some(bps).filter(|s| *s < self.nominal_floor_bps),
+            self.nominal_floor_bps,
+            self.prior_decay,
+        );
         self
+    }
+
+    /// FR-70 P1 — how the law measures the pipe (see [`MeasureRule`]).
+    pub fn with_measure(mut self, rule: MeasureRule) -> Self {
+        self.measure = rule;
+        self
+    }
+
+    /// FR-70 P1 — the scenario's frame rate (the steady-window test in
+    /// [`MeasureRule::OnPushBack`] needs it).
+    pub fn with_fps(mut self, fps: u32) -> Self {
+        self.fps = fps.max(1);
+        self
+    }
+
+    /// FR-70 P1 — the remembered rate decays while nothing measures
+    /// (`rate_prior_decay`). Meaningful under [`MeasureRule::OnPushBack`]
+    /// only; under `EveryWindow` a prior never survives the first window.
+    pub fn with_prior_decay(mut self, on: bool) -> Self {
+        self.prior_decay = on;
+        self.prior = super::prior::RatePrior::new(
+            self.seed_bps.filter(|s| *s < self.nominal_floor_bps),
+            self.nominal_floor_bps,
+            on,
+        );
+        self
+    }
+
+    /// FR-70 P1 — what the floor relief and the queue budget read: a live
+    /// measurement, else (under the shipped rule) the prior's stand-in.
+    fn measured_pipe_bps(&self) -> Option<u32> {
+        match self.measure {
+            MeasureRule::EveryWindow => self.measured_bps,
+            MeasureRule::OnPushBack => self.measured_bps.or(self.prior.stand_in_bps()),
+        }
     }
 
     /// FR-59 P1's floor relief, on by default in production.
@@ -636,8 +786,9 @@ impl RateLaw for GovernorLaw {
             }
         }
 
-        // FR-59 P1 — the legibility floor descends toward a measured pipe.
-        let mut floor = match self.measured_bps {
+        // FR-59 P1 — the legibility floor descends toward a measured pipe
+        // (FR-70 P1: or toward the remembered rate standing in for one).
+        let mut floor = match self.measured_pipe_bps() {
             Some(g) if self.floor_relief => {
                 super::goodput::measured_floor_bps(g, self.nominal_floor_bps, HARD_MIN_BPS)
             }
@@ -687,9 +838,40 @@ impl RateLaw for GovernorLaw {
         ctrl.observe(occupied, full, now);
         if full {
             self.ramp_congested = true;
+            self.full_seen = true;
         }
         self.target = ctrl.desired();
         self.target
+    }
+
+    fn on_budget_skip(&mut self, now: Instant) {
+        // `RateGovernor::on_backpressure_skip`: the ramp's congestion bit and a
+        // full-occupancy sample for the AIMD (the multiplicative decrease runs
+        // DURING congestion). Deliberately not `full_seen`: no send blocked.
+        self.ramp_congested = true;
+        if let Some(ctrl) = self.aimd.as_mut() {
+            ctrl.observe(self.depth, true, now);
+            self.target = ctrl.desired();
+        }
+    }
+
+    fn queue_budget_bytes(&self) -> usize {
+        // `rate_profile::constrained_queue_reference_bps` +
+        // `constrained_queue_budget_bytes`, with the constants explicit
+        // (450 ms, 16 KiB minimum) so the result cannot depend on the
+        // environment.
+        let reference = match self.measured_pipe_bps() {
+            Some(g) if g > 0 => self.nominal_ceiling_bps.min(g),
+            _ => self.nominal_ceiling_bps,
+        };
+        ((u64::from(reference) * 450 / 8000) as usize).max(16 * 1024)
+    }
+
+    fn remembered_candidate_bps(&self) -> Option<u32> {
+        if !self.prior_decay {
+            return None;
+        }
+        self.measured_bps.or(self.prior.stand_in_bps())
     }
 
     fn on_window(&mut self, w: &WindowStats, now: Instant) {
@@ -730,8 +912,54 @@ impl RateLaw for GovernorLaw {
         // A window that delivered nothing is a stall, and a stall is NOT
         // evidence about the pipe's rate — the FR-63 design's `fps == 0`
         // rule, which the shipped governor does not yet have.
-        if w.frames_rx > 0 {
-            self.measured_bps = Some(w.rx_bps);
+        let full_seen = std::mem::take(&mut self.full_seen);
+        match self.measure {
+            MeasureRule::EveryWindow => {
+                if w.frames_rx > 0 {
+                    self.measured_bps = Some(w.rx_bps);
+                }
+            }
+            MeasureRule::OnPushBack => {
+                // The link loop's onset: two windows of a growing queue.
+                self.growth_streak = if w.queue_ms >= i64::from(super::viewer_rate::QUEUE_GROWTH_MS)
+                {
+                    self.growth_streak.saturating_add(1)
+                } else {
+                    0
+                };
+                let congested = self.growth_streak >= 2;
+                // A blocked sender measures the DRAIN rate (goodput is
+                // Σbytes/Σblocked-time over blocked sends). The window's
+                // arrival rate stands for it only when the channel was full
+                // two windows running — a SATURATED pipe, whose arrival rate
+                // over a whole window is its drain rate. A one-off full
+                // window (the opener's keyframe draining) is a catch-up
+                // burst that reads several times the pipe, which the real
+                // estimator's byte-weighting over blocked time would not.
+                let saturated = full_seen && self.full_seen_prev;
+                self.full_seen_prev = full_seen;
+                if (saturated || congested) && w.frames_rx > 0 {
+                    // A blocked sender (goodput) or a growing viewer queue
+                    // (link loop): the delivered rate IS the pipe's.
+                    self.measured_bps = Some(w.rx_bps);
+                } else if !congested && w.queue_ms <= 0 && !full_seen {
+                    // Released: the queue is no longer growing and has
+                    // drained (the governor's release rule, simplified).
+                    self.measured_bps = None;
+                }
+                let live = self.measured_bps;
+                // The age LEVEL against the session's learned floor — the
+                // FR-15 `AgeLoop` in one line: the smallest window average
+                // seen is the floor, and `AGE_SLACK_MS` over it is elevated.
+                if w.frames_rx > 0 && w.age_ms > 0 {
+                    self.age_floor_ms = self.age_floor_ms.min(w.age_ms);
+                }
+                let age_elevated = w.frames_rx > 0
+                    && self.age_floor_ms < u32::MAX
+                    && w.age_ms >= self.age_floor_ms + u32::from(super::viewer_rate::AGE_SLACK_MS);
+                let pushed_back = full_seen || congested || age_elevated;
+                self.prior.on_window(live, pushed_back);
+            }
         }
     }
 
@@ -791,6 +1019,13 @@ pub struct Trace {
     pub law: &'static str,
     pub scenario: &'static str,
     pub rows: Vec<Row>,
+    /// FR-70 P1 — frames the byte-budget gate skipped (0 unless modelled).
+    pub gate_skips: u32,
+    /// FR-70 P1 — keyframes a rebuild-bound encoder emitted for rate moves
+    /// (0 unless modelled).
+    pub rebuild_idrs: u32,
+    /// FR-70 P1 — what the law would hand the rate memory at the end.
+    pub remembered_bps: Option<u32>,
 }
 
 impl Trace {
@@ -886,11 +1121,18 @@ impl Trace {
 
 /// Run one scenario against one law.
 pub fn run(scenario: &Scenario, law: &mut dyn RateLaw) -> Trace {
+    run_opts(scenario, law, SimOptions::default())
+}
+
+/// [`run`] with the FR-70 P1 harness options (see [`SimOptions`]).
+pub fn run_opts(scenario: &Scenario, law: &mut dyn RateLaw, opts: SimOptions) -> Trace {
     let start = Instant::now();
     let mut pipe = Pipe::new(scenario.pipe.clone(), CONSTRAINED_DEPTH, scenario.seed);
     let mut enc = EncoderSim::new(scenario.fps, scenario.idr_factor);
+    enc.rebuild_idr = opts.rebuild_idr;
     let mut viewer = ViewerSim::default();
     let mut rows = Vec::new();
+    let mut gate_skips_total = 0u32;
 
     let frame_interval = enc.frame_interval();
     let mut next_frame = Duration::ZERO;
@@ -905,10 +1147,21 @@ pub fn run(scenario: &Scenario, law: &mut dyn RateLaw) -> Trace {
         // ("the decrease runs DURING congestion").
         if t >= next_frame {
             let occupied = pipe.occupied();
+            // FR-70 P1 — the FR-59 P2 byte-budget gate, when modelled: the
+            // pump reads it as "the channel is full" and skips production,
+            // exactly as `on_backpressure_skip` does.
+            let over_budget = opts.budget_gate && pipe.inflight_bytes() >= law.queue_budget_bytes();
             let full = pipe.full();
-            let target = law.on_frame(occupied, full, start + t);
+            let mut target = law.on_frame(occupied, full, start + t);
+            if over_budget && !full {
+                // The gate, as the pump runs it: a congestion sample and a
+                // skipped frame — NOT a blocked send (see `on_budget_skip`).
+                gate_skips_total += 1;
+                law.on_budget_skip(start + t);
+                target = law.target_bps();
+            }
             peak_target = peak_target.max(target);
-            if full {
+            if full || over_budget {
                 skips_this_window += 1;
             } else {
                 let bytes = enc.produce(target, &scenario.motion, t);
@@ -950,6 +1203,9 @@ pub fn run(scenario: &Scenario, law: &mut dyn RateLaw) -> Trace {
         law: law.label(),
         scenario: scenario.name,
         rows,
+        gate_skips: gate_skips_total,
+        rebuild_idrs: enc.rebuild_idrs,
+        remembered_bps: law.remembered_candidate_bps(),
     }
 }
 
@@ -1102,6 +1358,80 @@ pub mod fixtures {
             duration: Duration::from_secs(40),
             seed: 0xFA57_5A11,
             idr_factor: 25,
+        }
+    }
+
+    /// **FR-70 P1 — the pinned session, CORPLAP-1 → neo16, 2026-09-04
+    /// (`6a9abc30`).** The overlay pair through the corp VPN's DERP path
+    /// (host↔host over the mesh, `relay=false` but constrained, ~80 ms),
+    /// remembered at 200 kbps, encoding at the slow-link profile's 15 fps
+    /// on a rebuild-bound `hevc_qsv`. Recorded: four minutes of
+    /// `200k → 225k → 253k → 285k → 200k`, `goodput_bps=None`, zero send
+    /// stalls, zero viewer-congested windows, age 55–108 ms — the pipe never
+    /// pushed back; the FR-59 P2 budget (16 KB at a 200 kbps reference)
+    /// tripped on each rebuild's keyframe and every trip was a decrease.
+    ///
+    /// The pipe's real rate was never measured, so it is modelled FAST
+    /// (20 Mbps): the point of the cell is that its rate does not matter —
+    /// the memory shapes the session the same way whatever the pipe is.
+    ///
+    /// The content is a window drag: a burst of motion frames at 6× the CBR
+    /// mean for 200 ms of every second (the HRD lets motion frames run to
+    /// roughly the 2× window), which is what lifts the bytes in flight over
+    /// a 16 KB budget on an 80 ms path. `idr_factor` 8, not the FR-63
+    /// fixtures' 25: that figure is the 2.55 Mbps opener's; a 200 kbps
+    /// opener was measured on 0.4.50 as "no burst" (FR-59 field log,
+    /// 2026-09-02), and a keyframe is bounded by the HRD window, not by a
+    /// constant multiple of a frame.
+    pub fn corplap1_remembered_slow_relay() -> Scenario {
+        Scenario {
+            name: "CORPLAP-1 remembered slow (20 Mbps behind an 80 ms path, seed 200 kbps, 15 fps)",
+            pipe: PipeSpec {
+                rate_bps: 20_000_000,
+                rate_steps: Vec::new(),
+                buffer_bytes: 1_000_000,
+                rtt: Duration::from_millis(100),
+                loss_pct: 0,
+                stalls: Vec::new(),
+            },
+            motion: Motion::Bursts {
+                period: Duration::from_secs(1),
+                len: Duration::from_millis(200),
+                factor: 6,
+            },
+            fps: 15,
+            duration: Duration::from_secs(180),
+            seed: 0x6A9A_BC30,
+            idr_factor: 8,
+        }
+    }
+
+    /// **FR-70 P1 — the pair the memory was RIGHT about.** The same path at
+    /// a genuine 300 kbps (the 2026-09-02 measurement of this pair under
+    /// 0.4.49's over-drive), remembered at 200 kbps. The decay must probe
+    /// it, get measured, and NOT over-drive it by more than the AIMD's own
+    /// step would have.
+    pub fn corplap1_genuinely_slow_relay() -> Scenario {
+        Scenario {
+            name: "CORPLAP-1 genuinely slow (300 kbps, 80 ms, seed 200 kbps, 15 fps)",
+            pipe: PipeSpec {
+                rate_bps: 300_000,
+                rate_steps: Vec::new(),
+                // A relay that holds ~1.5 s of this pipe.
+                buffer_bytes: 60_000,
+                rtt: Duration::from_millis(80),
+                loss_pct: 0,
+                stalls: Vec::new(),
+            },
+            motion: Motion::Bursts {
+                period: Duration::from_secs(1),
+                len: Duration::from_millis(200),
+                factor: 6,
+            },
+            fps: 15,
+            duration: Duration::from_secs(180),
+            seed: 0x0902_0300,
+            idr_factor: 8,
         }
     }
 
@@ -1553,6 +1883,12 @@ mod tests {
     fn fast_pair_recovers_from_a_slow_seed() {
         // FR-59 P8's remembered rate is a PRIOR, not a pin: a pair remembered
         // at 200 kbps that is now on 20 Mbps must climb away from the memory.
+        //
+        // ⚠️ FR-70 P1: this passes under B0's `EveryWindow` rule, which hands
+        // the floor relief the delivered rate every window and so overwrites
+        // the memory with the truth in the first second. The shipped governor
+        // does not measure that way — see `p1_the_memory_pins_the_session`,
+        // which is the same pair under the shipped rule.
         let sc = fast_pair_misremembered();
         let mut law = GovernorLaw::new(FLAT_FLOOR_BPS, 20_000_000, true).with_seed(200_000);
         let tr = run(&sc, &mut law);
@@ -1562,5 +1898,196 @@ mod tests {
             "the session never climbed away from a stale 200 kbps memory{}",
             tr.render()
         );
+    }
+
+    // ── FR-70 P1 — the prior that pinned CORPLAP-1 ─────────────────────────
+
+    /// The shipped rules on the recorded session: measurement on push-back
+    /// only, the byte-budget gate, a rebuild-bound encoder, the remembered
+    /// rate standing in as a constant (`rate_prior_decay=false`). This is
+    /// the arm that must FAIL — the memory holds the session near the floor
+    /// for the whole run while the pipe never once pushes back.
+    fn p1_arm(decay: bool, sc: &Scenario, ceiling_bps: u32) -> Trace {
+        let mut law = GovernorLaw::new(FLAT_FLOOR_BPS, ceiling_bps, false)
+            .with_measure(MeasureRule::OnPushBack)
+            .with_fps(sc.fps)
+            .with_prior_decay(decay)
+            .with_seed(200_000);
+        run_opts(
+            sc,
+            &mut law,
+            SimOptions {
+                budget_gate: true,
+                rebuild_idr: true,
+            },
+        )
+    }
+
+    /// The viewer's queue never grew past the link loop's onset threshold —
+    /// the pipe never pushed back, so whatever the target did was the law's
+    /// own doing.
+    fn never_congested(tr: &Trace) -> bool {
+        tr.rows
+            .iter()
+            .all(|r| r.stats.queue_ms < i64::from(super::super::viewer_rate::QUEUE_GROWTH_MS))
+    }
+
+    #[test]
+    fn p1_the_memory_pins_the_session_under_the_shipped_rules() {
+        let sc = corplap1_remembered_slow_relay();
+        let tr = p1_arm(false, &sc, RELAY_CEILING_BPS);
+        // Never the band: three minutes on a 20 Mbps pipe and the session has
+        // not once reached the nominal 1.5 M floor an unremembered session
+        // opens ABOVE. (The exact hover point is a geometry of the model —
+        // the burst size at which a frame is still in flight when the next
+        // is due — and is not a claim about the field's 200–285 k sawtooth;
+        // the claim is that the budget stays denominated in the memory.)
+        assert!(
+            tr.peak_target_bps() < FLAT_FLOOR_BPS,
+            "expected the memory to keep the session below the band, peak was {}{}",
+            tr.peak_target_bps(),
+            tr.render()
+        );
+        // And the pin is the GATE's doing, not the pipe's: the viewer's queue
+        // never grew, the channel never filled — every skip is a budget skip.
+        assert!(
+            tr.gate_skips > 0,
+            "the budget gate never engaged{}",
+            tr.render()
+        );
+        assert!(tr.rebuild_idrs > 0);
+        assert!(
+            never_congested(&tr),
+            "the pipe must never push back{}",
+            tr.render()
+        );
+        // With decay off the law offers the memory nothing better than the
+        // applied rate, which is the pinned one: the memory refreshes itself.
+        assert_eq!(tr.remembered_bps, None);
+    }
+
+    #[test]
+    fn p1_the_prior_decays_and_the_session_escapes() {
+        let sc = corplap1_remembered_slow_relay();
+        let tr = p1_arm(true, &sc, RELAY_CEILING_BPS);
+        // ~10 decay steps from 200 k reach the band inside 110 s; from there
+        // the nominal floor stands and the AIMD's ordinary step climbs to the
+        // relay ceiling.
+        let at_120 = tr
+            .rows
+            .iter()
+            .find(|r| r.t >= Duration::from_secs(120))
+            .expect("120 s");
+        assert!(
+            at_120.target_bps >= FLAT_FLOOR_BPS,
+            "expected the band by 120 s, got {}{}",
+            at_120.target_bps,
+            tr.render()
+        );
+        let last = tr.rows.last().expect("windows");
+        assert!(
+            last.target_bps >= RELAY_CEILING_BPS,
+            "the escape must reach the ceiling and hold: {}{}",
+            last.target_bps,
+            tr.render()
+        );
+        // The pipe still never pushed back — the climb was the prior letting
+        // go, not evidence arriving.
+        assert!(never_congested(&tr), "{}", tr.render());
+        // The memory is left with nothing below the band to re-seed from:
+        // the prior has decayed away, so the pump records the applied rate.
+        assert_eq!(tr.remembered_bps, None, "the prior must be gone at the end");
+        // And it costs nothing in delivered latency on a fast pipe.
+        assert!(
+            tr.max_age_ms() < 300,
+            "max age {} ms{}",
+            tr.max_age_ms(),
+            tr.render()
+        );
+    }
+
+    /// The same memory on the pipe it was RIGHT about: the decay probes
+    /// upward, the probe gets MEASURED (the queue grows, the sender blocks),
+    /// the prior re-anchors on the measurement — and from a measured base
+    /// the re-probe is gentle, so the session sits near the pipe instead of
+    /// running away from it, at a latency cost bounded against the arm
+    /// that never probes at all.
+    #[test]
+    fn p1_a_genuinely_slow_pipe_is_measured_not_overdriven() {
+        let sc = corplap1_genuinely_slow_relay();
+        let held = p1_arm(false, &sc, RELAY_CEILING_BPS);
+        let tr = p1_arm(true, &sc, RELAY_CEILING_BPS);
+        let n = tr.rows.len();
+        let last_minute = &tr.rows[n.saturating_sub(60)..];
+        let peak = last_minute
+            .iter()
+            .map(|r| r.peak_target_bps)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            peak <= 400_000,
+            "the decay must not run away from a measured 300 kbps pipe: peak {peak}{}",
+            tr.render()
+        );
+        // The probe was answered by a measurement, not by a runaway.
+        let measured = tr
+            .remembered_bps
+            .expect("a measurement or a prior must stand");
+        assert!(
+            (200_000..=400_000).contains(&measured),
+            "the memory should record roughly the pipe, got {measured}{}",
+            tr.render()
+        );
+        // The latency cost of probing, against the arm that holds the memory
+        // as a constant: the mean paint age over the run stays under FR-59's
+        // 600 ms AC4 bar, and the worst window is not worse than the held
+        // arm's by more than one probe's worth of queue.
+        let mean = |t: &Trace| {
+            t.rows
+                .iter()
+                .map(|r| u64::from(r.stats.age_ms))
+                .sum::<u64>()
+                / (t.rows.len().max(1) as u64)
+        };
+        assert!(
+            mean(&tr) < 600,
+            "mean age {} ms (held arm {} ms){}",
+            mean(&tr),
+            mean(&held),
+            tr.render()
+        );
+        assert!(
+            tr.max_age_ms() <= held.max_age_ms() + 500,
+            "max age {} ms vs {} ms held{}",
+            tr.max_age_ms(),
+            held.max_age_ms(),
+            tr.render()
+        );
+    }
+
+    /// Reporting aid — both arms on both cells.
+    ///
+    /// `cargo test -p roomlerd --lib p1_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reporting aid; run with --ignored --nocapture"]
+    fn p1_report() {
+        for sc in [
+            corplap1_remembered_slow_relay(),
+            corplap1_genuinely_slow_relay(),
+        ] {
+            for decay in [false, true] {
+                let tr = p1_arm(decay, &sc, RELAY_CEILING_BPS);
+                println!(
+                    "\n=== {} — rate_prior_decay={decay}: peak {} bps, max age {} ms, gate skips {}, rebuild IDRs {}, remembered {:?}{}",
+                    sc.name,
+                    tr.peak_target_bps(),
+                    tr.max_age_ms(),
+                    tr.gate_skips,
+                    tr.rebuild_idrs,
+                    tr.remembered_bps,
+                    tr.render()
+                );
+            }
+        }
     }
 }
