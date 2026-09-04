@@ -1343,7 +1343,7 @@ pub async fn trigger_agents_update(
 /// (TTL-enforced) directory record on ANY pod. Redis down / timeout ⇒
 /// empty set — `to_agent_response` then degrades to the pre-A-1
 /// heartbeat disjunction, never to hard-offline.
-pub(crate) async fn agent_presence_batch(
+pub async fn agent_presence_batch(
     state: &FleetState,
     agents: &[roomler_ai_remote_control::models::Agent],
 ) -> std::collections::HashSet<ObjectId> {
@@ -1387,7 +1387,7 @@ pub(crate) async fn agent_presence_batch(
 /// socket ONLY, and never hard-offline). The returned bool is the back-compat
 /// `is_online` = the reachable state only (pre-A-1 it also counted
 /// heartbeat-only agents, which is what lied green).
-pub(crate) fn derive_agent_presence(
+pub fn derive_agent_presence(
     state: &FleetState,
     a: &roomler_ai_remote_control::models::Agent,
     redis_fresh: bool,

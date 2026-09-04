@@ -496,6 +496,12 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes)
         .nest("/tenant/{tenant_id}/agent", agent_routes)
+        // The device listing joins fleet and network data — the host's until
+        // `network` exists (FR-69 P5a).
+        .nest(
+            "/tenant/{tenant_id}/device",
+            Router::new().route("/", get(routes::device::list_devices)),
+        )
         .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client_routes)
         .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy_routes)
         .nest("/tenant/{tenant_id}/overlay-node", overlay_node_routes)

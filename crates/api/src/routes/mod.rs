@@ -11,6 +11,9 @@ pub mod background_task;
 pub mod capabilities;
 pub mod cluster;
 pub mod cost;
+// The device listing joins agents (fleet) with tunnel clients and overlay
+// nodes (network): a cross-pillar view that stays here until `network` exists.
+pub mod device;
 pub mod integration;
 pub mod invite;
 pub mod notification;

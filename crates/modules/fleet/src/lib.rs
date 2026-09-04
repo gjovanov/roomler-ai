@@ -61,7 +61,6 @@ pub mod auth_agent;
 pub mod consent;
 pub mod consent_consumer;
 pub mod ctrl;
-pub mod device;
 pub mod enroll_key;
 pub mod hub;
 pub mod nudge;
@@ -297,7 +296,9 @@ impl Module for FleetState {
                 put(remote_config::set_desired_config),
             );
 
-        let device = Router::new().route("/", get(device::list_devices));
+        // NB `/tenant/{tenant_id}/device` (the device listing) is NOT here: it
+        // joins agents with tunnel clients and overlay nodes — a cross-pillar
+        // view the host keeps until `network` exists.
         let exec_audit = Router::new().route("/", get(agent_exec::audit));
         let exec_settings = Router::new().route(
             "/",
@@ -362,7 +363,6 @@ impl Module for FleetState {
 
         Router::new()
             .nest("/tenant/{tenant_id}/agent", agent)
-            .nest("/tenant/{tenant_id}/device", device)
             .nest("/tenant/{tenant_id}/exec-audit", exec_audit)
             .nest("/tenant/{tenant_id}/exec-settings", exec_settings)
             .nest(
