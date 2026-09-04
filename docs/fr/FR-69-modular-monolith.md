@@ -1,7 +1,7 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 + P1 + P2 + P3 + P4 + P5a shipped (#1309 · #1311 · #1312 · #1315 · #1317 ·
-#1318 · #1320 · #1323 · #1325 · #1329) · P5b (the namespace map) + P5c (the agent socket) next ·
+**Status**: P0 + P1 + P2 + P3 + P4 + P5a + P5b shipped (#1309 · #1311 · #1312 · #1315 · #1317 ·
+#1318 · #1320 · #1323 · #1325 · #1329 · #1332) · P5c (the agent socket) next ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -452,7 +452,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P3** ✅ | `chat` module — #1323: rooms, messages, reactions, files, search, export, Giphy, the unread summary, and `typing:*` as the first module-owned WebSocket namespace; the call endpoints stay in the host as `routes/call.rs` for P4 | baseline identical; integration lane (the tenant-scoping tests included); prod roll | `chat = false` | medium | 2–3 |
 | **P4** ✅ | `conference` module — #1325: the SFU room manager + worker pool (from `services/media`), the media cluster, the sampler, the call lifecycle, recordings, and `media:*` as a module namespace; **mediasoup links in this one crate only**; the contract's stateful surfaces used for the first time (`WsHandler::closed`, `Module::jobs` under the host's startup lease, `Module::shutdown`) | baseline identical; integration lane; prod roll. AC4's Docker measurement waits for the profiles (P8) — the mechanism is in place | `conference = false` | medium | 3–4 |
 | **P5a** ✅ | `fleet` module — #1329: the Hub out of `remote_control`, `AuthAgent`, every fleet HTTP path, presence, the nudge machinery, consent and its consumer, the removal sequence; `Core.hooks` (the D6 registry) with the host's transitional `network` hooks so the agent cascade already runs in `HOOK_ORDER`. The agent socket stays in the host on `Arc` aliases of the module's handles | baseline identical; integration lane; prod roll | none — `fleet` is a required dependency until the socket moves; `fleet = false` refuses to boot | high | 2–3 |
-| **P5b** | the exhaustive `ClientMsg::namespace()` map + its locked test (AC6); the map joins the composition baseline | baseline re-recorded for the new section only | none (a pure function) | low | 1 |
+| **P5b** ✅ | #1332 — `Owner { Fleet, Remote, Network }` + the exhaustive `ClientMsg::namespace()` and `wire_tag()` matches + the 44-entry `CLIENT_MSG_OWNERS` table in the wire crate, locked four ways (the enum's own renames, the match on buildable variants, the D7 placements, the module graph); the composition baseline gained a `namespaces` section | baseline re-recorded for the new section only — routes, index sets and wire names byte-identical | none (a pure function) | low | 1 |
 | **P5c** | the agent socket into `fleet` behind a core-owned `(role, namespace)` handler registry; the host's remote/network agent-side arms registered transitionally; the `AppState` aliases and the required-dependency go | same + no dip in online agents | redeploy previous tag | high | 3–4 |
 | **P6** | `remote` module | same + one RC session per carrier class | `remote = false` | medium | 2–3 |
 | **P7** | `network` module, `/derp` included | same + overlay/tunnel field sweep | `network = false` | high | 5–7 |
@@ -484,8 +484,10 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       and after, and recorded in the field log.
 - [ ] **AC5** A `mesh` image boots with Mongo, Redis and coturn only; `/health` lists `fleet`
       and `network`; a daemon enrolls and joins the overlay against it (a vmtest cell).
-- [ ] **AC6** Every `ClientMsg` variant has an owner in the namespace map, enforced by an
-      exhaustive match and a locked test.
+- [x] **AC6** Every `ClientMsg` variant has an owner in the namespace map, enforced by an
+      exhaustive match and a locked test. — P5b #1332: `ClientMsg::namespace()` is exhaustive
+      (a new variant does not compile until it names an owner), `CLIENT_MSG_OWNERS` is checked
+      against the enum's renames read from the source, and the baseline snapshots the table.
 - [ ] **AC7** The full UI against a `mesh` server shows no chat or conference navigation and no
       console errors; against `full` the e2e nightly is unchanged.
 - [ ] **AC8** Every phase's prod roll is field-verified from the fleet and recorded in the field
@@ -737,3 +739,26 @@ Rust job and exercised by the integration lane rather than locally.
   workflow next to the variable. (The by-value `Settings` inside `Core` is the underlying
   cost; turning it into an `Arc` is a later, separate change.)
 - Routes, index sets and wire names unchanged; the baseline holds as recorded.
+
+### 2026-09-04 — P5b: the namespace map
+
+- **#1332** — the wire crate gained `Owner { Fleet, Remote, Network }` (ids as the module
+  graph spells them; the crate is MPL and agent-linked, so it names modules by id, never by
+  type), `ClientMsg::namespace()` — one exhaustive match over all 44 client variants, so a new
+  variant does not compile until it names an owner — `ClientMsg::wire_tag()` (the serde tag per
+  variant, so a variant can be named without an instance), and `CLIENT_MSG_OWNERS`, the table
+  the composition baseline snapshots as its new `namespaces` section.
+- **The prefix is not the owner**, and the map says so per variant: `rc:consent*` is fleet's
+  (one consent payload for RC, exec and SSH since FR-27); `rc:relay.*` is network's; and
+  `rc:agent.key_rotated` is network's although it rides the agent's `rc:agent.*` lane. `rc:ping`
+  is fleet's (the socket's owner); `rc:session.stats` is remote's. Everything `rc:tunnel.*`,
+  `rc:overlay.*` and `rc:ssh.*` is network's.
+- Locked four ways: the table is checked against the enum's renames read from the file's own
+  source (no variant without an owner, none for a variant that is gone, no duplicates); on the
+  variants a test can build, the serde tag equals `wire_tag()` and `namespace()` equals the
+  table; the D7 placements are spelled out; and core asserts every owner id is in
+  `graph::MODULES`. The baseline was re-recorded for the new section only — the two files
+  differ by exactly that block.
+- What P5c uses it for: the socket's dispatch looks up the owner's handler by
+  `msg.namespace()` instead of by string prefix, which is what lets the agent socket move into
+  `fleet` while `remote` and `network` register their arms.

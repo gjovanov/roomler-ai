@@ -44,6 +44,22 @@ pub struct Snapshot {
     pub routes: Vec<RouteEntry>,
     pub indexes: serde_json::Value,
     pub wire: Vec<String>,
+    /// FR-69 P5b — every client wire tag with the module that owns it
+    /// (`ClientMsg::namespace()`'s table). A sorted map, so the rendering is
+    /// stable; `default` so a baseline recorded before the section existed
+    /// still parses and reports the section as the diff.
+    #[serde(default)]
+    pub namespaces: std::collections::BTreeMap<String, String>,
+}
+
+/// The client wire tags with their owning module ids, as the snapshot
+/// records them (FR-69 D7): the table the wire crate keeps next to the
+/// exhaustive `ClientMsg::namespace()` match.
+pub fn namespaces() -> std::collections::BTreeMap<String, String> {
+    roomler_ai_remote_control::signaling::CLIENT_MSG_OWNERS
+        .iter()
+        .map(|(tag, owner)| (tag.to_string(), owner.id().to_string()))
+        .collect()
 }
 
 impl Snapshot {
@@ -60,11 +76,12 @@ impl Snapshot {
                 .unwrap_or(0)
         };
         format!(
-            "routes={} index_sets(single_block)={} index_sets(multi_block)={} wire_names={}",
+            "routes={} index_sets(single_block)={} index_sets(multi_block)={} wire_names={} namespaces={}",
             self.routes.len(),
             sets("single_block"),
             sets("multi_block"),
-            self.wire.len()
+            self.wire.len(),
+            self.namespaces.len()
         )
     }
 }
@@ -240,6 +257,25 @@ fn normalise_methods(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P5b — every owner the wire crate names is a module the graph knows,
+    /// and the snapshot section carries the whole table.
+    #[test]
+    fn every_client_message_owner_is_a_module() {
+        for (tag, owner) in roomler_ai_remote_control::signaling::CLIENT_MSG_OWNERS {
+            assert!(
+                crate::graph::MODULES.contains(&owner.id()),
+                "{tag} names `{}`, which is not a module",
+                owner.id()
+            );
+        }
+        let map = namespaces();
+        assert_eq!(
+            map.len(),
+            roomler_ai_remote_control::signaling::CLIENT_MSG_OWNERS.len()
+        );
+        assert_eq!(map.get("rc:agent.hello").map(String::as_str), Some("fleet"));
+    }
     use axum::{
         Router,
         routing::{any, delete, get, post},
