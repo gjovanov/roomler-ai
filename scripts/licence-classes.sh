@@ -80,7 +80,7 @@ CLIENT_CRATES=(
   roomler-cli-shim
   roomler-setup
   roomler-cli
-  roomler-core
+  roomler-node-core
   roomler-setup-core
   roomler-ai-tunnel-core
   roomler-ai-remote-control

@@ -109,7 +109,7 @@ pub const RUN_SUBCOMMAND: &str = "service-run";
 pub fn default_log_dir() -> Option<PathBuf> {
     // Canonical path lives in agent-core (P3e lever E) so the desktop
     // companion resolves the same directory without linking this crate.
-    Some(roomler_core::appdirs::service_log_dir())
+    Some(roomler_node_core::appdirs::service_log_dir())
 }
 
 /// Transactional takeover install (P3D rename).

@@ -258,7 +258,7 @@ pub fn check_forward_request(
 
 // `dst_matches` / `host_matches` moved to `remote_control::models` in P3e
 // lever E — the matcher now lives next to the shapes it matches over, and
-// `roomler-core`'s ACL can call it without this crate's data plane.
+// `roomler-node-core`'s ACL can call it without this crate's data plane.
 // Re-exported here so every existing `policy::dst_matches` caller (the
 // forward gate, the agent ACL tests, T2.3's evaluate flow) is unchanged.
 pub use roomler_ai_remote_control::models::{dst_matches, host_matches};
