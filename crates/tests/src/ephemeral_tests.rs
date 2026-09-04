@@ -93,6 +93,7 @@ async fn reaper_removes_expired_ephemeral_row_outright() {
     // The response surface says what the row is BEFORE it vanishes — the
     // grid badge is how an operator is never surprised by the vanishing.
     app.state
+        .fleet()
         .agents
         .set_ephemeral(aid, Some(60))
         .await
@@ -162,6 +163,7 @@ async fn reaper_respects_the_row_own_deadline() {
     let t = app.seed_tenant("ephem3").await;
     let aid = enroll_agent(&app, &t.tenant_id, &t.admin.access_token, "ephem3-m1").await;
     app.state
+        .fleet()
         .agents
         .set_ephemeral(aid, Some(3600))
         .await
@@ -206,6 +208,7 @@ async fn admin_delete_hard_deletes_ephemeral_and_tombstones_permanent() {
     let permanent = enroll_agent(&app, &t.tenant_id, &t.admin.access_token, "ephem5-perm").await;
     let ephemeral = enroll_agent(&app, &t.tenant_id, &t.admin.access_token, "ephem5-eph").await;
     app.state
+        .fleet()
         .agents
         .set_ephemeral(ephemeral, None)
         .await
