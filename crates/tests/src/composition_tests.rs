@@ -132,6 +132,9 @@ async fn composition_matches_baseline() {
             path.display()
         )
     });
+    // A checkout with `core.autocrlf=true` hands the file back with CRLF;
+    // the snapshot is rendered with LF. Compare content, not line endings.
+    let expected = expected.replace("\r\n", "\n");
     if expected == rendered {
         return;
     }
