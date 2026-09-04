@@ -48,6 +48,7 @@
 //! (`crates/agent-core`), which held the name `roomler-core` from FR-21 until
 //! FR-69.
 
+pub mod agent_socket;
 pub mod capabilities;
 pub mod cluster;
 pub mod composition;
@@ -68,6 +69,9 @@ pub mod storage;
 pub mod user_analytics;
 pub mod ws;
 
+pub use agent_socket::{
+    AgentCtx, AgentMsgHandler, AgentSocketHooks, AgentSocketLifecycle, AgentSocketRegistry,
+};
 pub use capabilities::{Capabilities, TenantCtx};
 pub use error::ApiError;
 pub use hooks::{
