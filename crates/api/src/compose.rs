@@ -18,7 +18,11 @@
 //! [`Modules::ws_closed`] (a socket closed — every handler for that role is
 //! told), [`Modules::run_startup_jobs`] (the host's startup lease drives the
 //! modules' leader-gated jobs) and [`Modules::shutdown`] (reverse composition
-//! order, ahead of the host's own cleanup).
+//! order). P5a added [`Modules::register_hooks`] (each module's inverse edges
+//! into the core registry) and `fleet` — the one module the host cannot run
+//! without yet: it still serves the agent socket from the fleet's handles, so
+//! `fleet` is a required dependency and its switch refuses to boot rather
+//! than unmounting (spec: the P5 kill switch is "redeploy the previous tag").
 
 use std::sync::Arc;
 
@@ -37,6 +41,7 @@ pub const EXTRACTED: &[&str] = &[
     "chat",
     #[cfg(feature = "conference")]
     "conference",
+    "fleet",
 ];
 
 /// The modules this build links, initialised — `None` where the operator
@@ -49,6 +54,8 @@ pub struct Modules {
     pub chat: Option<roomler_ai_mod_chat::ChatState>,
     #[cfg(feature = "conference")]
     pub conference: Option<roomler_ai_mod_conference::ConferenceState>,
+    /// Always linked (P5a): the host's agent socket reads its handles.
+    pub fleet: Option<roomler_ai_mod_fleet::FleetState>,
     /// Every mounted module's WebSocket namespace handlers, collected at
     /// init so the socket dispatch can look one up per message.
     ws: Vec<WsHandlerSpec>,
@@ -101,6 +108,11 @@ impl Modules {
                 modules.ws.extend(m.ws().handlers);
             }
         }
+        modules.fleet =
+            init_one::<roomler_ai_mod_fleet::FleetState>(core.clone(), settings).await?;
+        if let Some(m) = &modules.fleet {
+            modules.ws.extend(m.ws().handlers);
+        }
 
         let _ = core;
         Ok(modules)
@@ -121,6 +133,9 @@ impl Modules {
         #[cfg(feature = "conference")]
         if self.conference.is_some() {
             ids.push("conference");
+        }
+        if self.fleet.is_some() {
+            ids.push("fleet");
         }
         ids
     }
@@ -143,6 +158,9 @@ impl Modules {
         #[cfg(feature = "conference")]
         if let Some(conference) = &self.conference {
             api = api.merge(conference.routes().with_state(()));
+        }
+        if let Some(fleet) = &self.fleet {
+            api = api.merge(fleet.routes().with_state(()));
         }
         api
     }
@@ -167,6 +185,9 @@ impl Modules {
         if let Some(conference) = &self.conference {
             root = root.merge(conference.unlimited_routes().with_state(()));
         }
+        if let Some(fleet) = &self.fleet {
+            root = root.merge(fleet.unlimited_routes().with_state(()));
+        }
         root
     }
 
@@ -187,6 +208,9 @@ impl Modules {
         if let Some(conference) = &self.conference {
             sets.extend(conference.indexes());
         }
+        if let Some(fleet) = &self.fleet {
+            sets.extend(fleet.indexes());
+        }
         sets
     }
 
@@ -206,7 +230,37 @@ impl Modules {
         if let Some(conference) = &self.conference {
             jobs.extend(conference.jobs());
         }
+        if let Some(fleet) = &self.fleet {
+            jobs.extend(fleet.jobs());
+        }
         jobs
+    }
+
+    /// Register every mounted module's hooks (its inverse edges) into the
+    /// core registry, under the module's id. The host adds its transitional
+    /// implementations for the modules not extracted yet right after this.
+    pub fn register_hooks(&self, core: &Core) {
+        #[cfg(feature = "saas")]
+        if let Some(saas) = &self.saas {
+            core.hooks
+                .register(roomler_ai_mod_saas::SaasState::ID, saas.hooks());
+        }
+        #[cfg(feature = "chat")]
+        if let Some(chat) = &self.chat {
+            core.hooks
+                .register(roomler_ai_mod_chat::ChatState::ID, chat.hooks());
+        }
+        #[cfg(feature = "conference")]
+        if let Some(conference) = &self.conference {
+            core.hooks.register(
+                roomler_ai_mod_conference::ConferenceState::ID,
+                conference.hooks(),
+            );
+        }
+        if let Some(fleet) = &self.fleet {
+            core.hooks
+                .register(roomler_ai_mod_fleet::FleetState::ID, fleet.hooks());
+        }
     }
 
     /// Run every mounted module's startup jobs, in composition order — the
@@ -261,6 +315,9 @@ impl Modules {
     /// Orderly stop of every mounted module, in REVERSE composition order
     /// (a module stops before the ones it depends on).
     pub async fn shutdown(&self) {
+        if let Some(fleet) = &self.fleet {
+            fleet.shutdown().await;
+        }
         #[cfg(feature = "conference")]
         if let Some(conference) = &self.conference {
             conference.shutdown().await;

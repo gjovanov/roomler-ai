@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 
-use crate::state::AppState;
+use crate::FleetState;
 
 pub const ONLINE: &str = "online";
 pub const STALE: &str = "stale";
@@ -57,7 +57,7 @@ pub struct PresenceUpdate {
     pub presence: &'static str,
 }
 
-/// AppState-held fan-out state: per-tenant pending batches + the member-list
+/// FleetState-held fan-out state: per-tenant pending batches + the member-list
 /// cache. One instance per pod.
 #[derive(Default)]
 pub struct PresenceFanout {
@@ -71,7 +71,7 @@ pub struct PresenceFanout {
 ///
 /// Fail-soft: a Mongo error here loses one badge event, never a session.
 pub async fn note_transition(
-    state: &AppState,
+    state: &FleetState,
     tenant_id: ObjectId,
     agent_id: ObjectId,
     name: &str,
@@ -128,7 +128,7 @@ pub async fn note_transition(
 /// Drain one tenant's pending batch and broadcast it to the tenant's
 /// members (cross-pod via the Redis fan-out — recipients' sockets may live
 /// anywhere, and multi-org users are usually affine to a DIFFERENT tenant).
-async fn flush_tenant(state: &AppState, tenant_id: ObjectId) {
+async fn flush_tenant(state: &FleetState, tenant_id: ObjectId) {
     let Some((_, updates)) = state.presence_fanout.pending.remove(&tenant_id) else {
         return;
     };
@@ -160,7 +160,7 @@ async fn flush_tenant(state: &AppState, tenant_id: ObjectId) {
             "agents": agents,
         }
     });
-    crate::ws::dispatcher::broadcast_with_redis(
+    roomler_core::ws::dispatcher::broadcast_with_redis(
         &state.ws_storage,
         &state.redis_pubsub,
         &members,
@@ -197,7 +197,7 @@ fn coalesce(updates: Vec<PresenceUpdate>) -> Vec<PresenceUpdate> {
     latest
 }
 
-async fn member_ids_cached(state: &AppState, tenant_id: ObjectId) -> Option<Arc<Vec<ObjectId>>> {
+async fn member_ids_cached(state: &FleetState, tenant_id: ObjectId) -> Option<Arc<Vec<ObjectId>>> {
     if let Some(entry) = state.presence_fanout.members.get(&tenant_id)
         && entry.0.elapsed() < MEMBERS_CACHE_TTL
     {
@@ -230,7 +230,7 @@ async fn member_ids_cached(state: &AppState, tenant_id: ObjectId) -> Option<Arc<
 /// must not demote agents that are alive on another pod. With no Redis at
 /// all (single-pod deployments and most tests) the local hub IS the whole
 /// truth, so the sweep proceeds on it alone.
-pub async fn run_presence_sweep(state: &AppState) -> usize {
+pub async fn run_presence_sweep(state: &FleetState) -> usize {
     let rows = match state.agents.find_presence_scan_set().await {
         Ok(rows) => rows,
         Err(e) => {
@@ -310,7 +310,7 @@ pub async fn run_presence_sweep(state: &AppState) -> usize {
 /// Redis ⇒ single pod ⇒ it just runs locally every interval. The first
 /// tick is a full interval out, so short-lived TestApps never race a test
 /// that drives [`run_presence_sweep`] directly.
-pub fn spawn_sweeper(state: AppState) {
+pub fn spawn_sweeper(state: FleetState) {
     let interval = Duration::from_secs(state.settings.rc.presence_sweep_secs.max(5));
     tokio::spawn(async move {
         loop {

@@ -26,13 +26,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use roomler_core::ApiError;
+
 use crate::{
-    error::ApiError,
-    routes::{
-        agent_release::{AgentRelease, AgentReleaseAsset},
-        releases,
-    },
-    state::AppState,
+    FleetState,
+    agent_release::{AgentRelease, AgentReleaseAsset},
+    releases,
 };
 
 #[derive(Deserialize)]
@@ -66,19 +65,19 @@ pub struct InstallerHealth {
 /// agent's HEVC libs — was served as the latest tunnel, so self-update reported
 /// a bogus version and failed the SHA-256 check against the wrong asset.
 pub async fn latest_release(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
     let releases = releases::cached(&state).await?;
-    Ok(Json(
-        crate::routes::agent_release::filter_component_releases(releases, "tunnel-v"),
-    ))
+    Ok(Json(crate::agent_release::filter_component_releases(
+        releases, "tunnel-v",
+    )))
 }
 
 /// `GET /api/tunnel/installer/{platform}/health` — manifest (tag,
 /// filename, size, digest, download URI) for the asset matching the
 /// requested platform + version.
 pub async fn installer_health(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path(platform): Path<String>,
     Query(params): Query<InstallerQuery>,
 ) -> Result<Json<InstallerHealth>, ApiError> {
@@ -109,7 +108,7 @@ pub async fn installer_health(
 /// `GET /api/tunnel/installer/{platform}` — streams the archive
 /// bytes. Content-Type derived from filename suffix.
 pub async fn installer_proxy(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path(platform): Path<String>,
     Query(params): Query<InstallerQuery>,
 ) -> Result<Response, ApiError> {
@@ -375,8 +374,7 @@ mod tests {
             ),
             release("tunnel-v0.3.0-rc.166", false, &[]),
         ];
-        let filtered =
-            crate::routes::agent_release::filter_component_releases(releases, "tunnel-v");
+        let filtered = crate::agent_release::filter_component_releases(releases, "tunnel-v");
         assert_eq!(filtered.len(), 2, "only tunnel-v* survive");
         assert_eq!(
             filtered.first().unwrap().tag_name,
