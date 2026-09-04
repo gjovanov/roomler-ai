@@ -1,24 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 pub mod cluster;
-pub mod cookies;
 pub mod core_state;
-pub mod error;
 pub mod extractors;
 pub mod media_stats;
 pub mod media_type;
 pub mod middleware;
 pub mod newsletter_send;
-pub mod origin;
 pub mod routes;
 pub mod state;
 pub mod stats_rollup;
 pub mod ws;
 
-// FR-69 P1b — these four moved into `roomler-core` unchanged (they hold or
-// serve `Core`'s fields); re-exported so every `crate::…` path in this crate
-// reads as before.
-pub use roomler_core::{rate_limit, relay_load, storage, user_analytics};
+// FR-69 P1b/P1d — these moved into `roomler-core` unchanged (they hold or
+// serve `Core`'s fields, or are the request-side primitives a module's
+// handlers need: the error type, the session cookie helpers, the origin
+// policy); re-exported so every `crate::…` path in this crate reads as before.
+pub use roomler_core::{cookies, error, origin, rate_limit, relay_load, storage, user_analytics};
 
 use axum::{
     Router,

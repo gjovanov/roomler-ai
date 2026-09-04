@@ -10,9 +10,9 @@ use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    core_state::Core,
     error::ApiError,
     extractors::auth::{AuthUser, OptionalAuthUser},
-    state::AppState,
 };
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_services::dao::{base::PaginationParams, invite::CreateInviteParams};
@@ -114,7 +114,7 @@ pub struct BatchCreateInviteResponse {
 
 /// GET /api/invite/{code} — public invite info
 pub async fn get_invite_info(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     optional_auth: OptionalAuthUser,
     Path(code): Path<String>,
 ) -> Result<Json<InviteInfoResponse>, ApiError> {
@@ -156,7 +156,7 @@ pub async fn get_invite_info(
 
 /// POST /api/invite/{code}/accept — accept invite (requires auth)
 pub async fn accept_invite(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(code): Path<String>,
 ) -> Result<Json<AcceptInviteResponse>, ApiError> {
@@ -272,7 +272,7 @@ fn invite_default_per_page() -> u64 {
 
 /// GET /api/tenant/{tenant_id}/invite — list tenant invites
 pub async fn list_invites(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<InviteListQuery>,
@@ -328,7 +328,7 @@ pub async fn list_invites(
 
 /// POST /api/tenant/{tenant_id}/invite — create invite
 pub async fn create_invite(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateInviteRequest>,
@@ -379,7 +379,7 @@ pub async fn create_invite(
 
 /// POST /api/tenant/{tenant_id}/invite/batch — create multiple invites
 pub async fn batch_create_invite(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<BatchCreateInviteRequest>,
@@ -480,7 +480,7 @@ pub async fn batch_create_invite(
 
 /// DELETE /api/tenant/{tenant_id}/invite/{invite_id} — revoke invite
 pub async fn revoke_invite(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path((tenant_id, invite_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -495,7 +495,7 @@ pub async fn revoke_invite(
 
 /// POST /api/tenant/{tenant_id}/member — direct add member
 pub async fn add_member(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<AddMemberRequest>,
@@ -586,7 +586,7 @@ struct InviteEmailCtx {
     tenant_name: String,
 }
 
-async fn invite_email_ctx(state: &AppState, inviter_id: ObjectId, tid: ObjectId) -> InviteEmailCtx {
+async fn invite_email_ctx(state: &Core, inviter_id: ObjectId, tid: ObjectId) -> InviteEmailCtx {
     let inviter_name = state
         .users
         .base
@@ -614,7 +614,7 @@ async fn invite_email_ctx(state: &AppState, inviter_id: ObjectId, tid: ObjectId)
 /// drift again — the batch route shipped for months sending nothing while its
 /// dialog said "N invites sent".
 fn spawn_invite_email(
-    state: &AppState,
+    state: &Core,
     ctx: &InviteEmailCtx,
     invite: &roomler_ai_db::models::Invite,
 ) -> bool {
@@ -654,7 +654,7 @@ fn parse_oid(s: &str) -> Result<ObjectId, ApiError> {
 /// Returns the caller's own combined mask, so the callers can pass it to
 /// `role::check_grant_roles` without a second lookup.
 async fn require_invite_permission(
-    state: &AppState,
+    state: &Core,
     tenant_id: ObjectId,
     user_id: ObjectId,
 ) -> Result<u64, ApiError> {

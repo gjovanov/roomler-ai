@@ -7,7 +7,7 @@ use axum::{
 use bson::oid::ObjectId;
 use roomler_ai_services::auth::Claims;
 
-use crate::{core_state::Core, error::ApiError};
+use crate::{Core, error::ApiError};
 
 /// Extracts the authenticated user from JWT (cookie or Authorization header)
 #[derive(Debug, Clone)]
