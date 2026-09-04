@@ -61,7 +61,7 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "derp_rehome_close_total": DERP_REHOME_CLOSE_TOTAL.load(Ordering::Relaxed),
             "derp_bytes_relayed_total": DERP_BYTES_RELAYED_TOTAL.load(Ordering::Relaxed),
             "derp_rehome_stuck_total":
-                crate::ws::derp_cluster::DERP_REHOME_STUCK_TOTAL.load(Ordering::Relaxed),
+                DERP_REHOME_STUCK_TOTAL.load(Ordering::Relaxed),
             "split_evidence_total": SPLIT_EVIDENCE_TOTAL.load(Ordering::Relaxed),
             "relay_region_pick_total": RELAY_REGION_PICK_TOTAL.load(Ordering::Relaxed),
             "rc_rehome_controller_total": RC_REHOME_CONTROLLER_TOTAL.load(Ordering::Relaxed),
@@ -70,9 +70,11 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "rc_relay_total": RC_RELAY_TOTAL.load(Ordering::Relaxed),
         },
         "local": {
-            "agents_online": state.rc_hub.online_agents().len(),
-            "tunnel_sessions": state.tunnel_clients_by_session.len(),
-            "derp_registrations": state.network().derp_registry.len(),
+            // FR-69 P7b — fleet's and network's gauges; zero when a module
+            // is not mounted on this pod.
+            "agents_online": state.modules.fleet_gauges().agents_online,
+            "tunnel_sessions": state.modules.network_gauges().tunnel_sessions,
+            "derp_registrations": state.modules.network_gauges().derp_registrations,
             "media_rooms": media_rooms.len(),
             "media_participants": participants_total,
             "media_consumers": consumers_total,

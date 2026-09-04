@@ -59,6 +59,11 @@ pub static AGENT_NUDGE_STUCK_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// sessions WORKING rather than converging; sustained growth means a
 /// stable co-location gap worth investigating).
 pub static RC_RELAY_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// C-5 — DERP rehomes suppressed by the attempts cap: a stable split a
+/// rehome can't fix (the client keeps re-landing on the losing pod).
+/// SPLIT EVIDENCE. Core's since P7b so the status snapshot reads every
+/// counter from one place while the relay itself is the network module's.
+pub static DERP_REHOME_STUCK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);

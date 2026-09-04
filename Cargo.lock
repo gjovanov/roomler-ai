@@ -7979,7 +7979,6 @@ dependencies = [
  "roomler-ai-mod-saas",
  "roomler-ai-remote-control",
  "roomler-ai-services",
- "roomler-ai-tunnel-core",
  "roomler-core",
  "serde",
  "serde_json",
@@ -8108,6 +8107,7 @@ dependencies = [
  "base64 0.22.1",
  "bson",
  "dashmap",
+ "futures",
  "ipnet",
  "rand 0.9.4",
  "roomler-ai-config",
@@ -8121,6 +8121,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -8246,6 +8247,7 @@ dependencies = [
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-mod-conference",
+ "roomler-ai-mod-fleet",
  "roomler-ai-mod-network",
  "roomler-ai-remote-control",
  "roomler-ai-services",
