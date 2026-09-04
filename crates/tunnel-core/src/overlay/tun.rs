@@ -479,6 +479,16 @@ mod system {
             yielded_until: Option<std::time::Instant>,
         }
 
+        /// ⚠️ Keyed by PREFIX ONLY, not by adapter LUID, and that is deliberate.
+        ///
+        /// With `v6_defend_narrow` on (the default since #1246) each org's
+        /// adapter defends a disjoint `/(96+block_plen)`, so two orgs never
+        /// share a key and the ladders are independent anyway. With the
+        /// `OVERLAY_V6_DEFEND_NARROW=0` fallback they DO share the whole `/96`
+        /// — and there a shared ladder is the behaviour we want: that is the
+        /// pre-#1237 shape where both runtimes fought over one prefix, so one
+        /// org standing down should stand the other down too rather than let
+        /// the sibling keep the fight alive under a different LUID.
         static WRITE_STRIKES: std::sync::Mutex<
             Option<std::collections::HashMap<(IpAddr, u8), Strike>>,
         > = std::sync::Mutex::new(None);
