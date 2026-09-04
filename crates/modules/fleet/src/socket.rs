@@ -31,6 +31,8 @@ use tracing::{debug, info, warn};
 
 use crate::FleetState;
 use crate::hub::DispatchCtx;
+use axum::{extract::WebSocketUpgrade, response::Response};
+use roomler_core::ws::upgrade::{MAX_WS_MESSAGE_BYTES, send_goodbye_and_close, tid_matches_claim};
 
 /// Handle a socket that authenticated as an agent.
 ///
@@ -1058,4 +1060,102 @@ mod tests {
         assert_eq!(d.get_i64("rx").unwrap(), 0);
         assert_eq!(d.get_str("relay").unwrap(), "turn/udp");
     }
+}
+
+/// The `/ws?role=agent` upgrade (FR-69 P7b, from the host): verify the agent
+/// JWT, the affinity key and the row, say why on refusal, then run the loop.
+/// The host keeps the `/ws` route and the role gate and hands the token here.
+pub fn ws_upgrade_agent(
+    state: FleetState,
+    token: String,
+    tid: Option<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let claims = match state.auth.verify_agent_token(&token) {
+        Ok(c) => c,
+        Err(_) => {
+            return Response::builder()
+                .status(401)
+                .body("Unauthorized (agent)".into())
+                .unwrap();
+        }
+    };
+
+    // S6 — a present affinity key must match the token's tenant.
+    if !tid_matches_claim(&tid, &claims.tenant_id) {
+        return Response::builder()
+            .status(403)
+            .body("tid does not match token tenant".into())
+            .unwrap();
+    }
+
+    let agent_id = match ObjectId::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid agent ID".into())
+                .unwrap();
+        }
+    };
+    let tenant_id = match ObjectId::parse_str(&claims.tenant_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid tenant ID".into())
+                .unwrap();
+        }
+    };
+
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            // Verify the agent still exists and isn't quarantined/deleted before
+            // we pump any signalling. One Mongo read per connect is cheap and
+            // gives us a clean revocation story without needing a token blacklist.
+            let agent = match state.agents.find_in_tenant(tenant_id, agent_id).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(%agent_id, %e, "agent lookup failed on WS connect");
+                    return;
+                }
+            };
+            // One definition of "this agent may still act", shared with the
+            // HTTP ingest routes' `AuthAgent` extractor. This path is the
+            // original; the extractor exists because two HTTP routes had
+            // silently never grown the equivalent.
+            if let Some(reason) = crate::auth_agent::refusal_reason(&agent) {
+                // rc.53: push a `ServerMsg::Goodbye { reason: AgentDeleted }`
+                // text frame + a Close frame BEFORE dropping the socket so
+                // the agent can log a useful "your row was deleted, re-enrol"
+                // line instead of an opaque `ws read` (the failure mode
+                // WINHOST-B wedged on for hours pre-rc.53). The agent's
+                // `handle_server_msg::ServerMsg::Goodbye` arm decides this is
+                // fatal + exits with `AGENT_DELETED_EXIT_CODE = 7`, which
+                // the SCM supervisor's rc.53 code-7 fast-alarm fires on the
+                // FIRST exit.
+                info!(%agent_id, reason, "refusing WS with rc:goodbye");
+                let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
+                    reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
+                    message: "This agent's server-side row was deleted (or quarantined). \
+                          Re-enrol with a fresh enrollment token from the admin UI to \
+                          revive (soft-deleted rows rehydrate by (tenant_id, machine_id))."
+                        .into(),
+                };
+                send_goodbye_and_close(socket, &goodbye, 4003, "agent_deleted").await;
+                return;
+            }
+            // FR-69 P5c — the socket is the fleet module's; the host keeps
+            // the upgrade and the role gate (D7), the module runs the loop.
+            handle_agent_socket(
+                state.clone(),
+                socket,
+                agent_id,
+                tenant_id,
+                agent.owner_user_id,
+                tid,
+            )
+            .await;
+        })
 }

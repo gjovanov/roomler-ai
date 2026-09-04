@@ -110,7 +110,7 @@ flowchart BT
     network["crates/modules/network → roomler-ai-mod-network<br/>overlay engine · tunnels · peer relays · SSH · key rotation · DERP ACL"]
     rc["crates/remote_control<br/>signalling · consent · wire types¹ · ACL shapes"]
     services["crates/services<br/>DAOs · auth · billing · export"]
-    api["crates/api<br/>Axum: REST + /ws + /derp"]
+    api["crates/api<br/>Axum: core REST + /ws · composes the modules (/derp is network's)"]
     tests["crates/tests<br/>integration suite"]
 
     localapi["crates/localapi<br/>LocalAPI wire types + client"]

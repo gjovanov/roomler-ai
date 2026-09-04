@@ -29,6 +29,10 @@ use serde::{Deserialize, Serialize};
 pub mod dispatcher;
 pub mod redis_pubsub;
 pub mod storage;
+// FR-69 P7b — what every upgrade shares (the frame ceiling, the query shape,
+// the affinity check, the "say why, then close" refusal); the upgrades
+// themselves live with their owners.
+pub mod upgrade;
 
 /// The three roles the socket gate admits, as today's `?role=` query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
