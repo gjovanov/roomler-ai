@@ -104,8 +104,9 @@ flowchart BT
     core["crates/core → roomler-core<br/>Core · module contract · composition snapshot"]
     saas["crates/modules/saas → roomler-ai-mod-saas<br/>Stripe · newsletter · plan compliance (add-on)"]
     chat["crates/modules/chat → roomler-ai-mod-chat<br/>rooms · messages · files · search · typing"]
+    conference["crates/modules/conference → roomler-ai-mod-conference<br/>mediasoup SFU · media:* · calls · recordings"]
     rc["crates/remote_control<br/>signalling · consent · Hub¹ · ACL shapes"]
-    services["crates/services<br/>DAOs · auth · media (mediasoup) · billing"]
+    services["crates/services<br/>DAOs · auth · billing · export"]
     api["crates/api<br/>Axum: REST + /ws + /derp"]
     tests["crates/tests<br/>integration suite"]
 
@@ -126,9 +127,10 @@ flowchart BT
     core --> services
     saas --> core
     chat --> core
+    conference --> core & chat
     rc --> db
     services --> rc
-    api --> services & core & saas & chat
+    api --> services & core & saas & chat & conference
     tests --> api & roomlerd & core
 
     tunnelcore --> localapi & tcpturn & rc

@@ -166,14 +166,8 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // and `custom_emojis` are the `chat` module's: their sets live in
     // `roomler_ai_mod_chat::ChatState::indexes`.
 
-    // Recordings
-    sets.push(set(
-        "recordings",
-        vec![
-            index(bson::doc! { "room_id": 1, "recording_type": 1 }),
-            index(bson::doc! { "tenant_id": 1, "status": 1 }),
-        ],
-    ));
+    // FR-69 P4 — `recordings` and `call_sessions` are the `conference`
+    // module's: their sets live in `roomler_ai_mod_conference::ConferenceState::indexes`.
 
     // Invites
     sets.push(set(
@@ -702,18 +696,6 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     sets.push(set(
         "tunnel_audit",
         vec![index(bson::doc! { "user_id": 1, "at": -1 })],
-    ));
-
-    // One document per call instance (PR-2 lifecycle). `ended_at: null`
-    // scan backs the orphan sweep; TTL on started_at bounds the ledger.
-    sets.push(set(
-        "call_sessions",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "started_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "room_id": 1, "started_at": -1 }),
-            index(bson::doc! { "ended_at": 1 }),
-            index_ttl(bson::doc! { "started_at": 1 }, 730 * 24 * 60 * 60),
-        ],
     ));
 
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task

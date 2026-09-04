@@ -108,7 +108,11 @@ impl TestApp {
             .await
             .expect("Failed to create indexes");
 
-        let app_state = AppState::new(db.clone(), settings.clone())
+        // FR-69 P4 — boxed: the server-construction future (every module init,
+        // the mediasoup worker pool) is the largest state machine in the crate,
+        // and a test that builds several servers in one body carried it inline
+        // on the test thread (2 MiB) until `peer_relay_mint_tests` overflowed.
+        let app_state = Box::pin(AppState::new(db.clone(), settings.clone()))
             .await
             .expect("Failed to create AppState");
         // FR-69 — the module crates' index sets, after the core plan (the
@@ -214,7 +218,11 @@ impl TestApp {
             .await
             .expect("Failed to create indexes");
 
-        let app_state = AppState::new(db.clone(), settings.clone())
+        // FR-69 P4 — boxed: the server-construction future (every module init,
+        // the mediasoup worker pool) is the largest state machine in the crate,
+        // and a test that builds several servers in one body carried it inline
+        // on the test thread (2 MiB) until `peer_relay_mint_tests` overflowed.
+        let app_state = Box::pin(AppState::new(db.clone(), settings.clone()))
             .await
             .expect("Failed to create AppState");
         // FR-69 — the module crates' index sets, after the core plan (the
@@ -292,7 +300,11 @@ impl TestApp {
             .await
             .expect("Failed to create indexes");
 
-        let app_state = AppState::new(db.clone(), settings.clone())
+        // FR-69 P4 — boxed: the server-construction future (every module init,
+        // the mediasoup worker pool) is the largest state machine in the crate,
+        // and a test that builds several servers in one body carried it inline
+        // on the test thread (2 MiB) until `peer_relay_mint_tests` overflowed.
+        let app_state = Box::pin(AppState::new(db.clone(), settings.clone()))
             .await
             .expect("Failed to create AppState");
         // FR-69 — the module crates' index sets, after the core plan (the

@@ -17,9 +17,11 @@ path = "src/main.rs"
 # FR-69 — one feature per module crate. `default` is the hosted build; the
 # named profiles (P8) will select subsets. `saas` is the add-on the published
 # self-host images never carry.
-default = ["saas", "chat"]
+default = ["saas", "chat", "conference"]
 saas = ["dep:roomler-ai-mod-saas"]
 chat = ["dep:roomler-ai-mod-chat"]
+# `conference` is the only feature that links mediasoup (the C++ worker build).
+conference = ["dep:roomler-ai-mod-conference"]
 
 
 [dependencies]
@@ -35,6 +37,7 @@ roomler-core = { path = "../core" }
 # features below (`crates/api/src/compose.rs` is where they are mounted).
 roomler-ai-mod-saas = { path = "../modules/saas", optional = true }
 roomler-ai-mod-chat = { path = "../modules/chat", optional = true }
+roomler-ai-mod-conference = { path = "../modules/conference", optional = true }
 
 axum.workspace = true
 tokio.workspace = true
@@ -60,7 +63,6 @@ rand.workspace = true
 futures.workspace = true
 validator.workspace = true
 reqwest.workspace = true
-mediasoup.workspace = true
 dotenvy.workspace = true
 hmac.workspace = true
 sha1.workspace = true

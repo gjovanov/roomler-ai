@@ -23,6 +23,7 @@ members = [
     # FR-69 — the module crates, one per pillar, behind features on `crates/api`.
     "crates/modules/saas",
     "crates/modules/chat",
+    "crates/modules/conference",
 
     "crates/api",
     "crates/tests",
