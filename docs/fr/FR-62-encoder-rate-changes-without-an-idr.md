@@ -1,6 +1,6 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; A1 shipped inert; A2 + const flip shipped (0.4.51) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; the recorded cause is REFUTED and a code-grounded replacement is queued for a sweep; A1 shipped inert; A2 + const flip shipped (0.4.51) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
 
@@ -9,11 +9,13 @@
   **20/20** rungs, but the apply is **0.001–0.008 ms** (an in-place `AVCodecContext` field write).
   So the entire cost of a NVENC rate move is the forced keyframe — exactly what patch
   `0001-nvenc-no-idr` removes. Codec-independent (shared `reconfig_encoder`). Full table on #1242.
-- **A1 — the in-place path** ships behind `encoder_inplace_rate` (**default OFF, inert**): QSV writes
+- **A1 — the in-place path** ships behind `encoder_inplace_rate` (**default OFF, inert**): QSV wrote
   `bit_rate + rc_max_rate + rc_buffer_size` (CBR) so `qsvenc`'s per-frame `update_bitrate` resets the
   BRC with no rebuild; NVENC's in-place buffer is sized to the open window (fixing the pre-A1 1×
   write). `supports_dynamic_bitrate()` = "not a rebuild" so the pump immediate-applies QSV when on.
   Heartbeat gains `inplace_rate / rate_moves / rebuilds / idr_count`.
+  ⚠️ **The `rc_buffer_size` write is now off by default** — it is the suspected cause of the -14
+  below; see "Why the Reset fails".
 - 🚨 **A0-QSV MEASURED, AND IT REFUTED THE PLAN'S ASSUMPTION** (CORPLAP-1's Iris Xe, 0.4.51,
   2026-09-02 — full tables on #1242). The flag's flip-ON condition was "A0 clears the QSV
   `MFXVideoENCODE_Reset`". It does not clear:
@@ -28,6 +30,37 @@
     **load-bearing for QSV**, because QSV has no cheap apply path at all. NVENC is settled (A2: 20
     IDRs → 0, apply 0.004 ms) and can shed its rationing; QSV cannot until it has its own answer.
     A4 is therefore **per-backend, not a flat delete** — see the amended A4 below.
+
+### Why the Reset fails — the recorded hypothesis is refuted, and the replacement is testable
+
+⚠️ **The hypothesis previously recorded on #1242 is refuted by our own open path.** It supposed we
+open QSV *quality-driven* (`global_quality`, ICQ), so that `TargetKbps`/`MaxKbps` "aren't the
+governing params and MSDK rejects resetting them", and proposed testing it with a sweep that omits
+`global_quality`. But `build_encoder` sets `bit_rate = maxrate_bps` for every non-NVENC backend and
+the option dict sets `maxrate` to the same value, so `qsvenc.c::select_rc_mode` takes its **CBR**
+branch (`rc_max_rate == bit_rate`) before it ever reaches ICQ. `global_quality` is inert there. In
+CBR those two fields are exactly what governs, so the stated mechanism cannot be the cause — and the
+proposed experiment would have removed an already-inert option and produced a null that looked like
+a refutation of something else.
+
+🔑 **The replacement, grounded in the code rather than in inference: the third field.** The in-place
+arm writes `bit_rate`, `rc_max_rate` **and** `rc_buffer_size`. `qsvenc` maps `rc_buffer_size` onto
+`mfxInfoMFX::BufferSizeInKB`, which sizes an internal bitstream buffer allocated at Init, and our
+value is `target × hrd_pct` so it moves on **every** rate change. The oneVPL spec defines
+`MFX_ERR_INCOMPATIBLE_VIDEO_PARAM` as *"Reset requires additional memory allocation and cannot be
+executed"* — which is what changing that field asks for. It also explains the fact `low_power` ruled
+out: an allocation constraint is identical on VDENC and VME, which is exactly what was measured.
+
+**The experiment**: `encode::qsv_inplace_writes_bufsize` (env `ROOMLERD_QSV_INPLACE_BUFSIZE`)
+defaults to **skipping** the write — the measured behaviour of writing it is an unusable encoder, so
+the burden of proof sits with the old path — and `=1` restores it as the A-arm. Both arms therefore
+run from ONE released binary via `encoder-smoke --reconfigure-sweep` on CORPLAP-1, the same harness
+A0 used. Inert unless `encoder_inplace_rate` is on, which is default OFF.
+
+⚠️ **Not free if it works.** Holding `BufferSizeInKB` at the open value while `TargetKbps` falls
+widens the HRD window in seconds — a buffer sized for 6 Mbps is a 30× reservoir at 200 kbps, more
+latency tolerance than a remote-desktop stream wants. If the Reset then succeeds, the follow-up is
+whether the window should be re-established by an occasional rebuild rather than left to drift.
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
