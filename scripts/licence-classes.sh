@@ -71,6 +71,7 @@ SERVER_CRATES=(
   roomler-ai-api
   roomler-core
   roomler-ai-mod-saas
+  roomler-ai-mod-chat
   roomler-ai-services
   roomler-ai-db
   roomler-ai-config

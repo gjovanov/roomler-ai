@@ -7,7 +7,9 @@ use axum::{
 use bson::oid::ObjectId;
 use serde::Deserialize;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::ChatState;
 
 #[derive(Debug, Deserialize)]
 pub struct AddReactionRequest {
@@ -15,7 +17,7 @@ pub struct AddReactionRequest {
 }
 
 pub async fn add(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, _room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<AddReactionRequest>,
@@ -28,7 +30,7 @@ pub async fn add(
     // The reaction is keyed by message id, which is decoupled from the path
     // room — so the message, not the room, is the object we must bind to this
     // tenant, and its own room is the correct fan-out target.
-    let message = super::helpers::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    let message = crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
     let rid = message.room_id;
 
     let reaction = state
@@ -47,7 +49,7 @@ pub async fn add(
             "emoji": reaction.emoji.value,
         }
     });
-    crate::ws::dispatcher::broadcast_with_redis(
+    roomler_core::ws::dispatcher::broadcast_with_redis(
         &state.ws_storage,
         &state.redis_pubsub,
         &member_ids,
@@ -59,7 +61,7 @@ pub async fn add(
 }
 
 pub async fn remove(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, _room_id, message_id, emoji)): Path<(String, String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -68,7 +70,7 @@ pub async fn remove(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    let message = super::helpers::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    let message = crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
 
     let removed = state
         .reactions
@@ -88,7 +90,7 @@ pub async fn remove(
                 "emoji": emoji,
             }
         });
-        crate::ws::dispatcher::broadcast_with_redis(
+        roomler_core::ws::dispatcher::broadcast_with_redis(
             &state.ws_storage,
             &state.redis_pubsub,
             &member_ids,

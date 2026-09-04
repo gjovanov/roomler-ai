@@ -9,7 +9,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::ChatState;
 use roomler_ai_db::models::TaskCategory;
 use roomler_ai_services::dao::base::PaginationParams;
 
@@ -19,7 +21,7 @@ pub struct ExportConversationRequest {
 }
 
 pub async fn export_conversation(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<ExportConversationRequest>,
@@ -29,7 +31,7 @@ pub async fn export_conversation(
     let rid = ObjectId::parse_str(&body.room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     // Create background task
     let task = state
