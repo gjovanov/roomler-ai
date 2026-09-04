@@ -132,6 +132,12 @@ Arm A **can** fail here, which is the property the field cell lacked: it deliver
 *nothing* for ten windows. The ordering survives a keyframe-sensitivity re-run at
 3×, so it is not an artefact of the modelled IDR size.
 
+⚠️ **The table above was taken under B0's original every-window measurement
+rule, which is not the governor's.** Re-taken under the shipped rule on
+2026-09-04 (see "B0 re-run under the SHIPPED measurement rule" below) the
+commitment and over-drive columns hold, the paint-age column does not: arm B
+peaks at 5.9 s, not 1.2 s. Quote the re-run's table, not this one.
+
 ⚠️ **This does not tick AC0b.** A model of a corporate VPN is not a corporate
 VPN. The box stays open until the same A/B runs on a real thin path; what the
 simulation buys is that the law is now known to be right, so the field run is a
@@ -197,16 +203,102 @@ measures. This is the same finding as above from a second direction: the
 opener's keyframe budget (FR-31) is a separate lever, and no rate rule will
 touch it.
 
-🔑 **The honest gap: I could not build a cell where a candidate COSTS anything.**
-Three healthy cells (a 20 Mbps pair, a 5 Mbps LAN with motion bursts, and a fast
-pipe deliberately stalled at 2 s while the ramp was still climbing) return
-*byte-identical* numbers for all three rules. That is not agreement between the
-rules — it is the exit rule never binding, because on an unsaturated pipe the
-FR-59 P1 floor relief tracks the delivered rate and the floor never snaps back
-to the constant. So these cells demonstrate **no regression**, not superiority,
-and the adversarial cell for "halving gives away rate the link has" remains
-unconstructed. Treat that as a gap in the evidence rather than proof of its
-absence.
+🔑 **The honest gap, as first recorded: I could not build a cell where a
+candidate COSTS anything.** Three healthy cells (a 20 Mbps pair, a 5 Mbps LAN
+with motion bursts, and a fast pipe deliberately stalled at 2 s while the ramp
+was still climbing) returned *byte-identical* numbers for all three rules. That
+was not agreement between the rules — it was the exit rule never binding,
+because under B0's original measurement rule the FR-59 P1 floor relief tracked
+the delivered rate every window and the floor never snapped back to the
+constant. **The re-run below, under the shipped rule, closes that gap**: the
+LAN-burst cell now discriminates, and a candidate does cost rate there.
+
+## B0 re-run under the SHIPPED measurement rule (2026-09-04, after FR-70 P1)
+
+FR-70 P1 found that B0's measurement rule was not the governor's. B0 fed the
+floor relief the window's delivered rate **every window** (`MeasureRule::
+EveryWindow`); the shipped governor measures the pipe only on **push-back** —
+blocked sends (the goodput estimator) or two windows of viewer-reported queue
+growth (the FR-59 P3 link loop) — and its FR-59 P2 byte budget skips frames
+before a queue can form. On a remembered pair that difference held a real
+session at 200 kbps for four minutes while `EveryWindow` would have freed it in
+one window (FR-70 #1330). So every number above was re-taken under the shipped
+rule (`MeasureRule::OnPushBack`), with the byte-budget gate and a rebuild-bound
+encoder modelled (`cargo test -p roomlerd --lib shipped_rule_report -- --ignored
+--nocapture`).
+
+**AC0b, the 213 kbps cell, both rules side by side:**
+
+| | arm A, `EveryWindow` | arm B, `EveryWindow` | arm A, **shipped rule** | arm B, **shipped rule** |
+|---|---|---|---|---|
+| peak target committed | 2 550 000 | 1 500 000 | 2 550 000 | 1 500 000 |
+| over-drive integral (bits above 1.1× pipe) | 19 582 316 | 4 054 846 | 27 533 122 | 8 600 680 |
+| peak p95 paint age | 10 016 ms | **1 226 ms** | 10 016 ms | **5 929 ms** |
+| windows > 500 ms | — | 4 | 10 | 15 |
+| windows to settle within 25 % | 17 | 7 | 30 | 24 |
+
+What survives: the ramp still commits less (peak 1.5 M vs 2.55 M) and still cuts
+the over-drive — **3.2×, not 4.8×** — and the ordering survives the 3× keyframe
+re-run (1 435 vs 1 636 ms). What does **not** survive is the headline: arm B's
+peak paint is **5.9 s, not 1.2 s**. The 1 226 ms was the optimistic rule handing
+the floor relief the pipe's rate in window 2; under the shipped rule the ramp
+ends at the first congested window, the flat 1.5 M floor re-pins the opener
+(exactly the mechanism "the ramp-exit rule" describes), and the session
+sawtooths for ~24 windows until push-back finally measures the pipe — and the
+first "measurement" it gets is a catch-up burst (window 8 reads 1.25 Mbps on a
+213 kbps pipe: the queued keyframe arriving at once), which re-lifts the floor
+before the next window corrects it. By windows-over-500-ms arm B is *worse* than
+arm A, because arm A delivers nothing for ten windows and then settles once.
+
+🔑 **So the simulated AC0b answer is: slow-start removes most of the opening
+commitment and about half of the harm, not most of it.** The remaining harm is
+the flat floor re-pinning an unmeasured session, which is the ramp-exit
+question — and which FR-70 P1's decaying prior addresses only for REMEMBERED
+pairs (an unremembered thin pipe has no prior to decay). AC0b stays open in the
+field, and this table is what the field run is now a confirmation of.
+
+**The ramp-exit rule, under the shipped rule:**
+
+| cell | `EndsOnCongestion` (shipped) | `HalveAndContinue` | `HoldFloorUntilMeasured` |
+|---|---|---|---|
+| thin pipe 213 k — peak / max p95 age / settles | 1 500 000 / 5 929 ms / w24 | 300 000 / **1 226 ms** / w1 | 348 500 / 1 529 ms / w3 |
+| fast pair 20 M — final target | 9 300 000 | 9 300 000 | 9 300 000 |
+| **LAN 5 M bursts — peak / final target** | 1 941 865 / 1 650 530 | 1 200 000 / **600 000** | 1 500 000 / 1 200 000 |
+| fast pipe, stall at 2 s — final target | 10 250 000 | 9 600 000 | 7 768 750 |
+
+Under the shipped rule the candidates matter far more on the thin pipe than
+they did (a 3.9–4.8× cut in peak paint, not 1 %) — **and they now cost rate on
+the fast cells**: `HalveAndContinue` ends the LAN-burst cell at 600 kbps against
+the shipped rule's 1.65 M, and `HoldFloorUntilMeasured` gives up a quarter of
+the stalled fast pipe. The adversarial cell exists after all; it needed the
+shipped measurement rule to bind. 🔑 This is the trade-off B1's controller is
+designed around: on congestion, **hold** — neither end the ramp (and hand the
+session to a constant) nor halve (and give away rate the link has).
+
+⚠️ A claim I made while writing this and then refuted in the same hour, kept
+because the refutation is the useful part: "FR-59 P2's 16 KiB minimum budget is
+615 ms of standing queue on a 213 kbps pipe by construction". It is not. The
+budget is a *ceiling* on the bytes in flight, not a standing level; a session
+settled onto the pipe carries about one frame. What the report's "26 windows
+over 500 ms" under `HalveAndContinue` actually shows is the **p95** paint age —
+the average sits at 71–259 ms in the settled tail — i.e. periodic excursions
+from the candidate's ×2/÷2 oscillation, each rebuild on a rebuild-bound encoder
+costing a keyframe. A test asserting the 615 ms plateau failed on the first run
+and was deleted rather than loosened.
+
+⚠️ **And the "fast pair misremembered slow" fixture passes for the wrong
+reason under the shipped rule**: its assertion is `> 400 kbps`, and the session
+ends at **513 kbps on a 20 Mbps pipe** — pinned by the budget exactly as FR-70
+P1 described. What actually frees a misremembered pair is P1's decaying prior,
+which is tested in `p1_the_prior_decays_and_the_session_escapes`; the FR-63
+fixture only shows the AIMD's own step does not.
+
+The four fixtures under the shipped rule (arm B): airport hotspot settles onto
+the pipe (final 200 k against 240 k) but peaks at 7 980 ms with 16 windows over
+500 ms; DERP-with-stalls likewise (5 885 ms, 15 windows); the LAN cell is fine
+(465 ms peak, none over 500 ms). FR-59's AC4 (< 600 ms sustained on the
+airport-class link) is therefore **not** met by the shipped laws in simulation
+either — which is the number B1 has to beat.
 
 ## Open decisions
 
