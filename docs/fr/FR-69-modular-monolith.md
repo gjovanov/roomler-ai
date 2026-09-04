@@ -1,10 +1,10 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 + P1 + P2 + P3 + P4 + P5a + P5b + P5c shipped (#1309 · #1311 · #1312 · #1315 ·
-#1317 · #1318 · #1320 · #1323 · #1325 · #1329 · #1332 · #1336) · P6 (`remote`) in PR — merged
-when CI is green · every phase's field gate (a prod roll watched from the fleet: no dip in
-online agents; for P6 one RC session per carrier class) is still to be run · P7 (`network`)
-next ·
+**Status**: P0 + P1 + P2 + P3 + P4 + P5a + P5b + P5c + P6 shipped (#1309 · #1311 · #1312 ·
+#1315 · #1317 · #1318 · #1320 · #1323 · #1325 · #1329 · #1332 · #1336 · #1337) · P7
+(`network`) planned as two PRs, P7a next · every phase's field gate (a prod roll watched from
+the fleet: no dip in online agents; for P6 one RC session per carrier class) is still to be
+run ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -458,7 +458,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P5b** ✅ | #1332 — `Owner { Fleet, Remote, Network }` + the exhaustive `ClientMsg::namespace()` and `wire_tag()` matches + the 44-entry `CLIENT_MSG_OWNERS` table in the wire crate, locked four ways (the enum's own renames, the match on buildable variants, the D7 placements, the module graph); the composition baseline gained a `namespaces` section | baseline re-recorded for the new section only — routes, index sets and wire names byte-identical | none (a pure function) | low | 1 |
 | **P5c** ✅ (CI) | the agent socket into `fleet` (`roomler_ai_mod_fleet::socket`) behind `Core::agent_socket` — per-owner message handlers + per-module lifecycles (`hello` / `heartbeat` / `closing` / `closed(removal_was_ours)`), dispatch by `ClientMsg::namespace()`; the host registers its `remote`/`network` halves transitionally (`ws/agent_socket_host.rs`). The `AppState` aliases and the required dependency STAY until the host code that reads them moves (P6/P7) | baseline identical; integration lane; **prod roll with no dip in online agents — not yet run** | redeploy previous tag | high | 3–4 |
 | **P6** ✅ (CI) | `remote` module (`crates/modules/remote`, feature `remote`, in `default`): the session routes + TURN credentials + relay regions, the controller's `rc:*` dispatch with its authz gate (`controller.rs`), the cross-pod RC relay (`relay.rs`), the session-stats agent-socket half. `Module::Deps` is born here: `remote`'s is `FleetState` (the Hub is one live object), supplied by the host in composition order. The host keeps the user socket and calls `Modules::remote_controller_frame` with the connection's Hub sender | baseline identical; integration lane; **one RC session per carrier class on a prod roll — not yet run** | `remote = false` | medium | 2–3 |
-| **P7** | `network` module, `/derp` included | same + overlay/tunnel field sweep | `network = false` | high | 5–7 |
+| **P7** (plan recorded) | `network` module, `/derp` included — TWO PRs on the P5 shape: **P7a** the engine (`ws/overlay.rs`, `org_relay.rs`, `derp_acl.rs`), the seven route files + the per-device sub-routes, and the hooks, with `network` REQUIRED; **P7b** the sockets (tunnel-client loop, `/derp` as an `UpgradeSpec`, derp cluster, ephemeral reaper, the agent-socket half), the `AgentBusy` query hook, the last `AppState` aliases, then `fleet` + `network` as features. Field log: "P7: the plan" | same + overlay/tunnel field sweep | P7a: previous tag · P7b: `network = false` | high | 5–7 |
 | **P8** | profiles, Docker args, CI matrix, publish axis, self-host docs | five checks green; `mesh` image boots (AC5) | `full` stays default | medium | 2–3 |
 | **P9** | UI module registry and runtime gating | Vitest + e2e nightly; full UI against a `mesh` server (AC7) | `VITE_MODULES` unset | medium | 3–5 |
 | later | `roomlerd` `Subsystem` trait — its own FR, after FR-59/63/65 settle | fleet roll + FR-61 matrix | release revert | high | 5–8 |
@@ -891,3 +891,68 @@ cannot be unmounted under a fleet that is dialing it.
   reads the two collections by name (a per-user usage view across pillars), never a DAO.
 - **The field gate is open, as for every phase**: one RC session per carrier class (LAN /
   direct / relay / DERP) on the new pods, on a prod roll the operator runs.
+
+### 2026-09-04 — P7: the `network` module, the plan (recorded before the work)
+
+The largest phase — ~9.5 k lines under `ws/`, ~5.7 k of routes, the `/derp` upgrade, the
+tunnel-client socket, the host's transitional hooks and agent-socket half, and the last
+`AppState` aliases — so it ships as TWO PRs on the P5 shape: **P7a** moves the engine, the
+routes and the hooks with `network` REQUIRED (the host's sockets still call into it, the way
+they called fleet's handles between P5a and P5c); **P7b** moves the sockets, drops every
+alias, and makes both `fleet` and `network` features. Nothing on the wire moves in either.
+
+**P7a — `crates/modules/network` = `roomler-ai-mod-network`, `NetworkState` built on
+`FleetState` (the P6 `Module::Deps` seam, reused as is).** Moves: `ws/overlay.rs` (the
+overlay engine: join, netmap, leases, relay grants, key rotation — every route and socket
+arm calls into it, so it goes first), `ws/org_relay.rs`, `ws/derp_acl.rs`, the seven route
+files (`overlay_block`, `overlay_route`, `overlay_policy`, `overlay_key`, `tunnel`,
+`peer_relay`, `agent_ssh`) with the per-device sub-routes the host still nests under
+`/tenant/{tenant_id}/agent` (`overlay-key/rotate`, `ssh`, `ssh-policy`,
+`peer-relay-policy`), and `hooks.rs` — `HostNetworkHooks` becomes the module's
+`Module::hooks` (overlay release, MagicDNS rename), the registration the module's own.
+`AppState` fields that leave: `overlay_networks`, `overlay_nodes`, `overlay_policies`,
+`overlay_nodes_by_id`, `org_relay`, `relay_pair_churn`, `peer_relay_audit`, `ssh_audit`,
+`ssh_activity`, `key_rotation_audit`, `derp_acl`, `ssh_rate_limiter`, `relay_rate_limiter`,
+`key_rotation_rate_limiter`, `tunnel_clients`, `tunnel_policies`, `tunnel_audit`. The
+network index sets leave `crates/db/src/indexes.rs` for `Module::indexes` — including the
+`overlay_networks` set that differs by `multi_block`, which is why the snapshot gains
+`Modules::index_sets_for(multi_block)` (the composition test already records both plans;
+the baseline stays byte-identical). The one thing `org_relay.rs` reaches through `routes::push` is
+`is_global_unicast` — an address predicate the push SSRF check and the relay
+static-endpoint check share — and it moves to core as a small `net` helper before the cut (the push route is
+core's, the relay check is network's; neither may name the other's file). Kill switch: the previous tag (`network = false` refuses to boot, as `fleet = false`
+does today).
+
+**P7b — the sockets, and the end of the aliases.** Moves: `ws/tunnel.rs` (the tunnel-client
+socket loop and the relays the agent-socket half calls), `ws/derp.rs` + `ws/derp_cluster.rs`
+(the `/derp` upgrade becomes the module's `WsRegistration.upgrades` entry — `UpgradeSpec
+{path, router}` has waited for this since P0 — with the census, the usage flush and the
+rehome handler as init spawns / `Module::jobs`), `ws/ephemeral.rs` (the reaper), the
+network half of `ws/agent_socket_host.rs` and what is left of `ws/remote_control.rs` (SSH
+activity + request leg, key-rotation reports, DERP tickets, probe reports, the tunnel
+relay) as the module's `AgentSocketLifecycle` + handler, registered from its init like
+remote's. Three seams are new: (1) the host keeps `ws_upgrade_tunnel_client` (upgrade, role
+gate, row check, Goodbye) and hands the socket to `Modules::tunnel_client_socket(…)` — a
+host → module call like `remote_controller_frame`; with `network` unmounted the upgrade is
+refused with a Goodbye (`network_unavailable`), never silently dropped; (2) the owner-side
+`rc.agent_nudge` bus handler (fleet's — it cycles an agent's socket iff the agent is idle)
+reads the tunnel session maps to judge "idle", and fleet cannot name network, so
+`core.hooks` gains an **`AgentBusy` query** (`agent_busy(agent_id) -> bool`; any registered
+holder answering true means busy) that `network` implements over its tunnel maps and the
+handler — moved to fleet's `nudge.rs` — consults through the registry; (3) the fourteen
+fleet aliases go, and their three remaining readers outside network files follow the
+shapes already in the tree: `ws/handler.rs` ×2 → `state.fleet()`; `routes/tenant.rs`'s
+archive cascade (revoke every device, release every mesh node) → the `TenantLifecycle`
+hook core has carried since P0, implemented by fleet and by network under their ids and
+run in `HOOK_ORDER`, so the tenant route stops naming either pillar; `cluster/metrics.rs`'s
+local gauges (`agents_online`, `tunnel_sessions`, `derp_registrations`) →
+`Modules::fleet_gauges()` / `Modules::network_gauges()` reads that are zero when the
+module is not mounted (the P4 `media_gauges` shape). The device
+listing (`routes/device.rs`) STAYS in the host as the composition view it is: fleet rows
+always, tunnel-client and overlay rows only when `network` is mounted. Then `fleet` and
+`network` become features (`remote` and `network` depend on `fleet` in `Cargo.toml` as in
+the graph), which is what the P8 profile matrix builds on.
+
+**Gate, both PRs:** baseline identical; the suite; then the operator's prod roll with the
+overlay/tunnel field sweep the phase table names — a tunnel opened, an overlay pair on each
+carrier class, a DERP-floor host, an SSH session — read from the fleet, not from CI.
