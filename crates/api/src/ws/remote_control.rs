@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
-// FR-69 P5a: the rc control pair (publish + apply) is the fleet module s now;
+// FR-69 P5a: the rc control pair (publish + apply) is the fleet module's now;
 // re-exported so every path in this crate reads as before.
 pub use roomler_ai_mod_fleet::ctrl::{apply_rc_ctrl, publish_rc_ctrl};
 // FR-69 P5c — the agent socket and its pump moved to the fleet module too;
@@ -76,7 +76,7 @@ pub(crate) async fn record_ssh_activity(
 }
 
 /// FR-40 — persist a device's [`ClientMsg::KeyRotated`] onto its agent row.
-/// Same rules as [`record_config_report`]: last report wins, `reported_at`
+/// Same rules as the config report: last report wins, `reported_at`
 /// is stamped here, `detail` is re-clamped on receipt. Public keys only —
 /// the frame has no field for anything else, by construction.
 #[allow(clippy::too_many_arguments)]
@@ -128,7 +128,7 @@ pub(crate) async fn record_key_rotation_report(
 
 /// The device-originated SSH leg (`roomler ssh <device>`).
 ///
-/// Mirrors [`handle_agent_exec_request`] and goes through the SAME
+/// Mirrors the fleet module's exec request and goes through the SAME
 /// [`agent_ssh::dispatch`] the HTTP route uses, so there is exactly one place
 /// where the gates are evaluated regardless of how the request arrived.
 ///
@@ -171,13 +171,16 @@ pub(crate) async fn handle_agent_ssh_request(
         }
     };
 
-    let agent = match resolve_exec_target(state, tenant_id, &target).await {
-        Some(a) => a,
-        None => {
-            let _ = reply_tx.try_send(fail(format!("no device named {target:?} in this org")));
-            return;
-        }
-    };
+    let agent =
+        match roomler_ai_mod_fleet::socket::resolve_exec_target(state.fleet(), tenant_id, &target)
+            .await
+        {
+            Some(a) => a,
+            None => {
+                let _ = reply_tx.try_send(fail(format!("no device named {target:?} in this org")));
+                return;
+            }
+        };
 
     // "<person> (via <device>)" — the target's log and consent prompt name
     // both the human accountable and the box the request came from.

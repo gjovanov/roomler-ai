@@ -842,7 +842,7 @@ async fn record_config_report(
 
 /// Resolve an exec target within one org: hex agent id first, then an
 /// exact-then-case-insensitive device name.
-async fn resolve_exec_target(
+pub async fn resolve_exec_target(
     state: &FleetState,
     tenant_id: bson::oid::ObjectId,
     target: &str,
