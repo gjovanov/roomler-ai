@@ -6,7 +6,9 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::ChatState;
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
@@ -30,7 +32,7 @@ fn default_limit() -> u32 {
 }
 
 pub async fn search(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     _auth: AuthUser,
     Query(params): Query<SearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -48,7 +50,7 @@ pub async fn search(
 }
 
 pub async fn trending(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     _auth: AuthUser,
     Query(params): Query<TrendingQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

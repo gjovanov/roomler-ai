@@ -1,0 +1,34 @@
+[package]
+name = "roomler-ai-mod-chat"
+license = "AGPL-3.0-only"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "FR-69 module: chat — rooms and membership, messages, reactions, files, search, export, Giphy, the typing indicator."
+
+[lib]
+name = "roomler_ai_mod_chat"
+path = "src/lib.rs"
+
+# The second module crate (FR-69 P3). Depends on `roomler-core` and the crates
+# below it, never on the api crate. `conference` will depend on THIS crate:
+# rooms are the container calls run in.
+[dependencies]
+roomler-core = { path = "../../core" }
+roomler-ai-config = { path = "../../config" }
+roomler-ai-db = { path = "../../db" }
+roomler-ai-services = { path = "../../services" }
+
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+bson.workspace = true
+futures.workspace = true
+# Magic-byte content sniffing for uploads (`media_type.rs`): a stored
+# content-type that came from the client is a claim, not a fact.
+infer = "0.19"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

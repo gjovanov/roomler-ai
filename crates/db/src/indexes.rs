@@ -162,48 +162,9 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         ],
     ));
 
-    // Rooms
-    sets.push(set(
-        "rooms",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "parent_id": 1, "position": 1 }),
-            index_unique(bson::doc! { "tenant_id": 1, "path": 1 }),
-            index(bson::doc! { "tenant_id": 1, "name": 1 }),
-            index(bson::doc! { "tenant_id": 1, "is_default": 1 }),
-            index_unique_sparse(bson::doc! { "meeting_code": 1 }),
-            index_text(bson::doc! { "name": "text", "purpose": "text", "tags": "text" }),
-        ],
-    ));
-
-    // Room Members
-    sets.push(set(
-        "room_members",
-        vec![
-            index_unique(bson::doc! { "room_id": 1, "user_id": 1 }),
-            index(bson::doc! { "user_id": 1, "tenant_id": 1 }),
-        ],
-    ));
-
-    // Messages
-    sets.push(set(
-        "messages",
-        vec![
-            index(bson::doc! { "room_id": 1, "created_at": -1 }),
-            index(bson::doc! { "thread_id": 1, "created_at": 1 }),
-            index(bson::doc! { "tenant_id": 1, "author_id": 1, "created_at": -1 }),
-            index(bson::doc! { "room_id": 1, "is_pinned": 1 }),
-            index(bson::doc! { "mentions.users": 1 }),
-            index_text(bson::doc! { "content": "text" }),
-        ],
-    ));
-
-    // Reactions
-    sets.push(set(
-        "reactions",
-        vec![index_unique(
-            bson::doc! { "message_id": 1, "emoji.value": 1, "user_id": 1 },
-        )],
-    ));
+    // FR-69 P3 — `rooms`, `room_members`, `messages`, `reactions`, `files`
+    // and `custom_emojis` are the `chat` module's: their sets live in
+    // `roomler_ai_mod_chat::ChatState::indexes`.
 
     // Recordings
     sets.push(set(
@@ -211,17 +172,6 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         vec![
             index(bson::doc! { "room_id": 1, "recording_type": 1 }),
             index(bson::doc! { "tenant_id": 1, "status": 1 }),
-        ],
-    ));
-
-    // Files
-    sets.push(set(
-        "files",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "context.context_type": 1, "context.entity_id": 1 }),
-            index(bson::doc! { "tenant_id": 1, "uploaded_by": 1, "created_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "context.room_id": 1, "created_at": -1 }),
-            index(bson::doc! { "external_source.provider": 1, "external_source.external_id": 1 }),
         ],
     ));
 
@@ -279,12 +229,6 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // are the `saas` module's: their sets live in
     // `roomler_ai_mod_saas::SaasState::indexes` and the host applies them
     // after this plan.
-
-    // Custom Emojis
-    sets.push(set(
-        "custom_emojis",
-        vec![index_unique(bson::doc! { "tenant_id": 1, "name": 1 })],
-    ));
 
     // Activation Codes
     sets.push(set(
