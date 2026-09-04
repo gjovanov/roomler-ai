@@ -8055,6 +8055,7 @@ dependencies = [
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-mod-chat",
+ "roomler-ai-remote-control",
  "roomler-ai-services",
  "roomler-core",
  "serde",
@@ -8062,6 +8063,7 @@ dependencies = [
  "sha1 0.10.6",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
