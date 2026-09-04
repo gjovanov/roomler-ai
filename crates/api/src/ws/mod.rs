@@ -18,12 +18,10 @@ pub const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 pub mod derp;
 pub mod derp_acl;
 pub mod derp_cluster;
-pub mod device_presence;
 pub mod ephemeral;
 pub mod handler;
 pub mod org_relay;
 pub mod overlay;
-pub mod rc_cluster;
 pub mod rc_relay;
 pub mod remote_control;
 pub mod tunnel;
@@ -33,3 +31,10 @@ pub mod tunnel;
 // `crate::ws::{storage, dispatcher, redis_pubsub}` path in this crate reads
 // as before.
 pub use roomler_core::ws::{dispatcher, redis_pubsub, storage};
+
+// FR-69 P5a — device presence and the agent-nudge machinery are the fleet
+// module's; re-exported so every `crate::ws::{device_presence, rc_cluster}`
+// path in this crate reads as before. Their functions take the module's
+// state: host code hands them `AppState::fleet()`.
+pub use roomler_ai_mod_fleet::nudge as rc_cluster;
+pub use roomler_ai_mod_fleet::presence as device_presence;

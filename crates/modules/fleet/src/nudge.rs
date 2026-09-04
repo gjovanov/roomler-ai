@@ -148,8 +148,9 @@ pub fn nudge_gate_at(
         return NudgeGate::Cooldown;
     }
     if entry.attempts >= pacing.max_attempts {
-        let total =
-            crate::cluster::metrics::AGENT_NUDGE_STUCK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let total = roomler_core::cluster::metrics::AGENT_NUDGE_STUCK_TOTAL
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         warn!(
             agent = %agent_id,
             agent_nudge_stuck_total = total,

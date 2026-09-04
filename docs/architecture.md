@@ -105,7 +105,8 @@ flowchart BT
     saas["crates/modules/saas → roomler-ai-mod-saas<br/>Stripe · newsletter · plan compliance (add-on)"]
     chat["crates/modules/chat → roomler-ai-mod-chat<br/>rooms · messages · files · search · typing"]
     conference["crates/modules/conference → roomler-ai-mod-conference<br/>mediasoup SFU · media:* · calls · recordings"]
-    rc["crates/remote_control<br/>signalling · consent · Hub¹ · ACL shapes"]
+    fleet["crates/modules/fleet → roomler-ai-mod-fleet<br/>agents · enrollment · presence · Hub · consent · exec · releases"]
+    rc["crates/remote_control<br/>signalling · consent · wire types¹ · ACL shapes"]
     services["crates/services<br/>DAOs · auth · billing · export"]
     api["crates/api<br/>Axum: REST + /ws + /derp"]
     tests["crates/tests<br/>integration suite"]
@@ -128,9 +129,10 @@ flowchart BT
     saas --> core
     chat --> core
     conference --> core & chat
+    fleet --> core & rc
     rc --> db
     services --> rc
-    api --> services & core & saas & chat & conference
+    api --> services & core & saas & chat & conference & fleet
     tests --> api & roomlerd & core
 
     tunnelcore --> localapi & tcpturn & rc
@@ -142,7 +144,8 @@ flowchart BT
     derprelay --> rc
 ```
 
-¹ `remote_control`'s Mongo-backed parts (audit DAO, session Hub) sit behind a
+¹ `remote_control`'s Mongo-backed part (the audit sink; the session Hub has been the
+`fleet` module's since FR-69 P5a) sits behind a
 default-on `server` cargo feature; agent-side consumers disable it, which keeps the
 MongoDB driver out of every shipped native binary.
 

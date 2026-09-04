@@ -17,7 +17,9 @@ use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::DesiredConfig;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::FleetState;
 
 #[derive(Debug, Deserialize)]
 pub struct DesiredConfigBody {
@@ -42,11 +44,11 @@ pub struct DesiredConfigBody {
 /// in its store, so its `updated_at` was an object where its own type said
 /// string. A write and a read must not describe one object two ways.
 ///
-/// [`DesiredConfigView`]: crate::routes::remote_control::DesiredConfigView
+/// [`DesiredConfigView`]: crate::agent::DesiredConfigView
 #[derive(Debug, Serialize)]
 pub struct DesiredConfigResponse {
     pub revision: u64,
-    pub desired: crate::routes::remote_control::DesiredConfigView,
+    pub desired: crate::agent::DesiredConfigView,
 }
 
 /// Why a desired-config write was refused. Enumerated rather than stringly
@@ -137,7 +139,7 @@ pub fn decide(
 }
 
 pub async fn set_desired_config(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<DesiredConfigBody>,
