@@ -367,6 +367,7 @@ async fn nudge_verb_reasons_cooldown_and_idle_cycle() {
     // (a) tunnel session TARGETING the agent: refused, truthfully.
     let fake_session = bson::oid::ObjectId::new();
     app1.state
+        .network()
         .tunnel_sessions_by_target_agent
         .entry(aid)
         .or_default()
@@ -385,6 +386,7 @@ async fn nudge_verb_reasons_cooldown_and_idle_cycle() {
     // (b) session the agent ORIGINATED (declared routes) - the pre-PR-1
     // blind spot index.
     app1.state
+        .network()
         .tunnel_sessions_by_origin_agent
         .entry(aid)
         .or_default()

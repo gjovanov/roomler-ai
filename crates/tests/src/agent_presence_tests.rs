@@ -349,13 +349,13 @@ async fn presence_sweep_transitions_stale_then_offline_once() {
         .await
         .unwrap();
 
-    let n = roomler_ai_api::ws::device_presence::run_presence_sweep(app.state.fleet()).await;
+    let n = roomler_ai_mod_fleet::presence::run_presence_sweep(app.state.fleet()).await;
     assert_eq!(n, 1, "fresh-heartbeat stranded row must announce stale");
     let ev = wait_for_event(&mut user_ws, "device:presence", 5).await;
     assert_eq!(ev["data"]["agents"][0]["presence"], "stale", "ev: {ev}");
 
     // Unchanged state ⇒ the ledger CAS keeps a repeat sweep silent.
-    let n = roomler_ai_api::ws::device_presence::run_presence_sweep(app.state.fleet()).await;
+    let n = roomler_ai_mod_fleet::presence::run_presence_sweep(app.state.fleet()).await;
     assert_eq!(n, 0, "repeat sweep with no transition must be silent");
 
     // Age the heartbeat past the 90 s freshness window ⇒ offline + heal.
@@ -367,7 +367,7 @@ async fn presence_sweep_transitions_stale_then_offline_once() {
         )
         .await
         .unwrap();
-    let n = roomler_ai_api::ws::device_presence::run_presence_sweep(app.state.fleet()).await;
+    let n = roomler_ai_mod_fleet::presence::run_presence_sweep(app.state.fleet()).await;
     assert_eq!(n, 1);
     let ev = wait_for_event(&mut user_ws, "device:presence", 5).await;
     assert_eq!(ev["data"]["agents"][0]["presence"], "offline", "ev: {ev}");
@@ -385,7 +385,7 @@ async fn presence_sweep_transitions_stale_then_offline_once() {
     assert_eq!(row.get_str("last_presence").unwrap(), "offline");
 
     // Offline rows leave the scan set entirely.
-    let n = roomler_ai_api::ws::device_presence::run_presence_sweep(app.state.fleet()).await;
+    let n = roomler_ai_mod_fleet::presence::run_presence_sweep(app.state.fleet()).await;
     assert_eq!(n, 0);
 }
 
