@@ -70,6 +70,7 @@ pub mod remote_config;
 pub mod removal;
 pub mod setup_release;
 pub mod socket;
+pub mod tenant_hooks;
 pub mod tunnel_release;
 
 pub use hub::Hub;
@@ -240,11 +241,20 @@ impl Module for FleetState {
         // a DB-name-scoped Redis NX claim; first tick a full interval out so
         // tests driving `run_presence_sweep` directly stay deterministic).
         presence::spawn_sweeper(state.clone());
+        // C-2/PR-1 — the owner-side idle-agent nudge handler (P7b, from the
+        // host): cycles an agent's socket iff every holder reads it idle.
+        nudge::register_bus_handler(&state);
         Ok(state)
     }
 
     fn enabled(settings: &Settings) -> bool {
         settings.modules.fleet
+    }
+
+    /// Fleet's side of the tenant cascade (device revocation on archive).
+    /// Fleet is the CALLER of the agent cascade, never a holder of it.
+    fn hooks(&self) -> roomler_core::Hooks {
+        tenant_hooks::hooks(self)
     }
 
     fn capabilities(&self, _tenant: &TenantCtx) -> Capabilities {

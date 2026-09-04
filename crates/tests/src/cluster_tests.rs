@@ -284,7 +284,7 @@ async fn cross_pod_session_relays_without_nudge() {
         }
     }
     assert!(saw_request, "forwarded rc:request never reached the agent");
-    assert!(app1.state.rc_hub.is_agent_online(aid));
+    assert!(app1.state.fleet().rc_hub.is_agent_online(aid));
 
     // Browser socket dies -> rc.conn_closed forwards -> the owner pod's
     // proxy unregisters -> the agent sees rc:terminate; its socket
@@ -367,6 +367,7 @@ async fn nudge_verb_reasons_cooldown_and_idle_cycle() {
     // (a) tunnel session TARGETING the agent: refused, truthfully.
     let fake_session = bson::oid::ObjectId::new();
     app1.state
+        .network()
         .tunnel_sessions_by_target_agent
         .entry(aid)
         .or_default()
@@ -377,11 +378,15 @@ async fn nudge_verb_reasons_cooldown_and_idle_cycle() {
         .expect("nudge rpc");
     assert_eq!(rep["nudged"], false, "{rep}");
     assert_eq!(rep["reason"], "tunnel_busy", "{rep}");
-    app1.state.tunnel_sessions_by_target_agent.remove(&aid);
+    app1.state
+        .network()
+        .tunnel_sessions_by_target_agent
+        .remove(&aid);
 
     // (b) session the agent ORIGINATED (declared routes) - the pre-PR-1
     // blind spot index.
     app1.state
+        .network()
         .tunnel_sessions_by_origin_agent
         .entry(aid)
         .or_default()
@@ -392,7 +397,10 @@ async fn nudge_verb_reasons_cooldown_and_idle_cycle() {
         .expect("nudge rpc");
     assert_eq!(rep["nudged"], false, "{rep}");
     assert_eq!(rep["reason"], "origin_busy", "{rep}");
-    app1.state.tunnel_sessions_by_origin_agent.remove(&aid);
+    app1.state
+        .network()
+        .tunnel_sessions_by_origin_agent
+        .remove(&aid);
 
     // Busy refusals never cycled the socket (nor consumed cooldown
     // attempts - the fired cycle below proves the gate stayed open).
@@ -412,12 +420,12 @@ async fn nudge_verb_reasons_cooldown_and_idle_cycle() {
         "idle nudge must cycle the agent WS"
     );
     for _ in 0..10 {
-        if !app1.state.rc_hub.is_agent_online(aid) {
+        if !app1.state.fleet().rc_hub.is_agent_online(aid) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    assert!(!app1.state.rc_hub.is_agent_online(aid));
+    assert!(!app1.state.fleet().rc_hub.is_agent_online(aid));
 
     // (d) straight after a fired cycle: the cooldown refuses.
     let rep = b2
@@ -443,7 +451,7 @@ async fn kick_ctrl_event_applies_cross_pod() {
     let _agent_ws = crate::agent_presence_tests::connect_agent(&app1, &agent_token).await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let aid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
-    assert!(app1.state.rc_hub.is_agent_online(aid));
+    assert!(app1.state.fleet().rc_hub.is_agent_online(aid));
 
     // DELETE via pod2's HTTP API — its local hub has no entry; the ctrl
     // broadcast must reach pod1.
@@ -464,7 +472,7 @@ async fn kick_ctrl_event_applies_cross_pod() {
     let mut kicked = false;
     for _ in 0..20 {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if !app1.state.rc_hub.is_agent_online(aid) {
+        if !app1.state.fleet().rc_hub.is_agent_online(aid) {
             kicked = true;
             break;
         }
@@ -809,7 +817,7 @@ async fn derp_split_rehomes_toward_newest_registration() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use futures::{SinkExt, StreamExt};
     use roomler_ai_api::cluster::directory::derp_key;
-    use roomler_ai_api::ws::derp_cluster::pk_hex;
+    use roomler_ai_mod_network::derp_cluster::pk_hex;
     use roomler_ai_remote_control::models::NodeRef;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -1029,7 +1037,7 @@ async fn shutdown_releases_tunnel_and_derp_records() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use futures::SinkExt;
     use roomler_ai_api::cluster::directory::{derp_key, tunnel_key};
-    use roomler_ai_api::ws::derp_cluster::pk_hex;
+    use roomler_ai_mod_network::derp_cluster::pk_hex;
     use roomler_ai_remote_control::models::NodeRef;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -1091,7 +1099,10 @@ async fn shutdown_releases_tunnel_and_derp_records() {
     dir.claim_lww(&tunnel_key(&sid.to_hex()), &ttoken)
         .await
         .unwrap();
-    app.state.tunnel_presence_tokens.insert(sid, ttoken);
+    app.state
+        .network()
+        .tunnel_presence_tokens
+        .insert(sid, ttoken);
 
     roomler_ai_api::state::shutdown_cleanup(&app.state).await;
 

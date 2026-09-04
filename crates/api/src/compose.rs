@@ -47,9 +47,11 @@ pub const EXTRACTED: &[&str] = &[
     "chat",
     #[cfg(feature = "conference")]
     "conference",
+    #[cfg(feature = "fleet")]
     "fleet",
     #[cfg(feature = "remote")]
     "remote",
+    #[cfg(feature = "network")]
     "network",
 ];
 
@@ -63,15 +65,20 @@ pub struct Modules {
     pub chat: Option<roomler_ai_mod_chat::ChatState>,
     #[cfg(feature = "conference")]
     pub conference: Option<roomler_ai_mod_conference::ConferenceState>,
-    /// Always linked (P5a): the host's network code reads its handles.
+    /// P5a/P7b — device management; `None` when switched off (the agent
+    /// socket is then refused with 503 and the device listing shows no
+    /// agents).
+    #[cfg(feature = "fleet")]
     pub fleet: Option<roomler_ai_mod_fleet::FleetState>,
     /// P6 — built on `fleet`; `None` when switched off (the controller's
     /// `rc:*` frames then fall through unhandled and the session routes are
     /// absent, while the Hub — fleet's — keeps serving the agents).
     #[cfg(feature = "remote")]
     pub remote: Option<roomler_ai_mod_remote::RemoteState>,
-    /// P7a — built on `fleet`; always linked until the sockets move (P7b):
-    /// the host's tunnel, DERP and agent-socket code calls its engine.
+    /// P7 — built on `fleet`; `None` when switched off (the tunnel-client
+    /// socket is refused with 503, `/derp` is not mounted, the overlay and
+    /// tunnel routes are absent).
+    #[cfg(feature = "network")]
     pub network: Option<roomler_ai_mod_network::NetworkState>,
     /// Every mounted module's WebSocket namespace handlers, collected at
     /// init so the socket dispatch can look one up per message.
@@ -126,17 +133,20 @@ impl Modules {
                 modules.ws.extend(m.ws().handlers);
             }
         }
-        modules.fleet =
-            init_one::<roomler_ai_mod_fleet::FleetState>(core.clone(), settings, ()).await?;
-        if let Some(m) = &modules.fleet {
-            modules.ws.extend(m.ws().handlers);
+        #[cfg(feature = "fleet")]
+        {
+            modules.fleet =
+                init_one::<roomler_ai_mod_fleet::FleetState>(core.clone(), settings, ()).await?;
+            if let Some(m) = &modules.fleet {
+                modules.ws.extend(m.ws().handlers);
+            }
         }
         #[cfg(feature = "remote")]
         {
             // `remote → fleet`: the Hub is one live object, so the module is
             // built on fleet's state rather than re-creating it. A fleet
-            // that is switched off refuses the boot in `AppState::new`
-            // before this matters; here it simply means no `remote`.
+            // that is switched off simply means no `remote` either — the
+            // switch is logged by `init_one` for fleet.
             if let Some(fleet) = modules.fleet.clone() {
                 modules.remote =
                     init_one::<roomler_ai_mod_remote::RemoteState>(core.clone(), settings, fleet)
@@ -146,13 +156,16 @@ impl Modules {
                 }
             }
         }
-        // `network → fleet`, the same seam.
-        if let Some(fleet) = modules.fleet.clone() {
-            modules.network =
-                init_one::<roomler_ai_mod_network::NetworkState>(core.clone(), settings, fleet)
-                    .await?;
-            if let Some(m) = &modules.network {
-                modules.ws.extend(m.ws().handlers);
+        #[cfg(feature = "network")]
+        {
+            // `network → fleet`, the same seam.
+            if let Some(fleet) = modules.fleet.clone() {
+                modules.network =
+                    init_one::<roomler_ai_mod_network::NetworkState>(core.clone(), settings, fleet)
+                        .await?;
+                if let Some(m) = &modules.network {
+                    modules.ws.extend(m.ws().handlers);
+                }
             }
         }
 
@@ -176,6 +189,7 @@ impl Modules {
         if self.conference.is_some() {
             ids.push("conference");
         }
+        #[cfg(feature = "fleet")]
         if self.fleet.is_some() {
             ids.push("fleet");
         }
@@ -183,6 +197,7 @@ impl Modules {
         if self.remote.is_some() {
             ids.push("remote");
         }
+        #[cfg(feature = "network")]
         if self.network.is_some() {
             ids.push("network");
         }
@@ -208,6 +223,7 @@ impl Modules {
         if let Some(conference) = &self.conference {
             api = api.merge(conference.routes().with_state(()));
         }
+        #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
             api = api.merge(fleet.routes().with_state(()));
         }
@@ -215,10 +231,148 @@ impl Modules {
         if let Some(remote) = &self.remote {
             api = api.merge(remote.routes().with_state(()));
         }
+        #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             api = api.merge(network.routes().with_state(()));
         }
         api
+    }
+
+    /// Mount every mounted module's own upgrade endpoints at the root (P7b:
+    /// `/derp` is the network module's). The paths never move — agents in
+    /// the field dial them across every release.
+    pub fn mount_upgrades<S>(&self, root: Router<S>) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        #[allow(unused_mut)]
+        let mut root = root;
+        #[cfg(feature = "network")]
+        if let Some(network) = &self.network {
+            for up in network.ws().upgrades {
+                root = root.merge(up.router.with_state(()));
+            }
+        }
+        root
+    }
+
+    /// P7b — the `/ws?role=agent` upgrade is the fleet module's. A build or
+    /// deployment without `fleet` answers 503: an agent that dials a pod
+    /// with no fleet module must learn it is not a credential problem.
+    #[allow(unused_variables)]
+    pub fn agent_upgrade(
+        &self,
+        token: String,
+        tid: Option<String>,
+        ws: axum::extract::WebSocketUpgrade,
+    ) -> axum::response::Response {
+        #[cfg(feature = "fleet")]
+        if let Some(fleet) = &self.fleet {
+            return roomler_ai_mod_fleet::socket::ws_upgrade_agent(fleet.clone(), token, tid, ws);
+        }
+        module_unavailable("fleet")
+    }
+
+    /// P7b — the `/ws?role=tunnel-client` upgrade is the network module's;
+    /// 503 without it, for the same reason.
+    #[allow(unused_variables)]
+    pub fn tunnel_client_upgrade(
+        &self,
+        token: String,
+        tid: Option<String>,
+        ws: axum::extract::WebSocketUpgrade,
+    ) -> axum::response::Response {
+        #[cfg(feature = "network")]
+        if let Some(network) = &self.network {
+            return roomler_ai_mod_network::tunnel::ws_upgrade_tunnel_client(
+                network.clone(),
+                token,
+                tid,
+                ws,
+            );
+        }
+        module_unavailable("network")
+    }
+
+    /// P7b — register a browser connection with the remote-control Hub
+    /// (fleet's) so `rc:*` replies find it, and pump those replies onto the
+    /// socket. `None` when fleet is not mounted: the tab has no controller
+    /// plane, and its `rc:*` frames fall through unhandled.
+    #[allow(unused_variables)]
+    pub fn register_controller(
+        &self,
+        user_id: bson::oid::ObjectId,
+        sender: roomler_core::ws::storage::WsSender,
+    ) -> Option<ControllerRegistration> {
+        #[cfg(feature = "fleet")]
+        if let Some(fleet) = &self.fleet {
+            let (tx, rx) = fleet.rc_hub.register_controller(user_id);
+            let pump = tokio::spawn(roomler_ai_mod_fleet::socket::pump_server_messages(
+                rx, sender,
+            ));
+            return Some((tx, pump));
+        }
+        None
+    }
+
+    /// The inverse of [`Self::register_controller`], at socket close.
+    #[allow(unused_variables)]
+    pub fn unregister_controller(
+        &self,
+        user_id: bson::oid::ObjectId,
+        rc: Option<&ControllerRegistration>,
+    ) {
+        #[cfg(feature = "fleet")]
+        if let (Some(fleet), Some((tx, pump))) = (&self.fleet, rc) {
+            fleet.rc_hub.unregister_controller(user_id, tx);
+            pump.abort();
+        }
+    }
+
+    /// P7b — apply one cross-pod rc control event (consent verdicts, admin
+    /// kicks) to the local Hub; a no-op without fleet.
+    #[allow(unused_variables)]
+    pub fn apply_rc_ctrl(&self, ctrl: &serde_json::Value) {
+        #[cfg(feature = "fleet")]
+        if let Some(fleet) = &self.fleet {
+            roomler_ai_mod_fleet::ctrl::apply_rc_ctrl(&fleet.rc_hub, ctrl);
+        }
+    }
+
+    /// P7b — the sender the host's Redis ctrl subscriber feeds cross-pod
+    /// `overlay_removes` envelopes into (#1186); `None` without network.
+    pub fn overlay_ctrl_sender(&self) -> Option<tokio::sync::mpsc::Sender<serde_json::Value>> {
+        #[cfg(feature = "network")]
+        if let Some(network) = &self.network {
+            return Some(network.overlay_ctrl_tx.clone());
+        }
+        None
+    }
+
+    /// The fleet module's live gauge for the cluster status snapshot:
+    /// agents online on this pod. Zero when the module is not mounted.
+    pub fn fleet_gauges(&self) -> FleetGauges {
+        #[cfg(feature = "fleet")]
+        if let Some(fleet) = &self.fleet {
+            return FleetGauges {
+                agents_online: fleet.rc_hub.online_agents().len(),
+            };
+        }
+        FleetGauges::default()
+    }
+
+    /// The network module's live gauges for the cluster status snapshot:
+    /// tunnel sessions and DERP registrations on this pod. Zero when the
+    /// module is not mounted.
+    pub fn network_gauges(&self) -> NetworkGauges {
+        #[cfg(feature = "network")]
+        if let Some(network) = &self.network {
+            return NetworkGauges {
+                tunnel_sessions: network.tunnel_clients_by_session.len(),
+                derp_registrations: network.derp_registry.len(),
+            };
+        }
+        NetworkGauges::default()
     }
 
     /// Mount every module's ungoverned routes onto the root router (the
@@ -241,6 +395,7 @@ impl Modules {
         if let Some(conference) = &self.conference {
             root = root.merge(conference.unlimited_routes().with_state(()));
         }
+        #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
             root = root.merge(fleet.unlimited_routes().with_state(()));
         }
@@ -248,6 +403,7 @@ impl Modules {
         if let Some(remote) = &self.remote {
             root = root.merge(remote.unlimited_routes().with_state(()));
         }
+        #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             root = root.merge(network.unlimited_routes().with_state(()));
         }
@@ -271,6 +427,7 @@ impl Modules {
         if let Some(conference) = &self.conference {
             sets.extend(conference.indexes());
         }
+        #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
             sets.extend(fleet.indexes());
         }
@@ -278,6 +435,7 @@ impl Modules {
         if let Some(remote) = &self.remote {
             sets.extend(remote.indexes());
         }
+        #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             sets.extend(network.indexes());
         }
@@ -302,6 +460,7 @@ impl Modules {
         if let Some(conference) = &self.conference {
             sets.extend(conference.indexes_for(multi_block));
         }
+        #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
             sets.extend(fleet.indexes_for(multi_block));
         }
@@ -309,6 +468,7 @@ impl Modules {
         if let Some(remote) = &self.remote {
             sets.extend(remote.indexes_for(multi_block));
         }
+        #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             sets.extend(network.indexes_for(multi_block));
         }
@@ -331,6 +491,7 @@ impl Modules {
         if let Some(conference) = &self.conference {
             jobs.extend(conference.jobs());
         }
+        #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
             jobs.extend(fleet.jobs());
         }
@@ -338,6 +499,7 @@ impl Modules {
         if let Some(remote) = &self.remote {
             jobs.extend(remote.jobs());
         }
+        #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             jobs.extend(network.jobs());
         }
@@ -365,6 +527,7 @@ impl Modules {
                 conference.hooks(),
             );
         }
+        #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
             core.hooks
                 .register(roomler_ai_mod_fleet::FleetState::ID, fleet.hooks());
@@ -374,6 +537,7 @@ impl Modules {
             core.hooks
                 .register(roomler_ai_mod_remote::RemoteState::ID, remote.hooks());
         }
+        #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             core.hooks
                 .register(roomler_ai_mod_network::NetworkState::ID, network.hooks());
@@ -432,6 +596,7 @@ impl Modules {
     /// Orderly stop of every mounted module, in REVERSE composition order
     /// (a module stops before the ones it depends on).
     pub async fn shutdown(&self) {
+        #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             network.shutdown().await;
         }
@@ -439,6 +604,7 @@ impl Modules {
         if let Some(remote) = &self.remote {
             remote.shutdown().await;
         }
+        #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
             fleet.shutdown().await;
         }
@@ -525,6 +691,42 @@ impl Modules {
             roomler_ai_mod_remote::relay::forward_conn_closed(remote, connection_id);
         }
     }
+}
+
+/// The fleet module's live gauge (`Modules::fleet_gauges`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FleetGauges {
+    pub agents_online: usize,
+}
+
+/// The network module's live gauges (`Modules::network_gauges`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetworkGauges {
+    pub tunnel_sessions: usize,
+    pub derp_registrations: usize,
+}
+
+/// What [`Modules::register_controller`] hands the user socket: the tab's
+/// Hub sender (the `rc:*` dispatch addresses replies to it) and the task
+/// pumping the Hub's replies onto the socket, aborted at close.
+pub type ControllerRegistration = (
+    roomler_ai_remote_control::session::ClientTx,
+    tokio::task::JoinHandle<()>,
+);
+
+/// 503 for a socket role whose module this pod does not mount: the caller
+/// dialed the right place with the right credential and must not read the
+/// refusal as either being wrong.
+#[allow(dead_code)]
+fn module_unavailable(module: &str) -> axum::response::Response {
+    warn!(
+        module,
+        "socket upgrade refused — module not mounted on this pod"
+    );
+    axum::response::Response::builder()
+        .status(503)
+        .body(format!("{module} module not mounted").into())
+        .unwrap()
 }
 
 /// Initialise one module unless its switch is off.

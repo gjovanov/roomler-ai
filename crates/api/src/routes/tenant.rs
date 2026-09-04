@@ -163,77 +163,24 @@ pub async fn archive(
     // session, so the teardown below is not racing new arrivals.
     let tenant = state.tenants.set_archived(tid, true).await?;
 
-    // Devices: revoke the enrollment. The agent's long-lived JWT stays
-    // cryptographically valid for its full year, so the row is the only
-    // thing that can withdraw it — `soft_delete` is what every auth path
-    // already checks.
-    let agents = state
-        .agents
-        .list_all_active_for_tenant(tid)
+    // FR-69 P7b — the pillars tear down what they hold, through the core
+    // registry in HOOK_ORDER: `network` releases every mesh node (which
+    // pools its address and tells the peers) and quarantines the tenant's
+    // block — never re-issued, a device that never saw the archive still
+    // thinks it owns an address in that range — then `fleet` revokes every
+    // device's enrollment (the agent's long-lived JWT stays cryptographically
+    // valid for its full year, so the row is the only thing that can
+    // withdraw it — `soft_delete` is what every auth path already checks). A
+    // pillar this pod does not mount simply holds nothing.
+    let archived = state
+        .core
+        .hooks
+        .tenant_archived(tid, "tenant archived")
         .await
-        .unwrap_or_default();
-    let mut devices_revoked = 0u64;
-    for a in &agents {
-        if let Some(id) = a.id
-            && state.agents.soft_delete(tid, id).await.unwrap_or(false)
-        {
-            devices_revoked += 1;
-        }
-    }
-
-    // Mesh: release every node, which pools its address and tells the peers.
-    let network = state
-        .network()
-        .overlay_networks
-        .find_for_tenant(tid)
-        .await
-        .ok()
-        .flatten();
-    let mut nodes_released = 0u64;
-    if let Some(net) = &network
-        && let Some(net_id) = net.id
-    {
-        let nodes = state
-            .network()
-            .overlay_nodes
-            .list_active_in_network(tid, net_id)
-            .await
-            .unwrap_or_default();
-        for n in &nodes {
-            if roomler_ai_mod_network::overlay::release_overlay_node(
-                state.network(),
-                n,
-                "tenant archived",
-            )
-            .await
-            .is_some()
-            {
-                nodes_released += 1;
-            }
-        }
-    }
-
-    // Block: quarantine, never re-issue. A device that never saw the
-    // archive still thinks it owns an address in that range.
-    let mut block_quarantined = None;
-    if let Some(net_id) = network.as_ref().and_then(|n| n.id)
-        && let Ok(Some(block)) = state
-            .network()
-            .overlay_networks
-            .blocks()
-            .find_assigned_for_network(net_id)
-            .await
-        && let Some(bid) = block.id
-        && state
-            .network()
-            .overlay_networks
-            .blocks()
-            .quarantine(bid, "tenant archived")
-            .await
-            .unwrap_or(false)
-    {
-        block_quarantined = Some(block.cidr);
-    }
+        .map_err(|e| ApiError::Internal(format!("archive cascade: {e}")))?;
+    let devices_revoked = archived.devices_revoked;
+    let nodes_released = archived.nodes_released;
+    let block_quarantined = archived.block_quarantined;
 
     tracing::info!(
         owner = %auth.user_id, tenant = %tid, name = %tenant.name,

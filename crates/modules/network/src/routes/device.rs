@@ -26,7 +26,9 @@ use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::{Agent, AgentStatus, NodeRef, OsKind, TunnelClient};
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::NetworkState;
 use roomler_ai_mod_fleet::agent::{AgentPresence, agent_presence_batch, derive_agent_presence};
 
 /// Fields are declared INLINE, deliberately not `#[serde(flatten)]
@@ -114,7 +116,7 @@ pub struct DeviceRow {
 /// GET /api/tenant/{tenant_id}/device — membership-gated like every other
 /// fleet list (mutations stay behind MANAGE_AGENTS on their own routes).
 pub async fn list_devices(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<DeviceListQuery>,
@@ -164,36 +166,24 @@ pub async fn list_devices(
     let page = params.page.max(1);
 
     // ── Fetch + join ────────────────────────────────────────────
+    // FR-69 P7b — this listing joins fleet's agents with this module's tunnel
+    // clients and overlay nodes: a `network → fleet` read, which is why it
+    // lives here and not in the host.
     let agents = if kind_filter.as_deref() == Some("tunnel_client") {
         Vec::new()
     } else {
-        state.agents.list_all_active_for_tenant(tid).await?
+        state.fleet.agents.list_all_active_for_tenant(tid).await?
     };
     let clients = if kind_filter.as_deref() == Some("agent") {
         Vec::new()
     } else {
-        state
-            .network()
-            .tunnel_clients
-            .list_all_active_for_tenant(tid)
-            .await?
+        state.tunnel_clients.list_all_active_for_tenant(tid).await?
     };
 
-    let (nodes, dns_domain) = match state
-        .network()
-        .overlay_networks
-        .find_for_tenant(tid)
-        .await?
-    {
+    let (nodes, dns_domain) = match state.overlay_networks.find_for_tenant(tid).await? {
         Some(net) => {
             let nodes = match net.id {
-                Some(nid) => {
-                    state
-                        .network()
-                        .overlay_nodes
-                        .list_active_in_network(tid, nid)
-                        .await?
-                }
+                Some(nid) => state.overlay_nodes.list_active_in_network(tid, nid).await?,
                 None => Vec::new(),
             };
             let domain = state
@@ -220,12 +210,12 @@ pub async fn list_devices(
         }
     }
 
-    let fresh = agent_presence_batch(state.fleet(), &agents).await;
+    let fresh = agent_presence_batch(&state.fleet, &agents).await;
 
     let mut rows: Vec<DeviceRow> = Vec::with_capacity(agents.len() + clients.len());
     for a in agents {
         let redis_fresh = a.id.map(|i| fresh.contains(&i)).unwrap_or(false);
-        let (presence, is_online) = derive_agent_presence(state.fleet(), &a, redis_fresh);
+        let (presence, is_online) = derive_agent_presence(&state.fleet, &a, redis_fresh);
         let node = a.id.and_then(|i| node_by_agent.get(&i).copied());
         rows.push(agent_row(
             a,

@@ -25,20 +25,17 @@
 //! split-evidence counter fires instead (a stable split that rehome
 //! cannot fix — surface it, don't thrash).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
-use super::derp::{DerpKey, DerpPubKey};
-use crate::cluster::directory::{OwnerRecord, derp_key, derpnet_key};
-use crate::state::AppState;
-
-/// Rehomes suppressed by the attempts cap — a stable split rehome can't
-/// fix (client keeps re-landing on the losing pod). SPLIT EVIDENCE.
-pub static DERP_REHOME_STUCK_TOTAL: AtomicU64 = AtomicU64::new(0);
+use crate::NetworkState;
+use crate::derp_types::{DerpKey, DerpPubKey};
+use roomler_core::cluster::directory::{OwnerRecord, derp_key, derpnet_key};
+use roomler_core::cluster::metrics::DERP_REHOME_STUCK_TOTAL;
 
 const REHOME_COOLDOWN: Duration = Duration::from_secs(60);
 const REHOME_MAX_ATTEMPTS: u32 = 3;
@@ -73,7 +70,7 @@ fn pk_from_hex(s: &str) -> Option<DerpPubKey> {
 /// Registration hook: write the LWW record + the per-network member
 /// index, then run one convergence sweep.
 pub async fn on_derp_register(
-    state: &AppState,
+    state: &NetworkState,
     network_id: ObjectId,
     pk: &DerpPubKey,
     agent_id: ObjectId,
@@ -105,7 +102,7 @@ pub async fn on_derp_register(
 /// the last owner, drop the member from the network index. A displaced
 /// older socket never gets here (the registry remove is same-channel
 /// guarded), so it can't free the newer registration.
-pub async fn on_derp_teardown(state: &AppState, network_id: ObjectId, pk: &DerpPubKey) {
+pub async fn on_derp_teardown(state: &NetworkState, network_id: ObjectId, pk: &DerpPubKey) {
     let Some((_, token)) = state.derp_presence_tokens.remove(&(network_id, *pk)) else {
         return;
     };
@@ -126,7 +123,7 @@ pub async fn on_derp_teardown(state: &AppState, network_id: ObjectId, pk: &DerpP
 /// One convergence sweep over a network's live registrations. Target =
 /// the pod of the newest record; every other pod gets a rehome for its
 /// members (locally short-circuited for ourselves).
-pub async fn converge_network(state: &AppState, network_id: ObjectId) {
+pub async fn converge_network(state: &NetworkState, network_id: ObjectId) {
     let Some(dir) = state.cluster_directory.clone() else {
         return;
     };
@@ -193,7 +190,7 @@ pub async fn converge_network(state: &AppState, network_id: ObjectId) {
 /// Close local DERP sockets for the given pubkeys (cooldown-paced).
 /// The socket loop's cancel arm breaks, teardown releases the record,
 /// and the client's reconnect re-lands per the current LB map.
-pub fn local_rehome_close(state: &AppState, network_id: ObjectId, pks: &[String]) {
+pub fn local_rehome_close(state: &NetworkState, network_id: ObjectId, pks: &[String]) {
     for member in pks {
         let Some(pk) = pk_from_hex(member) else {
             continue;
@@ -201,9 +198,11 @@ pub fn local_rehome_close(state: &AppState, network_id: ObjectId, pks: &[String]
         if !rehome_allowed(&state.derp_rehome_cooldowns, network_id, member) {
             continue;
         }
-        if let Some(cancel) = state.network().derp_cancels.get(&(network_id, pk)) {
+        if let Some(cancel) = state.derp_cancels.get(&(network_id, pk)) {
             info!(%network_id, pubkey = %member, "derp: closing socket for cluster rehome");
-            crate::cluster::metrics::bump(&crate::cluster::metrics::DERP_REHOME_CLOSE_TOTAL);
+            roomler_core::cluster::metrics::bump(
+                &roomler_core::cluster::metrics::DERP_REHOME_CLOSE_TOTAL,
+            );
             cancel.notify_one();
         }
     }
@@ -251,7 +250,7 @@ fn rehome_allowed_at(
 
 /// Wire the C-5 machinery: the owner-side rehome handler + the derp
 /// record refresh lives in the shared directory heartbeat (state.rs).
-pub fn wire_derp_cluster(state: &AppState) {
+pub fn wire_derp_cluster(state: &NetworkState) {
     if let Some(bus) = &state.cluster_bus {
         let st = state.clone();
         bus.register("derp.rehome", move |body| {
@@ -281,12 +280,11 @@ pub fn wire_derp_cluster(state: &AppState) {
 /// Purge one connection's cancel handle iff it is still `ours` (a newer
 /// registration may have replaced it — same discipline as the registry).
 pub fn remove_cancel_if_ours(
-    state: &AppState,
+    state: &NetworkState,
     key: &DerpKey,
     ours: &std::sync::Arc<tokio::sync::Notify>,
 ) {
     state
-        .network()
         .derp_cancels
         .remove_if(key, |_, c| std::sync::Arc::ptr_eq(c, ours));
 }
