@@ -219,6 +219,22 @@ jobs:
               fi
               case " $GOT " in *" saas "*) echo "::error::a self-host image must never carry saas"; exit 1;; esac
               echo "  modules: $GOT (profile ${{ inputs.profile }}) ✓"
+              # The devices page's listing is the host's composition view over
+              # fleet (required) and network (optional): every profile that
+              # carries fleet must MOUNT it — 401 unauthenticated proves the
+              # route exists, 404 proves it does not (the `remote` profile
+              # shipped that 404 once, unnoticed by a smoke that read only
+              # /health). collab has no fleet and must answer 404.
+              DEV=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/api/tenant/000000000000000000000000/device)
+              case " $GOT " in
+                *" fleet "*) WANT_DEV=401 ;;
+                *)           WANT_DEV=404 ;;
+              esac
+              if [ "$DEV" != "$WANT_DEV" ]; then
+                echo "::error::GET /api/tenant/…/device answered $DEV, expected $WANT_DEV for profile ${{ inputs.profile }} — the device listing is not mounted where fleet is"
+                exit 1
+              fi
+              echo "  device listing: $DEV ✓"
               exit 0
             fi
             sleep 10

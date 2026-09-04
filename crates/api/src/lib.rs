@@ -341,6 +341,17 @@ pub fn build_router(state: AppState) -> Router {
         // P7b: it depends on fleet, which the graph allows; the host may not).
         .nest("/tenant/{tenant_id}/stats", tenant_stats_routes);
 
+    // FR-69 — the unified device listing is the host's composition view:
+    // fleet's agents (required) joined with network's tunnel clients and
+    // overlay nodes (optional). Mounted wherever `fleet` is compiled in, so
+    // a `remote` profile keeps its devices page; the handler answers 503
+    // when the module is switched off at runtime.
+    #[cfg(feature = "fleet")]
+    let api = api.nest(
+        "/tenant/{tenant_id}/device",
+        Router::new().route("/", get(routes::device::list_devices)),
+    );
+
     // Health check. `/health` stays a cheap process-alive 200 (liveness /
     // startup probes — must NOT flap on dependency blips or k8s restarts the
     // pod during a Redis outage); `/health/ready` checks the dependencies
