@@ -4184,6 +4184,9 @@ async fn media_pump_vp9_444_dc(
                 viewer_age_ms = ?governor.viewer_age().map(|(a, _)| a),
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 viewer_age_implausible = governor.viewer_age_implausible(),
+                // FR-70 M0 — the fused age split by plane (transit is an
+                // upper bound here: this pump keeps no send-wait figure).
+                age_split = ?governor.viewer_age_split(None),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
                 // FR-70 P1 — what stands in for a pipe measurement while
@@ -7103,6 +7106,15 @@ async fn media_pump_ffmpeg_dc(
                 viewer_age_ms = ?governor.viewer_age().map(|(a, _)| a),
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 viewer_age_implausible = governor.viewer_age_implausible(),
+                // FR-70 M0 — the fused age SPLIT by plane, so an excursion
+                // is attributable without reading source: `viewer_ms` is
+                // what this browser added after the frame arrived,
+                // `sender_ms` is this window's send-queue wait, and
+                // `transit_ms` is everything between — the relay included.
+                // Finding 4 (2026-09-04: age 4903 with inflight 1485 B and
+                // iter_max 28 ms) reads here as transit ≈ 4.9 s. None = a
+                // pre-M0 viewer, or a window with no age report.
+                age_split = ?governor.viewer_age_split(Some(send_wait_avg_ms)),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
                 // minimum. None = the flat floor stands, which on a slow
@@ -7729,11 +7741,17 @@ fn attach_control_handler(
                         .get("probe_rtt_ms")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    // FR-70 M0 — the window's age at ARRIVAL (last chunk in
+                    // the viewer's worker), same clock mapping as `age_ms`.
+                    // Absent (pre-M0 viewer) ⇒ 0 ⇒ the slot reads as absent
+                    // and the heartbeat's split stays `None`.
+                    let arr = val.get("arr_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                     if let (Some(a), Some(m)) = (age, age_min) {
-                        viewer_report.store_age(crate::encode::viewer_rate::pack_age(
+                        viewer_report.store_age(crate::encode::viewer_rate::pack_age_with_arrival(
                             a.min(u16::MAX as u64) as u16,
                             m.min(u16::MAX as u64) as u16,
                             rtt.min(u16::MAX as u64) as u16,
+                            arr.min(u16::MAX as u64) as u16,
                         ));
                     }
                     // FR-59 P3 — the viewer's LINK report: bytes/s it

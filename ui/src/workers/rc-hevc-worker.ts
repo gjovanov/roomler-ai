@@ -275,6 +275,17 @@ const queueDrift = new QueueDrift()
 let clockOffsetUs: number | null = null
 let outGapMaxMs = 0
 const pendingDecodeAt = new Map<number, number>()
+// FR-70 M0 — the age SPLIT. `ageStats` fuses sender, transit and viewer
+// latency into one number, which is how a 4903 ms relay stall on 2026-09-04
+// arrived looking like a pump problem. `arrivalStats` is the age of the
+// frame when its LAST CHUNK reached this worker (agent clock via the probe,
+// like `ageStats`), and `viewerStats` is the purely local time from that
+// arrival to the paint (decode queue + decode + paint) — no probe needed.
+// The agent subtracts: viewer = age − arrival, transit = arrival − its own
+// send-queue wait. Keyed by the wire timestamp, like `pendingDecodeAt`.
+const arrivalStats = new HopStats()
+const viewerStats = new HopStats()
+const pendingArrivalUs = new Map<number, number>()
 
 // P7 — FSR sharpening state (see rc-fsr-render.ts). The renderer is created
 // lazily on the first frame that needs it; a GL failure disposes it and the
@@ -329,6 +340,10 @@ function maybeEmitStats(): void {
     decode: decodeStats.snapshotAndReset(),
     // FR-1 P7 — end-to-end frame age; null until the clock probe lands.
     age: clockOffsetUs !== null ? ageStats.snapshotAndReset() : null,
+    // FR-70 M0 — the split: age at ARRIVAL (same clock mapping as `age`)
+    // and the local arrival→paint time.
+    arrival: clockOffsetUs !== null ? arrivalStats.snapshotAndReset() : null,
+    viewer: viewerStats.snapshotAndReset(),
     // FR-59 P3 — window queue growth in ms (null = fewer than two frames
     // arrived, which is no-signal rather than a stable queue).
     queueMs: queueDrift.snapshotAndReset(),
@@ -531,6 +546,16 @@ function initDecoder() {
       if (clockOffsetUs !== null) {
         ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivalUs))
       }
+      // FR-70 M0 — the same age at the moment the frame ARRIVED, and the
+      // local arrival→paint time; see `arrivalStats`.
+      const arrivedUs = pendingArrivalUs.get(wireTsUs)
+      if (arrivedUs !== undefined) {
+        pendingArrivalUs.delete(wireTsUs)
+        if (clockOffsetUs !== null) {
+          arrivalStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivedUs))
+        }
+        viewerStats.add((arrivalUs - arrivedUs) / 1000)
+      }
       // FR-59 P3 — unconditional: the drift needs no probe lock.
       queueDrift.add(wireTsUs, arrivalUs)
       if (rewrapped) frame.close() // paintFrame closed `render`; close the original too
@@ -713,6 +738,9 @@ function emitFrame(): void {
     // see the vp9-444 worker's mirror).
     if (pendingDecodeAt.size > 240) pendingDecodeAt.clear()
     pendingDecodeAt.set(ts, performance.now())
+    // FR-70 M0 — and the frame's arrival (its last chunk is in hand here).
+    if (pendingArrivalUs.size > 240) pendingArrivalUs.clear()
+    pendingArrivalUs.set(ts, epochNowUs())
     decoder.decode(chunk)
   } catch (err) {
     workerScope.postMessage({
