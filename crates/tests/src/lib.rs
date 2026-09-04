@@ -29,6 +29,11 @@ mod recording_tests;
 #[cfg(test)]
 mod harness_tests;
 
+/// FR-69 — the composition baseline (routes, index plan, wire names) asserted
+/// identical after every module move. See docs/fr/FR-69-modular-monolith.md.
+#[cfg(test)]
+mod composition_tests;
+
 #[cfg(test)]
 mod agent_crash_tests;
 #[cfg(test)]
