@@ -1,0 +1,320 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
+//! FR-69 P5c — the host's TRANSITIONAL agent-socket handlers: what `remote`
+//! and `network` will register through the core's `AgentSocketRegistry`
+//! once they are modules, implemented over the host's own code until then
+//! and registered under their ids, so the socket — the fleet module's now —
+//! dispatches every message to its owner without naming the host.
+//!
+//! The order inside the network handler is the socket's old pipeline
+//! verbatim: the tunnel-client relay (this agent as an ORIGINATOR of
+//! tunnels), the tunnel relay (this agent as a TARGET), the overlay relay,
+//! then the five explicit arms. Each stage consumes what it owns and hands
+//! the rest on; what none of them owns goes back to the socket for the Hub's
+//! own dispatch, exactly as before.
+//!
+//! Per-connection state (the tunnel originator with its sessions and
+//! transports, the probe-persist throttle) is keyed by the connection id the
+//! socket minted — never by agent id: two connections of one agent overlap
+//! during a displacement, and the old one's teardown must not find the new
+//! one's sessions.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use bson::oid::ObjectId;
+use dashmap::DashMap;
+use roomler_ai_remote_control::signaling::ClientMsg;
+use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
+use tokio::sync::Mutex;
+use tracing::debug;
+
+use crate::state::AppState;
+use crate::ws::overlay::NodeIdentity;
+use crate::ws::remote_control::{
+    handle_agent_ssh_request, handle_derp_ticket_request, handle_relay_probe_report,
+    record_key_rotation_report, record_ssh_activity, relay_tunnel_msg_from_agent,
+};
+use crate::ws::tunnel::{
+    Originator, TunnelSession, relay_tunnel_client_msg_from_agent,
+    teardown_agent_originated_sessions, terminate_sessions_targeting_agent,
+};
+
+/// What the network arms keep per connection. The originator is shared
+/// (`Arc`) so the teardown can take the sessions out from under a handler
+/// call that still holds the lock, without a `Clone` on the originator.
+struct NetConn {
+    orig: Arc<Originator>,
+    sessions: HashMap<ObjectId, TunnelSession>,
+    transports: Vec<String>,
+    last_probe_persist: Option<std::time::Instant>,
+}
+
+/// `network`'s half of the agent socket, over the host's tunnel, overlay,
+/// relay, DERP-ticket, SSH and key-rotation code.
+pub struct HostNetworkAgentSocket {
+    state: AppState,
+    conns: DashMap<String, Arc<Mutex<NetConn>>>,
+}
+
+impl HostNetworkAgentSocket {
+    pub fn new(state: AppState) -> Self {
+        Self {
+            state,
+            conns: DashMap::new(),
+        }
+    }
+
+    fn conn(&self, ctx: &AgentCtx) -> Option<Arc<Mutex<NetConn>>> {
+        self.conns.get(&ctx.conn_id).map(|e| e.value().clone())
+    }
+}
+
+#[async_trait]
+impl AgentMsgHandler for HostNetworkAgentSocket {
+    async fn handle(&self, ctx: &AgentCtx, msg: ClientMsg) -> Option<ClientMsg> {
+        let state = &self.state;
+        let Some(conn) = self.conn(ctx) else {
+            // No hello ran for this connection (cannot happen: the socket
+            // calls `hello` before it reads); hand the message back rather
+            // than drop it silently.
+            debug!(agent = %ctx.agent_id, conn = %ctx.conn_id, "network arm without a connection record");
+            return Some(msg);
+        };
+        let mut conn = conn.lock().await;
+        let NetConn {
+            orig,
+            sessions,
+            transports,
+            last_probe_persist,
+        } = &mut *conn;
+        // P3b-2 — this agent as a tunnel ORIGINATOR (declared routes).
+        let msg =
+            relay_tunnel_client_msg_from_agent(state, orig.as_ref(), sessions, transports, msg)
+                .await?;
+        // This agent as a tunnel TARGET.
+        let msg = relay_tunnel_msg_from_agent(state, msg).await?;
+        // The overlay node behind this socket.
+        let msg = crate::ws::overlay::relay_overlay_msg_from_node(
+            state,
+            NodeIdentity::Agent(ctx.agent_id),
+            msg,
+        )
+        .await?;
+        match msg {
+            ClientMsg::RelayProbeReport { results } => {
+                handle_relay_probe_report(state, ctx.agent_id, &results, last_probe_persist).await;
+                None
+            }
+            ClientMsg::DerpTicketRequest {} => {
+                handle_derp_ticket_request(state, ctx.agent_id, &ctx.tx).await;
+                None
+            }
+            ClientMsg::SshRequest {
+                request_id,
+                target,
+                public_key,
+                session_secs,
+            } => {
+                let state = state.clone();
+                let (tenant_id, agent_id, reply_tx) = (ctx.tenant_id, ctx.agent_id, ctx.tx.clone());
+                tokio::spawn(async move {
+                    handle_agent_ssh_request(
+                        &state,
+                        tenant_id,
+                        agent_id,
+                        request_id,
+                        target,
+                        public_key,
+                        session_secs,
+                        reply_tx,
+                    )
+                    .await;
+                });
+                None
+            }
+            ClientMsg::SshActivity {
+                grant_id,
+                caller,
+                kind,
+                detail,
+                exit_code,
+                allowed,
+            } => {
+                let state = state.clone();
+                let (tenant_id, agent_id) = (ctx.tenant_id, ctx.agent_id);
+                tokio::spawn(async move {
+                    record_ssh_activity(
+                        &state, tenant_id, agent_id, grant_id, caller, kind, detail, exit_code,
+                        allowed,
+                    )
+                    .await;
+                });
+                None
+            }
+            ClientMsg::KeyRotated {
+                request_id,
+                outcome,
+                old_public_key,
+                new_public_key,
+                key_epoch,
+                detail,
+            } => {
+                let state = state.clone();
+                let (tenant_id, agent_id) = (ctx.tenant_id, ctx.agent_id);
+                tokio::spawn(async move {
+                    record_key_rotation_report(
+                        &state,
+                        tenant_id,
+                        agent_id,
+                        request_id,
+                        outcome,
+                        old_public_key,
+                        new_public_key,
+                        key_epoch,
+                        detail,
+                    )
+                    .await;
+                });
+                None
+            }
+            other => Some(other),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentSocketLifecycle for HostNetworkAgentSocket {
+    async fn hello(&self, ctx: &AgentCtx) {
+        let orig = Originator {
+            principal: tunnel_core::policy::Principal::Agent(ctx.agent_id),
+            tenant_id: ctx.tenant_id,
+            owner_user_id: ctx.owner_user_id,
+            client_version: ctx.agent_version.clone(),
+            client_os: ctx.os,
+            outbound_tx: ctx.tx.clone(),
+            dialed_tid: ctx.dialed_tid.clone(),
+            conn_established_ms: ctx.conn_established_ms,
+        };
+        self.conns.insert(
+            ctx.conn_id.clone(),
+            Arc::new(Mutex::new(NetConn {
+                orig: Arc::new(orig),
+                sessions: HashMap::new(),
+                transports: Vec::new(),
+                last_probe_persist: None,
+            })),
+        );
+    }
+
+    /// The device's warm-relay choice mirrored onto its overlay node.
+    async fn heartbeat(&self, ctx: &AgentCtx, warm_relay: Option<&str>) {
+        if let Err(e) = self
+            .state
+            .overlay_nodes
+            .set_warm_relay_for_agent(ctx.agent_id, warm_relay)
+            .await
+        {
+            tracing::warn!(agent = %ctx.agent_id, %e, "overlay-node warm-relay mirror failed");
+        }
+    }
+
+    /// Before the Hub unregistration, regardless of who owns the slot: the
+    /// tunnel sessions this connection originated die with its peers (P3b-2),
+    /// and every session targeting the agent is unrecoverable on a new
+    /// connection instance (P7 flap resilience).
+    async fn closing(&self, ctx: &AgentCtx) {
+        if let Some((_, conn)) = self.conns.remove(&ctx.conn_id) {
+            let conn = match Arc::try_unwrap(conn) {
+                Ok(m) => m.into_inner(),
+                Err(arc) => {
+                    // A handler call still holds the lock: wait for it and
+                    // take the state out from under it rather than skip the
+                    // teardown.
+                    let mut guard = arc.lock().await;
+                    NetConn {
+                        orig: guard.orig.clone(),
+                        sessions: std::mem::take(&mut guard.sessions),
+                        transports: std::mem::take(&mut guard.transports),
+                        last_probe_persist: guard.last_probe_persist.take(),
+                    }
+                }
+            };
+            teardown_agent_originated_sessions(&self.state, conn.orig.as_ref(), conn.sessions)
+                .await;
+        }
+        terminate_sessions_targeting_agent(&self.state, ctx.agent_id).await;
+    }
+
+    /// The overlay leave, ONLY if the Hub removal was this connection's:
+    /// unconditional, a displaced connection's late teardown would mark the
+    /// node Offline after the replacing connection's re-join set it Online
+    /// (rc.307 B).
+    async fn closed(&self, ctx: &AgentCtx, removal_was_ours: bool) {
+        if removal_was_ours {
+            crate::ws::overlay::handle_overlay_leave(
+                &self.state,
+                NodeIdentity::Agent(ctx.agent_id),
+            )
+            .await;
+        }
+    }
+}
+
+/// `remote`'s half of the agent socket: the session-stats merge. Everything
+/// else remote-owned (session request, SDP, ICE, terminate) is the Hub's own
+/// dispatch, which the socket runs on whatever a handler hands back.
+pub struct HostRemoteAgentSocket {
+    state: AppState,
+}
+
+impl HostRemoteAgentSocket {
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentMsgHandler for HostRemoteAgentSocket {
+    async fn handle(&self, ctx: &AgentCtx, msg: ClientMsg) -> Option<ClientMsg> {
+        match msg {
+            ClientMsg::SessionStats {
+                session_id,
+                bytes_sent,
+                bytes_recv,
+                fps,
+                rtt_ms,
+                keyframe_requests,
+                input_events,
+                shared_seconds,
+                mixed_dial_seconds,
+            } => {
+                if self.state.settings.stats.enabled
+                    && let Ok(sid) = ObjectId::parse_str(&session_id)
+                {
+                    let stats = roomler_ai_remote_control::models::SessionStats {
+                        bytes_sent,
+                        bytes_recv,
+                        peak_fps: fps,
+                        avg_rtt_ms: rtt_ms,
+                        keyframe_requests,
+                        input_events,
+                        shared_seconds,
+                        mixed_dial_seconds,
+                    };
+                    if let Err(e) = self
+                        .state
+                        .remote_sessions
+                        .merge_live_stats(sid, ctx.agent_id, &stats)
+                        .await
+                    {
+                        debug!(agent = %ctx.agent_id, %e, "session stats merge failed");
+                    }
+                }
+                None
+            }
+            other => Some(other),
+        }
+    }
+}

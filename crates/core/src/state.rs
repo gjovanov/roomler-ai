@@ -114,4 +114,8 @@ pub struct Core {
     /// hooks, invoked in `HOOK_ORDER` by whoever runs a cascade. Shared, so a
     /// registration made after this `Core` was cloned is visible to the clone.
     pub hooks: crate::hooks::HookRegistry,
+    /// FR-69 P5c — the agent socket's seam: the message handlers and the
+    /// per-connection lifecycles the modules register for `/ws?role=agent`,
+    /// dispatched by `fleet` (the socket's owner) per `ClientMsg::namespace()`.
+    pub agent_socket: crate::agent_socket::AgentSocketRegistry,
 }
