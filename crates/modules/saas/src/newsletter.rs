@@ -27,8 +27,10 @@ use roomler_ai_db::models::{IssueCounts, IssueStatus, NewsletterIssue};
 use roomler_ai_services::email::SendOptions;
 use roomler_ai_services::newsletter::{clean_header_text, render_issue_html, substitute_recipient};
 
-use super::stats::require_platform_admin;
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::guards::require_platform_admin;
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::SaasState;
 
 /// Storage guard for the markdown body. An issue is an email, not a book.
 const MAX_BODY_MD_BYTES: usize = 256 * 1024;
@@ -179,7 +181,7 @@ fn clean_issue_body(b: IssueBody) -> Result<CleanIssueBody, ApiError> {
 
 /// The newsletter From mailbox: `newsletter.from_*` with per-field fallback to
 /// the transactional `email.from_*`. `None` = no override at all (both unset).
-pub(crate) fn newsletter_from(state: &AppState) -> Option<(String, String)> {
+pub(crate) fn newsletter_from(state: &SaasState) -> Option<(String, String)> {
     let nl = &state.settings.newsletter;
     let em = &state.settings.email;
     match (nl.from_email.clone(), nl.from_name.clone()) {
@@ -202,7 +204,7 @@ pub(crate) fn unsubscribe_headers(unsubscribe_url: &str) -> Vec<(String, String)
     ]
 }
 
-pub(crate) fn unsubscribe_url(state: &AppState, token: &str) -> String {
+pub(crate) fn unsubscribe_url(state: &SaasState, token: &str) -> String {
     let base = state.settings.app.frontend_url.trim_end_matches('/');
     format!("{base}/api/subscribe/unsubscribe/{token}")
 }
@@ -211,7 +213,7 @@ pub(crate) fn unsubscribe_url(state: &AppState, token: &str) -> String {
 
 /// `POST /api/admin/newsletter/issues`
 pub async fn create(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
     Json(body): Json<CreateIssue>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -248,7 +250,7 @@ pub async fn create(
 
 /// `PUT /api/admin/newsletter/issues/{slug}` — drafts only.
 pub async fn update(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
     Json(body): Json<IssueBody>,
@@ -311,7 +313,7 @@ pub async fn update(
 
 /// `GET /api/admin/newsletter/issues`
 pub async fn list(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
 ) -> Result<Json<Vec<IssueListItem>>, ApiError> {
     require_platform_admin(&state, &auth)?;
@@ -334,7 +336,7 @@ pub async fn list(
 
 /// `GET /api/admin/newsletter/issues/{slug}`
 pub async fn get_one(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
 ) -> Result<Json<IssueView>, ApiError> {
@@ -350,7 +352,7 @@ pub async fn get_one(
 /// `GET /api/admin/newsletter/issues/{slug}/preview` — the exact send-path
 /// bytes, with a sample unsubscribe URL substituted.
 pub async fn preview(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -394,7 +396,7 @@ pub struct TestSendResult {
 /// change; failures are propagated honestly (this caller is an operator, not
 /// an oracle-sensitive public form).
 pub async fn test_send(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
     Json(body): Json<TestSend>,
@@ -451,7 +453,7 @@ pub struct SendAccepted {
 /// Re-POSTing is the RESUME path: the CAS re-claims a `sending` issue whose
 /// claim went stale (dead pod), and the ledger makes the re-run idempotent.
 pub async fn send(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
     body: Option<Json<SendRequest>>,
@@ -535,7 +537,7 @@ pub struct IssueStatusView {
 
 /// `GET /api/admin/newsletter/issues/{slug}/status`
 pub async fn status(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
     Path(slug): Path<String>,
 ) -> Result<Json<IssueStatusView>, ApiError> {
@@ -602,7 +604,7 @@ pub struct SetNewsletterPref {
 
 /// `GET /api/user/newsletter`
 pub async fn user_get(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
 ) -> Result<Json<NewsletterPref>, ApiError> {
     // The user row, not the JWT claim — the row is what activation verified.
@@ -613,7 +615,7 @@ pub async fn user_get(
 
 /// `PUT /api/user/newsletter` `{subscribed}`
 pub async fn user_set(
-    State(state): State<AppState>,
+    State(state): State<SaasState>,
     auth: AuthUser,
     Json(body): Json<SetNewsletterPref>,
 ) -> Result<Json<NewsletterPref>, ApiError> {

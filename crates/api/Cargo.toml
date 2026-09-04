@@ -14,7 +14,11 @@ name = "roomler-ai-api"
 path = "src/main.rs"
 
 [features]
-default = []
+# FR-69 — one feature per module crate. `default` is the hosted build; the
+# named profiles (P8) will select subsets. `saas` is the add-on the published
+# self-host images never carry.
+default = ["saas"]
+saas = ["dep:roomler-ai-mod-saas"]
 
 
 [dependencies]
@@ -23,9 +27,12 @@ roomler-ai-db = { path = "../db" }
 roomler-ai-services = { path = "../services" }
 roomler-ai-remote-control = { path = "../remote_control" }
 roomler-ai-tunnel-core = { path = "../tunnel-core" }
-# FR-69 — the composition contract (the module graph today; the `Module`
-# trait and `Core` from P1b on).
+# FR-69 — the composition contract, `Core`, and the primitives every module
+# handler needs.
 roomler-core = { path = "../core" }
+# FR-69 — module crates, one optional dependency each, selected by the
+# features below (`crates/api/src/compose.rs` is where they are mounted).
+roomler-ai-mod-saas = { path = "../modules/saas", optional = true }
 
 axum.workspace = true
 tokio.workspace = true

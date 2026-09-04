@@ -738,2816 +738,2810 @@
     }
   ],
   "indexes": {
-    "single_block": {
-      "multi_block": false,
-      "sets": [
-        {
-          "collection": "tenants",
-          "indexes": [
-            {
-              "key": {
-                "slug": 1
-              },
-              "unique": true
+    "single_block": [
+      {
+        "collection": "activation_codes",
+        "indexes": [
+          {
+            "key": {
+              "user_id": 1
+            }
+          },
+          {
+            "key": {
+              "valid_to": 1
             },
-            {
-              "key": {
-                "owner_id": 1
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "agent_crashes",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "crashed_at_unix": -1
+            }
+          },
+          {
+            "key": {
+              "reported_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "agent_logs",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "source": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "session_id": 1
+            }
+          },
+          {
+            "key": {
+              "lines.msg": "text"
+            }
+          },
+          {
+            "key": {
+              "created_at": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "agents",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "machine_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          },
+          {
+            "key": {
+              "owner_user_id": 1
+            }
+          },
+          {
+            "key": {
+              "ephemeral": 1,
+              "deleted_at": 1,
+              "last_seen_at": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "background_tasks",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "status": 1
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "call_sessions",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "room_id": 1,
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "ended_at": 1
+            }
+          },
+          {
+            "key": {
+              "started_at": 1
+            },
+            "expireAfterSeconds": 63072000
+          }
+        ]
+      },
+      {
+        "collection": "config_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "consent_requests",
+        "indexes": [
+          {
+            "key": {
+              "token": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "session_id": 1
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "custom_emojis",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "enrollment_key_uses",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "key_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "created_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "enrollment_keys",
+        "indexes": [
+          {
+            "key": {
+              "jti": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "exec_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "files",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "context.context_type": 1,
+              "context.entity_id": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "uploaded_by": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "context.room_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "external_source.provider": 1,
+              "external_source.external_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "invites",
+        "indexes": [
+          {
+            "key": {
+              "code": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "key_rotation_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "messages",
+        "indexes": [
+          {
+            "key": {
+              "room_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "thread_id": 1,
+              "created_at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "author_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "room_id": 1,
+              "is_pinned": 1
+            }
+          },
+          {
+            "key": {
+              "mentions.users": 1
+            }
+          },
+          {
+            "key": {
+              "content": "text"
+            }
+          }
+        ]
+      },
+      {
+        "collection": "newsletter_issues",
+        "indexes": [
+          {
+            "key": {
+              "slug": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "newsletter_sends",
+        "indexes": [
+          {
+            "key": {
+              "issue_id": 1,
+              "subscriber_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "issue_id": 1,
+              "status": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "notifications",
+        "indexes": [
+          {
+            "key": {
+              "user_id": 1,
+              "is_read": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "overlay_blocks",
+        "indexes": [
+          {
+            "key": {
+              "slot": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "end_slot": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "seq": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "state": "assigned"
+            }
+          }
+        ]
+      },
+      {
+        "collection": "overlay_networks",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "overlay_nodes",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "machine_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
               }
             }
-          ]
-        },
-        {
-          "collection": "users",
-          "indexes": [
-            {
-              "key": {
-                "email": 1
-              },
-              "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "network_id": 1,
+              "overlay_ip": 1
             },
-            {
-              "key": {
-                "username": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "display_name": "text",
-                "username": "text"
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
               }
             }
-          ]
-        },
-        {
-          "collection": "tenant_members",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "user_id": 1
-              }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "network_id": 1,
+              "deleted_at": 1
             }
-          ]
-        },
-        {
-          "collection": "roles",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "name": 1
-              },
-              "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "network_id": 1,
+              "name": 1
             },
-            {
-              "key": {
-                "tenant_id": 1,
-                "position": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "rooms",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "parent_id": 1,
-                "position": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "path": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "name": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "is_default": 1
-              }
-            },
-            {
-              "key": {
-                "meeting_code": 1
-              },
-              "sparse": true,
-              "unique": true
-            },
-            {
-              "key": {
-                "name": "text",
-                "purpose": "text",
-                "tags": "text"
-              }
-            }
-          ]
-        },
-        {
-          "collection": "room_members",
-          "indexes": [
-            {
-              "key": {
-                "room_id": 1,
-                "user_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "tenant_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "messages",
-          "indexes": [
-            {
-              "key": {
-                "room_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "thread_id": 1,
-                "created_at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "author_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "room_id": 1,
-                "is_pinned": 1
-              }
-            },
-            {
-              "key": {
-                "mentions.users": 1
-              }
-            },
-            {
-              "key": {
-                "content": "text"
-              }
-            }
-          ]
-        },
-        {
-          "collection": "reactions",
-          "indexes": [
-            {
-              "key": {
-                "message_id": 1,
-                "emoji.value": 1,
-                "user_id": 1
-              },
-              "unique": true
-            }
-          ]
-        },
-        {
-          "collection": "recordings",
-          "indexes": [
-            {
-              "key": {
-                "room_id": 1,
-                "recording_type": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "status": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "files",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "context.context_type": 1,
-                "context.entity_id": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "uploaded_by": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "context.room_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "external_source.provider": 1,
-                "external_source.external_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "invites",
-          "indexes": [
-            {
-              "key": {
-                "code": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "status": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "consent_requests",
-          "indexes": [
-            {
-              "key": {
-                "token": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "session_id": 1
-              }
-            },
-            {
-              "key": {
-                "expires_at": 1
-              },
-              "expireAfterSeconds": 0
-            }
-          ]
-        },
-        {
-          "collection": "background_tasks",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "status": 1
-              }
-            },
-            {
-              "key": {
-                "expires_at": 1
-              },
-              "expireAfterSeconds": 0
-            }
-          ]
-        },
-        {
-          "collection": "stripe_events",
-          "indexes": [
-            {
-              "key": {
-                "processed_at": 1
-              },
-              "expireAfterSeconds": 2592000
-            }
-          ]
-        },
-        {
-          "collection": "notifications",
-          "indexes": [
-            {
-              "key": {
-                "user_id": 1,
-                "is_read": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "subscribers",
-          "indexes": [
-            {
-              "key": {
-                "email": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "unsubscribe_token": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "confirm_token": 1
-              }
-            },
-            {
-              "key": {
-                "created_at": -1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "newsletter_issues",
-          "indexes": [
-            {
-              "key": {
-                "slug": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "created_at": -1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "newsletter_sends",
-          "indexes": [
-            {
-              "key": {
-                "issue_id": 1,
-                "subscriber_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "issue_id": 1,
-                "status": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "custom_emojis",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "name": 1
-              },
-              "unique": true
-            }
-          ]
-        },
-        {
-          "collection": "activation_codes",
-          "indexes": [
-            {
-              "key": {
-                "user_id": 1
-              }
-            },
-            {
-              "key": {
-                "valid_to": 1
-              },
-              "expireAfterSeconds": 0
-            }
-          ]
-        },
-        {
-          "collection": "agents",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "machine_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "status": 1
-              }
-            },
-            {
-              "key": {
-                "owner_user_id": 1
-              }
-            },
-            {
-              "key": {
-                "ephemeral": 1,
-                "deleted_at": 1,
-                "last_seen_at": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "remote_sessions",
-          "indexes": [
-            {
-              "key": {
-                "agent_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "controller_user_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "phase": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "remote_audit",
-          "indexes": [
-            {
-              "key": {
-                "session_id": 1,
-                "at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "agent_crashes",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "crashed_at_unix": -1
-              }
-            },
-            {
-              "key": {
-                "reported_at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "tunnel_clients",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "machine_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "status": 1
-              }
-            },
-            {
-              "key": {
-                "owner_user_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "overlay_networks",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1
-              },
-              "unique": true
-            }
-          ]
-        },
-        {
-          "collection": "used_tokens",
-          "indexes": [
-            {
-              "key": {
-                "used_at": 1
-              },
-              "expireAfterSeconds": 3600
-            }
-          ]
-        },
-        {
-          "collection": "enrollment_keys",
-          "indexes": [
-            {
-              "key": {
-                "jti": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "created_at": -1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "enrollment_key_uses",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "key_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "created_at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "overlay_blocks",
-          "indexes": [
-            {
-              "key": {
-                "slot": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "end_slot": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1
-              }
-            },
-            {
-              "key": {
-                "network_id": 1,
-                "seq": 1
-              }
-            },
-            {
-              "key": {
-                "network_id": 1
-              },
-              "unique": true,
-              "partialFilterExpression": {
-                "state": "assigned"
-              }
-            }
-          ]
-        },
-        {
-          "collection": "overlay_nodes",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "machine_id": 1
-              },
-              "unique": true,
-              "partialFilterExpression": {
-                "deleted_at": {
-                  "$type": "null"
-                }
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "network_id": 1,
-                "overlay_ip": 1
-              },
-              "unique": true,
-              "partialFilterExpression": {
-                "deleted_at": {
-                  "$type": "null"
-                }
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "network_id": 1,
-                "deleted_at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "network_id": 1,
-                "name": 1
-              },
-              "unique": true,
-              "partialFilterExpression": {
-                "$and": [
-                  {
-                    "name": {
-                      "$gt": ""
-                    }
-                  },
-                  {
-                    "deleted_at": {
-                      "$type": "null"
-                    }
+            "unique": true,
+            "partialFilterExpression": {
+              "$and": [
+                {
+                  "name": {
+                    "$gt": ""
                   }
-                ]
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "node_ref.id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "tunnel_policies",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "deleted_at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "name": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "tunnel_audit",
-          "indexes": [
-            {
-              "key": {
-                "tunnel_session_id": 1,
-                "at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "dst_host": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "exec_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "config_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "key_rotation_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "peer_relay_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "requester_node_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "ssh_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "ssh_activity",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "grant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "agent_logs",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "source": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "session_id": 1
-              }
-            },
-            {
-              "key": {
-                "lines.msg": "text"
-              }
-            },
-            {
-              "key": {
-                "created_at": 1
-              },
-              "expireAfterSeconds": 604800
-            }
-          ]
-        },
-        {
-          "collection": "stats_relay",
-          "indexes": [
-            {
-              "key": {
-                "region": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
-            }
-          ]
-        },
-        {
-          "collection": "stats_usage",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "meter": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
-            }
-          ]
-        },
-        {
-          "collection": "stats_machine",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
-            }
-          ]
-        },
-        {
-          "collection": "ws_sessions",
-          "indexes": [
-            {
-              "key": {
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "ended_at": 1
-              }
-            },
-            {
-              "key": {
-                "started_at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "page_views",
-          "indexes": [
-            {
-              "key": {
-                "ts": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": -1
-              }
-            },
-            {
-              "key": {
-                "path": 1,
-                "ts": -1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "stats_mesh",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": -1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
-            }
-          ]
-        },
-        {
-          "collection": "stats_events",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            }
-          ]
-        },
-        {
-          "collection": "stats_call",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "room_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "call_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
-            }
-          ]
-        },
-        {
-          "collection": "stats_call_user",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
-            }
-          ]
-        },
-        {
-          "collection": "remote_sessions",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "created_at": -1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "tunnel_audit",
-          "indexes": [
-            {
-              "key": {
-                "user_id": 1,
-                "at": -1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "call_sessions",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "room_id": 1,
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "ended_at": 1
-              }
-            },
-            {
-              "key": {
-                "started_at": 1
-              },
-              "expireAfterSeconds": 63072000
-            }
-          ]
-        },
-        {
-          "collection": "stats_usage_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_relay_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            },
-            {
-              "key": {
-                "region": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_machine_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_call_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_call_user_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_usage_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_relay_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            },
-            {
-              "key": {
-                "region": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_machine_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_call_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "stats_call_user_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "ts": 1
-              }
-            }
-          ]
-        }
-      ]
-    },
-    "multi_block": {
-      "multi_block": true,
-      "sets": [
-        {
-          "collection": "tenants",
-          "indexes": [
-            {
-              "key": {
-                "slug": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "owner_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "users",
-          "indexes": [
-            {
-              "key": {
-                "email": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "username": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "display_name": "text",
-                "username": "text"
-              }
-            }
-          ]
-        },
-        {
-          "collection": "tenant_members",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "user_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "roles",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "name": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "position": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "rooms",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "parent_id": 1,
-                "position": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "path": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "name": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "is_default": 1
-              }
-            },
-            {
-              "key": {
-                "meeting_code": 1
-              },
-              "sparse": true,
-              "unique": true
-            },
-            {
-              "key": {
-                "name": "text",
-                "purpose": "text",
-                "tags": "text"
-              }
-            }
-          ]
-        },
-        {
-          "collection": "room_members",
-          "indexes": [
-            {
-              "key": {
-                "room_id": 1,
-                "user_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "tenant_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "messages",
-          "indexes": [
-            {
-              "key": {
-                "room_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "thread_id": 1,
-                "created_at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "author_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "room_id": 1,
-                "is_pinned": 1
-              }
-            },
-            {
-              "key": {
-                "mentions.users": 1
-              }
-            },
-            {
-              "key": {
-                "content": "text"
-              }
-            }
-          ]
-        },
-        {
-          "collection": "reactions",
-          "indexes": [
-            {
-              "key": {
-                "message_id": 1,
-                "emoji.value": 1,
-                "user_id": 1
-              },
-              "unique": true
-            }
-          ]
-        },
-        {
-          "collection": "recordings",
-          "indexes": [
-            {
-              "key": {
-                "room_id": 1,
-                "recording_type": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "status": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "files",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "context.context_type": 1,
-                "context.entity_id": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "uploaded_by": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "context.room_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "external_source.provider": 1,
-                "external_source.external_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "invites",
-          "indexes": [
-            {
-              "key": {
-                "code": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "status": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "consent_requests",
-          "indexes": [
-            {
-              "key": {
-                "token": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "session_id": 1
-              }
-            },
-            {
-              "key": {
-                "expires_at": 1
-              },
-              "expireAfterSeconds": 0
-            }
-          ]
-        },
-        {
-          "collection": "background_tasks",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "status": 1
-              }
-            },
-            {
-              "key": {
-                "expires_at": 1
-              },
-              "expireAfterSeconds": 0
-            }
-          ]
-        },
-        {
-          "collection": "stripe_events",
-          "indexes": [
-            {
-              "key": {
-                "processed_at": 1
-              },
-              "expireAfterSeconds": 2592000
-            }
-          ]
-        },
-        {
-          "collection": "notifications",
-          "indexes": [
-            {
-              "key": {
-                "user_id": 1,
-                "is_read": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "subscribers",
-          "indexes": [
-            {
-              "key": {
-                "email": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "unsubscribe_token": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "confirm_token": 1
-              }
-            },
-            {
-              "key": {
-                "created_at": -1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "newsletter_issues",
-          "indexes": [
-            {
-              "key": {
-                "slug": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "created_at": -1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "newsletter_sends",
-          "indexes": [
-            {
-              "key": {
-                "issue_id": 1,
-                "subscriber_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "issue_id": 1,
-                "status": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "custom_emojis",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "name": 1
-              },
-              "unique": true
-            }
-          ]
-        },
-        {
-          "collection": "activation_codes",
-          "indexes": [
-            {
-              "key": {
-                "user_id": 1
-              }
-            },
-            {
-              "key": {
-                "valid_to": 1
-              },
-              "expireAfterSeconds": 0
-            }
-          ]
-        },
-        {
-          "collection": "agents",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "machine_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "status": 1
-              }
-            },
-            {
-              "key": {
-                "owner_user_id": 1
-              }
-            },
-            {
-              "key": {
-                "ephemeral": 1,
-                "deleted_at": 1,
-                "last_seen_at": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "remote_sessions",
-          "indexes": [
-            {
-              "key": {
-                "agent_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "controller_user_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "phase": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "remote_audit",
-          "indexes": [
-            {
-              "key": {
-                "session_id": 1,
-                "at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "agent_crashes",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "crashed_at_unix": -1
-              }
-            },
-            {
-              "key": {
-                "reported_at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "tunnel_clients",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "machine_id": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "status": 1
-              }
-            },
-            {
-              "key": {
-                "owner_user_id": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "overlay_networks",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1
-              },
-              "unique": true
-            }
-          ]
-        },
-        {
-          "collection": "used_tokens",
-          "indexes": [
-            {
-              "key": {
-                "used_at": 1
-              },
-              "expireAfterSeconds": 3600
-            }
-          ]
-        },
-        {
-          "collection": "enrollment_keys",
-          "indexes": [
-            {
-              "key": {
-                "jti": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "created_at": -1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "enrollment_key_uses",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "key_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "created_at": 1
-              },
-              "expireAfterSeconds": 7776000
-            }
-          ]
-        },
-        {
-          "collection": "overlay_blocks",
-          "pre_ops": [
-            {
-              "op": "drop_index_if_present",
-              "index": "network_id_1",
-              "why": "multi-block schema — one-block-per-network guard removed"
-            }
-          ],
-          "indexes": [
-            {
-              "key": {
-                "slot": 1
-              },
-              "unique": true
-            },
-            {
-              "key": {
-                "end_slot": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1
-              }
-            },
-            {
-              "key": {
-                "network_id": 1,
-                "seq": 1
-              }
-            }
-          ]
-        },
-        {
-          "collection": "overlay_nodes",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "machine_id": 1
-              },
-              "unique": true,
-              "partialFilterExpression": {
-                "deleted_at": {
-                  "$type": "null"
-                }
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "network_id": 1,
-                "overlay_ip": 1
-              },
-              "unique": true,
-              "partialFilterExpression": {
-                "deleted_at": {
-                  "$type": "null"
-                }
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "network_id": 1,
-                "deleted_at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "network_id": 1,
-                "name": 1
-              },
-              "unique": true,
-              "partialFilterExpression": {
-                "$and": [
-                  {
-                    "name": {
-                      "$gt": ""
-                    }
-                  },
-                  {
-                    "deleted_at": {
-                      "$type": "null"
-                    }
+                },
+                {
+                  "deleted_at": {
+                    "$type": "null"
                   }
-                ]
-              }
+                }
+              ]
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "node_ref.id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "page_views",
+        "indexes": [
+          {
+            "key": {
+              "ts": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": -1
+            }
+          },
+          {
+            "key": {
+              "path": 1,
+              "ts": -1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
             },
-            {
-              "key": {
-                "tenant_id": 1,
-                "node_ref.id": 1
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "peer_relay_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "requester_node_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "reactions",
+        "indexes": [
+          {
+            "key": {
+              "message_id": 1,
+              "emoji.value": 1,
+              "user_id": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "recordings",
+        "indexes": [
+          {
+            "key": {
+              "room_id": 1,
+              "recording_type": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "remote_audit",
+        "indexes": [
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "remote_sessions",
+        "indexes": [
+          {
+            "key": {
+              "agent_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "controller_user_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "phase": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "remote_sessions",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "roles",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "position": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "room_members",
+        "indexes": [
+          {
+            "key": {
+              "room_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "tenant_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "rooms",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "parent_id": 1,
+              "position": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "path": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "is_default": 1
+            }
+          },
+          {
+            "key": {
+              "meeting_code": 1
+            },
+            "sparse": true,
+            "unique": true
+          },
+          {
+            "key": {
+              "name": "text",
+              "purpose": "text",
+              "tags": "text"
+            }
+          }
+        ]
+      },
+      {
+        "collection": "ssh_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "grant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "ssh_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "stats_call",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "room_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "call_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_user",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_user_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_user_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_events",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          }
+        ]
+      },
+      {
+        "collection": "stats_machine",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_machine_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_machine_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_mesh",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": -1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_relay",
+        "indexes": [
+          {
+            "key": {
+              "region": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_relay_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "region": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_relay_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "region": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_usage",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "meter": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_usage_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_usage_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stripe_events",
+        "indexes": [
+          {
+            "key": {
+              "processed_at": 1
+            },
+            "expireAfterSeconds": 2592000
+          }
+        ]
+      },
+      {
+        "collection": "subscribers",
+        "indexes": [
+          {
+            "key": {
+              "email": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "unsubscribe_token": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "confirm_token": 1
+            }
+          },
+          {
+            "key": {
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tenant_members",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tenants",
+        "indexes": [
+          {
+            "key": {
+              "slug": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "owner_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tunnel_audit",
+        "indexes": [
+          {
+            "key": {
+              "tunnel_session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "dst_host": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "tunnel_audit",
+        "indexes": [
+          {
+            "key": {
+              "user_id": 1,
+              "at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tunnel_clients",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "machine_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          },
+          {
+            "key": {
+              "owner_user_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tunnel_policies",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "deleted_at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "used_tokens",
+        "indexes": [
+          {
+            "key": {
+              "used_at": 1
+            },
+            "expireAfterSeconds": 3600
+          }
+        ]
+      },
+      {
+        "collection": "users",
+        "indexes": [
+          {
+            "key": {
+              "email": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "username": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "display_name": "text",
+              "username": "text"
+            }
+          }
+        ]
+      },
+      {
+        "collection": "ws_sessions",
+        "indexes": [
+          {
+            "key": {
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "ended_at": 1
+            }
+          },
+          {
+            "key": {
+              "started_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      }
+    ],
+    "multi_block": [
+      {
+        "collection": "activation_codes",
+        "indexes": [
+          {
+            "key": {
+              "user_id": 1
+            }
+          },
+          {
+            "key": {
+              "valid_to": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "agent_crashes",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "crashed_at_unix": -1
+            }
+          },
+          {
+            "key": {
+              "reported_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "agent_logs",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "source": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "session_id": 1
+            }
+          },
+          {
+            "key": {
+              "lines.msg": "text"
+            }
+          },
+          {
+            "key": {
+              "created_at": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "agents",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "machine_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          },
+          {
+            "key": {
+              "owner_user_id": 1
+            }
+          },
+          {
+            "key": {
+              "ephemeral": 1,
+              "deleted_at": 1,
+              "last_seen_at": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "background_tasks",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "status": 1
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "call_sessions",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "room_id": 1,
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "ended_at": 1
+            }
+          },
+          {
+            "key": {
+              "started_at": 1
+            },
+            "expireAfterSeconds": 63072000
+          }
+        ]
+      },
+      {
+        "collection": "config_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "consent_requests",
+        "indexes": [
+          {
+            "key": {
+              "token": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "session_id": 1
+            }
+          },
+          {
+            "key": {
+              "expires_at": 1
+            },
+            "expireAfterSeconds": 0
+          }
+        ]
+      },
+      {
+        "collection": "custom_emojis",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "enrollment_key_uses",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "key_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "created_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "enrollment_keys",
+        "indexes": [
+          {
+            "key": {
+              "jti": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "exec_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "files",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "context.context_type": 1,
+              "context.entity_id": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "uploaded_by": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "context.room_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "external_source.provider": 1,
+              "external_source.external_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "invites",
+        "indexes": [
+          {
+            "key": {
+              "code": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "key_rotation_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "messages",
+        "indexes": [
+          {
+            "key": {
+              "room_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "thread_id": 1,
+              "created_at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "author_id": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "room_id": 1,
+              "is_pinned": 1
+            }
+          },
+          {
+            "key": {
+              "mentions.users": 1
+            }
+          },
+          {
+            "key": {
+              "content": "text"
+            }
+          }
+        ]
+      },
+      {
+        "collection": "newsletter_issues",
+        "indexes": [
+          {
+            "key": {
+              "slug": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "newsletter_sends",
+        "indexes": [
+          {
+            "key": {
+              "issue_id": 1,
+              "subscriber_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "issue_id": 1,
+              "status": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "notifications",
+        "indexes": [
+          {
+            "key": {
+              "user_id": 1,
+              "is_read": 1,
+              "created_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "overlay_blocks",
+        "pre_ops": [
+          {
+            "op": "drop_index_if_present",
+            "index": "network_id_1",
+            "why": "multi-block schema — one-block-per-network guard removed"
+          }
+        ],
+        "indexes": [
+          {
+            "key": {
+              "slot": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "end_slot": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "seq": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "overlay_networks",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "overlay_nodes",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "machine_id": 1
+            },
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
               }
             }
-          ]
-        },
-        {
-          "collection": "tunnel_policies",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "deleted_at": 1
-              }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "network_id": 1,
+              "overlay_ip": 1
             },
-            {
-              "key": {
-                "tenant_id": 1,
-                "name": 1
+            "unique": true,
+            "partialFilterExpression": {
+              "deleted_at": {
+                "$type": "null"
               }
             }
-          ]
-        },
-        {
-          "collection": "tunnel_audit",
-          "indexes": [
-            {
-              "key": {
-                "tunnel_session_id": 1,
-                "at": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "dst_host": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "network_id": 1,
+              "deleted_at": 1
             }
-          ]
-        },
-        {
-          "collection": "exec_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "network_id": 1,
+              "name": 1
             },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
+            "unique": true,
+            "partialFilterExpression": {
+              "$and": [
+                {
+                  "name": {
+                    "$gt": ""
+                  }
+                },
+                {
+                  "deleted_at": {
+                    "$type": "null"
+                  }
+                }
+              ]
             }
-          ]
-        },
-        {
-          "collection": "config_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "node_ref.id": 1
             }
-          ]
-        },
-        {
-          "collection": "key_rotation_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "page_views",
+        "indexes": [
+          {
+            "key": {
+              "ts": -1
             }
-          ]
-        },
-        {
-          "collection": "peer_relay_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "requester_node_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": -1
             }
-          ]
-        },
-        {
-          "collection": "ssh_audit",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "path": 1,
+              "ts": -1
             }
-          ]
-        },
-        {
-          "collection": "ssh_activity",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "at": -1
-              }
+          },
+          {
+            "key": {
+              "ts": 1
             },
-            {
-              "key": {
-                "agent_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "grant_id": 1,
-                "at": -1
-              }
-            },
-            {
-              "key": {
-                "at": 1
-              },
-              "expireAfterSeconds": 7776000
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "peer_relay_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "agent_logs",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "source": 1,
-                "created_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "session_id": 1
-              }
-            },
-            {
-              "key": {
-                "lines.msg": "text"
-              }
-            },
-            {
-              "key": {
-                "created_at": 1
-              },
-              "expireAfterSeconds": 604800
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_relay",
-          "indexes": [
-            {
-              "key": {
-                "region": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "requester_node_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_usage",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "meter": 1,
-                "ts": 1
-              }
+          },
+          {
+            "key": {
+              "at": 1
             },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "reactions",
+        "indexes": [
+          {
+            "key": {
+              "message_id": 1,
+              "emoji.value": 1,
+              "user_id": 1
+            },
+            "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "recordings",
+        "indexes": [
+          {
+            "key": {
+              "room_id": 1,
+              "recording_type": 1
             }
-          ]
-        },
-        {
-          "collection": "stats_machine",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
             }
-          ]
-        },
-        {
-          "collection": "ws_sessions",
-          "indexes": [
-            {
-              "key": {
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "ended_at": 1
-              }
-            },
-            {
-              "key": {
-                "started_at": 1
-              },
-              "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "remote_audit",
+        "indexes": [
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
             }
-          ]
-        },
-        {
-          "collection": "page_views",
-          "indexes": [
-            {
-              "key": {
-                "ts": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": -1
-              }
-            },
-            {
-              "key": {
-                "path": 1,
-                "ts": -1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_mesh",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": -1
-              }
+          },
+          {
+            "key": {
+              "at": 1
             },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "remote_sessions",
+        "indexes": [
+          {
+            "key": {
+              "agent_id": 1,
+              "created_at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_events",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "agent_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "controller_user_id": 1,
+              "created_at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_call",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "room_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "call_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "phase": 1
             }
-          ]
-        },
-        {
-          "collection": "stats_call_user",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "user_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "remote_sessions",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "created_at": -1
             }
-          ]
-        },
-        {
-          "collection": "remote_sessions",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "created_at": -1
-              }
+          }
+        ]
+      },
+      {
+        "collection": "roles",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "position": 1
             }
-          ]
-        },
-        {
-          "collection": "tunnel_audit",
-          "indexes": [
-            {
-              "key": {
-                "user_id": 1,
-                "at": -1
-              }
+          }
+        ]
+      },
+      {
+        "collection": "room_members",
+        "indexes": [
+          {
+            "key": {
+              "room_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "tenant_id": 1
             }
-          ]
-        },
-        {
-          "collection": "call_sessions",
-          "indexes": [
-            {
-              "key": {
-                "tenant_id": 1,
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "room_id": 1,
-                "started_at": -1
-              }
-            },
-            {
-              "key": {
-                "ended_at": 1
-              }
-            },
-            {
-              "key": {
-                "started_at": 1
-              },
-              "expireAfterSeconds": 63072000
+          }
+        ]
+      },
+      {
+        "collection": "rooms",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "parent_id": 1,
+              "position": 1
             }
-          ]
-        },
-        {
-          "collection": "stats_usage_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "path": 1
             },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
             }
-          ]
-        },
-        {
-          "collection": "stats_relay_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            },
-            {
-              "key": {
-                "region": 1,
-                "ts": 1
-              }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "is_default": 1
             }
-          ]
-        },
-        {
-          "collection": "stats_machine_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "meeting_code": 1
             },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
+            "sparse": true,
+            "unique": true
+          },
+          {
+            "key": {
+              "name": "text",
+              "purpose": "text",
+              "tags": "text"
             }
-          ]
-        },
-        {
-          "collection": "stats_call_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
+          }
+        ]
+      },
+      {
+        "collection": "ssh_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_call_user_1h",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 7776000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "ts": 1
-              }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_usage_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "grant_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_relay_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "at": 1
             },
-            {
-              "key": {
-                "region": 1,
-                "ts": 1
-              }
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "ssh_audit",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_machine_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
+          },
+          {
+            "key": {
+              "agent_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_call_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
-            },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "at": -1
             }
-          ]
-        },
-        {
-          "collection": "stats_call_user_1d",
-          "indexes": [
-            {
-              "key": {
-                "ts": 1
-              },
-              "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "at": 1
             },
-            {
-              "key": {
-                "tenant_id": 1,
-                "ts": 1
-              }
-            },
-            {
-              "key": {
-                "user_id": 1,
-                "ts": 1
-              }
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "stats_call",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
             }
-          ]
-        }
-      ]
-    }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "room_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "call_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_user",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_user_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_call_user_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_events",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          }
+        ]
+      },
+      {
+        "collection": "stats_machine",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_machine_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_machine_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_mesh",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": -1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_relay",
+        "indexes": [
+          {
+            "key": {
+              "region": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_relay_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "region": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_relay_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "region": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_usage",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "meter": 1,
+              "ts": 1
+            }
+          },
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 604800
+          }
+        ]
+      },
+      {
+        "collection": "stats_usage_1d",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 63072000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stats_usage_1h",
+        "indexes": [
+          {
+            "key": {
+              "ts": 1
+            },
+            "expireAfterSeconds": 7776000
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "ts": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "stripe_events",
+        "indexes": [
+          {
+            "key": {
+              "processed_at": 1
+            },
+            "expireAfterSeconds": 2592000
+          }
+        ]
+      },
+      {
+        "collection": "subscribers",
+        "indexes": [
+          {
+            "key": {
+              "email": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "unsubscribe_token": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "confirm_token": 1
+            }
+          },
+          {
+            "key": {
+              "created_at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tenant_members",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "user_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "user_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tenants",
+        "indexes": [
+          {
+            "key": {
+              "slug": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "owner_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tunnel_audit",
+        "indexes": [
+          {
+            "key": {
+              "tunnel_session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "dst_host": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
+        "collection": "tunnel_audit",
+        "indexes": [
+          {
+            "key": {
+              "user_id": 1,
+              "at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tunnel_clients",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "machine_id": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "status": 1
+            }
+          },
+          {
+            "key": {
+              "owner_user_id": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "tunnel_policies",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "deleted_at": 1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "name": 1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "used_tokens",
+        "indexes": [
+          {
+            "key": {
+              "used_at": 1
+            },
+            "expireAfterSeconds": 3600
+          }
+        ]
+      },
+      {
+        "collection": "users",
+        "indexes": [
+          {
+            "key": {
+              "email": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "username": 1
+            },
+            "unique": true
+          },
+          {
+            "key": {
+              "display_name": "text",
+              "username": "text"
+            }
+          }
+        ]
+      },
+      {
+        "collection": "ws_sessions",
+        "indexes": [
+          {
+            "key": {
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "tenant_id": 1,
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "user_id": 1,
+              "started_at": -1
+            }
+          },
+          {
+            "key": {
+              "ended_at": 1
+            }
+          },
+          {
+            "key": {
+              "started_at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      }
+    ]
   },
   "wire": [
     "rc:agent.hello",

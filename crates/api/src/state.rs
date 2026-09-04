@@ -21,14 +21,13 @@ use roomler_ai_services::{
         activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
         consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
         invite::InviteDao, key_rotation_audit::KeyRotationAuditDao, message::MessageDao,
-        newsletter_issue::NewsletterIssueDao, newsletter_send::NewsletterSendDao,
         notification::NotificationDao, overlay_network::OverlayNetworkDao,
         overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
         peer_relay_audit::PeerRelayAuditDao, push_subscription::PushSubscriptionDao,
         reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
         remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao,
-        ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, subscriber::SubscriberDao,
-        tenant::TenantDao, tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
+        ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
+        tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
         tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
@@ -71,16 +70,13 @@ pub struct AppState {
     pub files: Arc<FileDao>,
     pub recordings: Arc<RecordingDao>,
 
+    /// FR-69 P2 — the module crates this build links, initialised (or `None`
+    /// where the operator switched one off). Mounted by `build_router`;
+    /// their index sets applied by the host after the core plan.
+    pub modules: crate::compose::Modules,
+
     pub room_manager: Arc<RoomManager>,
     pub giphy: Option<Arc<GiphyService>>,
-    /// FR-39 — the public updates list. Not a user store: no password, no
-    /// tenant, no session.
-    pub subscribers: Arc<SubscriberDao>,
-    /// FR-58 — newsletter issues (platform-admin surface).
-    pub newsletter_issues: Arc<NewsletterIssueDao>,
-    /// FR-58 — the per-recipient delivery ledger; its unique index is the
-    /// send program's at-most-once invariant.
-    pub newsletter_sends: Arc<NewsletterSendDao>,
 
     // Remote-control subsystem
     pub agents: Arc<AgentDao>,
@@ -295,9 +291,6 @@ impl AppState {
         let email = EmailService::from_settings(&settings.email).map(Arc::new);
 
         let push_subscriptions = Arc::new(PushSubscriptionDao::new(&db));
-        let subscribers = Arc::new(SubscriberDao::new(&db));
-        let newsletter_issues = Arc::new(NewsletterIssueDao::new(&db));
-        let newsletter_sends = Arc::new(NewsletterSendDao::new(&db));
         let push = if !settings.push.vapid_private_key.is_empty() {
             match PushService::new(
                 &settings.push.vapid_private_key,
@@ -865,8 +858,12 @@ impl AppState {
             turn_map,
             relay_load,
         };
+        // FR-69 P2 — the module crates, after the core and before the host
+        // state that mounts them.
+        let modules = crate::compose::Modules::init(core.clone(), &core.settings).await?;
         let state = Self {
             core,
+            modules,
             rooms,
             messages,
             reactions,
@@ -875,9 +872,6 @@ impl AppState {
 
             room_manager,
             giphy,
-            subscribers,
-            newsletter_issues,
-            newsletter_sends,
             agents,
             enrollment_keys,
             remote_sessions,

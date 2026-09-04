@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 pub mod cluster;
+pub mod compose;
 pub mod core_state;
 pub mod extractors;
 pub mod media_stats;
 pub mod media_type;
 pub mod middleware;
-pub mod newsletter_send;
 pub mod routes;
 pub mod state;
 pub mod stats_rollup;
@@ -283,15 +283,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{provider}", get(routes::oauth::oauth_redirect))
         .route("/callback/{provider}", get(routes::oauth::oauth_callback));
 
-    // Stripe routes
-    // S5 — the webhook route is NOT here: Stripe's retry bursts must
-    // never hit the per-IP governor (a 429'd delivery marks the endpoint
-    // failing on their side). It's mounted un-governed in the outer
-    // router below; its own HMAC signature check is the auth.
-    let stripe_routes = Router::new()
-        .route("/plans", get(routes::stripe::get_plans))
-        .route("/checkout", post(routes::stripe::create_checkout))
-        .route("/portal", post(routes::stripe::create_portal));
+    // Stripe routes are the `saas` module's (FR-69 P2), including the
+    // webhook, which that module mounts un-governed at the root.
 
     // Giphy proxy routes
     let giphy_routes = Router::new()
@@ -322,12 +315,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/unread-summary", get(routes::user::unread_summary))
         // FR-12 P3 — likewise static, likewise above the capture.
         .route("/tutorial", put(routes::user::update_tutorial))
-        // FR-58 P4 — the signed-in newsletter toggle (static, above the
-        // capture). A different door into `subscribers`, not a second list.
-        .route(
-            "/newsletter",
-            get(routes::newsletter::user_get).put(routes::newsletter::user_set),
-        )
+        // FR-58 P4 — `/user/newsletter` (the signed-in toggle) is mounted by
+        // the `saas` module; a static segment, it still wins over the capture.
         .route("/{user_id}", get(routes::user::get_profile));
 
     // rc.58 — browser console log batch ingest. User-authed (the
@@ -698,24 +687,8 @@ pub fn build_router(state: AppState) -> Router {
         // what makes "in which org did this happen" answerable.
         .route("/usage", get(routes::usage::admin_usage))
         .route("/usage/{user_id}", get(routes::usage::admin_usage_detail));
-    // FR-58 — the newsletter sending program's admin surface. Same gate,
-    // same 404-on-miss; `platform_admins` unset ⇒ the whole family 404s.
-    let admin_newsletter_routes = Router::new()
-        .route(
-            "/issues",
-            post(routes::newsletter::create).get(routes::newsletter::list),
-        )
-        .route(
-            "/issues/{slug}",
-            put(routes::newsletter::update).get(routes::newsletter::get_one),
-        )
-        .route("/issues/{slug}/preview", get(routes::newsletter::preview))
-        .route(
-            "/issues/{slug}/test-send",
-            post(routes::newsletter::test_send),
-        )
-        .route("/issues/{slug}/send", post(routes::newsletter::send))
-        .route("/issues/{slug}/status", get(routes::newsletter::status));
+    // FR-58 — the newsletter admin surface (`/admin/newsletter/*`) is
+    // mounted by the `saas` module (FR-69 P2).
     let tenant_stats_routes = Router::new()
         .route("/overview", get(routes::stats::tenant_overview))
         .route("/mesh", get(routes::stats::tenant_mesh))
@@ -742,7 +715,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/auth", auth_routes)
         .nest("/user", user_routes)
         .nest("/oauth", oauth_routes)
-        .nest("/stripe", stripe_routes)
         .nest("/invite", public_invite_routes)
         .nest("/giphy", giphy_routes)
         .nest("/push", push_routes)
@@ -756,13 +728,9 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
         .nest("/admin/stats", admin_stats_routes)
-        .nest("/admin/newsletter", admin_newsletter_routes)
-        // FR-32 P1c — "who would break if enforcement were turned on?".
-        // Platform-admin only (404 on miss, like the rest of /admin).
-        .route(
-            "/admin/plan-compliance",
-            get(routes::plan_compliance::admin_plan_compliance),
-        )
+        // `/stripe/*`, `/admin/newsletter/*`, `/admin/plan-compliance`,
+        // `/user/newsletter` and `/subscribe*` are the `saas` module's
+        // (FR-69 P2), merged in by `state.modules.mount` below.
         // The block registry is GLOBAL, so reclaiming from it is a platform
         // operation, not a tenant one. Dry-run by default.
         .route(
@@ -779,26 +747,6 @@ pub fn build_router(state: AppState) -> Router {
         // normalised server-side). User-scoped, not tenant-scoped: a
         // user navigates across orgs within one session.
         .route("/stats/pageview", post(routes::stats::page_view))
-        // FR-39 — the public updates list. No auth extractor: `subscribe` is an
-        // open form, and for the other two the unguessable token IS the
-        // capability (same shape as `public_consent_routes` above). Flat rather
-        // than nested so the POST target and its two token paths read together.
-        // ⚠️ `subscribe` answers 202 for every outcome, including failure — the
-        // uniform response is a membership-oracle control, not error handling.
-        .route("/subscribe", post(routes::subscribe::subscribe))
-        // FR-58 follow-up: the GET is a pure redirect to the confirm PAGE —
-        // Gmail's link scanner burned the first field subscriber's single-use
-        // token via the old confirming GET. The POST is the deliberate click.
-        .route(
-            "/subscribe/confirm/{token}",
-            get(routes::subscribe::confirm_redirect).post(routes::subscribe::confirm),
-        )
-        // FR-58: the POST leg is the RFC 8058 one-click target — same path,
-        // same token capability, plain 200 (providers follow no redirects).
-        .route(
-            "/subscribe/unsubscribe/{token}",
-            get(routes::subscribe::unsubscribe).post(routes::subscribe::unsubscribe_oneclick),
-        )
         .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
@@ -851,17 +799,22 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/health/ready", get(readiness_check));
 
+    // FR-69 — the module crates' governed routes join the host's under
+    // `/api` (`crates/api/src/compose.rs`).
+    let api = state.modules.mount(api);
+
     // Apply rate limiting only to API routes (not health/ws which need unrestricted access)
     let rate_limited_api = Router::new().nest("/api", api).layer(governor_layer);
 
-    Router::new()
-        .merge(rate_limited_api)
-        .merge(health)
-        // S5 — Stripe webhook outside the governor (signature-authed;
-        // retry bursts from Stripe's fixed IPs would trip the per-IP
-        // limiter and mark the endpoint failing on their dashboard).
-        .route("/api/stripe/webhook", post(routes::stripe::webhook))
-        .route("/ws", get(ws::handler::ws_upgrade))
+    // FR-69 — the module crates' ungoverned routes join at the root: the
+    // Stripe webhook (S5) is signature-authed, and retry bursts from Stripe's
+    // fixed IPs would trip the per-IP limiter and mark the endpoint failing
+    // on their dashboard.
+    let root = state
+        .modules
+        .mount_unlimited(Router::new().merge(rate_limited_api).merge(health));
+
+    root.route("/ws", get(ws::handler::ws_upgrade))
         .route("/derp", get(ws::derp::derp_upgrade))
         // Security — never let a bearer-carrying query string into the logs:
         // `/ws?token=<jwt>&role=agent` and `/derp?token=<jwt>` authenticate

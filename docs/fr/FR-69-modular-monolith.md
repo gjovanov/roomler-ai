@@ -1,6 +1,7 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 shipped · P1 in flight (P1a #1315 + P1b #1317 shipped; P1c open) ·
+**Status**: P0 + P1 + P2 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320) ·
+P3 (`chat`) next ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -446,8 +447,8 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | Phase | Delivers | Gate | Kill switch | Complexity | Days |
 |---|---|---|---|---|---:|
 | **P0** ✅ | FR claimed; `agent-core` → `roomler-node-core`; `crates/core` (`roomler-core`) contract types; composition baseline + test — #1309, #1311, #1312 | CI green; baseline committed and reproducible (recorded by the lane itself, see the field log) | none needed (docs + a rename + an unused crate) | low | 2–3 |
-| **P1** 🟡 | `Core` extraction, state split, `[modules]` settings, `GET /api/capabilities` — P1a #1315 (the split, in place) and P1b #1317 (the move into `roomler-core`) shipped; P1c (core-owned handlers to `State<Core>`) open | baseline identical (P1a: +1 route, intended); integration lane; prod roll | revert | high | 5–8 |
-| **P2** | `saas` module | same | `[modules] saas = false` | low | 1–2 |
+| **P1** ✅ | `Core` extraction, state split, `[modules]` settings, `GET /api/capabilities` — P1a #1315 (the split, in place), P1b #1317 (the move into `roomler-core`), P1c + P1d #1318 (core-owned handlers on `State<Core>`; `ApiError`, cookies, origin and the core extractors below the api crate) | baseline identical (P1a: +1 route, intended); integration lane; prod roll | revert | high | 5–8 |
+| **P2** ✅ | `saas` module — #1320: the first module crate, plus the host composition (`crates/api/src/compose.rs`) that mounts it | baseline identical (index sets re-sorted, intended); integration lane; prod roll | `[modules] saas = false` (real from this PR on) | low | 1–2 |
 | **P3** | `chat` module | same + tenant-scoping tests | `chat = false` | medium | 2–3 |
 | **P4** | `conference` module; mediasoup out of `services` | same + Docker time measured (AC4) | `conference = false` | medium | 3–4 |
 | **P5** | `fleet` module; Hub leaves `remote_control`; namespace map | same + no dip in online agents | redeploy previous tag | high | 4–6 |
@@ -572,3 +573,48 @@ Rust job and exercised by the integration lane rather than locally.
   links `mediasoup` — so the contract crate's unit tests can no longer run on a box without the
   server toolchain either. That is temporary by construction: P4 moves `services/media` into
   the `conference` module and the dependency disappears with it.
+
+### 2026-09-04 — P1c + P1d: the handler seam, and the primitives below the api crate
+
+- **P1c (#1318, squash `abdbc5a6`)** — the twelve route files whose handlers read only core
+  fields (auth, oauth, role, invite, notification, push, background_task, stats, usage, cost,
+  plan_compliance, stripe) take `State<Core>`; their file-local guards and the six notification
+  helpers take `&Core`; the three room/message guards keep `&AppState` (chat's). Measured before
+  converting, not assumed: the non-core readers were `user.rs` (`rooms`) and `tenant.rs`
+  (`agents` + the archive cascade), both left alone. No call site outside those files changed.
+- **P1d (same PR)** — `ApiError`, the cookie helpers, the origin policy and the core-only
+  extractors moved into `roomler-core` with `git mv`; the api re-exports each under its old
+  path. The reason is structural: a module crate cannot depend on the crate that composes it,
+  so everything a module's handler needs had to live below it before the first module.
+- Green on the first run. Baseline untouched.
+
+### 2026-09-04 — P2: `saas`, the first module crate
+
+- **#1320** — `crates/modules/saas` = `roomler-ai-mod-saas` (Stripe, the public updates list
+  and the newsletter, plan compliance), an **add-on feature** on the host (`saas`, in
+  `default`), never in a profile. `SaasState` = `Core` + its three DAOs, derefs to `Core`,
+  `impl FromRef<SaasState> for Core`; `impl Module for SaasState` — `init` from `core.db`,
+  `enabled` = `[modules] saas` (**the switch is real for this module**: off ⇒ not initialised,
+  not mounted, no index sets), `routes` = exactly the paths the host mounted before,
+  `unlimited_routes` = the Stripe webhook outside the governor, `indexes` = the three sets the
+  db plan used to hold.
+- The host gained `crates/api/src/compose.rs` (`Modules`: one optional field per linked
+  module behind its feature; `init` in composition order; `mount` / `mount_unlimited` — a
+  module's `Router<()>` joins the host's via `with_state(())`; `index_sets`, applied after the
+  core plan by `main.rs` and the test fixture). `AppState` carries `modules`; the three saas
+  fields left it. The platform-admin guards moved into `roomler_core::guards`; the db index
+  helpers became `pub`; `Module::init` takes `Core` by value.
+- **The snapshot now sorts index sets by collection.** A module PR moves sets between crates
+  and must not change them; the definition-order snapshot would have flagged every move. The
+  baseline was re-recorded from the lane's own output (run 33859133420 on the stacked branch,
+  before the rebase; the whole P1c+P1d+P2 stack compiled there on the first try): **184
+  routes, 62 index sets per schema, 96 wire names — routes and wire names byte-identical to
+  the previous baseline, the index sets the same collections and specs, re-ordered**. The
+  route-list diff between the two baselines is empty; the collection-list diff is empty.
+- 🔑 Two lessons for the next module. (1) `Snapshot::summary` counted `"sets"` inside a plan
+  object and reported 0 once the shape became a sorted array — the preconditions in the test
+  were right, the log line was not; fixed, and a reminder that the display path and the
+  assertion path must read the same shape. (2) The lane's warm cache turns a full-stack
+  compile + one test into a ~4-minute dispatch — cheaper than any local build this dev box
+  could do, so "dispatch the lane with `filter=composition_matches_baseline`" is now the
+  standard way to compile-check a stacked branch before its PR exists.
