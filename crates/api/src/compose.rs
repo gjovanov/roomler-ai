@@ -302,18 +302,8 @@ impl Modules {
     pub fn register_controller(
         &self,
         user_id: bson::oid::ObjectId,
-        sender: Arc<
-            tokio::sync::Mutex<
-                futures::stream::SplitSink<
-                    axum::extract::ws::WebSocket,
-                    axum::extract::ws::Message,
-                >,
-            >,
-        >,
-    ) -> Option<(
-        roomler_ai_remote_control::session::ClientTx,
-        tokio::task::JoinHandle<()>,
-    )> {
+        sender: roomler_core::ws::storage::WsSender,
+    ) -> Option<ControllerRegistration> {
         #[cfg(feature = "fleet")]
         if let Some(fleet) = &self.fleet {
             let (tx, rx) = fleet.rc_hub.register_controller(user_id);
@@ -330,10 +320,7 @@ impl Modules {
     pub fn unregister_controller(
         &self,
         user_id: bson::oid::ObjectId,
-        rc: Option<&(
-            roomler_ai_remote_control::session::ClientTx,
-            tokio::task::JoinHandle<()>,
-        )>,
+        rc: Option<&ControllerRegistration>,
     ) {
         #[cfg(feature = "fleet")]
         if let (Some(fleet), Some((tx, pump))) = (&self.fleet, rc) {
@@ -718,6 +705,14 @@ pub struct NetworkGauges {
     pub tunnel_sessions: usize,
     pub derp_registrations: usize,
 }
+
+/// What [`Modules::register_controller`] hands the user socket: the tab's
+/// Hub sender (the `rc:*` dispatch addresses replies to it) and the task
+/// pumping the Hub's replies onto the socket, aborted at close.
+pub type ControllerRegistration = (
+    roomler_ai_remote_control::session::ClientTx,
+    tokio::task::JoinHandle<()>,
+);
 
 /// 503 for a socket role whose module this pod does not mount: the caller
 /// dialed the right place with the right credential and must not read the
