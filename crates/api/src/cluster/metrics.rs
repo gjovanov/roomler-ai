@@ -19,21 +19,9 @@ pub use roomler_core::cluster::metrics::*;
 /// Snapshot every counter + live gauge for one pod.
 pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
     // Media gauges: per-room participant/consumer counts (the
-    // PipeTransport trigger inputs).
-    let mut media_rooms = Vec::new();
-    let mut participants_total = 0usize;
-    let mut consumers_total = 0usize;
-    for room in state.room_manager.rooms_ref().iter() {
-        let participants = room.participants.len();
-        let consumers: usize = room.participants.iter().map(|p| p.consumers.len()).sum();
-        participants_total += participants;
-        consumers_total += consumers;
-        media_rooms.push(serde_json::json!({
-            "room_id": room.key().to_hex(),
-            "participants": participants,
-            "consumers": consumers,
-        }));
-    }
+    // PipeTransport trigger inputs). FR-69 P4 — conference's; a build
+    // without the module reports zero rooms.
+    let (media_rooms, participants_total, consumers_total) = state.modules.media_gauges();
 
     // Alive pods per the advisory directory records.
     let pods_alive: Vec<String> = match &state.cluster_directory {
@@ -69,7 +57,7 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "bus_deadline_total": BUS_DEADLINE_TOTAL.load(Ordering::Relaxed),
             "media_fold_total": MEDIA_FOLD_TOTAL.load(Ordering::Relaxed),
             "media_belt_fallback_total":
-                crate::ws::media_cluster::MEDIA_BELT_FALLBACK_TOTAL.load(Ordering::Relaxed),
+                MEDIA_BELT_FALLBACK_TOTAL.load(Ordering::Relaxed),
             "derp_rehome_close_total": DERP_REHOME_CLOSE_TOTAL.load(Ordering::Relaxed),
             "derp_bytes_relayed_total": DERP_BYTES_RELAYED_TOTAL.load(Ordering::Relaxed),
             "derp_rehome_stuck_total":

@@ -6,7 +6,7 @@
 //! cluster and mint call sessions. Carved out of `room.rs` when the chat half
 //! of that file moved into the `chat` module (P3); they stay in the host
 //! until the `conference` module exists (P4), and `rooms` stays on
-//! `AppState` for them. Bodies unchanged.
+//! `ConferenceState` for them. Bodies unchanged.
 
 use axum::{
     Json,
@@ -15,12 +15,14 @@ use axum::{
 use bson::oid::ObjectId;
 use serde::Deserialize;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::ConferenceState;
 
 // ── Call endpoints ──────────────────────────────────────────────
 
 pub async fn call_start(
-    State(state): State<AppState>,
+    State(state): State<ConferenceState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -29,7 +31,7 @@ pub async fn call_start(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     // Stats PR-2 — transition-gated: only the caller that actually flips
     // the room to in_progress mints the call instance; a re-invoked
@@ -50,15 +52,14 @@ pub async fn call_start(
     // local creation — its members' `media:join` then routes to the
     // owner (the UI never reads these HTTP caps; the real ones arrive
     // via `media:router_capabilities` on the WS).
-    let rtp_capabilities = match crate::ws::media_cluster::resolve_media_route(&state, &rid, true)
-        .await
+    let rtp_capabilities = match crate::media_cluster::resolve_media_route(&state, &rid, true).await
     {
-        crate::ws::media_cluster::MediaRoute::Local { .. } => state
+        crate::media_cluster::MediaRoute::Local { .. } => state
             .room_manager
             .create_room(rid)
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to create media room: {}", e)))?,
-        crate::ws::media_cluster::MediaRoute::Remote(pod) => {
+        crate::media_cluster::MediaRoute::Remote(pod) => {
             tracing::info!(room = %rid, owner = %pod, "call/start: conference already owned by another pod");
             serde_json::Value::Null
         }
@@ -81,7 +82,7 @@ pub async fn call_start(
                 "started_by": auth.user_id.to_hex(),
             }
         });
-        crate::ws::dispatcher::broadcast_with_redis(
+        roomler_core::ws::dispatcher::broadcast_with_redis(
             &state.ws_storage,
             &state.redis_pubsub,
             &member_ids,
@@ -100,7 +101,7 @@ pub async fn call_start(
             .cloned()
             .unwrap_or_else(|| auth.user_id.to_hex());
 
-        super::helpers::notify_call_started(
+        roomler_core::notify::notify_call_started(
             &state,
             tid,
             rid,
@@ -130,7 +131,7 @@ pub struct CallSessionBody {
 }
 
 pub async fn call_join(
-    State(state): State<AppState>,
+    State(state): State<ConferenceState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     body: Option<Json<CallSessionBody>>,
@@ -140,7 +141,7 @@ pub async fn call_join(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let connection_id = body.and_then(|Json(b)| b.connection_id);
     let user = state.users.base.find_by_id(auth.user_id).await?;
@@ -187,7 +188,7 @@ pub async fn call_join(
                 "conference_status": conference_status,
             }
         });
-        crate::ws::dispatcher::broadcast_with_redis(
+        roomler_core::ws::dispatcher::broadcast_with_redis(
             &state.ws_storage,
             &state.redis_pubsub,
             &member_ids,
@@ -203,7 +204,7 @@ pub async fn call_join(
 }
 
 pub async fn call_leave(
-    State(state): State<AppState>,
+    State(state): State<ConferenceState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     body: Option<Json<CallSessionBody>>,
@@ -213,7 +214,7 @@ pub async fn call_leave(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let connection_id = body.and_then(|Json(b)| b.connection_id);
     close_call_media(&state, rid, auth.user_id, connection_id.as_deref()).await;
@@ -229,13 +230,13 @@ pub async fn call_leave(
 /// runs. C-4: the media island may live on another pod — the owner then drops
 /// the transports and broadcasts `media:peer_left` itself.
 pub(crate) async fn close_call_media(
-    state: &AppState,
+    state: &ConferenceState,
     rid: ObjectId,
     user_id: ObjectId,
     connection_id: Option<&str>,
 ) {
-    match crate::ws::media_cluster::resolve_media_route(state, &rid, false).await {
-        crate::ws::media_cluster::MediaRoute::Local { .. } => {
+    match crate::media_cluster::resolve_media_route(state, &rid, false).await {
+        crate::media_cluster::MediaRoute::Local { .. } => {
             let closed = match connection_id {
                 // Ownership-checked: the conn id comes from an HTTP body, so
                 // it must not be able to close another participant's media.
@@ -260,7 +261,7 @@ pub(crate) async fn close_call_media(
                     data["connection_id"] = serde_json::Value::String(cid.to_string());
                 }
                 let event = serde_json::json!({ "type": "media:peer_left", "data": data });
-                crate::ws::dispatcher::broadcast_with_redis(
+                roomler_core::ws::dispatcher::broadcast_with_redis(
                     &state.ws_storage,
                     &state.redis_pubsub,
                     &remaining,
@@ -269,9 +270,8 @@ pub(crate) async fn close_call_media(
                 .await;
             }
         }
-        crate::ws::media_cluster::MediaRoute::Remote(pod) => {
-            crate::ws::media_cluster::rpc_leave_user(state, &pod, &rid, &user_id, connection_id)
-                .await;
+        crate::media_cluster::MediaRoute::Remote(pod) => {
+            crate::media_cluster::rpc_leave_user(state, &pod, &rid, &user_id, connection_id).await;
         }
     }
 }
@@ -280,8 +280,8 @@ pub(crate) async fn close_call_media(
 /// disconnect path (which historically skipped it entirely — the "1 Active
 /// call after refresh" bug): close the session, and only when the user's
 /// LAST session closed broadcast the new count / auto-end the call.
-pub(crate) async fn finalize_call_leave_db(
-    state: &AppState,
+pub async fn finalize_call_leave_db(
+    state: &ConferenceState,
     rid: ObjectId,
     user_id: ObjectId,
     connection_id: Option<&str>,
@@ -323,7 +323,7 @@ pub(crate) async fn finalize_call_leave_db(
                     "conference_status": status.clone().unwrap_or_else(|| "in_progress".into()),
                 }
             });
-            crate::ws::dispatcher::broadcast_with_redis(
+            roomler_core::ws::dispatcher::broadcast_with_redis(
                 &state.ws_storage,
                 &state.redis_pubsub,
                 &member_ids,
@@ -340,7 +340,7 @@ pub(crate) async fn finalize_call_leave_db(
             tracing::debug!(room = %rid, %e, "call session close failed (last_left)");
         }
         // C-4 — the media island may live on another pod.
-        crate::ws::media_cluster::close_room_everywhere(state, &rid).await;
+        crate::media_cluster::close_room_everywhere(state, &rid).await;
 
         if !member_ids.is_empty() {
             let event = serde_json::json!({
@@ -349,7 +349,7 @@ pub(crate) async fn finalize_call_leave_db(
                     "room_id": rid.to_hex(),
                 }
             });
-            crate::ws::dispatcher::broadcast_with_redis(
+            roomler_core::ws::dispatcher::broadcast_with_redis(
                 &state.ws_storage,
                 &state.redis_pubsub,
                 &member_ids,
@@ -367,7 +367,7 @@ pub(crate) async fn finalize_call_leave_db(
 /// (orphans from a crash gap, closed late by the legacy close-all leave)
 /// are skipped entirely — they must not book days into the current call.
 async fn book_call_minutes(
-    state: &AppState,
+    state: &ConferenceState,
     rid: ObjectId,
     closed: &[(bson::DateTime, bson::DateTime)],
 ) {
@@ -405,7 +405,7 @@ async fn book_call_minutes(
 }
 
 pub async fn call_end(
-    State(state): State<AppState>,
+    State(state): State<ConferenceState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -414,7 +414,7 @@ pub async fn call_end(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let ended_call = state.rooms.end_call(rid).await?;
     if let Some(call_id) = ended_call
@@ -429,7 +429,7 @@ pub async fn call_end(
     // media:room_closed block was dead code: it read the participant
     // list AFTER removing the room, so the list was always empty — the
     // UI teardown signal is `room:call_ended` below.
-    crate::ws::media_cluster::close_room_everywhere(&state, &rid).await;
+    crate::media_cluster::close_room_everywhere(&state, &rid).await;
 
     // Notify all room members that the call has ended
     let member_ids = state
@@ -444,7 +444,7 @@ pub async fn call_end(
                 "room_id": rid.to_hex(),
             }
         });
-        crate::ws::dispatcher::broadcast_with_redis(
+        roomler_core::ws::dispatcher::broadcast_with_redis(
             &state.ws_storage,
             &state.redis_pubsub,
             &member_ids,
@@ -457,7 +457,7 @@ pub async fn call_end(
 }
 
 pub async fn participants(
-    State(state): State<AppState>,
+    State(state): State<ConferenceState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
@@ -466,7 +466,7 @@ pub async fn participants(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let parts = state.rooms.list_participants(rid).await?;
     let items: Vec<serde_json::Value> = parts
