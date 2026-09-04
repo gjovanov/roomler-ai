@@ -1,0 +1,40 @@
+[package]
+name = "roomler-ai-mod-network"
+license = "AGPL-3.0-only"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "FR-69 module: network — the overlay mesh (IPAM, netmaps, ACL, relays, DERP ACL), tunnels, peer relays, Roomler SSH and key rotation: the server side of pillar 2."
+
+[lib]
+name = "roomler_ai_mod_network"
+path = "src/lib.rs"
+
+# The sixth module crate (FR-69 P7a): pillar 2's server side. Built on `fleet`
+# (the Hub, the agent row, presence — `network → fleet` in the module graph)
+# and on `roomler-core`; never on the api crate. P7a moves the engine
+# (`overlay`, `org_relay`, `derp_acl`), the routes and the hooks; the sockets
+# (tunnel client, `/derp`, the agent-socket half) follow in P7b, which is why
+# the host still depends on this crate unconditionally until then.
+[dependencies]
+roomler-core = { path = "../../core" }
+roomler-ai-config = { path = "../../config" }
+roomler-ai-db = { path = "../../db" }
+roomler-ai-services = { path = "../../services" }
+roomler-ai-remote-control = { path = "../../remote_control" }
+roomler-ai-tunnel-core = { path = "../../tunnel-core" }
+roomler-ai-mod-fleet = { path = "../fleet" }
+
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+bson.workspace = true
+dashmap.workspace = true
+# Subnet / static-endpoint validation in the overlay ACL and relay routes (not a workspace dep).
+ipnet = "2"
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

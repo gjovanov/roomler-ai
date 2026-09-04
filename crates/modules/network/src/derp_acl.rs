@@ -43,8 +43,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use roomler_ai_remote_control::models::OverlayNode;
 use tunnel_core::policy::{OverlayPeerRef, evaluate_overlay};
 
-use super::derp::DerpPubKey;
-use crate::state::AppState;
+use crate::NetworkState;
+use crate::derp_types::DerpPubKey;
 
 /// One network's relay permissions: `src_pubkey → {dst_pubkey}`.
 #[derive(Debug, Default)]
@@ -67,10 +67,12 @@ impl DerpAllowTable {
         self.enforcing
     }
 
-    /// Test-only builder so `ws::derp`'s tests can exercise the gate without
+    /// Test builder so the DERP relay's tests can exercise the gate without
     /// standing up Mongo (the fields stay private to this module otherwise).
-    #[cfg(test)]
-    pub(crate) fn for_test(enforcing: bool, pairs: &[(DerpPubKey, DerpPubKey)]) -> Self {
+    /// `pub` and NOT `cfg(test)`: the relay and its tests live in the host
+    /// crate until P7b, and `cfg(test)` does not cross crates (FR-69 P7a).
+    #[doc(hidden)]
+    pub fn for_test(enforcing: bool, pairs: &[(DerpPubKey, DerpPubKey)]) -> Self {
         let mut allow: HashMap<DerpPubKey, HashSet<DerpPubKey>> = HashMap::new();
         for (s, d) in pairs {
             allow.entry(*s).or_default().insert(*d);
@@ -96,7 +98,7 @@ fn pubkey_of(node: &OverlayNode) -> Option<DerpPubKey> {
 /// gate at all). O(N²) over the network's nodes, but it runs only on policy
 /// changes and joins — never per datagram, and never on an endpoint trickle,
 /// which cannot change an ACL decision.
-pub async fn rebuild(state: &AppState, tenant_id: ObjectId, network_id: ObjectId) {
+pub async fn rebuild(state: &NetworkState, tenant_id: ObjectId, network_id: ObjectId) {
     let acl = super::overlay::load_acl(state, tenant_id).await;
     // `Off` needs no table: `permits` would allow everything anyway, and
     // dropping the entry keeps a disabled tenant's memory at zero.

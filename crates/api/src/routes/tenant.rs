@@ -183,6 +183,7 @@ pub async fn archive(
 
     // Mesh: release every node, which pools its address and tells the peers.
     let network = state
+        .network()
         .overlay_networks
         .find_for_tenant(tid)
         .await
@@ -193,14 +194,19 @@ pub async fn archive(
         && let Some(net_id) = net.id
     {
         let nodes = state
+            .network()
             .overlay_nodes
             .list_active_in_network(tid, net_id)
             .await
             .unwrap_or_default();
         for n in &nodes {
-            if crate::ws::overlay::release_overlay_node(&state, n, "tenant archived")
-                .await
-                .is_some()
+            if roomler_ai_mod_network::overlay::release_overlay_node(
+                state.network(),
+                n,
+                "tenant archived",
+            )
+            .await
+            .is_some()
             {
                 nodes_released += 1;
             }
@@ -212,12 +218,14 @@ pub async fn archive(
     let mut block_quarantined = None;
     if let Some(net_id) = network.as_ref().and_then(|n| n.id)
         && let Ok(Some(block)) = state
+            .network()
             .overlay_networks
             .blocks()
             .find_assigned_for_network(net_id)
             .await
         && let Some(bid) = block.id
         && state
+            .network()
             .overlay_networks
             .blocks()
             .quarantine(bid, "tenant archived")

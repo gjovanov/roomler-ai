@@ -79,7 +79,7 @@ async fn snapshot() -> Snapshot {
     // every mounted module's, sorted by collection — see `index_sets_json`.
     let all_sets = |multi_block: bool| {
         let mut sets = roomler_ai_db::indexes::index_plan(multi_block).sets;
-        sets.extend(app.state.modules.index_sets());
+        sets.extend(app.state.modules.index_sets_for(multi_block));
         index_sets_json(sets)
     };
     Snapshot {

@@ -14,7 +14,7 @@
 //! rather than the allocator.
 
 use bson::{doc, oid::ObjectId};
-use roomler_ai_db::indexes::ensure_indexes;
+use roomler_ai_db::indexes::apply_index_sets;
 use roomler_ai_remote_control::models::{NodeRef, OverlayNetwork, OverlayNode};
 use roomler_ai_services::dao::base::DaoError;
 use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
@@ -2016,11 +2016,17 @@ async fn turning_multi_block_off_after_a_grow_fails_the_boot_loudly() {
         "precondition: the network must actually hold two assigned blocks"
     );
 
-    // The door. Booting with the flag back OFF must REFUSE.
-    let err = ensure_indexes(&app.db, false).await.expect_err(
-        "a boot that cannot recreate the one-block-per-network guard must fail; \
-         running on without it leaves the invariant silently unenforced",
-    );
+    // The door. Booting with the flag back OFF must REFUSE. Since FR-69 P7a
+    // the `overlay_blocks` set — and with it the guard — is the network
+    // module's (`Module::indexes_for`), applied by the host right after the
+    // core plan; the boot's door is that application, so that is what the
+    // test drives.
+    let err = apply_index_sets(&app.db, &app.state.modules.index_sets_for(false))
+        .await
+        .expect_err(
+            "a boot that cannot recreate the one-block-per-network guard must fail; \
+             running on without it leaves the invariant silently unenforced",
+        );
     let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("duplicate")
@@ -2031,7 +2037,7 @@ async fn turning_multi_block_off_after_a_grow_fails_the_boot_loudly() {
 
     // And the flag still ON is fine — the same database boots cleanly, so the
     // failure above is the DOOR, not a broken fixture.
-    ensure_indexes(&app.db, true)
+    apply_index_sets(&app.db, &app.state.modules.index_sets_for(true))
         .await
         .expect("multi-block schema still applies to a grown network");
 }

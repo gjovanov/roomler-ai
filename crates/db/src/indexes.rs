@@ -242,25 +242,11 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // `roomler_ai_remote_control::models::AgentCrashRecord` for the
     // shape (defined by the crash-report plan).
 
-    // tunnel clients — same uniqueness contract as agents
-    // (re-enroll-on-same-machine rehydrates the soft-deleted row in
-    // place). `owner_user_id` index speeds the "my tunnel clients"
-    // view on the user-facing dashboard.
-    sets.push(set(
-        "tunnel_clients",
-        vec![
-            index_unique(bson::doc! { "tenant_id": 1, "machine_id": 1 }),
-            index(bson::doc! { "tenant_id": 1, "status": 1 }),
-            index(bson::doc! { "owner_user_id": 1 }),
-        ],
-    ));
-
-    // Overlay networks — one IPAM row per tenant. Unique on tenant_id
-    // so `get_or_create` races collapse to one network.
-    sets.push(set(
-        "overlay_networks",
-        vec![index_unique(bson::doc! { "tenant_id": 1 })],
-    ));
+    // FR-69 P7a — `tunnel_clients`, `overlay_networks`, `overlay_blocks` (both
+    // `multi_block` plans), `overlay_nodes`, `tunnel_policies`, `tunnel_audit`
+    // (both sets), `key_rotation_audit`, `peer_relay_audit`, `ssh_audit` and
+    // `ssh_activity` are the `network` module's: their sets live in
+    // `roomler_ai_mod_network::NetworkState::indexes_for`.
 
     // Single-use token ledger (`_id` = the token's jti, so uniqueness is the
     // primary key and a claim is one insert). Rows expire an hour after use —
@@ -277,194 +263,12 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // ceiling). No TTL: a dead key is a record until pruning is decided
     // explicitly (P4).
 
-    // Multi-org P2b — the GLOBAL overlay block registry. Deliberately NOT
-    // tenant-scoped: its entire job is guaranteeing that two tenants can
-    // never hold overlapping slices of 100.64.0.0/10.
-    //
-    // `slot` unique is the structural half of that guarantee — the allocator
-    // computes aligned, monotonic starts, so two racers either collide on the
-    // same slot (this index arbitrates) or claim disjoint ranges. Without it
-    // the allocator would need a lock.
-    //
-    // `network_id` unique is scoped to ASSIGNED rows: a renumbered tenant
-    // keeps its quarantined predecessors forever (they hold their slots out
-    // of circulation), and only one of its blocks may be live at a time.
-    // FR-47 P5c — `slot` unique is what makes overlap unrepresentable and is
-    // ALWAYS present. The `network_id` partial-unique is the separate
-    // "one assigned block per network" rule, which multi-block removes.
-    let mut overlay_block_indexes = vec![
-        index_unique(bson::doc! { "slot": 1 }),
-        // The allocator's "highest end" probe — one indexed sort+limit.
-        index(bson::doc! { "end_slot": -1 }),
-        index(bson::doc! { "tenant_id": 1 }),
-        // Multi-block reads a network's blocks in allocation order.
-        index(bson::doc! { "network_id": 1, "seq": 1 }),
-    ];
-    let mut overlay_block_ops = Vec::new();
-    if multi_block {
-        // Drop the guard rather than merely stop creating it: a deployment
-        // that ran single-block already HAS the index, and an existing index
-        // would refuse the second block with a duplicate key — which the
-        // allocator's retry loop would then misreport as "lost too many
-        // races" rather than as the schema problem it is. The drop runs in
-        // `apply_op`, which tolerates both "nothing to drop" outcomes (27 and
-        // 26) — see the comment there for why both are normal.
-        overlay_block_ops.push(IndexOp::DropIndexIfPresent {
-            index: "network_id_1",
-            why: "multi-block schema — one-block-per-network guard removed",
-        });
-    } else {
-        overlay_block_indexes.push(index_unique_partial(
-            bson::doc! { "network_id": 1 },
-            bson::doc! { "state": "assigned" },
-        ));
-    }
-    sets.push(IndexSet {
-        collection: "overlay_blocks",
-        pre_ops: overlay_block_ops,
-        indexes: overlay_block_indexes,
-    });
-
-    // Overlay nodes — virtual-LAN membership above agents/tunnel_clients.
-    //
-    // All three unique indexes are scoped to LIVE rows, because removing a
-    // device from the fleet TOMBSTONES its node in place (keeping the address
-    // and name as the forensic record of who held them) and returns the host
-    // number to `overlay_networks.free_hosts` for reuse. A non-scoped unique
-    // index would let a tombstone go on holding its IP and its name forever,
-    // which is exactly the leak the release feature exists to close.
-    //
-    // The filter is `$type: "null"`, NOT `{deleted_at: null}`: equality-to-null
-    // in Mongo also matches ABSENT, whereas `$type` matches only an explicit
-    // BSON null. `OverlayNode.deleted_at` is declared without
-    // `skip_serializing_if`/`serde(default)`, so it is written on every insert
-    // and required on every read — "absent" is unreachable and `$type` is
-    // exact. Tradeoff: a `$type`-filtered partial index is NOT usable by the
-    // planner for a `{deleted_at: null}` query predicate. That is fine — these
-    // three enforce uniqueness; the plain (tenant_id, network_id, deleted_at)
-    // index below is what serves the netmap build query.
-    sets.push(set(
-        "overlay_nodes",
-        vec![
-            // Rehydrate key. Many tombstones per machine (a machine can be
-            // removed and re-enrolled repeatedly, taking a fresh lease each
-            // time) must coexist with AT MOST ONE live row.
-            index_unique_partial(
-                bson::doc! { "tenant_id": 1, "machine_id": 1 },
-                bson::doc! { "deleted_at": { "$type": "null" } },
-            ),
-            // No two LIVE nodes share an overlay address.
-            index_unique_partial(
-                bson::doc! { "tenant_id": 1, "network_id": 1, "overlay_ip": 1 },
-                bson::doc! { "deleted_at": { "$type": "null" } },
-            ),
-            index(bson::doc! { "tenant_id": 1, "network_id": 1, "deleted_at": 1 }),
-            // Phase 0 — per-network-unique node name (MagicDNS). The `name > ""`
-            // half keeps the empty names on pre-Phase-0 rows (backfilled on next
-            // rejoin) from colliding; the `deleted_at` half releases the name on
-            // removal so the next device can take it.
-            index_unique_partial(
-                bson::doc! { "tenant_id": 1, "network_id": 1, "name": 1 },
-                bson::doc! { "$and": [
-                    { "name": { "$gt": "" } },
-                    { "deleted_at": { "$type": "null" } },
-                ] },
-            ),
-            // Backs the by-node_ref lookups on the removal paths.
-            index(bson::doc! { "tenant_id": 1, "node_ref.id": 1 }),
-        ],
-    ));
-
-    // Tunnel policies — tenant-scoped allowlists. The server-side ACL
-    // gate fetches `list_active_for_tenant(tenant_id)` on every
-    // TcpForwardRequest; the (tenant_id, deleted_at) compound index
-    // covers that query precisely.
-    sets.push(set(
-        "tunnel_policies",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "deleted_at": 1 }),
-            index(bson::doc! { "tenant_id": 1, "name": 1 }),
-        ],
-    ));
-
-    // Tunnel audit log — 90-day retention mirroring remote_audit.
-    // Compound index on (tenant_id, dst_host, at) backs the admin
-    // "who connected to X in the last 7 days?" query in T4. The
-    // standalone (session_id, at) entry mirrors the remote_audit
-    // pattern for per-session reconstruction.
-    sets.push(set(
-        "tunnel_audit",
-        vec![
-            index(bson::doc! { "tunnel_session_id": 1, "at": 1 }),
-            index(bson::doc! { "tenant_id": 1, "dst_host": 1, "at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "at": -1 }),
-            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
-
     // Fleet-RPC audit log — 90-day retention, same posture as remote_audit /
     // tunnel_audit. Every exec ATTEMPT lands here, allowed or denied, so the
     // (tenant_id, at) index backs the org-wide "what ran on my fleet?" view
     // and (agent_id, at) backs the per-device console history. The
     // (tenant_id, user_id, at) entry answers "what did this person run?" —
     // the question an incident review actually starts from.
-
-    // FR-40 overlay-key rotation orders — who ordered which device to retire
-    // its key, dispatched or refused. Same 90-day TTL as the other audit logs.
-    sets.push(set(
-        "key_rotation_audit",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "at": -1 }),
-            index(bson::doc! { "agent_id": 1, "at": -1 }),
-            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
-
-    // FR-19 peer-relay decisions — approvals (who made a device a relay) and
-    // mints (what was routed through it), granted or refused. `agent_id`
-    // answers both halves of the incident-review question in one query,
-    // `requester_node_id` is what a rate-limit forensics pass walks, and the
-    // TTL is the same 90 days as the other decision logs: making a device a
-    // chokepoint for the tenant's traffic is the same class of event as
-    // opening exec on it.
-    sets.push(set(
-        "peer_relay_audit",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "requester_node_id": 1, "at": -1 }),
-            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
-
-    // Roomler-SSH grant decisions. Same three questions as `exec_audit`, same
-    // 90-day TTL — an SSH session is the bigger power of the two, so its log
-    // must not be the shorter-lived one.
-    sets.push(set(
-        "ssh_audit",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "at": -1 }),
-            index(bson::doc! { "agent_id": 1, "at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
-            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
-
-    // Roomler-SSH session activity (P8) — what devices REPORT doing inside a
-    // session, as opposed to `ssh_audit`'s record of what the server DECIDED.
-    // Separate collection on purpose (see `SshActivityEvent`): one is
-    // authoritative, the other is a claim by the host. Same 90-day TTL, and
-    // `grant_id` is indexed because correlating a reported action back to the
-    // authoritative decision row is the main thing a reader does here.
-    sets.push(set(
-        "ssh_activity",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "at": -1 }),
-            index(bson::doc! { "agent_id": 1, "at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "grant_id": 1, "at": -1 }),
-            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
 
     // Centralized log batches (rc.58). 7-day TTL on `created_at` so
     // operators have a one-week diagnostic window. The compound
@@ -593,14 +397,9 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         ],
     ));
 
-    // Wave 3 — per-user usage reads scan this by (user, time); it already
-    // has a tenant-leading index for the org dashboards, which could not
-    // serve a cross-org "what did this user do" query. (Its `remote_sessions`
-    // twin is the `remote` module's since P6.)
-    sets.push(set(
-        "tunnel_audit",
-        vec![index(bson::doc! { "user_id": 1, "at": -1 })],
-    ));
+    // Wave 3 — the per-user usage reads' (user, time) indexes on
+    // `remote_sessions` and `tunnel_audit` are the `remote` (P6) and
+    // `network` (P7a) modules' now.
 
     // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
     // whole-bucket-replaces via $merge on _id, so these are also upserts.

@@ -68,7 +68,7 @@ pub(crate) async fn record_ssh_activity(
         allowed,
         at: bson::DateTime::now(),
     };
-    if let Err(e) = state.ssh_activity.record(event).await {
+    if let Err(e) = state.network().ssh_activity.record(event).await {
         warn!(%agent_id, %e, "ssh_activity insert failed");
     }
 }
@@ -130,7 +130,7 @@ pub(crate) async fn record_key_rotation_report(
 /// [`agent_ssh::dispatch`] the HTTP route uses, so there is exactly one place
 /// where the gates are evaluated regardless of how the request arrived.
 ///
-/// [`agent_ssh::dispatch`]: crate::routes::agent_ssh::dispatch
+/// [`agent_ssh::dispatch`]: roomler_ai_mod_network::routes::agent_ssh::dispatch
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_agent_ssh_request(
     state: &AppState,
@@ -189,14 +189,14 @@ pub(crate) async fn handle_agent_ssh_request(
         .await
         .map(|u| u.display_name)
         .unwrap_or_else(|_| origin.owner_user_id.to_hex());
-    let caller = crate::routes::agent_ssh::Caller {
+    let caller = roomler_ai_mod_network::routes::agent_ssh::Caller {
         user_id: origin.owner_user_id,
         display: format!("{who} (via {})", origin.name),
         origin_agent_id: Some(origin_agent_id),
     };
 
-    let res = crate::routes::agent_ssh::dispatch(
-        state,
+    let res = roomler_ai_mod_network::routes::agent_ssh::dispatch(
+        state.network(),
         tenant_id,
         &agent,
         &caller,
@@ -210,7 +210,7 @@ pub(crate) async fn handle_agent_ssh_request(
     // field-by-field literal silently kept sending the old shape, which
     // compiles perfectly. Binding every field means the next addition has to be
     // decided about rather than forgotten.
-    let crate::routes::agent_ssh::SshResponseBody {
+    let roomler_ai_mod_network::routes::agent_ssh::SshResponseBody {
         address,
         port,
         // Dropped on purpose: this leg answers a device that named its own
@@ -249,9 +249,11 @@ pub(crate) async fn handle_derp_ticket_request(
         debug!(%agent_id, "derp ticket requested but no signer configured");
         return;
     };
-    let Some(node) =
-        crate::ws::overlay::current_node(state, crate::ws::overlay::NodeIdentity::Agent(agent_id))
-            .await
+    let Some(node) = roomler_ai_mod_network::overlay::current_node(
+        state.network(),
+        roomler_ai_mod_network::overlay::NodeIdentity::Agent(agent_id),
+    )
+    .await
     else {
         debug!(%agent_id, "derp ticket requested but agent has no overlay node");
         return;
@@ -325,6 +327,7 @@ pub(crate) async fn handle_relay_probe_report(
         warn!(%agent_id, %e, "set_relay_home (agents) failed");
     }
     if let Err(e) = state
+        .network()
         .overlay_nodes
         .set_relay_home_for_agent(agent_id, new_home.as_deref())
         .await

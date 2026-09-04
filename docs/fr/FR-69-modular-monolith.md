@@ -2,9 +2,10 @@
 
 **Status**: P0 + P1 + P2 + P3 + P4 + P5a + P5b + P5c + P6 shipped (#1309 · #1311 · #1312 ·
 #1315 · #1317 · #1318 · #1320 · #1323 · #1325 · #1329 · #1332 · #1336 · #1337) · P7
-(`network`) planned as two PRs, P7a next · every phase's field gate (a prod roll watched from
-the fleet: no dip in online agents; for P6 one RC session per carrier class) is still to be
-run ·
+(`network`) planned as two PRs (#1339): **P7a in PR** (#1340 — the engine, the routes, the
+hooks; `network` required) · P7b next · every phase's field gate (a prod roll watched from
+the fleet: no dip in online agents; for P6 one RC session per carrier class; for P7 the
+overlay/tunnel sweep) is still to be run ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -458,7 +459,8 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P5b** ✅ | #1332 — `Owner { Fleet, Remote, Network }` + the exhaustive `ClientMsg::namespace()` and `wire_tag()` matches + the 44-entry `CLIENT_MSG_OWNERS` table in the wire crate, locked four ways (the enum's own renames, the match on buildable variants, the D7 placements, the module graph); the composition baseline gained a `namespaces` section | baseline re-recorded for the new section only — routes, index sets and wire names byte-identical | none (a pure function) | low | 1 |
 | **P5c** ✅ (CI) | the agent socket into `fleet` (`roomler_ai_mod_fleet::socket`) behind `Core::agent_socket` — per-owner message handlers + per-module lifecycles (`hello` / `heartbeat` / `closing` / `closed(removal_was_ours)`), dispatch by `ClientMsg::namespace()`; the host registers its `remote`/`network` halves transitionally (`ws/agent_socket_host.rs`). The `AppState` aliases and the required dependency STAY until the host code that reads them moves (P6/P7) | baseline identical; integration lane; **prod roll with no dip in online agents — not yet run** | redeploy previous tag | high | 3–4 |
 | **P6** ✅ (CI) | `remote` module (`crates/modules/remote`, feature `remote`, in `default`): the session routes + TURN credentials + relay regions, the controller's `rc:*` dispatch with its authz gate (`controller.rs`), the cross-pod RC relay (`relay.rs`), the session-stats agent-socket half. `Module::Deps` is born here: `remote`'s is `FleetState` (the Hub is one live object), supplied by the host in composition order. The host keeps the user socket and calls `Modules::remote_controller_frame` with the connection's Hub sender | baseline identical; integration lane; **one RC session per carrier class on a prod roll — not yet run** | `remote = false` | medium | 2–3 |
-| **P7** (plan recorded) | `network` module, `/derp` included — TWO PRs on the P5 shape: **P7a** the engine (`ws/overlay.rs`, `org_relay.rs`, `derp_acl.rs`), the seven route files + the per-device sub-routes, and the hooks, with `network` REQUIRED; **P7b** the sockets (tunnel-client loop, `/derp` as an `UpgradeSpec`, derp cluster, ephemeral reaper, the agent-socket half), the `AgentBusy` query hook, the last `AppState` aliases, then `fleet` + `network` as features. Field log: "P7: the plan" | same + overlay/tunnel field sweep | P7a: previous tag · P7b: `network = false` | high | 5–7 |
+| **P7a** ✅ (CI) | `network` module, part one (`crates/modules/network`, `NetworkState` built on `FleetState`): the engine (`overlay.rs`, `org_relay.rs`, `derp_acl.rs` + the DERP registry types), the seven route files + the per-device sub-routes at the host's old paths, the hooks (`NetworkHooks`), the eleven index sets through `Module::indexes_for(multi_block)` (born here); `is_global_unicast` and the TURN builders moved to core first. `network` REQUIRED: the host's sockets reach the engine through `AppState::network()`. Field log: "P7a" | baseline identical; integration lane; **overlay/tunnel field sweep on a prod roll — not yet run** | previous tag | high | — |
+| **P7b** | the sockets (tunnel-client loop, `/derp` as an `UpgradeSpec`, derp cluster + census, the ephemeral reaper, the agent-socket network half + the rest of `ws/remote_control.rs`), `Modules::tunnel_client_socket(…)`, the `AgentBusy` query hook, the tenant-archive cascade through `TenantLifecycle`, the local gauges through module reads, the last `AppState` aliases, then `fleet` + `network` as features. Field log: "P7: the plan" | same + overlay/tunnel field sweep | `network = false` | high | — |
 | **P8** | profiles, Docker args, CI matrix, publish axis, self-host docs | five checks green; `mesh` image boots (AC5) | `full` stays default | medium | 2–3 |
 | **P9** | UI module registry and runtime gating | Vitest + e2e nightly; full UI against a `mesh` server (AC7) | `VITE_MODULES` unset | medium | 3–5 |
 | later | `roomlerd` `Subsystem` trait — its own FR, after FR-59/63/65 settle | fleet roll + FR-61 matrix | release revert | high | 5–8 |
@@ -956,3 +958,34 @@ the graph), which is what the P8 profile matrix builds on.
 **Gate, both PRs:** baseline identical; the suite; then the operator's prod roll with the
 overlay/tunnel field sweep the phase table names — a tunnel opened, an overlay pair on each
 carrier class, a DERP-floor host, an SSH session — read from the fleet, not from CI.
+
+### 2026-09-04 — P7a: the engine, the routes, the hooks
+
+- As planned, with three things the plan did not foresee. (1) The DERP registry TYPES had to
+  move with the engine (`derp_types.rs`; the host relay re-exports them under their old
+  names): the overlay engine addresses the registry, so its types cannot stay behind the
+  socket that fills it. (2) The `#1186` cross-pod `overlay_removes` channel is created by
+  the module — `overlay_ctrl_tx` on its state, the applier from its init — and the host's
+  Redis subscriber only holds the sender; a module cannot receive a channel through
+  `Module::init`, so it owns both ends. (3) `build_turn_config`/`build_turn_map` moved to
+  core (`roomler_core::turn`) next to the map they fill, alongside `is_global_unicast`
+  (`roomler_core::net`).
+- **`Module::indexes_for(multi_block)`** is the one contract addition: `overlay_blocks` has
+  two mutually exclusive schemas (FR-47 P5c), the composition snapshot records both, and
+  `Module::indexes` answers for the running deployment's setting only. The baseline stayed
+  byte-identical through the move.
+- Eight lane rounds, every one a cross-crate leftover of the cut rather than a design
+  problem: an absolute-path dependency (`ipnet`, used by path and not by `use`), a DAO
+  import the relay-load poller still needs in the host, multi-line accessor chains a
+  line-oriented rename skipped (`overlay_nodes_by_id`, `tunnel_policies` — one a prefix
+  collision, one simply unlisted), one accessor doubled by a second pass, the integration
+  tests' own reads of the moved fields, a `cfg(test)` test builder the host's relay tests
+  call — `cfg(test)` does not cross crates — and the one real suite failure (406/407): the
+  multi-block DOOR test drove the db crate's plan, but the guard it asserts is the module's
+  set now, so a test of a BOOT property has to drive what the boot applies
+  (`Modules::index_sets_for(false)`), not the plan it used to live in. Each is recorded in
+  CLAUDE.md rule 12.
+- A repository-wide history rewrite landed mid-PR and force-pushed this branch with two
+  commits missing; rebuilt on the rewritten remote by cherry-pick, never by force-push.
+- **The field gate is open, as for every phase**: the overlay/tunnel sweep on a prod roll
+  the operator runs.

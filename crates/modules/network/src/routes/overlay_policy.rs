@@ -29,10 +29,10 @@ use roomler_ai_remote_control::models::{
 use roomler_ai_services::dao::base::PaginationParams;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::guards::require_permission;
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::NetworkState;
 
 #[derive(Debug, Serialize)]
 pub struct OverlayPolicyResponse {
@@ -136,7 +136,11 @@ fn validate(body: &UpsertOverlayPolicyRequest) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn gate(state: &AppState, tenant_id: &str, auth: &AuthUser) -> Result<ObjectId, ApiError> {
+async fn gate(
+    state: &NetworkState,
+    tenant_id: &str,
+    auth: &AuthUser,
+) -> Result<ObjectId, ApiError> {
     let tid = ObjectId::parse_str(tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     require_permission(
@@ -151,7 +155,7 @@ async fn gate(state: &AppState, tenant_id: &str, auth: &AuthUser) -> Result<Obje
 }
 
 pub async fn list(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<PaginationParams>,
@@ -169,7 +173,7 @@ pub async fn list(
 }
 
 pub async fn create(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<UpsertOverlayPolicyRequest>,
@@ -192,7 +196,7 @@ pub async fn create(
 }
 
 pub async fn get(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
 ) -> Result<Json<OverlayPolicyResponse>, ApiError> {
@@ -209,7 +213,7 @@ pub async fn get(
 }
 
 pub async fn update(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
     Json(body): Json<UpsertOverlayPolicyRequest>,
@@ -241,7 +245,7 @@ pub async fn update(
 }
 
 pub async fn delete(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -256,7 +260,7 @@ pub async fn delete(
 }
 
 pub async fn get_mode(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<AclModeResponse>, ApiError> {
@@ -266,7 +270,7 @@ pub async fn get_mode(
 }
 
 pub async fn set_mode(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<SetAclModeRequest>,
@@ -289,7 +293,7 @@ pub async fn set_mode(
 /// denied pair still able to relay by pubkey, which is the bypass the gate
 /// exists to close. It runs AFTER the fan so the two never disagree in the
 /// permissive direction — a peer loses its netmap entry before it loses relay.
-async fn refan_tenant(state: &AppState, tenant_id: ObjectId) {
+async fn refan_tenant(state: &NetworkState, tenant_id: ObjectId) {
     let Ok(network) = state.overlay_networks.get_or_create(tenant_id).await else {
         return;
     };
@@ -302,9 +306,9 @@ async fn refan_tenant(state: &AppState, tenant_id: ObjectId) {
         return;
     };
     for n in &nodes {
-        crate::ws::overlay::refan_node(state, n).await;
+        crate::overlay::refan_node(state, n).await;
     }
-    crate::ws::derp_acl::rebuild(state, tenant_id, network_id).await;
+    crate::derp_acl::rebuild(state, tenant_id, network_id).await;
     // FR-19 — a policy edit can un-grant a live relay session; revoke those.
-    crate::ws::org_relay::reconcile_acl(state, tenant_id).await;
+    crate::org_relay::reconcile_acl(state, tenant_id).await;
 }
