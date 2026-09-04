@@ -207,6 +207,61 @@ of the lot. M0–M3 are the structural fix; P1 is the bleeding.
 the deletions do not happen, this is one more lever and the operator's complaint
 stands. Every phase before it exists to make a deletion safe.
 
+## Honest evaluation — read this before approving
+
+**What it genuinely fixes:** the encoder open leaving the frame path at both
+session start and every rebuild; the per-frame encode call; the capture open;
+and the removal of the in-loop decision sites the heuristics exist to protect.
+
+**What it does not fix, bluntly:**
+
+- The worst number measured today — a **4903 ms paint with a 1485-byte send
+  queue**, 28 ms iterations and a healthy multi-megabit link — is a relay
+  head-of-line block. **No threading change touches it.**
+- The most damaging finding — a remembered **170 kbps** ceiling with no live
+  measurement pinning a healthy link at the 200 kbps floor, forcing the
+  resolution cap to override an explicit `Native` and producing 0.013 bits per
+  pixel of blurred text while frame age read 66 ms — is a **control-plane policy
+  bug**. Threading does not touch that either.
+
+⇒ Judged by *"does restructuring the pipeline fix what the operator sees
+today"*, the answer is **partly no**. Two of the five findings need different
+work, and saying so up front is the difference between a plan and a pitch.
+
+**The risk of the proposal itself.** A dedicated thread per session is real
+concurrency surface: handoff latency, backpressure across channels, teardown
+ordering. ⚠️ **It could be a net loss if the channel handoff costs more than the
+blocking it removes.** That must be measured with the stall watch before and
+after — not assumed because the shape is nicer.
+
+## How to keep this from becoming more patch-work
+
+Three commitments, and they matter more than the design:
+
+1. **Deletion is the acceptance criterion, not a follow-up.** 34 heuristics → ≤
+   10, 11 kill switches → ≤ 4, 8 estimators → 1, each retirement gated on a
+   counter measured fleet-zero. 🔑 **If a phase ships and nothing is deleted,
+   that phase added a lever and the complaint stands.**
+2. **Sequence by what unblocks deletion, not by what is most interesting.**
+   Measurement first — nothing after it is verifiable otherwise. Then the
+   thread, make-before-break, the plan handoff, one controller, the deletions.
+   Each behind a kill switch, each with a before/after from the same instrument.
+3. **Do the cheap visible thing first.** P1 — an unmeasured prior decaying
+   instead of pinning, and an overridden resolution choice surfaced to the
+   viewer — needs *no threading work at all*. It is the smallest change in the
+   plan and it addresses what is on screen right now. ⚠️ Leading with the
+   architecture while the blur persists would be the wrong order.
+
+## The question this plan most wants challenged
+
+**Does the transport classification (T1) belong in this FR, or its own?** It is
+the largest measured harm (4903 ms) and it shares *nothing* with the threading
+work except the instrument. The case for keeping it here is that the
+sender/transit/viewer split is part of M0 and everything else depends on it; the
+case for splitting is that T1's fix is a transport-plane design with its own
+field cells, and bundling it lets the FR claim credit for work that has not
+started. **Decide before M1 starts.**
+
 ## What this explicitly does NOT claim
 
 - ⚠️ **It does not fix finding 4 by itself.** M1–M3 are about the pipeline; the
