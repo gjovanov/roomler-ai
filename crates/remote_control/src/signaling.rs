@@ -1212,6 +1212,313 @@ pub enum ClientMsg {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// FR-69 D7 — who owns each client message
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The server module that owns a client message (FR-69 D7). The wire stays
+/// ONE socket and ONE `rc:*` enum; this is the map that tells the socket
+/// which module's handler a message belongs to. The prefix is NOT the owner:
+/// `rc:consent*` is fleet's (one consent payload for RC, exec and SSH since
+/// FR-27), `rc:relay.*` is network's, and `rc:agent.key_rotated` is
+/// network's (overlay-key rotation) although it arrives on the agent's
+/// `rc:agent.*` lane. So the map is explicit per variant, exhaustive, and
+/// locked by the tests below.
+///
+/// The wire crate is MPL and agent-linked, so this names modules by id and
+/// never by type; `roomler-core` checks the ids against its module graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Owner {
+    /// Device management: the agent's own lane (hello, heartbeat, config
+    /// status), fleet RPC, owner consent, the socket keepalive.
+    Fleet,
+    /// Remote-desktop sessions: request, SDP, ICE, terminate, stats.
+    Remote,
+    /// The mesh and what rides it: overlay, tunnels, relays and DERP
+    /// tickets, SSH, key rotation.
+    Network,
+}
+
+impl Owner {
+    /// The module id, as `roomler_core::graph::MODULES` spells it.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Owner::Fleet => "fleet",
+            Owner::Remote => "remote",
+            Owner::Network => "network",
+        }
+    }
+}
+
+impl ClientMsg {
+    /// The wire tag this variant serialises as (`t`) — the same string as its
+    /// `#[serde(rename)]`, spelled out so a variant can be named without an
+    /// instance. Exhaustive: a new variant does not compile until it is here.
+    pub fn wire_tag(&self) -> &'static str {
+        match self {
+            ClientMsg::AgentHello { .. } => "rc:agent.hello",
+            ClientMsg::AgentHeartbeat { .. } => "rc:agent.heartbeat",
+            ClientMsg::RelayProbeReport { .. } => "rc:relay.probe_report",
+            ClientMsg::SessionStats { .. } => "rc:session.stats",
+            ClientMsg::DerpTicketRequest { .. } => "rc:relay.derp_ticket_request",
+            ClientMsg::RpcResult { .. } => "rc:rpc.result",
+            ClientMsg::RpcExecRequest { .. } => "rc:rpc.request",
+            ClientMsg::SshRequest { .. } => "rc:ssh.request",
+            ClientMsg::SshActivity { .. } => "rc:ssh.activity",
+            ClientMsg::ConfigStatus { .. } => "rc:agent.config_status",
+            ClientMsg::KeyRotated { .. } => "rc:agent.key_rotated",
+            ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
+            ClientMsg::Consent { .. } => "rc:consent",
+            ClientMsg::ConsentPending { .. } => "rc:consent.pending",
+            ClientMsg::SessionRequest { .. } => "rc:session.request",
+            ClientMsg::SdpOffer { .. } => "rc:sdp.offer",
+            ClientMsg::Ice { .. } => "rc:ice",
+            ClientMsg::Terminate { .. } => "rc:terminate",
+            ClientMsg::Ping { .. } => "rc:ping",
+            ClientMsg::TunnelHello { .. } => "rc:tunnel.hello",
+            ClientMsg::TunnelOpen { .. } => "rc:tunnel.open",
+            ClientMsg::TcpForwardRequest { .. } => "rc:tunnel.tcp.request",
+            ClientMsg::TcpForwardAccept { .. } => "rc:tunnel.tcp.accept",
+            ClientMsg::TcpForwardReject { .. } => "rc:tunnel.tcp.reject",
+            ClientMsg::TcpHalfClose { .. } => "rc:tunnel.tcp.half_close",
+            ClientMsg::TcpClosed { .. } => "rc:tunnel.tcp.closed",
+            ClientMsg::UdpForwardRequest { .. } => "rc:tunnel.udp.request",
+            ClientMsg::UdpForwardAccept { .. } => "rc:tunnel.udp.accept",
+            ClientMsg::UdpForwardReject { .. } => "rc:tunnel.udp.reject",
+            ClientMsg::UdpClosed { .. } => "rc:tunnel.udp.closed",
+            ClientMsg::TunnelTerminate { .. } => "rc:tunnel.terminate",
+            ClientMsg::TunnelSdpOffer { .. } => "rc:tunnel.sdp.offer",
+            ClientMsg::TunnelSdpAnswer { .. } => "rc:tunnel.sdp.answer",
+            ClientMsg::TunnelIce { .. } => "rc:tunnel.ice",
+            ClientMsg::TunnelQuicReady { .. } => "rc:tunnel.quic.ready",
+            ClientMsg::TunnelQuicCandidate { .. } => "rc:tunnel.quic.candidate",
+            ClientMsg::OverlayJoin { .. } => "rc:overlay.join",
+            ClientMsg::OverlayEndpoints { .. } => "rc:overlay.endpoints",
+            ClientMsg::OverlaySrflx { .. } => "rc:overlay.srflx",
+            ClientMsg::OverlayNetcheck { .. } => "rc:overlay.netcheck",
+            ClientMsg::OverlayLeave { .. } => "rc:overlay.leave",
+            ClientMsg::OverlayRelayProbe { .. } => "rc:overlay.relay_probe",
+            ClientMsg::OverlayRelayRequest { .. } => "rc:overlay.relay_request",
+            ClientMsg::OverlayWarmRelayRequest { .. } => "rc:overlay.warm_relay_request",
+        }
+    }
+
+    /// The module that owns this message. Exhaustive on purpose (FR-69 AC6):
+    /// a new variant does not compile until it names an owner — the
+    /// structural replacement for the `_ =>` catch-all hazard.
+    pub fn namespace(&self) -> Owner {
+        match self {
+            ClientMsg::AgentHello { .. }
+            | ClientMsg::AgentHeartbeat { .. }
+            | ClientMsg::RpcResult { .. }
+            | ClientMsg::RpcExecRequest { .. }
+            | ClientMsg::ConfigStatus { .. }
+            | ClientMsg::Consent { .. }
+            | ClientMsg::ConsentPending { .. }
+            | ClientMsg::Ping { .. } => Owner::Fleet,
+            ClientMsg::SessionRequest { .. }
+            | ClientMsg::SdpOffer { .. }
+            | ClientMsg::SdpAnswer { .. }
+            | ClientMsg::Ice { .. }
+            | ClientMsg::Terminate { .. }
+            | ClientMsg::SessionStats { .. } => Owner::Remote,
+            ClientMsg::RelayProbeReport { .. }
+            | ClientMsg::DerpTicketRequest { .. }
+            | ClientMsg::SshRequest { .. }
+            | ClientMsg::SshActivity { .. }
+            | ClientMsg::KeyRotated { .. }
+            | ClientMsg::TunnelHello { .. }
+            | ClientMsg::TunnelOpen { .. }
+            | ClientMsg::TcpForwardRequest { .. }
+            | ClientMsg::TcpForwardAccept { .. }
+            | ClientMsg::TcpForwardReject { .. }
+            | ClientMsg::TcpHalfClose { .. }
+            | ClientMsg::TcpClosed { .. }
+            | ClientMsg::UdpForwardRequest { .. }
+            | ClientMsg::UdpForwardAccept { .. }
+            | ClientMsg::UdpForwardReject { .. }
+            | ClientMsg::UdpClosed { .. }
+            | ClientMsg::TunnelTerminate { .. }
+            | ClientMsg::TunnelSdpOffer { .. }
+            | ClientMsg::TunnelSdpAnswer { .. }
+            | ClientMsg::TunnelIce { .. }
+            | ClientMsg::TunnelQuicReady { .. }
+            | ClientMsg::TunnelQuicCandidate { .. }
+            | ClientMsg::OverlayJoin { .. }
+            | ClientMsg::OverlayEndpoints { .. }
+            | ClientMsg::OverlaySrflx { .. }
+            | ClientMsg::OverlayNetcheck { .. }
+            | ClientMsg::OverlayLeave { .. }
+            | ClientMsg::OverlayRelayProbe { .. }
+            | ClientMsg::OverlayRelayRequest { .. }
+            | ClientMsg::OverlayWarmRelayRequest { .. } => Owner::Network,
+        }
+    }
+}
+
+/// Every client wire tag with its owner: the table the composition baseline
+/// snapshots (`crates/tests/fixtures/composition.baseline.json`, section
+/// `namespaces`), so a message that changes hands is a visible line in a
+/// review. Kept next to [`ClientMsg::namespace`] and locked against both the
+/// enum's renames and the match by the tests below.
+pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
+    ("rc:agent.hello", Owner::Fleet),
+    ("rc:agent.heartbeat", Owner::Fleet),
+    ("rc:relay.probe_report", Owner::Network),
+    ("rc:session.stats", Owner::Remote),
+    ("rc:relay.derp_ticket_request", Owner::Network),
+    ("rc:rpc.result", Owner::Fleet),
+    ("rc:rpc.request", Owner::Fleet),
+    ("rc:ssh.request", Owner::Network),
+    ("rc:ssh.activity", Owner::Network),
+    ("rc:agent.config_status", Owner::Fleet),
+    ("rc:agent.key_rotated", Owner::Network),
+    ("rc:sdp.answer", Owner::Remote),
+    ("rc:consent", Owner::Fleet),
+    ("rc:consent.pending", Owner::Fleet),
+    ("rc:session.request", Owner::Remote),
+    ("rc:sdp.offer", Owner::Remote),
+    ("rc:ice", Owner::Remote),
+    ("rc:terminate", Owner::Remote),
+    ("rc:ping", Owner::Fleet),
+    ("rc:tunnel.hello", Owner::Network),
+    ("rc:tunnel.open", Owner::Network),
+    ("rc:tunnel.tcp.request", Owner::Network),
+    ("rc:tunnel.tcp.accept", Owner::Network),
+    ("rc:tunnel.tcp.reject", Owner::Network),
+    ("rc:tunnel.tcp.half_close", Owner::Network),
+    ("rc:tunnel.tcp.closed", Owner::Network),
+    ("rc:tunnel.udp.request", Owner::Network),
+    ("rc:tunnel.udp.accept", Owner::Network),
+    ("rc:tunnel.udp.reject", Owner::Network),
+    ("rc:tunnel.udp.closed", Owner::Network),
+    ("rc:tunnel.terminate", Owner::Network),
+    ("rc:tunnel.sdp.offer", Owner::Network),
+    ("rc:tunnel.sdp.answer", Owner::Network),
+    ("rc:tunnel.ice", Owner::Network),
+    ("rc:tunnel.quic.ready", Owner::Network),
+    ("rc:tunnel.quic.candidate", Owner::Network),
+    ("rc:overlay.join", Owner::Network),
+    ("rc:overlay.endpoints", Owner::Network),
+    ("rc:overlay.srflx", Owner::Network),
+    ("rc:overlay.netcheck", Owner::Network),
+    ("rc:overlay.leave", Owner::Network),
+    ("rc:overlay.relay_probe", Owner::Network),
+    ("rc:overlay.relay_request", Owner::Network),
+    ("rc:overlay.warm_relay_request", Owner::Network),
+];
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    /// The renames inside the `ClientMsg` enum, read from this file's own
+    /// source — so the table below is checked against what serde actually
+    /// emits, not against a second hand-written list.
+    fn client_renames() -> Vec<String> {
+        let src = include_str!("signaling.rs");
+        let start = src
+            .find("pub enum ClientMsg {")
+            .expect("the enum is in this file");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("the enum closes");
+        let body = &body[..end];
+        let needle = "rename = \"";
+        let mut out = Vec::new();
+        let mut rest = body;
+        while let Some(i) = rest.find(needle) {
+            rest = &rest[i + needle.len()..];
+            let Some(j) = rest.find('"') else { break };
+            out.push(rest[..j].to_string());
+            rest = &rest[j + 1..];
+        }
+        out
+    }
+
+    fn owner_of(tag: &str) -> Option<Owner> {
+        CLIENT_MSG_OWNERS
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, o)| *o)
+    }
+
+    /// The table names every client wire tag exactly once — no variant
+    /// without an owner, no owner for a variant that is gone.
+    #[test]
+    fn the_owner_table_names_every_client_wire_tag_exactly_once() {
+        let renames = client_renames();
+        assert!(
+            renames.len() >= 40,
+            "the enum span was not read: {} renames",
+            renames.len()
+        );
+        let table: Vec<&str> = CLIENT_MSG_OWNERS.iter().map(|(t, _)| *t).collect();
+        let mut deduped = table.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), table.len(), "a wire tag is listed twice");
+        let mut missing: Vec<&str> = renames
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !table.contains(r))
+            .collect();
+        let mut extra: Vec<&str> = table
+            .iter()
+            .copied()
+            .filter(|t| !renames.iter().any(|r| r == t))
+            .collect();
+        missing.sort_unstable();
+        extra.sort_unstable();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "owner table drift — missing: {missing:?}, extra: {extra:?}"
+        );
+    }
+
+    /// `wire_tag()` is the tag serde emits, and `namespace()` is the table's
+    /// owner — checked on the variants cheap enough to build.
+    #[test]
+    fn wire_tag_and_namespace_agree_with_the_table() {
+        let samples = [
+            ClientMsg::Ping { id: 7 },
+            ClientMsg::Terminate {
+                session_id: ObjectId::new(),
+                reason: EndReason::AdminTerminated,
+            },
+            ClientMsg::OverlayLeave {},
+            ClientMsg::TunnelTerminate {
+                session_id: ObjectId::new(),
+                reason: CloseReason::ClientShutdown,
+            },
+        ];
+        for m in &samples {
+            let v = serde_json::to_value(m).expect("a client message serialises");
+            assert_eq!(v["t"].as_str(), Some(m.wire_tag()), "{m:?}");
+            let owner = owner_of(m.wire_tag()).expect("every variant is in the table");
+            assert_eq!(m.namespace(), owner, "{m:?}");
+        }
+    }
+
+    /// The three placements D7 calls out because the prefix would mislead.
+    #[test]
+    fn the_prefix_is_not_the_owner() {
+        assert_eq!(owner_of("rc:consent"), Some(Owner::Fleet));
+        assert_eq!(owner_of("rc:consent.pending"), Some(Owner::Fleet));
+        assert_eq!(owner_of("rc:relay.probe_report"), Some(Owner::Network));
+        assert_eq!(owner_of("rc:agent.key_rotated"), Some(Owner::Network));
+    }
+
+    /// The ids are what the module graph spells, and they serialise as such.
+    #[test]
+    fn owner_ids_are_stable_lowercase_module_ids() {
+        for owner in [Owner::Fleet, Owner::Remote, Owner::Network] {
+            let json = serde_json::to_string(&owner).unwrap();
+            assert_eq!(json, format!("\"{}\"", owner.id()));
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Outbound from server
 // ────────────────────────────────────────────────────────────────────────────
 
