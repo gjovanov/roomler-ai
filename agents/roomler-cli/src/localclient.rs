@@ -1424,8 +1424,17 @@ fn print_status(s: &NodeStatus) {
             }
             None => String::new(),
         };
+        // #1328 — the stand-down count. Shown only when non-zero, so a healthy
+        // host's line is unchanged and a yielding host names itself. It sits
+        // next to `evicted` on purpose: yields up while evicted goes flat is
+        // the fight being bounded; BOTH climbing means the cooldown is too
+        // short for whatever is competing here.
+        let yields = match s.route_yields {
+            Some(y) if y > 0 => format!(" yielded={y}"),
+            _ => String::new(),
+        };
         println!(
-            "  route guard evicted={evicted} spared={spared} waves={waves}{arms} revalidations={revalidations} \n             (cumulative — DIFF two readings, never judge the absolute)"
+            "  route guard evicted={evicted} spared={spared} waves={waves}{arms} revalidations={revalidations}{yields} \n             (cumulative — DIFF two readings, never judge the absolute)"
         );
     }
 

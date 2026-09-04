@@ -495,6 +495,9 @@ impl LocalApiState for DaemonState {
                 tunnel_core::evidence::ROUTE_WAVES_TICK.load(Ordering::Relaxed),
                 tunnel_core::evidence::ROUTE_WAVES_EVENT.load(Ordering::Relaxed),
             )),
+            // #1328 — same snapshot, because the number only means something
+            // next to the eviction count it is supposed to be bounding.
+            route_yields: Some(tunnel_core::evidence::ROUTE_YIELDS.load(Ordering::Relaxed)),
             disco_answered: Some(tunnel_core::evidence::DISCO_ANSWERED.load(Ordering::Relaxed)),
             // FR-19 — present ONLY when the responder actually bound, so a
             // failed bind reads as "no relay here" rather than a phantom one.

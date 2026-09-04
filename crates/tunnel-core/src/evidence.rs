@@ -92,6 +92,15 @@ pub static ROUTE_SIBLING_SPARES: AtomicU64 = AtomicU64::new(0);
 /// cadence means the guard is driving itself.
 pub static ROUTE_WAVES: AtomicU64 = AtomicU64::new(0);
 
+/// #1328 — times this node STOOD DOWN from defending a prefix after repeated
+/// futile re-assertions (the generalised auto-yield).
+///
+/// Nonzero means a route war was detected and bounded. Zero on a healthy host.
+/// ⚠️ Read it with [`ROUTE_EVICTIONS`]: yields climbing while evictions go flat
+/// is the fix working; BOTH climbing means the backoff is being out-paced and
+/// the cooldown is too short for that competitor.
+pub static ROUTE_YIELDS: AtomicU64 = AtomicU64::new(0);
+
 /// #1282 — which ARM armed a route-defense wave.
 ///
 /// [`ROUTE_WAVES`] measured the rate and could not explain it: an idle host

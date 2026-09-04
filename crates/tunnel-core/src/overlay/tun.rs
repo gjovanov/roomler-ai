@@ -465,10 +465,62 @@ mod system {
         static METRIC0_REJECTED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
 
-        /// Per-prefix count of "we wrote it, it is gone again" observations.
+        /// Per-prefix "we wrote it, it is gone again" state.
+        ///
+        /// #1328 — `n` alone was enough while the only remedy was the
+        /// metric-0 downgrade. A metric-1 war has no lower metric to fall
+        /// back to, so it also needs a STAND-DOWN, which needs the two extra
+        /// fields: how many times we have already stood down for this prefix
+        /// (drives the backoff) and until when the current stand-down runs.
+        #[derive(Default)]
+        struct Strike {
+            n: u32,
+            yields: u32,
+            yielded_until: Option<std::time::Instant>,
+        }
+
+        /// ⚠️ Keyed by PREFIX ONLY, not by adapter LUID, and that is deliberate.
+        ///
+        /// With `v6_defend_narrow` on (the default since #1246) each org's
+        /// adapter defends a disjoint `/(96+block_plen)`, so two orgs never
+        /// share a key and the ladders are independent anyway. With the
+        /// `OVERLAY_V6_DEFEND_NARROW=0` fallback they DO share the whole `/96`
+        /// — and there a shared ladder is the behaviour we want: that is the
+        /// pre-#1237 shape where both runtimes fought over one prefix, so one
+        /// org standing down should stand the other down too rather than let
+        /// the sibling keep the fight alive under a different LUID.
         static WRITE_STRIKES: std::sync::Mutex<
-            Option<std::collections::HashMap<(IpAddr, u8), u32>>,
+            Option<std::collections::HashMap<(IpAddr, u8), Strike>>,
         > = std::sync::Mutex::new(None);
+
+        /// Consecutive futile re-assertions before this node stands down from
+        /// a prefix at ANY metric. Equal to [`STRIKES_TO_WARN`] on purpose: the
+        /// operator gets the explanation and the stand-down in the same breath.
+        /// One MORE than [`METRIC0_STRIKES_TO_YIELD`], so the cheap remedy
+        /// (drop metric 0 → 1) is always tried before the expensive one.
+        const STRIKES_TO_YIELD: u32 = 4;
+
+        /// #1328 — is this prefix currently stood down?
+        ///
+        /// Expiry deliberately does NOT clear the entry: the next wave writes
+        /// once as a PROBE, and if that write is reaped too, `note_absent`
+        /// stands down again at the next rung. Clearing here would reset the
+        /// ladder every cooldown and re-create a slow version of the war.
+        fn yielded(key: (IpAddr, u8)) -> bool {
+            if !super::route_yield_enabled() {
+                return false;
+            }
+            WRITE_STRIKES
+                .lock()
+                .ok()
+                .and_then(|g| {
+                    g.as_ref()?
+                        .get(&key)?
+                        .yielded_until
+                        .map(|t| std::time::Instant::now() < t)
+                })
+                .unwrap_or(false)
+        }
 
         /// Consecutive guard waves that may find a written prefix missing
         /// before metric-0 is abandoned. Three waves ≈ 6 s — long enough to
@@ -497,12 +549,43 @@ mod system {
         fn note_absent(key: (IpAddr, u8), metric: u32) {
             let mut g = WRITE_STRIKES.lock().unwrap();
             let map = g.get_or_insert_with(std::collections::HashMap::new);
-            let n = map.entry(key).or_insert(0);
-            *n += 1;
+            let st = map.entry(key).or_default();
+            st.n += 1;
+            let n = st.n;
+            let already_yielded = st
+                .yielded_until
+                .is_some_and(|t| std::time::Instant::now() < t);
+
+            // #1328 — stand down from a prefix we keep losing, at ANY metric.
+            //
+            // 🔑 Safe because a strike means the route is ALREADY absent: we
+            // stop RE-ADDING it, we do not remove anything. Reachability is
+            // lost either way, so the only thing yielding costs is the fight,
+            // and the fight is what burned 437 evictions/min on CORPLAP-3.
+            //
+            // Re-armable on purpose (probe → back off further), because a
+            // competitor is usually transient — a VPN that disconnects must
+            // get its prefixes handed straight back.
+            if super::route_yield_enabled() && !already_yielded && n >= STRIKES_TO_YIELD {
+                st.yields = st.yields.saturating_add(1);
+                let back = super::yield_backoff(st.yields);
+                st.yielded_until = Some(std::time::Instant::now() + back);
+                crate::evidence::ROUTE_YIELDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    dest = %key.0, plen = key.1, metric,
+                    yields = st.yields, backoff_s = back.as_secs(),
+                    "overlay: STANDING DOWN from this prefix — re-asserting it has been \
+                     futile and something outside this agent keeps deleting it. We stop \
+                     re-adding AND stop evicting the competitor's row for the backoff, \
+                     then probe once. The route was already gone each time, so this \
+                     costs no reachability; it bounds a fight neither side can win."
+                );
+            }
+
             // `==` so a permanently-reaped prefix warns ONCE per streak;
             // `note_present` clears the entry, which re-arms it if the route
             // ever survives again (e.g. the VPN disconnects).
-            if *n == STRIKES_TO_WARN {
+            if n == STRIKES_TO_WARN {
                 tracing::warn!(
                     dest = %key.0, plen = key.1, metric,
                     "overlay: a defended route we install keeps DISAPPEARING within \
@@ -515,7 +598,7 @@ mod system {
                 );
             }
             if metric == 0
-                && *n >= METRIC0_STRIKES_TO_YIELD
+                && n >= METRIC0_STRIKES_TO_YIELD
                 && !METRIC0_REJECTED.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 tracing::warn!(
@@ -546,6 +629,14 @@ mod system {
                     metric
                 };
             let key = (dest, plen);
+            // #1328 — stood down from this prefix: do not re-assert it until
+            // the backoff expires. Ok(()) rather than an error because nothing
+            // is wrong from the caller's point of view — the guard's job for
+            // this prefix is deliberately paused, and every caller `.ok()`s
+            // this anyway.
+            if yielded(key) {
+                return Ok(());
+            }
             let mut probe = make_row(luid, dest, plen, 0);
             // SAFETY: GetIpForwardEntry2 matches on LUID + prefix + next-hop
             // and fills the row on success.
@@ -667,6 +758,10 @@ mod system {
             // route deletion; `overlay_route_evict=0` trades overlay
             // reachability under such VPNs for leaving foreign routes alone.
             if !super::route_evict_enabled() {
+                return;
+            }
+            // #1328 — the other half of the stand-down; see the v6 twin.
+            if yielded((IpAddr::V4(dest), plen)) {
                 return;
             }
             let want = u32::from_ne_bytes(dest.octets());
@@ -865,6 +960,12 @@ mod system {
         /// WARN-on-actual-deletion observability contract.
         pub fn evict_competing_v6(ours: u64, dest: std::net::Ipv6Addr, plen: u8) {
             if !super::route_evict_enabled() {
+                return;
+            }
+            // #1328 — the other half of the stand-down. Pausing only our own
+            // re-assertion would leave us still deleting the competitor's row
+            // every wave, which is most of the cost and all of the churn.
+            if yielded((IpAddr::V6(dest), plen)) {
                 return;
             }
             let want = dest.octets();
@@ -1707,6 +1808,91 @@ mod system {
     #[cfg(windows)]
     fn route_evict_enabled() -> bool {
         crate::env::flag("OVERLAY_ROUTE_EVICT", true)
+    }
+
+    /// #1328 — how long to stand down from a prefix after `yields` consecutive
+    /// futile defend-cycles: 30 s, doubling, capped at 15 min.
+    ///
+    /// Deliberately OUTSIDE `#[cfg(windows)]` even though its only caller is
+    /// the Windows route guard. It is pure arithmetic with no OS dependency,
+    /// and CI's Rust lane is **Linux** — a windows-gated ladder would compile
+    /// and test nowhere that CI can see, which is how the `Own::luid`
+    /// dead-code failure got in earlier in this arc.
+    ///
+    /// The shape, and why each end is where it is:
+    /// - **30 s floor.** A stand-down costs nothing while the route is already
+    ///   gone, but it delays recovery once the competitor leaves, and the
+    ///   common competitor (a VPN) disconnects on human timescales.
+    /// - **15 min cap.** ⚠️ The ladder must never grow unbounded: a host that
+    ///   yielded for hours would look identical to a host whose guard is
+    ///   broken, and a returning VPN-free window would go unused.
+    /// - ⚠️ **Never 0.** A zero cooldown restores the unbounded fight this
+    ///   exists to stop, so the floor is a `max`, not a comment.
+    ///
+    /// ⚠️ The `allow` is the price of that placement: CI's workspace clippy
+    /// runs WITHOUT `--all-targets`, so the `#[cfg(test)]` module below is not
+    /// compiled there and the only non-test caller is `#[cfg(windows)]` — i.e.
+    /// on the Linux lane this really is dead, and honestly so.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn yield_backoff(yields: u32) -> std::time::Duration {
+        // `1 << yields` with `yields` clamped first: shifting by ≥64 is UB-adjacent
+        // (a debug panic, a wrapped shift in release), and this takes a
+        // saturating counter.
+        let step = 30u64.saturating_mul(1u64 << yields.min(5));
+        std::time::Duration::from_secs(step.clamp(30, 900))
+    }
+
+    #[cfg(test)]
+    mod yield_backoff_tests {
+        use super::yield_backoff;
+
+        /// The ladder's contract: monotone, bounded at both ends, and — the
+        /// load-bearing one — never zero at any input including the saturated
+        /// tail, because a 0 s cooldown is the unbounded route war again.
+        #[test]
+        fn ladder_is_monotone_bounded_and_never_zero() {
+            assert_eq!(yield_backoff(1).as_secs(), 60);
+            assert_eq!(yield_backoff(2).as_secs(), 120);
+            assert_eq!(yield_backoff(3).as_secs(), 240);
+            assert_eq!(yield_backoff(4).as_secs(), 480);
+            // Rung 5 would be 960 s; the cap bites here and holds forever after.
+            assert_eq!(yield_backoff(5).as_secs(), 900);
+            assert_eq!(yield_backoff(6).as_secs(), 900);
+            assert_eq!(yield_backoff(u32::MAX).as_secs(), 900);
+
+            let mut prev = 0;
+            for y in 0..64u32 {
+                let s = yield_backoff(y).as_secs();
+                assert!((30..=900).contains(&s), "rung {y} left the bounds: {s}");
+                assert!(s >= prev, "rung {y} went backwards");
+                prev = s;
+            }
+        }
+
+        /// `yields` is 1 on the first stand-down (it is incremented before the
+        /// call), so rung 0 is unreachable in production — but it must still be
+        /// a legal 30 s rather than 0, since nothing in the type system stops a
+        /// future caller from passing it.
+        #[test]
+        fn rung_zero_is_the_floor_not_zero() {
+            assert_eq!(yield_backoff(0).as_secs(), 30);
+        }
+    }
+
+    /// #1328 — kill-switch for the generalised stand-down:
+    /// `ROOMLERD_OVERLAY_ROUTE_YIELD`. Default **ON**.
+    ///
+    /// Default-on because the alternative is measured, not hypothetical: with
+    /// the yield gated to metric-0 (and metric-0 itself default-off), a
+    /// metric-1 war could never self-limit, and CORPLAP-3 was recorded at
+    /// **437 evictions/min — ~629 k/day**, roughly 20x the previous worst.
+    ///
+    /// ⚠️ Turning it OFF restores an unbounded fight. It exists for a site
+    /// that would rather burn the CPU than ever leave a competitor holding a
+    /// prefix — not as a routine tuning knob.
+    #[cfg(windows)]
+    fn route_yield_enabled() -> bool {
+        crate::env::flag("OVERLAY_ROUTE_YIELD", true)
     }
 
     /// #1237 — a multi-org host runs ONE daemon with N overlay adapters

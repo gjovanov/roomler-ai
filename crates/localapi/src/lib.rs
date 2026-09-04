@@ -217,6 +217,19 @@ pub struct NodeStatus {
     /// caller of `run_defense_wave` that nobody attributed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_wave_arms: Option<(u64, u64)>,
+    /// #1328 — times the route guard STOOD DOWN from a prefix it kept losing
+    /// (`tunnel_core::evidence::ROUTE_YIELDS`), cumulative.
+    ///
+    /// Its own scalar for the same compatibility reason as `route_wave_arms`:
+    /// both tuples above already shipped, and widening a released tuple breaks
+    /// an older CLI's parse against a newer daemon — the normal state mid-roll.
+    ///
+    /// ⚠️ Read it WITH `route_guard.0`. Yields climbing while evictions go flat
+    /// is the stand-down working; BOTH climbing means the backoff is being
+    /// out-paced and the cooldown is too short for that competitor. Zero on a
+    /// healthy host, and zero on every non-Windows host (the guard is a no-op).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_yields: Option<u64>,
     /// C1 (disco) — out-of-tunnel carrier echoes this node ANSWERED
     /// (`tunnel_core::evidence::DISCO_ANSWERED`). Nonzero on every node is the C1
     /// field gate: the fleet can answer, so a prober may ship next. `None`
@@ -2491,6 +2504,7 @@ mod tests {
                 roam_adoptions: None,
                 route_guard: None,
                 route_wave_arms: None,
+                route_yields: None,
                 disco_answered: None,
                 org_relay: None,
                 legacy_env_uses: Some(Vec::new()),
