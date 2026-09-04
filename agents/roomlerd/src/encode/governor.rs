@@ -209,6 +209,9 @@ pub struct RateGovernor {
     age_loop: viewer_rate::AgeLoop,
     /// Last viewer age (window avg, learned floor) for the heartbeat.
     last_viewer_age: Option<(u16, u16)>,
+    /// FR-70 M0 — the last window's age at ARRIVAL (ms), for the heartbeat's
+    /// sender / transit / viewer split. `None` from a pre-M0 viewer.
+    last_viewer_arrival: Option<u16>,
     /// FR-15 kill switch, resolved once by the pump
     /// (`encode::relay_age_feedback_enabled` — env/config
     /// `RELAY_AGE_FEEDBACK`). False = learn + report only, never act.
@@ -348,6 +351,7 @@ impl RateGovernor {
             frames_skipped_decode: 0,
             age_loop: viewer_rate::AgeLoop::new(),
             last_viewer_age: None,
+            last_viewer_arrival: None,
             age_feedback: flags.age_feedback,
             pressure: EncodePressure::new(),
             encode_factor: 1.0,
@@ -945,7 +949,12 @@ impl RateGovernor {
         // relay, FR-10-deferred — rules). Direct transports keep their own
         // machinery; the loop still LEARNS there so the heartbeat can show
         // ages on every transport.
-        let report = viewer_rate::unpack_age(take_age());
+        let raw_age = take_age();
+        let report = viewer_rate::unpack_age(raw_age);
+        // FR-70 M0 — the same window's age at ARRIVAL, when the viewer sends
+        // it; the heartbeat splits the fused age with it. Stored beside the
+        // report (absent ⇒ absent) — it is telemetry, no loop reads it.
+        self.last_viewer_arrival = viewer_rate::unpack_age_arrival(raw_age);
         let mut age_over = false;
         // FR-59 — is the queue still DEEP right now? This is the LEVEL, not
         // the streak `age_over` needs, and it is what holds the P3 clamp.
@@ -1116,6 +1125,17 @@ impl RateGovernor {
     /// `agent_logs` instead of the viewer's screen.
     pub fn viewer_age(&self) -> Option<(u16, u16)> {
         self.last_viewer_age
+    }
+
+    /// FR-70 M0 — the fused paint age split by plane, when the viewer
+    /// reported an arrival age: `sender_ms` is the pump's own send-queue
+    /// wait for the window (`None` where the pump has no such figure),
+    /// `transit_ms` is arrival − sender, `viewer_ms` is paint − arrival.
+    /// `None` from a pre-M0 viewer, or a window with no age at all.
+    pub fn viewer_age_split(&self, sender_ms: Option<f64>) -> Option<viewer_rate::AgeSplit> {
+        let (age, _) = self.last_viewer_age?;
+        let arrival = self.last_viewer_arrival?;
+        Some(viewer_rate::split_age(age, arrival, sender_ms))
     }
 
     /// FR-15 P2 — count of floor samples rejected as below the path's

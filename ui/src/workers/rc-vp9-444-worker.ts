@@ -263,6 +263,12 @@ let outGapMaxMs = 0
 // output callback → submit→output latency. Entries are deleted on match;
 // cleared wholesale if drops/gating ever let it grow past 240.
 const pendingDecodeAt = new Map<number, number>()
+// FR-70 M0 — the age SPLIT (mirrors rc-hevc-worker): the age at ARRIVAL of
+// the frame's last chunk (agent clock via the probe) and the local
+// arrival→paint time. The agent subtracts the rest.
+const arrivalStats = new HopStats()
+const viewerStats = new HopStats()
+const pendingArrivalUs = new Map<number, number>()
 
 // P7 — FSR sharpening state (mirrors rc-hevc-worker; see rc-fsr-render.ts).
 const MAX_FSR_REBUILDS = 3
@@ -310,6 +316,9 @@ function maybeEmitStats(): void {
     paint: paintStats.snapshotAndReset(),
     // FR-1 P7 — end-to-end frame age; null until the clock probe lands.
     age: clockOffsetUs !== null ? ageStats.snapshotAndReset() : null,
+    // FR-70 M0 — the split (see the hevc worker).
+    arrival: clockOffsetUs !== null ? arrivalStats.snapshotAndReset() : null,
+    viewer: viewerStats.snapshotAndReset(),
     // FR-59 P3 — window queue growth in ms (null = fewer than two frames
     // arrived, which is no-signal rather than a stable queue).
     queueMs: queueDrift.snapshotAndReset(),
@@ -459,6 +468,15 @@ function initDecoder() {
       const arrivalUs = epochNowUs()
       if (clockOffsetUs !== null) {
         ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivalUs))
+      }
+      // FR-70 M0 — the same age at ARRIVAL, and the local arrival→paint time.
+      const arrivedUs = pendingArrivalUs.get(wireTsUs)
+      if (arrivedUs !== undefined) {
+        pendingArrivalUs.delete(wireTsUs)
+        if (clockOffsetUs !== null) {
+          arrivalStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivedUs))
+        }
+        viewerStats.add((arrivalUs - arrivedUs) / 1000)
       }
       // FR-59 P3 — unconditional: the drift needs no probe lock.
       queueDrift.add(wireTsUs, arrivalUs)
@@ -650,6 +668,9 @@ function emitFrame(): void {
     // (gate/drop churn) can't grow the map past 240.
     if (pendingDecodeAt.size > 240) pendingDecodeAt.clear()
     pendingDecodeAt.set(ts, performance.now())
+    // FR-70 M0 — and the frame's arrival (its last chunk is in hand here).
+    if (pendingArrivalUs.size > 240) pendingArrivalUs.clear()
+    pendingArrivalUs.set(ts, epochNowUs())
     decoder.decode(chunk)
   } catch (err) {
     workerScope.postMessage({
@@ -731,10 +752,13 @@ function teardown(): void {
   framesDroppedBacklog = 0
   // P1 — drop the hop-instrumentation state with the session.
   pendingDecodeAt.clear()
+  pendingArrivalUs.clear()
   paintStats.snapshotAndReset()
   fwdStats.snapshotAndReset()
   decodeStats.snapshotAndReset()
   ageStats.snapshotAndReset()
+  arrivalStats.snapshotAndReset()
+  viewerStats.snapshotAndReset()
   queueDrift.snapshotAndReset()
   queueDrift.reset()
   clockOffsetUs = null
