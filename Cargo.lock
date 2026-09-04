@@ -8108,6 +8108,7 @@ dependencies = [
  "base64 0.22.1",
  "bson",
  "dashmap",
+ "ipnet",
  "rand 0.9.4",
  "roomler-ai-config",
  "roomler-ai-db",
