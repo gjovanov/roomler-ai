@@ -754,7 +754,7 @@ impl AppState {
                     }
                 }
             });
-        );
+        }
 
         // tunnel subsystem
         let tunnel_clients = Arc::new(TunnelClientDao::new(&db));
@@ -976,7 +976,6 @@ pub(crate) fn build_turn_map(settings: &Settings) -> TurnMap {
         enabled: settings.relay.regions_enabled,
     }
 }
-
 
 /// Phase A-1 graceful shutdown (SIGTERM/CTRL-C): make this pod's death
 /// honest BEFORE the process exits, so a roll never strands

@@ -966,7 +966,14 @@ async fn handle_agent_exec_request(
         max_output_bytes: 0,
         cwd: None,
     };
-    let res = roomler_ai_mod_fleet::agent_exec::dispatch(state.fleet(), tenant_id, &agent, &caller, &body).await;
+    let res = roomler_ai_mod_fleet::agent_exec::dispatch(
+        state.fleet(),
+        tenant_id,
+        &agent,
+        &caller,
+        &body,
+    )
+    .await;
     if reply_tx.try_send(reply(res.outcome)).is_err() {
         warn!(%origin_agent_id, %request_id, "rc:rpc.response undeliverable — origin WS gone");
     }
@@ -1895,7 +1902,6 @@ pub(crate) fn spawn_agent_nudge(state: &AppState, owner_pod: String, agent_hex: 
         }
     });
 }
-
 
 /// Phase A-1 split-evidence probe (A2b): fired on a LOCAL hub miss; if
 /// another pod holds a FRESH presence record for the agent, that miss was

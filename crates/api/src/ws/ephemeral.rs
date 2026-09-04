@@ -55,7 +55,6 @@ fn effective_ttl_secs(agent: &Agent, state: &AppState) -> u64 {
         .max(MIN_TTL_SECS)
 }
 
-
 /// The ONE device-removal sequence behind the admin delete, the ephemeral
 /// self-unenroll and the reaper (FR-51 F3) — the fleet module's since FR-69
 /// P5a (`roomler_ai_mod_fleet::removal`), where the overlay release runs
