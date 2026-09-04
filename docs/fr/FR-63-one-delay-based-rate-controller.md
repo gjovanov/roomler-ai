@@ -112,43 +112,53 @@ bugs found while building this were in the harness:
   concealing the very commitment this phase exists to remove. Rows now carry the
   window's peak.
 
+## The AC0b A/B — answered in simulation, still open in the field
+
+The blocker was never the flag, it was the **cell**: no reachable host produces a
+pipe thin enough for arm A to fail, and three were tried. B0's
+`corp_vpn_thin_pipe` fixture replays the recorded 2026-09-02 case — a 213 180 bps
+link, a 2 550 000 ceiling, the flat 1 500 000 floor — with the two arms differing
+in `rate_slow_start` alone, on one build, deterministically.
+
+| | arm A (`false`) | arm B (`true`) |
+|---|---|---|
+| peak target committed | 2 550 000 | 1 500 000 |
+| over-drive integral (bits above 1.1× pipe) | 19 582 316 | 4 054 846 |
+| peak p95 paint age | **10 016 ms** | **1 226 ms** |
+| backpressure skips | 453 | 157 |
+| windows to settle within 25 % of the pipe | 17 | 7 |
+
+Arm A **can** fail here, which is the property the field cell lacked: it delivers
+*nothing* for ten windows. The ordering survives a keyframe-sensitivity re-run at
+3×, so it is not an artefact of the modelled IDR size.
+
+⚠️ **This does not tick AC0b.** A model of a corporate VPN is not a corporate
+VPN. The box stays open until the same A/B runs on a real thin path; what the
+simulation buys is that the law is now known to be right, so the field run is a
+confirmation rather than a search.
+
+🔑 **Two findings the field would not have shown, both about the shipped law:**
+
+1. **Most of arm A's harm is the opening KEYFRAME, not the steady rate.** At the
+   plan's 25× multiplier a 2.55 Mbps opener emits a ~265 KB IDR, which is ten
+   seconds of a 213 kbps pipe — and because nothing arrives, the FR-59 P1 floor
+   relief has no measurement, so the floor stays pinned at 1.5 M and the AIMD
+   *cannot* descend. The opener's bitrate and the opener's keyframe budget are
+   one problem; FR-31's `max_frame_size` is the other half of this phase.
+2. **The ramp protects roughly one window on a pipe thinner than `OPEN_BPS`.**
+   300 kbps into 213 kbps is still an over-drive, so window 0 congests,
+   `on_congestion` ends the ramp permanently, and the flat 1.5 M floor
+   immediately re-pins the opener — arm B's peak target is 1.5 M, not 300 k. It
+   still wins by a wide margin, but the mechanism is "a smaller opening
+   commitment and one clean window", not "a gentle ramp". A ramp that halved
+   instead of ending, or a floor that stayed down while the ramp ran, is the
+   next lever.
+
 ## Acceptance criteria
 
 - [x] AC0a — **the ramp engages and opens where it says.** Field-verified 2026-09-03 on 0.4.56, CORPLAP-1: `FR-63 slow-start armed open_bps=300000 ceiling_bps=2550000`, against an arm-A opener of `2_550_000` on the same host and build — an 8.5× smaller opening commitment. `slf=Some(600000)` on the first window with `gp=None` proves the **floor descent** did it, since the P1 relief cannot fire without a measurement; on 0.4.55, which capped only the ceiling, the opener was pinned at the flat 1.5 M and the ramp was inert.
-- [ ] AC0b — **the ramp removes the harm.** **Answered in simulation, still open in the field.**
-      The blocker was never the flag, it was the cell: no reachable host produces a pipe thin enough
-      for arm A to fail (three were tried). B0's `corp_vpn_thin_pipe` fixture replays the recorded
-      2026-09-02 cell — a 213 180 bps link, a 2 550 000 ceiling, the flat 1 500 000 floor — and both
-      arms differ in `rate_slow_start` alone, on one build, deterministically:
-
-      | | arm A (`false`) | arm B (`true`) |
-      |---|---|---|
-      | peak target committed | 2 550 000 | 1 500 000 |
-      | over-drive integral (bits above 1.1× pipe) | 19 582 316 | 4 054 846 |
-      | peak p95 paint age | 10 016 ms | 1 226 ms |
-      | backpressure skips | 453 | 157 |
-      | windows to settle within 25 % of the pipe | 17 | 7 |
-
-      Arm A **can** fail here, which is the property the field cell lacked: it delivers *nothing* for
-      ten windows. The ordering survives a keyframe-sensitivity re-run at 3× (see below), so it is
-      not an artefact of the modelled IDR size.
-
-      🔑 **Two findings the field would not have shown, both about the shipped law:**
-      1. **Most of arm A's harm is the opening KEYFRAME, not the steady rate.** At the plan's 25×
-         multiplier a 2.55 Mbps opener emits a ~265 KB IDR, which is ten seconds of a 213 kbps pipe —
-         and because nothing arrives, the FR-59 P1 floor relief has no measurement, so the floor
-         stays pinned at 1.5 M and the AIMD cannot descend. The opener's bitrate and the opener's
-         keyframe budget are the same problem, and FR-31's `max_frame_size` is the other half of
-         this phase.
-      2. **The ramp protects roughly one window on a pipe thinner than `OPEN_BPS`.** 300 kbps into
-         213 kbps is still an over-drive, so window 0 congests, `on_congestion` ends the ramp
-         permanently, and the flat 1.5 M floor immediately re-pins the opener — arm B's peak target
-         is 1.5 M, not 300 k. It still wins by a wide margin, but the mechanism is "a smaller
-         opening commitment and one clean window", not "a gentle ramp". A ramp that halved instead
-         of ending, or a floor that stayed down while the ramp ran, would be the next lever.
-
-      ⚠️ This does **not** tick AC0b. A model of a corporate VPN is not a corporate VPN; the box
-      stays open until the same A/B runs on a real thin path.
+- [ ] AC0b — **the ramp removes the harm.** **Answered in simulation, still open in the field** — see
+      "The AC0b A/B" below for the numbers, the two findings and why this does not tick the box.
 - [x] AC1 — All four fixtures green in `cargo test -p roomlerd --lib` on the default build.
       Shipped with seven more: four asserting the simulator itself, the AC0b A/B, and the
       keyframe-sensitivity check. 11 tests, ~10 ms.
