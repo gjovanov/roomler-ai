@@ -11,8 +11,8 @@
 use axum::extract::ws::{Message, WebSocket};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
+use roomler_ai_mod_fleet::hub::DispatchCtx;
 use roomler_ai_remote_control::{
-    hub::DispatchCtx,
     models::{ConsentMode, RpcCap},
     signaling::{AgentSysStats, ClientMsg, RelayRegionRtt, Role, ServerMsg},
     turn_creds::relay_regions_wire,
