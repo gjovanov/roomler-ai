@@ -3110,6 +3110,9 @@ impl OverlayRuntime {
                         // (every peer /32, then our own /32 + v6 twins —
                         // composed in one place, `route_guard::defended_routes`).
                         let set = defended_routes(&by_node, self_v4);
+                        // #1282 — attribute the wave to the TICK arm.
+                        crate::evidence::ROUTE_WAVES_TICK
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tokio::spawn(async move {
                             let _guard = guard;
                             run_defense_wave(tun2, set).await;
@@ -3284,6 +3287,9 @@ impl OverlayRuntime {
                                     // /32 for our own address; evict it NOW
                                     // rather than waiting for the 2 s tick.
                                     let set = defended_routes(&by_node, self_v4);
+                                    // #1282 — attribute the wave to the EVENT arm.
+                                    crate::evidence::ROUTE_WAVES_EVENT
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tokio::spawn(async move {
                                         let _guard = guard;
                                         run_defense_wave(tun2, set).await;

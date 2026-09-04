@@ -92,6 +92,22 @@ pub static ROUTE_SIBLING_SPARES: AtomicU64 = AtomicU64::new(0);
 /// cadence means the guard is driving itself.
 pub static ROUTE_WAVES: AtomicU64 = AtomicU64::new(0);
 
+/// #1282 — which ARM armed a route-defense wave.
+///
+/// [`ROUTE_WAVES`] measured the rate and could not explain it: an idle host
+/// runs 20/min average, bursting to ~40, against an intended 30 s heartbeat
+/// (~2/min), and there is no log line for it at all. The two arms have
+/// completely different meanings and completely different fixes — the blind
+/// 2 s TICK means no live route-change subscription, while the EVENT arm at
+/// its 3 s floor means something is generating change notifications
+/// continuously (plausibly the guard's own re-assertions feeding back).
+///
+/// ⚠️ These are counted at the two CALL SITES, not inside `run_defense_wave`,
+/// so `ROUTE_WAVES - (TICK + EVENT)` stays non-zero for any third caller
+/// rather than silently mis-attributing it. A discrepancy is a finding.
+pub static ROUTE_WAVES_TICK: AtomicU64 = AtomicU64::new(0);
+pub static ROUTE_WAVES_EVENT: AtomicU64 = AtomicU64::new(0);
+
 /// FR-68 — carrier revalidations forced by a network change ("forced rekey
 /// poke"). Each one re-keys every peer and can demote a healthy direct
 /// carrier, so this is the counter that turns "the mesh feels unstable" into
