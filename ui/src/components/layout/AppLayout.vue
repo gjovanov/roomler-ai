@@ -164,7 +164,7 @@
           <v-list-item
             v-for="d in deviceNav.items.value"
             :key="d.id"
-            :to="`/tenant/${tenantId}/agent/${d.id}/remote`"
+            :to="caps.has('remote') ? `/tenant/${tenantId}/agent/${d.id}/remote` : undefined"
             :title="d.name"
             :disabled="d.presence === 'offline'"
             density="compact"
@@ -193,7 +193,7 @@
             @click="deviceNav.loadMore()"
           />
         </v-list-group>
-        <v-list-group v-if="showFleetNav" value="network">
+        <v-list-group v-if="showFleetNav && caps.has('network')" value="network">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-lan" :title="$t('nav.network')" />
           </template>
@@ -211,7 +211,7 @@
              SLICE of roomStore.rooms — that store list stays complete
              (dashboard tiles, the app-bar call menu and updateRoomCallStatus
              iterate it), the cap is presentational only. -->
-        <v-list-group value="rooms" class="nav-entity-group">
+        <v-list-group v-if="caps.has('chat')" value="rooms" class="nav-entity-group">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-pound" :title="$t('nav.rooms')">
               <template #append>
@@ -261,7 +261,7 @@
             :key="room.id"
             :to="`/tenant/${tenantId}/room/${room.id}`"
             :title="room.name"
-            :prepend-icon="room.has_media ? 'mdi-video' : 'mdi-pound'"
+            :prepend-icon="room.has_media && caps.has('conference') ? 'mdi-video' : 'mdi-pound'"
             density="compact"
           >
             <template #append>
@@ -289,6 +289,7 @@
           />
         </v-list-group>
         <v-list-item
+          v-if="caps.has('chat')"
           :to="`/tenant/${tenantId}/files`"
           prepend-icon="mdi-folder"
           :title="$t('nav.files')"
@@ -338,7 +339,7 @@
           </template>
           <v-list-item :to="`/tenant/${tenantId}/admin/members`" prepend-icon="mdi-account-group" :title="$t('nav.members')" />
           <v-list-item :to="`/tenant/${tenantId}/admin/roles`" prepend-icon="mdi-shield-account" :title="$t('nav.roles')" />
-          <v-list-item :to="`/tenant/${tenantId}/billing`" prepend-icon="mdi-credit-card" :title="$t('nav.billing')" />
+          <v-list-item v-if="caps.has('saas')" :to="`/tenant/${tenantId}/billing`" prepend-icon="mdi-credit-card" :title="$t('nav.billing')" />
         </v-list-group>
         <!-- Audit trails, out of Admin/Settings (2026-08-26). FAIL-CLOSED
              per item on the SERVER's own bit split (VIEW_EXEC_AUDIT vs
@@ -604,6 +605,7 @@ import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
 import { useWsStore } from '@/stores/ws'
+import { useCapabilitiesStore } from '@/stores/capabilities'
 import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import MiniConference from '@/components/conference/MiniConference.vue'
@@ -631,6 +633,11 @@ const notificationStore = useNotificationStore()
 const orgBadges = useOrgBadgesStore()
 const conferenceStore = useConferenceStore()
 const wsStore = useWsStore()
+// FR-69 P9 — which pillars THIS server mounts. Every nav item below that
+// belongs to a module reads `caps.has(...)`: one predicate for navigation
+// and routes (the router guard reads the same store), fail-open until the
+// server has answered.
+const caps = useCapabilitiesStore()
 const route = useRoute()
 // FR-12 P2 — `?tour=<id>` starts a spotlight tour on arrival. The param is
 // stripped immediately: a tour is a one-time nudge, and leaving it in the URL
@@ -880,8 +887,8 @@ watch(
 // Gate the Devices page + Network group on fleet permissions
 // (MANAGE_AGENTS / REMOTE_CONTROL / ADMINISTRATOR / owner). Collab +
 // Admin groups stay visible for every member.
-const showFleetNav = computed(() =>
-  canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner),
+const showFleetNav = computed(
+  () => caps.has('fleet') && canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner),
 )
 const showAnalyticsNav = computed(() =>
   canQueryAnalytics(tenantStore.myPermissions, tenantStore.isOwner),
