@@ -7,7 +7,7 @@ use axum::{
 use bson::oid::ObjectId;
 use serde::Serialize;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
@@ -25,7 +25,7 @@ pub struct NotificationResponse {
 }
 
 pub async fn list(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -46,7 +46,7 @@ pub async fn list(
 }
 
 pub async fn unread(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -67,7 +67,7 @@ pub async fn unread(
 }
 
 pub async fn unread_count(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let count = state.notifications.unread_count(auth.user_id).await?;
@@ -75,7 +75,7 @@ pub async fn unread_count(
 }
 
 pub async fn mark_read(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(notification_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -89,7 +89,7 @@ pub async fn mark_read(
 }
 
 pub async fn mark_all_read(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let count = state.notifications.mark_all_read(auth.user_id).await?;
@@ -101,7 +101,7 @@ pub async fn mark_all_read(
 /// the user's connections (the `notification:unread_count` client handler
 /// predates this; there was no server emitter, so a bell read in one tab
 /// left every other device's badge stuck until reload). Best-effort.
-async fn emit_unread_count(state: &AppState, user_id: ObjectId) {
+async fn emit_unread_count(state: &Core, user_id: ObjectId) {
     let Ok(count) = state.notifications.unread_count(user_id).await else {
         return;
     };
