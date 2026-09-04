@@ -69,6 +69,7 @@ pub mod releases;
 pub mod remote_config;
 pub mod removal;
 pub mod setup_release;
+pub mod socket;
 pub mod tunnel_release;
 
 pub use hub::Hub;

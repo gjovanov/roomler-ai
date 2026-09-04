@@ -1,7 +1,9 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
 **Status**: P0 + P1 + P2 + P3 + P4 + P5a + P5b shipped (#1309 · #1311 · #1312 · #1315 · #1317 ·
-#1318 · #1320 · #1323 · #1325 · #1329 · #1332) · P5c (the agent socket) next ·
+#1318 · #1320 · #1323 · #1325 · #1329 · #1332) · P5c (the agent socket into `fleet`) in PR —
+merged when CI is green; its field gate (no dip in online agents across a prod roll) is still
+to be run · P6 (`remote`) next ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -453,7 +455,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P4** ✅ | `conference` module — #1325: the SFU room manager + worker pool (from `services/media`), the media cluster, the sampler, the call lifecycle, recordings, and `media:*` as a module namespace; **mediasoup links in this one crate only**; the contract's stateful surfaces used for the first time (`WsHandler::closed`, `Module::jobs` under the host's startup lease, `Module::shutdown`) | baseline identical; integration lane; prod roll. AC4's Docker measurement waits for the profiles (P8) — the mechanism is in place | `conference = false` | medium | 3–4 |
 | **P5a** ✅ | `fleet` module — #1329: the Hub out of `remote_control`, `AuthAgent`, every fleet HTTP path, presence, the nudge machinery, consent and its consumer, the removal sequence; `Core.hooks` (the D6 registry) with the host's transitional `network` hooks so the agent cascade already runs in `HOOK_ORDER`. The agent socket stays in the host on `Arc` aliases of the module's handles | baseline identical; integration lane; prod roll | none — `fleet` is a required dependency until the socket moves; `fleet = false` refuses to boot | high | 2–3 |
 | **P5b** ✅ | #1332 — `Owner { Fleet, Remote, Network }` + the exhaustive `ClientMsg::namespace()` and `wire_tag()` matches + the 44-entry `CLIENT_MSG_OWNERS` table in the wire crate, locked four ways (the enum's own renames, the match on buildable variants, the D7 placements, the module graph); the composition baseline gained a `namespaces` section | baseline re-recorded for the new section only — routes, index sets and wire names byte-identical | none (a pure function) | low | 1 |
-| **P5c** | the agent socket into `fleet` behind a core-owned `(role, namespace)` handler registry; the host's remote/network agent-side arms registered transitionally; the `AppState` aliases and the required-dependency go | same + no dip in online agents | redeploy previous tag | high | 3–4 |
+| **P5c** ✅ (CI) | the agent socket into `fleet` (`roomler_ai_mod_fleet::socket`) behind `Core::agent_socket` — per-owner message handlers + per-module lifecycles (`hello` / `heartbeat` / `closing` / `closed(removal_was_ours)`), dispatch by `ClientMsg::namespace()`; the host registers its `remote`/`network` halves transitionally (`ws/agent_socket_host.rs`). The `AppState` aliases and the required dependency STAY until the host code that reads them moves (P6/P7) | baseline identical; integration lane; **prod roll with no dip in online agents — not yet run** | redeploy previous tag | high | 3–4 |
 | **P6** | `remote` module | same + one RC session per carrier class | `remote = false` | medium | 2–3 |
 | **P7** | `network` module, `/derp` included | same + overlay/tunnel field sweep | `network = false` | high | 5–7 |
 | **P8** | profiles, Docker args, CI matrix, publish axis, self-host docs | five checks green; `mesh` image boots (AC5) | `full` stays default | medium | 2–3 |
@@ -813,3 +815,40 @@ suite, then a prod roll watched from the fleet — **no dip in online agents** a
 (the `agents.status` count on the server, not an exec sweep), the presence sweeper quiet, an
 RC session and a tunnel open on the new pods. The kill switch is the previous tag: a socket
 cannot be unmounted under a fleet that is dialing it.
+
+### 2026-09-04 — P5c: the agent socket into `fleet`, as planned
+
+- The move followed the plan above line by line: `handle_agent_socket` and its fleet helpers
+  (the exec request, the config report, the exec-target resolver, the RTT ladder, the frame
+  reader, the pump, the heartbeat docs with their tests) are `roomler_ai_mod_fleet::socket`;
+  `Core::agent_socket` is the registry (`AgentCtx`, `AgentMsgHandler`, `AgentSocketLifecycle`,
+  `AgentSocketHooks`, `AgentSocketRegistry`); the host's `ws/agent_socket_host.rs` is the
+  transitional `network` half (the two tunnel relays, the overlay relay, the probe report, the
+  DERP ticket, SSH, key rotation, the tunnel originator and the overlay leave as lifecycle
+  steps) and `remote` half (the session-stats merge). The host keeps the `/ws` upgrade and the
+  role gate and calls the module from its agent branch.
+- **One structural change, no behavioural one.** The loop's pipeline of relays and explicit
+  arms became ONE dispatch by `ClientMsg::namespace()`: fleet's own arms run in-crate, the
+  other two owners' through the registry, and a handler hands back what it did not consume
+  so the Hub's own dispatch (session signalling, consent, ping) sees exactly what it saw
+  before. The relays' per-connection locals became the network lifecycle's state, keyed by a
+  connection id the socket mints — never the agent id, because a displacing connection's
+  teardown must not find its successor's sessions.
+- **The teardown order is written once**, in `roomler_core::agent_socket`'s docs and in the
+  loop: `closing` for every lifecycle (tunnel teardown, sessions targeting the agent) → the
+  Hub's unregister answering `removal_was_ours` → `closed(ours)` for every lifecycle (the
+  overlay leave, only if ours) → fleet's Offline write, presence compare-DEL and OFFLINE
+  transition, only if ours. Each step keeps the invariant the code it replaced paid for
+  (rc.53, rc.307 B, Phase A-1).
+- Two things moved down so fleet never names the host: the key-rotation order predicates
+  (`order_is_satisfied`, `should_redeliver`, `REDELIVER_AFTER_SECS`) into the wire crate's
+  models — a pure judgement over two models — and the tunnel `Originator`'s `tunnel-core`
+  principal stays behind the network lifecycle, so `fleet` still links no `tunnel-core` (the
+  D3 re-check answered).
+- What did NOT change yet, deliberately: the fourteen `AppState` aliases and the required
+  `fleet` dependency. The host code that reads them (`ws/tunnel.rs`, `ws/overlay.rs`, the
+  overlay/ssh/peer-relay routes, the nudge bus handler) is network's and remote's; each alias
+  leaves with the file that reads it in P6/P7.
+- **The field gate is open.** CI proves the composition and the suite; only a prod roll
+  watched from the fleet proves that no agent drops across it. That roll has not been run —
+  for this phase or for P0–P5b — and it is the operator's action.
