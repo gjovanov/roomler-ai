@@ -40,3 +40,9 @@ sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# The Hub's unit tests build their audit sink on a `mongodb::Client` (the
+# wire crate carried the driver behind its `server` feature; only the tests
+# here name it directly).
+mongodb.workspace = true

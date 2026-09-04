@@ -8080,6 +8080,7 @@ dependencies = [
  "futures",
  "hex",
  "ipnet",
+ "mongodb",
  "parking_lot 0.12.5",
  "reqwest 0.12.28",
  "roomler-ai-config",
