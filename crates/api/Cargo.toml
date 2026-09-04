@@ -38,6 +38,10 @@ roomler-core = { path = "../core" }
 roomler-ai-mod-saas = { path = "../modules/saas", optional = true }
 roomler-ai-mod-chat = { path = "../modules/chat", optional = true }
 roomler-ai-mod-conference = { path = "../modules/conference", optional = true }
+# FR-69 P5a — NOT optional yet: the host still serves the agent socket from
+# the fleet module's handles (the Hub, the agent row, presence). It becomes a
+# feature like the others when the socket moves into the module (P5b).
+roomler-ai-mod-fleet = { path = "../modules/fleet" }
 
 axum.workspace = true
 tokio.workspace = true

@@ -1,73 +1,117 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! The inverse edges: what core tells modules, and in what order.
+//! The inverse edges (FR-69 D6): what a module does when core — or the
+//! module that owns a record — tells it that record is going away.
 //!
-//! Calls flow module → core along the DAG in [`crate::graph`]. The flows that
-//! go the other way today — a tenant archive releasing every overlay node, an
-//! agent's removal terminating its sessions and releasing its lease, presence
-//! changes — become hooks a module registers at init and core invokes
-//! **synchronously, in-process, in a fixed order**. Not an event bus: eventual
-//! consistency on a cascade that must not pool an address before its tombstone
-//! is the bug class the overlay IPAM already paid for (FR-69 D6).
+//! The call graph is a DAG (`conference → chat`, `remote → fleet`,
+//! `network → fleet`), so the module that OWNS a record can never call the
+//! modules that hold state about it: fleet cannot ask network to release an
+//! overlay lease, or remote to terminate a session. Those flows exist today
+//! as direct calls inside the host; here they are **typed hook traits**,
+//! registered at composition time and invoked in [`HOOK_ORDER`] — session
+//! holders → lease holders → the record owner — by whoever runs the cascade.
 //!
-//! Every hook must be idempotent — a cascade can be re-run after a crash
-//! mid-way, which is already true of today's code.
+//! Hooks must be idempotent: a cascade can be re-run after a crash mid-way
+//! (already true of the code they replace). A hook a profile does not
+//! compile is simply not registered, and the cascade skips it.
+//!
+//! # Registry
+//!
+//! [`HookRegistry`] lives on `Core` (`core.hooks`) and is shared through
+//! every `Core` clone, so a module built BEFORE the host finished composing
+//! still sees the hooks registered after it. The host registers each mounted
+//! module's [`Module::hooks`](crate::Module::hooks) under the module's id; until
+//! a module is extracted, the host registers its own implementation of that
+//! module's hooks under the same id (the transitional shape P5a introduced —
+//! the network steps of the agent cascade run from host code, but through
+//! this registry, in this order).
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 
-/// The order core invokes hooks in, for every event: the modules that hold
-/// sessions first, then the ones that hold leases, then the owner of the
-/// record being removed. Written once, here, so it is a fact and not a
-/// convention spread over call sites.
+/// The order the cascade runs in: session holders (`remote`) release first,
+/// then lease holders (`network`), then the record owner (`fleet`); the
+/// collaboration modules and `saas` follow, in composition order.
 pub const HOOK_ORDER: &[&str] = &["remote", "network", "fleet", "conference", "chat", "saas"];
 
-/// Tenant lifecycle events, owned by core.
+/// What a lease holder freed when an agent was removed — the one piece of
+/// hook output a caller reports back (the admin delete route answers with
+/// the overlay address it released).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedLease {
+    pub overlay_ip: String,
+}
+
+/// What a derived-label holder did with an agent rename. Three outcomes on
+/// purpose: the agent route reports "no live node" and "propagation failed"
+/// differently, and folding them would lose that on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenamePropagation {
+    /// The holder has nothing live for this agent — nothing to propagate.
+    NoLiveNode,
+    /// A live record exists but the new label could not be applied.
+    Failed,
+    /// The label the record carries now.
+    Propagated(String),
+}
+
+/// Hooks core invokes on tenant events.
 #[async_trait]
 pub trait TenantLifecycle: Send + Sync {
-    /// The tenant was archived: release what the module holds for it. The
-    /// `reason` is the audit string core recorded.
     async fn tenant_archived(&self, tenant_id: ObjectId, reason: &str) -> anyhow::Result<()> {
         let _ = (tenant_id, reason);
         Ok(())
     }
 
-    /// A member left or was removed: drop what the module holds for that user
-    /// in that tenant (sessions, subscriptions, sockets).
     async fn member_removed(&self, tenant_id: ObjectId, user_id: ObjectId) -> anyhow::Result<()> {
         let _ = (tenant_id, user_id);
         Ok(())
     }
 }
 
-/// Device lifecycle events, owned by `fleet` and relayed through core so
-/// `remote` and `network` never have to be called by `fleet` directly.
+/// Hooks `fleet` invokes on agent events. Implemented by the modules that hold
+/// state ABOUT an agent (`remote`: sessions; `network`: the overlay lease,
+/// tunnels, the MagicDNS label) — never by fleet itself, which is the caller.
 #[async_trait]
 pub trait FleetLifecycle: Send + Sync {
-    /// The agent row is being removed (delete cascade, admin evict, ephemeral
-    /// reap): terminate sessions, release leases. Runs BEFORE the row is
-    /// tombstoned — the order that only ever leaks, never double-allocates.
+    /// The agent is being removed (admin delete, self-unenroll, the ephemeral
+    /// reaper). Release what you hold for it. Runs BEFORE the row is deleted
+    /// or tombstoned and BEFORE the socket is kicked — the order the overlay
+    /// release has always needed (the kick's teardown must find an
+    /// already-tombstoned node rather than race the release CAS). Return the
+    /// lease you freed, if any.
     async fn agent_removed(
         &self,
         tenant_id: ObjectId,
         agent_id: ObjectId,
+        machine_id: &str,
         reason: &str,
-    ) -> anyhow::Result<()> {
-        let _ = (tenant_id, agent_id, reason);
-        Ok(())
+    ) -> anyhow::Result<Option<ReleasedLease>> {
+        let _ = (tenant_id, agent_id, machine_id, reason);
+        Ok(None)
     }
 
-    /// The agent's control socket went away.
+    /// The agent's name changed. A holder of a derived label (the overlay
+    /// node's MagicDNS name) propagates it and says what happened.
+    async fn agent_renamed(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        name: &str,
+    ) -> anyhow::Result<RenamePropagation> {
+        let _ = (tenant_id, agent_id, name);
+        Ok(RenamePropagation::NoLiveNode)
+    }
+
     async fn agent_offline(&self, tenant_id: ObjectId, agent_id: ObjectId) -> anyhow::Result<()> {
         let _ = (tenant_id, agent_id);
         Ok(())
     }
 }
 
-/// What a module registers. Both are optional; a module with nothing to
-/// release registers nothing and costs nothing.
+/// What one module registers: the hook traits it implements.
 #[derive(Clone, Default)]
 pub struct Hooks {
     pub tenant: Option<Arc<dyn TenantLifecycle>>,
@@ -80,6 +124,120 @@ impl std::fmt::Debug for Hooks {
             .field("tenant", &self.tenant.is_some())
             .field("fleet", &self.fleet.is_some())
             .finish()
+    }
+}
+
+/// Every registered module's hooks, keyed by module id, invoked in
+/// [`HOOK_ORDER`]. Shared (an `Arc`) so a registration made after a `Core`
+/// was cloned is visible to that clone.
+#[derive(Clone, Default)]
+pub struct HookRegistry {
+    inner: Arc<RwLock<Vec<(&'static str, Hooks)>>>,
+}
+
+impl std::fmt::Debug for HookRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ids: Vec<&'static str> = self.registered();
+        f.debug_struct("HookRegistry")
+            .field("modules", &ids)
+            .finish()
+    }
+}
+
+impl HookRegistry {
+    /// Register `hooks` under a module id. A second registration for the same
+    /// id replaces the first (a module's hooks are one object).
+    pub fn register(&self, module: &'static str, hooks: Hooks) {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        inner.retain(|(id, _)| *id != module);
+        inner.push((module, hooks));
+    }
+
+    /// The module ids with hooks registered, in [`HOOK_ORDER`].
+    pub fn registered(&self) -> Vec<&'static str> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        HOOK_ORDER
+            .iter()
+            .copied()
+            .filter(|id| inner.iter().any(|(m, _)| m == id))
+            .collect()
+    }
+
+    /// The registered [`FleetLifecycle`] hooks, in [`HOOK_ORDER`].
+    pub fn fleet_lifecycles(&self) -> Vec<(&'static str, Arc<dyn FleetLifecycle>)> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        HOOK_ORDER
+            .iter()
+            .filter_map(|id| {
+                inner
+                    .iter()
+                    .find(|(m, _)| m == id)
+                    .and_then(|(_, h)| h.fleet.clone())
+                    .map(|h| (*id, h))
+            })
+            .collect()
+    }
+
+    /// The registered [`TenantLifecycle`] hooks, in [`HOOK_ORDER`].
+    pub fn tenant_lifecycles(&self) -> Vec<(&'static str, Arc<dyn TenantLifecycle>)> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        HOOK_ORDER
+            .iter()
+            .filter_map(|id| {
+                inner
+                    .iter()
+                    .find(|(m, _)| m == id)
+                    .and_then(|(_, h)| h.tenant.clone())
+                    .map(|h| (*id, h))
+            })
+            .collect()
+    }
+
+    /// Run every `agent_removed` hook in order. The first lease a holder
+    /// reports is the cascade's answer; a failing hook stops the cascade —
+    /// removing the row while a holder still has the lease is exactly the
+    /// state this order exists to prevent.
+    pub async fn agent_removed(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        machine_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<Option<ReleasedLease>> {
+        let mut released = None;
+        for (module, hook) in self.fleet_lifecycles() {
+            let out = hook
+                .agent_removed(tenant_id, agent_id, machine_id, reason)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: agent_removed: {e}"))?;
+            if released.is_none() {
+                released = out;
+            }
+        }
+        Ok(released)
+    }
+
+    /// Run every `agent_renamed` hook in order; the first holder that had a
+    /// live record decides the outcome. A failing hook is an error for the
+    /// caller to report — a rename that did not reach the mesh must not read
+    /// as one that did.
+    pub async fn agent_renamed(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        name: &str,
+    ) -> anyhow::Result<RenamePropagation> {
+        let mut outcome = RenamePropagation::NoLiveNode;
+        for (module, hook) in self.fleet_lifecycles() {
+            let out = hook
+                .agent_renamed(tenant_id, agent_id, name)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: agent_renamed: {e}"))?;
+            if outcome == RenamePropagation::NoLiveNode {
+                outcome = out;
+            }
+        }
+        Ok(outcome)
     }
 }
 
@@ -102,5 +260,104 @@ mod tests {
         let pos = |id: &str| HOOK_ORDER.iter().position(|m| *m == id).unwrap();
         assert!(pos("remote") < pos("network"));
         assert!(pos("network") < pos("fleet"));
+    }
+
+    struct Releases(&'static str);
+
+    #[async_trait]
+    impl FleetLifecycle for Releases {
+        async fn agent_removed(
+            &self,
+            _tenant_id: ObjectId,
+            _agent_id: ObjectId,
+            _machine_id: &str,
+            _reason: &str,
+        ) -> anyhow::Result<Option<ReleasedLease>> {
+            Ok(Some(ReleasedLease {
+                overlay_ip: self.0.to_string(),
+            }))
+        }
+    }
+
+    struct Fails;
+
+    #[async_trait]
+    impl FleetLifecycle for Fails {
+        async fn agent_removed(
+            &self,
+            _tenant_id: ObjectId,
+            _agent_id: ObjectId,
+            _machine_id: &str,
+            _reason: &str,
+        ) -> anyhow::Result<Option<ReleasedLease>> {
+            anyhow::bail!("lease still held")
+        }
+    }
+
+    #[tokio::test]
+    async fn hooks_run_in_hook_order_regardless_of_registration_order() {
+        let reg = HookRegistry::default();
+        reg.register(
+            "fleet",
+            Hooks {
+                fleet: Some(Arc::new(Releases("from-fleet"))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "network",
+            Hooks {
+                fleet: Some(Arc::new(Releases("100.65.4.2"))),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reg.registered(), vec!["network", "fleet"]);
+        // network runs before fleet, so its lease is the cascade's answer.
+        let out = reg
+            .agent_removed(ObjectId::new(), ObjectId::new(), "m", "test")
+            .await
+            .unwrap();
+        assert_eq!(out.map(|r| r.overlay_ip).as_deref(), Some("100.65.4.2"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_holder_stops_the_cascade() {
+        let reg = HookRegistry::default();
+        reg.register(
+            "network",
+            Hooks {
+                fleet: Some(Arc::new(Fails)),
+                ..Default::default()
+            },
+        );
+        let err = reg
+            .agent_removed(ObjectId::new(), ObjectId::new(), "m", "test")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("network: agent_removed"));
+    }
+
+    #[test]
+    fn a_re_registration_replaces_the_first() {
+        let reg = HookRegistry::default();
+        reg.register("network", Hooks::default());
+        reg.register("network", Hooks::default());
+        assert_eq!(reg.registered(), vec!["network"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_registry_is_a_no_op_cascade() {
+        let reg = HookRegistry::default();
+        let out = reg
+            .agent_removed(ObjectId::new(), ObjectId::new(), "m", "test")
+            .await
+            .unwrap();
+        assert!(out.is_none());
+        assert_eq!(
+            reg.agent_renamed(ObjectId::new(), ObjectId::new(), "n")
+                .await
+                .unwrap(),
+            RenamePropagation::NoLiveNode
+        );
     }
 }

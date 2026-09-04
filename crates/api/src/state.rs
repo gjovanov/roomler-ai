@@ -7,10 +7,6 @@ use dashmap::DashMap;
 use mongodb::Database;
 use roomler_ai_config::Settings;
 use roomler_ai_remote_control::{
-    Hub,
-    audit::AuditSink,
-    hub::ConsentEvent,
-    models::ConsentMode,
     signaling::ServerMsg,
     turn_creds::{TurnConfig, TurnMap},
     turn_url::{VariantCaps, expand_turn_url},
@@ -94,7 +90,7 @@ pub struct AppState {
     pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
-    pub rc_hub: Arc<Hub>,
+    pub rc_hub: Arc<roomler_ai_mod_fleet::Hub>,
     /// Multi-region DERP ticket signer (`relay.derp_ticket_private_key`).
     /// `None` = no key configured — ticket requests go unanswered and agents
     /// keep using the central `/derp`.
@@ -213,7 +209,7 @@ pub struct AppState {
     /// TTL comes from `settings.releases.cache_ttl_secs`;
     /// `POST /api/releases/refresh` busts it cluster-wide on a release.
     /// See `routes::releases` for the lifecycle.
-    pub releases_cache: Arc<crate::routes::releases::ReleasesCache>,
+    pub releases_cache: Arc<roomler_ai_mod_fleet::releases::ReleasesCache>,
 }
 
 /// FR-69 P1 — every `state.<core field>` in the tree keeps reading through
@@ -224,6 +220,19 @@ impl std::ops::Deref for AppState {
 
     fn deref(&self) -> &Core {
         &self.core
+    }
+}
+
+impl AppState {
+    /// FR-69 P5a — the fleet module's state, for the host code that still
+    /// serves the agent socket from it. Always mounted: `AppState::new`
+    /// refuses to boot without it (the module cannot be switched off while
+    /// the socket lives here — the P5 kill switch is the previous tag).
+    pub fn fleet(&self) -> &roomler_ai_mod_fleet::FleetState {
+        self.modules
+            .fleet
+            .as_ref()
+            .expect("the fleet module is mounted (AppState::new refuses to boot without it)")
     }
 }
 
@@ -320,24 +329,13 @@ impl AppState {
         };
 
         // Remote-control subsystem
-        let agents = Arc::new(AgentDao::new(&db));
         let used_tokens = Arc::new(roomler_ai_services::dao::used_token::UsedTokenDao::new(&db));
-        let enrollment_keys =
-            Arc::new(roomler_ai_services::dao::enrollment_key::EnrollmentKeyDao::new(&db));
         let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
-        let exec_audit = Arc::new(ExecAuditDao::new(&db));
         let ssh_audit = Arc::new(SshAuditDao::new(&db));
-        let config_audit = Arc::new(ConfigAuditDao::new(&db));
         let key_rotation_audit = Arc::new(KeyRotationAuditDao::new(&db));
         let peer_relay_audit = Arc::new(PeerRelayAuditDao::new(&db));
         let ssh_activity = Arc::new(SshActivityDao::new(&db));
-        let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
-            &db,
-        ));
-        let agent_logs = Arc::new(roomler_ai_services::dao::agent_log::AgentLogDao::new(&db));
-
-        let consent_requests = Arc::new(ConsentRequestDao::new(&db));
         let stats = Arc::new(roomler_ai_services::dao::stats::StatsDao::new(&db));
         // Stats PR-3 — malformed allowlist entries are skipped LOUDLY (a
         // silent skip would read as "dashboards mysteriously 404").
@@ -425,18 +423,6 @@ impl AppState {
                 None
             }
         };
-        let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());
-        // Phase 4 — owner-side consent: the Hub emits a `ConsentEvent` for each
-        // Email/Push session; this consumer resolves the owner + persists a
-        // `ConsentRequest` + sends the email / web-push. Wiring `Some(consent_tx)`
-        // is what turns those modes on; with `None` (tests) they'd just time out.
-        let (consent_tx, consent_rx) = mpsc::channel::<ConsentEvent>(64);
-        let rc_hub = Arc::new(Hub::new_with_consent(
-            audit_sink,
-            (*turn_map).clone(),
-            Some(consent_tx),
-            relay_load.clone(),
-        ));
 
         // C-1 — the directory heartbeat: every 30 s, re-assert this pod's
         // agent presence records (gated on STILL holding the hub slot).
@@ -447,7 +433,6 @@ impl AppState {
         // A CONFLICT (foreign owner) is the fold signal: log it; the
         // socket-level machinery (displacement Goodbye / A2b counter)
         // owns the reaction.
-        let agent_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
         let tunnel_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
         let derp_presence_tokens: Arc<DashMap<crate::ws::derp::DerpKey, String>> =
             Arc::new(DashMap::new());
@@ -457,14 +442,62 @@ impl AppState {
             Arc::new(DashMap::new());
         let tunnel_sessions_by_origin_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
             Arc::new(DashMap::new());
-        let agent_nudge_cooldowns: Arc<crate::ws::rc_cluster::NudgeCooldowns> =
-            Arc::new(DashMap::new());
 
         // C-2 — the global-channel subscriber + forwarder, MOVED here from
         // main.rs so two-pod TestApps exercise cross-pod delivery (chat,
         // presence, and the new rc ctrl events). Same reconnect-and-backoff
         // subscription; the forwarder gains the ctrl lane.
         let redis_sub_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // FR-69 P1/P5a — the core, then the modules, BEFORE the host tasks
+        // below: the fleet module's init builds the Hub and the presence and
+        // nudge maps that the global-channel subscriber, the nudge handler
+        // and the tail spawns capture. The core's fields are cloned in
+        // (every one is an `Arc`, a handle, or `Settings` once), so the
+        // locals stay usable for the rest of the constructor.
+        let core = Core {
+            db: db.clone(),
+            settings: settings.clone(),
+            auth: auth.clone(),
+            users: users.clone(),
+            activation_codes: activation_codes.clone(),
+            tenants: tenants.clone(),
+            invites: invites.clone(),
+            roles: roles.clone(),
+            notifications: notifications.clone(),
+            oauth: oauth.clone(),
+            email: email.clone(),
+            push: push.clone(),
+            push_subscriptions: push_subscriptions.clone(),
+            used_tokens: used_tokens.clone(),
+            tasks: tasks.clone(),
+            ws_storage: ws_storage.clone(),
+            redis_pubsub: redis_pubsub.clone(),
+            redis_sub_alive: redis_sub_alive.clone(),
+            storage: storage.clone(),
+            stats: stats.clone(),
+            platform_admins: platform_admins.clone(),
+            geoip: geoip.clone(),
+            pod: pod.clone(),
+            cluster_directory: cluster_directory.clone(),
+            cluster_bus: cluster_bus.clone(),
+            turn_map: turn_map.clone(),
+            relay_load: relay_load.clone(),
+            hooks: roomler_core::HookRegistry::default(),
+        };
+        // FR-69 P2 — the module crates, after the core and before the host
+        // state that mounts them.
+        let modules = crate::compose::Modules::init(core.clone(), &core.settings).await?;
+        // P5a — the host serves the agent socket from the fleet module's
+        // handles until P5b moves the socket; a build that switches fleet
+        // off has nothing to serve it from, so it refuses to boot rather
+        // than come up with a dead socket.
+        let fleet = modules.fleet.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[modules] fleet = false is not supported while the host serves the agent \
+                 socket (FR-69 P5a) — redeploy the previous tag instead"
+            )
+        })?;
         // #1186 — `overlay_removes` ctrl envelopes need the FULL state to
         // re-fan (a Mongo peer read + the overlay send paths), which this
         // subscriber closure cannot capture (it is spawned mid-construction;
@@ -478,7 +511,7 @@ impl AppState {
             let mut redis_rx = redis_tx.subscribe();
             let own_instance = pubsub.instance_id().to_string();
             let fwd_storage = ws_storage.clone();
-            let ctrl_hub = rc_hub.clone();
+            let ctrl_hub = fleet.rc_hub.clone();
             RedisPubSub::subscribe_with_reconnect(
                 settings.redis.url.clone(),
                 redis_tx,
@@ -587,10 +620,10 @@ impl AppState {
         // planes; it must never flap), truthful refusal reasons on the
         // reply, and refusal/stuck counters.
         if let Some(bus) = &cluster_bus {
-            let hub = rc_hub.clone();
+            let hub = fleet.rc_hub.clone();
             let tunnel_targets = tunnel_sessions_by_target_agent.clone();
             let tunnel_origins = tunnel_sessions_by_origin_agent.clone();
-            let cooldowns = agent_nudge_cooldowns.clone();
+            let cooldowns = fleet.agent_nudge_cooldowns.clone();
             let pacing = crate::ws::rc_cluster::NudgePacing {
                 cooldown: std::time::Duration::from_secs(settings.rc.nudge_cooldown_secs),
                 max_attempts: settings.rc.nudge_max_attempts,
@@ -604,7 +637,7 @@ impl AppState {
                 let tunnel_origins = tunnel_origins.clone();
                 let cooldowns = cooldowns.clone();
                 Box::pin(async move {
-                    use roomler_ai_remote_control::hub::NudgeOutcome;
+                    use roomler_ai_mod_fleet::hub::NudgeOutcome;
                     let hex = body
                         .get("agent_id")
                         .and_then(|v| v.as_str())
@@ -664,32 +697,12 @@ impl AppState {
                 })
             });
         }
-        // The releases cache is constructed here rather than inline in the
-        // struct literal because the bus handler below has to capture it:
-        // `POST /api/releases/refresh` lands on ONE pod, and this handler is
-        // how the other pods get busted too.
-        let releases_cache = crate::routes::releases::ReleasesCache::new();
-        if let Some(bus) = &cluster_bus {
-            let cache = releases_cache.clone();
-            let pod_id = pod.pod_id.clone();
-            bus.register(crate::routes::releases::BUS_CLASS_REFRESH, move |body| {
-                let cache = cache.clone();
-                let pod_id = pod_id.clone();
-                Box::pin(async move {
-                    let expect = body
-                        .get("expect_tag")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    let report = cache.force_refresh(&pod_id, expect.as_deref()).await;
-                    serde_json::to_value(report).map_err(|e| e.to_string())
-                })
-            });
-        }
 
+        // C-3/C-5 — the directory heartbeat for the host's own classes
+        // (tunnel sessions, derp registrations). The agent-presence half is
+        // the fleet module's (FR-69 P5a), spawned by its init.
         if let Some(dir) = &cluster_directory {
             let dir = dir.clone();
-            let hub = rc_hub.clone();
-            let tokens = agent_presence_tokens.clone();
             let tunnel_tokens = tunnel_presence_tokens.clone();
             let tunnel_sessions = tunnel_clients_by_session.clone();
             let derp_tokens = derp_presence_tokens.clone();
@@ -697,23 +710,6 @@ impl AppState {
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    for entry in tokens.iter() {
-                        let (agent_id, token) = (*entry.key(), entry.value().clone());
-                        if !hub.is_agent_online(agent_id) {
-                            continue;
-                        }
-                        let key = crate::cluster::directory::agent_key(&agent_id.to_hex());
-                        match dir.refresh_if_mine(&key, &token, 90).await {
-                            Ok(true) => {}
-                            Ok(false) => tracing::warn!(
-                                agent = %agent_id,
-                                "directory heartbeat CONFLICT — foreign pod owns this agent's record"
-                            ),
-                            Err(e) => {
-                                tracing::debug!(agent = %agent_id, %e, "directory heartbeat failed");
-                            }
-                        }
-                    }
                     // C-3 — tunnel session records: refresh while the session
                     // map holds the session (its four teardown paths all drop
                     // the map entry, which stops the refresh here; the 90 s
@@ -759,21 +755,6 @@ impl AppState {
                 }
             });
         }
-        spawn_consent_consumer(
-            consent_rx,
-            ConsentConsumerDeps {
-                agents: agents.clone(),
-                users: users.clone(),
-                consent_requests: consent_requests.clone(),
-                push_subscriptions: push_subscriptions.clone(),
-                email: email.clone(),
-                push: push.clone(),
-                base_url: settings.oauth.base_url.clone(),
-                notifications: notifications.clone(),
-                ws_storage: ws_storage.clone(),
-                redis_pubsub: redis_pubsub.clone(),
-            },
-        );
 
         // tunnel subsystem
         let tunnel_clients = Arc::new(TunnelClientDao::new(&db));
@@ -794,60 +775,31 @@ impl AppState {
         let overlay_nodes = Arc::new(OverlayNodeDao::new(&db));
         let overlay_policies = Arc::new(OverlayPolicyDao::new(&db));
 
-        // FR-69 P1 — the core first, then the module-owned rest.
-        let core = Core {
-            db,
-            settings,
-            auth,
-            users,
-            activation_codes,
-            tenants,
-            invites,
-            roles,
-            notifications,
-            oauth,
-            email,
-            push,
-            push_subscriptions,
-            used_tokens,
-            tasks,
-            ws_storage,
-            redis_pubsub,
-            redis_sub_alive,
-            storage,
-            stats,
-            platform_admins,
-            geoip,
-            pod,
-            cluster_directory,
-            cluster_bus,
-            turn_map,
-            relay_load,
-        };
-        // FR-69 P2 — the module crates, after the core and before the host
-        // state that mounts them.
-        let modules = crate::compose::Modules::init(core.clone(), &core.settings).await?;
         let state = Self {
             core,
             modules,
 
-            agents,
-            enrollment_keys,
+            // FR-69 P5a — ALIASES of the fleet module's handles (the same
+            // `Arc`s; the module owns them) for the host code that still
+            // serves the agent socket. Each alias leaves with the host file
+            // that reads it (P5b, P6, P7).
+            agents: fleet.agents.clone(),
+            enrollment_keys: fleet.enrollment_keys.clone(),
             remote_sessions,
             remote_audit,
-            exec_audit,
+            exec_audit: fleet.exec_audit.clone(),
             ssh_audit,
-            config_audit,
+            config_audit: fleet.config_audit.clone(),
             key_rotation_audit,
             peer_relay_audit,
             ssh_activity,
-            agent_crashes,
-            agent_logs,
-            consent_requests,
-            rc_hub,
+            agent_crashes: fleet.agent_crashes.clone(),
+            agent_logs: fleet.agent_logs.clone(),
+            consent_requests: fleet.consent_requests.clone(),
+            rc_hub: fleet.rc_hub.clone(),
             derp_ticket,
-            agent_presence_tokens,
-            presence_fanout: Arc::new(crate::ws::device_presence::PresenceFanout::default()),
+            agent_presence_tokens: fleet.agent_presence_tokens.clone(),
+            presence_fanout: fleet.presence_fanout.clone(),
             tunnel_presence_tokens: tunnel_presence_tokens.clone(),
             tunnel_clients,
             tunnel_policies,
@@ -855,8 +807,8 @@ impl AppState {
             tunnel_clients_by_session: tunnel_clients_by_session.clone(),
             tunnel_sessions_by_target_agent: tunnel_sessions_by_target_agent.clone(),
             tunnel_sessions_by_origin_agent: tunnel_sessions_by_origin_agent.clone(),
-            agent_nudge_cooldowns: agent_nudge_cooldowns.clone(),
-            agent_nudge_throttle: Arc::new(DashMap::new()),
+            agent_nudge_cooldowns: fleet.agent_nudge_cooldowns.clone(),
+            agent_nudge_throttle: fleet.agent_nudge_throttle.clone(),
             rc_proxy_controllers: Arc::new(DashMap::new()),
             remote_rc_conns: Arc::new(DashMap::new()),
             overlay_networks,
@@ -869,12 +821,12 @@ impl AppState {
             derp_presence_tokens: derp_presence_tokens.clone(),
             derp_rehome_cooldowns: Arc::new(DashMap::new()),
             relay_pair_churn: Arc::new(DashMap::new()),
-            exec_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
+            exec_rate_limiter: fleet.exec_rate_limiter.clone(),
             ssh_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             relay_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             key_rotation_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             org_relay: Arc::new(crate::ws::org_relay::OrgRelayState::new()),
-            releases_cache,
+            releases_cache: fleet.releases_cache.clone(),
         };
 
         // FR-69 P4 — the media claim-or-route bus handlers + claim heartbeat
@@ -886,11 +838,6 @@ impl AppState {
         // PR-2 — cross-pod rc signalling relay: owner-side rc.cmd /
         // rc.conn_closed / rc.conn_alive + the proxy janitor sweep.
         crate::ws::rc_relay::wire_rc_relay(&state);
-        // P4 — the presence staleness sweep (cluster-singleton per cycle
-        // via a DB-name-scoped Redis NX claim; first tick a full interval
-        // out so tests driving `run_presence_sweep` directly stay
-        // deterministic).
-        crate::ws::device_presence::spawn_sweeper(state.clone());
         // FR-51 — the ephemeral-node reaper (cluster-singleton per cycle via
         // the same DB-name-scoped claim pattern). Spawns NOTHING unless
         // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.
@@ -908,6 +855,22 @@ impl AppState {
         // each writes only the bytes it relayed, into the same deterministic
         // `_id`, and `$inc` sums them.
         crate::ws::derp::spawn_derp_usage_flush(state.clone());
+
+        // FR-69 P5a — the inverse edges (D6). Each mounted module registers
+        // its hooks; the host registers its TRANSITIONAL implementation of
+        // the network steps of the agent cascade (overlay release, MagicDNS
+        // rename) under the `network` id, so the fleet module's cascades
+        // already run in HOOK_ORDER through the core registry.
+        state.modules.register_hooks(&state.core);
+        state.core.hooks.register(
+            "network",
+            roomler_core::Hooks {
+                fleet: Some(Arc::new(crate::hooks::HostNetworkHooks {
+                    state: state.clone(),
+                })),
+                tenant: None,
+            },
+        );
 
         Ok(state)
     }
@@ -1014,244 +977,6 @@ pub(crate) fn build_turn_map(settings: &Settings) -> TurnMap {
     }
 }
 
-/// Dependencies the Phase-4 owner-consent consumer needs — cheap `Arc` clones of
-/// the relevant DAOs / services, captured when [`AppState`] is built.
-struct ConsentConsumerDeps {
-    agents: Arc<AgentDao>,
-    users: Arc<UserDao>,
-    consent_requests: Arc<ConsentRequestDao>,
-    push_subscriptions: Arc<PushSubscriptionDao>,
-    email: Option<Arc<EmailService>>,
-    push: Option<Arc<PushService>>,
-    base_url: String,
-    // P4 — the owner also gets an IN-APP notification row + `notification:new`
-    // WS push (the email/web-push above are useless when the owner is sitting
-    // in the app on another org's page).
-    notifications: Arc<NotificationDao>,
-    ws_storage: Arc<WsStorage>,
-    redis_pubsub: Option<Arc<RedisPubSub>>,
-}
-
-/// P4 — persist an in-app Notification for the device owner and push it over
-/// WS (`notification:new`, same payload shape as `routes::helpers`). Consent
-/// requests carry the approve/deny page as their link; break-glass notices
-/// link the device list. Best-effort — the email/push legs stay authoritative.
-async fn consent_in_app_notification(
-    deps: &ConsentConsumerDeps,
-    ev: &ConsentEvent,
-    owner_id: bson::oid::ObjectId,
-    title: String,
-    body: String,
-    link: String,
-) {
-    let created = deps
-        .notifications
-        .create(
-            ev.tenant_id,
-            owner_id,
-            roomler_ai_db::models::NotificationType::ConsentRequest,
-            title,
-            body,
-            Some(link),
-            roomler_ai_db::models::NotificationSource {
-                entity_type: "remote_session".to_string(),
-                entity_id: ev.session_id,
-                actor_id: Some(ev.controller_user_id),
-            },
-        )
-        .await;
-    match created {
-        Ok(n) => {
-            let event = serde_json::json!({
-                "type": "notification:new",
-                "data": {
-                    "id": n.id.map(|i| i.to_hex()).unwrap_or_default(),
-                    "tenant_id": ev.tenant_id.to_hex(),
-                    "title": n.title,
-                    "body": n.body,
-                    "link": n.link,
-                    "notification_type": "consent_request",
-                    "created_at": n.created_at.try_to_rfc3339_string().unwrap_or_default(),
-                }
-            });
-            crate::ws::dispatcher::send_to_user_with_redis(
-                &deps.ws_storage,
-                &deps.redis_pubsub,
-                &owner_id,
-                &event,
-            )
-            .await;
-        }
-        Err(e) => {
-            tracing::warn!(session = %ev.session_id, %e, "consent in-app notification failed");
-        }
-    }
-}
-
-/// Spawn the background task that turns Hub [`ConsentEvent`]s (Email/Push sessions
-/// awaiting the device owner) into a `ConsentRequest` row + an email / web-push
-/// carrying the approve-link. One task for the process lifetime; a per-event
-/// failure is logged, never fatal.
-fn spawn_consent_consumer(mut rx: mpsc::Receiver<ConsentEvent>, deps: ConsentConsumerDeps) {
-    tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if let Err(e) = handle_consent_event(&deps, &ev).await {
-                tracing::warn!(session = %ev.session_id, %e, "owner-consent notification failed");
-            }
-        }
-    });
-}
-
-async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> anyhow::Result<()> {
-    // Resolve the device owner + display name (the Hub is DB-agnostic, so it
-    // only knows the agent_id).
-    let agent = deps.agents.base.find_by_id(ev.agent_id).await?;
-    let owner_id = agent.owner_user_id;
-    let device_name = agent.name.clone();
-
-    // Phase 5 — break-glass NOTICE: an admin already forced the session, so this
-    // is informational (no approval, no ConsentRequest). Tell the owner their
-    // device was accessed + why, then we're done.
-    if let Some(reason) = &ev.override_reason {
-        consent_in_app_notification(
-            deps,
-            ev,
-            owner_id,
-            "Device accessed (admin override)".to_string(),
-            format!(
-                "{} accessed {} via admin break-glass. Reason: {}",
-                ev.controller_name, device_name, reason
-            ),
-            format!("/tenant/{}/devices", ev.tenant_id.to_hex()),
-        )
-        .await;
-        if let Some(email) = &deps.email {
-            let owner = deps.users.base.find_by_id(owner_id).await?;
-            let _ = email
-                .send_override_notice(&owner.email, &ev.controller_name, &device_name, reason)
-                .await;
-        }
-        if let Some(push) = &deps.push {
-            let subs = deps
-                .push_subscriptions
-                .find_by_user(owner_id)
-                .await
-                .unwrap_or_default();
-            let body = format!(
-                "{} accessed {} via admin break-glass. Reason: {}",
-                ev.controller_name, device_name, reason
-            );
-            for sub in subs {
-                let _ = push
-                    .send(
-                        &sub.endpoint,
-                        &sub.keys.auth,
-                        &sub.keys.p256dh,
-                        "Device accessed (admin override)",
-                        &body,
-                        None,
-                    )
-                    .await;
-            }
-        }
-        return Ok(());
-    }
-
-    // Persist the request with a fresh capability token + a TTL that matches the
-    // session's consent window (a stale link can't resolve a long-gone session).
-    let req = deps
-        .consent_requests
-        .create(
-            ev.tenant_id,
-            ev.session_id,
-            ev.agent_id,
-            ev.controller_user_id,
-            ev.controller_name.clone(),
-            owner_id,
-            ev.timeout_secs as i64,
-        )
-        .await?;
-
-    let consent_url = format!(
-        "{}/consent/{}",
-        deps.base_url.trim_end_matches('/'),
-        req.token
-    );
-
-    // P4 — in-app row + WS for the owner alongside the email/push leg. The
-    // link is the RELATIVE approve/deny page (in-app navigation).
-    consent_in_app_notification(
-        deps,
-        ev,
-        owner_id,
-        "Remote control request".to_string(),
-        format!("{} wants to control {}", ev.controller_name, device_name),
-        format!("/consent/{}", req.token),
-    )
-    .await;
-
-    match ev.mode {
-        // Email + PromptThenEmail both email the owner an approve-link. For
-        // PromptThenEmail the agent ALSO prompts on the host in parallel — either
-        // the person at the console or the owner via the link can approve, first
-        // wins (both resolve the same slot within the shared timeout).
-        ConsentMode::Email | ConsentMode::PromptThenEmail => {
-            let owner = deps.users.base.find_by_id(owner_id).await?;
-            match &deps.email {
-                Some(email) => {
-                    email
-                        .send_consent_request(
-                            &owner.email,
-                            &ev.controller_name,
-                            &device_name,
-                            &consent_url,
-                        )
-                        .await?;
-                }
-                None => tracing::warn!(
-                    session = %ev.session_id,
-                    "Email consent mode but no email service is configured — owner cannot approve"
-                ),
-            }
-        }
-        ConsentMode::Push => match &deps.push {
-            Some(push) => {
-                let subs = deps.push_subscriptions.find_by_user(owner_id).await?;
-                if subs.is_empty() {
-                    tracing::warn!(
-                        session = %ev.session_id,
-                        "Push consent mode but the owner has no push subscriptions"
-                    );
-                }
-                let title = "Remote control request";
-                let body = format!("{} wants to control {}", ev.controller_name, device_name);
-                for sub in subs {
-                    // Best-effort per subscription (a stale endpoint shouldn't
-                    // block the others).
-                    let _ = push
-                        .send(
-                            &sub.endpoint,
-                            &sub.keys.auth,
-                            &sub.keys.p256dh,
-                            title,
-                            &body,
-                            Some(&consent_url),
-                        )
-                        .await;
-                }
-            }
-            None => tracing::warn!(
-                session = %ev.session_id,
-                "Push consent mode but no push service is configured — owner cannot approve"
-            ),
-        },
-        // The Hub only emits events for Email/Push; other modes never reach here.
-        _ => {}
-    }
-
-    Ok(())
-}
-
 /// Phase A-1 graceful shutdown (SIGTERM/CTRL-C): make this pod's death
 /// honest BEFORE the process exits, so a roll never strands
 /// `agents.status = 'Online'` rows + stale presence claims (the
@@ -1269,9 +994,6 @@ pub async fn shutdown_cleanup(state: &AppState) {
     // FIRST (before the agent sweep's early return): a graceful deploy
     // hands each entity off with a ZERO-length ownerless window instead
     // of waiting out the TTLs (media 30 s, tunnel/derp 90 s).
-    // FR-69 P4 — each module releases what it owns (conference: the media
-    // claims) through `Module::shutdown`, ahead of the host's own classes.
-    state.modules.shutdown().await;
     if let Some(dir) = &state.cluster_directory {
         // C-6 — tunnel session records (their sessions die with this
         // pod; the CLI redials and re-opens on the survivor).
@@ -1314,37 +1036,12 @@ pub async fn shutdown_cleanup(state: &AppState) {
         }
     }
 
-    let ids = state.rc_hub.cancel_all_agents();
-    if ids.is_empty() {
-        return;
-    }
-    tracing::info!(
-        agents = ids.len(),
-        "shutdown: cancelling local agent sockets + bulk offline sweep"
-    );
-    // Give the per-socket teardowns a beat to do the fine-grained cleanup.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    if let Err(e) = state
-        .agents
-        .mark_status_many(
-            &ids,
-            roomler_ai_remote_control::models::AgentStatus::Offline,
-        )
-        .await
-    {
-        tracing::warn!(%e, "shutdown: bulk mark_status(Offline) failed");
-    }
-    if let Some(redis) = &state.redis_pubsub {
-        for id in &ids {
-            if let Some((_, token)) = state.agent_presence_tokens.remove(id)
-                && let Err(e) = redis
-                    .agent_presence_del_if_owned(&id.to_hex(), &token)
-                    .await
-            {
-                tracing::debug!(agent = %id, %e, "shutdown: presence release failed");
-            }
-        }
-    }
+    // FR-69 P4/P5a — the modules release what they own, in reverse
+    // composition order: fleet the agent sweep (cancel every local agent
+    // socket, bulk-mark them Offline, compare-DEL their presence claims),
+    // conference its media claims. After the host's own directory releases
+    // above, so the sweep's settling beat never delays them.
+    state.modules.shutdown().await;
 }
 
 #[cfg(test)]

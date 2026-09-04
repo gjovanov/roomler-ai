@@ -33,12 +33,11 @@
 //! cannot match any pre-FR-51 row: they all deserialise permanent.
 
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::models::{Agent, NodeRef};
+use roomler_ai_remote_control::models::Agent;
 use roomler_ai_services::dao::base::DaoResult;
 use std::time::Duration;
 
 use crate::state::AppState;
-use crate::ws::overlay::ReleasedNode;
 
 /// Floor on every effective TTL, applied at READ time so a bad stored value
 /// can never disable it. Below this, an ordinary network blip or a pod roll
@@ -56,77 +55,16 @@ fn effective_ttl_secs(agent: &Agent, state: &AppState) -> u64 {
         .max(MIN_TTL_SECS)
 }
 
-/// Remove ONE device from the fleet: overlay release → row delete → hub kick,
-/// in that order. The single removal sequence behind both the admin
-/// `DELETE …/agent/{id}` route and the reaper — factored so the two cannot
-/// drift (FR-51 F3).
-///
-/// The ORDER is inherited from `delete_agent` and is load-bearing: the
-/// overlay lease is released BEFORE the row delete and BEFORE the kick,
-/// because the kick's WS teardown runs `handle_overlay_leave`, which must
-/// find an already-tombstoned node rather than race the release CAS with a
-/// second `removes` fan.
-///
-/// The row delete is chosen by the ROW's own nature, not by the caller: an
-/// ephemeral row is hard-deleted (its tombstone would reserve a random
-/// machine_id forever — FR-51 F4), a permanent row is tombstoned exactly as
-/// before. Returns what the overlay release freed, for the route's response.
+/// The ONE device-removal sequence behind the admin delete, the ephemeral
+/// self-unenroll and the reaper (FR-51 F3) — the fleet module's since FR-69
+/// P5a (`roomler_ai_mod_fleet::removal`), where the overlay release runs
+/// through the core hooks. The reaper reaches it through this wrapper.
 pub(crate) async fn remove_agent_device(
     state: &AppState,
     agent: &Agent,
     reason: &str,
-) -> DaoResult<Option<ReleasedNode>> {
-    let aid = agent.id.ok_or_else(|| {
-        roomler_ai_services::dao::base::DaoError::Validation("agent missing _id".into())
-    })?;
-
-    // 1 — release the overlay lease (peers get their `removes` delta, the
-    //     address returns to the pool). `None` = the device had no live
-    //     overlay node, or another path already released it; both fine.
-    let released = crate::ws::overlay::release_overlay_node_for(
-        state,
-        agent.tenant_id,
-        &agent.machine_id,
-        &NodeRef::Agent { agent_id: aid },
-        reason,
-    )
-    .await;
-
-    // 2 — the row. Ephemeral ⇒ gone outright; permanent ⇒ tombstone.
-    if agent.ephemeral {
-        state
-            .agents
-            .hard_delete_ephemeral(agent.tenant_id, aid)
-            .await?;
-        // P4 — close the lifecycle on the birth row (the record that
-        // survives the hard delete). Best-effort: a device with no key-use
-        // row (DAO-marked, pre-P2) simply has nothing to stamp.
-        match state
-            .enrollment_keys
-            .record_removal(agent.tenant_id, aid, reason)
-            .await
-        {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(agent_id = %aid, %e, "ephemeral removal stamp failed")
-            }
-        }
-    } else {
-        state.agents.soft_delete(agent.tenant_id, aid).await?;
-    }
-
-    // 3 — kick any live WS, on this pod and (via the ctrl bus) on every
-    //     other. `None` tx = unconditional removal — this is an operator/
-    //     lifecycle removal, not the displaced-handler unregister race.
-    state.rc_hub.unregister_agent(aid, None);
-    crate::ws::remote_control::publish_rc_ctrl(
-        state,
-        "kick",
-        serde_json::json!({ "agent_id": aid.to_hex() }),
-    )
-    .await;
-
-    Ok(released)
+) -> DaoResult<Option<roomler_core::hooks::ReleasedLease>> {
+    roomler_ai_mod_fleet::removal::remove_agent_device(state.fleet(), agent, reason).await
 }
 
 /// One reap cycle. Pub so integration tests can drive it deterministically

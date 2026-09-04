@@ -7,7 +7,7 @@
 //! Phase 2 of the Task 9 crash-log feature. The agent's
 //! `crash_uploader` POSTs an `AgentCrashPayload` JSON body with an
 //! `Authorization: Bearer <agent_jwt>` header. The ingest handler takes the
-//! [`AuthAgent`](crate::extractors::agent::AuthAgent) extractor — which
+//! [`AuthAgent`](crate::auth_agent::AuthAgent) extractor — which
 //! verifies the JWT *and* confirms the agent's row is still one we accept,
 //! the same rule `crates/api/src/ws/handler.rs` applies on the WS upgrade —
 //! validates the body shape, and persists via `AgentCrashDao::record`.
@@ -27,11 +27,9 @@ use roomler_ai_remote_control::models::{AgentCrashPayload, AgentCrashRecord};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::{
-    error::ApiError,
-    extractors::{agent::AuthAgent, auth::AuthUser},
-    state::AppState,
-};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::{FleetState, auth_agent::AuthAgent};
 
 /// Maximum `log_tail` byte length accepted by the ingest endpoint.
 /// Matches `roomlerd::crash_recorder::MAX_PAYLOAD_BYTES` so a
@@ -61,7 +59,7 @@ const MAX_FUTURE_SECS: i64 = 60 * 60; // 1h tolerance for clock skew
 /// used to trust the claims alone, so a deleted or quarantined device kept
 /// writing crash reports for the remaining life of its year-long token.
 pub async fn ingest(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     agent: AuthAgent,
     Json(payload): Json<AgentCrashPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -80,7 +78,7 @@ pub async fn ingest(
 /// most-recent 50 crash reports for the agent. Auth: standard user
 /// JWT + tenant membership.
 pub async fn list_for_agent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
 ) -> Result<Json<AgentCrashListResponse>, ApiError> {

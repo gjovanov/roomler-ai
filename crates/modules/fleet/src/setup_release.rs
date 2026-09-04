@@ -14,8 +14,8 @@
 //! resolves a platform asset manifest; the bare platform route
 //! streams the artifact bytes.
 //!
-//! Parallel to [`crate::routes::tunnel_release`] (bare CLI tarball)
-//! and [`crate::routes::agent_release`] (agent MSIs).
+//! Parallel to [`crate::tunnel_release`] (bare CLI tarball)
+//! and [`crate::agent_release`] (agent MSIs).
 
 use axum::{
     Json,
@@ -27,13 +27,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, time::Duration};
 
+use roomler_core::ApiError;
+
 use crate::{
-    error::ApiError,
-    routes::{
-        agent_release::{AgentRelease, AgentReleaseAsset},
-        releases,
-    },
-    state::AppState,
+    FleetState,
+    agent_release::{AgentRelease, AgentReleaseAsset},
+    releases,
 };
 
 #[derive(Deserialize)]
@@ -62,7 +61,7 @@ pub struct InstallerHealth {
 /// `GET /api/setup/latest-release` — recent `setup-v*` releases ONLY
 /// (filtered server-side from the mixed tag list the cache holds).
 pub async fn setup_latest_release(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
     let releases = releases::cached(&state).await?;
     let filtered: Vec<AgentRelease> = releases
@@ -76,7 +75,7 @@ pub async fn setup_latest_release(
 /// wizard EXE matching the requested platform + version. 404s until
 /// P4c tags the first `setup-v*` release.
 pub async fn setup_installer_health(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path(platform): Path<String>,
     Query(params): Query<InstallerQuery>,
 ) -> Result<Json<InstallerHealth>, ApiError> {
@@ -106,7 +105,7 @@ pub async fn setup_installer_health(
 
 /// `GET /api/setup/{platform}` — streams the unified wizard bytes.
 pub async fn setup_installer_proxy(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path(platform): Path<String>,
     Query(params): Query<InstallerQuery>,
 ) -> Result<Response, ApiError> {
@@ -277,7 +276,7 @@ fn script_response(body: Cow<'static, str>, content_type: &'static str) -> Respo
 }
 
 /// `GET /api/setup/install.sh` — the Linux/macOS terminal installer.
-pub async fn install_script_sh(State(state): State<AppState>) -> Response {
+pub async fn install_script_sh(State(state): State<FleetState>) -> Response {
     let body = with_server_default(
         INSTALL_SH,
         SERVER_NEEDLE_SH,
@@ -288,7 +287,7 @@ pub async fn install_script_sh(State(state): State<AppState>) -> Response {
 }
 
 /// `GET /api/setup/install.ps1` — the Windows terminal installer.
-pub async fn install_script_ps1(State(state): State<AppState>) -> Response {
+pub async fn install_script_ps1(State(state): State<FleetState>) -> Response {
     let body = with_server_default(
         INSTALL_PS1,
         SERVER_NEEDLE_PS1,
