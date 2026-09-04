@@ -44,7 +44,7 @@ use super::stats::{
     Tier, disabled_payload, floor_dt, parse_tid, range_spec, require_platform_admin,
     require_tenant_stats,
 };
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 use roomler_ai_services::dao::stats::{STATS_CALL_USER, STATS_CALL_USER_1D, STATS_CALL_USER_1H};
 
 /// `remote_audit` is TTL'd at 90 days, so watcher windows simply do not
@@ -183,7 +183,7 @@ struct UserTotals {
 /// the session never got past consent — no screen was viewed, so it is
 /// excluded rather than counted as a zero-length view.
 async fn rc_sessions(
-    state: &AppState,
+    state: &Core,
     tenant: Option<ObjectId>,
     user: Option<ObjectId>,
     floor: DateTime,
@@ -250,7 +250,7 @@ struct ViewWindow {
 /// that happened before the query window still needs to be seen so its
 /// window can be clamped rather than lost.
 async fn watcher_windows(
-    state: &AppState,
+    state: &Core,
     sessions: &[Document],
     only_user: Option<ObjectId>,
 ) -> Result<Vec<ViewWindow>, ApiError> {
@@ -347,7 +347,7 @@ async fn watcher_windows(
 
 /// Controller windows + watcher windows, as one list.
 async fn view_windows(
-    state: &AppState,
+    state: &Core,
     tenant: Option<ObjectId>,
     user: Option<ObjectId>,
     floor: DateTime,
@@ -394,7 +394,7 @@ async fn view_windows(
 /// Per-user in-call seconds from the participation ledger. `left_at: null`
 /// is an open session, clamped to now.
 async fn call_minutes(
-    state: &AppState,
+    state: &Core,
     tenant: Option<ObjectId>,
     user: Option<ObjectId>,
     floor: DateTime,
@@ -448,7 +448,7 @@ async fn call_minutes(
 /// stored rates. Tier follows the same raw/1h/1d selection as every other
 /// series so a 1-year query doesn't fall off the 7-day raw TTL.
 async fn call_bytes(
-    state: &AppState,
+    state: &Core,
     tenant: Option<ObjectId>,
     user: Option<ObjectId>,
     floor: DateTime,
@@ -512,7 +512,7 @@ async fn call_bytes(
 /// writer passes 0 (the payload is P2P over the data channel — the server
 /// never sees it). PR-3 has the originator report them.
 async fn tunnel_windows(
-    state: &AppState,
+    state: &Core,
     tenant: Option<ObjectId>,
     user: Option<ObjectId>,
     floor: DateTime,
@@ -567,7 +567,7 @@ async fn tunnel_windows(
 // ── Name resolution ─────────────────────────────────────────────────────
 
 async fn names(
-    state: &AppState,
+    state: &Core,
     coll: &str,
     ids: &HashSet<ObjectId>,
     fields: &[&str],
@@ -603,28 +603,28 @@ async fn names(
         .collect()
 }
 
-async fn user_names(state: &AppState, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
+async fn user_names(state: &Core, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
     names(state, "users", ids, &["display_name", "username", "email"]).await
 }
 
-async fn agent_names(state: &AppState, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
+async fn agent_names(state: &Core, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
     // "hostname" was projected here for as long as this helper existed, but
     // no such field has ever been on the Agent model — harmless, misleading.
     names(state, "agents", ids, &["name", "machine_id"]).await
 }
 
-async fn tenant_names(state: &AppState, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
+async fn tenant_names(state: &Core, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
     names(state, "tenants", ids, &["name", "slug"]).await
 }
 
-async fn room_names(state: &AppState, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
+async fn room_names(state: &Core, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
     names(state, "rooms", ids, &["name", "slug"]).await
 }
 
 // ── Table ───────────────────────────────────────────────────────────────
 
 async fn usage_table(
-    state: &AppState,
+    state: &Core,
     tenant: Option<ObjectId>,
     range: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
@@ -757,7 +757,7 @@ async fn usage_table(
 // ── Detail ──────────────────────────────────────────────────────────────
 
 async fn usage_detail(
-    state: &AppState,
+    state: &Core,
     tenant: Option<ObjectId>,
     user: ObjectId,
     range: Option<&str>,
@@ -931,7 +931,7 @@ async fn usage_detail(
 /// `GET /api/tenant/{tid}/stats/usage` — per-user usage for one org.
 /// Requires `MANAGE_AGENTS` (it shows everyone's activity).
 pub async fn tenant_usage(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<UsageQuery>,
@@ -952,7 +952,7 @@ pub async fn tenant_usage(
 /// `MANAGE_AGENTS`. Seeing what the platform recorded about yourself should
 /// not require the admin bit.
 pub async fn tenant_usage_detail(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path((tenant_id, user_id)): Path<(String, String)>,
     Query(q): Query<UsageQuery>,
@@ -974,7 +974,7 @@ pub async fn tenant_usage_detail(
 
 /// `GET /api/admin/stats/usage` — per-user usage across every org.
 pub async fn admin_usage(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -991,7 +991,7 @@ pub async fn admin_usage(
 
 /// `GET /api/admin/stats/usage/{uid}` — one user's timeline across orgs.
 pub async fn admin_usage_detail(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(user_id): Path<String>,
     Query(q): Query<UsageQuery>,

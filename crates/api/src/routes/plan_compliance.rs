@@ -29,8 +29,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::stats::require_platform_admin,
-    state::AppState,
+    core_state::Core, error::ApiError, extractors::auth::AuthUser,
+    routes::stats::require_platform_admin,
 };
 
 #[derive(Debug, Serialize)]
@@ -62,7 +62,7 @@ pub struct TenantCompliance {
 /// One aggregation per collection, grouped by tenant, rather than N queries per
 /// tenant: the fleet has hundreds of orgs, most of them empty test artifacts.
 async fn group_by_tenant(
-    state: &AppState,
+    state: &Core,
     coll: &str,
     accumulator: Document,
     extra_match: Option<Document>,
@@ -105,7 +105,7 @@ async fn group_by_tenant(
 /// GET /api/admin/plan-compliance — every tenant, with the limits it is
 /// already over. Platform-admin only (404 on miss, like the rest of `/admin`).
 pub async fn admin_plan_compliance(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_platform_admin(&state, &auth)?;
