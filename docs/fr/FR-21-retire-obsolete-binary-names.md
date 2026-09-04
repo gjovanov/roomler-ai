@@ -110,8 +110,8 @@ correct before this FR; everything else moved in P2a.
 | bin | `roomlerd` | unchanged — was already right |
 | package | `roomler-agent-tray` | **`roomler-desktop`** |
 | bin | `roomler-desktop` | unchanged — was already right |
-| package | `roomler-agent-core` | **`roomler-core`** |
-| lib | `roomler_agent_core` | **`roomler_core`** |
+| package | `roomler-agent-core` | **`roomler-core`** — renamed again by FR-69 (2026-09-04) to **`roomler-node-core`**; `roomler-core` is now the SERVER core at `crates/core` |
+| lib | `roomler_agent_core` | **`roomler_core`** — now **`roomler_node_core`** (FR-69) |
 | directories | `agents/roomler-agent/`, `agents/roomler-agent-tray/` | **`agents/roomlerd/`, `agents/roomler-desktop/`** |
 | Debian `Package:` | derived `roomler-agent` | **explicit `roomlerd`** + `provides`/`replaces` takeover |
 
@@ -454,7 +454,10 @@ breaking shell history and runbooks nobody has an inventory of.
 **D3 — what does `roomler-agent-core` become?** `roomlerd-core` reads as daemon-only, but the
 crate exists **because** the desktop companion deps it *without* the daemon (P3e lever E).
 **RESOLVED: `roomler-core`** (lib `roomler_core`) — it is the node's shared core, not the
-daemon's.
+daemon's. *Superseded 2026-09-04 by [FR-69](FR-69-modular-monolith.md): the crate is now
+**`roomler-node-core`** (lib `roomler_node_core`) — the same reasoning, spelled out — because
+FR-69 gives the name `roomler-core` to the server's core crate at `crates/core`. The
+pre-FR-21 name stays retired; the directory stays `crates/agent-core`.*
 
 **D4 — rename the directories, or only the package names?** Renaming `agents/roomlerd/`
 costs `git log` legibility for the naive reader. **RESOLVED: rename, in a commit that changes

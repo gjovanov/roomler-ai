@@ -1570,7 +1570,7 @@ pub struct DestinationRule {
 /// Lived in `tunnel_core::policy` until P3e lever E moved it HERE, next to
 /// the shapes it matches over (this crate is where `HostPattern` /
 /// `PortRange` / `DestinationRule` are canonical — the doc block above this
-/// section says so). The move lets `roomler-core`'s config-side ACL
+/// section says so). The move lets `roomler-node-core`'s config-side ACL
 /// evaluate rules without depending on tunnel-core's data plane; tunnel-core
 /// re-exports both fns from `policy` so its callers are unchanged.
 pub fn dst_matches(rule: &DestinationRule, dst_host: &str, dst_port: u16) -> bool {

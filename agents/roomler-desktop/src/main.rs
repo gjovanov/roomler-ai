@@ -17,7 +17,7 @@
 //!   state comes from the running daemon over the LocalAPI
 //!   (`roomler_localapi::Client`); consent decisions go the same
 //!   way (P2b — the daemon owns the profile-correct sentinel dir).
-//! - Enrollment goes through `roomler_core::enrollment::enroll` as a
+//! - Enrollment goes through `roomler_node_core::enrollment::enroll` as a
 //!   direct lib call (no subprocess).
 //! - Service control / self-update shell out to the daemon CLI
 //!   (`roomlerd service install`, `roomlerd self-update`).

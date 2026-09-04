@@ -7,13 +7,13 @@
 // P3e lever E: the daemon-free building blocks (appdirs, machine, config,
 // config_surface, enrollment, logging, logs_upload, crash_recorder, the
 // notify primitives, the forward ACL, the apps config shapes) moved to the
-// `roomler-core` crate so the desktop companion can link them without
+// `roomler-node-core` crate so the desktop companion can link them without
 // this crate's data plane. Re-exported here under their old `crate::` paths —
 // every internal call site is unchanged. `notify` stays a real module (it
 // layers the daemon-only worker-aware wrappers over the core primitives);
 // `apps` re-exports the moved config shapes; the ACL is re-exported inside
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
-pub use roomler_core::{
+pub use roomler_node_core::{
     appdirs, config, config_surface, crash_recorder, enrollment, logging, logs_upload, machine,
 };
 
@@ -107,7 +107,7 @@ pub mod system_context;
 /// companion can use them without depending on the agent (P3e lever E). Every
 /// `crate::tcc::…` call site here is unchanged.
 #[cfg(target_os = "macos")]
-pub use roomler_core::tcc;
+pub use roomler_node_core::tcc;
 pub mod telemetry;
 pub mod tunnel;
 pub mod updater;

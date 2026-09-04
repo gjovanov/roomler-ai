@@ -243,7 +243,7 @@ crates/
   services/         → Business logic: auth, DAOs, media (mediasoup), export, background tasks, OAuth, push, email, Stripe, Giphy, Claude AI
   remote_control/   → TeamViewer-style remote-desktop subsystem: Hub, signalling, consent, audit, TURN creds (+ the canonical ACL rule shapes AND `dst_matches`/`host_matches`)
   localapi/         → LocalAPI protocol LEAF crate (wire types, client, dispatch) — re-exported as `tunnel_core::localapi`; thin clients dep it directly (P3e lever E)
-  agent-core/       → Daemon-free agent building blocks: config, enrollment, machine-id, logging, sentinels, forward ACL — re-exported by `roomlerd` under the old `crate::` paths; the desktop companion deps THIS, never the full agent (P3e lever E)
+  agent-core/       → package `roomler-node-core` (lib `roomler_node_core`; it was `roomler-core` from FR-21 until FR-69 — that name is now the SERVER core at `crates/core`): daemon-free agent building blocks: config, enrollment, machine-id, logging, sentinels, forward ACL — re-exported by `roomlerd` under the old `crate::` paths; the desktop companion deps THIS, never the full agent (P3e lever E)
   api/              → Axum HTTP/WS server: ~85 API routes + /ws + /health
   tests/            → Integration tests (24 test modules, 163+ tests)
 agents/
