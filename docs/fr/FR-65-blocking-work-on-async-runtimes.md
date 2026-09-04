@@ -258,6 +258,47 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 
 _(every entry must carry a before/after from the stall watch.)_
 
+- **2026-09-04 — `other_ms` found a SECOND untimed phase, and this one is not the
+  open.** Operator report: on all three CORPLAP hosts the frame age goes over
+  100 ms — sometimes over 400 ms — just after a window drag starts, then
+  settles. Reading the stall lines on 0.4.61/0.4.62 separates that into three
+  independent causes, which is the whole point of the instrument.
+  - **The encoder open, every session, every host** (the known P0 finding):
+    `open_ms` 457/495/736/762 on CORPLAP-1, **912** on CORPLAP-2, 532/565/779 on
+    CORPLAP-3. #1284 took this off the shared runtime worker, but the session
+    still has **no encoder at all** while it runs, so the first frames are late
+    by roughly the open. That is P1's make-before-break, still not done.
+  - 🔑 **A second gap, with `open_ms = 0`.** CORPLAP-1 at drag onset:
+    `iter 171.5 / capture 0.3 / encode 13.6 / open 0 / apply 0 / other 157.6`,
+    and `iter 358.8 … other 347.4`. CORPLAP-2 is starker — `iter 662.0` and
+    `iter 782.0` passes that are **100 % `other` with capture AND encode both
+    zero**, i.e. the pump produced nothing and still spent most of a second.
+    Zero capture is the tell: it means the pass took a `continue` *before*
+    capture, which only the backpressure gate does.
+  - **CORPLAP-3 is additionally encode-bound**: single frames at 346, 371 and
+    **502 ms**. A different problem from the other two, on the same symptom.
+  - 🚨 **A counter that read zero through the event it counts.** First reading of
+    this data said "the encoder applied **zero** rate changes — `rebuilds=0`,
+    `rate_moves=0` — while the governor's target swung 4 145 343 → 486 191 →
+    2 550 000, so the controller reacted to the drag and the encoder never did."
+    **That conclusion was wrong, and the counters caused it.** The daemon log
+    carries two `background-rebuilt encoder adopted` lines at 11:03:03 and
+    11:03:08 — the encoder moved its rate *twice*, mid-drag. `adopt_rebuilt`
+    incremented **neither** counter, and on a DIRECT QSV session every rate move
+    goes through exactly that path (`swap_wanted` → `open_rebuilt` →
+    `adopt_rebuilt`), so the pair reads zero **by construction** on the one
+    configuration where it is most load-bearing.
+    A new `swaps` counter now counts adoptions, kept **separate** from
+    `rebuilds` because P3's whole point is that a swap is stall-free and folding
+    them would lose that. ⚠️ Read `swaps` alongside the other two, never instead
+    of them.
+
+  **Instrumented rather than guessed at**: `pace`, `stats`, `ctrl`, `swap` and
+  `gate` are now timed, so `other_ms` decomposes itself the way it did for the
+  open. ⚠️ `pace_us` is **excluded from `work_us`** alongside `capture_us` — at a
+  paced 2 fps the cadence sleep is ~500 ms of one pass, and counting a
+  deliberate idle as work is exactly the storm the capture rule removed.
+
 - **2026-09-04 — P0's instrument and #1284, read one build apart on CORPLAP-1**
   (Iris Xe, `hevc_qsv`, 1920×1200, direct host↔host path, host **LOCKED**). Same
   viewer (neo16 Chrome), same procedure (Connect → ~40 s idle → three cursor
