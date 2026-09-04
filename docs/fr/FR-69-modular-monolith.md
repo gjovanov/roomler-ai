@@ -1,11 +1,13 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 + P1 + P2 + P3 + P4 + P5a + P5b + P5c + P6 + P7a shipped (#1309 · #1311 ·
-#1312 · #1315 · #1317 · #1318 · #1320 · #1323 · #1325 · #1329 · #1332 · #1336 · #1337 ·
-#1339 · #1340) · **P7b in PR** (the sockets, the last aliases, `fleet` + `network` as
-features — every pillar is a module now; P8 profiles next) · every phase's field gate (a
-prod roll watched from the fleet: no dip in online agents; for P6 one RC session per
-carrier class; for P7 the overlay/tunnel sweep) is still to be run ·
+**Status**: P0 – P7b shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 · #1323 ·
+#1325 · #1329 · #1332 · #1336 · #1337 · #1339 · #1340 · #1347) — **every pillar is a
+module** · **P8 in PR** (the five profiles as feature aggregates, `ARG PROFILE`/`SAAS` on the
+Dockerfile, the `profiles` CI job with the AC3 graph assertions, the `profile` axis on the
+self-host publish with its boot smoke, `/health` + `/api/capabilities` reporting the MOUNTED
+set, the self-host docs) · every phase's field gate (a prod roll watched from the fleet: no
+dip in online agents; for P6 one RC session per carrier class; for P7 the overlay/tunnel
+sweep) is still to be run ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -461,7 +463,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P6** ✅ (CI) | `remote` module (`crates/modules/remote`, feature `remote`, in `default`): the session routes + TURN credentials + relay regions, the controller's `rc:*` dispatch with its authz gate (`controller.rs`), the cross-pod RC relay (`relay.rs`), the session-stats agent-socket half. `Module::Deps` is born here: `remote`'s is `FleetState` (the Hub is one live object), supplied by the host in composition order. The host keeps the user socket and calls `Modules::remote_controller_frame` with the connection's Hub sender | baseline identical; integration lane; **one RC session per carrier class on a prod roll — not yet run** | `remote = false` | medium | 2–3 |
 | **P7a** ✅ (CI) | `network` module, part one (`crates/modules/network`, `NetworkState` built on `FleetState`): the engine (`overlay.rs`, `org_relay.rs`, `derp_acl.rs` + the DERP registry types), the seven route files + the per-device sub-routes at the host's old paths, the hooks (`NetworkHooks`), the eleven index sets through `Module::indexes_for(multi_block)` (born here); `is_global_unicast` and the TURN builders moved to core first. `network` REQUIRED: the host's sockets reach the engine through `AppState::network()`. Field log: "P7a" | baseline identical; integration lane; **overlay/tunnel field sweep on a prod roll — not yet run** | previous tag | high | — |
 | **P7b** ✅ (CI) | the sockets (the tunnel-client upgrade + loop, `/derp` as the module's `UpgradeSpec`, the DERP cluster + census + usage flush, the ephemeral reaper, the agent-socket network half + the rest of `ws/remote_control.rs`) and the agent upgrade into `fleet` — the host keeps the role gate and calls `Modules::agent_upgrade` / `tunnel_client_upgrade` (503 when unmounted); the `AgentBusy` query hook (a reason, not a bool); the tenant archive through `TenantLifecycle`; the local gauges through `fleet_gauges` / `network_gauges`; the device listing into `network` (a two-module view); **`AppState` is `{ core, modules }`**; `fleet` + `network` are features. Field log: "P7b" | baseline identical; integration lane; **overlay/tunnel field sweep on a prod roll — not yet run** | `network = false` / `fleet = false` (unmounts now) | high | — |
-| **P8** | profiles, Docker args, CI matrix, publish axis, self-host docs | five checks green; `mesh` image boots (AC5) | `full` stays default | medium | 2–3 |
+| **P8** ✅ (CI) | profiles: `profile-full` … `profile-access` as feature aggregates on the api crate (`default = ["profile-full", "saas"]`, `conference` implies `chat`); `ARG PROFILE` + `ARG SAAS` on the Dockerfile with package-qualified features; `/health` + `/api/capabilities` report the MOUNTED set (+ `compiled`); the `profiles` job in `ci.yml` (four reduced profiles `cargo check`ed + the AC3 `cargo tree` assertions with a positive control); the `profile` input on the self-host publish (tag `<tag>-<profile>`, `SAAS=0`, the boot smoke asserts the module set, `latest` reserved for full); compose/env passthrough; self-host + deployment docs. Field log: "P8" | the five checks green; `mesh` image boots — the smoke half of AC5; the "a daemon enrolls against it" half is a vmtest cell still to run | `full` stays default; the hosted build passes no args | medium | — |
 | **P9** | UI module registry and runtime gating | Vitest + e2e nightly; full UI against a `mesh` server (AC7) | `VITE_MODULES` unset | medium | 3–5 |
 | later | `roomlerd` `Subsystem` trait — its own FR, after FR-59/63/65 settle | fleet roll + FR-61 matrix | release revert | high | 5–8 |
 

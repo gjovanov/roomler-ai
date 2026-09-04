@@ -26,6 +26,30 @@ Redis, MinIO for file storage, and optionally coturn as a relay.
 | Video conferencing (mediasoup SFU) | yes, with the media-port caveat below |
 | Push notifications, email, OAuth, billing | needs your own keys — see *Optional integrations* |
 
+### Choose a profile
+
+The server is one binary composed from six modules, and the published image
+comes in five **profiles** — the same server with only the pillars you run.
+A smaller profile is not a crippled one: it is the same code with fewer doors,
+and `GET /health` on any of them lists the modules it actually mounts.
+
+| Profile | Image tag | What it runs | Needs alongside it | What it skips |
+|---|---|---|---|---|
+| `full` (default) | `<tag>` | everything | MongoDB, Redis, MinIO, coturn, the media port range | — |
+| `collab` | `<tag>-collab` | chat, rooms, files, video calls | MongoDB, Redis, MinIO, coturn, the media port range | the device fleet, the overlay mesh, tunnels, remote desktop |
+| `remote` | `<tag>-remote` | devices + remote desktop | MongoDB, Redis, coturn | the SFU worker build, MinIO, the overlay mesh |
+| `mesh` | `<tag>-mesh` | devices + overlay mesh, tunnels, `roomler ssh` | MongoDB, Redis, coturn (and DERP relays if you run them) | the SFU worker build, MinIO |
+| `access` | `<tag>-access` | devices + remote desktop + mesh — no chat, no calls | MongoDB, Redis, coturn | the SFU worker build, MinIO |
+
+Pick one by **tag** when you pull (`ROOMLER_IMAGE=ghcr.io/gjovanov/roomler-ai:<tag>-mesh`
+in `.env.selfhost`) or by **`ROOMLER_PROFILE`** when you build from source. No published
+image carries the hosted service's billing and newsletter module — that is what `roomler.ai`
+runs, not what you run.
+
+> A profile does not reject configuration it does not use: a `mesh` image given MinIO
+> credentials simply never opens them. A web app built for `full` works against every
+> profile — the navigation follows `GET /api/capabilities`.
+
 ---
 
 ## Quickstart

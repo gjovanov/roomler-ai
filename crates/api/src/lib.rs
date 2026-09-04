@@ -390,12 +390,20 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health_check() -> axum::Json<serde_json::Value> {
+async fn health_check(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-        // FR-69 — the compiled module set; a profile boot smoke asserts it.
-        "modules": roomler_core::graph::MODULES,
+        // FR-69 P8 — the modules THIS binary mounts, which is what a profile
+        // boot smoke asserts. `compiled` is the set the build linked
+        // (`compose::EXTRACTED`); the two differ only by `[modules]`
+        // switches. ⚠️ Not `graph::MODULES` — that is the DAG every build
+        // knows about, and a `mesh` image answering all six would be exactly
+        // the lie the smoke exists to catch.
+        "modules": state.modules.mounted(),
+        "compiled": compose::EXTRACTED,
     }))
 }
 

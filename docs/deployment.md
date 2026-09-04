@@ -30,7 +30,12 @@ flowchart TB
 
 One multi-stage `Dockerfile`:
 
-1. `rust:1.88-bookworm` — builds `roomler-ai-api`
+1. `rust:1.88-bookworm` — builds `roomler-ai-api` (+ `derp-relay`). Two build
+   args select the composition (FR-69 P8): `PROFILE` (`full` | `collab` | `remote` |
+   `mesh` | `access`, the Cargo feature aggregate the api crate is built with) and
+   `SAAS` (`1` adds the hosted service's billing + newsletter module). **The hosted
+   build passes neither** — the defaults are `full` + `SAAS=1`, so the deploy recipe
+   below is unchanged; the self-host publish workflow passes `SAAS=0` and asserts it.
 2. `oven/bun:1` — builds the Vue SPA
 3. `debian:trixie-slim` — runtime: **nginx + the binary in one image**, SPA at
    `/var/www/roomler-ai`, nginx config from `files/nginx-pod.conf` (SPA fallback,

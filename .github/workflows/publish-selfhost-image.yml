@@ -40,6 +40,17 @@ on:
         required: false
         default: true
         type: boolean
+      profile:
+        # FR-69 P8 (D9/D13) — which pillars the image carries. `full` is THE
+        # documented image and the only one `latest` may point at; the others
+        # publish as `<tag>-<profile>` and are the same server composed from
+        # fewer modules. No profile carries the hosted service's billing
+        # module: the build passes SAAS=0 and the smoke asserts it.
+        description: 'Pillars the image carries: full (default) | collab | remote | mesh | access — non-full publishes as <tag>-<profile>'
+        required: false
+        default: full
+        type: choice
+        options: [full, collab, remote, mesh, access]
 
 permissions:
   contents: read
@@ -98,6 +109,27 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_ENV"
 
+      # FR-69 P8 — the IMAGE tag carries the profile: `<tag>` for full,
+      # `<tag>-<profile>` otherwise, so two profiles of one release never
+      # overwrite each other. `latest` is reserved for full: a `latest` that
+      # silently became a `mesh` image would break every self-hoster's next
+      # `pull` in a way no error names.
+      - name: Resolve the image tag for this profile
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          PROFILE='${{ inputs.profile }}'
+          if [ "$PROFILE" = 'full' ]; then
+            ITAG='${{ env.tag }}'
+          else
+            ITAG='${{ env.tag }}'"-$PROFILE"
+            if [ '${{ inputs.also_latest }}' = 'true' ]; then
+              echo "::error::also_latest is only valid for profile=full — latest must stay the full image"
+              exit 1
+            fi
+          fi
+          echo "itag=$ITAG" >> "$GITHUB_ENV"
+          echo "  profile=$PROFILE  image tag=$ITAG"
+
       - name: Set up Buildx
         if: steps.gate.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
@@ -120,14 +152,21 @@ jobs:
           # EXACT image that would be pushed, rather than a rebuild of it.
           load: true
           push: false
-          tags: ${{ env.IMAGE }}:${{ env.tag }}-${{ matrix.arch }}
+          tags: ${{ env.IMAGE }}:${{ env.itag }}-${{ matrix.arch }}
+          # FR-69 P8 — the profile selects the Cargo features the Dockerfile
+          # builds with; SAAS=0 because a published image never carries the
+          # hosted service's billing module (the Dockerfile's own default is
+          # 1, for the operator's manual prod build).
           build-args: |
             VERSION=${{ env.tag }}
             GIT_SHA=${{ github.sha }}
-          # Cache is PER-ARCH: a shared scope would have each architecture
-          # evicting the other's layers on every run.
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+            PROFILE=${{ inputs.profile }}
+            SAAS=0
+          # Cache is PER-ARCH and PER-PROFILE: a shared scope would have each
+          # architecture (and each feature set) evicting the other's layers on
+          # every run.
+          cache-from: type=gha,scope=${{ matrix.arch }}-${{ inputs.profile }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}-${{ inputs.profile }}
 
       # ⚠️ The point of publishing is that someone else runs this without
       # reading the source. An image that builds but does not start is worse
@@ -138,7 +177,7 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          IMG='${{ env.IMAGE }}:${{ env.tag }}-${{ matrix.arch }}'
+          IMG='${{ env.IMAGE }}:${{ env.itag }}-${{ matrix.arch }}'
           # Generated per run, never written down. A literal here would be a
           # credential-shaped string in a public repo — inert, but secret
           # scanners cannot know that and neither can a reader skimming the
@@ -163,6 +202,23 @@ jobs:
               # The SPA must be served too — an API-only container would pass a
               # /health check and still be useless as "the whole product".
               curl -fsS -o /dev/null -w '  GET / -> %{http_code}\n' http://localhost:8080/
+              # FR-69 P8 — the image must BE the profile it claims. `/health`
+              # lists the modules this binary mounts (not the DAG), so an image
+              # built with the wrong features, or one that quietly kept `saas`,
+              # fails here rather than on a self-hoster's box.
+              WANT_full='chat conference fleet network remote'
+              WANT_collab='chat conference'
+              WANT_remote='fleet remote'
+              WANT_mesh='fleet network'
+              WANT_access='fleet network remote'
+              eval "WANT=\$WANT_${{ inputs.profile }}"
+              GOT=$(curl -fsS http://localhost:8080/health | jq -r '.modules | sort | join(" ")')
+              if [ "$GOT" != "$WANT" ]; then
+                echo "::error::profile '${{ inputs.profile }}' mounts [$GOT], expected [$WANT] — the image is not the profile it claims"
+                exit 1
+              fi
+              case " $GOT " in *" saas "*) echo "::error::a self-host image must never carry saas"; exit 1;; esac
+              echo "  modules: $GOT (profile ${{ inputs.profile }}) ✓"
               exit 0
             fi
             sleep 10
@@ -175,7 +231,7 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         run: |
           set -uo pipefail
-          IMG='${{ env.IMAGE }}:${{ env.tag }}-${{ matrix.arch }}'
+          IMG='${{ env.IMAGE }}:${{ env.itag }}-${{ matrix.arch }}'
           docker image inspect "$IMG" \
             --format '  labels: version={{index .Config.Labels "org.opencontainers.image.version"}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}'
           docker image inspect "$IMG" --format '  arch: {{.Architecture}}  size: {{.Size}} bytes'
@@ -217,7 +273,7 @@ jobs:
         id: push
         run: |
           set -euo pipefail
-          SRC='${{ env.IMAGE }}:${{ env.tag }}-${{ matrix.arch }}'
+          SRC='${{ env.IMAGE }}:${{ env.itag }}-${{ matrix.arch }}'
           docker push "$SRC"
           DIGEST=$(docker image inspect "$SRC" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
           echo "  ${{ matrix.arch }} -> $DIGEST"
@@ -266,7 +322,12 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
+          # FR-69 P8 — the same tag rule the build job applied (the merge job
+          # has no env from it): `<tag>` for full, `<tag>-<profile>` otherwise.
           TAG='${{ inputs.tag }}'
+          if [ '${{ inputs.profile }}' != 'full' ]; then
+            TAG="$TAG-${{ inputs.profile }}"
+          fi
           REFS=""
           FOUND=""
           for a in amd64 arm64; do
@@ -302,6 +363,7 @@ jobs:
           D=$(docker buildx imagetools inspect "${{ env.IMAGE }}:$TAG" --format '{{.Manifest.Digest}}')
           echo "digest=$D" >> "$GITHUB_OUTPUT"
           echo "platforms=$LIST" >> "$GITHUB_OUTPUT"
+          echo "itag=$TAG" >> "$GITHUB_OUTPUT"
 
       # The image runs a privileged product on someone else's machine. Signing
       # its provenance costs one step and lets them verify where it came from,
@@ -320,8 +382,10 @@ jobs:
             echo "### Self-host image"
             echo
             echo '```'
-            echo 'docker pull ${{ env.IMAGE }}:${{ inputs.tag }}'
+            echo 'docker pull ${{ env.IMAGE }}:${{ steps.manifest.outputs.itag }}'
             echo '```'
+            echo
+            echo "Profile: \`${{ inputs.profile }}\`"
             echo
             echo "Platforms: \`${{ steps.manifest.outputs.platforms }}\`"
             echo
