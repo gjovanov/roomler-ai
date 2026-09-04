@@ -1,7 +1,7 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 + P1 + P2 + P3 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 ·
-#1323) · P4 (`conference`) next ·
+**Status**: P0 + P1 + P2 + P3 + P4 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 ·
+#1320 · #1323 · #1325) · P5 (`fleet`) next ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -450,7 +450,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P1** ✅ | `Core` extraction, state split, `[modules]` settings, `GET /api/capabilities` — P1a #1315 (the split, in place), P1b #1317 (the move into `roomler-core`), P1c + P1d #1318 (core-owned handlers on `State<Core>`; `ApiError`, cookies, origin and the core extractors below the api crate) | baseline identical (P1a: +1 route, intended); integration lane; prod roll | revert | high | 5–8 |
 | **P2** ✅ | `saas` module — #1320: the first module crate, plus the host composition (`crates/api/src/compose.rs`) that mounts it | baseline identical (index sets re-sorted, intended); integration lane; prod roll | `[modules] saas = false` (real from this PR on) | low | 1–2 |
 | **P3** ✅ | `chat` module — #1323: rooms, messages, reactions, files, search, export, Giphy, the unread summary, and `typing:*` as the first module-owned WebSocket namespace; the call endpoints stay in the host as `routes/call.rs` for P4 | baseline identical; integration lane (the tenant-scoping tests included); prod roll | `chat = false` | medium | 2–3 |
-| **P4** | `conference` module; mediasoup out of `services` | same + Docker time measured (AC4) | `conference = false` | medium | 3–4 |
+| **P4** ✅ | `conference` module — #1325: the SFU room manager + worker pool (from `services/media`), the media cluster, the sampler, the call lifecycle, recordings, and `media:*` as a module namespace; **mediasoup links in this one crate only**; the contract's stateful surfaces used for the first time (`WsHandler::closed`, `Module::jobs` under the host's startup lease, `Module::shutdown`) | baseline identical; integration lane; prod roll. AC4's Docker measurement waits for the profiles (P8) — the mechanism is in place | `conference = false` | medium | 3–4 |
 | **P5** | `fleet` module; Hub leaves `remote_control`; namespace map | same + no dip in online agents | redeploy previous tag | high | 4–6 |
 | **P6** | `remote` module | same + one RC session per carrier class | `remote = false` | medium | 2–3 |
 | **P7** | `network` module, `/derp` included | same + overlay/tunnel field sweep | `network = false` | high | 5–7 |
@@ -645,3 +645,44 @@ Rust job and exercised by the integration lane rather than locally.
   them). Both fixed in the second commit. 🔑 Grep for `^\s*\.<field>\s*$` as well as
   `state.<field>` before declaring a field gone.
 - Routes, index sets and wire names unchanged; the baseline holds as recorded.
+
+### 2026-09-04 — P4: `conference`, and the contract's stateful surfaces
+
+- **#1325** — `crates/modules/conference` = `roomler-ai-mod-conference`, and from this PR on
+  **the only crate in the workspace that links `mediasoup`**: `services/media` (the room
+  manager over the worker pool, the signalling types) moved in with history, the `mediasoup`
+  dependency left `services` and the api crate, and `roomler-core` — which had inherited the
+  C++ worker build through `services` since P1b — no longer carries it either. That is D9's
+  mechanism: a profile without `conference` never compiles the worker. The measurement (AC4)
+  waits for the profiles themselves.
+- What else moved, changed only in imports and the state type: the C-4 claim-or-route
+  (`ws/media_cluster.rs`), the per-pod media sampler, the call lifecycle (`routes/call.rs`,
+  carved out in P3 for exactly this), the recording routes, and the ~930 lines of `media:*`
+  handlers from the socket file — now a `media` namespace handler registered through
+  `Module::ws`, so the host's socket knows nothing about media at all.
+- **Three contract surfaces the earlier modules never needed.** A participant's transports
+  and its call session must be dropped when its socket closes, not only on an explicit leave:
+  `WsHandler::closed(ctx)` (new, default no-op) is called by the host for every handler of
+  the socket's role after its own cleanup, and conference's `on_closed` is the disconnect
+  path that used to sit inline in `handle_socket`. The stale-call reset that ran inline in
+  `main.rs` under the startup lease is a leader-gated `Job::at_startup`; the host runs
+  `Modules::run_startup_jobs(startup_leader)` under the same lease, logging a failing job
+  rather than refusing to boot (the inline block swallowed with `.ok()`), and warning on a
+  periodic cadence nothing schedules yet. `Module::shutdown` releases this pod's media claims
+  in reverse composition order ahead of the host's own `shutdown_cleanup` classes.
+- Two seams deliberately stayed **host → module** (the allowed direction): the cluster status
+  snapshot reads the media gauges through `Modules::media_gauges()`, and the stats rollup loop
+  calls `Modules::close_orphaned_call_state()` every cycle — a build without the module has no
+  call sessions to close. `MEDIA_BELT_FALLBACK_TOTAL` joined its siblings in
+  `roomler_core::cluster::metrics` (conference bumps it, the snapshot reads it).
+- `conference → chat` is the first module-to-module edge exercised: chat's room guards gained
+  `_with(tenants, rooms, …)` forms so both modules run ONE visibility rule, and the host's
+  `routes/helpers.rs` — the copy kept for the call and recording handlers — is gone.
+  `AppState` lost `rooms`, `recordings`, `room_manager`, `media_claim_tokens` and
+  `remote_media_conns`; the `recordings` and `call_sessions` index sets moved to
+  `ConferenceState::indexes`.
+- Two things the cut taught: slicing the socket file's tail took its `#[cfg(test)] mod tests`
+  along — those tests exercise `session_cookie`, a HOST function, and they went back; and a
+  new workspace member needs `cargo update -w` for the lockfile before the lane will build it.
+- Routes (the singular `/call/participant` included), index sets and wire names unchanged;
+  the baseline holds as recorded.

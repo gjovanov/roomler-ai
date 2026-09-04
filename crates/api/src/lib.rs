@@ -4,7 +4,6 @@ pub mod cluster;
 pub mod compose;
 pub mod core_state;
 pub mod extractors;
-pub mod media_stats;
 pub mod middleware;
 pub mod routes;
 pub mod state;
@@ -176,24 +175,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{user_id}", delete(routes::user::remove_member));
 
     // Room CRUD, messages, reactions, files, search, the xlsx export and
-    // Giphy are the `chat` module's (FR-69 P3). The call endpoints below
-    // share the `/room` prefix with it and are conference's — they stay here
-    // until P4.
-    let call_routes = Router::new()
-        .route("/{room_id}/call/start", post(routes::call::call_start))
-        .route("/{room_id}/call/join", post(routes::call::call_join))
-        .route("/{room_id}/call/leave", post(routes::call::call_leave))
-        .route("/{room_id}/call/end", post(routes::call::call_end))
-        .route(
-            "/{room_id}/call/participant",
-            get(routes::call::participants),
-        );
-
-    // Recording routes (under room)
-    let recording_routes = Router::new()
-        .route("/", get(routes::recording::list))
-        .route("/", post(routes::recording::create))
-        .route("/{recording_id}", delete(routes::recording::delete));
+    // Giphy are the `chat` module's (FR-69 P3); the call lifecycle and the
+    // recording routes under the same `/room` prefix are `conference`'s (P4).
 
     // Background task routes (under tenant)
     let task_routes = Router::new()
@@ -701,11 +684,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/member", member_routes)
         .nest("/tenant/{tenant_id}/role", role_routes)
         .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
-        .nest("/tenant/{tenant_id}/room", call_routes)
-        .nest(
-            "/tenant/{tenant_id}/room/{room_id}/recording",
-            recording_routes,
-        )
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes)
         .nest("/tenant/{tenant_id}/agent", agent_routes)

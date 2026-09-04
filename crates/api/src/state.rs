@@ -23,13 +23,11 @@ use roomler_ai_services::{
         key_rotation_audit::KeyRotationAuditDao, notification::NotificationDao,
         overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
         overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
-        push_subscription::PushSubscriptionDao, recording::RecordingDao,
-        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
-        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
-        tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
-        tunnel_policy::TunnelPolicyDao, user::UserDao,
+        push_subscription::PushSubscriptionDao, remote_audit::RemoteAuditDao,
+        remote_session::RemoteSessionDao, role::RoleDao, ssh_activity::SshActivityDao,
+        ssh_audit::SshAuditDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
+        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
-    media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
 use tokio::sync::mpsc;
 
@@ -63,18 +61,12 @@ pub struct AppState {
     /// [`crate::core_state`].
     pub core: Core,
 
-    /// FR-69 P3 — `rooms` is the `chat` module's, but the call and recording
-    /// handlers that conference takes over in P4 still read it from here; a
-    /// DAO is a stateless handle on the collection, so a second one is free.
-    pub rooms: Arc<RoomDao>,
-    pub recordings: Arc<RecordingDao>,
-
     /// FR-69 P2 — the module crates this build links, initialised (or `None`
     /// where the operator switched one off). Mounted by `build_router`;
-    /// their index sets applied by the host after the core plan.
+    /// their index sets applied by the host after the core plan. P4 — the
+    /// mediasoup room manager, the recordings DAO and the media cluster maps
+    /// live on `modules.conference` now; the host holds no room state.
     pub modules: crate::compose::Modules,
-
-    pub room_manager: Arc<RoomManager>,
 
     // Remote-control subsystem
     pub agents: Arc<AgentDao>,
@@ -122,15 +114,6 @@ pub struct AppState {
     /// never explicitly released — the 90 s TTL reaps ≤90 s after any of
     /// the four teardown paths drops the map entry.
     pub tunnel_presence_tokens: Arc<DashMap<ObjectId, String>>,
-    /// C-4 — directory owner-tokens for LOCAL media rooms
-    /// (`roomler:own:media:<room>`, the SET-NX namespace). Written when a
-    /// claim is won (call/start or media:join); refreshed every 10 s by
-    /// the media claim heartbeat; released on room close / shutdown.
-    pub media_claim_tokens: Arc<DashMap<ObjectId, String>>,
-    /// C-4 — LOCAL viewer connections joined to a REMOTE media room
-    /// (conn_id → room). On WS close the owner pod is told to drop the
-    /// participant's transports (`ws::media_cluster::forward_close_leave`).
-    pub remote_media_conns: Arc<DashMap<String, ObjectId>>,
 
     // tunnel subsystem
     pub tunnel_clients: Arc<TunnelClientDao>,
@@ -258,15 +241,11 @@ impl AppState {
         let users = Arc::new(UserDao::new(&db));
         let activation_codes = Arc::new(ActivationCodeDao::new(&db));
         let tenants = Arc::new(TenantDao::new(&db));
-        let rooms = Arc::new(RoomDao::new(&db));
         let invites = Arc::new(InviteDao::new(&db));
         let notifications = Arc::new(NotificationDao::new(&db));
         let roles = Arc::new(RoleDao::new(&db));
-        let recordings = Arc::new(RecordingDao::new(&db));
         let tasks = Arc::new(TaskService::new(&db));
 
-        let worker_pool = Arc::new(WorkerPool::new(&settings.mediasoup).await?);
-        let room_manager = Arc::new(RoomManager::new(worker_pool, &settings.mediasoup));
         let ws_storage = Arc::new(WsStorage::new());
 
         let oauth = if !settings.oauth.google.client_id.is_empty()
@@ -470,8 +449,6 @@ impl AppState {
         // owns the reaction.
         let agent_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
         let tunnel_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
-        let media_claim_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
-        let remote_media_conns: Arc<DashMap<String, ObjectId>> = Arc::new(DashMap::new());
         let derp_presence_tokens: Arc<DashMap<crate::ws::derp::DerpKey, String>> =
             Arc::new(DashMap::new());
         let derp_registry: crate::ws::derp::DerpRegistry = Arc::new(DashMap::new());
@@ -853,10 +830,7 @@ impl AppState {
         let state = Self {
             core,
             modules,
-            rooms,
-            recordings,
 
-            room_manager,
             agents,
             enrollment_keys,
             remote_sessions,
@@ -875,8 +849,6 @@ impl AppState {
             agent_presence_tokens,
             presence_fanout: Arc::new(crate::ws::device_presence::PresenceFanout::default()),
             tunnel_presence_tokens: tunnel_presence_tokens.clone(),
-            media_claim_tokens,
-            remote_media_conns,
             tunnel_clients,
             tunnel_policies,
             tunnel_audit,
@@ -905,10 +877,8 @@ impl AppState {
             releases_cache,
         };
 
-        // C-4 — media claim-or-route: bus handlers (owner-side command
-        // execution) + the 10 s claim heartbeat. Registered on the built
-        // state because the handlers need the full AppState.
-        crate::ws::media_cluster::wire_media_cluster(&state);
+        // FR-69 P4 — the media claim-or-route bus handlers + claim heartbeat
+        // and the media sampler are wired by the `conference` module's init.
         // C-5 — derp rehome: the owner-side close handler.
         crate::ws::derp_cluster::wire_derp_cluster(&state);
         // Split-brain observability: the per-pod DERP registry census.
@@ -938,9 +908,6 @@ impl AppState {
         // each writes only the bytes it relayed, into the same deterministic
         // `_id`, and `$inc` sums them.
         crate::ws::derp::spawn_derp_usage_flush(state.clone());
-        // Stats PR-2 — per-pod mediasoup conference sampler (this pod's
-        // own rooms only; media ownership is single-pod per room).
-        crate::media_stats::spawn_media_sampler(state.clone());
 
         Ok(state)
     }
@@ -1302,21 +1269,10 @@ pub async fn shutdown_cleanup(state: &AppState) {
     // FIRST (before the agent sweep's early return): a graceful deploy
     // hands each entity off with a ZERO-length ownerless window instead
     // of waiting out the TTLs (media 30 s, tunnel/derp 90 s).
+    // FR-69 P4 — each module releases what it owns (conference: the media
+    // claims) through `Module::shutdown`, ahead of the host's own classes.
+    state.modules.shutdown().await;
     if let Some(dir) = &state.cluster_directory {
-        let held: Vec<(bson::oid::ObjectId, String)> = state
-            .media_claim_tokens
-            .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        for (rid, token) in held {
-            state.media_claim_tokens.remove(&rid);
-            if let Err(e) = dir
-                .release(&crate::cluster::directory::media_key(&rid.to_hex()), &token)
-                .await
-            {
-                tracing::debug!(room = %rid, %e, "shutdown: media claim release failed");
-            }
-        }
         // C-6 — tunnel session records (their sessions die with this
         // pod; the CLI redials and re-opens on the survivor).
         let held: Vec<(bson::oid::ObjectId, String)> = state

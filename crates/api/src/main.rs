@@ -164,45 +164,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Clean up ALL stale calls — no calls can be active at server startup
-    if startup_leader {
-        let rooms_coll = db.collection::<bson::Document>("rooms");
-        // Stats PR-2: also stamp actual_end_time (previously left stale —
-        // any duration derived from the room doc was wrong after a crash)
-        // and clear the call-instance pointer.
-        let result = rooms_coll
-            .update_many(
-                bson::doc! { "conference_status": "in_progress" },
-                bson::doc! {
-                    "$set": {
-                        "conference_status": "ended",
-                        "participant_count": 0_i32,
-                        "actual_end_time": bson::DateTime::now(),
-                    },
-                    "$unset": { "current_call_id": "" },
-                },
-            )
-            .await
-            .ok();
-        if let Some(res) = result
-            && res.modified_count > 0
-        {
-            info!(
-                "Cleaned up {} stale calls (all in_progress reset to ended)",
-                res.modified_count
-            );
-        }
-        // Close the matching call_sessions docs + dangling member sessions
-        // (same closer the rollup task runs every cycle).
-        let (calls, sessions) =
-            roomler_ai_api::stats_rollup::close_orphaned_call_state(&app_state).await;
-        if calls > 0 || sessions > 0 {
-            info!(
-                calls,
-                sessions, "startup orphan sweep closed stale call state"
-            );
-        }
-    }
+    // FR-69 P4 — the modules' startup jobs under the same lease: the
+    // stale-call reset (no call can be active at server startup) is
+    // conference's leader-gated job now. A failing job is logged, not fatal —
+    // exactly what the inline block did with its `.ok()`.
+    app_state.modules.run_startup_jobs(startup_leader).await;
 
     // Fix thread metadata for existing thread roots with null metadata
     // (bug: MongoDB $inc fails on null subdocuments, so reply_count was never set)

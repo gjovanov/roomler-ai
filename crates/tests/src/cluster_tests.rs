@@ -5,6 +5,17 @@
 
 use crate::fixtures::test_app::TestApp;
 use roomler_ai_api::cluster::directory::{ClaimOutcome, OwnerRecord};
+use roomler_ai_mod_conference::ConferenceState;
+
+/// FR-69 P4 — the mediasoup room manager and the media claim maps are the
+/// `conference` module's state now.
+fn conf(app: &TestApp) -> &ConferenceState {
+    app.state
+        .modules
+        .conference
+        .as_ref()
+        .expect("the conference module is mounted in tests")
+}
 
 /// Directory disciplines against real Redis: LWW overwrite, NX mutex,
 /// refresh-if-mine conflict, compare-DEL identity gating.
@@ -640,8 +651,8 @@ async fn media_join_routes_to_owner_pod_single_router() {
     let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
 
     // call/start claimed + created on app1 only.
-    assert!(app1.state.room_manager.has_room(&rid));
-    assert!(!app2.state.room_manager.has_room(&rid));
+    assert!(conf(&app1).room_manager.has_room(&rid));
+    assert!(!conf(&app2).room_manager.has_room(&rid));
 
     // Member joins via app2 (the NON-owner pod).
     let mut ws2 = connect_user_ws(&app2, &tenant.member.access_token).await;
@@ -656,9 +667,9 @@ async fn media_join_routes_to_owner_pod_single_router() {
     );
 
     // Exactly ONE router: app2 must NOT have materialized the room.
-    assert!(!app2.state.room_manager.has_room(&rid));
+    assert!(!conf(&app2).room_manager.has_room(&rid));
     assert!(
-        app2.state.remote_media_conns.len() == 1,
+        conf(&app2).remote_media_conns.len() == 1,
         "remote membership tracked for WS-close forwarding"
     );
 
@@ -718,7 +729,7 @@ async fn media_owner_shutdown_releases_claim_rejoin_wins() {
     let m = next_media_msg(&mut ws2).await;
     assert_eq!(m["type"], "media:transport_created");
     assert!(
-        app2.state.room_manager.has_room(&rid),
+        conf(&app2).room_manager.has_room(&rid),
         "survivor must own the rebuilt room"
     );
     let raw = d2.get(&key).await.unwrap().expect("fresh claim exists");
@@ -775,9 +786,9 @@ async fn media_conflict_folds_loser_island() {
     d2.claim_lww(&key, &d2.owner_token("media")).await.unwrap();
 
     // One maintenance pass on the loser: CONFLICT → fold.
-    roomler_ai_api::ws::media_cluster::refresh_media_claims_once(&app1.state).await;
+    roomler_ai_mod_conference::media_cluster::refresh_media_claims_once(conf(&app1)).await;
     assert!(
-        !app1.state.room_manager.has_room(&rid),
+        !conf(&app1).room_manager.has_room(&rid),
         "claim loser must tear down its island"
     );
     let closed = next_media_msg(&mut ws1).await;

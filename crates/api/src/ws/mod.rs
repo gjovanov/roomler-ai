@@ -21,7 +21,6 @@ pub mod derp_cluster;
 pub mod device_presence;
 pub mod ephemeral;
 pub mod handler;
-pub mod media_cluster;
 pub mod org_relay;
 pub mod overlay;
 pub mod rc_cluster;
