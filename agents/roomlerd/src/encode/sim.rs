@@ -1778,6 +1778,245 @@ mod tests {
         }
     }
 
+    // -- FR-63 B0 under the SHIPPED measurement rule (FR-70 P1 follow-up) ------
+    //
+    // Everything above measures the pipe with `MeasureRule::EveryWindow`: every
+    // window that delivered anything hands the floor relief the delivered
+    // rate. The shipped governor does not work that way — it measures only on
+    // PUSH-BACK (blocked sends, or the viewer's queue growing), and its FR-59
+    // P2 byte budget skips frames before a queue can form. FR-70 P1 found that
+    // the difference is not cosmetic: under the shipped rule a remembered rate
+    // pinned a session that `EveryWindow` would have freed in one window. So
+    // the AC0b answer and the ramp-exit numbers are re-taken here under the
+    // shipped rule, with the budget gate and a rebuild-bound encoder modelled,
+    // and the conclusions that survive are the ones the field can rely on.
+
+    /// The realistic harness: the shipped measurement rule, the FR-59 P2 byte
+    /// budget at the gate, a rebuild-bound (QSV-shaped) encoder.
+    fn run_shipped(sc: &Scenario, law: GovernorLaw) -> Trace {
+        let mut law = law.with_measure(MeasureRule::OnPushBack).with_fps(sc.fps);
+        run_opts(
+            sc,
+            &mut law,
+            SimOptions {
+                budget_gate: true,
+                rebuild_idr: true,
+            },
+        )
+    }
+
+    /// `cargo test -p roomlerd --lib shipped_rule_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reporting aid; run with --ignored --nocapture"]
+    fn shipped_rule_report() {
+        println!(
+            "=== AC0b under the shipped rule: {}",
+            corp_vpn_thin_pipe().name
+        );
+        let sc = corp_vpn_thin_pipe();
+        for (n, slow_start) in [("A", false), ("B", true)] {
+            let t = run_shipped(
+                &sc,
+                GovernorLaw::new(FLAT_FLOOR_BPS, RELAY_CEILING_BPS, slow_start),
+            );
+            println!(
+                "arm {n}: peak_target={} overdrive_bits(110)={} max_p95_age={}ms peak_queue={}ms \
+                 skips={} gate_skips={} rebuild_idrs={} windows_over_500ms={} settled(25%)={:?}{}",
+                t.peak_target_bps(),
+                t.overdrive_bits(110),
+                t.max_age_ms(),
+                t.peak_queue_ms(),
+                t.total_skips(),
+                t.gate_skips,
+                t.rebuild_idrs,
+                t.windows_above_age(500),
+                t.settled_window(25),
+                t.render()
+            );
+        }
+        println!("=== AC0b under the shipped rule, keyframe 3x");
+        let mut sc3 = corp_vpn_thin_pipe();
+        sc3.idr_factor = 3;
+        for (n, slow_start) in [("A", false), ("B", true)] {
+            let t = run_shipped(
+                &sc3,
+                GovernorLaw::new(FLAT_FLOOR_BPS, RELAY_CEILING_BPS, slow_start),
+            );
+            println!(
+                "arm {n}: peak_target={} overdrive_bits(110)={} max_p95_age={}ms skips={} settled(25%)={:?}",
+                t.peak_target_bps(),
+                t.overdrive_bits(110),
+                t.max_age_ms(),
+                t.total_skips(),
+                t.settled_window(25),
+            );
+        }
+        println!("=== ramp exit under the shipped rule");
+        for (label, sc, ceiling) in [
+            ("thin pipe 213k", corp_vpn_thin_pipe(), RELAY_CEILING_BPS),
+            ("fast pair 20M", fast_pair_misremembered(), 20_000_000u32),
+            ("LAN 5M bursts", lan_wifi_burst(), 5_000_000u32),
+            (
+                "fast pipe, stall at 2s",
+                fast_pipe_early_stall(),
+                20_000_000u32,
+            ),
+        ] {
+            println!("--- {label}");
+            for exit in [
+                RampExit::EndsOnCongestion,
+                RampExit::HalveAndContinue,
+                RampExit::HoldFloorUntilMeasured,
+            ] {
+                let t = run_shipped(
+                    &sc,
+                    GovernorLaw::new(FLAT_FLOOR_BPS, ceiling, true).with_exit(exit),
+                );
+                let last = t.rows.last().map(|r| r.target_bps).unwrap_or(0);
+                println!(
+                    "  {exit:?}: peak={} final={} overdrive={} max_p95_age={}ms skips={} gate_skips={} \
+                     settled(25%)={:?} over500ms={}",
+                    t.peak_target_bps(),
+                    last,
+                    t.overdrive_bits(110),
+                    t.max_age_ms(),
+                    t.total_skips(),
+                    t.gate_skips,
+                    t.settled_window(25),
+                    t.windows_above_age(500),
+                );
+            }
+        }
+        println!("=== the four fixtures under the shipped rule (arm B)");
+        for (label, sc, ceiling) in [
+            ("airport hotspot", airport_hotspot(), RELAY_CEILING_BPS),
+            ("DERP with stalls", derp_with_stalls(), RELAY_CEILING_BPS),
+            ("LAN 5M bursts", lan_wifi_burst(), 5_000_000u32),
+            (
+                "fast pair misremembered (seed 200k)",
+                fast_pair_misremembered(),
+                20_000_000u32,
+            ),
+        ] {
+            let seeded = label.contains("seed");
+            let mut law = GovernorLaw::new(FLAT_FLOOR_BPS, ceiling, true);
+            if seeded {
+                law = law.with_seed(200_000);
+            }
+            let t = run_shipped(&sc, law);
+            let last = t
+                .rows
+                .last()
+                .map(|r| (r.target_bps, r.pipe_bps))
+                .unwrap_or((0, 0));
+            println!(
+                "--- {label}: peak={} final_target={} final_pipe={} max_p95_age={}ms over500ms={} settled(25%)={:?}",
+                t.peak_target_bps(),
+                last.0,
+                last.1,
+                t.max_age_ms(),
+                t.windows_above_age(500),
+                t.settled_window(25),
+            );
+        }
+    }
+
+    /// What survives of the AC0b answer under the shipped rule: the ramp
+    /// still commits less (peak 1.5 M vs 2.55 M), still cuts the over-drive
+    /// (3.2×, not the 4.8× `EveryWindow` reported) and still cuts the peak
+    /// paint — but by 1.7×, not 8×. The 1 226 ms figure on #1243 was the
+    /// optimistic rule finding the pipe in window 2; under the shipped rule
+    /// arm B's floor snaps back to the flat 1.5 M when the ramp ends, and the
+    /// session sawtooths for ~24 windows before push-back measures the pipe.
+    #[test]
+    fn ac0b_under_the_shipped_rule_the_ramp_still_commits_less() {
+        let sc = corp_vpn_thin_pipe();
+        let ta = run_shipped(
+            &sc,
+            GovernorLaw::new(FLAT_FLOOR_BPS, RELAY_CEILING_BPS, false),
+        );
+        let tb = run_shipped(
+            &sc,
+            GovernorLaw::new(FLAT_FLOOR_BPS, RELAY_CEILING_BPS, true),
+        );
+        assert!(
+            tb.peak_target_bps() < ta.peak_target_bps(),
+            "B={} A={}{}{}",
+            tb.peak_target_bps(),
+            ta.peak_target_bps(),
+            ta.render(),
+            tb.render()
+        );
+        let (od_a, od_b) = (ta.overdrive_bits(110), tb.overdrive_bits(110));
+        assert!(
+            od_b * 2 < od_a,
+            "the ramp no longer halves the over-drive under the shipped rule: A={od_a} B={od_b}{}{}",
+            ta.render(),
+            tb.render()
+        );
+        assert!(
+            tb.max_age_ms() < ta.max_age_ms(),
+            "the ramp no longer cuts the peak paint under the shipped rule: A={} B={}{}{}",
+            ta.max_age_ms(),
+            tb.max_age_ms(),
+            ta.render(),
+            tb.render()
+        );
+        // The claim guard: FR-63's table must not quote a ~1.2 s arm-B peak
+        // paint as the shipped behaviour. If this ever holds, the table is
+        // out of date in the OTHER direction — update it, then relax this.
+        assert!(
+            tb.max_age_ms() >= 3 * 1_226,
+            "arm B's peak paint under the shipped rule is now {} ms — the EveryWindow \
+             figure (1 226 ms) has become true; update FR-63's AC0b table",
+            tb.max_age_ms()
+        );
+    }
+
+    /// The candidates are measured on the fast cells under the shipped rule
+    /// too — and there they COST rate: halving on a transient congestion
+    /// event gives away capacity the link has. The trade-off is real in both
+    /// directions, which is the reason FR-63 B1's controller is designed to
+    /// HOLD on congestion rather than end or halve.
+    #[test]
+    fn under_the_shipped_rule_the_candidates_win_the_thin_pipe_and_pay_on_lan_bursts() {
+        let thin = corp_vpn_thin_pipe();
+        let shipped = run_shipped(
+            &thin,
+            GovernorLaw::new(FLAT_FLOOR_BPS, RELAY_CEILING_BPS, true),
+        );
+        for exit in [RampExit::HalveAndContinue, RampExit::HoldFloorUntilMeasured] {
+            let cand = run_shipped(
+                &thin,
+                GovernorLaw::new(FLAT_FLOOR_BPS, RELAY_CEILING_BPS, true).with_exit(exit),
+            );
+            assert!(
+                cand.max_age_ms() * 3 < shipped.max_age_ms(),
+                "{exit:?} no longer cuts the thin-pipe peak paint 3×: {} vs {}{}{}",
+                cand.max_age_ms(),
+                shipped.max_age_ms(),
+                shipped.render(),
+                cand.render()
+            );
+        }
+        let lan = lan_wifi_burst();
+        let shipped = run_shipped(&lan, GovernorLaw::new(FLAT_FLOOR_BPS, 5_000_000, true));
+        let halve = run_shipped(
+            &lan,
+            GovernorLaw::new(FLAT_FLOOR_BPS, 5_000_000, true).with_exit(RampExit::HalveAndContinue),
+        );
+        let last = |t: &Trace| t.rows.last().map(|r| r.target_bps).unwrap_or(0);
+        assert!(
+            last(&halve) < last(&shipped),
+            "HalveAndContinue stopped costing rate on LAN bursts ({} vs {}) — re-open the \
+             exit-rule decision on #1243{}{}",
+            last(&halve),
+            last(&shipped),
+            shipped.render(),
+            halve.render()
+        );
+    }
+
     #[test]
     fn a_candidate_exit_rule_must_beat_the_shipped_one_to_be_worth_proposing() {
         // Not a product assertion — a guard on the CLAIM. If a candidate stops
