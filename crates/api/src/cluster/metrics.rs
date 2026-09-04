@@ -1,63 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! C-6 — cluster observability: the counters every rehome/fallback path
-//! increments, and the snapshot the `/api/cluster/status` route serves.
+//! C-6 — cluster observability: the snapshot the `/api/cluster/status`
+//! route serves.
 //!
-//! Counters are process-local statics (per-pod by construction — exactly
-//! the attribution we want; the operator queries each pod through the
-//! LB's `?tid` pinning or the pod IPs directly). Gauges are computed at
-//! snapshot time from the live registries — never stored, so they can't
-//! go stale. The media gauges (rooms / participants / consumers) are the
-//! trigger inputs for the deferred PipeTransport stage: revisit when any
-//! room sustains ≥12–15 AV participants (≈450+ consumers vs the
+//! FR-69 P1b — the counters themselves live in
+//! `roomler_core::cluster::metrics` (they moved with the cluster bus that
+//! bumps them) and are re-exported here under their old paths. Gauges are
+//! computed at snapshot time from the live registries — never stored, so
+//! they can't go stale. The media gauges (rooms / participants / consumers)
+//! are the trigger inputs for the deferred PipeTransport stage: revisit when
+//! any room sustains ≥12–15 AV participants (≈450+ consumers vs the
 //! ~500/worker ceiling) or pod aggregate >60% capacity.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
-/// rc `SessionRequest` misses answered with `agent_on_other_pod` (C-2).
-pub static RC_REHOME_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Tunnel opens rejected with `agent_on_other_pod` (C-3).
-pub static TUNNEL_REHOME_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Idle-agent nudges EXECUTED (WS cycled so both ends re-hash) (C-2).
-pub static AGENT_NUDGE_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Bus RPCs that hit their deadline (owner presumed dead) (C-1).
-pub static BUS_DEADLINE_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Media islands folded (claim lost / belt-era split resolution) (C-4).
-pub static MEDIA_FOLD_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// DERP sockets closed for cluster convergence (C-5).
-pub static DERP_REHOME_CLOSE_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// FR-19 — total bytes this pod has relayed over `/derp` (peer-to-peer WG
-/// carrier that crossed the control plane). This is the quantity a peer relay
-/// takes OFF the pod: when a tenant moves a pair onto `relay:org/udp`, that
-/// pair's carrier no longer traverses `/derp`, so this counter's growth rate
-/// falls for the moved traffic. ⚠️ `derp_registrations` must NOT fall with it —
-/// the DERP floor is never torn down (§7); a falling registration count is a
-/// regression, a falling BYTE rate is the win.
-pub static DERP_BYTES_RELAYED_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Split-evidence observations (rc hub-miss with fresh foreign record,
-/// tunnel relay drop with foreign session record) (A2b).
-pub static SPLIT_EVIDENCE_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Relay grants issued on a NON-default region (multi-region PoPs).
-pub static RELAY_REGION_PICK_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// PR-1 rehome — cross-pod rc/tunnel misses resolved by MOVING THE
-/// CONTROLLER (mis-keyed / stale / ambiguous dial): rehome reply sent,
-/// agent nudge deliberately suppressed. The 2026-08-04 incident class.
-pub static RC_REHOME_CONTROLLER_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// PR-1 rehome — owner-side nudge refusals (rc/tunnel/origin busy). A
-/// persistently growing value = a parked-busy population that only
-/// converges on idle; the deferred-fire follow-up feeds on this signal.
-pub static AGENT_NUDGE_REFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// PR-1 rehome — nudges suppressed by the cooldown cap (split evidence:
-/// repeated convergence attempts are not converging).
-pub static AGENT_NUDGE_STUCK_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// PR-2 — rc frames successfully relayed to the owner pod (cross-pod
-/// sessions WORKING rather than converging; sustained growth means a
-/// stable co-location gap worth investigating).
-pub static RC_RELAY_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-pub fn bump(counter: &AtomicU64) {
-    counter.fetch_add(1, Ordering::Relaxed);
-}
+pub use roomler_core::cluster::metrics::*;
 
 /// Snapshot every counter + live gauge for one pod.
 pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {

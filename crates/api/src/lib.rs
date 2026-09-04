@@ -10,14 +10,15 @@ pub mod media_type;
 pub mod middleware;
 pub mod newsletter_send;
 pub mod origin;
-pub mod rate_limit;
-pub mod relay_load;
 pub mod routes;
 pub mod state;
 pub mod stats_rollup;
-pub mod storage;
-pub mod user_analytics;
 pub mod ws;
+
+// FR-69 P1b — these four moved into `roomler-core` unchanged (they hold or
+// serve `Core`'s fields); re-exported so every `crate::…` path in this crate
+// reads as before.
+pub use roomler_core::{rate_limit, relay_load, storage, user_analytics};
 
 use axum::{
     Router,
