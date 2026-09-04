@@ -762,3 +762,54 @@ Rust job and exercised by the integration lane rather than locally.
 - What P5c uses it for: the socket's dispatch looks up the owner's handler by
   `msg.namespace()` instead of by string prefix, which is what lets the agent socket move into
   `fleet` while `remote` and `network` register their arms.
+
+### P5c — the agent socket into `fleet`: the plan (recorded before the work)
+
+What the socket is today (`crates/api/src/ws/remote_control.rs::handle_agent_socket`,
+~860 lines): after the `/ws?role=agent` auth in `ws/handler.rs` (the row check through the
+fleet extractor), the loop reads the `AgentHello`, registers with the Hub, claims presence,
+then dispatches. Eleven explicit arms — **fleet**: `AgentHello` (setup), `AgentHeartbeat`,
+`RpcResult`, `RpcExecRequest`, `ConfigStatus`; **remote**: `SessionStats`; **network**:
+`RelayProbeReport`, `DerpTicketRequest`, `SshRequest`, `SshActivity`, `KeyRotated` — and two
+catch-alls, `relay_tunnel_msg_from_agent` for every `rc:tunnel.*` and
+`ws::overlay::relay_overlay_msg_from_node` for every `rc:overlay.*`. The hello itself makes
+network's per-connection state (the tunnel `Originator`/`TunnelSession` registration, the
+overlay `NodeIdentity`). The teardown order is load-bearing and crosses modules twice:
+
+1. network — tear down the tunnel sessions this agent originated, terminate those targeting it;
+2. fleet — `Hub::unregister_agent` with the connection's own `tx`, which answers
+   `removal_was_ours` (a displaced handler's late teardown must not evict the newer connection);
+3. network, **only if ours** — `handle_overlay_leave` (mark the node offline, fan `removes`);
+4. fleet, only if ours — `agents.mark_status(Offline)`, the presence compare-DEL, the
+   `device:presence` OFFLINE transition.
+
+The shape that keeps every one of those properties:
+
+- **A core-owned agent-socket registry.** `Core.agent_socket: AgentSocketRegistry` — for each
+  `Owner` an `Arc<dyn AgentMsgHandler>` (`async fn handle(&self, ctx: &AgentCtx, msg: ClientMsg)`),
+  plus an `AgentSocketLifecycle` per module with `hello(ctx, &caps)`, `closing(ctx)` (step 1),
+  `closed(ctx, removal_was_ours)` (step 3). `AgentCtx` carries what every arm needs today:
+  agent id, tenant id, owner user id, connection id, `dialed_tid`, the outbound `ServerMsg`
+  sender, the connection's established-ms. The registry lives on `Core` for the same reason
+  the hook registry does: fleet, which owns the socket, cannot name `remote` or `network`.
+- **Dispatch by `msg.namespace()`** (P5b's map), never by prefix: fleet's own arms run
+  in-crate, the other two owners' through the registry. Until `remote` and `network` are
+  extracted the HOST registers their handlers and lifecycles (the P5a transitional shape for
+  hooks, applied to the socket); P6 and P7 then move each registration into its module.
+- **Fleet owns the loop and the order.** `handle_agent_socket` moves to
+  `roomler_ai_mod_fleet::socket` unchanged in its sequence: hello → hub register → presence →
+  lifecycles' `hello` → read loop (dispatch) → `closing` for every registered lifecycle →
+  unregister → `closed(ours)` → offline + presence. The `removal_was_ours` gate stays a value
+  fleet computes and passes; no module re-derives it.
+- **The upgrade path.** `ws/handler.rs` keeps the `/ws` upgrade and the role gate (core keeps
+  the socket, D7); the agent branch calls the fleet module's entry through `Modules`, so the
+  wire, the URL and the LB pinning are untouched.
+- **The aliases leave with it.** With the socket in the module, `AppState` drops the fourteen
+  fleet aliases, `roomler-ai-mod-fleet` becomes an optional feature like the others, and
+  `[modules] fleet = false` unmounts instead of refusing to boot — the state P5a deferred.
+
+Gate and rollout: the composition baseline (the wire is untouched by construction), the full
+suite, then a prod roll watched from the fleet — **no dip in online agents** across the roll
+(the `agents.status` count on the server, not an exec sweep), the presence sweeper quiet, an
+RC session and a tunnel open on the new pods. The kill switch is the previous tag: a socket
+cannot be unmounted under a fleet that is dialing it.
