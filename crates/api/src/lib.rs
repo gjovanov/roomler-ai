@@ -4,7 +4,6 @@ pub mod cluster;
 pub mod compose;
 pub mod core_state;
 pub mod extractors;
-pub mod hooks;
 pub mod middleware;
 pub mod routes;
 pub mod state;
@@ -260,145 +259,18 @@ pub fn build_router(state: AppState) -> Router {
     // controller user's JWT). The body MUST include an explicit
     // `tenant_id` field since the user JWT doesn't pin a tenant; the
     // route handler verifies membership before persisting.
-    // Agent routes still the host's under the fleet module's `/agent` prefix
-    // (FR-69 P5a): the network- and remote-owned per-device sub-routes. The
-    // rest of `/tenant/{tenant_id}/agent` — and the public `/agent`,
-    // `/consent`, `/tunnel`, `/setup`, `/releases` and `/log` families — is
-    // mounted by `roomler_ai_mod_fleet`.
-    let agent_routes = Router::new()
-        // FR-40 — order the device to retire its overlay key (MANAGE_AGENTS;
-        // cap-gated, audited, queued for an offline device).
-        .route(
-            "/{agent_id}/overlay-key/rotate",
-            post(routes::overlay_key::rotate_overlay_key),
-        )
-        // Roomler SSH — ask for a session on one device. Answers 200 with
-        // either where to dial or which gate refused; a denial is a policy
-        // outcome the caller must read, not a transport failure.
-        .route("/{agent_id}/ssh", post(routes::agent_ssh::request_session))
-        // Gate 3's twin, and the same MANAGE_AGENTS-not-SSH_DEVICE split.
-        .route("/{agent_id}/ssh-policy", put(routes::agent_ssh::set_policy))
-        // FR-19 gate 3 — approve a device as an org relay. MANAGE_AGENTS +
-        // EXEC_DEVICE (there is no free permission bit; routes/peer_relay.rs
-        // says why), audited on both arms.
-        .route(
-            "/{agent_id}/peer-relay-policy",
-            put(routes::peer_relay::set_policy),
-        );
+    // The per-device network sub-routes under the fleet module's `/agent`
+    // prefix (`overlay-key/rotate`, `ssh`, `ssh-policy`, `peer-relay-policy`)
+    // are the `network` module's (FR-69 P7a), merged in by
+    // `state.modules.mount` below — as is the rest of pillar 2's HTTP
+    // surface: tunnel clients + policies, overlay nodes / ACL / MagicDNS /
+    // blocks, peer relays, SSH audit + activity + settings, the public
+    // `/tunnel-client/*` enrollment pair and the two `/admin/overlay-*`
+    // platform operations.
 
     // `/tenant/{tenant_id}/session/*`, `/turn/credentials` and
     // `/relay/regions` are the `remote` module's (FR-69 P6), merged in by
     // `state.modules.mount` below.
-
-    // roomler-cli routes — same enrollment two-step shape as the
-    // agent, but a distinct audience (`TunnelClient` JWT) so a leaked
-    // agent token can't impersonate a client and vice-versa. CRUD +
-    // policy + audit endpoints land in T2.
-    let tunnel_client_routes = Router::new()
-        .route("/", get(routes::tunnel::list_tunnel_clients))
-        .route(
-            "/enroll-token",
-            post(routes::tunnel::issue_tunnel_enrollment_token),
-        )
-        // matchit gives the static `/enroll-token` above precedence over this
-        // parameterised segment, so there is no shadowing.
-        .route(
-            "/{client_id}",
-            put(routes::tunnel::update_tunnel_client).delete(routes::tunnel::delete_tunnel_client),
-        );
-    let tunnel_policy_routes = Router::new()
-        .route(
-            "/",
-            get(routes::tunnel::list_tunnel_policies).post(routes::tunnel::create_tunnel_policy),
-        )
-        .route(
-            "/{policy_id}",
-            get(routes::tunnel::get_tunnel_policy)
-                .put(routes::tunnel::update_tunnel_policy)
-                .delete(routes::tunnel::delete_tunnel_policy),
-        );
-    // Phase 1 subnet router — admin approves which advertised routes a node may
-    // actually route for peers.
-    let overlay_node_routes = Router::new()
-        .route("/", get(routes::overlay_route::list_overlay_nodes))
-        .route(
-            "/{node_id}/approved-routes",
-            put(routes::overlay_route::set_approved_routes),
-        )
-        .route(
-            "/{node_id}/exit-node",
-            put(routes::overlay_route::set_exit_node),
-        )
-        // Evict a node from the mesh + release its address back to the pool.
-        .route(
-            "/{node_id}",
-            delete(routes::overlay_route::evict_overlay_node),
-        );
-
-    // Overlay L3 ACL — shapes the netmap each node receives. `/mode` carries
-    // the tenant-wide posture (off | warn | enforce); it is `off` by default so
-    // deploying the feature can never black-hole a live mesh.
-    let overlay_policy_routes = Router::new()
-        .route(
-            "/",
-            get(routes::overlay_policy::list).post(routes::overlay_policy::create),
-        )
-        .route(
-            "/mode",
-            get(routes::overlay_policy::get_mode).put(routes::overlay_policy::set_mode),
-        )
-        .route(
-            "/{policy_id}",
-            get(routes::overlay_policy::get)
-                .put(routes::overlay_policy::update)
-                .delete(routes::overlay_policy::delete),
-        );
-
-    // Fleet RPC — the org kill-switch (gate 1) and the attempt log. Both are
-    // tenant-scoped rather than per-device: the switch governs every device,
-    // and the log is the org-wide "what ran on my fleet?" view.
-    // FR-19 — peer relays: the org switch + approved-relay listing, and the
-    // decision log. Approval itself is on the agent router (gate 3 is per
-    // device).
-    let peer_relay_routes = Router::new().route(
-        "/",
-        get(routes::peer_relay::get_settings).put(routes::peer_relay::set_mode),
-    );
-    let peer_relay_audit_routes = Router::new().route("/", get(routes::peer_relay::audit));
-    let ssh_audit_routes = Router::new().route("/", get(routes::agent_ssh::audit));
-    let ssh_activity_routes = Router::new().route("/", get(routes::agent_ssh::activity));
-    // Roomler SSH — its own org kill-switch (gate 1). A separate switch from
-    // the exec one on purpose: allowing bounded diagnostic commands is not
-    // the same decision as allowing interactive sessions.
-    let ssh_settings_routes = Router::new().route(
-        "/",
-        get(routes::agent_ssh::get_org_settings).put(routes::agent_ssh::set_org_settings),
-    );
-
-    // Phase 2 MagicDNS — the tenant's overlay DNS domain + upstreams.
-    let magic_dns_routes = Router::new().route(
-        "/",
-        get(routes::overlay_route::get_magic_dns).put(routes::overlay_route::set_magic_dns),
-    );
-
-    // Multi-org P2b — the tenant's overlay address block + the renumber
-    // migration onto it. `renumber` defaults to a DRY RUN.
-    let overlay_block_routes = Router::new()
-        .route("/", get(routes::overlay_block::get_block))
-        .route("/renumber", post(routes::overlay_block::renumber))
-        // FR-47 P3 — return leaked host ordinals to the recycle pool.
-        // Platform-operator only (checked in-handler, like the block reclaim
-        // route) and dry-run by default.
-        .route(
-            "/reconcile-hosts",
-            post(routes::overlay_block::reconcile_hosts),
-        );
-
-    let public_tunnel_routes = Router::new()
-        .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
-        // Auth is in-handler (TunnelClient bearer token), so it rides the
-        // "public" (no user-JWT-middleware) tunnel router.
-        .route("/agents", get(routes::tunnel::list_tenant_agents));
 
     // Stats PR-3 — observability queries. The /admin family is gated by
     // the platform_admins ObjectId allowlist (404 on miss); the tenant
@@ -450,23 +322,10 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/invite", public_invite_routes)
         .nest("/push", push_routes)
         .nest("/notification", notification_routes)
-        .nest("/tunnel-client", public_tunnel_routes)
         .nest("/admin/stats", admin_stats_routes)
         // `/stripe/*`, `/admin/newsletter/*`, `/admin/plan-compliance`,
         // `/user/newsletter` and `/subscribe*` are the `saas` module's
         // (FR-69 P2), merged in by `state.modules.mount` below.
-        // The block registry is GLOBAL, so reclaiming from it is a platform
-        // operation, not a tenant one. Dry-run by default.
-        .route(
-            "/admin/overlay-block/reclaim",
-            post(routes::overlay_block::reclaim),
-        )
-        // FR-54 — overlay networks whose organization no longer exists.
-        // Platform-operator only (checked in-handler), dry-run by default.
-        .route(
-            "/admin/overlay-network/orphans",
-            post(routes::overlay_block::orphans),
-        )
         // Wave 2 — the SPA's route-change beacon (authenticated, paths
         // normalised server-side). User-scoped, not tenant-scoped: a
         // user navigates across orgs within one session.
@@ -477,28 +336,14 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes)
-        .nest("/tenant/{tenant_id}/agent", agent_routes)
-        // The device listing joins fleet and network data — the host's until
-        // `network` exists (FR-69 P5a).
+        // The device listing joins fleet and network data — the host's
+        // composition view (FR-69 P5a): fleet rows always, tunnel-client and
+        // overlay rows from the network module.
         .nest(
             "/tenant/{tenant_id}/device",
             Router::new().route("/", get(routes::device::list_devices)),
         )
-        .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client_routes)
-        .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy_routes)
-        .nest("/tenant/{tenant_id}/overlay-node", overlay_node_routes)
-        .nest("/tenant/{tenant_id}/overlay-acl", overlay_policy_routes)
-        .nest("/tenant/{tenant_id}/magic-dns", magic_dns_routes)
-        .nest("/tenant/{tenant_id}/overlay-block", overlay_block_routes)
-        .nest("/tenant/{tenant_id}/stats", tenant_stats_routes)
-        .nest("/tenant/{tenant_id}/peer-relay", peer_relay_routes)
-        .nest(
-            "/tenant/{tenant_id}/peer-relay-audit",
-            peer_relay_audit_routes,
-        )
-        .nest("/tenant/{tenant_id}/ssh-audit", ssh_audit_routes)
-        .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity_routes)
-        .nest("/tenant/{tenant_id}/ssh-settings", ssh_settings_routes);
+        .nest("/tenant/{tenant_id}/stats", tenant_stats_routes);
 
     // Health check. `/health` stays a cheap process-alive 200 (liveness /
     // startup probes — must NOT flap on dependency blips or k8s restarts the

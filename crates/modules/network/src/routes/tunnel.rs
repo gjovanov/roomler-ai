@@ -25,10 +25,10 @@ use roomler_ai_services::dao::base::PaginationParams;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::guards::require_permission;
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::NetworkState;
 
 /// 10 minutes — same TTL as the agent enrollment token (see plan
 /// §"Security model"; matches `ENROLLMENT_TTL_SECS` in
@@ -51,7 +51,7 @@ pub struct TunnelEnrollmentTokenResponse {
 /// `roomler enroll`. Mirrors `issue_enrollment_token` for
 /// agents.
 pub async fn issue_tunnel_enrollment_token(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<TunnelEnrollmentTokenResponse>, ApiError> {
@@ -102,7 +102,7 @@ pub struct TunnelEnrollResponse {
 /// enrollment request with an operator user-id once we have the
 /// admin-UI flow to enter it.
 pub async fn enroll_tunnel_client(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     Json(body): Json<TunnelEnrollRequest>,
 ) -> Result<Json<TunnelEnrollResponse>, ApiError> {
     let claims = state
@@ -194,7 +194,7 @@ pub struct TunnelAgentInfo {
 /// name instead of the raw 24-hex id. Authenticated by the caller's TunnelClient
 /// JWT (`Authorization: Bearer <token>`) and scoped to that token's tenant.
 pub async fn list_tenant_agents(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<TunnelAgentInfo>>, ApiError> {
     let token = bearer_token(&headers)
@@ -211,13 +211,13 @@ pub async fn list_tenant_agents(
         per_page: 500,
         ..Default::default()
     };
-    let page = state.agents.list_for_tenant(tid, &params).await?;
+    let page = state.fleet.agents.list_for_tenant(tid, &params).await?;
     let agents = page
         .items
         .into_iter()
         .map(|a| {
             let online =
-                a.id.map(|i| state.rc_hub.is_agent_online(i))
+                a.id.map(|i| state.fleet.rc_hub.is_agent_online(i))
                     .unwrap_or(false);
             TunnelAgentInfo {
                 agent_id: a.id.map(|i| i.to_hex()).unwrap_or_default(),
@@ -284,7 +284,7 @@ fn to_tunnel_client_response(
 /// enrolled tunnel clients for the tenant. Mirrors `list_agents`.
 /// T2 extends with the WS-live `is_online` derivation.
 pub async fn list_tunnel_clients(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<PaginationParams>,
@@ -326,7 +326,7 @@ pub struct UpdateTunnelClientRequest {
 /// Mirrors `remote_control::update_agent` incl. the overlay/MagicDNS
 /// propagation and the additive response envelope. `MANAGE_AGENTS`.
 pub async fn update_tunnel_client(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, client_id)): Path<(String, String)>,
     Json(body): Json<UpdateTunnelClientRequest>,
@@ -361,7 +361,7 @@ pub async fn update_tunnel_client(
             .find_live_by_tunnel_client(tid, cid)
             .await?
         {
-            match crate::ws::overlay::propagate_node_rename(&state, &node, &name).await {
+            match crate::overlay::propagate_node_rename(&state, &node, &name).await {
                 Some(label) => {
                     dns_renamed = Some(true);
                     dns_name = Some(label);
@@ -403,7 +403,7 @@ pub async fn update_tunnel_client(
 /// Gated on `MANAGE_AGENTS` — the device-management bit; there is no separate
 /// tunnel-client permission and minting one would mean a role migration.
 pub async fn delete_tunnel_client(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, client_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -424,7 +424,7 @@ pub async fn delete_tunnel_client(
     // Read first — tenant-scopes the target and 404s a bogus id.
     let client = state.tunnel_clients.find_in_tenant(tid, cid).await?;
 
-    let released = crate::ws::overlay::release_overlay_node_for(
+    let released = crate::overlay::release_overlay_node_for(
         &state,
         tid,
         &client.machine_id,
@@ -570,7 +570,7 @@ fn validate_policy_input(
 
 /// POST /api/tenant/{tenant_id}/tunnel-policy — create a new policy.
 pub async fn create_tunnel_policy(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<TunnelPolicyCreateRequest>,
@@ -600,7 +600,7 @@ pub async fn create_tunnel_policy(
 /// GET /api/tenant/{tenant_id}/tunnel-policy — paginated list of live
 /// policies for the tenant. Soft-deleted rows are excluded.
 pub async fn list_tunnel_policies(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<PaginationParams>,
@@ -623,7 +623,7 @@ pub async fn list_tunnel_policies(
 
 /// GET /api/tenant/{tenant_id}/tunnel-policy/{policy_id} — fetch one.
 pub async fn get_tunnel_policy(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
 ) -> Result<Json<TunnelPolicyResponse>, ApiError> {
@@ -641,7 +641,7 @@ pub async fn get_tunnel_policy(
 /// PUT /api/tenant/{tenant_id}/tunnel-policy/{policy_id} — partial
 /// update. Any field omitted from the body stays unchanged.
 pub async fn update_tunnel_policy(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
     Json(body): Json<TunnelPolicyUpdateRequest>,
@@ -714,7 +714,7 @@ pub async fn update_tunnel_policy(
 /// denied at the next policy fetch (every request — there's no
 /// cache, see `list_active_for_tenant`).
 pub async fn delete_tunnel_policy(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {

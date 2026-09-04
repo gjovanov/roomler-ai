@@ -36,10 +36,10 @@ use roomler_ai_services::dao::base::PaginationParams;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::guards::require_permission;
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::NetworkState;
 
 /// The whole approval policy as one pure function, so it can be tested without
 /// a database and every refusal has exactly one place to come from — the shape
@@ -112,7 +112,7 @@ pub struct PeerRelaySettings {
 
 /// `GET /api/tenant/{tenant_id}/peer-relay`
 pub async fn get_settings(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<PeerRelaySettings>, ApiError> {
@@ -131,6 +131,7 @@ pub async fn get_settings(
         .await?
         .peer_relay_mode;
     let relays = state
+        .fleet
         .agents
         .list_relay_approved(tid)
         .await?
@@ -142,7 +143,7 @@ pub async fn get_settings(
 
 /// `PUT /api/tenant/{tenant_id}/peer-relay` — gate 1.
 pub async fn set_mode(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<PeerRelayModeBody>,
@@ -163,7 +164,7 @@ pub async fn set_mode(
     state.org_relay.invalidate_mode(tid);
     if body.mode == PeerRelayMode::Off {
         // §7 trigger 1 — off means off NOW, not at the next expiry.
-        let n = crate::ws::org_relay::revoke_tenant(&state, tid, "mode_off").await;
+        let n = crate::org_relay::revoke_tenant(&state, tid, "mode_off").await;
         if n > 0 {
             warn!(tenant = %tenant_id, revoked = n, "peer-relay: live sessions revoked by the org switch");
         }
@@ -180,7 +181,7 @@ pub async fn set_mode(
 /// Audited on BOTH arms from one call site, so a new refusal cannot forget to
 /// audit itself; a refused caller gets a 403 that names the gate.
 pub async fn set_policy(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(requested): Json<PeerRelayPolicy>,
@@ -198,7 +199,12 @@ pub async fn set_policy(
 
     // Tenant-scoped, so an agent id from another org is a 404 rather than a
     // cross-tenant read.
-    let agent = state.agents.base.find_by_id_in_tenant(tid, aid).await?;
+    let agent = state
+        .fleet
+        .agents
+        .base
+        .find_by_id_in_tenant(tid, aid)
+        .await?;
     // Static endpoints are server-pushed probe targets that every device in
     // the tenant will dial as SYSTEM/root: public `ip:port` literals only
     // (spec §5, SSRF). Checked before the decision so a refused body never
@@ -206,7 +212,7 @@ pub async fn set_policy(
     if let Some(bad) = requested
         .static_endpoints
         .iter()
-        .find(|e| !crate::ws::org_relay::valid_static_endpoint(e))
+        .find(|e| !crate::org_relay::valid_static_endpoint(e))
     {
         return Err(ApiError::BadRequest(format!(
             "static endpoint {bad} is not a public ip:port"
@@ -240,12 +246,13 @@ pub async fn set_policy(
     }
 
     state
+        .fleet
         .agents
         .update_peer_relay_policy(tid, aid, &requested)
         .await?;
     if !requested.serve {
         // §7 trigger 3 — clearing the approval tears down what it carried.
-        let n = crate::ws::org_relay::revoke_relay_agent(&state, tid, aid, "policy_revoked").await;
+        let n = crate::org_relay::revoke_relay_agent(&state, tid, aid, "policy_revoked").await;
         if n > 0 {
             warn!(tenant = %tenant_id, agent = %agent_id, revoked = n,
                 "peer-relay: live sessions revoked with the approval");
@@ -341,7 +348,7 @@ pub struct PeerRelayAuditResponse {
 
 /// `GET /api/tenant/{tenant_id}/peer-relay-audit`
 pub async fn audit(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<AuditQuery>,

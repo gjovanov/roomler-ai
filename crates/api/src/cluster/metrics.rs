@@ -72,7 +72,7 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
         "local": {
             "agents_online": state.rc_hub.online_agents().len(),
             "tunnel_sessions": state.tunnel_clients_by_session.len(),
-            "derp_registrations": state.derp_registry.len(),
+            "derp_registrations": state.network().derp_registry.len(),
             "media_rooms": media_rooms.len(),
             "media_participants": participants_total,
             "media_consumers": consumers_total,

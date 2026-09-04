@@ -88,6 +88,17 @@ pub trait Module: Sized + Send + Sync + 'static {
         Vec::new()
     }
 
+    /// The same sets for an explicit `multi_block` schema switch (FR-47 P5c:
+    /// the overlay block registry has two mutually exclusive index plans).
+    /// The composition snapshot records BOTH plans, so it asks each module
+    /// through this rather than through [`Module::indexes`], which answers
+    /// for the running deployment's setting. A module whose sets do not vary
+    /// keeps the default.
+    fn indexes_for(&self, multi_block: bool) -> Vec<IndexSet> {
+        let _ = multi_block;
+        self.indexes()
+    }
+
     /// Background work: leader-gated startup maintenance and periodic sweeps.
     /// The host owns the leader lease and the scheduler; a module only declares.
     fn jobs(&self) -> Vec<Job> {

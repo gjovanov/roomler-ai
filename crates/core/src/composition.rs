@@ -344,26 +344,28 @@ mod tests {
         );
     }
 
+    /// The core plan is plain data — and since FR-69 P7a it carries NO set
+    /// that varies with the `multi_block` schema switch: `overlay_blocks`, the
+    /// one that did (multi-block DROPS the one-block-per-network guard
+    /// instead of creating it), is the network module's, reachable through
+    /// `Module::indexes_for(multi_block)` and pinned by the composition
+    /// baseline for both values. A core set that started varying again would
+    /// be a plan the snapshot records twice without anyone deciding so.
     #[test]
-    fn index_plan_is_plain_data_and_differs_by_multi_block() {
+    fn index_plan_is_plain_data_and_no_core_set_varies_by_multi_block() {
         let single = index_plan_json(false);
         let multi = index_plan_json(true);
-        assert_ne!(single, multi);
-        let blocks = |v: &serde_json::Value| {
-            v["sets"]
+        assert_eq!(single["sets"], multi["sets"]);
+        assert!(
+            single["sets"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|s| s["collection"] == "overlay_blocks")
-                .cloned()
-                .unwrap()
-        };
-        // Multi-block DROPS the one-block-per-network guard instead of creating it.
-        assert!(
-            blocks(&multi)["pre_ops"]
-                .as_array()
-                .is_some_and(|o| !o.is_empty())
+                .all(|s| s["collection"] != "overlay_blocks"),
+            "overlay_blocks is the network module's set, not the core plan's"
         );
-        assert!(blocks(&single).get("pre_ops").is_none());
+        // The switch is still recorded on the plan itself.
+        assert_eq!(single["multi_block"], false);
+        assert_eq!(multi["multi_block"], true);
     }
 }
