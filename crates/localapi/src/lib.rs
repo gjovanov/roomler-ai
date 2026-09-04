@@ -204,6 +204,19 @@ pub struct NodeStatus {
     /// guard is a no-op, so evictions and spares stay 0 honestly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_guard: Option<(u64, u64, u64, u64)>,
+    /// #1282 — which ARM armed each route-defense wave: `(tick, event)`,
+    /// cumulative.
+    ///
+    /// A SEPARATE field rather than two more slots on `route_guard`,
+    /// deliberately: that tuple's shape already shipped in 0.4.58, and
+    /// widening it would make a 0.4.58 CLI fail to parse a newer daemon's
+    /// status — a mixed-version pair is the normal state during a fleet roll.
+    /// Additive + `serde(default)` keeps both directions working.
+    ///
+    /// `route_guard.2 - (tick + event)` should be 0; anything else is a third
+    /// caller of `run_defense_wave` that nobody attributed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_wave_arms: Option<(u64, u64)>,
     /// C1 (disco) — out-of-tunnel carrier echoes this node ANSWERED
     /// (`tunnel_core::evidence::DISCO_ANSWERED`). Nonzero on every node is the C1
     /// field gate: the fleet can answer, so a prober may ship next. `None`
@@ -2477,6 +2490,7 @@ mod tests {
                 direct_bind_walks: None,
                 roam_adoptions: None,
                 route_guard: None,
+                route_wave_arms: None,
                 disco_answered: None,
                 org_relay: None,
                 legacy_env_uses: Some(Vec::new()),

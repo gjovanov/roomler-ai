@@ -489,6 +489,12 @@ impl LocalApiState for DaemonState {
                 tunnel_core::evidence::ROUTE_WAVES.load(Ordering::Relaxed),
                 tunnel_core::evidence::FORCED_REVALIDATIONS.load(Ordering::Relaxed),
             )),
+            // #1282 — read alongside route_guard so one snapshot is internally
+            // consistent: tick + event should equal route_guard's wave total.
+            route_wave_arms: Some((
+                tunnel_core::evidence::ROUTE_WAVES_TICK.load(Ordering::Relaxed),
+                tunnel_core::evidence::ROUTE_WAVES_EVENT.load(Ordering::Relaxed),
+            )),
             disco_answered: Some(tunnel_core::evidence::DISCO_ANSWERED.load(Ordering::Relaxed)),
             // FR-19 — present ONLY when the responder actually bound, so a
             // failed bind reads as "no relay here" rather than a phantom one.
