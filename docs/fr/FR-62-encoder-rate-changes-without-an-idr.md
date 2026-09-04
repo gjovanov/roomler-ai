@@ -1,6 +1,6 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 tool shipped (#1247); A0 NVENC measured; A1 in-place path landing (inert, `encoder_inplace_rate` OFF) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; A1 shipped inert; A2 + const flip shipped (0.4.51) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
 
@@ -13,9 +13,21 @@
   `bit_rate + rc_max_rate + rc_buffer_size` (CBR) so `qsvenc`'s per-frame `update_bitrate` resets the
   BRC with no rebuild; NVENC's in-place buffer is sized to the open window (fixing the pre-A1 1×
   write). `supports_dynamic_bitrate()` = "not a rebuild" so the pump immediate-applies QSV when on.
-  Heartbeat gains `inplace_rate / rate_moves / rebuilds / idr_count`. Flips ON after **A0 clears the
-  QSV `MFXVideoENCODE_Reset`** on CORPLAP-1's Iris Xe (the encoder A1 targets first — not measurable
-  on neo16, which has no Intel iGPU; it rides A1's first release).
+  Heartbeat gains `inplace_rate / rate_moves / rebuilds / idr_count`.
+- 🚨 **A0-QSV MEASURED, AND IT REFUTED THE PLAN'S ASSUMPTION** (CORPLAP-1's Iris Xe, 0.4.51,
+  2026-09-02 — full tables on #1242). The flag's flip-ON condition was "A0 clears the QSV
+  `MFXVideoENCODE_Reset`". It does not clear:
+  - `encoder_inplace_rate=1` fails the Reset outright (`hevc_qsv Error during resetting:
+    incompatible video parameters`), in **both** `low_power` modes — the VDENC fixed-function path
+    and the VME path fail byte-identically, so `low_power` is ruled out as the cause.
+  - The rebuild path that in-place was meant to replace costs **1.3–2.0 s at ≤ 1 Mbps** and
+    340–390 ms above 1.5 Mbps, which is the ~2 s pump freeze #1254 then moved off-thread.
+  - ⚠️ **`encoder_inplace_rate` must stay OFF for QSV.** Flipping it fleet-wide would break every
+    QSV rate move, on the encoder the constrained population actually runs.
+  - 🔑 **Consequence for A4, which the deletion list did not anticipate:** the coarsen ladder is
+    **load-bearing for QSV**, because QSV has no cheap apply path at all. NVENC is settled (A2: 20
+    IDRs → 0, apply 0.004 ms) and can shed its rationing; QSV cannot until it has its own answer.
+    A4 is therefore **per-backend, not a flat delete** — see the amended A4 below.
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
@@ -30,12 +42,22 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
 - **A0 — measure on silicon**: `roomlerd encoder-smoke --reconfigure-sweep` (moving-block synthetic content, 20 rate changes 6 M → 200 k → 6 M, per rung: key packets, `set_bitrate_ms`, burst, bytes-per-frame ratio). Pass = 0 key packets after the opener, apply < 5 ms, ratio ±25 % by frame 10, burst ≤ 2×. Hosts: Iris Xe (`hevc_qsv`, `low_power` 1/0), Arc (`av1_qsv`), RTX (`hevc/av1_nvenc`), Apple Silicon (`hevc_videotoolbox`); AMD recorded as unmeasured.
 - **A1 — in-place applies, gated** (`encoder_inplace_rate`, default OFF in the PR, ON after A0 passes): `RateReconfig::{InPlace, Rebuild}` resolved at open; QSV writes `bit_rate + rc_max_rate + rc_buffer_size` together (CBR); the HRD sizing bug fixed; a 3 % dead-band; counters `rate_moves / rebuilds / idr_count` in the heartbeat; a startup probe per host/codec (a driver table is not evidence).
 - **A2 — FFmpeg patches** carried in `.github/ffmpeg-patches/` and applied by all three vendor builders (Linux/macOS from source, Windows via the vcpkg overlay port's `PATCHES`), with a `ROOMLER-PATCHES.txt` hash gate in `release-agent.yml`: `0001-nvenc-no-idr-on-bitrate-reconfig`, `0002-videotoolbox-runtime-bitrate` (as WebRTC's VT encoder does), `0003-amf-runtime-bitrate` (disabled, unmeasured).
-- **A3 — VideoToolbox/AMF** per A0; **A4 — delete** the nine rationing heuristics one shippable PR at a time (anchors in the spec).
+- **A3 — VideoToolbox/AMF** per A0; **A4 — retire** the nine rationing heuristics one shippable PR at
+  a time (anchors in the spec). ⚠️ **Amended after A0-QSV**: this cannot be a flat delete. A
+  heuristic that rations rate moves is dead weight on NVENC (a move is 0.004 ms and no longer costs
+  an IDR) and **load-bearing on QSV** (a move is a 0.34–2.0 s rebuild). Each retirement is therefore
+  gated on the backend it is retired for, and `coarsen_bitrate` in particular stays until QSV has a
+  cheap apply path — deleting it because "FR-62 removed the need" would pin every QSV session to the
+  rebuild cost it exists to avoid.
 - **A5 (later A/B)**: QSV to QVBR (`bit_rate = 0.9 × maxrate`, keeps `global_quality`) — stops CBR padding idle frames.
 
 ## Acceptance criteria
 
-- [ ] AC1 — A0 report per backend on real hardware, attached here, with the pass/fail per codec.
+- [x] AC1 — A0 report per backend on real hardware, attached here, with the pass/fail per codec.
+      **Done for the two backends the fleet runs**: NVENC on an RTX 5090 (PASS — 20/20 rate-caused
+      IDRs before A2, 0 after; apply 0.001–0.008 ms) and QSV on an Iris Xe (**FAIL** — Reset refuses
+      in both `low_power` modes; rebuild 0.34–2.0 s). AMD and VideoToolbox remain unmeasured and are
+      recorded as such rather than assumed; A3 covers them.
 - [ ] AC2 — On a constrained session the bytes-per-frame ratio is ≈ 1.0 within 2 s of every target change (FR-59's instrument).
 - [ ] AC3 — A 5-minute constrained session's `idr_count` ≤ dims changes + viewer keyframe requests.
 - [ ] AC4 — Every deleted heuristic's kill switch is retired through the registry table with its evidence.
