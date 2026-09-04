@@ -1782,6 +1782,30 @@ mod system {
             (u32::from(a.0) & mask) == (u32::from(b.0) & mask)
         }
 
+        /// The already-registered sibling whose block overlaps `mine`, if any.
+        ///
+        /// Split out of [`register`] so the DECISION is unit-testable without a
+        /// tracing capture — `register` then only formats the WARN. That
+        /// matters more than usual here: the field condition this guards
+        /// (a legacy `/10` org beside a carved `/22`) is currently
+        /// unreachable in production, because FR-47 moved every org onto a
+        /// carved block and the registry hands out disjoint ones. Without a
+        /// test the guard would be unverifiable code protecting against a
+        /// regression nobody can stage.
+        fn overlapping_sibling(
+            existing: &BTreeMap<String, Own>,
+            if_name: &str,
+            mine: (Ipv4Addr, u8),
+        ) -> Option<(String, (Ipv4Addr, u8))> {
+            existing.iter().find_map(|(name, other)| {
+                if name == if_name {
+                    return None;
+                }
+                let theirs = other.block?;
+                blocks_overlap(mine, theirs).then(|| (name.clone(), theirs))
+            })
+        }
+
         pub(super) fn register(if_name: &str, luid: u64, block: Option<(Ipv4Addr, u8)>) {
             if let Ok(mut g) = OWN.lock() {
                 // FR-68 C2(b) — FR-64 C2 asked for a WARN when two orgs' blocks
@@ -1796,26 +1820,19 @@ mod system {
                 // nested afterwards. It makes the condition attributable
                 // instead of silent, which is the whole reason the CORPLAP-3
                 // diagnosis was cheap and this one was not.
-                if let Some(mine) = block {
-                    for (other_name, other) in g.iter() {
-                        if other_name == if_name {
-                            continue;
-                        }
-                        if let Some(theirs) = other.block
-                            && blocks_overlap(mine, theirs)
-                        {
-                            tracing::warn!(
-                                adapter = %if_name,
-                                block = %format_args!("{}/{}", mine.0, mine.1),
-                                sibling = %other_name,
-                                sibling_block = %format_args!("{}/{}", theirs.0, theirs.1),
-                                "overlay: two of our adapters serve OVERLAPPING v4 blocks — \
-                                 their derived-ULA v6 prefixes nest instead of being disjoint, \
-                                 so the per-adapter route defense can fight itself (#1237). \
-                                 Renumber one org onto its own block."
-                            );
-                        }
-                    }
+                if let Some(mine) = block
+                    && let Some((sibling, theirs)) = overlapping_sibling(&g, if_name, mine)
+                {
+                    tracing::warn!(
+                        adapter = %if_name,
+                        block = %format_args!("{}/{}", mine.0, mine.1),
+                        sibling = %sibling,
+                        sibling_block = %format_args!("{}/{}", theirs.0, theirs.1),
+                        "overlay: two of our adapters serve OVERLAPPING v4 blocks — \
+                         their derived-ULA v6 prefixes nest instead of being disjoint, \
+                         so the per-adapter route defense can fight itself (#1237). \
+                         Renumber one org onto its own block."
+                    );
                 }
                 g.insert(if_name.to_string(), Own { luid, block });
             }
@@ -1866,6 +1883,60 @@ mod system {
             fn a_block_overlaps_itself() {
                 let a = (Ipv4Addr::new(100, 65, 4, 0), 22);
                 assert!(blocks_overlap(a, a));
+            }
+
+            fn reg(entries: &[(&str, Option<(Ipv4Addr, u8)>)]) -> BTreeMap<String, Own> {
+                entries
+                    .iter()
+                    .map(|(n, b)| ((*n).to_string(), Own { luid: 1, block: *b }))
+                    .collect()
+            }
+
+            /// FR-68 AC9 — the case the WARN exists for: a legacy `/10` org
+            /// beside a carved `/22` nested inside it. Their derived-ULA
+            /// prefixes nest instead of being disjoint, which is how the
+            /// #1237 sibling war re-opens.
+            #[test]
+            fn a_carved_block_nested_in_a_legacy_ten_is_reported() {
+                let existing = reg(&[("roomler", Some((Ipv4Addr::new(100, 64, 0, 0), 10)))]);
+                let mine = (Ipv4Addr::new(100, 65, 4, 0), 22);
+                let hit = overlapping_sibling(&existing, "roomler-abc", mine);
+                assert_eq!(
+                    hit,
+                    Some(("roomler".to_string(), (Ipv4Addr::new(100, 64, 0, 0), 10))),
+                    "the nested pair must be named, and by the SIBLING's block so the \
+                     operator knows which org to renumber"
+                );
+            }
+
+            /// The shipped fleet shape: two carved `/22`s from the global
+            /// registry, which is disjoint by construction. A WARN here would
+            /// fire on every healthy multi-org host and train people to ignore it.
+            #[test]
+            fn two_carved_blocks_are_silent() {
+                let existing = reg(&[("roomler", Some((Ipv4Addr::new(100, 65, 4, 0), 22)))]);
+                let mine = (Ipv4Addr::new(100, 65, 8, 0), 22);
+                assert_eq!(overlapping_sibling(&existing, "roomler-abc", mine), None);
+            }
+
+            /// A re-registration of the SAME adapter (a reconnect reuses the
+            /// name) must not report itself: its block trivially overlaps its
+            /// own, which would make every bring-up log a false war.
+            #[test]
+            fn an_adapter_does_not_report_itself() {
+                let mine = (Ipv4Addr::new(100, 65, 4, 0), 22);
+                let existing = reg(&[("roomler", Some(mine))]);
+                assert_eq!(overlapping_sibling(&existing, "roomler", mine), None);
+            }
+
+            /// A sibling registered with an UNKNOWN mask carries no block, and
+            /// "unknown" is not "overlapping" — treating it as a hit would warn
+            /// about a pairing nobody can act on.
+            #[test]
+            fn a_sibling_without_a_block_is_not_a_hit() {
+                let existing = reg(&[("roomler", None)]);
+                let mine = (Ipv4Addr::new(100, 65, 4, 0), 22);
+                assert_eq!(overlapping_sibling(&existing, "roomler-abc", mine), None);
             }
         }
     }
