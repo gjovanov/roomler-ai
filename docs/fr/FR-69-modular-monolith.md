@@ -1,13 +1,12 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 – P7b shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 · #1323 ·
-#1325 · #1329 · #1332 · #1336 · #1337 · #1339 · #1340 · #1347) — **every pillar is a
-module** · **P8 in PR** (the five profiles as feature aggregates, `ARG PROFILE`/`SAAS` on the
-Dockerfile, the `profiles` CI job with the AC3 graph assertions, the `profile` axis on the
-self-host publish with its boot smoke, `/health` + `/api/capabilities` reporting the MOUNTED
-set, the self-host docs) · every phase's field gate (a prod roll watched from the fleet: no
-dip in online agents; for P6 one RC session per carrier class; for P7 the overlay/tunnel
-sweep) is still to be run ·
+**Status**: P0 – P8 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 · #1323 ·
+#1325 · #1329 · #1332 · #1336 · #1337 · #1339 · #1340 · #1347 · #1348) — **every pillar is a
+module, the five profiles build and are checked for what they leave out** · **P9 in PR** (the
+UI module registry + runtime gating on `/api/capabilities`) · every phase's field gate (a
+prod roll watched from the fleet: no dip in online agents; for P6 one RC session per carrier
+class; for P7 the overlay/tunnel sweep; for P8 the `mesh` image's daemon cell and the
+build-time measurement; for P9 the full UI against a `mesh` server) is still to be run ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -464,7 +463,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P7a** ✅ (CI) | `network` module, part one (`crates/modules/network`, `NetworkState` built on `FleetState`): the engine (`overlay.rs`, `org_relay.rs`, `derp_acl.rs` + the DERP registry types), the seven route files + the per-device sub-routes at the host's old paths, the hooks (`NetworkHooks`), the eleven index sets through `Module::indexes_for(multi_block)` (born here); `is_global_unicast` and the TURN builders moved to core first. `network` REQUIRED: the host's sockets reach the engine through `AppState::network()`. Field log: "P7a" | baseline identical; integration lane; **overlay/tunnel field sweep on a prod roll — not yet run** | previous tag | high | — |
 | **P7b** ✅ (CI) | the sockets (the tunnel-client upgrade + loop, `/derp` as the module's `UpgradeSpec`, the DERP cluster + census + usage flush, the ephemeral reaper, the agent-socket network half + the rest of `ws/remote_control.rs`) and the agent upgrade into `fleet` — the host keeps the role gate and calls `Modules::agent_upgrade` / `tunnel_client_upgrade` (503 when unmounted); the `AgentBusy` query hook (a reason, not a bool); the tenant archive through `TenantLifecycle`; the local gauges through `fleet_gauges` / `network_gauges`; the device listing into `network` (a two-module view); **`AppState` is `{ core, modules }`**; `fleet` + `network` are features. Field log: "P7b" | baseline identical; integration lane; **overlay/tunnel field sweep on a prod roll — not yet run** | `network = false` / `fleet = false` (unmounts now) | high | — |
 | **P8** ✅ (CI) | profiles: `profile-full` … `profile-access` as feature aggregates on the api crate (`default = ["profile-full", "saas"]`, `conference` implies `chat`); `ARG PROFILE` + `ARG SAAS` on the Dockerfile with package-qualified features; `/health` + `/api/capabilities` report the MOUNTED set (+ `compiled`); the `profiles` job in `ci.yml` (four reduced profiles `cargo check`ed + the AC3 `cargo tree` assertions with a positive control); the `profile` input on the self-host publish (tag `<tag>-<profile>`, `SAAS=0`, the boot smoke asserts the module set, `latest` reserved for full); compose/env passthrough; self-host + deployment docs. Field log: "P8" | the five checks green; `mesh` image boots — the smoke half of AC5; the "a daemon enrolls against it" half is a vmtest cell still to run | `full` stays default; the hosted build passes no args | medium | — |
-| **P9** | UI module registry and runtime gating | Vitest + e2e nightly; full UI against a `mesh` server (AC7) | `VITE_MODULES` unset | medium | 3–5 |
+| **P9** ✅ (CI) | UI module registry (`ui/src/modules/registry.ts`: the six module ids, `VITE_MODULES` build-time pruning, the graph's dependency closure) + runtime gating: a `capabilities` store that asks `GET /api/capabilities` once per page load and answers `has(module)` (bundle AND server, fail-OPEN until the server has answered), `meta.module` on every pillar route with a second router guard that awaits the answer and lands a refused route on the org dashboard, and the layout + tenant dashboard hiding what the server does not mount. Field log: "P9" | Vitest (the store + registry: 10 cases; the full suite); `bun run build`; the e2e nightly against `full` unchanged by construction (no path moved). **AC7's "full UI against a `mesh` server" half is a field check still to run** | `VITE_MODULES` unset (the published bundle carries everything; the runtime gate alone decides) | medium | — |
 | later | `roomlerd` `Subsystem` trait — its own FR, after FR-59/63/65 settle | fleet roll + FR-61 matrix | release revert | high | 5–8 |
 
 **P0 in detail** (three PRs, merged in this order):
@@ -482,11 +481,19 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 
 ## Acceptance criteria
 
-- [ ] **AC1** The `full` profile's composition snapshot is identical to the P0 baseline after
-      every module PR (P1–P7).
-- [ ] **AC2** The integration lane holds its floor with the same two skips through P1–P8.
-- [ ] **AC3** `cargo tree` shows `remote`, `mesh` and `access` link neither `mediasoup` nor
-      `mediasoup-sys`, and `collab` does not link `roomler-ai-tunnel-core`.
+- [x] **AC1** The `full` profile's composition snapshot is identical to the P0 baseline after
+      every module PR (P1–P7). — Asserted by the lane on every module PR (P1a–P7b, then P8)
+      against `crates/tests/fixtures/composition.baseline.json`; the one re-record was the
+      intended `/api/capabilities` addition in P1 (routes · both index plans · wire names ·
+      namespaces otherwise byte-identical throughout).
+- [x] **AC2** The integration lane holds its floor with the same two skips through P1–P8. —
+      407 passed / 0 failed on the P7a, P7b and P8 PR merge refs (runs 33908175773,
+      33914646001, 33916479511), zero leaked databases; the two skips unchanged.
+- [x] **AC3** `cargo tree` shows `remote`, `mesh` and `access` link neither `mediasoup` nor
+      `mediasoup-sys`, and `collab` does not link `roomler-ai-tunnel-core`. — Measured by the
+      `profiles` CI job on #1348: `profile-remote` 411 crates, `profile-mesh` 471,
+      `profile-access` 472 (no `mediasoup`), `profile-collab` 433 (no tunnel-core); the
+      positive controls found both crates in the full graph. Re-asserted on every PR.
 - [ ] **AC4** Docker build time for a non-conference profile is measured against `full`, before
       and after, and recorded in the field log.
 - [ ] **AC5** A `mesh` image boots with Mongo, Redis and coturn only; `/health` lists `fleet`
@@ -499,9 +506,15 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       console errors; against `full` the e2e nightly is unchanged.
 - [ ] **AC8** Every phase's prod roll is field-verified from the fleet and recorded in the field
       log, wrong turns included.
-- [ ] **AC9** No wire, socket URL, collection or index changed: the baseline proves the last two
-      and the wire names, the fixed `/ws` and `/derp` paths the second.
-- [ ] **AC10** The licensing dependency-graph assertion proves `roomler-core` (AGPL) never enters
+- [x] **AC9** No wire, socket URL, collection or index changed: the baseline proves the last two
+      and the wire names, the fixed `/ws` and `/derp` paths the second. — `/ws` stays the
+      host's (`crates/api/src/lib.rs`), `/derp` is mounted by the network module's
+      `UpgradeSpec` at the same path (P7b) and is in the baseline's route set; `ClientMsg` /
+      `ServerMsg` never left `remote_control/src/signaling.rs` (rule 4).
+- [x] **AC10** (`scripts/licence-classes.sh` lists `crates/core` / `roomler-core` on the server
+      side and inverts `cargo tree` from every agent binary; the "Licence split integrity"
+      check has been green on every PR since P0 #1312.) The licensing dependency-graph
+      assertion proves `roomler-core` (AGPL) never enters
       a shipped agent binary.
 
 ## Open decisions
@@ -1033,3 +1046,75 @@ carrier class, a DERP-floor host, an SSH session — read from the fleet, not fr
   grep. Recorded in CLAUDE.md rule 13.
 - **The field gate is open, as for every phase**: the overlay/tunnel sweep on a prod roll
   the operator runs.
+
+### 2026-09-04 — P8: profiles, the Docker args, the CI job, the publish axis, the docs
+
+- **Five profiles as feature aggregates** on `crates/api/Cargo.toml` (`profile-full` …
+  `profile-access`), `conference` now implying `chat` (the graph edge as a feature edge, so
+  `profile-collab` cannot be mis-cut later). **Two deliberate departures from D9/D13**, on one
+  reasoning: `default = ["profile-full", "saas"]` (not the bare `profile-full`) and the
+  Dockerfile's `ARG SAAS=1` (not `0`). The hosted image is a MANUAL `docker build` on the build
+  host with no feature argument, and the integration suite builds the api crate with `default`;
+  with the spec as written, the next prod deploy would have dropped Stripe, the newsletter and
+  plan compliance silently, and the billing tests would have stopped compiling. The asymmetry
+  decides it — a self-host image that accidentally carried `saas` is an inert webhook, a prod
+  image that accidentally lost it is a billing outage — so the self-host guarantee is enforced
+  where the image is MADE: the publish workflow passes `SAAS=0` and its boot smoke asserts the
+  mounted set never contains `saas` (FR-47's lesson: a default that must be remembered is not a
+  default).
+- **The build line is package-qualified**: `cargo build -p roomler-ai-api -p derp-relay
+  --no-default-features --features roomler-ai-api/profile-$PROFILE[,roomler-ai-api/saas]`.
+  `derp-relay` has no features, so one line serves both packages.
+- **`/health` and `/api/capabilities` were reporting `graph::MODULES`** — the DAG every build
+  knows, so a `mesh` image would have answered all six and the profile smoke would have
+  asserted nothing. Both report `Modules::mounted()` now, plus `compiled` (`compose::EXTRACTED`);
+  `switched_off` stays, and since P7b `modules = compiled − switched_off` exactly.
+- **The `profiles` CI job** checks the four reduced profiles per package (`cargo clippy
+  --workspace` unifies features and can never see one) and asserts AC3 from `cargo tree`:
+  `remote`/`mesh`/`access` list no `mediasoup`/`mediasoup-sys`, `collab` no
+  `roomler-ai-tunnel-core` — each against a tree that must list ≥100 crates, and with a
+  positive control on the full graph, because an absence assertion that cannot fail proves
+  nothing. One sequential job, not a matrix: the module crates are shared artifacts.
+- **The self-host publish gains the `profile` input**: `<tag>` for full, `<tag>-<profile>`
+  otherwise (the merge job re-derives it — it has no env from the build job), `latest` refused
+  for a non-full profile, the build cache scoped per arch AND profile, and the smoke asserts the
+  module set. Compose passes `PROFILE=${ROOMLER_PROFILE:-full}` + `SAAS=0`; the env example
+  documents both ways of choosing (tag for a pull, `ROOMLER_PROFILE` for a build).
+- Outcomes: the composition baseline stayed byte-identical (run 33916410333 — the `full` profile is the feature set it always was); PR #1348 green on all thirteen checks (Rust checks 25 min cold, the suite 15 min 43 s at 407/0, the new `profiles` job 8 min 21 s); AC3 measured on the PR: `profile-remote` 411 crates, `profile-mesh` 471, `profile-access` 472 — none lists `mediasoup`; `profile-collab` 433 crates, no `roomler-ai-tunnel-core`; both positive controls found their crate in the full graph. Merged as `618c763e`.
+- **Still open**: AC4 (the Docker build-time measurement for a non-conference profile — two
+  publish dry-runs, `full` vs `mesh`) and the daemon half of AC5 (a `mesh` image boots under
+  the smoke; "a daemon enrolls and joins the overlay against it" is a vmtest cell the
+  operator's fleet runs). AC8 (every phase's prod roll) is unchanged: nothing has rolled.
+
+### 2026-09-04 — P9: the SPA's module registry and runtime gating
+
+- **One predicate, two gates.** `ui/src/stores/capabilities.ts` asks `GET /api/capabilities`
+  once per page load (kicked off in `main.ts` before the first navigation; concurrent callers
+  share the request; it never throws) and answers `has(module)` = the bundle carries it AND
+  the server mounts it. `ui/src/modules/registry.ts` holds the six module ids, the
+  `VITE_MODULES` build-time prune (unset = all; unknown names ignored; a list naming nothing
+  known keeps everything and says so) and the graph's dependency closure.
+- **Fail-OPEN until the server has answered** — deliberately the same rule `canSeeFleetNav`
+  follows for permissions: before the request lands, or if it fails (an older server, a proxy
+  hiccup), every module the bundle carries is treated as present. The server enforces every
+  action anyway, so the worst case of failing open is a link whose page 404s; failing closed
+  would blank the whole product behind one round-trip on every load.
+- **Routes carry `meta.module`** (`chat`: rooms, explore, files, the room view; `conference`:
+  the call view; `fleet`: devices, the exec audit, the public consent page; `remote`: the
+  remote-control view; `network`: the network section — its children inherit through
+  `to.matched` — and the SSH audits; `saas`: billing), and a second `router.beforeEach`,
+  after the auth guard so an anonymous deep-link still meets login first, awaits the answer
+  and lands a refused route on the org dashboard (or 404 outside a tenant), with a console
+  warning that names the route and the module. `AppLayout.vue` and `TenantDashboard.vue`
+  read the same `caps.has(...)` for their groups, items and tiles; the agent rows lose their
+  remote-view link without `remote`, the room rows their call icon without `conference`.
+- Deliberately NOT done here: the D11 re-fold of `views/` and `stores/` into
+  `ui/src/modules/<m>/` folders and the generalisation of `stores/ws.ts`'s handler registry.
+  Route-level lazy chunks already keep an unmounted pillar's code out of the initial bundle,
+  and the ws registry is load-bearing (the multi-subscriber `rc:*` fix lives there) — a
+  re-fold is a follow-up with its own Vitest coverage per prefix, not a gating requirement.
+- Verified locally: the store + registry spec (10 cases) and the full Vitest suite
+  (47 files, 1 208 tests); `bun run build` (vue-tsc + vite). **AC7's field half — the full
+  UI against a `mesh` server showing no chat or conference navigation and no console errors —
+  needs a `mesh` image someone can reach; it is still to run**, and the e2e nightly against
+  `full` is unchanged by construction (no path moved, no component changed its contract).

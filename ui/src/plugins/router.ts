@@ -3,6 +3,21 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { looksSignedIn } from '@/api/session'
+import { useCapabilitiesStore } from '@/stores/capabilities'
+import type { ModuleId } from '@/modules/registry'
+
+declare module 'vue-router' {
+  interface RouteMeta {
+    /** Requires a signed-in session (the cookie hint). */
+    auth?: boolean
+    /** A page for the signed-out state (login, landing, …). */
+    guest?: boolean
+    /** FR-69 P9 — the server module this route belongs to. Absent on every
+     *  core route; children inherit it through `to.matched`, so a `network`
+     *  section needs no meta of its own. */
+    module?: ModuleId
+  }
+}
 
 const routes: RouteRecordRaw[] = [
   {
@@ -62,6 +77,7 @@ const routes: RouteRecordRaw[] = [
     path: '/consent/:token',
     name: 'consent',
     component: () => import('@/views/remote/ConsentView.vue'),
+    meta: { module: 'fleet' },
   },
   {
     // FR-58 follow-up — the confirm PAGE: the email links here and the
@@ -131,26 +147,31 @@ const routes: RouteRecordRaw[] = [
             path: 'room/:roomId',
             name: 'room-chat',
             component: () => import('@/views/chat/ChatView.vue'),
+            meta: { module: 'chat' },
           },
           {
             path: 'room/:roomId/call',
             name: 'room-call',
             component: () => import('@/views/conference/ConferenceView.vue'),
+            meta: { module: 'conference' },
           },
           {
             path: 'rooms',
             name: 'rooms',
             component: () => import('@/views/rooms/RoomList.vue'),
+            meta: { module: 'chat' },
           },
           {
             path: 'explore',
             name: 'explore',
             component: () => import('@/views/rooms/ExploreView.vue'),
+            meta: { module: 'chat' },
           },
           {
             path: 'files',
             name: 'files',
             component: () => import('@/views/files/FilesBrowser.vue'),
+            meta: { module: 'chat' },
           },
           {
             path: 'invites',
@@ -181,6 +202,7 @@ const routes: RouteRecordRaw[] = [
             path: 'devices',
             name: 'devices',
             component: () => import('@/views/devices/DevicesView.vue'),
+            meta: { module: 'fleet' },
           },
           {
             // S4 pivot — the overlay/tunnel network group, promoted out
@@ -193,6 +215,7 @@ const routes: RouteRecordRaw[] = [
             // rows now); the parent lands on ACL, the first remaining child.
             redirect: { name: 'network-acl' },
             component: () => import('@/views/network/NetworkPanel.vue'),
+            meta: { module: 'network' },
             children: [
               { path: 'machines',       redirect: { name: 'devices' } },
               { path: 'tunnel-clients', redirect: { name: 'devices' } },
@@ -241,20 +264,22 @@ const routes: RouteRecordRaw[] = [
             redirect: { name: 'audit-exec' },
             component: () => import('@/views/admin/AuditPanel.vue'),
             children: [
-              { path: 'exec',         name: 'audit-exec',         props: true, component: () => import('@/components/admin/ExecAuditSection.vue') },
-              { path: 'ssh',          name: 'audit-ssh',          props: true, component: () => import('@/components/admin/SshAuditSection.vue') },
-              { path: 'ssh-activity', name: 'audit-ssh-activity', props: true, component: () => import('@/components/admin/SshActivitySection.vue') },
+              { path: 'exec',         name: 'audit-exec',         props: true, meta: { module: 'fleet' },   component: () => import('@/components/admin/ExecAuditSection.vue') },
+              { path: 'ssh',          name: 'audit-ssh',          props: true, meta: { module: 'network' }, component: () => import('@/components/admin/SshAuditSection.vue') },
+              { path: 'ssh-activity', name: 'audit-ssh-activity', props: true, meta: { module: 'network' }, component: () => import('@/components/admin/SshActivitySection.vue') },
             ],
           },
           {
             path: 'billing',
             name: 'billing',
             component: () => import('@/views/billing/BillingView.vue'),
+            meta: { module: 'saas' },
           },
           {
             path: 'agent/:agentId/remote',
             name: 'agent-remote',
             component: () => import('@/views/remote/RemoteControl.vue'),
+            meta: { module: 'remote' },
           },
         ],
       },
@@ -314,6 +339,29 @@ router.beforeEach((to, _from, next) => {
   } else {
     next()
   }
+})
+
+// FR-69 P9 — a pillar the server does not mount is absent everywhere at
+// once: the navigation hides it (AppLayout, TenantDashboard) and this guard
+// refuses its routes, so a bookmark or a stale link lands on the org
+// dashboard instead of a page whose every request 404s. Runs AFTER the
+// auth guard above, so an anonymous deep-link still meets login first.
+// `to.matched` carries the parents' meta, so a `network` section child needs
+// no meta of its own. Fail-OPEN: an unanswered `/api/capabilities` gates
+// nothing (see `stores/capabilities.ts`).
+router.beforeEach(async (to) => {
+  const wanted = to.matched.map((r) => r.meta.module).find((m): m is ModuleId => Boolean(m))
+  if (!wanted) return true
+  const caps = useCapabilitiesStore()
+  await caps.ready()
+  if (caps.has(wanted)) return true
+  console.warn(
+    `[modules] route '${String(to.name)}' needs module '${wanted}', which this server does not mount`,
+  )
+  const tenantId = to.params.tenantId
+  return typeof tenantId === 'string' && tenantId !== ''
+    ? { name: 'tenant-dashboard', params: { tenantId } }
+    : { name: 'not-found' }
 })
 
 export default router

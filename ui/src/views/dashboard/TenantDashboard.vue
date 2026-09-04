@@ -11,7 +11,7 @@
          overview when available (accurate at any fleet size); the agents
          store — capped at its fetch page — is only the fallback. -->
     <v-row>
-      <v-col cols="6" sm="4" md>
+      <v-col v-if="caps.has('fleet')" cols="6" sm="4" md>
         <v-card :to="showFleet ? `/tenant/${tenantId}/devices` : undefined" :hover="showFleet">
           <v-card-text class="text-center">
             <v-icon size="48" color="warning">mdi-monitor-multiple</v-icon>
@@ -20,7 +20,7 @@
           </v-card-text>
         </v-card>
       </v-col>
-      <v-col cols="6" sm="4" md>
+      <v-col v-if="caps.has('network')" cols="6" sm="4" md>
         <!-- No `title` PROP here — on v-card it renders a whole title bar
              and made this tile taller than its siblings. Lands on the
              devices page pre-filtered to tunnels (?type=tunnel). -->
@@ -35,7 +35,7 @@
           </v-card-text>
         </v-card>
       </v-col>
-      <v-col cols="6" sm="4" md>
+      <v-col v-if="showChat" cols="6" sm="4" md>
         <v-card :to="`/tenant/${tenantId}/rooms`" hover>
           <v-card-text class="text-center">
             <v-icon size="48" color="primary">mdi-pound</v-icon>
@@ -44,7 +44,7 @@
           </v-card-text>
         </v-card>
       </v-col>
-      <v-col cols="6" sm="4" md>
+      <v-col v-if="showConference" cols="6" sm="4" md>
         <v-card>
           <v-card-text class="text-center">
             <v-icon size="48" color="secondary">mdi-video</v-icon>
@@ -53,7 +53,7 @@
           </v-card-text>
         </v-card>
       </v-col>
-      <v-col cols="6" sm="4" md>
+      <v-col v-if="showChat" cols="6" sm="4" md>
         <v-card :to="`/tenant/${tenantId}/rooms`" hover>
           <v-card-text class="text-center">
             <v-icon size="48" color="accent">mdi-message-text</v-icon>
@@ -134,14 +134,14 @@
     </template>
 
     <!-- Quick actions -->
-    <h2 class="text-h6 mt-4 mb-2">Quick Actions</h2>
-    <v-row>
+    <h2 v-if="showChat" class="text-h6 mt-4 mb-2">Quick Actions</h2>
+    <v-row v-if="showChat">
       <v-col cols="12" sm="6" md="3">
         <v-btn block color="primary" prepend-icon="mdi-plus" :to="`/tenant/${tenantId}/rooms`">
           New Room
         </v-btn>
       </v-col>
-      <v-col cols="12" sm="6" md="3">
+      <v-col v-if="showConference" cols="12" sm="6" md="3">
         <v-btn block color="secondary" prepend-icon="mdi-video-plus" @click="startCall">
           Start Call
         </v-btn>
@@ -173,7 +173,7 @@
           </v-card-text>
         </v-card>
       </v-col>
-      <v-col v-if="showFleet" cols="12" sm="6" md="3">
+      <v-col v-if="showNetwork" cols="12" sm="6" md="3">
         <!-- /network (the ACL landing) — /network/machines has been a
              redirect stub since the S4 fold-in. -->
         <v-card :to="`/tenant/${tenantId}/network`" hover>
@@ -233,6 +233,7 @@ import { useRoomStore } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
 import { useTunnelClientStore } from '@/stores/tunnelClients'
 import { useStatsStore } from '@/stores/stats'
+import { useCapabilitiesStore } from '@/stores/capabilities'
 import { usePolling } from '@/composables/usePolling'
 import { canManageInvites, canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
@@ -245,6 +246,11 @@ const roomStore = useRoomStore()
 const agentStore = useAgentStore()
 const tunnelClientStore = useTunnelClientStore()
 const statsStore = useStatsStore()
+// FR-69 P9 — the pillars THIS server mounts (fail-open until answered);
+// the same predicate the navigation and the router guard read.
+const caps = useCapabilitiesStore()
+const showChat = computed(() => caps.has('chat'))
+const showConference = computed(() => caps.has('conference'))
 
 const tenantId = computed(() => route.params.tenantId as string)
 const activeCallCount = computed(
@@ -269,7 +275,10 @@ const tunnelsLabel = computed(() => {
   const online = tunnelClientStore.clients.filter((c) => c.status === 'online').length
   return `${online}/${tunnelClientStore.total}`
 })
-const showFleet = computed(() => canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner))
+const showFleet = computed(
+  () => caps.has('fleet') && canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner),
+)
+const showNetwork = computed(() => showFleet.value && caps.has('network'))
 const showAnalytics = computed(() =>
   canQueryAnalytics(tenantStore.myPermissions, tenantStore.isOwner),
 )
