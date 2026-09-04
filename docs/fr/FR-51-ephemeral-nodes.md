@@ -1,9 +1,11 @@
 # FR-51: Ephemeral nodes — a device that removes itself
 
 **Issue:** [#1095](https://github.com/gjovanov/roomler-ai/issues/1095) ·
-**Status:** **field-verified on prod 0.4.46 (2026-09-01)** — all ten ACs ticked; AC5's
-≥24 h re-read is the one residual gate, and the non-affine `removes` fan gap spun out
-as [#1186](https://github.com/gjovanov/roomler-ai/issues/1186) ·
+**Status:** **CLOSED (#1095, 2026-09-04)** — all ten ACs field-verified on prod 0.4.46;
+AC5 confirmed at +72 h across the FR-69 refactor deploys (4/4 surviving permanent
+sentinels alive, `ephemeral_live=0`, reaper flag still ON; the one sentinel that left was
+a logged admin `DELETE`, not the reaper). The non-affine `removes` fan gap
+([#1186](https://github.com/gjovanov/roomler-ai/issues/1186)) was fixed + closed (#1241) ·
 **Owner:** overlay/networking + control plane ·
 **Anchors verified against master `ccc58bb0`**
 
