@@ -277,13 +277,21 @@ _(every entry must carry a before/after from the stall watch.)_
     capture, which only the backpressure gate does.
   - **CORPLAP-3 is additionally encode-bound**: single frames at 346, 371 and
     **502 ms**. A different problem from the other two, on the same symptom.
-  - ⚠️ **Also observed, and not yet explained:** across the whole episode the
-    encoder applied **zero** rate changes — `rebuilds=0` and `rate_moves=0` —
-    while the governor's `target_bps` swung 4 145 343 → 486 191 → 2 550 000 and
-    92 frames were dropped to backpressure at a 2374 ms paint. The controller
-    reacted to the drag; the encoder never did. Consistent with the ladder trap
-    recorded on #1242 for a direct session, but the mechanism is untraced — do
-    not repeat this as if it were.
+  - 🚨 **A counter that read zero through the event it counts.** First reading of
+    this data said "the encoder applied **zero** rate changes — `rebuilds=0`,
+    `rate_moves=0` — while the governor's target swung 4 145 343 → 486 191 →
+    2 550 000, so the controller reacted to the drag and the encoder never did."
+    **That conclusion was wrong, and the counters caused it.** The daemon log
+    carries two `background-rebuilt encoder adopted` lines at 11:03:03 and
+    11:03:08 — the encoder moved its rate *twice*, mid-drag. `adopt_rebuilt`
+    incremented **neither** counter, and on a DIRECT QSV session every rate move
+    goes through exactly that path (`swap_wanted` → `open_rebuilt` →
+    `adopt_rebuilt`), so the pair reads zero **by construction** on the one
+    configuration where it is most load-bearing.
+    A new `swaps` counter now counts adoptions, kept **separate** from
+    `rebuilds` because P3's whole point is that a swap is stall-free and folding
+    them would lose that. ⚠️ Read `swaps` alongside the other two, never instead
+    of them.
 
   **Instrumented rather than guessed at**: `pace`, `stats`, `ctrl`, `swap` and
   `gate` are now timed, so `other_ms` decomposes itself the way it did for the
