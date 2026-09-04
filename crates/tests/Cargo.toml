@@ -16,6 +16,7 @@ roomler-ai-services = { path = "../services" }
 base64.workspace = true
 roomler-ai-remote-control = { path = "../remote_control" }
 roomler-ai-api = { path = "../api" }
+roomler-core = { path = "../core" }
 roomlerd = { path = "../../agents/roomlerd" }
 webrtc.workspace = true
 tokio.workspace = true

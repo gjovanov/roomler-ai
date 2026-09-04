@@ -1,0 +1,35 @@
+[package]
+name = "roomler-core"
+license = "AGPL-3.0-only"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "The server's composition contract (FR-69): the Module trait, capabilities, hooks, index plans and jobs every pillar module implements, plus the composition snapshot that gates every module move."
+
+[lib]
+name = "roomler_core"
+path = "src/lib.rs"
+
+# FR-69 P0 — TYPES ONLY. This crate carries the contract every server module
+# implements and the tooling that proves a module move changed nothing. It has
+# no runtime behaviour of its own until P1 fills `Core`. It is SERVER-side
+# (AGPL, `SERVER_CRATES` in scripts/licence-classes.sh), and the licensing
+# workflow's dependency-graph assertion is what keeps it out of every shipped
+# agent binary — that assertion is AC10 of the FR.
+#
+# ⚠️ Not to be confused with `roomler-node-core` (crates/agent-core), the
+# daemon's shared building blocks, which held THIS name from FR-21 until FR-69.
+[dependencies]
+roomler-ai-config = { path = "../config" }
+roomler-ai-db = { path = "../db" }
+
+axum.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+bson.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tower.workspace = true
