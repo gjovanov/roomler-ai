@@ -148,6 +148,55 @@ is documented at the top of the root `Cargo.toml`):
 | `crates/vendored/webrtc` | exposes SCTP `a_rwnd` so native⇄native DataChannels advertise 8 MiB and stay link-bound at high BDP |
 | `crates/vendored/wintun-bindings` | keeps the Windows NetworkList registry entry on drop |
 
+## Modular monolith — the target shape (FR-69)
+
+The map above is the **current** server: one crate (`crates/api`) whose `AppState` carries every
+pillar and whose single `build_router` mounts every route. [FR-69](fr/FR-69-modular-monolith.md)
+decouples it into a **modular monolith** — the same process, the same container, the same wire —
+composed from a small core and six module crates:
+
+```mermaid
+flowchart BT
+    core["crates/core → roomler-core<br/>identity · tenancy · plans · notifications · storage<br/>/ws socket + fan-out · cluster · TURN creds · metering"]
+    fleet["modules/fleet<br/>agents · enrollment · presence · Hub · consent · exec · releases"]
+    chat["modules/chat<br/>rooms · messages · files · search · export"]
+    conference["modules/conference<br/>mediasoup · media:* · recordings"]
+    remote["modules/remote<br/>RC sessions · sdp/ice · rc relay"]
+    network["modules/network<br/>overlay · tunnels · DERP · peer relays · SSH"]
+    saas["modules/saas (add-on)<br/>Stripe · newsletter · plan compliance"]
+    fleet --> core
+    chat --> core
+    saas --> core
+    conference --> chat
+    remote --> fleet
+    network --> fleet
+```
+
+The rules that keep it a monolith rather than a pile of crates:
+
+- **One contract.** Every module implements `roomler_core::Module` — routes, WebSocket
+  namespaces, index specs, jobs, lifecycle hooks, capabilities — and the host composes the
+  concrete types under `#[cfg(feature)]`. No dynamic loading, no runtime registry.
+- **A DAG, not peers.** Any module may call core; `conference → chat`, `remote → fleet`,
+  `network → fleet`. Core never calls a module: the inverse flows (tenant archive, agent removal)
+  are hooks that core invokes in a fixed order.
+- **Core membership.** Something lives in core only if at least two modules need it **and** it is
+  identity, tenancy or infrastructure. Everything else belongs to a module.
+- **Profiles, not switches.** Cargo features select the pillars a build links (`full`, `collab`,
+  `remote`, `mesh`, `access`; `saas` as an add-on the self-host images never carry). What a
+  running server offers is discovered through `GET /api/capabilities`, so one UI build and one
+  daemon work against any profile.
+- **The wire and the documents do not move.** One `/ws` socket with an exhaustive
+  `ClientMsg::namespace()` map; `/derp` unchanged; DAOs and indexes change owner, never shape.
+- **Every move is checked.** A composition baseline — routes with their allowed methods, the
+  index plan, the wire names — is asserted byte-identical after each module PR.
+
+**Crate naming, as of FR-69.** Server-side crates are `roomler-ai-*`; the server core is
+**`roomler-core`** (`crates/core`, AGPL-3.0-only); module crates are `roomler-ai-mod-<name>`.
+The daemon's shared building blocks — config, enrollment, machine-id, logging — are
+**`roomler-node-core`** (`crates/agent-core`, MPL-2.0), which held the name `roomler-core` from
+FR-21 until FR-69. Its pre-FR-21 name is retired (FR-21); do not bring it back.
+
 ## The native stack on an enrolled machine
 
 | Binary | Role |
