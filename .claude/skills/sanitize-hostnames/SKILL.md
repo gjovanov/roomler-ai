@@ -82,6 +82,61 @@ python3 ~/bin/git-filter-repo \
 git push --mirror https://github.com/<owner>/<repo>.git      # irreversible
 ```
 
+## Three layers, and only the first one is cheap
+
+| layer | stops it at | enable |
+|---|---|---|
+| `.githooks/pre-commit` | the commit | `git config core.hooksPath .githooks` |
+| CI job **No real machine names** | the merge | required status check on `master` |
+| the sweep below | after publication | run it by hand |
+
+Layer 3 has run three times now. Each run force-pushes ~700 branches and ~660
+tags with GitHub Actions disabled around it, and it still **cannot remove
+anything from GitHub** — the pre-rewrite commits stay reachable by SHA through
+`refs/pull/*` until GitHub Support runs GC. Treat every sweep as damage
+control, and the hook as the actual fix.
+
+⚠️ **Set `core.hooksPath` in every clone.** It is per-clone config, so a fresh
+clone has no hook until someone runs that line. Worktrees **share** that config
+and the hook is tracked, so setting it once in the clone covers every worktree
+made from it — but a worktree on a branch predating the hook still has no file,
+which is the harmless `tool absent -- do not block` path.
+
+### The hook's exit-code contract — the hard-won part
+
+`.githooks/pre-commit` blocks on **`EXIT_FOUND` (1) and nothing else**. Every
+other status means *the guard did not answer*, and the hook says so and lets the
+commit through, because the required CI check still refuses the merge.
+
+| status | meaning | hook |
+|---|---|---|
+| `0` | clean | commit |
+| `1` | names found | **REFUSE** |
+| `2` | bad arguments — hook and guard drifted | warn, allow |
+| `20` | guard raised, or a git call inside it failed | warn, allow |
+
+⚠️ **This existed as one status until 2026-09-04, and it was worse than useless.**
+`if ! out=$(run_guard)` collapsed every failure into "a real machine name",
+so the hook told authors they had committed a hostname when it had merely
+crashed. Measured twice that day, from two unrelated causes:
+
+- a worktree whose `check_shapes.py` predated `--staged`, so argparse exited 2;
+- **every** worktree on Windows, where `.git` is a file holding a Windows path
+  WSL's git cannot follow — so `git` inside the WSL fallback exited 128 and the
+  guard was inert in ~53 worktrees while working fine in the main clone. The
+  hook now resolves the git dir natively and exports it across the boundary.
+
+🔑 The rule this is an instance of, already written three times in this
+directory: **a check whose result cannot distinguish "passed" from "never
+answered" is not a check.** A guard that cries hostname when it means "I
+crashed" is one somebody silences with `--no-verify`, and that removes the layer
+permanently. `selftest.sh` asserts each status leads to its own outcome, and
+asserts a **non-1** status specifically — "non-zero" would pass on the bug.
+
+⚠️ The hook must be committed **mode 755**. Git skips a non-executable hook in
+silence, which is layer 1 disarmed with nothing anywhere to say so; the selftest
+checks this too.
+
 ## The four things that go wrong
 
 **1. `--replace-text` does NOT touch commit messages.** It rewrites blob
@@ -92,11 +147,18 @@ real names in the commit log — which on this repo is the *richer* of the two
 surfaces, because the field-test narratives live in commit bodies. Always
 verify against `git log --all --format=%B`, never the tree alone.
 
-**2. `residual: none` is the only success condition.** The residual scan
-re-reads everything case-INSENSITIVELY after the rewrite. The first pass of the
+**2. `residual: none` is the only success condition, and CASE IS THE TRAP.**
+The residual scan re-reads everything case-INSENSITIVELY. The first pass of the
 2026-08-28 sweep listed only uppercase spellings, reported success, and left 60
-real tags in the tree because half the prose was lowercase. Never trust a run
-that ends any other way, whatever else it printed.
+real tags in the tree because half the prose was lowercase.
+
+⚠️ That exact mistake was then **rebuilt one file over**: `check_shapes.py`
+shipped with uppercase-only patterns, and on 2026-09-04 a field log wrote two
+asset tags in lowercase — the guard printed `none found`, CI went green, and
+the names reached a public repo and 15 GitHub items. Everything here matches
+case-insensitively now, and `selftest.sh` carries every canary in both casings
+so the regression cannot come back quietly. People write a hostname however it
+came out of their terminal; a check that assumes a casing is not a check.
 
 **3. Longest key first, or you orphan a prefix.** A `DESKTOP-`/`LAPTOP-`
 qualified form has to be rewritten before its bare tag, or the qualifier is
