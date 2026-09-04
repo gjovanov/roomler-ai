@@ -8,6 +8,7 @@ pub mod agent_release;
 pub mod agent_ssh;
 pub mod auth;
 pub mod background_task;
+pub mod capabilities;
 pub mod cluster;
 pub mod consent;
 pub mod cost;
