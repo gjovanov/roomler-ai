@@ -10,7 +10,7 @@ use roomler_ai_db::models::TutorialState;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -135,7 +135,7 @@ pub struct RefreshRequest {
 }
 
 pub async fn register(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<RegisterResponse>), ApiError> {
     let password_hash = state.auth.hash_password(&body.password)?;
@@ -296,7 +296,7 @@ pub async fn register(
 }
 
 pub async fn login(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     Json(body): Json<LoginRequest>,
 ) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
     let lookup = if let Some(ref username) = body.username {
@@ -390,7 +390,7 @@ pub async fn login(
 /// answered measurably faster than a known one, which is an account-existence
 /// oracle. It is never compared against anything a caller controls, so the
 /// random input is only there to guarantee no one can pre-image it.
-fn dummy_password_hash(state: &AppState) -> &'static str {
+fn dummy_password_hash(state: &Core) -> &'static str {
     static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DUMMY.get_or_init(|| {
         state
@@ -403,7 +403,7 @@ fn dummy_password_hash(state: &AppState) -> &'static str {
 /// `; Secure` in production, empty in dev — the session cookie is a full API
 /// credential (the auth extractor accepts it), so it must never travel over
 /// cleartext http; the http://localhost dev/test flow still needs it set.
-fn secure_attr(state: &AppState) -> &'static str {
+fn secure_attr(state: &Core) -> &'static str {
     if state.settings.app.environment == "production" {
         "; Secure"
     } else {
@@ -427,7 +427,7 @@ const REFRESH_COOKIE: &str = "refresh_token";
 const REFRESH_COOKIE_PATH: &str = "/api/auth/refresh";
 
 /// `Set-Cookie` for the refresh token, scoped to the refresh endpoint.
-pub(crate) fn refresh_cookie(state: &AppState, token: &str) -> String {
+pub(crate) fn refresh_cookie(state: &Core, token: &str) -> String {
     format!(
         "{}={}; HttpOnly; Path={}; SameSite=Lax; Max-Age={}{}",
         REFRESH_COOKIE,
@@ -441,7 +441,7 @@ pub(crate) fn refresh_cookie(state: &AppState, token: &str) -> String {
 /// `Set-Cookie` that expires the refresh cookie. The attributes other than
 /// `Max-Age` must match the ones it was set with, or the browser keeps the
 /// original — a "logout" that leaves a 30-day credential in place.
-fn clear_refresh_cookie(state: &AppState) -> String {
+fn clear_refresh_cookie(state: &Core) -> String {
     format!(
         "{}=; HttpOnly; Path={}; SameSite=Lax; Max-Age=0{}",
         REFRESH_COOKIE,
@@ -450,7 +450,7 @@ fn clear_refresh_cookie(state: &AppState) -> String {
     )
 }
 
-pub async fn logout(State(state): State<AppState>) -> Result<HeaderMap, ApiError> {
+pub async fn logout(State(state): State<Core>) -> Result<HeaderMap, ApiError> {
     let mut headers = HeaderMap::new();
     let cookie = format!(
         "access_token=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{}",
@@ -468,10 +468,7 @@ pub async fn logout(State(state): State<AppState>) -> Result<HeaderMap, ApiError
     Ok(headers)
 }
 
-pub async fn me(
-    State(state): State<AppState>,
-    auth: AuthUser,
-) -> Result<Json<UserResponse>, ApiError> {
+pub async fn me(State(state): State<Core>, auth: AuthUser) -> Result<Json<UserResponse>, ApiError> {
     let user = state.users.base.find_by_id(auth.user_id).await?;
 
     Ok(Json(UserResponse {
@@ -486,7 +483,7 @@ pub async fn me(
 }
 
 pub async fn refresh(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     req_headers: HeaderMap,
     Json(body): Json<RefreshRequest>,
 ) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
@@ -546,7 +543,7 @@ pub async fn refresh(
 }
 
 pub async fn activate(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     Json(body): Json<ActivateRequest>,
 ) -> Result<Json<MessageResponse>, ApiError> {
     let user_id = bson::oid::ObjectId::parse_str(&body.user_id)
@@ -600,7 +597,7 @@ pub async fn activate(
 
 /// Auto-accept an invite for a newly registered user.
 async fn auto_accept_invite(
-    state: &AppState,
+    state: &Core,
     user_id: bson::oid::ObjectId,
     email: &str,
     invite_code: &str,

@@ -38,7 +38,7 @@ use super::stats::{
     RangeQuery, agg, disabled_payload, floor_dt, parse_tid, range_spec, require_platform_admin,
     require_tenant_stats, tier_coll,
 };
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 use roomler_ai_config::RelayCosts;
 use roomler_ai_db::models::tenant::Plan;
 
@@ -75,7 +75,7 @@ fn str_of(v: &serde_json::Value, k: &str) -> String {
 /// `GET /api/admin/stats/cost?range=24h|7d|30d|1y` — per-org metered cost,
 /// list-price MRR, and the fleet carrier mix.
 pub async fn admin_cost(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -305,7 +305,7 @@ pub async fn admin_cost(
 /// client wipes tokens on 403 — a member removed from the org mid-poll must
 /// not be logged out of everything.
 pub async fn tenant_resources(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<RangeQuery>,

@@ -4,7 +4,7 @@ use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 
 /// SSRF guard for the client-supplied Web Push `endpoint`.
 ///
@@ -144,7 +144,7 @@ pub struct PushConfigResponse {
 }
 
 /// GET /push/config — returns the VAPID public key for client-side subscription
-pub async fn config(State(state): State<AppState>) -> Result<Json<PushConfigResponse>, ApiError> {
+pub async fn config(State(state): State<Core>) -> Result<Json<PushConfigResponse>, ApiError> {
     Ok(Json(PushConfigResponse {
         vapid_public_key: state.settings.push.vapid_public_key.clone(),
     }))
@@ -152,7 +152,7 @@ pub async fn config(State(state): State<AppState>) -> Result<Json<PushConfigResp
 
 /// POST /push/subscribe — register a push subscription for the authenticated user
 pub async fn subscribe(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Json(body): Json<SubscribeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -174,7 +174,7 @@ pub async fn subscribe(
 
 /// POST /push/unsubscribe — remove a push subscription
 pub async fn unsubscribe(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Json(body): Json<UnsubscribeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

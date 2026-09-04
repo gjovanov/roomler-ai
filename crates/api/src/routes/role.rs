@@ -8,14 +8,14 @@ use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 
 /// Require `MANAGE_ROLES` for role administration, returning the caller's own
 /// combined mask so the escalation guard below doesn't re-query it. Doubles as
 /// the membership check — `get_member_permissions` returns `Forbidden` for a
 /// non-member; `owner`/admin pass via the `ADMINISTRATOR` bypass in `has`.
 async fn require_manage_roles(
-    state: &AppState,
+    state: &Core,
     tenant_id: ObjectId,
     user_id: ObjectId,
 ) -> Result<u64, ApiError> {
@@ -74,7 +74,7 @@ pub(crate) fn check_grant(held: u64, current: u64, requested: u64) -> Result<(),
 /// tenant-scoped, so a silent skip would let a caller reference a role the
 /// check never sees.
 pub(crate) async fn check_grant_roles(
-    state: &AppState,
+    state: &Core,
     tenant_id: ObjectId,
     held: u64,
     role_ids: &[ObjectId],
@@ -127,7 +127,7 @@ pub struct UpdateRoleRequest {
 }
 
 pub async fn list(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<Vec<RoleResponse>>, ApiError> {
@@ -145,7 +145,7 @@ pub async fn list(
 }
 
 pub async fn create(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateRoleRequest>,
@@ -175,7 +175,7 @@ pub async fn create(
 }
 
 pub async fn update(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path((tenant_id, role_id)): Path<(String, String)>,
     Json(body): Json<UpdateRoleRequest>,
@@ -211,7 +211,7 @@ pub async fn update(
 }
 
 pub async fn delete(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path((tenant_id, role_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -228,7 +228,7 @@ pub async fn delete(
 }
 
 pub async fn assign(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path((tenant_id, role_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -255,7 +255,7 @@ pub async fn assign(
 }
 
 pub async fn unassign(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path((tenant_id, role_id, user_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

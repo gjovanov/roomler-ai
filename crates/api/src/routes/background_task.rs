@@ -9,7 +9,7 @@ use axum::{
 use bson::oid::ObjectId;
 use serde::Serialize;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
@@ -25,7 +25,7 @@ pub struct TaskResponse {
 }
 
 pub async fn list(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<PaginationParams>,
@@ -63,7 +63,7 @@ pub async fn list(
 }
 
 pub async fn get(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path((_tenant_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<TaskResponse>, ApiError> {
@@ -89,7 +89,7 @@ pub async fn get(
 }
 
 pub async fn download(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path((_tenant_id, task_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {

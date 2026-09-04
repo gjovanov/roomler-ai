@@ -4,8 +4,8 @@ use bson::oid::ObjectId;
 use roomler_ai_db::models::{Message, NotificationSource, NotificationType, Room};
 
 use crate::error::ApiError;
-use crate::state::AppState;
 use crate::ws;
+use crate::{core_state::Core, state::AppState};
 
 /// Parameters for creating and dispatching notifications.
 pub struct NotifyParams {
@@ -25,7 +25,7 @@ pub struct NotifyParams {
 /// with push+email for every mention. Registry unavailable → treat as
 /// offline (matches the pre-S6 single-pod behaviour of "not here = not
 /// connected").
-async fn user_online_anywhere(state: &AppState, user_id: &ObjectId) -> bool {
+async fn user_online_anywhere(state: &Core, user_id: &ObjectId) -> bool {
     if state.ws_storage.is_connected(user_id) {
         return true;
     }
@@ -38,7 +38,7 @@ async fn user_online_anywhere(state: &AppState, user_id: &ObjectId) -> bool {
 }
 
 async fn create_and_send_notification(
-    state: &AppState,
+    state: &Core,
     params: &NotifyParams,
     user_id: ObjectId,
 ) -> bool {
@@ -93,7 +93,7 @@ async fn create_and_send_notification(
 
 /// Send push notifications for a list of offline user IDs (spawns a background task).
 fn spawn_push_for_offline(
-    state: &AppState,
+    state: &Core,
     offline_user_ids: Vec<ObjectId>,
     title: String,
     body: String,
@@ -126,7 +126,7 @@ fn spawn_push_for_offline(
 
 /// Send email notification for a single offline user about a mention (spawns a background task).
 fn spawn_mention_email(
-    state: &AppState,
+    state: &Core,
     user_id: ObjectId,
     mentioner_name: String,
     room_name: String,
@@ -162,7 +162,7 @@ fn spawn_mention_email(
 /// Create notifications and send push/email for mentioned users in a message.
 #[allow(clippy::too_many_arguments)]
 pub async fn notify_mentions(
-    state: &AppState,
+    state: &Core,
     tenant_id: ObjectId,
     _room_id: ObjectId,
     message_id: ObjectId,
@@ -228,7 +228,7 @@ pub async fn notify_mentions(
 /// Create call-started notifications for room members and send push to offline users.
 #[allow(clippy::too_many_arguments)]
 pub async fn notify_call_started(
-    state: &AppState,
+    state: &Core,
     tenant_id: ObjectId,
     room_id: ObjectId,
     caller_id: ObjectId,
