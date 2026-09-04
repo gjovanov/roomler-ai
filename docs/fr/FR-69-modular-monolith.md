@@ -1161,3 +1161,9 @@ carrier class, a DERP-floor host, an SSH session — read from the fleet, not fr
 - **The UI half of the same gap**: `AgentsSection.vue` offers the overlay-key rotation and the
   SSH policy on every device — network's routes; on a `remote`
   profile those menus led to 404s. They read `caps.has('network')` now.
+- **Proven on the surface that was broken** (dry-runs on master `812cc365`, 2026-09-04): the
+  publish smoke's new per-profile assertion ran on both arms — the `remote` image (run
+  33923335770) booted with `/health` → `["fleet","remote"]` and answered
+  `GET /api/tenant/…/device` **401** (mounted), the `collab` image (run 33923337969) booted
+  with `["chat","conference"]` and answered **404** (absent). An absence check that could
+  not fail would prove nothing; both arms can.
