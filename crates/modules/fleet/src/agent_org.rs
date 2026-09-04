@@ -36,10 +36,9 @@ use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::{ApiError, extractors::auth::AuthUser, guards::require_permission};
+
+use crate::FleetState;
 
 /// Enrollment-token lifetime for a pushed join. Deliberately shorter than the
 /// interactive `ENROLLMENT_TTL_SECS` (10 min): nobody has to copy this one
@@ -100,7 +99,7 @@ pub fn needs_restart_for_tun(overlay_mode: Option<&str>, caps_multi_org: &[Strin
 
 /// POST /api/tenant/{tenant_id}/agent/{agent_id}/join-org
 pub async fn join_org(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<JoinOrgRequest>,
@@ -260,7 +259,7 @@ pub async fn join_org(
     let delivered = if state.rc_hub.send_to_agent_in_tenant(aid, tid, msg).is_ok() {
         true
     } else {
-        crate::ws::remote_control::publish_rc_ctrl(
+        crate::ctrl::publish_rc_ctrl(
             &state,
             "agent_join_org",
             serde_json::json!({
@@ -306,7 +305,7 @@ pub async fn join_org(
 ///
 /// The UI needs this to render a picker that can't produce a 403.
 pub async fn join_targets(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

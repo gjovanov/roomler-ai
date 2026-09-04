@@ -44,7 +44,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::{error::ApiError, routes::agent_release::AgentRelease, state::AppState};
+use roomler_core::ApiError;
+
+use crate::{FleetState, agent_release::AgentRelease};
 
 /// GitHub repo slug. A fork can override here without touching agents.
 const RELEASES_REPO: &str = "gjovanov/roomler-ai";
@@ -76,7 +78,7 @@ struct CacheEntry {
     payload: Vec<AgentRelease>,
 }
 
-/// The one releases cache. Lives on `AppState` behind an `Arc` so
+/// The one releases cache. Lives on `FleetState` behind an `Arc` so
 /// cloning the state is cheap; `RwLock` so concurrent reads don't
 /// serialise through a mutex.
 pub struct ReleasesCache {
@@ -207,7 +209,7 @@ impl ReleasesCache {
 
 /// TTL-respecting read against the state's cache — the entry point every
 /// `latest-release` / installer handler uses.
-pub async fn cached(state: &AppState) -> Result<Vec<AgentRelease>, ApiError> {
+pub async fn cached(state: &FleetState) -> Result<Vec<AgentRelease>, ApiError> {
     state
         .releases_cache
         .get(Duration::from_secs(state.settings.releases.cache_ttl_secs))
@@ -281,7 +283,7 @@ impl NewestTags {
             releases
                 .iter()
                 .filter(|r| !r.draft && r.tag_name.starts_with(prefix))
-                .max_by_key(|r| super::remote_control::release_ord(&r.tag_name))
+                .max_by_key(|r| crate::agent::release_ord(&r.tag_name))
                 .map(|r| r.tag_name.clone())
         };
         Self {
@@ -325,7 +327,7 @@ pub struct RefreshReport {
 /// data served is public, but an open endpoint would let anyone burn
 /// GitHub's 60-req/h unauthenticated quota for the whole cluster.
 pub async fn refresh(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Query(params): Query<RefreshQuery>,
     headers: HeaderMap,
 ) -> Result<Json<RefreshReport>, ApiError> {
@@ -357,7 +359,7 @@ pub async fn refresh(
 /// Fail-soft: no bus / no directory (single-pod or dev) just means no
 /// peers, and a peer that misses its deadline is reported as
 /// `ok: false` rather than failing the whole call.
-async fn refresh_peers(state: &AppState, expect_tag: Option<&str>) -> Vec<PodRefresh> {
+async fn refresh_peers(state: &FleetState, expect_tag: Option<&str>) -> Vec<PodRefresh> {
     let (Some(bus), Some(dir)) = (&state.cluster_bus, &state.cluster_directory) else {
         return Vec::new();
     };
@@ -403,7 +405,7 @@ async fn refresh_peers(state: &AppState, expect_tag: Option<&str>) -> Vec<PodRef
 /// Bearer check against `releases.refresh_token`. An unset token
 /// disables the endpoint outright (503) — deliberately no permissive
 /// default, per the `change-me-in-production` lesson.
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+fn authorize(state: &FleetState, headers: &HeaderMap) -> Result<(), ApiError> {
     let configured = state
         .settings
         .releases
@@ -440,7 +442,7 @@ fn tokens_match(presented: &str, configured: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::agent_release::AgentRelease;
+    use crate::agent_release::AgentRelease;
 
     fn release(tag: &str, draft: bool) -> AgentRelease {
         AgentRelease {

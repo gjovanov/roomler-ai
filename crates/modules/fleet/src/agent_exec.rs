@@ -53,10 +53,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::{ApiError, extractors::auth::AuthUser, guards::require_permission};
+
+use crate::FleetState;
 
 /// How long the server waits for a device's answer beyond the command's own
 /// budget. Generous on purpose: the agent answers its OWN timeout, and
@@ -256,7 +255,7 @@ pub struct Caller {
 /// and so no path can accidentally skip a gate by taking a different route
 /// into the push.
 pub async fn authorize(
-    state: &AppState,
+    state: &FleetState,
     tenant_id: ObjectId,
     agent: &Agent,
     caller: &Caller,
@@ -337,7 +336,7 @@ pub async fn authorize(
 /// Gate, push, await, audit. The ONE path a command takes, whether it came
 /// from the browser, the CLI, or a bulk fan-out.
 pub async fn dispatch(
-    state: &AppState,
+    state: &FleetState,
     tenant_id: ObjectId,
     agent: &Agent,
     caller: &Caller,
@@ -536,7 +535,7 @@ async fn tenant_of(tenant_id: &str) -> Result<ObjectId, ApiError> {
 /// whole roster). Membership is the cheap check that stops a non-member
 /// enumerating a fleet by asking it to run something.
 async fn member_tenant(
-    state: &AppState,
+    state: &FleetState,
     tenant_id: &str,
     auth: &AuthUser,
 ) -> Result<ObjectId, ApiError> {
@@ -548,7 +547,7 @@ async fn member_tenant(
 }
 
 async fn load_agent(
-    state: &AppState,
+    state: &FleetState,
     tenant_id: ObjectId,
     agent_id: &str,
 ) -> Result<Agent, ApiError> {
@@ -558,7 +557,7 @@ async fn load_agent(
 }
 
 /// Resolve the acting principal for a browser/API caller.
-async fn http_caller(state: &AppState, auth: &AuthUser) -> Caller {
+async fn http_caller(state: &FleetState, auth: &AuthUser) -> Caller {
     let display = state
         .users
         .base
@@ -580,7 +579,7 @@ async fn http_caller(state: &AppState, auth: &AuthUser) -> Caller {
 /// result (`outcome.error`), not a transport error, so the caller renders one
 /// consistent shape and the audit row is the source of truth either way.
 pub async fn exec(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<ExecRequestBody>,
@@ -600,7 +599,7 @@ pub async fn exec(
 /// the whole point: `roomler exec --all -- <probe>` across a heterogeneous
 /// fleet in one round-trip.
 pub async fn exec_bulk(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<BulkExecRequestBody>,
@@ -662,7 +661,7 @@ pub async fn exec_bulk(
 
 /// `POST /api/tenant/{tenant_id}/agent/{agent_id}/exec/{request_id}/cancel`
 pub async fn cancel(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id, request_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -689,7 +688,7 @@ pub async fn cancel(
 /// require `EXEC_DEVICE`: deciding a device may be exec'd is a management act,
 /// performing the exec is a separate power.
 pub async fn set_policy(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<ExecPolicyBody>,
@@ -743,7 +742,7 @@ pub struct OrgExecSettings {
 /// *why* every device is refusing before anyone starts editing per-device
 /// policy.
 pub async fn get_org_settings(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<OrgExecSettings>, ApiError> {
@@ -768,7 +767,7 @@ pub async fn get_org_settings(
 /// org's devices can be shelled into at all, which is an org-owner decision
 /// rather than a fleet-admin one.
 pub async fn set_org_settings(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<OrgExecSettings>,
@@ -849,7 +848,7 @@ impl AuditQuery {
 
 /// `GET /api/tenant/{tenant_id}/exec-audit`
 pub async fn audit(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<AuditQuery>,

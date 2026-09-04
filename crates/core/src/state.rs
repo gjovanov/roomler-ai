@@ -110,4 +110,8 @@ pub struct Core {
     /// P6b — live per-region load written by the `/stats` poller; consulted
     /// by the Hub (session freeze) and the overlay pair-region pick.
     pub relay_load: RelayLoadMap,
+    /// FR-69 D6 — the inverse edges: every module's registered lifecycle
+    /// hooks, invoked in `HOOK_ORDER` by whoever runs a cascade. Shared, so a
+    /// registration made after this `Core` was cloned is visible to the clone.
+    pub hooks: crate::hooks::HookRegistry,
 }

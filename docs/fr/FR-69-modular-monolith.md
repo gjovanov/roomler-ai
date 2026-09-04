@@ -1,7 +1,7 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 + P1 + P2 + P3 + P4 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 ·
-#1320 · #1323 · #1325) · P5 (`fleet`) next ·
+**Status**: P0 + P1 + P2 + P3 + P4 + P5a shipped (#1309 · #1311 · #1312 · #1315 · #1317 ·
+#1318 · #1320 · #1323 · #1325 · #1329) · P5b (the namespace map) + P5c (the agent socket) next ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -451,7 +451,9 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P2** ✅ | `saas` module — #1320: the first module crate, plus the host composition (`crates/api/src/compose.rs`) that mounts it | baseline identical (index sets re-sorted, intended); integration lane; prod roll | `[modules] saas = false` (real from this PR on) | low | 1–2 |
 | **P3** ✅ | `chat` module — #1323: rooms, messages, reactions, files, search, export, Giphy, the unread summary, and `typing:*` as the first module-owned WebSocket namespace; the call endpoints stay in the host as `routes/call.rs` for P4 | baseline identical; integration lane (the tenant-scoping tests included); prod roll | `chat = false` | medium | 2–3 |
 | **P4** ✅ | `conference` module — #1325: the SFU room manager + worker pool (from `services/media`), the media cluster, the sampler, the call lifecycle, recordings, and `media:*` as a module namespace; **mediasoup links in this one crate only**; the contract's stateful surfaces used for the first time (`WsHandler::closed`, `Module::jobs` under the host's startup lease, `Module::shutdown`) | baseline identical; integration lane; prod roll. AC4's Docker measurement waits for the profiles (P8) — the mechanism is in place | `conference = false` | medium | 3–4 |
-| **P5** | `fleet` module; Hub leaves `remote_control`; namespace map | same + no dip in online agents | redeploy previous tag | high | 4–6 |
+| **P5a** ✅ | `fleet` module — #1329: the Hub out of `remote_control`, `AuthAgent`, every fleet HTTP path, presence, the nudge machinery, consent and its consumer, the removal sequence; `Core.hooks` (the D6 registry) with the host's transitional `network` hooks so the agent cascade already runs in `HOOK_ORDER`. The agent socket stays in the host on `Arc` aliases of the module's handles | baseline identical; integration lane; prod roll | none — `fleet` is a required dependency until the socket moves; `fleet = false` refuses to boot | high | 2–3 |
+| **P5b** | the exhaustive `ClientMsg::namespace()` map + its locked test (AC6); the map joins the composition baseline | baseline re-recorded for the new section only | none (a pure function) | low | 1 |
+| **P5c** | the agent socket into `fleet` behind a core-owned `(role, namespace)` handler registry; the host's remote/network agent-side arms registered transitionally; the `AppState` aliases and the required-dependency go | same + no dip in online agents | redeploy previous tag | high | 3–4 |
 | **P6** | `remote` module | same + one RC session per carrier class | `remote = false` | medium | 2–3 |
 | **P7** | `network` module, `/derp` included | same + overlay/tunnel field sweep | `network = false` | high | 5–7 |
 | **P8** | profiles, Docker args, CI matrix, publish axis, self-host docs | five checks green; `mesh` image boots (AC5) | `full` stays default | medium | 2–3 |
@@ -686,3 +688,52 @@ Rust job and exercised by the integration lane rather than locally.
   new workspace member needs `cargo update -w` for the lockfile before the lane will build it.
 - Routes (the singular `/call/participant` included), index sets and wire names unchanged;
   the baseline holds as recorded.
+
+### 2026-09-04 — P5a: `fleet`, the Hub's move, and the first hooks
+
+- **#1329** — `crates/modules/fleet` = `roomler-ai-mod-fleet`. Sixteen files moved with
+  history: the Hub (3.1k lines, with its unit tests — CI now runs them in the new crate),
+  `AuthAgent`, eleven route files, the agent half of `routes/remote_control.rs` (its
+  session/TURN/relay half stays as the host's `routes/remote_session.rs` for P6), device
+  presence and the nudge machinery. The device LISTING went and came back: it joins agents
+  with tunnel clients and overlay nodes — a cross-pillar view, the host's until `network`
+  exists (the lane said so in five `E0609`s before any reasoning did). `FleetState` = `Core` + exactly the fourteen fields D3
+  assigned to fleet. `roomler-ai-remote-control` is wire-only for the server now; its
+  `server` feature keeps just the Mongo audit sink.
+- **P5 is three PRs, not one.** The socket cannot move with the routes: its `rc:*` arms call
+  overlay, tunnel and org-relay code that is still the host's, and a module cannot name the
+  host. So P5a is the state, the Hub and the HTTP surface; P5b the namespace map (a pure
+  function, its own baseline section); P5c the socket, behind a core-owned handler registry —
+  the PR with the "no dip in online agents" gate.
+- **The transitional shape**: `AppState` keeps `Arc` ALIASES of the fleet handles (`rc_hub`,
+  `agents`, the presence and nudge maps, the audits, the releases cache), initialised FROM
+  the module after `Modules::init` — one owner, zero host call sites touched. That makes
+  `fleet` a required dependency for now, and `[modules] fleet = false` refuses to boot
+  rather than unmounting a socket the host cannot serve. `AppState::new` builds `Core` and
+  runs the modules BEFORE the host tasks that capture the Hub (the global-channel subscriber,
+  the nudge bus handler), which is the one reorder the constructor needed.
+- **The first hooks (D6)**: `Core.hooks` is a `HookRegistry`, shared through every `Core`
+  clone; `Modules::register_hooks` registers each mounted module's `hooks()` under its id,
+  and the host registers its transitional implementation of the network steps (overlay
+  release, MagicDNS rename) under the `network` id. `removal::remove_agent_device` — the ONE
+  sequence behind admin delete, self-unenroll and the ephemeral reaper — runs the holders in
+  `HOOK_ORDER` first, then deletes the row, then kicks the socket: the order the overlay
+  release always needed, now written once. A failing holder stops the cascade (deleting the
+  row while a lease is held is the state the order exists to prevent). Renaming propagates
+  the label the same way; `RenamePropagation` keeps the route's three outcomes apart.
+- Two seams recorded rather than solved: the `rc.agent_nudge` bus handler stays in the host
+  because its busy check reads the tunnel session maps (network's — a "busy?" query hook
+  when P7 arrives), and `SshPolicyBody` moved to the wire crate because fleet's agent update
+  accepts it inside its body while the SSH route (network) reads and writes it.
+- The first push carried a parse error: a range deletion counted from a print took the
+  heartbeat block's closing brace instead of the consent spawn's last line. `rustfmt --check`
+  on the file finds that in a second; it runs before every push of a line-cut file now.
+- **The seven-server test overflowed its stack again** — the same
+  `peer_relay_mint_tests::every_refusal_is_audited_with_its_reason` P4 fixed by boxing the
+  construction future. Each module adds a `Core`-sized state to every server (`Settings` is
+  held by value), so the margin boxing bought was about 25 KB and fleet spent it. A debug-build
+  binary that constructs seven servers in one body does not fit the harness's default 2 MiB
+  test thread; the lane runs with `RUST_MIN_STACK=8388608` now, and the history is in the
+  workflow next to the variable. (The by-value `Settings` inside `Core` is the underlying
+  cost; turning it into an `Arc` is a later, separate change.)
+- Routes, index sets and wire names unchanged; the baseline holds as recorded.

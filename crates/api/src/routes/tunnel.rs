@@ -378,7 +378,7 @@ pub async fn update_tunnel_client(
             .await?;
     }
     if let Some(tags) = body.tags {
-        let normalized = crate::routes::remote_control::normalize_tags(tags)?;
+        let normalized = roomler_ai_mod_fleet::agent::normalize_tags(tags)?;
         state.tunnel_clients.set_tags(tid, cid, &normalized).await?;
     }
 

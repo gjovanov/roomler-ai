@@ -1,0 +1,50 @@
+[package]
+name = "roomler-ai-mod-fleet"
+license = "AGPL-3.0-only"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "FR-69 module: fleet — agents, enrollment, presence, the agent Hub, consent, remote config, exec, releases and installer proxies."
+
+[lib]
+name = "roomler_ai_mod_fleet"
+path = "src/lib.rs"
+
+# The fourth module crate (FR-69 P5a): device management. `remote` and
+# `network` depend on THIS crate (the Hub, the agent row, presence); it depends
+# on `roomler-core` and the crates below it, never on the api crate. The Hub
+# came here from `roomler-ai-remote-control`, which is wire-only for the
+# server now (its `server` feature keeps just the Mongo audit sink).
+[dependencies]
+roomler-core = { path = "../../core" }
+roomler-ai-config = { path = "../../config" }
+roomler-ai-db = { path = "../../db" }
+roomler-ai-services = { path = "../../services" }
+roomler-ai-remote-control = { path = "../../remote_control" }
+
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+bson.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+hex.workspace = true
+# Static-endpoint / subnet validation in the agent routes (not a workspace dep).
+ipnet = "2"
+parking_lot.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# The Hub's unit tests build their audit sink on a `mongodb::Client` (the
+# wire crate carried the driver behind its `server` feature; only the tests
+# here name it directly) and drive the negotiating-timeout reaper on a paused
+# clock (`#[tokio::test(start_paused = true)]` needs `test-util`).
+mongodb.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

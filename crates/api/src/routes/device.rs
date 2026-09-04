@@ -26,8 +26,8 @@ use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::{Agent, AgentStatus, NodeRef, OsKind, TunnelClient};
 use serde::{Deserialize, Serialize};
 
-use super::remote_control::{AgentPresence, agent_presence_batch, derive_agent_presence};
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_ai_mod_fleet::agent::{AgentPresence, agent_presence_batch, derive_agent_presence};
 
 /// Fields are declared INLINE, deliberately not `#[serde(flatten)]
 /// PaginationParams` — axum's `Query` deserializes via serde_urlencoded,
@@ -205,12 +205,12 @@ pub async fn list_devices(
         }
     }
 
-    let fresh = agent_presence_batch(&state, &agents).await;
+    let fresh = agent_presence_batch(state.fleet(), &agents).await;
 
     let mut rows: Vec<DeviceRow> = Vec::with_capacity(agents.len() + clients.len());
     for a in agents {
         let redis_fresh = a.id.map(|i| fresh.contains(&i)).unwrap_or(false);
-        let (presence, is_online) = derive_agent_presence(&state, &a, redis_fresh);
+        let (presence, is_online) = derive_agent_presence(state.fleet(), &a, redis_fresh);
         let node = a.id.and_then(|i| node_by_agent.get(&i).copied());
         rows.push(agent_row(
             a,

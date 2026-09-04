@@ -221,6 +221,11 @@ jobs:
       - name: Run core unit tests
         run: cargo test -p roomler-core --lib
 
+      # FR-69 P5a — the Hub's unit tests (consent, the session state machine,
+      # nudges) moved with it into the fleet module.
+      - name: Run fleet module unit tests
+        run: cargo test -p roomler-ai-mod-fleet --lib
+
       # The integration crate cannot RUN here (it needs MongoDB + Redis), but
       # it can still be compiled — and compiling it is what was missing. It sat
       # broken for an unknown stretch because `OverlayNodeDao::create` grew

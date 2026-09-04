@@ -7973,6 +7973,7 @@ dependencies = [
  "roomler-ai-db",
  "roomler-ai-mod-chat",
  "roomler-ai-mod-conference",
+ "roomler-ai-mod-fleet",
  "roomler-ai-mod-saas",
  "roomler-ai-remote-control",
  "roomler-ai-services",
@@ -8061,6 +8062,35 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.10.6",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "roomler-ai-mod-fleet"
+version = "0.4.63"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bson",
+ "chrono",
+ "dashmap",
+ "futures",
+ "hex",
+ "ipnet",
+ "mongodb",
+ "parking_lot 0.12.5",
+ "reqwest 0.12.28",
+ "roomler-ai-config",
+ "roomler-ai-db",
+ "roomler-ai-remote-control",
+ "roomler-ai-services",
+ "roomler-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "uuid",

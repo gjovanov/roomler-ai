@@ -14,11 +14,13 @@ use axum::{
 };
 use roomler_ai_db::models::consent_request::ConsentRequestStatus;
 
-use crate::{error::ApiError, state::AppState};
+use roomler_core::ApiError;
+
+use crate::FleetState;
 
 /// `POST /api/consent/{token}/approve`
 pub async fn approve_consent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path(token): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     resolve(&state, &token, true).await
@@ -26,14 +28,14 @@ pub async fn approve_consent(
 
 /// `POST /api/consent/{token}/deny`
 pub async fn deny_consent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path(token): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     resolve(&state, &token, false).await
 }
 
 async fn resolve(
-    state: &AppState,
+    state: &FleetState,
     token: &str,
     granted: bool,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -81,7 +83,7 @@ async fn resolve(
     // C-2 — the approve-link HTTP can land on a pod that doesn't hold the
     // session; broadcast the verdict so the holding pod applies it too
     // (idempotent — the local attempt above already ran here).
-    crate::ws::remote_control::publish_rc_ctrl(
+    crate::ctrl::publish_rc_ctrl(
         state,
         "consent",
         serde_json::json!({ "session_id": req.session_id.to_hex(), "granted": granted }),

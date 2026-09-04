@@ -17,7 +17,7 @@
 //!     value rather than failing every agent's check simultaneously.
 //!
 //! Cache lifecycle: lazy + TTL, and shared with the tunnel + setup
-//! release routes — see [`crate::routes::releases`], which owns the
+//! release routes — see [`crate::releases`], which owns the
 //! cache itself and the `POST /api/releases/refresh` cache-bust the
 //! release workflows call on every tag push.
 //!
@@ -35,7 +35,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::{error::ApiError, routes::releases, state::AppState};
+use roomler_core::ApiError;
+
+use crate::{FleetState, releases};
 
 /// Subset of GitHub's release JSON the agent actually consults. We
 /// don't need authors, body, html_url, or hundreds of bytes of CI
@@ -77,7 +79,7 @@ pub struct AgentRelease {
 /// existing GitHub-shape parser so the agent-side code change is
 /// just a URL swap.
 pub async fn latest_release(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
     let releases = releases::cached(&state).await?;
     Ok(Json(filter_component_releases(releases, "agent-v")))
@@ -110,7 +112,7 @@ pub(crate) fn filter_component_releases(
     // each having to remember. Unparseable tags sort last but keep their
     // relative order (`sort_by_key` is stable), so a hand-made tag is still
     // reachable by explicit version — it just never wins "latest".
-    out.sort_by_key(|r| std::cmp::Reverse(super::remote_control::release_ord(&r.tag_name)));
+    out.sort_by_key(|r| std::cmp::Reverse(crate::agent::release_ord(&r.tag_name)));
     for r in &mut out {
         order_assets_daemon_first(&mut r.assets);
     }
@@ -211,7 +213,7 @@ pub struct InstallerHealth {
 
 /// `GET /api/agent/installer/{flavour}/health`.
 pub async fn installer_health(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path(flavour): Path<String>,
     Query(params): Query<InstallerQuery>,
 ) -> Result<Json<InstallerHealth>, ApiError> {
@@ -241,7 +243,7 @@ pub async fn installer_health(
 
 /// `GET /api/agent/installer/{flavour}` — streams the MSI bytes.
 pub async fn installer_proxy(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path(flavour): Path<String>,
     Query(params): Query<InstallerQuery>,
 ) -> Result<Response, ApiError> {

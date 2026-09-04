@@ -36,7 +36,9 @@ use roomler_ai_remote_control::models::{Agent, AgentStatus};
 
 use axum::extract::FromRef;
 
-use crate::{error::ApiError, state::AppState};
+use roomler_core::ApiError;
+
+use crate::FleetState;
 
 /// An agent that authenticated with its own JWT **and** still has a row we
 /// accept. Carries the row so a handler that needs it does not re-read.
@@ -100,13 +102,13 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
 
 impl<S> FromRequestParts<S> for AuthAgent
 where
-    AppState: FromRef<S>,
+    FleetState: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let app_state = AppState::from_ref(state);
+        let app_state = FleetState::from_ref(state);
 
         let token = bearer_token(&parts.headers)
             .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
