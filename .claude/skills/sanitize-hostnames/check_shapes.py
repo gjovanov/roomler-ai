@@ -30,6 +30,26 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sanitize import SKIP_DIRS, SKIP_SUFFIXES, read_text, walk  # noqa: E402
 
+# Exit codes. These are a CONTRACT with .githooks/pre-commit, which blocks a
+# commit on EXIT_FOUND and on nothing else.
+#
+# ⚠️⚠️ The reason they exist: until 2026-09-04 "a real name is staged" and "the
+# guard could not run" were the SAME exit code, so the hook could not tell them
+# apart and reported every failure as `COMMIT REFUSED: this change carries what
+# looks like a real machine name`. Measured that day: a file containing nothing
+# but ordinary prose was refused, because the hook passed `--staged` to a
+# checkout of this script from before that flag existed and argparse exited
+# non-zero. A guard that says "I found a hostname" when it means "I crashed"
+# teaches people to reach for --no-verify, which removes the layer entirely.
+#
+# ⚠️ EXIT_ERROR is deliberately NOT 1 and NOT 2: an unhandled Python exception
+# exits 1 and argparse exits 2, so a distinct value is the only way the caller
+# can be sure the run actually completed. main() catches everything for the
+# same reason -- see the wrapper at the bottom of this file.
+EXIT_CLEAN = 0
+EXIT_FOUND = 1
+EXIT_ERROR = 20
+
 # Each shape, with why a match identifies a physical machine.
 #
 # ⚠️⚠️ MATCHED CASE-INSENSITIVELY (re.I, applied in scan()). This is the single
@@ -144,7 +164,7 @@ def main():
     findings = scan(args.root, staged=args.staged)
     if not findings:
         print("machine-name shapes: none found")
-        return 0
+        return EXIT_CLEAN
 
     seen = set()
     print("Real machine names look like they are committed here:\n")
@@ -163,8 +183,25 @@ side -- then re-run the sweep:
         --map <path-to-map> --root . --apply
 
 Do NOT add a real machine name to this file's allowlist. See SKILL.md.""")
-    return 1
+    return EXIT_FOUND
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Any failure that is NOT "a name was found" must leave through EXIT_ERROR,
+    # so the hook can tell a verdict from a crash. Without this a git failure
+    # inside staged_files() (`subprocess.run(..., check=True)`) would surface as
+    # a bare exit 1 -- indistinguishable from a real finding, and reported to
+    # the author as a hostname they did not write.
+    #
+    # SystemExit passes through untouched: it carries main()'s own return value
+    # and argparse's exit 2, both of which already mean something specific.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        sys.exit(EXIT_ERROR)
+    except BaseException as exc:  # noqa: BLE001 - deliberate: see above
+        print("machine-name guard could not run: %s: %s"
+              % (type(exc).__name__, exc), file=sys.stderr)
+        sys.exit(EXIT_ERROR)

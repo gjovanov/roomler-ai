@@ -96,8 +96,46 @@ anything from GitHub** — the pre-rewrite commits stay reachable by SHA through
 `refs/pull/*` until GitHub Support runs GC. Treat every sweep as damage
 control, and the hook as the actual fix.
 
-⚠️ **Set `core.hooksPath` in every clone and every worktree.** It is per-clone
-config, so a fresh clone has no hook until someone runs that line.
+⚠️ **Set `core.hooksPath` in every clone.** It is per-clone config, so a fresh
+clone has no hook until someone runs that line. Worktrees **share** that config
+and the hook is tracked, so setting it once in the clone covers every worktree
+made from it — but a worktree on a branch predating the hook still has no file,
+which is the harmless `tool absent -- do not block` path.
+
+### The hook's exit-code contract — the hard-won part
+
+`.githooks/pre-commit` blocks on **`EXIT_FOUND` (1) and nothing else**. Every
+other status means *the guard did not answer*, and the hook says so and lets the
+commit through, because the required CI check still refuses the merge.
+
+| status | meaning | hook |
+|---|---|---|
+| `0` | clean | commit |
+| `1` | names found | **REFUSE** |
+| `2` | bad arguments — hook and guard drifted | warn, allow |
+| `20` | guard raised, or a git call inside it failed | warn, allow |
+
+⚠️ **This existed as one status until 2026-09-04, and it was worse than useless.**
+`if ! out=$(run_guard)` collapsed every failure into "a real machine name",
+so the hook told authors they had committed a hostname when it had merely
+crashed. Measured twice that day, from two unrelated causes:
+
+- a worktree whose `check_shapes.py` predated `--staged`, so argparse exited 2;
+- **every** worktree on Windows, where `.git` is a file holding a Windows path
+  WSL's git cannot follow — so `git` inside the WSL fallback exited 128 and the
+  guard was inert in ~53 worktrees while working fine in the main clone. The
+  hook now resolves the git dir natively and exports it across the boundary.
+
+🔑 The rule this is an instance of, already written three times in this
+directory: **a check whose result cannot distinguish "passed" from "never
+answered" is not a check.** A guard that cries hostname when it means "I
+crashed" is one somebody silences with `--no-verify`, and that removes the layer
+permanently. `selftest.sh` asserts each status leads to its own outcome, and
+asserts a **non-1** status specifically — "non-zero" would pass on the bug.
+
+⚠️ The hook must be committed **mode 755**. Git skips a non-executable hook in
+silence, which is layer 1 disarmed with nothing anywhere to say so; the selftest
+checks this too.
 
 ## The four things that go wrong
 
