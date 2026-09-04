@@ -484,6 +484,40 @@ pub trait RateLaw {
     fn target_bps(&self) -> u32;
 }
 
+/// What a congested window does to the opener's ramp.
+///
+/// ⚠️ Only [`RampExit::EndsOnCongestion`] is SHIPPED — it is
+/// `SlowStart::on_congestion`, driven here through the real type. The other two
+/// are **models of candidate rules, deliberately not implemented in the
+/// product**: B0 exists so a candidate can be measured before anybody argues
+/// for it, and a candidate that lives only in the simulator costs nothing if
+/// the numbers say no.
+///
+/// The question they answer was raised BY B0: on a pipe thinner than
+/// `slow_start::OPEN_BPS` the opening window congests, the shipped rule ends
+/// the ramp permanently, and the flat `area_min_bitrate_bps` floor immediately
+/// re-pins the opener — so the ramp protects roughly one window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RampExit {
+    /// SHIPPED. Congestion ends the ramp; the AIMD and the flat floor take over.
+    #[default]
+    EndsOnCongestion,
+    /// CANDIDATE (modelled). Congestion halves the ramp's target and the ramp
+    /// keeps controlling, so the opener keeps descending toward the pipe
+    /// instead of handing back to a constant.
+    HalveAndContinue,
+    /// CANDIDATE (modelled). The shipped ramp, but the FLOOR stays at the
+    /// ramp's last target until a measurement exists.
+    ///
+    /// 🔑 This targets the actual mechanism rather than the ramp: the harm is
+    /// not that the ramp stopped, it is that a flat constant re-pinned the
+    /// session while there was still no evidence. FR-59 P1 already descends the
+    /// floor toward a MEASURED pipe; the gap is that with nothing arriving
+    /// there is no measurement, which is exactly when the constant is most
+    /// wrong.
+    HoldFloorUntilMeasured,
+}
+
 /// The shipped governor's rate path: the FR-59 floor relief, the FR-63
 /// slow-start ramp and the AIMD, in the order `pre_encode_tick` runs them.
 ///
@@ -493,6 +527,13 @@ pub trait RateLaw {
 #[derive(Debug)]
 pub struct GovernorLaw {
     slow_start: bool,
+    exit: RampExit,
+    /// `HalveAndContinue`'s own target, since `SlowStart` cannot be told to
+    /// halve — it only ends.
+    cand_bps: Option<u32>,
+    cand_done: bool,
+    /// The ramp's target at the moment it ended, for `HoldFloorUntilMeasured`.
+    ramp_last_bps: Option<u32>,
     floor_relief: bool,
     nominal_floor_bps: u32,
     nominal_ceiling_bps: u32,
@@ -526,7 +567,18 @@ impl GovernorLaw {
             measured_bps: None,
             target: nominal_ceiling_bps,
             ramp_open_bps: None,
+            exit: RampExit::EndsOnCongestion,
+            cand_bps: None,
+            cand_done: false,
+            ramp_last_bps: None,
         }
+    }
+
+    /// Swap in a CANDIDATE exit rule. Default is the shipped one, so every
+    /// other fixture is unaffected.
+    pub fn with_exit(mut self, exit: RampExit) -> Self {
+        self.exit = exit;
+        self
     }
 
     /// FR-59 P8 — this pair was remembered at `bps`.
@@ -572,7 +624,14 @@ impl RateLaw for GovernorLaw {
                 *armed = Some(r.target_bps());
                 r
             });
-            if !ramp.done() {
+            if self.exit == RampExit::HalveAndContinue {
+                // The candidate opens exactly where the shipped ramp does; only
+                // its response to congestion differs.
+                let cand = *self.cand_bps.get_or_insert(ramp.target_bps());
+                if !self.cand_done {
+                    ceiling = ceiling.min(cand).max(1);
+                }
+            } else if !ramp.done() {
                 ceiling = ceiling.min(ramp.target_bps()).max(1);
             }
         }
@@ -587,10 +646,34 @@ impl RateLaw for GovernorLaw {
         // FR-63 — and the floor descends WITH the ramp, or `set_ceiling`
         // raises the capped ceiling straight back to it. This coupling is
         // what made 0.4.55 ship the ramp inert.
-        if let Some(ramp) = self.ramp.as_ref()
-            && !ramp.done()
-        {
-            floor = floor.min(ramp.target_bps().max(HARD_MIN_BPS));
+        match self.exit {
+            RampExit::HalveAndContinue => {
+                if let Some(cand) = self.cand_bps
+                    && !self.cand_done
+                {
+                    floor = floor.min(cand.max(HARD_MIN_BPS));
+                }
+            }
+            RampExit::HoldFloorUntilMeasured => {
+                // While the ramp runs, exactly as shipped. Once it has ended,
+                // KEEP the floor at its last target until evidence arrives —
+                // the shipped rule hands straight back to the flat constant.
+                let held = match self.ramp.as_ref() {
+                    Some(r) if !r.done() => Some(r.target_bps()),
+                    _ if self.measured_bps.is_none() => self.ramp_last_bps,
+                    _ => None,
+                };
+                if let Some(h) = held {
+                    floor = floor.min(h.max(HARD_MIN_BPS));
+                }
+            }
+            RampExit::EndsOnCongestion => {
+                if let Some(ramp) = self.ramp.as_ref()
+                    && !ramp.done()
+                {
+                    floor = floor.min(ramp.target_bps().max(HARD_MIN_BPS));
+                }
+            }
         }
 
         let depth = self.depth;
@@ -616,10 +699,31 @@ impl RateLaw for GovernorLaw {
         if let Some(ramp) = self.ramp.as_mut()
             && !ramp.done()
         {
+            // Remember where the ramp was BEFORE this verdict, so
+            // `HoldFloorUntilMeasured` can hold the last live target rather
+            // than whatever the ramp reports after it has ended.
+            self.ramp_last_bps = Some(ramp.target_bps());
             if congested {
                 ramp.on_congestion();
             } else {
                 ramp.on_clean_window();
+            }
+        }
+        // The candidate ramp, modelled: halve on congestion and keep going,
+        // double on a clean window exactly as the shipped ramp does. It stops
+        // only at the ceiling — congestion never ends it.
+        if self.exit == RampExit::HalveAndContinue
+            && let Some(cand) = self.cand_bps
+            && !self.cand_done
+        {
+            let next = if congested {
+                (cand / 2).max(HARD_MIN_BPS)
+            } else {
+                cand.saturating_mul(2).min(self.nominal_ceiling_bps)
+            };
+            self.cand_bps = Some(next);
+            if next >= self.nominal_ceiling_bps {
+                self.cand_done = true;
             }
         }
         // The window's delivered rate is the evidence the floor relief uses.
@@ -969,6 +1073,38 @@ pub mod fixtures {
         }
     }
 
+    /// A genuinely fast pipe that hiccups WHILE the opener's ramp is still
+    /// climbing — the cell that discriminates between the ramp-exit rules.
+    ///
+    /// 🔑 Every other fast cell lets the ramp reach its ceiling before anything
+    /// congests, so all three exit rules return identical numbers there and
+    /// prove only "no regression". Here a 250 ms outage lands at 2 s, two
+    /// windows into a ramp that needs ~6 to cross 300 k → 20 M: a rule that
+    /// halves on congestion gives away rate the link demonstrably has, and a
+    /// rule that ends the ramp hands back to a floor that is, on this pipe,
+    /// far too LOW rather than too high.
+    pub fn fast_pipe_early_stall() -> Scenario {
+        Scenario {
+            name: "fast pipe with an early transient stall (20 Mbps, 250 ms at 2 s)",
+            pipe: PipeSpec {
+                rate_bps: 20_000_000,
+                rate_steps: Vec::new(),
+                buffer_bytes: 1_000_000,
+                rtt: Duration::from_millis(6),
+                loss_pct: 0,
+                stalls: vec![Stall {
+                    at: Duration::from_secs(2),
+                    len: Duration::from_millis(250),
+                }],
+            },
+            motion: Motion::Steady,
+            fps: 30,
+            duration: Duration::from_secs(40),
+            seed: 0xFA57_5A11,
+            idr_factor: 25,
+        }
+    }
+
     /// **Fast pair misremembered slow** — a 20 Mbps pipe opened at a
     /// remembered 200 kbps. The ramp must not leave a fast pair crawling.
     pub fn fast_pair_misremembered() -> Scenario {
@@ -1255,6 +1391,85 @@ mod tests {
             ta.render(),
             tb.render()
         );
+    }
+
+    /// The open decision B0 raised, measured instead of argued: on a pipe
+    /// thinner than `OPEN_BPS` the shipped ramp ends at the first congested
+    /// window and the flat floor re-pins the opener. Two candidate rules are
+    /// modelled in [`RampExit`]; this reports all three side by side.
+    ///
+    /// `cargo test -p roomlerd --lib ramp_exit_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reporting aid; run with --ignored --nocapture"]
+    fn ramp_exit_report() {
+        // ⚠️ Every candidate is run on a FAST cell as well as the thin one it
+        // was designed for. A rule measured only where it was invented is how
+        // a regression ships: "halve on congestion" is obviously good on a
+        // 213 kbps pipe and could plausibly cripple a 20 Mbps pair.
+        for (label, sc, ceiling) in [
+            ("thin pipe 213k", corp_vpn_thin_pipe(), RELAY_CEILING_BPS),
+            ("fast pair 20M", fast_pair_misremembered(), 20_000_000u32),
+            ("LAN 5M bursts", lan_wifi_burst(), 5_000_000u32),
+            // 🔑 THE DISCRIMINATING CELL. The two cells above return identical
+            // numbers for all three rules — not because the rules agree, but
+            // because the ramp REACHED ITS CEILING before anything congested
+            // (300k doubling to 5 M takes ~5 windows; the LAN bursts start at
+            // 6 s). They prove "no regression", not "better". The risk unique
+            // to HalveAndContinue is a TRANSIENT congestion event while the
+            // ramp is still climbing on a genuinely fast pipe: halving there
+            // would give away rate the link actually has.
+            (
+                "fast pipe, stall at 2s",
+                fast_pipe_early_stall(),
+                20_000_000u32,
+            ),
+        ] {
+            println!("--- {label}");
+            for exit in [
+                RampExit::EndsOnCongestion,
+                RampExit::HalveAndContinue,
+                RampExit::HoldFloorUntilMeasured,
+            ] {
+                let mut law = arm_b(FLAT_FLOOR_BPS, ceiling).with_exit(exit);
+                let t = run(&sc, &mut law);
+                let last = t.rows.last().map(|r| r.target_bps).unwrap_or(0);
+                println!(
+                    "  {exit:?}: peak={} final={} overdrive={} max_p95_age={}ms \
+                     skips={} settled(25%)={:?} over500ms={}",
+                    t.peak_target_bps(),
+                    last,
+                    t.overdrive_bits(110),
+                    t.max_age_ms(),
+                    t.total_skips(),
+                    t.settled_window(25),
+                    t.windows_above_age(500),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_candidate_exit_rule_must_beat_the_shipped_one_to_be_worth_proposing() {
+        // Not a product assertion — a guard on the CLAIM. If a candidate stops
+        // beating the shipped rule on the cell that motivated it, the open
+        // decision on #1243 is answered "no" and this test says so loudly
+        // rather than the numbers quietly rotting in a comment.
+        let sc = corp_vpn_thin_pipe();
+        let mut shipped = arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let base = run(&sc, &mut shipped);
+
+        for exit in [RampExit::HalveAndContinue, RampExit::HoldFloorUntilMeasured] {
+            let mut law = arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS).with_exit(exit);
+            let cand = run(&sc, &mut law);
+            assert!(
+                cand.peak_target_bps() <= base.peak_target_bps(),
+                "{exit:?} committed MORE than the shipped rule ({} vs {}){}{}",
+                cand.peak_target_bps(),
+                base.peak_target_bps(),
+                base.render(),
+                cand.render()
+            );
+        }
     }
 
     // -- the four scenario fixtures -------------------------------------------
