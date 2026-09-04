@@ -149,7 +149,7 @@ fn is_id_like(seg: &str) -> bool {
 /// Open a WS session row and return its id (for the close update).
 #[allow(clippy::too_many_arguments)]
 pub async fn open_session(
-    state: &crate::state::AppState,
+    state: &crate::Core,
     user_id: ObjectId,
     tenant_id: Option<ObjectId>,
     ua: &str,
@@ -190,7 +190,7 @@ pub async fn open_session(
 }
 
 /// Close a WS session row, stamping its duration.
-pub async fn close_session(state: &crate::state::AppState, id: ObjectId) {
+pub async fn close_session(state: &crate::Core, id: ObjectId) {
     let now = DateTime::now();
     let update = vec![doc! { "$set": {
         "ended_at": bson::Bson::DateTime(now),
