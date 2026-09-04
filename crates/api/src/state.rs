@@ -1,43 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-use std::collections::HashSet;
-
 use bson::oid::ObjectId;
-use dashmap::DashMap;
 use mongodb::Database;
 use roomler_ai_config::Settings;
-use roomler_ai_remote_control::signaling::ServerMsg;
 use roomler_ai_services::{
     AuthService, EmailService, OAuthService, PushService, TaskService,
     dao::{
-        activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
-        consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, invite::InviteDao,
-        notification::NotificationDao, overlay_network::OverlayNetworkDao,
-        push_subscription::PushSubscriptionDao, role::RoleDao, tenant::TenantDao, user::UserDao,
+        activation_code::ActivationCodeDao, invite::InviteDao, notification::NotificationDao,
+        overlay_network::OverlayNetworkDao, push_subscription::PushSubscriptionDao, role::RoleDao,
+        tenant::TenantDao, user::UserDao,
     },
 };
 use roomler_core::turn::build_turn_map;
-use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
 use crate::core_state::Core;
 use crate::ws::redis_pubsub::RedisPubSub;
 use crate::ws::storage::WsStorage;
-
-/// Outbound channel for a connected `roomler` client, keyed by
-/// the `tunnel_session_id` issued on `rc:tunnel.open`. The tunnel WS
-/// handler registers its sender on TunnelOpen success and unregisters
-/// on disconnect / TunnelTerminate; the agent WS handler reads this
-/// map to relay `TcpForwardAccept` / `TcpForwardReject` /
-/// `TcpHalfClose` / `TcpClosed` / `TunnelTerminate` from agent →
-/// client.
-///
-/// Mirror of the Hub's per-agent `tx` registry, but kept in `AppState`
-/// rather than in the `remote_control::Hub` because the Hub is the
-/// remote-control session state machine and tunnel-clients are a
-/// distinct lifecycle.
-pub type TunnelClientOutbound = Arc<DashMap<ObjectId, mpsc::Sender<ServerMsg>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -55,92 +35,11 @@ pub struct AppState {
     /// mediasoup room manager, the recordings DAO and the media cluster maps
     /// live on `modules.conference` now; the host holds no room state.
     pub modules: crate::compose::Modules,
-
-    // Remote-control subsystem
-    pub agents: Arc<AgentDao>,
-    /// FR-51 P2 — reusable ephemeral enrollment keys + their per-use audit.
-    pub enrollment_keys: Arc<roomler_ai_services::dao::enrollment_key::EnrollmentKeyDao>,
-    /// Fleet-RPC attempt log — every exec, allowed or denied.
-    pub exec_audit: Arc<ExecAuditDao>,
-    /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
-    /// on a device, granted or refused — never what the device did.
-    pub config_audit: Arc<ConfigAuditDao>,
-    pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
-    pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
-    /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
-    pub consent_requests: Arc<ConsentRequestDao>,
-    pub rc_hub: Arc<roomler_ai_mod_fleet::Hub>,
-    /// Multi-region DERP ticket signer (`relay.derp_ticket_private_key`).
-    /// `None` = no key configured — ticket requests go unanswered and agents
-    /// keep using the central `/derp`.
-    pub derp_ticket: Option<Arc<roomler_ai_remote_control::derp_ticket::DerpTicketSigner>>,
-    /// Phase A-1 — the Redis presence owner-token per locally-registered
-    /// agent WS. Written/removed by `ws::remote_control::handle_agent_socket`;
-    /// read by [`shutdown_cleanup`] so the SIGTERM sweep can compare-DEL
-    /// each key (an unconditional DEL could erase a claim an agent already
-    /// re-made on the surviving pod mid-roll).
-    pub agent_presence_tokens: Arc<DashMap<ObjectId, String>>,
-    /// P4 — per-tenant `device:presence` batching + member-list cache.
-    /// See [`crate::ws::device_presence`].
-    pub presence_fanout: Arc<crate::ws::device_presence::PresenceFanout>,
-    /// C-3 — directory owner-tokens for LOCAL tunnel sessions
-    /// (`roomler:own:tunnel:<session>`). Written on open; refreshed by the
-    /// directory heartbeat while the session map still holds the session;
-    /// never explicitly released — the 90 s TTL reaps ≤90 s after any of
-    /// the four teardown paths drops the map entry.
-    pub tunnel_presence_tokens: Arc<DashMap<ObjectId, String>>,
-
-    // tunnel subsystem — the DAOs are the network module's (P7a); the live
-    // session maps below leave with the tunnel socket (P7b).
-    /// Per-tunnel-session WS outbound channels. See [`TunnelClientOutbound`].
-    pub tunnel_clients_by_session: TunnelClientOutbound,
-    /// P7 flap resilience: which tunnel sessions TARGET a given agent —
-    /// `agent_id → {tunnel_session_id}`. Maintained by `ws::tunnel`'s open +
-    /// teardown paths and drained by
-    /// [`crate::ws::tunnel::terminate_sessions_targeting_agent`] when the
-    /// agent's WS drops: the agent's per-connection tunnel peers died with
-    /// its socket, so every session targeting it is unrecoverable and its
-    /// client must re-open rather than forward into a corpse forever.
-    pub tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>>,
-    /// PR-1 rehome — which tunnel sessions a given agent ORIGINATED
-    /// (P3b-2 agent-as-tunnel-client, i.e. declared routes) —
-    /// `origin_agent_id → {tunnel_session_id}`. Twin of the by-target
-    /// index above, consulted by the `rc.agent_nudge` busy check: the
-    /// per-connection session map is invisible here, so without this a
-    /// routes-only agent read as IDLE and got its WS cycled (tearing
-    /// every declared route plus its overlay carriers).
-    pub tunnel_sessions_by_origin_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>>,
-    /// PR-1 rehome — owner-side per-agent nudge pacing (cooldown trio;
-    /// see `ws::rc_cluster`). Settings: `rc.nudge_*`.
-    pub agent_nudge_cooldowns: Arc<crate::ws::rc_cluster::NudgeCooldowns>,
-    /// PR-1 rehome — requester-side per-agent throttle for
-    /// `rc.agent_nudge` RPCs (click storms sent 11 in 15 s pre-PR-1).
-    pub agent_nudge_throttle: Arc<crate::ws::rc_cluster::NudgeRequestThrottle>,
-
-    // Overlay-network subsystem (Tailscale-style L3 mesh) — the DAOs, the
-    // node channels, the DERP registry + ACL cache and the relay state are
-    // the network module's (P7a, `state.network()`); what is left here
-    // belongs to the DERP socket and leaves with it (P7b).
-    /// C-5 — directory owner-tokens for LOCAL derp registrations
-    /// (`roomler:own:derp:<net>:<pubkey>`); refreshed by the directory
-    /// heartbeat while the registry holds the key.
-    pub derp_presence_tokens: Arc<DashMap<crate::ws::derp::DerpKey, String>>,
-    /// C-5 — per-(network, pubkey) rehome pacing (60 s cooldown, 3
-    /// attempts / 10 min, then the split-evidence counter).
-    pub derp_rehome_cooldowns: Arc<crate::ws::derp_cluster::RehomeCooldowns>,
-    /// Per-(caller, device) ceiling for the exec control plane. Shared by
-    /// the HTTP route and the device-originated WS leg — both funnel through
-    /// the same `authorize`, so neither transport is unlimited. (The SSH,
-    /// relay-mint and key-rotation ceilings are the network module's.)
-    pub exec_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
-
-    /// The one GitHub-releases cache, shared by `/api/agent/*`,
-    /// `/api/tunnel/*` and `/api/setup/*` — they all read the same
-    /// upstream list and only differ in the tag prefix they filter on.
-    /// TTL comes from `settings.releases.cache_ttl_secs`;
-    /// `POST /api/releases/refresh` busts it cluster-wide on a release.
-    /// See `routes::releases` for the lifecycle.
-    pub releases_cache: Arc<roomler_ai_mod_fleet::releases::ReleasesCache>,
+    // FR-69 P7b — nothing pillar-owned is left here. The fleet handles the
+    // host aliased since P5a and the sockets' live state (tunnel session
+    // maps, presence tokens, the DERP ticket signer) are their modules';
+    // the composition views that need a module reach it through
+    // `modules.fleet` / `modules.network`, absent when it is not mounted.
 }
 
 /// FR-69 P1 — every `state.<core field>` in the tree keeps reading through
@@ -155,26 +54,25 @@ impl std::ops::Deref for AppState {
 }
 
 impl AppState {
-    /// FR-69 P5a — the fleet module's state, for the host code that still
-    /// serves the agent socket from it. Always mounted: `AppState::new`
-    /// refuses to boot without it (the module cannot be switched off while
-    /// the socket lives here — the P5 kill switch is the previous tag).
+    /// The fleet module's state, for callers that KNOW it is mounted — the
+    /// integration tests (which build every module) and nothing in the host
+    /// since P7b: host code that may run without the module reads
+    /// `modules.fleet` and handles `None`.
+    #[cfg(feature = "fleet")]
     pub fn fleet(&self) -> &roomler_ai_mod_fleet::FleetState {
         self.modules
             .fleet
             .as_ref()
-            .expect("the fleet module is mounted (AppState::new refuses to boot without it)")
+            .expect("the fleet module is mounted")
     }
 
-    /// FR-69 P7a — the network module's state, for the host code that still
-    /// serves the tunnel, DERP and agent sockets from its engine. Always
-    /// mounted until the sockets move (P7b): `AppState::new` refuses to boot
-    /// without it.
+    /// The network module's state, under the same rule as [`Self::fleet`].
+    #[cfg(feature = "network")]
     pub fn network(&self) -> &roomler_ai_mod_network::NetworkState {
         self.modules
             .network
             .as_ref()
-            .expect("the network module is mounted (AppState::new refuses to boot without it)")
+            .expect("the network module is mounted")
     }
 }
 
@@ -390,21 +288,9 @@ impl AppState {
         // handles until P5b moves the socket; a build that switches fleet
         // off has nothing to serve it from, so it refuses to boot rather
         // than come up with a dead socket.
-        let fleet = modules.fleet.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "[modules] fleet = false is not supported while the host serves the agent \
-                 socket (FR-69 P5a) — redeploy the previous tag instead"
-            )
-        })?;
-        // P7a — the same for `network`: the host's tunnel, DERP and
-        // agent-socket code calls the engine that moved into the module
-        // (`state.network()`) until the sockets follow it (P7b).
-        let network = modules.network.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "[modules] network = false is not supported while the host serves the tunnel, \
-                 DERP and agent sockets (FR-69 P7a) — redeploy the previous tag instead"
-            )
-        })?;
+        // FR-69 P7b — every pillar is a module now; a switched-off module is
+        // simply not mounted, and the host's two cross-pod ctrl lanes below
+        // skip the arm whose owner is absent.
         // #1186 — `overlay_removes` ctrl envelopes need the FULL state to
         // re-fan (a Mongo peer read + the overlay send paths), which this
         // subscriber closure cannot capture (it is spawned mid-construction;
@@ -412,13 +298,13 @@ impl AppState {
         // module owns the channel and its applier (P7a); the subscriber only
         // holds the sender. Bounded + try_send: losing one under pressure
         // costs a push the peer's rejoin heals.
-        let overlay_ctrl_tx = network.overlay_ctrl_tx.clone();
+        let overlay_ctrl_tx = modules.overlay_ctrl_sender();
         if let Some(pubsub) = &redis_pubsub {
             let (redis_tx, _) = tokio::sync::broadcast::channel::<String>(1024);
             let mut redis_rx = redis_tx.subscribe();
             let own_instance = pubsub.instance_id().to_string();
             let fwd_storage = ws_storage.clone();
-            let ctrl_hub = fleet.rc_hub.clone();
+            let ctrl_modules = modules.clone();
             RedisPubSub::subscribe_with_reconnect(
                 settings.redis.url.clone(),
                 redis_tx,
@@ -447,10 +333,12 @@ impl AppState {
                                 if ctrl.get("evt").and_then(|v| v.as_str())
                                     == Some("overlay_removes")
                                 {
-                                    let _ = overlay_ctrl_tx.try_send(ctrl.clone());
+                                    if let Some(tx) = &overlay_ctrl_tx {
+                                        let _ = tx.try_send(ctrl.clone());
+                                    }
                                     continue;
                                 }
-                                crate::ws::remote_control::apply_rc_ctrl(&ctrl_hub, ctrl);
+                                ctrl_modules.apply_rc_ctrl(ctrl);
                                 continue;
                             }
                             // C-4 — conn-addressed delivery (media replies +
@@ -517,38 +405,7 @@ impl AppState {
             });
         }
 
-
-
-        let state = Self {
-            core,
-            modules,
-
-            // FR-69 P5a — ALIASES of the fleet module's handles (the same
-            // `Arc`s; the module owns them) for the host code that still
-            // serves the agent socket. Each alias leaves with the host file
-            // that reads it (P7).
-            agents: fleet.agents.clone(),
-            enrollment_keys: fleet.enrollment_keys.clone(),
-            exec_audit: fleet.exec_audit.clone(),
-            config_audit: fleet.config_audit.clone(),
-            agent_crashes: fleet.agent_crashes.clone(),
-            agent_logs: fleet.agent_logs.clone(),
-            consent_requests: fleet.consent_requests.clone(),
-            rc_hub: fleet.rc_hub.clone(),
-            derp_ticket,
-            agent_presence_tokens: fleet.agent_presence_tokens.clone(),
-            presence_fanout: fleet.presence_fanout.clone(),
-            tunnel_presence_tokens: tunnel_presence_tokens.clone(),
-            tunnel_clients_by_session: tunnel_clients_by_session.clone(),
-            tunnel_sessions_by_target_agent: tunnel_sessions_by_target_agent.clone(),
-            tunnel_sessions_by_origin_agent: tunnel_sessions_by_origin_agent.clone(),
-            agent_nudge_cooldowns: fleet.agent_nudge_cooldowns.clone(),
-            agent_nudge_throttle: fleet.agent_nudge_throttle.clone(),
-            derp_presence_tokens: derp_presence_tokens.clone(),
-            derp_rehome_cooldowns: Arc::new(DashMap::new()),
-            exec_rate_limiter: fleet.exec_rate_limiter.clone(),
-            releases_cache: fleet.releases_cache.clone(),
-        };
+        let state = Self { core, modules };
 
         // FR-69 P4 — the media claim-or-route bus handlers + claim heartbeat
         // and the media sampler are wired by the `conference` module's init.
@@ -585,17 +442,13 @@ impl AppState {
 /// in time. Agents see a plain socket close (never a Goodbye — those are
 /// fatal client-side) and reconnect with backoff through the LB.
 pub async fn shutdown_cleanup(state: &AppState) {
-    // C-4/C-6 — release directory records for every locally-owned class
-    // FIRST (before the agent sweep's early return): a graceful deploy
-    // hands each entity off with a ZERO-length ownerless window instead
-    // of waiting out the TTLs (media 30 s, tunnel/derp 90 s).
-    }
-
-    // FR-69 P4/P5a — the modules release what they own, in reverse
-    // composition order: fleet the agent sweep (cancel every local agent
-    // socket, bulk-mark them Offline, compare-DEL their presence claims),
-    // conference its media claims. After the host's own directory releases
-    // above, so the sweep's settling beat never delays them.
+    // FR-69 P4/P5a/P7b — the modules release what they own, in reverse
+    // composition order: network its tunnel-session and derp-registration
+    // directory records (C-6: a graceful deploy hands each entity off with
+    // a ZERO-length ownerless window instead of waiting out the 90 s TTLs),
+    // then fleet the agent sweep (cancel every local agent socket, bulk-mark
+    // them Offline, compare-DEL their presence claims), then conference its
+    // media claims. The host holds nothing of its own to release any more.
     state.modules.shutdown().await;
 }
 

@@ -402,9 +402,7 @@ pub async fn handle_tunnel_client_socket(
     // Overlay teardown: drop this node from the registry + mark it
     // offline so peers' netmaps lose it. Best-effort; no-op if the
     // client never joined the overlay.
-    state
-        .overlay_nodes_by_id
-        .remove(&tunnel_client_id);
+    state.overlay_nodes_by_id.remove(&tunnel_client_id);
     crate::overlay::handle_overlay_leave(
         state,
         crate::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
@@ -621,7 +619,9 @@ async fn handle_tunnel_open(
             state.settings.rc.rehome_direction_guard_ms,
         ) {
             roomler_ai_mod_fleet::nudge::RehomeDirection::ControllerMove { reason } => {
-                roomler_core::cluster::metrics::bump(&roomler_core::cluster::metrics::RC_REHOME_CONTROLLER_TOTAL);
+                roomler_core::cluster::metrics::bump(
+                    &roomler_core::cluster::metrics::RC_REHOME_CONTROLLER_TOTAL,
+                );
                 info!(
                     origin = %orig.log_id(), %agent_id, %owner_pod, reason,
                     "cross-pod tunnel miss: originator re-dials (nudge suppressed)"
@@ -1535,10 +1535,7 @@ fn spawn_revocation_check(
                     if c.deleted_at.is_none()
                         && matches!(c.status, AgentStatus::Online | AgentStatus::Offline) =>
                 {
-                    let _ = state
-                        .tunnel_clients
-                        .touch_heartbeat(tunnel_client_id)
-                        .await;
+                    let _ = state.tunnel_clients.touch_heartbeat(tunnel_client_id).await;
                 }
                 Ok(_) => {
                     info!(%tunnel_client_id, "tunnel-client revoked mid-session; closing WS");

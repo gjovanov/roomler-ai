@@ -7979,7 +7979,6 @@ dependencies = [
  "roomler-ai-mod-saas",
  "roomler-ai-remote-control",
  "roomler-ai-services",
- "roomler-ai-tunnel-core",
  "roomler-core",
  "serde",
  "serde_json",

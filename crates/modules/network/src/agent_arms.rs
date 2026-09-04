@@ -68,7 +68,7 @@ pub async fn record_ssh_activity(
         allowed,
         at: bson::DateTime::now(),
     };
-    if let Err(e) = .ssh_activity.record(event).await {
+    if let Err(e) = state.ssh_activity.record(event).await {
         warn!(%agent_id, %e, "ssh_activity insert failed");
     }
 }
@@ -249,11 +249,8 @@ pub async fn handle_derp_ticket_request(
         debug!(%agent_id, "derp ticket requested but no signer configured");
         return;
     };
-    let Some(node) = crate::overlay::current_node(
-        state,
-        crate::overlay::NodeIdentity::Agent(agent_id),
-    )
-    .await
+    let Some(node) =
+        crate::overlay::current_node(state, crate::overlay::NodeIdentity::Agent(agent_id)).await
     else {
         debug!(%agent_id, "derp ticket requested but agent has no overlay node");
         return;

@@ -35,12 +35,16 @@ pub async fn ws_upgrade(
         // Native clients. They have no cookie jar, so the URL is the only
         // place their credential can be — and accepting a cookie for these
         // roles would mean a logged-in browser could open an AGENT socket.
+        // FR-69 P7b — the upgrades are their owners': the agent socket is
+        // fleet's, the tunnel-client socket is network's. The host keeps the
+        // `/ws` route and this role gate; a role whose module is not mounted
+        // is refused with 503 rather than silently dropped.
         Some("agent") => match params.token {
-            Some(t) => ws_upgrade_agent(state, t, params.tid, ws),
+            Some(t) => state.modules.agent_upgrade(t, params.tid, ws),
             None => unauthorized("agent role requires ?token="),
         },
         Some("tunnel-client") => match params.token {
-            Some(t) => ws_upgrade_tunnel_client(state, t, params.tid, ws),
+            Some(t) => state.modules.tunnel_client_upgrade(t, params.tid, ws),
             None => unauthorized("tunnel-client role requires ?token="),
         },
         _ => {
@@ -223,12 +227,10 @@ async fn handle_socket(
 
     // Register this tab with the remote-control Hub so `rc:*` replies find us.
     // Each browser tab gets its own controller tx; the Hub routes by tx, not
-    // by user id, so multiple tabs don't cross signals.
-    let (rc_controller_tx, rc_controller_rx) = state.rc_hub.register_controller(user_id);
-    let rc_pump = tokio::spawn(crate::ws::remote_control::pump_server_messages(
-        rc_controller_rx,
-        sender.clone(),
-    ));
+    // by user id, so multiple tabs don't cross signals. FR-69 P7b — the Hub
+    // is the fleet module's; a pod without it has no controller plane, and
+    // the tab's `rc:*` frames fall through unhandled.
+    let rc = state.modules.register_controller(user_id, sender.clone());
 
     {
         // `connection_id` lets the client scope its call sessions to this
@@ -264,7 +266,7 @@ async fn handle_socket(
                     &user_id,
                     &connection_id,
                     &controller_display,
-                    &rc_controller_tx,
+                    rc.as_ref().map(|(tx, _)| tx),
                     &text,
                     dialed_tid.as_deref(),
                     conn_established_ms,
@@ -287,10 +289,7 @@ async fn handle_socket(
     }
 
     // Cleanup
-    state
-        .rc_hub
-        .unregister_controller(user_id, &rc_controller_tx);
-    rc_pump.abort();
+    state.modules.unregister_controller(user_id, rc.as_ref());
     // PR-2 — this conn may have rc sessions proxied on OTHER pods: tell
     // each owner (fire-and-forget; the relay's janitor sweep is the
     // belt), mirroring the C-4 media leave-forwarding below. The `remote`
@@ -329,7 +328,7 @@ async fn handle_client_message(
     user_id: &ObjectId,
     connection_id: &str,
     username: &str,
-    rc_controller_tx: &roomler_ai_remote_control::session::ClientTx,
+    rc_controller_tx: Option<&roomler_ai_remote_control::session::ClientTx>,
     text: &str,
     dialed_tid: Option<&str>,
     conn_established_ms: i64,
@@ -339,14 +338,16 @@ async fn handle_client_message(
     // every media/presence message. The frame is the `remote` module's
     // (FR-69 P6): its authz gate + dispatch run there, with this
     // connection's Hub-registered sender; `false` = not an rc:* frame, or
-    // no `remote` module mounted — either way the arms below get it.
+    // no `remote` module mounted — either way the arms below get it. No
+    // sender (no fleet module) = no controller plane at all.
     if text.contains("\"rc:")
+        && let Some(tx) = rc_controller_tx
         && state
             .modules
             .remote_controller_frame(
                 *user_id,
                 username,
-                rc_controller_tx,
+                tx,
                 text,
                 dialed_tid,
                 conn_established_ms,

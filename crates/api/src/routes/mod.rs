@@ -12,15 +12,11 @@ pub mod cluster;
 pub mod cost;
 // The device listing joins agents (fleet) with tunnel clients and overlay
 // nodes (network): a cross-pillar view that stays here until `network` exists.
-pub mod device;
 pub mod integration;
 pub mod invite;
 pub mod notification;
 pub mod oauth;
 pub mod push;
-// P5a — a re-export shim: the agent routes left for the fleet module, the
-// permission guard the other route files import from here is core's.
-pub mod remote_control;
 pub mod role;
 pub mod stats;
 pub mod tenant;

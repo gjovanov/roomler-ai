@@ -43,8 +43,9 @@
 //! single-replica Recreate deployment, so a web deploy severs all DERP links
 //! (they rebuild via the carrier `dead` latch) and it can't scale past one
 //! replica — fine for the handful of corp pairs this tier serves.
-use roomler_core::ws::upgrade::WsParams;
 use crate::NetworkState;
+use crate::derp_acl::DerpAclCache;
+use crate::overlay::{NodeIdentity, current_node};
 use axum::{
     extract::{
         Query, State, WebSocketUpgrade,
@@ -56,8 +57,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use crate::derp_acl::DerpAclCache;
-use crate::overlay::{NodeIdentity, current_node};
+use roomler_core::ws::upgrade::WsParams;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -67,9 +67,7 @@ use tracing::{info, warn};
 // FR-69 P7a — the registry's key and map types moved to the network module
 // with the overlay engine that addresses them; re-exported under their old
 // names so every path in this crate reads as before.
-pub use crate::derp_types::{
-    DerpCancelRegistry, DerpKey, DerpPubKey, DerpRegistry,
-};
+pub use crate::derp_types::{DerpCancelRegistry, DerpKey, DerpPubKey, DerpRegistry};
 /// Per-connection outbound queue depth. Bounded so a slow or hostile consumer
 /// can't grow the relay's memory without bound; on overflow we DROP the frame
 /// (WG/QUIC are loss-tolerant — a dropped carrier datagram just retransmits).
@@ -281,7 +279,7 @@ fn drop_log_due(map: &DashMap<DerpKey, Instant>, key: DerpKey) -> bool {
 /// transition to empty) — the ground truth the split-brain diagnosis
 /// compares against clients' "connected + registered" claims.
 pub fn spawn_registry_census(state: &NetworkState) {
-    let reg = .derp_registry.clone();
+    let reg = state.derp_registry.clone();
     let pod = state.pod.pod_id.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -459,11 +457,7 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
     // old entry would otherwise black-hole inbound frames). The old socket's
     // read loop keeps working as a SENDER until it notices its own close; only
     // inbound routing moves to the new connection.
-    if state
-        .derp_registry
-        .insert(key, out_tx.clone())
-        .is_some()
-    {
+    if state.derp_registry.insert(key, out_tx.clone()).is_some() {
         info!(
             %agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey),
             "derp: re-registration displaced a live socket (reconnect churn — old flow was still parked)"
@@ -472,7 +466,7 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
     // C-5 — cancel handle (rehome close) + directory record + one
     // convergence sweep over this network's registrations.
     let cancel = Arc::new(tokio::sync::Notify::new());
-    .derp_cancels.insert(key, cancel.clone());
+    state.derp_cancels.insert(key, cancel.clone());
     super::derp_cluster::on_derp_register(&state, network_id, &self_pubkey, agent_id).await;
     info!(%agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey), "derp: node registered");
     // Write task: drain outbound frames → WS binary, interleaved with a
@@ -516,8 +510,8 @@ async fn handle_derp_socket(state: NetworkState, socket: WebSocket, agent_id: Ob
             msg = ws_rx.next() => match msg {
                 Some(Ok(Message::Binary(frame))) => {
                     forward_frame(
-                        &.derp_registry,
-                        &.derp_acl,
+                        &state.derp_registry,
+                        &state.derp_acl,
                         network_id,
                         &self_pubkey,
                         &frame[..],
@@ -651,7 +645,8 @@ fn forward_frame(
         // FR-19 — the pod actually relayed `out_len` bytes for this pair over
         // the control plane. Counted only on a SUCCESSFUL enqueue: a dropped
         // frame is not carried, so it must not inflate the offload baseline.
-        roomler_core::cluster::metrics::DERP_BYTES_RELAYED_TOTAL.fetch_add(out_len, Ordering::Relaxed);
+        roomler_core::cluster::metrics::DERP_BYTES_RELAYED_TOTAL
+            .fetch_add(out_len, Ordering::Relaxed);
         // FR-20 collection point A — the same bytes, attributed per network so
         // they can become a per-tenant cost bucket.
         //
@@ -745,10 +740,7 @@ mod tests {
         Arc::new(DashMap::new())
     }
     /// A cache holding one network's table.
-    fn acl_with(
-        net: ObjectId,
-        table: crate::derp_acl::DerpAllowTable,
-    ) -> DerpAclCache {
+    fn acl_with(net: ObjectId, table: crate::derp_acl::DerpAllowTable) -> DerpAclCache {
         let c: DerpAclCache = Arc::new(DashMap::new());
         c.insert(net, Arc::new(table));
         c
@@ -801,10 +793,7 @@ mod tests {
         let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
         reg.insert((net, b), b_tx);
         // Table enforces and lists no A→B pair.
-        let acl = acl_with(
-            net,
-            crate::derp_acl::DerpAllowTable::for_test(true, &[]),
-        );
+        let acl = acl_with(net, crate::derp_acl::DerpAllowTable::for_test(true, &[]));
         forward_frame(&reg, &acl, net, &a, &frame(&b, &[1, 2, 3]));
         assert!(
             b_rx.try_recv().is_err(),
@@ -827,10 +816,7 @@ mod tests {
         let (a, b) = (pk(0xAA), pk(0xBB));
         let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
         reg.insert((net, b), b_tx);
-        let acl = acl_with(
-            net,
-            crate::derp_acl::DerpAllowTable::for_test(false, &[]),
-        );
+        let acl = acl_with(net, crate::derp_acl::DerpAllowTable::for_test(false, &[]));
         forward_frame(&reg, &acl, net, &a, &frame(&b, &[7]));
         assert!(b_rx.try_recv().is_ok(), "warn mode must not drop");
     }
@@ -937,10 +923,7 @@ mod tests {
         // ⚠️ `for_test(true, …)`, not `default()`: a default table is WARN mode,
         // which permits — so the precondition below would pass while billing
         // zero for the wrong reason. It caught exactly that when first written.
-        let acl = acl_with(
-            net,
-            crate::derp_acl::DerpAllowTable::for_test(true, &[]),
-        );
+        let acl = acl_with(net, crate::derp_acl::DerpAllowTable::for_test(true, &[]));
         forward_frame(&reg, &acl, net, &a, &frame(&b, &[1, 2, 3]));
         assert!(b_rx.try_recv().is_err(), "precondition: the ACL dropped it");
         assert_eq!(
@@ -976,10 +959,7 @@ mod tests {
         // Warn mode lists no pair but permits anyway — the point of warn is to
         // gather evidence WITHOUT dropping. The bytes really do leave the pod,
         // so the mirror of the test above holds: they must be billed.
-        let acl = acl_with(
-            net,
-            crate::derp_acl::DerpAllowTable::for_test(false, &[]),
-        );
+        let acl = acl_with(net, crate::derp_acl::DerpAllowTable::for_test(false, &[]));
         forward_frame(&reg, &acl, net, &a, &frame(&b, &[1, 2, 3]));
         assert!(b_rx.try_recv().is_ok(), "precondition: warn mode delivers");
         assert_eq!(

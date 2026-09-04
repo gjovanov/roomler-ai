@@ -34,11 +34,11 @@ use crate::agent_arms::{
     handle_agent_ssh_request, handle_derp_ticket_request, handle_relay_probe_report,
     record_key_rotation_report, record_ssh_activity, relay_tunnel_msg_from_agent,
 };
+use crate::overlay::NodeIdentity;
 use crate::tunnel::{
     Originator, TunnelSession, relay_tunnel_client_msg_from_agent,
     teardown_agent_originated_sessions, terminate_sessions_targeting_agent,
 };
-use crate::overlay::NodeIdentity;
 
 /// What the network arms keep per connection. The originator is shared
 /// (`Arc`) so the teardown can take the sessions out from under a handler
@@ -252,11 +252,8 @@ impl AgentSocketLifecycle for NetworkAgentSocket {
     /// (rc.307 B).
     async fn closed(&self, ctx: &AgentCtx, removal_was_ours: bool) {
         if removal_was_ours {
-            crate::overlay::handle_overlay_leave(
-                self.state,
-                NodeIdentity::Agent(ctx.agent_id),
-            )
-            .await;
+            crate::overlay::handle_overlay_leave(self.state, NodeIdentity::Agent(ctx.agent_id))
+                .await;
         }
     }
 }

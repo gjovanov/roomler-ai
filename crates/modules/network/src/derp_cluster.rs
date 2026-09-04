@@ -32,11 +32,10 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
+use crate::NetworkState;
 use crate::derp_types::{DerpKey, DerpPubKey};
 use roomler_core::cluster::directory::{OwnerRecord, derp_key, derpnet_key};
-use crate::NetworkState;
 use roomler_core::cluster::metrics::DERP_REHOME_STUCK_TOTAL;
-
 
 const REHOME_COOLDOWN: Duration = Duration::from_secs(60);
 const REHOME_MAX_ATTEMPTS: u32 = 3;
@@ -199,9 +198,11 @@ pub fn local_rehome_close(state: &NetworkState, network_id: ObjectId, pks: &[Str
         if !rehome_allowed(&state.derp_rehome_cooldowns, network_id, member) {
             continue;
         }
-        if let Some(cancel) = .derp_cancels.get(&(network_id, pk)) {
+        if let Some(cancel) = state.derp_cancels.get(&(network_id, pk)) {
             info!(%network_id, pubkey = %member, "derp: closing socket for cluster rehome");
-            roomler_core::cluster::metrics::bump(&roomler_core::cluster::metrics::DERP_REHOME_CLOSE_TOTAL);
+            roomler_core::cluster::metrics::bump(
+                &roomler_core::cluster::metrics::DERP_REHOME_CLOSE_TOTAL,
+            );
             cancel.notify_one();
         }
     }

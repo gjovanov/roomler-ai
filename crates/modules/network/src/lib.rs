@@ -41,16 +41,27 @@ use roomler_ai_services::dao::{
     peer_relay_audit::PeerRelayAuditDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao,
     tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao,
 };
-use roomler_core::{Capabilities, Core, Hooks, Module, TenantCtx, rate_limit::RateLimiter};
+use roomler_core::{
+    Capabilities, Core, Hooks, Module, TenantCtx, WsRegistration, rate_limit::RateLimiter,
+    ws::UpgradeSpec,
+};
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 
+pub mod agent_arms;
+pub mod agent_socket;
+pub mod derp;
 pub mod derp_acl;
+pub mod derp_cluster;
 pub mod derp_types;
+pub mod ephemeral;
 pub mod hooks;
 pub mod org_relay;
 pub mod overlay;
+pub mod tunnel;
 pub mod routes {
     pub mod agent_ssh;
+    pub mod device;
     pub mod overlay_block;
     pub mod overlay_key;
     pub mod overlay_policy;
@@ -144,6 +155,49 @@ pub struct NetworkState {
     /// (the limiter's `caller` slot carries the device id too): a second
     /// admin clicking inside the window is the same storm, not a new budget.
     pub key_rotation_rate_limiter: Arc<RateLimiter>,
+
+    // The sockets' live state (P7b, from the host)
+    /// Multi-region DERP ticket signer (`relay.derp_ticket_private_key`).
+    /// `None` = no key configured — ticket requests go unanswered and agents
+    /// keep using the central `/derp`.
+    pub derp_ticket: Option<Arc<roomler_ai_remote_control::derp_ticket::DerpTicketSigner>>,
+    /// C-3 — directory owner-tokens for LOCAL tunnel sessions
+    /// (`roomler:own:tunnel:<session>`). Written on open; refreshed by the
+    /// directory heartbeat while the session map still holds the session;
+    /// never explicitly released — the 90 s TTL reaps ≤90 s after any of
+    /// the four teardown paths drops the map entry.
+    pub tunnel_presence_tokens: Arc<DashMap<ObjectId, String>>,
+    /// Per-tunnel-session WS outbound channels, keyed by the
+    /// `tunnel_session_id` issued on `rc:tunnel.open`. The tunnel WS handler
+    /// registers its sender on TunnelOpen success and unregisters on
+    /// disconnect / TunnelTerminate; the agent socket's tunnel relay reads
+    /// this map to relay `TcpForwardAccept` / `TcpForwardReject` /
+    /// `TcpHalfClose` / `TcpClosed` / `TunnelTerminate` from agent → client.
+    pub tunnel_clients_by_session: TunnelClientOutbound,
+    /// P7 flap resilience: which tunnel sessions TARGET a given agent —
+    /// `agent_id → {tunnel_session_id}`. Maintained by `tunnel`'s open +
+    /// teardown paths and drained by
+    /// [`tunnel::terminate_sessions_targeting_agent`] when the agent's WS
+    /// drops: the agent's per-connection tunnel peers died with its socket,
+    /// so every session targeting it is unrecoverable and its client must
+    /// re-open rather than forward into a corpse forever.
+    pub tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>>,
+    /// PR-1 rehome — which tunnel sessions a given agent ORIGINATED
+    /// (P3b-2 agent-as-tunnel-client, i.e. declared routes) —
+    /// `origin_agent_id → {tunnel_session_id}`. Twin of the by-target index
+    /// above, consulted by fleet's `rc.agent_nudge` busy check through
+    /// [`roomler_core::hooks::FleetLifecycle::agent_busy`]: the
+    /// per-connection session map is invisible there, so without this a
+    /// routes-only agent read as IDLE and got its WS cycled (tearing every
+    /// declared route plus its overlay carriers).
+    pub tunnel_sessions_by_origin_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>>,
+    /// C-5 — directory owner-tokens for LOCAL derp registrations
+    /// (`roomler:own:derp:<net>:<pubkey>`); refreshed by the directory
+    /// heartbeat while the registry holds the key.
+    pub derp_presence_tokens: Arc<DashMap<derp_types::DerpKey, String>>,
+    /// C-5 — per-(network, pubkey) rehome pacing (60 s cooldown, 3
+    /// attempts / 10 min, then the split-evidence counter).
+    pub derp_rehome_cooldowns: Arc<derp_cluster::RehomeCooldowns>,
 }
 
 impl std::ops::Deref for NetworkState {
@@ -170,7 +224,44 @@ impl Module for NetworkState {
         let db = &core.db;
         // #1186 — see `overlay_ctrl_tx`.
         let (overlay_ctrl_tx, overlay_ctrl_rx) = mpsc::channel::<serde_json::Value>(256);
+        // Multi-region DERP tickets: load the signer when a key is configured;
+        // log the derived public key so the operator can copy it to PoPs.
+        // Regions carrying derp_urls without a key = loud warn, never fatal.
+        let derp_ticket = match settings.relay.derp_ticket_private_key.as_deref() {
+            Some(key) => {
+                match roomler_ai_remote_control::derp_ticket::DerpTicketSigner::from_pkcs8_b64(key)
+                {
+                    Ok(s) => {
+                        tracing::info!(
+                            public_key = %s.public_key_b64(),
+                            "derp ticket signer loaded — set DERP_TICKET_PUBLIC_KEY to this on every PoP relay"
+                        );
+                        Some(Arc::new(s))
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY is unusable; regional DERP disabled");
+                        None
+                    }
+                }
+            }
+            None => {
+                if core.turn_map.enabled && core.turn_map.specs.iter().any(|s| s.derp_url.is_some())
+                {
+                    tracing::warn!(
+                        "relay regions carry derp_urls but no ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY is set — regional DERP disabled"
+                    );
+                }
+                None
+            }
+        };
         let state = Self {
+            derp_ticket,
+            tunnel_presence_tokens: Arc::new(DashMap::new()),
+            tunnel_clients_by_session: Arc::new(DashMap::new()),
+            tunnel_sessions_by_target_agent: Arc::new(DashMap::new()),
+            tunnel_sessions_by_origin_agent: Arc::new(DashMap::new()),
+            derp_presence_tokens: Arc::new(DashMap::new()),
+            derp_rehome_cooldowns: Arc::new(DashMap::new()),
             tunnel_clients: Arc::new(TunnelClientDao::new(db)),
             tunnel_policies: Arc::new(TunnelPolicyDao::new(db)),
             tunnel_audit: Arc::new(TunnelAuditDao::new(db)),
@@ -207,6 +298,90 @@ impl Module for NetworkState {
         // fed by the host's redis ctrl subscriber; with no Redis the sender
         // side never fires and this task just parks).
         overlay::spawn_removes_applier(state.clone(), overlay_ctrl_rx);
+
+        // P7b — the sockets' machinery, from the host's `AppState::new`.
+        // The agent socket is fleet's; this module's half (the tunnel and
+        // overlay relays with their per-connection state, SSH, key rotation,
+        // DERP tickets, probe reports) is dispatched to it by
+        // `ClientMsg::namespace()` (P5c).
+        let arms = Arc::new(agent_socket::NetworkAgentSocket::new(state.clone()));
+        state.core.agent_socket.register(
+            Self::ID,
+            roomler_core::AgentSocketHooks {
+                handler: Some(arms.clone()),
+                lifecycle: Some(arms),
+            },
+        );
+        // C-5 — derp rehome: the owner-side close handler.
+        derp_cluster::wire_derp_cluster(&state);
+        // Split-brain observability: the per-pod DERP registry census.
+        derp::spawn_registry_census(&state);
+        // FR-51 — the ephemeral-node reaper (cluster-singleton per cycle via
+        // the DB-name-scoped claim pattern). Spawns NOTHING unless
+        // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.
+        ephemeral::spawn_reaper(state.clone());
+        // FR-20 P1 — drain the per-network DERP byte counters into the
+        // `stats_usage` cost ledger every 60 s. Runs on BOTH pods on purpose:
+        // each writes only the bytes it relayed, into the same deterministic
+        // `_id`, and `$inc` sums them.
+        derp::spawn_derp_usage_flush(state.clone());
+        // C-3/C-5 — the directory heartbeat for this module's classes
+        // (tunnel sessions, derp registrations). The agent-presence half is
+        // fleet's, spawned by its init.
+        if let Some(dir) = &state.cluster_directory {
+            let dir = dir.clone();
+            let tunnel_tokens = state.tunnel_presence_tokens.clone();
+            let tunnel_sessions = state.tunnel_clients_by_session.clone();
+            let derp_tokens = state.derp_presence_tokens.clone();
+            let derp_reg = state.derp_registry.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    // C-3 — tunnel session records: refresh while the session
+                    // map holds the session (its four teardown paths all drop
+                    // the map entry, which stops the refresh here; the 90 s
+                    // TTL then reaps the record — no explicit release).
+                    let dead: Vec<ObjectId> = tunnel_tokens
+                        .iter()
+                        .filter(|e| !tunnel_sessions.contains_key(e.key()))
+                        .map(|e| *e.key())
+                        .collect();
+                    for sid in dead {
+                        tunnel_tokens.remove(&sid);
+                    }
+                    for entry in tunnel_tokens.iter() {
+                        let (sid, token) = (*entry.key(), entry.value().clone());
+                        let key = roomler_core::cluster::directory::tunnel_key(&sid.to_hex());
+                        if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
+                            tracing::debug!(session = %sid, %e, "tunnel directory refresh failed");
+                        }
+                    }
+                    // C-5 — derp registration records: prune tokens whose
+                    // registry entry is gone (socket closed / displaced),
+                    // refresh the rest. A CONFLICT here just means the
+                    // node re-registered on another pod (LWW) while our
+                    // stale socket lingers — nothing to fold.
+                    let dead: Vec<derp_types::DerpKey> = derp_tokens
+                        .iter()
+                        .filter(|e| !derp_reg.contains_key(e.key()))
+                        .map(|e| *e.key())
+                        .collect();
+                    for k in dead {
+                        derp_tokens.remove(&k);
+                    }
+                    for entry in derp_tokens.iter() {
+                        let ((net, pk), token) = (*entry.key(), entry.value().clone());
+                        let key = roomler_core::cluster::directory::derp_key(
+                            &net.to_hex(),
+                            &derp_cluster::pk_hex(&pk),
+                        );
+                        if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
+                            tracing::debug!(network = %net, %e, "derp directory refresh failed");
+                        }
+                    }
+                }
+            });
+        }
         Ok(state)
     }
 
@@ -346,8 +521,14 @@ impl Module for NetworkState {
             .route("/enroll", post(routes::tunnel::enroll_tunnel_client))
             .route("/agents", get(routes::tunnel::list_tenant_agents));
 
+        // The device listing joins agents (fleet's) with tunnel clients and
+        // overlay nodes (this module's) — a `network → fleet` read, which the
+        // graph allows and the host may not (P7b).
+        let device = Router::new().route("/", get(routes::device::list_devices));
+
         Router::new()
             .nest("/tenant/{tenant_id}/agent", agent)
+            .nest("/tenant/{tenant_id}/device", device)
             .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client)
             .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy)
             .nest("/tenant/{tenant_id}/overlay-node", overlay_node)
@@ -608,15 +789,91 @@ impl Module for NetworkState {
         ]
     }
 
-    /// The inverse edges of the agent cascade: the overlay lease release
-    /// (BEFORE the row delete and the kick) and the MagicDNS rename
-    /// propagation — registered under this module's id, run in `HOOK_ORDER`.
+    /// The inverse edges: the agent cascade (the overlay lease release BEFORE
+    /// the row delete and the kick, the MagicDNS rename propagation, the
+    /// tunnel-busy answer to fleet's nudge) and the tenant cascade (release
+    /// every mesh node, quarantine the block) — registered under this
+    /// module's id, run in `HOOK_ORDER`.
     fn hooks(&self) -> Hooks {
         Hooks {
             fleet: Some(Arc::new(hooks::NetworkHooks {
                 state: self.clone(),
             })),
-            tenant: None,
+            tenant: Some(Arc::new(hooks::NetworkTenantHooks {
+                state: self.clone(),
+            })),
+        }
+    }
+
+    /// `/derp` — the pubkey-addressed relay for the both-UDP-blocked carrier
+    /// tier — is this module's upgrade endpoint (P7b). The host mounts it at
+    /// the root next to `/ws`; the path never moves (agents dial it across
+    /// every release).
+    fn ws(&self) -> WsRegistration {
+        WsRegistration {
+            handlers: Vec::new(),
+            upgrades: vec![UpgradeSpec {
+                path: "/derp",
+                router: Router::new()
+                    .route("/derp", get(derp::derp_upgrade))
+                    .with_state(self.clone()),
+            }],
+        }
+    }
+
+    /// C-6 — release the directory records for the tunnel sessions and derp
+    /// registrations this pod owns, so a graceful deploy hands each entity
+    /// off with a ZERO-length ownerless window instead of waiting out the
+    /// 90 s TTLs. Runs before fleet's agent sweep (reverse composition order),
+    /// exactly where the host's `shutdown_cleanup` ran it.
+    fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send {
+        let state = self.clone();
+        async move {
+            let Some(dir) = &state.cluster_directory else {
+                return;
+            };
+            // Tunnel session records (their sessions die with this pod; the
+            // CLI redials and re-opens on the survivor).
+            let held: Vec<(ObjectId, String)> = state
+                .tunnel_presence_tokens
+                .iter()
+                .map(|e| (*e.key(), e.value().clone()))
+                .collect();
+            for (sid, token) in held {
+                state.tunnel_presence_tokens.remove(&sid);
+                let _ = dir
+                    .release(
+                        &roomler_core::cluster::directory::tunnel_key(&sid.to_hex()),
+                        &token,
+                    )
+                    .await;
+            }
+            // Derp registrations (+ the per-network member index, so the
+            // survivor's convergence sweep sees a clean roster).
+            let held: Vec<(derp_types::DerpKey, String)> = state
+                .derp_presence_tokens
+                .iter()
+                .map(|e| (*e.key(), e.value().clone()))
+                .collect();
+            for ((net, pk), token) in held {
+                state.derp_presence_tokens.remove(&(net, pk));
+                let net_hex = net.to_hex();
+                let member = derp_cluster::pk_hex(&pk);
+                if let Ok(true) = dir
+                    .release(
+                        &roomler_core::cluster::directory::derp_key(&net_hex, &member),
+                        &token,
+                    )
+                    .await
+                {
+                    let _ = dir
+                        .set_remove(
+                            &roomler_core::cluster::directory::derpnet_key(&net_hex),
+                            &member,
+                        )
+                        .await;
+                }
+            }
         }
     }
 }

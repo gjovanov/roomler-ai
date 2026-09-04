@@ -124,8 +124,8 @@ async fn presence_online_cross_pod_via_redis() {
 
     // Sanity: pod 2's LOCAL hub genuinely doesn't know the agent.
     let aid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
-    assert!(!app2.state.rc_hub.is_agent_online(aid));
-    assert!(app1.state.rc_hub.is_agent_online(aid));
+    assert!(!app2.state.fleet().rc_hub.is_agent_online(aid));
+    assert!(app1.state.fleet().rc_hub.is_agent_online(aid));
 
     let row = fetch_agent_row(&app2, &seeded, &agent_id).await;
     assert_eq!(row["presence"], "online", "row: {row}");
@@ -159,7 +159,7 @@ async fn rehome_race_keeps_newest_claim() {
     let _ = ws_old.close(None).await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-    assert!(app2.state.rc_hub.is_agent_online(aid));
+    assert!(app2.state.fleet().rc_hub.is_agent_online(aid));
     let row = fetch_agent_row(&app1, &seeded, &agent_id).await;
     assert_eq!(
         row["presence"], "online",
@@ -200,7 +200,7 @@ async fn rx_deadline_reaps_silent_socket() {
 
     let ws = connect_agent(&app, &agent_token).await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(app.state.rc_hub.is_agent_online(aid));
+    assert!(app.state.fleet().rc_hub.is_agent_online(aid));
 
     // Go silent WITHOUT closing (a close frame would be a normal
     // disconnect, not a reap). Leaking the stream keeps the TCP socket
@@ -211,7 +211,7 @@ async fn rx_deadline_reaps_silent_socket() {
     let mut reaped = false;
     for _ in 0..12 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if !app.state.rc_hub.is_agent_online(aid) {
+        if !app.state.fleet().rc_hub.is_agent_online(aid) {
             reaped = true;
             break;
         }
@@ -237,12 +237,12 @@ async fn shutdown_cleanup_marks_local_agents_offline() {
 
     let _ws = connect_agent(&app, &agent_token).await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(app.state.rc_hub.is_agent_online(aid));
+    assert!(app.state.fleet().rc_hub.is_agent_online(aid));
 
     roomler_ai_api::state::shutdown_cleanup(&app.state).await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    assert!(!app.state.rc_hub.is_agent_online(aid));
+    assert!(!app.state.fleet().rc_hub.is_agent_online(aid));
     let row = fetch_agent_row(&app, &seeded, &agent_id).await;
     assert_ne!(row["presence"], "online", "row: {row}");
     assert_eq!(row["status"], "offline", "row: {row}");
