@@ -82,6 +82,23 @@ python3 ~/bin/git-filter-repo \
 git push --mirror https://github.com/<owner>/<repo>.git      # irreversible
 ```
 
+## Three layers, and only the first one is cheap
+
+| layer | stops it at | enable |
+|---|---|---|
+| `.githooks/pre-commit` | the commit | `git config core.hooksPath .githooks` |
+| CI job **No real machine names** | the merge | required status check on `master` |
+| the sweep below | after publication | run it by hand |
+
+Layer 3 has run three times now. Each run force-pushes ~700 branches and ~660
+tags with GitHub Actions disabled around it, and it still **cannot remove
+anything from GitHub** — the pre-rewrite commits stay reachable by SHA through
+`refs/pull/*` until GitHub Support runs GC. Treat every sweep as damage
+control, and the hook as the actual fix.
+
+⚠️ **Set `core.hooksPath` in every clone and every worktree.** It is per-clone
+config, so a fresh clone has no hook until someone runs that line.
+
 ## The four things that go wrong
 
 **1. `--replace-text` does NOT touch commit messages.** It rewrites blob
@@ -92,11 +109,18 @@ real names in the commit log — which on this repo is the *richer* of the two
 surfaces, because the field-test narratives live in commit bodies. Always
 verify against `git log --all --format=%B`, never the tree alone.
 
-**2. `residual: none` is the only success condition.** The residual scan
-re-reads everything case-INSENSITIVELY after the rewrite. The first pass of the
+**2. `residual: none` is the only success condition, and CASE IS THE TRAP.**
+The residual scan re-reads everything case-INSENSITIVELY. The first pass of the
 2026-08-28 sweep listed only uppercase spellings, reported success, and left 60
-real tags in the tree because half the prose was lowercase. Never trust a run
-that ends any other way, whatever else it printed.
+real tags in the tree because half the prose was lowercase.
+
+⚠️ That exact mistake was then **rebuilt one file over**: `check_shapes.py`
+shipped with uppercase-only patterns, and on 2026-09-04 a field log wrote two
+asset tags in lowercase — the guard printed `none found`, CI went green, and
+the names reached a public repo and 15 GitHub items. Everything here matches
+case-insensitively now, and `selftest.sh` carries every canary in both casings
+so the regression cannot come back quietly. People write a hostname however it
+came out of their terminal; a check that assumes a casing is not a check.
 
 **3. Longest key first, or you orphan a prefix.** A `DESKTOP-`/`LAPTOP-`
 qualified form has to be rewritten before its bare tag, or the qualifier is

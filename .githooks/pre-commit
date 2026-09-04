@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Refuse a commit that carries a real machine name.
+#
+# This is the FIRST of three layers, and the only one that stops a name before
+# it ever leaves the machine:
+#
+#   1. this hook          -- blocks the commit
+#   2. the CI check       -- blocks the merge (required status check on master)
+#   3. the periodic sweep -- cleans what the first two let through
+#
+# Layer 3 has now run three times. Each run force-pushes ~700 branches and ~660
+# tags with GitHub Actions disabled around it, and it STILL cannot remove
+# anything from GitHub: the pre-rewrite commits stay reachable by SHA through
+# refs/pull/* until GitHub Support runs GC. The only cheap place to fix this is
+# here, before the commit exists.
+#
+# Enable with:  git config core.hooksPath .githooks
+set -u
+
+REPO="$(git rev-parse --show-toplevel)"
+GUARD="$REPO/.claude/skills/sanitize-hostnames/check_shapes.py"
+[ -f "$GUARD" ] || exit 0          # tool absent (old checkout) -- do not block
+
+# Find an interpreter that actually RUNS. On Windows, `python3` and `python`
+# are usually Microsoft Store stubs: they are on PATH, they exit non-zero, and
+# they print "Python was not found". A `command -v` check passes on those, so
+# the hook "worked" by refusing every commit for the wrong reason -- which is
+# how a hook gets disabled within a day. Probe by execution, not by presence.
+PY=""
+for cand in python3 python py; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c 'pass' >/dev/null 2>&1; then
+    PY="$cand"; break
+  fi
+done
+
+run_guard() {
+  if [ -n "$PY" ]; then
+    "$PY" "$GUARD" --root "$REPO" --staged 2>&1
+  else
+    # No native interpreter: fall back to WSL, which is how this repo is built
+    # on Windows anyway. Paths must cross the boundary too.
+    wsl -- bash -lc "python3 \"\$(wslpath '$GUARD')\" --root \"\$(wslpath '$REPO')\" --staged" 2>&1
+  fi
+}
+
+if [ -z "$PY" ] && ! command -v wsl >/dev/null 2>&1; then
+  # Degrade to a LOUD warning rather than blocking every commit forever. The
+  # required CI check still refuses the merge, so this only loses the early
+  # signal -- whereas an unconditional block gets the hook switched off, which
+  # loses it permanently.
+  echo "WARNING: no working python3 and no wsl; machine-name pre-commit guard SKIPPED." >&2
+  echo "         CI will still refuse the merge. Install python3 to get the early check." >&2
+  exit 0
+fi
+
+if ! out=$(run_guard); then
+  printf '%s\n' "$out"
+  cat <<'EOF'
+
+------------------------------------------------------------------------
+COMMIT REFUSED: this change carries what looks like a real machine name.
+
+This repo is PUBLIC. Committed hostnames are reconnaissance value -- they
+map the fleet and say which host runs what.
+
+Use the product display name instead (the map that pairs them lives OUTSIDE
+the repo, at the path recorded in the skill's SKILL.md), then re-stage:
+
+    python3 .claude/skills/sanitize-hostnames/sanitize.py \
+        --map <path-to-map> --root . --apply
+
+If this is a FALSE POSITIVE, fix the SHAPE or the ALLOW list in
+check_shapes.py and add a canary to selftest.sh -- never silence it by
+adding the real name, and never by reaching for --no-verify.
+------------------------------------------------------------------------
+EOF
+  exit 1
+fi
+exit 0

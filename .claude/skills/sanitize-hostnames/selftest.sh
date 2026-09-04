@@ -25,12 +25,31 @@ GUARD=".claude/skills/sanitize-hostnames/check_shapes.py"
 CANARY="canary-selftest.md"
 trap 'rm -f "$CANARY"' EXIT
 
-D="DESK""TOP-AB12XY9"; L="LAP""TOP-QR34ST78"; W="W""IN-ABCDEFGHIJK"
+D="DESK""TOP-AB12XY9"; L="LAP""TOP-QR34ST78"; W="W""IN-ABC4EFGHIJK"
 P5="P""C51234";        P4="P""C5123";         C="CL""K00099887"
 X="Someone-X""MG-BOX9"; M="Someones-Mac""Book-Pro"
-CAUGHT=("$D" "$L" "$W" "$P5" "$P4" "$C" "$X" "$M")
-# Alias forms the guard must NOT flag.
-IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888")
+
+# ⚠️⚠️ EVERY canary appears TWICE, upper and lower. A guard blind to lowercase
+# is not a hypothetical: on 2026-09-04 a field log wrote two asset tags in
+# lowercase, this guard reported "none found", CI went green, and the names
+# reached a public repo. The uppercase canaries all passed that day -- which is
+# exactly why the lowercase ones now exist. Do not "tidy" them away as
+# duplicates; they are the regression test for the leak that happened.
+d="desk""top-ab12xy9"; l="lap""top-qr34st78"; w="w""in-abc4efghijk"
+p5="p""c51234";        p4="p""c5123";         c="cl""k00099887"
+x="someone-x""mg-box9"; m="someones-mac""book-pro"
+
+CAUGHT=("$D" "$L" "$W" "$P5" "$P4" "$C" "$X" "$M"
+        "$d" "$l" "$w" "$p5" "$p4" "$c" "$x" "$m")
+
+# Things the guard must NOT flag: our own alias forms (in both casings, since
+# prose writes them either way), and ordinary hyphenated words that fit the
+# DESKTOP- shape. Those words are all real strings in this repo, and flagging
+# them is how a guard earns enough noise to get deleted -- the digit
+# requirement in SHAPES is what keeps them out, and this locks it.
+IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888"
+         "win""host-a" "corp""lap-2"
+         "desk""top-classic" "desk""top-content" "desk""top-rebound")
 
 { printf '%s\n' "${CAUGHT[@]}"; printf 'must not trip: %s\n' "${IGNORED[*]}"; } > "$CANARY"
 
