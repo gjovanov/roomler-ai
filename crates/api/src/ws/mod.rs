@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-/// Ceiling on a single inbound WebSocket frame/message.
-///
-/// axum inherits tungstenite's defaults (64 MiB message, 16 MiB frame), and
-/// nothing else bounds a post-upgrade frame: `tower_governor` is HTTP
-/// middleware and never sees them, so an authenticated peer could make the
-/// server buffer multi-MiB messages on every connection it opens.
-///
-/// Everything that legitimately crosses these sockets is control-plane —
-/// signalling JSON, a netmap, an MTU-sized DERP packet — so 8 MiB is orders of
-/// magnitude above real traffic while removing that amplification. Deliberately
-/// generous rather than tight: a cap that is merely large is safe, whereas one
-/// tuned close to the real maximum silently drops a big-but-valid netmap on the
-/// day a fleet grows.
-pub const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+// FR-69 P7b — the frame ceiling is core's (`roomler_core::ws::upgrade`),
+// shared by every upgrade whoever owns it; re-exported so the paths in this
+// crate read as before.
+pub use roomler_core::ws::upgrade::MAX_WS_MESSAGE_BYTES;
 
 // FR-69 P5c — the host's transitional `network` half of the agent
 // socket, registered on the core's `AgentSocketRegistry` under that id (the

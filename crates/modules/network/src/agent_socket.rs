@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! FR-69 P5c — the host's TRANSITIONAL agent-socket handler: what `network`
-//! will register through the core's `AgentSocketRegistry` once it is a
-//! module (P7), implemented over the host's own code until then and
-//! registered under its id, so the socket — the fleet module's — dispatches
-//! every message to its owner without naming the host. (`remote`'s half
-//! registers itself from its module since P6.)
+//! `network`'s half of the agent socket (FR-69 P5c → P7b): what the module
+//! registers through the core's `AgentSocketRegistry` from its init, so the
+//! socket — the fleet module's — dispatches every message to its owner
+//! without naming this crate. (`remote`'s half registers itself the same way.)
 //!
 //! The order inside the network handler is the socket's old pipeline
 //! verbatim: the tunnel-client relay (this agent as an ORIGINATOR of
@@ -31,16 +29,16 @@ use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use crate::state::AppState;
-use crate::ws::remote_control::{
+use crate::NetworkState;
+use crate::agent_arms::{
     handle_agent_ssh_request, handle_derp_ticket_request, handle_relay_probe_report,
     record_key_rotation_report, record_ssh_activity, relay_tunnel_msg_from_agent,
 };
-use crate::ws::tunnel::{
+use crate::tunnel::{
     Originator, TunnelSession, relay_tunnel_client_msg_from_agent,
     teardown_agent_originated_sessions, terminate_sessions_targeting_agent,
 };
-use roomler_ai_mod_network::overlay::NodeIdentity;
+use crate::overlay::NodeIdentity;
 
 /// What the network arms keep per connection. The originator is shared
 /// (`Arc`) so the teardown can take the sessions out from under a handler
@@ -54,13 +52,13 @@ struct NetConn {
 
 /// `network`'s half of the agent socket, over the host's tunnel, overlay,
 /// relay, DERP-ticket, SSH and key-rotation code.
-pub struct HostNetworkAgentSocket {
-    state: AppState,
+pub struct NetworkAgentSocket {
+    state: NetworkState,
     conns: DashMap<String, Arc<Mutex<NetConn>>>,
 }
 
-impl HostNetworkAgentSocket {
-    pub fn new(state: AppState) -> Self {
+impl NetworkAgentSocket {
+    pub fn new(state: NetworkState) -> Self {
         Self {
             state,
             conns: DashMap::new(),
@@ -73,7 +71,7 @@ impl HostNetworkAgentSocket {
 }
 
 #[async_trait]
-impl AgentMsgHandler for HostNetworkAgentSocket {
+impl AgentMsgHandler for NetworkAgentSocket {
     async fn handle(&self, ctx: &AgentCtx, msg: ClientMsg) -> Option<ClientMsg> {
         let state = &self.state;
         let Some(conn) = self.conn(ctx) else {
@@ -97,8 +95,8 @@ impl AgentMsgHandler for HostNetworkAgentSocket {
         // This agent as a tunnel TARGET.
         let msg = relay_tunnel_msg_from_agent(state, msg).await?;
         // The overlay node behind this socket.
-        let msg = roomler_ai_mod_network::overlay::relay_overlay_msg_from_node(
-            state.network(),
+        let msg = crate::overlay::relay_overlay_msg_from_node(
+            state,
             NodeIdentity::Agent(ctx.agent_id),
             msg,
         )
@@ -186,7 +184,7 @@ impl AgentMsgHandler for HostNetworkAgentSocket {
 }
 
 #[async_trait]
-impl AgentSocketLifecycle for HostNetworkAgentSocket {
+impl AgentSocketLifecycle for NetworkAgentSocket {
     async fn hello(&self, ctx: &AgentCtx) {
         let orig = Originator {
             principal: tunnel_core::policy::Principal::Agent(ctx.agent_id),
@@ -213,7 +211,6 @@ impl AgentSocketLifecycle for HostNetworkAgentSocket {
     async fn heartbeat(&self, ctx: &AgentCtx, warm_relay: Option<&str>) {
         if let Err(e) = self
             .state
-            .network()
             .overlay_nodes
             .set_warm_relay_for_agent(ctx.agent_id, warm_relay)
             .await
@@ -255,8 +252,8 @@ impl AgentSocketLifecycle for HostNetworkAgentSocket {
     /// (rc.307 B).
     async fn closed(&self, ctx: &AgentCtx, removal_was_ours: bool) {
         if removal_was_ours {
-            roomler_ai_mod_network::overlay::handle_overlay_leave(
-                self.state.network(),
+            crate::overlay::handle_overlay_leave(
+                self.state,
                 NodeIdentity::Agent(ctx.agent_id),
             )
             .await;

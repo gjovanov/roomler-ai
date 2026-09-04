@@ -49,8 +49,10 @@ use tunnel_core::policy::{
 };
 use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
-use crate::state::AppState;
-use crate::ws::remote_control::pump_server_messages;
+use crate::NetworkState;
+use crate::agent_arms::pump_server_messages;
+use axum::{extract::WebSocketUpgrade, response::Response};
+use roomler_core::ws::upgrade::{MAX_WS_MESSAGE_BYTES, send_goodbye_and_close, tid_matches_claim};
 
 /// Outbound channel capacity. Per-tunnel-client. Generous because a
 /// single peer multiplexes many flows; the dominant traffic is per-
@@ -67,7 +69,7 @@ const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// connection. Replaces the T1 stub message loop with real
 /// `rc:tunnel.*` dispatch.
 pub async fn handle_tunnel_client_socket(
-    state: AppState,
+    state: NetworkState,
     socket: WebSocket,
     tunnel_client_id: ObjectId,
     tenant_id: ObjectId,
@@ -84,7 +86,7 @@ pub async fn handle_tunnel_client_socket(
     // Hub-owned mpsc. All `ServerMsg` writes go through `outbound_tx`;
     // a single pump task drains the receiver onto the socket. Once
     // the tunnel-session is established we register a clone of
-    // `outbound_tx` in `AppState::tunnel_clients_by_session` so the
+    // `outbound_tx` in `NetworkState::tunnel_clients_by_session` so the
     // agent's WS handler can push relayed `TcpForwardAccept` etc.
     // back to this client.
     let (outbound_tx, outbound_rx) = mpsc::channel::<ServerMsg>(OUTBOUND_CAP);
@@ -95,7 +97,6 @@ pub async fn handle_tunnel_client_socket(
     // it as a node. Harmless if the client never joins the overlay;
     // removed on disconnect below.
     state
-        .network()
         .overlay_nodes_by_id
         .insert(tunnel_client_id, outbound_tx.clone());
 
@@ -103,7 +104,6 @@ pub async fn handle_tunnel_client_socket(
     // (client_version + client_os). Best-effort — audit rows still
     // get written if this fails, just with empty version/os.
     let (client_version, client_os) = match state
-        .network()
         .tunnel_clients
         .find_in_tenant(tenant_id, tunnel_client_id)
         .await
@@ -183,9 +183,9 @@ pub async fn handle_tunnel_client_socket(
         // Overlay `rc:overlay.*` variants are brokered separately (this
         // tunnel-client is an overlay node). Consumed messages return
         // None; everything else falls through to the tunnel match below.
-        let Some(parsed) = roomler_ai_mod_network::overlay::relay_overlay_msg_from_node(
-            state.network(),
-            roomler_ai_mod_network::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
+        let Some(parsed) = crate::overlay::relay_overlay_msg_from_node(
+            state,
+            crate::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
             parsed,
         )
         .await
@@ -273,7 +273,7 @@ pub async fn handle_tunnel_client_socket(
                 if let Some(s) = session.as_ref()
                     && s.tunnel_session_id == session_id
                 {
-                    let _ = state.rc_hub.send_to_agent(
+                    let _ = state.fleet.rc_hub.send_to_agent(
                         s.agent_id,
                         ServerMsg::TunnelTerminate {
                             session_id: s.tunnel_session_id,
@@ -403,12 +403,11 @@ pub async fn handle_tunnel_client_socket(
     // offline so peers' netmaps lose it. Best-effort; no-op if the
     // client never joined the overlay.
     state
-        .network()
         .overlay_nodes_by_id
         .remove(&tunnel_client_id);
-    roomler_ai_mod_network::overlay::handle_overlay_leave(
-        state.network(),
-        roomler_ai_mod_network::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
+    crate::overlay::handle_overlay_leave(
+        state,
+        crate::overlay::NodeIdentity::TunnelClient(tunnel_client_id),
     )
     .await;
 
@@ -421,7 +420,7 @@ pub async fn handle_tunnel_client_socket(
         );
         // Best-effort: tell the agent the peer is gone so it tears
         // down its side.
-        let _ = state.rc_hub.send_to_agent(
+        let _ = state.fleet.rc_hub.send_to_agent(
             s.agent_id,
             ServerMsg::TunnelTerminate {
                 session_id: s.tunnel_session_id,
@@ -443,8 +442,8 @@ pub async fn handle_tunnel_client_socket(
 /// Per-connection state created on `TunnelOpen` and consumed by every
 /// subsequent flow event for audit correlation.
 #[derive(Debug, Clone)]
-pub(crate) struct TunnelSession {
-    pub(crate) tunnel_session_id: ObjectId,
+pub struct TunnelSession {
+    pub tunnel_session_id: ObjectId,
     agent_id: ObjectId,
     agent_tenant_id: ObjectId,
     #[allow(dead_code)] // T2.6 will plumb this into the agent-WS relay
@@ -463,28 +462,28 @@ pub(crate) struct TunnelSession {
 /// of handlers serve both WS roles instead of duplicating the open /
 /// forward / relay / audit logic per role.
 #[derive(Clone)]
-pub(crate) struct Originator {
-    pub(crate) principal: Principal,
+pub struct Originator {
+    pub principal: Principal,
     /// The originator's own tenant. For an agent origin this is the
     /// agent's tenant — the value the cross-tenant gate compares against
     /// the TARGET agent's tenant.
-    pub(crate) tenant_id: ObjectId,
-    pub(crate) owner_user_id: ObjectId,
-    pub(crate) client_version: String,
-    pub(crate) client_os: OsKind,
+    pub tenant_id: ObjectId,
+    pub owner_user_id: ObjectId,
+    pub client_version: String,
+    pub client_os: OsKind,
     /// The originator's outbound `ServerMsg` channel. For a tunnel-client
     /// WS this is its per-connection `outbound_tx`; for an agent it is a
     /// clone of the agent's Hub-owned `registered_tx`, so a target's
     /// answers relayed via `tunnel_clients_by_session[session_id]` reach
     /// the agent's socket through its EXISTING pump — no target-side change.
-    pub(crate) outbound_tx: mpsc::Sender<ServerMsg>,
+    pub outbound_tx: mpsc::Sender<ServerMsg>,
     /// PR-1 rehome — the affinity key this conn DIALED with (`None` =
     /// key-less legacy dial that hashed on client IP) and when it
     /// established. Direction inputs for the cross-pod open-reject: only
     /// a correctly-keyed, provably-newer conn justifies nudging the
     /// target agent's WS.
-    pub(crate) dialed_tid: Option<String>,
-    pub(crate) conn_established_ms: i64,
+    pub dialed_tid: Option<String>,
+    pub conn_established_ms: i64,
 }
 
 impl Originator {
@@ -512,7 +511,7 @@ impl Originator {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_tunnel_open(
-    state: &AppState,
+    state: &NetworkState,
     orig: &Originator,
     agent_id: ObjectId,
     transport: String,
@@ -525,7 +524,7 @@ async fn handle_tunnel_open(
     // the cross-tenant gate ourselves). `find_in_tenant` is wrong
     // here because it scopes by tenant — we need the agent's actual
     // tenant_id to compare. Use a direct lookup via the base DAO.
-    let agent = match state.agents.base.find_by_id(agent_id).await {
+    let agent = match state.fleet.agents.base.find_by_id(agent_id).await {
         Ok(a) => a,
         Err(_) => {
             send_msg(
@@ -590,7 +589,7 @@ async fn handle_tunnel_open(
     // and nudge the owner to cycle the agent if idle so both ends
     // converge. Plain hub-miss with no foreign record keeps today's
     // behaviour (the P7 terminate machinery owns real agent flaps).
-    if !state.rc_hub.is_agent_online(agent_id)
+    if !state.fleet.rc_hub.is_agent_online(agent_id)
         && let Some(redis) = &state.redis_pubsub
         && let Ok(Ok(Some(owner))) = tokio::time::timeout(
             std::time::Duration::from_millis(250),
@@ -598,7 +597,7 @@ async fn handle_tunnel_open(
         )
         .await
     {
-        let record = crate::cluster::directory::OwnerRecord::parse(&owner);
+        let record = roomler_core::cluster::directory::OwnerRecord::parse(&owner);
         let owner_pod = record
             .as_ref()
             .map(|r| r.pod_id.clone())
@@ -614,29 +613,29 @@ async fn handle_tunnel_open(
         // wrong-keyed / older-or-ambiguous originator is itself the
         // mis-placed party and its own fresh redial converges it.
         // `agent` (the target's row) is already fetched above.
-        match crate::ws::rc_cluster::rehome_direction(
+        match roomler_ai_mod_fleet::nudge::rehome_direction(
             orig.dialed_tid.as_deref(),
             &agent.tenant_id.to_hex(),
             orig.conn_established_ms,
             agent_since_ms,
             state.settings.rc.rehome_direction_guard_ms,
         ) {
-            crate::ws::rc_cluster::RehomeDirection::ControllerMove { reason } => {
-                crate::cluster::metrics::bump(&crate::cluster::metrics::RC_REHOME_CONTROLLER_TOTAL);
+            roomler_ai_mod_fleet::nudge::RehomeDirection::ControllerMove { reason } => {
+                roomler_core::cluster::metrics::bump(&roomler_core::cluster::metrics::RC_REHOME_CONTROLLER_TOTAL);
                 info!(
                     origin = %orig.log_id(), %agent_id, %owner_pod, reason,
                     "cross-pod tunnel miss: originator re-dials (nudge suppressed)"
                 );
             }
-            crate::ws::rc_cluster::RehomeDirection::NudgeAgent => {
+            roomler_ai_mod_fleet::nudge::RehomeDirection::NudgeAgent => {
                 roomler_ai_mod_fleet::nudge::spawn_agent_nudge(
-                    state.fleet(),
+                    &state.fleet,
                     owner_pod.clone(),
                     agent_id.to_hex(),
                 );
             }
         }
-        crate::cluster::metrics::bump(&crate::cluster::metrics::TUNNEL_REHOME_TOTAL);
+        roomler_core::cluster::metrics::bump(&roomler_core::cluster::metrics::TUNNEL_REHOME_TOTAL);
         // Pod identity stays in server logs; the wire carries only the
         // actionable fact + the open_nonce so the CLI fails the exact
         // pending flow and its reconnect loop dials fresh.
@@ -660,7 +659,7 @@ async fn handle_tunnel_open(
     // a mid-session quarantine from spawning a fresh tunnel.
     if let Principal::Agent(origin_id) = orig.principal {
         let origin_ok = matches!(
-            state.agents.base.find_by_id(origin_id).await,
+            state.fleet.agents.base.find_by_id(origin_id).await,
             Ok(a) if a.deleted_at.is_none() && !matches!(a.status, AgentStatus::Quarantined)
         );
         if !origin_ok {
@@ -768,7 +767,7 @@ async fn handle_tunnel_open(
         let token = dir.owner_token(&tunnel_session_id.to_hex());
         if let Err(e) = dir
             .claim_lww(
-                &crate::cluster::directory::tunnel_key(&tunnel_session_id.to_hex()),
+                &roomler_core::cluster::directory::tunnel_key(&tunnel_session_id.to_hex()),
                 &token,
             )
             .await
@@ -792,7 +791,6 @@ async fn handle_tunnel_open(
     // 5. Audit the open. RelayMode is "Direct" until ICE finishes —
     // T2.7 updates this after candidate selection.
     let _ = state
-        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -839,7 +837,7 @@ async fn handle_tunnel_open(
     // `TunnelQuicReady` can race back and be relayed to the client
     // while it's still processing the `TunnelOpened` below.
     if let Some(token) = quic_auth_token.clone()
-        && let Err(e) = state.rc_hub.send_to_agent(
+        && let Err(e) = state.fleet.rc_hub.send_to_agent(
             agent_id,
             ServerMsg::TunnelQuicSetup {
                 session_id: tunnel_session_id,
@@ -958,7 +956,7 @@ fn forward_forward_msg(
 #[allow(clippy::too_many_arguments)]
 async fn handle_forward_request(
     proto: ProtocolKind,
-    state: &AppState,
+    state: &NetworkState,
     orig: &Originator,
     session: Option<&TunnelSession>,
     request_session_id: ObjectId,
@@ -998,7 +996,7 @@ async fn handle_forward_request(
 
     // Re-fetch the agent row each time so a quarantine that lands
     // mid-session bites the next forward.
-    let agent = match state.agents.base.find_by_id(s.agent_id).await {
+    let agent = match state.fleet.agents.base.find_by_id(s.agent_id).await {
         Ok(a) => a,
         Err(_) => {
             audit_tcp_reject(
@@ -1031,7 +1029,6 @@ async fn handle_forward_request(
     // the auth boundary; the agent runs its own minimal allowlist
     // as defence-in-depth (T2.6).
     let policies = match state
-        .network()
         .tunnel_policies
         .list_active_for_tenant(s.agent_tenant_id)
         .await
@@ -1074,7 +1071,7 @@ async fn handle_forward_request(
             // then replies with `ClientMsg::TcpForwardAccept` /
             // `UdpForwardAccept` (or Reject) which the agent WS handler
             // routes back to us via `tunnel_clients_by_session`.
-            let relay = state.rc_hub.send_to_agent(
+            let relay = state.fleet.rc_hub.send_to_agent(
                 s.agent_id,
                 forward_forward_msg(
                     proto,
@@ -1143,7 +1140,7 @@ async fn handle_forward_request(
 
 #[allow(clippy::too_many_arguments)]
 async fn audit_tcp_accept(
-    state: &AppState,
+    state: &NetworkState,
     session: &TunnelSession,
     orig: &Originator,
     flow_id: u32,
@@ -1151,7 +1148,6 @@ async fn audit_tcp_accept(
     dst_port: u16,
 ) {
     let _ = state
-        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1182,7 +1178,7 @@ async fn audit_tcp_accept(
 
 #[allow(clippy::too_many_arguments)]
 async fn audit_tcp_reject(
-    state: &AppState,
+    state: &NetworkState,
     session: &TunnelSession,
     orig: &Originator,
     flow_id: u32,
@@ -1192,7 +1188,6 @@ async fn audit_tcp_reject(
     reason: &str,
 ) {
     let _ = state
-        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1221,9 +1216,8 @@ async fn audit_tcp_reject(
         .await;
 }
 
-async fn audit_peer_close(state: &AppState, session: &TunnelSession, orig: &Originator) {
+async fn audit_peer_close(state: &NetworkState, session: &TunnelSession, orig: &Originator) {
     let _ = state
-        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1292,7 +1286,7 @@ async fn send_error(
 /// sentinel does the actual mailbox close on the peer); this message
 /// gives the agent's audit path a half-close event to record.
 async fn relay_half_close_to_agent(
-    state: &AppState,
+    state: &NetworkState,
     session: Option<&TunnelSession>,
     tunnel_client_id: ObjectId,
     request_session_id: ObjectId,
@@ -1307,7 +1301,7 @@ async fn relay_half_close_to_agent(
         debug!(%tunnel_client_id, %flow_id, "half-close with mismatched session_id — ignoring");
         return;
     }
-    if let Err(e) = state.rc_hub.send_to_agent(
+    if let Err(e) = state.fleet.rc_hub.send_to_agent(
         s.agent_id,
         ServerMsg::TcpHalfClose {
             session_id: request_session_id,
@@ -1324,7 +1318,7 @@ async fn relay_half_close_to_agent(
 /// point; `tunnel_audit` records the close reason so admins can
 /// reconstruct the lifecycle.
 async fn relay_tcp_closed_to_agent(
-    state: &AppState,
+    state: &NetworkState,
     orig: &Originator,
     session: Option<&TunnelSession>,
     request_session_id: ObjectId,
@@ -1339,7 +1333,7 @@ async fn relay_tcp_closed_to_agent(
     if s.tunnel_session_id != request_session_id {
         return;
     }
-    if let Err(e) = state.rc_hub.send_to_agent(
+    if let Err(e) = state.fleet.rc_hub.send_to_agent(
         s.agent_id,
         ServerMsg::TcpClosed {
             session_id: request_session_id,
@@ -1356,7 +1350,7 @@ async fn relay_tcp_closed_to_agent(
 /// to the agent + append an audit row. Reuses [`audit_tcp_close`] — the
 /// close accounting is L4-agnostic (flow_id + reason).
 async fn relay_udp_closed_to_agent(
-    state: &AppState,
+    state: &NetworkState,
     orig: &Originator,
     session: Option<&TunnelSession>,
     request_session_id: ObjectId,
@@ -1369,7 +1363,7 @@ async fn relay_udp_closed_to_agent(
     if s.tunnel_session_id != request_session_id {
         return;
     }
-    if let Err(e) = state.rc_hub.send_to_agent(
+    if let Err(e) = state.fleet.rc_hub.send_to_agent(
         s.agent_id,
         ServerMsg::UdpClosed {
             session_id: request_session_id,
@@ -1391,7 +1385,7 @@ async fn relay_udp_closed_to_agent(
 /// already fired on TunnelOpen, so reaching here means the session
 /// is sound.
 async fn relay_sdp_offer_to_agent(
-    state: &AppState,
+    state: &NetworkState,
     session: Option<&TunnelSession>,
     request_session_id: ObjectId,
     sdp: String,
@@ -1404,7 +1398,7 @@ async fn relay_sdp_offer_to_agent(
         debug!(%request_session_id, "SDP offer session_id mismatch — ignoring");
         return;
     }
-    if let Err(e) = state.rc_hub.send_to_agent(
+    if let Err(e) = state.fleet.rc_hub.send_to_agent(
         s.agent_id,
         ServerMsg::TunnelSdpOffer {
             session_id: request_session_id,
@@ -1418,7 +1412,7 @@ async fn relay_sdp_offer_to_agent(
 /// Relay a tunnel ICE candidate to the agent. Symmetric to
 /// [`relay_sdp_offer_to_agent`].
 async fn relay_ice_to_agent(
-    state: &AppState,
+    state: &NetworkState,
     session: Option<&TunnelSession>,
     request_session_id: ObjectId,
     candidate: serde_json::Value,
@@ -1429,7 +1423,7 @@ async fn relay_ice_to_agent(
     if s.tunnel_session_id != request_session_id {
         return;
     }
-    if let Err(e) = state.rc_hub.send_to_agent(
+    if let Err(e) = state.fleet.rc_hub.send_to_agent(
         s.agent_id,
         ServerMsg::TunnelIce {
             session_id: request_session_id,
@@ -1449,7 +1443,7 @@ async fn relay_ice_to_agent(
 /// can install a TURN permission for the client's relay address before
 /// the QUIC handshake (Phase 3c). Mirror of [`relay_ice_to_agent`].
 async fn relay_quic_candidate_to_agent(
-    state: &AppState,
+    state: &NetworkState,
     session: Option<&TunnelSession>,
     request_session_id: ObjectId,
     addrs: Vec<String>,
@@ -1460,7 +1454,7 @@ async fn relay_quic_candidate_to_agent(
     if s.tunnel_session_id != request_session_id {
         return;
     }
-    if let Err(e) = state.rc_hub.send_to_agent(
+    if let Err(e) = state.fleet.rc_hub.send_to_agent(
         s.agent_id,
         ServerMsg::TunnelQuicCandidate {
             session_id: request_session_id,
@@ -1480,7 +1474,7 @@ async fn relay_quic_candidate_to_agent(
 /// `(0, 0)` from a pre-wave-3 client is therefore still the honest answer:
 /// nobody counted.
 async fn audit_tcp_close(
-    state: &AppState,
+    state: &NetworkState,
     session: &TunnelSession,
     orig: &Originator,
     flow_id: u32,
@@ -1488,7 +1482,6 @@ async fn audit_tcp_close(
     bytes: (u64, u64),
 ) {
     let _ = state
-        .network()
         .tunnel_audit
         .append(&TunnelAuditEvent {
             id: None,
@@ -1522,7 +1515,7 @@ async fn audit_tcp_close(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn spawn_revocation_check(
-    state: AppState,
+    state: NetworkState,
     socket_tx: Arc<Mutex<SplitSink<WebSocket, Message>>>,
     outbound_tx: mpsc::Sender<ServerMsg>,
     tunnel_client_id: ObjectId,
@@ -1534,7 +1527,6 @@ fn spawn_revocation_check(
         loop {
             tick.tick().await;
             match state
-                .network()
                 .tunnel_clients
                 .find_in_tenant(tenant_id, tunnel_client_id)
                 .await
@@ -1544,7 +1536,6 @@ fn spawn_revocation_check(
                         && matches!(c.status, AgentStatus::Online | AgentStatus::Offline) =>
                 {
                     let _ = state
-                        .network()
                         .tunnel_clients
                         .touch_heartbeat(tunnel_client_id)
                         .await;
@@ -1583,7 +1574,7 @@ fn spawn_revocation_check(
 /// Agent-WS interception for the tunnel-CLIENT role (P3b-2, identity model
 /// (b)). An enrolled agent may ORIGINATE tunnel-client sessions over its
 /// own agent WS. This runs FIRST in the agent read-loop — ahead of the
-/// target-side [`crate::ws::remote_control::relay_tunnel_msg_from_agent`] —
+/// target-side [`crate::agent_arms::relay_tunnel_msg_from_agent`] —
 /// and consumes the variants where THIS agent acts as the tunnel
 /// *originator*, driving the same subject-agnostic handlers with
 /// `Principal::Agent`.
@@ -1604,8 +1595,8 @@ fn spawn_revocation_check(
 /// `tunnel_clients_by_session[session_id]` — registered on open with the
 /// agent's OWN outbound channel — so a target's answers reach this agent's
 /// socket unchanged.
-pub(crate) async fn relay_tunnel_client_msg_from_agent(
-    state: &AppState,
+pub async fn relay_tunnel_client_msg_from_agent(
+    state: &NetworkState,
     orig: &Originator,
     sessions: &mut std::collections::HashMap<ObjectId, TunnelSession>,
     supported_transports: &mut Vec<String>,
@@ -1796,7 +1787,7 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
                 // We originated this session — tear it down like the
                 // tunnel-client socket's terminate arm: tell the target
                 // agent, drop the reply-channel registration, audit close.
-                let _ = state.rc_hub.send_to_agent(
+                let _ = state.fleet.rc_hub.send_to_agent(
                     s.agent_id,
                     ServerMsg::TunnelTerminate {
                         session_id: s.tunnel_session_id,
@@ -1832,8 +1823,8 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
 /// Mirrors the tunnel-client socket's disconnect path: for each session,
 /// tell the target agent, drop the reply-channel registration, and audit
 /// the close. Consumes the map.
-pub(crate) async fn teardown_agent_originated_sessions(
-    state: &AppState,
+pub async fn teardown_agent_originated_sessions(
+    state: &NetworkState,
     orig: &Originator,
     sessions: std::collections::HashMap<ObjectId, TunnelSession>,
 ) {
@@ -1853,7 +1844,7 @@ pub(crate) async fn teardown_agent_originated_sessions(
                 s.tunnel_session_id,
             );
         }
-        let _ = state.rc_hub.send_to_agent(
+        let _ = state.fleet.rc_hub.send_to_agent(
             s.agent_id,
             ServerMsg::TunnelTerminate {
                 session_id: s.tunnel_session_id,
@@ -1865,7 +1856,7 @@ pub(crate) async fn teardown_agent_originated_sessions(
 }
 
 /// Drop one session from the by-target-agent index (see
-/// `AppState::tunnel_sessions_by_target_agent`), tidying away the agent's
+/// `NetworkState::tunnel_sessions_by_target_agent`), tidying away the agent's
 /// entry once its set is empty. The guard is dropped before `remove_if` so
 /// the two DashMap operations never overlap on the same shard.
 fn unindex_session_target(
@@ -1890,7 +1881,7 @@ fn unindex_session_target(
 /// reply-channel entry is left for that ack path (pre-P7 clients without
 /// the ack still end their session on our terminate, and their entry is
 /// swept on their own disconnect, exactly as today).
-pub(crate) async fn terminate_sessions_targeting_agent(state: &AppState, agent_id: ObjectId) {
+pub async fn terminate_sessions_targeting_agent(state: &NetworkState, agent_id: ObjectId) {
     // R3 — optional grace before terminating sessions when the target agent's
     // control WS drops. `0` (default) = terminate immediately (pre-R3). `>0` =
     // keep the sessions (their QUIC data plane + the nudge busy-gate index rely
@@ -1906,7 +1897,7 @@ pub(crate) async fn terminate_sessions_targeting_agent(state: &AppState, agent_i
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
-        if state.rc_hub.is_agent_online(agent_id) {
+        if state.fleet.rc_hub.is_agent_online(agent_id) {
             debug!(%agent_id, "R3 grace: agent re-registered on this pod — tunnel sessions kept");
             return;
         }
@@ -1933,7 +1924,7 @@ pub(crate) async fn terminate_sessions_targeting_agent(state: &AppState, agent_i
 /// Immediately terminate every tunnel session targeting `agent_id`: drop the
 /// by-target index and push `TunnelTerminate` to each client. The pre-R3
 /// behaviour, now also the grace-expiry path.
-async fn terminate_agent_sessions_now(state: &AppState, agent_id: ObjectId) {
+async fn terminate_agent_sessions_now(state: &NetworkState, agent_id: ObjectId) {
     let Some((_, session_ids)) = state.tunnel_sessions_by_target_agent.remove(&agent_id) else {
         return;
     };
@@ -1961,4 +1952,106 @@ async fn terminate_agent_sessions_now(state: &AppState, agent_id: ObjectId) {
             }
         }
     }
+}
+
+/// The `/ws?role=tunnel-client` upgrade (FR-69 P7b, from the host): verify the
+/// tunnel-client JWT, the affinity key and the row, say why on refusal, then
+/// run the loop. The host keeps the `/ws` route and the role gate.
+pub fn ws_upgrade_tunnel_client(
+    state: NetworkState,
+    token: String,
+    tid: Option<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let claims = match state.auth.verify_tunnel_client_token(&token) {
+        Ok(c) => c,
+        Err(_) => {
+            return Response::builder()
+                .status(401)
+                .body("Unauthorized (tunnel-client)".into())
+                .unwrap();
+        }
+    };
+
+    // S6 — a present affinity key must match the token's tenant.
+    if !tid_matches_claim(&tid, &claims.tenant_id) {
+        return Response::builder()
+            .status(403)
+            .body("tid does not match token tenant".into())
+            .unwrap();
+    }
+
+    let tunnel_client_id = match ObjectId::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid tunnel-client ID".into())
+                .unwrap();
+        }
+    };
+    let tenant_id = match ObjectId::parse_str(&claims.tenant_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid tenant ID".into())
+                .unwrap();
+        }
+    };
+    let owner_user_id = match ObjectId::parse_str(&claims.owner_user_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid owner user ID".into())
+                .unwrap();
+        }
+    };
+
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+        // Connect-time revocation check. Periodic re-check (every 60 s)
+        // lives in `ws::tunnel::handle_tunnel_client_socket`.
+        let client = match state
+            .tunnel_clients
+            .find_in_tenant(tenant_id, tunnel_client_id)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(%tunnel_client_id, %e, "tunnel-client lookup failed on WS connect");
+                return;
+            }
+        };
+        if client.deleted_at.is_some()
+            || matches!(
+                client.status,
+                roomler_ai_remote_control::models::AgentStatus::Quarantined
+            )
+        {
+            // rc.53: mirror of the agent refusal path. Tunnel-clients
+            // have their own taxonomy (`ServerMsg::TunnelRevoked`) and
+            // the periodic re-check in `handle_tunnel_client_socket`
+            // already emits it on mid-session revocation — extend the
+            // same notification to the connect-time refusal so the CLI
+            // logs "tunnel revoked" instead of opaque socket close.
+            info!(%tunnel_client_id, "tunnel-client is quarantined or deleted; refusing WS with rc:tunnel.revoked");
+            let revoked = roomler_ai_remote_control::signaling::ServerMsg::TunnelRevoked {
+                reason: "tunnel-client row was deleted or quarantined; re-enrol to revive".into(),
+            };
+            send_goodbye_and_close(socket, &revoked, 4003, "tunnel_client_deleted").await;
+            return;
+        }
+        handle_tunnel_client_socket(
+            state,
+            socket,
+            tunnel_client_id,
+            tenant_id,
+            owner_user_id,
+            tid,
+        )
+        .await;
+    })
 }

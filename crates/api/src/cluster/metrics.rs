@@ -61,7 +61,7 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "derp_rehome_close_total": DERP_REHOME_CLOSE_TOTAL.load(Ordering::Relaxed),
             "derp_bytes_relayed_total": DERP_BYTES_RELAYED_TOTAL.load(Ordering::Relaxed),
             "derp_rehome_stuck_total":
-                crate::ws::derp_cluster::DERP_REHOME_STUCK_TOTAL.load(Ordering::Relaxed),
+                DERP_REHOME_STUCK_TOTAL.load(Ordering::Relaxed),
             "split_evidence_total": SPLIT_EVIDENCE_TOTAL.load(Ordering::Relaxed),
             "relay_region_pick_total": RELAY_REGION_PICK_TOTAL.load(Ordering::Relaxed),
             "rc_rehome_controller_total": RC_REHOME_CONTROLLER_TOTAL.load(Ordering::Relaxed),

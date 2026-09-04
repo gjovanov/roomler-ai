@@ -330,35 +330,6 @@ impl AppState {
                 .enabled
                 .then(|| Arc::new(OverlayNetworkDao::new(&db))),
         );
-        // Multi-region DERP tickets: load the signer when a key is configured;
-        // log the derived public key so the operator can copy it to PoPs.
-        // Regions carrying derp_urls without a key = loud warn, never fatal.
-        let derp_ticket = match settings.relay.derp_ticket_private_key.as_deref() {
-            Some(key) => {
-                match roomler_ai_remote_control::derp_ticket::DerpTicketSigner::from_pkcs8_b64(key)
-                {
-                    Ok(s) => {
-                        tracing::info!(
-                            public_key = %s.public_key_b64(),
-                            "derp ticket signer loaded — set DERP_TICKET_PUBLIC_KEY to this on every PoP relay"
-                        );
-                        Some(Arc::new(s))
-                    }
-                    Err(e) => {
-                        tracing::error!(%e, "ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY is unusable; regional DERP disabled");
-                        None
-                    }
-                }
-            }
-            None => {
-                if turn_map.enabled && turn_map.specs.iter().any(|s| s.derp_url.is_some()) {
-                    tracing::warn!(
-                        "relay regions carry derp_urls but no ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY is set — regional DERP disabled"
-                    );
-                }
-                None
-            }
-        };
 
         // C-1 — the directory heartbeat: every 30 s, re-assert this pod's
         // agent presence records (gated on STILL holding the hub slot).
@@ -369,15 +340,6 @@ impl AppState {
         // A CONFLICT (foreign owner) is the fold signal: log it; the
         // socket-level machinery (displacement Goodbye / A2b counter)
         // owns the reaction.
-        let tunnel_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
-        let derp_presence_tokens: Arc<DashMap<crate::ws::derp::DerpKey, String>> =
-            Arc::new(DashMap::new());
-        let tunnel_clients_by_session: TunnelClientOutbound = Arc::new(DashMap::new());
-        let tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
-            Arc::new(DashMap::new());
-        let tunnel_sessions_by_origin_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
-            Arc::new(DashMap::new());
-
         // C-2 — the global-channel subscriber + forwarder, MOVED here from
         // main.rs so two-pod TestApps exercise cross-pod delivery (chat,
         // presence, and the new rc ctrl events). Same reconnect-and-backoff
@@ -443,7 +405,6 @@ impl AppState {
                  DERP and agent sockets (FR-69 P7a) — redeploy the previous tag instead"
             )
         })?;
-        let derp_registry = network.derp_registry.clone();
         // #1186 — `overlay_removes` ctrl envelopes need the FULL state to
         // re-fan (a Mongo peer read + the overlay send paths), which this
         // subscriber closure cannot capture (it is spawned mid-construction;
@@ -556,151 +517,7 @@ impl AppState {
             });
         }
 
-        // C-2/PR-1 — the idle-agent nudge handler: the pod OWNING an
-        // agent's WS receives `rc.agent_nudge` from a pod whose
-        // controller found the agent foreign, and cycles that WS iff the
-        // agent is FULLY idle — no rc sessions, no tunnel sessions
-        // targeting it, and (PR-1) none it ORIGINATED (declared routes) —
-        // so both ends re-land at the current LB hash. PR-1 adds the
-        // cooldown trio (a cycle tears the agent's rc/tunnel/overlay
-        // planes; it must never flap), truthful refusal reasons on the
-        // reply, and refusal/stuck counters.
-        if let Some(bus) = &cluster_bus {
-            let hub = fleet.rc_hub.clone();
-            let tunnel_targets = tunnel_sessions_by_target_agent.clone();
-            let tunnel_origins = tunnel_sessions_by_origin_agent.clone();
-            let cooldowns = fleet.agent_nudge_cooldowns.clone();
-            let pacing = crate::ws::rc_cluster::NudgePacing {
-                cooldown: std::time::Duration::from_secs(settings.rc.nudge_cooldown_secs),
-                max_attempts: settings.rc.nudge_max_attempts,
-                attempts_reset_after: std::time::Duration::from_secs(
-                    settings.rc.nudge_attempts_reset_secs,
-                ),
-            };
-            bus.register("rc.agent_nudge", move |body| {
-                let hub = hub.clone();
-                let tunnel_targets = tunnel_targets.clone();
-                let tunnel_origins = tunnel_origins.clone();
-                let cooldowns = cooldowns.clone();
-                Box::pin(async move {
-                    use roomler_ai_mod_fleet::hub::NudgeOutcome;
-                    let hex = body
-                        .get("agent_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "missing agent_id".to_string())?;
-                    let aid = ObjectId::parse_str(hex).map_err(|_| "bad agent_id".to_string())?;
-                    let target_busy = tunnel_targets
-                        .get(&aid)
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false);
-                    let origin_busy = tunnel_origins
-                        .get(&aid)
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false);
-                    // Gate (peek) -> fire -> book: attempts count FIRED
-                    // cycles only, so busy refusals can never trip the
-                    // stuck/split-evidence signal.
-                    let outcome = if target_busy || origin_busy {
-                        NudgeOutcome::ExtraBusy
-                    } else {
-                        match crate::ws::rc_cluster::nudge_gate(&cooldowns, aid, pacing) {
-                            crate::ws::rc_cluster::NudgeGate::Allow => {
-                                let o = hub.nudge_agent_if_idle(aid, false);
-                                if o == NudgeOutcome::Nudged {
-                                    crate::ws::rc_cluster::nudge_book(&cooldowns, aid, pacing);
-                                }
-                                o
-                            }
-                            crate::ws::rc_cluster::NudgeGate::Cooldown
-                            | crate::ws::rc_cluster::NudgeGate::Stuck => {
-                                crate::cluster::metrics::bump(
-                                    &crate::cluster::metrics::AGENT_NUDGE_REFUSED_TOTAL,
-                                );
-                                return Ok(serde_json::json!({
-                                    "nudged": false,
-                                    "reason": "cooldown",
-                                }));
-                            }
-                        }
-                    };
-                    if outcome == NudgeOutcome::Nudged {
-                        crate::cluster::metrics::bump(&crate::cluster::metrics::AGENT_NUDGE_TOTAL);
-                        return Ok(serde_json::json!({ "nudged": true, "reason": "nudged" }));
-                    }
-                    crate::cluster::metrics::bump(
-                        &crate::cluster::metrics::AGENT_NUDGE_REFUSED_TOTAL,
-                    );
-                    // The truthful reason, at info: pre-PR-1 refusals were
-                    // debug-only and the 2026-08-04 stuck loop was
-                    // invisible without pod-log spelunking.
-                    let reason = if origin_busy && !target_busy {
-                        "origin_busy"
-                    } else {
-                        outcome.reason()
-                    };
-                    tracing::info!(agent = %aid, reason, "agent nudge refused");
-                    Ok(serde_json::json!({ "nudged": false, "reason": reason }))
-                })
-            });
-        }
 
-        // C-3/C-5 — the directory heartbeat for the host's own classes
-        // (tunnel sessions, derp registrations). The agent-presence half is
-        // the fleet module's (FR-69 P5a), spawned by its init.
-        if let Some(dir) = &cluster_directory {
-            let dir = dir.clone();
-            let tunnel_tokens = tunnel_presence_tokens.clone();
-            let tunnel_sessions = tunnel_clients_by_session.clone();
-            let derp_tokens = derp_presence_tokens.clone();
-            let derp_reg = derp_registry.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    // C-3 — tunnel session records: refresh while the session
-                    // map holds the session (its four teardown paths all drop
-                    // the map entry, which stops the refresh here; the 90 s
-                    // TTL then reaps the record — no explicit release).
-                    let dead: Vec<ObjectId> = tunnel_tokens
-                        .iter()
-                        .filter(|e| !tunnel_sessions.contains_key(e.key()))
-                        .map(|e| *e.key())
-                        .collect();
-                    for sid in dead {
-                        tunnel_tokens.remove(&sid);
-                    }
-                    for entry in tunnel_tokens.iter() {
-                        let (sid, token) = (*entry.key(), entry.value().clone());
-                        let key = crate::cluster::directory::tunnel_key(&sid.to_hex());
-                        if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
-                            tracing::debug!(session = %sid, %e, "tunnel directory refresh failed");
-                        }
-                    }
-                    // C-5 — derp registration records: prune tokens whose
-                    // registry entry is gone (socket closed / displaced),
-                    // refresh the rest. A CONFLICT here just means the
-                    // node re-registered on another pod (LWW) while our
-                    // stale socket lingers — nothing to fold.
-                    let dead: Vec<crate::ws::derp::DerpKey> = derp_tokens
-                        .iter()
-                        .filter(|e| !derp_reg.contains_key(e.key()))
-                        .map(|e| *e.key())
-                        .collect();
-                    for k in dead {
-                        derp_tokens.remove(&k);
-                    }
-                    for entry in derp_tokens.iter() {
-                        let ((net, pk), token) = (*entry.key(), entry.value().clone());
-                        let key = crate::cluster::directory::derp_key(
-                            &net.to_hex(),
-                            &crate::ws::derp_cluster::pk_hex(&pk),
-                        );
-                        if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
-                            tracing::debug!(network = %net, %e, "derp directory refresh failed");
-                        }
-                    }
-                }
-            });
-        }
 
         let state = Self {
             core,
@@ -735,27 +552,14 @@ impl AppState {
 
         // FR-69 P4 — the media claim-or-route bus handlers + claim heartbeat
         // and the media sampler are wired by the `conference` module's init.
-        // C-5 — derp rehome: the owner-side close handler.
-        crate::ws::derp_cluster::wire_derp_cluster(&state);
-        // Split-brain observability: the per-pod DERP registry census.
-        crate::ws::derp::spawn_registry_census(&state);
         // PR-2 — the cross-pod rc signalling relay is wired by the `remote`
         // module's init (FR-69 P6).
-        // FR-51 — the ephemeral-node reaper (cluster-singleton per cycle via
-        // the same DB-name-scoped claim pattern). Spawns NOTHING unless
-        // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.
-        crate::ws::ephemeral::spawn_reaper(state.clone());
         // #1186 — the cross-pod `overlay_removes` applier is spawned by the
         // network module's init (P7a); the subscriber above feeds its channel.
         // Stats PR-1 — the rollup compactor (raw → _1h → _1d), cluster-
         // singleton per cycle via the same DB-name-scoped claim pattern.
         // No-op task when `stats.enabled=false`.
         crate::stats_rollup::spawn_stats_rollup(state.clone());
-        // FR-20 P1 — drain the per-network DERP byte counters into the
-        // `stats_usage` cost ledger every 60 s. Runs on BOTH pods on purpose:
-        // each writes only the bytes it relayed, into the same deterministic
-        // `_id`, and `$inc` sums them.
-        crate::ws::derp::spawn_derp_usage_flush(state.clone());
 
         // FR-69 P5a — the inverse edges (D6). Each mounted module registers
         // its hooks (since P7a that includes the network steps of the agent
@@ -763,21 +567,6 @@ impl AppState {
         // id), so the fleet module's cascades run in HOOK_ORDER through the
         // core registry.
         state.modules.register_hooks(&state.core);
-        // FR-69 P5c — the agent socket is the fleet module's; the host
-        // registers its TRANSITIONAL `network` half (the tunnel/overlay
-        // relays with their per-connection state, SSH, key rotation, DERP
-        // tickets, probe reports) so the module dispatches by owner without
-        // naming the host. The `remote` half registers itself (P6).
-        let net = Arc::new(crate::ws::agent_socket_host::HostNetworkAgentSocket::new(
-            state.clone(),
-        ));
-        state.core.agent_socket.register(
-            "network",
-            roomler_core::AgentSocketHooks {
-                handler: Some(net.clone()),
-                lifecycle: Some(net),
-            },
-        );
 
         Ok(state)
     }
@@ -800,46 +589,6 @@ pub async fn shutdown_cleanup(state: &AppState) {
     // FIRST (before the agent sweep's early return): a graceful deploy
     // hands each entity off with a ZERO-length ownerless window instead
     // of waiting out the TTLs (media 30 s, tunnel/derp 90 s).
-    if let Some(dir) = &state.cluster_directory {
-        // C-6 — tunnel session records (their sessions die with this
-        // pod; the CLI redials and re-opens on the survivor).
-        let held: Vec<(bson::oid::ObjectId, String)> = state
-            .tunnel_presence_tokens
-            .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        for (sid, token) in held {
-            state.tunnel_presence_tokens.remove(&sid);
-            let _ = dir
-                .release(
-                    &crate::cluster::directory::tunnel_key(&sid.to_hex()),
-                    &token,
-                )
-                .await;
-        }
-        // C-6 — derp registrations (+ the per-network member index, so
-        // the survivor's convergence sweep sees a clean roster).
-        let held: Vec<(crate::ws::derp::DerpKey, String)> = state
-            .derp_presence_tokens
-            .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        for ((net, pk), token) in held {
-            state.derp_presence_tokens.remove(&(net, pk));
-            let net_hex = net.to_hex();
-            let member = crate::ws::derp_cluster::pk_hex(&pk);
-            if let Ok(true) = dir
-                .release(
-                    &crate::cluster::directory::derp_key(&net_hex, &member),
-                    &token,
-                )
-                .await
-            {
-                let _ = dir
-                    .set_remove(&crate::cluster::directory::derpnet_key(&net_hex), &member)
-                    .await;
-            }
-        }
     }
 
     // FR-69 P4/P5a — the modules release what they own, in reverse

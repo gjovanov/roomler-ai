@@ -11,7 +11,7 @@ use bson::oid::ObjectId;
 use roomler_ai_remote_control::signaling::{ClientMsg, RelayRegionRtt, ServerMsg};
 use tracing::{debug, info, warn};
 
-use crate::state::AppState;
+use crate::NetworkState;
 
 // FR-69 P5a: the rc control pair (publish + apply) is the fleet module's now;
 // re-exported so every path in this crate reads as before.
@@ -36,8 +36,8 @@ const PROBE_PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// `detail` is re-clamped server-side. The device already caps it, but a
 /// length bound that only exists on the reporting side is not a bound.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn record_ssh_activity(
-    state: &AppState,
+pub async fn record_ssh_activity(
+    state: &NetworkState,
     tenant_id: ObjectId,
     agent_id: ObjectId,
     grant_id: Option<String>,
@@ -68,7 +68,7 @@ pub(crate) async fn record_ssh_activity(
         allowed,
         at: bson::DateTime::now(),
     };
-    if let Err(e) = state.network().ssh_activity.record(event).await {
+    if let Err(e) = .ssh_activity.record(event).await {
         warn!(%agent_id, %e, "ssh_activity insert failed");
     }
 }
@@ -78,8 +78,8 @@ pub(crate) async fn record_ssh_activity(
 /// is stamped here, `detail` is re-clamped on receipt. Public keys only —
 /// the frame has no field for anything else, by construction.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn record_key_rotation_report(
-    state: &AppState,
+pub async fn record_key_rotation_report(
+    state: &NetworkState,
     tenant_id: ObjectId,
     agent_id: ObjectId,
     request_id: String,
@@ -130,10 +130,10 @@ pub(crate) async fn record_key_rotation_report(
 /// [`agent_ssh::dispatch`] the HTTP route uses, so there is exactly one place
 /// where the gates are evaluated regardless of how the request arrived.
 ///
-/// [`agent_ssh::dispatch`]: roomler_ai_mod_network::routes::agent_ssh::dispatch
+/// [`agent_ssh::dispatch`]: crate::routes::agent_ssh::dispatch
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_agent_ssh_request(
-    state: &AppState,
+pub async fn handle_agent_ssh_request(
+    state: &NetworkState,
     tenant_id: bson::oid::ObjectId,
     origin_agent_id: bson::oid::ObjectId,
     request_id: String,
@@ -170,7 +170,7 @@ pub(crate) async fn handle_agent_ssh_request(
     };
 
     let agent =
-        match roomler_ai_mod_fleet::socket::resolve_exec_target(state.fleet(), tenant_id, &target)
+        match roomler_ai_mod_fleet::socket::resolve_exec_target(&state.fleet, tenant_id, &target)
             .await
         {
             Some(a) => a,
@@ -189,14 +189,14 @@ pub(crate) async fn handle_agent_ssh_request(
         .await
         .map(|u| u.display_name)
         .unwrap_or_else(|_| origin.owner_user_id.to_hex());
-    let caller = roomler_ai_mod_network::routes::agent_ssh::Caller {
+    let caller = crate::routes::agent_ssh::Caller {
         user_id: origin.owner_user_id,
         display: format!("{who} (via {})", origin.name),
         origin_agent_id: Some(origin_agent_id),
     };
 
-    let res = roomler_ai_mod_network::routes::agent_ssh::dispatch(
-        state.network(),
+    let res = crate::routes::agent_ssh::dispatch(
+        state,
         tenant_id,
         &agent,
         &caller,
@@ -210,7 +210,7 @@ pub(crate) async fn handle_agent_ssh_request(
     // field-by-field literal silently kept sending the old shape, which
     // compiles perfectly. Binding every field means the next addition has to be
     // decided about rather than forgotten.
-    let roomler_ai_mod_network::routes::agent_ssh::SshResponseBody {
+    let crate::routes::agent_ssh::SshResponseBody {
         address,
         port,
         // Dropped on purpose: this leg answers a device that named its own
@@ -240,8 +240,8 @@ pub(crate) async fn handle_agent_ssh_request(
 /// overlay `(network_id, wg_public_key)` — exactly the invariants the central
 /// `/derp` enforces from Mongo, so a PoP relay can enforce them with the
 /// PUBLIC key alone.
-pub(crate) async fn handle_derp_ticket_request(
-    state: &AppState,
+pub async fn handle_derp_ticket_request(
+    state: &NetworkState,
     agent_id: ObjectId,
     tx: &tokio::sync::mpsc::Sender<ServerMsg>,
 ) {
@@ -249,9 +249,9 @@ pub(crate) async fn handle_derp_ticket_request(
         debug!(%agent_id, "derp ticket requested but no signer configured");
         return;
     };
-    let Some(node) = roomler_ai_mod_network::overlay::current_node(
-        state.network(),
-        roomler_ai_mod_network::overlay::NodeIdentity::Agent(agent_id),
+    let Some(node) = crate::overlay::current_node(
+        state,
+        crate::overlay::NodeIdentity::Agent(agent_id),
     )
     .await
     else {
@@ -274,8 +274,8 @@ pub(crate) async fn handle_derp_ticket_request(
 /// measurable (dropped from the region set, or all its samples timed out).
 /// This keeps a border-line agent from flapping between two near-equal PoPs —
 /// the sticky pair cache protects live pairs, this protects everything else.
-pub(crate) async fn handle_relay_probe_report(
-    state: &AppState,
+pub async fn handle_relay_probe_report(
+    state: &NetworkState,
     agent_id: ObjectId,
     results: &[RelayRegionRtt],
     last_persist: &mut Option<std::time::Instant>,
@@ -292,7 +292,7 @@ pub(crate) async fn handle_relay_probe_report(
         .iter()
         .filter_map(|r| r.rtt_ms.map(|ms| (ms, r.region.as_str())))
         .min();
-    let current = state.rc_hub.agent_relay_home(agent_id);
+    let current = state.fleet.rc_hub.agent_relay_home(agent_id);
     let new_home: Option<String> = match (best, current.as_deref()) {
         // Nothing measurable (full-UDP-block / dead PoPs) → default region.
         (None, _) => None,
@@ -327,7 +327,6 @@ pub(crate) async fn handle_relay_probe_report(
         warn!(%agent_id, %e, "set_relay_home (agents) failed");
     }
     if let Err(e) = state
-        .network()
         .overlay_nodes
         .set_relay_home_for_agent(agent_id, new_home.as_deref())
         .await
@@ -345,8 +344,8 @@ pub(crate) async fn handle_relay_probe_report(
 /// Returns `None` if the message was consumed by the tunnel relay
 /// (don't dispatch to the Hub afterwards), or `Some(parsed)` if the
 /// caller should continue with Hub dispatch.
-pub(crate) async fn relay_tunnel_msg_from_agent(
-    state: &AppState,
+pub async fn relay_tunnel_msg_from_agent(
+    state: &NetworkState,
     parsed: ClientMsg,
 ) -> Option<ClientMsg> {
     match parsed {
@@ -550,7 +549,7 @@ pub(crate) async fn relay_tunnel_msg_from_agent(
 /// Push a `ServerMsg` to the tunnel-client registered for
 /// `session_id`. No-op when the client has gone away (peer torn
 /// down between agent emit + relay).
-async fn relay_to_client(state: &AppState, session_id: bson::oid::ObjectId, msg: ServerMsg) {
+async fn relay_to_client(state: &NetworkState, session_id: bson::oid::ObjectId, msg: ServerMsg) {
     let Some(tx) = state
         .tunnel_clients_by_session
         .get(&session_id)
@@ -577,11 +576,11 @@ async fn relay_to_client(state: &AppState, session_id: bson::oid::ObjectId, msg:
                     .is_ok()
             {
                 tokio::spawn(async move {
-                    let key = crate::cluster::directory::tunnel_key(&session_id.to_hex());
+                    let key = roomler_core::cluster::directory::tunnel_key(&session_id.to_hex());
                     if let Ok(Some(owner)) = dir.get(&key).await
                         && dir.is_foreign(&owner)
                     {
-                        let total = crate::cluster::metrics::SPLIT_EVIDENCE_TOTAL
+                        let total = roomler_core::cluster::metrics::SPLIT_EVIDENCE_TOTAL
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                             + 1;
                         warn!(
