@@ -10,7 +10,9 @@
 //!   deadline is the ACTIVE failure detector, directory TTLs the passive
 //!   backstop, `roomler:pod-alive:*` advisory only.
 
-pub mod bus;
-pub mod directory;
-pub mod identity;
+// FR-69 P1b — the three pieces above are core (`roomler_core::cluster`);
+// re-exported so every `crate::cluster::{bus, directory, identity}` path in
+// this crate reads as before. The metrics snapshot stays here: it reads
+// module-owned counters.
+pub use roomler_core::cluster::{bus, directory, identity};
 pub mod metrics;

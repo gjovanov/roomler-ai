@@ -1,6 +1,6 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 shipped (claim, rename, contract + baseline) · P1 waits for a trigger ·
+**Status**: P0 shipped · P1 in flight (P1a #1315 + P1b #1317 shipped; P1c open) ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -446,7 +446,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | Phase | Delivers | Gate | Kill switch | Complexity | Days |
 |---|---|---|---|---|---:|
 | **P0** ✅ | FR claimed; `agent-core` → `roomler-node-core`; `crates/core` (`roomler-core`) contract types; composition baseline + test — #1309, #1311, #1312 | CI green; baseline committed and reproducible (recorded by the lane itself, see the field log) | none needed (docs + a rename + an unused crate) | low | 2–3 |
-| **P1** | `Core` extraction, state split, `[modules]` settings, `GET /api/capabilities` | baseline identical; integration lane; prod roll | revert | high | 5–8 |
+| **P1** 🟡 | `Core` extraction, state split, `[modules]` settings, `GET /api/capabilities` — P1a #1315 (the split, in place) and P1b #1317 (the move into `roomler-core`) shipped; P1c (core-owned handlers to `State<Core>`) open | baseline identical (P1a: +1 route, intended); integration lane; prod roll | revert | high | 5–8 |
 | **P2** | `saas` module | same | `[modules] saas = false` | low | 1–2 |
 | **P3** | `chat` module | same + tenant-scoping tests | `chat = false` | medium | 2–3 |
 | **P4** | `conference` module; mediasoup out of `services` | same + Docker time measured (AC4) | `conference = false` | medium | 3–4 |
@@ -540,3 +540,35 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
   order covers every module once, the axum 0.8.9 Debug parser reads a real router with nested
   and `any` routes, the index plan differs by `multi_block` exactly at `overlay_blocks`).
 - What the P0 baseline does NOT yet prove: nothing has moved. AC1 becomes meaningful with P1.
+
+### 2026-09-04 — P1a + P1b: the split, then the move
+
+The operator triggered P1 the same day. Both cuts were sized for a **CI-only compile loop** —
+this dev box has no Linux server toolchain, so every api-level change was compiled by the
+Rust job and exercised by the integration lane rather than locally.
+
+- **P1a (#1315, squash `957aeef0`)** — `Core` split out of `AppState` inside the api crate:
+  the 27 core fields moved, `AppState` keeps `core` first and **derefs** to it, so none of the
+  95 direct `state.settings`/`state.db` reads and none of the test-side `app.state.<field>`
+  reads changed. `AuthUser`/`OptionalAuthUser` bound on `Core: FromRef<S>` (axum's `FromRef`;
+  the local helper trait is gone); `AuthAgent` stays on `AppState` (it loads the agent row).
+  `[modules]` switches added (recorded, logged at boot as not yet effective). `GET
+  /api/capabilities` is the proof handler on `State<Core>`; `/health` lists `modules`. Green on
+  the first CI run, integration suite included. **The baseline changed by exactly one route**
+  (`GET,HEAD /api/capabilities`) — the first intended change, hand-edited into the JSON with
+  the reason in the commit message; the lane confirmed it.
+- **P1b (#1317)** — the move: `ws/{storage,dispatcher,redis_pubsub}`,
+  `cluster/{identity,directory,bus}` + the counters half of `cluster/metrics`, `storage`,
+  `user_analytics` (its two `&AppState` functions now take `&Core`; callers deref),
+  `rate_limit`, `relay_load`, and `Core` itself (`roomler_core::state::Core`) — with `git mv`,
+  unchanged. None of them referenced anything else in the api crate, which is what made them
+  core. The api crate re-exports every moved module under its old path, so the diff outside the
+  moved files is a handful of `pub use` lines. Two things stay by design: the metrics
+  **snapshot** (reads module-owned counters) and `impl FromRef<AppState> for Core` (orphan
+  rules; `roomler-core` never learns `AppState` exists). The api crate drops five dependencies
+  nothing in it references any more; CI now runs `roomler-core`'s unit tests, which no lane ran
+  before. Baseline untouched.
+- ⚠️ Side effect worth knowing: `roomler-core` now depends on `roomler-ai-services`, which
+  links `mediasoup` — so the contract crate's unit tests can no longer run on a box without the
+  server toolchain either. That is temporary by construction: P4 moves `services/media` into
+  the `conference` module and the dependency disappears with it.
