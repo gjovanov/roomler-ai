@@ -1574,6 +1574,8 @@ import {
   type RcResolutionSetting,
   type RcPriority,
   type RcCodecChoice,
+  resolutionCapAnnotation,
+  resolutionOverrideHint,
 } from '@/composables/useRemoteControl'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useDisplay } from 'vuetify'
@@ -2572,6 +2574,12 @@ const sharpenHint = computed<string>(() => {
 const resolutionSettingHint = computed<string>(() => {
   const native = nativeSourceLabel.value
   if (!native) return 'Native dimensions surface after the first decoded frame'
+  // FR-70 P1 — an overridden choice is never silent: when the agent caps
+  // the stream below what was asked, the setting says what, why and what
+  // lifts it, ahead of the native-dims note.
+  const { w, h } = decodedDims.value
+  const override = resolutionOverrideHint(rc.videoInfo.value, w, h)
+  if (override) return `${override} Agent native ${native}.`
   return customTargetExceedsNative.value
     ? `Agent native ${native} — custom target exceeds this; capped at native`
     : `Agent native ${native}`
@@ -3135,19 +3143,32 @@ const statsResolutionLabel = computed(() => {
   if (!w || !h) return ''
   const base = `${w}×${h}`
   // rc.199 — the "why is Original blurry?" answer. The agent reports its
-  // native panel dims in rc:video-info; when a RELAY session encodes below
-  // native it's the link-physics hard cap clamping even an explicit
-  // Original/Native pick. Surface it so the operator knows to switch
-  // Priority → Sharper (which lifts the cap; the suffix then disappears).
-  // Only shown for the relay-capped case — user-chosen fit/custom downscales
-  // aren't flagged (the Native chip already shows the source dims).
-  const vi = rc.videoInfo.value
-  const nw = vi?.native_w ?? 0
-  const nh = vi?.native_h ?? 0
-  if (nw > 0 && nh > 0 && vi?.transport === 'relay' && (w < nw || h < nh)) {
-    return `${base} · relay-limited (native ${nw}×${nh})`
-  }
-  return base
+  // native panel dims in rc:video-info; when the stream is encoded below
+  // them the pill names the cap in force. FR-70 P1: the NAME comes from the
+  // agent's own rung reason (`cap_reason`), because the old transport-only
+  // guess ("relay-limited — switch Priority to Sharper") was wrong exactly
+  // where it mattered: the slow-link profile is resolved once at pump start
+  // from the pair's REMEMBERED rate and no dial lifts it (operator's report,
+  // 2026-09-04: "blurred at 1200×800 even though original resolution was
+  // selected"). Pre-P1 agents still get the rc.199 relay-only guess.
+  // User-chosen fit/custom downscales aren't flagged (the agent reports a
+  // cap only while its effective target differs from the user's).
+  return base + resolutionCapAnnotation(rc.videoInfo.value, w, h)
+})
+/** FR-70 P1 — the decoded frame size, for the Resolution setting's
+ *  override hint (same source as the pill above). */
+const decodedDims = computed(() => {
+  const w = rc.hevcActive.value
+    ? rc.hevcStats.value.width
+    : rc.vp9_444Active.value
+      ? rc.vp9_444Stats.value.width
+      : rc.mediaIntrinsicW.value
+  const h = rc.hevcActive.value
+    ? rc.hevcStats.value.height
+    : rc.vp9_444Active.value
+      ? rc.vp9_444Stats.value.height
+      : rc.mediaIntrinsicH.value
+  return { w, h }
 })
 
 // Remote cursor overlay (1E.3). Requires both a position and a
