@@ -167,15 +167,55 @@ confirmation rather than a search.
 - [ ] AC4 — FR-59 AC4 (< 600 ms sustained on the airport-class link) closes here.
 - [ ] AC5 — The eight replaced estimators and their six switches are deleted; `ratectl = off` restores the prior behaviour for one release.
 
+## The ramp-exit rule — measured, not argued
+
+B0 raised it: on a pipe thinner than `slow_start::OPEN_BPS` the opening window
+congests, `SlowStart::on_congestion` ends the ramp permanently, and the flat
+`area_min_bitrate_bps` floor re-pins the opener — so the ramp protects roughly
+one window. `encode::sim::RampExit` models two candidates beside the shipped
+rule. ⚠️ **Only `EndsOnCongestion` is shipped**; the other two exist in the
+simulator so a candidate can be measured before anyone argues for it.
+
+On the recorded 213 kbps cell (`cargo test -p roomlerd --lib ramp_exit_report --
+--ignored --nocapture`):
+
+| exit rule | peak target | over-drive bits | skips | settles | windows > 500 ms |
+|---|---|---|---|---|---|
+| `EndsOnCongestion` (shipped) | 1 500 000 | 4 054 846 | 157 | w7 | 4 |
+| `HalveAndContinue` | 300 000 | **65 502** | 39 | **w1** | 1 |
+| `HoldFloorUntilMeasured` | 348 500 | 376 280 | 64 | w3 | 1 |
+
+`HalveAndContinue` cuts the over-drive **62×** and settles six windows sooner.
+`HoldFloorUntilMeasured` is close behind and is arguably the more principled
+fix, because it targets the actual mechanism — a flat constant re-pinning the
+session while there is still no evidence — rather than the ramp. They are not
+mutually exclusive.
+
+⚠️ **Peak paint age barely moves** (1226 → 1213 ms). All three open at the same
+rate, so they share the same opening keyframe, and that is what the peak
+measures. This is the same finding as above from a second direction: the
+opener's keyframe budget (FR-31) is a separate lever, and no rate rule will
+touch it.
+
+🔑 **The honest gap: I could not build a cell where a candidate COSTS anything.**
+Three healthy cells (a 20 Mbps pair, a 5 Mbps LAN with motion bursts, and a fast
+pipe deliberately stalled at 2 s while the ramp was still climbing) return
+*byte-identical* numbers for all three rules. That is not agreement between the
+rules — it is the exit rule never binding, because on an unsaturated pipe the
+FR-59 P1 floor relief tracks the delivered rate and the floor never snaps back
+to the constant. So these cells demonstrate **no regression**, not superiority,
+and the adversarial cell for "halving gives away rate the link has" remains
+unconstructed. Treat that as a gap in the evidence rather than proof of its
+absence.
+
 ## Open decisions
 
 - **Deferred from B0: CSV trace replay from `agent_logs`.** The four fixtures are calibrated from
   recorded field numbers but are generated, not replayed. Replay is worth building when a trace
   disagrees with a fixture; building it first would have delayed the AC0b answer for no evidence.
-- **Raised by B0:** should `SlowStart::on_congestion` end the ramp, or halve and continue? Ending it
-  hands a pipe thinner than `OPEN_BPS` straight back to the flat floor after one window. The module
-  doc argues ending is right because "once congestion has spoken there IS evidence"; the simulation
-  shows the evidence is then discarded by a constant. Decide with a fixture, not an opinion.
+- **Raised by B0, and now MEASURED — see "The ramp-exit rule" below.** Both modelled candidates beat
+  the shipped rule on the thin pipe and cost nothing on three healthy cells. Not shipped: the choice
+  between them is a design call, and the field A/B (AC0b) has not run on ANY of them yet.
 - Whether the viewer computes the delay slope (recommended; the data is there) or sends per-frame pairs.
 - Follower (multi-viewer) folding: worst follower's `rx_bps/queue_ms` into the same window.
 
