@@ -30,13 +30,13 @@ use futures::TryStreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 use roomler_ai_db::models::role::permissions;
 
 // ── Guards ──────────────────────────────────────────────────────────────
 
 /// Platform-operator gate. 404 by design (see module docs).
-pub(crate) fn require_platform_admin(state: &AppState, auth: &AuthUser) -> Result<(), ApiError> {
+pub(crate) fn require_platform_admin(state: &Core, auth: &AuthUser) -> Result<(), ApiError> {
     if state.platform_admins.contains(&auth.user_id) {
         Ok(())
     } else {
@@ -48,7 +48,7 @@ pub(crate) fn require_platform_admin(state: &AppState, auth: &AuthUser) -> Resul
 /// are 404, not 403 — the web client wipes tokens on 403, and a member
 /// removed from the org mid-poll must not be logged out of everything.
 pub(crate) async fn require_tenant_stats(
-    state: &AppState,
+    state: &Core,
     tenant_id: ObjectId,
     user_id: ObjectId,
     need_manage: bool,
@@ -119,7 +119,7 @@ pub(crate) fn t_secs() -> Document {
 }
 
 pub(crate) async fn agg(
-    state: &AppState,
+    state: &Core,
     coll: &str,
     pipeline: Vec<Document>,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
@@ -376,7 +376,7 @@ pub(crate) fn tier_coll(base: &str, tier: Tier) -> String {
 /// GET /api/tenant/{tid}/stats/overview — ANY member. Powers the org
 /// dashboard Insights panel: current counts + two small sparklines.
 pub async fn tenant_overview(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -476,7 +476,7 @@ pub async fn tenant_overview(
 
 /// GET /api/tenant/{tid}/stats/machines?range= — MANAGE_AGENTS.
 pub async fn tenant_machines(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<RangeQuery>,
@@ -490,7 +490,7 @@ pub async fn tenant_machines(
 }
 
 async fn machines_payload(
-    state: &AppState,
+    state: &Core,
     tid: ObjectId,
     range: Option<&str>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -562,7 +562,7 @@ const UPTIME_MAX_INTERVALS: usize = 500;
 /// `unknown` — honest about "we weren't recording yet" rather than
 /// back-filling a state we never observed.
 async fn uptime_intervals(
-    state: &AppState,
+    state: &Core,
     tid: ObjectId,
     floor: DateTime,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
@@ -737,7 +737,7 @@ fn carrier_rank(c: &str) -> u8 {
 /// Member-visible (read-only, no addresses or secrets — carrier kind and
 /// latency only), because the dashboard panel it feeds is.
 pub async fn tenant_mesh(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -925,7 +925,7 @@ pub async fn tenant_mesh(
 
 /// GET /api/tenant/{tid}/stats/calls?range= — MANAGE_AGENTS.
 pub async fn tenant_calls(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<RangeQuery>,
@@ -939,7 +939,7 @@ pub async fn tenant_calls(
 }
 
 async fn calls_payload(
-    state: &AppState,
+    state: &Core,
     tid: Option<ObjectId>,
     range: Option<&str>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -990,7 +990,7 @@ async fn calls_payload(
 /// the existing tunnel_audit ledger (bytes + RelayMode per closed flow;
 /// 90 d TTL bounds `1y` to what exists).
 pub async fn tenant_tunnels(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(q): Query<RangeQuery>,
@@ -1052,7 +1052,7 @@ pub struct PageViewBody {
 /// route and the timestamp, nothing else. Batches are capped so a
 /// misbehaving client can't turn this into a write amplifier.
 pub async fn page_view(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Json(body): Json<PageViewBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1096,7 +1096,7 @@ pub async fn page_view(
 /// sessions over time, durations, browsers, platforms, countries, pages,
 /// and the per-org split.
 pub async fn admin_users(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1235,7 +1235,7 @@ pub async fn admin_users(
 /// per-pod), busy from this pod's load map, and the fleet-eye latency
 /// (avg of agents' probe RTTs per region).
 pub async fn admin_relay_current(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_platform_admin(&state, &auth)?;
@@ -1308,7 +1308,7 @@ pub async fn admin_relay_current(
 
 /// GET /api/admin/stats/relay/history?region&range
 pub async fn admin_relay_history(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1337,7 +1337,7 @@ pub async fn admin_relay_history(
 
 /// GET /api/admin/stats/orgs — per-tenant machine + call rollup.
 pub async fn admin_orgs(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_platform_admin(&state, &auth)?;
@@ -1415,7 +1415,7 @@ pub async fn admin_orgs(
 /// GET /api/admin/stats/machines?tenant_id&range — cross-org machine
 /// series for a chosen tenant.
 pub async fn admin_machines(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1434,7 +1434,7 @@ pub async fn admin_machines(
 /// GET /api/admin/stats/calls?tenant_id&range — tenant_id optional
 /// (omitted ⇒ platform-wide).
 pub async fn admin_calls(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Query(q): Query<RangeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

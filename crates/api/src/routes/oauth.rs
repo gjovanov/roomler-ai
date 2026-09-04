@@ -8,11 +8,11 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::{error::ApiError, state::AppState};
+use crate::{core_state::Core, error::ApiError};
 
 /// `; Secure` in production, empty in dev — the http://localhost dev/test flow
 /// must still receive the cookie, and prod is https end-to-end.
-fn secure_attr(state: &AppState) -> &'static str {
+fn secure_attr(state: &Core) -> &'static str {
     if state.settings.app.environment == "production" {
         "; Secure"
     } else {
@@ -36,7 +36,7 @@ pub struct CallbackQuery {
 }
 
 pub async fn oauth_redirect(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     Path(provider): Path<String>,
 ) -> Result<Response, ApiError> {
     let oauth = state
@@ -68,7 +68,7 @@ pub async fn oauth_redirect(
 }
 
 pub async fn oauth_callback(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     Path(provider): Path<String>,
     req_headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
