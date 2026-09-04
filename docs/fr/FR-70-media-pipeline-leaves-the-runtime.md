@@ -1,6 +1,6 @@
 # FR-70 — The media pipeline leaves the runtime
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) · **Status:** proposed 2026-09-04 ·
+**Issue:** [#1330](https://github.com/gjovanov/roomler-ai/issues/1330) · **Status:** proposed 2026-09-04 ·
 **Plan:** [`media-pipeline-architecture`](../plans/media-pipeline-architecture.md)
 
 ## Goal
