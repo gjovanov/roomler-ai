@@ -10,6 +10,7 @@
 // the only-prompt-on-positive-evidence idiom from the tutorial auto-open.
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { useCapabilitiesStore } from '@/stores/capabilities'
 
 interface NewsletterPref {
   subscribed: boolean
@@ -20,6 +21,10 @@ export function useNewsletterPref() {
   const busy = ref(false)
 
   async function load(): Promise<void> {
+    // FR-69 P9 — the newsletter is the `saas` module's; a self-host image
+    // never mounts it, and `/user/newsletter` there is a 400 in the console
+    // for nothing. `null` already means "do not prompt".
+    if (!useCapabilitiesStore().has('saas')) return
     try {
       subscribed.value = (await api.get<NewsletterPref>('/user/newsletter')).subscribed
     } catch {

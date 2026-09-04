@@ -877,7 +877,7 @@ watch(
     // Org SWITCH (not the immediate first fire — onMounted owns the
     // initial fetch): reload the sidebar's rooms + unread badges for the
     // new org; the old switcher left them showing the previous org.
-    if (tid && prevTid !== undefined && prevTid !== tid) {
+    if (tid && prevTid !== undefined && prevTid !== tid && caps.has('chat')) {
       void roomStore.fetchRooms(tid).then(() => roomStore.fetchAllUnreadCounts(tid))
     }
   },
@@ -947,7 +947,7 @@ async function maybeAutoOpenTour() {
   try {
     await Promise.all([
       agentStore.fetchAgents(tid),
-      roomStore.rooms.length ? Promise.resolve() : roomStore.fetchRooms(tid),
+      roomStore.rooms.length || !caps.has('chat') ? Promise.resolve() : roomStore.fetchRooms(tid),
     ])
   } catch {
     return
@@ -1065,6 +1065,9 @@ async function onWsReconnected() {
   roomNav.reset()
   deviceNav.reset()
   if (showFleetNav.value) void agentStore.fetchAgents(tenantId.value).catch(() => {})
+  // FR-69 P9 — rooms, unread counts and messages are the chat module's; a
+  // server without it has nothing to refetch (and would answer 404).
+  if (!caps.has('chat')) return
   await roomStore.fetchRooms(tenantId.value)
   roomStore.fetchAllUnreadCounts(tenantId.value)
   const messageStore = useMessageStore()
@@ -1080,8 +1083,9 @@ onMounted(async () => {
   window.addEventListener('room:call_started', onCallStarted)
   window.addEventListener('keydown', onSearchShortcut)
   window.addEventListener('ws:reconnected', onWsReconnected)
-  // Fetch rooms and unread counts for current tenant
-  if (tenantId.value) {
+  // Fetch rooms and unread counts for current tenant — the chat module's;
+  // skipped where the server does not mount it (FR-69 P9).
+  if (tenantId.value && caps.has('chat')) {
     await roomStore.fetchRooms(tenantId.value)
     roomStore.fetchAllUnreadCounts(tenantId.value)
   }

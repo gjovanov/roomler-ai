@@ -3,9 +3,10 @@
 **Status**: P0 – P9 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 · #1323 ·
 #1325 · #1329 · #1332 · #1336 · #1337 · #1339 · #1340 · #1347 · #1348 · #1351) — **every
 pillar is a module, the five profiles build and are checked for what they leave out, the SPA
-gates on what the server mounts** · **a composition fix in PR** (the device listing returns
-to the host — a `remote` profile 404'd its devices page — with the publish smoke asserting
-the route per profile; AC4 measured, AC5's smoke half held) · every phase's field gate (a
+gates on what the server mounts** · the device-listing composition fix shipped (#1352, proven
+on both profile arms #1354) · **AC7 verified on a local `mesh` stack** (`ui/e2e/mesh-profile.spec.ts`; the same PR
+stopped the shell calling modules the server does not mount) · AC4 measured, AC5's smoke half
+held · every phase's field gate (a
 prod roll watched from the fleet: no dip in online agents; for P6 one RC session per carrier
 class; for P7 the overlay/tunnel sweep; for P8 the `mesh` image's daemon cell and the
 build-time measurement; for P9 the full UI against a `mesh` server) is still to be run ·
@@ -508,8 +509,14 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       exhaustive match and a locked test. — P5b #1332: `ClientMsg::namespace()` is exhaustive
       (a new variant does not compile until it names an owner), `CLIENT_MSG_OWNERS` is checked
       against the enum's renames read from the source, and the baseline snapshots the table.
-- [ ] **AC7** The full UI against a `mesh` server shows no chat or conference navigation and no
-      console errors; against `full` the e2e nightly is unchanged.
+- [x] **AC7** The full UI against a `mesh` server shows no chat or conference navigation and no
+      console errors; against `full` the e2e nightly is unchanged. — The first half on a
+      local `mesh` stack built from source (`ui/e2e/mesh-profile.spec.ts`: no collaboration
+      tiles, actions or navigation, the chat deep-link refused, the devices listing 200, zero
+      console errors and zero failed `/api/` calls — after the three shell fixes it caught);
+      the second half by construction (the spec skips itself where `chat` is mounted) and
+      confirmed by the next nightly. Field log: "AC7 on a local `mesh` stack". Still to see:
+      the same against a `mesh` server across a real network.
 - [ ] **AC8** Every phase's prod roll is field-verified from the fleet and recorded in the field
       log, wrong turns included.
 - [x] **AC9** No wire, socket URL, collection or index changed: the baseline proves the last two
@@ -1167,3 +1174,37 @@ carrier class, a DERP-floor host, an SSH session — read from the fleet, not fr
   `GET /api/tenant/…/device` **401** (mounted), the `collab` image (run 33923337969) booted
   with `["chat","conference"]` and answered **404** (absent). An absence check that could
   not fail would prove nothing; both arms can.
+
+### 2026-09-05 — AC7 on a local `mesh` stack, and what the console said
+
+
+Built the `mesh` profile from source through the self-host compose (`ROOMLER_PROFILE=mesh`,
+`SAAS=0`; the Rust stage compiled fleet + network and no mediasoup), booted it with its own
+Mongo, Redis and MinIO on port 8090, and ran a dedicated Playwright spec against it
+(`ui/e2e/mesh-profile.spec.ts`, which skips itself on any server that mounts `chat`, so the
+nightly against `full` is untouched).
+
+| Check | Result |
+|---|---|
+| `/health` | `{"modules":["fleet","network"],"compiled":["fleet","network"]}` |
+| `/api/capabilities` | the same two modules, `switched_off: []` |
+| org dashboard tiles | Devices Online, Tunnels — no Rooms, Active Calls or Messages |
+| quick actions | none rendered (no New Room / Start Call / Upload File / Explore) |
+| navigation | Dashboard, Devices, Network, Invites, Analytics, Admin, Audit, Settings — no Rooms / Explore / Files, no Billing |
+| chat deep-link `/tenant/{id}/rooms` | landed on `/tenant/{id}` (the router guard) |
+| devices page | the listing answered 200 (the host's composition view, network rows included) |
+| console errors / failed `/api/` calls during the flow | **none** — the spec passed in 1.7 s (`1 passed`) after the three shell fixes below; before them the same assertion listed eleven `GET …/room -> 404`s, a `/user/newsletter -> 400` and an unhandled `API error 404` page error |
+
+Found and fixed on the way — the first run's UI assertions all passed, and the console-and-API
+assertion is what caught these: (1) the shell still fetched the org's ROOMS on every mount,
+org switch and reconnect (`AppLayout.vue` ×4, `TenantDashboard.vue`) — chat's route, so a
+`mesh` server answered 404 eleven times per page and the awaited fetch surfaced as an unhandled
+`API error 404` page error; (2) the profile's newsletter preference read `/user/newsletter`
+(saas's) — a 400 in the console for nothing; (3) the Insights row still rendered a
+**"Call minutes — 7d"** card with no conference module. All three read `caps.has(...)` now,
+and the spec asserts zero console errors and zero failed `/api/` calls across the whole flow,
+so the next call to an absent module fails the spec rather than a self-hoster's console.
+
+Not covered here: AC7 against a REMOTE `mesh` server over the real network (this is the same
+image on loopback), and AC5's daemon half (a `roomlerd` enrolled against it) — still the fleet's
+to run.
