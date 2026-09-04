@@ -70,7 +70,9 @@ pub mod ws;
 
 pub use capabilities::{Capabilities, TenantCtx};
 pub use error::ApiError;
-pub use hooks::{FleetLifecycle, Hooks, TenantLifecycle};
+pub use hooks::{
+    FleetLifecycle, HookRegistry, Hooks, ReleasedLease, RenamePropagation, TenantLifecycle,
+};
 pub use job::{Cadence, Job, JobFuture};
 pub use module::Module;
 pub use roomler_ai_db::indexes::{IndexOp, IndexPlan, IndexSet};

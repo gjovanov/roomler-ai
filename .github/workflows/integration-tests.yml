@@ -220,6 +220,17 @@ jobs:
         id: run
         env:
           FILTER: ${{ github.event.inputs.filter }}
+          # FR-69 P4/P5a — the test binary is a DEBUG build whose frames are
+          # enormous, and `peer_relay_mint_tests::every_refusal_is_audited…`
+          # builds SEVEN servers in one body. On the harness's default 2 MiB
+          # test thread it overflowed twice, deterministically: once when the
+          # conference module made the server-construction future bigger
+          # (fixed by boxing it in the fixture), and again when the fleet
+          # module added one more Core-sized state per server — the margin
+          # that boxing bought was ~25 KB. 8 MiB is the honest floor for a
+          # server-in-a-test binary at opt-level 0; it costs nothing (stack
+          # pages are committed on touch).
+          RUST_MIN_STACK: "8388608"
         run: |
           set -o pipefail
           # 2 threads, not 4: every test creates and drops its OWN database,
