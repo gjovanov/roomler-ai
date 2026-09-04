@@ -93,7 +93,7 @@
             </v-card-text>
           </v-card>
         </v-col>
-        <v-col cols="12" md="6">
+        <v-col v-if="showConference" cols="12" md="6">
           <v-card>
             <v-card-title class="text-subtitle-1 d-flex align-center">
               Call minutes — 7d
@@ -342,7 +342,7 @@ async function startCall() {
 
 onMounted(() => {
   if (tenantId.value) {
-    roomStore.fetchRooms(tenantId.value)
+    if (showChat.value) roomStore.fetchRooms(tenantId.value)
     if (showFleet.value) {
       agentStore.fetchAgents(tenantId.value).catch(() => {})
       tunnelClientStore.fetchTunnelClients(tenantId.value)
