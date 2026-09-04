@@ -16,7 +16,7 @@
 //! - no claim → only `media:join` may materialize the room, gated on
 //!   Mongo `in_progress` + winning the NX claim;
 //! - directory unavailable → the S6 belt verbatim (get-or-create), with
-//!   [`MEDIA_BELT_FALLBACK_TOTAL`] counting the accepted split risk.
+//!   `MEDIA_BELT_FALLBACK_TOTAL` (core metrics) counting the accepted split risk.
 //!
 //! Claim lifetime: 30 s TTL, 10 s refresh (crash gap ≤30 s; graceful
 //! shutdown compare-DELs for a zero-gap deploy handoff). A refresh
@@ -25,21 +25,17 @@
 //! `media:room_closed {reason:"rehomed"}` so participants rejoin via
 //! the normal join path, which lands on the surviving owner.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bson::oid::ObjectId;
 use tracing::{debug, info, warn};
 
-use crate::cluster::bus::BusError;
-use crate::cluster::directory::{ClaimOutcome, MEDIA_TTL_SECS, OwnerRecord, media_key};
-use crate::state::AppState;
+use crate::ConferenceState;
+use roomler_core::cluster::bus::BusError;
+use roomler_core::cluster::directory::{ClaimOutcome, MEDIA_TTL_SECS, OwnerRecord, media_key};
 
 /// Claim refresh cadence (TTL/3, same ratio as the 90/30 registries).
 pub const MEDIA_REFRESH_SECS: u64 = 10;
-
-/// Joins served through the belt while the directory was unavailable —
-/// each one accepted today's split-brain risk for the outage window.
-pub static MEDIA_BELT_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Where a media command executes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +50,11 @@ pub enum MediaRoute {
 
 /// Resolve placement for one room. `is_join` gates materialization —
 /// only the join path (WS `media:join` / HTTP `call/start`) may create.
-pub async fn resolve_media_route(state: &AppState, rid: &ObjectId, is_join: bool) -> MediaRoute {
+pub async fn resolve_media_route(
+    state: &ConferenceState,
+    rid: &ObjectId,
+    is_join: bool,
+) -> MediaRoute {
     if state.room_manager.has_room(rid) {
         return MediaRoute::Local { create: false };
     }
@@ -104,8 +104,8 @@ pub async fn resolve_media_route(state: &AppState, rid: &ObjectId, is_join: bool
 /// everything else serves locally where the handler produces the natural
 /// "room does not exist" outcome.
 async fn claim_missing(
-    state: &AppState,
-    dir: &crate::cluster::directory::OwnershipDirectory,
+    state: &ConferenceState,
+    dir: &roomler_core::cluster::directory::OwnershipDirectory,
     rid: &ObjectId,
     is_join: bool,
 ) -> MediaRoute {
@@ -138,7 +138,7 @@ async fn claim_missing(
     }
 }
 
-async fn call_in_progress(state: &AppState, rid: &ObjectId) -> bool {
+async fn call_in_progress(state: &ConferenceState, rid: &ObjectId) -> bool {
     state
         .rooms
         .base
@@ -151,13 +151,15 @@ async fn call_in_progress(state: &AppState, rid: &ObjectId) -> bool {
 /// Directory unavailable — the S6 belt verbatim (Mongo-gated local
 /// get-or-create), counted: each entry accepted split-brain risk for
 /// the duration of the Redis outage.
-async fn belt_fallback(state: &AppState, rid: &ObjectId, is_join: bool) -> MediaRoute {
+async fn belt_fallback(state: &ConferenceState, rid: &ObjectId, is_join: bool) -> MediaRoute {
     if !is_join {
         return MediaRoute::Local { create: false };
     }
     let create = call_in_progress(state, rid).await;
     if create {
-        let total = MEDIA_BELT_FALLBACK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        let total = roomler_core::cluster::metrics::MEDIA_BELT_FALLBACK_TOTAL
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         warn!(
             room = %rid,
             media_belt_fallback_total = total,
@@ -170,7 +172,7 @@ async fn belt_fallback(state: &AppState, rid: &ObjectId, is_join: bool) -> Media
 /// Forward one viewer command to the owning pod. Sends the viewer a
 /// `media:error` on terminal failure. Returns whether the owner acked.
 pub async fn forward_media_cmd(
-    state: &AppState,
+    state: &ConferenceState,
     owner_pod: &str,
     user_id: &ObjectId,
     connection_id: &str,
@@ -196,7 +198,7 @@ pub async fn forward_media_cmd(
     let deadline = if msg_type == "media:join" {
         std::time::Duration::from_secs(5)
     } else {
-        crate::cluster::bus::RPC_DEADLINE
+        roomler_core::cluster::bus::RPC_DEADLINE
     };
     match bus
         .request_with_deadline(owner_pod, "media.cmd", body.clone(), deadline)
@@ -241,7 +243,7 @@ pub async fn forward_media_cmd(
 /// re-resolves immediately (typically winning the claim locally) so the
 /// viewer heals without a manual retry.
 async fn prune_owner_record(
-    state: &AppState,
+    state: &ConferenceState,
     connection_id: &str,
     user_id: &ObjectId,
     msg_type: &str,
@@ -263,7 +265,7 @@ async fn prune_owner_record(
             // One re-resolve: with the corpse pruned this usually claims
             // locally and serves the join in-place.
             if let MediaRoute::Local { create } = resolve_media_route(state, &rid, true).await {
-                crate::ws::handler::dispatch_media_local(
+                crate::ws_media::dispatch_media_local(
                     state,
                     user_id,
                     connection_id,
@@ -285,12 +287,12 @@ async fn prune_owner_record(
     false
 }
 
-async fn media_error(state: &AppState, connection_id: &str, message: &str) {
+async fn media_error(state: &ConferenceState, connection_id: &str, message: &str) {
     let msg = serde_json::json!({
         "type": "media:error",
         "data": { "message": message }
     });
-    super::dispatcher::send_to_connection_routed(
+    roomler_core::ws::dispatcher::send_to_connection_routed(
         &state.ws_storage,
         &state.redis_pubsub,
         connection_id,
@@ -302,7 +304,7 @@ async fn media_error(state: &AppState, connection_id: &str, message: &str) {
 /// Close a room's media island wherever it lives (call_end / last-leave
 /// auto-end): locally = remove + release; foreign = `media.close_room`
 /// RPC to the owner.
-pub async fn close_room_everywhere(state: &AppState, rid: &ObjectId) {
+pub async fn close_room_everywhere(state: &ConferenceState, rid: &ObjectId) {
     if state.room_manager.has_room(rid) {
         state.room_manager.remove_room(rid);
         release_media_claim(state, rid).await;
@@ -335,7 +337,7 @@ pub async fn close_room_everywhere(state: &AppState, rid: &ObjectId) {
 }
 
 /// Release our claim for one room (compare-DEL via the held token).
-pub async fn release_media_claim(state: &AppState, rid: &ObjectId) {
+pub async fn release_media_claim(state: &ConferenceState, rid: &ObjectId) {
     if let Some((_, token)) = state.media_claim_tokens.remove(rid)
         && let Some(dir) = state.cluster_directory.clone()
         && let Err(e) = dir.release(&media_key(&rid.to_hex()), &token).await
@@ -351,7 +353,7 @@ pub async fn release_media_claim(state: &AppState, rid: &ObjectId) {
 /// keep their media); `None` is the legacy close-all-of-user path, kept as
 /// the mixed-version fallback during rolls.
 pub async fn rpc_leave_user(
-    state: &AppState,
+    state: &ConferenceState,
     owner_pod: &str,
     rid: &ObjectId,
     user_id: &ObjectId,
@@ -370,7 +372,7 @@ pub async fn rpc_leave_user(
 
 /// Best-effort leave for a REMOTE participant whose WS just closed on
 /// this pod: the owner still holds their transports.
-pub async fn forward_close_leave(state: &AppState, user_id: &ObjectId, connection_id: &str) {
+pub async fn forward_close_leave(state: &ConferenceState, user_id: &ObjectId, connection_id: &str) {
     let Some((_, rid)) = state.remote_media_conns.remove(connection_id) else {
         return;
     };
@@ -391,7 +393,7 @@ pub async fn forward_close_leave(state: &AppState, user_id: &ObjectId, connectio
         }
         // Folded home meanwhile — the plain local leave covers it.
         MediaRoute::Local { .. } => {
-            crate::ws::handler::dispatch_media_local(
+            crate::ws_media::dispatch_media_local(
                 state,
                 user_id,
                 connection_id,
@@ -407,9 +409,9 @@ pub async fn forward_close_leave(state: &AppState, user_id: &ObjectId, connectio
 /// The claim-loser rule: tear down the local island and push a rejoin
 /// signal; participants re-enter via the normal join path, which routes
 /// to the surviving owner.
-pub async fn fold_media_room(state: &AppState, rid: &ObjectId, reason: &str) {
+pub async fn fold_media_room(state: &ConferenceState, rid: &ObjectId, reason: &str) {
     warn!(room = %rid, reason, "folding local media-room island");
-    crate::cluster::metrics::bump(&crate::cluster::metrics::MEDIA_FOLD_TOTAL);
+    roomler_core::cluster::metrics::bump(&roomler_core::cluster::metrics::MEDIA_FOLD_TOTAL);
     // The key belongs to the foreign owner now — drop the token WITHOUT
     // a release.
     state.media_claim_tokens.remove(rid);
@@ -425,7 +427,7 @@ pub async fn fold_media_room(state: &AppState, rid: &ObjectId, reason: &str) {
         "data": { "room_id": rid.to_hex(), "reason": "rehomed" }
     });
     for conn in &conns {
-        super::dispatcher::send_to_connection_routed(
+        roomler_core::ws::dispatcher::send_to_connection_routed(
             &state.ws_storage,
             &state.redis_pubsub,
             conn,
@@ -437,7 +439,7 @@ pub async fn fold_media_room(state: &AppState, rid: &ObjectId, reason: &str) {
 
 /// One claim-maintenance pass: lazy-release tokens whose room is gone,
 /// refresh the rest, fold on CONFLICT. Public so tests drive it directly.
-pub async fn refresh_media_claims_once(state: &AppState) {
+pub async fn refresh_media_claims_once(state: &ConferenceState) {
     let Some(dir) = state.cluster_directory.clone() else {
         return;
     };
@@ -509,9 +511,30 @@ pub async fn refresh_media_claims_once(state: &AppState) {
 }
 
 /// Wire the C-4 machinery: bus handlers (owner side) + the claim
-/// heartbeat. Called once at the end of `AppState::new` (the bus
+/// heartbeat. Called once at the end of `ConferenceState::new` (the bus
 /// handlers need the fully-built state).
-pub fn wire_media_cluster(state: &AppState) {
+/// Graceful shutdown: compare-DEL every media claim this pod holds so a
+/// deploy hands each room off with a ZERO-length ownerless window instead
+/// of waiting out the 30 s TTL. Conference's `Module::shutdown`; the host's
+/// `shutdown_cleanup` used to do this inline (C-4).
+pub async fn release_all_claims(state: &ConferenceState) {
+    let Some(dir) = &state.cluster_directory else {
+        return;
+    };
+    let held: Vec<(ObjectId, String)> = state
+        .media_claim_tokens
+        .iter()
+        .map(|e| (*e.key(), e.value().clone()))
+        .collect();
+    for (rid, token) in held {
+        state.media_claim_tokens.remove(&rid);
+        if let Err(e) = dir.release(&media_key(&rid.to_hex()), &token).await {
+            debug!(room = %rid, %e, "shutdown: media claim release failed");
+        }
+    }
+}
+
+pub fn wire_media_cluster(state: &ConferenceState) {
     if let Some(bus) = &state.cluster_bus {
         // media.cmd — execute one viewer command against the local room.
         let st = state.clone();
@@ -546,7 +569,7 @@ pub fn wire_media_cluster(state: &AppState) {
                         data["connection_id"] = serde_json::Value::String(cid.to_string());
                     }
                     let event = serde_json::json!({ "type": "media:peer_left", "data": data });
-                    super::dispatcher::broadcast_with_redis(
+                    roomler_core::ws::dispatcher::broadcast_with_redis(
                         &st.ws_storage,
                         &st.redis_pubsub,
                         &remaining,
@@ -577,7 +600,7 @@ pub fn wire_media_cluster(state: &AppState) {
                     "data": { "room_id": rid.to_hex(), "reason": "ended" }
                 });
                 for conn in &conns {
-                    super::dispatcher::send_to_connection_routed(
+                    roomler_core::ws::dispatcher::send_to_connection_routed(
                         &st.ws_storage,
                         &st.redis_pubsub,
                         conn,
@@ -607,7 +630,7 @@ pub fn wire_media_cluster(state: &AppState) {
 /// conn-addressed channel back; moved → structured NACK naming the new
 /// owner so the caller can retry once.
 async fn handle_media_cmd_rpc(
-    state: AppState,
+    state: ConferenceState,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let uid = parse_oid(&body, "user_id")?;
@@ -632,7 +655,7 @@ async fn handle_media_cmd_rpc(
     match resolve_media_route(&state, &rid, msg_type == "media:join").await {
         MediaRoute::Remote(pod) => Err(format!("not_owner:{pod}")),
         MediaRoute::Local { create } => {
-            crate::ws::handler::dispatch_media_local(
+            crate::ws_media::dispatch_media_local(
                 &state,
                 &uid,
                 &conn,

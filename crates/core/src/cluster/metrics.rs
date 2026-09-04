@@ -25,6 +25,10 @@ pub static AGENT_NUDGE_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static BUS_DEADLINE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Media islands folded (claim lost / belt-era split resolution) (C-4).
 pub static MEDIA_FOLD_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Joins served through the belt while the directory was unavailable —
+/// each one accepted the split-brain risk for the outage window (C-4).
+/// Bumped by the `conference` module; read by the cluster status snapshot.
+pub static MEDIA_BELT_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// DERP sockets closed for cluster convergence (C-5).
 pub static DERP_REHOME_CLOSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// FR-19 — total bytes this pod has relayed over `/derp` (peer-to-peer WG

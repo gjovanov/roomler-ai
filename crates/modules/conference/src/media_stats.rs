@@ -30,7 +30,7 @@ use mediasoup::types::data_structures::TransportTuple;
 use mediasoup::webrtc_transport::WebRtcTransportStat;
 use tracing::{debug, info};
 
-use crate::state::AppState;
+use crate::ConferenceState;
 
 const SAMPLE_INTERVAL_SECS: u64 = 30;
 const TURN_RESOLVE_INTERVAL_SECS: u64 = 1800;
@@ -86,7 +86,7 @@ fn stat_of(stats: &Option<Vec<WebRtcTransportStat>>) -> Option<&WebRtcTransportS
 
 /// Sample every locally-owned conference once. Public so tests can drive
 /// it without the timer. Returns the number of rooms sampled.
-pub async fn run_media_sample_once(state: &AppState, turn_ips: &HashSet<IpAddr>) -> usize {
+pub async fn run_media_sample_once(state: &ConferenceState, turn_ips: &HashSet<IpAddr>) -> usize {
     let snapshot = state.room_manager.sample_transports();
     if snapshot.is_empty() {
         return 0;
@@ -235,7 +235,7 @@ pub async fn run_media_sample_once(state: &AppState, turn_ips: &HashSet<IpAddr>)
 
 /// Spawn the per-pod sampler. No claim: each pod samples only rooms in
 /// its OWN RoomManager (media ownership is single-pod per room).
-pub fn spawn_media_sampler(state: AppState) {
+pub fn spawn_media_sampler(state: ConferenceState) {
     if !state.settings.stats.enabled {
         return;
     }

@@ -8,7 +8,9 @@ use bson::oid::ObjectId;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::ConferenceState;
 use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Serialize)]
@@ -24,7 +26,7 @@ pub struct RecordingResponse {
 }
 
 pub async fn list(
-    State(state): State<AppState>,
+    State(state): State<ConferenceState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
@@ -34,7 +36,7 @@ pub async fn list(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let result = state.recordings.find_by_room(rid, &params).await?;
     let items: Vec<RecordingResponse> = result.items.into_iter().map(to_response).collect();
@@ -54,7 +56,7 @@ pub struct CreateRecordingRequest {
 }
 
 pub async fn create(
-    State(state): State<AppState>,
+    State(state): State<ConferenceState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     Json(body): Json<CreateRecordingRequest>,
@@ -64,7 +66,7 @@ pub async fn create(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     // FR-32 P1a — `recordings` is advertised per plan and was enforced nowhere.
     // Ships in the tenant's `plan_enforcement` mode, which defaults to `Warn`:
@@ -106,7 +108,7 @@ pub async fn create(
 }
 
 pub async fn delete(
-    State(state): State<AppState>,
+    State(state): State<ConferenceState>,
     auth: AuthUser,
     Path((tenant_id, _room_id, recording_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {

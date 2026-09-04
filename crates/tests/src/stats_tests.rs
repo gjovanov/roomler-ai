@@ -11,6 +11,7 @@ use bson::{Document, doc, oid::ObjectId};
 
 use crate::fixtures::test_app::TestApp;
 use roomler_ai_api::stats_rollup::{pass_count, run_stats_rollup_once};
+use roomler_ai_mod_conference::maintenance::close_orphaned_call_state;
 use roomler_ai_services::dao::stats::{RelaySample, bucket_start};
 
 fn unix_now() -> i64 {
@@ -441,8 +442,14 @@ async fn orphan_sweep_closes_stale_call_state() {
         .await
         .unwrap();
 
-    let (calls, sessions) =
-        roomler_ai_api::stats_rollup::close_orphaned_call_state(&app.state).await;
+    let (calls, sessions) = close_orphaned_call_state(
+        app.state
+            .modules
+            .conference
+            .as_ref()
+            .expect("the conference module is mounted in tests"),
+    )
+    .await;
     assert_eq!(calls, 1);
     assert_eq!(sessions, 1);
 

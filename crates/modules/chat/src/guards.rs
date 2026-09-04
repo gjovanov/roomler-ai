@@ -2,15 +2,68 @@
 // Copyright (C) 2026 G ROX EOOD
 //! Object-level authorisation for room- and message-scoped routes.
 //!
-//! FR-69 P3 — moved from the api crate's `routes/helpers.rs` unchanged. The
-//! host keeps its own copy of the two room guards for the call and recording
-//! handlers that conference takes over in P4.
+//! FR-69 P3 — moved from the api crate's `routes/helpers.rs` unchanged. P4 —
+//! the room guards gained `_with` forms over the two DAOs, so `conference`
+//! (which owns its own `RoomDao` handle for call state) shares ONE visibility
+//! rule instead of a copy; the `ChatState` forms below bind them.
 
 use bson::oid::ObjectId;
 use roomler_ai_db::models::{Message, Room};
+use roomler_ai_services::dao::{room::RoomDao, tenant::TenantDao};
 use roomler_core::ApiError;
 
 use crate::ChatState;
+
+/// [`resolve_room_in_tenant`] over the two DAOs it needs, for a caller whose
+/// state is not [`ChatState`].
+pub async fn resolve_room_in_tenant_with(
+    tenants: &TenantDao,
+    rooms: &RoomDao,
+    tenant_id: ObjectId,
+    room_id: ObjectId,
+    user_id: ObjectId,
+) -> Result<Room, ApiError> {
+    if !tenants.is_member(tenant_id, user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+    Ok(rooms.base.find_by_id_in_tenant(tenant_id, room_id).await?)
+}
+
+/// [`require_room_in_tenant`] over the two DAOs it needs — the one room
+/// visibility rule, shared with `conference`.
+pub async fn require_room_in_tenant_with(
+    tenants: &TenantDao,
+    rooms: &RoomDao,
+    tenant_id: ObjectId,
+    room_id: ObjectId,
+    user_id: ObjectId,
+) -> Result<Room, ApiError> {
+    let room = resolve_room_in_tenant_with(tenants, rooms, tenant_id, room_id, user_id).await?;
+
+    // Room-level read authorization. Tenant membership answers "may you be
+    // here at all"; this answers "may you be in THIS room" — the question that
+    // previously had no answer, so every member could read every room while
+    // the sidebar drew a padlock on most of them.
+    //
+    // `Public` (the default, and what every pre-existing room reads back as)
+    // short-circuits, so this costs no query for the overwhelming majority of
+    // requests and changes no behaviour on the day it ships.
+    if room.visibility.requires_membership()
+        && !rooms.is_member(tenant_id, room_id, user_id).await?
+    {
+        // NOT FOUND, not FORBIDDEN, for a `Secret` room: 403 would confirm it
+        // exists to someone who is not supposed to know that, which is the
+        // whole point of Secret. `Private` is listed anyway, so its existence
+        // is not a secret and a 403 is the more useful answer.
+        return Err(if room.visibility.hidden_from_non_members() {
+            ApiError::NotFound("Resource not found".to_string())
+        } else {
+            ApiError::Forbidden("Not a member of this room".to_string())
+        });
+    }
+
+    Ok(room)
+}
 
 /// Tenant membership + the room resolved WITHIN that tenant, and nothing else.
 ///
@@ -29,14 +82,7 @@ pub async fn resolve_room_in_tenant(
     room_id: ObjectId,
     user_id: ObjectId,
 ) -> Result<Room, ApiError> {
-    if !state.tenants.is_member(tenant_id, user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
-    Ok(state
-        .rooms
-        .base
-        .find_by_id_in_tenant(tenant_id, room_id)
-        .await?)
+    resolve_room_in_tenant_with(&state.tenants, &state.rooms, tenant_id, room_id, user_id).await
 }
 
 /// Object-level authorization gate for room-scoped collaboration routes.
@@ -55,31 +101,7 @@ pub async fn require_room_in_tenant(
     room_id: ObjectId,
     user_id: ObjectId,
 ) -> Result<Room, ApiError> {
-    let room = resolve_room_in_tenant(state, tenant_id, room_id, user_id).await?;
-
-    // Room-level read authorization. Tenant membership answers "may you be
-    // here at all"; this answers "may you be in THIS room" — the question that
-    // previously had no answer, so every member could read every room while
-    // the sidebar drew a padlock on most of them.
-    //
-    // `Public` (the default, and what every pre-existing room reads back as)
-    // short-circuits, so this costs no query for the overwhelming majority of
-    // requests and changes no behaviour on the day it ships.
-    if room.visibility.requires_membership()
-        && !state.rooms.is_member(tenant_id, room_id, user_id).await?
-    {
-        // NOT FOUND, not FORBIDDEN, for a `Secret` room: 403 would confirm it
-        // exists to someone who is not supposed to know that, which is the
-        // whole point of Secret. `Private` is listed anyway, so its existence
-        // is not a secret and a 403 is the more useful answer.
-        return Err(if room.visibility.hidden_from_non_members() {
-            ApiError::NotFound("Resource not found".to_string())
-        } else {
-            ApiError::Forbidden("Not a member of this room".to_string())
-        });
-    }
-
-    Ok(room)
+    require_room_in_tenant_with(&state.tenants, &state.rooms, tenant_id, room_id, user_id).await
 }
 
 /// The message-keyed sibling of [`require_room_in_tenant`]. Handlers keyed by
