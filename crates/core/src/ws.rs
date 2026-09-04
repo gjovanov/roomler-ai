@@ -56,6 +56,14 @@ pub struct WsCtx {
 #[async_trait]
 pub trait WsHandler: Send + Sync {
     async fn handle(&self, ctx: &WsCtx, msg: serde_json::Value) -> anyhow::Result<()>;
+
+    /// The socket closed, for any reason. A handler that keeps per-connection
+    /// state releases it here — conference drops the participant's transports
+    /// and closes its call session, a leave the client never sent. The host
+    /// calls every handler registered for the socket's role, after its own
+    /// cleanup (registry removal, online mirror) and before it logs the
+    /// disconnect.
+    async fn closed(&self, _ctx: &WsCtx) {}
 }
 
 /// One (role, namespace) → handler binding.
