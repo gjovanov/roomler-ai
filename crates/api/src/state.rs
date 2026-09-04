@@ -12,8 +12,8 @@ use roomler_ai_services::{
     dao::{
         activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
         consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, invite::InviteDao,
-        notification::NotificationDao, push_subscription::PushSubscriptionDao, role::RoleDao,
-        tenant::TenantDao, user::UserDao,
+        notification::NotificationDao, overlay_network::OverlayNetworkDao,
+        push_subscription::PushSubscriptionDao, role::RoleDao, tenant::TenantDao, user::UserDao,
     },
 };
 use roomler_core::turn::build_turn_map;
