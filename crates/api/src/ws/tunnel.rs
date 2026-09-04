@@ -95,6 +95,7 @@ pub async fn handle_tunnel_client_socket(
     // it as a node. Harmless if the client never joins the overlay;
     // removed on disconnect below.
     state
+        .network()
         .overlay_nodes_by_id
         .insert(tunnel_client_id, outbound_tx.clone());
 
@@ -402,6 +403,7 @@ pub async fn handle_tunnel_client_socket(
     // offline so peers' netmaps lose it. Best-effort; no-op if the
     // client never joined the overlay.
     state
+        .network()
         .network()
         .overlay_nodes_by_id
         .remove(&tunnel_client_id);
@@ -1030,6 +1032,7 @@ async fn handle_forward_request(
     // the auth boundary; the agent runs its own minimal allowlist
     // as defence-in-depth (T2.6).
     let policies = match state
+        .network()
         .tunnel_policies
         .list_active_for_tenant(s.agent_tenant_id)
         .await
