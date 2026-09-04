@@ -669,7 +669,7 @@ async fn media_join_routes_to_owner_pod_single_router() {
     // Exactly ONE router: app2 must NOT have materialized the room.
     assert!(!conf(&app2).room_manager.has_room(&rid));
     assert!(
-        app2.state.remote_media_conns.len() == 1,
+        conf(&app2).remote_media_conns.len() == 1,
         "remote membership tracked for WS-close forwarding"
     );
 
