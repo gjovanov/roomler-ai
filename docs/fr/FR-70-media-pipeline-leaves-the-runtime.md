@@ -82,6 +82,29 @@ threading work. **P1 landed 2026-09-04 in #1333** (kill switch `rate_prior_decay
 afterthought — if the deletions do not happen this is one more lever and the
 complaint stands.
 
+**M0's last item — the age split — landed 2026-09-04.** The viewer's decode
+workers now stamp every frame's ARRIVAL (last chunk in the worker) beside its
+paint, and `rc:decodestat` carries the window's arrival age as an optional
+`arr_ms` beside `age_ms` (same clock mapping, so it rides only alongside it;
+floored at 1 because 0 is the agent's absent sentinel). The agent packs it into
+the spare `u16` of the age word (`viewer_rate::pack_age_with_arrival`) and the
+heartbeat prints one field:
+
+```
+age_split=Some(AgeSplit { sender_ms: Some(12.3), transit_ms: 4878, viewer_ms: 13 })
+```
+
+`viewer_ms` = paint − arrival (decode queue + decode + paint, inside the
+browser); `sender_ms` = this window's send-queue wait (`send_wait_avg_ms`,
+enqueue → wire-complete — `None` on the VP9-444 pump, which keeps no such
+figure, so its `transit_ms` is an upper bound); `transit_ms` = arrival − sender,
+everything between the wire and the worker, the relay included. Finding 4 reads
+as `transit_ms ≈ 4.9 s` with `viewer_ms` and `sender_ms` in the tens of ms —
+attributable without reading source, which was M0's gate. `None` from a pre-M0
+viewer, or a window with no age report. ⚠️ Telemetry only: no loop reads it
+yet — acting on it (a transit stall must not cut the rate) is T1, and the diag
+HUD does not render the two new `HopWindow`s yet.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
@@ -93,6 +116,8 @@ complaint stands.
       each retirement gated on a counter measured fleet-zero.
 - [ ] **AC5** — a transit stall is classified as such and does **not** cut the
       rate; a repeat of finding 4 is attributable without reading source.
+      *The attribution half is instrumented (M0's `age_split`, 2026-09-04);
+      the "does not cut the rate" half is T1 and untouched.*
 - [x] **AC6 (rate half)** — an unmeasured prior cannot hold a session at the
       floor. **Field-verified 2026-09-04 on 0.4.64** on the pair that failed:
       the prior decayed to `None` at 106 s and the target reached 3.9 Mbps with

@@ -190,7 +190,7 @@ Each ships independently, is individually verifiable, and carries a kill switch.
 
 | # | phase | what | gate |
 |---|---|---|---|
-| **M0** | trustworthy measurement | phase-complete stall breakdown ✅ (#1327), `swaps` counter ✅ (#1327), **+ split `viewer_age` into sender / transit / viewer** | an excursion is attributable to a plane without reading source |
+| **M0** | trustworthy measurement | phase-complete stall breakdown ✅ (#1327), `swaps` counter ✅ (#1327), split `viewer_age` into sender / transit / viewer ✅ (2026-09-04: heartbeat `age_split`, from an optional `arr_ms` on `rc:decodestat`) | an excursion is attributable to a plane without reading source — **met for the pipeline↔transport↔viewer question**; the diag HUD still shows the fused number |
 | **M1** | the media thread | capture→scale→encode onto one dedicated thread per session; async keeps signalling + send; bounded channels both ways | frame cadence unchanged or better on all three hosts; kill switch restores today's loop |
 | **M2** | make-before-break | the replacement encoder opens on the media thread while the current one produces | `open_ms` disappears from the *frame path*: first-frame latency drops by the open (0.29–0.96 s measured) |
 | **M3** | the Plan handoff | control plane publishes an immutable plan; every in-loop decision site removed | no rate/geometry decision remains in the media loop |
