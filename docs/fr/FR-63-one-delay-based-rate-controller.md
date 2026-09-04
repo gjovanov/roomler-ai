@@ -1,6 +1,6 @@
 # FR-63 — One delay-based rate controller for remote desktop
 
-**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress (B-opener shipped, default OFF) · **Plan:** `immutable-doodling-neumann` (approved 2026-09-02)
+**Issue:** [#1243](https://github.com/gjovanov/roomler-ai/issues/1243) · **Status:** in progress — B-opener shipped (default OFF); **B0 simulator shipped**, AC0b answered in simulation and still open in the field · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
@@ -22,7 +22,7 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
 | **B-opener** | Slow-start for the session opener — `encode::slow_start` (pure law) + the governor cap on the opening ceiling **and floor** | `rate_slow_start` (default **OFF**) | shipped **inert** in 0.4.55 (#1262, #1265 capped only the ceiling, which `set_ceiling` raised back to the flat 1.5 M floor); fixed in 0.4.56 (#1275) and **field-verified engaging** — AC0a done, AC0b open |
-| B0 | `encode/sim.rs` + CSV trace replay, four fixtures | n/a (test-only) | not started |
+| B0 | `encode/sim.rs` — pipe/encoder/viewer simulator + the four scenario fixtures, driving the SHIPPED laws | n/a (test-only) | **shipped** — 11 tests in `cargo test -p roomlerd --lib` on the default build. CSV trace replay deferred (see below) |
 | B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ratectl = shadow` (default) | not started |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
 | B3 | Retire the eight estimators and their switches | `ratectl = off` for one release | not started |
@@ -81,11 +81,77 @@ the encoder and the relay are all real, and the only thing changed is **what
 the encoder believes it may use** — which is exactly the mistake this phase
 exists to stop. Clear both pins when the measurement is done.
 
+## B0 — what shipped, and what it found
+
+`encode::sim` (test-only, zero shipped bytes) is a deterministic token-bucket
+link, the bounded send channel the AIMD actually observes, a CBR encoder and a
+viewer folding arrivals into `decodestat`-shaped windows. It drives
+**`SlowStart` and `AimdController` themselves**, in the order `governor.rs`
+calls them, so a fixture binds production code rather than a copy of it.
+
+⚠️ **A simulator result is evidence about the LAW, not about the fleet.** It can
+show that a rate law over-drives a 213 kbps token bucket; it cannot show that a
+corporate VPN behaves like a token bucket. Criteria that say "field-verified"
+below still mean field-verified.
+
+Four of the eleven tests assert the **model**, not the product — that the pipe
+delivers at its rate and no faster, that an idle bucket does not bank capacity,
+that a stall carries nothing, and that a link with headroom grows no queue. A
+fixture is only evidence if the harness under it is right, and two of the three
+bugs found while building this were in the harness:
+
+- 🔑 **Backpressure has to reach the law or the law is being tested blind.** The
+  first version refused byte-full offers inside the link while reporting
+  fullness only from the frame-depth limit. On a thin pipe three big frames fill
+  a 32 KB buffer before four frames fill the channel, so **every frame was
+  dropped and the AIMD was never told**: it sat at its opening 2.55 Mbps for the
+  whole 40 s run with not one decrease. That looked exactly like a damning
+  result about the AIMD and was entirely an artefact.
+- **Sampling the target at window close hides the opener.** A session that opens
+  at 2.55 Mbps and is cut by the first decrease reports 1.84 Mbps for window 0 —
+  concealing the very commitment this phase exists to remove. Rows now carry the
+  window's peak.
+
 ## Acceptance criteria
 
 - [x] AC0a — **the ramp engages and opens where it says.** Field-verified 2026-09-03 on 0.4.56, CORPLAP-1: `FR-63 slow-start armed open_bps=300000 ceiling_bps=2550000`, against an arm-A opener of `2_550_000` on the same host and build — an 8.5× smaller opening commitment. `slf=Some(600000)` on the first window with `gp=None` proves the **floor descent** did it, since the P1 relief cannot fire without a measurement; on 0.4.55, which capped only the ceiling, the opener was pinned at the flat 1.5 M and the ramp was inert.
-- [ ] AC0b — **the ramp removes the harm.** Not yet measured: it needs an arm A that actually fails. See "the cell must be able to fail" below.
-- [ ] AC1 — All four fixtures green in `cargo test -p roomlerd --lib` on the default build.
+- [ ] AC0b — **the ramp removes the harm.** **Answered in simulation, still open in the field.**
+      The blocker was never the flag, it was the cell: no reachable host produces a pipe thin enough
+      for arm A to fail (three were tried). B0's `corp_vpn_thin_pipe` fixture replays the recorded
+      2026-09-02 cell — a 213 180 bps link, a 2 550 000 ceiling, the flat 1 500 000 floor — and both
+      arms differ in `rate_slow_start` alone, on one build, deterministically:
+
+      | | arm A (`false`) | arm B (`true`) |
+      |---|---|---|
+      | peak target committed | 2 550 000 | 1 500 000 |
+      | over-drive integral (bits above 1.1× pipe) | 19 582 316 | 4 054 846 |
+      | peak p95 paint age | 10 016 ms | 1 226 ms |
+      | backpressure skips | 453 | 157 |
+      | windows to settle within 25 % of the pipe | 17 | 7 |
+
+      Arm A **can** fail here, which is the property the field cell lacked: it delivers *nothing* for
+      ten windows. The ordering survives a keyframe-sensitivity re-run at 3× (see below), so it is
+      not an artefact of the modelled IDR size.
+
+      🔑 **Two findings the field would not have shown, both about the shipped law:**
+      1. **Most of arm A's harm is the opening KEYFRAME, not the steady rate.** At the plan's 25×
+         multiplier a 2.55 Mbps opener emits a ~265 KB IDR, which is ten seconds of a 213 kbps pipe —
+         and because nothing arrives, the FR-59 P1 floor relief has no measurement, so the floor
+         stays pinned at 1.5 M and the AIMD cannot descend. The opener's bitrate and the opener's
+         keyframe budget are the same problem, and FR-31's `max_frame_size` is the other half of
+         this phase.
+      2. **The ramp protects roughly one window on a pipe thinner than `OPEN_BPS`.** 300 kbps into
+         213 kbps is still an over-drive, so window 0 congests, `on_congestion` ends the ramp
+         permanently, and the flat 1.5 M floor immediately re-pins the opener — arm B's peak target
+         is 1.5 M, not 300 k. It still wins by a wide margin, but the mechanism is "a smaller
+         opening commitment and one clean window", not "a gentle ramp". A ramp that halved instead
+         of ending, or a floor that stayed down while the ramp ran, would be the next lever.
+
+      ⚠️ This does **not** tick AC0b. A model of a corporate VPN is not a corporate VPN; the box
+      stays open until the same A/B runs on a real thin path.
+- [x] AC1 — All four fixtures green in `cargo test -p roomlerd --lib` on the default build.
+      Shipped with seven more: four asserting the simulator itself, the AC0b A/B, and the
+      keyframe-sensitivity check. 11 tests, ~10 ms.
 - [ ] AC2 — One release of shadow logs across the fleet meets the flip criterion, report attached.
 - [ ] AC3 — Field A/B (`scripts/rc-ab.sh`) on CORPLAP-1 (QSV, corp VPN) and CORPLAP-2 (real relay): paint age p90 ≤ 0.4.50's and no window with a standing queue while the encoder tracks (FR-62).
 - [ ] AC4 — FR-59 AC4 (< 600 ms sustained on the airport-class link) closes here.
@@ -93,6 +159,13 @@ exists to stop. Clear both pins when the measurement is done.
 
 ## Open decisions
 
+- **Deferred from B0: CSV trace replay from `agent_logs`.** The four fixtures are calibrated from
+  recorded field numbers but are generated, not replayed. Replay is worth building when a trace
+  disagrees with a fixture; building it first would have delayed the AC0b answer for no evidence.
+- **Raised by B0:** should `SlowStart::on_congestion` end the ramp, or halve and continue? Ending it
+  hands a pipe thinner than `OPEN_BPS` straight back to the flat floor after one window. The module
+  doc argues ending is right because "once congestion has spoken there IS evidence"; the simulation
+  shows the evidence is then discarded by a constant. Decide with a fixture, not an opinion.
 - Whether the viewer computes the delay slope (recommended; the data is there) or sends per-frame pairs.
 - Follower (multi-viewer) folding: worst follower's `rx_bps/queue_ms` into the same window.
 
