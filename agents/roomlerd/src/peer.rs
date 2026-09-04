@@ -4789,6 +4789,16 @@ async fn media_pump_ffmpeg_dc(
     // phases summing to 33-52). Rebuilds come through the same site.
     let mut open_us: u64 = 0;
     let mut open_us_max: u64 = 0;
+    // FR-65 — the five regions between the loop top and capture that `other_ms`
+    // caught in the field (2026-09-04, all three CORPLAP hosts): passes of
+    // 157-782 ms with `open_ms=0` and, on the gate arm, `capture_ms=0` and
+    // `encode_ms=0` too. `other_ms` existing is what made them visible; naming
+    // them is what makes them actionable. Same move as #1279 made for the open.
+    let mut pace_us: u64 = 0;
+    let mut stats_us: u64 = 0;
+    let mut ctrl_us: u64 = 0;
+    let mut swap_us: u64 = 0;
+    let mut gate_us: u64 = 0;
     // FR-65 P0 — worst single loop pass in the window, and how many overran.
     let mut iter_us_max: u64 = 0;
     let mut pump_stalls: u32 = 0;
@@ -4796,7 +4806,10 @@ async fn media_pump_ffmpeg_dc(
     let stall_warn = Duration::from_millis(crate::encode::pump_stall_warn_ms());
     // Measured at the TOP of the NEXT pass, so every `continue` path in this
     // loop is covered without an RAII guard fighting the borrow checker.
-    let mut iter_mark: Option<(std::time::Instant, u64, u64, u64, u64, u64, u64)> = None;
+    // FR-65 — one struct rather than the old 7-tuple: with eleven phases a
+    // positional tuple is a mismatched-pair waiting to happen, and the
+    // subtraction now lives in `PhaseAccum::delta` where it is unit-tested.
+    let mut iter_mark: Option<(std::time::Instant, crate::encode::stall::PhaseAccum)> = None;
     // ⚠️ Rate-limited: a stall storm that floods its own log is a second
     // performance problem.
     let mut last_stall_log = crate::clock::instant_before(Duration::from_secs(60));
@@ -5173,7 +5186,7 @@ async fn media_pump_ffmpeg_dc(
     loop {
         // FR-65 P0 — close out the PREVIOUS pass. Measuring here rather than at
         // the tail is what makes every `continue` path in this loop count.
-        if stall_watch && let Some((started, c0, s0, e0, d0, a0, o0)) = iter_mark.take() {
+        if stall_watch && let Some((started, mark)) = iter_mark.take() {
             let took = started.elapsed();
             let took_us = took.as_micros() as u64;
             if took_us > iter_us_max {
@@ -5211,15 +5224,20 @@ async fn media_pump_ffmpeg_dc(
             // written here is invisible to `cargo test -p roomlerd --lib`. Both
             // subtractions below are field-paid judgements (see that module),
             // and each reads like a simplification waiting to happen.
-            let pass = crate::encode::stall::PassTiming {
-                iter_us: took_us,
-                capture_us: capture_us.saturating_sub(c0),
-                scale_us: scale_us.saturating_sub(s0),
-                encode_us: encode_us.saturating_sub(e0),
-                send_us: send_us.saturating_sub(d0),
-                apply_us: apply_us.saturating_sub(a0),
-                open_us: open_us.saturating_sub(o0),
-            };
+            let pass = crate::encode::stall::PhaseAccum {
+                capture_us,
+                scale_us,
+                encode_us,
+                send_us,
+                apply_us,
+                open_us,
+                pace_us,
+                stats_us,
+                ctrl_us,
+                swap_us,
+                gate_us,
+            }
+            .delta(mark, took_us);
             if pass.is_stall(stall_warn.as_micros() as u64) {
                 pump_stalls += 1;
                 if last_stall_log.elapsed() >= Duration::from_secs(2) {
@@ -5240,8 +5258,14 @@ async fn media_pump_ffmpeg_dc(
                         send_ms = pass.send_us as f64 / 1000.0,
                         apply_ms = pass.apply_us as f64 / 1000.0,
                         open_ms = pass.open_us as f64 / 1000.0,
+                        pace_ms = pass.pace_us as f64 / 1000.0,
+                        stats_ms = pass.stats_us as f64 / 1000.0,
+                        ctrl_ms = pass.ctrl_us as f64 / 1000.0,
+                        swap_ms = pass.swap_us as f64 / 1000.0,
+                        gate_ms = pass.gate_us as f64 / 1000.0,
                         other_ms = pass.other_us() as f64 / 1000.0,
                         work_ms = pass.work_us() as f64 / 1000.0,
+                        dominant = ?pass.dominant_phase(),
                         target_bps = governor.applied_bps(),
                         "FFmpeg DC pump STALL — one pass exceeded the budget"
                     );
@@ -5251,12 +5275,19 @@ async fn media_pump_ffmpeg_dc(
         if stall_watch {
             iter_mark = Some((
                 std::time::Instant::now(),
-                capture_us,
-                scale_us,
-                encode_us,
-                send_us,
-                apply_us,
-                open_us,
+                crate::encode::stall::PhaseAccum {
+                    capture_us,
+                    scale_us,
+                    encode_us,
+                    send_us,
+                    apply_us,
+                    open_us,
+                    pace_us,
+                    stats_us,
+                    ctrl_us,
+                    swap_us,
+                    gate_us,
+                },
             ));
         }
         // rc.443 — owner-liveness beat, FIRST statement of the loop (see
@@ -5279,6 +5310,11 @@ async fn media_pump_ffmpeg_dc(
         // of production skips. Replaces the rc.445 motion-defer when
         // `bg_rebuild` is on; the defer machinery stays as the
         // kill-switch fallback (`ROOMLERD_BG_REBUILD=0`).
+        // FR-65 — `handle.await` on a finished task is cheap, but `is_finished`
+        // is a race: the task can complete between the check and the await, and
+        // the adopt itself touches the live encoder. Timed so a swap that turns
+        // out to cost something says so instead of landing in `other_ms`.
+        let swap_start = std::time::Instant::now();
         if bg_rebuild {
             if let Some(handle) = pending_swap.as_ref()
                 && handle.is_finished()
@@ -5345,6 +5381,7 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
         }
+        swap_us += swap_start.elapsed().as_micros() as u64;
         // Relay-escape — twin of the VP9 pump's loop-top block: re-read the
         // selected ICE pair every TRANSPORT_RECHECK_INTERVAL and follow a
         // mid-session renomination. A flip flows into `ceiling` (recomputed
@@ -5359,7 +5396,13 @@ async fn media_pump_ffmpeg_dc(
         if last_transport_check.elapsed() >= TRANSPORT_RECHECK_INTERVAL {
             last_transport_check = std::time::Instant::now();
             if !crate::encode::transport_is_constrained() {
+                // FR-65 — a stats read, not a free predicate: it walks the
+                // stats graph under locks the ICE agent and SCTP association
+                // also take, so it is slowest exactly when the session is
+                // busiest. Timed so it stops hiding in `other_ms`.
+                let stats_start = std::time::Instant::now();
                 let relay_now = current_pair_is_relay(&pc, session_id, constrained).await;
+                stats_us += stats_start.elapsed().as_micros() as u64;
                 if let Some(relay) = relay_now {
                     if relay != constrained {
                         constrained = relay;
@@ -5425,7 +5468,13 @@ async fn media_pump_ffmpeg_dc(
                 unpack_dims(capture_native_dims.load(std::sync::atomic::Ordering::Relaxed));
             if native_w > 0 {
                 // FR-33 P3 — see the twin block in the VP9-444 pump.
+                // FR-65 — a second stats read on the same graph, added
+                // 2026-09-04. It retries every 500 ms until `rc:video-info` is
+                // delivered, so on a session whose control DC is slow to open
+                // it runs many times; timed for the same reason as the first.
+                let stats_start = std::time::Instant::now();
                 let reason = lan_capture_reason(&pc, constrained).await;
+                stats_us += stats_start.elapsed().as_micros() as u64;
                 let payload = video_info_payload(
                     codec.wire_codec(),
                     enc_name,
@@ -5443,10 +5492,17 @@ async fn media_pump_ffmpeg_dc(
                     viewers,
                     reason,
                 );
+                // FR-65 — the control-DC lock and send both await; the lock is
+                // shared with every other control-plane writer, and a congested
+                // DC makes the send slow. Timed together so neither hides.
+                let ctrl_start = std::time::Instant::now();
                 let cdc = control_dc.lock().await.clone();
-                if let Some(cdc) = cdc
-                    && cdc.send_text(payload.clone()).await.is_ok()
-                {
+                let delivered = match cdc {
+                    Some(cdc) => cdc.send_text(payload.clone()).await.is_ok(),
+                    None => false,
+                };
+                ctrl_us += ctrl_start.elapsed().as_micros() as u64;
+                if delivered {
                     video_info_sent = true;
                     // P5 — followers' badges mirror the owner's (their
                     // stats chips describe the SAME shared stream).
@@ -5542,6 +5598,12 @@ async fn media_pump_ffmpeg_dc(
         if inflight_now < queue_budget / 2 {
             grace_congested_since = None;
         }
+        // FR-65 — the gate arm `continue`s BEFORE capture, so a pass that takes
+        // it reports `capture_ms=0` and `encode_ms=0` and every millisecond it
+        // spends lands in `other_ms`. That is exactly the shape CORPLAP-2
+        // produced on 2026-09-04 (662 ms and 782 ms passes with both at zero),
+        // and it is why this whole block is timed rather than just its sleep.
+        let gate_start = std::time::Instant::now();
         if send_tx.capacity() == 0 || pipeline.followers_congested() || byte_gate {
             if byte_gate && !constrained && !direct_gate_logged {
                 direct_gate_logged = true;
@@ -5614,8 +5676,12 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
+            gate_us += gate_start.elapsed().as_micros() as u64;
             continue;
         }
+        // Not congested: the gate cost only its own predicate, but record it so
+        // the accounting is complete on every pass, not only on the skips.
+        gate_us += gate_start.elapsed().as_micros() as u64;
 
         // P5 (FR-1) — cadence pacing: when the HW encoder can't hold
         // target_fps, consume frames on an even grid at the sustainable
@@ -5631,7 +5697,14 @@ async fn media_pump_ffmpeg_dc(
             if let Some(due) = pace_due
                 && due > now
             {
+                // FR-65 — at a paced 2 fps this is ~500 ms of a single pass.
+                // Timed AND excluded from `work_us` (see `encode::stall`): it
+                // is the loop idling on purpose, exactly like a capture wait,
+                // and counting it as work would re-create the warning storm the
+                // capture rule removed.
+                let pace_start = std::time::Instant::now();
                 tokio::time::sleep(due - now).await;
+                pace_us += pace_start.elapsed().as_micros() as u64;
             }
             pace_due = Some(std::time::Instant::now() + interval);
         } else {
