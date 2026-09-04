@@ -110,6 +110,10 @@ All keys live in the agent config (`roomler config set …`) with
 | rc.443 | HRD trim reverted; stale-pipeline eviction; encode-error ladder | Intel AV1 rejects + hangs on an over-budget forced IDR; a hung pump zombied the shared pipeline ("no video after 4 attempts") |
 | rc.445 | **No-flip motion**: dial rungs off, dial ceiling factors, motion-deferred QSV bitrate, send-epoch flush, proven-encoder fast path | The remaining ~1 s mid-drag freeze measured as the flip's blocking encoder open (865/654 ms) + mid-motion ladder rebuilds |
 | rc.446 | Deferral motion clock on any ≥4 KB frame | Light motion (GDI + AV1 window moves at 5–30 KB) slipped under the significance floor and let ladder rebuilds through mid-burst |
+| 0.4.50 | FR-59 P8 — remembered-slow-pair opener; the coarsen ladder's bottom rung lowered | The ladder bottomed at 1.5 M, so no relieved target ever reached the encoder: bytes/frame 4.88 → 0.90, SACK drops 24 → 0 |
+| 0.4.51 | FR-62 A1/A2 — in-place rate applies behind `encoder_inplace_rate`; the NVENC no-IDR patch | An NVENC rate move cost a forced keyframe on 20/20 rungs while the apply itself was 0.004 ms |
+| 0.4.55–0.4.56 | FR-63 B-opener — slow-start on the session opener (`rate_slow_start`, default off) | The opener over-drove from BOTH directions on one host in one day: a remembered 6.13 M (6287 ms paint) and a nominal 2.55 M into a 213 kbps path (1550 ms) |
+| 0.4.59–0.4.60 | FR-65 P0 — `open_ms`/`other_ms` on the stall watch; the encoder open moved off the shared runtime worker | A 0.5–1 s hole on every session's first pass sat in no measured phase; it was the encoder open, blocking a tokio worker at the moment the control plane is busiest |
 
 ## The measured-rate closed loop
 
@@ -120,7 +124,7 @@ occupancy and SCTP absorbs the mismatch, so it parks at the ceiling and never
 learns the pipe — a field capture shows `target_bps=3000000` constant across a
 session delivering 1.75 Mbps.
 
-### Stage 0 — measured, reported, not yet consumed (rc.453)
+### How the measurement is taken (v2)
 
 `encode::goodput::GoodputEstimator`, owned by the governor, folded on the
 existing 1 s viewer-window tick, reported in the heartbeat as `goodput_bps`
@@ -129,32 +133,64 @@ the same line — the gap between them is the open-loop error.**
 
 The hard part is that *a fast sample is not evidence*. Handing a frame to SCTP
 is not delivering it: with buffer headroom a frame serialises in microseconds,
-which computes to an absurd rate and means only "at least this fast". So the
-measurement is taken across a **busy period** — an unbroken stretch where the
-send task always had another frame waiting — and only when that stretch lasted
-≥ 300 ms. A period that long can only end when the pipe drains, so its
-bytes-over-time *is* the drain rate. Shorter periods are **discarded, not
-down-weighted**, so no amount of idle traffic can bias the estimate upward.
+which computes to an absurd rate and means only "at least this fast".
 
-Two consequences, both intentional:
+⚠️ **The first answer to that did not work, and the way it failed is worth
+keeping.** Stage 0 (rc.453) bracketed a **busy period** — an unbroken ≥ 300 ms
+stretch where the send task always had another frame waiting — on the reasoning
+that a period that long can only end when the pipe drains. It turned out to be
+structurally unsatisfiable at the frame rates we run: at 40 fps a ~30 KB frame
+drains in ~24 ms, just under the ~25 ms inter-arrival, so the queue dried
+*between frames* even while the cumulative deficit grew. No period ever formed,
+and field heartbeats read `goodput_samples: (0, N)` for whole sessions — an
+estimator that was wired, reported, and structurally incapable of producing a
+number.
 
-- On an unbound link no period qualifies, so the estimate stays `None`,
-  everything falls back to the nominal band, and **direct sessions behave
-  exactly as before, by construction**. `accepted=0` with a large `rejected`
-  is the healthy signature there, not a wiring fault.
-- On relay sessions the at-rest polish traffic (~1.75 Mbps) keeps periods
-  alive, so the estimate survives an idle viewer.
+v2 keeps the philosophy and fixes the granularity. The send task times each
+frame's chunked `dc.send()` serialisation; a frame that took at least
+`MIN_BLOCKED_SEND` (10 ms) was flow-controlled by SCTP for its whole transit,
+so its bytes-over-time **is** the drain rate. Sub-threshold sends are discarded
+at the source, so no amount of idle traffic can bias the estimate upward. The
+window's accepted samples are aggregated byte-weighted (Σbytes / Σelapsed) and
+the window must carry at least `MIN_WINDOW_BLOCKED` (60 ms) of genuinely
+blocked time before it counts.
 
 The EWMA is asymmetric — down fast (α 0.5), up slow (α 0.1): a VPN throttling
 mid-session is worth believing at once, one lucky burst is not proof the pipe
-grew. Confidence decays to `None` after 60 s without a qualifying sample, so a
-stale number can never outlive the conditions that produced it.
+grew. Confidence decays to `None` after `CONFIDENCE_TTL` (60 s) without a
+qualifying sample, so a stale number can never outlive the conditions that
+produced it.
 
-### Stages 1–2 — planned
+### What consumes it today
 
-`B = min(nominal, 0.85 × G)` becomes the effective budget, turning the ceiling,
-queue budget, HRD window (with a per-codec keyframe floor — the rc.442 lesson)
-and settle into measured quantities, behind a `measured_rate` kill switch with
-the current constants as the confidence-`None` fallback. Then the tunables are
-deleted. ⚠️ Measurement may only ever LOWER the clamp: the clamp also protects
-the TURN path.
+The measurement is **no longer observe-only**. Both consumers take the same
+`MEASURED_CEILING_PCT` (85 %) margin, deliberately: the estimate is "what the
+pipe carried", and a bound set exactly AT it leaves the controller nothing to
+converge under.
+
+| Consumer | Rule | Guard |
+|---|---|---|
+| FR-59 P1 — floor relief | the legibility floor descends toward `0.85 × measured`, floored at `slow_link_min_bitrate` | evidence-gated: with no measurement the session is byte-for-byte unchanged |
+| FR-59 P3 — arrival clamp | the ceiling is bounded by what the VIEWER reports arriving while its transit queue grows | constrained paths only; applied AFTER the learner, because a live report outranks past evidence |
+
+⚠️ The two are **coupled**, and the coupling is not obvious: `set_ceiling`
+raises any ceiling back up to the floor, so the P3 clamp is silently undone
+unless the P1 relief lowers the floor with it. That coupling bit FR-63's opener
+phase in exactly the same place — 0.4.55 shipped a ceiling cap with no floor
+descent and the ramp was inert while looking wired.
+
+⚠️ Measurement may only ever LOWER a clamp: the relay clamp also protects the
+TURN path, so a measurement that reads high is not permission to exceed it.
+
+### Where the program went next
+
+The remaining constants are the subject of an approved plan
+(`docs/plans/rate-control-architecture.md`) split into three FRs. Read those
+for current state rather than this section:
+
+- **FR-62** (#1242) — make an encoder rate change cost neither an IDR nor a
+  rebuild, so the nine heuristics that exist only to ration that cost can go.
+- **FR-63** (#1243) — replace eight estimators of one quantity with one
+  delay-based controller, shadow-first, verified against a deterministic
+  simulator (`encode::sim`) rather than against the fleet.
+- **FR-64** (#1244) — remote control never rides the overlay.
