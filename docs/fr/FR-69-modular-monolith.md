@@ -974,13 +974,17 @@ carrier class, a DERP-floor host, an SSH session — read from the fleet, not fr
   two mutually exclusive schemas (FR-47 P5c), the composition snapshot records both, and
   `Module::indexes` answers for the running deployment's setting only. The baseline stayed
   byte-identical through the move.
-- Seven lane rounds, every one a cross-crate leftover of the cut rather than a design
+- Eight lane rounds, every one a cross-crate leftover of the cut rather than a design
   problem: an absolute-path dependency (`ipnet`, used by path and not by `use`), a DAO
   import the relay-load poller still needs in the host, multi-line accessor chains a
   line-oriented rename skipped (`overlay_nodes_by_id`, `tunnel_policies` — one a prefix
   collision, one simply unlisted), one accessor doubled by a second pass, the integration
-  tests' own reads of the moved fields, and a `cfg(test)` test builder the host's relay
-  tests call — `cfg(test)` does not cross crates. Each is recorded in CLAUDE.md rule 12.
+  tests' own reads of the moved fields, a `cfg(test)` test builder the host's relay tests
+  call — `cfg(test)` does not cross crates — and the one real suite failure (406/407): the
+  multi-block DOOR test drove the db crate's plan, but the guard it asserts is the module's
+  set now, so a test of a BOOT property has to drive what the boot applies
+  (`Modules::index_sets_for(false)`), not the plan it used to live in. Each is recorded in
+  CLAUDE.md rule 12.
 - A repository-wide history rewrite landed mid-PR and force-pushed this branch with two
   commits missing; rebuilt on the rewritten remote by cherry-pick, never by force-push.
 - **The field gate is open, as for every phase**: the overlay/tunnel sweep on a prod roll
