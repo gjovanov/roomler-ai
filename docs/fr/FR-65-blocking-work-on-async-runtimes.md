@@ -64,11 +64,27 @@ loop), rather than three wraps.
 
 ### P0 — the stall watch (blocks every other phase)
 
-> **Status 2026-09-04 — shipped and field-read.** The watch (0.4.55), the
-> 100 ms bar, `open_ms`/`other_ms` (#1279, 0.4.59) and the `work_us` decision
-> (#1284, 0.4.60) are all live on CORPLAP-1; the field log below shows the
-> breakdown summing to its total on two builds. Still open under P0: **AC1**
-> (the overhead A/B) and **AC2** (a synthetic stall attributed to its phase).
+> **Status 2026-09-04 — shipped, field-read, and now unit-tested.** The watch
+> (0.4.55), the 100 ms bar, `open_ms`/`other_ms` (#1279, 0.4.59) and the
+> `work_us` decision (#1284, 0.4.60) are all live on CORPLAP-1; the field log
+> below shows the breakdown summing to its total on two builds. **AC2 is
+> closed** — the verdict moved into `encode::stall::PassTiming`, a pure type on
+> the default feature set, with seven tests that assert phase ATTRIBUTION and
+> not merely that something was flagged. **AC1** (the overhead A/B) is the last
+> P0 item.
+>
+> 🔑 **Why the extraction, and not a test where the code was:** the decision
+> lived inline in `media_pump_ffmpeg_dc`, which is behind `ffmpeg-encoder` — a
+> NON-default feature, so `cargo test -p roomlerd --lib` compiled none of it.
+> The rule deciding whether an operator ever sees a stall was unreachable in
+> the lane everyone runs, which is the same shape as the defect this FR exists
+> to fix: an instrument nobody can check is not an instrument.
+>
+> ⚠️ The `work_us` half of #1284 is verified **deterministically**, not in the
+> field: the idle-capture storm never reproduced on a locked host (see the log
+> below), and the unit test pins the rule instead — the exact field shape
+> `iter 111 ms / capture 101.9 ms` must NOT warn, while a 789 ms encoder open
+> must, and must be blamed on `open`.
 
 A per-iteration wall-clock watch on the pump loop, threshold-gated.
 
