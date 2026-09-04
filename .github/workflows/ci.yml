@@ -196,7 +196,7 @@ jobs:
       # `#[cfg(test)]` gate compiles the module's helpers into the lib target as
       # dead code, which only `--all-targets` surfaces.
       - name: Run clippy on the audited crates (incl. test targets)
-        run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests --all-targets -- -D warnings
+        run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests -p roomler-core --all-targets -- -D warnings
 
       # `crates/api` unit tests ran in NO lane until now: the clippy step above
       # is `--workspace` WITHOUT `--all-targets`, so it does not even compile
@@ -210,6 +210,16 @@ jobs:
       # tests and need no services.
       - name: Run API unit tests
         run: cargo test -p roomler-ai-api --lib
+
+      # FR-69 — `roomler-core` carries the module contract's own guards (the
+      # DAG stays acyclic, the hook order covers every module, the axum Debug
+      # parser behind the composition baseline still reads a real router) and,
+      # since P1b, the cluster/storage/analytics primitives that moved out of
+      # the api crate with their unit tests. Named explicitly for the same
+      # reason the api step above is: `--workspace` clippy compiles none of
+      # their `#[cfg(test)]` bodies, and a test no lane runs is decorative.
+      - name: Run core unit tests
+        run: cargo test -p roomler-core --lib
 
       # The integration crate cannot RUN here (it needs MongoDB + Redis), but
       # it can still be compiled — and compiling it is what was missing. It sat

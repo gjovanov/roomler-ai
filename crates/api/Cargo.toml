@@ -48,11 +48,8 @@ rand.workspace = true
 # Optional GeoIP country lookup (platform user analytics). The database
 # itself is operator-supplied via ROOMLER__STATS__GEOIP_MMDB — nothing
 # licensed is vendored, and an absent file degrades to "unknown".
-maxminddb.workspace = true
-redis.workspace = true
 futures.workspace = true
 validator.workspace = true
-tempfile.workspace = true
 reqwest.workspace = true
 mediasoup.workspace = true
 dotenvy.workspace = true
@@ -64,12 +61,10 @@ base64.workspace = true
 async-trait.workspace = true
 nanoid.workspace = true
 ipnet = "2" # subnet-route CIDR validation for the mesh subnet-router admin API
-# S3/MinIO file-storage backend (uploads + export artifacts). `aws` feature =
-# the AmazonS3 implementation; MinIO speaks the same dialect via a custom
-# endpoint + path-style addressing. See `src/storage.rs`.
-object_store = { version = "0.12", features = ["aws"] }
 # Magic-byte content sniffing for uploads. A stored content-type that came
 # from the client is a claim, not a fact; this reads what the bytes actually
 # are. Pure Rust, no transitive deps, already in the lockfile.
 infer = "0.19"
-bytes = "1"
+# FR-69 P1b — `object_store`, `maxminddb`, `redis`, `bytes` and `tempfile`
+# left with the storage / analytics / cluster / pub-sub modules that used
+# them; they are `roomler-core`'s now.

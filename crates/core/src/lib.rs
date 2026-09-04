@@ -13,10 +13,12 @@
 //!
 //! * [`Module`] — the trait every pillar module implements: routes, WebSocket
 //!   namespaces, index specs, jobs, lifecycle hooks, capabilities.
-//! * [`Core`] — the server-wide services modules build on. **P0 ships it as a
-//!   placeholder**: the type exists so the contract's signatures are final; its
-//!   fields (identity, tenancy, plans, notifications, storage, the socket, the
-//!   cluster bus, TURN credentials, metering) arrive in P1.
+//! * [`Core`] — the server-wide services modules build on: identity and
+//!   tenancy, notifications and their channels, storage, the `/ws` registry
+//!   and its Redis fan-out ([`ws`]), the cluster identity/directory/bus
+//!   ([`cluster`]), TURN credentials and relay load, the metering sink. P1
+//!   moved it here from the api crate, with the modules that hold its fields
+//!   ([`storage`], [`user_analytics`], [`rate_limit`], [`relay_load`]).
 //! * [`graph`] — the module set and the allowed dependency edges, as data, with
 //!   a test that keeps them a DAG.
 //! * [`composition`] — the snapshot that gates every module move: the router's
@@ -47,16 +49,23 @@
 //! FR-69.
 
 pub mod capabilities;
+pub mod cluster;
 pub mod composition;
 pub mod graph;
 pub mod hooks;
 pub mod job;
 pub mod module;
+pub mod rate_limit;
+pub mod relay_load;
+pub mod state;
+pub mod storage;
+pub mod user_analytics;
 pub mod ws;
 
 pub use capabilities::{Capabilities, TenantCtx};
 pub use hooks::{FleetLifecycle, Hooks, TenantLifecycle};
 pub use job::{Cadence, Job, JobFuture};
-pub use module::{Core, Module};
+pub use module::Module;
 pub use roomler_ai_db::indexes::{IndexOp, IndexPlan, IndexSet};
+pub use state::Core;
 pub use ws::{Role, UpgradeSpec, WsCtx, WsHandler, WsHandlerSpec, WsRegistration};

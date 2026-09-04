@@ -22,14 +22,33 @@ path = "src/lib.rs"
 [dependencies]
 roomler-ai-config = { path = "../config" }
 roomler-ai-db = { path = "../db" }
+# P1b — `Core` holds the auth service and the identity/tenancy DAOs, and the
+# relay-load poller writes `stats_relay` samples.
+roomler-ai-services = { path = "../services" }
+# P1b — TURN issuance (`TurnMap`, `RelayLoadMap`) is core: RC, tunnels and
+# the mediasoup ICE servers all issue from it.
+roomler-ai-remote-control = { path = "../remote_control" }
 
 axum.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 bson.workspace = true
+bytes = "1"
+dashmap.workspace = true
+futures.workspace = true
+maxminddb.workspace = true
+mongodb.workspace = true
+# S3/MinIO file-storage backend (`storage.rs`), moved with `Core` in P1b.
+object_store = { version = "0.12", features = ["aws"] }
+redis.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tempfile.workspace = true
 tower.workspace = true

@@ -7,19 +7,7 @@ use std::{future::Future, sync::Arc};
 use axum::Router;
 use roomler_ai_config::Settings;
 
-use crate::{Capabilities, Hooks, IndexSet, Job, TenantCtx, WsRegistration};
-
-/// The server-wide services every module builds on.
-///
-/// **P0: a placeholder.** The type exists so [`Module::init`]'s signature is
-/// final before any module is written; P1 fills it with what the 27 core
-/// fields of today's `AppState` become (identity, tenancy, plans, notifications,
-/// storage, the `/ws` socket and its fan-out, the cluster bus, TURN credentials,
-/// the metering sink). `#[non_exhaustive]` so no module can construct one —
-/// only the host does.
-#[non_exhaustive]
-#[derive(Debug, Default)]
-pub struct Core {}
+use crate::{Capabilities, Core, Hooks, IndexSet, Job, TenantCtx, WsRegistration};
 
 /// What a pillar module is, to the host.
 ///

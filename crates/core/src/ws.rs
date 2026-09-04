@@ -22,6 +22,14 @@ use axum::Router;
 use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
+// FR-69 P1b — the socket layer's primitives, moved from the api crate
+// unchanged: the connection registry, the fan-out helpers, the Redis pub/sub
+// layer. The upgrade handler and the role gate stay in the api crate until
+// the modules exist to register namespaces on them.
+pub mod dispatcher;
+pub mod redis_pubsub;
+pub mod storage;
+
 /// The three roles the socket gate admits, as today's `?role=` query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
