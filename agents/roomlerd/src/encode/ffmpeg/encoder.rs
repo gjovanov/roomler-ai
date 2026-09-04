@@ -1778,25 +1778,38 @@ impl VideoEncoder for FfmpegEncoder {
                 // encoder rebuild (which is 0.65-0.87 s on Iris-Xe-class and the
                 // reason the whole defer/swap machinery exists).
                 //
-                // ⚠️ A0 measured that Reset FAILING on real Iris Xe with
-                // `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM` (-14), leaving the encoder
-                // unusable — which is why `encoder_inplace_rate` is still OFF.
-                // The suspected cause is the THIRD field: `rc_buffer_size` maps
-                // to `BufferSizeInKB`, which sizes a buffer allocated at Init,
-                // and our value is `target × hrd_pct` so it moves on every rate
-                // change. `encode::qsv_inplace_writes_bufsize` documents the
-                // full reasoning (including why the hypothesis previously
-                // recorded on #1242 is refuted by our own open path) and gates
-                // the A/B; default is to LEAVE THE FIELD ALONE.
-                let write_bufsize = crate::encode::qsv_inplace_writes_bufsize();
+                // ⚠️ **This path does not work on Iris Xe and the flag stays
+                // OFF.** A0 measured `MFX_ERR_INCOMPATIBLE_VIDEO_PARAM` (-14) on
+                // the FIRST rate change, leaving the encoder unusable. Two
+                // explanations have now been tried and BOTH are dead, so do not
+                // re-derive either:
+                //
+                // 1. "We open quality-driven (ICQ), so TargetKbps/MaxKbps aren't
+                //    governing and MSDK rejects resetting them." Refuted by our
+                //    own open path: `build_encoder` sets `bit_rate =
+                //    maxrate_bps` and the option dict sets `maxrate` to the same
+                //    value, so `select_rc_mode` takes its CBR branch before it
+                //    reaches ICQ and `global_quality` is inert.
+                // 2. "The third field is the trigger — `rc_buffer_size` maps to
+                //    `BufferSizeInKB`, allocated at Init, and moves on every
+                //    change." Refuted by MEASUREMENT on 0.4.62 (CORPLAP-1,
+                //    2026-09-04): skipping the write entirely still fails -14,
+                //    including the clean case where the encoder opened at 6 Mbps
+                //    and the first move was DOWN to 4.5 Mbps while the buffer
+                //    stayed at a generously valid 6 Mbps.
+                //
+                // ⇒ this driver rejects the BITRATE CHANGE ITSELF on Reset, in
+                // both `low_power` modes (VME was measured identical). The
+                // remaining candidate is `mfxExtEncoderResetOption` (the FR's
+                // untested patch 0004), which is an FFmpeg-level change, not
+                // something reachable from here. See `docs/fr/FR-62-*` and #1242.
+                //
                 // SAFETY: as InPlaceVbr — `&mut self` is exclusive.
                 unsafe {
                     let ctx = self.encoder.as_mut_ptr();
                     (*ctx).bit_rate = target as i64;
                     (*ctx).rc_max_rate = target as i64;
-                    if write_bufsize {
-                        (*ctx).rc_buffer_size = bufsize as std::os::raw::c_int;
-                    }
+                    (*ctx).rc_buffer_size = bufsize as std::os::raw::c_int;
                 }
                 self.maxrate_bps = target;
                 self.rate_moves += 1;
@@ -1804,7 +1817,6 @@ impl VideoEncoder for FfmpegEncoder {
                     encoder = self.encoder_name,
                     maxrate_bps = target,
                     bufsize,
-                    write_bufsize,
                     "ffmpeg set_bitrate: QSV in-place CBR reconfigure"
                 );
             }
