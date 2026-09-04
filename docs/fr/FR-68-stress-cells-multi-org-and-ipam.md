@@ -1,8 +1,9 @@
 # FR-68: Stress cells for multi-org guard contention and IPAM growth
 
-**Status**: P0–P4 shipped (unmerged); P5–P7 open · **Owner**: overlay/networking ·
-**Issue**: [#1272](https://github.com/gjovanov/roomler-ai/issues/1272) ·
-**PRs**: roomler-ai [#1273](https://github.com/gjovanov/roomler-ai/pull/1273), deploy `fr68-vmtest-cells`
+**Status**: shipped and field-verified — **every AC met except AC2**, which is
+deliberately deferred (see "Is AC2 worth its cost?"). All PRs merged, both
+repos. · **Owner**: overlay/networking ·
+**Issue**: [#1272](https://github.com/gjovanov/roomler-ai/issues/1272)
 
 ## Goal
 
@@ -161,7 +162,7 @@ the next reader does not assume back-off exists.
       i.e. AC7 is not passing vacuously.
 - [ ] **AC9** A nested-block pair (legacy `/10` primary + carved `/22` secondary) emits the
       overlap WARN.
-- [ ] **AC10** The 18 pre-existing vmtest cells are unchanged by the two-tenant plumbing.
+- [x] **AC10** The 18 pre-existing vmtest cells are unchanged by the two-tenant plumbing.
 
 ## Open decisions
 
@@ -435,6 +436,35 @@ topology rather than a bare PASS.
 🔑 And the env channel was never the problem. "The kill switch never reached the
 daemon" was my hypothesis for two rounds; the route-table receipt disproved it
 (`/96 asserted by 2 adapters`) before any change was spent on it.
+
+### 2026-09-04 — full 20-cell matrix: **PASS 92 / fail 0**. AC10 met.
+
+`pass=92 fail=0 na=12 total=119 unexpected=''` — the whole matrix, ~1.5 h on
+zeus. **The two-tenant plumbing changed nothing for the 18 pre-existing cells**:
+every Ubuntu and Win11 lane green across `install / enroll / overlay / wayland /
+rd / desktop`, which is what the defaulted-tenant-argument shape was designed
+for, now measured rather than argued.
+
+All three multi-org cells reproduced independently inside the full run:
+
+| cell | evicted | spared | waves |
+|---|---|---|---|
+| `multiorg` | +0 | +0 | +80 |
+| `multiorg-narrow` | +0 | **+80** | +80 |
+| `multiorg-war` | **+66** | +0 | +80 |
+
+🔑 `multiorg-war` landing on **66** where the standalone run gave **67** is the
+right kind of variance: eviction vs re-assertion is a race, so an exact repeat
+would have been more suspicious than a near-miss. The other two are identical,
+which is what a deterministic path should give.
+
+The 12 NA are the by-design impossible combinations, and the 15 WARNs are the
+best-effort `overlay-reverse` checks plus one teardown row awaiting the reaper's
+TTL. ⚠️ `overlay-reverse` WARNs on every cell; it does not gate the verdict and
+touches none of the changed helpers (it is `docker exec vmtest-anchor roomler
+ping`), so it is a standing property of the anchor's reverse path to a fresh VM,
+not a regression. No retained earlier run carries these lanes to compare
+against — stated as reasoning from the code, not as a measured before/after.
 
 ### ⚠️ Method note — a cumulative counter that DECREASES means a restart
 
