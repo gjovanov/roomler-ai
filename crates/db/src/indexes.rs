@@ -232,26 +232,8 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
     // `enrollment_key_uses`, `exec_audit`, `config_audit` and `agent_logs` are
     // the `fleet` module's: their sets live in
     // `roomler_ai_mod_fleet::FleetState::indexes`.
-
-    // Remote-control sessions
-    sets.push(set(
-        "remote_sessions",
-        vec![
-            index(bson::doc! { "agent_id": 1, "created_at": -1 }),
-            index(bson::doc! { "controller_user_id": 1, "created_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "phase": 1 }),
-        ],
-    ));
-
-    // Remote-control audit log — 90-day retention
-    sets.push(set(
-        "remote_audit",
-        vec![
-            index(bson::doc! { "session_id": 1, "at": 1 }),
-            index(bson::doc! { "tenant_id": 1, "at": -1 }),
-            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    ));
+    // FR-69 P6 — `remote_sessions` (both sets) and `remote_audit` are the
+    // `remote` module's: `roomler_ai_mod_remote::RemoteState::indexes`.
 
     // Remote-control agent crash reports — 90-day TTL on
     // `reported_at` (server clock). Compound index drives the admin
@@ -611,13 +593,10 @@ pub fn index_plan(multi_block: bool) -> IndexPlan {
         ],
     ));
 
-    // Wave 3 — per-user usage reads scan these two by (user, time); both
-    // already have tenant-leading indexes for the org dashboards, neither
-    // could serve a cross-org "what did this user do" query.
-    sets.push(set(
-        "remote_sessions",
-        vec![index(bson::doc! { "tenant_id": 1, "created_at": -1 })],
-    ));
+    // Wave 3 — per-user usage reads scan this by (user, time); it already
+    // has a tenant-leading index for the org dashboards, which could not
+    // serve a cross-org "what did this user do" query. (Its `remote_sessions`
+    // twin is the `remote` module's since P6.)
     sets.push(set(
         "tunnel_audit",
         vec![index(bson::doc! { "user_id": 1, "at": -1 })],

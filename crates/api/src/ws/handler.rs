@@ -571,8 +571,9 @@ async fn handle_socket(
     rc_pump.abort();
     // PR-2 — this conn may have rc sessions proxied on OTHER pods: tell
     // each owner (fire-and-forget; the relay's janitor sweep is the
-    // belt), mirroring the C-4 media leave-forwarding below.
-    crate::ws::rc_relay::forward_conn_closed(&state, &connection_id);
+    // belt), mirroring the C-4 media leave-forwarding below. The `remote`
+    // module's (FR-69 P6); a no-op when it is not mounted.
+    state.modules.remote_conn_closed(&connection_id);
     state.ws_storage.remove(&user_id, &connection_id, &sender);
 
     // S6 — drop this pod's online-registry claim once the user's LAST
@@ -613,46 +614,25 @@ async fn handle_client_message(
 ) {
     // Remote-control messages use a `t` discriminator prefixed with "rc:".
     // Peek at the raw JSON before full parse so we don't pay the cost on
-    // every media/presence message.
-    if text.contains("\"rc:") {
-        // Authorization + consent-mode gate for `rc:session.request`
-        // (self-control / admin / REMOTE_CONTROL + per-device allowlist +
-        // quarantine). A non-request rc:* message resolves to `Ok(Prompt)` and
-        // falls straight through to dispatch (the mode is unused for it).
-        let authz =
-            match crate::ws::remote_control::resolve_session_authz(state, *user_id, text).await {
-                Ok(a) => a,
-                Err(reason) => {
-                    warn!(?user_id, %reason, "rc:session.request denied by authz gate");
-                    let _ = rc_controller_tx.try_send(
-                        roomler_ai_remote_control::signaling::ServerMsg::Error {
-                            session_id: None,
-                            code: "permission_denied".to_string(),
-                            message: reason,
-                            open_nonce: None,
-                        },
-                    );
-                    return;
-                }
-            };
-        let handled = crate::ws::remote_control::dispatch_controller_rc(
-            state,
-            *user_id,
-            username,
-            rc_controller_tx,
-            text,
-            authz.mode,
-            authz.override_reason,
-            authz.input_mode,
-            authz.tenant_name,
-            dialed_tid,
-            conn_established_ms,
-            connection_id,
-        )
-        .await;
-        if handled {
-            return;
-        }
+    // every media/presence message. The frame is the `remote` module's
+    // (FR-69 P6): its authz gate + dispatch run there, with this
+    // connection's Hub-registered sender; `false` = not an rc:* frame, or
+    // no `remote` module mounted — either way the arms below get it.
+    if text.contains("\"rc:")
+        && state
+            .modules
+            .remote_controller_frame(
+                *user_id,
+                username,
+                rc_controller_tx,
+                text,
+                dialed_tid,
+                conn_established_ms,
+                connection_id,
+            )
+            .await
+    {
+        return;
     }
 
     let parsed: serde_json::Value = match serde_json::from_str(text) {

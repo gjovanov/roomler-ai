@@ -20,9 +20,15 @@
 //! modules' leader-gated jobs) and [`Modules::shutdown`] (reverse composition
 //! order). P5a added [`Modules::register_hooks`] (each module's inverse edges
 //! into the core registry) and `fleet` — the one module the host cannot run
-//! without yet: it still serves the agent socket from the fleet's handles, so
-//! `fleet` is a required dependency and its switch refuses to boot rather
-//! than unmounting (spec: the P5 kill switch is "redeploy the previous tag").
+//! without yet: its handles still serve the host's network code, so `fleet`
+//! is a required dependency and its switch refuses to boot rather than
+//! unmounting (spec: the P5 kill switch is "redeploy the previous tag").
+//! P6 added `remote`, the first module built ON another (`remote → fleet`):
+//! its `Module::Deps` is the fleet state, supplied here in composition order
+//! — and the two host → module calls the controller socket makes
+//! ([`Modules::remote_controller_frame`], [`Modules::remote_conn_closed`]),
+//! because the socket mints the controller's Hub sender and the module's
+//! dispatch needs it.
 
 use std::sync::Arc;
 
@@ -42,6 +48,8 @@ pub const EXTRACTED: &[&str] = &[
     #[cfg(feature = "conference")]
     "conference",
     "fleet",
+    #[cfg(feature = "remote")]
+    "remote",
 ];
 
 /// The modules this build links, initialised — `None` where the operator
@@ -54,8 +62,13 @@ pub struct Modules {
     pub chat: Option<roomler_ai_mod_chat::ChatState>,
     #[cfg(feature = "conference")]
     pub conference: Option<roomler_ai_mod_conference::ConferenceState>,
-    /// Always linked (P5a): the host's agent socket reads its handles.
+    /// Always linked (P5a): the host's network code reads its handles.
     pub fleet: Option<roomler_ai_mod_fleet::FleetState>,
+    /// P6 — built on `fleet`; `None` when switched off (the controller's
+    /// `rc:*` frames then fall through unhandled and the session routes are
+    /// absent, while the Hub — fleet's — keeps serving the agents).
+    #[cfg(feature = "remote")]
+    pub remote: Option<roomler_ai_mod_remote::RemoteState>,
     /// Every mounted module's WebSocket namespace handlers, collected at
     /// init so the socket dispatch can look one up per message.
     ws: Vec<WsHandlerSpec>,
@@ -63,8 +76,9 @@ pub struct Modules {
 
 impl Modules {
     /// Initialise every linked module the settings do not switch off, in
-    /// composition order (`graph::MODULES`). Logs each switch that is off
-    /// for a module that is not extracted yet — that switch unmounts nothing.
+    /// composition order (`graph::MODULES`) — so a module's `Deps` are
+    /// always initialised before it. Logs each switch that is off for a
+    /// module that is not extracted yet — that switch unmounts nothing.
     pub async fn init(core: Core, settings: &Settings) -> anyhow::Result<Self> {
         for id in settings.modules.switched_off() {
             if !EXTRACTED.contains(&id) {
@@ -86,7 +100,7 @@ impl Modules {
         #[cfg(feature = "saas")]
         {
             modules.saas =
-                init_one::<roomler_ai_mod_saas::SaasState>(core.clone(), settings).await?;
+                init_one::<roomler_ai_mod_saas::SaasState>(core.clone(), settings, ()).await?;
             if let Some(m) = &modules.saas {
                 modules.ws.extend(m.ws().handlers);
             }
@@ -94,7 +108,7 @@ impl Modules {
         #[cfg(feature = "chat")]
         {
             modules.chat =
-                init_one::<roomler_ai_mod_chat::ChatState>(core.clone(), settings).await?;
+                init_one::<roomler_ai_mod_chat::ChatState>(core.clone(), settings, ()).await?;
             if let Some(m) = &modules.chat {
                 modules.ws.extend(m.ws().handlers);
             }
@@ -102,16 +116,31 @@ impl Modules {
         #[cfg(feature = "conference")]
         {
             modules.conference =
-                init_one::<roomler_ai_mod_conference::ConferenceState>(core.clone(), settings)
+                init_one::<roomler_ai_mod_conference::ConferenceState>(core.clone(), settings, ())
                     .await?;
             if let Some(m) = &modules.conference {
                 modules.ws.extend(m.ws().handlers);
             }
         }
         modules.fleet =
-            init_one::<roomler_ai_mod_fleet::FleetState>(core.clone(), settings).await?;
+            init_one::<roomler_ai_mod_fleet::FleetState>(core.clone(), settings, ()).await?;
         if let Some(m) = &modules.fleet {
             modules.ws.extend(m.ws().handlers);
+        }
+        #[cfg(feature = "remote")]
+        {
+            // `remote → fleet`: the Hub is one live object, so the module is
+            // built on fleet's state rather than re-creating it. A fleet
+            // that is switched off refuses the boot in `AppState::new`
+            // before this matters; here it simply means no `remote`.
+            if let Some(fleet) = modules.fleet.clone() {
+                modules.remote =
+                    init_one::<roomler_ai_mod_remote::RemoteState>(core.clone(), settings, fleet)
+                        .await?;
+                if let Some(m) = &modules.remote {
+                    modules.ws.extend(m.ws().handlers);
+                }
+            }
         }
 
         let _ = core;
@@ -137,6 +166,10 @@ impl Modules {
         if self.fleet.is_some() {
             ids.push("fleet");
         }
+        #[cfg(feature = "remote")]
+        if self.remote.is_some() {
+            ids.push("remote");
+        }
         ids
     }
 
@@ -161,6 +194,10 @@ impl Modules {
         }
         if let Some(fleet) = &self.fleet {
             api = api.merge(fleet.routes().with_state(()));
+        }
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            api = api.merge(remote.routes().with_state(()));
         }
         api
     }
@@ -188,6 +225,10 @@ impl Modules {
         if let Some(fleet) = &self.fleet {
             root = root.merge(fleet.unlimited_routes().with_state(()));
         }
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            root = root.merge(remote.unlimited_routes().with_state(()));
+        }
         root
     }
 
@@ -211,6 +252,10 @@ impl Modules {
         if let Some(fleet) = &self.fleet {
             sets.extend(fleet.indexes());
         }
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            sets.extend(remote.indexes());
+        }
         sets
     }
 
@@ -232,6 +277,10 @@ impl Modules {
         }
         if let Some(fleet) = &self.fleet {
             jobs.extend(fleet.jobs());
+        }
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            jobs.extend(remote.jobs());
         }
         jobs
     }
@@ -260,6 +309,11 @@ impl Modules {
         if let Some(fleet) = &self.fleet {
             core.hooks
                 .register(roomler_ai_mod_fleet::FleetState::ID, fleet.hooks());
+        }
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            core.hooks
+                .register(roomler_ai_mod_remote::RemoteState::ID, remote.hooks());
         }
     }
 
@@ -315,6 +369,10 @@ impl Modules {
     /// Orderly stop of every mounted module, in REVERSE composition order
     /// (a module stops before the ones it depends on).
     pub async fn shutdown(&self) {
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            remote.shutdown().await;
+        }
         if let Some(fleet) = &self.fleet {
             fleet.shutdown().await;
         }
@@ -355,11 +413,61 @@ impl Modules {
         }
         (Vec::new(), 0, 0)
     }
+
+    /// P6 — one `rc:*` text frame from a controller browser tab, with the
+    /// connection's Hub-registered sender (minted by the host's socket, which
+    /// is why this is a call and not a namespace handler). `true` = the
+    /// module took it (dispatched, or answered a refusal on the sender);
+    /// `false` = not an rc:* frame, or no `remote` module mounted.
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    pub async fn remote_controller_frame(
+        &self,
+        user_id: bson::oid::ObjectId,
+        controller_name: &str,
+        controller_tx: &roomler_ai_remote_control::session::ClientTx,
+        text: &str,
+        dialed_tid: Option<&str>,
+        conn_established_ms: i64,
+        connection_id: &str,
+    ) -> bool {
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            return roomler_ai_mod_remote::controller::handle_controller_frame(
+                remote,
+                roomler_ai_mod_remote::controller::ControllerFrame {
+                    user_id,
+                    controller_name,
+                    controller_tx,
+                    text,
+                    dialed_tid,
+                    conn_established_ms,
+                    connection_id,
+                },
+            )
+            .await;
+        }
+        false
+    }
+
+    /// P6 — a controller browser socket closed: the owner pods hosting rc
+    /// sessions proxied for it are told (PR-2). A no-op when the module is
+    /// not mounted.
+    #[allow(unused_variables)]
+    pub fn remote_conn_closed(&self, connection_id: &str) {
+        #[cfg(feature = "remote")]
+        if let Some(remote) = &self.remote {
+            roomler_ai_mod_remote::relay::forward_conn_closed(remote, connection_id);
+        }
+    }
 }
 
 /// Initialise one module unless its switch is off.
 #[allow(dead_code)]
-async fn init_one<M: Module>(core: Core, settings: &Settings) -> anyhow::Result<Option<M>> {
+async fn init_one<M: Module>(
+    core: Core,
+    settings: &Settings,
+    deps: M::Deps,
+) -> anyhow::Result<Option<M>> {
     if !M::enabled(settings) {
         info!(
             module = M::ID,
@@ -367,7 +475,7 @@ async fn init_one<M: Module>(core: Core, settings: &Settings) -> anyhow::Result<
         );
         return Ok(None);
     }
-    let module = M::init(core, settings).await?;
+    let module = M::init(core, settings, deps).await?;
     info!(module = M::ID, "module mounted");
     Ok(Some(module))
 }

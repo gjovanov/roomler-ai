@@ -125,7 +125,9 @@ impl ConferenceState {
 impl Module for ConferenceState {
     const ID: &'static str = "conference";
 
-    async fn init(core: Core, settings: &Settings) -> anyhow::Result<Self> {
+    type Deps = ();
+
+    async fn init(core: Core, settings: &Settings, _deps: ()) -> anyhow::Result<Self> {
         let db = &core.db;
         let worker_pool = Arc::new(WorkerPool::new(&settings.mediasoup).await?);
         let room_manager = Arc::new(RoomManager::new(worker_pool, &settings.mediasoup));
