@@ -51,10 +51,14 @@
 pub mod capabilities;
 pub mod cluster;
 pub mod composition;
+pub mod cookies;
+pub mod error;
+pub mod extractors;
 pub mod graph;
 pub mod hooks;
 pub mod job;
 pub mod module;
+pub mod origin;
 pub mod rate_limit;
 pub mod relay_load;
 pub mod state;
@@ -63,6 +67,7 @@ pub mod user_analytics;
 pub mod ws;
 
 pub use capabilities::{Capabilities, TenantCtx};
+pub use error::ApiError;
 pub use hooks::{FleetLifecycle, Hooks, TenantLifecycle};
 pub use job::{Cadence, Job, JobFuture};
 pub use module::Module;

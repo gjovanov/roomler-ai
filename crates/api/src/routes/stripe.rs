@@ -9,7 +9,7 @@ use axum::{
 use bson::oid::ObjectId;
 use serde::Deserialize;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_services::stripe::{StripeEvent, StripeService};
 
@@ -38,7 +38,7 @@ pub async fn get_plans() -> Json<Vec<roomler_ai_services::stripe::PlanInfo>> {
 // ---- POST /api/stripe/checkout (authenticated, MANAGE_TENANT) ------------
 
 pub async fn create_checkout(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Json(body): Json<CheckoutRequest>,
 ) -> Result<Json<roomler_ai_services::stripe::CheckoutResponse>, ApiError> {
@@ -64,7 +64,7 @@ pub async fn create_checkout(
 // ---- POST /api/stripe/portal (authenticated, MANAGE_TENANT) --------------
 
 pub async fn create_portal(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     auth: AuthUser,
     Json(body): Json<PortalRequest>,
 ) -> Result<Json<roomler_ai_services::stripe::PortalResponse>, ApiError> {
@@ -83,7 +83,7 @@ pub async fn create_portal(
 // ---- POST /api/stripe/webhook (no auth, raw body) ------------------------
 
 pub async fn webhook(
-    State(state): State<AppState>,
+    State(state): State<Core>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
@@ -117,7 +117,7 @@ fn parse_oid(s: &str) -> Result<ObjectId, ApiError> {
 }
 
 async fn require_manage_tenant(
-    state: &AppState,
+    state: &Core,
     tenant_id: ObjectId,
     user_id: ObjectId,
 ) -> Result<(), ApiError> {
