@@ -4484,6 +4484,14 @@ mod system {
         /// accident: it re-metrics Windows' own connected route on every
         /// enrolled machine. rc.289 is the precedent — metric-0 routes shipped
         /// as a default, got deleted by the VPN, and left the prefix unrouted.
+        ///
+        /// ⚠️ `#[cfg(windows)]`, like its neighbour above: every gate it reads
+        /// is Windows-only, so without it the macOS and Linux lanes fail to
+        /// COMPILE. Nothing run locally catches that — a Windows `cargo test`
+        /// has the functions, and the workspace clippy runs without
+        /// `--all-targets` so it never builds this module at all. Only a
+        /// cross-platform `cargo check --all-targets` sees it.
+        #[cfg(windows)]
         #[test]
         fn ula_metric_defaults_to_the_stock_connected_route() {
             // No env override in the test process ⇒ every gate reads its
