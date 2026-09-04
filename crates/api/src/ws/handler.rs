@@ -289,6 +289,7 @@ fn ws_upgrade_tunnel_client(
         // Connect-time revocation check. Periodic re-check (every 60 s)
         // lives in `ws::tunnel::handle_tunnel_client_socket`.
         let client = match state
+            .network()
             .tunnel_clients
             .find_in_tenant(tenant_id, tunnel_client_id)
             .await

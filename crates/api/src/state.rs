@@ -6,24 +6,17 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use mongodb::Database;
 use roomler_ai_config::Settings;
-use roomler_ai_remote_control::{
-    signaling::ServerMsg,
-    turn_creds::{TurnConfig, TurnMap},
-    turn_url::{VariantCaps, expand_turn_url},
-};
+use roomler_ai_remote_control::signaling::ServerMsg;
 use roomler_ai_services::{
     AuthService, EmailService, OAuthService, PushService, TaskService,
     dao::{
         activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
         consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, invite::InviteDao,
-        key_rotation_audit::KeyRotationAuditDao, notification::NotificationDao,
-        overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
-        overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
-        push_subscription::PushSubscriptionDao, role::RoleDao, ssh_activity::SshActivityDao,
-        ssh_audit::SshAuditDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
-        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
+        notification::NotificationDao, overlay_network::OverlayNetworkDao,
+        push_subscription::PushSubscriptionDao, role::RoleDao, tenant::TenantDao, user::UserDao,
     },
 };
+use roomler_core::turn::build_turn_map;
 use tokio::sync::mpsc;
 
 use std::sync::Arc;
@@ -69,20 +62,9 @@ pub struct AppState {
     pub enrollment_keys: Arc<roomler_ai_services::dao::enrollment_key::EnrollmentKeyDao>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
-    /// Roomler-SSH grant log — every session request, granted or refused.
-    pub ssh_audit: Arc<SshAuditDao>,
     /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
     /// on a device, granted or refused — never what the device did.
     pub config_audit: Arc<ConfigAuditDao>,
-    /// FR-40 — overlay-key rotation orders, dispatched or refused.
-    pub key_rotation_audit: Arc<KeyRotationAuditDao>,
-    /// FR-19 peer-relay decisions: approvals (who made a device a relay) and
-    /// mints (what the server routed through it), granted or refused.
-    pub peer_relay_audit: Arc<PeerRelayAuditDao>,
-    /// P8 — device-reported session activity. Separate from `ssh_audit`
-    /// because one is the server's decision and the other is a claim by the
-    /// device; see `SshActivityEvent`.
-    pub ssh_activity: Arc<SshActivityDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
@@ -108,10 +90,8 @@ pub struct AppState {
     /// the four teardown paths drops the map entry.
     pub tunnel_presence_tokens: Arc<DashMap<ObjectId, String>>,
 
-    // tunnel subsystem
-    pub tunnel_clients: Arc<TunnelClientDao>,
-    pub tunnel_policies: Arc<TunnelPolicyDao>,
-    pub tunnel_audit: Arc<TunnelAuditDao>,
+    // tunnel subsystem — the DAOs are the network module's (P7a); the live
+    // session maps below leave with the tunnel socket (P7b).
     /// Per-tunnel-session WS outbound channels. See [`TunnelClientOutbound`].
     pub tunnel_clients_by_session: TunnelClientOutbound,
     /// P7 flap resilience: which tunnel sessions TARGET a given agent —
@@ -137,29 +117,10 @@ pub struct AppState {
     /// `rc.agent_nudge` RPCs (click storms sent 11 in 15 s pre-PR-1).
     pub agent_nudge_throttle: Arc<crate::ws::rc_cluster::NudgeRequestThrottle>,
 
-    // Overlay-network subsystem (Tailscale-style L3 mesh)
-    pub overlay_networks: Arc<OverlayNetworkDao>,
-    pub overlay_nodes: Arc<OverlayNodeDao>,
-    /// Overlay L3 ACL. Read on every netmap event (join / leave / admin edit),
-    /// not per flow — the overlay data plane never touches the server.
-    pub overlay_policies: Arc<OverlayPolicyDao>,
-    /// Connection-lifetime WS outbound channels for **tunnel-client**
-    /// overlay nodes, keyed by `tunnel_client_id` (agent nodes are
-    /// reached via [`Hub::send_to_agent`]). Used by the overlay broker
-    /// to fan netmaps/deltas to client nodes. Distinct from
-    /// `tunnel_clients_by_session`, which is keyed per forward-session.
-    pub overlay_nodes_by_id: TunnelClientOutbound,
-    /// DERP relay registry: `(network_id, wg_pubkey)` → the outbound frame
-    /// sender for that node's live `/derp` WS. The pubkey-addressed forwarding
-    /// map for the both-UDP-blocked carrier tier. See [`crate::ws::derp`].
-    pub derp_registry: crate::ws::derp::DerpRegistry,
-    /// Overlay ACL — per-network relay allow tables consulted by
-    /// `ws::derp::forward_frame`. Precomputed because forwarding is a
-    /// synchronous per-datagram path; a missing entry fails OPEN. See
-    /// [`crate::ws::derp_acl`].
-    pub derp_acl: crate::ws::derp_acl::DerpAclCache,
-    /// C-5 — per-connection rehome-close signals (cluster convergence).
-    pub derp_cancels: crate::ws::derp::DerpCancelRegistry,
+    // Overlay-network subsystem (Tailscale-style L3 mesh) — the DAOs, the
+    // node channels, the DERP registry + ACL cache and the relay state are
+    // the network module's (P7a, `state.network()`); what is left here
+    // belongs to the DERP socket and leaves with it (P7b).
     /// C-5 — directory owner-tokens for LOCAL derp registrations
     /// (`roomler:own:derp:<net>:<pubkey>`); refreshed by the directory
     /// heartbeat while the registry holds the key.
@@ -167,31 +128,11 @@ pub struct AppState {
     /// C-5 — per-(network, pubkey) rehome pacing (60 s cooldown, 3
     /// attempts / 10 min, then the split-evidence counter).
     pub derp_rehome_cooldowns: Arc<crate::ws::derp_cluster::RehomeCooldowns>,
-    /// P7 — per-pair TURN-relay churn state for the forced-DERP escalation,
-    /// keyed by the symmetric `pair_key`. Manual TTL (checked on access) +
-    /// a size-capped retain sweep — see [`crate::ws::overlay::PairChurn`].
-    pub relay_pair_churn: Arc<DashMap<String, crate::ws::overlay::PairChurn>>,
-    /// Per-(caller, device) ceilings for the exec / SSH control planes. Shared
-    /// by the HTTP routes and the device-originated WS legs — both funnel
-    /// through the same `authorize`, so neither transport is unlimited.
+    /// Per-(caller, device) ceiling for the exec control plane. Shared by
+    /// the HTTP route and the device-originated WS leg — both funnel through
+    /// the same `authorize`, so neither transport is unlimited. (The SSH,
+    /// relay-mint and key-rotation ceilings are the network module's.)
     pub exec_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
-    pub ssh_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
-    /// FR-19 — per-(requesting node, relay node) mint ceiling
-    /// (`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`), checked by the mint
-    /// in `ws::overlay` AFTER the identity gates so a refusal is attributable.
-    pub relay_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
-    /// FR-40 — one rotation order per device per minute. Keyed on the DEVICE
-    /// (the limiter's `caller` slot carries the device id too): a second
-    /// admin clicking inside the window is the same storm, not a new budget.
-    pub key_rotation_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
-    /// FR-19 — the org-relay mint's pod-local state: minted sessions (keyed
-    /// by pair), per-relay VNI cursors, the server-wide generation clock,
-    /// join extras (primary-org flag, relay port) and reachability reports.
-    /// Pod-local is correct here for the same reason `relay_pair_churn` is:
-    /// tenant affinity puts a tenant's nodes on ONE pod, and the relay's own
-    /// table is the truth a restart falls back on (sessions then run out
-    /// their `max_lifetime`).
-    pub org_relay: Arc<crate::ws::org_relay::OrgRelayState>,
 
     /// The one GitHub-releases cache, shared by `/api/agent/*`,
     /// `/api/tunnel/*` and `/api/setup/*` — they all read the same
@@ -223,6 +164,17 @@ impl AppState {
             .fleet
             .as_ref()
             .expect("the fleet module is mounted (AppState::new refuses to boot without it)")
+    }
+
+    /// FR-69 P7a — the network module's state, for the host code that still
+    /// serves the tunnel, DERP and agent sockets from its engine. Always
+    /// mounted until the sockets move (P7b): `AppState::new` refuses to boot
+    /// without it.
+    pub fn network(&self) -> &roomler_ai_mod_network::NetworkState {
+        self.modules
+            .network
+            .as_ref()
+            .expect("the network module is mounted (AppState::new refuses to boot without it)")
     }
 }
 
@@ -320,10 +272,6 @@ impl AppState {
 
         // Remote-control subsystem
         let used_tokens = Arc::new(roomler_ai_services::dao::used_token::UsedTokenDao::new(&db));
-        let ssh_audit = Arc::new(SshAuditDao::new(&db));
-        let key_rotation_audit = Arc::new(KeyRotationAuditDao::new(&db));
-        let peer_relay_audit = Arc::new(PeerRelayAuditDao::new(&db));
-        let ssh_activity = Arc::new(SshActivityDao::new(&db));
         let stats = Arc::new(roomler_ai_services::dao::stats::StatsDao::new(&db));
         // Stats PR-3 — malformed allowlist entries are skipped LOUDLY (a
         // silent skip would read as "dashboards mysteriously 404").
@@ -424,7 +372,6 @@ impl AppState {
         let tunnel_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
         let derp_presence_tokens: Arc<DashMap<crate::ws::derp::DerpKey, String>> =
             Arc::new(DashMap::new());
-        let derp_registry: crate::ws::derp::DerpRegistry = Arc::new(DashMap::new());
         let tunnel_clients_by_session: TunnelClientOutbound = Arc::new(DashMap::new());
         let tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
             Arc::new(DashMap::new());
@@ -487,14 +434,24 @@ impl AppState {
                  socket (FR-69 P5a) — redeploy the previous tag instead"
             )
         })?;
+        // P7a — the same for `network`: the host's tunnel, DERP and
+        // agent-socket code calls the engine that moved into the module
+        // (`state.network()`) until the sockets follow it (P7b).
+        let network = modules.network.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[modules] network = false is not supported while the host serves the tunnel, \
+                 DERP and agent sockets (FR-69 P7a) — redeploy the previous tag instead"
+            )
+        })?;
+        let derp_registry = network.derp_registry.clone();
         // #1186 — `overlay_removes` ctrl envelopes need the FULL state to
         // re-fan (a Mongo peer read + the overlay send paths), which this
         // subscriber closure cannot capture (it is spawned mid-construction;
-        // `apply_rc_ctrl` is hub-only for the same reason). Ferry them to an
-        // applier task spawned once the state exists. Bounded + try_send:
-        // losing one under pressure costs a push the peer's rejoin heals.
-        let (overlay_ctrl_tx, overlay_ctrl_rx) =
-            tokio::sync::mpsc::channel::<serde_json::Value>(256);
+        // `apply_rc_ctrl` is hub-only for the same reason). The network
+        // module owns the channel and its applier (P7a); the subscriber only
+        // holds the sender. Bounded + try_send: losing one under pressure
+        // costs a push the peer's rejoin heals.
+        let overlay_ctrl_tx = network.overlay_ctrl_tx.clone();
         if let Some(pubsub) = &redis_pubsub {
             let (redis_tx, _) = tokio::sync::broadcast::channel::<String>(1024);
             let mut redis_rx = redis_tx.subscribe();
@@ -745,25 +702,6 @@ impl AppState {
             });
         }
 
-        // tunnel subsystem
-        let tunnel_clients = Arc::new(TunnelClientDao::new(&db));
-        let tunnel_policies = Arc::new(TunnelPolicyDao::new(&db));
-        let tunnel_audit = Arc::new(TunnelAuditDao::new(&db));
-
-        // Overlay-network subsystem
-        // P2b — carving is opt-in per deployment. With the flag off the DAO
-        // behaves exactly as it did pre-P2b (no registry reads at all).
-        let overlay_networks = Arc::new(
-            OverlayNetworkDao::new(&db).with_block_prefix(
-                settings
-                    .overlay
-                    .blocks_enabled
-                    .then_some(settings.overlay.block_prefix),
-            ),
-        );
-        let overlay_nodes = Arc::new(OverlayNodeDao::new(&db));
-        let overlay_policies = Arc::new(OverlayPolicyDao::new(&db));
-
         let state = Self {
             core,
             modules,
@@ -775,11 +713,7 @@ impl AppState {
             agents: fleet.agents.clone(),
             enrollment_keys: fleet.enrollment_keys.clone(),
             exec_audit: fleet.exec_audit.clone(),
-            ssh_audit,
             config_audit: fleet.config_audit.clone(),
-            key_rotation_audit,
-            peer_relay_audit,
-            ssh_activity,
             agent_crashes: fleet.agent_crashes.clone(),
             agent_logs: fleet.agent_logs.clone(),
             consent_requests: fleet.consent_requests.clone(),
@@ -788,29 +722,14 @@ impl AppState {
             agent_presence_tokens: fleet.agent_presence_tokens.clone(),
             presence_fanout: fleet.presence_fanout.clone(),
             tunnel_presence_tokens: tunnel_presence_tokens.clone(),
-            tunnel_clients,
-            tunnel_policies,
-            tunnel_audit,
             tunnel_clients_by_session: tunnel_clients_by_session.clone(),
             tunnel_sessions_by_target_agent: tunnel_sessions_by_target_agent.clone(),
             tunnel_sessions_by_origin_agent: tunnel_sessions_by_origin_agent.clone(),
             agent_nudge_cooldowns: fleet.agent_nudge_cooldowns.clone(),
             agent_nudge_throttle: fleet.agent_nudge_throttle.clone(),
-            overlay_networks,
-            overlay_nodes,
-            overlay_policies,
-            overlay_nodes_by_id: Arc::new(DashMap::new()),
-            derp_registry: derp_registry.clone(),
-            derp_acl: Arc::new(DashMap::new()),
-            derp_cancels: Arc::new(DashMap::new()),
             derp_presence_tokens: derp_presence_tokens.clone(),
             derp_rehome_cooldowns: Arc::new(DashMap::new()),
-            relay_pair_churn: Arc::new(DashMap::new()),
             exec_rate_limiter: fleet.exec_rate_limiter.clone(),
-            ssh_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
-            relay_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
-            key_rotation_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
-            org_relay: Arc::new(crate::ws::org_relay::OrgRelayState::new()),
             releases_cache: fleet.releases_cache.clone(),
         };
 
@@ -826,10 +745,8 @@ impl AppState {
         // the same DB-name-scoped claim pattern). Spawns NOTHING unless
         // `rc.ephemeral_reaper_enabled` — the P1 kill switch, default off.
         crate::ws::ephemeral::spawn_reaper(state.clone());
-        // #1186 — apply cross-pod `overlay_removes` envelopes (the channel is
-        // fed by the redis ctrl subscriber above; with no Redis the sender
-        // side never fires and this task just parks).
-        crate::ws::overlay::spawn_removes_applier(state.clone(), overlay_ctrl_rx);
+        // #1186 — the cross-pod `overlay_removes` applier is spawned by the
+        // network module's init (P7a); the subscriber above feeds its channel.
         // Stats PR-1 — the rollup compactor (raw → _1h → _1d), cluster-
         // singleton per cycle via the same DB-name-scoped claim pattern.
         // No-op task when `stats.enabled=false`.
@@ -841,20 +758,11 @@ impl AppState {
         crate::ws::derp::spawn_derp_usage_flush(state.clone());
 
         // FR-69 P5a — the inverse edges (D6). Each mounted module registers
-        // its hooks; the host registers its TRANSITIONAL implementation of
-        // the network steps of the agent cascade (overlay release, MagicDNS
-        // rename) under the `network` id, so the fleet module's cascades
-        // already run in HOOK_ORDER through the core registry.
+        // its hooks (since P7a that includes the network steps of the agent
+        // cascade — overlay release, MagicDNS rename — under the module's own
+        // id), so the fleet module's cascades run in HOOK_ORDER through the
+        // core registry.
         state.modules.register_hooks(&state.core);
-        state.core.hooks.register(
-            "network",
-            roomler_core::Hooks {
-                fleet: Some(Arc::new(crate::hooks::HostNetworkHooks {
-                    state: state.clone(),
-                })),
-                tenant: None,
-            },
-        );
         // FR-69 P5c — the agent socket is the fleet module's; the host
         // registers its TRANSITIONAL `network` half (the tunnel/overlay
         // relays with their per-connection state, SSH, key rotation, DERP
@@ -872,107 +780,6 @@ impl AppState {
         );
 
         Ok(state)
-    }
-}
-
-/// Build a [`TurnConfig`] from settings. Returns `None` when `shared_secret` is
-/// absent (e.g. dev environments using static username/password instead).
-/// `pub(crate)` so the tunnel WS handler (`ws/tunnel.rs`) can mint
-/// per-session QUIC-over-TURN creds the same way (Phase 3c).
-pub(crate) fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Option<TurnConfig> {
-    let secret = turn.shared_secret.as_ref()?.clone();
-    let base = turn.url.as_deref()?;
-
-    // Same-worker TURN affinity (2026-07-14): optional comma-separated
-    // per-worker base URLs, each expanded into the same transport variants
-    // as the generic hostname. The Hub then pins BOTH sides of a session to
-    // one worker (see `turn_creds::issue_for_session`) — the generic
-    // hostname is 3 DNS A records, so without this each ICE side resolves
-    // independently and relay↔relay sessions straddle two coturn workers.
-    // Unset → empty → exactly the old single-hostname behaviour.
-    let workers: Vec<Vec<String>> = turn
-        .worker_urls
-        .as_deref()
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|w| !w.is_empty())
-                .map(|w| expand_turn_url(w, &VariantCaps::default()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Some(TurnConfig {
-        urls: expand_turn_url(base, &VariantCaps::default()),
-        workers,
-        shared_secret: secret,
-        ttl_secs: turn.ttl_secs.unwrap_or(600),
-    })
-}
-
-/// Build the region-keyed [`TurnMap`]: the legacy `turn.*` config as the
-/// default region plus one [`TurnConfig`] per enabled spec in
-/// `ROOMLER__RELAY__REGIONS`. A malformed JSON or a region without any usable
-/// shared secret is logged and skipped — never fatal, and with
-/// `relay.regions_enabled=false` the map degrades to exactly the legacy
-/// behaviour.
-pub(crate) fn build_turn_map(settings: &Settings) -> TurnMap {
-    use roomler_ai_remote_control::turn_creds::RelayRegionSpec;
-
-    let default = build_turn_config(&settings.turn);
-    let ttl_secs = settings.turn.ttl_secs.unwrap_or(600);
-    let mut regions = std::collections::HashMap::new();
-    let mut specs: Vec<RelayRegionSpec> = Vec::new();
-    if let Some(json) = settings.relay.regions.as_deref() {
-        match serde_json::from_str::<Vec<RelayRegionSpec>>(json) {
-            Ok(list) => {
-                for spec in list {
-                    if !spec.enabled {
-                        specs.push(spec);
-                        continue;
-                    }
-                    let Some(secret) = spec
-                        .shared_secret
-                        .clone()
-                        .or_else(|| settings.turn.shared_secret.clone())
-                    else {
-                        tracing::warn!(
-                            region = %spec.id,
-                            "relay region has no shared secret (own or global turn.shared_secret); skipping"
-                        );
-                        continue;
-                    };
-                    regions.insert(
-                        spec.id.clone(),
-                        TurnConfig {
-                            urls: expand_turn_url(&spec.turn_url, &spec.caps),
-                            workers: spec
-                                .worker_urls
-                                .iter()
-                                .map(|w| expand_turn_url(w, &spec.caps))
-                                .collect(),
-                            shared_secret: secret,
-                            ttl_secs,
-                        },
-                    );
-                    specs.push(spec);
-                }
-            }
-            Err(e) => {
-                tracing::error!(%e, "ROOMLER__RELAY__REGIONS is not valid JSON; ignoring regions");
-            }
-        }
-    }
-    if settings.relay.regions_enabled && regions.is_empty() {
-        tracing::warn!(
-            "relay.regions_enabled=true but no usable regions parsed — all issuance stays on the default region"
-        );
-    }
-    TurnMap {
-        default,
-        regions,
-        specs,
-        enabled: settings.relay.regions_enabled,
     }
 }
 

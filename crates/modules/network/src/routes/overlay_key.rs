@@ -28,7 +28,9 @@ use roomler_ai_remote_control::{
 };
 use serde::Serialize;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::NetworkState;
 use roomler_core::guards::require_permission;
 
 /// One order per device per minute. A rotation churns every peer's carrier
@@ -119,7 +121,7 @@ pub struct RotateKeyResult {
 }
 
 pub async fn rotate_overlay_key(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
 ) -> Result<Json<RotateKeyResult>, ApiError> {
@@ -138,10 +140,10 @@ pub async fn rotate_overlay_key(
     .await?;
 
     // Tenant-scoped: a foreign agent id is a 404, not a cross-tenant order.
-    let agent = state.agents.find_in_tenant(tid, aid).await?;
+    let agent = state.fleet.agents.find_in_tenant(tid, aid).await?;
 
     let request_id = ObjectId::new().to_hex();
-    let online = state.rc_hub.is_agent_online(aid);
+    let online = state.fleet.rc_hub.is_agent_online(aid);
     // The hello caps are persisted on the row at every connect, so for a
     // live device this is what it advertised THIS session.
     let supports_rotation = agent.capabilities.has_rpc(RpcCap::KeyRotate);
@@ -171,11 +173,13 @@ pub async fn rotate_overlay_key(
                     .map(|i| i.public_key.clone()),
             };
             state
+                .fleet
                 .agents
                 .record_key_rotation_request(tid, aid, &request)
                 .await?;
             let pushed = dispatch == Dispatch::Pushed
                 && state
+                    .fleet
                     .rc_hub
                     .send_to_agent(
                         aid,
@@ -186,6 +190,7 @@ pub async fn rotate_overlay_key(
                     .is_ok();
             if pushed {
                 if let Err(e) = state
+                    .fleet
                     .agents
                     .mark_key_rotation_delivered(tid, aid, &request_id)
                     .await

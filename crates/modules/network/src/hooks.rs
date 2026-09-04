@@ -14,15 +14,15 @@ use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::NodeRef;
 use roomler_core::hooks::{FleetLifecycle, ReleasedLease, RenamePropagation};
 
-use crate::state::AppState;
+use crate::NetworkState;
 
 /// The overlay lease + MagicDNS label holder, over the host's overlay code.
-pub struct HostNetworkHooks {
-    pub state: AppState,
+pub struct NetworkHooks {
+    pub state: NetworkState,
 }
 
 #[async_trait]
-impl FleetLifecycle for HostNetworkHooks {
+impl FleetLifecycle for NetworkHooks {
     /// Release the overlay lease BEFORE the row delete and BEFORE the kick
     /// (the kick's WS teardown runs `handle_overlay_leave`, which must find an
     /// already-tombstoned node rather than race the release CAS).
@@ -33,7 +33,7 @@ impl FleetLifecycle for HostNetworkHooks {
         machine_id: &str,
         reason: &str,
     ) -> anyhow::Result<Option<ReleasedLease>> {
-        let released = crate::ws::overlay::release_overlay_node_for(
+        let released = crate::overlay::release_overlay_node_for(
             &self.state,
             tenant_id,
             machine_id,
@@ -64,7 +64,7 @@ impl FleetLifecycle for HostNetworkHooks {
             return Ok(RenamePropagation::NoLiveNode);
         };
         Ok(
-            match crate::ws::overlay::propagate_node_rename(&self.state, &node, name).await {
+            match crate::overlay::propagate_node_rename(&self.state, &node, name).await {
                 Some(label) => RenamePropagation::Propagated(label),
                 None => RenamePropagation::Failed,
             },
