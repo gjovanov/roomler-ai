@@ -260,6 +260,61 @@ pub fn unpack_age(raw: u64) -> Option<(u16, u16, u16)> {
     ))
 }
 
+/// FR-70 M0 — [`pack_age`] plus the window's age at ARRIVAL (the frame's
+/// last chunk reaching the viewer's worker, same clock mapping as the paint
+/// age) in the fourth `u16`. `0` = the viewer did not report one (pre-M0),
+/// so the slot reads as absent rather than as an instantaneous arrival.
+pub fn pack_age_with_arrival(age_ms: u16, age_min_ms: u16, rtt_ms: u16, arrival_ms: u16) -> u64 {
+    pack_age(age_ms, age_min_ms, rtt_ms) | ((arrival_ms as u64) << 48)
+}
+
+/// The arrival age carried by [`pack_age_with_arrival`]; `None` for no
+/// report at all or a viewer that does not send one.
+pub fn unpack_age_arrival(raw: u64) -> Option<u16> {
+    if raw == 0 {
+        return None;
+    }
+    let arrival = ((raw >> 48) & 0xFFFF) as u16;
+    (arrival > 0).then_some(arrival)
+}
+
+/// FR-70 M0 — the fused paint age, split by plane.
+///
+/// `viewer_age_ms` fuses three latencies into one number, which is how a
+/// 4903 ms relay stall (CORPLAP-3, 2026-09-04: `inflight=1485` bytes,
+/// `iter_max=28 ms`) arrived looking like a pump problem. With the viewer
+/// reporting the age at ARRIVAL as well, the three separate:
+///
+/// - **viewer** = paint age − arrival age: decode queue + decode + paint,
+///   entirely inside the browser;
+/// - **sender** = the agent's own send-queue wait for the window
+///   (`send_wait_avg_ms`: enqueue → wire-complete), when the pump has it;
+/// - **transit** = arrival age − sender: the network, the relay, the
+///   receiver's socket — everything between the wire and the worker.
+///
+/// A `sender` of `None` (a pump with no send-wait figure) leaves `transit`
+/// as the whole arrival age, an upper bound. Saturating throughout: the
+/// three averages come from the same window but not the same frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgeSplit {
+    pub sender_ms: Option<f64>,
+    pub transit_ms: u16,
+    pub viewer_ms: u16,
+}
+
+pub fn split_age(age_ms: u16, arrival_ms: u16, sender_ms: Option<f64>) -> AgeSplit {
+    let viewer_ms = age_ms.saturating_sub(arrival_ms);
+    let transit_ms = match sender_ms {
+        Some(s) if s.is_finite() && s > 0.0 => (f64::from(arrival_ms) - s).max(0.0).round() as u16,
+        _ => arrival_ms,
+    };
+    AgeSplit {
+        sender_ms,
+        transit_ms,
+        viewer_ms,
+    }
+}
+
 /// FR-59 P3 — pack the viewer's LINK report: the bytes/s it actually
 /// received this window, and how much the transit queue GREW during it
 /// (ms, signed — negative means it drained).
@@ -617,6 +672,49 @@ impl AgeLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // FR-70 M0 — the arrival slot rides in the spare u16 of the age word and
+    // is absent (not zero) for a viewer that does not send it.
+    #[test]
+    fn age_word_carries_the_arrival_age_without_disturbing_the_three_it_had() {
+        let raw = pack_age_with_arrival(4903, 61, 80, 4890);
+        assert_eq!(unpack_age(raw), Some((4903, 61, 80)));
+        assert_eq!(unpack_age_arrival(raw), Some(4890));
+        // The pre-M0 packer leaves the slot empty ⇒ absent.
+        assert_eq!(unpack_age_arrival(pack_age(4903, 61, 80)), None);
+        assert_eq!(
+            unpack_age_arrival(pack_age_with_arrival(4903, 61, 80, 0)),
+            None
+        );
+        // No report at all.
+        assert_eq!(unpack_age_arrival(0), None);
+        // The u16 ceiling survives the pack.
+        assert_eq!(
+            unpack_age_arrival(pack_age_with_arrival(1, 1, 0, u16::MAX)),
+            Some(u16::MAX)
+        );
+    }
+
+    // FR-70 M0 — finding 4 in numbers: a 4903 ms paint with a 12 ms send
+    // wait and a 13 ms browser is a TRANSIT stall, and the split says so.
+    #[test]
+    fn the_split_attributes_a_relay_stall_to_transit() {
+        let s = split_age(4903, 4890, Some(12.3));
+        assert_eq!(s.viewer_ms, 13);
+        assert_eq!(s.transit_ms, 4878);
+        assert_eq!(s.sender_ms, Some(12.3));
+        // A browser that is the problem: 66 ms of transit, 900 ms of decode.
+        let s = split_age(966, 66, Some(2.0));
+        assert_eq!(s.viewer_ms, 900);
+        assert_eq!(s.transit_ms, 64);
+        // No sender figure ⇒ transit is the whole arrival age (an upper bound).
+        let s = split_age(966, 66, None);
+        assert_eq!(s.transit_ms, 66);
+        // Averages from different frames can invert; saturate, never wrap.
+        let s = split_age(50, 60, Some(70.0));
+        assert_eq!(s.viewer_ms, 0);
+        assert_eq!(s.transit_ms, 0);
+    }
 
     // Deterministic controller regardless of ambient env. `slow_start` is
     // pinned OFF here so these tests keep locking the pure additive climb;

@@ -1264,6 +1264,7 @@ export function decodeStatWireMessage(
   age?: { avgMs: number; minMs: number } | null,
   probeRttMs?: number | null,
   link?: { rxBps: number; queueMs: number | null } | null,
+  arrival?: { avgMs: number } | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -1284,6 +1285,14 @@ export function decodeStatWireMessage(
     // when a probe has actually landed.
     if (typeof probeRttMs === 'number' && Number.isFinite(probeRttMs) && probeRttMs >= 0) {
       msg.probe_rtt_ms = clamp(probeRttMs)
+    }
+    // FR-70 M0 — the window's age at ARRIVAL (same clock mapping as
+    // `age_ms`, so it rides only alongside it). The agent splits the fused
+    // age with it: viewer = age − arrival, transit = arrival − its own
+    // send-queue wait. Clamped to ≥ 1 because 0 is the agent's "absent"
+    // sentinel for this slot.
+    if (arrival && Number.isFinite(arrival.avgMs)) {
+      msg.arr_ms = Math.max(clamp(arrival.avgMs), 1)
     }
   }
   // FR-59 P3 — the link report: what actually arrived this window, and how
@@ -1586,6 +1595,12 @@ export type RcDecodeDiag = {
    *  on the agent's clock mapped via the rc:clock probe. Null until the
    *  probe lands (old agents never echo — the field just stays null). */
   age: HopWindow | null
+  /** FR-70 M0 — the age at ARRIVAL (last chunk in the worker), same clock
+   *  mapping as `age`; and the local arrival→paint time. `age − arrival`
+   *  is what this browser adds; `arrival` minus the agent's send-queue
+   *  wait is the transit. Absent from workers older than M0. */
+  arrival?: HopWindow | null
+  viewer?: HopWindow | null
   /** FR-1 P7 — control-DC round trip of the best retained clock probe. */
   probeRttMs: number | null
   outGapMaxMs: number
@@ -5013,11 +5028,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     age?: { avgMs: number; minMs: number } | null,
     probeRttMs?: number | null,
     link?: { rxBps: number; queueMs: number | null } | null,
+    arrival?: { avgMs: number } | null,
   ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
-      ch.send(JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link)))
+      ch.send(
+        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival)),
+      )
     } catch {
       /* channel closed between check and send Ã¢ÂÂ drop */
     }
@@ -5033,6 +5051,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     framesDroppedBacklog?: number
     decodeQueueSize?: number
     age?: HopWindow | null
+    /** FR-70 M0 — the window's age at arrival (null until the probe locks). */
+    arrival?: HopWindow | null
     /** FR-59 P3 — bytes/s the worker actually received this window. */
     bitrateBps?: number
     /** FR-59 P3 — ms the transit queue grew this window; `null`/absent =
@@ -5064,12 +5084,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       typeof m.queueMs === 'number'
         ? { rxBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0, queueMs: m.queueMs }
         : null
+    // FR-70 M0 — the age at arrival, present under the same conditions as
+    // `age` (probe locked, frames painted).
+    const arrival = age && m.arrival && m.arrival.n > 0 ? { avgMs: m.arrival.avgMs } : null
     sendDecodeStat(
       typeof m.fps === 'number' ? m.fps : 0,
       struggleWindow.observe(bad),
       age,
       clockBest?.rttMs ?? null,
       link,
+      arrival,
     )
   }
 
@@ -5622,6 +5646,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     fwd?: HopWindow
     decode?: HopWindow
     age?: HopWindow | null
+    arrival?: HopWindow | null
+    viewer?: HopWindow | null
     outGapMaxMs?: number
     decodeQueueSize?: number
     framesDroppedBacklog?: number
@@ -5633,6 +5659,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       fwd: m.fwd ?? null,
       decode: m.decode ?? null,
       age: m.age ?? null,
+      arrival: m.arrival ?? null,
+      viewer: m.viewer ?? null,
       probeRttMs: clockBest?.rttMs ?? null,
       outGapMaxMs: typeof m.outGapMaxMs === 'number' ? m.outGapMaxMs : 0,
       queue: typeof m.decodeQueueSize === 'number' ? m.decodeQueueSize : 0,

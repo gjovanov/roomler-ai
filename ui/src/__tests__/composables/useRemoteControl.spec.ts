@@ -2834,6 +2834,30 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
   it('caps absurd fps at 240 so the packed 16-bit agent field never overflows', () => {
     expect(decodeStatWireMessage(100000, true).fps).toBe(240)
   })
+
+  // FR-70 M0 — the age at arrival rides only alongside an age (same clock
+  // mapping), never on its own, and never as a 0 (the agent's absent
+  // sentinel for the slot).
+  it('sends arr_ms only alongside age_ms, floored at 1', () => {
+    const withAge = decodeStatWireMessage(
+      30,
+      false,
+      { avgMs: 4903, minMs: 61 },
+      80,
+      null,
+      { avgMs: 4890.4 },
+    )
+    expect(withAge.age_ms).toBe(4903)
+    expect(withAge.arr_ms).toBe(4890)
+    // No age ⇒ no arrival, whatever the worker measured.
+    const noAge = decodeStatWireMessage(30, false, null, null, null, { avgMs: 4890 })
+    expect('arr_ms' in noAge).toBe(false)
+    // A sub-millisecond arrival age is reported as 1, not 0.
+    const tiny = decodeStatWireMessage(30, false, { avgMs: 5, minMs: 2 }, 4, null, { avgMs: 0.2 })
+    expect(tiny.arr_ms).toBe(1)
+    // Pre-M0 callers omit it entirely.
+    expect('arr_ms' in decodeStatWireMessage(30, false, { avgMs: 5, minMs: 2 })).toBe(false)
+  })
 })
 
 describe('priorityWireMessage (rc.199 Priority dial)', () => {
