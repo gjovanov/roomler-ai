@@ -31,42 +31,14 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::{core_state::Core, error::ApiError, extractors::auth::AuthUser};
-use roomler_ai_db::models::role::permissions;
 
 // ── Guards ──────────────────────────────────────────────────────────────
-
-/// Platform-operator gate. 404 by design (see module docs).
-pub(crate) fn require_platform_admin(state: &Core, auth: &AuthUser) -> Result<(), ApiError> {
-    if state.platform_admins.contains(&auth.user_id) {
-        Ok(())
-    } else {
-        Err(ApiError::NotFound("Not found".to_string()))
-    }
-}
-
-/// Tenant-scope gate: membership (+ optionally MANAGE_AGENTS). Failures
-/// are 404, not 403 — the web client wipes tokens on 403, and a member
-/// removed from the org mid-poll must not be logged out of everything.
-pub(crate) async fn require_tenant_stats(
-    state: &Core,
-    tenant_id: ObjectId,
-    user_id: ObjectId,
-    need_manage: bool,
-) -> Result<(), ApiError> {
-    let perms = state
-        .tenants
-        .get_member_permissions(tenant_id, user_id)
-        .await
-        .map_err(|_| ApiError::NotFound("Not found".to_string()))?;
-    if need_manage && !permissions::has(perms, permissions::MANAGE_AGENTS) {
-        return Err(ApiError::NotFound("Not found".to_string()));
-    }
-    Ok(())
-}
-
-pub(crate) fn parse_tid(tenant_id: &str) -> Result<ObjectId, ApiError> {
-    ObjectId::parse_str(tenant_id).map_err(|_| ApiError::BadRequest("Invalid tenant_id".into()))
-}
+//
+// FR-69 P2 — the platform-admin and tenant-stats gates moved into
+// `roomler_core::guards` (the `saas` module gates its admin surface on the
+// first one, and a module cannot reach into this crate). Re-exported so the
+// `super::stats::require_platform_admin` paths in this crate read as before.
+pub(crate) use roomler_core::guards::{parse_tid, require_platform_admin, require_tenant_stats};
 
 // ── Range plumbing ──────────────────────────────────────────────────────
 

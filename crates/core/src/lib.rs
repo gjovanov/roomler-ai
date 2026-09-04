@@ -55,6 +55,7 @@ pub mod cookies;
 pub mod error;
 pub mod extractors;
 pub mod graph;
+pub mod guards;
 pub mod hooks;
 pub mod job;
 pub mod module;

@@ -20,6 +20,8 @@ members = [
     # FR-69 — the server composition contract (the Module trait, hooks, jobs,
     # capabilities) and the composition snapshot that gates every module move.
     "crates/core",
+    # FR-69 — the module crates, one per pillar, behind features on `crates/api`.
+    "crates/modules/saas",
 
     "crates/api",
     "crates/tests",

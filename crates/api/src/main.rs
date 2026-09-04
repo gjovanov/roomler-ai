@@ -3,7 +3,7 @@
 use roomler_ai_api::{build_router, state, state::AppState};
 use roomler_ai_config::{DEFAULT_FRONTEND_URL, Settings};
 use roomler_ai_db::{connect, indexes::ensure_indexes};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -107,18 +107,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // FR-69 P1 — the per-module switches exist before the modules do. A switch
-    // that is off is said out loud here so nobody believes it unmounted
-    // anything yet: each takes effect with its own module's PR.
-    let switched_off = settings.modules.switched_off();
-    if !switched_off.is_empty() {
-        warn!(
-            modules = ?switched_off,
-            "[modules] switches are OFF in config but not yet effective — nothing is \
-             unmounted until that module has been extracted (FR-69)"
-        );
-    }
-
     info!(
         "Starting Roomler2 API on {}:{}",
         settings.app.host, settings.app.port
@@ -140,6 +128,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Build app state (async: spawns mediasoup workers)
     let app_state = AppState::new(db.clone(), settings.clone()).await?;
+    // FR-69 — the module crates' index sets, after the core plan above. The
+    // `[modules]` switches decide which crates initialised; a switched-off
+    // module contributes nothing here either.
+    roomler_ai_db::indexes::apply_index_sets(&db, &app_state.modules.index_sets()).await?;
 
     // S6 — leader-gate the startup maintenance below. With two pods, a
     // restarting pod must NOT reset `in_progress` calls that are live on

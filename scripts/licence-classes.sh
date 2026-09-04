@@ -34,6 +34,7 @@ SERVER_PATHS=(
   crates/db
   crates/config
   crates/core
+  crates/modules
   crates/derp-relay
   crates/tests
   ui
@@ -69,6 +70,7 @@ EXCLUDE_PATTERNS=(
 SERVER_CRATES=(
   roomler-ai-api
   roomler-core
+  roomler-ai-mod-saas
   roomler-ai-services
   roomler-ai-db
   roomler-ai-config
