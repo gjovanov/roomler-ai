@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
+use crate::core_state::Core;
 use crate::ws::redis_pubsub::RedisPubSub;
 use crate::ws::storage::WsStorage;
 
@@ -56,29 +57,22 @@ pub type TunnelClientOutbound = Arc<DashMap<ObjectId, mpsc::Sender<ServerMsg>>>;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: Database,
-    pub settings: Settings,
-    pub auth: Arc<AuthService>,
-    pub users: Arc<UserDao>,
-    pub activation_codes: Arc<ActivationCodeDao>,
-    pub tenants: Arc<TenantDao>,
+    /// FR-69 P1 — the 27 core fields (identity, tenancy, notifications,
+    /// storage, the socket registry, the cluster bus, TURN credentials,
+    /// metering). `AppState` derefs to it, so `state.settings`,
+    /// `state.users` and the rest read exactly as before, while the
+    /// module-owned fields below wait for their module PRs. See
+    /// [`crate::core_state`].
+    pub core: Core,
+
     pub rooms: Arc<RoomDao>,
-    pub invites: Arc<InviteDao>,
     pub messages: Arc<MessageDao>,
-    pub notifications: Arc<NotificationDao>,
     pub reactions: Arc<ReactionDao>,
-    pub roles: Arc<RoleDao>,
     pub files: Arc<FileDao>,
     pub recordings: Arc<RecordingDao>,
 
-    pub tasks: Arc<TaskService>,
     pub room_manager: Arc<RoomManager>,
-    pub ws_storage: Arc<WsStorage>,
-    pub oauth: Option<Arc<OAuthService>>,
     pub giphy: Option<Arc<GiphyService>>,
-    pub email: Option<Arc<EmailService>>,
-    pub push: Option<Arc<PushService>>,
-    pub push_subscriptions: Arc<PushSubscriptionDao>,
     /// FR-39 — the public updates list. Not a user store: no password, no
     /// tenant, no session.
     pub subscribers: Arc<SubscriberDao>,
@@ -87,21 +81,9 @@ pub struct AppState {
     /// FR-58 — the per-recipient delivery ledger; its unique index is the
     /// send program's at-most-once invariant.
     pub newsletter_sends: Arc<NewsletterSendDao>,
-    pub redis_pubsub: Option<Arc<RedisPubSub>>,
-    /// True while the Redis pub/sub subscriber holds a live subscription —
-    /// flipped by `RedisPubSub::subscribe_with_reconnect` (started in
-    /// `AppState::new` since C-2, so TestApps exercise cross-pod delivery),
-    /// read by `/health/ready`.
-    pub redis_sub_alive: Arc<std::sync::atomic::AtomicBool>,
-    /// File-storage backend for uploads + export artifacts (local disk or
-    /// S3/MinIO, picked from `s3.enabled` at startup). See [`crate::storage`].
-    pub storage: Arc<crate::storage::FileStorage>,
 
     // Remote-control subsystem
     pub agents: Arc<AgentDao>,
-    /// Single-use ledger for enrollment-token jtis. See
-    /// [`roomler_ai_services::dao::used_token`].
-    pub used_tokens: Arc<roomler_ai_services::dao::used_token::UsedTokenDao>,
     /// FR-51 P2 — reusable ephemeral enrollment keys + their per-use audit.
     pub enrollment_keys: Arc<roomler_ai_services::dao::enrollment_key::EnrollmentKeyDao>,
     pub remote_sessions: Arc<RemoteSessionDao>,
@@ -124,29 +106,9 @@ pub struct AppState {
     pub ssh_activity: Arc<SshActivityDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
-    /// Observability sample sinks (`stats_*` collections) — idempotent
-    /// deterministic-`_id` upserts, so every collector is 2-pod safe.
-    /// Writers gate on `settings.stats.enabled`.
-    pub stats: Arc<roomler_ai_services::dao::stats::StatsDao>,
-    /// Stats PR-3 — platform-operator allowlist parsed from
-    /// `ROOMLER__STATS__PLATFORM_ADMINS` (user OBJECTIDS, deliberately not
-    /// emails: OAuth links accounts by bare email, so an email allowlist
-    /// would turn a provider-asserted address into platform-root).
-    pub platform_admins: Arc<std::collections::HashSet<ObjectId>>,
-    /// Wave 2 — optional country resolver for the user analytics. The
-    /// client IP is resolved at connect time and DROPPED; no address is
-    /// ever stored. Absent database ⇒ every session reads `unknown`.
-    pub geoip: Arc<crate::user_analytics::GeoIp>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
     pub rc_hub: Arc<Hub>,
-    /// Region-keyed TURN issuance (the Hub holds its own clone). Built once at
-    /// startup from `turn.*` + `relay.*` settings; `cfg_for(None)` == the
-    /// legacy single-region config.
-    pub turn_map: Arc<roomler_ai_remote_control::turn_creds::TurnMap>,
-    /// P6b — live per-region load written by the `/stats` poller; consulted
-    /// by the Hub (session freeze) and the overlay pair-region pick.
-    pub relay_load: roomler_ai_remote_control::turn_creds::RelayLoadMap,
     /// Multi-region DERP ticket signer (`relay.derp_ticket_private_key`).
     /// `None` = no key configured — ticket requests go unanswered and agents
     /// keep using the central `/derp`.
@@ -175,14 +137,6 @@ pub struct AppState {
     /// (conn_id → room). On WS close the owner pod is told to drop the
     /// participant's transports (`ws::media_cluster::forward_close_leave`).
     pub remote_media_conns: Arc<DashMap<String, ObjectId>>,
-
-    // C-1 — cluster foundation (None without Redis; consumers fail soft).
-    /// Stable pod identity + process epoch.
-    pub pod: crate::cluster::identity::PodIdentity,
-    /// Entity → owning-pod records (LWW / NX namespaces).
-    pub cluster_directory: Option<crate::cluster::directory::OwnershipDirectory>,
-    /// Per-pod request/reply bus.
-    pub cluster_bus: Option<Arc<crate::cluster::bus::PodBus>>,
 
     // tunnel subsystem
     pub tunnel_clients: Arc<TunnelClientDao>,
@@ -283,6 +237,17 @@ pub struct AppState {
     /// `POST /api/releases/refresh` busts it cluster-wide on a release.
     /// See `routes::releases` for the lifecycle.
     pub releases_cache: Arc<crate::routes::releases::ReleasesCache>,
+}
+
+/// FR-69 P1 — every `state.<core field>` in the tree keeps reading through
+/// this. Transitional on purpose: when the last module-owned field has left
+/// `AppState` (P7), the host state IS the core and this goes with it.
+impl std::ops::Deref for AppState {
+    type Target = Core;
+
+    fn deref(&self) -> &Core {
+        &self.core
+    }
 }
 
 impl AppState {
@@ -870,41 +835,50 @@ impl AppState {
         let overlay_nodes = Arc::new(OverlayNodeDao::new(&db));
         let overlay_policies = Arc::new(OverlayPolicyDao::new(&db));
 
-        let state = Self {
+        // FR-69 P1 — the core first, then the module-owned rest.
+        let core = Core {
             db,
             settings,
-            pod,
-            cluster_directory,
-            cluster_bus,
             auth,
             users,
             activation_codes,
             tenants,
-            rooms,
             invites,
-            messages,
-            notifications,
-            reactions,
             roles,
-            files,
-            recordings,
-
-            tasks,
-            room_manager,
-            ws_storage,
+            notifications,
             oauth,
-            giphy,
             email,
             push,
             push_subscriptions,
-            subscribers,
-            newsletter_issues,
-            newsletter_sends,
+            used_tokens,
+            tasks,
+            ws_storage,
             redis_pubsub,
             redis_sub_alive,
             storage,
+            stats,
+            platform_admins,
+            geoip,
+            pod,
+            cluster_directory,
+            cluster_bus,
+            turn_map,
+            relay_load,
+        };
+        let state = Self {
+            core,
+            rooms,
+            messages,
+            reactions,
+            files,
+            recordings,
+
+            room_manager,
+            giphy,
+            subscribers,
+            newsletter_issues,
+            newsletter_sends,
             agents,
-            used_tokens,
             enrollment_keys,
             remote_sessions,
             remote_audit,
@@ -916,13 +890,8 @@ impl AppState {
             ssh_activity,
             agent_crashes,
             agent_logs,
-            stats,
-            platform_admins,
-            geoip,
             consent_requests,
             rc_hub,
-            turn_map,
-            relay_load,
             derp_ticket,
             agent_presence_tokens,
             presence_fanout: Arc::new(crate::ws::device_presence::PresenceFanout::default()),
