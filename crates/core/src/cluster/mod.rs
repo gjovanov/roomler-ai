@@ -9,10 +9,13 @@
 //! - [`bus`]: per-pod channels + request/reply with deadlines; the RPC
 //!   deadline is the ACTIVE failure detector, directory TTLs the passive
 //!   backstop, `roomler:pod-alive:*` advisory only.
+//!
+//! FR-69 P1b — moved here from `crates/api/src/cluster/` unchanged; the
+//! per-pod metrics snapshot stayed behind in the api crate because it reads
+//! module-owned counters. The api crate re-exports these three under their
+//! old paths.
 
-// FR-69 P1b — the three pieces above are core (`roomler_core::cluster`);
-// re-exported so every `crate::cluster::{bus, directory, identity}` path in
-// this crate reads as before. The metrics snapshot stays here: it reads
-// module-owned counters.
-pub use roomler_core::cluster::{bus, directory, identity};
+pub mod bus;
+pub mod directory;
+pub mod identity;
 pub mod metrics;
