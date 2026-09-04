@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-pub mod agent_crash;
-pub mod agent_exec;
-pub mod agent_log;
-pub mod agent_org;
-pub mod agent_release;
+// FR-69 — the host's remaining route files. The collaboration routes are the
+// `chat` and `conference` modules' (P3, P4); device management (agents,
+// enrollment, consent, exec, remote config, releases and the installer
+// proxies, logs, crashes) is the `fleet` module's (P5a). What is left here is
+// core's, `remote`'s and `network`'s, until their own PRs.
 pub mod agent_ssh;
 pub mod auth;
 pub mod background_task;
 pub mod capabilities;
 pub mod cluster;
-pub mod consent;
 pub mod cost;
-pub mod device;
-pub mod enroll_key;
 pub mod integration;
 pub mod invite;
 pub mod notification;
@@ -24,15 +21,11 @@ pub mod overlay_policy;
 pub mod overlay_route;
 pub mod peer_relay;
 pub mod push;
-pub mod releases;
-pub mod remote_config;
-pub mod remote_control;
+pub mod remote_session;
 pub mod role;
-pub mod setup_release;
 pub mod stats;
 pub mod tenant;
 pub mod tunnel;
-pub mod tunnel_release;
 pub mod usage;
 
 pub mod user;

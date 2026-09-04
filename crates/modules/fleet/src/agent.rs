@@ -22,7 +22,9 @@ use roomler_ai_services::dao::base::PaginationParams;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::FleetState;
 
 const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
 
@@ -36,7 +38,7 @@ const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
 // FR-69 P3 — the gate itself is `roomler_core::guards::require_permission`
 // (the `chat` module's room routes need it too); re-exported so every
 // `super::remote_control::require_permission(&state, …)` in this crate reads
-// as before — an `&AppState` argument derefs to `&Core`.
+// as before — an `&FleetState` argument derefs to `&Core`.
 pub(crate) use roomler_core::guards::require_permission;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -54,7 +56,7 @@ pub struct EnrollmentTokenResponse {
 /// token that a new agent binary exchanges (once, within 10 min) for a
 /// long-lived agent token.
 pub async fn issue_enrollment_token(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<EnrollmentTokenResponse>, ApiError> {
@@ -111,7 +113,7 @@ pub struct EnrollResponse {
 /// could pick would let a device declare itself permanent and evade the
 /// reaper, or schedule a permanent device for silent deletion).
 pub async fn enroll_agent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Json(body): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, ApiError> {
     let (claims, is_ephemeral) = state
@@ -255,7 +257,7 @@ pub async fn enroll_agent(
 ///   caller error, and claiming after create would let racing enrollments
 ///   overshoot the ceiling.)
 async fn enroll_agent_ephemeral(
-    state: &AppState,
+    state: &FleetState,
     tid: ObjectId,
     admin_uid: ObjectId,
     jti: &str,
@@ -373,8 +375,8 @@ async fn enroll_agent_ephemeral(
 /// tombstone is the thing that lets it revive in place); a permanent
 /// device's removal stays an admin decision. The refusal is 403, loudly.
 pub async fn self_unenroll(
-    State(state): State<AppState>,
-    agent: crate::extractors::agent::AuthAgent,
+    State(state): State<FleetState>,
+    agent: crate::auth_agent::AuthAgent,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !agent.agent.ephemeral {
         return Err(ApiError::Forbidden(
@@ -384,7 +386,7 @@ pub async fn self_unenroll(
         ));
     }
     let released =
-        crate::ws::ephemeral::remove_agent_device(&state, &agent.agent, "ephemeral_self_unenroll")
+        crate::removal::remove_agent_device(&state, &agent.agent, "ephemeral_self_unenroll")
             .await?;
     tracing::info!(
         tenant_id = %agent.tenant_id, agent_id = %agent.agent_id, name = %agent.agent.name,
@@ -484,7 +486,7 @@ pub struct AgentResponse {
     /// leaves the dialog on its own closed default. See [`Self::ssh_policy`],
     /// where the difference has teeth.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exec_policy: Option<crate::routes::agent_exec::ExecPolicyBody>,
+    pub exec_policy: Option<crate::agent_exec::ExecPolicyBody>,
     /// Roomler-SSH gate 3 as stored, with the same replace-on-save warning as
     /// [`Self::exec_policy`] — and this is the one that makes `Option`
     /// load-bearing rather than tidy.
@@ -496,7 +498,7 @@ pub struct AgentResponse {
     /// that dialog and undo exactly that protection — so a policy equal to the
     /// default is reported as absent instead.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_policy: Option<crate::routes::agent_ssh::SshPolicyBody>,
+    pub ssh_policy: Option<roomler_ai_remote_control::models::SshPolicyBody>,
     /// Remote config — what an operator has ASKED this device to run, and what
     /// the device SAID it did (`docs/remote-config.md`).
     ///
@@ -850,7 +852,7 @@ fn configured_only<T: Default + PartialEq, B: From<T>>(policy: T) -> Option<B> {
 }
 
 pub async fn list_agents(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<PaginationParams>,
@@ -883,7 +885,7 @@ pub async fn list_agents(
 }
 
 pub async fn get_agent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
 ) -> Result<Json<AgentResponse>, ApiError> {
@@ -921,7 +923,7 @@ pub struct UpdateAgentRequest {
 
 /// Trim / drop-empties / de-dup (order-preserving) / cap a client-supplied
 /// tag list. Shared by the agent and tunnel-client update routes.
-pub(crate) fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, ApiError> {
+pub fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, ApiError> {
     const MAX_TAGS: usize = 16;
     const MAX_TAG_LEN: usize = 40;
     let mut out: Vec<String> = Vec::new();
@@ -948,7 +950,7 @@ pub(crate) fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, ApiError>
 }
 
 pub async fn update_agent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<UpdateAgentRequest>,
@@ -983,17 +985,22 @@ pub async fn update_agent(
             return Err(ApiError::BadRequest("name must not be empty".to_string()));
         }
         state.agents.rename(tid, aid, &name).await?;
-        // Best-effort propagation onto the live overlay node: peers see the
-        // new MagicDNS label immediately (delta re-fan); the device itself
-        // re-learns its self-name on its next reconnect.
-        if let Some(node) = state.overlay_nodes.find_live_by_agent(tid, aid).await? {
-            match crate::ws::overlay::propagate_node_rename(&state, &node, &name).await {
-                Some(label) => {
-                    dns_renamed = Some(true);
-                    dns_name = Some(label);
-                }
-                None => dns_renamed = Some(false),
+        // Best-effort propagation onto the live overlay node — network's, so
+        // through the core hooks (FR-69 D6): peers see the new MagicDNS label
+        // immediately (delta re-fan); the device itself re-learns its
+        // self-name on its next reconnect.
+        match state
+            .hooks
+            .agent_renamed(tid, aid, &name)
+            .await
+            .map_err(|e| ApiError::Internal(format!("rename propagation failed: {e}")))?
+        {
+            roomler_core::RenamePropagation::Propagated(label) => {
+                dns_renamed = Some(true);
+                dns_name = Some(label);
             }
+            roomler_core::RenamePropagation::Failed => dns_renamed = Some(false),
+            roomler_core::RenamePropagation::NoLiveNode => {}
         }
     }
     if let Some(display_name) = body.display_name {
@@ -1035,7 +1042,7 @@ pub async fn update_agent(
 /// reuse. The agent binary stays installed on the host and may be enrolled
 /// again — but it comes back as a NEW mesh node with a fresh address.
 pub async fn delete_agent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1065,8 +1072,7 @@ pub async fn delete_agent(
     // hard-deleted here too — its tombstone would reserve a random,
     // never-reused machine_id forever — while a permanent row tombstones
     // exactly as before.
-    let released =
-        crate::ws::ephemeral::remove_agent_device(&state, &agent, "agent_delete").await?;
+    let released = crate::removal::remove_agent_device(&state, &agent, "agent_delete").await?;
     Ok(Json(serde_json::json!({
         "deleted": true,
         "overlay_released": released.is_some(),
@@ -1154,7 +1160,7 @@ pub struct TriggerUpdateResult {
 /// to one agent. MANAGE_AGENTS. Pre-S1a agents ignore the unknown message
 /// (decode-and-drop, same contract as `rc:goodbye`).
 pub async fn trigger_agent_update(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     // Body is required (send `{}` for defaults) — plain `Json` keeps us off
@@ -1236,7 +1242,7 @@ pub struct BulkTriggerUpdateResponse {
 /// (or all) agents in the tenant. MANAGE_AGENTS. Fleet-side stampede control
 /// is the agents' own 5-min install-storm cooldown + the release proxy cache.
 pub async fn trigger_agents_update(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<BulkTriggerUpdateRequest>,
@@ -1334,220 +1340,6 @@ pub async fn trigger_agents_update(
     }))
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Sessions
-// ────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct SessionResponse {
-    pub id: String,
-    pub agent_id: String,
-    pub tenant_id: String,
-    pub controller_user_id: String,
-    pub permissions: Permissions,
-    pub phase: roomler_ai_remote_control::models::SessionPhase,
-    pub created_at: String,
-    pub started_at: Option<String>,
-    pub ended_at: Option<String>,
-}
-
-pub async fn get_session(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Path((tenant_id, session_id)): Path<(String, String)>,
-) -> Result<Json<SessionResponse>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let sid = ObjectId::parse_str(&session_id)
-        .map_err(|_| ApiError::BadRequest("Invalid session_id".to_string()))?;
-
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
-
-    let session = state.remote_sessions.find_in_tenant(tid, sid).await?;
-    Ok(Json(to_session_response(session)))
-}
-
-pub async fn terminate_session(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Path((tenant_id, session_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let sid = ObjectId::parse_str(&session_id)
-        .map_err(|_| ApiError::BadRequest("Invalid session_id".to_string()))?;
-
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
-
-    // P3 security — bare tenant membership no longer suffices: only the
-    // session's OWN controller or a member holding REMOTE_CONTROL may
-    // force-close it. Party/tenant facts come from the LIVE session when this
-    // pod holds it; a session homed on ANOTHER pod (rc sessions are pod-local
-    // under S6) can't be inspected here, so non-controllers fall back to the
-    // permission check against the ROUTE tenant — the ctrl event below only
-    // acts on a hub that actually holds the session, and its tenant is
-    // re-checked there.
-    let live = state.rc_hub.session_snapshot(sid);
-    if let Some((live_tid, _)) = live
-        && live_tid != tid
-    {
-        // The path tenant must own the session it names.
-        return Err(ApiError::NotFound("Session not found".to_string()));
-    }
-    let is_controller = matches!(live, Some((_, controller)) if controller == auth.user_id);
-    if !is_controller {
-        require_permission(
-            &state,
-            tid,
-            auth.user_id,
-            permissions::REMOTE_CONTROL,
-            "remote-control",
-        )
-        .await?;
-    }
-
-    // Force-close via Hub. The Hub pushes a Terminate to both peers and audits.
-    let terminated_here = state
-        .rc_hub
-        .terminate(
-            sid,
-            roomler_ai_remote_control::models::EndReason::AdminTerminated,
-        )
-        .is_ok();
-    // P3 — rc sessions are pod-local (S6): when the session is homed on a
-    // different pod the local terminate is a no-op that previously STILL
-    // returned `{"terminated": true}`. Broadcast an idempotent ctrl event so
-    // the owning pod applies it; `terminated` now reports only what THIS
-    // request could verify locally.
-    crate::ws::remote_control::publish_rc_ctrl(
-        &state,
-        "terminate",
-        serde_json::json!({
-            "session_id": sid.to_hex(),
-            "tenant_id": tid.to_hex(),
-        }),
-    )
-    .await;
-    Ok(Json(serde_json::json!({
-        "terminated": terminated_here && live.is_some(),
-        "broadcast": true,
-    })))
-}
-
-#[derive(Debug, Serialize)]
-pub struct AuditListResponse {
-    pub items: Vec<RemoteAuditEvent>,
-    pub total: u64,
-    pub page: u64,
-    pub per_page: u64,
-    pub total_pages: u64,
-}
-
-pub async fn session_audit(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    Path((tenant_id, session_id)): Path<(String, String)>,
-    Query(params): Query<PaginationParams>,
-) -> Result<Json<AuditListResponse>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let sid = ObjectId::parse_str(&session_id)
-        .map_err(|_| ApiError::BadRequest("Invalid session_id".to_string()))?;
-
-    require_permission(
-        &state,
-        tid,
-        auth.user_id,
-        permissions::VIEW_REMOTE_AUDIT,
-        "VIEW_REMOTE_AUDIT",
-    )
-    .await?;
-
-    // Ensure the session actually belongs to this tenant.
-    let _ = state.remote_sessions.find_in_tenant(tid, sid).await?;
-
-    let page = state.remote_audit.list_for_session(sid, &params).await?;
-    Ok(Json(AuditListResponse {
-        items: page.items,
-        total: page.total,
-        page: page.page,
-        per_page: page.per_page,
-        total_pages: page.total_pages,
-    }))
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// TURN credentials
-// ────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct TurnCredentialsResponse {
-    pub ice_servers: Vec<IceServer>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RelayRegionsResponse {
-    pub regions_enabled: bool,
-    pub regions: Vec<RelayRegionSummary>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RelayRegionSummary {
-    pub id: String,
-    pub turn_url: String,
-    pub derp_url: Option<String>,
-    pub enabled: bool,
-    /// P6b — the poller's latest load snapshot (`None` = never sampled).
-    pub load: Option<roomler_ai_remote_control::turn_creds::RegionLoad>,
-    /// P6b — currently steered around by the load-aware pick (fresh-busy).
-    pub busy: bool,
-}
-
-/// GET /api/relay/regions — the configured relay PoP topology (region ids +
-/// endpoints; never secrets). Authed users only; the same hostnames every
-/// TURN grant already exposes to clients.
-pub async fn relay_regions(
-    State(state): State<AppState>,
-    _auth: AuthUser,
-) -> Result<Json<RelayRegionsResponse>, ApiError> {
-    let regions = state
-        .turn_map
-        .specs
-        .iter()
-        .map(|s| RelayRegionSummary {
-            load: state.relay_load.get(&s.id).map(|l| l.value().clone()),
-            busy: roomler_ai_remote_control::turn_creds::region_busy(&state.relay_load, &s.id),
-            id: s.id.clone(),
-            turn_url: s.turn_url.clone(),
-            derp_url: s.derp_url.clone(),
-            enabled: s.enabled,
-        })
-        .collect();
-    Ok(Json(RelayRegionsResponse {
-        regions_enabled: state.turn_map.enabled,
-        regions,
-    }))
-}
-
-/// GET /api/turn/credentials — user-scoped, returns short-lived (10 min) TURN
-/// creds plus a STUN fallback. Used by the browser controller and by the
-/// native agent when it needs to trickle ICE.
-pub async fn turn_credentials(
-    State(state): State<AppState>,
-    auth: AuthUser,
-) -> Result<Json<TurnCredentialsResponse>, ApiError> {
-    // This route is session-less (a pre-fetch), so it issues the default
-    // region's generic URL list; the per-session same-worker affinity and the
-    // region pick happen on the Hub's issuance paths.
-    let ice_servers = ice_servers_for(&auth.user_id.to_hex(), state.turn_map.cfg_for(None));
-    Ok(Json(TurnCredentialsResponse { ice_servers }))
-}
-
-// ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1557,7 +1349,7 @@ pub async fn turn_credentials(
 /// empty set — `to_agent_response` then degrades to the pre-A-1
 /// heartbeat disjunction, never to hard-offline.
 pub(crate) async fn agent_presence_batch(
-    state: &AppState,
+    state: &FleetState,
     agents: &[roomler_ai_remote_control::models::Agent],
 ) -> std::collections::HashSet<ObjectId> {
     let Some(redis) = &state.redis_pubsub else {
@@ -1601,7 +1393,7 @@ pub(crate) async fn agent_presence_batch(
 /// `is_online` = the reachable state only (pre-A-1 it also counted
 /// heartbeat-only agents, which is what lied green).
 pub(crate) fn derive_agent_presence(
-    state: &AppState,
+    state: &FleetState,
     a: &roomler_ai_remote_control::models::Agent,
     redis_fresh: bool,
 ) -> (AgentPresence, bool) {
@@ -1627,7 +1419,7 @@ pub(crate) fn derive_agent_presence(
 }
 
 fn to_agent_response(
-    state: &AppState,
+    state: &FleetState,
     a: roomler_ai_remote_control::models::Agent,
     redis_fresh: bool,
 ) -> AgentResponse {
@@ -1676,21 +1468,7 @@ fn to_agent_response(
     }
 }
 
-fn to_session_response(s: RemoteSession) -> SessionResponse {
-    SessionResponse {
-        id: s.id.map(|i| i.to_hex()).unwrap_or_default(),
-        agent_id: s.agent_id.to_hex(),
-        tenant_id: s.tenant_id.to_hex(),
-        controller_user_id: s.controller_user_id.to_hex(),
-        permissions: s.permissions,
-        phase: s.phase,
-        created_at: fmt_dt(s.created_at),
-        started_at: s.started_at.map(fmt_dt),
-        ended_at: s.ended_at.map(fmt_dt),
-    }
-}
-
-fn fmt_dt(dt: DateTime) -> String {
+pub fn fmt_dt(dt: DateTime) -> String {
     dt.try_to_rfc3339_string()
         .unwrap_or_else(|_| dt.timestamp_millis().to_string())
 }

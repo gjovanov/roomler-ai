@@ -29,11 +29,9 @@ use roomler_ai_db::models::{AgentLogBatch, LogLine, LogSource};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{
-    error::ApiError,
-    extractors::{agent::AuthAgent, auth::AuthUser},
-    state::AppState,
-};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::{FleetState, auth_agent::AuthAgent};
 
 /// Body shape POSTed by an uploader. `source` must NOT be `Browser`
 /// on the agent-authed route; route handler enforces this.
@@ -117,7 +115,7 @@ impl From<AgentLogBatch> for AgentLogBatchView {
 /// used to trust the claims alone, so a deleted or quarantined device kept
 /// uploading logs for the remaining life of its year-long token.
 pub async fn ingest_agent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     agent: AuthAgent,
     Json(payload): Json<LogBatchPayload>,
@@ -165,7 +163,7 @@ pub async fn ingest_agent(
 /// rc.59 where the browser-side composable lands). For now the body
 /// must include `tenant_id`.
 pub async fn ingest_browser(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Json(payload): Json<BrowserLogBatchPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -206,7 +204,7 @@ pub struct BrowserLogBatchPayload {
 /// list the most-recent N batches. Auth: standard user JWT + tenant
 /// membership. Default limit: 50.
 pub async fn list_for_agent(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Query(q): Query<ListLogsQuery>,

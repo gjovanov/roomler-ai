@@ -4,6 +4,7 @@ pub mod cluster;
 pub mod compose;
 pub mod core_state;
 pub mod extractors;
+pub mod hooks;
 pub mod middleware;
 pub mod routes;
 pub mod state;
@@ -259,88 +260,17 @@ pub fn build_router(state: AppState) -> Router {
     // controller user's JWT). The body MUST include an explicit
     // `tenant_id` field since the user JWT doesn't pin a tenant; the
     // route handler verifies membership before persisting.
-    let log_routes = Router::new().route("/browser", post(routes::agent_log::ingest_browser));
-
-    // Remote-control agent routes (tenant-scoped)
+    // Agent routes still the host's under the fleet module's `/agent` prefix
+    // (FR-69 P5a): the network- and remote-owned per-device sub-routes. The
+    // rest of `/tenant/{tenant_id}/agent` — and the public `/agent`,
+    // `/consent`, `/tunnel`, `/setup`, `/releases` and `/log` families — is
+    // mounted by `roomler_ai_mod_fleet`.
     let agent_routes = Router::new()
-        .route("/", get(routes::remote_control::list_agents))
-        .route(
-            "/enroll-token",
-            post(routes::remote_control::issue_enrollment_token),
-        )
-        // FR-51 P2 — reusable ephemeral enrollment keys (static segments win
-        // over the `{agent_id}` param below, same as `/enroll-token`).
-        .route(
-            "/enroll-key",
-            get(routes::enroll_key::list_keys).post(routes::enroll_key::mint_key),
-        )
-        .route(
-            "/enroll-key/{key_id}",
-            delete(routes::enroll_key::revoke_key),
-        )
-        .route(
-            "/enroll-key/{key_id}/uses",
-            get(routes::enroll_key::list_key_uses),
-        )
-        // S1a — operator-forced self-update: bulk (static segment wins over
-        // the `{agent_id}` param below) + per-agent.
-        .route(
-            "/update",
-            post(routes::remote_control::trigger_agents_update),
-        )
-        .route(
-            "/{agent_id}/update",
-            post(routes::remote_control::trigger_agent_update),
-        )
         // FR-40 — order the device to retire its overlay key (MANAGE_AGENTS;
         // cap-gated, audited, queued for an offline device).
         .route(
             "/{agent_id}/overlay-key/rotate",
             post(routes::overlay_key::rotate_overlay_key),
-        )
-        // Multi-org — add an already-enrolled device to a SECOND org from the
-        // UI (MANAGE_AGENTS in both). `join-targets` is the picker's source
-        // of truth so the dialog can never offer a choice that 403s.
-        .route("/{agent_id}/join-org", post(routes::agent_org::join_org))
-        .route(
-            "/{agent_id}/join-targets",
-            get(routes::agent_org::join_targets),
-        )
-        .route(
-            "/{agent_id}",
-            get(routes::remote_control::get_agent)
-                .put(routes::remote_control::update_agent)
-                .delete(routes::remote_control::delete_agent),
-        )
-        .route(
-            "/{agent_id}/crash",
-            get(routes::agent_crash::list_for_agent),
-        )
-        // rc.58 — centralized log batch ingest + listing. Agent
-        // uploader POSTs here with its agent JWT; admin UI GETs to
-        // view recent batches. Route is under the `/agent/{agent_id}`
-        // tenant-scoped tree so the standard tenant-membership check
-        // applies for reads, and the agent JWT's `tenant_id` +
-        // `sub` claims are matched against the route params on writes.
-        .route(
-            "/{agent_id}/logs",
-            post(routes::agent_log::ingest_agent).get(routes::agent_log::list_for_agent),
-        )
-        // Fleet RPC — remote command execution. `/exec` (the fleet sweep) and
-        // `/{agent_id}/exec` (one device) sit at different depths, so they
-        // can't shadow each other whatever the declaration order.
-        .route("/exec", post(routes::agent_exec::exec_bulk))
-        .route("/{agent_id}/exec", post(routes::agent_exec::exec))
-        .route(
-            "/{agent_id}/exec/{request_id}/cancel",
-            post(routes::agent_exec::cancel),
-        )
-        // Gate 3 — the per-device policy. MANAGE_AGENTS, not EXEC_DEVICE:
-        // deciding a device MAY be exec'd is a management act; performing
-        // the exec is a separate power.
-        .route(
-            "/{agent_id}/exec-policy",
-            put(routes::agent_exec::set_policy),
         )
         // Roomler SSH — ask for a session on one device. Answers 200 with
         // either where to dial or which gate refused; a denial is a policy
@@ -348,12 +278,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/{agent_id}/ssh", post(routes::agent_ssh::request_session))
         // Gate 3's twin, and the same MANAGE_AGENTS-not-SSH_DEVICE split.
         .route("/{agent_id}/ssh-policy", put(routes::agent_ssh::set_policy))
-        // Remote config — records an INTENT for the device to reconcile; the
-        // device may refuse it (docs/remote-config.md).
-        .route(
-            "/{agent_id}/desired-config",
-            put(routes::remote_config::set_desired_config),
-        )
         // FR-19 gate 3 — approve a device as an org relay. MANAGE_AGENTS +
         // EXEC_DEVICE (there is no free permission bit; routes/peer_relay.rs
         // says why), audited on both arms.
@@ -364,58 +288,15 @@ pub fn build_router(state: AppState) -> Router {
 
     // Remote-control session routes (tenant-scoped)
     let remote_session_routes = Router::new()
-        .route("/{session_id}", get(routes::remote_control::get_session))
+        .route("/{session_id}", get(routes::remote_session::get_session))
         .route(
             "/{session_id}/terminate",
-            post(routes::remote_control::terminate_session),
+            post(routes::remote_session::terminate_session),
         )
         .route(
             "/{session_id}/audit",
-            get(routes::remote_control::session_audit),
+            get(routes::remote_session::session_audit),
         );
-
-    // Public agent endpoints: enrollment uses an admin-issued enrollment
-    // token (no user JWT); /latest-release is unauthenticated because
-    // the agent's auto-updater calls it before any session and the
-    // payload is already public via github.com/.../releases — we just
-    // proxy + cache so a fleet of agents behind one IP doesn't blow
-    // past GitHub's 60-req/hr unauth quota.
-    let public_agent_routes = Router::new()
-        .route("/enroll", post(routes::remote_control::enroll_agent))
-        .route(
-            "/latest-release",
-            get(routes::agent_release::latest_release),
-        )
-        .route(
-            "/installer/{flavour}/health",
-            get(routes::agent_release::installer_health),
-        )
-        .route(
-            "/installer/{flavour}",
-            get(routes::agent_release::installer_proxy),
-        )
-        // Agent crash-report ingest (Task 9 Phase 2). "Public" only in the
-        // sense that the user-JWT extractor does not apply: the agent
-        // authenticates with its own JWT in the Authorization header, via the
-        // `AuthAgent` extractor — which also confirms the agent's row is still
-        // one we accept (deleted / quarantined ⇒ 401), the same rule the WS
-        // `/ws?role=agent` upgrade applies. Until #667 this handler read the
-        // claims and nothing else, so a deleted device kept writing for the
-        // remaining year of its token.
-        .route("/crash", post(routes::agent_crash::ingest))
-        // FR-51 P3 — an ephemeral device removes itself on clean shutdown.
-        // Agent-JWT authenticated (`AuthAgent`); a permanent row is refused.
-        .route(
-            "/self/unenroll",
-            post(routes::remote_control::self_unenroll),
-        );
-
-    // Public owner-consent routes (Phase 4). No auth extractor — the unguessable
-    // token IS the capability; the handler validates it, single-uses it, and
-    // resolves the session's consent slot via the Hub.
-    let public_consent_routes = Router::new()
-        .route("/{token}/approve", post(routes::consent::approve_consent))
-        .route("/{token}/deny", post(routes::consent::deny_consent));
 
     // roomler-cli routes — same enrollment two-step shape as the
     // agent, but a distinct audience (`TunnelClient` JWT) so a leaked
@@ -484,7 +365,6 @@ pub fn build_router(state: AppState) -> Router {
     // Fleet RPC — the org kill-switch (gate 1) and the attempt log. Both are
     // tenant-scoped rather than per-device: the switch governs every device,
     // and the log is the org-wide "what ran on my fleet?" view.
-    let exec_audit_routes = Router::new().route("/", get(routes::agent_exec::audit));
     // FR-19 — peer relays: the org switch + approved-relay listing, and the
     // decision log. Approval itself is on the agent router (gate 3 is per
     // device).
@@ -495,19 +375,6 @@ pub fn build_router(state: AppState) -> Router {
     let peer_relay_audit_routes = Router::new().route("/", get(routes::peer_relay::audit));
     let ssh_audit_routes = Router::new().route("/", get(routes::agent_ssh::audit));
     let ssh_activity_routes = Router::new().route("/", get(routes::agent_ssh::activity));
-    let exec_settings_routes = Router::new().route(
-        "/",
-        get(routes::agent_exec::get_org_settings).put(routes::agent_exec::set_org_settings),
-    );
-
-    // FR-51 P2 — the ephemeral-key class switch (MANAGE_TENANT, the exec/ssh
-    // twins' shape): whether reusable device-minting credentials exist in
-    // this org at all.
-    let ephemeral_key_settings_routes = Router::new().route(
-        "/",
-        get(routes::enroll_key::get_org_settings).put(routes::enroll_key::set_org_settings),
-    );
-
     // Roomler SSH — its own org kill-switch (gate 1). A separate switch from
     // the exec one on purpose: allowing bounded diagnostic commands is not
     // the same decision as allowing interactive sessions.
@@ -541,65 +408,13 @@ pub fn build_router(state: AppState) -> Router {
         // "public" (no user-JWT-middleware) tunnel router.
         .route("/agents", get(routes::tunnel::list_tenant_agents));
 
-    // `/api/tunnel/{latest-release,installer/{platform}}` — public
-    // GitHub-Releases proxy for the roomler CLI binary. Same
-    // shape + lifecycle as `/api/agent/{latest-release,installer/...}`
-    // but a separate namespace so the two artifact sets don't collide.
-    let public_tunnel_release_routes = Router::new()
-        .route(
-            "/latest-release",
-            get(routes::tunnel_release::latest_release),
-        )
-        .route(
-            "/installer/{platform}/health",
-            get(routes::tunnel_release::installer_health),
-        )
-        .route(
-            "/installer/{platform}",
-            get(routes::tunnel_release::installer_proxy),
-        );
-
-    // `/api/setup/{latest-release,{platform}/health,{platform}}` —
-    // public proxy for the unified `roomler-setup` wizard (tag
-    // `setup-v*`, live since setup-v0.3.0-rc.196; the legacy
-    // `/api/tunnel-wizard/*` family was retired in P4c-2).
-    // NB `/install.sh` + `/install.ps1` are static segments — axum's
-    // matchit gives them precedence over the `/{platform}` param, so
-    // the script endpoints never shadow (or get shadowed by) the
-    // artifact proxy.
-    let public_setup_routes = Router::new()
-        .route(
-            "/latest-release",
-            get(routes::setup_release::setup_latest_release),
-        )
-        .route("/install.sh", get(routes::setup_release::install_script_sh))
-        .route(
-            "/install.ps1",
-            get(routes::setup_release::install_script_ps1),
-        )
-        .route(
-            "/{platform}/health",
-            get(routes::setup_release::setup_installer_health),
-        )
-        .route(
-            "/{platform}",
-            get(routes::setup_release::setup_installer_proxy),
-        );
-
-    // `/api/releases/refresh` — bearer-authenticated cache-bust called by
-    // the release workflows on every published tag. One HTTP call busts
-    // every pod (the receiving pod fans out over the C-1 bus), so a new
-    // release is visible fleet-wide in seconds instead of after one TTL.
-    let releases_routes =
-        Router::new().route("/refresh", axum::routing::post(routes::releases::refresh));
-
     // TURN credentials (user-scoped, no tenant prefix)
     let turn_routes = Router::new().route(
         "/credentials",
-        get(routes::remote_control::turn_credentials),
+        get(routes::remote_session::turn_credentials),
     );
     // Multi-region relay PoP topology (user-scoped, read-only, no secrets).
-    let relay_routes = Router::new().route("/regions", get(routes::remote_control::relay_regions));
+    let relay_routes = Router::new().route("/regions", get(routes::remote_session::relay_regions));
 
     // Stats PR-3 — observability queries. The /admin family is gated by
     // the platform_admins ObjectId allowlist (404 on miss); the tenant
@@ -651,12 +466,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/invite", public_invite_routes)
         .nest("/push", push_routes)
         .nest("/notification", notification_routes)
-        .nest("/agent", public_agent_routes)
-        .nest("/consent", public_consent_routes)
         .nest("/tunnel-client", public_tunnel_routes)
-        .nest("/tunnel", public_tunnel_release_routes)
-        .nest("/setup", public_setup_routes)
-        .nest("/releases", releases_routes)
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
         .nest("/admin/stats", admin_stats_routes)
@@ -679,7 +489,6 @@ pub fn build_router(state: AppState) -> Router {
         // normalised server-side). User-scoped, not tenant-scoped: a
         // user navigates across orgs within one session.
         .route("/stats/pageview", post(routes::stats::page_view))
-        .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
         .nest("/tenant/{tenant_id}/role", role_routes)
@@ -687,10 +496,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes)
         .nest("/tenant/{tenant_id}/agent", agent_routes)
-        .nest(
-            "/tenant/{tenant_id}/device",
-            Router::new().route("/", get(routes::device::list_devices)),
-        )
         .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client_routes)
         .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy_routes)
         .nest("/tenant/{tenant_id}/overlay-node", overlay_node_routes)
@@ -698,7 +503,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/magic-dns", magic_dns_routes)
         .nest("/tenant/{tenant_id}/overlay-block", overlay_block_routes)
         .nest("/tenant/{tenant_id}/stats", tenant_stats_routes)
-        .nest("/tenant/{tenant_id}/exec-audit", exec_audit_routes)
         .nest("/tenant/{tenant_id}/peer-relay", peer_relay_routes)
         .nest(
             "/tenant/{tenant_id}/peer-relay-audit",
@@ -706,12 +510,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .nest("/tenant/{tenant_id}/ssh-audit", ssh_audit_routes)
         .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity_routes)
-        .nest("/tenant/{tenant_id}/exec-settings", exec_settings_routes)
         .nest("/tenant/{tenant_id}/ssh-settings", ssh_settings_routes)
-        .nest(
-            "/tenant/{tenant_id}/ephemeral-key-settings",
-            ephemeral_key_settings_routes,
-        )
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check. `/health` stays a cheap process-alive 200 (liveness /

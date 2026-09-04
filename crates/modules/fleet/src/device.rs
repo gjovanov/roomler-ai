@@ -26,8 +26,10 @@ use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::{Agent, AgentStatus, NodeRef, OsKind, TunnelClient};
 use serde::{Deserialize, Serialize};
 
-use super::remote_control::{AgentPresence, agent_presence_batch, derive_agent_presence};
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::agent::{AgentPresence, agent_presence_batch, derive_agent_presence};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::FleetState;
 
 /// Fields are declared INLINE, deliberately not `#[serde(flatten)]
 /// PaginationParams` — axum's `Query` deserializes via serde_urlencoded,
@@ -114,7 +116,7 @@ pub struct DeviceRow {
 /// GET /api/tenant/{tenant_id}/device — membership-gated like every other
 /// fleet list (mutations stay behind MANAGE_AGENTS on their own routes).
 pub async fn list_devices(
-    State(state): State<AppState>,
+    State(state): State<FleetState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<DeviceListQuery>,

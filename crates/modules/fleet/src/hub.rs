@@ -19,26 +19,28 @@ use std::sync::Arc;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::audit::AuditSink;
-use crate::consent::{
+use roomler_ai_remote_control::audit::AuditSink;
+use roomler_ai_remote_control::consent::{
     ASYNC_CONSENT_TIMEOUT, ConsentOutcome, DEFAULT_CONSENT_TIMEOUT, HOST_PROMPT_TIMEOUT,
     hub_consent_deadline,
 };
-use crate::error::{Error, Result};
-use crate::models::{AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, SessionPhase};
-use crate::permissions::Permissions;
-use crate::session::{ClientTx, LiveSession};
-use crate::signaling::{
+use roomler_ai_remote_control::error::{Error, Result};
+use roomler_ai_remote_control::models::{
+    AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, SessionPhase,
+};
+use roomler_ai_remote_control::permissions::Permissions;
+use roomler_ai_remote_control::session::{ClientTx, LiveSession};
+use roomler_ai_remote_control::signaling::{
     AgentCloseReason, ClientMsg, IceServer, LocalRelayDescriptor, Role, ServerMsg,
 };
-use crate::turn_creds::{
+use roomler_ai_remote_control::turn_creds::{
     RelayLoadMap, TurnConfig, TurnMap, ice_servers_for_session, pick_region_with_load,
 };
 
 const SERVER_TX_CAPACITY: usize = 64;
 
 // The consent windows (`DEFAULT_CONSENT_TIMEOUT`, `ASYNC_CONSENT_TIMEOUT`,
-// `HOST_PROMPT_TIMEOUT`) live in `crate::consent` — FR-27 moved
+// `HOST_PROMPT_TIMEOUT`) live in `roomler_ai_remote_control::consent` — FR-27 moved
 // `ASYNC_CONSENT_TIMEOUT` there from here, because the on-host and owner-side
 // windows now differ within a single mode and the split needs one home.
 
@@ -678,7 +680,7 @@ impl Hub {
         consent_mode: ConsentMode,
         override_reason: Option<String>,
         local_relay: Option<LocalRelayDescriptor>,
-        input_mode: Option<crate::models::InputMode>,
+        input_mode: Option<roomler_ai_remote_control::models::InputMode>,
         // Multi-org — display name of the requesting org, for the host's
         // consent prompt. See `ServerMsg::Request::tenant_name`.
         tenant_name: Option<String>,
@@ -1096,7 +1098,7 @@ impl Hub {
         granted: bool,
         reason: Option<&str>,
     ) -> Result<()> {
-        let outcome = crate::consent::outcome_of(granted, reason);
+        let outcome = roomler_ai_remote_control::consent::outcome_of(granted, reason);
         let arc = self
             .inner
             .sessions
@@ -1561,7 +1563,7 @@ pub struct DispatchCtx {
     /// P6 — the device's `AccessPolicy.input_mode`, resolved by the API WS
     /// layer alongside `consent_mode`; forwarded to the agent's InputArbiter
     /// in `ServerMsg::Request`. `None` = agent default (free).
-    pub input_mode: Option<crate::models::InputMode>,
+    pub input_mode: Option<roomler_ai_remote_control::models::InputMode>,
     /// Multi-org — the display name of the organization the request is made
     /// in, resolved by the API WS layer (the Hub has no DB access) and
     /// forwarded in `ServerMsg::Request` so the host's consent prompt can
@@ -1748,8 +1750,8 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::AuditSink;
     use mongodb::Client;
+    use roomler_ai_remote_control::audit::AuditSink;
     use std::time::Duration;
 
     async fn test_hub() -> Hub {
@@ -2348,7 +2350,7 @@ mod tests {
                 ConsentMode::Prompt,
                 None,
                 None,
-                Some(crate::models::InputMode::Exclusive),
+                Some(roomler_ai_remote_control::models::InputMode::Exclusive),
                 None, // tenant_name
             )
         };
@@ -2372,7 +2374,10 @@ mod tests {
         // agent's arbiter.
         match agent_rx.try_recv().unwrap() {
             ServerMsg::Request { input_mode, .. } => {
-                assert_eq!(input_mode, Some(crate::models::InputMode::Exclusive));
+                assert_eq!(
+                    input_mode,
+                    Some(roomler_ai_remote_control::models::InputMode::Exclusive)
+                );
             }
             other => panic!("expected Request, got {other:?}"),
         }

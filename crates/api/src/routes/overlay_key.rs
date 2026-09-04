@@ -28,7 +28,7 @@ use roomler_ai_remote_control::{
 };
 use serde::Serialize;
 
-use super::remote_control::require_permission;
+use roomler_core::guards::require_permission;
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 
 /// One order per device per minute. A rotation churns every peer's carrier

@@ -35,8 +35,6 @@ pub mod audit;
 pub mod consent;
 pub mod derp_ticket;
 pub mod error;
-#[cfg(feature = "server")]
-pub mod hub;
 pub mod models;
 pub mod permissions;
 pub mod serde_helpers;
@@ -47,8 +45,6 @@ pub mod turn_url;
 pub mod worker_pick;
 
 pub use error::{Error, Result};
-#[cfg(feature = "server")]
-pub use hub::Hub;
 pub use models::{Agent, AgentStatus, RemoteSession, SessionPhase};
 pub use permissions::Permissions;
 pub use signaling::{ClientMsg, ServerMsg};
