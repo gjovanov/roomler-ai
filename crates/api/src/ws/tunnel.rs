@@ -404,7 +404,6 @@ pub async fn handle_tunnel_client_socket(
     // client never joined the overlay.
     state
         .network()
-        .network()
         .overlay_nodes_by_id
         .remove(&tunnel_client_id);
     roomler_ai_mod_network::overlay::handle_overlay_leave(
