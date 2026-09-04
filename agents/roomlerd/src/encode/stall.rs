@@ -73,6 +73,77 @@ pub struct PassTiming {
     pub apply_us: u64,
     /// Opening (or rebuilding) the encoder.
     pub open_us: u64,
+    /// FR-1 P5 cadence pacing — the deliberate sleep to the next slot when the
+    /// encoder cannot hold `target_fps`.
+    ///
+    /// ⚠️ **Idle by design, like [`Self::capture_us`], and excluded from
+    /// [`Self::work_us`] for the same reason.** At a paced 2 fps this is ~500 ms
+    /// of a single pass. Counting it as work would re-create the warning storm
+    /// the `work_us` rule removed for capture, one door along.
+    pub pace_us: u64,
+    /// Reading the peer connection's ICE/candidate stats — the relay-escape
+    /// re-check and FR-33's LAN-capture reason.
+    ///
+    /// ⚠️ This is **not** free and it is not obviously on the video path: it
+    /// walks the stats graph and takes locks the ICE agent and SCTP association
+    /// also hold, so it is at its slowest exactly when the session is busiest.
+    pub stats_us: u64,
+    /// The control DataChannel: taking its lock and sending `rc:video-info`.
+    pub ctrl_us: u64,
+    /// Adopting a finished background encoder rebuild.
+    pub swap_us: u64,
+    /// The backpressure gate — the congestion decision plus its short sleep, on
+    /// the pass where the pump skips production entirely.
+    ///
+    /// 🔑 This is the arm that made the gap hard to see: it `continue`s BEFORE
+    /// capture, so such a pass reports `capture_us == 0` and `encode_us == 0`
+    /// and every millisecond it spent landed in [`Self::other_us`].
+    pub gate_us: u64,
+}
+
+/// The pump's running phase accumulators, snapshotted at a pass boundary.
+///
+/// The pump keeps plain `u64` counters and marks them at the start of each
+/// pass; [`Self::delta`] turns "then" and "now" into one [`PassTiming`]. Having
+/// the subtraction in ONE place is the point — it used to be eleven inline
+/// `saturating_sub`s in the warn macro, where a mismatched pair is invisible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PhaseAccum {
+    pub capture_us: u64,
+    pub scale_us: u64,
+    pub encode_us: u64,
+    pub send_us: u64,
+    pub apply_us: u64,
+    pub open_us: u64,
+    pub pace_us: u64,
+    pub stats_us: u64,
+    pub ctrl_us: u64,
+    pub swap_us: u64,
+    pub gate_us: u64,
+}
+
+impl PhaseAccum {
+    /// This pass's timing: `self` (now) minus `mark` (the pass start).
+    ///
+    /// Saturating throughout: an accumulator can only grow, so a negative delta
+    /// means the mark was taken after the reading, which is a bug rather than a
+    /// number to propagate.
+    pub fn delta(self, mark: Self, iter_us: u64) -> PassTiming {
+        PassTiming {
+            iter_us,
+            capture_us: self.capture_us.saturating_sub(mark.capture_us),
+            scale_us: self.scale_us.saturating_sub(mark.scale_us),
+            encode_us: self.encode_us.saturating_sub(mark.encode_us),
+            send_us: self.send_us.saturating_sub(mark.send_us),
+            apply_us: self.apply_us.saturating_sub(mark.apply_us),
+            open_us: self.open_us.saturating_sub(mark.open_us),
+            pace_us: self.pace_us.saturating_sub(mark.pace_us),
+            stats_us: self.stats_us.saturating_sub(mark.stats_us),
+            ctrl_us: self.ctrl_us.saturating_sub(mark.ctrl_us),
+            swap_us: self.swap_us.saturating_sub(mark.swap_us),
+            gate_us: self.gate_us.saturating_sub(mark.gate_us),
+        }
+    }
 }
 
 impl PassTiming {
@@ -80,8 +151,21 @@ impl PassTiming {
     /// on. Saturating, so a capture delta that somehow exceeds the iteration
     /// (a clock that moved under us) reads 0 rather than wrapping to ~18
     /// billion milliseconds and reporting a stall on every idle pass.
+    /// Time not spent waiting for input — the quantity the stall decision runs
+    /// on. Saturating, so a capture delta that somehow exceeds the iteration
+    /// (a clock that moved under us) reads 0 rather than wrapping to ~18
+    /// billion milliseconds and reporting a stall on every idle pass.
+    ///
+    /// ⚠️ **Two deliberate idles are excluded, not one.** `capture_us` is
+    /// waiting for the screen to change; `pace_us` is waiting for the next
+    /// cadence slot because the encoder cannot hold `target_fps`. Both are the
+    /// loop idling on purpose, and at a paced 2 fps the second is ~500 ms — so
+    /// counting it would report a "stall" on every paced pass, which is the
+    /// same mistake the 100 ms bar exposed for capture.
     pub fn work_us(&self) -> u64 {
-        self.iter_us.saturating_sub(self.capture_us)
+        self.iter_us
+            .saturating_sub(self.capture_us)
+            .saturating_sub(self.pace_us)
     }
 
     /// Everything the pump explicitly timed.
@@ -92,6 +176,11 @@ impl PassTiming {
             .saturating_add(self.send_us)
             .saturating_add(self.apply_us)
             .saturating_add(self.open_us)
+            .saturating_add(self.pace_us)
+            .saturating_add(self.stats_us)
+            .saturating_add(self.ctrl_us)
+            .saturating_add(self.swap_us)
+            .saturating_add(self.gate_us)
     }
 
     /// `iter − Σphases`: time that fell into no named phase. **A non-trivial
@@ -117,13 +206,18 @@ impl PassTiming {
     /// (FR-65 AC2), because "a stall was caught" and "a stall was caught and
     /// blamed on the right phase" are different claims.
     pub fn dominant_phase(&self) -> Option<(&'static str, u64)> {
-        let named: [(&'static str, u64); 6] = [
+        let named: [(&'static str, u64); 11] = [
             ("capture", self.capture_us),
             ("scale", self.scale_us),
             ("encode", self.encode_us),
             ("send", self.send_us),
             ("apply", self.apply_us),
             ("open", self.open_us),
+            ("pace", self.pace_us),
+            ("stats", self.stats_us),
+            ("ctrl", self.ctrl_us),
+            ("swap", self.swap_us),
+            ("gate", self.gate_us),
         ];
         let (name, us) = named.into_iter().max_by_key(|(_, us)| *us)?;
         if us == 0 || us < self.other_us() {
@@ -231,6 +325,113 @@ mod tests {
         assert_eq!(pass.work_us(), 0);
         assert!(!pass.is_stall(100_000));
         assert_eq!(pass.other_us(), 0);
+    }
+
+    /// CORPLAP-2, 2026-09-04: `iter 662 / capture 0.0 / encode 0.0`, the whole
+    /// pass in `other`. Zero capture AND zero encode is the signature of the
+    /// backpressure gate, which `continue`s BEFORE capture — so every
+    /// millisecond it spent was invisible.
+    #[test]
+    fn a_gate_skip_is_attributed_to_gate_not_to_other() {
+        let pass = PassTiming {
+            iter_us: 662_022,
+            gate_us: 661_500,
+            ..Default::default()
+        };
+        assert_eq!(pass.dominant_phase(), Some(("gate", 661_500)));
+        assert!(
+            pass.other_us() < 1_000,
+            "the gate skip left {} us unexplained",
+            pass.other_us()
+        );
+        assert!(pass.is_stall(100_000), "a 662 ms gate pass is real work");
+    }
+
+    /// A paced pass is the loop idling on purpose, exactly like a capture wait.
+    /// At 2 fps the sleep is ~500 ms and it must NOT warn.
+    #[test]
+    fn a_cadence_sleep_is_idle_and_does_not_warn() {
+        let pass = PassTiming {
+            iter_us: 505_000,
+            capture_us: 4_000,
+            encode_us: 11_000,
+            pace_us: 490_000,
+            ..Default::default()
+        };
+        assert_eq!(pass.work_us(), 11_000, "pace is excluded from work");
+        assert!(
+            !pass.is_stall(100_000),
+            "a 490 ms deliberate cadence sleep must not report a stall"
+        );
+        assert!(pass.other_us() < 1_000);
+    }
+
+    /// The stats read is the opposite case: not idle, and slowest exactly when
+    /// the session is busiest, so it must both count as work and be blamed.
+    #[test]
+    fn an_ice_stats_read_counts_as_work_and_is_named() {
+        let pass = PassTiming {
+            iter_us: 171_500,
+            capture_us: 300,
+            encode_us: 13_600,
+            stats_us: 157_000,
+            ..Default::default()
+        };
+        assert!(pass.is_stall(100_000));
+        assert_eq!(pass.dominant_phase(), Some(("stats", 157_000)));
+        assert!(pass.other_us() < 1_000);
+    }
+
+    /// `PhaseAccum::delta` is the one place the eleven subtractions live.
+    #[test]
+    fn phase_accum_delta_subtracts_each_counter_once() {
+        let mark = PhaseAccum {
+            capture_us: 10,
+            scale_us: 20,
+            encode_us: 30,
+            send_us: 40,
+            apply_us: 50,
+            open_us: 60,
+            pace_us: 70,
+            stats_us: 80,
+            ctrl_us: 90,
+            swap_us: 100,
+            gate_us: 110,
+        };
+        let now = PhaseAccum {
+            capture_us: 11,
+            scale_us: 22,
+            encode_us: 33,
+            send_us: 44,
+            apply_us: 55,
+            open_us: 66,
+            pace_us: 77,
+            stats_us: 88,
+            ctrl_us: 99,
+            swap_us: 110,
+            gate_us: 121,
+        };
+        let d = now.delta(mark, 1_000);
+        assert_eq!(
+            (
+                d.capture_us,
+                d.scale_us,
+                d.encode_us,
+                d.send_us,
+                d.apply_us,
+                d.open_us
+            ),
+            (1, 2, 3, 4, 5, 6)
+        );
+        assert_eq!(
+            (d.pace_us, d.stats_us, d.ctrl_us, d.swap_us, d.gate_us),
+            (7, 8, 9, 10, 11)
+        );
+        assert_eq!(d.iter_us, 1_000);
+        // ⚠️ A counter that went BACKWARDS is a bug, not a number to propagate.
+        let back = PhaseAccum::default().delta(mark, 500);
+        assert_eq!(back.capture_us, 0);
+        assert_eq!(back.gate_us, 0);
     }
 
     #[test]
