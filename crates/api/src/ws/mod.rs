@@ -20,12 +20,9 @@ pub const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 // `remote` half is the remote module's since P6).
 pub mod agent_socket_host;
 pub mod derp;
-pub mod derp_acl;
 pub mod derp_cluster;
 pub mod ephemeral;
 pub mod handler;
-pub mod org_relay;
-pub mod overlay;
 pub mod remote_control;
 pub mod tunnel;
 

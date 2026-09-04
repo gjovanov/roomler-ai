@@ -172,13 +172,28 @@ pub async fn list_devices(
     let clients = if kind_filter.as_deref() == Some("agent") {
         Vec::new()
     } else {
-        state.tunnel_clients.list_all_active_for_tenant(tid).await?
+        state
+            .network()
+            .tunnel_clients
+            .list_all_active_for_tenant(tid)
+            .await?
     };
 
-    let (nodes, dns_domain) = match state.overlay_networks.find_for_tenant(tid).await? {
+    let (nodes, dns_domain) = match state
+        .network()
+        .overlay_networks
+        .find_for_tenant(tid)
+        .await?
+    {
         Some(net) => {
             let nodes = match net.id {
-                Some(nid) => state.overlay_nodes.list_active_in_network(tid, nid).await?,
+                Some(nid) => {
+                    state
+                        .network()
+                        .overlay_nodes
+                        .list_active_in_network(tid, nid)
+                        .await?
+                }
                 None => Vec::new(),
             };
             let domain = state

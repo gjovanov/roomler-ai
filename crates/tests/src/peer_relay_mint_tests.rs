@@ -176,6 +176,7 @@ async fn grant_relay(app: &TestApp, seeded: &SeededTenant, relay_node_id: &str) 
 async fn node_id(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> String {
     let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
     app.state
+        .network()
         .overlay_nodes
         .find_live_by_tenant_and_machine(tid, machine_id)
         .await
@@ -646,7 +647,7 @@ async fn every_refusal_is_audited_with_its_reason() {
             ObjectId::parse_str(&rig.r_node).unwrap(),
         );
         for _ in 0..30 {
-            assert!(rig.app.state.relay_rate_limiter.check(a, r, 30));
+            assert!(rig.app.state.network().relay_rate_limiter.check(a, r, 30));
         }
         rig.request().await;
         let row = wait_mint_row(&rig.app, &rig.seeded).await;

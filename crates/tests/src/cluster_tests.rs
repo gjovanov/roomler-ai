@@ -1183,6 +1183,7 @@ async fn overlay_removes_reach_peers_homed_on_another_pod() {
     let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
     let node_a = app1
         .state
+        .network()
         .overlay_nodes
         .find_live_by_tenant_and_machine(tid, "ovrm-a")
         .await

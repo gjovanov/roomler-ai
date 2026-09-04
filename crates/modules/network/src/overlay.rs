@@ -53,7 +53,9 @@ use tunnel_core::policy::{
     OverlayPeerRef, OverlaySource, evaluate_overlay, evaluate_overlay_ingress,
 };
 
-use crate::state::{AppState, build_turn_config};
+use roomler_core::turn::build_turn_config;
+
+use crate::NetworkState;
 
 /// Which underlying host an overlay message arrived from, captured at
 /// the WS handler so the broker can resolve the node + route replies.
@@ -79,7 +81,7 @@ impl NodeIdentity {
 /// caller's existing dispatch handles non-overlay traffic. Shared by
 /// both WS read loops.
 pub async fn relay_overlay_msg_from_node(
-    state: &AppState,
+    state: &NetworkState,
     ident: NodeIdentity,
     parsed: ClientMsg,
 ) -> Option<ClientMsg> {
@@ -173,7 +175,7 @@ pub async fn relay_overlay_msg_from_node(
             reachable,
             rtt_ms,
         } => {
-            crate::ws::org_relay::handle_relay_probe(
+            crate::org_relay::handle_relay_probe(
                 state,
                 ident,
                 relay_node_id,
@@ -194,7 +196,7 @@ pub async fn relay_overlay_msg_from_node(
 /// permissions toward peers are opened at pairing time, and pairing still
 /// goes through the ACL-checked `relay_request` path. Request-driven only —
 /// never pushed — so it needs no hello capability flag.
-async fn handle_overlay_warm_relay_request(state: &AppState, ident: NodeIdentity) {
+async fn handle_overlay_warm_relay_request(state: &NetworkState, ident: NodeIdentity) {
     let Some(self_node) = current_node(state, ident).await else {
         debug!(?ident, "overlay.warm_relay_request before join; ignoring");
         return;
@@ -229,7 +231,7 @@ async fn handle_overlay_warm_relay_request(state: &AppState, ident: NodeIdentity
 /// joiner → upsert delta to each permitted peer.
 #[allow(clippy::too_many_arguments)]
 async fn handle_overlay_join(
-    state: &AppState,
+    state: &NetworkState,
     ident: NodeIdentity,
     wg_public_key: String,
     key_epoch: u32,
@@ -495,7 +497,7 @@ async fn handle_overlay_join(
     if let Some(id) = self_node.id {
         state.org_relay.note_join(
             id,
-            crate::ws::org_relay::JoinExtras {
+            crate::org_relay::JoinExtras {
                 org_primary,
                 relay_port,
             },
@@ -562,6 +564,7 @@ async fn handle_overlay_join(
         let st = state.clone();
         tokio::spawn(async move {
             if let Err(e) = st
+                .fleet
                 .agents
                 .record_overlay_identity(tenant_id, agent_id, &identity)
                 .await
@@ -685,7 +688,11 @@ async fn handle_overlay_join(
 
 /// Trickle: update the node's candidates → fan an upsert delta so peers
 /// learn the new endpoints.
-async fn handle_overlay_endpoints(state: &AppState, ident: NodeIdentity, candidates: Vec<String>) {
+async fn handle_overlay_endpoints(
+    state: &NetworkState,
+    ident: NodeIdentity,
+    candidates: Vec<String>,
+) {
     let Some(self_node) = current_node(state, ident).await else {
         debug!(?ident, "overlay.endpoints before join; ignoring");
         return;
@@ -715,7 +722,7 @@ async fn handle_overlay_endpoints(state: &AppState, ident: NodeIdentity, candida
 /// (`direct::pick_public_endpoint`), and a peer only dials the srflx of an
 /// ACL-authorised netmap peer — same trust model as `endpoints`/`lan_endpoints`.
 async fn handle_overlay_srflx(
-    state: &AppState,
+    state: &NetworkState,
     ident: NodeIdentity,
     candidates: Vec<String>,
     nat: Option<String>,
@@ -756,7 +763,7 @@ async fn handle_overlay_srflx(
 /// A CHANGED vector logs at INFO — it is exactly the evidence the selection
 /// layers act on from PR-B3.
 async fn handle_overlay_netcheck(
-    state: &AppState,
+    state: &NetworkState,
     ident: NodeIdentity,
     caps: roomler_ai_remote_control::signaling::CapVectorWire,
 ) {
@@ -814,7 +821,7 @@ fn needs_tls_relay(node: &OverlayNode) -> bool {
 }
 
 /// Graceful leave (or WS teardown): mark offline + tell peers to drop.
-pub async fn handle_overlay_leave(state: &AppState, ident: NodeIdentity) {
+pub async fn handle_overlay_leave(state: &NetworkState, ident: NodeIdentity) {
     let Some(self_node) = current_node(state, ident).await else {
         return; // never joined the overlay — nothing to tear down
     };
@@ -822,7 +829,7 @@ pub async fn handle_overlay_leave(state: &AppState, ident: NodeIdentity) {
     // FR-19 — a party that leaves takes its relay sessions with it: the
     // other member and the relay hear the revoke now rather than at the
     // session's absolute lifetime.
-    crate::ws::org_relay::revoke_node(state, self_id, "device_left").await;
+    crate::org_relay::revoke_node(state, self_id, "device_left").await;
     let _ = state
         .overlay_nodes
         .mark_status(self_id, AgentStatus::Offline)
@@ -854,7 +861,7 @@ struct RelayRequestEvidence {
 
 /// Mint symmetric coturn creds for a relay leg to `peer_node_id`.
 async fn handle_overlay_relay_request(
-    state: &AppState,
+    state: &NetworkState,
     ident: NodeIdentity,
     peer_node_id: ObjectId,
     evidence: RelayRequestEvidence,
@@ -910,7 +917,7 @@ async fn handle_overlay_relay_request(
     // Runs alongside the TURN grant below, never instead of it: the client
     // cascade (P4) prefers Org when a session arrives, and a pair without
     // one keeps exactly the path it has today.
-    crate::ws::org_relay::maybe_mint(state, &self_node, &peer).await;
+    crate::org_relay::maybe_mint(state, &self_node, &peer).await;
 
     let pair_key = pair_key(self_id, peer_node_id);
 
@@ -1115,7 +1122,7 @@ fn forced_active(pc: &PairChurn, now: Instant) -> bool {
 /// caller then pushes `force_derp` to both ends instead of granting. Kept
 /// state-free of `AppState` so the threshold arithmetic is unit-tested
 /// directly.
-pub(crate) fn churn_note_request(pc: &mut PairChurn, now: Instant) -> bool {
+pub fn churn_note_request(pc: &mut PairChurn, now: Instant) -> bool {
     if forced_active(pc, now) {
         // Mid-TTL re-request = a client that restarted and lost its pin;
         // re-escalate it (the peer keeps its own pin).
@@ -1162,7 +1169,7 @@ fn forced_derp_enabled() -> bool {
 
 /// P7 — record + decide for a live request (the impure wrapper around
 /// [`churn_note_request`]), with the size-capped stale sweep.
-fn note_relay_request(state: &AppState, pair_key: &str) -> bool {
+fn note_relay_request(state: &NetworkState, pair_key: &str) -> bool {
     let now = Instant::now();
     if state.relay_pair_churn.len() > CHURN_MAP_CAP {
         state.relay_pair_churn.retain(|_, pc| {
@@ -1192,14 +1199,14 @@ fn note_relay_request(state: &AppState, pair_key: &str) -> bool {
 /// FIRST grant of a burst bounds the dedup window to one burst: a "burst"
 /// that outlives the gap counts, as it should (a client re-requesting for
 /// longer than the dedup window is not deduplicating, it is churning).
-pub(crate) fn arm_grant(pc: &mut PairChurn, now: Instant) {
+pub fn arm_grant(pc: &mut PairChurn, now: Instant) {
     if pc.last_grant_at.is_none() {
         pc.last_grant_at = Some(now);
     }
 }
 
 /// P7 — arm the cycle detector after sending a TURN grant.
-fn note_grant_sent(state: &AppState, pair_key: &str) {
+fn note_grant_sent(state: &NetworkState, pair_key: &str) {
     if let Some(mut pc) = state.relay_pair_churn.get_mut(pair_key) {
         arm_grant(pc.value_mut(), Instant::now());
     } else {
@@ -1217,7 +1224,7 @@ fn note_grant_sent(state: &AppState, pair_key: &str) {
 /// node (its in-process pin died with the old process; the single-relay
 /// DIALER has no reactive path to relearn it). Scans the pair map — tiny in
 /// practice (forced pairs are rare + capped).
-async fn repush_forced_pairs_on_join(state: &AppState, node: &OverlayNode) {
+async fn repush_forced_pairs_on_join(state: &NetworkState, node: &OverlayNode) {
     if !forced_derp_enabled() || !node.supports_forced_derp || !node.supports_derp {
         return;
     }
@@ -1270,7 +1277,7 @@ async fn repush_forced_pairs_on_join(state: &AppState, node: &OverlayNode) {
 /// when something OUT of band changes the node's wire shape (Phase 1: an admin
 /// approving/revoking its subnet `routes`), so peers pick it up immediately
 /// instead of waiting for the next join. Best-effort.
-pub(crate) async fn refan_node(state: &AppState, node: &OverlayNode) {
+pub async fn refan_node(state: &NetworkState, node: &OverlayNode) {
     // P9 — an out-of-band refan (admin route approval) can target a node
     // that is currently offline; carry its real presence, not a blanket true.
     let reach = reachability(state, std::slice::from_ref(node)).await;
@@ -1291,8 +1298,8 @@ pub(crate) async fn refan_node(state: &AppState, node: &OverlayNode) {
 /// `self_name` rides only `ServerMsg::OverlayNetmap` (join-time), and the
 /// client's mid-session full-netmap arm is field-untested. The device serves
 /// its own new self-name after its next reconnect; its PEERS see it live.
-pub(crate) async fn propagate_node_rename(
-    state: &AppState,
+pub async fn propagate_node_rename(
+    state: &NetworkState,
     node: &OverlayNode,
     new_display_name: &str,
 ) -> Option<String> {
@@ -1333,7 +1340,7 @@ pub(crate) async fn propagate_node_rename(
 
 /// What a successful [`release_overlay_node`] freed — for the route responses
 /// and the operator-facing log line.
-pub(crate) struct ReleasedNode {
+pub struct ReleasedNode {
     pub node_id: ObjectId,
     pub name: String,
     pub overlay_ip: String,
@@ -1369,8 +1376,8 @@ pub(crate) struct ReleasedNode {
 /// 4. Fan `removes` to the pinned peers, and to the released node itself so a
 ///    prune-aware client tears its carriers down instead of squatting an
 ///    address that is now recyclable.
-pub(crate) async fn release_overlay_node(
-    state: &AppState,
+pub async fn release_overlay_node(
+    state: &NetworkState,
     node: &OverlayNode,
     reason: &str,
 ) -> Option<ReleasedNode> {
@@ -1398,7 +1405,7 @@ pub(crate) async fn release_overlay_node(
     };
     // FR-19 — trigger 4 of §7: a removed device's relay sessions (as member
     // or as relay) are torn down by push, not left to expire.
-    crate::ws::org_relay::revoke_node(state, node_id, "device_removed").await;
+    crate::org_relay::revoke_node(state, node_id, "device_removed").await;
 
     // 3 — pool the host. Best-effort: a failure leaks, never conflicts.
     let host = state
@@ -1445,7 +1452,7 @@ pub(crate) async fn release_overlay_node(
     // client is an idempotent no-op, and a pod with no sockets fans to
     // nobody. Joins never need this: an upsert rides the joiner's own
     // tenant-affine WS.
-    crate::ws::remote_control::publish_rc_ctrl(
+    roomler_ai_mod_fleet::ctrl::publish_rc_ctrl(
         state,
         "overlay_removes",
         serde_json::json!({
@@ -1495,7 +1502,7 @@ pub(crate) async fn release_overlay_node(
 /// list cannot contain it; the tombstone is still read so the released node
 /// ITSELF also hears the delta when its socket is homed here (mirroring the
 /// local path's second send).
-pub(crate) async fn apply_removes_ctrl(state: &AppState, ctrl: &serde_json::Value) {
+pub async fn apply_removes_ctrl(state: &NetworkState, ctrl: &serde_json::Value) {
     let (Some(tid), Some(net), Some(node_id)) = (
         ctrl.get("tenant_id")
             .and_then(|v| v.as_str())
@@ -1538,8 +1545,8 @@ pub(crate) async fn apply_removes_ctrl(state: &AppState, ctrl: &serde_json::Valu
 /// the subscriber loop is spawned mid-`AppState::new` and cannot capture the
 /// full state the re-fan needs (`apply_rc_ctrl` is hub-only by the same
 /// constraint).
-pub(crate) fn spawn_removes_applier(
-    state: AppState,
+pub fn spawn_removes_applier(
+    state: NetworkState,
     mut rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
 ) {
     tokio::spawn(async move {
@@ -1556,8 +1563,8 @@ pub(crate) fn spawn_removes_applier(
 /// `machine_id`, and the unique index means only ONE of them can own the
 /// overlay node — so deleting the agent must not release a node the
 /// still-enrolled tunnel-client owns.
-pub(crate) async fn release_overlay_node_for(
-    state: &AppState,
+pub async fn release_overlay_node_for(
+    state: &NetworkState,
     tenant_id: ObjectId,
     machine_id: &str,
     expect: &NodeRef,
@@ -1587,7 +1594,7 @@ pub(crate) async fn release_overlay_node_for(
 /// being skipped — omitting a peer from a delta (or shipping it with
 /// `reachable: false`) does NOT tear down an already-installed peer; only the
 /// removes branch drops the WG peer, its route and its carrier.
-async fn fan_upsert_shaped(state: &AppState, node: &OverlayNode, epoch: u64, reachable: bool) {
+async fn fan_upsert_shaped(state: &NetworkState, node: &OverlayNode, epoch: u64, reachable: bool) {
     let peers = match state
         .overlay_nodes
         .list_active_in_network(node.tenant_id, node.network_id)
@@ -1697,7 +1704,7 @@ async fn fan_upsert_shaped(state: &AppState, node: &OverlayNode, epoch: u64, rea
 /// end receives the OTHER's row, ACL-shaped from its own source, with the
 /// verdict for its outgoing edge — the same two halves
 /// [`fan_upsert_shaped`] maintains on ordinary changes.
-async fn fan_pair_verdicts(state: &AppState, a: &OverlayNode, b: &OverlayNode) {
+async fn fan_pair_verdicts(state: &NetworkState, a: &OverlayNode, b: &OverlayNode) {
     let acl = load_acl(state, a.tenant_id).await;
     let a_src = overlay_source_of(state, a).await;
     let b_src = overlay_source_of(state, b).await;
@@ -1763,7 +1770,7 @@ async fn fan_pair_verdicts(state: &AppState, a: &OverlayNode, b: &OverlayNode) {
 /// gone from `list_active_in_network`. Pinning the list makes that ordering
 /// visible in the code instead of implied, and saves a round-trip.
 async fn fan_delta_to(
-    state: &AppState,
+    state: &NetworkState,
     peers: &[OverlayNode],
     exclude: Option<ObjectId>,
     epoch: u64,
@@ -1788,10 +1795,10 @@ async fn fan_delta_to(
 /// agent nodes go through the Hub, tunnel-client nodes through the
 /// connection-lifetime registry. Best-effort — an offline node is
 /// simply skipped (it re-syncs on its next join).
-pub(crate) async fn send_to_node(state: &AppState, node: &OverlayNode, msg: ServerMsg) {
+pub async fn send_to_node(state: &NetworkState, node: &OverlayNode, msg: ServerMsg) {
     match &node.node_ref {
         NodeRef::Agent { agent_id } => {
-            if let Err(e) = state.rc_hub.send_to_agent(*agent_id, msg) {
+            if let Err(e) = state.fleet.rc_hub.send_to_agent(*agent_id, msg) {
                 debug!(agent_id = %agent_id, %e, "overlay: agent node unreachable; skipped");
             }
         }
@@ -1817,10 +1824,10 @@ pub(crate) async fn send_to_node(state: &AppState, node: &OverlayNode, msg: Serv
 
 /// [`send_to_node`] by [`NodeRef`] alone — for callers that hold a session
 /// record rather than a row (FR-19's mint re-push and revoke).
-pub(crate) async fn send_to_node_ref(state: &AppState, node_ref: &NodeRef, msg: ServerMsg) {
+pub async fn send_to_node_ref(state: &NetworkState, node_ref: &NodeRef, msg: ServerMsg) {
     match node_ref {
         NodeRef::Agent { agent_id } => {
-            if let Err(e) = state.rc_hub.send_to_agent(*agent_id, msg) {
+            if let Err(e) = state.fleet.rc_hub.send_to_agent(*agent_id, msg) {
                 debug!(agent_id = %agent_id, %e, "overlay: agent node unreachable; skipped");
             }
         }
@@ -1846,11 +1853,12 @@ pub(crate) async fn send_to_node_ref(state: &AppState, node_ref: &NodeRef, msg: 
 /// display name is the underlying agent/tunnel-client `name` (Phase 0, for the
 /// overlay node name / MagicDNS).
 async fn resolve_tenant_and_machine(
-    state: &AppState,
+    state: &NetworkState,
     ident: NodeIdentity,
 ) -> Option<(ObjectId, String, String)> {
     match ident {
         NodeIdentity::Agent(id) => state
+            .fleet
             .agents
             .base
             .find_by_id(id)
@@ -1873,7 +1881,7 @@ async fn resolve_tenant_and_machine(
 /// relay_request, DERP registration) silently no-ops for a RELEASED node — which
 /// is correct: the release already fanned its `removes`. The `deleted_at` filter
 /// below is redundant now that the lookup is scoped; kept as belt and braces.
-pub(crate) async fn current_node(state: &AppState, ident: NodeIdentity) -> Option<OverlayNode> {
+pub async fn current_node(state: &NetworkState, ident: NodeIdentity) -> Option<OverlayNode> {
     let (tenant_id, machine_id, _name) = resolve_tenant_and_machine(state, ident).await?;
     state
         .overlay_nodes
@@ -1922,7 +1930,7 @@ fn dns_label(display: &str, fallback: &str) -> String {
 /// ignoring `exclude` (self, when backfilling). Best-effort — a lost race is
 /// still caught by the unique `(tenant,network,name)` index.
 async fn unique_node_name(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     network_id: ObjectId,
     base: &str,
@@ -1968,7 +1976,7 @@ const NODE_STALE_AFTER_MS: i64 = 120_000;
 /// crash can leave one Online-but-gone until its next clean leave; a
 /// periodic stale-sweep is the v2). FAIL-OPEN: a freshness-query error reads
 /// as "everything reachable" — a DB blip must not mark the fleet offline.
-async fn reachability(state: &AppState, nodes: &[OverlayNode]) -> HashMap<ObjectId, bool> {
+async fn reachability(state: &NetworkState, nodes: &[OverlayNode]) -> HashMap<ObjectId, bool> {
     let agent_ids: Vec<ObjectId> = nodes
         .iter()
         .filter_map(|n| match &n.node_ref {
@@ -1977,6 +1985,7 @@ async fn reachability(state: &AppState, nodes: &[OverlayNode]) -> HashMap<Object
         })
         .collect();
     let fresh = match state
+        .fleet
         .agents
         .last_seen_fresh(&agent_ids, NODE_STALE_AFTER_MS)
         .await
@@ -2031,13 +2040,13 @@ impl AclCtx {
             policies: Vec::new(),
         }
     }
-    pub(crate) fn enforcing(&self) -> bool {
+    pub fn enforcing(&self) -> bool {
         matches!(self.mode, OverlayAclMode::Enforce)
     }
     /// `true` when the ACL is doing anything at all (`Warn` or `Enforce`).
     /// `Warn` still evaluates — that's what produces the pre-cutover evidence —
     /// so "is a table worth building?" is this, not [`enforcing`](Self::enforcing).
-    pub(crate) fn gating(&self) -> bool {
+    pub fn gating(&self) -> bool {
         !matches!(self.mode, OverlayAclMode::Off)
     }
 }
@@ -2065,7 +2074,7 @@ pub enum PolicyLoad {
 /// and answers `PolicyUnreadable`; the netmap path keeps its open posture via
 /// the wrapper below.
 pub async fn try_load_acl(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     load: PolicyLoad,
 ) -> Result<AclCtx, DaoError> {
@@ -2094,7 +2103,7 @@ pub async fn try_load_acl(
 /// is an explicit `unwrap_or_else` at the one call site that decides it, not a
 /// hidden branch inside the loader, so a reader can see which callers fail
 /// open (this one) and which do not (the relay mint).
-pub async fn load_acl(state: &AppState, tenant_id: ObjectId) -> AclCtx {
+pub async fn load_acl(state: &NetworkState, tenant_id: ObjectId) -> AclCtx {
     try_load_acl(state, tenant_id, PolicyLoad::WhenGating)
         .await
         .unwrap_or_else(|e| {
@@ -2114,11 +2123,19 @@ pub async fn load_acl(state: &AppState, tenant_id: ObjectId) -> AclCtx {
 /// "matches only `AllNodes`". Netmap shaping keeps its degrading posture via
 /// [`overlay_source_of`].
 pub async fn try_overlay_source_of(
-    state: &AppState,
+    state: &NetworkState,
     node: &OverlayNode,
 ) -> Result<OverlaySource, DaoError> {
     let owner_user_id = match &node.node_ref {
-        NodeRef::Agent { agent_id } => state.agents.base.find_by_id(*agent_id).await?.owner_user_id,
+        NodeRef::Agent { agent_id } => {
+            state
+                .fleet
+                .agents
+                .base
+                .find_by_id(*agent_id)
+                .await?
+                .owner_user_id
+        }
         NodeRef::TunnelClient { tunnel_client_id } => {
             state
                 .tunnel_clients
@@ -2146,10 +2163,11 @@ pub async fn try_overlay_source_of(
 /// Each swallowed error is LOGGED. Before FR-19 this was `.ok()` and
 /// `unwrap_or_default()`: a scoped rule silently failing to match, with no
 /// trace to explain a peer that vanished from a netmap.
-pub(crate) async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> OverlaySource {
+pub async fn overlay_source_of(state: &NetworkState, node: &OverlayNode) -> OverlaySource {
     let node_id = node.id.unwrap_or_default();
     let owner = match &node.node_ref {
         NodeRef::Agent { agent_id } => state
+            .fleet
             .agents
             .base
             .find_by_id(*agent_id)
@@ -2213,7 +2231,7 @@ pub(crate) async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> O
 /// `SingleRelayDialer` (UDP-capability first, smaller-pubkey tie-break — the
 /// same rule and the same raw-byte comparison the client uses).
 fn server_relay_verdict(
-    state: &AppState,
+    state: &NetworkState,
     recipient: &OverlayNode,
     peer: &OverlayNode,
 ) -> Option<RelayStrategyWire> {
@@ -2523,7 +2541,7 @@ fn union_endpoints(lan: &[String], rest: &[String]) -> Vec<String> {
 }
 
 /// Symmetric per-pair key so both ends mint identical coturn creds.
-pub(crate) fn pair_key(a: ObjectId, b: ObjectId) -> String {
+pub fn pair_key(a: ObjectId, b: ObjectId) -> String {
     let (x, y) = (a.to_hex(), b.to_hex());
     if x <= y {
         format!("{x}:{y}")
@@ -2551,7 +2569,7 @@ fn next_epoch() -> u64 {
 /// to the hostname-based servers (pre-fix behaviour) with no TURN config or on
 /// DNS failure.
 async fn overlay_ice_servers(
-    state: &AppState,
+    state: &NetworkState,
     pair_key: &str,
     home_a: Option<&str>,
     home_b: Option<&str>,
@@ -2565,7 +2583,7 @@ async fn overlay_ice_servers(
 /// the allocation's total life; the 600 s pair TTL killed every warm
 /// allocation at the 10-minute mark); pair grants keep the config TTL.
 async fn overlay_ice_servers_with_ttl(
-    state: &AppState,
+    state: &NetworkState,
     pair_key: &str,
     home_a: Option<&str>,
     home_b: Option<&str>,
@@ -2581,7 +2599,9 @@ async fn overlay_ice_servers_with_ttl(
         needs_tls,
     );
     if region.is_some() {
-        crate::cluster::metrics::bump(&crate::cluster::metrics::RELAY_REGION_PICK_TOTAL);
+        roomler_core::cluster::metrics::bump(
+            &roomler_core::cluster::metrics::RELAY_REGION_PICK_TOTAL,
+        );
     }
     let Some(turn_cfg) = state.turn_map.cfg_for(region.as_deref()) else {
         return turn_creds::ice_servers_for_with_ttl(pair_key, None, ttl_override);
@@ -2650,7 +2670,7 @@ fn turn_url_host_port(u: &str) -> Option<String> {
 /// each UDP `turn:` URL maps to a `stun:host:port`. `turns:` (TLS) and
 /// `?transport=tcp` variants are skipped — plain STUN is UDP. Deduped. Empty
 /// when TURN isn't configured (dev), which leaves the srflx tier inert.
-fn stun_urls_from_turn(state: &AppState) -> Vec<String> {
+fn stun_urls_from_turn(state: &NetworkState) -> Vec<String> {
     match build_turn_config(&state.settings.turn) {
         Some(cfg) => stun_urls_from_turn_urls(&cfg.urls),
         None => Vec::new(),

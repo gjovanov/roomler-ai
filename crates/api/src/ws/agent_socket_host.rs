@@ -32,7 +32,6 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use crate::state::AppState;
-use crate::ws::overlay::NodeIdentity;
 use crate::ws::remote_control::{
     handle_agent_ssh_request, handle_derp_ticket_request, handle_relay_probe_report,
     record_key_rotation_report, record_ssh_activity, relay_tunnel_msg_from_agent,
@@ -41,6 +40,7 @@ use crate::ws::tunnel::{
     Originator, TunnelSession, relay_tunnel_client_msg_from_agent,
     teardown_agent_originated_sessions, terminate_sessions_targeting_agent,
 };
+use roomler_ai_mod_network::overlay::NodeIdentity;
 
 /// What the network arms keep per connection. The originator is shared
 /// (`Arc`) so the teardown can take the sessions out from under a handler
@@ -97,8 +97,8 @@ impl AgentMsgHandler for HostNetworkAgentSocket {
         // This agent as a tunnel TARGET.
         let msg = relay_tunnel_msg_from_agent(state, msg).await?;
         // The overlay node behind this socket.
-        let msg = crate::ws::overlay::relay_overlay_msg_from_node(
-            state,
+        let msg = roomler_ai_mod_network::overlay::relay_overlay_msg_from_node(
+            state.network(),
             NodeIdentity::Agent(ctx.agent_id),
             msg,
         )
@@ -213,6 +213,7 @@ impl AgentSocketLifecycle for HostNetworkAgentSocket {
     async fn heartbeat(&self, ctx: &AgentCtx, warm_relay: Option<&str>) {
         if let Err(e) = self
             .state
+            .network()
             .overlay_nodes
             .set_warm_relay_for_agent(ctx.agent_id, warm_relay)
             .await
@@ -254,8 +255,8 @@ impl AgentSocketLifecycle for HostNetworkAgentSocket {
     /// (rc.307 B).
     async fn closed(&self, ctx: &AgentCtx, removal_was_ours: bool) {
         if removal_was_ours {
-            crate::ws::overlay::handle_overlay_leave(
-                &self.state,
+            roomler_ai_mod_network::overlay::handle_overlay_leave(
+                self.state.network(),
                 NodeIdentity::Agent(ctx.agent_id),
             )
             .await;

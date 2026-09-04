@@ -36,10 +36,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
-use crate::{
-    error::ApiError, extractors::auth::AuthUser, routes::remote_control::require_permission,
-    state::AppState,
-};
+use roomler_core::guards::require_permission;
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::NetworkState;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -304,7 +304,7 @@ pub fn version_meets_floor(version: &str, floor: &str) -> bool {
 /// GET /api/tenant/{tenant_id}/overlay-block — the tenant's address-block
 /// posture: current range, usage, registry trail and fleet readiness.
 pub async fn get_block(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<BlockStatusResponse>, ApiError> {
@@ -392,7 +392,7 @@ pub async fn get_block(
 /// operator reaching into an org they are not a member of should leave a
 /// trace, and a renumber is disruptive enough to want one.
 async fn require_block_operator(
-    state: &AppState,
+    state: &NetworkState,
     tid: ObjectId,
     user_id: ObjectId,
     op: &str,
@@ -417,7 +417,7 @@ async fn require_block_operator(
 /// POST /api/tenant/{tenant_id}/overlay-block/renumber — plan (default) or
 /// perform the tenant's migration onto its own block.
 pub async fn renumber(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<RenumberRequest>,
@@ -592,8 +592,8 @@ pub async fn renumber(
                 if body.cycle {
                     // Local first (the common single-pod case), then the ctrl
                     // lane for whichever pod actually holds the socket.
-                    state.rc_hub.cycle_agent_ws(agent_id);
-                    crate::ws::remote_control::publish_rc_ctrl(
+                    state.fleet.rc_hub.cycle_agent_ws(agent_id);
+                    roomler_ai_mod_fleet::ctrl::publish_rc_ctrl(
                         &state,
                         "overlay_cycle",
                         serde_json::json!({ "agent_id": agent_id.to_hex() }),
@@ -654,7 +654,7 @@ fn node_kind(n: &OverlayNode) -> &'static str {
 /// device row is gone is skipped: it can't rejoin, so it can't be broken by
 /// the migration.
 async fn resolve_versions(
-    state: &AppState,
+    state: &NetworkState,
     tenant_id: ObjectId,
     nodes: &[OverlayNode],
 ) -> Vec<DeviceVersion> {
@@ -669,6 +669,7 @@ async fn resolve_versions(
     let mut out = Vec::new();
     if !agent_ids.is_empty()
         && let Ok(rows) = state
+            .fleet
             .agents
             .base
             .find_many(
@@ -917,7 +918,7 @@ pub struct ReclaimResponse {
 /// * the block has been quarantined for at least `min_age_days`;
 /// * no live overlay node anywhere holds an address inside it.
 pub async fn reclaim(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Json(body): Json<ReclaimRequest>,
 ) -> Result<Json<ReclaimResponse>, ApiError> {
@@ -1100,7 +1101,7 @@ fn orphaned_ordinals(
 /// whether the leak is purely historical (pre-2026-07-29 releases) or whether
 /// a live path is still dropping ordinals.
 pub async fn reconcile_hosts(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<ReconcileHostsRequest>,
@@ -1292,12 +1293,12 @@ pub struct OrphanResponse {
 /// it would be a far worse bug than the one this fixes. The test asserts it.
 ///
 /// Applying releases each node through
-/// [`crate::ws::overlay::release_overlay_node`] — never by deleting rows —
+/// [`crate::overlay::release_overlay_node`] — never by deleting rows —
 /// because that path tombstones under a CAS, pools the host ordinal, and fans
 /// `netmap_delta{removes}` to peers. Bypassing it to tidy up would be the same
 /// class of act that created the mess.
 pub async fn orphans(
-    State(state): State<AppState>,
+    State(state): State<NetworkState>,
     auth: AuthUser,
     Json(body): Json<OrphanRequest>,
 ) -> Result<Json<OrphanResponse>, ApiError> {
@@ -1328,6 +1329,7 @@ pub async fn orphans(
         for n in &nodes {
             let agent_version = match &n.node_ref {
                 NodeRef::Agent { agent_id } => state
+                    .fleet
                     .agents
                     .base
                     .find_by_id(*agent_id)
@@ -1351,7 +1353,7 @@ pub async fn orphans(
         let mut released = Vec::new();
         if !body.dry_run {
             for n in &nodes {
-                if crate::ws::overlay::release_overlay_node(
+                if crate::overlay::release_overlay_node(
                     &state,
                     n,
                     "orphaned network: the tenant row no longer exists (FR-54)",
