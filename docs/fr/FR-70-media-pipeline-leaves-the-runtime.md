@@ -77,7 +77,7 @@ overridden.
 `T1` transport classification · `P1` priors decay + visible overrides.
 
 ⚠️ **P1 first in value**: it is what the operator can see today and needs no
-threading work. **P1 landed 2026-09-04** (kill switch `rate_prior_decay`) — see
+threading work. **P1 landed 2026-09-04 in #1333** (kill switch `rate_prior_decay`) — see
 "P1 — as built" below. ⚠️ **M5 is the acceptance criterion**, not an
 afterthought — if the deletions do not happen this is one more lever and the
 complaint stands.
@@ -99,7 +99,7 @@ complaint stands.
 - [ ] **AC7** — every phase carries a before/after from the same instrument, and
       each field test is shown to FAIL on the current deploy first.
 
-## P1 — as built (2026-09-04)
+## P1 — as built (2026-09-04, PR #1333)
 
 ### The mechanism, corrected
 
