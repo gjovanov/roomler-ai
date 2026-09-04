@@ -36,7 +36,7 @@ use std::time::Instant;
 
 use bson::oid::ObjectId;
 use dashmap::DashMap;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 /// Who moves to converge a cross-pod miss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,4 +357,116 @@ mod tests {
             t0 + Duration::from_secs(6)
         ));
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// FR-69 P6 — the requester-side pair every cross-pod miss uses (the
+// controller's session request in `remote`, the tunnel originator's forward
+// and ICE relays in `network`): both are fleet's, because they act on the
+// AGENT's home (its directory record, its presence claim), not on a session.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// C-2/C-3 — fire-and-forget idle-agent nudge at the pod owning an
+/// agent's WS (read from its directory record): the owner cycles the
+/// socket iff the agent is fully idle, so its reconnect re-hashes onto
+/// the current LB map. Failure is harmless (the requester's own retry
+/// path still works; the agent converges on its next natural reconnect).
+pub fn spawn_agent_nudge(state: &crate::FleetState, owner_pod: String, agent_hex: String) {
+    let Some(bus) = state.cluster_bus.clone() else {
+        return;
+    };
+    if owner_pod.is_empty() {
+        return;
+    }
+    // PR-1 requester-side throttle: a controller click storm + retry
+    // ladder sent 11 nudge RPCs in 15 s at one refusing owner in the
+    // 2026-08-04 incident. The owner has its own cooldown; this just
+    // keeps the bus quiet.
+    if let Ok(aid) = ObjectId::parse_str(&agent_hex)
+        && !nudge_request_allowed(
+            &state.agent_nudge_throttle,
+            aid,
+            std::time::Duration::from_millis(state.settings.rc.nudge_requester_throttle_ms),
+        )
+    {
+        debug!(agent = %agent_hex, "agent nudge RPC suppressed (requester throttle)");
+        return;
+    }
+    tokio::spawn(async move {
+        match bus
+            .request(
+                &owner_pod,
+                "rc.agent_nudge",
+                serde_json::json!({ "agent_id": agent_hex }),
+            )
+            .await
+        {
+            Ok(rep) => {
+                let nudged = rep.get("nudged").and_then(|v| v.as_bool()).unwrap_or(false);
+                // `reason` is absent from pre-PR-1 peers (mixed-version
+                // roll) — tolerate.
+                let reason = rep.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                if nudged {
+                    info!(agent = %agent_hex, %owner_pod, "agent rehome nudge fired on owner pod");
+                } else {
+                    info!(
+                        agent = %agent_hex,
+                        %owner_pod,
+                        reason,
+                        "agent rehome nudge refused by owner pod"
+                    );
+                }
+            }
+            Err(e) => debug!(agent = %agent_hex, %e, "agent rehome nudge failed"),
+        }
+    });
+}
+
+/// Phase A-1 split-evidence probe (A2b): fired on a LOCAL hub miss; if
+/// another pod holds a FRESH presence record for the agent, that miss was
+/// a cross-pod split, not a real offline. One warn + a process counter —
+/// the permanent field instrument that gates the Phase A-2 rehome work
+/// (steady-state nonzero = stable split; spikes only around rolls =
+/// churn). Fire-and-forget: never blocks the caller.
+pub fn note_agent_offline_evidence(
+    state: &roomler_core::Core,
+    agent_hex: String,
+    caller: &'static str,
+) {
+    // Probe throttle: the tunnel-ICE path can miss at candidate rate
+    // (>10/s in the 2026-08-02 incident); one Redis GET per 5 s is
+    // plenty for an existence instrument.
+    static LAST_PROBE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now_ms = bson::DateTime::now().timestamp_millis();
+    let last = LAST_PROBE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms - last < 5_000
+        || LAST_PROBE_MS
+            .compare_exchange(
+                last,
+                now_ms,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return;
+    }
+    let Some(redis) = state.redis_pubsub.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        match redis.agent_presence_foreign(&agent_hex).await {
+            Ok(Some(owner)) => {
+                let total = roomler_core::cluster::metrics::SPLIT_EVIDENCE_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                warn!(
+                    agent = %agent_hex, caller, owner = %owner, total,
+                    "SPLIT EVIDENCE: local hub miss but another pod holds a fresh presence record"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => debug!(%agent_hex, %e, "split-evidence probe failed"),
+        }
+    });
 }

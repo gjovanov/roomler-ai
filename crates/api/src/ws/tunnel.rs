@@ -624,8 +624,8 @@ async fn handle_tunnel_open(
                 );
             }
             crate::ws::rc_cluster::RehomeDirection::NudgeAgent => {
-                crate::ws::remote_control::spawn_agent_nudge(
-                    state,
+                roomler_ai_mod_fleet::nudge::spawn_agent_nudge(
+                    state.fleet(),
                     owner_pod.clone(),
                     agent_id.to_hex(),
                 );
@@ -1088,7 +1088,7 @@ async fn handle_forward_request(
                 Err(e) => {
                     // Agent not online or its channel is wedged.
                     warn!(origin = %orig.log_id(), %flow_id, agent = %s.agent_id, %e, "agent relay failed");
-                    crate::ws::remote_control::note_agent_offline_evidence(
+                    roomler_ai_mod_fleet::nudge::note_agent_offline_evidence(
                         state,
                         s.agent_id.to_hex(),
                         "tunnel_forward",
@@ -1427,7 +1427,7 @@ async fn relay_ice_to_agent(
         },
     ) {
         debug!(%request_session_id, %e, "tunnel ICE relay to agent failed");
-        crate::ws::remote_control::note_agent_offline_evidence(
+        roomler_ai_mod_fleet::nudge::note_agent_offline_evidence(
             state,
             s.agent_id.to_hex(),
             "tunnel_ice",

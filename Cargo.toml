@@ -25,6 +25,7 @@ members = [
     "crates/modules/chat",
     "crates/modules/conference",
     "crates/modules/fleet",
+    "crates/modules/remote",
 
     "crates/api",
     "crates/tests",
