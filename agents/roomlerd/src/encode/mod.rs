@@ -54,6 +54,12 @@ pub mod aimd;
 pub mod ceiling_learn;
 /// FR-35 P2 — per-peer rate memory (one JSON file in the data dir).
 pub mod rate_memory;
+/// FR-63 B0 — the deterministic rate-law simulator. TEST-ONLY: it ships zero
+/// bytes, and it exists so the cells the field cannot summon (a genuinely thin
+/// pipe, a link that stalls on cue) can still be run against the SHIPPED laws.
+/// ⚠️ A simulator result is evidence about a law, never about the fleet.
+#[cfg(test)]
+pub mod sim;
 /// FR-63 — slow-start for the session opener (pure; no clock, no I/O).
 pub mod slow_start;
 

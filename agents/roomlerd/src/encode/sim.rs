@@ -1,0 +1,1351 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! FR-63 B0 — a deterministic simulator for the remote-desktop rate laws.
+//!
+//! # Why this exists
+//!
+//! Every rate decision this codebase makes has been verified by opening a
+//! session on somebody's laptop and reading a heartbeat. That works, and it
+//! found real bugs, but it has two properties that keep costing us releases:
+//!
+//! 1. **The interesting cells are the ones we cannot summon.** FR-63's AC0b —
+//!    "the opener's ramp removes the harm" — was blocked for a day because no
+//!    reachable host could produce a pipe thin enough for the *baseline arm to
+//!    fail*. Three cells were tried; each was genuinely constrained and none
+//!    over-drove, because a 2.55 Mbps opener into a relay carrying ~3 Mbps is
+//!    not an over-drive. The field case that motivated the whole phase was
+//!    ~213 kbps, and nothing agent-side manufactures that.
+//! 2. **A field run is not repeatable.** The pipe, the content and the encoder
+//!    all move between arms, so a difference is never attributable with
+//!    confidence to the one flag under test.
+//!
+//! A simulator fixes both, at the cost of being a *model*. So the rule for
+//! reading anything this module prints:
+//!
+//! ⚠️ **A simulator result is evidence about the LAW, not about the fleet.** It
+//! can prove that a rate law over-drives a 213 kbps token bucket; it cannot
+//! prove that a corporate VPN behaves like a token bucket. Field verification
+//! is not replaced by this — it is *aimed* by it. Acceptance criteria that say
+//! "field-verified" still mean field-verified.
+//!
+//! # What is modelled, and what is not
+//!
+//! The harness drives the **shipped laws directly** — [`SlowStart`] and
+//! [`AimdController`] are the real types, in the real order `governor.rs`
+//! calls them (`set_floor` then `set_ceiling` then `observe`; one ramp verdict
+//! per viewer window). Nothing here re-implements a law, so a fixture that
+//! passes is a statement about production code rather than about a copy of it.
+//!
+//! Modelled: a token-bucket link with an RTT, a finite buffer, seeded loss and
+//! scheduled stalls; the bounded send channel the AIMD actually observes
+//! (occupancy and full-ness); CBR frame production with a keyframe multiplier;
+//! and a viewer folding arrivals into `decodestat`-shaped windows (age, p95
+//! age, `rx_bps`, `queue_ms` by the same Σ(Δarrival − Δwire) the browser's
+//! `rc-hop-stats.ts` uses).
+//!
+//! NOT modelled, deliberately: the encoder's rate-following error (FR-62's
+//! subject — here the encoder hits its target exactly, so a fixture failure is
+//! never an encoder artefact), packet-level SCTP behaviour, the ICE ladder,
+//! and anything about *pixels*. The send channel and the SCTP buffer are
+//! collapsed into one queue, because they are in series and the slow end
+//! governs; the AIMD's view of that queue is what it sees in production.
+//!
+//! # Test-only
+//!
+//! `#[cfg(test)]`, so this ships zero bytes. It builds on the DEFAULT feature
+//! set — no FFmpeg, no capture backends — because `cargo test -p roomlerd
+//! --lib` is the lane that runs it, and that lane compiles none of the pump.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use super::aimd::AimdController;
+use super::slow_start::SlowStart;
+
+/// The tick the simulator advances by. One millisecond is fine enough that a
+/// 30 fps frame (33 ms) and the AIMD's 500 ms decrease spacing are both many
+/// ticks, and coarse enough that a 60 s scenario is 60 000 iterations.
+const TICK: Duration = Duration::from_millis(1);
+
+/// The viewer/heartbeat window, mirroring `governor::VIEWER_WINDOW`.
+const WINDOW: Duration = Duration::from_secs(1);
+
+/// The absolute legibility stop, mirroring the default of
+/// `encode::slow_link_min_bitrate_bps()`. Explicit rather than read from the
+/// environment: a simulator whose result depends on an env var is not
+/// deterministic, which is the one property it exists to have.
+const HARD_MIN_BPS: u32 = 200_000;
+
+/// Send-channel depth on a constrained path (`peer.rs`: `if constrained { 4 }`).
+const CONSTRAINED_DEPTH: u32 = 4;
+
+// ---------------------------------------------------------------------------
+// Deterministic RNG
+// ---------------------------------------------------------------------------
+
+/// xorshift64*, so loss is reproducible from a scenario's seed and a failing
+/// fixture can be re-run byte-for-byte. `rand` is not a dependency of this
+/// crate's default build and a simulator does not need a good generator — it
+/// needs the SAME generator every time.
+#[derive(Debug, Clone)]
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        // A zero state is a fixed point of xorshift; refuse it.
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// True with probability `pct/100`.
+    fn chance_pct(&mut self, pct: u32) -> bool {
+        if pct == 0 {
+            return false;
+        }
+        (self.next_u64() % 100) < u64::from(pct.min(100))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pipe
+// ---------------------------------------------------------------------------
+
+/// A scheduled outage: the link carries nothing for `len` starting at `at`.
+/// Models a DERP relay's reconnect or a Wi-Fi roam.
+#[derive(Debug, Clone, Copy)]
+pub struct Stall {
+    pub at: Duration,
+    pub len: Duration,
+}
+
+/// What the link does.
+#[derive(Debug, Clone)]
+pub struct PipeSpec {
+    /// Drain rate from t=0 until the first entry of `rate_steps`.
+    pub rate_bps: u32,
+    /// Piecewise rate changes `(at, rate_bps)`, applied in order. A link that
+    /// degrades mid-session (the airport hotspot) or recovers.
+    pub rate_steps: Vec<(Duration, u32)>,
+    /// Bytes the link will hold before tail-dropping.
+    pub buffer_bytes: u32,
+    /// Round trip; a frame's arrival is one half-RTT after its last byte
+    /// leaves the sender.
+    pub rtt: Duration,
+    /// Seeded per-frame loss, percent.
+    pub loss_pct: u32,
+    pub stalls: Vec<Stall>,
+}
+
+impl PipeSpec {
+    /// A steady link with no loss and no stalls.
+    pub fn steady(rate_bps: u32, rtt_ms: u64, buffer_bytes: u32) -> Self {
+        Self {
+            rate_bps,
+            rate_steps: Vec::new(),
+            buffer_bytes,
+            rtt: Duration::from_millis(rtt_ms),
+            loss_pct: 0,
+            stalls: Vec::new(),
+        }
+    }
+
+    fn rate_at(&self, t: Duration) -> u32 {
+        let mut rate = self.rate_bps;
+        for (at, r) in &self.rate_steps {
+            if t >= *at {
+                rate = *r;
+            }
+        }
+        rate
+    }
+
+    fn stalled_at(&self, t: Duration) -> bool {
+        self.stalls.iter().any(|s| t >= s.at && t < s.at + s.len)
+    }
+}
+
+/// One frame sitting in the send channel / link buffer.
+#[derive(Debug, Clone, Copy)]
+struct QFrame {
+    bytes: u32,
+    /// When the encoder produced it — the anchor for viewer age.
+    produced: Duration,
+    remaining_bits: u64,
+}
+
+/// A frame that reached the viewer.
+#[derive(Debug, Clone, Copy)]
+struct Arrival {
+    bytes: u32,
+    produced: Duration,
+    at: Duration,
+}
+
+/// The link plus the bounded send channel in front of it.
+#[derive(Debug)]
+struct Pipe {
+    spec: PipeSpec,
+    depth: u32,
+    queue: VecDeque<QFrame>,
+    queued_bytes: u32,
+    credit_bits: u64,
+    rng: Rng,
+    /// Frames whose last byte has left the sender but which have not yet
+    /// arrived (in flight for half an RTT).
+    in_flight: VecDeque<Arrival>,
+}
+
+impl Pipe {
+    fn new(spec: PipeSpec, depth: u32, seed: u64) -> Self {
+        Self {
+            spec,
+            depth: depth.max(1),
+            queue: VecDeque::new(),
+            queued_bytes: 0,
+            credit_bits: 0,
+            rng: Rng::new(seed),
+            in_flight: VecDeque::new(),
+        }
+    }
+
+    /// Frames waiting in the channel — what the AIMD reads as occupancy.
+    fn occupied(&self) -> u32 {
+        self.queue.len() as u32
+    }
+
+    /// Is the channel refusing frames?
+    ///
+    /// ⚠️ **Both limits report through this one predicate, and that is
+    /// load-bearing.** An earlier version refused byte-full offers inside
+    /// `offer` while `full()` reported only the frame-depth limit, so on a
+    /// thin pipe (where three big frames fill a 32 KB buffer before four
+    /// frames fill the channel) every frame was dropped and **the AIMD was
+    /// never told**: it sat at its opening 2.55 Mbps for 40 s with no
+    /// decrease, because its only congestion input was disconnected. In
+    /// production backpressure propagates — a full SCTP buffer blocks the
+    /// send task, which fills the bounded mpsc, which is what the pump's
+    /// `try_send` failure and `on_backpressure_skip` report. A model that
+    /// drops the signal is testing the law with its eyes shut.
+    fn full(&self) -> bool {
+        self.occupied() >= self.depth || self.queued_bytes >= self.spec.buffer_bytes
+    }
+
+    /// Offer a frame. `false` means the channel refused it — production's
+    /// backpressure skip.
+    fn offer(&mut self, bytes: u32, now: Duration) -> bool {
+        if self.full() {
+            return false;
+        }
+        self.queued_bytes += bytes;
+        self.queue.push_back(QFrame {
+            bytes,
+            produced: now,
+            remaining_bits: u64::from(bytes) * 8,
+        });
+        true
+    }
+
+    /// Advance one tick; return the frames that ARRIVED during it, and how
+    /// many were lost in transit.
+    ///
+    /// ⚠️ The loss count is returned rather than discarded because a viewer
+    /// that never learns about loss reports `frames_lost: 0` forever, and a
+    /// fixture with `loss_pct` set would then be silently testing a lossless
+    /// link — a green run proving the opposite of what it claims.
+    fn advance(&mut self, now: Duration) -> (Vec<Arrival>, u32) {
+        let mut lost = 0u32;
+        if !self.spec.stalled_at(now) {
+            // bits per tick = rate_bps × tick_ms / 1000
+            let ms = TICK.as_millis() as u64;
+            self.credit_bits += u64::from(self.spec.rate_at(now)) * ms / 1000;
+        }
+        while self.credit_bits > 0 {
+            let Some(head) = self.queue.front_mut() else {
+                // An idle link does not bank capacity: a token bucket that
+                // accumulated while nothing was queued would let the next
+                // frame teleport, which is exactly the "a fast sample is not
+                // evidence" error `goodput.rs` documents.
+                self.credit_bits = 0;
+                break;
+            };
+            let take = self.credit_bits.min(head.remaining_bits);
+            head.remaining_bits -= take;
+            self.credit_bits -= take;
+            if head.remaining_bits == 0 {
+                let done = self.queue.pop_front().expect("front exists");
+                self.queued_bytes = self.queued_bytes.saturating_sub(done.bytes);
+                let arrival = now + self.spec.rtt / 2;
+                if self.rng.chance_pct(self.spec.loss_pct) {
+                    lost += 1;
+                } else {
+                    self.in_flight.push_back(Arrival {
+                        bytes: done.bytes,
+                        produced: done.produced,
+                        at: arrival,
+                    });
+                }
+            }
+        }
+        let mut arrived = Vec::new();
+        while let Some(front) = self.in_flight.front() {
+            if front.at <= now {
+                arrived.push(self.in_flight.pop_front().expect("front exists"));
+            } else {
+                break;
+            }
+        }
+        (arrived, lost)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The encoder
+// ---------------------------------------------------------------------------
+
+/// How busy the screen is over time — scales frame size around the CBR mean.
+#[derive(Debug, Clone)]
+pub enum Motion {
+    /// Every frame is the CBR size. The cleanest signal for a rate-law test.
+    Steady,
+    /// Quiet, with periodic bursts `factor`× the CBR size for `len`.
+    Bursts {
+        period: Duration,
+        len: Duration,
+        factor: u32,
+    },
+}
+
+impl Motion {
+    fn factor_at(&self, t: Duration) -> u32 {
+        match self {
+            Motion::Steady => 1,
+            Motion::Bursts {
+                period,
+                len,
+                factor,
+            } => {
+                let p = period.as_millis().max(1);
+                let phase = t.as_millis() % p;
+                if phase < len.as_millis() { *factor } else { 1 }
+            }
+        }
+    }
+}
+
+/// A CBR encoder that hits its target exactly.
+///
+/// ⚠️ Deliberately perfect. FR-62 is the FR about an encoder that does NOT
+/// follow its target; modelling that error here would make every FR-63 fixture
+/// failure ambiguous between "the law is wrong" and "the encoder lagged".
+#[derive(Debug)]
+struct EncoderSim {
+    fps: u32,
+    /// A keyframe is this many times a delta frame.
+    idr_factor: u32,
+    frames: u64,
+}
+
+impl EncoderSim {
+    fn new(fps: u32, idr_factor: u32) -> Self {
+        Self {
+            fps: fps.max(1),
+            idr_factor: idr_factor.max(1),
+            frames: 0,
+        }
+    }
+
+    fn frame_interval(&self) -> Duration {
+        Duration::from_micros(1_000_000 / u64::from(self.fps))
+    }
+
+    /// Bytes for the next frame at `target_bps`.
+    fn produce(&mut self, target_bps: u32, motion: &Motion, t: Duration) -> u32 {
+        let cbr = u64::from(target_bps) / u64::from(self.fps) / 8;
+        let scaled = cbr * u64::from(motion.factor_at(t));
+        let bytes = if self.frames == 0 {
+            // The opening keyframe.
+            cbr * u64::from(self.idr_factor)
+        } else {
+            scaled
+        };
+        self.frames += 1;
+        bytes.max(1).min(u64::from(u32::MAX)) as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The viewer
+// ---------------------------------------------------------------------------
+
+/// One `decodestat`-shaped window, the shape `tick_viewer_window` folds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowStats {
+    pub rx_bps: u32,
+    pub age_ms: u32,
+    pub age_p95_ms: u32,
+    /// Σ(Δarrival − Δproduced) over the window — the browser's `QueueDrift`.
+    /// Positive means the transit queue grew.
+    pub queue_ms: i64,
+    pub frames_rx: u32,
+    pub frames_lost: u32,
+}
+
+/// Folds arrivals into windows.
+#[derive(Debug, Default)]
+struct ViewerSim {
+    ages_ms: Vec<u32>,
+    bytes: u64,
+    last_arrival: Option<Arrival>,
+    queue_drift_ms: i64,
+    frames_rx: u32,
+    frames_lost: u32,
+}
+
+impl ViewerSim {
+    fn on_arrival(&mut self, a: Arrival) {
+        let age = a.at.saturating_sub(a.produced).as_millis() as u32;
+        self.ages_ms.push(age);
+        self.bytes += u64::from(a.bytes);
+        self.frames_rx += 1;
+        if let Some(prev) = self.last_arrival {
+            let d_arrival = a.at.saturating_sub(prev.at).as_millis() as i64;
+            let d_produced = a.produced.saturating_sub(prev.produced).as_millis() as i64;
+            self.queue_drift_ms += d_arrival - d_produced;
+        }
+        self.last_arrival = Some(a);
+    }
+
+    fn on_loss(&mut self) {
+        self.frames_lost += 1;
+    }
+
+    /// Close the window and reset. `elapsed` is its real length.
+    fn fold(&mut self, elapsed: Duration) -> WindowStats {
+        self.ages_ms.sort_unstable();
+        let n = self.ages_ms.len();
+        let age_ms = if n == 0 {
+            0
+        } else {
+            (self.ages_ms.iter().map(|v| u64::from(*v)).sum::<u64>() / n as u64) as u32
+        };
+        let age_p95_ms = if n == 0 {
+            0
+        } else {
+            // Index of the p95 sample, clamped into range.
+            self.ages_ms[((n * 95) / 100).min(n - 1)]
+        };
+        let ms = elapsed.as_millis().max(1) as u64;
+        let stats = WindowStats {
+            rx_bps: (self.bytes.saturating_mul(8000) / ms).min(u64::from(u32::MAX)) as u32,
+            age_ms,
+            age_p95_ms,
+            queue_ms: self.queue_drift_ms,
+            frames_rx: self.frames_rx,
+            frames_lost: self.frames_lost,
+        };
+        self.ages_ms.clear();
+        self.bytes = 0;
+        self.queue_drift_ms = 0;
+        self.frames_rx = 0;
+        self.frames_lost = 0;
+        stats
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The law under test
+// ---------------------------------------------------------------------------
+
+/// Anything that decides a target bitrate, driven at the two positions the
+/// governor drives one: every frame at the capacity gate, and once per viewer
+/// window.
+///
+/// B1's `ratectl::Controller` implements this and runs the same fixtures, so
+/// the numbers below become the baseline it has to beat rather than a
+/// separate exercise.
+pub trait RateLaw {
+    fn label(&self) -> &'static str;
+    /// At the capacity gate, before encoding. Returns the current target.
+    fn on_frame(&mut self, occupied: u32, full: bool, now: Instant) -> u32;
+    /// Once per viewer window, after folding.
+    fn on_window(&mut self, w: &WindowStats, now: Instant);
+    fn target_bps(&self) -> u32;
+}
+
+/// The shipped governor's rate path: the FR-59 floor relief, the FR-63
+/// slow-start ramp and the AIMD, in the order `pre_encode_tick` runs them.
+///
+/// Arm A of the FR-63 A/B is this with `slow_start: false`; arm B is
+/// `slow_start: true`. Nothing else differs, which is the property the field
+/// cell could not guarantee.
+#[derive(Debug)]
+pub struct GovernorLaw {
+    slow_start: bool,
+    floor_relief: bool,
+    nominal_floor_bps: u32,
+    nominal_ceiling_bps: u32,
+    /// FR-59 P8's remembered-slow-pair open; `None` = no memory for this pair.
+    seed_bps: Option<u32>,
+    depth: u32,
+    aimd: Option<AimdController>,
+    ramp: Option<SlowStart>,
+    ramp_congested: bool,
+    measured_bps: Option<u32>,
+    target: u32,
+    /// The ramp's target AT ARMING. Recorded separately because the ramp
+    /// doubles every clean window, so reading `SlowStart::target_bps()` after
+    /// a run answers "where is the ramp now", not "where did it open" — the
+    /// value the field log prints as `open_bps=`.
+    ramp_open_bps: Option<u32>,
+}
+
+impl GovernorLaw {
+    pub fn new(nominal_floor_bps: u32, nominal_ceiling_bps: u32, slow_start: bool) -> Self {
+        Self {
+            slow_start,
+            floor_relief: true,
+            nominal_floor_bps,
+            nominal_ceiling_bps,
+            seed_bps: None,
+            depth: CONSTRAINED_DEPTH,
+            aimd: None,
+            ramp: None,
+            ramp_congested: false,
+            measured_bps: None,
+            target: nominal_ceiling_bps,
+            ramp_open_bps: None,
+        }
+    }
+
+    /// FR-59 P8 — this pair was remembered at `bps`.
+    pub fn with_seed(mut self, bps: u32) -> Self {
+        self.seed_bps = Some(bps);
+        self
+    }
+
+    /// FR-59 P1's floor relief, on by default in production.
+    pub fn with_floor_relief(mut self, on: bool) -> Self {
+        self.floor_relief = on;
+        self
+    }
+
+    /// The ramp's opening target, once armed — what the field log prints as
+    /// `FR-63 slow-start armed open_bps=…`.
+    pub fn ramp_open_bps(&self) -> Option<u32> {
+        self.ramp_open_bps
+    }
+}
+
+impl RateLaw for GovernorLaw {
+    fn label(&self) -> &'static str {
+        if self.slow_start {
+            "arm B (rate_slow_start=true)"
+        } else {
+            "arm A (rate_slow_start=false)"
+        }
+    }
+
+    fn on_frame(&mut self, occupied: u32, full: bool, now: Instant) -> u32 {
+        let mut ceiling = self.nominal_ceiling_bps;
+
+        // FR-63 — arm the ramp from THIS tick's resolved ceiling, seeded with
+        // the remembered rate and NOT with the nominal floor (governor.rs
+        // documents why: the flat floor is a fleet constant, and passing it
+        // opened at 1.5 M — no ramp at all).
+        if self.slow_start {
+            let seed = self.seed_bps.unwrap_or(0);
+            let armed = &mut self.ramp_open_bps;
+            let ramp = self.ramp.get_or_insert_with(|| {
+                let r = SlowStart::new(seed, ceiling);
+                *armed = Some(r.target_bps());
+                r
+            });
+            if !ramp.done() {
+                ceiling = ceiling.min(ramp.target_bps()).max(1);
+            }
+        }
+
+        // FR-59 P1 — the legibility floor descends toward a measured pipe.
+        let mut floor = match self.measured_bps {
+            Some(g) if self.floor_relief => {
+                super::goodput::measured_floor_bps(g, self.nominal_floor_bps, HARD_MIN_BPS)
+            }
+            _ => self.nominal_floor_bps,
+        };
+        // FR-63 — and the floor descends WITH the ramp, or `set_ceiling`
+        // raises the capped ceiling straight back to it. This coupling is
+        // what made 0.4.55 ship the ramp inert.
+        if let Some(ramp) = self.ramp.as_ref()
+            && !ramp.done()
+        {
+            floor = floor.min(ramp.target_bps().max(HARD_MIN_BPS));
+        }
+
+        let depth = self.depth;
+        let seed = self.seed_bps;
+        let ctrl = self.aimd.get_or_insert_with(|| {
+            let initial = seed.map_or(ceiling, |s| s.min(ceiling));
+            AimdController::new(initial, floor, ceiling, depth, now)
+        });
+        ctrl.set_floor(floor);
+        ctrl.set_ceiling(ceiling);
+        ctrl.observe(occupied, full, now);
+        if full {
+            self.ramp_congested = true;
+        }
+        self.target = ctrl.desired();
+        self.target
+    }
+
+    fn on_window(&mut self, w: &WindowStats, now: Instant) {
+        let _ = now;
+        // One verdict per window, taking the flag first — governor.rs:833.
+        let congested = std::mem::take(&mut self.ramp_congested);
+        if let Some(ramp) = self.ramp.as_mut()
+            && !ramp.done()
+        {
+            if congested {
+                ramp.on_congestion();
+            } else {
+                ramp.on_clean_window();
+            }
+        }
+        // The window's delivered rate is the evidence the floor relief uses.
+        // A window that delivered nothing is a stall, and a stall is NOT
+        // evidence about the pipe's rate — the FR-63 design's `fps == 0`
+        // rule, which the shipped governor does not yet have.
+        if w.frames_rx > 0 {
+            self.measured_bps = Some(w.rx_bps);
+        }
+    }
+
+    fn target_bps(&self) -> u32 {
+        self.target
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The harness
+// ---------------------------------------------------------------------------
+
+/// A complete cell: a link, content, and the session's nominal bounds.
+#[derive(Debug, Clone)]
+pub struct Scenario {
+    pub name: &'static str,
+    pub pipe: PipeSpec,
+    pub motion: Motion,
+    pub fps: u32,
+    pub duration: Duration,
+    pub seed: u64,
+    /// How many times a delta frame the opening keyframe is.
+    ///
+    /// ⚠️ **Sensitive, and uncapped on purpose.** The plan's figure is 25×,
+    /// which at a 2.55 Mbps opener is a 265 KB keyframe — ten seconds of a
+    /// 213 kbps pipe, and it dominates the first windows of any thin-pipe
+    /// run. A real CBR encoder can bound this (`max_frame_size`, runtime-
+    /// updatable in qsvenc — FR-31's lever), so a fixture that only holds at
+    /// 25× would be a statement about our keyframe budget rather than about
+    /// the rate law. Every conclusion drawn from these fixtures is therefore
+    /// re-run at a small factor too; see `ac0b_conclusion_survives_a_small_keyframe`.
+    pub idr_factor: u32,
+}
+
+/// One window of the run.
+#[derive(Debug, Clone, Copy)]
+pub struct Row {
+    pub t: Duration,
+    /// The target at the window's close.
+    pub target_bps: u32,
+    /// The HIGHEST target committed to at any point inside the window.
+    ///
+    /// ⚠️ Not the same as `target_bps`, and the difference is the whole
+    /// opener question: a session that opens at 2.55 Mbps and is cut to
+    /// 1.2 Mbps by the first decrease shows `target_bps` 1.2 M for window 0
+    /// while having actually committed to 2.55 M. Sampling only at the close
+    /// hides exactly the commitment FR-63's B-opener exists to remove.
+    pub peak_target_bps: u32,
+    pub pipe_bps: u32,
+    pub stats: WindowStats,
+    pub skips: u32,
+}
+
+/// The result of a run, plus the assertions the plan names.
+#[derive(Debug)]
+pub struct Trace {
+    pub law: &'static str,
+    pub scenario: &'static str,
+    pub rows: Vec<Row>,
+}
+
+impl Trace {
+    /// Σ over windows of the bits committed above `margin`× the pipe's real
+    /// rate. The plan's over-drive integral: the total volume of bits the law
+    /// promised that the link was never going to carry.
+    ///
+    /// Uses each window's PEAK target, so it is an upper bound on the
+    /// commitment rather than a window-close snapshot. Both arms are measured
+    /// the same way, so the comparison is fair; the absolute number should be
+    /// read as "bits promised", not "bits queued".
+    pub fn overdrive_bits(&self, margin_pct: u32) -> u64 {
+        self.rows
+            .iter()
+            .map(|r| {
+                let allowed = u64::from(r.pipe_bps) * u64::from(margin_pct) / 100;
+                u64::from(r.peak_target_bps).saturating_sub(allowed)
+            })
+            .sum()
+    }
+
+    /// The first window index from which the target stays within `pct` of the
+    /// pipe for the rest of the run — the settling time.
+    pub fn settled_window(&self, pct: u32) -> Option<usize> {
+        (0..self.rows.len()).find(|&i| {
+            self.rows[i..].iter().all(|r| {
+                let hi = u64::from(r.pipe_bps) * u64::from(100 + pct) / 100;
+                u64::from(r.target_bps) <= hi.max(1)
+            })
+        })
+    }
+
+    pub fn max_age_ms(&self) -> u32 {
+        self.rows
+            .iter()
+            .map(|r| r.stats.age_p95_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn peak_queue_ms(&self) -> i64 {
+        self.rows
+            .iter()
+            .map(|r| r.stats.queue_ms)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn total_skips(&self) -> u32 {
+        self.rows.iter().map(|r| r.skips).sum()
+    }
+
+    /// The highest target the law ever committed to, at any instant.
+    pub fn peak_target_bps(&self) -> u32 {
+        self.rows
+            .iter()
+            .map(|r| r.peak_target_bps)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Windows whose p95 age exceeded `ms` — "how long was it bad for".
+    pub fn windows_above_age(&self, ms: u32) -> usize {
+        self.rows.iter().filter(|r| r.stats.age_p95_ms > ms).count()
+    }
+
+    /// A compact table, printed by a failing assertion so the reason is in
+    /// the test output rather than behind a re-run.
+    pub fn render(&self) -> String {
+        let mut s = format!(
+            "\n{} — {}\n  t  target_bps   peak_bps  pipe_bps   rx_bps  age  p95  queue  rx  lost  skips\n",
+            self.scenario, self.law
+        );
+        for r in &self.rows {
+            s.push_str(&format!(
+                "{:>3}  {:>10}  {:>9}  {:>8}  {:>7}  {:>3}  {:>3}  {:>5}  {:>2}  {:>4}  {:>5}\n",
+                r.t.as_secs(),
+                r.target_bps,
+                r.peak_target_bps,
+                r.pipe_bps,
+                r.stats.rx_bps,
+                r.stats.age_ms,
+                r.stats.age_p95_ms,
+                r.stats.queue_ms,
+                r.stats.frames_rx,
+                r.stats.frames_lost,
+                r.skips,
+            ));
+        }
+        s
+    }
+}
+
+/// Run one scenario against one law.
+pub fn run(scenario: &Scenario, law: &mut dyn RateLaw) -> Trace {
+    let start = Instant::now();
+    let mut pipe = Pipe::new(scenario.pipe.clone(), CONSTRAINED_DEPTH, scenario.seed);
+    let mut enc = EncoderSim::new(scenario.fps, scenario.idr_factor);
+    let mut viewer = ViewerSim::default();
+    let mut rows = Vec::new();
+
+    let frame_interval = enc.frame_interval();
+    let mut next_frame = Duration::ZERO;
+    let mut next_window = WINDOW;
+    let mut skips_this_window = 0u32;
+    let mut peak_target = 0u32;
+    let mut t = Duration::ZERO;
+
+    while t <= scenario.duration {
+        // The capacity gate: the pump asks the law for a target every frame,
+        // including the frames it goes on to skip — that is the FR-35 fix
+        // ("the decrease runs DURING congestion").
+        if t >= next_frame {
+            let occupied = pipe.occupied();
+            let full = pipe.full();
+            let target = law.on_frame(occupied, full, start + t);
+            peak_target = peak_target.max(target);
+            if full {
+                skips_this_window += 1;
+            } else {
+                let bytes = enc.produce(target, &scenario.motion, t);
+                if !pipe.offer(bytes, t) {
+                    skips_this_window += 1;
+                }
+            }
+            next_frame += frame_interval;
+        }
+
+        let (arrived, lost) = pipe.advance(t);
+        for a in arrived {
+            viewer.on_arrival(a);
+        }
+        for _ in 0..lost {
+            viewer.on_loss();
+        }
+
+        if t >= next_window {
+            let stats = viewer.fold(WINDOW);
+            law.on_window(&stats, start + t);
+            rows.push(Row {
+                t,
+                target_bps: law.target_bps(),
+                peak_target_bps: peak_target.max(law.target_bps()),
+                pipe_bps: scenario.pipe.rate_at(t),
+                stats,
+                skips: skips_this_window,
+            });
+            skips_this_window = 0;
+            peak_target = 0;
+            next_window += WINDOW;
+        }
+
+        t += TICK;
+    }
+
+    Trace {
+        law: law.label(),
+        scenario: scenario.name,
+        rows,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/// The four scenarios the plan names, plus the FR-63 AC0b cell.
+///
+/// Each is calibrated from a RECORDED field trace, not invented: the numbers
+/// in the doc comments are the ones in `agent_logs` / the FR issue threads.
+pub mod fixtures {
+    use super::*;
+
+    /// **AC0b — CORPLAP-1 over a corporate VPN, 2026-09-02.**
+    ///
+    /// The cell the field could not reproduce on demand. Recorded: the session
+    /// opened at the nominal relay cap `2_550_000` into a path measured at
+    /// ~`213_180`, producing 444 ms of queue and a **1550 ms** paint, then six
+    /// windows collapsing 921k → 783k → 566k → 347k → 295k → 251k → 213k.
+    ///
+    /// This is the arm that must FAIL. An A/B whose baseline cannot fail is
+    /// not a baseline — the lesson AC0b was blocked on for a day.
+    pub fn corp_vpn_thin_pipe() -> Scenario {
+        Scenario {
+            name: "corp-vpn thin pipe (213 kbps, recorded 2026-09-02)",
+            pipe: PipeSpec {
+                rate_bps: 213_180,
+                rate_steps: Vec::new(),
+                // A relay that will hold roughly a second of this pipe.
+                buffer_bytes: 32_000,
+                rtt: Duration::from_millis(80),
+                loss_pct: 0,
+                stalls: Vec::new(),
+            },
+            motion: Motion::Steady,
+            fps: 30,
+            duration: Duration::from_secs(40),
+            seed: 0x0902,
+            idr_factor: 25,
+        }
+    }
+
+    /// **Airport hotspot** — goodput wandering 65–395 kbps.
+    pub fn airport_hotspot() -> Scenario {
+        Scenario {
+            name: "airport hotspot (65–395 kbps, wandering)",
+            pipe: PipeSpec {
+                rate_bps: 395_000,
+                rate_steps: vec![
+                    (Duration::from_secs(8), 120_000),
+                    (Duration::from_secs(20), 65_000),
+                    (Duration::from_secs(34), 240_000),
+                ],
+                buffer_bytes: 48_000,
+                rtt: Duration::from_millis(120),
+                loss_pct: 1,
+                stalls: Vec::new(),
+            },
+            motion: Motion::Steady,
+            fps: 30,
+            duration: Duration::from_secs(50),
+            seed: 0xA152,
+            idr_factor: 25,
+        }
+    }
+
+    /// **CORPLAP-1 DERP** — 20–400 kbps with 1–4 s stalls.
+    pub fn derp_with_stalls() -> Scenario {
+        Scenario {
+            name: "DERP relay (20–400 kbps, 1–4 s stalls)",
+            pipe: PipeSpec {
+                rate_bps: 400_000,
+                rate_steps: vec![
+                    (Duration::from_secs(15), 120_000),
+                    (Duration::from_secs(30), 400_000),
+                ],
+                buffer_bytes: 40_000,
+                rtt: Duration::from_millis(150),
+                loss_pct: 0,
+                stalls: vec![
+                    Stall {
+                        at: Duration::from_secs(10),
+                        len: Duration::from_secs(2),
+                    },
+                    Stall {
+                        at: Duration::from_secs(25),
+                        len: Duration::from_secs(4),
+                    },
+                ],
+            },
+            motion: Motion::Steady,
+            fps: 30,
+            duration: Duration::from_secs(50),
+            seed: 0xDE12,
+            idr_factor: 25,
+        }
+    }
+
+    /// **LAN Wi-Fi burst** — a fast pipe with motion bursts.
+    pub fn lan_wifi_burst() -> Scenario {
+        Scenario {
+            name: "LAN Wi-Fi (5 Mbps, motion bursts)",
+            pipe: PipeSpec {
+                rate_bps: 5_000_000,
+                rate_steps: Vec::new(),
+                buffer_bytes: 300_000,
+                rtt: Duration::from_millis(8),
+                loss_pct: 0,
+                stalls: Vec::new(),
+            },
+            motion: Motion::Bursts {
+                period: Duration::from_secs(6),
+                len: Duration::from_millis(700),
+                factor: 5,
+            },
+            fps: 30,
+            duration: Duration::from_secs(40),
+            seed: 0x1A40,
+            idr_factor: 25,
+        }
+    }
+
+    /// **Fast pair misremembered slow** — a 20 Mbps pipe opened at a
+    /// remembered 200 kbps. The ramp must not leave a fast pair crawling.
+    pub fn fast_pair_misremembered() -> Scenario {
+        Scenario {
+            name: "fast pair misremembered slow (20 Mbps, seed 200 kbps)",
+            pipe: PipeSpec {
+                rate_bps: 20_000_000,
+                rate_steps: Vec::new(),
+                buffer_bytes: 1_000_000,
+                rtt: Duration::from_millis(6),
+                loss_pct: 0,
+                stalls: Vec::new(),
+            },
+            motion: Motion::Steady,
+            fps: 30,
+            duration: Duration::from_secs(40),
+            seed: 0xFA57,
+            idr_factor: 25,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+
+    /// The relay cap a constrained session opens against, and the flat
+    /// `area_min_bitrate_bps` floor under it. Both are the field constants
+    /// from the 2026-09-02/03 CORPLAP-1 cell.
+    const RELAY_CEILING_BPS: u32 = 2_550_000;
+    const FLAT_FLOOR_BPS: u32 = 1_500_000;
+
+    fn arm_a(floor: u32, ceiling: u32) -> GovernorLaw {
+        GovernorLaw::new(floor, ceiling, false)
+    }
+
+    fn arm_b(floor: u32, ceiling: u32) -> GovernorLaw {
+        GovernorLaw::new(floor, ceiling, true)
+    }
+
+    // -- the simulator itself -------------------------------------------------
+    //
+    // A fixture is only evidence if the harness under it is right. These test
+    // the MODEL, the way the `harness` integration test asserts `TestApp`'s
+    // own teardown rather than any product behaviour.
+
+    #[test]
+    fn pipe_delivers_at_its_rate_and_no_faster() {
+        let mut pipe = Pipe::new(PipeSpec::steady(800_000, 0, 1_000_000), 8, 1);
+        let mut delivered = 0u64;
+        let mut t = Duration::ZERO;
+        // Offer far more than the link can carry, then drain for a second.
+        while t < Duration::from_secs(1) {
+            let _ = pipe.offer(2_000, t);
+            for a in pipe.advance(t).0 {
+                delivered += u64::from(a.bytes);
+            }
+            t += TICK;
+        }
+        let bits = delivered * 8;
+        assert!(
+            (700_000..=800_000).contains(&bits),
+            "a 800 kbps pipe delivered {bits} bits in a second"
+        );
+    }
+
+    #[test]
+    fn an_idle_pipe_does_not_bank_capacity() {
+        // The "a fast sample is not evidence" error in model form: if the
+        // bucket accrued while nothing was queued, the first frame after a
+        // quiet stretch would arrive instantly and every viewer-measured rate
+        // in every fixture would be fiction.
+        let mut pipe = Pipe::new(PipeSpec::steady(100_000, 0, 1_000_000), 8, 1);
+        let mut t = Duration::ZERO;
+        while t < Duration::from_secs(5) {
+            let _ = pipe.advance(t);
+            t += TICK;
+        }
+        // 5 s of idling at 100 kbps would have banked 500 kbit. A 12 500-byte
+        // frame is 100 kbit and must take ~1 s, not arrive at once.
+        assert!(pipe.offer(12_500, t));
+        let mut transit = None;
+        let deadline = t + Duration::from_secs(3);
+        while t < deadline {
+            if let Some(a) = pipe.advance(t).0.first() {
+                transit = Some(a.at.saturating_sub(a.produced));
+                break;
+            }
+            t += TICK;
+        }
+        let transit = transit.expect("the frame must arrive within 3 s");
+        assert!(
+            transit >= Duration::from_millis(900),
+            "100 kbit over a 100 kbps pipe took {transit:?} — the bucket banked while idle"
+        );
+    }
+
+    #[test]
+    fn a_stall_carries_nothing_and_then_recovers() {
+        let spec = PipeSpec {
+            stalls: vec![Stall {
+                at: Duration::from_secs(1),
+                len: Duration::from_secs(2),
+            }],
+            ..PipeSpec::steady(400_000, 0, 1_000_000)
+        };
+        let mut pipe = Pipe::new(spec, 64, 1);
+        let mut in_stall = 0u64;
+        let mut after = 0u64;
+        let mut t = Duration::ZERO;
+        while t < Duration::from_secs(5) {
+            let _ = pipe.offer(1_000, t);
+            for a in pipe.advance(t).0 {
+                if t >= Duration::from_millis(1_200) && t < Duration::from_secs(3) {
+                    in_stall += u64::from(a.bytes);
+                } else if t >= Duration::from_secs(3) {
+                    after += u64::from(a.bytes);
+                }
+            }
+            t += TICK;
+        }
+        assert_eq!(in_stall, 0, "the link carried {in_stall} bytes mid-stall");
+        assert!(after > 0, "the link never recovered after the stall");
+    }
+
+    #[test]
+    fn viewer_queue_ms_is_flat_when_the_pipe_keeps_up() {
+        // A link with ample headroom must show no transit-queue growth. This
+        // is the signal every congestion decision keys off, so a model that
+        // reported drift on a healthy link would make every fixture lie.
+        let sc = Scenario {
+            name: "headroom",
+            pipe: PipeSpec::steady(8_000_000, 10, 500_000),
+            motion: Motion::Steady,
+            fps: 30,
+            duration: Duration::from_secs(10),
+            seed: 7,
+            idr_factor: 25,
+        };
+        let mut law = arm_a(FLAT_FLOOR_BPS, 2_000_000);
+        let tr = run(&sc, &mut law);
+        assert!(
+            tr.peak_queue_ms() < 40,
+            "a pipe with 4x headroom grew a queue{}",
+            tr.render()
+        );
+        // ⚠️ Window 0 is EXCLUDED, and the exclusion is the finding rather
+        // than a convenience: the opening keyframe is 25x a delta frame, so
+        // at 2 Mbps it is ~208 KB and takes ~208 ms to cross even an 8 Mbps
+        // link. The model reproduced a real effect — an opening IDR paints
+        // late on ANY link, which is what FR-31's keyframe budget is about —
+        // and it is not what this test is asking. Steady state is.
+        let steady = &tr.rows[1..];
+        let worst = steady.iter().map(|r| r.stats.age_p95_ms).max().unwrap_or(0);
+        assert!(
+            worst < 120,
+            "a pipe with 4x headroom painted late in steady state ({worst} ms){}",
+            tr.render()
+        );
+    }
+
+    // -- AC0b: the opener ------------------------------------------------------
+
+    #[test]
+    fn ac0b_the_baseline_arm_can_fail() {
+        // 🔑 The property the FIELD could not produce, and the reason AC0b sat
+        // open: an A/B whose baseline cannot fail proves nothing. Arm A opens
+        // at the relay cap — 12x a pipe that carries 213 kbps.
+        let sc = corp_vpn_thin_pipe();
+        let mut law = arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let tr = run(&sc, &mut law);
+
+        assert!(
+            tr.peak_target_bps() >= 2_000_000,
+            "arm A did not over-commit — the cell cannot fail{}",
+            tr.render()
+        );
+        assert!(
+            tr.max_age_ms() >= 1_000,
+            "arm A did not produce a multi-second paint{}",
+            tr.render()
+        );
+    }
+
+    #[test]
+    fn ac0b_slow_start_removes_the_overdrive() {
+        let sc = corp_vpn_thin_pipe();
+        let mut a = arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let mut b = arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let ta = run(&sc, &mut a);
+        let tb = run(&sc, &mut b);
+
+        // The ramp opens where `slow_start::OPEN_BPS` says, not at the cap.
+        assert_eq!(
+            b.ramp_open_bps(),
+            Some(super::super::slow_start::OPEN_BPS),
+            "the ramp did not arm at OPEN_BPS"
+        );
+
+        let od_a = ta.overdrive_bits(110);
+        let od_b = tb.overdrive_bits(110);
+        assert!(
+            od_b * 4 < od_a,
+            "slow-start did not materially cut the over-drive: A={od_a} B={od_b}{}{}",
+            ta.render(),
+            tb.render()
+        );
+        assert!(
+            tb.max_age_ms() * 3 < ta.max_age_ms(),
+            "slow-start did not cut the peak paint age: A={} B={}{}{}",
+            ta.max_age_ms(),
+            tb.max_age_ms(),
+            ta.render(),
+            tb.render()
+        );
+    }
+
+    /// Prints the AC0b A/B table. `#[ignore]`d because it asserts nothing —
+    /// it exists so the numbers quoted on #1243 can be regenerated on demand
+    /// instead of being retyped from a scrollback.
+    ///
+    /// `cargo test -p roomlerd --lib ac0b_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reporting aid; run with --ignored --nocapture"]
+    fn ac0b_report() {
+        let sc = corp_vpn_thin_pipe();
+        let mut a = arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let mut b = arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let ta = run(&sc, &mut a);
+        let tb = run(&sc, &mut b);
+        println!("{}", ta.render());
+        println!("{}", tb.render());
+        for (n, t) in [("A", &ta), ("B", &tb)] {
+            println!(
+                "arm {n}: peak_target={} overdrive_bits(110)={} max_p95_age={}ms \
+                 peak_queue={}ms skips={} windows_over_500ms={} settled(25%)={:?}",
+                t.peak_target_bps(),
+                t.overdrive_bits(110),
+                t.max_age_ms(),
+                t.peak_queue_ms(),
+                t.total_skips(),
+                t.windows_above_age(500),
+                t.settled_window(25),
+            );
+        }
+    }
+
+    #[test]
+    fn ac0b_conclusion_survives_a_small_keyframe() {
+        // 🔑 Sensitivity check, and the reason it exists: at the plan's 25×
+        // the opening keyframe of a 2.55 Mbps arm-A session is ~265 KB —
+        // ten seconds of a 213 kbps pipe — so arm A's first ten windows
+        // deliver NOTHING and the A/B partly measures who commits to a
+        // smaller opening IDR. That is a real effect (it is what FR-31's
+        // keyframe budget is about) but it is not the rate law, and a
+        // conclusion that only holds at one keyframe size would be an
+        // artefact. Re-run at 3×: the ordering must survive.
+        let mut sc = corp_vpn_thin_pipe();
+        sc.idr_factor = 3;
+
+        let mut a = arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let mut b = arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let ta = run(&sc, &mut a);
+        let tb = run(&sc, &mut b);
+
+        assert!(
+            tb.overdrive_bits(110) < ta.overdrive_bits(110),
+            "with a small keyframe the ramp no longer cuts the over-drive: A={} B={}{}{}",
+            ta.overdrive_bits(110),
+            tb.overdrive_bits(110),
+            ta.render(),
+            tb.render()
+        );
+        assert!(
+            tb.max_age_ms() < ta.max_age_ms(),
+            "with a small keyframe the ramp no longer cuts the peak paint: A={} B={}{}{}",
+            ta.max_age_ms(),
+            tb.max_age_ms(),
+            ta.render(),
+            tb.render()
+        );
+    }
+
+    // -- the four scenario fixtures -------------------------------------------
+
+    #[test]
+    fn airport_hotspot_tracks_a_wandering_pipe() {
+        let sc = airport_hotspot();
+        let mut law = arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let tr = run(&sc, &mut law);
+        let last = tr.rows.last().expect("windows");
+        assert!(
+            u64::from(last.target_bps) <= u64::from(last.pipe_bps) * 3,
+            "the target never came down to the pipe{}",
+            tr.render()
+        );
+    }
+
+    #[test]
+    fn derp_stalls_do_not_drive_the_target_up() {
+        let sc = derp_with_stalls();
+        let mut law = arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let tr = run(&sc, &mut law);
+        // A window that delivered nothing is a stall, and a stall is not
+        // evidence that the pipe got faster.
+        let mut stall_windows = 0;
+        for w in tr.rows.windows(2) {
+            let (prev, cur) = (w[0], w[1]);
+            if cur.stats.frames_rx == 0 {
+                stall_windows += 1;
+                assert!(
+                    cur.target_bps <= prev.target_bps,
+                    "the target rose during a stall at t={:?}{}",
+                    cur.t,
+                    tr.render()
+                );
+            }
+        }
+        // ⚠️ Without this the test is VACUOUS: the assertion above lives
+        // inside a conditional, so a fixture whose stalls stopped producing
+        // empty windows would pass while checking nothing at all. The
+        // scenario schedules a 2 s and a 4 s outage; at least one window must
+        // have delivered nothing.
+        assert!(
+            stall_windows >= 2,
+            "the fixture produced only {stall_windows} empty windows — the \
+             assertion never ran on a real stall{}",
+            tr.render()
+        );
+    }
+
+    #[test]
+    fn lan_burst_does_not_collapse_a_fast_pipe() {
+        let sc = lan_wifi_burst();
+        let mut law = arm_b(FLAT_FLOOR_BPS, 5_000_000);
+        let tr = run(&sc, &mut law);
+        assert!(
+            tr.max_age_ms() < 600,
+            "a 5 Mbps LAN pair painted late under motion bursts{}",
+            tr.render()
+        );
+        // ⚠️ Same vacuity trap one level up: this scenario is only a BURST
+        // test if the bursts actually cost something. A 5× motion burst on a
+        // 5 Mbps link must move the paint age off its floor somewhere, or the
+        // fixture is testing a steady link with a burst label.
+        let quietest = tr
+            .rows
+            .iter()
+            .map(|r| r.stats.age_p95_ms)
+            .min()
+            .unwrap_or(0);
+        assert!(
+            tr.max_age_ms() > quietest + 5,
+            "the motion bursts had no measurable effect (p95 {quietest}..{}) — \
+             this fixture is not exercising what it claims{}",
+            tr.max_age_ms(),
+            tr.render()
+        );
+    }
+
+    #[test]
+    fn fast_pair_recovers_from_a_slow_seed() {
+        // FR-59 P8's remembered rate is a PRIOR, not a pin: a pair remembered
+        // at 200 kbps that is now on 20 Mbps must climb away from the memory.
+        let sc = fast_pair_misremembered();
+        let mut law = GovernorLaw::new(FLAT_FLOOR_BPS, 20_000_000, true).with_seed(200_000);
+        let tr = run(&sc, &mut law);
+        let last = tr.rows.last().expect("windows");
+        assert!(
+            last.target_bps > 400_000,
+            "the session never climbed away from a stale 200 kbps memory{}",
+            tr.render()
+        );
+    }
+}
