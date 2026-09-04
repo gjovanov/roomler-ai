@@ -118,6 +118,16 @@ pub fn index_plan_json(multi_block: bool) -> serde_json::Value {
         .expect("an index plan is plain data")
 }
 
+/// The full set of index sets a host applies — the core plan plus every
+/// mounted module's — as JSON, **sorted by collection** so the snapshot does
+/// not depend on which crate a set happens to live in. A module PR moves
+/// sets between crates; it must not change them, and this is what checks
+/// that.
+pub fn index_sets_json(mut sets: Vec<roomler_ai_db::indexes::IndexSet>) -> serde_json::Value {
+    sets.sort_by(|a, b| a.collection.cmp(b.collection));
+    serde_json::to_value(sets).expect("index sets are plain data")
+}
+
 fn between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let i = s.find(start)? + start.len();
     let j = s[i..].find(end)? + i;
