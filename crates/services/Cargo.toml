@@ -35,7 +35,6 @@ base64.workspace = true
 futures.workspace = true
 validator.workspace = true
 async-trait.workspace = true
-mediasoup.workspace = true
 urlencoding.workspace = true
 nanoid.workspace = true
 hmac.workspace = true

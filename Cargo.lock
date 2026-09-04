@@ -7965,7 +7965,6 @@ dependencies = [
  "infer",
  "ipnet",
  "jsonwebtoken",
- "mediasoup",
  "mongodb",
  "nanoid",
  "rand 0.9.4",
@@ -7973,6 +7972,7 @@ dependencies = [
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-mod-chat",
+ "roomler-ai-mod-conference",
  "roomler-ai-mod-saas",
  "roomler-ai-remote-control",
  "roomler-ai-services",
@@ -8040,6 +8040,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomler-ai-mod-conference"
+version = "0.4.62"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bson",
+ "dashmap",
+ "futures",
+ "hmac 0.12.1",
+ "mediasoup",
+ "roomler-ai-config",
+ "roomler-ai-db",
+ "roomler-ai-mod-chat",
+ "roomler-ai-services",
+ "roomler-core",
+ "serde",
+ "serde_json",
+ "sha1 0.10.6",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "roomler-ai-mod-saas"
 version = "0.4.63"
 dependencies = [
@@ -8098,7 +8123,6 @@ dependencies = [
  "hmac 0.12.1",
  "jsonwebtoken",
  "lettre",
- "mediasoup",
  "mongodb",
  "nanoid",
  "password-hash 0.5.0",
@@ -8141,6 +8165,7 @@ dependencies = [
  "roomler-ai-api",
  "roomler-ai-config",
  "roomler-ai-db",
+ "roomler-ai-mod-conference",
  "roomler-ai-remote-control",
  "roomler-ai-services",
  "roomler-core",
