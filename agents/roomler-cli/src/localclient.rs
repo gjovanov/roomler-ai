@@ -1407,8 +1407,25 @@ fn print_status(s: &NodeStatus) {
     if let Some((evicted, spared, waves, revalidations)) = s.route_guard
         && (evicted > 0 || spared > 0 || waves > 0 || revalidations > 0)
     {
+        // #1282 — attribute the waves when the daemon reports it. `tick` is the
+        // blind 2 s fallback (i.e. no live route-change subscription); `event`
+        // at its 3 s floor means something is generating change notifications
+        // continuously. `other` is any wave neither call site claimed, which
+        // would be a third caller nobody attributed — shown rather than hidden.
+        let arms = match s.route_wave_arms {
+            Some((tick, event)) => {
+                let other = waves.saturating_sub(tick + event);
+                let tail = if other > 0 {
+                    format!(" other={other}")
+                } else {
+                    String::new()
+                };
+                format!(" [tick={tick} event={event}{tail}]")
+            }
+            None => String::new(),
+        };
         println!(
-            "  route guard evicted={evicted} spared={spared} waves={waves} revalidations={revalidations} \n             (cumulative — DIFF two readings, never judge the absolute)"
+            "  route guard evicted={evicted} spared={spared} waves={waves}{arms} revalidations={revalidations} \n             (cumulative — DIFF two readings, never judge the absolute)"
         );
     }
 
