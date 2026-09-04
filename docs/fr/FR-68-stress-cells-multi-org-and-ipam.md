@@ -155,9 +155,9 @@ the next reader does not assume back-off exists.
 - [ ] **AC5** `ensure_indexes(db, false)` after growth fails loudly.
 - [~] **AC6** (half — counters live and read on 3 hosts; the `spared` half needs a multi-org host) `ROUTE_EVICTIONS` / `ROUTE_WAVES` / `FORCED_REVALIDATIONS` are live and were
       read on two real multi-org hosts, **as a diff of two readings**.
-- [ ] **AC7** With C2(a)+C2(b), a two-org Windows guest shows **zero sibling evictions**
+- [x] **AC7** With C2(a)+C2(b), a two-org Windows guest shows **zero sibling evictions**
       over a sustained window.
-- [ ] **AC8** The negative control (`OVERLAY_SIBLING_EXEMPT=0`) **reproduces** the war —
+- [x] **AC8** The negative control (`OVERLAY_SIBLING_EXEMPT=0`) **reproduces** the war —
       i.e. AC7 is not passing vacuously.
 - [ ] **AC9** A nested-block pair (legacy `/10` primary + carved `/22` secondary) emits the
       overlap WARN.
@@ -331,6 +331,53 @@ The intended steady state is a 30 s heartbeat (~2/min); 20/min is *exactly* the
 `evicted=0` and `revalidations=0` throughout, so it is neither an eviction war
 nor a cause of carrier churn — apparently pure wasted work, which is why nothing
 ever surfaced it. No log line exists for it either. Filed as **#1282**.
+
+### 2026-09-04 — the multi-org cell trio, all three green. **AC7 + AC8 met.**
+
+Org B bootstrapped (`6a99ff01565641d3a027609e`; created on `free`, flipped to
+`business` and read back). Three cells on zeus, each a throwaway Win11 guest
+enrolled into TWO orgs, 120 s guard window:
+
+| cell | evicted | spared | waves | establishes |
+|---|---|---|---|---|
+| `multiorg` | **+0** | +0 | +80 | healthy — narrowing keeps the adapters apart |
+| `multiorg-narrow` | +0 | **+80** | +80 | the exemption IS load-bearing: one spare per wave |
+| `multiorg-war` | **+67** | +0 | +80 | the pre-#1246 war reproduces |
+
+Each run verified two adapters (`roomler` + `roomler-6a99ff0`) and dumped
+`org ls` and every `fd72:*` route, so the numbers are anchored to an observed
+topology rather than a bare PASS.
+
+🔑 The route table is the mechanism, visible per mode:
+- healthy → `…:1400/118` and `…:1c00/118`, **no `/96` row at all**
+- `narrow` → **two** `::/96` rows, one per adapter, both surviving
+- `narrow+exempt` → **one** `::/96` row — they delete each other every wave
+
+### ⚠️⚠️ Three corrections this trio forced, all to THIS cell
+
+1. **The first `multiorg` PASS was vacuous and was reported as a result.**
+   `enroll` appends every org entry with `overlay_mode: Off`, hardcoded
+   (`agent-core/src/enrollment.rs`, with a test asserting it); `--overlay` sets
+   the PRIMARY's `overlay_enabled` and cannot switch a secondary on. The
+   sequence needs `roomlerd org overlay <label> tun` — which this FR's own plan
+   specified and the driver never called. The guest came up with ONE adapter,
+   so `evicted=0 spared=0` was a structural zero with no sibling to contend
+   with. Caught only because the `narrow` control refused to reproduce.
+   **The negative control found the bug in the positive cell.**
+
+2. **`spared > 0` was the wrong assertion for a healthy host** (recorded
+   2026-09-03): narrowing makes the prefixes disjoint, so the exemption is
+   never consulted and `spared+0` is correct. Asserting otherwise would have
+   failed every healthy host and passed only where the outer defence was broken.
+
+3. **The `/96` receipt is mode-dependent.** Demanding two rows reported
+   `multiorg-war`'s row collapse — *the war itself* — as "kill switch not
+   applied". A guard that mistakes the phenomenon for a misconfiguration is
+   worse than none, because it stops you looking.
+
+🔑 And the env channel was never the problem. "The kill switch never reached the
+daemon" was my hypothesis for two rounds; the route-table receipt disproved it
+(`/96 asserted by 2 adapters`) before any change was spent on it.
 
 ### ⚠️ Method note — a cumulative counter that DECREASES means a restart
 
