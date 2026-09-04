@@ -1,8 +1,11 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 in progress (claim + contract + baseline) · **Owner**: server / architecture ·
+**Status**: P0 shipped (claim, rename, contract + baseline) · P1 waits for a trigger ·
+**Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
-**PRs**: P0 claim (this spec) · P0 rename · P0 contract + baseline — filled in as they merge
+**PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
+[#1311](https://github.com/gjovanov/roomler-ai/pull/1311) · P0 contract + baseline
+[#1312](https://github.com/gjovanov/roomler-ai/pull/1312)
 
 ## Goal
 
@@ -442,7 +445,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 
 | Phase | Delivers | Gate | Kill switch | Complexity | Days |
 |---|---|---|---|---|---:|
-| **P0** | FR claimed; `agent-core` → `roomler-node-core`; `crates/core` (`roomler-core`) contract types; composition baseline + test | CI green; baseline committed and reproducible | none needed (docs + a rename + an unused crate) | low | 2–3 |
+| **P0** ✅ | FR claimed; `agent-core` → `roomler-node-core`; `crates/core` (`roomler-core`) contract types; composition baseline + test — #1309, #1311, #1312 | CI green; baseline committed and reproducible (recorded by the lane itself, see the field log) | none needed (docs + a rename + an unused crate) | low | 2–3 |
 | **P1** | `Core` extraction, state split, `[modules]` settings, `GET /api/capabilities` | baseline identical; integration lane; prod roll | revert | high | 5–8 |
 | **P2** | `saas` module | same | `[modules] saas = false` | low | 1–2 |
 | **P3** | `chat` module | same + tenant-scoping tests | `chat = false` | medium | 2–3 |
@@ -508,8 +511,32 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 
 ## Field-verification log
 
-### 2026-09-04 — P0 claim
+### 2026-09-04 — P0: claim, rename, contract + baseline
 
-- FR-69 claimed; #1307 opened; the plan's five open questions answered by the operator (see
-  above). Baseline numbers (route count, index-spec count, wire-name count at `08ceb7ba`) are
-  recorded here by the contract + baseline PR.
+- FR-69 claimed (#1309, squash `2b7c3d3d`); #1307 opened; the plan's five open questions
+  answered by the operator (see above).
+- `crates/agent-core` renamed `roomler-core` → `roomler-node-core` (#1311, squash `ae1f5d2c`).
+  Build-graph identity only. `cargo check -p roomler-node-core -p roomlerd -p roomler-desktop`
+  clean; the retired-name audit `--strict` clean; the one CI red was rustfmt's import order
+  (`roomler_localapi` now sorts before `roomler_node_core`), fixed in the same PR.
+- `crates/core` (`roomler-core`), `index_plan`, the composition test and the baseline (#1312).
+  **Baseline recorded from the integration lane itself** (run 33849884647, dispatched with
+  `filter=composition_matches_baseline` on the branch at `c4da281c`), not from a dev box: this
+  Windows box has no Linux server toolchain, and the lane is the environment the gate runs in.
+  The test printed the snapshot between markers because no baseline existed; the file is those
+  lines verbatim.
+
+  | measure | value |
+  |---|---:|
+  | routes served by the full profile (path × allowed methods) | **183** |
+  | index sets, `multi_block = false` | **62** |
+  | index sets, `multi_block = true` | **62** (same sets; `overlay_blocks` carries the `network_id_1` drop as a pre-op instead of the partial-unique guard) |
+  | wire names in `signaling.rs` (`rename = "…"`) | **96** |
+  | baseline file | `crates/tests/fixtures/composition.baseline.json`, 3 646 lines |
+
+  ⚠️ These are the numbers every module PR from P1 on must reproduce byte-for-byte, or explain
+  in its commit message when it re-records.
+- Unit tests on the contract crate: 14 (the DAG is acyclic and topologically ordered, the hook
+  order covers every module once, the axum 0.8.9 Debug parser reads a real router with nested
+  and `any` routes, the index plan differs by `multi_block` exactly at `overlay_blocks`).
+- What the P0 baseline does NOT yet prove: nothing has moved. AC1 becomes meaningful with P1.

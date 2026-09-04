@@ -8105,6 +8105,7 @@ dependencies = [
  "roomler-ai-db",
  "roomler-ai-remote-control",
  "roomler-ai-services",
+ "roomler-core",
  "roomlerd",
  "serde",
  "serde_json",
@@ -8204,6 +8205,22 @@ dependencies = [
  "embed-resource",
  "libc",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "roomler-core"
+version = "0.4.61"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bson",
+ "roomler-ai-config",
+ "roomler-ai-db",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
