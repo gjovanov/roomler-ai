@@ -524,6 +524,19 @@ pub struct FfmpegEncoder {
     /// and IDRs emitted — so the before/after of the in-place flag is one grep.
     rate_moves: u32,
     rebuilds: u32,
+    /// FR-65 — background-swap ADOPTIONS.
+    ///
+    /// 🔑 Separate from `rebuilds` deliberately: P3's whole point is that a swap
+    /// is stall-free, so folding the two would lose the distinction that
+    /// matters. It exists because `adopt_rebuilt` incremented **neither**
+    /// counter, and on a DIRECT QSV session every rate move goes through that
+    /// path — so the heartbeat read `rate_moves=0 rebuilds=0` while the encoder
+    /// was being rebuilt twice within five seconds. Field 2026-09-04,
+    /// CORPLAP-1: two `background-rebuilt encoder adopted` lines at 11:03:03
+    /// and 11:03:08 against a heartbeat reporting no rate activity at all.
+    /// A counter that reads zero through the event it counts is worse than no
+    /// counter: it cost this investigation a wrong conclusion.
+    swaps: u32,
     idr_count: u64,
 }
 
@@ -592,6 +605,9 @@ pub(crate) fn reconfig_forces_idr_for(mode: RateReconfig, assume_nvenc_idr: bool
 pub struct RateStats {
     pub rate_moves: u32,
     pub rebuilds: u32,
+    /// Background-swap adoptions — see `FfmpegEncoder::swaps`. A rate move on a
+    /// direct QSV session lands here and in NEITHER of the two above.
+    pub swaps: u32,
     pub idr_count: u64,
 }
 
@@ -902,6 +918,7 @@ impl FfmpegEncoder {
             constrained: false,
             rate_moves: 0,
             rebuilds: 0,
+            swaps: 0,
             idr_count: 0,
         })
     }
@@ -1081,6 +1098,7 @@ impl FfmpegEncoder {
                         constrained,
                         rate_moves: 0,
                         rebuilds: 0,
+                        swaps: 0,
                         idr_count: 0,
                     });
                 }
@@ -1600,6 +1618,7 @@ impl FfmpegEncoder {
         RateStats {
             rate_moves: self.rate_moves,
             rebuilds: self.rebuilds,
+            swaps: self.swaps,
             idr_count: self.idr_count,
         }
     }
@@ -1674,6 +1693,12 @@ impl FfmpegEncoder {
         self.maxrate_bps = spec.maxrate_bps;
         self.frame_count = 0;
         self.force_keyframe = true;
+        // FR-65 — count it. This is a real rate move, and before this line the
+        // heartbeat reported none: `rate_moves` counts only the in-place write
+        // and `rebuilds` only the synchronous path, so a direct QSV session
+        // (where every move is a background swap) read zero on both while
+        // rebuilding repeatedly.
+        self.swaps = self.swaps.saturating_add(1);
         true
     }
 

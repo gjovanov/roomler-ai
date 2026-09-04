@@ -7034,6 +7034,11 @@ async fn media_pump_ffmpeg_dc(
                 inplace_rate = enc.supports_dynamic_bitrate(),
                 rate_moves = rate_stats.rate_moves,
                 rebuilds = rate_stats.rebuilds,
+                // FR-65 — read this ALONGSIDE the two above, never instead of
+                // them: on a direct QSV session a rate move is a background
+                // swap and lands ONLY here, so the pair reading zero used to
+                // look like "the encoder never moved" when it had moved twice.
+                swaps = rate_stats.swaps,
                 idr_count = rate_stats.idr_count,
                 // FR-62 A2 — whether the pump is still rationing this encoder's
                 // constrained increases. false ⇒ moves land live (NVENC,
