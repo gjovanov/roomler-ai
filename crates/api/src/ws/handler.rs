@@ -648,7 +648,7 @@ async fn handle_socket(
     };
     if let Some(rid) = db_rid
         && let Err(e) =
-            crate::routes::room::finalize_call_leave_db(&state, rid, user_id, Some(&connection_id))
+            crate::routes::call::finalize_call_leave_db(&state, rid, user_id, Some(&connection_id))
                 .await
     {
         warn!(?user_id, %connection_id, room = %rid, %e, "disconnect call-leave DB cleanup failed");
@@ -727,29 +727,6 @@ async fn handle_client_message(
             let pong = serde_json::json!({ "type": "pong" });
             super::dispatcher::send_to_user(&state.ws_storage, user_id, &pong).await;
         }
-        "typing:start" | "typing:stop" => {
-            if let Some(room_id_str) = data.and_then(|d| d.get("room_id")).and_then(|c| c.as_str())
-                && let Ok(rid) = ObjectId::parse_str(room_id_str)
-                && let Ok(member_ids) = state.rooms.find_member_user_ids(rid).await
-            {
-                let recipients: Vec<ObjectId> =
-                    member_ids.into_iter().filter(|id| id != user_id).collect();
-                let event = serde_json::json!({
-                    "type": msg_type,
-                    "data": {
-                        "room_id": room_id_str,
-                        "user_id": user_id.to_hex(),
-                    }
-                });
-                super::dispatcher::broadcast_with_redis(
-                    &state.ws_storage,
-                    &state.redis_pubsub,
-                    &recipients,
-                    &event,
-                )
-                .await;
-            }
-        }
         "presence:update" => {
             if let Some(presence) = data
                 .and_then(|d| d.get("presence"))
@@ -778,7 +755,21 @@ async fn handle_client_message(
             route_and_dispatch_media(state, user_id, connection_id, t, data).await;
         }
         _ => {
-            debug!(?user_id, msg_type, "Unknown WS message type");
+            // FR-69 — a module's namespace (`typing:*` is chat's). The host
+            // knows the socket; the module knows the message.
+            if let Some(handler) = state.modules.ws_handler(roomler_core::Role::User, msg_type) {
+                let ctx = roomler_core::WsCtx {
+                    connection_id: connection_id.to_string(),
+                    role: roomler_core::Role::User,
+                    principal: *user_id,
+                    tenant_id: dialed_tid.and_then(|t| ObjectId::parse_str(t).ok()),
+                };
+                if let Err(e) = handler.handle(&ctx, parsed.clone()).await {
+                    debug!(?user_id, msg_type, %e, "module WS handler failed");
+                }
+            } else {
+                debug!(?user_id, msg_type, "Unknown WS message type");
+            }
         }
     }
 }

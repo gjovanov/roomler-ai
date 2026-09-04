@@ -7972,6 +7972,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roomler-ai-config",
  "roomler-ai-db",
+ "roomler-ai-mod-chat",
  "roomler-ai-mod-saas",
  "roomler-ai-remote-control",
  "roomler-ai-services",
@@ -8018,8 +8019,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomler-ai-mod-chat"
+version = "0.4.62"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bson",
+ "futures",
+ "infer",
+ "roomler-ai-config",
+ "roomler-ai-db",
+ "roomler-ai-services",
+ "roomler-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "roomler-ai-mod-saas"
-version = "0.4.61"
+version = "0.4.62"
 dependencies = [
  "anyhow",
  "axum",
