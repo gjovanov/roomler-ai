@@ -1,7 +1,7 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 + P1 + P2 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320) ·
-P3 (`chat`) next ·
+**Status**: P0 + P1 + P2 + P3 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 ·
+#1323) · P4 (`conference`) next ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -449,7 +449,7 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 | **P0** ✅ | FR claimed; `agent-core` → `roomler-node-core`; `crates/core` (`roomler-core`) contract types; composition baseline + test — #1309, #1311, #1312 | CI green; baseline committed and reproducible (recorded by the lane itself, see the field log) | none needed (docs + a rename + an unused crate) | low | 2–3 |
 | **P1** ✅ | `Core` extraction, state split, `[modules]` settings, `GET /api/capabilities` — P1a #1315 (the split, in place), P1b #1317 (the move into `roomler-core`), P1c + P1d #1318 (core-owned handlers on `State<Core>`; `ApiError`, cookies, origin and the core extractors below the api crate) | baseline identical (P1a: +1 route, intended); integration lane; prod roll | revert | high | 5–8 |
 | **P2** ✅ | `saas` module — #1320: the first module crate, plus the host composition (`crates/api/src/compose.rs`) that mounts it | baseline identical (index sets re-sorted, intended); integration lane; prod roll | `[modules] saas = false` (real from this PR on) | low | 1–2 |
-| **P3** | `chat` module | same + tenant-scoping tests | `chat = false` | medium | 2–3 |
+| **P3** ✅ | `chat` module — #1323: rooms, messages, reactions, files, search, export, Giphy, the unread summary, and `typing:*` as the first module-owned WebSocket namespace; the call endpoints stay in the host as `routes/call.rs` for P4 | baseline identical; integration lane (the tenant-scoping tests included); prod roll | `chat = false` | medium | 2–3 |
 | **P4** | `conference` module; mediasoup out of `services` | same + Docker time measured (AC4) | `conference = false` | medium | 3–4 |
 | **P5** | `fleet` module; Hub leaves `remote_control`; namespace map | same + no dip in online agents | redeploy previous tag | high | 4–6 |
 | **P6** | `remote` module | same + one RC session per carrier class | `remote = false` | medium | 2–3 |
@@ -618,3 +618,30 @@ Rust job and exercised by the integration lane rather than locally.
   compile + one test into a ~4-minute dispatch — cheaper than any local build this dev box
   could do, so "dispatch the lane with `filter=composition_matches_baseline`" is now the
   standard way to compile-check a stacked branch before its PR exists.
+
+### 2026-09-04 — P3: `chat`, and the first module-owned WebSocket namespace
+
+- **#1323** — `crates/modules/chat` = `roomler-ai-mod-chat`: room CRUD and membership, messages,
+  reactions, files (with the upload sniffing helper), search, the xlsx export, the Giphy proxy,
+  `/user/unread-summary` (it counts messages), and the typing indicator. Eight files moved with
+  history, changed only in imports and the state type. `ChatState` = `Core` + four DAOs + the
+  Giphy client; `impl Module` with `routes` (the same paths), `indexes` (the six sets the db
+  plan held), `enabled` (`[modules] chat`), and **`ws`** — `typing` on the user socket is the
+  first handler a module registers through the contract; the host's dispatch now looks up a
+  module handler by namespace (`Modules::ws_handler`) for any message type it does not own.
+- **The call endpoints stayed in the host** as `routes/call.rs`, carved out of `room.rs`
+  unchanged: they drive mediasoup and mint call sessions, so they are conference's (P4).
+  `rooms` stays on `AppState` for them and for the recording guard; the host's `helpers.rs`
+  keeps its copy of the two room guards for the same reason. The PDF export builds its own
+  `MessageDao` until it follows the xlsx export into chat.
+- Two things moved down to serve both chat and the host: the six notification helpers into
+  `roomler_core::notify` (mentions for chat, call starts for conference) and
+  `require_permission` into `roomler_core::guards` (the room routes gate on `MANAGE_CHANNELS`
+  through it; every device-management surface keeps calling it through the old re-export).
+- The stacked branch's first lane run caught exactly two things the grep-based inventory
+  missed: a **multi-line method chain** reading `state.files` in the socket's play-audio
+  handler (`state\n.files\n.base…` — the line-anchored grep for `state.files` cannot see it),
+  and two re-exports nothing in the host used any more (`-D warnings` would have refused
+  them). Both fixed in the second commit. 🔑 Grep for `^\s*\.<field>\s*$` as well as
+  `state.<field>` before declaring a field gone.
+- Routes, index sets and wire names unchanged; the baseline holds as recorded.

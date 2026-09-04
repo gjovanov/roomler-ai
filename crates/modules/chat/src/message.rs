@@ -8,7 +8,9 @@ use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use roomler_core::{ApiError, extractors::auth::AuthUser};
+
+use crate::ChatState;
 use roomler_ai_db::models::{Mentions, MessageAttachment};
 use roomler_ai_services::dao::base::PaginationParams;
 
@@ -86,7 +88,7 @@ pub struct ReactionSummaryResponse {
 }
 
 pub async fn list(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
@@ -96,7 +98,7 @@ pub async fn list(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let result = state.messages.find_in_room(rid, &params).await?;
 
@@ -124,7 +126,7 @@ pub async fn list(
 }
 
 pub async fn create(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     Json(body): Json<CreateMessageRequest>,
@@ -134,7 +136,7 @@ pub async fn create(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let thread_id = body
         .thread_id
@@ -234,7 +236,7 @@ pub async fn create(
         "type": "message:create",
         "data": &response,
     });
-    crate::ws::dispatcher::broadcast_with_redis(
+    roomler_core::ws::dispatcher::broadcast_with_redis(
         &state.ws_storage,
         &state.redis_pubsub,
         &all_member_ids,
@@ -259,7 +261,7 @@ pub async fn create(
             "data": &parent_response,
         });
         // Broadcast to ALL members (including sender, so sender's UI also updates)
-        crate::ws::dispatcher::broadcast_with_redis(
+        roomler_core::ws::dispatcher::broadcast_with_redis(
             &state.ws_storage,
             &state.redis_pubsub,
             &all_member_ids,
@@ -295,7 +297,7 @@ pub async fn create(
             .cloned()
             .unwrap_or_else(|| auth.user_id.to_hex());
 
-        super::helpers::notify_mentions(
+        roomler_core::notify::notify_mentions(
             &state,
             tid,
             rid,
@@ -315,7 +317,7 @@ pub async fn create(
 }
 
 pub async fn update(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<UpdateMessageRequest>,
@@ -327,7 +329,7 @@ pub async fn update(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    super::helpers::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
 
     state
         .messages
@@ -353,7 +355,7 @@ pub async fn update(
         "type": "message:update",
         "data": &response,
     });
-    crate::ws::dispatcher::broadcast_with_redis(
+    roomler_core::ws::dispatcher::broadcast_with_redis(
         &state.ws_storage,
         &state.redis_pubsub,
         &member_ids,
@@ -365,7 +367,7 @@ pub async fn update(
 }
 
 pub async fn delete(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -400,7 +402,7 @@ pub async fn delete(
             "room_id": room_id,
         }
     });
-    crate::ws::dispatcher::broadcast_with_redis(
+    roomler_core::ws::dispatcher::broadcast_with_redis(
         &state.ws_storage,
         &state.redis_pubsub,
         &member_ids,
@@ -412,7 +414,7 @@ pub async fn delete(
 }
 
 pub async fn pinned(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<MessageResponse>>, ApiError> {
@@ -421,7 +423,7 @@ pub async fn pinned(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let messages = state.messages.find_pinned(rid).await?;
     let author_ids = collect_author_ids(&messages);
@@ -444,7 +446,7 @@ pub struct TogglePinRequest {
 }
 
 pub async fn toggle_pin(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<TogglePinRequest>,
@@ -471,7 +473,7 @@ pub async fn toggle_pin(
             "pinned": body.pinned,
         }
     });
-    crate::ws::dispatcher::broadcast_with_redis(
+    roomler_core::ws::dispatcher::broadcast_with_redis(
         &state.ws_storage,
         &state.redis_pubsub,
         &member_ids,
@@ -483,7 +485,7 @@ pub async fn toggle_pin(
 }
 
 pub async fn thread_replies(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, _room_id, message_id)): Path<(String, String, String)>,
     Query(params): Query<PaginationParams>,
@@ -493,7 +495,7 @@ pub async fn thread_replies(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    super::helpers::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
 
     let result = state.messages.find_thread_replies(mid, &params).await?;
 
@@ -596,7 +598,7 @@ pub struct MarkReadRequest {
 }
 
 pub async fn mark_read(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
     Json(body): Json<MarkReadRequest>,
@@ -606,7 +608,7 @@ pub async fn mark_read(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let message_ids: Vec<ObjectId> = body
         .message_ids
@@ -626,7 +628,7 @@ pub async fn mark_read(
 /// as `unread_count`, so the badge reliably reaches 0). Invoked when a room
 /// is opened — Slack-style auto-clear (2026-08-04 user decision).
 pub async fn read_all(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -635,7 +637,7 @@ pub async fn read_all(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let modified = state.messages.mark_all_read(rid, auth.user_id).await?;
 
@@ -643,7 +645,7 @@ pub async fn read_all(
 }
 
 pub async fn unread_count(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -652,7 +654,7 @@ pub async fn unread_count(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let count = state.messages.unread_count(rid, auth.user_id).await?;
 
