@@ -62,6 +62,9 @@ const SIGNALING_SOURCE: &str = include_str!("../../remote_control/src/signaling.
 const MIN_ROUTES: usize = 100;
 const MIN_INDEX_SETS: usize = 40;
 const MIN_WIRE_NAMES: usize = 80;
+/// P5b — `ClientMsg` has 44 variants today; a table that shrank to a
+/// handful would mean the owner map is not the one the socket dispatches on.
+const MIN_NAMESPACES: usize = 40;
 
 fn baseline_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/composition.baseline.json")
@@ -86,6 +89,10 @@ async fn snapshot() -> Snapshot {
             "multi_block": all_sets(true),
         }),
         wire: wire_names(SIGNALING_SOURCE),
+        // P5b — the owner of every client wire tag. Recorded so a module PR
+        // that re-homes a message (or a new variant that names an owner) is
+        // a visible line in the baseline diff, not a silent re-route.
+        namespaces: roomler_core::composition::namespaces(),
     }
 }
 
@@ -116,6 +123,11 @@ async fn composition_matches_baseline() {
         actual.wire.len() >= MIN_WIRE_NAMES,
         "only {} wire names — the signalling source was not read",
         actual.wire.len()
+    );
+    assert!(
+        actual.namespaces.len() >= MIN_NAMESPACES,
+        "only {} client namespaces — the owner table is not the one next to ClientMsg",
+        actual.namespaces.len()
     );
 
     let rendered = serde_json::to_string_pretty(&actual).expect("a snapshot is plain data") + "\n";
@@ -163,6 +175,17 @@ async fn composition_matches_baseline() {
         &mut report,
     );
     diff_lists("wire name", &expected.wire, &actual.wire, &mut report);
+    let owners = |m: &std::collections::BTreeMap<String, String>| {
+        m.iter()
+            .map(|(tag, owner)| format!("{tag} -> {owner}"))
+            .collect::<Vec<_>>()
+    };
+    diff_lists(
+        "namespace",
+        &owners(&expected.namespaces),
+        &owners(&actual.namespaces),
+        &mut report,
+    );
     if expected.indexes != actual.indexes {
         report.push_str("index plan: differs — diff fixtures/composition.baseline.json\n");
     }

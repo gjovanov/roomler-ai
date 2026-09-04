@@ -9,6 +9,13 @@ on:
 jobs:
   rust:
     name: Rust checks
+    # FR-69 P5b — 30 minutes, not 20: the job builds clippy for the whole
+    # workspace plus the unit tests of five audited crates, and since the
+    # module crates arrived (P2–P5a) a COLD-cache run — every rerun is one,
+    # a cancelled attempt saves no cache — takes ~20 min 18 s on the 2-core
+    # runner. The P5b rerun was cancelled by this ceiling at 20:18 with
+    # every step green; warm runs finish in ~10.
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     # Warm baseline is 4-5 min; the only step that can blow past it is an
     # Ubuntu-mirror stall inside apt (2026-08-18 evening: 14/19/20/29-min
@@ -16,7 +23,6 @@ jobs:
     # caches below take the mirror out of the hot path; this timeout turns
     # any residual pathological stall into a fast, loud, retryable failure
     # instead of a silent half-hour merge blocker.
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
