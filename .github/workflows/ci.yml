@@ -15,6 +15,15 @@ jobs:
     # a cancelled attempt saves no cache — takes ~20 min 18 s on the 2-core
     # runner. The P5b rerun was cancelled by this ceiling at 20:18 with
     # every step green; warm runs finish in ~10.
+    #
+    # ⚠️ Why this ceiling keeps rising, and why re-running never fixes it: the
+    # Rust cache key below is `hashFiles(ci.yml)`, so ANY edit to this file
+    # rotates it and guarantees the very next run is cold — and a cancelled
+    # attempt saves no cache, so the retry is cold again. A PR that touches CI
+    # therefore pays the cold time twice over and cannot converge by retrying.
+    # Measured on 2026-09-04 under the then-30-minute ceiling: cancelled at
+    # 31 min 29 s in `Test tunnel-core --features overlay-l3,overlay-netstack`
+    # with every prior step green.
     timeout-minutes: 50
     runs-on: ubuntu-latest
     # Warm baseline is 4-5 min; the only step that can blow past it is an
