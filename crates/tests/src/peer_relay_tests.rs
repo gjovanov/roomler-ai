@@ -269,7 +269,7 @@ async fn try_load_acl_fails_closed_where_load_acl_fails_open() {
     let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
 
     // Readable: both agree, and `Always` reads the rows even under `off`.
-    let ctx = try_load_acl(&app.state, tid, PolicyLoad::Always)
+    let ctx = try_load_acl(app.state.network(), tid, PolicyLoad::Always)
         .await
         .expect("a readable tenant loads");
     assert_eq!(ctx.mode, OverlayAclMode::Off);
@@ -305,14 +305,14 @@ async fn try_load_acl_fails_closed_where_load_acl_fails_open() {
 
     // The strict loader refuses to answer.
     assert!(
-        try_load_acl(&app.state, tid, PolicyLoad::Always)
+        try_load_acl(app.state.network(), tid, PolicyLoad::Always)
             .await
             .is_err(),
         "an unreadable policy set must be an error, not an empty ACL"
     );
 
     // The netmap loader keeps its posture: OPEN, exactly as before.
-    let ctx = load_acl(&app.state, tid).await;
+    let ctx = load_acl(app.state.network(), tid).await;
     assert_eq!(ctx.mode, OverlayAclMode::Off);
     assert!(ctx.policies.is_empty());
 }
