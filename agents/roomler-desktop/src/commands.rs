@@ -8,9 +8,9 @@
 //! Ok and rejects with the String on Err. The HTML/JS layer in
 //! `src/front/` consumes these via `window.__TAURI__.core.invoke`.
 
-use roomler_core::config::{self, AgentConfig};
-use roomler_core::enrollment::{self, EnrollInputs};
-use roomler_core::{logging, notify};
+use roomler_node_core::config::{self, AgentConfig};
+use roomler_node_core::enrollment::{self, EnrollInputs};
+use roomler_node_core::{logging, notify};
 use roomler_localapi::{self as localapi, ConsentRequest, FlowInfo, NodeStatus, PeerInfo};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -104,7 +104,7 @@ fn status_report() -> StatusReport {
 fn resolve_log_dir_path(is_scm: bool) -> Option<PathBuf> {
     #[cfg(windows)]
     if is_scm {
-        return Some(roomler_core::appdirs::service_log_dir());
+        return Some(roomler_node_core::appdirs::service_log_dir());
     }
     #[cfg(not(windows))]
     let _ = is_scm;
@@ -342,7 +342,7 @@ pub async fn cmd_enroll(
         Ok(p) => p,
         Err(_) => config::default_config_path().map_err(|e| format!("Config path: {e}"))?,
     };
-    let machine_id = roomler_core::machine::derive_machine_id(&path);
+    let machine_id = roomler_node_core::machine::derive_machine_id(&path);
     let cfg = enrollment::enroll(EnrollInputs {
         server_url: &server,
         enrollment_token: &trimmed_token,
@@ -418,7 +418,7 @@ pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> 
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
         let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        Ok(roomler_core::config_surface::entries(&cfg))
+        Ok(roomler_node_core::config_surface::entries(&cfg))
     })
     .await
     .map_err(|e| format!("task join: {e}"))?
@@ -462,9 +462,9 @@ fn config_set_blocking(
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
     let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-    roomler_core::config_surface::apply(&mut cfg, &key, value.as_deref())?;
+    roomler_node_core::config_surface::apply(&mut cfg, &key, value.as_deref())?;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
-    roomler_core::config_surface::entry_for(&cfg, &key)
+    roomler_node_core::config_surface::entry_for(&cfg, &key)
         .ok_or_else(|| format!("unknown config key {key:?}"))
 }
 
@@ -616,10 +616,10 @@ pub async fn cmd_tail_log(source: String, max_bytes: Option<u64>) -> Result<LogT
         });
     }
     tokio::task::spawn_blocking(move || {
-        let path = roomler_core::logging::tail_source_path(&source)
+        let path = roomler_node_core::logging::tail_source_path(&source)
             .ok_or_else(|| format!("no log file found for source {source:?}"))?;
         let cap = max_bytes.unwrap_or(32 * 1024).clamp(512, 64 * 1024);
-        let (size, content) = roomler_core::logging::read_tail(&path, cap)
+        let (size, content) = roomler_node_core::logging::read_tail(&path, cap)
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
         Ok(LogTailReport {
             path: path.display().to_string(),
@@ -827,7 +827,7 @@ pub struct PermissionState {
 pub fn cmd_permissions() -> PermissionState {
     #[cfg(target_os = "macos")]
     {
-        use roomler_core::tcc;
+        use roomler_node_core::tcc;
         PermissionState {
             applicable: true,
             screen_recording: tcc::screen_recording_granted(),
@@ -857,7 +857,7 @@ pub fn cmd_permissions() -> PermissionState {
 pub fn cmd_request_permission(which: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        use roomler_core::tcc;
+        use roomler_node_core::tcc;
         match which.as_str() {
             "screen" => {
                 let _ = tcc::request_screen_recording();
