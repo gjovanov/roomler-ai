@@ -5204,46 +5204,44 @@ async fn media_pump_ffmpeg_dc(
             // `avg_capture_ms` on the heartbeat, so it is visible to a reader,
             // but nothing ALERTS on it any more. If capture ever needs its own
             // alarm it needs its own threshold, not this one back.
-            let work_us = took_us.saturating_sub(capture_us.saturating_sub(c0));
-            if work_us >= stall_warn.as_micros() as u64 {
+            //
+            // The verdict and the phase arithmetic live in
+            // `encode::stall::PassTiming` — a pure type on the DEFAULT feature
+            // set — because this pump is behind `ffmpeg-encoder`, so every rule
+            // written here is invisible to `cargo test -p roomlerd --lib`. Both
+            // subtractions below are field-paid judgements (see that module),
+            // and each reads like a simplification waiting to happen.
+            let pass = crate::encode::stall::PassTiming {
+                iter_us: took_us,
+                capture_us: capture_us.saturating_sub(c0),
+                scale_us: scale_us.saturating_sub(s0),
+                encode_us: encode_us.saturating_sub(e0),
+                send_us: send_us.saturating_sub(d0),
+                apply_us: apply_us.saturating_sub(a0),
+                open_us: open_us.saturating_sub(o0),
+            };
+            if pass.is_stall(stall_warn.as_micros() as u64) {
                 pump_stalls += 1;
                 if last_stall_log.elapsed() >= Duration::from_secs(2) {
                     last_stall_log = std::time::Instant::now();
                     // Phase deltas come from the accumulators the pump already
                     // keeps, so the breakdown costs nothing extra. An overrun
                     // whose phases all read ~0 is itself the finding: the time
-                    // went somewhere still untimed.
-                    //
-                    // ⚠️ `other_ms` is that finding, COMPUTED rather than left
-                    // for a reader to subtract by hand. Field 2026-09-03: four
-                    // stalls on CORPLAP-1, one on the first pass of every
-                    // session, `iter_ms` 513–1006 while the named phases summed
-                    // to 33–52 — i.e. 0.46–0.96 s in no phase at all, almost
-                    // certainly the INITIAL encoder open (`apply_ms` times a
-                    // change to an encoder that already exists; the first pass
-                    // has none). It was spotted by eye on the fourth
-                    // occurrence. A breakdown that does not sum to its total is
-                    // the most useful number in the line, so it should not
-                    // depend on somebody noticing.
-                    let phases_us = capture_us.saturating_sub(c0)
-                        + scale_us.saturating_sub(s0)
-                        + encode_us.saturating_sub(e0)
-                        + send_us.saturating_sub(d0)
-                        + apply_us.saturating_sub(a0)
-                        + open_us.saturating_sub(o0);
+                    // went somewhere still untimed — which `other_ms` computes
+                    // rather than leaving for a reader to subtract by hand.
                     warn!(
                         %session_id,
                         codec_label,
                         constrained,
                         iter_ms = took.as_secs_f64() * 1000.0,
-                        capture_ms = capture_us.saturating_sub(c0) as f64 / 1000.0,
-                        scale_ms = scale_us.saturating_sub(s0) as f64 / 1000.0,
-                        encode_ms = encode_us.saturating_sub(e0) as f64 / 1000.0,
-                        send_ms = send_us.saturating_sub(d0) as f64 / 1000.0,
-                        apply_ms = apply_us.saturating_sub(a0) as f64 / 1000.0,
-                        open_ms = open_us.saturating_sub(o0) as f64 / 1000.0,
-                        other_ms = took_us.saturating_sub(phases_us) as f64 / 1000.0,
-                        work_ms = work_us as f64 / 1000.0,
+                        capture_ms = pass.capture_us as f64 / 1000.0,
+                        scale_ms = pass.scale_us as f64 / 1000.0,
+                        encode_ms = pass.encode_us as f64 / 1000.0,
+                        send_ms = pass.send_us as f64 / 1000.0,
+                        apply_ms = pass.apply_us as f64 / 1000.0,
+                        open_ms = pass.open_us as f64 / 1000.0,
+                        other_ms = pass.other_us() as f64 / 1000.0,
+                        work_ms = pass.work_us() as f64 / 1000.0,
                         target_bps = governor.applied_bps(),
                         "FFmpeg DC pump STALL — one pass exceeded the budget"
                     );
