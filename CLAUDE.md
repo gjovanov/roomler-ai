@@ -269,9 +269,9 @@ scripts/
   dev-xvfb.sh       → Run the agent's capture path against a virtual X framebuffer (headless smoke test)
 ```
 
-### Modular monolith — the FR-69 program (in flight)
+### Modular monolith — the FR-69 program (P0–P9 shipped 2026-09-04; the field gates remain)
 
-The server is being decoupled into **`roomler-core` + six module crates** (`fleet`, `chat`, `conference`, `remote`, `network`, `saas`) behind ONE `Module` contract (`crates/core/src/module.rs`), statically composed under Cargo features into five profiles (`full` / `collab` / `remote` / `mesh` / `access`; `saas` is an add-on the self-host images never carry) and discovered at runtime via `GET /api/capabilities`. Spec with every decision's pros/cons: `docs/fr/FR-69-modular-monolith.md` (#1307). Rules while it is in flight:
+The server is decoupled into **`roomler-core` + six module crates** (`fleet`, `chat`, `conference`, `remote`, `network`, `saas`) behind ONE `Module` contract (`crates/core/src/module.rs`), statically composed under Cargo features into five profiles (`full` / `collab` / `remote` / `mesh` / `access`; `saas` is an add-on the self-host images never carry) and discovered at runtime via `GET /api/capabilities`. Spec with every decision's pros/cons: `docs/fr/FR-69-modular-monolith.md` (#1307). Rules while it is in flight:
 
 1. **The DAG is data**: `crates/core/src/graph.rs`. Any module → core; `conference → chat`, `remote → fleet`, `network → fleet`; core NEVER calls a module — the inverse flows (tenant archive, agent removal) are hooks core invokes in `hooks::HOOK_ORDER` (session holders → lease holders → the record owner).
 2. **A module PR is pure moves + signature changes.** `crates/tests/src/composition_tests.rs` asserts the composition (every route with its allowed methods, the index plan for both `multi_block` values, every wire name in `signaling.rs`) is byte-identical to `crates/tests/fixtures/composition.baseline.json`. Re-record ONLY with `COMPOSITION_UPDATE=1` and a commit message that says why — a reviewer diffs the JSON against the claim.

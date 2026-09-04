@@ -481,11 +481,19 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 
 ## Acceptance criteria
 
-- [ ] **AC1** The `full` profile's composition snapshot is identical to the P0 baseline after
-      every module PR (P1–P7).
-- [ ] **AC2** The integration lane holds its floor with the same two skips through P1–P8.
-- [ ] **AC3** `cargo tree` shows `remote`, `mesh` and `access` link neither `mediasoup` nor
-      `mediasoup-sys`, and `collab` does not link `roomler-ai-tunnel-core`.
+- [x] **AC1** The `full` profile's composition snapshot is identical to the P0 baseline after
+      every module PR (P1–P7). — Asserted by the lane on every module PR (P1a–P7b, then P8)
+      against `crates/tests/fixtures/composition.baseline.json`; the one re-record was the
+      intended `/api/capabilities` addition in P1 (routes · both index plans · wire names ·
+      namespaces otherwise byte-identical throughout).
+- [x] **AC2** The integration lane holds its floor with the same two skips through P1–P8. —
+      407 passed / 0 failed on the P7a, P7b and P8 PR merge refs (runs 33908175773,
+      33914646001, 33916479511), zero leaked databases; the two skips unchanged.
+- [x] **AC3** `cargo tree` shows `remote`, `mesh` and `access` link neither `mediasoup` nor
+      `mediasoup-sys`, and `collab` does not link `roomler-ai-tunnel-core`. — Measured by the
+      `profiles` CI job on #1348: `profile-remote` 411 crates, `profile-mesh` 471,
+      `profile-access` 472 (no `mediasoup`), `profile-collab` 433 (no tunnel-core); the
+      positive controls found both crates in the full graph. Re-asserted on every PR.
 - [ ] **AC4** Docker build time for a non-conference profile is measured against `full`, before
       and after, and recorded in the field log.
 - [ ] **AC5** A `mesh` image boots with Mongo, Redis and coturn only; `/health` lists `fleet`
@@ -498,9 +506,15 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       console errors; against `full` the e2e nightly is unchanged.
 - [ ] **AC8** Every phase's prod roll is field-verified from the fleet and recorded in the field
       log, wrong turns included.
-- [ ] **AC9** No wire, socket URL, collection or index changed: the baseline proves the last two
-      and the wire names, the fixed `/ws` and `/derp` paths the second.
-- [ ] **AC10** The licensing dependency-graph assertion proves `roomler-core` (AGPL) never enters
+- [x] **AC9** No wire, socket URL, collection or index changed: the baseline proves the last two
+      and the wire names, the fixed `/ws` and `/derp` paths the second. — `/ws` stays the
+      host's (`crates/api/src/lib.rs`), `/derp` is mounted by the network module's
+      `UpgradeSpec` at the same path (P7b) and is in the baseline's route set; `ClientMsg` /
+      `ServerMsg` never left `remote_control/src/signaling.rs` (rule 4).
+- [x] **AC10** (`scripts/licence-classes.sh` lists `crates/core` / `roomler-core` on the server
+      side and inverts `cargo tree` from every agent binary; the "Licence split integrity"
+      check has been green on every PR since P0 #1312.) The licensing dependency-graph
+      assertion proves `roomler-core` (AGPL) never enters
       a shipped agent binary.
 
 ## Open decisions
