@@ -36,6 +36,8 @@ use std::time::Instant;
 
 use bson::oid::ObjectId;
 use dashmap::DashMap;
+
+use crate::FleetState;
 use tracing::{debug, info, warn};
 
 /// Who moves to converge a cross-pod miss.
@@ -371,7 +373,7 @@ mod tests {
 /// socket iff the agent is fully idle, so its reconnect re-hashes onto
 /// the current LB map. Failure is harmless (the requester's own retry
 /// path still works; the agent converges on its next natural reconnect).
-pub fn spawn_agent_nudge(state: &crate::FleetState, owner_pod: String, agent_hex: String) {
+pub fn spawn_agent_nudge(state: &FleetState, owner_pod: String, agent_hex: String) {
     let Some(bus) = state.cluster_bus.clone() else {
         return;
     };
@@ -468,5 +470,90 @@ pub fn note_agent_offline_evidence(
             Ok(None) => {}
             Err(e) => debug!(%agent_hex, %e, "split-evidence probe failed"),
         }
+    });
+}
+
+/// C-2/PR-1 — the owner-side idle-agent nudge handler (FR-69 P7b, from the
+/// host's `AppState::new`): the pod OWNING an agent's WS receives
+/// `rc.agent_nudge` from a pod whose controller found the agent foreign, and
+/// cycles that WS iff the agent is FULLY idle — no rc sessions, and nothing
+/// another holder would lose (the tunnel sessions targeting it, and PR-1's
+/// sessions it ORIGINATED through declared routes — both `network`'s, asked
+/// through [`roomler_core::hooks::HookRegistry::agent_busy`]) — so both ends
+/// re-land at the current LB hash. PR-1 adds the cooldown trio (a cycle tears
+/// the agent's rc/tunnel/overlay planes; it must never flap), truthful
+/// refusal reasons on the reply, and refusal/stuck counters.
+///
+/// Registered from the module's init; a pod without a cluster bus registers
+/// nothing, exactly as before.
+pub fn register_bus_handler(state: &FleetState) {
+    let Some(bus) = state.cluster_bus.clone() else {
+        return;
+    };
+    let hub = state.rc_hub.clone();
+    let cooldowns = state.agent_nudge_cooldowns.clone();
+    let hooks = state.hooks.clone();
+    let pacing = NudgePacing {
+        cooldown: std::time::Duration::from_secs(state.settings.rc.nudge_cooldown_secs),
+        max_attempts: state.settings.rc.nudge_max_attempts,
+        attempts_reset_after: std::time::Duration::from_secs(
+            state.settings.rc.nudge_attempts_reset_secs,
+        ),
+    };
+    bus.register("rc.agent_nudge", move |body| {
+        let hub = hub.clone();
+        let cooldowns = cooldowns.clone();
+        let hooks = hooks.clone();
+        Box::pin(async move {
+            use crate::hub::NudgeOutcome;
+            let hex = body
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "missing agent_id".to_string())?;
+            let aid = ObjectId::parse_str(hex).map_err(|_| "bad agent_id".to_string())?;
+            // The other holders' answer (network: tunnel sessions targeting
+            // the agent, or originated by it), with the reason they name.
+            let extra_busy = hooks.agent_busy(aid).await;
+            // Gate (peek) -> fire -> book: attempts count FIRED
+            // cycles only, so busy refusals can never trip the
+            // stuck/split-evidence signal.
+            let outcome = if extra_busy.is_some() {
+                NudgeOutcome::ExtraBusy
+            } else {
+                match nudge_gate(&cooldowns, aid, pacing) {
+                    NudgeGate::Allow => {
+                        let o = hub.nudge_agent_if_idle(aid, false);
+                        if o == NudgeOutcome::Nudged {
+                            nudge_book(&cooldowns, aid, pacing);
+                        }
+                        o
+                    }
+                    NudgeGate::Cooldown | NudgeGate::Stuck => {
+                        roomler_core::cluster::metrics::bump(
+                            &roomler_core::cluster::metrics::AGENT_NUDGE_REFUSED_TOTAL,
+                        );
+                        return Ok(serde_json::json!({
+                            "nudged": false,
+                            "reason": "cooldown",
+                        }));
+                    }
+                }
+            };
+            if outcome == NudgeOutcome::Nudged {
+                roomler_core::cluster::metrics::bump(
+                    &roomler_core::cluster::metrics::AGENT_NUDGE_TOTAL,
+                );
+                return Ok(serde_json::json!({ "nudged": true, "reason": "nudged" }));
+            }
+            roomler_core::cluster::metrics::bump(
+                &roomler_core::cluster::metrics::AGENT_NUDGE_REFUSED_TOTAL,
+            );
+            // The truthful reason, at info: pre-PR-1 refusals were
+            // debug-only and the 2026-08-04 stuck loop was
+            // invisible without pod-log spelunking.
+            let reason = extra_busy.unwrap_or_else(|| outcome.reason());
+            tracing::info!(agent = %aid, reason, "agent nudge refused");
+            Ok(serde_json::json!({ "nudged": false, "reason": reason }))
+        })
     });
 }

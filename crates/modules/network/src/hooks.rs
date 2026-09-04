@@ -12,7 +12,9 @@
 use async_trait::async_trait;
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::models::NodeRef;
-use roomler_core::hooks::{FleetLifecycle, ReleasedLease, RenamePropagation};
+use roomler_core::hooks::{
+    FleetLifecycle, ReleasedLease, RenamePropagation, TenantArchived, TenantLifecycle,
+};
 
 use crate::NetworkState;
 
@@ -69,5 +71,101 @@ impl FleetLifecycle for NetworkHooks {
                 None => RenamePropagation::Failed,
             },
         )
+    }
+
+    /// P7b — the tunnel sessions this node holds FOR the agent: the ones
+    /// targeting it, and (PR-1) the ones it originated through declared
+    /// routes. The per-connection session map is invisible to fleet's nudge
+    /// handler, so without this answer a routes-only agent read as IDLE and
+    /// got its WS cycled — tearing every declared route plus its overlay
+    /// carriers. The reason string is what the nudge reply carries.
+    async fn agent_busy(&self, agent_id: ObjectId) -> Option<&'static str> {
+        let target_busy = self
+            .state
+            .tunnel_sessions_by_target_agent
+            .get(&agent_id)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let origin_busy = self
+            .state
+            .tunnel_sessions_by_origin_agent
+            .get(&agent_id)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if origin_busy && !target_busy {
+            Some("origin_busy")
+        } else if target_busy || origin_busy {
+            Some("tunnel_busy")
+        } else {
+            None
+        }
+    }
+}
+
+/// Network's side of the tenant cascade (P7b, from the host's archive
+/// route): release every overlay node — which pools its address and tells
+/// the peers — then quarantine the tenant's block, never re-issue it (a
+/// device that never saw the archive still thinks it owns an address in that
+/// range).
+pub struct NetworkTenantHooks {
+    pub state: NetworkState,
+}
+
+#[async_trait]
+impl TenantLifecycle for NetworkTenantHooks {
+    async fn tenant_archived(
+        &self,
+        tenant_id: ObjectId,
+        reason: &str,
+    ) -> anyhow::Result<TenantArchived> {
+        let state = &self.state;
+        let network = state
+            .overlay_networks
+            .find_for_tenant(tenant_id)
+            .await
+            .ok()
+            .flatten();
+        let mut nodes_released = 0u64;
+        if let Some(net) = &network
+            && let Some(net_id) = net.id
+        {
+            let nodes = state
+                .overlay_nodes
+                .list_active_in_network(tenant_id, net_id)
+                .await
+                .unwrap_or_default();
+            for n in &nodes {
+                if crate::overlay::release_overlay_node(state, n, reason)
+                    .await
+                    .is_some()
+                {
+                    nodes_released += 1;
+                }
+            }
+        }
+
+        let mut block_quarantined = None;
+        if let Some(net_id) = network.as_ref().and_then(|n| n.id)
+            && let Ok(Some(block)) = state
+                .overlay_networks
+                .blocks()
+                .find_assigned_for_network(net_id)
+                .await
+            && let Some(bid) = block.id
+            && state
+                .overlay_networks
+                .blocks()
+                .quarantine(bid, reason)
+                .await
+                .unwrap_or(false)
+        {
+            block_quarantined = Some(block.cidr);
+        }
+
+        Ok(TenantArchived {
+            devices_revoked: 0,
+            nodes_released,
+            block_quarantined,
+        })
     }
 }

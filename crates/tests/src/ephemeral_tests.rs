@@ -93,6 +93,7 @@ async fn reaper_removes_expired_ephemeral_row_outright() {
     // The response surface says what the row is BEFORE it vanishes — the
     // grid badge is how an operator is never surprised by the vanishing.
     app.state
+        .fleet()
         .agents
         .set_ephemeral(aid, Some(60))
         .await
@@ -118,7 +119,7 @@ async fn reaper_removes_expired_ephemeral_row_outright() {
 
     // 5 minutes of silence against a 60 s deadline.
     rewind_last_seen(&app, aid, 300).await;
-    let n = roomler_ai_api::ws::ephemeral::run_ephemeral_reap(&app.state).await;
+    let n = roomler_ai_mod_network::ephemeral::run_ephemeral_reap(app.state.network()).await;
     assert_eq!(n, 1, "exactly this device is due");
 
     // Gone MEANS gone: zero raw rows (a tombstone would be one row with
@@ -129,7 +130,7 @@ async fn reaper_removes_expired_ephemeral_row_outright() {
     );
 
     // And a second cycle finds nothing — the reap is not replayable.
-    let n = roomler_ai_api::ws::ephemeral::run_ephemeral_reap(&app.state).await;
+    let n = roomler_ai_mod_network::ephemeral::run_ephemeral_reap(app.state.network()).await;
     assert_eq!(n, 0);
 }
 
@@ -142,7 +143,7 @@ async fn reaper_never_touches_a_permanent_row() {
     // 30 days of silence — the exact shape of the live prod rows AC5 guards
     // (five live devices unseen >7 days must survive an enabled reaper).
     rewind_last_seen(&app, aid, 30 * 86_400).await;
-    let n = roomler_ai_api::ws::ephemeral::run_ephemeral_reap(&app.state).await;
+    let n = roomler_ai_mod_network::ephemeral::run_ephemeral_reap(app.state.network()).await;
     assert_eq!(n, 0, "a permanent row is never the reaper's to touch");
 
     let rows = raw_rows(&app, aid).await;
@@ -162,6 +163,7 @@ async fn reaper_respects_the_row_own_deadline() {
     let t = app.seed_tenant("ephem3").await;
     let aid = enroll_agent(&app, &t.tenant_id, &t.admin.access_token, "ephem3-m1").await;
     app.state
+        .fleet()
         .agents
         .set_ephemeral(aid, Some(3600))
         .await
@@ -171,7 +173,7 @@ async fn reaper_respects_the_row_own_deadline() {
     // fetched), well inside its own 1 h deadline (so it must survive the
     // per-row check).
     rewind_last_seen(&app, aid, 300).await;
-    let n = roomler_ai_api::ws::ephemeral::run_ephemeral_reap(&app.state).await;
+    let n = roomler_ai_mod_network::ephemeral::run_ephemeral_reap(app.state.network()).await;
     assert_eq!(n, 0, "candidate by the floor, but its own TTL is longer");
     assert_eq!(raw_rows(&app, aid).await.len(), 1);
 }
@@ -183,10 +185,15 @@ async fn reaper_clamps_the_ttl_floor() {
     let aid = enroll_agent(&app, &t.tenant_id, &t.admin.access_token, "ephem4-m1").await;
     // A pathological 1-second deadline must not turn a 30 s heartbeat gap
     // into a deleted device: the floor is 60 s however small the stored TTL.
-    app.state.agents.set_ephemeral(aid, Some(1)).await.unwrap();
+    app.state
+        .fleet()
+        .agents
+        .set_ephemeral(aid, Some(1))
+        .await
+        .unwrap();
 
     rewind_last_seen(&app, aid, 30).await;
-    let n = roomler_ai_api::ws::ephemeral::run_ephemeral_reap(&app.state).await;
+    let n = roomler_ai_mod_network::ephemeral::run_ephemeral_reap(app.state.network()).await;
     assert_eq!(
         n, 0,
         "30 s of silence is below the floor, whatever the TTL says"
@@ -201,6 +208,7 @@ async fn admin_delete_hard_deletes_ephemeral_and_tombstones_permanent() {
     let permanent = enroll_agent(&app, &t.tenant_id, &t.admin.access_token, "ephem5-perm").await;
     let ephemeral = enroll_agent(&app, &t.tenant_id, &t.admin.access_token, "ephem5-eph").await;
     app.state
+        .fleet()
         .agents
         .set_ephemeral(ephemeral, None)
         .await

@@ -57,12 +57,30 @@ pub enum RenamePropagation {
     Propagated(String),
 }
 
+/// What the holders did when a tenant was archived — summed across them by
+/// [`HookRegistry::tenant_archived`], because the archive route reports the
+/// counts (P7b: fleet revokes the devices, network releases the mesh and
+/// quarantines the block).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantArchived {
+    pub devices_revoked: u64,
+    pub nodes_released: u64,
+    /// The overlay block quarantined, as a CIDR, if the tenant held one.
+    pub block_quarantined: Option<String>,
+}
+
 /// Hooks core invokes on tenant events.
 #[async_trait]
 pub trait TenantLifecycle: Send + Sync {
-    async fn tenant_archived(&self, tenant_id: ObjectId, reason: &str) -> anyhow::Result<()> {
+    /// The tenant was archived: the flag is already set, so nothing new can
+    /// enroll or start; tear down what you hold for it and say how much.
+    async fn tenant_archived(
+        &self,
+        tenant_id: ObjectId,
+        reason: &str,
+    ) -> anyhow::Result<TenantArchived> {
         let _ = (tenant_id, reason);
-        Ok(())
+        Ok(TenantArchived::default())
     }
 
     async fn member_removed(&self, tenant_id: ObjectId, user_id: ObjectId) -> anyhow::Result<()> {
@@ -108,6 +126,19 @@ pub trait FleetLifecycle: Send + Sync {
     async fn agent_offline(&self, tenant_id: ObjectId, agent_id: ObjectId) -> anyhow::Result<()> {
         let _ = (tenant_id, agent_id);
         Ok(())
+    }
+
+    /// Is the agent doing something a holder would lose if its socket were
+    /// cycled? Fleet's owner-side rehome nudge asks this before cycling an
+    /// idle-looking agent (P7b): `network` answers while tunnel sessions
+    /// target the agent (`"tunnel_busy"`) or were originated by it
+    /// (`"origin_busy"`, PR-1 — the per-connection session map is invisible
+    /// to fleet, and without this a routes-only agent read as IDLE and got
+    /// its WS cycled). The string is the refusal reason the nudge reply
+    /// carries, verbatim.
+    async fn agent_busy(&self, agent_id: ObjectId) -> Option<&'static str> {
+        let _ = agent_id;
+        None
     }
 }
 
@@ -238,6 +269,40 @@ impl HookRegistry {
             }
         }
         Ok(outcome)
+    }
+
+    /// The first holder that would lose work if the agent's socket were
+    /// cycled, with its reason; `None` = every holder reads the agent idle.
+    pub async fn agent_busy(&self, agent_id: ObjectId) -> Option<&'static str> {
+        for (_, hook) in self.fleet_lifecycles() {
+            if let Some(reason) = hook.agent_busy(agent_id).await {
+                return Some(reason);
+            }
+        }
+        None
+    }
+
+    /// Run every `tenant_archived` hook in order and sum what they did. A
+    /// failing holder stops the cascade — the caller reports the error
+    /// rather than an archive that silently left a pillar's state behind.
+    pub async fn tenant_archived(
+        &self,
+        tenant_id: ObjectId,
+        reason: &str,
+    ) -> anyhow::Result<TenantArchived> {
+        let mut total = TenantArchived::default();
+        for (module, hook) in self.tenant_lifecycles() {
+            let out = hook
+                .tenant_archived(tenant_id, reason)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: tenant_archived: {e}"))?;
+            total.devices_revoked += out.devices_revoked;
+            total.nodes_released += out.nodes_released;
+            if total.block_quarantined.is_none() {
+                total.block_quarantined = out.block_quarantined;
+            }
+        }
+        Ok(total)
     }
 }
 

@@ -336,13 +336,9 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes)
-        // The device listing joins fleet and network data — the host's
-        // composition view (FR-69 P5a): fleet rows always, tunnel-client and
-        // overlay rows from the network module.
-        .nest(
-            "/tenant/{tenant_id}/device",
-            Router::new().route("/", get(routes::device::list_devices)),
-        )
+        // `/tenant/{tenant_id}/device` — the listing that joins agents with
+        // tunnel clients and overlay nodes — is the `network` module's (FR-69
+        // P7b: it depends on fleet, which the graph allows; the host may not).
         .nest("/tenant/{tenant_id}/stats", tenant_stats_routes);
 
     // Health check. `/health` stays a cheap process-alive 200 (liveness /
@@ -367,9 +363,11 @@ pub fn build_router(state: AppState) -> Router {
     let root = state
         .modules
         .mount_unlimited(Router::new().merge(rate_limited_api).merge(health));
+    // FR-69 P7b — a module's own upgrade endpoints join the root too: `/derp`
+    // is the network module's, mounted at the path it has always had.
+    let root = state.modules.mount_upgrades(root);
 
     root.route("/ws", get(ws::handler::ws_upgrade))
-        .route("/derp", get(ws::derp::derp_upgrade))
         // Security — never let a bearer-carrying query string into the logs:
         // `/ws?token=<jwt>&role=agent` and `/derp?token=<jwt>` authenticate
         // via the query (WS clients can't set headers), and TraceLayer's

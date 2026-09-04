@@ -37,7 +37,7 @@ use roomler_ai_remote_control::models::Agent;
 use roomler_ai_services::dao::base::DaoResult;
 use std::time::Duration;
 
-use crate::state::AppState;
+use crate::NetworkState;
 
 /// Floor on every effective TTL, applied at READ time so a bad stored value
 /// can never disable it. Below this, an ordinary network blip or a pod roll
@@ -48,7 +48,7 @@ pub const MIN_TTL_SECS: u64 = 60;
 /// The inactivity deadline this row is actually held to: the per-device
 /// override from its enrollment key, else the server default — both clamped
 /// to the floor.
-fn effective_ttl_secs(agent: &Agent, state: &AppState) -> u64 {
+fn effective_ttl_secs(agent: &Agent, state: &NetworkState) -> u64 {
     agent
         .ephemeral_ttl_secs
         .unwrap_or(state.settings.rc.ephemeral_default_ttl_secs)
@@ -59,12 +59,12 @@ fn effective_ttl_secs(agent: &Agent, state: &AppState) -> u64 {
 /// self-unenroll and the reaper (FR-51 F3) — the fleet module's since FR-69
 /// P5a (`roomler_ai_mod_fleet::removal`), where the overlay release runs
 /// through the core hooks. The reaper reaches it through this wrapper.
-pub(crate) async fn remove_agent_device(
-    state: &AppState,
+pub async fn remove_agent_device(
+    state: &NetworkState,
     agent: &Agent,
     reason: &str,
 ) -> DaoResult<Option<roomler_core::hooks::ReleasedLease>> {
-    roomler_ai_mod_fleet::removal::remove_agent_device(state.fleet(), agent, reason).await
+    roomler_ai_mod_fleet::removal::remove_agent_device(&state.fleet, agent, reason).await
 }
 
 /// One reap cycle. Pub so integration tests can drive it deterministically
@@ -77,8 +77,9 @@ pub(crate) async fn remove_agent_device(
 /// socket OR the Redis directory says another pod does — and with Redis
 /// configured but unreachable the cycle ABORTS, since an unreadable
 /// directory must not let this pod reap agents that are alive elsewhere.
-pub async fn run_ephemeral_reap(state: &AppState) -> usize {
+pub async fn run_ephemeral_reap(state: &NetworkState) -> usize {
     let rows = match state
+        .fleet
         .agents
         .find_ephemeral_reap_candidates(MIN_TTL_SECS as i64 * 1000)
         .await
@@ -116,7 +117,7 @@ pub async fn run_ephemeral_reap(state: &AppState) -> usize {
     let mut reaped = 0usize;
     for row in rows {
         let Some(agent_id) = row.id else { continue };
-        if state.rc_hub.is_agent_online(agent_id) || redis_fresh.contains(&agent_id) {
+        if state.fleet.rc_hub.is_agent_online(agent_id) || redis_fresh.contains(&agent_id) {
             continue; // live somewhere — its heartbeat trail is the stale thing, not it
         }
         let ttl_ms = effective_ttl_secs(&row, state) as i64 * 1000;
@@ -154,7 +155,7 @@ pub async fn run_ephemeral_reap(state: &AppState) -> usize {
 ///
 /// No-op (nothing spawned) unless `rc.ephemeral_reaper_enabled` — the FR-51
 /// P1 kill switch: default off means zero queries and zero deletes.
-pub fn spawn_reaper(state: AppState) {
+pub fn spawn_reaper(state: NetworkState) {
     if !state.settings.rc.ephemeral_reaper_enabled {
         return;
     }

@@ -17,13 +17,16 @@ path = "src/main.rs"
 # FR-69 — one feature per module crate. `default` is the hosted build; the
 # named profiles (P8) will select subsets. `saas` is the add-on the published
 # self-host images never carry.
-default = ["saas", "chat", "conference", "remote"]
+default = ["saas", "chat", "conference", "fleet", "remote", "network"]
 saas = ["dep:roomler-ai-mod-saas"]
 chat = ["dep:roomler-ai-mod-chat"]
 # `conference` is the only feature that links mediasoup (the C++ worker build).
 conference = ["dep:roomler-ai-mod-conference"]
-# `remote` (P6) is built on `fleet`; its kill switch is `[modules] remote = false`.
-remote = ["dep:roomler-ai-mod-remote"]
+# `fleet` (P5a) is device management; `remote` (P6) and `network` (P7) are built
+# ON it, so their features imply it. Kill switches: `[modules] <id> = false`.
+fleet = ["dep:roomler-ai-mod-fleet"]
+remote = ["dep:roomler-ai-mod-remote", "fleet"]
+network = ["dep:roomler-ai-mod-network", "fleet"]
 
 
 [dependencies]
@@ -31,7 +34,6 @@ roomler-ai-config = { path = "../config" }
 roomler-ai-db = { path = "../db" }
 roomler-ai-services = { path = "../services" }
 roomler-ai-remote-control = { path = "../remote_control" }
-roomler-ai-tunnel-core = { path = "../tunnel-core" }
 # FR-69 — the composition contract, `Core`, and the primitives every module
 # handler needs.
 roomler-core = { path = "../core" }
@@ -44,11 +46,11 @@ roomler-ai-mod-remote = { path = "../modules/remote", optional = true }
 # FR-69 P5a — NOT optional yet: the host still serves the agent socket from
 # the fleet module's handles (the Hub, the agent row, presence). It becomes a
 # feature like the others when the socket moves into the module (P5b).
-roomler-ai-mod-fleet = { path = "../modules/fleet" }
+roomler-ai-mod-fleet = { path = "../modules/fleet", optional = true }
 # FR-69 P7a — NOT optional yet either: the host's tunnel, DERP and agent-socket
 # code still calls the engine that moved here (`state.network()`). It becomes a
 # feature when the sockets move (P7b).
-roomler-ai-mod-network = { path = "../modules/network" }
+roomler-ai-mod-network = { path = "../modules/network", optional = true }
 
 axum.workspace = true
 tokio.workspace = true
