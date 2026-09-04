@@ -3,14 +3,14 @@
 //! Needs-attention sentinel — daemon-side surface.
 //!
 //! P3e lever E: the sentinel machinery (paths, raise/read/clear, reasons)
-//! lives in `roomler-core::notify` so thin clients (the desktop
+//! lives in `roomler-node-core::notify` so thin clients (the desktop
 //! companion) can read it without linking this crate. Everything is
 //! re-exported here under the old paths. What could NOT move is the rc.53
 //! worker-aware trio below: it probes the process's worker role via
 //! [`crate::system_context::worker_role`], which is winlogon-token machinery
 //! gated on the daemon-only `system-context` feature.
 
-pub use roomler_core::notify::*;
+pub use roomler_node_core::notify::*;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
