@@ -10,8 +10,12 @@ pub mod background_task;
 pub mod capabilities;
 pub mod cluster;
 pub mod cost;
-// The device listing joins agents (fleet) with tunnel clients and overlay
-// nodes (network): a cross-pillar view that stays here until `network` exists.
+// The unified device listing joins agents (fleet, required) with tunnel
+// clients and overlay nodes (network, optional): a composition view over two
+// modules, which is the host's to hold — a `remote` profile has no network
+// module and still has a devices page.
+#[cfg(feature = "fleet")]
+pub mod device;
 pub mod integration;
 pub mod invite;
 pub mod notification;
