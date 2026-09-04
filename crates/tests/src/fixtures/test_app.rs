@@ -462,6 +462,7 @@ fn test_settings() -> Settings {
         // (and any deployment without the toml) actually looks like. Every
         // cost therefore reads "not priced" rather than 0.00.
         relay_costs: roomler_ai_config::RelayCosts::default(),
+        modules: roomler_ai_config::ModulesSettings::default(),
         // P2b — blocks OFF by default, exactly like a fresh deployment. The
         // renumber tests carve explicitly; the block-carve test flips the
         // flag via `spawn_with_settings`.

@@ -3,7 +3,7 @@
 use roomler_ai_api::{build_router, state, state::AppState};
 use roomler_ai_config::{DEFAULT_FRONTEND_URL, Settings};
 use roomler_ai_db::{connect, indexes::ensure_indexes};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -104,6 +104,18 @@ async fn main() -> anyhow::Result<()> {
             "Stripe secret key is set but price_pro/price_business is empty — \
              checkout WILL fail; set ROOMLER__STRIPE__PRICE_PRO and \
              ROOMLER__STRIPE__PRICE_BUSINESS."
+        );
+    }
+
+    // FR-69 P1 — the per-module switches exist before the modules do. A switch
+    // that is off is said out loud here so nobody believes it unmounted
+    // anything yet: each takes effect with its own module's PR.
+    let switched_off = settings.modules.switched_off();
+    if !switched_off.is_empty() {
+        warn!(
+            modules = ?switched_off,
+            "[modules] switches are OFF in config but not yet effective — nothing is \
+             unmounted until that module has been extracted (FR-69)"
         );
     }
 

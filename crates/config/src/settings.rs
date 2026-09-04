@@ -40,6 +40,78 @@ pub struct Settings {
     /// **not** `Default`: absent means *not priced*, never zero.
     #[serde(default)]
     pub relay_costs: RelayCosts,
+    /// FR-69 — per-module runtime switches. Absent ⇒ everything on, which is
+    /// exactly today's server.
+    #[serde(default)]
+    pub modules: ModulesSettings,
+}
+
+/// FR-69 — the per-module runtime switches (`[modules]`, env
+/// `ROOMLER__MODULES__<ID>=false`).
+///
+/// `false` unmounts a compiled module on a pod without a rebuild — the
+/// per-module kill switch during the roll that introduces it. Each switch
+/// takes effect with the PR that extracts its module (P2 onwards); until
+/// then it is recorded and logged at boot, and `GET /api/capabilities`
+/// reports it under `switched_off`, but the routes still serve.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ModulesSettings {
+    #[serde(default = "modules_default_on")]
+    pub chat: bool,
+    #[serde(default = "modules_default_on")]
+    pub conference: bool,
+    #[serde(default = "modules_default_on")]
+    pub fleet: bool,
+    #[serde(default = "modules_default_on")]
+    pub remote: bool,
+    #[serde(default = "modules_default_on")]
+    pub network: bool,
+    #[serde(default = "modules_default_on")]
+    pub saas: bool,
+}
+
+fn modules_default_on() -> bool {
+    true
+}
+
+impl Default for ModulesSettings {
+    fn default() -> Self {
+        Self {
+            chat: true,
+            conference: true,
+            fleet: true,
+            remote: true,
+            network: true,
+            saas: true,
+        }
+    }
+}
+
+impl ModulesSettings {
+    /// The module ids an operator has switched off, in the composition order
+    /// of `roomler_core::graph::MODULES`.
+    pub fn switched_off(&self) -> Vec<&'static str> {
+        let mut off = Vec::new();
+        if !self.saas {
+            off.push("saas");
+        }
+        if !self.chat {
+            off.push("chat");
+        }
+        if !self.conference {
+            off.push("conference");
+        }
+        if !self.fleet {
+            off.push("fleet");
+        }
+        if !self.remote {
+            off.push("remote");
+        }
+        if !self.network {
+            off.push("network");
+        }
+        off
+    }
 }
 
 /// Multi-org P2b — tenant-block addressing for the overlay mesh.

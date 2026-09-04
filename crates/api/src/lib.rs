@@ -2,6 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 pub mod cluster;
 pub mod cookies;
+pub mod core_state;
 pub mod error;
 pub mod extractors;
 pub mod media_stats;
@@ -734,6 +735,9 @@ pub fn build_router(state: AppState) -> Router {
 
     // Compose API
     let api = Router::new()
+        // FR-69 — what this server is composed of; the module list one UI
+        // build and one daemon read before offering a pillar.
+        .route("/capabilities", get(routes::capabilities::get))
         // C-6 — per-pod cluster status (identity, counters, gauges).
         .route("/cluster/status", get(routes::cluster::status))
         .nest("/auth", auth_routes)
@@ -886,6 +890,8 @@ async fn health_check() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        // FR-69 — the compiled module set; a profile boot smoke asserts it.
+        "modules": roomler_core::graph::MODULES,
     }))
 }
 
