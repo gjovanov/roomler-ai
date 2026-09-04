@@ -19,7 +19,6 @@ pub mod derp;
 pub mod derp_acl;
 pub mod derp_cluster;
 pub mod device_presence;
-pub mod dispatcher;
 pub mod ephemeral;
 pub mod handler;
 pub mod media_cluster;
@@ -27,7 +26,11 @@ pub mod org_relay;
 pub mod overlay;
 pub mod rc_cluster;
 pub mod rc_relay;
-pub mod redis_pubsub;
 pub mod remote_control;
-pub mod storage;
 pub mod tunnel;
+
+// FR-69 P1b — the connection registry, the fan-out primitives and the Redis
+// pub/sub layer are core (`roomler_core::ws`); re-exported here so every
+// `crate::ws::{storage, dispatcher, redis_pubsub}` path in this crate reads
+// as before.
+pub use roomler_core::ws::{dispatcher, redis_pubsub, storage};
