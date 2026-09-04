@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! FR-69 P5c — the host's TRANSITIONAL agent-socket handlers: what `remote`
-//! and `network` will register through the core's `AgentSocketRegistry`
-//! once they are modules, implemented over the host's own code until then
-//! and registered under their ids, so the socket — the fleet module's now —
-//! dispatches every message to its owner without naming the host.
+//! FR-69 P5c — the host's TRANSITIONAL agent-socket handler: what `network`
+//! will register through the core's `AgentSocketRegistry` once it is a
+//! module (P7), implemented over the host's own code until then and
+//! registered under its id, so the socket — the fleet module's — dispatches
+//! every message to its owner without naming the host. (`remote`'s half
+//! registers itself from its module since P6.)
 //!
 //! The order inside the network handler is the socket's old pipeline
 //! verbatim: the tunnel-client relay (this agent as an ORIGINATOR of
@@ -258,63 +259,6 @@ impl AgentSocketLifecycle for HostNetworkAgentSocket {
                 NodeIdentity::Agent(ctx.agent_id),
             )
             .await;
-        }
-    }
-}
-
-/// `remote`'s half of the agent socket: the session-stats merge. Everything
-/// else remote-owned (session request, SDP, ICE, terminate) is the Hub's own
-/// dispatch, which the socket runs on whatever a handler hands back.
-pub struct HostRemoteAgentSocket {
-    state: AppState,
-}
-
-impl HostRemoteAgentSocket {
-    pub fn new(state: AppState) -> Self {
-        Self { state }
-    }
-}
-
-#[async_trait]
-impl AgentMsgHandler for HostRemoteAgentSocket {
-    async fn handle(&self, ctx: &AgentCtx, msg: ClientMsg) -> Option<ClientMsg> {
-        match msg {
-            ClientMsg::SessionStats {
-                session_id,
-                bytes_sent,
-                bytes_recv,
-                fps,
-                rtt_ms,
-                keyframe_requests,
-                input_events,
-                shared_seconds,
-                mixed_dial_seconds,
-            } => {
-                if self.state.settings.stats.enabled
-                    && let Ok(sid) = ObjectId::parse_str(&session_id)
-                {
-                    let stats = roomler_ai_remote_control::models::SessionStats {
-                        bytes_sent,
-                        bytes_recv,
-                        peak_fps: fps,
-                        avg_rtt_ms: rtt_ms,
-                        keyframe_requests,
-                        input_events,
-                        shared_seconds,
-                        mixed_dial_seconds,
-                    };
-                    if let Err(e) = self
-                        .state
-                        .remote_sessions
-                        .merge_live_stats(sid, ctx.agent_id, &stats)
-                        .await
-                    {
-                        debug!(agent = %ctx.agent_id, %e, "session stats merge failed");
-                    }
-                }
-                None
-            }
-            other => Some(other),
         }
     }
 }
