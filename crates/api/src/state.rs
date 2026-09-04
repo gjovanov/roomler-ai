@@ -67,8 +67,6 @@ pub struct AppState {
     pub agents: Arc<AgentDao>,
     /// FR-51 P2 — reusable ephemeral enrollment keys + their per-use audit.
     pub enrollment_keys: Arc<roomler_ai_services::dao::enrollment_key::EnrollmentKeyDao>,
-    pub remote_sessions: Arc<RemoteSessionDao>,
-    pub remote_audit: Arc<RemoteAuditDao>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
     /// Roomler-SSH grant log — every session request, granted or refused.
