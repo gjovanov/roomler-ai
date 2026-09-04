@@ -46,3 +46,27 @@ pub async fn require_tenant_stats(
 pub fn parse_tid(tenant_id: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(tenant_id).map_err(|_| ApiError::BadRequest("Invalid tenant_id".into()))
 }
+
+/// Tenant-permission gate: the caller must hold `flag` in `tenant_id`.
+///
+/// FR-69 P3 — moved from the api crate's `routes/remote_control.rs`, where
+/// every device-management surface gated its destructive endpoints on it; the
+/// `chat` module's room routes gate on `MANAGE_CHANNELS` through the same
+/// function. 403 with the permission's name, unlike the platform-admin gate
+/// above: membership is not a secret, the missing bit is useful to know.
+pub async fn require_permission(
+    state: &Core,
+    tenant_id: ObjectId,
+    user_id: ObjectId,
+    flag: u64,
+    label: &str,
+) -> Result<(), ApiError> {
+    let perms = state
+        .tenants
+        .get_member_permissions(tenant_id, user_id)
+        .await?;
+    if !permissions::has(perms, flag) {
+        return Err(ApiError::Forbidden(format!("Missing {label} permission")));
+    }
+    Ok(())
+}

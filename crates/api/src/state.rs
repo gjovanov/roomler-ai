@@ -16,17 +16,16 @@ use roomler_ai_remote_control::{
     turn_url::{VariantCaps, expand_turn_url},
 };
 use roomler_ai_services::{
-    AuthService, EmailService, GiphyService, OAuthService, PushService, TaskService,
+    AuthService, EmailService, OAuthService, PushService, TaskService,
     dao::{
         activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
-        consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
-        invite::InviteDao, key_rotation_audit::KeyRotationAuditDao, message::MessageDao,
-        notification::NotificationDao, overlay_network::OverlayNetworkDao,
-        overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
-        peer_relay_audit::PeerRelayAuditDao, push_subscription::PushSubscriptionDao,
-        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
-        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao,
-        ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
+        consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, invite::InviteDao,
+        key_rotation_audit::KeyRotationAuditDao, notification::NotificationDao,
+        overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
+        overlay_policy::OverlayPolicyDao, peer_relay_audit::PeerRelayAuditDao,
+        push_subscription::PushSubscriptionDao, recording::RecordingDao,
+        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
+        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
         tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
         tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
@@ -64,10 +63,10 @@ pub struct AppState {
     /// [`crate::core_state`].
     pub core: Core,
 
+    /// FR-69 P3 — `rooms` is the `chat` module's, but the call and recording
+    /// handlers that conference takes over in P4 still read it from here; a
+    /// DAO is a stateless handle on the collection, so a second one is free.
     pub rooms: Arc<RoomDao>,
-    pub messages: Arc<MessageDao>,
-    pub reactions: Arc<ReactionDao>,
-    pub files: Arc<FileDao>,
     pub recordings: Arc<RecordingDao>,
 
     /// FR-69 P2 — the module crates this build links, initialised (or `None`
@@ -76,7 +75,6 @@ pub struct AppState {
     pub modules: crate::compose::Modules,
 
     pub room_manager: Arc<RoomManager>,
-    pub giphy: Option<Arc<GiphyService>>,
 
     // Remote-control subsystem
     pub agents: Arc<AgentDao>,
@@ -262,11 +260,8 @@ impl AppState {
         let tenants = Arc::new(TenantDao::new(&db));
         let rooms = Arc::new(RoomDao::new(&db));
         let invites = Arc::new(InviteDao::new(&db));
-        let messages = Arc::new(MessageDao::new(&db));
         let notifications = Arc::new(NotificationDao::new(&db));
-        let reactions = Arc::new(ReactionDao::new(&db));
         let roles = Arc::new(RoleDao::new(&db));
-        let files = Arc::new(FileDao::new(&db));
         let recordings = Arc::new(RecordingDao::new(&db));
         let tasks = Arc::new(TaskService::new(&db));
 
@@ -343,12 +338,6 @@ impl AppState {
                 )),
             ),
             None => (None, None),
-        };
-
-        let giphy = if !settings.giphy.api_key.is_empty() {
-            Some(Arc::new(GiphyService::new(settings.giphy.api_key.clone())))
-        } else {
-            None
         };
 
         // Remote-control subsystem
@@ -865,13 +854,9 @@ impl AppState {
             core,
             modules,
             rooms,
-            messages,
-            reactions,
-            files,
             recordings,
 
             room_manager,
-            giphy,
             agents,
             enrollment_keys,
             remote_sessions,

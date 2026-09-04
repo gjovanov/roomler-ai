@@ -103,6 +103,7 @@ flowchart BT
     db["crates/db<br/>Mongo models + indexes"]
     core["crates/core → roomler-core<br/>Core · module contract · composition snapshot"]
     saas["crates/modules/saas → roomler-ai-mod-saas<br/>Stripe · newsletter · plan compliance (add-on)"]
+    chat["crates/modules/chat → roomler-ai-mod-chat<br/>rooms · messages · files · search · typing"]
     rc["crates/remote_control<br/>signalling · consent · Hub¹ · ACL shapes"]
     services["crates/services<br/>DAOs · auth · media (mediasoup) · billing"]
     api["crates/api<br/>Axum: REST + /ws + /derp"]
@@ -124,9 +125,10 @@ flowchart BT
     db --> config
     core --> services
     saas --> core
+    chat --> core
     rc --> db
     services --> rc
-    api --> services & core & saas
+    api --> services & core & saas & chat
     tests --> api & roomlerd & core
 
     tunnelcore --> localapi & tcpturn & rc

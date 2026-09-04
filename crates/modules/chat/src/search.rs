@@ -8,9 +8,9 @@ use bson::{doc, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::error::ApiError;
-use crate::extractors::auth::AuthUser;
-use crate::state::AppState;
+use crate::ChatState;
+use roomler_core::ApiError;
+use roomler_core::extractors::auth::AuthUser;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -60,7 +60,7 @@ pub struct SearchResults {
 }
 
 pub async fn search(
-    State(state): State<AppState>,
+    State(state): State<ChatState>,
     Path(tenant_id): Path<String>,
     Query(query): Query<SearchQuery>,
     auth: AuthUser,
@@ -193,7 +193,7 @@ pub async fn search(
 }
 
 /// Fetch room names for a list of room IDs and return a map.
-async fn fetch_room_names(state: &AppState, room_ids: &[ObjectId]) -> HashMap<ObjectId, String> {
+async fn fetch_room_names(state: &ChatState, room_ids: &[ObjectId]) -> HashMap<ObjectId, String> {
     use futures::TryStreamExt;
 
     let mut result = HashMap::new();
@@ -225,7 +225,7 @@ async fn fetch_room_names(state: &AppState, room_ids: &[ObjectId]) -> HashMap<Ob
 }
 
 /// Get all user IDs that are members of a tenant.
-async fn get_tenant_member_user_ids(state: &AppState, tenant_id: ObjectId) -> Vec<ObjectId> {
+async fn get_tenant_member_user_ids(state: &ChatState, tenant_id: ObjectId) -> Vec<ObjectId> {
     use futures::TryStreamExt;
 
     let filter = doc! { "tenant_id": tenant_id };

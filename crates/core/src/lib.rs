@@ -59,6 +59,7 @@ pub mod guards;
 pub mod hooks;
 pub mod job;
 pub mod module;
+pub mod notify;
 pub mod origin;
 pub mod rate_limit;
 pub mod relay_load;

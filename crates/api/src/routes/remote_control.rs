@@ -33,22 +33,11 @@ const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
 /// `pub(crate)` so the sibling device-management surfaces in the same subsystem
 /// (`routes::overlay_route`, `routes::tunnel`) gate their destructive endpoints
 /// on the same `MANAGE_AGENTS` bit rather than re-deriving the check.
-pub(crate) async fn require_permission(
-    state: &AppState,
-    tenant_id: ObjectId,
-    user_id: ObjectId,
-    flag: u64,
-    label: &str,
-) -> Result<(), ApiError> {
-    let perms = state
-        .tenants
-        .get_member_permissions(tenant_id, user_id)
-        .await?;
-    if !permissions::has(perms, flag) {
-        return Err(ApiError::Forbidden(format!("Missing {label} permission")));
-    }
-    Ok(())
-}
+// FR-69 P3 — the gate itself is `roomler_core::guards::require_permission`
+// (the `chat` module's room routes need it too); re-exported so every
+// `super::remote_control::require_permission(&state, …)` in this crate reads
+// as before — an `&AppState` argument derefs to `&Core`.
+pub(crate) use roomler_core::guards::require_permission;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Agent enrollment
