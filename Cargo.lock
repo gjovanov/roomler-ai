@@ -8041,7 +8041,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-conference"
-version = "0.4.62"
+version = "0.4.63"
 dependencies = [
  "anyhow",
  "async-trait",
