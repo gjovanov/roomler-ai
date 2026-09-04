@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 use axum::{
-    extract::FromRequestParts,
+    extract::{FromRef, FromRequestParts},
     http::{header, request::Parts},
 };
 use bson::oid::ObjectId;
 use roomler_ai_services::auth::Claims;
 
-use crate::{error::ApiError, state::AppState};
+use crate::{core_state::Core, error::ApiError};
 
 /// Extracts the authenticated user from JWT (cookie or Authorization header)
 #[derive(Debug, Clone)]
@@ -21,13 +21,17 @@ pub struct AuthUser {
 
 impl<S> FromRequestParts<S> for AuthUser
 where
-    AppState: FromRef<S>,
+    Core: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let app_state = AppState::from_ref(state);
+        // FR-69 P1 — only the core is needed here: the JWT verifier. Bounding
+        // on `Core` rather than `AppState` is what lets a module crate's
+        // router (state = its own struct that derefs to `Core`) use this
+        // extractor unchanged.
+        let core = Core::from_ref(state);
 
         // Try Authorization header first, then the session cookie. The SPA is
         // moving to cookie-only, but the header stays accepted: scripts, the
@@ -42,7 +46,7 @@ where
             .or_else(|| crate::cookies::get(&parts.headers, "access_token"))
             .ok_or_else(|| ApiError::Unauthorized("No token provided".to_string()))?;
 
-        let claims = app_state.auth.verify_access_token(&token)?;
+        let claims = core.auth.verify_access_token(&token)?;
 
         let user_id = ObjectId::parse_str(&claims.sub)
             .map_err(|_| ApiError::Unauthorized("Invalid user ID in token".to_string()))?;
@@ -62,7 +66,7 @@ pub struct OptionalAuthUser(pub Option<AuthUser>);
 
 impl<S> FromRequestParts<S> for OptionalAuthUser
 where
-    AppState: FromRef<S>,
+    Core: FromRef<S>,
     S: Send + Sync,
 {
     type Rejection = std::convert::Infallible;
@@ -71,16 +75,5 @@ where
         Ok(OptionalAuthUser(
             AuthUser::from_request_parts(parts, state).await.ok(),
         ))
-    }
-}
-
-/// Helper trait for extracting AppState from composite state types
-pub trait FromRef<T> {
-    fn from_ref(input: &T) -> Self;
-}
-
-impl FromRef<AppState> for AppState {
-    fn from_ref(input: &AppState) -> Self {
-        input.clone()
     }
 }

@@ -121,6 +121,10 @@
       "methods": "POST"
     },
     {
+      "path": "/api/capabilities",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/cluster/status",
       "methods": "GET,HEAD"
     },

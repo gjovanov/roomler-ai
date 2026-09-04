@@ -23,6 +23,9 @@ roomler-ai-db = { path = "../db" }
 roomler-ai-services = { path = "../services" }
 roomler-ai-remote-control = { path = "../remote_control" }
 roomler-ai-tunnel-core = { path = "../tunnel-core" }
+# FR-69 — the composition contract (the module graph today; the `Module`
+# trait and `Core` from P1b on).
+roomler-core = { path = "../core" }
 
 axum.workspace = true
 tokio.workspace = true
