@@ -111,9 +111,41 @@ async function surfaceSig(page: Page): Promise<string> {
   })
 }
 
-/** Ground truth for ANY transport: a live surface appears and its pixels
- *  CHANGE across a 3 s window while the pointer wiggles. A frozen or absent
- *  stream fails; a streaming one passes whether it rides RTP or a DataChannel. */
+/** The fps the VIEWER ITSELF reports, from its own live stats pill. The pill
+ *  renders `v-if="metrics.fps"`, and those metrics are fed by the real pump on
+ *  EVERY transport — so a non-zero reading is direct evidence that frames are
+ *  arriving, including on a DataChannel path where inbound-rtp is silent.
+ *  Read from rendered text rather than a class, so a restyle cannot silently
+ *  turn this oracle off. 0 = the viewer is not reporting frames. */
+async function viewerFps(page: Page): Promise<number> {
+  return await page.evaluate(() => {
+    const m = (document.body.innerText || '').match(/(\d+(?:\.\d+)?)\s*fps/i)
+    return m ? Number(m[1]) : 0
+  })
+}
+
+/** Ground truth for ANY transport, in two independent forms:
+ *   1. the viewer's own fps readout is non-zero at both ends of a 3 s window —
+ *      the ONLY workable signal on a STATIC desktop, where a live stream is
+ *      re-encoded by the idle keepalive and successive frames are pixel-
+ *      identical (measured 2026-09-04: a healthy 28 fps VP9-444 stream failed a
+ *      pixel-change proof because the guest was just sitting at its wallpaper);
+ *   2. failing that, the painted surface CHANGES across the window.
+ *  A dead stream reports no fps and paints nothing, so it still fails. */
+async function proveStreamLive(page: Page): Promise<void> {
+  const f0 = await viewerFps(page)
+  if (f0 > 0) {
+    await wiggle(page)
+    await page.waitForTimeout(3_000)
+    const f1 = await viewerFps(page)
+    expect(f1, `viewer fps fell to 0 over 3s (was ${f0}) — stream stalled`).toBeGreaterThan(0)
+    return
+  }
+  await proveSurfaceLive(page)
+}
+
+/** Pixel-change proof: a live surface appears and its pixels CHANGE across a
+ *  3 s window while the pointer wiggles. Used when the viewer reports no fps. */
 async function proveSurfaceLive(page: Page): Promise<void> {
   await expect
     .poll(
@@ -213,7 +245,7 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
       // wiggles — a frozen or absent stream fails, a live one passes on any
       // transport. The hooks strengthen this automatically once they ship.
       console.warn('[vmtest-remote] FR-61 hooks absent -- using the surface pixel-change fallback')
-      await proveSurfaceLive(page)
+      await proveStreamLive(page)
       return
     }
 
@@ -235,13 +267,17 @@ test.describe('vmtest remote-desktop check (named agent)', () => {
         countersLive = true
         break
       }
+      // The viewer already reporting fps means frames ARE arriving on a
+      // transport the RTP counters cannot see — stop waiting out the 60 s and
+      // let proveStreamLive do the (transport-agnostic) liveness proof.
+      if ((await viewerFps(page)) > 0) break
       await page.waitForTimeout(1_000)
     }
     if (!countersLive) {
       console.warn(
         '[vmtest-remote] RTP counters flat (DataChannel transport?) — proving liveness on the SURFACE',
       )
-      await proveSurfaceLive(page)
+      await proveStreamLive(page)
       return
     }
 
