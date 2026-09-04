@@ -1279,9 +1279,11 @@ mod tests {
         let tr = run(&sc, &mut law);
         // A window that delivered nothing is a stall, and a stall is not
         // evidence that the pipe got faster.
+        let mut stall_windows = 0;
         for w in tr.rows.windows(2) {
             let (prev, cur) = (w[0], w[1]);
             if cur.stats.frames_rx == 0 {
+                stall_windows += 1;
                 assert!(
                     cur.target_bps <= prev.target_bps,
                     "the target rose during a stall at t={:?}{}",
@@ -1290,6 +1292,17 @@ mod tests {
                 );
             }
         }
+        // ⚠️ Without this the test is VACUOUS: the assertion above lives
+        // inside a conditional, so a fixture whose stalls stopped producing
+        // empty windows would pass while checking nothing at all. The
+        // scenario schedules a 2 s and a 4 s outage; at least one window must
+        // have delivered nothing.
+        assert!(
+            stall_windows >= 2,
+            "the fixture produced only {stall_windows} empty windows — the \
+             assertion never ran on a real stall{}",
+            tr.render()
+        );
     }
 
     #[test]
@@ -1300,6 +1313,23 @@ mod tests {
         assert!(
             tr.max_age_ms() < 600,
             "a 5 Mbps LAN pair painted late under motion bursts{}",
+            tr.render()
+        );
+        // ⚠️ Same vacuity trap one level up: this scenario is only a BURST
+        // test if the bursts actually cost something. A 5× motion burst on a
+        // 5 Mbps link must move the paint age off its floor somewhere, or the
+        // fixture is testing a steady link with a burst label.
+        let quietest = tr
+            .rows
+            .iter()
+            .map(|r| r.stats.age_p95_ms)
+            .min()
+            .unwrap_or(0);
+        assert!(
+            tr.max_age_ms() > quietest + 5,
+            "the motion bursts had no measurable effect (p95 {quietest}..{}) — \
+             this fixture is not exercising what it claims{}",
+            tr.max_age_ms(),
             tr.render()
         );
     }
