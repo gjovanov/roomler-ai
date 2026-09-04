@@ -25,12 +25,31 @@ GUARD=".claude/skills/sanitize-hostnames/check_shapes.py"
 CANARY="canary-selftest.md"
 trap 'rm -f "$CANARY"' EXIT
 
-D="DESK""TOP-AB12XY9"; L="LAP""TOP-QR34ST78"; W="W""IN-ABCDEFGHIJK"
+D="DESK""TOP-AB12XY9"; L="LAP""TOP-QR34ST78"; W="W""IN-ABC4EFGHIJK"
 P5="P""C51234";        P4="P""C5123";         C="CL""K00099887"
 X="Someone-X""MG-BOX9"; M="Someones-Mac""Book-Pro"
-CAUGHT=("$D" "$L" "$W" "$P5" "$P4" "$C" "$X" "$M")
-# Alias forms the guard must NOT flag.
-IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888")
+
+# ⚠️⚠️ EVERY canary appears TWICE, upper and lower. A guard blind to lowercase
+# is not a hypothetical: on 2026-09-04 a field log wrote two asset tags in
+# lowercase, this guard reported "none found", CI went green, and the names
+# reached a public repo. The uppercase canaries all passed that day -- which is
+# exactly why the lowercase ones now exist. Do not "tidy" them away as
+# duplicates; they are the regression test for the leak that happened.
+d="desk""top-ab12xy9"; l="lap""top-qr34st78"; w="w""in-abc4efghijk"
+p5="p""c51234";        p4="p""c5123";         c="cl""k00099887"
+x="someone-x""mg-box9"; m="someones-mac""book-pro"
+
+CAUGHT=("$D" "$L" "$W" "$P5" "$P4" "$C" "$X" "$M"
+        "$d" "$l" "$w" "$p5" "$p4" "$c" "$x" "$m")
+
+# Things the guard must NOT flag: our own alias forms (in both casings, since
+# prose writes them either way), and ordinary hyphenated words that fit the
+# DESKTOP- shape. Those words are all real strings in this repo, and flagging
+# them is how a guard earns enough noise to get deleted -- the digit
+# requirement in SHAPES is what keeps them out, and this locks it.
+IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888"
+         "win""host-a" "corp""lap-2"
+         "desk""top-classic" "desk""top-content" "desk""top-rebound")
 
 { printf '%s\n' "${CAUGHT[@]}"; printf 'must not trip: %s\n' "${IGNORED[*]}"; } > "$CANARY"
 
@@ -50,6 +69,67 @@ if python3 "$GUARD" --root . >/dev/null 2>&1; then :; else
   echo "expected exit 0 on the clean tree; the guard flags something already committed"
   python3 "$GUARD" --root . 2>&1 | sed -n '1,8p'
   fail=1
+fi
+
+# --- the exit-code CONTRACT with .githooks/pre-commit -----------------------
+#
+# The hook blocks on EXIT_FOUND (1) and on nothing else, so "a name was found"
+# and "the guard could not run" must never share a status. They did until
+# 2026-09-04, and the hook consequently reported `COMMIT REFUSED: this change
+# carries what looks like a real machine name` for a file of ordinary prose --
+# twice, from two unrelated causes (a checkout predating `--staged`, and git
+# exiting 128 inside a worktree). A guard that cries hostname when it means
+# "I crashed" is one someone silences with --no-verify, which removes the layer.
+#
+# Both canaries below assert a NON-1 status. Asserting merely "non-zero" would
+# pass on the exact bug this locks.
+
+# Bad arguments must be argparse's 2, never 1.
+python3 "$GUARD" --root . --no-such-flag >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ] || { echo "bad args: expected exit 2, got $rc"; fail=1; }
+
+# An internal failure must be EXIT_ERROR (20), never 1. Forcing one honestly:
+# --staged shells out to git, so a git dir that cannot exist makes the guard
+# raise exactly where a real worktree failure raised.
+( export GIT_DIR="$PWD/.no-such-git-dir"
+  python3 "$GUARD" --root . --staged >/dev/null 2>&1; exit $? ); rc=$?
+[ "$rc" -eq 20 ] || { echo "internal error: expected exit 20, got $rc"; fail=1; }
+
+# The hook's own decision, exercised in a THROWAWAY repo with a stub guard.
+#
+# Driving it against this repo would mean breaking the real check_shapes.py
+# mid-test; a scratch repo runs the identical code path with none of that risk,
+# and it is the only way to assert the branch honestly -- what matters is that a
+# guard exiting 20 and a guard exiting 1 lead to opposite outcomes.
+HOOK="$PWD/.githooks/pre-commit"
+if [ -e "$HOOK" ] && [ ! -x "$HOOK" ]; then
+  # Git silently ignores a non-executable hook, so this is layer 1 disarmed
+  # with no error anywhere -- the failure mode this whole file exists to catch.
+  echo "hook: .githooks/pre-commit is not executable (git will skip it silently)"; fail=1
+fi
+if [ -x "$HOOK" ] && command -v python3 >/dev/null 2>&1; then
+  hook_says() {   # $1 = status the stub guard exits with; echoes "<rc>|<output>"
+    t=$(mktemp -d); git init -q "$t"
+    mkdir -p "$t/.githooks" "$t/.claude/skills/sanitize-hostnames"
+    cp "$HOOK" "$t/.githooks/pre-commit"; chmod +x "$t/.githooks/pre-commit"
+    printf '#!/usr/bin/env python3\nimport sys\nsys.exit(%s)\n' "$1" \
+      > "$t/.claude/skills/sanitize-hostnames/check_shapes.py"
+    ( cd "$t" && echo ordinary-prose > a.txt && git add a.txt \
+      && o=$(.githooks/pre-commit 2>&1); printf '%s|%s' "$?" "$o" )
+    rm -rf "$t"
+  }
+
+  r=$(hook_says 20)
+  [ "${r%%|*}" = "0" ]              || { echo "hook: a guard that CANNOT RUN must not block (got ${r%%|*})"; fail=1; }
+  case "$r" in *"COULD NOT RUN"*) :;; *) echo "hook: missing the could-not-run warning"; fail=1;; esac
+  case "$r" in *"COMMIT REFUSED"*) echo "hook: claimed a hostname when it merely failed"; fail=1;; esac
+
+  r=$(hook_says 1)
+  [ "${r%%|*}" = "1" ]              || { echo "hook: a real finding must block (got ${r%%|*})"; fail=1; }
+  case "$r" in *"COMMIT REFUSED"*) :;; *) echo "hook: a finding must say COMMIT REFUSED"; fail=1;; esac
+
+  r=$(hook_says 0)
+  [ "${r%%|*}" = "0" ]              || { echo "hook: a clean guard must allow the commit (got ${r%%|*})"; fail=1; }
 fi
 
 if [ "$fail" -eq 0 ]; then echo "sanitize-hostnames selftest: ok"; else

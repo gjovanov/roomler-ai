@@ -15,6 +15,15 @@ jobs:
     # a cancelled attempt saves no cache — takes ~20 min 18 s on the 2-core
     # runner. The P5b rerun was cancelled by this ceiling at 20:18 with
     # every step green; warm runs finish in ~10.
+    #
+    # ⚠️ Why this ceiling keeps rising, and why re-running never fixes it: the
+    # Rust cache key below is `hashFiles(ci.yml)`, so ANY edit to this file
+    # rotates it and guarantees the very next run is cold — and a cancelled
+    # attempt saves no cache, so the retry is cold again. A PR that touches CI
+    # therefore pays the cold time twice over and cannot converge by retrying.
+    # Measured on 2026-09-04 under the then-30-minute ceiling: cancelled at
+    # 31 min 29 s in `Test tunnel-core --features overlay-l3,overlay-netstack`
+    # with every prior step green.
     timeout-minutes: 50
     runs-on: ubuntu-latest
     # Warm baseline is 4-5 min; the only step that can blow past it is an
@@ -64,32 +73,6 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check --all
-
-      # This repo is PUBLIC, and field notes are written in the heat of
-      # debugging — which is exactly when someone writes down the name of the
-      # machine they are debugging. Committed hostnames are reconnaissance
-      # value: they map the fleet and say which host runs what.
-      #
-      # The check is deliberately SHAPE-based, not name-based, so it needs no
-      # secret: the map that pairs each real name with its replacement lives
-      # outside the repo and must stay there. Shape is also the stronger test.
-      # The 2026-08-30 whole-history sweep started from a four-name map, applied
-      # it to every blob, every commit message and every issue — and this scan
-      # still found two more machines nobody had ever listed, one of them
-      # published in an FR spec since the PR that created it. A map finds the
-      # machines you know about; this finds the class.
-      #
-      # When it fires: add the real name to the map (outside the repo), re-run
-      # the sweep, and let this go green. Never add a real name to its
-      # allowlist. See .claude/skills/sanitize-hostnames/SKILL.md.
-      - name: No real machine names committed
-        run: |
-          # The selftest plants a canary of every shape and asserts the guard
-          # FAILS, then asserts it passes on the real tree. It runs first
-          # because this guard has silently self-disarmed three times, and each
-          # time the symptom was a confident "none found".
-          bash .claude/skills/sanitize-hostnames/selftest.sh
-          python3 .claude/skills/sanitize-hostnames/check_shapes.py --root .
 
       # The companion's icons shipped as 1x1 PLACEHOLDERS for its whole life.
       # Windows tolerated them; macOS aborts the process before the app starts —
@@ -685,6 +668,43 @@ jobs:
       - uses: actions/checkout@v4
       - name: Audit the FR registry
         run: bash scripts/fr-registry-audit.sh
+
+  machine-names:
+    name: No real machine names
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # This repo is PUBLIC, and field notes are written in the heat of debugging
+    # — which is exactly when someone writes down the name of the machine they
+    # are debugging. Committed hostnames are reconnaissance value: they map the
+    # fleet and say which host runs what.
+    #
+    # SHAPE-based, not name-based, so it needs no secret: the map that pairs
+    # each real name with its replacement lives outside the repo and must stay
+    # there. Shape is also the stronger test — the 2026-08-30 whole-history
+    # sweep applied a four-name map to every blob, message and issue, and this
+    # scan still found two machines nobody had ever listed, one of them
+    # published in an FR spec since the PR that created it.
+    #
+    # ⚠️ Its OWN job, deliberately, and a 5-minute one: it is the REQUIRED
+    # status check on master, so it must not be welded to the 30-minute Rust
+    # suite. It was a step inside `Rust checks` until 2026-09-04, which made it
+    # unusable as a required check and gave it no separate signal.
+    #
+    # When it fires: add the real name to the map (outside the repo), re-run
+    # the sweep, and let this go green. NEVER add a real name to the allowlist.
+    # See .claude/skills/sanitize-hostnames/SKILL.md.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard self-test, then scan
+        run: |
+          # The selftest plants a canary of every shape IN BOTH CASINGS and
+          # asserts the guard FAILS, then asserts it passes on the real tree.
+          # It runs first because this guard has silently self-disarmed four
+          # times and every symptom was a confident "none found" — most
+          # recently by matching uppercase only, while the leak that got
+          # through was written in lowercase.
+          bash .claude/skills/sanitize-hostnames/selftest.sh
+          python3 .claude/skills/sanitize-hostnames/check_shapes.py --root .
 
   name-audit:
     name: Retired-name audit (FR-21)
