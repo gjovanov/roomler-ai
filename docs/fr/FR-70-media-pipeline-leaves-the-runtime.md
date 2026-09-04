@@ -93,9 +93,14 @@ complaint stands.
       each retirement gated on a counter measured fleet-zero.
 - [ ] **AC5** — a transit stall is classified as such and does **not** cut the
       rate; a repeat of finding 4 is attributable without reading source.
-- [ ] **AC6** — an unmeasured prior cannot hold a session at the floor, and an
-      overridden `user_target` is visible to the operator. *Code + simulation
-      landed with P1 (2026-09-04); field verification pending — see the log.*
+- [x] **AC6 (rate half)** — an unmeasured prior cannot hold a session at the
+      floor. **Field-verified 2026-09-04 on 0.4.64** on the pair that failed:
+      the prior decayed to `None` at 106 s and the target reached 3.9 Mbps with
+      nothing measuring the pipe; the same build with `rate_prior_decay=false`
+      reproduced the 200–285 kbps pin for three minutes. See the log.
+- [ ] **AC6 (visible half)** — an overridden `user_target` is visible to the
+      operator. On the wire since 0.4.64 (`cap_reason`/`cap_detail`); the
+      on-screen label waits for the next web deploy.
 - [ ] **AC7** — every phase carries a before/after from the same instrument, and
       each field test is shown to FAIL on the current deploy first.
 
@@ -207,7 +212,22 @@ memory.
 | when | build | cell | result |
 |---|---|---|---|
 | 2026-09-04 12:40 UTC | 0.4.61 | CORPLAP-1 → neo16, overlay pair (`100.65.4.28 ↔ 100.65.4.2`, `relay=false`, constrained), seed 200 k, `hevc_qsv` | **The FAIL** (AC7's baseline): 4 min at `target 200–285 k`, `slow_link_floor_bps=Some(200000)`, `goodput_bps=None`, `send_stalls=0`, `link_stats=(0,…)`, age 55–108 ms, 69 budget skips, `1280×800@15`, pill `relay-limited`. Memory unchanged at 200 k. |
-| pending | P1 build | same cell, same seed | expect `prior_bps` to climb from `Some(200000)` on clean windows and reach `None` inside ~100 windows with `goodput_bps` still `None`; `slow_link_floor_bps` letting go; the target leaving the slow band **or** a measurement appearing; the pill naming the slow-link cap; the next session on the pair opening above 1 Mbps with no profile. |
+| 2026-09-04 18:40 UTC | **0.4.64** (`rate_prior_decay` default on) | **the same cell**: `6a9b10b5`, the primary-org overlay pair (`100.65.4.28:61310 ↔ 100.65.4.2:59196`, `relay=false`, constrained), seed 200 k from the real memory, `hevc_qsv`, the profile engaged (`1280×800@15`), log `reason="slow-link-cap"` | **PASS.** `prior_bps` `Some(200000)` → 250 000 (18:41:06) → 312 500 → 390 625 → 488 281 → 610 351 → 762 938 → 953 672 → 1 192 090 → 1 490 112 → **`None` at 18:42:39 (106 s)**; `slow_link_floor_bps` followed at 0.85× and let go with it; the target rode the floor and its own AI (200 k → 648 k at 70 s → 1.5 M → 3.0 M at 130 s → 3.9 M at 180 s, the FR-35 learner lifting the ceiling to 4.6 M) — with `goodput_bps=None`, `send_stalls=0` and `link_stats=(0,…)` in **every** window, i.e. under exactly the conditions that pinned `6a9abc30` for four minutes. Age 58–115 ms throughout. Pill at the end: `5.7 Mbps · 16 fps · 1280×800`. Write-back: `peer="100.65.4.2" stable_bps=6083280 kept_bps=6083280` — the pair is freed (200 k → 6.08 M). Repeated on the jovanov-org pair (`6a9b11c9`, `100.65.0.6 ↔ 100.65.0.5`, hand-seeded to 200 k): `None` at 114 s, 3.45 M at 155 s. |
+| 2026-09-04 18:51 UTC | **0.4.64 with `rate_prior_decay=false`** (the same-build FAIL control, one flag) | `6a9b1333`, the **same** primary-org overlay pair, memory hand-seeded back to 200 k | **FAIL, as it must**: three minutes of `prior_bps=Some(200000)` and `slow_link_floor_bps=Some(200000)`, the target sawing `200k → 225k → 253k → 285k → 200k` under budget skips (66 in 3 min), `goodput_bps=None`, zero stalls, zero congested windows, age 67–122 ms — the 12:40 session, reproduced on demand. Write-back: `stable_bps=253125` — **the attractor caught in the act** (the switch-on arm had just written 6 083 280 for the same pair). |
+| 2026-09-04 | 0.4.64, web bundle **not yet deployed** | the viewer half | **PENDING**: the agent sends `cap_reason="slow-link-cap"` (the log line proves the attribution), but roomler.ai still serves the pre-P1 bundle, so the pill read `1280×800 · relay-limited (native 1920×1200)` throughout. Verify the label and the Resolution-setting hint after the next web deploy (master also carries FR-69 P0–P5c, which has its own prod-rollout gate — not this FR's call). |
+| 2026-09-04 | 0.4.64 | the resolution half | as designed: the FR-59 P5 cap held `1280×800` for the whole session while the rate climbed to 5.7 Mbps — the cap lifts on the NEXT session (memory now 6.08 M ⇒ no profile). Making it lift mid-session is M2's job. |
+
+⚠️ Two things the run taught that the plan did not know: ICE nominates a
+**different pair on every reconnect** here (the two overlay host pairs and two
+public relays, in five sessions), so a cell keyed on one pair's memory is not
+reproducible on demand without seeding every constrained key; and a session
+started six seconds after the update task fired ran on the OLD binary until the
+installer restarted the service — read the version at the session, not at the
+task.
+
+**AC6 status**: the rate half is field-verified (above); the visible-override
+half is verified on the wire (log + unit tests) and pending the web deploy for
+the on-screen label.
 
 ## Open decisions
 
