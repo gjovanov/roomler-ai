@@ -5,7 +5,6 @@ pub mod compose;
 pub mod core_state;
 pub mod extractors;
 pub mod media_stats;
-pub mod media_type;
 pub mod middleware;
 pub mod routes;
 pub mod state;
@@ -20,7 +19,6 @@ pub use roomler_core::{cookies, error, origin, rate_limit, relay_load, storage, 
 
 use axum::{
     Router,
-    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
 };
 use middleware::{
@@ -177,65 +175,25 @@ pub fn build_router(state: AppState) -> Router {
         // parameterised segment.
         .route("/{user_id}", delete(routes::user::remove_member));
 
-    // Room routes (under tenant) — replaces channel + conference
-    let room_routes = Router::new()
-        .route("/", get(routes::room::list))
-        .route("/", post(routes::room::create))
-        .route("/explore", get(routes::room::explore))
-        .route("/{room_id}", get(routes::room::get))
-        .route("/{room_id}", put(routes::room::update))
-        .route("/{room_id}", delete(routes::room::delete))
-        .route("/{room_id}/join", post(routes::room::join))
-        .route("/{room_id}/leave", post(routes::room::leave))
-        .route("/{room_id}/member", get(routes::room::members))
-        // Call endpoints
-        .route("/{room_id}/call/start", post(routes::room::call_start))
-        .route("/{room_id}/call/join", post(routes::room::call_join))
-        .route("/{room_id}/call/leave", post(routes::room::call_leave))
-        .route("/{room_id}/call/end", post(routes::room::call_end))
+    // Room CRUD, messages, reactions, files, search, the xlsx export and
+    // Giphy are the `chat` module's (FR-69 P3). The call endpoints below
+    // share the `/room` prefix with it and are conference's — they stay here
+    // until P4.
+    let call_routes = Router::new()
+        .route("/{room_id}/call/start", post(routes::call::call_start))
+        .route("/{room_id}/call/join", post(routes::call::call_join))
+        .route("/{room_id}/call/leave", post(routes::call::call_leave))
+        .route("/{room_id}/call/end", post(routes::call::call_end))
         .route(
             "/{room_id}/call/participant",
-            get(routes::room::participants),
+            get(routes::call::participants),
         );
-
-    // Message routes (under tenant/room)
-    let message_routes = Router::new()
-        .route("/", get(routes::message::list))
-        .route("/", post(routes::message::create))
-        .route("/pin", get(routes::message::pinned))
-        .route("/{message_id}", put(routes::message::update))
-        .route("/{message_id}", delete(routes::message::delete))
-        .route("/{message_id}/pin", put(routes::message::toggle_pin))
-        .route("/{message_id}/thread", get(routes::message::thread_replies))
-        .route("/{message_id}/reaction", post(routes::reaction::add))
-        .route(
-            "/{message_id}/reaction/{emoji}",
-            delete(routes::reaction::remove),
-        )
-        .route("/read", post(routes::message::mark_read))
-        .route("/read-all", post(routes::message::read_all))
-        .route("/unread-count", get(routes::message::unread_count));
 
     // Recording routes (under room)
     let recording_routes = Router::new()
         .route("/", get(routes::recording::list))
         .route("/", post(routes::recording::create))
         .route("/{recording_id}", delete(routes::recording::delete));
-
-    // Room file routes (100 MB body limit for audio uploads)
-    let room_file_routes = Router::new()
-        .route("/", get(routes::file::list))
-        .route("/upload", post(routes::file::upload_room))
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024));
-
-    // File-by-ID routes (under tenant — no room prefix needed)
-    let file_by_id_routes = Router::new()
-        .route("/", get(routes::file::list_tenant_files))
-        .route("/upload", post(routes::file::upload))
-        .route("/{file_id}", get(routes::file::get))
-        .route("/{file_id}/download", get(routes::file::download))
-        .route("/{file_id}", delete(routes::file::delete))
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024));
 
     // Background task routes (under tenant)
     let task_routes = Router::new()
@@ -246,13 +204,13 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::background_task::download),
         );
 
-    // Export routes (under tenant)
-    let export_routes = Router::new()
-        .route("/conversation", post(routes::export::export_conversation))
-        .route(
-            "/conversation-pdf",
-            post(routes::integration::export_conversation_pdf),
-        );
+    // Export routes (under tenant). The xlsx `/conversation` export is the
+    // `chat` module's; this PDF one is the host's integration route, mounted
+    // under the same prefix.
+    let export_routes = Router::new().route(
+        "/conversation-pdf",
+        post(routes::integration::export_conversation_pdf),
+    );
 
     // Public invite routes (no auth required for info, auth required for accept)
     let public_invite_routes = Router::new()
@@ -286,11 +244,6 @@ pub fn build_router(state: AppState) -> Router {
     // Stripe routes are the `saas` module's (FR-69 P2), including the
     // webhook, which that module mounts un-governed at the root.
 
-    // Giphy proxy routes
-    let giphy_routes = Router::new()
-        .route("/search", get(routes::giphy::search))
-        .route("/trending", get(routes::giphy::trending));
-
     // Push notification routes (user-scoped, no tenant prefix)
     let push_routes = Router::new()
         .route("/config", get(routes::push::config))
@@ -311,8 +264,8 @@ pub fn build_router(state: AppState) -> Router {
     // User profile routes
     let user_routes = Router::new()
         .route("/me", put(routes::user::update_profile))
-        // P4 — static segment; wins over the `{user_id}` capture below.
-        .route("/unread-summary", get(routes::user::unread_summary))
+        // P4 — `/user/unread-summary` is the `chat` module's (it counts
+        // messages); a static segment, it still wins over the capture.
         // FR-12 P3 — likewise static, likewise above the capture.
         .route("/tutorial", put(routes::user::update_tutorial))
         // FR-58 P4 — `/user/newsletter` (the signed-in toggle) is mounted by
@@ -324,9 +277,6 @@ pub fn build_router(state: AppState) -> Router {
     // `tenant_id` field since the user JWT doesn't pin a tenant; the
     // route handler verifies membership before persisting.
     let log_routes = Router::new().route("/browser", post(routes::agent_log::ingest_browser));
-
-    // Search routes (under tenant)
-    let search_routes = Router::new().route("/", get(routes::search::search));
 
     // Remote-control agent routes (tenant-scoped)
     let agent_routes = Router::new()
@@ -716,7 +666,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/user", user_routes)
         .nest("/oauth", oauth_routes)
         .nest("/invite", public_invite_routes)
-        .nest("/giphy", giphy_routes)
         .nest("/push", push_routes)
         .nest("/notification", notification_routes)
         .nest("/agent", public_agent_routes)
@@ -752,15 +701,11 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/member", member_routes)
         .nest("/tenant/{tenant_id}/role", role_routes)
         .nest("/tenant/{tenant_id}/invite", tenant_invite_routes)
-        .nest("/tenant/{tenant_id}/search", search_routes)
-        .nest("/tenant/{tenant_id}/room", room_routes)
-        .nest("/tenant/{tenant_id}/room/{room_id}/message", message_routes)
+        .nest("/tenant/{tenant_id}/room", call_routes)
         .nest(
             "/tenant/{tenant_id}/room/{room_id}/recording",
             recording_routes,
         )
-        .nest("/tenant/{tenant_id}/room/{room_id}/file", room_file_routes)
-        .nest("/tenant/{tenant_id}/file", file_by_id_routes)
         .nest("/tenant/{tenant_id}/task", task_routes)
         .nest("/tenant/{tenant_id}/export", export_routes)
         .nest("/tenant/{tenant_id}/agent", agent_routes)
