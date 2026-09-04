@@ -431,6 +431,73 @@ export interface RcVideoInfo {
    *  agents and whenever the relay has another cause (e.g. a symmetric NAT
    *  toward an off-LAN viewer) — then the pill stays plain `relay`. */
   transport_reason?: string
+  /** FR-70 P1 — WHY the stream is encoded below the operator's resolution
+   *  choice, when it is: the agent's rung reason (`'slow-link-cap'`,
+   *  `'priority-cap'`, `'soft-cap'`, `'refined-cap'`). Present ONLY while
+   *  the agent's effective target differs from the user's, and re-sent
+   *  whenever the cap engages, moves or lifts. Absent from older agents —
+   *  the pill then falls back to the transport-only `relay-limited` guess,
+   *  whose advice (Priority → Sharper) is wrong for the slow-link profile:
+   *  that cap is resolved once at pump start from the pair's REMEMBERED rate
+   *  and lifts only on a later session. */
+  cap_reason?: string
+  /** FR-70 P1 — a short human detail for `cap_reason`, e.g.
+   *  `'remembered 200 kbps'` for the slow-link profile. */
+  cap_detail?: string
+}
+
+/** FR-70 P1 — the resolution pill's annotation for a stream encoded below
+ *  the agent's native panel: names the cap in force from the agent's own
+ *  report, so an overridden `Native` pick is never silent. `''` when the
+ *  stream is not below native, or when nothing about it is known.
+ *
+ *  Pure so it unit-tests: `vi` = the last `rc:video-info`, `w`/`h` = the
+ *  decoded frame size. A pre-P1 agent reports no `cap_reason`; then, and
+ *  only on a relay, the old transport-derived guess stands. */
+export function resolutionCapAnnotation(
+  vi: RcVideoInfo | null | undefined,
+  w: number,
+  h: number,
+): string {
+  const nw = vi?.native_w ?? 0
+  const nh = vi?.native_h ?? 0
+  if (!vi || nw <= 0 || nh <= 0 || !(w < nw || h < nh)) return ''
+  const native = `native ${nw}×${nh}`
+  switch (vi.cap_reason) {
+    case 'slow-link-cap':
+      return ` · slow link${vi.cap_detail ? ` (${vi.cap_detail})` : ''} · ${native}`
+    case 'priority-cap':
+      return ` · Priority cap · ${native}`
+    case 'soft-cap':
+      return ` · encode-bound · ${native}`
+    case 'refined-cap':
+      return ` · refined cap · ${native}`
+    case undefined:
+      // Pre-P1 agent: the rc.199 guess, relay-only.
+      return vi.transport === 'relay' ? ` · relay-limited (${native})` : ''
+    default:
+      return ` · ${vi.cap_reason} · ${native}`
+  }
+}
+
+/** FR-70 P1 — the Resolution setting's explanation when the operator's
+ *  choice is overridden by the agent: what is capping, why, and what lifts
+ *  it. `''` when nothing is overridden (or the agent is older than P1). */
+export function resolutionOverrideHint(vi: RcVideoInfo | null | undefined, w: number, h: number): string {
+  if (!vi?.cap_reason || !w || !h) return ''
+  const box = `${w}×${h}`
+  switch (vi.cap_reason) {
+    case 'slow-link-cap':
+      return `This session is capped at ${box}: the path was ${vi.cap_detail ?? 'remembered as slow'} when it opened (slow-link profile). It re-evaluates on the next session once the link has carried more.`
+    case 'priority-cap':
+      return `This session is capped at ${box} by the Priority dial — Sharper lifts it.`
+    case 'soft-cap':
+      return `This session is capped at ${box}: the host's encoder cannot keep up at native (encode-bound).`
+    case 'refined-cap':
+      return `This session is capped at ${box} by the crisp-at-rest refinement bound.`
+    default:
+      return `This session is capped at ${box} by the agent (${vi.cap_reason}).`
+  }
 }
 
 /** P6 — one participant on the agent's InputArbiter rail. */
@@ -600,6 +667,16 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         // FR-33 P3 — optional; only ever present when the agent can name it.
         ...(typeof obj.transport_reason === 'string'
           ? { transport_reason: obj.transport_reason }
+          : {}),
+        // FR-70 P1 — optional; present only while the agent overrides the
+        // operator's resolution choice. The detail never rides alone.
+        ...(typeof obj.cap_reason === 'string' && obj.cap_reason.length > 0
+          ? {
+              cap_reason: obj.cap_reason,
+              ...(typeof obj.cap_detail === 'string' && obj.cap_detail.length > 0
+                ? { cap_detail: obj.cap_detail }
+                : {}),
+            }
           : {}),
       },
     }
