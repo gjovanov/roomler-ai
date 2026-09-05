@@ -131,6 +131,13 @@ pub struct PipeClassifier {
     reported_once: bool,
     last: Option<PipeState>,
     counts: [u32; 5],
+    /// How many of the `TransitStalled` verdicts came from the report-gap
+    /// rule rather than the split. AC2 counts gap-holds and split-holds
+    /// separately: the first field sessions showed ~2 % of a long relay
+    /// session's windows are report gaps, which is ~1 hold a minute if the
+    /// hold acts on them — a number the counter has to carry before the
+    /// default flips.
+    gap_stalls: u32,
 }
 
 impl PipeClassifier {
@@ -174,6 +181,7 @@ impl PipeClassifier {
             // `clear`), and a viewer that never reports is not stalled — it
             // is a viewer this classifier knows nothing about.
             return if !s.reported && s.frames_sent > 0 && self.reported_once {
+                self.gap_stalls = self.gap_stalls.saturating_add(1);
                 PipeState::TransitStalled
             } else {
                 PipeState::Unknown
@@ -216,6 +224,12 @@ impl PipeClassifier {
 
     /// Windows per state so far — `[unknown, clear, overproduced,
     /// transit_stalled, viewer_late]` — for the heartbeat.
+    /// `TransitStalled` verdicts that came from the report-gap rule (a
+    /// subset of `counts()[3]`); the rest came from the split.
+    pub fn gap_stalls(&self) -> u32 {
+        self.gap_stalls
+    }
+
     pub fn counts(&self) -> [u32; 5] {
         self.counts
     }
@@ -341,6 +355,20 @@ mod tests {
         // …and from then on its silence is a gap.
         assert_eq!(c.classify(&silent), PipeState::TransitStalled);
         assert_eq!(c.counts(), [2, 1, 0, 1, 0]);
+        // The gap counter names the rule: one of the stalls, all of them.
+        assert_eq!(c.gap_stalls(), 1);
+        // A split-driven stall is NOT a gap.
+        let stalled = WindowSignals {
+            split: Some(SplitMs {
+                sender_ms: Some(0.1),
+                transit_ms: 900,
+                viewer_ms: 1,
+            }),
+            ..quiet(40, 1)
+        };
+        assert_eq!(c.classify(&stalled), PipeState::TransitStalled);
+        assert_eq!(c.counts()[3], 2);
+        assert_eq!(c.gap_stalls(), 1);
     }
 
     /// The thin-pipe cell: the budget gate skipping is the sender being the
