@@ -1052,9 +1052,9 @@ pub fn spawn_installer_with_watch(
     // detects the same pending update, spawns another installer, and
     // we get an install-storm. Field repro: operator 2026-05-02.
     record_update_attempt();
-    let installer_pid = spawn_installer_inner(installer_path)?;
+    let spawned = spawn_installer_inner(installer_path)?;
     if let Some(tag) = expected_version
-        && let Err(e) = spawn_watcher(installer_pid, installer_path, tag)
+        && let Err(e) = spawn_watcher(spawned, installer_path, tag)
     {
         // Don't fail the whole self-update flow on a watcher spawn
         // failure — the installer is already running and the agent
@@ -1141,7 +1141,22 @@ pub fn msiexec_argv_with_properties(
     argv
 }
 
-pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
+/// What [`spawn_installer_inner`] observed: the installer's pid, and whether it
+/// had ALREADY finished by the time we returned.
+///
+/// ⚠️ The flag is reported by the dispatch itself rather than re-derived from the
+/// artifact name, so the two cannot drift apart — the same coupling rule as
+/// `install_path_before_rename` and the installer's own `.prev` rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallerSpawn {
+    pub pid: u32,
+    /// True when the install completed synchronously inside this call, so the
+    /// pid names either this process or a corpse. Waiting on it is never
+    /// correct — see `post_install::should_wait_for_installer`.
+    pub already_exited: bool,
+}
+
+pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<InstallerSpawn> {
     // Auto-updater entry point: classify the RUNNING agent EXE's
     // location to decide whether the in-place MSI swap needs UAC
     // elevation. Correct for self-update because the running EXE
@@ -1158,11 +1173,25 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     // field-test host; see BLOCKER B6 in the rc.27/rc.28 master plan.
     #[cfg(target_os = "windows")]
     {
-        spawn_installer_as_flavour(installer_path, current_install_flavour())
+        // msiexec runs asynchronously; the watcher must observe its exit and
+        // `recover_wedged_install` depends on that wait.
+        spawn_installer_as_flavour(installer_path, current_install_flavour()).map(|pid| {
+            InstallerSpawn {
+                pid,
+                already_exited: false,
+            }
+        })
     }
     #[cfg(not(target_os = "windows"))]
     {
-        spawn_installer_for_flavour_inner(installer_path)
+        spawn_installer_for_flavour_inner(installer_path).map(|pid| InstallerSpawn {
+            pid,
+            // ⚠️ Linux only. BOTH arms of the Linux dispatch complete before
+            // returning — the tarball path installs inline and hands back
+            // `std::process::id()`, the `.deb` path `wait()`s on its child.
+            // macOS spawns `installer -pkg` and genuinely must be waited on.
+            already_exited: cfg!(target_os = "linux"),
+        })
     }
 }
 
@@ -1821,10 +1850,11 @@ fn install_path_before_rename(exe: &std::path::Path) -> Option<PathBuf> {
 }
 
 fn spawn_watcher(
-    installer_pid: u32,
+    spawned: InstallerSpawn,
     installer_path: &std::path::Path,
     expected_version: &str,
 ) -> Result<()> {
+    let installer_pid = spawned.pid;
     let exe = std::env::current_exe().context("locating own exe for watcher spawn")?;
     // Windows: launch the watcher from a staged COPY so it doesn't
     // hold the install-dir image — RestartManager shuts down every
@@ -1846,6 +1876,9 @@ fn spawn_watcher(
         .arg(installer_path)
         .arg("--expected-version")
         .arg(expected_version);
+    if spawned.already_exited {
+        cmd.arg("--installer-already-exited");
+    }
     if staged {
         // The copy's own path misclassifies flavour (%TEMP% →
         // PerUser) and probes the wrong binary; hand it the real
