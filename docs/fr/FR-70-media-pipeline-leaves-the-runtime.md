@@ -170,8 +170,14 @@ method call to a send, kill switch `media_thread` default off. A spawn
 failure hands the encoder back so the handle falls back to inline. Verified
 with the feature on in WSL against the vendored FFmpeg tree (rustc 1.95's
 diagnostic renderer panics on a pre-existing dead-code warning there — on
-master too — so `--message-format=short` is the form that answers). M1b and
-M1c open.
+master too — so `--message-format=short` is the form that answers). M1b built
+the same day: the VP9-444 pump on the same handle — which had run its whole
+libvpx encode (BGRA→YUV included) on the runtime worker with **no
+`block_in_place` at all** — through a generalised
+`encode::thread::EncoderHandle<E>` whose inline path keeps each pump's own
+behaviour verbatim (`EncoderOps::INLINE_BLOCK_IN_PLACE`), plus
+`EncoderHandle::with(f)` for the operations the trait does not name
+(`set_speed`); nine sites rewired, the same switch. M1c open.
 
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
