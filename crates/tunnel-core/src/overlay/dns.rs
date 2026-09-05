@@ -727,4 +727,60 @@ mod tests {
         let resp = build_response(&query_for("devbox", 1), &cfg).await.unwrap();
         assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 9]);
     }
+
+    /// FR-72 — the resolver OWNS its port for as long as its task lives, and
+    /// gives it back the moment the task is aborted.
+    ///
+    /// The runtime is scoped to one WS session and used to spawn this task
+    /// without keeping the handle, so a reconnect's resolver lost the bind to
+    /// its own dead predecessor and MagicDNS stayed off until the process
+    /// restarted. Field-measured on a corp laptop as two starts 14 s apart:
+    /// `resolver up` then `bind failed; resolver off … AddressAlreadyInUse`.
+    /// It reads exactly like a third-party `:53` squatter and is not one.
+    ///
+    /// ⚠️ The second bind MUST fail while the first task lives — otherwise this
+    /// test would pass on the broken code too, proving only that binding works.
+    /// That assertion is the negative control and is the point of the test.
+    #[tokio::test]
+    async fn an_aborted_resolver_releases_its_port_for_the_next_one() {
+        // A port nothing else holds: bind ephemeral, note it, drop it.
+        let port = {
+            let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let cfg = |p: u16| DnsConfig {
+            bind: format!("127.0.0.1:{p}").parse().unwrap(),
+            magic_domain: "myorg.roomler.net".into(),
+            upstream: "127.0.0.1:0".parse().unwrap(),
+            names: Arc::new(RwLock::new(HashMap::new())),
+            answer_aaaa: true,
+        };
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(run(cfg(port), tx1));
+        assert!(rx1.await.unwrap(), "the first resolver should bind");
+
+        // Negative control: while it lives, nobody else gets the port.
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let loser = tokio::spawn(run(cfg(port), tx2));
+        assert!(
+            !rx2.await.unwrap(),
+            "a second resolver must NOT be able to bind while the first holds the \
+             port — if this passes, the test cannot detect the leak it exists for"
+        );
+        loser.abort();
+
+        // The fix: the runtime aborts the task on teardown, and the port frees.
+        first.abort();
+        let _ = first.await;
+
+        let (tx3, rx3) = tokio::sync::oneshot::channel();
+        let successor = tokio::spawn(run(cfg(port), tx3));
+        assert!(
+            rx3.await.unwrap(),
+            "after the owner is aborted the successor must bind — this is what \
+             makes a WS reconnect recover MagicDNS instead of killing it"
+        );
+        successor.abort();
+    }
 }
