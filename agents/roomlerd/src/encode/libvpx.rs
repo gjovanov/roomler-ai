@@ -541,13 +541,15 @@ impl Drop for Vp9Encoder {
     }
 }
 
-#[async_trait]
-impl VideoEncoder for Vp9Encoder {
-    async fn encode(&mut self, frame: Arc<Frame>) -> Result<Vec<EncodedPacket>> {
+impl Vp9Encoder {
+    /// FR-70 M1b — the whole encode, synchronous: BGRA→YUV, `vpx_codec_encode`,
+    /// the packet drain. The `VideoEncoder::encode` below is this behind an
+    /// `Arc`; the encoder thread calls it directly.
+    pub(crate) fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
         if frame.pixel_format != PixelFormat::Bgra {
             bail!("vp9-444: expected BGRA input, got {:?}", frame.pixel_format);
         }
-        self.bgra_to_yuv(&frame)?;
+        self.bgra_to_yuv(frame)?;
 
         // Build a vpx_image_t pointing at our three plane buffers. We
         // don't use vpx_img_wrap because that requires a single
@@ -699,6 +701,55 @@ impl VideoEncoder for Vp9Encoder {
         }
         self.frame_idx += 1;
         Ok(out)
+    }
+}
+
+/// FR-70 M1b — what the encoder thread needs from libvpx. No background
+/// rebuild exists for this backend, so the rebuild types are uninhabited and
+/// `adopt_rebuilt` can never be called; the pump's `set_speed` rides
+/// [`crate::encode::thread::EncoderHandle::with`].
+impl crate::encode::thread::EncoderOps for Vp9Encoder {
+    type Rebuilt = std::convert::Infallible;
+    type RebuildSpec = std::convert::Infallible;
+    type Stats = ();
+
+    // The VP9-444 pump never wrapped its encode in `block_in_place`; the
+    // inline path stays a plain call, verbatim.
+    const INLINE_BLOCK_IN_PLACE: bool = false;
+
+    fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<EncodedPacket>> {
+        Vp9Encoder::encode_sync(self, frame)
+    }
+    fn set_bitrate(&mut self, bps: u32) {
+        VideoEncoder::set_bitrate(self, bps)
+    }
+    fn request_keyframe(&mut self) {
+        VideoEncoder::request_keyframe(self)
+    }
+    fn adopt_rebuilt(&mut self, rebuilt: std::convert::Infallible) -> bool {
+        match rebuilt {}
+    }
+    fn rebuild_spec(&self, _bps: u32) -> Option<std::convert::Infallible> {
+        None
+    }
+    fn caps(&self) -> crate::encode::thread::EncoderCaps {
+        crate::encode::thread::EncoderCaps {
+            name: VideoEncoder::name(self),
+            supports_dynamic_bitrate: true,
+            reconfig_forces_idr: false,
+            chroma444: matches!(self.chroma, Vp9Chroma::Yuv444),
+        }
+    }
+    fn current_maxrate_bps(&self) -> u32 {
+        self.target_bitrate
+    }
+    fn rate_stats(&self) {}
+}
+
+#[async_trait]
+impl VideoEncoder for Vp9Encoder {
+    async fn encode(&mut self, frame: Arc<Frame>) -> Result<Vec<EncodedPacket>> {
+        self.encode_sync(&frame)
     }
 
     fn request_keyframe(&mut self) {
