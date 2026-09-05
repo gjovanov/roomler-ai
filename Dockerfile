@@ -1,9 +1,40 @@
 # --- Stage 1: Rust build ---
-FROM rust:1.88-bookworm AS builder
+#
+# FR-73 P1b — three layers instead of one, so a registry-backed cache is worth
+# something on Actions (where every runner starts empty):
+#
+#   chef     the toolchain + cargo-chef, keyed by nothing that changes per commit
+#   planner  the dependency recipe, keyed by the manifests
+#   builder  `cargo chef cook` = every dependency (the mediasoup C++ worker
+#            included) as ONE layer keyed by that recipe, then the real build
+#            over ONLY the Rust sources
+#
+# Before this the stage was `COPY . .` then `cargo build`: any change anywhere —
+# a UI file, a doc — invalidated the build layer and paid the full cold build
+# (17 min 35 s measured on Actions, FR-69 AC4), and inside that layer rustup
+# ALSO downloaded the toolchain `rust-toolchain.toml` pins, because the base
+# image was a different minor. The base now matches the pin, so nothing is
+# fetched at build time.
+#
+# ⚠️ `cook` must receive exactly the arguments the real build does (`-p`,
+# `--no-default-features`, `--features`): a different feature set compiles the
+# dependencies twice, which is slower than no cache — silently.
+FROM rust:1.95-bookworm AS chef
 RUN apt-get update && apt-get install -y libclang-dev cmake python3-pip && rm -rf /var/lib/apt/lists/*
-RUN rustup component add rustfmt
 WORKDIR /app
-COPY . .
+# The pin comes first so `rustup` resolves the components the file lists
+# (rustfmt is needed by the build) for the toolchain the build will run on.
+COPY rust-toolchain.toml ./
+RUN rustup show active-toolchain && rustup component add rustfmt
+RUN cargo install cargo-chef --locked --version 0.1.78
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY agents agents
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
 # FR-69 P8 (D9/D13) — which pillars this image carries. `full` | `collab` |
 # `remote` | `mesh` | `access`; every profile is the same server composed from
 # fewer modules, and `/health` lists the ones it mounts. `SAAS=1` adds the
@@ -12,6 +43,15 @@ COPY . .
 # workflow passes `SAAS=0` and asserts the image does not mount it.
 ARG PROFILE=full
 ARG SAAS=1
+COPY --from=planner /app/recipe.json recipe.json
+# The `[patch.crates-io]` crates (`rtp`, `webrtc-ice`, `webrtc`) and the
+# other path dependencies under crates/vendored are NOT part of the recipe —
+# cargo-chef skeletonises workspace members, and a patch is resolved by
+# cargo from its real manifest at cook time (the first dry run died with
+# "failed to read /app/crates/vendored/rtp/Cargo.toml"). They ARE
+# dependencies, so they belong in this layer: a change to a vendored crate
+# invalidates the cook, which is the correct key.
+COPY crates/vendored crates/vendored
 # `derp-relay` rides along so the SAME image can run as the central
 # coturn workers' `/stats` sidecar (stats follow-up): one image, two
 # binaries, no second build+push pipeline. A few MB, and it keeps the
@@ -20,6 +60,36 @@ ARG SAAS=1
 # packages: `derp-relay` has no features, so `--no-default-features` is
 # inert for it, and `roomler-ai-api/profile-…` names exactly the one crate
 # that composes the modules.
+#
+# `cook --no-build` writes the skeleton (every workspace member reduced to
+# its manifest + an empty source file) and stops. The build is then ours,
+# because ONE member has to be real while the dependencies compile: the
+# vendored `webrtc-ice` patch (a real crate, not a skeleton) depends on
+# `crates/tcp-turn-conn`, and against the skeleton it fails with
+# "cannot find `TcpTurnConn` in `tcp_turn_conn`" (the second dry run). So
+# that member is overlaid with its real sources before the dependency build.
+# Afterwards every member's artefacts are removed, which is what `cook`
+# itself does after building: the real sources arrive by COPY with the
+# build context's OLDER mtimes, and cargo would otherwise keep the skeleton's
+# empty artefacts as "fresh" — a server whose main() is `{}`.
+RUN cargo chef cook --no-build --release --recipe-path recipe.json -p roomler-ai-api -p derp-relay --no-default-features \
+      --features "roomler-ai-api/profile-${PROFILE}$( [ "$SAAS" = "1" ] && printf ',roomler-ai-api/saas' )"
+COPY crates/tcp-turn-conn crates/tcp-turn-conn
+RUN cargo build --release -p roomler-ai-api -p derp-relay --no-default-features \
+      --features "roomler-ai-api/profile-${PROFILE}$( [ "$SAAS" = "1" ] && printf ',roomler-ai-api/saas' )" \
+ && cargo metadata --no-deps --format-version 1 \
+      | python3 -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"]))' \
+      | xargs -n1 cargo clean --release -p
+# Only what the server build reads: the manifests, the crates, the agents
+# (workspace members — their manifests must exist for the workspace to
+# resolve, and nothing in them is compiled for these two packages) and the
+# two terminal installers `crates/modules/fleet` embeds with `include_str!`.
+# NOT `ui/`, `docs/`, `files/`, `config/`: a change there must not touch a
+# Rust layer.
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY agents agents
+COPY scripts/install.sh scripts/install.ps1 scripts/
 RUN cargo build --release -p roomler-ai-api -p derp-relay --no-default-features \
       --features "roomler-ai-api/profile-${PROFILE}$( [ "$SAAS" = "1" ] && printf ',roomler-ai-api/saas' )"
 
