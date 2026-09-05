@@ -73,6 +73,9 @@ pub mod slow_start;
 /// set: the rule deciding whether an operator ever sees a stall used to live
 /// behind `ffmpeg-encoder`, i.e. unreachable in the lane everyone runs.
 pub mod stall;
+/// FR-70 M1 — the encoder thread (generic; the FFmpeg encoder implements its
+/// trait behind the feature).
+pub mod thread;
 
 // Viewer-rate controller (rc.188) — folds the browser's measured `rc:decodestat`
 // (decoded fps + struggling) into a send-fps cap for the DC pumps, so the agent
@@ -501,6 +504,17 @@ pub fn transit_classify_enabled() -> bool {
 /// `transit_hold`.
 pub fn transit_hold_enabled() -> bool {
     tunnel_core::env::flag("TRANSIT_HOLD", false)
+}
+
+/// FR-70 M1 — the FFmpeg encoder lives on its own OS thread per session
+/// (`rc-enc-<session>`) behind a command channel, instead of encoding under
+/// `block_in_place` on whichever runtime worker polls the pump. Every
+/// decision the pump makes is unchanged; a method call becomes a message.
+/// Default **off** for one release: the gate is FR-65's counters on the three
+/// CORPLAP hosts, unchanged or better. Env `ROOMLERD_MEDIA_THREAD` / config
+/// `media_thread`.
+pub fn media_thread_enabled() -> bool {
+    tunnel_core::env::flag("MEDIA_THREAD", false)
 }
 
 /// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase
