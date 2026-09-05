@@ -1267,6 +1267,13 @@ impl RateGovernor {
         self.pipe.last()
     }
 
+    /// FR-71 AC2 — how many `transit-stalled` windows were report gaps
+    /// (a subset of `pipe_state_counts()[3]`), so gap-holds and split-holds
+    /// are counted apart in the heartbeat.
+    pub fn pipe_gap_stalls(&self) -> u32 {
+        self.pipe.gap_stalls()
+    }
+
     /// FR-71 T1a — windows per verdict so far: `[unknown, clear, overproduced,
     /// transit_stalled, viewer_late]`.
     pub fn pipe_state_counts(&self) -> [u32; 5] {
