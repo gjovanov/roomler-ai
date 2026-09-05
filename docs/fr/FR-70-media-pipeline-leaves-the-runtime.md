@@ -123,9 +123,11 @@ HUD does not render the two new `HopWindow`s yet.
       the prior decayed to `None` at 106 s and the target reached 3.9 Mbps with
       nothing measuring the pipe; the same build with `rate_prior_decay=false`
       reproduced the 200–285 kbps pin for three minutes. See the log.
-- [ ] **AC6 (visible half)** — an overridden `user_target` is visible to the
-      operator. On the wire since 0.4.64 (`cap_reason`/`cap_detail`); the
-      on-screen label waits for the next web deploy.
+- [x] **AC6 (visible half)** — an overridden `user_target` is visible to the
+      operator. **Field-verified 2026-09-05** on web `v20260905-1c2753684ab9`:
+      the pill names the slow-link cap and its remembered rate, and the
+      Resolution setting says what caps the session and what lifts it. See the
+      log.
 - [ ] **AC7** — every phase carries a before/after from the same instrument, and
       each field test is shown to FAIL on the current deploy first.
 
@@ -241,6 +243,10 @@ memory.
 | 2026-09-04 18:51 UTC | **0.4.64 with `rate_prior_decay=false`** (the same-build FAIL control, one flag) | `6a9b1333`, the **same** primary-org overlay pair, memory hand-seeded back to 200 k | **FAIL, as it must**: three minutes of `prior_bps=Some(200000)` and `slow_link_floor_bps=Some(200000)`, the target sawing `200k → 225k → 253k → 285k → 200k` under budget skips (66 in 3 min), `goodput_bps=None`, zero stalls, zero congested windows, age 67–122 ms — the 12:40 session, reproduced on demand. Write-back: `stable_bps=253125` — **the attractor caught in the act** (the switch-on arm had just written 6 083 280 for the same pair). |
 | 2026-09-04 | 0.4.64, web bundle **not yet deployed** | the viewer half | **PENDING**: the agent sends `cap_reason="slow-link-cap"` (the log line proves the attribution), but roomler.ai still serves the pre-P1 bundle, so the pill read `1280×800 · relay-limited (native 1920×1200)` throughout. Verify the label and the Resolution-setting hint after the next web deploy (master also carries FR-69 P0–P5c, which has its own prod-rollout gate — not this FR's call). |
 | 2026-09-04 | 0.4.64 | the resolution half | as designed: the FR-59 P5 cap held `1280×800` for the whole session while the rate climbed to 5.7 Mbps — the cap lifts on the NEXT session (memory now 6.08 M ⇒ no profile). Making it lift mid-session is M2's job. |
+| 2026-09-05 08:57 UTC | **web `v20260905-1c2753684ab9` + agent 0.4.65** | the visible half: CORPLAP-1 pinned to the relay (`ice_relay_tcp`), the viewer's public address seeded to 200 k so the profile engages, session `6a9bd981` | **PASS.** Pill: `1280×800 · slow link (remembered 200 kbps) · native 1920×1200`. Resolution setting: *"This session is capped at 1280×800: the path was remembered 200 kbps when it opened (slow-link profile). It re-evaluates on the next session once the link has carried more. Agent native 1920×1200."* Agent log for the same session: `reason="slow-link-cap"`. ⚠️ The memory key for a relay-pinned agent is the VIEWER's public address (`37.63.112.129`), not a relay's — seeding the seven known keys engaged nothing until the session's own write-back named it. |
+| 2026-09-05 09:00 UTC | **agent 0.4.66** (M0), same web | the age split: the viewer auto-reconnected after the self-update, relay-pinned, session `6a9bda3f` | **PASS.** Every heartbeat: `viewer_age_ms=Some(45)` split as `AgeSplit { sender_ms: Some(0.08–0.12), transit_ms: 43–44, viewer_ms: 1–2 }` — the fused 45 ms is the relay round trip, with the browser and the send queue each contributing ~1 ms. M0's gate (attributable to a plane without reading source) is met on a live path; the pre-M0 windows of the same day read `age_split=None`, as designed. |
+
+Device left clean after both: `ice_relay_tcp` cleared, memory restored from the pre-test backup, daemon restarted on 0.4.66.
 
 ⚠️ Two things the run taught that the plan did not know: ICE nominates a
 **different pair on every reconnect** here (the two overlay host pairs and two
@@ -250,9 +256,8 @@ started six seconds after the update task fired ran on the OLD binary until the
 installer restarted the service — read the version at the session, not at the
 task.
 
-**AC6 status**: the rate half is field-verified (above); the visible-override
-half is verified on the wire (log + unit tests) and pending the web deploy for
-the on-screen label.
+**AC6 status**: both halves field-verified — the rate half on 0.4.64
+(2026-09-04), the visible half on web `v20260905-1c2753684ab9` (2026-09-05).
 
 ## Open decisions
 
