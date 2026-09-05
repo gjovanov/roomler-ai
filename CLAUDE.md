@@ -560,6 +560,16 @@ write-up produced afterwards. Plan it, open it, then build against it:
    spec's status table and check off acceptance criteria in the same breath.
 4. **Close** the issue only when the acceptance criteria are field-verified; a regression
    reopens it with the evidence.
+5. **Docs before close — STANDING RULE (operator, 2026-09-05).** Closing an FR requires the
+   docs that describe what it built to be **updated, or created**, in the house style of the
+   other `docs/*.md`: **mermaid diagrams** (a DAG as a `flowchart`/`graph`, a lifecycle as a
+   `sequenceDiagram` — `docs/overlay-communication.md` is the reference), tables, callouts,
+   `file:line` anchors, and a row in `docs/README.md`'s index (map + table). The spec is the
+   record of decisions and evidence; the doc is how the next person understands the system
+   without reading the spec. It is a **phase row and an acceptance criterion in every FR spec**
+   ("docs updated/created with diagrams, linked from `docs/README.md`"), ticked before the close
+   — not a write-up filed afterwards. FR-69 was the first case, owed after the fact
+   (`docs/modular-monolith.md`); FR-73's is the pipeline section of `docs/deployment.md`.
 
 `docs/fr/README.md` is the registry — every FR, its issue and its status, plus the claim
 protocol. Retroactive FRs for already-shipped arcs are welcome when a program resurfaces.
