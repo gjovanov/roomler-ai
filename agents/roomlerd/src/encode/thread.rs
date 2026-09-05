@@ -79,6 +79,12 @@ pub trait EncoderOps: Send + 'static {
     /// (dims/backend no longer match) and `self` is untouched.
     fn adopt_rebuilt(&mut self, rebuilt: Self::Rebuilt) -> bool;
     fn rebuild_spec(&self, bps: u32) -> Option<Self::RebuildSpec>;
+    /// FR-70 M2 — the spec for a replacement at NEW dims (`None` = this
+    /// backend has no background rebuild, so a dims change re-opens inline).
+    fn rebuild_spec_at_dims(&self, width: u32, height: u32, bps: u32) -> Option<Self::RebuildSpec> {
+        let _ = (width, height, bps);
+        None
+    }
     fn caps(&self) -> EncoderCaps;
     /// The maxrate the encoder is currently configured for.
     fn current_maxrate_bps(&self) -> u32;
@@ -96,6 +102,7 @@ enum Cmd<E: EncoderOps> {
     RequestKeyframe(oneshot::Sender<()>),
     Adopt(E::Rebuilt, oneshot::Sender<(bool, u32)>),
     RebuildSpec(u32, oneshot::Sender<Option<E::RebuildSpec>>),
+    RebuildSpecAtDims(u32, u32, u32, oneshot::Sender<Option<E::RebuildSpec>>),
     RateStats(oneshot::Sender<E::Stats>),
     /// An encoder-specific operation the trait does not name (the VP9
     /// pump's `set_speed`), run on the thread in order like the rest.
@@ -218,6 +225,17 @@ impl<E: EncoderOps> EncoderThread<E> {
         self.ask(Cmd::RebuildSpec(bps, tx), rx).await
     }
 
+    pub async fn rebuild_spec_at_dims(
+        &self,
+        width: u32,
+        height: u32,
+        bps: u32,
+    ) -> Result<Option<E::RebuildSpec>> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(Cmd::RebuildSpecAtDims(width, height, bps, tx), rx)
+            .await
+    }
+
     pub async fn rate_stats(&self) -> Result<E::Stats> {
         let (tx, rx) = oneshot::channel();
         self.ask(Cmd::RateStats(tx), rx).await
@@ -269,6 +287,9 @@ fn serve<E: EncoderOps>(mut enc: E, rx: Receiver<Cmd<E>>) {
             }
             Cmd::RebuildSpec(bps, reply) => {
                 let _ = reply.send(enc.rebuild_spec(bps));
+            }
+            Cmd::RebuildSpecAtDims(w, h, bps, reply) => {
+                let _ = reply.send(enc.rebuild_spec_at_dims(w, h, bps));
             }
             Cmd::RateStats(reply) => {
                 let _ = reply.send(enc.rate_stats());
@@ -410,6 +431,27 @@ impl<E: EncoderOps> EncoderHandle<E> {
                 tracing::warn!(%e, "FR-70 M1: rebuild spec unavailable");
                 None
             }),
+        }
+    }
+
+    /// FR-70 M2 — the spec for a replacement at new dims, for the dims
+    /// make-before-break; `None` where the backend cannot rebuild in the
+    /// background (the pump then re-opens inline, as it always did).
+    pub async fn rebuild_spec_at_dims(
+        &mut self,
+        width: u32,
+        height: u32,
+        bps: u32,
+    ) -> Option<E::RebuildSpec> {
+        match self {
+            Self::Inline(e) => e.rebuild_spec_at_dims(width, height, bps),
+            Self::Threaded(t) => t
+                .rebuild_spec_at_dims(width, height, bps)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(%e, "FR-70 M2: dims rebuild spec unavailable");
+                    None
+                }),
         }
     }
 
