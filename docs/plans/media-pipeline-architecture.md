@@ -196,7 +196,7 @@ Each ships independently, is individually verifiable, and carries a kill switch.
 | **M3** | the Plan handoff | control plane publishes an immutable plan; every in-loop decision site removed | no rate/geometry decision remains in the media loop |
 | **M4** | one controller | FR-63 B1 shadow → B2 live, now that adopting is cheap | the flip criterion already written on FR-63 |
 | **M5** | the deletions | FR-62 A4 + FR-63 B3, **each gated on a counter being fleet-zero** | 34 heuristics → target ≤ 10; 11 kill switches → ≤ 4; 8 estimators → 1 |
-| **T1** | the transport answer | act on the sender/transit/viewer split: a transit stall is not an over-production signal and must not cut the rate | a repeat of finding 4 is classified correctly and the rate is *not* cut |
+| ~~**T1**~~ → **FR-71 #1362** | the transport answer | act on the sender/transit/viewer split: a transit stall is not an over-production signal and must not cut the rate — **moved to its own FR on 2026-09-05** (decided below) | a repeat of finding 4 is classified correctly and the rate is *not* cut — now FR-71's AC3 |
 | **P1** | **priors decay, and overrides are visible** | a ceiling with no live measurement decays toward the band instead of pinning; an overridden `user_target` is surfaced to the viewer | finding 5 cannot recur silently: either the rate climbs off the stale prior, or the operator is told why their choice was refused |
 
 ⚠️ **P1 is first in value even though it is last in the table.** It is the one
@@ -261,6 +261,11 @@ sender/transit/viewer split is part of M0 and everything else depends on it; the
 case for splitting is that T1's fix is a transport-plane design with its own
 field cells, and bundling it lets the FR claim credit for work that has not
 started. **Decide before M1 starts.**
+
+**Decided 2026-09-05: its own FR — FR-71 (#1362).** M0 delivered the
+instrument (the split, field-verified that morning), which made the split clean:
+the instrument stays here, the response moves. M1 is unblocked on this plan's
+own terms; FR-71's shadow classification runs beside it.
 
 ## What this explicitly does NOT claim
 
