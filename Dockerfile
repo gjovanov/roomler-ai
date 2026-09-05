@@ -44,6 +44,14 @@ FROM chef AS builder
 ARG PROFILE=full
 ARG SAAS=1
 COPY --from=planner /app/recipe.json recipe.json
+# The `[patch.crates-io]` crates (`rtp`, `webrtc-ice`, `webrtc`) and the
+# other path dependencies under crates/vendored are NOT part of the recipe —
+# cargo-chef skeletonises workspace members, and a patch is resolved by
+# cargo from its real manifest at cook time (the first dry run died with
+# "failed to read /app/crates/vendored/rtp/Cargo.toml"). They ARE
+# dependencies, so they belong in this layer: a change to a vendored crate
+# invalidates the cook, which is the correct key.
+COPY crates/vendored crates/vendored
 # `derp-relay` rides along so the SAME image can run as the central
 # coturn workers' `/stats` sidecar (stats follow-up): one image, two
 # binaries, no second build+push pipeline. A few MB, and it keeps the
