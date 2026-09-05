@@ -1,6 +1,6 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** P0 + P1 **complete and field-verified** (0.4.33 → 0.4.36, see the field-verification log); P2 next. Tracking issue: `FR-43`. Anchors verified against
+**Status:** P0 + P1 + **P2 complete and field-verified** (0.4.33 → 0.4.43) — the daemon's row streams real pixels; P2c/P3 next. Tracking issue: `FR-43`. Anchors verified against
 master `0bfdc263`.
 
 ## Goal
@@ -419,3 +419,58 @@ the session has no user half. Bounded and self-healing; noted, not tuned.
 
 **P1 is complete.** The switch stays default-off until P2 gives the daemon something to
 delegate to.
+
+### 2026-09-01 — P2b: the daemon's row streams real pixels
+
+The goal of this FR, demonstrated on `agent-v0.4.43`. A session opened against the
+**root daemon's device row** — session 0, no WindowServer, never able to show a
+screen — streams the real desktop and accepts input, served by the GUI worker:
+
+```
+6a96be11  delegated  hevc_videotoolbox  viewer_age_ms 26, 5, 6
+6a96bed9  delegated  hevc_videotoolbox  viewer_age_ms 5, 13, 8
+6a96bf00  delegated  hevc_videotoolbox  viewer_age_ms 6, 8, 10
+```
+
+5–13 ms, indistinguishable from a direct session on the user's own row.
+
+**The negative arm came for free.** Before delegation was armed, the same row gave a
+black screen — and reproduced this FR's premise exactly:
+
+```
+WARN scrap capture unavailable — falling back to NoopCapture
+     error=creating scrap::Capturer: other error
+```
+
+Session established, consent auto-granted, encoder running, ICE direct: everything
+worked except the picture.
+
+**Two bugs the field found and CI could not.**
+
+1. **The delegated session was missing everything `Request` resolved** (#1137). First
+   attempt: input worked — the operator unlocked macOS and dragged a window from the
+   browser — and the screen stayed black. `Request` is not delegable, but it is the arm
+   that RESOLVES the session and stashes seven values `SdpOffer` CONSUMES. `transport`
+   defaults to `None` = the legacy RTP track, so the worker wrote 13 MB to a pipe the
+   browser was not reading. The whitelist was chosen by asking which messages a session
+   HANDLES; the miss was that one of them carries state another consumes.
+
+2. **A latency finding that was NOT delegation** (#1152). 230–600 ms frame age vs 5–9 ms
+   direct. Delegation and codec were perfectly confounded — every delegated session
+   H.264 and slow, every direct one HEVC and fast — and breaking that needed one
+   controlled run: among DELEGATED sessions, HEVC gives 5–13 ms and H.264 gives 139 ms.
+   Ruled out first, each by measurement: ICE relay (`relay=false`, Host↔Host), the media
+   path (`send_wait_avg 0.04 ms`, zero drops/errors), the daemon negotiating on weaker
+   caps (both halves report identical caps), B-frame reordering (`max_b_frames(0)` is
+   applied to every encoder). ⚠️ The UI auto-selected H.264, so the slow path was the
+   DEFAULT.
+
+⚠️ **Instrumentation lesson.** The delegation trace shipped at `debug!`, so the field
+logs could not answer *"did it cross?"* — the first diagnosis had to correlate session
+ids across two log files. Now `info!`, and the serving line should also carry
+`session_id`: establishing WHICH sessions were delegated still took three queries.
+A feature whose whole question is "did this reach the other side" must answer it at the
+level the field runs at.
+
+**P2b is complete.** P2c is next: the daemon's row still advertises `no-gui-session`, so
+the UI presents it as "not a capture target" even though it now is one.
