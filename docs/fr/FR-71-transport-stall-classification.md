@@ -61,7 +61,7 @@ One verdict per viewer window from signals the governor already holds:
 | state | says | evidence |
 |---|---|---|
 | `Overproduced` | the sender is the limiter | `send_wait` rising, `inflight` at or over the byte budget, blocked sends (goodput samples accepted), budget-gate skips |
-| `TransitStalled` | the path is the limiter | `transit_ms` above its learned floor by more than the slack (200 ms) while `viewer_ms` sits near its own floor; or a viewer report gap while the sender kept writing frames through a queue that passed every `Overproduced` check (as built: the "queue under half the budget" clause of the first draft was dropped — a keyframe on a ramp step trips it for one window, and the sender screen already owns "queue over budget") |
+| `TransitStalled` | the path is the limiter | `transit_ms` above its learned floor by more than the slack (200 ms) while `viewer_ms` sits near its own floor; or a viewer report gap — silence from a viewer that has reported at least once this session — while the sender kept writing frames through a queue that passed every `Overproduced` check (as built: the "queue under half the budget" clause of the first draft was dropped — a keyframe on a ramp step trips it for one window, and the sender screen already owns "queue over budget"; the "has reported once" clause was added after the first field session on 0.4.67 classified its opening window `transit-stalled` because the viewer's first report had not arrived yet — silence before any report is `Unknown`, so a viewer that never reports can never hold a session under T1b) |
 | `ViewerLate` | the browser is the limiter | `viewer_ms` rising, decode queue deep, `struggling` |
 | `Clear` | none of the above | |
 | `Unknown` | no split reported (pre-M0 viewer, no age this window) | the loops behave exactly as today |
@@ -161,7 +161,15 @@ places; each is recorded here because the next phase depends on it.
 - [ ] **AC2** — one release of shadow classification across the fleet, reviewed
       from `agent_logs`: no constrained session classified `TransitStalled`
       while its send queue was over budget, and finding 4's shape classifies
-      as `TransitStalled` in replay.
+      as `TransitStalled` in replay. *(First session read 2026-09-05 on
+      0.4.67, CORPLAP-1 over a pinned TURN relay, `6a9c3933`, 90 windows:
+      89 `clear`, 1 `overproduced` — the lock-screen transition burst that
+      skipped 18 frames at the budget gate, the right verdict — and 1
+      `transit-stalled`, which was the OPENING window, before the viewer's
+      first report: a start-of-session false positive, fixed in this FR's
+      third PR by requiring a prior report before silence counts as a gap.
+      Nothing was classified stalled while over budget. The fleet-wide
+      review still needs a release with the fix and a week of sessions.)*
 - [ ] **AC3** — with `transit_hold` on, a repeat of finding 4 shows **no rate
       cut** during the stall and recovery within the stall's own length; the
       same cell with the hold off still cuts — the FAIL recorded first.
@@ -219,3 +227,4 @@ consumes `PipeState`), FR-64 #1244, FR-19 #805.
 | 2026-09-05 | T1a branch (simulation, not the field) | `finding4_transit_stall` under `run_shipped` | classifier: windows 13–17 s `transit-stalled`, nothing `overproduced`, all others `clear`; the sender's queue stayed at 15 KB through the stall (finding 4's 1485 B) and the target **kept climbing** through it (1.82 → 1.98 Mbps — the AIMD's additive increase; the ramp had ended by 5 s) |
 | 2026-09-05 | T1b branch (simulation, not the field) | `finding4_transit_stall` under `run_shipped` + `with_age_cut`, hold **off** | **AC3's FAIL, recorded**: with the post-ack backlog draining at the link's rate the paint age reads 4497 / 2652 / 446 ms over windows 17–19, the age loop fires on the second and the AIMD cuts 1.98 → 1.5 Mbps into an 8 Mbps link |
 | 2026-09-05 | T1b branch (simulation, not the field) | the same cell, hold **on** | no window below the pre-stall target; 7 windows held (13–19 s); the P3 clamp and the prior untouched; first clear window at 20 s, 3.2 s after a 4.8 s stall lifted; windows 22–40 s clear. Thin pipe / LAN burst / genuinely-slow relay: traces byte-identical with the hold on and off, 0 held |
+| 2026-09-05 15:46–15:48 UTC | **0.4.67** (`transit_classify` on, `transit_hold` off) | CORPLAP-1 → neo16, ICE pinned to a TURN relay (`ice_relay_tcp`, reverted after), session `6a9c3933`, HEVC 1920×1200, `c=true`, age 44–47 ms = 0.1 sender + 44 transit + 1–2 viewer | **the shadow's first live read**: `pipe_states=[0, 89, 1, 1, 0]` over 90 windows. The one `overproduced` window was the lock-screen transition (18 budget-gate skips, target 4.15 → 3.52 Mbps, goodput measured 22 Mbps on the burst) — correct. The one `transit-stalled` window was window 1, before the viewer's first report — a start-gap false positive, fixed the same day (silence counts as a gap only after a report). `transit_holds=0` (hold off). No window read `unknown`: the 0.4.67 viewer stamps every window |
