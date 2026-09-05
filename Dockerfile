@@ -80,15 +80,18 @@ RUN cargo build --release -p roomler-ai-api -p derp-relay --no-default-features 
  && cargo metadata --no-deps --format-version 1 \
       | python3 -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"]))' \
       | xargs -n1 cargo clean --release -p
-# Only what the server build reads: the manifests, the crates, the agents
-# (workspace members — their manifests must exist for the workspace to
-# resolve, and nothing in them is compiled for these two packages) and the
-# two terminal installers `crates/modules/fleet` embeds with `include_str!`.
-# NOT `ui/`, `docs/`, `files/`, `config/`: a change there must not touch a
-# Rust layer.
+# Only what the server build reads: the manifests, the crates and the two
+# terminal installers `crates/modules/fleet` embeds with `include_str!`.
+# NOT `agents/`: the workspace manifest names those members, but nothing in
+# them is compiled for these two packages, and the SKELETONS the cook wrote
+# (manifests + empty sources) satisfy the workspace — copying the real agent
+# sources here made every daemon-only merge recompile the server for five
+# minutes (FR-73 P1c: the first "no-change" measurement was exactly that).
+# The planner still sees the real `agents/` manifests, so an agent DEPENDENCY
+# change still re-cooks. NOT `ui/`, `docs/`, `files/`, `config/` either: a
+# change there must not touch a Rust layer.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-COPY agents agents
 COPY scripts/install.sh scripts/install.ps1 scripts/
 RUN cargo build --release -p roomler-ai-api -p derp-relay --no-default-features \
       --features "roomler-ai-api/profile-${PROFILE}$( [ "$SAAS" = "1" ] && printf ',roomler-ai-api/saas' )"
