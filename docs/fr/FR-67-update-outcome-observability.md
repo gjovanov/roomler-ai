@@ -108,10 +108,10 @@ It was the first design, and it was refuted:
 
 | # | Phase | Kill switch | Status |
 |---|-------|-------------|--------|
-| P1 | Stop waiting on a synchronously-completed install (Linux) | revert = today's unconditional wait | proposed |
+| P1 | Stop waiting on a synchronously-completed install (Linux) | revert = today's unconditional wait | **shipped (#1400)** — field verification pending a release |
 | P2 | Normalise a `(deleted)` exe path + refuse a non-existent watcher binary | n/a — pure guard | proposed |
 | P3 | Read the verdict: startup log + `NodeStatus` + `roomler status` | pure addition; revert = today's silence | proposed |
-| P4 | macOS `AbandonProcessGroup` in the launchd plists | packaging-only revert | proposed |
+| P4 | macOS `AbandonProcessGroup` — **`com.roomler.update.plist`** is the job that matters (`update-helper` is that LaunchDaemon's body and is where `installer -pkg` is spawned) | packaging-only revert | proposed — see the note below |
 | P5 | Fleet answer: report the outcome to the server and show it | render-only; absent field ⇒ today's blank | proposed |
 | P6 | Transient systemd unit — **only if P1 leaves a measurable race** | `update_watcher_escape_cgroup`, default OFF | deferred, evidence-gated |
 
@@ -157,3 +157,36 @@ It was the first design, and it was refuted:
 | 2026-09-02 | Preconditions measured on two distros | `systemd-run` present and `INVOCATION_ID` set in the unit process on both (Fedora/systemd 257, Ubuntu/systemd 255); `KillMode=control-group` on both |
 | 2026-09-02 | ⚠️ Measurement hazard | `pgrep -x roomlerd` matched a **container's** process on a host running containerised test nodes (cgroup `/system.slice/docker-….scope`). A first reading wrongly showed `INVOCATION_ID` absent on Ubuntu. Probe `systemctl show roomlerd -p MainPID` instead |
 | 2026-09-02 | ⛔ First design refuted before implementation | A systemd transient unit was the initial P1. Adversarial review found its safety premise false without `--service-type=exec`, its kill switch inert against the mode it guards, and that it would *create* a PID-reuse false-`Timeout` mode. The real defect is the self-pid wait (`updater.rs:1577` + `post_install.rs:221`) — removing it needs no systemd at all |
+
+## P4 — scoped, and one question left before it is safe to write
+
+Verified: **no** plist in `agents/roomlerd/packaging/macos/` sets
+`AbandonProcessGroup`, so it defaults to false and launchd reaps the job's
+remaining process group when the job exits — the same bug class as the systemd
+cgroup teardown.
+
+macOS is also the platform where it matters most, because it is the one where the
+installer genuinely IS asynchronous: `installer -pkg` is `.spawn()`ed and returns
+a live pid, so **P1 does not help there** — the watcher must actually wait, and
+therefore must actually survive.
+
+The job to fix is **`com.roomler.update`**, whose body is `roomlerd update-helper`
+(`main.rs`, `Command::UpdateHelper`) — that is where the install runs.
+`com.roomler.daemon` may need it too if the daemon ever spawns an installer
+directly rather than delegating to the helper.
+
+⚠️ Deliberately not written yet: `AbandonProcessGroup=true` stops launchd reaping
+**every** remaining child, not just the watcher, and FR-41 already records a
+grandchild holding a unit open. The open question is whether `update-helper`
+exits immediately after spawning `installer(8)` — if so the key is exactly right;
+if it waits, the reap window may not exist and the key would be loosening
+shutdown for nothing. That wants checking on a real Mac (there is one on the
+mesh) before a packaging change lands.
+
+## Field-verification log — P1
+
+| Date | What | Result |
+|---|---|---|
+| 2026-09-05 | The failing **"before"**, three hosts, prior to any fix | all `InProgress`: two stuck on `agent-v0.4.16` (written 2026-08-29) and one on `agent-v0.4.13` (2026-08-28), while all three were running **0.4.70**. ~54 releases, not one recorded outcome |
+| 2026-09-05 | P2's `(deleted)` check | **INCONCLUSIVE, not negative** — `readlink /proc/<MainPID>/exe` is clean on all three, but the suffix can only exist between a `.deb` install and the next restart, and all three had restarted since. Needs running inside that window |
+| 2026-09-05 | ⚠️ Probe hygiene | measured via `systemctl show roomlerd -p MainPID`, never `pgrep -x roomlerd` — the latter matches containerised test nodes and already produced one wrong reading in this FR |
