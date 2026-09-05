@@ -116,6 +116,54 @@ and the hook is tracked, so setting it once in the clone covers every worktree
 made from it — but a worktree on a branch predating the hook still has no file,
 which is the harmless `tool absent -- do not block` path.
 
+## The other kind of name: WHO, not WHICH MACHINE
+
+Everything above is about **content** — a hostname inside a file or a commit
+message. A second surface leaks a name without touching content at all, and
+this skill's guards are structurally blind to it:
+
+| surface | what leaks | guarded by |
+|---|---|---|
+| a blob or a commit message | which machine | `check_shapes.py` + the sweep |
+| a commit's author / committer | **who**, as an email address | `.githooks/check-identity.sh` |
+| a GitHub issue, comment, review, release | **who**, as an account login | `.claude/hooks/gh-account-guard.sh` |
+
+Rows 2 and 3 arrived on 2026-09-05, after an audit found a second GitHub
+account — a corp one, whose *login alone* named an employer — had authored one
+issue and three comments on this public repo, across three days spanning
+eleven. It had authored no commits, and that was luck: nothing checked. In the
+same history sat 520 commits carrying a corp mailbox as their author address.
+
+Three things are worth carrying over from that:
+
+- **A commit identity is metadata**, so it is in no blob and no message. The
+  shape scan walks straight past it, and always would have.
+- **`gh auth switch` is global.** It rewrites the active account in a shared
+  config, for every process and every concurrent session. A second account
+  signed in for unrelated work is one command away from authoring things, and
+  `gh issue comment` prints a URL rather than an identity — so the mistake is
+  invisible from inside the session making it. `scripts/gh-scoped-config.sh`
+  builds a config directory the other account is not *in*, which is the
+  difference between a rule that is checked and one that cannot be broken.
+- **An ALLOWLIST, not a denylist**, and for the same reason the shape guard is
+  shape-based: a denylist would have to write the unwanted addresses into a
+  public file, publishing exactly what it exists to remove — and it only ever
+  finds the mistakes someone already thought of. A denylist finds the
+  identities you know about; an allowlist finds the class.
+
+⚠️ **Neither is recoverable downstream**, which is why both are cheap only
+here. A commit identity cannot be edited, only rewritten — renumbering every
+SHA above it, and still leaving the old objects reachable through
+`refs/pull/*`. An issue or comment author cannot be changed at all: the only
+remedy is delete-and-recreate, which loses the thread and dangles every
+reference to its number, including any already baked into a merged commit
+subject.
+
+⚠️ **One hole no local layer can close**: a merge made through the GitHub web
+UI is committed *on GitHub*, from the email set on the **account**, and passes
+through no hook and no PR check. Only a repository ruleset
+(`commit_author_email_pattern`) sees that one.
+
 ### The hook's exit-code contract — the hard-won part
 
 `.githooks/pre-commit` blocks on **`EXIT_FOUND` (1) and nothing else**. Every
