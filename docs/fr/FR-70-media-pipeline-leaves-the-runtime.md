@@ -177,7 +177,32 @@ libvpx encode (BGRA→YUV included) on the runtime worker with **no
 `encode::thread::EncoderHandle<E>` whose inline path keeps each pump's own
 behaviour verbatim (`EncoderOps::INLINE_BLOCK_IN_PLACE`), plus
 `EncoderHandle::with(f)` for the operations the trait does not name
-(`set_speed`); nine sites rewired, the same switch. M1c open.
+(`set_speed`); nine sites rewired, the same switch. Both shipped in
+`agent-v0.4.69` with the switch off.
+
+**M1c — first point (2026-09-05 18:11–18:18 UTC, CORPLAP-1 on 0.4.69).** Two
+back-to-back sessions, hevc_qsv 1920×1200 on the same relay path (the host's
+corp VPN was up), the host at its lock screen with mouse motion only, the
+switch flipped between them by `roomler config set media_thread …` + a detached
+restart; session B logged `FR-70 M1: encoder handed to its own thread …
+threaded=true`.
+
+| steady state (heartbeats 4+) | A: switch off (`6a9c5b65`) | B: switch on (`6a9c5c6d`) |
+|---|---|---|
+| heartbeats | 32 | 28 |
+| `avg_encode_ms` avg / max | 11.19 / 11.94 | 10.89 / 12.11 |
+| `avg_capture_ms` | 3.31 | 3.15 |
+| `iter_ms_max` avg over windows / worst | 29.0 / **90.0** | 18.2 / **50.4** |
+| windows with `iter_ms_max` > 50 ms | 5 | 1 |
+| `pump_stalls` / `send_stalls` / `apply_ms_max` | 0 / 0 / 0 | 0 / 0 / 0 |
+| the open, `open_ms` (unchanged by M1) | 414 | 485 |
+
+Encode and capture averages equal within noise (the channel hop is invisible
+at this scale); the loop's worst pass per window came down — the worst steady
+window 90 → 50 ms, the >50 ms windows 5 → 1 — which is the runtime worker no
+longer carrying the encode. **Unchanged or better on this host.** One host, one
+short session per arm, low motion: the gate wants the same on CORPLAP-2 and
+CORPLAP-3 before the default flips. The device was returned to the default.
 
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
