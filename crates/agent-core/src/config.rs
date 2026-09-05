@@ -897,6 +897,10 @@ pub struct AgentConfig {
     /// and P3 clamp masked, prior held). Default OFF for one release. See
     /// `transit_hold`.
     pub transit_hold: Option<bool>,
+    /// FR-70 M1 — the encoder runs on its own OS thread per session behind a
+    /// command channel instead of `block_in_place` on a runtime worker.
+    /// Default OFF for one release. See `media_thread`.
+    pub media_thread: Option<bool>,
     /// FR-65 P0 — the pump stall watch. Default ON. See `pump_stall_watch`.
     #[serde(default)]
     pub pump_stall_watch: Option<bool>,
@@ -2064,6 +2068,7 @@ pub fn test_fixture() -> AgentConfig {
         rate_prior_decay: None,
         transit_classify: None,
         transit_hold: None,
+        media_thread: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
         bg_rebuild_constrained: None,
@@ -2197,7 +2202,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 81] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2208,6 +2213,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 81]
         ("RATE_PRIOR_DECAY", cfg.rate_prior_decay),
         ("TRANSIT_CLASSIFY", cfg.transit_classify),
         ("TRANSIT_HOLD", cfg.transit_hold),
+        ("MEDIA_THREAD", cfg.media_thread),
         ("PUMP_STALL_WATCH", cfg.pump_stall_watch),
         ("BG_REBUILD_CONSTRAINED", cfg.bg_rebuild_constrained),
         ("SLOW_LINK_FLOOR", cfg.slow_link_floor),
