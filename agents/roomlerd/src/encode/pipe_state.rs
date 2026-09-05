@@ -24,9 +24,14 @@
 //!   a full send queue is real back-pressure the controller must answer.
 //! - [`PipeState::TransitStalled`] — the path is the limiter: the transit
 //!   share of the age sits [`TRANSIT_SLACK_MS`] or more over its learned floor
-//!   while the browser's share is near its own floor; or the viewer sent no
-//!   report at all while the sender kept sending frames through a queue that
-//!   passed every sender-side check (finding 4's silent windows).
+//!   while the browser's share is near its own floor; or a GAP in the viewer's
+//!   reports — silence from a viewer that has reported at least once this
+//!   session — while the sender kept sending frames through a queue that
+//!   passed every sender-side check (finding 4's silent windows). Silence
+//!   before the first report is `Unknown`: the first field session on 0.4.67
+//!   classified its opening window `TransitStalled` because the viewer's first
+//!   report had simply not arrived yet, and a viewer that never reports must
+//!   not hold a session forever under T1b.
 //! - [`PipeState::ViewerLate`] — the browser is the limiter: its own share is
 //!   [`VIEWER_SLACK_MS`] or more over its floor, or it reports `struggling`.
 //! - [`PipeState::Clear`] — none of the above.
@@ -121,6 +126,9 @@ pub struct WindowSignals {
 pub struct PipeClassifier {
     transit_floor_ms: Option<u16>,
     viewer_floor_ms: Option<u16>,
+    /// Has the viewer reported at all this session? A report GAP is only a
+    /// gap once there was something to have a gap in.
+    reported_once: bool,
     last: Option<PipeState>,
     counts: [u32; 5],
 }
@@ -132,6 +140,9 @@ impl PipeClassifier {
 
     /// One verdict per viewer window.
     pub fn classify(&mut self, s: &WindowSignals) -> PipeState {
+        if s.reported {
+            self.reported_once = true;
+        }
         let state = self.decide(s);
         self.last = Some(state);
         self.counts[state.index()] = self.counts[state.index()].saturating_add(1);
@@ -156,8 +167,13 @@ impl PipeClassifier {
             // required the queue to be under half the budget; the finding-4
             // cell showed a keyframe on a ramp step trips that for one
             // window, and the Overproduced screen above already owns the
-            // "queue over budget" case.)
-            return if !s.reported && s.frames_sent > 0 {
+            // "queue over budget" case.) Only once the viewer HAS reported:
+            // the opening window of every session is silent because the
+            // first report is still on its way (field, 0.4.67, session
+            // `6a9c3933`: window 1 `transit-stalled`, 89 of the next 90
+            // `clear`), and a viewer that never reports is not stalled — it
+            // is a viewer this classifier knows nothing about.
+            return if !s.reported && s.frames_sent > 0 && self.reported_once {
                 PipeState::TransitStalled
             } else {
                 PipeState::Unknown
@@ -301,6 +317,30 @@ mod tests {
             ..quiet(0, 0)
         };
         assert_eq!(c.classify(&old), PipeState::Unknown);
+    }
+
+    /// Field, 0.4.67, the first shadow session (CORPLAP-1 over a pinned
+    /// relay, `6a9c3933`): the opening window read `transit-stalled` because
+    /// the sender had written frames and the viewer's FIRST report had not
+    /// arrived yet. Silence before any report is `Unknown`; the same silence
+    /// after a report is the gap finding 4 showed. A viewer that never
+    /// reports therefore never holds a session under T1b.
+    #[test]
+    fn silence_before_the_first_report_is_unknown_not_a_stall() {
+        let mut c = PipeClassifier::new();
+        let silent = WindowSignals {
+            split: None,
+            reported: false,
+            frames_sent: 30,
+            ..quiet(0, 0)
+        };
+        assert_eq!(c.classify(&silent), PipeState::Unknown);
+        assert_eq!(c.classify(&silent), PipeState::Unknown);
+        // The viewer speaks once…
+        assert_eq!(c.classify(&quiet(40, 1)), PipeState::Clear);
+        // …and from then on its silence is a gap.
+        assert_eq!(c.classify(&silent), PipeState::TransitStalled);
+        assert_eq!(c.counts(), [2, 1, 0, 1, 0]);
     }
 
     /// The thin-pipe cell: the budget gate skipping is the sender being the
