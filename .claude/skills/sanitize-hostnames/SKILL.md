@@ -221,7 +221,38 @@ asserts a **non-1** status specifically — "non-zero" would pass on the bug.
 silence, which is layer 1 disarmed with nothing anywhere to say so; the selftest
 checks this too.
 
-## The four things that go wrong
+## The six things that go wrong
+
+**0. The `--replace-text` rules file has NO COMMENT SYNTAX.** `get_replace_text()`
+treats **every** line as a literal to match, and when a line carries no `==>`
+the replacement defaults to `***REMOVED***`. So a line containing just `#` means
+*replace every `#` in every blob*. Measured 2026-09-06 on a rules file whose
+first four lines were ordinary explanation: **548,700 blob lines rewritten**,
+`CLAUDE.md` stripped of all 53 of its headings, `.gitattributes` turned into
+`***REMOVED***!/bin/sh`. The only tell during the run is a burst of
+`is not a valid attribute name: .gitattributes:N` warnings, buried in the
+progress spam.
+
+Keep the `.txt` pure rules; put prose in a sibling file. Assert it before
+running:
+
+```bash
+grep -c ''  replace.txt        # every line is a rule -- is that how many you meant?
+grep -vc '==>' replace.txt     # want 0: a line without ==> uses the REMOVED default
+```
+
+⚠️ The `--mailmap` file is a *different* format (git's own) and **does** support
+`#` comments. The two files sharing a directory and not a syntax is exactly the
+trap.
+
+**0b. A verification must not contaminate what it verifies.** To diff the
+pre- and post-rewrite trees it is tempting to fetch the old master into the
+rewritten mirror. That works, and it also re-imports every pre-rewrite commit:
+`git log --all` then reports the addresses as still present, and — far worse —
+`git push --mirror` would have **published `refs/orig/master`**, re-uploading in
+one step the exact history the rewrite existed to remove. Do the comparison in a
+third, throwaway repo, and assert before pushing that the mirror holds nothing
+outside `refs/heads/*` and `refs/tags/*`.
 
 **1. `--replace-text` does NOT touch commit messages.** It rewrites blob
 contents only; commit and annotated-tag messages are a separate surface behind
