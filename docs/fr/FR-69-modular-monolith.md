@@ -11,9 +11,10 @@ container cell** (the signed release daemon enrolled and joined the `mesh` image
 AC4 measured · **the first prod roll field-verified 2026-09-05** (`v20260905-1c2753684ab9` of
 master `89ea3128`: no dip in online agents, fleet RPC, RC sessions on two carrier classes,
 overlay pairs on LAN / srflx / DERP, tunnels, the SSH dispatch, the device listing, every
-pillar of the SPA) · **still to see across a real network**: a `mesh` server reached by a
-daemon and a browser from another machine, a single-relay overlay pair and a relay-class RC
-session ·
+pillar of the SPA) · **the detailed post-deploy test (2026-09-05)**: a relay-class RC session
+✓ (TURN forced on a device), a `mesh` server across a real network ✓ (the server and the
+browser halves; the daemon's own hop needs a TLS-fronted cell), a single-relay overlay pair not
+observable on the fleet ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -1263,3 +1264,22 @@ Not covered: a second node and traffic between them (one node is what AC5 asks: 
 **Wrong turns, recorded.** (1) `exec_audit` read as **0 since the roll** on the first query — the field is `at`, not `created_at`; the same query by `_id` time says 65. A zero makes you conclude; cross-check. (2) `overlay_nodes` "online" is not a stored field (the listing computes it), so `countDocuments({online:true})` = 0 means nothing; `last_seen_at` within 15 min = 18 of 27. (3) The SOCKS routes' 45 ms refusals looked like dead flows until the TCP forwards on the same flows connected.
 
 **Still open after this**: AC5 and AC7 against a `mesh` server across a real network (both verified on loopback cells); a single-relay (TURN) overlay pair and a relay-class RC session were not observable on today's fleet.
+
+### 2026-09-05 — the detailed post-deploy field test: the three refinements
+
+
+The three refinements the closing summary named, taken one by one.
+
+### 1. A relay-class remote-control session — ✓ served through the new deploy
+
+`ice_relay_tcp` was at its default on every fleet device, and no viewer can choose its path, so the relay class had to be forced on a device: CORPLAP-1 (Windows, on the same LAN as the controller — the hardest case to push onto a relay), `roomler config set ice_relay_tcp true` over `roomler exec`, then a restart the exec channel cannot tear down — two one-shot scheduled tasks as SYSTEM, `sc stop Roomler` at 15:42 and `sc start Roomler` at 15:43 on the device's clock — because `Restart-Service` from inside `roomler exec` would be killed with the exec's own process tree between the stop and the start. Both daemon pids changed and the service read `Running` at 15:43:41; the session from this controller at 13:44 UTC then came up with the viewer chips reading `connected · H.265 4:2:0 HW (hevc_qsv) · relay · dec HW · FSR · 1.4–1.8 Mbps · 16 fps · 1920×1200 · ~45 ms` (the device's screen was locked — static content, hence the low rate), and the device's own log says why: `selected pair changed: … udp4 relay ↔ udp4 relay` — both ICE candidates are allocations on the cluster's TURN server (`TURN allocation established … TURN relay allocated (tier2-udp)`), the credentials minted by the `remote` module's `/turn/credentials`. Ended with DISCONNECT (server row: 13:44:07 → 13:44:49 UTC, `controller_hangup`, `peak_fps 16`). The flag was then cleared and the daemon restarted the same way, back to its default direct path.
+
+### 2. A `mesh` server across a real network — ✓ the server and the browser halves; the daemon hop stays on the server's host
+
+The `mesh` profile was built from master on the cluster's build host (`PROFILE=mesh`, `SAAS=0`) and run there with its own Mongo and Redis, **bound to the host's overlay address only** (port 8090 on its mesh address) — reachable from mesh peers, from nobody else. `/health` → `{"modules":["fleet","network"],"compiled":["fleet","network"]}`. From this controller, across the overlay: `/api/capabilities` the same two modules; an account, an org and an enrollment token created through the API; **the AC7 Playwright spec run from this box against that server — `1 passed (3.5 s)`**: the browser registered, logged in, saw the org dashboard with only the fleet tiles, no Rooms / Explore / Files in the navigation, the chat deep-link refused, the devices listing answering 200, and zero console errors or failed `/api/` calls — the same assertions that passed on loopback, now with a real network between browser and server. The daemon cell (the signed release `.deb`, verified against the release key on that host) enrolled with the token minted from here, sent its hello, joined the overlay as `100.65.0.1` in userspace netstack mode and registered on `/derp`; the server's device listing and overlay node list, read from here, show it online. The daemon's own hop is still loopback to the server on the same host: the daemon upgrades any non-loopback `http://` enrollment URL to TLS, and this cell has no certificate — a TLS-fronted `mesh` server is the remaining way to move that hop across the network. The cell was torn down afterwards.
+
+### 3. A single-relay (TURN) overlay pair — not observable
+
+From both vantages — this controller and the cluster host — every online pair is `direct` (LAN 3–5 ms, srflx across the internet 19–53 ms) or on the DERP floor (`relay:derp/tcp`, the WSL host behind a Hyper-V NAT). Nothing on today's fleet fails direct and srflx while TURN succeeds; the single-relay tier is the one cell only a UDP-blocked-but-TURN-reachable network produces, and none of the corp-VPN hosts was on its VPN today.
+
+**What this changes for #1307:** nothing that reopens it — the relay-class RC session and the cross-network `mesh` server both behave on the deployed build. The single-relay overlay pair stays an unobserved tier, not a regression; the daemon's own network hop to a `mesh` server needs a TLS-fronted cell.
