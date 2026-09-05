@@ -24,15 +24,29 @@ Measured against `origin/master`, not assumed from the README.
 
 ```
 $ git log --format='%aN <%aE>' | sort | uniq -c | sort -rn
-    961 gjovanov <goran.jovanov@gmail.com>
-    756 Goran Jovanov <goran.jovanov@gmail.com>
-      3 Goran Jovanov <goran.jovanov@gmail.com>
+   1289 gjovanov <goran.jovanov@gmail.com>
+   1251 Goran Jovanov <goran.jovanov@gmail.com>
 ```
 
-One human, three identity strings, two of his own addresses. **Sole copyright
-holder ⇒ no consent campaign, no consent log, no rewrite-their-surviving-lines
-fallback.** An earlier strategy brief treated this as a blocking gate with its
-own document set; all of it is deleted.
+One human, two identity strings, one address. **Sole copyright holder ⇒ no
+consent campaign, no consent log, no rewrite-their-surviving-lines fallback.**
+An earlier strategy brief treated this as a blocking gate with its own document
+set; all of it is deleted.
+
+> **Re-measured 2026-09-06, after the identity rewrite.** This table used to
+> carry a third row — the same human under a corporate mailbox, on 528 commits
+> made through the GitHub web UI while that address was the account's commit
+> email. Those commits were rewritten to the address above
+> (`git filter-repo --mailmap`), so the row is gone rather than edited away:
+> the tally is a live command's output and now reproduces.
+>
+> The conclusion it supports is unchanged, and was never in doubt — every
+> identity here was always the same person. What changed is that a public repo
+> no longer names an employer in 528 commit objects. The guards that stop it
+> recurring are `.githooks/check-identity.sh` and
+> `.claude/hooks/gh-account-guard.sh`; see the *sanitize-hostnames* skill's
+> "The other kind of name" section for why content scanning could never have
+> caught this one.
 
 The MIT grant on published history stays irrevocable, and `LICENSE-MIT` retains
 it verbatim. Anyone may fork the pre-split tree under MIT forever. That is
