@@ -151,6 +151,11 @@ pub struct GovernorFlags {
     /// the limiter (sender / path / browser), in SHADOW: logged and counted,
     /// acted on by nothing until T1b (`encode::transit_classify_enabled`).
     pub transit_classify: bool,
+    /// FR-71 T1b — ACT on a `transit-stalled` window: the ramp neither steps
+    /// nor ends, the age loop does not fire, the P3 clamp is held rather than
+    /// re-armed, the prior takes no push-back. Default OFF for one release
+    /// (`encode::transit_hold_enabled`).
+    pub transit_hold: bool,
 }
 
 impl Default for GovernorFlags {
@@ -168,6 +173,7 @@ impl Default for GovernorFlags {
             slow_start: false,
             prior_decay: true,
             transit_classify: true,
+            transit_hold: false,
         }
     }
 }
@@ -190,6 +196,7 @@ impl GovernorFlags {
             slow_start: super::rate_slow_start_enabled(),
             prior_decay: super::rate_prior_decay_enabled(),
             transit_classify: super::transit_classify_enabled(),
+            transit_hold: super::transit_hold_enabled(),
         }
     }
 }
@@ -308,6 +315,8 @@ pub struct RateGovernor {
     /// keeps no such figures (the VP9-444 pump), so the sender side reads as
     /// quiet and only the split and the viewer's report classify.
     window_sender: Option<WindowSenderStats>,
+    /// FR-71 T1b — windows on which the hold engaged (heartbeat `transit_holds`).
+    transit_holds: u32,
     /// FR-63 — the opener's ramp. Lazily built at the first CONSTRAINED tick
     /// because it needs that tick's RESOLVED ceiling, exactly as the AIMD is.
     /// `None` while the flag is off, on a direct transport, or once the ramp
@@ -415,6 +424,7 @@ impl RateGovernor {
             stall_seen: false,
             pipe: super::pipe_state::PipeClassifier::new(),
             window_sender: None,
+            transit_holds: 0,
             slow_start: None,
             slow_start_logged: false,
             slow_start_congested: false,
@@ -949,15 +959,9 @@ impl RateGovernor {
         // nothing congested since the last one, otherwise END it. Taking the
         // flag first keeps the borrow of `self.slow_start` clean.
         let congested = std::mem::take(&mut self.slow_start_congested);
-        if let Some(ss) = self.slow_start.as_mut()
-            && !ss.done()
-        {
-            if congested {
-                ss.on_congestion();
-            } else {
-                ss.on_clean_window();
-            }
-        }
+        // (Applied below, once the window's plane verdict is in: FR-71 T1b
+        // holds the ramp on a stalled window, which is neither clean nor
+        // congested.)
         // FR-35 — the window's delivered rate, from the send task's running
         // byte total (bits per second over the actual elapsed window).
         let sent_bps: u32 = {
@@ -989,6 +993,74 @@ impl RateGovernor {
         // it; the heartbeat splits the fused age with it. Stored beside the
         // report (absent ⇒ absent) — it is telemetry, no loop reads it.
         self.last_viewer_arrival = viewer_rate::unpack_age_arrival(raw_age);
+        // FR-59 P3 — the viewer's own view of the link, taken here so the
+        // verdict below can see whether the viewer said anything at all.
+        let link = viewer_rate::unpack_link(take_link());
+        // FR-71 — one verdict per window on which plane is the limiter,
+        // taken BEFORE any loop acts on the window. T1a: the heartbeat
+        // prints it and the counters accumulate. T1b (`transit_hold`): a
+        // `transit-stalled` window is one the sender's queue passed every
+        // check on while the frames were held beyond it (finding 4: a
+        // 4.9 s paint over a 1485-byte queue), so nothing below may read it
+        // as over-production — the ramp neither steps nor ends, the age
+        // loop does not fire, the P3 clamp is held rather than re-armed and
+        // the prior takes no push-back. The FR-59 P4 drain still runs: a
+        // pause is a drain, not a cut. `samples` is this window's blocked
+        // sends (already folded into the goodput estimate above); the
+        // sender's other figures arrive from the pump through
+        // `note_window_sender`.
+        let hold = if constrained && self.slow_link.transit_classify {
+            let sender = self.window_sender.take();
+            let split = match (report, self.last_viewer_arrival) {
+                (Some((avg, _, _)), Some(arrival)) => {
+                    let s = viewer_rate::split_age(
+                        avg,
+                        arrival,
+                        sender.and_then(|s| s.send_wait_avg_ms),
+                    );
+                    Some(super::pipe_state::SplitMs {
+                        sender_ms: s.sender_ms,
+                        transit_ms: s.transit_ms,
+                        viewer_ms: s.viewer_ms,
+                    })
+                }
+                _ => None,
+            };
+            let signals = super::pipe_state::WindowSignals {
+                split,
+                reported: raw_report != 0 || report.is_some() || link.is_some(),
+                inflight_bytes: sender.map_or(0, |s| s.inflight_bytes),
+                budget_bytes: sender.map_or(0, |s| s.budget_bytes),
+                gate_skips: sender.map_or(0, |s| s.gate_skips),
+                blocked_sends: samples.len() as u32,
+                send_wait_max_ms: sender.map_or(0.0, |s| s.send_wait_max_ms),
+                frames_sent: sender.map_or(0, |s| s.frames_sent),
+                struggling,
+            };
+            let state = self.pipe.classify(&signals);
+            let hold = self.slow_link.transit_hold
+                && state == super::pipe_state::PipeState::TransitStalled;
+            if hold {
+                self.transit_holds = self.transit_holds.saturating_add(1);
+            }
+            hold
+        } else {
+            false
+        };
+        // FR-63 — one verdict per window for the opener's ramp: double if
+        // nothing congested since the last one, otherwise END it. Neither on
+        // a held window (FR-71 T1b): a stall is not a clean window, and it is
+        // not congestion either.
+        if !hold
+            && let Some(ss) = self.slow_start.as_mut()
+            && !ss.done()
+        {
+            if congested {
+                ss.on_congestion();
+            } else {
+                ss.on_clean_window();
+            }
+        }
         let mut age_over = false;
         // FR-59 — is the queue still DEEP right now? This is the LEVEL, not
         // the streak `age_over` needs, and it is what holds the P3 clamp.
@@ -1009,7 +1081,12 @@ impl RateGovernor {
             // reject impossible floor samples and to catch a session that was
             // congested from its first window.
             let triggered = self.age_loop.observe(avg, min, rtt / 2);
-            age_over = triggered && constrained && self.age_feedback;
+            // FR-71 T1b — the loop still LEARNS on a held window (a stall
+            // never lowers a floor that is a minimum), it just does not fire.
+            age_over = triggered && constrained && self.age_feedback && !hold;
+            if hold {
+                self.age_loop.reset_streak();
+            }
             // Same floor the age loop learned, falling back to the path's
             // physical minimum so a session with nothing learned yet still
             // has a bound rather than treating every age as elevated.
@@ -1025,11 +1102,12 @@ impl RateGovernor {
         // rejected as implausible — which on a jittery mobile path is most
         // of them. Learned on every transport, ACTED on when constrained
         // (a direct path has the measured-ceiling clamp for this job).
-        let link = viewer_rate::unpack_link(take_link());
         let verdict = link
             .map(|(rx_bps, queue_ms)| self.link_loop.observe(rx_bps, queue_ms))
             .unwrap_or_default();
-        let link_acts = constrained && self.slow_link.viewer_rate_clamp;
+        // FR-71 T1b — on a held window the clamp is neither armed nor
+        // released: whatever it held before the stall, it still holds.
+        let link_acts = constrained && self.slow_link.viewer_rate_clamp && !hold;
         // FR-59 P4 — a queue too deep to cut our way out of. A rate cut
         // drains at `capacity − inflow`, which on a converged session is
         // nearly nothing: at 90 % of a 400 kbps pipe a 2 s backlog clears
@@ -1121,7 +1199,9 @@ impl RateGovernor {
         // field session was the prior's own artefact (`encode::prior`).
         // `age_elevated` rather than `age_over` alone: the LEVEL speaks even
         // when the age loop is switched off from acting.
-        if constrained {
+        // FR-71 T1b — a held window is neither clean nor pushed back, so the
+        // prior does not move at all.
+        if constrained && !hold {
             let stall_seen = std::mem::take(&mut self.stall_seen);
             let live = self.goodput.estimate_bps(now).or(match self.link_rx_bps {
                 Some((rx, at)) if now.duration_since(at) <= LINK_CEILING_TTL => Some(rx),
@@ -1130,34 +1210,6 @@ impl RateGovernor {
             let pushed_back =
                 age_over || age_elevated || link_over || drain_for_ms.is_some() || stall_seen;
             self.prior.on_window(live, pushed_back);
-            // FR-71 T1a — one verdict per window on which plane is the
-            // limiter, in SHADOW: the heartbeat prints it and the counters
-            // accumulate, nothing acts on it until T1b. `samples` is this
-            // window's blocked sends (already folded into the goodput
-            // estimate above); the sender's other figures arrive from the
-            // pump through `note_window_sender`.
-            if self.slow_link.transit_classify {
-                let sender = self.window_sender.take();
-                let split = self
-                    .viewer_age_split(sender.and_then(|s| s.send_wait_avg_ms))
-                    .map(|s| super::pipe_state::SplitMs {
-                        sender_ms: s.sender_ms,
-                        transit_ms: s.transit_ms,
-                        viewer_ms: s.viewer_ms,
-                    });
-                let signals = super::pipe_state::WindowSignals {
-                    split,
-                    reported: raw_report != 0 || report.is_some() || link.is_some(),
-                    inflight_bytes: sender.map_or(0, |s| s.inflight_bytes),
-                    budget_bytes: sender.map_or(0, |s| s.budget_bytes),
-                    gate_skips: sender.map_or(0, |s| s.gate_skips),
-                    blocked_sends: samples.len() as u32,
-                    send_wait_max_ms: sender.map_or(0.0, |s| s.send_wait_max_ms),
-                    frames_sent: sender.map_or(0, |s| s.frames_sent),
-                    struggling,
-                };
-                self.pipe.classify(&signals);
-            }
         }
         // FR-35 — hand the learner this window's evidence.
         let ceiling_grown = if constrained {
@@ -1219,6 +1271,13 @@ impl RateGovernor {
     /// transit_stalled, viewer_late]`.
     pub fn pipe_state_counts(&self) -> [u32; 5] {
         self.pipe.counts()
+    }
+
+    /// FR-71 T1b — windows on which the hold engaged: classified
+    /// `transit-stalled` with `transit_hold` on, so the ramp, the age loop,
+    /// the P3 clamp and the prior all left the window alone.
+    pub fn transit_holds(&self) -> u32 {
+        self.transit_holds
     }
 
     /// FR-15 P2 — count of floor samples rejected as below the path's
@@ -1339,6 +1398,92 @@ mod tests {
             None,
             now,
         )
+    }
+
+    /// FR-71 T1b — the WIRING (the classifier is unit-tested in
+    /// `encode::pipe_state`, the law in the B0 cells). A silent window while
+    /// the pump kept sending is a transit stall; so is a report whose transit
+    /// share dwarfs its floor. With the hold ON those windows are counted and
+    /// the age loop's streak is reset, so the backlog's own elevated windows
+    /// do not fire the loop; with the hold OFF the same windows are only
+    /// classified and the loop fires on the stall's count — today's cut.
+    #[test]
+    fn transit_hold_masks_the_age_loop_and_counts_the_window() {
+        use crate::encode::pipe_state::PipeState;
+        for hold in [false, true] {
+            let start = Instant::now();
+            let mut g = gov(start);
+            g.slow_link.transit_classify = true;
+            g.slow_link.transit_hold = hold;
+            let mut t = start;
+            let sender = |frames_sent: u32| WindowSenderStats {
+                inflight_bytes: 1_500,
+                budget_bytes: 128_000,
+                gate_skips: 0,
+                send_wait_max_ms: 1.0,
+                send_wait_avg_ms: Some(0.5),
+                frames_sent,
+            };
+            // Three clean windows learn the floors (40 ms transit, 1 ms viewer).
+            for _ in 0..3 {
+                t += Duration::from_millis(1100);
+                g.note_window_sender(sender(30));
+                g.tick_viewer_window(
+                    t,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || viewer_rate::pack_age_with_arrival(42, 40, 80, 41),
+                    || 0,
+                    true,
+                    |o| o,
+                    0,
+                )
+                .expect("window due");
+                assert_eq!(g.pipe_state(), Some(PipeState::Clear), "hold={hold}");
+            }
+            // Two silent windows with the pump still sending: finding 4's
+            // first seconds.
+            for _ in 0..2 {
+                t += Duration::from_millis(1100);
+                g.note_window_sender(sender(30));
+                g.tick_viewer_window(t, 30, || 0, || 0, || 0, true, |o| o, 0)
+                    .expect("window due");
+                assert_eq!(
+                    g.pipe_state(),
+                    Some(PipeState::TransitStalled),
+                    "hold={hold}"
+                );
+            }
+            // The backlog lands: two windows whose transit share is seconds.
+            let mut fired = false;
+            for _ in 0..2 {
+                t += Duration::from_millis(1100);
+                g.note_window_sender(sender(30));
+                let w = g
+                    .tick_viewer_window(
+                        t,
+                        30,
+                        || viewer_rate::pack_report(30, false),
+                        || viewer_rate::pack_age_with_arrival(4000, 3500, 80, 3999),
+                        || 0,
+                        true,
+                        |o| o,
+                        0,
+                    )
+                    .expect("window due");
+                assert_eq!(
+                    g.pipe_state(),
+                    Some(PipeState::TransitStalled),
+                    "hold={hold}"
+                );
+                fired |= w.age_over;
+            }
+            assert_eq!(
+                fired, !hold,
+                "hold={hold}: the age loop must fire exactly when the hold is off"
+            );
+            assert_eq!(g.transit_holds(), if hold { 4 } else { 0 });
+        }
     }
 
     /// FR-70 P1 — a remembered-slow pair, constrained, as the field ran it.
