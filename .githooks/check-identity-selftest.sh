@@ -13,16 +13,39 @@
 # to a PUBLIC repo, and a canary naming a real mailbox publishes exactly what
 # the guard exists to keep out -- the mistake the sibling selftest documents
 # making twice, in its own explanatory prose.
+#
+# ⚠️⚠️ HERMETIC. Every assertion below is about the GUARD, never about the
+# repository this happens to be running in. The first version was not, and CI
+# found two ways that fails, both on the first run:
+#
+#   * a CI runner has NO git identity, so `git var GIT_AUTHOR_IDENT` errors and
+#     every --pending canary got exit 20 ("could not run") instead of 1;
+#   * on a pull_request, actions/checkout checks out GitHub's ephemeral MERGE
+#     commit, which is authored with the email set on the GitHub ACCOUNT -- so
+#     a HEAD-relative assertion judged a commit that never lands on master, and
+#     failed for a reason unrelated to whether the guard works.
+#
+# Whether the real history is clean is the CI STEP's question, answered with a
+# properly computed range right after this script runs. Mixing the two made a
+# guard that is fine look broken, which is how a guard gets switched off.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 GUARD=".githooks/check-identity.sh"
 ALLOW=".githooks/allowed-identities.txt"
 fail=0
-
-note() { echo "  $*"; }
-bad()  { echo "FAIL: $*"; fail=1; }
+bad() { echo "FAIL: $*"; fail=1; }
 
 [ -f "$GUARD" ] || { echo "FAIL: $GUARD missing"; exit 1; }
+[ -f "$ALLOW" ] || { echo "FAIL: $ALLOW missing"; exit 1; }
+
+OK_ADDR=$(grep -vE '^\s*(#|$)' "$ALLOW" | head -1 | tr -d '[:space:]')
+[ -n "$OK_ADDR" ] || { echo "FAIL: allowlist has no entries"; exit 1; }
+
+# A known-good identity for the whole script, so `git var` always resolves and
+# each canary can override exactly one field. Without this the canaries depend
+# on the ambient git config -- present on a developer box, absent on a runner.
+export GIT_AUTHOR_NAME="Identity Selftest"    GIT_COMMITTER_NAME="Identity Selftest"
+export GIT_AUTHOR_EMAIL="$OK_ADDR"            GIT_COMMITTER_EMAIL="$OK_ADDR"
 
 # ⚠️⚠️ Git skips a non-executable hook in SILENCE -- the layer disarmed with
 # nothing anywhere to say so.
@@ -51,7 +74,15 @@ done
 
 # ── 1. the clean path ──────────────────────────────────────────────────────
 bash "$GUARD" --pending >/dev/null 2>&1 \
-  || bad "the repo's own configured identity is refused by its own allowlist"
+  || bad "an allowlisted identity was refused by --pending"
+
+# The developer's OWN configured identity, checked only where there is one. On
+# a runner there is not, and asserting it there is what broke the first run.
+if cfg_addr=$(git config user.email 2>/dev/null) && [ -n "$cfg_addr" ]; then
+  GIT_AUTHOR_EMAIL="$cfg_addr" GIT_COMMITTER_EMAIL="$cfg_addr" \
+    bash "$GUARD" --pending >/dev/null 2>&1 \
+    || bad "this clone's configured git identity ($cfg_addr) is not on the allowlist"
+fi
 
 # ── 2. a foreign identity is CAUGHT, in BOTH casings ───────────────────────
 #
@@ -77,17 +108,13 @@ case "$out" in (*committer*) :;; (*) bad "committer canary: role not reported as
 # The other half of case-insensitivity, and the one that turns the guard into
 # noise if it regresses: refusing the owner's own address because it arrived
 # uppercased is how a hook gets switched off within a week.
-ok_addr=$(grep -vE '^\s*(#|$)' "$ALLOW" | head -1 | tr -d '[:space:]')
-[ -n "$ok_addr" ] || bad "allowlist has no entries"
-if [ -n "$ok_addr" ]; then
-  upper=$(printf '%s' "$ok_addr" | tr '[:lower:]' '[:upper:]')
-  GIT_AUTHOR_EMAIL="$upper" GIT_COMMITTER_EMAIL="$upper" \
-    bash "$GUARD" --pending >/dev/null 2>&1 \
-    || bad "an allowlisted address written UPPERCASE was refused"
-fi
+upper=$(printf '%s' "$OK_ADDR" | tr '[:lower:]' '[:upper:]')
+GIT_AUTHOR_EMAIL="$upper" GIT_COMMITTER_EMAIL="$upper" \
+  bash "$GUARD" --pending >/dev/null 2>&1 \
+  || bad "an allowlisted address written UPPERCASE was refused"
 
 # ── 4. the allowlist may not be loosened into a pattern ────────────────────
-# `*@gmail.com` or a bare domain admits every address anyone ever mistypes,
+# `*@example.com` or a bare domain admits every address anyone ever mistypes,
 # which is precisely the property the allowlist exists to deny. It reads like a
 # harmless simplification in review, so it is asserted here instead.
 if grep -qE '^\s*[^#]*[*?]' "$ALLOW"; then
@@ -121,7 +148,10 @@ bash "$GUARD" >/dev/null 2>&1; rc=$?
 # overlay ACLs, where collapsing them turns a deny into a grant. Here,
 # collapsing them would make an unreadable allowlist mean "everything is fine".
 scratch=$(mktemp -d) || exit 1
-trap 'rm -rf "$scratch"' EXIT
+r=$(mktemp -d) || exit 1
+p=$(mktemp -d) || exit 1
+trap 'rm -rf "$scratch" "$r" "$p"' EXIT
+
 mkdir -p "$scratch/g"
 cp "$GUARD" "$scratch/g/check-identity.sh"
 ( cd "$scratch/g" && bash ./check-identity.sh --pending >/dev/null 2>&1 ); rc=$?
@@ -131,50 +161,62 @@ printf '# only comments and blanks\n\n' > "$scratch/g/allowed-identities.txt"
 ( cd "$scratch/g" && bash ./check-identity.sh --pending >/dev/null 2>&1 ); rc=$?
 [ "$rc" -eq 20 ] || bad "EMPTY allowlist: expected exit 20 (never a pass), got $rc"
 
-# ── 6. --range actually reads commits, not the config ──────────────────────
-# A guard that quietly answered from `git config` in every mode would pass this
-# repo's whole history and every canary above, and would be worthless in CI --
-# where the config identity is the runner's, not the commit's.
-r=$(mktemp -d) || exit 1
-trap 'rm -rf "$scratch" "$r"' EXIT
+# ── 6. the commit-reading modes, in a repo built for the purpose ───────────
+#
+# ⚠️ A throwaway repo, NOT this one. A guard that quietly answered from `git
+# config` in every mode would pass every canary above and be worthless in CI,
+# so the modes have to be exercised against real commits -- but against
+# commits whose identities this file CHOSE, not whichever ones the checkout
+# happened to produce.
+GUARD_ABS="$PWD/$GUARD"; ALLOW_ABS="$PWD/$ALLOW"
 (
   unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
   git init -q "$r" && cd "$r" || exit 1
   git config core.autocrlf false
-  git config user.name  "Canary"
-  git config user.email "nobody@example.invalid"
   mkdir -p .githooks
-  cp "$OLDPWD/$GUARD" .githooks/check-identity.sh
-  cp "$OLDPWD/$ALLOW" .githooks/allowed-identities.txt
-  echo x > a.txt && git add a.txt
-  git commit -qm "canary commit with a foreign identity" --no-verify
-  bash .githooks/check-identity.sh --commits HEAD -1 >/dev/null 2>&1
-  exit $?
+  cp "$GUARD_ABS" .githooks/check-identity.sh
+  cp "$ALLOW_ABS" .githooks/allowed-identities.txt
+  G=.githooks/check-identity.sh
+
+  # A clean commit, then a foreign one, so both verdicts are exercised against
+  # commits rather than config.
+  echo a > a.txt && git add a.txt
+  git commit -qm "clean commit" --no-verify || exit 70
+  bash "$G" --commits HEAD -1 >/dev/null 2>&1 || exit 71
+
+  # The count must be REPORTED. "all known" over zero commits and over forty
+  # are the same sentence and opposite facts.
+  out=$(bash "$G" --commits HEAD -1 2>&1)
+  case "$out" in (*"(1 checked)"*) :;; (*) exit 72;; esac
+
+  echo b > b.txt && git add b.txt
+  GIT_AUTHOR_EMAIL='nobody@example.invalid' \
+    git commit -qm "foreign commit" --no-verify || exit 73
+  bash "$G" --commits HEAD -1 >/dev/null 2>&1 && exit 74
+  bash "$G" --range HEAD~1..HEAD >/dev/null 2>&1 && exit 75
+
+  # ⚠️ An EMPTY range must not read as a pass when the caller says so. This
+  # canary exists because writing this file FOUND the bug: the first draft
+  # asserted against `HEAD~0..HEAD`, which is empty, and the guard happily
+  # answered "all known" -- a green verdict over zero commits, the same defect
+  # as a `cargo test` filter matching no test. A pre-push hook legitimately
+  # sees empty ranges, so silence stays the default; CI passes
+  # --require-commits, where an empty range means the range expression is wrong.
+  bash "$G" --range 'HEAD..HEAD' >/dev/null 2>&1 || exit 76
+  bash "$G" --require-commits --range 'HEAD..HEAD' >/dev/null 2>&1; [ $? -eq 20 ] || exit 77
+  exit 0
 ); rc=$?
-[ "$rc" -eq 1 ] || bad "a commit with a foreign identity: expected exit 1, got $rc"
-
-# ── 6b. an EMPTY range must not read as a pass when the caller says so ─────
-#
-# ⚠️ This canary is here because writing this file FOUND the bug. The first
-# draft asserted against `HEAD~0..HEAD`, which is empty, and the guard happily
-# answered "all known" -- a green verdict over zero commits. That is the same
-# defect as a `cargo test` filter matching no test: a job that silently ran
-# nothing is indistinguishable from a passing one, and this repo has already
-# been bitten by exactly that in its integration lane.
-#
-# A pre-push hook legitimately sees empty ranges, so silence stays the default;
-# CI passes --require-commits, because an empty range THERE means the range
-# expression is wrong and the check examined nothing.
-bash "$GUARD" --range 'HEAD..HEAD' >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 0 ] || bad "an empty range without --require-commits should be quiet, got $rc"
-
-bash "$GUARD" --require-commits --range 'HEAD..HEAD' >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 20 ] || bad "an empty range WITH --require-commits must be exit 20, got $rc"
-
-# The count must actually be reported, or a reader of a green log cannot tell
-# "checked forty" from "checked none".
-out=$(bash "$GUARD" --commits HEAD -1 2>&1)
-case "$out" in (*"(1 checked)"*) :;; (*) bad "the clean line does not report how many commits were checked: $out";; esac
+case "$rc" in
+  0)  ;;
+  70|73) bad "scratch repo: could not create a commit (exit $rc)" ;;
+  71) bad "--commits over a CLEAN commit was refused" ;;
+  72) bad "the clean line does not report how many commits were checked" ;;
+  74) bad "--commits over a commit with a foreign identity did not refuse" ;;
+  75) bad "--range over a commit with a foreign identity did not refuse" ;;
+  76) bad "an empty range without --require-commits should be quiet" ;;
+  77) bad "an empty range WITH --require-commits must be exit 20" ;;
+  *)  bad "scratch-repo canaries could not run (exit $rc)" ;;
+esac
 
 # ── 7. pre-push REFUSES a real push, end to end ────────────────────────────
 #
@@ -183,35 +225,33 @@ case "$out" in (*"(1 checked)"*) :;; (*) bad "the clean line does not report how
 # around with --no-verify and is absent entirely in a clone where nobody set
 # core.hooksPath; pre-push is the last thing between a foreign identity and a
 # public remote, so "the hook is wired correctly" has to be tested, not assumed.
-p=$(mktemp -d) || exit 1
-trap 'rm -rf "$scratch" "$r" "$p"' EXIT
+HOOKS_ABS="$PWD/.githooks"
 (
   unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+  [ -f "$HOOKS_ABS/pre-push" ] || exit 0        # branch predates the hook
   git init -q --bare "$p/remote.git" || exit 1
   git init -q "$p/work" && cd "$p/work" || exit 1
   git config core.autocrlf false
   git config core.hooksPath .githooks
-  git config user.name "Canary"
   git remote add origin "$p/remote.git"
   mkdir -p .githooks
   for f in pre-push check-identity.sh allowed-identities.txt; do
-    cp "$OLDPWD/.githooks/$f" ".githooks/$f"
+    cp "$HOOKS_ABS/$f" ".githooks/$f"
   done
   chmod +x .githooks/pre-push .githooks/check-identity.sh
 
   # A commit whose identity is foreign, made with --no-verify so pre-commit is
   # explicitly bypassed -- the exact scenario pre-push exists to catch.
-  git config user.email "nobody@example.invalid"
   echo x > a.txt && git add a.txt
-  git commit -qm "bypassed pre-commit" --no-verify || exit 1
+  GIT_AUTHOR_EMAIL='nobody@example.invalid' GIT_COMMITTER_EMAIL='nobody@example.invalid' \
+    git commit -qm "bypassed pre-commit" --no-verify || exit 1
   if git push -q origin HEAD:refs/heads/main >/dev/null 2>&1; then
     exit 90            # pushed anyway: the hook did not fire
   fi
 
   # And the same push must SUCCEED once the identity is right, or the hook is
-  # simply broken rather than protective. (Amend rather than a fresh commit, so
-  # what changes between the two halves is only the identity.)
-  git config user.email "$(grep -vE '^\s*(#|$)' .githooks/allowed-identities.txt | head -1 | tr -d '[:space:]')"
+  # simply broken rather than protective. Amend rather than a fresh commit, so
+  # what changes between the two halves is only the identity.
   git commit -q --amend --reset-author --no-edit --no-verify || exit 1
   git push -q origin HEAD:refs/heads/main >/dev/null 2>&1 || exit 91
   exit 0
@@ -223,15 +263,12 @@ case "$rc" in
   *)  bad "pre-push end-to-end canary could not run (exit $rc)" ;;
 esac
 
-# ── 8. the guard runs green over what is actually about to be pushed ───────
-# Not decoration: it is the assertion that the allowlist and this repo's real
-# history agree, so a green CI run means something. Scoped to commits not yet
-# on origin, because the historical corp-address commits below that point are
-# the subject of a separate rewrite and would make this permanently red.
-if git rev-parse --verify -q origin/master >/dev/null; then
-  bash "$GUARD" --commits HEAD --not --remotes=origin >/dev/null 2>&1 \
-    || bad "commits on this branch but not on origin carry an unknown identity"
-fi
+# NOTE: there is deliberately NO assertion here that this repository's own
+# history is clean. That is the CI step's question, asked immediately after
+# this script with a range computed from the event -- and it is a question with
+# a different answer on a developer box, on a PR merge commit, and mid-way
+# through a history rewrite. An earlier version asserted it and failed on the
+# first CI run for a reason that had nothing to do with the guard.
 
 if [ "$fail" -eq 0 ]; then echo "commit-identity selftest: ok"; else
   echo "commit-identity selftest: FAILED"; fi
