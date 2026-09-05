@@ -254,6 +254,52 @@ all three hosts: `media_thread` flips to on for 0.4.70** (this PR), with
 `iter_ms_max` / `pump_stalls` in `agent_logs` after the roll is the check
 that the three short pairs did not mislead.
 
+**0.4.70 — the same-day fleet read (2026-09-05, released 19:46 UTC, read
+20:05–20:42 UTC).** One trap first, because it would have made the read
+unfalsifiable: all three CORPLAP hosts still carried an explicit
+`media_thread = false` in `config.toml`, left behind by the M1c pairs (the
+off-arm was written last on each; CORPLAP-1 also kept `transit_hold = false`
+from FR-71's field session). An explicit key beats the built-in default, so
+the flip would have changed nothing on exactly the hosts being read and
+"no regression" would have been measured on the inline encoder. The keys
+were cleared with `roomler config clear` on all three before any reading;
+CORPLAP-3 was restarted on the default, CORPLAP-1 and -2 took it at the
+restart of the operator's own dashboard-triggered update. `threaded=true` in
+every session's log is the proof the default is what ran. The rule this
+leaves: a default flip's field check starts by proving the key is absent on
+every host, not by reading counters.
+
+Before = the operator's own sessions on 0.4.69 (inline), 597 heartbeats
+each; after = the operator's own sessions on 0.4.70 on CORPLAP-1/-2
+(597 and 570 heartbeats) and a driven 3-minute session on CORPLAP-3
+(185), steady state = heartbeats 4+:
+
+| | CORPLAP-1 (hevc_qsv, relay) | CORPLAP-2 (av1_nvenc, relay) | CORPLAP-3 (av1_qsv, direct) |
+|---|---|---|---|
+| `avg_encode_ms` before → after | 9.63 → 10.01 | 11.17 → 10.34 | 12.35 → 12.48 |
+| `avg_capture_ms` | 2.64 → 3.36 | 1.40 → 1.39 | 2.37 → 2.63 |
+| `iter_ms_max` avg over windows | 21.2 → 21.9 | 27.8 → 23.9 | 15.2 → 17.1 |
+| worst steady window | 90.6 → 120.6 | 81.1 → 84.0 | 67.5 → 67.2 |
+| windows > 50 ms | 8 (1 %) → 11 (2 %) | 130 (22 %) → 93 (16 %) | 2 (0 %) → 4 (2 %) |
+| pump stalls after the opening | 0 → 1 | 0 → 0 | 0 → 0 |
+| the session-start open | 534 ms | 2915 ms | 711 ms |
+
+Encode and capture equal within noise on all three; the host M1c had called
+ambiguous (CORPLAP-2) is the one that moved most, 22 % → 16 % of windows
+over 50 ms on a 20-minute natural session — the same direction as its long
+pair. CORPLAP-3's four windows over 50 ms are the +10 s start burst (67 and
+63 ms, eight budget-gate skips) and two at 52 ms. CORPLAP-1's one steady
+stall is the number worth keeping: at +20 s a single pass took 120.6 ms
+with `capture_ms=0.345 encode_ms=0.0 … other_ms=120.273 dominant=None` —
+nothing in the frame path ran, the encoder was on its thread, and the whole
+pass sat in the un-instrumented residual. That is not the encoder (M1's
+job, done) and not a rebuild (M2's); it is the loop body still living on a
+runtime worker with everything else that runs there, which is M3's case.
+**Verdict: the default holds; no host needed the way back
+(`media_thread = false`); the three short pairs did not mislead.** M2a and
+FR-71's gap counter rode `agent-v0.4.71` (20:37 UTC the same evening);
+M2a's field gate on CORPLAP-2 is the next read.
+
 ## M2 — make-before-break, as designed and built (2026-09-05)
 
 **What the measurement says.** The encoder open is the largest stall left in
@@ -306,7 +352,10 @@ not drag the session back to dims it has left. M2a generalises it:
 updating through each (frames keep flowing at the old dims while the open
 runs) and `dims_swaps` counts them; `open_ms` appears in the heartbeat only
 for the session's first open. The VP9-444 pump has no background rebuild
-and keeps its inline re-open (its libvpx open is milliseconds).
+and keeps its inline re-open (its libvpx open is milliseconds). **Released
+in `agent-v0.4.71` (2026-09-05 20:37 UTC), merged as #1388; the field gate
+is still open** — it needs CORPLAP-2 (the 2.9 s host) on 0.4.71 and a
+session driven through the resolution rungs.
 
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
