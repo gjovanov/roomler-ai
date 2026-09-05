@@ -195,11 +195,38 @@ pub fn read_outcome() -> Result<Option<InstallOutcome>> {
 /// when the watcher runs from a staged copy (see the module docs).
 /// `None` = the watcher runs from the install dir itself, so its own
 /// `current_exe` is the correct probe/flavour source.
+/// Whether the watcher must wait on `installer_pid` at all.
+///
+/// ⚠️ Waiting is never correct for an install that already completed in the
+/// daemon's own process. On Linux BOTH install paths are synchronous — the
+/// tarball path does the work inline and hands back `std::process::id()`
+/// (`updater.rs`, `install_tarball_linux`), and the `.deb` path `wait()`s on its
+/// child and hands back an already-reaped pid. So the pid handed over is either
+/// the DAEMON's or a corpse, and polling it means the watcher's only exit
+/// condition is **its own parent's death** — which is also precisely what kills
+/// it, because the daemon's exit tears down the systemd unit's cgroup.
+///
+/// That is why `last-install.json` sat at `InProgress` on every Linux host: one
+/// still showed `agent-v0.4.16` written 2026-08-29 while the host was running
+/// 0.4.50. See FR-67 (#1267).
+///
+/// ⚠️ Windows keeps the wait: msiexec is genuinely asynchronous and
+/// `recover_wedged_install` depends on observing its exit.
+fn should_wait_for_installer(installer_pid: u32, already_exited: bool) -> bool {
+    if already_exited {
+        return false;
+    }
+    // A zero pid is not waitable; `kill(0, 0)` addresses the caller's whole
+    // process group, which would make the poll succeed forever.
+    installer_pid != 0
+}
+
 pub fn watch(
     installer_pid: u32,
     installer_path: PathBuf,
     expected_version: String,
     origin_exe: Option<PathBuf>,
+    already_exited: bool,
 ) -> Result<InstallOutcome> {
     let started_unix = unix_now();
     let mut outcome = InstallOutcome {
@@ -218,7 +245,18 @@ pub fn watch(
     // crashes mid-wait still leaves a forensic trail.
     let _ = write_outcome(&outcome);
 
-    let exit = wait_for_pid(installer_pid, INSTALLER_BUDGET);
+    let exit = if should_wait_for_installer(installer_pid, already_exited) {
+        wait_for_pid(installer_pid, INSTALLER_BUDGET)
+    } else {
+        // Nothing to observe: the install finished before this process
+        // existed. Treat it as a clean exit and go straight to verifying the
+        // binary that is now on disk.
+        tracing::info!(
+            installer_pid,
+            "installer already completed synchronously — verifying without waiting"
+        );
+        WaitOutcome::Exited(0)
+    };
     match exit {
         WaitOutcome::Exited(code) => {
             outcome.installer_exit_code = Some(code);
@@ -743,6 +781,42 @@ mod tests {
             WindowsInstallFlavour::PerUser
         );
         assert_eq!(install_flavour(None), WindowsInstallFlavour::PerUser);
+    }
+
+    /// FR-67 P1 — the watcher must not wait for an install that already
+    /// finished.
+    ///
+    /// On Linux both install paths complete inside the daemon: the tarball path
+    /// installs inline and returns `std::process::id()`, and the `.deb` path
+    /// `wait()`s on its child and returns an already-reaped pid. Polling that pid
+    /// means the watcher's only exit condition is its own parent's death — and
+    /// that death is exactly what tears down the unit's cgroup and kills it. The
+    /// result was `last-install.json` frozen at `InProgress` on every Linux host,
+    /// one of them still naming `agent-v0.4.16` while running 0.4.50.
+    ///
+    /// ⚠️ The first assertion is the load-bearing one and it is the shape of the
+    /// real bug: the daemon's own pid, an install that is already done. It fails
+    /// against the previous code, which called `wait_for_pid` unconditionally.
+    ///
+    /// ⚠️ The second pins what must NOT change — a genuinely asynchronous
+    /// installer (msiexec, `installer -pkg`) is still waited on, because
+    /// `recover_wedged_install` depends on observing its exit.
+    #[test]
+    fn the_watcher_never_waits_on_an_already_completed_install() {
+        assert!(
+            !should_wait_for_installer(std::process::id(), true),
+            "an install that already completed must not be waited on: the pid is this process or a corpse, and the wait ends only when we are killed"
+        );
+
+        assert!(
+            should_wait_for_installer(4242, false),
+            "a genuinely asynchronous installer must still be waited on; Windows wedge recovery depends on observing its exit"
+        );
+
+        assert!(
+            !should_wait_for_installer(0, false),
+            "pid 0 is not waitable — kill(0, 0) addresses the whole process group, so the poll would succeed forever"
+        );
     }
 
     #[test]
