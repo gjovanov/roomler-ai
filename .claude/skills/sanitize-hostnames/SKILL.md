@@ -70,6 +70,20 @@ python3 $S/sanitize.py --map $M --root $R --apply     # or --check for CI
 # 2. GitHub: issue + PR titles/bodies, comments, release notes
 python3 $S/sanitize_github.py --map $M --apply        # or --check
 
+# 2b. GitHub by SHAPE, which step 2 cannot do. sanitize_github.py is
+#     map-driven, so it finds only names somebody already listed; nothing
+#     otherwise scans PUBLISHED content for the *class*. Dump the bodies and
+#     point check_shapes.py at them. (2026-09-05: 58k lines of issues, PRs,
+#     comments and releases — clean.)
+O=$(mktemp -d)
+gh api --paginate '/repos/<owner>/<repo>/issues?state=all&per_page=100' \
+  -q '.[] | "=== #\(.number) \(.title)\n\(.body // "")"'      > $O/issues.txt
+gh api --paginate '/repos/<owner>/<repo>/issues/comments?per_page=100' \
+  -q '.[] | "=== \(.id)\n\(.body // "")"'                     > $O/comments.txt
+gh api --paginate '/repos/<owner>/<repo>/releases?per_page=100' \
+  -q '.[] | "=== \(.tag_name)\n\(.body // "")"'               > $O/releases.txt
+python3 $S/check_shapes.py --root $O; rm -rf $O
+
 # 3. whole git history — see the warnings below before running this
 python3 $S/sanitize.py --map $M --gen-filter-repo ~/sanitize/replace.txt
 git clone --mirror https://github.com/<owner>/<repo>.git ~/sanitize/repo.git
