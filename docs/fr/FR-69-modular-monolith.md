@@ -5,8 +5,9 @@
 pillar is a module, the five profiles build and are checked for what they leave out, the SPA
 gates on what the server mounts** · the device-listing composition fix shipped (#1352, proven
 on both profile arms #1354) · **AC7 verified on a local `mesh` stack** (`ui/e2e/mesh-profile.spec.ts`; the same PR
-stopped the shell calling modules the server does not mount) · AC4 measured, AC5's smoke half
-held · every phase's field gate (a
+stopped the shell calling modules the server does not mount) · **AC5 verified in a local
+container cell** (the signed release daemon enrolled and joined the `mesh` image's overlay) ·
+AC4 measured · every phase's field gate (a
 prod roll watched from the fleet: no dip in online agents; for P6 one RC session per carrier
 class; for P7 the overlay/tunnel sweep; for P8 the `mesh` image's daemon cell and the
 build-time measurement; for P9 the full UI against a `mesh` server) is still to be run ·
@@ -501,10 +502,14 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       and after, and recorded in the field log. — Publish dry-runs on master `618c763e`
       (amd64, cold cache, one sample each): `full` 17 min 35 s / 204 MiB, `mesh` 13 min 39 s /
       173 MiB — 22 % shorter, 15 % smaller. Field log: "after P9".
-- [ ] **AC5** A `mesh` image boots with Mongo, Redis and coturn only; `/health` lists `fleet`
+- [x] **AC5** A `mesh` image boots with Mongo, Redis and coturn only; `/health` lists `fleet`
       and `network`; a daemon enrolls and joins the overlay against it (a vmtest cell). — The
       smoke half held on the `mesh` dry-run (Mongo + Redis only, `/health` →
-      `modules: ["fleet","network"]` in 20 s, the SPA served); the daemon cell is still to run.
+      `modules: ["fleet","network"]` in 20 s, the SPA served); the daemon half in a local
+      container cell (2026-09-05): the signed `roomlerd 0.4.65` enrolled, sent its hello,
+      joined the overlay as `100.65.0.1` in userspace netstack mode and registered on the
+      network module's `/derp` — the device listing and the overlay node list both showed it
+      online. Field log: "AC5, the daemon half". Still to see: the same across a real network.
 - [x] **AC6** Every `ClientMsg` variant has an owner in the namespace map, enforced by an
       exhaustive match and a locked test. — P5b #1332: `ClientMsg::namespace()` is exhaustive
       (a new variant does not compile until it names an owner), `CLIENT_MSG_OWNERS` is checked
@@ -1208,3 +1213,20 @@ so the next call to an absent module fails the spec rather than a self-hoster's 
 Not covered here: AC7 against a REMOTE `mesh` server over the real network (this is the same
 image on loopback), and AC5's daemon half (a `roomlerd` enrolled against it) — still the fleet's
 to run.
+
+### 2026-09-05 — AC5, the daemon half: a release daemon enrols and joins the `mesh` overlay
+
+
+The cell: the `mesh` image built from master `89ea3128` through the self-host compose (`ROOMLER_PROFILE=mesh`, Mongo + Redis + MinIO, no coturn), and the **signed release daemon** `roomlerd 0.4.65` from the Linux `.deb` (`gpg`: `Good signature from "Roomler Release Signing"` against the pinned release key) extracted into a `debian:bookworm-slim` container that shares the server container's network namespace — the daemon upgrades any non-loopback `http://` enrollment URL to TLS, and loopback is the exemption a local trial gets. Overlay in **userspace netstack** mode (`overlay_enabled = true` + `netstack_socks_port = 1080`: no TUN, no `NET_ADMIN`, no routing changes), `auto_update = false`.
+
+| Step | Daemon log (`docker logs`) | Server side |
+|---|---|---|
+| enroll | `POST /api/agent/enroll` → agent token written to the config | `agents` row `ac5-cell`, `os: linux`, `version: 0.4.65` |
+| control socket | `connecting to signaling server (role=agent) server=ws://127.0.0.1:80/ws` → `rc:agent.hello sent` | device listing: `status: online`, `presence: online` |
+| overlay join | `overlay: rc:overlay.join sent` → `overlay netstack: userspace stack up (OS-free) ip=100.65.0.1 socks_port=1080` → `overlay: TUN up self_v4=100.65.0.1 mtu=1280` | `overlay blocks: carved a tenant block … cidr=100.65.0.0/22`; overlay node `ac5-cell` `overlay_ip: 100.65.0.1`, `online: true`, `will_rejoin: true`; the device listing carries `overlay_ip`, `magic_dns_name: ac5-cell`, `overlay_key_epoch: 0` |
+| the DERP floor | `overlay derp: /derp WS connected + registered relay=central` | `roomler_ai_mod_network::derp: derp: node registered agent_id=… node=… pk=ca46d1db` → `derp registry census … entries=1 networks=1` |
+| the server verdict | `carrier plane: srflx gather yielded NO public candidate` (no STUN reachable from the cell — expected) | `overlay.netcheck: capability vector changed … stun_udp=false relay_band_udp=Some(false)` |
+
+Three things this proves at once: the `mesh` image (fleet + network, nothing else) takes an enrollment, a control socket and an overlay join from an unmodified release daemon; **`/derp` mounted by the network module's `UpgradeSpec` (P7b) serves a real daemon** — the log target is `roomler_ai_mod_network::derp`; and the device listing back in the host (#1352) reads the network module's overlay rows for that agent.
+
+Not covered: a second node and traffic between them (one node is what AC5 asks: enrol + join), and the same against a `mesh` server across a real network. The cell was torn down afterwards (`down -v`, the daemon container and its image removed).
