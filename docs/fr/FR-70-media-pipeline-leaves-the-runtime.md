@@ -254,6 +254,60 @@ all three hosts: `media_thread` flips to on for 0.4.70** (this PR), with
 `iter_ms_max` / `pump_stalls` in `agent_logs` after the roll is the check
 that the three short pairs did not mislead.
 
+## M2 — make-before-break, as designed and built (2026-09-05)
+
+**What the measurement says.** The encoder open is the largest stall left in
+the frame path once M1 is in: 414–685 ms on CORPLAP-1 and CORPLAP-3, and
+**2.8–2.9 s on every session on CORPLAP-2** (av1_nvenc). Today every
+*rebuild* pays it again with a frozen picture: `need_rebuild` fires whenever
+the resampled frame's dims differ from the encoder's (`peer.rs`, the
+`encoder_dims` compare before the open), and the plan moves the resolution
+often — priority rungs, the relay cap, idle refine, the soft cap, a transport
+flip — so a session sees several. The open itself already runs off the
+worker (`spawn_blocking`, FR-65); what M2 removes is the *wait*.
+
+**The two halves of the open.** At session start there is nothing to serve
+meanwhile: the pump spawns when the answer is sent, the open starts on the
+first captured frame and overlaps the ICE/DTLS setup that is already in
+flight — on CORPLAP-2 the viewer's own breakdown reads
+`pc_connected:+644 dc_open:+237 first_frame:+2689`, i.e. the 2.9 s open
+*is* the first-frame latency and the setup it could hide behind is ~0.9 s.
+That half is the encoder's cost, not the pump's, and M2 leaves it. The
+other half — every rebuild after the first — is the pump's, and M2a takes
+it.
+
+**M2a — the dims make-before-break.** The rate swap already had the shape
+(FR-62 P3's `bg_rebuild`: `rebuild_spec` → `open_rebuilt` on a blocking
+thread → `adopt_rebuilt` between frames), but only at the encoder's own
+dims — `adopt_rebuilt` refused anything else, because a stale rate swap must
+not drag the session back to dims it has left. M2a generalises it:
+
+- `FfmpegEncoder::rebuild_spec_at_dims(w, h, bps)` — the same backend, fps,
+  cq and chroma at the new dims; `adopt_rebuilt` accepts a dims change (the
+  packets' codec still cannot change under a live decoder, so backend and
+  chroma must match), and the *pump* now guards the stale rate swap by
+  comparing `RebuiltEncoder::dims` with `encoder_dims` before adopting.
+- In the pump: when `need_rebuild` fires with a live encoder, the replacement
+  opens in the background at the new dims while the effective target stays
+  **pinned** to `built_target` — the target the live encoder was built for —
+  so the capturer's cap and the resampler keep producing frames the live
+  encoder can take. The frame that revealed the change is at the new dims
+  already, so it is the one frame skipped. When the open completes the
+  replacement is adopted between frames (its first frame is an IDR, the
+  send epoch bumps, `video-info` is re-announced), the pin lifts and the
+  plan's target takes over. A failed or refused open, a target that moved
+  again, or an encoder that was never live falls through to the inline open
+  exactly as before — there is no second loop and no new switch.
+- Heartbeat: `dims_swaps`; per swap a log line with the dims and how long
+  the old encoder kept serving (`FR-70 M2: dims swap adopted — the picture
+  never froze`).
+
+**Gate.** On a session with several resolution moves, the picture keeps
+updating through each (frames keep flowing at the old dims while the open
+runs) and `dims_swaps` counts them; `open_ms` appears in the heartbeat only
+for the session's first open. The VP9-444 pump has no background rebuild
+and keeps its inline re-open (its libvpx open is milliseconds).
+
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
 thread while the current encoder keeps serving `Encode`, which is the whole
