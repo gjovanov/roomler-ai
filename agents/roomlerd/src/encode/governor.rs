@@ -147,6 +147,10 @@ pub struct GovernorFlags {
     /// the floor and the queue budget at the memory for the whole session
     /// (`encode::rate_prior_decay_enabled`). False = FR-59 P8 verbatim.
     pub prior_decay: bool,
+    /// FR-71 T1a — classify every constrained viewer window by which plane is
+    /// the limiter (sender / path / browser), in SHADOW: logged and counted,
+    /// acted on by nothing until T1b (`encode::transit_classify_enabled`).
+    pub transit_classify: bool,
 }
 
 impl Default for GovernorFlags {
@@ -163,6 +167,7 @@ impl Default for GovernorFlags {
             // FR-63 — see the field doc: OFF even here, until field evidence.
             slow_start: false,
             prior_decay: true,
+            transit_classify: true,
         }
     }
 }
@@ -184,6 +189,7 @@ impl GovernorFlags {
             queue_drain: super::queue_drain_enabled(),
             slow_start: super::rate_slow_start_enabled(),
             prior_decay: super::rate_prior_decay_enabled(),
+            transit_classify: super::transit_classify_enabled(),
         }
     }
 }
@@ -295,6 +301,13 @@ pub struct RateGovernor {
     /// prior's "clean" verdict needs the PIPE's push-back, and a stall is the
     /// one push-back that reaches the governor between windows.
     stall_seen: bool,
+    /// FR-71 T1a — the per-window plane classifier (shadow).
+    pipe: super::pipe_state::PipeClassifier,
+    /// FR-71 T1a — what the pump measured about its own send side since the
+    /// last viewer window, handed in just before the tick. `None` = the pump
+    /// keeps no such figures (the VP9-444 pump), so the sender side reads as
+    /// quiet and only the split and the viewer's report classify.
+    window_sender: Option<WindowSenderStats>,
     /// FR-63 — the opener's ramp. Lazily built at the first CONSTRAINED tick
     /// because it needs that tick's RESOLVED ceiling, exactly as the AIMD is.
     /// `None` while the flag is off, on a direct transport, or once the ramp
@@ -311,6 +324,24 @@ pub struct RateGovernor {
     slow_start_congested: bool,
 }
 
+/// FR-71 T1a — what the pump measured about its own send side over one
+/// viewer window, handed to [`RateGovernor::note_window_sender`] just before
+/// the tick. Every field is a delta or a level for THAT window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowSenderStats {
+    /// Bytes still held for this session (the FR-59 P2 ledger) and the
+    /// budget the gate compares it against.
+    pub inflight_bytes: usize,
+    pub budget_bytes: usize,
+    /// Frames the byte-budget gate skipped this window.
+    pub gate_skips: u32,
+    /// The longest a frame waited in the send queue this window, ms, and
+    /// the window's average (`None` where the pump keeps no such figure).
+    pub send_wait_max_ms: f64,
+    pub send_wait_avg_ms: Option<f64>,
+    /// Frames the send task wrote this window.
+    pub frames_sent: u32,
+}
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
 const VIEWER_WINDOW: Duration = Duration::from_secs(1);
 
@@ -382,6 +413,8 @@ impl RateGovernor {
                 flags.prior_decay,
             ),
             stall_seen: false,
+            pipe: super::pipe_state::PipeClassifier::new(),
+            window_sender: None,
             slow_start: None,
             slow_start_logged: false,
             slow_start_congested: false,
@@ -939,7 +972,8 @@ impl RateGovernor {
         // existing once-a-second rendezvous.
         let samples = self.goodput_sink.drain();
         self.goodput.observe_window(&samples, now);
-        let (reported_fps, struggling) = viewer_rate::unpack_report(take_report());
+        let raw_report = take_report();
+        let (reported_fps, struggling) = viewer_rate::unpack_report(raw_report);
         // FR-15 — the viewer's paint age is the only sensor that sees the
         // whole constrained path (WG-over-DERP/TCP queues sit below every
         // agent counter). Sustained age over the learned floor drives BOTH
@@ -1096,6 +1130,34 @@ impl RateGovernor {
             let pushed_back =
                 age_over || age_elevated || link_over || drain_for_ms.is_some() || stall_seen;
             self.prior.on_window(live, pushed_back);
+            // FR-71 T1a — one verdict per window on which plane is the
+            // limiter, in SHADOW: the heartbeat prints it and the counters
+            // accumulate, nothing acts on it until T1b. `samples` is this
+            // window's blocked sends (already folded into the goodput
+            // estimate above); the sender's other figures arrive from the
+            // pump through `note_window_sender`.
+            if self.slow_link.transit_classify {
+                let sender = self.window_sender.take();
+                let split = self
+                    .viewer_age_split(sender.and_then(|s| s.send_wait_avg_ms))
+                    .map(|s| super::pipe_state::SplitMs {
+                        sender_ms: s.sender_ms,
+                        transit_ms: s.transit_ms,
+                        viewer_ms: s.viewer_ms,
+                    });
+                let signals = super::pipe_state::WindowSignals {
+                    split,
+                    reported: raw_report != 0 || report.is_some() || link.is_some(),
+                    inflight_bytes: sender.map_or(0, |s| s.inflight_bytes),
+                    budget_bytes: sender.map_or(0, |s| s.budget_bytes),
+                    gate_skips: sender.map_or(0, |s| s.gate_skips),
+                    blocked_sends: samples.len() as u32,
+                    send_wait_max_ms: sender.map_or(0.0, |s| s.send_wait_max_ms),
+                    frames_sent: sender.map_or(0, |s| s.frames_sent),
+                    struggling,
+                };
+                self.pipe.classify(&signals);
+            }
         }
         // FR-35 — hand the learner this window's evidence.
         let ceiling_grown = if constrained {
@@ -1136,6 +1198,27 @@ impl RateGovernor {
         let (age, _) = self.last_viewer_age?;
         let arrival = self.last_viewer_arrival?;
         Some(viewer_rate::split_age(age, arrival, sender_ms))
+    }
+
+    /// FR-71 T1a — the pump hands in what it measured about its own send
+    /// side since the last viewer window, just before the tick. The tick
+    /// consumes it; a pump that never calls this (the VP9-444 pump) classifies
+    /// from the split and the viewer's report alone.
+    pub fn note_window_sender(&mut self, stats: WindowSenderStats) {
+        self.window_sender = Some(stats);
+    }
+
+    /// FR-71 T1a — the last window's verdict on which plane is the limiter
+    /// (shadow), for the heartbeat. `None` before the first constrained window
+    /// or with `transit_classify` off.
+    pub fn pipe_state(&self) -> Option<super::pipe_state::PipeState> {
+        self.pipe.last()
+    }
+
+    /// FR-71 T1a — windows per verdict so far: `[unknown, clear, overproduced,
+    /// transit_stalled, viewer_late]`.
+    pub fn pipe_state_counts(&self) -> [u32; 5] {
+        self.pipe.counts()
     }
 
     /// FR-15 P2 — count of floor samples rejected as below the path's
