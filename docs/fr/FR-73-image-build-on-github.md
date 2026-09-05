@@ -3,8 +3,11 @@
 **Status**: **in flight 2026-09-05** — P0 claim (#1390) · P1 the build lane (#1391, first cold run
 13 min 37 s build / 15 min merge → tag) · P3 `promote` (#1393) · P4 retention (#1395) · the e2e
 lane follows the deploy repo's registry (#1396) · **P2 rolled 20:07Z and field-verified** (pulls
-3.3 s / 2.7 s per node, 20 s from the deploy-repo push to both pods, fleet unchanged) · P1b
-(#1392) in validation ·
+3.3 s / 2.7 s per node, 20 s from the deploy-repo push to both pods, fleet unchanged) · **P1b
+merged and AC2 measured** (Rust change 6 min 49 s, UI-only 1 min 04 s — both targets met) · P1c
+(#1406, daemon-only merges stop recompiling the server) in validation · the break-glass path
+rehearsed · retention dry-run-verified · docs merged · **open: `DEPLOY_REPO_TOKEN` for `promote`
+(AC4)** ·
 **Owner**: deploy / build ·
 **Issue**: [#1389](https://github.com/gjovanov/roomler-ai/issues/1389) ·
 **Related**: FR-6 (build-speed SLO — this lane inherits its ≤10 min warm target as an aspiration, not a gate), FR-69 (the publish workflow this one copies its smoke from), FR-37 (the e2e lane, which pins by image tag and gains a second registry to pin from)
@@ -127,7 +130,8 @@ projects. Nothing on the host is torn down by this FR.
 |---|---|---|---|---|
 | P0 | This spec, the ledger row, the issue | [#1390](https://github.com/gjovanov/roomler-ai/pull/1390) | — | ✅ merged `5a9f357a1` |
 | P1 | `.github/workflows/hosted-image.yml`: build on merge / dispatch, registry cache, smoke (`/health` = all six modules incl. `saas`, device route 401, SPA served), push `hosted-<date>-<sha7>` + `hosted`, attest, a summary with the measured build time | [#1391](https://github.com/gjovanov/roomler-ai/pull/1391) | `gh workflow disable hosted-image` | ✅ merged `5ef003087` — its merge was the cold run: 13 min 37 s build, 15 min 01 s merge → tag (field log) |
-| P1b | Dockerfile: `cargo chef` dependency layer + Rust stage copies only Rust sources; base image matches the pinned toolchain; measured against P1's numbers (cold, warm-no-change, warm-Rust-change, warm-UI-only) | [#1392](https://github.com/gjovanov/roomler-ai/pull/1392) | revert the Dockerfile PR — the workflow is indifferent to the layering | dry-run validated on the branch (second attempt — see the field log) |
+| P1b | Dockerfile: `cargo chef` dependency layer + Rust stage copies only Rust sources; base image matches the pinned toolchain; measured against P1's numbers (cold, warm-no-change, warm-Rust-change, warm-UI-only) | [#1392](https://github.com/gjovanov/roomler-ai/pull/1392) | revert the Dockerfile PR — the workflow is indifferent to the layering | ✅ merged `3d2f31b23` after three dry runs (field log); measured: Rust change 6 min 49 s, UI-only 1 min 04 s |
+| P1c | The builder's final section keeps the agents' skeletons instead of copying `agents/` — a daemon-only merge no longer recompiles the server | [#1406](https://github.com/gjovanov/roomler-ai/pull/1406) | revert | dry-run validating |
 | P2 | The cluster pulls from GHCR: deploy repo `newName: ghcr.io/gjovanov/roomler-ai`, `newTag: hosted-…`; one roll, field-verified from the fleet; per-node pull time recorded | deploy repo `2efae23` | revert `newName`/`newTag` — the build-host registry still holds the previous tag | ✅ **rolled 2026-09-05 20:07Z**, field-verified (field log): pulls 3.3 s / 2.7 s per node, push → both pods 20 s |
 | P3 | `promote` dispatch: bump `newTag` in the deploy repo with `DEPLOY_REPO_TOKEN`; prints the bump when the secret is absent; refuses while `newName` is not GHCR | [#1393](https://github.com/gjovanov/roomler-ai/pull/1393) | remove the secret | |
 | P4 | GHCR retention job ([#1395](https://github.com/gjovanov/roomler-ai/pull/1395), fixed by [#1399](https://github.com/gjovanov/roomler-ai/pull/1399) after the first dry run: GHCR stores attestations UNTAGGED, so only BuildKit cache manifests may be deleted); `CLAUDE.md` deploy section rewritten (Actions path first, build-host path as break-glass, [#1398](https://github.com/gjovanov/roomler-ai/pull/1398)); `docs/self-hosting.md` on the `hosted-*` family ([#1396](https://github.com/gjovanov/roomler-ai/pull/1396)); **docs with diagrams**: the pipeline section of `docs/deployment.md` (the rule of CLAUDE.md § FR workflow step 5) | | — | ✅ retention merged + dry-run-verified; docs merged |
@@ -142,9 +146,12 @@ projects. Nothing on the host is torn down by this FR.
       route 401, `/` 200, then the push. Every later merge touching the paths has built (a burst is
       cancelled down to the newest commit by the concurrency group — run 33989978860 was cancelled by
       the P1b merge, by design).
-- [ ] **AC2** Build time on Actions recorded for four cases — cold; warm with no source change;
+- [x] **AC2** Build time on Actions recorded for four cases — cold; warm with no source change;
       warm after a Rust change; warm after a UI-only change — before and after P1b. Targets after
-      P1b: Rust change ≤ 12 min, UI-only ≤ 4 min (the estimate this FR was opened against).
+      P1b: Rust change ≤ 12 min, UI-only ≤ 4 min (the estimate this FR was opened against). —
+      Recorded in the field log ("AC2: the four build cases"): cold 13 min 37 s (`COPY . .`) and
+      17 min 42 s (chef, first export); warm Rust change **6 min 49 s**; warm UI-only **1 min 04 s**;
+      the no-change floor **10 s**. Both targets met.
 - [x] **AC3** Both prod pods run a `hosted-*` image pulled from GHCR; the per-node pull time is
       read from the pod events and recorded; the roll is field-verified from the fleet exactly as
       every roll (online-agent count unchanged, an RC session, an overlay pair, a tunnel forward).
@@ -167,7 +174,9 @@ projects. Nothing on the host is torn down by this FR.
       and 3 untagged — one of them the hosted image's provenance, because GHCR stores attestations
       untagged behind a `sha256-<subject>` index. #1399 narrows the untagged prune to BuildKit cache
       manifests (each candidate's manifest is read back by digest); the protected-tag assertion is
-      unchanged. Scheduled Mondays 05:00 UTC.
+      unchanged. The fixed job's dry run (33990772888) keeps all three — their manifests report
+      `config.mediaType = application/vnd.oci.empty.v1+json`, the OCI artifact shape attestations
+      use — "untagged: 3, of which cache manifests: 0". Scheduled Mondays 05:00 UTC.
 - [x] **AC8** The break-glass path is documented and was exercised once after the switch (a
       build-host build pushed to the old registry, not deployed). — 2026-09-05 20:20–20:30Z: master
       `70a279d` built on the build host in 9 min 38 s (warm), pushed to the build host's registry in
@@ -263,3 +272,36 @@ at **20:07:38Z**. No pull secret was added (`regcred` stays on the Deployment, u
 uplink; the nodes took three seconds. Deploy-repo push → both pods on the new image: **20 s**.
 The build-host registry keeps the previous tag, so the kill switch (revert `newName`/`newTag`)
 stays a one-line commit.
+
+### 2026-09-05 — AC2: the four build cases, before and after the layering
+
+Every number is the workflow's **Build** step (the Docker build, including the registry-cache
+import and export) on a standard `ubuntu-latest` runner, one sample each:
+
+| case | Dockerfile | build | what ran |
+|---|---|---|---|
+| cold — the merge that created the lane | `COPY . .` (P1) | **13 min 37 s** | everything; merge push → tag on GHCR 15 min 01 s |
+| cold — the first build with the new layers | chef (P1b) | **17 min 42 s** | everything, plus the first export of the chef/planner/cook layers to the cache |
+| warm — a daemon-only change (`agents/roomlerd`, #1400) | chef | 6 min 36 s | the cook layer hit; `COPY agents` missed, the server's workspace recompiled for 313 s although nothing it links had moved → **P1c** |
+| warm — a Rust-only change (one line in `crates/api`) | chef | **6 min 49 s** | the cook layer hit; the workspace recompiled (325 s) — the honest cost of a server change |
+| warm — a UI-only change, first attempt | chef | 6 min 45 s | contaminated: the cache manifest holds ONE build's layers, and the previous build was the Rust-only tree, so `crates/` missed |
+| warm — a UI-only change, cache matching | chef | **1 min 04 s** | every Rust layer hit; only the bun build and the runtime assembly ran |
+| warm — no change (the same tree twice) | chef | **10 s** | the floor: cache import + export and the runtime assembly |
+
+Against the estimate this FR was opened with (8–12 min for a Rust change, ~2 min for a UI-only
+change): a Rust change lands at **6 min 49 s**, a UI-only change at **1 min 04 s** — both inside
+the band, the UI case well inside it. Two things the measurements taught:
+
+- **A "warm, no change" run on a shared `master` is not one.** Between the chef build and the
+  first warm dispatch another session's daemon fix merged; the dispatched ref was `master`, so
+  the tree had moved. Pin the SHA (dispatch a branch) for any measurement that claims "no change".
+- **The registry cache is one build's layer set, not a union.** `cache-to` replaces the
+  `buildcache-hosted` manifest every run, so a build can only reuse the *previous* build's
+  layers. On `master`'s linear history that is exactly right (consecutive merges share most
+  layers); interleaving dispatches from unrelated trees makes the next build pay for whatever the
+  last one changed — which is what the first UI-only attempt measured.
+
+**P1c** (#1406) follows from the daemon-only row: the builder's final section no longer copies
+`agents/` — the cook's skeletons satisfy the workspace, and nothing in the agent crates is
+compiled for the two server packages — so a daemon-only merge, the commonest kind on this
+`master`, no longer touches a server layer at all.

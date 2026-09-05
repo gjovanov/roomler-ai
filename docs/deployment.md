@@ -77,7 +77,7 @@ flowchart LR
 
 | Step | Who | Measured (first day) |
 |---|---|---|
-| build → tag on GHCR | the workflow, on every merge | cold 13 min 37 s build, 15 min 01 s merge → tag (the `COPY . .` Dockerfile); the chef layering (P1b) is measured in the FR's field log |
+| build → tag on GHCR | the workflow, on every merge | cold 13 min 37 s build / 15 min 01 s merge → tag (the `COPY . .` Dockerfile), 17 min 42 s cold with the chef layers' first export; **warm: a Rust change 6 min 49 s, a UI-only change 1 min 04 s, no change 10 s** (the cache holds the previous build's layers, so consecutive merges reuse what they share) |
 | promote | a human, `gh workflow run promote.yml -f tag=…` (empty tag = the `hosted` pointer) | needs the repo secret `DEPLOY_REPO_TOKEN`; without it the job prints the exact bump |
 | roll | ArgoCD, one pod at a time | 20 s from the deploy-repo push to both pods on the new image; pulls 3.3 s / 2.7 s per node |
 | verify | from the fleet, after every roll | the workflow only proves the public `/health` kept answering |
