@@ -738,9 +738,20 @@ jobs:
     # pass — the same defect as a `cargo test` filter matching no test, which
     # this repo's integration lane already shipped once.
     #
-    # ⚠️ This CANNOT see a merge made through the GitHub web UI: that commit is
-    # created on GitHub from the email set on the ACCOUNT and passes through no
-    # local hook and no PR check. The repository ruleset is the layer for that.
+    # ⚠️ A merge made through the GitHub web UI is created ON GitHub from the
+    # email set on the ACCOUNT, after every local hook and PR check has already
+    # passed — so nothing can BLOCK it here. A ruleset would, but the whole
+    # metadata-rule family is organisation-and-paid-plan only and is refused
+    # with HTTP 422 on this user-owned repo (measured 2026-09-06).
+    #
+    # This job's `push` trigger is therefore the backstop: it scans
+    # `event.before..sha` and turns master red within a minute. Detection, not
+    # prevention — but the alternative was finding out in an audit eleven days
+    # later, which is how the leak that prompted all this was found.
+    #
+    # ⚠️ The `event.before` fallback below is load-bearing, and was exercised on
+    # its first real run: after a force-push that SHA no longer exists, and
+    # `git log A..B` against a missing A is an error, not a pass.
     steps:
       - uses: actions/checkout@v4
         with:
