@@ -203,6 +203,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         rate_slow_start: None,
         rate_prior_decay: None,
         transit_classify: None,
+        transit_hold: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
         bg_rebuild_constrained: None,
