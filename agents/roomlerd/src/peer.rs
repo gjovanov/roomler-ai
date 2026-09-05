@@ -4775,6 +4775,22 @@ async fn media_pump_ffmpeg_dc(
     let media_thread = crate::encode::media_thread_enabled();
     let mut encoder: Option<crate::encode::ffmpeg::EncoderHandle> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
+    // FR-70 M2 — the dims make-before-break. When the plan moves the
+    // resolution, the replacement opens in the background at the NEW dims
+    // (`open_rebuilt`, 0.4–2.9 s measured) while the current encoder keeps
+    // serving at the OLD dims: the effective target stays pinned to the one
+    // the current encoder was built for until the swap. `built_target` is
+    // that target; `pending_dims_open` is the open in flight with the dims
+    // it will produce and when it started.
+    let mut built_target: Option<TargetResolution> = None;
+    /// The open in flight, the dims it will produce, and when it started.
+    type PendingDimsOpen = (
+        tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
+        (u32, u32),
+        std::time::Instant,
+    );
+    let mut pending_dims_open: Option<PendingDimsOpen> = None;
+    let mut dims_swaps: u32 = 0;
     // rc.93 — single keepalive clock, mirroring `media_pump`. The rc.92
     // pacing clock + pump-side floor sleep were REMOVED: the capture
     // backend is the single pacer (scrap sleeps to `1000/target_fps`;
@@ -5407,6 +5423,51 @@ async fn media_pump_ffmpeg_dc(
         // is a race: the task can complete between the check and the await, and
         // the adopt itself touches the live encoder. Timed so a swap that turns
         // out to cost something says so instead of landing in `other_ms`.
+        // FR-70 M2 — the dims swap: the replacement finished opening; adopt it
+        // between frames (a forced IDR rides the adoption) and let the
+        // target follow the plan again. A refused or failed open drops the
+        // pending state and the next frame takes the inline path, exactly
+        // as before M2.
+        if let Some((handle, _, _)) = pending_dims_open.as_ref()
+            && handle.is_finished()
+        {
+            let (handle, dims, started) = pending_dims_open.take().expect("checked above");
+            let open_ms = started.elapsed().as_millis() as u64;
+            match handle.await {
+                Ok(Ok(rebuilt)) => {
+                    if let Some(enc) = encoder.as_mut() {
+                        let from = encoder_dims.unwrap_or((0, 0));
+                        if timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
+                            encoder_dims = Some(dims);
+                            built_target = None;
+                            dims_swaps += 1;
+                            send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            video_info_sent = false;
+                            governor.on_encoder_rebuilt();
+                            info!(
+                                %session_id,
+                                codec_label,
+                                from_w = from.0,
+                                from_h = from.1,
+                                to_w = dims.0,
+                                to_h = dims.1,
+                                open_ms,
+                                dims_swaps,
+                                "FR-70 M2: dims swap adopted — the picture never froze"
+                            );
+                        } else {
+                            warn!(%session_id, codec_label, "FR-70 M2: replacement refused (backend/chroma changed) — inline re-open next frame");
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(%session_id, codec_label, %e, open_ms, "FR-70 M2: background open failed — inline re-open next frame");
+                }
+                Err(e) => {
+                    warn!(%session_id, codec_label, %e, "FR-70 M2: background open task panicked — inline re-open next frame");
+                }
+            }
+        }
         let swap_start = std::time::Instant::now();
         if bg_rebuild {
             if let Some(handle) = pending_swap.as_ref()
@@ -5424,8 +5485,13 @@ async fn media_pump_ffmpeg_dc(
                 match handle.await {
                     Ok(Ok(rebuilt)) => {
                         let maxrate = rebuilt.maxrate_bps();
+                        // FR-70 M2 — `adopt_rebuilt` now accepts other dims
+                        // (the dims swap below needs it), so the rate swap
+                        // guards its own staleness here: a replacement opened
+                        // for dims the session has since left is discarded.
+                        let stale_dims = encoder_dims.is_some_and(|d| d != rebuilt.dims());
                         if let Some(enc) = encoder.as_mut() {
-                            if timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
+                            if !stale_dims && timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                                 // Stale pre-swap frames yield to the fresh
                                 // IDR, exactly like the sync rebuild path.
                                 send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6083,6 +6149,13 @@ async fn media_pump_ffmpeg_dc(
             soft_cap: governor.auto_res_cap(),
         });
         let effective_target = dims_plan.effective_target;
+        // FR-70 M2 — while a replacement opens at the new dims, keep the
+        // capturer's cap and the resampler on the dims the live encoder was
+        // built for; the plan's target takes over at the swap.
+        let effective_target = match (&pending_dims_open, built_target) {
+            (Some(_), Some(pinned)) => pinned,
+            _ => effective_target,
+        };
         // Phase B — hand the effective box to the capture backend so a
         // GPU-capable one can scale BEFORE the readback (applies from the
         // next frame; the CPU resample below stays the fallback + truth).
@@ -6201,6 +6274,47 @@ async fn media_pump_ffmpeg_dc(
             Some((ew, eh)) => ew != w || eh != h,
             None => true,
         };
+        // FR-70 M2 — a dims change with a live encoder becomes a
+        // make-before-break: open the replacement in the background at the
+        // new dims and keep serving at the old ones (the target is pinned to
+        // `built_target` above until the swap). The frame that revealed the
+        // change is at the new dims already, so it is the one frame skipped
+        // — against the 0.4–2.9 s freeze the inline re-open costs. Falls
+        // through to the inline open when nothing is live yet, when a swap
+        // is already in flight, or when the backend cannot rebuild off the
+        // frame path.
+        if !need_rebuild {
+            built_target = Some(effective_target);
+        } else if let Some(enc) = encoder.as_mut()
+            && encoder_dims.is_some()
+            && pending_dims_open.is_none()
+            && built_target.is_some()
+        {
+            let bps = match governor.applied_bps() {
+                0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
+                applied => ceiling.min(applied),
+            };
+            if let Some(spec) = enc.rebuild_spec_at_dims(w, h, bps).await {
+                let from = encoder_dims.unwrap_or((0, 0));
+                info!(
+                    %session_id,
+                    codec_label,
+                    from_w = from.0,
+                    from_h = from.1,
+                    to_w = w,
+                    to_h = h,
+                    "FR-70 M2: dims change — opening the replacement in the background, serving at the old dims meanwhile"
+                );
+                pending_dims_open = Some((
+                    tokio::task::spawn_blocking(move || {
+                        crate::encode::ffmpeg::FfmpegEncoder::open_rebuilt(spec)
+                    }),
+                    (w, h),
+                    std::time::Instant::now(),
+                ));
+                continue;
+            }
+        }
         if need_rebuild {
             let cq_bias = rate.cq_bias;
             // Open at the AIMD's current target when it sits below the
@@ -6329,6 +6443,11 @@ async fn media_pump_ffmpeg_dc(
                     }
                     encoder = Some(handle);
                     encoder_dims = Some((w, h));
+                    // FR-70 M2 — an inline open supersedes any replacement
+                    // still opening in the background (the target moved
+                    // again, or nothing was live): dropping the handle
+                    // detaches that task and its result is never adopted.
+                    pending_dims_open = None;
                     // Phase B — a fresh encoder starts at the full `ceiling`
                     // maxrate; force the AIMD to re-apply its current (possibly
                     // lower) target so we don't snap back up to the ceiling
@@ -7234,6 +7353,7 @@ async fn media_pump_ffmpeg_dc(
                 // swap and lands ONLY here, so the pair reading zero used to
                 // look like "the encoder never moved" when it had moved twice.
                 swaps = rate_stats.swaps,
+                dims_swaps,
                 idr_count = rate_stats.idr_count,
                 // FR-62 A2 — whether the pump is still rationing this encoder's
                 // constrained increases. false ⇒ moves land live (NVENC,
