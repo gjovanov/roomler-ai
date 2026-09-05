@@ -52,6 +52,9 @@ pub mod ffmpeg;
 pub mod aimd;
 /// FR-35 — the constrained ceiling learns the pair (pure controller).
 pub mod ceiling_learn;
+/// FR-71 T1a — which plane is the limiter this window: sender, path or
+/// browser (pure; shadow — nothing acts on it until T1b).
+pub mod pipe_state;
 /// FR-70 P1 — the remembered rate as a PRIOR that decays while nothing
 /// measures (pure; no clock, no I/O).
 pub mod prior;
@@ -477,6 +480,16 @@ pub fn rate_slow_start_enabled() -> bool {
 /// verbatim (the seed is a constant for the session).
 pub fn rate_prior_decay_enabled() -> bool {
     tunnel_core::env::flag("RATE_PRIOR_DECAY", true)
+}
+
+/// FR-71 T1a kill switch (2026-09-05): when on (default), every constrained
+/// viewer window is classified — sender / path / browser as the limiter
+/// (`encode::pipe_state`) — and the verdict is logged in the heartbeat as
+/// `pipe_state` with per-state counts. **Shadow only**: nothing acts on the
+/// verdict until T1b (`transit_hold`). `0` = no classification, no counters.
+/// Env `ROOMLERD_TRANSIT_CLASSIFY` / config `transit_classify`.
+pub fn transit_classify_enabled() -> bool {
+    tunnel_core::env::flag("TRANSIT_CLASSIFY", true)
 }
 
 /// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase

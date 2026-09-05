@@ -60,6 +60,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::aimd::AimdController;
+use super::pipe_state::PipeState;
 use super::slow_start::SlowStart;
 
 /// The tick the simulator advances by. One millisecond is fine enough that a
@@ -146,6 +147,13 @@ pub struct PipeSpec {
     /// Seeded per-frame loss, percent.
     pub loss_pct: u32,
     pub stalls: Vec<Stall>,
+    /// FR-71 — outages that delay ARRIVAL without stopping the sender: frames
+    /// still leave the send channel at the pipe's rate and sit in transit
+    /// until the stall ends. The shape of a DERP/TCP head-of-line block seen
+    /// from the agent (finding 4: a 4.9 s paint with 1485 bytes in the queue),
+    /// as opposed to [`Self::stalls`], which freezes the drain and so fills
+    /// the sender's queue — a stall the sender CAN see.
+    pub transit_stalls: Vec<Stall>,
 }
 
 impl PipeSpec {
@@ -158,6 +166,7 @@ impl PipeSpec {
             rtt: Duration::from_millis(rtt_ms),
             loss_pct: 0,
             stalls: Vec::new(),
+            transit_stalls: Vec::new(),
         }
     }
 
@@ -190,6 +199,13 @@ struct QFrame {
 struct Arrival {
     bytes: u32,
     produced: Duration,
+    /// When the last bit left the send channel — FR-71's sender/transit
+    /// split: `sent − produced` is the sender's share, `at − sent` transit.
+    sent: Duration,
+    /// When the far end acked it — the moment it stops counting against the
+    /// sender's channel (`inflight_bytes`).
+    acked: Duration,
+    /// When the viewer observed it (the paint, for the sim's instant viewer).
     at: Duration,
 }
 
@@ -205,6 +221,10 @@ struct Pipe {
     /// Frames whose last byte has left the sender but which have not yet
     /// arrived (in flight for half an RTT).
     in_flight: VecDeque<Arrival>,
+    /// FR-71 — acked by the far SCTP end but not yet OBSERVED by the viewer:
+    /// a transit stall beyond the ack point holds frames here, where the
+    /// sender cannot count them (finding 4: `inflight=1485 B`, `age=4903 ms`).
+    held: VecDeque<Arrival>,
 }
 
 impl Pipe {
@@ -217,6 +237,7 @@ impl Pipe {
             credit_bits: 0,
             rng: Rng::new(seed),
             in_flight: VecDeque::new(),
+            held: VecDeque::new(),
         }
     }
 
@@ -299,22 +320,46 @@ impl Pipe {
             if head.remaining_bits == 0 {
                 let done = self.queue.pop_front().expect("front exists");
                 self.queued_bytes = self.queued_bytes.saturating_sub(done.bytes);
-                let arrival = now + self.spec.rtt / 2;
+                // FR-71: a transit stall BEYOND the ack point. The far SCTP
+                // end acks on time, so the send channel drains at the pipe's
+                // rate and `inflight_bytes` stays small — nothing the sender
+                // can see moves; the frame is simply observed late, when the
+                // stall lifts. (A stall BEFORE the ack point backs the sender
+                // up and is `stalls`, the freeze model.)
+                let acked = now + self.spec.rtt / 2;
+                let mut observed = acked;
+                for s in &self.spec.transit_stalls {
+                    if observed >= s.at && observed < s.at + s.len {
+                        observed = s.at + s.len;
+                    }
+                }
                 if self.rng.chance_pct(self.spec.loss_pct) {
                     lost += 1;
                 } else {
                     self.in_flight.push_back(Arrival {
                         bytes: done.bytes,
                         produced: done.produced,
-                        at: arrival,
+                        sent: now,
+                        acked,
+                        at: observed,
                     });
                 }
             }
         }
-        let mut arrived = Vec::new();
+        // Two stages, both in order: the ack (what the sender accounts
+        // for), then the viewer's observation (what the age measures).
         while let Some(front) = self.in_flight.front() {
+            if front.acked <= now {
+                self.held
+                    .push_back(self.in_flight.pop_front().expect("front exists"));
+            } else {
+                break;
+            }
+        }
+        let mut arrived = Vec::new();
+        while let Some(front) = self.held.front() {
             if front.at <= now {
-                arrived.push(self.in_flight.pop_front().expect("front exists"));
+                arrived.push(self.held.pop_front().expect("front exists"));
             } else {
                 break;
             }
@@ -429,6 +474,18 @@ pub struct WindowStats {
     pub queue_ms: i64,
     pub frames_rx: u32,
     pub frames_lost: u32,
+    /// FR-71 — the M0 age split as the sim's viewer would report it:
+    /// window-average sender share (`sent − produced`) and transit share
+    /// (`at − sent`); the sim's viewer decodes instantly, so its share is 0.
+    pub sender_ms: u32,
+    /// The window's worst sender share — the pump's `send_wait_max`.
+    pub sender_max_ms: u32,
+    pub transit_ms: u32,
+    /// Sender-side facts the harness fills in AFTER the fold (the viewer
+    /// cannot know them): bytes queued in the send channel at the window's
+    /// close, and frames the pump handed to the channel this window.
+    pub inflight_bytes: usize,
+    pub frames_sent: u32,
 }
 
 /// Folds arrivals into windows.
@@ -440,6 +497,9 @@ struct ViewerSim {
     queue_drift_ms: i64,
     frames_rx: u32,
     frames_lost: u32,
+    sender_ms_sum: u64,
+    sender_max_ms: u32,
+    transit_ms_sum: u64,
 }
 
 impl ViewerSim {
@@ -448,6 +508,10 @@ impl ViewerSim {
         self.ages_ms.push(age);
         self.bytes += u64::from(a.bytes);
         self.frames_rx += 1;
+        let sender_ms = a.sent.saturating_sub(a.produced).as_millis() as u32;
+        self.sender_ms_sum += u64::from(sender_ms);
+        self.sender_max_ms = self.sender_max_ms.max(sender_ms);
+        self.transit_ms_sum += a.at.saturating_sub(a.sent).as_millis() as u64;
         if let Some(prev) = self.last_arrival {
             let d_arrival = a.at.saturating_sub(prev.at).as_millis() as i64;
             let d_produced = a.produced.saturating_sub(prev.produced).as_millis() as i64;
@@ -483,12 +547,28 @@ impl ViewerSim {
             queue_ms: self.queue_drift_ms,
             frames_rx: self.frames_rx,
             frames_lost: self.frames_lost,
+            sender_ms: if n == 0 {
+                0
+            } else {
+                (self.sender_ms_sum / n as u64) as u32
+            },
+            sender_max_ms: self.sender_max_ms,
+            transit_ms: if n == 0 {
+                0
+            } else {
+                (self.transit_ms_sum / n as u64) as u32
+            },
+            inflight_bytes: 0,
+            frames_sent: 0,
         };
         self.ages_ms.clear();
         self.bytes = 0;
         self.queue_drift_ms = 0;
         self.frames_rx = 0;
         self.frames_lost = 0;
+        self.sender_ms_sum = 0;
+        self.sender_max_ms = 0;
+        self.transit_ms_sum = 0;
         stats
     }
 }
@@ -521,6 +601,12 @@ pub trait RateLaw {
     /// FR-70 P1 — what the law would hand the rate memory at session end
     /// (`RateGovernor::remembered_candidate_bps`), when it models one.
     fn remembered_candidate_bps(&self) -> Option<u32> {
+        None
+    }
+    /// FR-71 T1a — how the law classified the window it just consumed, when
+    /// it runs the shadow classifier (`RateGovernor::pipe_state`). Laws that
+    /// predate it answer `None`, which the trace records as "not classified".
+    fn pipe_state(&self) -> Option<super::pipe_state::PipeState> {
         None
     }
     /// FR-70 P1 — the pump skipped a frame at the FR-59 P2 byte-budget gate
@@ -652,6 +738,11 @@ pub struct GovernorLaw {
     /// The smallest window-average paint age seen — the FR-15 age loop's
     /// learned floor, for the prior's push-back verdict.
     age_floor_ms: u32,
+    /// FR-71 T1a — the shadow classifier, fed exactly what the shipped
+    /// governor feeds it (`RateGovernor::tick_viewer_window`).
+    pipe: super::pipe_state::PipeClassifier,
+    /// Budget-gate skips since the last window (the pump's `win_skips`).
+    gate_skips_window: u32,
 }
 
 impl GovernorLaw {
@@ -670,6 +761,8 @@ impl GovernorLaw {
             growth_streak: 0,
             fps: 30,
             age_floor_ms: u32::MAX,
+            pipe: super::pipe_state::PipeClassifier::new(),
+            gate_skips_window: 0,
             depth: CONSTRAINED_DEPTH,
             aimd: None,
             ramp: None,
@@ -844,11 +937,16 @@ impl RateLaw for GovernorLaw {
         self.target
     }
 
+    fn pipe_state(&self) -> Option<super::pipe_state::PipeState> {
+        self.pipe.last()
+    }
+
     fn on_budget_skip(&mut self, now: Instant) {
         // `RateGovernor::on_backpressure_skip`: the ramp's congestion bit and a
         // full-occupancy sample for the AIMD (the multiplicative decrease runs
         // DURING congestion). Deliberately not `full_seen`: no send blocked.
         self.ramp_congested = true;
+        self.gate_skips_window += 1;
         if let Some(ctrl) = self.aimd.as_mut() {
             ctrl.observe(self.depth, true, now);
             self.target = ctrl.desired();
@@ -913,6 +1011,27 @@ impl RateLaw for GovernorLaw {
         // evidence about the pipe's rate — the FR-63 design's `fps == 0`
         // rule, which the shipped governor does not yet have.
         let full_seen = std::mem::take(&mut self.full_seen);
+        // FR-71 T1a — classify the window from the same signals the shipped
+        // governor holds: the M0 split (the sim's viewer decodes instantly,
+        // so its share is 0), the send channel's occupancy against the
+        // budget, the gate's skips and the window's worst send wait. Shadow
+        // only: nothing below reads the verdict yet (T1b is the hold).
+        let split = (w.frames_rx > 0).then(|| super::pipe_state::SplitMs {
+            sender_ms: Some(f64::from(w.sender_ms)),
+            transit_ms: w.transit_ms.min(u32::from(u16::MAX)) as u16,
+            viewer_ms: 0,
+        });
+        self.pipe.classify(&super::pipe_state::WindowSignals {
+            split,
+            reported: w.frames_rx > 0,
+            inflight_bytes: w.inflight_bytes,
+            budget_bytes: self.queue_budget_bytes(),
+            gate_skips: std::mem::take(&mut self.gate_skips_window),
+            blocked_sends: u32::from(full_seen),
+            send_wait_max_ms: f64::from(w.sender_max_ms),
+            frames_sent: w.frames_sent,
+            struggling: false,
+        });
         match self.measure {
             MeasureRule::EveryWindow => {
                 if w.frames_rx > 0 {
@@ -1011,6 +1130,9 @@ pub struct Row {
     pub pipe_bps: u32,
     pub stats: WindowStats,
     pub skips: u32,
+    /// FR-71 T1a — the law's shadow classification of this window (`None`
+    /// for laws without the classifier).
+    pub state: Option<super::pipe_state::PipeState>,
 }
 
 /// The result of a run, plus the assertions the plan names.
@@ -1096,12 +1218,12 @@ impl Trace {
     /// the test output rather than behind a re-run.
     pub fn render(&self) -> String {
         let mut s = format!(
-            "\n{} — {}\n  t  target_bps   peak_bps  pipe_bps   rx_bps  age  p95  queue  rx  lost  skips\n",
+            "\n{} — {}\n  t  target_bps   peak_bps  pipe_bps   rx_bps  age  p95  queue  rx  lost  skips  snd/tr  inflight  state\n",
             self.scenario, self.law
         );
         for r in &self.rows {
             s.push_str(&format!(
-                "{:>3}  {:>10}  {:>9}  {:>8}  {:>7}  {:>3}  {:>3}  {:>5}  {:>2}  {:>4}  {:>5}\n",
+                "{:>3}  {:>10}  {:>9}  {:>8}  {:>7}  {:>3}  {:>3}  {:>5}  {:>2}  {:>4}  {:>5}  {:>3}/{:<4} {:>8}  {}\n",
                 r.t.as_secs(),
                 r.target_bps,
                 r.peak_target_bps,
@@ -1113,6 +1235,10 @@ impl Trace {
                 r.stats.frames_rx,
                 r.stats.frames_lost,
                 r.skips,
+                r.stats.sender_ms,
+                r.stats.transit_ms,
+                r.stats.inflight_bytes,
+                r.state.map_or("-", PipeState::as_str),
             ));
         }
         s
@@ -1138,6 +1264,7 @@ pub fn run_opts(scenario: &Scenario, law: &mut dyn RateLaw, opts: SimOptions) ->
     let mut next_frame = Duration::ZERO;
     let mut next_window = WINDOW;
     let mut skips_this_window = 0u32;
+    let mut frames_sent_this_window = 0u32;
     let mut peak_target = 0u32;
     let mut t = Duration::ZERO;
 
@@ -1165,7 +1292,9 @@ pub fn run_opts(scenario: &Scenario, law: &mut dyn RateLaw, opts: SimOptions) ->
                 skips_this_window += 1;
             } else {
                 let bytes = enc.produce(target, &scenario.motion, t);
-                if !pipe.offer(bytes, t) {
+                if pipe.offer(bytes, t) {
+                    frames_sent_this_window += 1;
+                } else {
                     skips_this_window += 1;
                 }
             }
@@ -1181,7 +1310,11 @@ pub fn run_opts(scenario: &Scenario, law: &mut dyn RateLaw, opts: SimOptions) ->
         }
 
         if t >= next_window {
-            let stats = viewer.fold(WINDOW);
+            let mut stats = viewer.fold(WINDOW);
+            // The sender-side half of the window, which the viewer's fold
+            // cannot know (FR-71): what is still queued, and what was sent.
+            stats.inflight_bytes = pipe.inflight_bytes();
+            stats.frames_sent = frames_sent_this_window;
             law.on_window(&stats, start + t);
             rows.push(Row {
                 t,
@@ -1190,8 +1323,10 @@ pub fn run_opts(scenario: &Scenario, law: &mut dyn RateLaw, opts: SimOptions) ->
                 pipe_bps: scenario.pipe.rate_at(t),
                 stats,
                 skips: skips_this_window,
+                state: law.pipe_state(),
             });
             skips_this_window = 0;
+            frames_sent_this_window = 0;
             peak_target = 0;
             next_window += WINDOW;
         }
@@ -1240,6 +1375,7 @@ pub mod fixtures {
                 rtt: Duration::from_millis(80),
                 loss_pct: 0,
                 stalls: Vec::new(),
+                transit_stalls: Vec::new(),
             },
             motion: Motion::Steady,
             fps: 30,
@@ -1264,6 +1400,7 @@ pub mod fixtures {
                 rtt: Duration::from_millis(120),
                 loss_pct: 1,
                 stalls: Vec::new(),
+                transit_stalls: Vec::new(),
             },
             motion: Motion::Steady,
             fps: 30,
@@ -1296,6 +1433,7 @@ pub mod fixtures {
                         len: Duration::from_secs(4),
                     },
                 ],
+                transit_stalls: Vec::new(),
             },
             motion: Motion::Steady,
             fps: 30,
@@ -1316,6 +1454,7 @@ pub mod fixtures {
                 rtt: Duration::from_millis(8),
                 loss_pct: 0,
                 stalls: Vec::new(),
+                transit_stalls: Vec::new(),
             },
             motion: Motion::Bursts {
                 period: Duration::from_secs(6),
@@ -1352,6 +1491,7 @@ pub mod fixtures {
                     at: Duration::from_secs(2),
                     len: Duration::from_millis(250),
                 }],
+                transit_stalls: Vec::new(),
             },
             motion: Motion::Steady,
             fps: 30,
@@ -1393,6 +1533,7 @@ pub mod fixtures {
                 rtt: Duration::from_millis(100),
                 loss_pct: 0,
                 stalls: Vec::new(),
+                transit_stalls: Vec::new(),
             },
             motion: Motion::Bursts {
                 period: Duration::from_secs(1),
@@ -1422,6 +1563,7 @@ pub mod fixtures {
                 rtt: Duration::from_millis(80),
                 loss_pct: 0,
                 stalls: Vec::new(),
+                transit_stalls: Vec::new(),
             },
             motion: Motion::Bursts {
                 period: Duration::from_secs(1),
@@ -1447,12 +1589,45 @@ pub mod fixtures {
                 rtt: Duration::from_millis(6),
                 loss_pct: 0,
                 stalls: Vec::new(),
+                transit_stalls: Vec::new(),
             },
             motion: Motion::Steady,
             fps: 30,
             duration: Duration::from_secs(40),
             seed: 0xFA57,
             idr_factor: 25,
+        }
+    }
+
+    /// **FR-71 — finding 4, the transit stall** (CORPLAP-3 over DERP,
+    /// 2026-09-04, session `6a9abaa8`): a path good for 5.6–8.5 Mbps whose
+    /// relay leg head-of-line-blocked for ~4.9 s with **1485 bytes** in the
+    /// send queue — nothing sender-side was wrong, and the backlog then
+    /// painted at once. Modelled as an 8 Mbps / 80 ms pipe with ONE
+    /// `transit_stalls` entry: the sender keeps draining, the frames sit in
+    /// transit, and every one of them lands when the stall lifts. The
+    /// shipped law reads the paint age of that window as over-production and
+    /// cuts; T1a must classify it `TransitStalled`, T1b must not cut.
+    pub fn finding4_transit_stall() -> Scenario {
+        Scenario {
+            name: "finding 4: DERP transit stall (8 Mbps, 80 ms, 4.8 s stall at 12 s)",
+            pipe: PipeSpec {
+                rate_bps: 8_000_000,
+                rate_steps: Vec::new(),
+                buffer_bytes: 1_000_000,
+                rtt: Duration::from_millis(80),
+                loss_pct: 0,
+                stalls: Vec::new(),
+                transit_stalls: vec![Stall {
+                    at: Duration::from_secs(12),
+                    len: Duration::from_millis(4_800),
+                }],
+            },
+            motion: Motion::Steady,
+            fps: 30,
+            duration: Duration::from_secs(40),
+            seed: 0x6A9A_BAA8,
+            idr_factor: 8,
         }
     }
 }
@@ -1544,6 +1719,7 @@ mod tests {
                 at: Duration::from_secs(1),
                 len: Duration::from_secs(2),
             }],
+            transit_stalls: Vec::new(),
             ..PipeSpec::steady(400_000, 0, 1_000_000)
         };
         let mut pipe = Pipe::new(spec, 64, 1);
@@ -1803,6 +1979,176 @@ mod tests {
                 rebuild_idr: true,
             },
         )
+    }
+
+    // -- FR-71 T1a: the shadow classifier on the cells ------------------------
+
+    fn states_between(tr: &Trace, from_s: u64, to_s: u64) -> Vec<(u64, Option<PipeState>)> {
+        tr.rows
+            .iter()
+            .filter(|r| r.t.as_secs() >= from_s && r.t.as_secs() < to_s)
+            .map(|r| (r.t.as_secs(), r.state))
+            .collect()
+    }
+
+    /// FR-71 AC1 — every window inside finding 4's transit stall classifies
+    /// `TransitStalled`, and no window of the run is `Overproduced`: the
+    /// sender's queue never left its budget (1485 bytes in the field), so the
+    /// one verdict the law must not reach is "the encoder produced too much".
+    #[test]
+    fn t1a_finding_4_stall_windows_classify_as_transit_stalled() {
+        let sc = finding4_transit_stall();
+        let tr = run_shipped(&sc, arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS));
+        // The stall runs 12.0–16.8 s. Window [12,13) still receives the
+        // frames that were in flight before the block, so it is an ordinary
+        // window; [13,17) receive nothing, then the whole backlog at 16.88 s.
+        let inside = states_between(&tr, 13, 17);
+        assert_eq!(inside.len(), 4, "{}", tr.render());
+        for (t, st) in &inside {
+            assert_eq!(
+                *st,
+                Some(PipeState::TransitStalled),
+                "window at {t} s{}",
+                tr.render()
+            );
+        }
+        assert!(
+            tr.rows
+                .iter()
+                .all(|r| r.state != Some(PipeState::Overproduced)),
+            "a transit stall read as over-production{}",
+            tr.render()
+        );
+        // The windows either side of it read as what they are.
+        for (t, st) in states_between(&tr, 4, 12)
+            .iter()
+            .chain(states_between(&tr, 20, 40).iter())
+        {
+            assert_eq!(
+                *st,
+                Some(PipeState::Clear),
+                "window at {t} s{}",
+                tr.render()
+            );
+        }
+    }
+
+    /// FR-71 AC1 — on the thin pipe every window the byte-budget gate or a
+    /// full channel touched is `Overproduced`, and nothing on it is ever
+    /// `TransitStalled`: a pipe that is simply too small for the target is
+    /// the sender's problem, and the classifier must say so even while the
+    /// viewer's reports are sparse.
+    #[test]
+    fn t1a_thin_pipe_budget_windows_classify_as_overproduced() {
+        let sc = corp_vpn_thin_pipe();
+        let tr = run_shipped(&sc, arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS));
+        let gated: Vec<_> = tr.rows.iter().filter(|r| r.skips > 0).collect();
+        assert!(
+            !gated.is_empty(),
+            "the thin pipe never gated a frame{}",
+            tr.render()
+        );
+        for r in &gated {
+            assert_eq!(
+                r.state,
+                Some(PipeState::Overproduced),
+                "gated window at {} s{}",
+                r.t.as_secs(),
+                tr.render()
+            );
+        }
+        assert!(
+            tr.rows
+                .iter()
+                .all(|r| r.state != Some(PipeState::TransitStalled)),
+            "a thin pipe read as a transit stall{}",
+            tr.render()
+        );
+    }
+
+    /// FR-71 — the B0 freeze stalls (`derp_with_stalls`) are NOT finding 4.
+    /// A frozen drain backs the sender's own queue up, so the sender can see
+    /// it and `Overproduced` is the honest verdict once the queue is over
+    /// budget; a window may read `TransitStalled` only in the first second,
+    /// before the queue has filled. What the classifier must never do on a
+    /// stalled window is call it `Clear`.
+    #[test]
+    fn t1a_freeze_stalls_are_sender_visible() {
+        let sc = derp_with_stalls();
+        let tr = run_shipped(&sc, arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS));
+        let mut inside = Vec::new();
+        for s in &sc.pipe.stalls {
+            let from = s.at.as_secs() + 1;
+            let to = (s.at + s.len).as_secs();
+            inside.extend(states_between(&tr, from, to));
+        }
+        assert!(
+            !inside.is_empty(),
+            "no window sits fully inside a stall{}",
+            tr.render()
+        );
+        for (t, st) in &inside {
+            assert!(
+                matches!(
+                    st,
+                    Some(PipeState::Overproduced) | Some(PipeState::TransitStalled)
+                ),
+                "stalled window at {t} s read {st:?}{}",
+                tr.render()
+            );
+        }
+    }
+
+    /// FR-71 — a law without the classifier records no verdict, so a trace
+    /// cannot mistake "unclassified" for "clear".
+    #[test]
+    fn t1a_laws_without_the_classifier_record_no_state() {
+        let sc = finding4_transit_stall();
+        let mut law = arm_a(FLAT_FLOOR_BPS, RELAY_CEILING_BPS);
+        let tr = run(&sc, &mut law);
+        assert!(tr.rows.iter().any(|r| r.state.is_some()), "{}", tr.render());
+
+        /// A constant-rate law with none of the governor's machinery.
+        struct Flat(u32);
+        impl RateLaw for Flat {
+            fn label(&self) -> &'static str {
+                "flat"
+            }
+            fn on_frame(&mut self, _occupied: u32, _full: bool, _now: Instant) -> u32 {
+                self.0
+            }
+            fn on_window(&mut self, _w: &WindowStats, _now: Instant) {}
+            fn target_bps(&self) -> u32 {
+                self.0
+            }
+        }
+        let mut flat = Flat(RELAY_CEILING_BPS);
+        let tr = run(&sc, &mut flat);
+        assert!(tr.rows.iter().all(|r| r.state.is_none()), "{}", tr.render());
+    }
+
+    /// `cargo test -p roomlerd --lib t1a_report -- --ignored --nocapture`
+    #[test]
+    #[ignore = "reporting aid; run with --ignored --nocapture"]
+    fn t1a_report() {
+        for sc in [
+            finding4_transit_stall(),
+            corp_vpn_thin_pipe(),
+            derp_with_stalls(),
+        ] {
+            let tr = run_shipped(&sc, arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS));
+            let counts = tr.rows.iter().fold([0u32; 5], |mut c, r| {
+                if let Some(s) = r.state {
+                    c[s as usize] += 1;
+                }
+                c
+            });
+            println!(
+                "{}: states clear/over/transit/viewer/unknown = {counts:?}{}",
+                sc.name,
+                tr.render()
+            );
+        }
     }
 
     /// `cargo test -p roomlerd --lib shipped_rule_report -- --ignored --nocapture`
