@@ -225,6 +225,9 @@ struct Pipe {
     /// a transit stall beyond the ack point holds frames here, where the
     /// sender cannot count them (finding 4: `inflight=1485 B`, `age=4903 ms`).
     held: VecDeque<Arrival>,
+    /// FR-71 — when the last held frame finishes crossing the link after a
+    /// transit stall (the backlog drains at the link's rate, not at once).
+    release_cursor: Duration,
 }
 
 impl Pipe {
@@ -238,6 +241,7 @@ impl Pipe {
             rng: Rng::new(seed),
             in_flight: VecDeque::new(),
             held: VecDeque::new(),
+            release_cursor: Duration::ZERO,
         }
     }
 
@@ -332,6 +336,19 @@ impl Pipe {
                     if observed >= s.at && observed < s.at + s.len {
                         observed = s.at + s.len;
                     }
+                }
+                // …and the backlog drains at the link's rate once the stall
+                // lifts, not all at once: each held frame is observed after
+                // the one before it has crossed the link, and a live frame
+                // that arrives while the backlog is still draining queues
+                // behind it. Only then — a frame observed at its own ack
+                // time was already paced by the token bucket, and re-adding
+                // its serialisation here shifted every steady-state cell.
+                if observed > acked || self.release_cursor > acked {
+                    observed = observed.max(self.release_cursor);
+                    let ser_secs =
+                        f64::from(done.bytes) * 8.0 / f64::from(self.spec.rate_at(now)).max(1.0);
+                    self.release_cursor = observed + Duration::from_secs_f64(ser_secs);
                 }
                 if self.rng.chance_pct(self.spec.loss_pct) {
                     lost += 1;
@@ -481,11 +498,16 @@ pub struct WindowStats {
     /// The window's worst sender share — the pump's `send_wait_max`.
     pub sender_max_ms: u32,
     pub transit_ms: u32,
+    /// The window's smallest paint age — the FR-15 age loop's floor sample.
+    pub age_min_ms: u32,
     /// Sender-side facts the harness fills in AFTER the fold (the viewer
     /// cannot know them): bytes queued in the send channel at the window's
-    /// close, and frames the pump handed to the channel this window.
+    /// close, frames the pump handed to the channel this window, and the
+    /// path's physical one-way minimum (half the scenario's round trip —
+    /// what the real loop gets from the viewer's clock probe).
     pub inflight_bytes: usize,
     pub frames_sent: u32,
+    pub one_way_ms: u16,
 }
 
 /// Folds arrivals into windows.
@@ -558,8 +580,10 @@ impl ViewerSim {
             } else {
                 (self.transit_ms_sum / n as u64) as u32
             },
+            age_min_ms: if n == 0 { 0 } else { self.ages_ms[0] },
             inflight_bytes: 0,
             frames_sent: 0,
+            one_way_ms: 0,
         };
         self.ages_ms.clear();
         self.bytes = 0;
@@ -608,6 +632,10 @@ pub trait RateLaw {
     /// predate it answer `None`, which the trace records as "not classified".
     fn pipe_state(&self) -> Option<super::pipe_state::PipeState> {
         None
+    }
+    /// FR-71 T1b — windows the law held (`RateGovernor::transit_holds`).
+    fn transit_holds(&self) -> u32 {
+        0
     }
     /// FR-70 P1 — the pump skipped a frame at the FR-59 P2 byte-budget gate
     /// (`on_backpressure_skip`): a congestion sample for the AIMD, but NOT a
@@ -743,6 +771,14 @@ pub struct GovernorLaw {
     pipe: super::pipe_state::PipeClassifier,
     /// Budget-gate skips since the last window (the pump's `win_skips`).
     gate_skips_window: u32,
+    /// FR-71 T1c — the FR-15 age loop, the REAL one, for the cut this law
+    /// did not model before (`age_cut`; opt-in per cell, because the FR-63
+    /// and FR-70 conclusions were taken without it).
+    age_loop: super::viewer_rate::AgeLoop,
+    age_cut: bool,
+    /// FR-71 T1b — hold a `TransitStalled` window (`transit_hold`).
+    transit_hold: bool,
+    holds: u32,
 }
 
 impl GovernorLaw {
@@ -763,6 +799,10 @@ impl GovernorLaw {
             age_floor_ms: u32::MAX,
             pipe: super::pipe_state::PipeClassifier::new(),
             gate_skips_window: 0,
+            age_loop: super::viewer_rate::AgeLoop::new(),
+            age_cut: false,
+            transit_hold: false,
+            holds: 0,
             depth: CONSTRAINED_DEPTH,
             aimd: None,
             ramp: None,
@@ -798,6 +838,20 @@ impl GovernorLaw {
     /// FR-70 P1 — how the law measures the pipe (see [`MeasureRule`]).
     pub fn with_measure(mut self, rule: MeasureRule) -> Self {
         self.measure = rule;
+        self
+    }
+
+    /// FR-71 T1c — model the FR-15 age loop's CUT (`governor.rs`: two
+    /// elevated windows ⇒ `note_buffer_overflow`), with the real `AgeLoop`.
+    pub fn with_age_cut(mut self, on: bool) -> Self {
+        self.age_cut = on;
+        self
+    }
+
+    /// FR-71 T1b — hold a `TransitStalled` window: no ramp step, no age
+    /// cut, no measurement, no prior push-back.
+    pub fn with_transit_hold(mut self, on: bool) -> Self {
+        self.transit_hold = on;
         self
     }
 
@@ -941,6 +995,10 @@ impl RateLaw for GovernorLaw {
         self.pipe.last()
     }
 
+    fn transit_holds(&self) -> u32 {
+        self.holds
+    }
+
     fn on_budget_skip(&mut self, now: Instant) {
         // `RateGovernor::on_backpressure_skip`: the ramp's congestion bit and a
         // full-occupancy sample for the AIMD (the multiplicative decrease runs
@@ -973,10 +1031,38 @@ impl RateLaw for GovernorLaw {
     }
 
     fn on_window(&mut self, w: &WindowStats, now: Instant) {
-        let _ = now;
         // One verdict per window, taking the flag first — governor.rs:833.
         let congested = std::mem::take(&mut self.ramp_congested);
-        if let Some(ramp) = self.ramp.as_mut()
+        let full_seen = std::mem::take(&mut self.full_seen);
+        // FR-71 — classify the window BEFORE anything acts on it, from the
+        // same signals the shipped governor holds: the M0 split (the sim's
+        // viewer decodes instantly, so its share is 0), the send channel's
+        // occupancy against the budget, the gate's skips and the window's
+        // worst send wait. T1a records the verdict; T1b (`transit_hold`)
+        // holds a `TransitStalled` window — no ramp step, no age cut, no
+        // measurement, no prior push-back.
+        let split = (w.frames_rx > 0).then(|| super::pipe_state::SplitMs {
+            sender_ms: Some(f64::from(w.sender_ms)),
+            transit_ms: w.transit_ms.min(u32::from(u16::MAX)) as u16,
+            viewer_ms: 0,
+        });
+        let state = self.pipe.classify(&super::pipe_state::WindowSignals {
+            split,
+            reported: w.frames_rx > 0,
+            inflight_bytes: w.inflight_bytes,
+            budget_bytes: self.queue_budget_bytes(),
+            gate_skips: std::mem::take(&mut self.gate_skips_window),
+            blocked_sends: u32::from(full_seen),
+            send_wait_max_ms: f64::from(w.sender_max_ms),
+            frames_sent: w.frames_sent,
+            struggling: false,
+        });
+        let hold = self.transit_hold && state == PipeState::TransitStalled;
+        if hold {
+            self.holds += 1;
+        }
+        if !hold
+            && let Some(ramp) = self.ramp.as_mut()
             && !ramp.done()
         {
             // Remember where the ramp was BEFORE this verdict, so
@@ -992,7 +1078,8 @@ impl RateLaw for GovernorLaw {
         // The candidate ramp, modelled: halve on congestion and keep going,
         // double on a clean window exactly as the shipped ramp does. It stops
         // only at the ceiling — congestion never ends it.
-        if self.exit == RampExit::HalveAndContinue
+        if !hold
+            && self.exit == RampExit::HalveAndContinue
             && let Some(cand) = self.cand_bps
             && !self.cand_done
         {
@@ -1010,28 +1097,6 @@ impl RateLaw for GovernorLaw {
         // A window that delivered nothing is a stall, and a stall is NOT
         // evidence about the pipe's rate — the FR-63 design's `fps == 0`
         // rule, which the shipped governor does not yet have.
-        let full_seen = std::mem::take(&mut self.full_seen);
-        // FR-71 T1a — classify the window from the same signals the shipped
-        // governor holds: the M0 split (the sim's viewer decodes instantly,
-        // so its share is 0), the send channel's occupancy against the
-        // budget, the gate's skips and the window's worst send wait. Shadow
-        // only: nothing below reads the verdict yet (T1b is the hold).
-        let split = (w.frames_rx > 0).then(|| super::pipe_state::SplitMs {
-            sender_ms: Some(f64::from(w.sender_ms)),
-            transit_ms: w.transit_ms.min(u32::from(u16::MAX)) as u16,
-            viewer_ms: 0,
-        });
-        self.pipe.classify(&super::pipe_state::WindowSignals {
-            split,
-            reported: w.frames_rx > 0,
-            inflight_bytes: w.inflight_bytes,
-            budget_bytes: self.queue_budget_bytes(),
-            gate_skips: std::mem::take(&mut self.gate_skips_window),
-            blocked_sends: u32::from(full_seen),
-            send_wait_max_ms: f64::from(w.sender_max_ms),
-            frames_sent: w.frames_sent,
-            struggling: false,
-        });
         match self.measure {
             MeasureRule::EveryWindow => {
                 if w.frames_rx > 0 {
@@ -1057,7 +1122,7 @@ impl RateLaw for GovernorLaw {
                 // estimator's byte-weighting over blocked time would not.
                 let saturated = full_seen && self.full_seen_prev;
                 self.full_seen_prev = full_seen;
-                if (saturated || congested) && w.frames_rx > 0 {
+                if (saturated || congested) && w.frames_rx > 0 && !hold {
                     // A blocked sender (goodput) or a growing viewer queue
                     // (link loop): the delivered rate IS the pipe's.
                     self.measured_bps = Some(w.rx_bps);
@@ -1077,7 +1142,24 @@ impl RateLaw for GovernorLaw {
                     && self.age_floor_ms < u32::MAX
                     && w.age_ms >= self.age_floor_ms + u32::from(super::viewer_rate::AGE_SLACK_MS);
                 let pushed_back = full_seen || congested || age_elevated;
-                self.prior.on_window(live, pushed_back);
+                if !hold {
+                    self.prior.on_window(live, pushed_back);
+                }
+            }
+        }
+        // FR-71 T1c — the FR-15 age loop's CUT, with the real loop:
+        // `governor.rs` fires `note_buffer_overflow` when the loop has seen
+        // two elevated windows in a row. Under the hold the loop still
+        // learns and its streak is reset, exactly as the governor does.
+        if self.age_cut && w.frames_rx > 0 {
+            let avg = w.age_ms.min(u32::from(u16::MAX)) as u16;
+            let min = w.age_min_ms.min(u32::from(u16::MAX)) as u16;
+            let triggered = self.age_loop.observe(avg, min, w.one_way_ms.max(1));
+            if hold {
+                self.age_loop.reset_streak();
+            } else if triggered && let Some(ctrl) = self.aimd.as_mut() {
+                ctrl.note_buffer_overflow(now);
+                self.target = ctrl.desired();
             }
         }
     }
@@ -1146,6 +1228,8 @@ pub struct Trace {
     /// FR-70 P1 — keyframes a rebuild-bound encoder emitted for rate moves
     /// (0 unless modelled).
     pub rebuild_idrs: u32,
+    /// FR-71 T1b — windows the law held (0 for laws without the hold).
+    pub holds: u32,
     /// FR-70 P1 — what the law would hand the rate memory at the end.
     pub remembered_bps: Option<u32>,
 }
@@ -1315,6 +1399,7 @@ pub fn run_opts(scenario: &Scenario, law: &mut dyn RateLaw, opts: SimOptions) ->
             // cannot know (FR-71): what is still queued, and what was sent.
             stats.inflight_bytes = pipe.inflight_bytes();
             stats.frames_sent = frames_sent_this_window;
+            stats.one_way_ms = (scenario.pipe.rtt / 2).as_millis().clamp(1, 65_535) as u16;
             law.on_window(&stats, start + t);
             rows.push(Row {
                 t,
@@ -1340,6 +1425,7 @@ pub fn run_opts(scenario: &Scenario, law: &mut dyn RateLaw, opts: SimOptions) ->
         rows,
         gate_skips: gate_skips_total,
         rebuild_idrs: enc.rebuild_idrs,
+        holds: law.transit_holds(),
         remembered_bps: law.remembered_candidate_bps(),
     }
 }
@@ -2148,6 +2234,127 @@ mod tests {
                 sc.name,
                 tr.render()
             );
+        }
+    }
+
+    // -- FR-71 T1b: the hold, and T1c's FAIL-first cell -----------------------
+
+    fn target_at(tr: &Trace, s: u64) -> u32 {
+        tr.rows
+            .iter()
+            .find(|r| r.t.as_secs() == s)
+            .map(|r| r.target_bps)
+            .unwrap_or_else(|| panic!("no window at {s} s{}", tr.render()))
+    }
+
+    fn min_target_between(tr: &Trace, from_s: u64, to_s: u64) -> u32 {
+        tr.rows
+            .iter()
+            .filter(|r| r.t.as_secs() >= from_s && r.t.as_secs() < to_s)
+            .map(|r| r.target_bps)
+            .min()
+            .unwrap_or_else(|| panic!("no windows in [{from_s},{to_s}){}", tr.render()))
+    }
+
+    /// FR-71 AC3, the FAIL recorded first — the finding-4 cell with the FR-15
+    /// age loop's cut modelled and the hold OFF: the backlog windows fire the
+    /// age loop and the AIMD cuts a rate the pipe never asked for.
+    #[test]
+    fn t1c_finding_4_cuts_the_rate_with_the_hold_off() {
+        let sc = finding4_transit_stall();
+        let tr = run_shipped(
+            &sc,
+            arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS).with_age_cut(true),
+        );
+        let before = target_at(&tr, 11);
+        let after_min = min_target_between(&tr, 16, 22);
+        assert!(
+            after_min < before,
+            "the shipped law did not cut on the stall (before {before}, min after {after_min}){}",
+            tr.render()
+        );
+        assert_eq!(tr.holds, 0, "{}", tr.render());
+    }
+
+    /// FR-71 AC3 — the same cell with the hold ON: no cut during or after
+    /// the stall, the ramp frozen through it, the path reading clear again
+    /// within the stall's own length.
+    #[test]
+    fn t1b_finding_4_hold_keeps_the_rate() {
+        let sc = finding4_transit_stall();
+        let tr = run_shipped(
+            &sc,
+            arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS)
+                .with_age_cut(true)
+                .with_transit_hold(true),
+        );
+        let before = target_at(&tr, 11);
+        let during_min = min_target_between(&tr, 12, 22);
+        assert!(
+            during_min >= before,
+            "the hold cut anyway (before {before}, min {during_min}){}",
+            tr.render()
+        );
+        // Nothing cut through the silence. (The target may still CLIMB: the
+        // AIMD's additive increase is per frame and the sender's queue is
+        // genuinely clear during a transit stall — whether the hold should
+        // also freeze that is an open decision on the FR, not this cell's
+        // claim. What the T1a cell saw as "the ramp climbing" was this
+        // additive increase; the ramp had ended by 5 s.)
+        assert!(target_at(&tr, 17) >= target_at(&tr, 12), "{}", tr.render());
+        assert!(tr.holds >= 4, "holds={}{}", tr.holds, tr.render());
+        // Recovery within the stall's own length: the stall lifts at 16.8 s,
+        // the backlog drains at the link's rate through 17–19 s (each of
+        // those windows still reads stalled — the transit share IS the
+        // backlog), and the first clear window must come no later than
+        // 16.8 + 4.8 s. Measured: 20 s.
+        let first_clear = tr
+            .rows
+            .iter()
+            .find(|r| r.t.as_secs() >= 17 && r.state == Some(PipeState::Clear))
+            .map(|r| r.t.as_secs())
+            .unwrap_or_else(|| panic!("never recovered{}", tr.render()));
+        assert!(
+            first_clear <= 21,
+            "recovered only at {first_clear} s{}",
+            tr.render()
+        );
+        for (t, st) in states_between(&tr, 22, 30) {
+            assert_eq!(st, Some(PipeState::Clear), "window at {t} s{}", tr.render());
+        }
+    }
+
+    /// FR-71 AC4 — where nothing stalls the hold changes nothing: the thin
+    /// pipe, the LAN burst and the genuinely slow relay trace identically
+    /// with it on and off, and hold nothing.
+    #[test]
+    fn t1b_hold_is_inert_where_nothing_stalls() {
+        for sc in [
+            corp_vpn_thin_pipe(),
+            lan_wifi_burst(),
+            corplap1_genuinely_slow_relay(),
+        ] {
+            let off = run_shipped(
+                &sc,
+                arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS).with_age_cut(true),
+            );
+            let on = run_shipped(
+                &sc,
+                arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS)
+                    .with_age_cut(true)
+                    .with_transit_hold(true),
+            );
+            let off_t: Vec<u32> = off.rows.iter().map(|r| r.target_bps).collect();
+            let on_t: Vec<u32> = on.rows.iter().map(|r| r.target_bps).collect();
+            assert_eq!(
+                off_t,
+                on_t,
+                "{}: the hold changed a cell with no stall{}{}",
+                sc.name,
+                off.render(),
+                on.render()
+            );
+            assert_eq!(on.holds, 0, "{}: held a window with no stall", sc.name);
         }
     }
 

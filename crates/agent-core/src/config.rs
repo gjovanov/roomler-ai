@@ -893,6 +893,10 @@ pub struct AgentConfig {
     /// the limiter, in shadow. Default ON. See `transit_classify`.
     #[serde(default)]
     pub transit_classify: Option<bool>,
+    /// FR-71 T1b — ACT on a `transit-stalled` window (ramp frozen, age loop
+    /// and P3 clamp masked, prior held). Default OFF for one release. See
+    /// `transit_hold`.
+    pub transit_hold: Option<bool>,
     /// FR-65 P0 — the pump stall watch. Default ON. See `pump_stall_watch`.
     #[serde(default)]
     pub pump_stall_watch: Option<bool>,
@@ -2059,6 +2063,7 @@ pub fn test_fixture() -> AgentConfig {
         rate_slow_start: None,
         rate_prior_decay: None,
         transit_classify: None,
+        transit_hold: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
         bg_rebuild_constrained: None,
@@ -2192,7 +2197,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 80] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 81] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2202,6 +2207,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 80]
         ("RATE_SLOW_START", cfg.rate_slow_start),
         ("RATE_PRIOR_DECAY", cfg.rate_prior_decay),
         ("TRANSIT_CLASSIFY", cfg.transit_classify),
+        ("TRANSIT_HOLD", cfg.transit_hold),
         ("PUMP_STALL_WATCH", cfg.pump_stall_watch),
         ("BG_REBUILD_CONSTRAINED", cfg.bg_rebuild_constrained),
         ("SLOW_LINK_FLOOR", cfg.slow_link_floor),

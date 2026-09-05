@@ -584,6 +584,7 @@ const AGE_OVER_QUEUE_MIN_MS: u16 = 250;
 /// `true` each window while the overload lasts (the caller's MD is
 /// rate-limited internally, so "true every window" is exactly the intended
 /// ×0.85-per-window pressure).
+#[derive(Debug)]
 pub struct AgeLoop {
     ring: [u16; AGE_FLOOR_RING],
     len: usize,
@@ -661,6 +662,14 @@ impl AgeLoop {
     /// The learned path floor (min of the ring), None before any report.
     pub fn floor_ms(&self) -> Option<u16> {
         self.ring[..self.len].iter().copied().min()
+    }
+
+    /// FR-71 T1b — a held window is not evidence of over-production: the
+    /// floor ring keeps what it learned, the over-streak starts again, so
+    /// the first elevated window AFTER a stall does not fire on the stall's
+    /// own count.
+    pub fn reset_streak(&mut self) {
+        self.over_streak = 0;
     }
 
     /// P2 — floor samples rejected as below the path's physical minimum.

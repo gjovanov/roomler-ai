@@ -79,6 +79,16 @@ not a permanent stall. Pure and `Instant`-explicit, like `slow_start` and
   a pause is a drain, not a cut, and on a stalled path it is the right move.
   The target stays where it was; when the path recovers the backlog drains at
   the rate the link actually has (finding 4 drained at 8.5 Mbps).
+  **As built (T1b, 2026-09-05)**: the verdict is taken at the top of the
+  viewer-window tick, before any loop acts, and on a held window (a) the
+  opener's ramp neither steps nor ends, (b) the age loop still *learns* but
+  does not fire and its over-streak is reset — so the backlog's own elevated
+  windows after a stall need two fresh windows to fire, not the stall's
+  count, (c) the P3 clamp is neither armed nor released, (d) the rate prior
+  takes neither a clean window nor a push-back, (e) the P4 drain runs as
+  before. The AIMD's per-frame *additive increase* is untouched (an open
+  decision below). Held windows are counted in the heartbeat as
+  `transit_holds`.
 - On `Overproduced`: exactly today's behaviour.
 - On `ViewerLate`: today's viewer-rate cap (fps shedding), no bitrate cut.
 - `Unknown`: today's behaviour, unchanged — an old viewer costs nothing.
@@ -109,25 +119,31 @@ places; each is recorded here because the next phase depends on it.
    late — and the `finding4_transit_stall` fixture (8 Mbps, 80 ms, a 4.8 s
    stall at 12 s), which reproduces the field shape: a 15 KB send queue
    throughout, zero gate skips, and the whole backlog painting at once.
-2. **A silent window is a clean window to the shipped ramp.** Through the
-   stall the slow-start ramp stepped 1.82 → 1.98 Mbps: no report means no
-   congestion bit, and no congestion bit is a clean window. T1b's hold has to
-   freeze the ramp on `TransitStalled` as well as suppress the decreases —
-   "no decision on a stalled window" in both directions.
-3. **The sim's law does not yet cut on age.** `GovernorLaw` models the FR-15
+2. **The target keeps climbing through a stall.** Through the stall the
+   target stepped 1.82 → 1.98 Mbps. *(Corrected while building T1b: the T1a
+   write-up blamed the slow-start ramp; the ramp had ended by 5 s and the
+   step is the AIMD's per-frame **additive increase**, which sees a clear
+   send queue and no congestion sample. The ramp would behave the same way
+   — a silent window carries no congestion bit, so it is a clean window to
+   it — and T1b freezes it; whether the hold should also pause the additive
+   increase is an open decision.)*
+3. **The sim's law did not cut on age.** `GovernorLaw` modelled the FR-15
    age loop's push-back (for the prior) but not its rate *cut*, so the
-   finding-4 cell under the shipped rule shows the classification and the
-   ramp climb but not the harm. AC3's FAIL-first cell therefore needs the age
-   loop's cut modelled in the sim law before T1b can show a difference — the
-   first task of T1c, not an afterthought.
+   finding-4 cell under the shipped rule showed the classification and the
+   climb but not the harm. T1b added the cut with the real `viewer_rate::AgeLoop`
+   (`GovernorLaw::with_age_cut`, opt-in per cell because the FR-63 and FR-70
+   conclusions were taken without it), and a post-ack backlog that drains at
+   the link's rate rather than landing in one instant — with those two the
+   cell reproduces the field: the backlog spans three windows, the second
+   fires the age loop, and the AIMD cuts.
 
 ## Phases
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
 | **T1a** | `encode::pipe_state` + heartbeat `pipe_state` + per-state counters; the B0 fixtures classified under the shipped-rule harness | `transit_classify` | **built 2026-09-05** ([#1366](https://github.com/gjovanov/roomler-ai/pull/1366)), shadow only — AC1's sim/unit half met (see *What the T1a cell taught*); the fleet half (AC2) waits for the next agent release |
-| **T1b** | the hold: no MD, no age-loop fire, clamp held on `TransitStalled` | `transit_hold` (default off) | proposed |
-| **T1c** | the cells: `derp_with_stalls` in B0 (the law), then the corp-VPN DERP path (the field), each shown to FAIL with the hold off first | — | proposed |
+| **T1b** | the hold: no MD, no age-loop fire, clamp held on `TransitStalled` | `transit_hold` (default off) | **built 2026-09-05** — the verdict precedes every loop in the tick; ramp frozen, age loop masked + streak reset, clamp held, prior held, `transit_holds` in the heartbeat; default **off** |
+| **T1c** | the cells: `finding4_transit_stall` in B0 (the law), then the corp-VPN DERP path (the field), each shown to FAIL with the hold off first | — | **sim half done 2026-09-05**: the FAIL recorded (`t1c_finding_4_cuts_the_rate_with_the_hold_off`), the hold's cell green (`t1b_finding_4_hold_keeps_the_rate`), the no-stall cells byte-identical with the hold on and off; the field half waits for the release |
 
 ## Acceptance criteria
 
@@ -149,8 +165,16 @@ places; each is recorded here because the next phase depends on it.
 - [ ] **AC3** — with `transit_hold` on, a repeat of finding 4 shows **no rate
       cut** during the stall and recovery within the stall's own length; the
       same cell with the hold off still cuts — the FAIL recorded first.
+      *(Sim half met 2026-09-05: hold off — the AIMD cuts 1.98 → 1.5 Mbps on
+      the backlog's second window; hold on — no window below the pre-stall
+      target, seven windows held, first clear window 3.2 s after the stall
+      lifted against a 4.8 s stall. The field half needs a release with the
+      hold on and a repeat of finding 4's path.)*
 - [ ] **AC4** — no regression on the LAN, direct and thin-pipe cells (peak
       paint, settle time, over-drive integral unchanged within noise).
+      *(Sim half met 2026-09-05: the thin pipe, the LAN burst and the genuinely
+      slow relay trace **byte-identical** with the hold on and off and hold
+      nothing — `t1b_hold_is_inert_where_nothing_stalls`.)*
 - [ ] **AC5** — FR-70's AC5 closes here, and FR-63 B1's controller consumes
       `PipeState` rather than re-deriving it.
 
@@ -165,8 +189,15 @@ places; each is recorded here because the next phase depends on it.
 - Whether a viewer *report gap* should be held on at all under T1b. T1a
   classifies it `TransitStalled` (the sender passed every check and kept
   sending), but a hidden tab produces the same gap; holding the rate is more
-  conservative than today's ramp climb either way, and AC2's fleet review is
+  conservative than today's climb either way, and AC2's fleet review is
   where the gap's real causes get counted before the hold ships.
+- Whether the hold should also pause the AIMD's per-frame **additive
+  increase**. During a transit stall the send queue is genuinely clear and no
+  congestion sample arrives, so the increase keeps stepping (+160 kbps per
+  window in the finding-4 cell); a marginal pipe backs the sender up and is
+  `Overproduced`, not held, so the exposure is a fast pipe climbing during a
+  stall it cannot see. Left running in T1b; the shadow's `transit_holds`
+  beside `target_bps` in `agent_logs` is where the answer will come from.
 
 ## Out of scope
 
@@ -185,4 +216,6 @@ consumes `PipeState`), FR-64 #1244, FR-19 #805.
 | when | build | cell | result |
 |---|---|---|---|
 | 2026-09-04 12:34 UTC | 0.4.59 | CORPLAP-3 → neo16, DERP path, session `6a9abaa8` | **the FAIL on record**: 4903 ms paint with a 1485-byte send queue; the rate was cut into a link that was never the limiter |
-| 2026-09-05 | T1a branch (simulation, not the field) | `finding4_transit_stall` under `run_shipped` | classifier: windows 13–17 s `transit-stalled`, nothing `overproduced`, all others `clear`; the sender's queue stayed at 15 KB through the stall (finding 4's 1485 B) and the ramp **kept climbing** through it (1.82 → 1.98 Mbps) — a silent window is a clean window to the shipped ramp |
+| 2026-09-05 | T1a branch (simulation, not the field) | `finding4_transit_stall` under `run_shipped` | classifier: windows 13–17 s `transit-stalled`, nothing `overproduced`, all others `clear`; the sender's queue stayed at 15 KB through the stall (finding 4's 1485 B) and the target **kept climbing** through it (1.82 → 1.98 Mbps — the AIMD's additive increase; the ramp had ended by 5 s) |
+| 2026-09-05 | T1b branch (simulation, not the field) | `finding4_transit_stall` under `run_shipped` + `with_age_cut`, hold **off** | **AC3's FAIL, recorded**: with the post-ack backlog draining at the link's rate the paint age reads 4497 / 2652 / 446 ms over windows 17–19, the age loop fires on the second and the AIMD cuts 1.98 → 1.5 Mbps into an 8 Mbps link |
+| 2026-09-05 | T1b branch (simulation, not the field) | the same cell, hold **on** | no window below the pre-stall target; 7 windows held (13–19 s); the P3 clamp and the prior untouched; first clear window at 20 s, 3.2 s after a 4.8 s stall lifted; windows 22–40 s clear. Thin pipe / LAN burst / genuinely-slow relay: traces byte-identical with the hold on and off, 0 held |
