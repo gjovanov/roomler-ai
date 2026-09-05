@@ -81,7 +81,26 @@ SHAPES = [
     (r"WIN-(?=[A-Z0-9]{11}\b)[A-Z]*[0-9][A-Z0-9]*\b",
      "Windows Server auto-generated hostname"),
     (r"\bPC[0-9]{4,6}\b", "corp asset tag, PC-prefixed"),
-    (r"\bCLK[0-9]{5,}\b", "corp asset tag, three-letter prefix + 5-8 digits"),
+    # Generalised from a single hard-coded prefix on 2026-09-05. A corp DNS
+    # server surfaced in `nslookup` output during a field test and NOTHING
+    # caught it: not the map (unlisted) and not this file, whose only
+    # three-letter rule named one specific prefix. An arbitrary corp naming
+    # scheme has no prefix we can know in advance, so the shape has to be the
+    # shape.
+    #
+    # ⚠️ The lookahead drops tokens whose letters are ALL hex digits, because
+    # those are GUID/UUID fragments, not hostnames. Measured over this repo's
+    # entire history — 16,162 blobs, every commit message, the whole master
+    # tree — the generalised form matched exactly four token families, and
+    # three were hex: `{12345678-1234-5678-9ABC-DEF012345678}` (an MSI GUID
+    # example), the tail of a codecov UUID, and a font's ISO charset number.
+    # A hex run is hex by construction; a hostname is not.
+    #
+    # ⚠️ The cost is a tag whose three letters happen to all fall in a-f
+    # (~1.2% of prefixes) — those fall to the map, exactly as the ~10% of
+    # all-letter Windows names above do. This guard is for the class.
+    (r"\b(?![0-9A-Fa-f]{3}[0-9]{5,}\b)[A-Z]{3}[0-9]{5,}\b",
+     "corp asset tag, three-letter prefix + 5+ digits"),
     (r"\b[A-Za-z]{3,}-XMG-[A-Za-z0-9]+\b", "owner-name-prefixed laptop hostname"),
     (r"\b[A-Za-z]{3,}s-MacBook[A-Za-z0-9-]*", "Apple default '<owner>s-MacBook'"),
 ]
@@ -110,7 +129,12 @@ SHAPES = [
 # the guard would be switched off within a week.
 ALLOW = re.compile(
     r"WINHOST-[A-Z]|CORPLAP-[0-9]|DESKTOP-WINHOST|MacBook-1"  # our replacements
-    r"|ARGB2101010|XRGB8888|RGBA[0-9]+",                      # pixel formats
+    r"|ARGB2101010|XRGB8888|RGBA[0-9]+"                       # pixel formats
+    # Spec numbers that fit the three-letter shape. ISO10646 is the Unicode
+    # charset named in an X11 font string; it is the ONLY non-hex false
+    # positive the generalised shape produced across the whole history, so it
+    # is listed rather than weakening the shape.
+    r"|ISO[0-9]+",                                            # spec numbers
     re.I,
 )
 
