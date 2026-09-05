@@ -182,7 +182,10 @@ places; each is recorded here because the next phase depends on it.
       paint, settle time, over-drive integral unchanged within noise).
       *(Sim half met 2026-09-05: the thin pipe, the LAN burst and the genuinely
       slow relay trace **byte-identical** with the hold on and off and hold
-      nothing — `t1b_hold_is_inert_where_nothing_stalls`.)*
+      nothing — `t1b_hold_is_inert_where_nothing_stalls`. Field half, first
+      point, the same day on 0.4.68: a healthy pinned-relay session with the
+      hold ON climbed 2.55 → 3.0 Mbps exactly as the hold-off session had,
+      with one benign gap-hold — see the field log.)*
 - [ ] **AC5** — FR-70's AC5 closes here, and FR-63 B1's controller consumes
       `PipeState` rather than re-deriving it.
 
@@ -199,6 +202,11 @@ places; each is recorded here because the next phase depends on it.
   sending), but a hidden tab produces the same gap; holding the rate is more
   conservative than today's climb either way, and AC2's fleet review is
   where the gap's real causes get counted before the hold ships.
+- *(Live data on the report-gap question, 2026-09-05, 0.4.68 hold-on session
+  `6a9c50e1`: a healthy relay session produced one report-gap window in ~45
+  and the hold engaged on it — the cost was one skipped ramp step, taken the
+  next window. Benign at that rate; the fleet review should count gap-holds
+  separately from split-holds before the default flips.)*
 - Whether the hold should also pause the AIMD's per-frame **additive
   increase**. During a transit stall the send queue is genuinely clear and no
   congestion sample arrives, so the increase keeps stepping (+160 kbps per
@@ -228,3 +236,4 @@ consumes `PipeState`), FR-64 #1244, FR-19 #805.
 | 2026-09-05 | T1b branch (simulation, not the field) | `finding4_transit_stall` under `run_shipped` + `with_age_cut`, hold **off** | **AC3's FAIL, recorded**: with the post-ack backlog draining at the link's rate the paint age reads 4497 / 2652 / 446 ms over windows 17–19, the age loop fires on the second and the AIMD cuts 1.98 → 1.5 Mbps into an 8 Mbps link |
 | 2026-09-05 | T1b branch (simulation, not the field) | the same cell, hold **on** | no window below the pre-stall target; 7 windows held (13–19 s); the P3 clamp and the prior untouched; first clear window at 20 s, 3.2 s after a 4.8 s stall lifted; windows 22–40 s clear. Thin pipe / LAN burst / genuinely-slow relay: traces byte-identical with the hold on and off, 0 held |
 | 2026-09-05 15:46–15:48 UTC | **0.4.67** (`transit_classify` on, `transit_hold` off) | CORPLAP-1 → neo16, ICE pinned to a TURN relay (`ice_relay_tcp`, reverted after), session `6a9c3933`, HEVC 1920×1200, `c=true`, age 44–47 ms = 0.1 sender + 44 transit + 1–2 viewer | **the shadow's first live read**: `pipe_states=[0, 89, 1, 1, 0]` over 90 windows. The one `overproduced` window was the lock-screen transition (18 budget-gate skips, target 4.15 → 3.52 Mbps, goodput measured 22 Mbps on the burst) — correct. The one `transit-stalled` window was window 1, before the viewer's first report — a start-gap false positive, fixed the same day (silence counts as a gap only after a report). `transit_holds=0` (hold off). No window read `unknown`: the 0.4.67 viewer stamps every window |
+| 2026-09-05 17:27–17:29 UTC | **0.4.68** (`transit_classify` on, **`transit_hold` on** — the first hold-on session), with the start-gap fix | CORPLAP-1 → neo16, ICE pinned to a TURN relay, the corp VPN up (the pill read `relay · VPN captures the host's LAN`), session `6a9c50e1`, HEVC 1920×1200, `c=true`, age 48–75 ms | window 1 now `unknown` (the start-gap fix, working). ~45 windows: one `overproduced` (the lock-screen click burst, 35 gate skips — correct), one `transit-stalled` at ~17:27:07 with **`transit_holds=1` — the hold engaged once**, on a viewer report gap (transit stayed 50–75 ms against a 200 ms slack, so the split rule did not fire; the gap rule did). What the hold cost: the ramp skipped that window's step and stepped the next (2.74 → 2.93 Mbps); target climbed 2.55 → 3.0 Mbps exactly as the hold-off session had. **AC4's field half on a healthy relay path: no regression with the hold on.** Reverted after (hold off, pin off, restart) |
