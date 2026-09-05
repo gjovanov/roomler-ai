@@ -37,6 +37,12 @@ ui/e2e/video/output/
 .claude/skills/*
 !.claude/skills/sanitize-hostnames/
 .claude/skills/sanitize-hostnames/__pycache__/
+# Same reasoning one directory over: .claude/hooks/ holds the GitHub-write
+# identity guard and its selftest, which CI RUNS. Ignored, they would not be in
+# the repo at all -- the CI job would fail on a missing file, and the guard
+# would exist only on the machine that wrote it. That is exactly how the
+# sanitisation skill above was lost once already.
+!.claude/hooks/
 dist/
 # Operator-supplied GeoLite2 databases — licensed data, never committed.
 files/geoip/*.mmdb
