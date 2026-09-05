@@ -416,9 +416,48 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 - **nginx**: Pod-internal reverse proxy (`files/nginx-pod.conf`) — SPA fallback + API proxy + WS proxy
 - **Agent binary**: built separately (`cargo build -p roomlerd --release --features full`) and distributed to controlled hosts via GitHub Releases (MSI / .pkg / .deb auto-built by `.github/workflows/release-agent.yml` on `agent-v*` tag push). Not part of the API Docker image.
 
-### K8s deploy pipeline (ArgoCD GitOps)
+### Deploy pipeline (FR-73, since 2026-09-05): Actions builds, GHCR serves, a dispatch promotes
 
-The build host builds the image, pushes to `<internal-registry>/roomler-ai:<tag>`, bumps the tag in the gitops repo, and ArgoCD reconciles the Deployment. Fill in the env vars at the top once per shell session:
+The hosted image is **built by GitHub Actions on every merge to `master`** that can change it
+(`.github/workflows/hosted-image.yml`: `crates/**`, `ui/**`, `files/**`, `config/**`, the two
+installer scripts, the Dockerfile, `Cargo.*`), smoke-booted with Mongo + Redis (`/health` must
+mount all six modules including `saas`, the device route must answer 401, `/` must serve the
+SPA), attested, and pushed to the public package as
+**`ghcr.io/gjovanov/roomler-ai:hosted-<YYYYMMDD>-<sha7>`** plus the moving `hosted` pointer. The
+job summary carries the measured build time (first cold run: 13 min 37 s build, 15 min merge →
+tag). ⚠️ The lane never writes `latest` — that is the self-host `full` image (no `saas`), owned by
+`publish-selfhost-image.yml`. ⚠️ Build ≠ deploy: nothing rolls until someone promotes.
+
+```bash
+# 1. find the image a merge produced (or read the run summary)
+gh run list --workflow hosted-image.yml --limit 3
+# 2. promote it — bumps newTag in the deploy repo; ArgoCD rolls within seconds
+gh workflow run promote.yml -f tag=hosted-20260905-5ef0030   # empty tag = whatever `hosted` points at
+# 3. field-verify from the fleet, as after EVERY roll (pods on the new image, online-agent
+#    count, an RC session, an overlay pair, a tunnel forward) — the workflow only proves
+#    the public /health kept answering
+```
+
+`promote` needs the repo secret `DEPLOY_REPO_TOKEN` (a fine-grained PAT, Contents read/write on
+the private deploy repo); without it the job prints the exact manual bump
+(`sed -i 's|newTag:.*|newTag: <tag>|' k8s/overlays/prod/kustomization.yaml` in the deploy repo,
+commit, push). It refuses anything that is not an existing `hosted-*` tag, and refuses while the
+deploy repo's `newName` is not `ghcr.io/gjovanov/roomler-ai`. The cluster pulls from GHCR with
+**no pull secret** (the package is public; `regcred` on the Deployment is vestigial) — measured
+3 s per node for the whole 81 MB image on the first roll, 20 s from the deploy-repo push to both
+pods. Retention: `ghcr-retention.yml` (Mondays) deletes untagged versions and keeps the newest
+20 `hosted-*` tags, never touching any other tag family.
+
+⚠️ The e2e lane (`scripts/e2e-nightly.sh`, `scripts/e2e-run.sh`) reads the registry from the
+deploy repo's `newName` — a bare tag given to `e2e-run.sh` is resolved against it; a full
+reference containing `/` pins anything.
+
+#### Break-glass: the build-host path (a GitHub outage, or a fix that must not wait for a runner)
+
+The recipe below still works unchanged — build, push to the build host's registry, then set
+BOTH `newName: registry.roomler.ai/roomler-ai` and `newTag` in the deploy repo (`promote` will
+refuse until `newName` is switched back to GHCR). Fill in the env vars at the top once per shell
+session:
 
 ```bash
 # Operator-filled (set once per shell):
