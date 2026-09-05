@@ -1,6 +1,10 @@
 # FR-73: The prod image is built by GitHub Actions, served from GHCR, and promoted by a dispatch
 
-**Status**: **proposed 2026-09-05** — P0 claim ·
+**Status**: **in flight 2026-09-05** — P0 claim (#1390) · P1 the build lane (#1391, first cold run
+13 min 37 s build / 15 min merge → tag) · P3 `promote` (#1393) · P4 retention (#1395) · the e2e
+lane follows the deploy repo's registry (#1396) · **P2 rolled 20:07Z and field-verified** (pulls
+3.3 s / 2.7 s per node, 20 s from the deploy-repo push to both pods, fleet unchanged) · P1b
+(#1392) in validation ·
 **Owner**: deploy / build ·
 **Issue**: [#1389](https://github.com/gjovanov/roomler-ai/issues/1389) ·
 **Related**: FR-6 (build-speed SLO — this lane inherits its ≤10 min warm target as an aspiration, not a gate), FR-69 (the publish workflow this one copies its smoke from), FR-37 (the e2e lane, which pins by image tag and gains a second registry to pin from)
@@ -122,9 +126,9 @@ projects. Nothing on the host is torn down by this FR.
 | Phase | What | PR | Kill switch | Status |
 |---|---|---|---|---|
 | P0 | This spec, the ledger row, the issue | [#1390](https://github.com/gjovanov/roomler-ai/pull/1390) | — | ✅ merged `5a9f357a1` |
-| P1 | `.github/workflows/hosted-image.yml`: build on merge / dispatch, registry cache, smoke (`/health` = all six modules incl. `saas`, device route 401, SPA served), push `hosted-<date>-<sha7>` + `hosted`, attest, a summary with the measured build time | [#1391](https://github.com/gjovanov/roomler-ai/pull/1391) | `gh workflow disable hosted-image` | ✅ merged `5ef003087` — its merge is the cold run |
+| P1 | `.github/workflows/hosted-image.yml`: build on merge / dispatch, registry cache, smoke (`/health` = all six modules incl. `saas`, device route 401, SPA served), push `hosted-<date>-<sha7>` + `hosted`, attest, a summary with the measured build time | [#1391](https://github.com/gjovanov/roomler-ai/pull/1391) | `gh workflow disable hosted-image` | ✅ merged `5ef003087` — its merge was the cold run: 13 min 37 s build, 15 min 01 s merge → tag (field log) |
 | P1b | Dockerfile: `cargo chef` dependency layer + Rust stage copies only Rust sources; base image matches the pinned toolchain; measured against P1's numbers (cold, warm-no-change, warm-Rust-change, warm-UI-only) | [#1392](https://github.com/gjovanov/roomler-ai/pull/1392) | revert the Dockerfile PR — the workflow is indifferent to the layering | dry-run validated on the branch (second attempt — see the field log) |
-| P2 | The cluster pulls from GHCR: deploy repo `newName: ghcr.io/gjovanov/roomler-ai`, `newTag: hosted-…`; one roll, field-verified from the fleet; per-node pull time recorded | deploy repo | revert `newName`/`newTag` — the build-host registry still holds the previous tag | |
+| P2 | The cluster pulls from GHCR: deploy repo `newName: ghcr.io/gjovanov/roomler-ai`, `newTag: hosted-…`; one roll, field-verified from the fleet; per-node pull time recorded | deploy repo `2efae23` | revert `newName`/`newTag` — the build-host registry still holds the previous tag | ✅ **rolled 2026-09-05 20:07Z**, field-verified (field log): pulls 3.3 s / 2.7 s per node, push → both pods 20 s |
 | P3 | `promote` dispatch: bump `newTag` in the deploy repo with `DEPLOY_REPO_TOKEN`; prints the bump when the secret is absent; refuses while `newName` is not GHCR | [#1393](https://github.com/gjovanov/roomler-ai/pull/1393) | remove the secret | |
 | P4 | GHCR retention job ([#1395](https://github.com/gjovanov/roomler-ai/pull/1395)); `CLAUDE.md` deploy section rewritten (Actions path first, build-host path as break-glass); `docs/self-hosting.md` on the `hosted-*` family; the e2e lane doc notes it can pin either registry | | — | |
 
@@ -168,4 +172,71 @@ retiring the build-host registry for the other projects; a registry mirror on th
 
 ## Field-verification log
 
-_(appended per phase — the numbers, wrong turns included)_
+### 2026-09-05 — P1: the first hosted build, cold, on the merge that created the lane
+
+The merge of #1391 (`5ef0030`) triggered the workflow's first run (33988344500) — cold by
+construction: no `buildcache-hosted` existed yet, and the Dockerfile was still the
+`COPY . .` one.
+
+| step | wall clock |
+|---|---|
+| Build (the Docker build, including the first export of every layer to the registry cache) | **13 min 37 s** (817 s) |
+| labels check + smoke boot (healthy in ~20 s, all six modules incl. `saas`, device route 401, `/` 200) | 24 s |
+| push `hosted-20260905-5ef0030` + move `hosted` | 11 s |
+| attestation | 4 s |
+| **merge push → tag on GHCR** | **15 min 01 s** (19:50:59Z → 20:06:00Z) |
+
+Image 80.96 MB compressed; `org.opencontainers.image.revision` = the merged commit (the
+workflow asserts it); `latest` untouched — its digest (`e19b3c72…`) differs from `hosted`'s
+(`386a25b8…`), and the workflow has no path that writes it (AC5, AC6). The 13 min 37 s cold is
+below the 17 min 35 s FR-69 measured for the same Dockerfile on the same runner class: a
+runner-to-runner spread, not a change — the number to beat is the band, not one sample.
+
+### 2026-09-05 — P1b, three dry runs before the layering was right (the wrong turns)
+
+Validated end to end by dispatching the self-host publish workflow in dry-run mode against the
+branch (any branch can be built that way; a new workflow file cannot be dispatched until it is
+on master). Three failures, each a fact about cargo-chef worth keeping:
+
+1. `failed to read /app/crates/vendored/rtp/Cargo.toml` — cargo-chef skeletonises workspace
+   members; the `[patch.crates-io]` path crates are resolved by cargo from their real manifests
+   at cook time. They are dependencies, so `crates/vendored` is copied into the cook layer.
+2. `cannot find TcpTurnConn in tcp_turn_conn` — the vendored `webrtc-ice` patch (a real crate
+   during the cook) depends on the workspace member `crates/tcp-turn-conn`, which the skeleton
+   had reduced to an empty `lib.rs`. A non-member dependency that uses a member's types cannot be
+   cooked with that member skeletonised.
+3. The fix: `cargo chef cook --no-build` writes the skeleton and stops; that one member is
+   overlaid with its real sources; the dependency build is ours; then every member's artefacts
+   are removed (`cargo clean --release -p` over `cargo metadata --no-deps`) — which is what
+   `cook` does itself after building, because the real sources arrive by `COPY` with the build
+   context's OLDER mtimes and cargo would otherwise keep the skeleton's empty artefacts as
+   fresh. The smoke would have caught a server whose `main()` is `{}`, but only after a
+   twenty-minute build.
+
+Also found on the way: the base image was `rust:1.88` while `rust-toolchain.toml` pins
+**1.95.0**, so every build had been downloading and installing a second toolchain inside the
+uncached build layer. The base now matches the pin.
+
+### 2026-09-05 — P2: the cluster pulls from GHCR — one roll, field-verified
+
+Between the running image (`89ea3128`, the FR-69 roll of 08:49Z) and `hosted-20260905-5ef0030`
+master had only workspace-version bumps and agent-side FR-70/FR-71 features — the least
+eventful roll available, which is what a registry switch wants. The deploy repo's prod overlay
+was set to `newName: ghcr.io/gjovanov/roomler-ai`, `newTag: hosted-20260905-5ef0030` and pushed
+at **20:07:38Z**. No pull secret was added (`regcred` stays on the Deployment, unused).
+
+| | |
+|---|---|
+| pods on the new image | both — started 20:07:41Z and 20:07:58Z; `rollout status` complete inside the minute |
+| pull, per node (pod events) | **3.3 s** and **2.7 s** for the whole 80.96 MB image — nothing of it was cached on the nodes, the registry had changed |
+| public `/health` | 200 throughout; `version 0.4.70`, all six modules mounted and compiled |
+| `/` | 200 (the SPA) |
+| fleet RPC | `roomler exec` to the cluster's build host through the new pods answered (`uptime`) |
+| remote desktop | a session to a cluster node from this controller: `[WS] received: connected`, connect attempt 1, **ttff 633 ms**, `rc:video-info` vp9 4:4:4 on **transport direct**, clock echoes every second |
+| tunnels | this box's seven declared routes all `active` afterwards |
+| overlay | online peers unchanged (14 with a live carrier after vs 13–14 before; every device that was online stayed online); the direct pair to the build host survived (39 ms); the WAN peers behind NAT were on `relay:derp/tcp` before and after — from this box today the `srflx` tier is ineligible (`why.tiers`), unrelated to the roll — and re-registered on the restarted pods' DERP within seconds |
+
+**What got slower: nothing measurable.** D8 budgeted 10–60 s per node for the pull over the site
+uplink; the nodes took three seconds. Deploy-repo push → both pods on the new image: **20 s**.
+The build-host registry keeps the previous tag, so the kill switch (revert `newName`/`newTag`)
+stays a one-line commit.
