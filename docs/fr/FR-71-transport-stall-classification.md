@@ -61,7 +61,7 @@ One verdict per viewer window from signals the governor already holds:
 | state | says | evidence |
 |---|---|---|
 | `Overproduced` | the sender is the limiter | `send_wait` rising, `inflight` at or over the byte budget, blocked sends (goodput samples accepted), budget-gate skips |
-| `TransitStalled` | the path is the limiter | `transit_ms` rising or above its floor by more than the slack while `sender_ms` is flat, `inflight` is small and `viewer_ms` is flat; or a viewer report gap with a non-empty send queue |
+| `TransitStalled` | the path is the limiter | `transit_ms` above its learned floor by more than the slack (200 ms) while `viewer_ms` sits near its own floor; or a viewer report gap while the sender kept writing frames through a queue that passed every `Overproduced` check (as built: the "queue under half the budget" clause of the first draft was dropped — a keyframe on a ramp step trips it for one window, and the sender screen already owns "queue over budget") |
 | `ViewerLate` | the browser is the limiter | `viewer_ms` rising, decode queue deep, `struggling` |
 | `Clear` | none of the above | |
 | `Unknown` | no split reported (pre-M0 viewer, no age this window) | the loops behave exactly as today |
@@ -89,20 +89,59 @@ not a permanent stall. Pure and `Instant`-explicit, like `slow_start` and
 and `transit_hold` (T1b, default **off** for one release — a controller change
 ships behind evidence, FR-63's rule).
 
+### What the T1a cell taught (2026-09-05)
+
+Building the classifier against the simulator corrected the spec in three
+places; each is recorded here because the next phase depends on it.
+
+1. **Finding 4's stall sits beyond the ack point.** The agent's `inflight` is
+   the data channel's buffered amount, which webrtc-rs decrements on the far
+   end's SACK — 1485 bytes in flight during a 4.9 s paint means the viewer's
+   SCTP had *acked* those frames. A relay that merely buffered them would
+   have left them unacked and backed the sender up into the budget gate.
+   Whatever held the frames (the browser's main thread, the worker's queue,
+   a DERP → viewer leg whose acks still flowed) did so where the sender cannot
+   count them. The B0 freeze fixtures (`PipeSpec::stalls`) model the *other*
+   kind — a frozen drain that fills the sender's own queue, which the sender
+   can see and the classifier rightly calls `Overproduced` once the queue is
+   over budget (`t1a_freeze_stalls_are_sender_visible`). The simulator
+   therefore gained `PipeSpec::transit_stalls` — acked on time, *observed*
+   late — and the `finding4_transit_stall` fixture (8 Mbps, 80 ms, a 4.8 s
+   stall at 12 s), which reproduces the field shape: a 15 KB send queue
+   throughout, zero gate skips, and the whole backlog painting at once.
+2. **A silent window is a clean window to the shipped ramp.** Through the
+   stall the slow-start ramp stepped 1.82 → 1.98 Mbps: no report means no
+   congestion bit, and no congestion bit is a clean window. T1b's hold has to
+   freeze the ramp on `TransitStalled` as well as suppress the decreases —
+   "no decision on a stalled window" in both directions.
+3. **The sim's law does not yet cut on age.** `GovernorLaw` models the FR-15
+   age loop's push-back (for the prior) but not its rate *cut*, so the
+   finding-4 cell under the shipped rule shows the classification and the
+   ramp climb but not the harm. AC3's FAIL-first cell therefore needs the age
+   loop's cut modelled in the sim law before T1b can show a difference — the
+   first task of T1c, not an afterthought.
+
 ## Phases
 
 | Phase | What | Kill switch | Status |
 |---|---|---|---|
-| **T1a** | `encode::pipe_state` + heartbeat `pipe_state` + per-state counters; the B0 fixtures classified under the shipped-rule harness | `transit_classify` | proposed |
+| **T1a** | `encode::pipe_state` + heartbeat `pipe_state` + per-state counters; the B0 fixtures classified under the shipped-rule harness | `transit_classify` | **built 2026-09-05** ([#1366](https://github.com/gjovanov/roomler-ai/pull/1366)), shadow only — AC1's sim/unit half met (see *What the T1a cell taught*); the fleet half (AC2) waits for the next agent release |
 | **T1b** | the hold: no MD, no age-loop fire, clamp held on `TransitStalled` | `transit_hold` (default off) | proposed |
 | **T1c** | the cells: `derp_with_stalls` in B0 (the law), then the corp-VPN DERP path (the field), each shown to FAIL with the hold off first | — | proposed |
 
 ## Acceptance criteria
 
-- [ ] **AC1** — the classifier locks in unit tests and on the B0 stall fixtures
+- [x] **AC1** — the classifier locks in unit tests and on the B0 stall fixtures
       under the shipped-rule harness: every stall window is `TransitStalled`,
       every budget-gate window on the thin pipe is `Overproduced`, a decode
-      backlog is `ViewerLate`, a pre-M0 window is `Unknown`.
+      backlog is `ViewerLate`, a pre-M0 window is `Unknown`. *(2026-09-05,
+      T1a: `t1a_finding_4_stall_windows_classify_as_transit_stalled` — all
+      four silent windows and the backlog window `TransitStalled`, none
+      `Overproduced`, every window either side `Clear`;
+      `t1a_thin_pipe_budget_windows_classify_as_overproduced`;
+      `t1a_freeze_stalls_are_sender_visible`; `ViewerLate` and `Unknown` in
+      the unit tests — the sim's viewer decodes instantly, so it cannot
+      produce a decode backlog.)*
 - [ ] **AC2** — one release of shadow classification across the fleet, reviewed
       from `agent_logs`: no constrained session classified `TransitStalled`
       while its send queue was over budget, and finding 4's shape classifies
@@ -123,6 +162,11 @@ ships behind evidence, FR-63's rule).
   follow-through (a stall is not evidence the pair cannot carry the ceiling).
 - How long a hold may last before it is treated as a real capacity change
   (`MAX_LIFETIME`-style bound, so a path that never recovers still converges).
+- Whether a viewer *report gap* should be held on at all under T1b. T1a
+  classifies it `TransitStalled` (the sender passed every check and kept
+  sending), but a hidden tab produces the same gap; holding the rate is more
+  conservative than today's ramp climb either way, and AC2's fleet review is
+  where the gap's real causes get counted before the hold ships.
 
 ## Out of scope
 
@@ -141,3 +185,4 @@ consumes `PipeState`), FR-64 #1244, FR-19 #805.
 | when | build | cell | result |
 |---|---|---|---|
 | 2026-09-04 12:34 UTC | 0.4.59 | CORPLAP-3 → neo16, DERP path, session `6a9abaa8` | **the FAIL on record**: 4903 ms paint with a 1485-byte send queue; the rate was cut into a link that was never the limiter |
+| 2026-09-05 | T1a branch (simulation, not the field) | `finding4_transit_stall` under `run_shipped` | classifier: windows 13–17 s `transit-stalled`, nothing `overproduced`, all others `clear`; the sender's queue stayed at 15 KB through the stall (finding 4's 1485 B) and the ramp **kept climbing** through it (1.82 → 1.98 Mbps) — a silent window is a clean window to the shipped ramp |
