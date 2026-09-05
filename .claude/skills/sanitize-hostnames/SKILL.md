@@ -160,9 +160,31 @@ reference to its number, including any already baked into a merged commit
 subject.
 
 ⚠️ **One hole no local layer can close**: a merge made through the GitHub web
-UI is committed *on GitHub*, from the email set on the **account**, and passes
-through no hook and no PR check. Only a repository ruleset
-(`commit_author_email_pattern`) sees that one.
+UI is committed *on GitHub*, from the email set on the **account**, after every
+hook and PR check has already passed. Two things follow, and the second is the
+one people get wrong:
+
+1. **The fix is the account setting**, not a guard — GitHub Settings → Emails.
+   Keep the address off the account, or turn on *Keep my email address private*
+   so commits use the `users.noreply.github.com` form.
+2. **A repository ruleset cannot help here.** `commit_author_email_pattern`
+   would block it, but the whole metadata-rule family is organisation-and-paid-
+   plan only: on this user-owned public repo the API refuses every one of
+   `commit_author_email_pattern`, `committer_email_pattern`,
+   `commit_message_pattern` and `branch_name_pattern` with HTTP 422 (measured
+   2026-09-06, in `active` enforcement — `evaluate` is separately Enterprise-
+   only). Do not plan around it.
+
+What actually covers it is the **CI job's push-to-master run**: `on: push`
+scans `github.event.before..github.sha`, so a merge commit with a foreign
+identity turns master red within a minute. That is detection, not prevention —
+the commit exists by then — but it is the difference between finding out in a
+minute and finding out in an audit eleven days later, which is how this whole
+entry started.
+
+⚠️ Its fallback matters and was exercised on day one: after a force-push,
+`github.event.before` names a commit that no longer exists, so the job falls
+back to `<sha>~1..<sha>` rather than erroring or, worse, scanning nothing.
 
 ### The hook's exit-code contract — the hard-won part
 
@@ -199,7 +221,38 @@ asserts a **non-1** status specifically — "non-zero" would pass on the bug.
 silence, which is layer 1 disarmed with nothing anywhere to say so; the selftest
 checks this too.
 
-## The four things that go wrong
+## The six things that go wrong
+
+**0. The `--replace-text` rules file has NO COMMENT SYNTAX.** `get_replace_text()`
+treats **every** line as a literal to match, and when a line carries no `==>`
+the replacement defaults to `***REMOVED***`. So a line containing just `#` means
+*replace every `#` in every blob*. Measured 2026-09-06 on a rules file whose
+first four lines were ordinary explanation: **548,700 blob lines rewritten**,
+`CLAUDE.md` stripped of all 53 of its headings, `.gitattributes` turned into
+`***REMOVED***!/bin/sh`. The only tell during the run is a burst of
+`is not a valid attribute name: .gitattributes:N` warnings, buried in the
+progress spam.
+
+Keep the `.txt` pure rules; put prose in a sibling file. Assert it before
+running:
+
+```bash
+grep -c ''  replace.txt        # every line is a rule -- is that how many you meant?
+grep -vc '==>' replace.txt     # want 0: a line without ==> uses the REMOVED default
+```
+
+⚠️ The `--mailmap` file is a *different* format (git's own) and **does** support
+`#` comments. The two files sharing a directory and not a syntax is exactly the
+trap.
+
+**0b. A verification must not contaminate what it verifies.** To diff the
+pre- and post-rewrite trees it is tempting to fetch the old master into the
+rewritten mirror. That works, and it also re-imports every pre-rewrite commit:
+`git log --all` then reports the addresses as still present, and — far worse —
+`git push --mirror` would have **published `refs/orig/master`**, re-uploading in
+one step the exact history the rewrite existed to remove. Do the comparison in a
+third, throwaway repo, and assert before pushing that the mirror holds nothing
+outside `refs/heads/*` and `refs/tags/*`.
 
 **1. `--replace-text` does NOT touch commit messages.** It rewrites blob
 contents only; commit and annotated-tag messages are a separate surface behind

@@ -190,9 +190,16 @@ that setting), add it to .githooks/allowed-identities.txt in its own commit --
 deliberately, having decided you are content to publish it.
 
 ⚠️ Merges made through the GitHub web UI use the commit email set in your
-GitHub ACCOUNT, which no local hook can see. If that address is wrong, fix it
-in GitHub Settings -> Emails; the repository ruleset is the only layer that
-catches that one.
+GitHub ACCOUNT, which no local hook can see -- the commit is created on
+GitHub, after every check has already passed. Fix that one in GitHub
+Settings -> Emails.
+
+A repository ruleset (commit_author_email_pattern) would BLOCK it, but the
+whole metadata-rule family is organisation-and-paid-plan only and is refused
+on a user-owned repo (measured 2026-09-06: HTTP 422 "Invalid rule", for
+active enforcement too). What covers it here instead is the CI job's
+push-to-master run, which scans the pushed range and goes red within a
+minute -- detection, not prevention.
 EOF
 } >&2
 exit $EXIT_FOUND
