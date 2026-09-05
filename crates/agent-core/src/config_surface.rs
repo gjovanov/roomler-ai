@@ -647,6 +647,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Act on a transit-stalled window (2026-09-05, FR-71 T1b). Default OFF for one release: a controller change ships behind the shadow classifier's evidence. ON: when transit_classify calls a constrained viewer window transit-stalled (the send queue passed every sender-side check while the frames were held beyond it), the rate loops leave that window alone - the opener's ramp neither steps nor ends, the FR-15 age loop does not fire, the FR-59 P3 arrival clamp is held rather than re-armed or released, and the rate prior takes no push-back; the FR-59 P4 drain still runs, because a pause is a drain, not a cut. The heartbeat counts held windows as transit_holds. It exists because the alternative is what happened on 2026-09-04: a 4.9 s DERP head-of-line block read as over-production and the rate was cut into a link that was never the limiter. Needs transit_classify. false = classify only, act as today. Env: ROOMLERD_TRANSIT_HOLD. Restart required.",
     ),
     (
+        "media_thread",
+        "tribool",
+        "The encoder runs on its own OS thread per session (2026-09-05, FR-70 M1). Default OFF for one release. ON: the FFmpeg encoder lives on a dedicated thread named rc-enc-<session> behind a command channel - the pump sends each frame and awaits the packets, and every rate move, keyframe request and background-rebuild adoption is a message applied in order - instead of encoding under block_in_place on whichever async worker happens to poll the pump. Nothing the pump decides changes: same frame, same decision, same packet, one thread hop later. What changes is that the async runtime is never held for the 5-30 ms of an encode (the send task, the control channel and the heartbeats stop sharing a worker with it) and hardware encoders that are thread-affine (Media Foundation per-thread COM, QSV sessions) are driven from one thread for the whole session. A thread that cannot be spawned falls back to the inline path with a warning; a thread that dies surfaces as the next encode's error, which the existing error ladder turns into a rebuild. Gate for flipping the default: FR-65's iter_ms_max / pump_stalls / apply_ms_max on the three CORPLAP hosts, unchanged or better. false = today's inline encode. Env: ROOMLERD_MEDIA_THREAD. Restart required.",
+    ),
+    (
         "pump_stall_watch",
         "tribool",
         "Pump stall watch (2026-09-03, FR-65 P0). Default ON: a send-pump iteration slower than pump_stall_warn_ms is logged once with its phase breakdown (capture/scale/encode/apply/send), and the per-heartbeat apply_us / apply_us_max / iter_us_max / pump_stalls counters are published. Costs two Instant::now() per iteration (~20-40ns against a 16.7ms budget at 60fps) and logs nothing until an iteration actually overruns. It exists because a 2s blocking encoder open hid for months: the pump measured capture/scale/encode/send and the stall appeared in NONE of them - the apply/rebuild phase was untimed, and a per-heartbeat AVERAGE cannot represent a single outlier even where it is counted. false = no timing, no counters. Env: ROOMLERD_PUMP_STALL_WATCH. Restart required.",
@@ -933,6 +938,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "rate_prior_decay" => cfg.rate_prior_decay.map(fmt_bool),
         "transit_classify" => cfg.transit_classify.map(fmt_bool),
         "transit_hold" => cfg.transit_hold.map(fmt_bool),
+        "media_thread" => cfg.media_thread.map(fmt_bool),
         "pump_stall_watch" => cfg.pump_stall_watch.map(fmt_bool),
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms.map(|p| p.to_string()),
         "bg_rebuild_constrained" => cfg.bg_rebuild_constrained.map(fmt_bool),
@@ -1355,6 +1361,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "rate_prior_decay" => cfg.rate_prior_decay = parse_tribool(value)?,
         "transit_classify" => cfg.transit_classify = parse_tribool(value)?,
         "transit_hold" => cfg.transit_hold = parse_tribool(value)?,
+        "media_thread" => cfg.media_thread = parse_tribool(value)?,
         "pump_stall_watch" => cfg.pump_stall_watch = parse_tribool(value)?,
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms = parse_u32_range(key, value, 10, 5000)?,
         "bg_rebuild_constrained" => cfg.bg_rebuild_constrained = parse_tribool(value)?,
