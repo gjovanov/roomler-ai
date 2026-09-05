@@ -706,6 +706,75 @@ jobs:
           bash .claude/skills/sanitize-hostnames/selftest.sh
           python3 .claude/skills/sanitize-hostnames/check_shapes.py --root .
 
+  commit-identity:
+    name: No foreign commit identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The sibling of `No real machine names`, one layer over. That job asks
+    # whether the CONTENT names a real machine; this asks whether the COMMIT
+    # names a real person we did not mean to publish.
+    #
+    # Neither can see the other's surface. A commit's author and committer are
+    # METADATA — they are in no blob and no message, so the shape scan walks
+    # straight past them — and this repo is PUBLIC, so an address from a corp
+    # mailbox names an employer beside a personal project in every clone,
+    # forever.
+    #
+    # Why it exists: an audit on 2026-09-05 found a second GitHub account (a
+    # corp one, whose LOGIN alone named an employer) had authored an issue and
+    # three comments here. It had authored no commits, and that was luck rather
+    # than design — nothing anywhere checked, while 520 commits already in this
+    # history carried a corp mailbox as their author address.
+    #
+    # ⚠️ An ALLOWLIST, not a denylist, and the reason is structural rather than
+    # stylistic: a denylist of unwanted addresses would have to write them into
+    # a public file, publishing exactly what the guard exists to remove. It
+    # would also only find the mistakes someone already thought of. Same
+    # reasoning as check_shapes.py being shape-based rather than map-based — a
+    # denylist finds the identities you know about, an allowlist finds the class.
+    #
+    # ⚠️ `--require-commits` is load-bearing. Without it an empty range answers
+    # "all known" over zero commits, which is indistinguishable from a real
+    # pass — the same defect as a `cargo test` filter matching no test, which
+    # this repo's integration lane already shipped once.
+    #
+    # ⚠️ This CANNOT see a merge made through the GitHub web UI: that commit is
+    # created on GitHub from the email set on the ACCOUNT and passes through no
+    # local hook and no PR check. The repository ruleset is the layer for that.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The identity check reads commits, so it needs their objects. The
+          # default shallow checkout has the PR head but not the base, and
+          # `base..head` against a missing base is an error, not a pass.
+          fetch-depth: 0
+
+      - name: Guard self-tests, then scan the commits this PR adds
+        run: |
+          # Selftests first, and both of them: a guard nobody has watched FAIL
+          # is not evidence of anything. The sibling shape guard has silently
+          # self-disarmed four times and every symptom was a confident pass.
+          bash .githooks/check-identity-selftest.sh
+          bash .claude/hooks/gh-account-guard-selftest.sh
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            # A push to master. `github.event.before` is the zero sha for the
+            # first push to a new branch and for a force-push over a deleted
+            # ref; fall back to the single head commit rather than scanning
+            # nothing or the whole history.
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              RANGE="${{ github.sha }}~1..${{ github.sha }}"
+            else
+              RANGE="$BEFORE..${{ github.sha }}"
+            fi
+          fi
+          echo "range: $RANGE"
+          bash .githooks/check-identity.sh --require-commits --range "$RANGE"
+
   name-audit:
     name: Retired-name audit (FR-21)
     runs-on: ubuntu-latest

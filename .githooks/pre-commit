@@ -18,6 +18,36 @@
 set -u
 
 REPO="$(git rev-parse --show-toplevel)"
+
+# ── Gate 1: the commit IDENTITY ────────────────────────────────────────────
+# Runs first and separately, because it is pure bash + git: no python, no WSL,
+# no interpreter probe. Everything below this block can degrade to "could not
+# run, allowed with a warning" on a machine without a working python3, and on
+# THIS machine that is the normal case (Git-Bash has none). An identity check
+# that shares that fate would be inert exactly where it is needed.
+#
+# It answers a question the shape guard structurally cannot: a commit's author
+# and committer are METADATA, so they appear in no blob and no message and the
+# content scan walks straight past them. See check-identity.sh for why this is
+# the only cheap moment -- an identity cannot be edited after the fact, only
+# rewritten, and a rewrite renumbers every SHA above it.
+IDGUARD="$REPO/.githooks/check-identity.sh"
+if [ -f "$IDGUARD" ]; then
+  idout=$(bash "$IDGUARD" --pending 2>&1); idrc=$?
+  if [ "$idrc" -eq 1 ]; then
+    printf '%s\n' "$idout" >&2
+    echo "COMMIT REFUSED: wrong identity (see above)." >&2
+    exit 1
+  elif [ "$idrc" -ne 0 ]; then
+    # Same contract as below: only status 1 blocks. Anything else means the
+    # guard did not answer, and saying so is the whole point of the split.
+    printf '%s\n' "$idout" >&2
+    echo "WARNING: commit-identity guard could not run (exit $idrc) -- commit allowed." >&2
+    echo "         Nothing was checked, so nothing was cleared. CI still refuses the merge." >&2
+  fi
+fi
+
+# ── Gate 2: real machine names in the CONTENT ──────────────────────────────
 GUARD="$REPO/.claude/skills/sanitize-hostnames/check_shapes.py"
 [ -f "$GUARD" ] || exit 0          # tool absent (old checkout) -- do not block
 
