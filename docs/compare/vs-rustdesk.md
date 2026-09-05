@@ -12,10 +12,13 @@ machine you own without a subscription.
 - **Native clients everywhere.** Desktop viewers plus **iOS and Android**.
   Roomler's viewer is a browser tab — no install, but also no native mobile app,
   and the low-latency rendering path is Chromium-first.
-- **Wayland.** RustDesk ships unattended access on Wayland. Roomler does not
-  capture a Wayland session at all yet; on those desktops the stream is black.
-  This is tracked openly as [FR-36](../fr/FR-36-wayland-capture.md) and is a
-  genuine gap, not a footnote.
+- **Wayland breadth.** Both capture Wayland now — Roomler's landed in
+  [FR-36](../fr/FR-36-wayland-capture.md) (DRM/KMS plus `uinput`, field-verified
+  against a GNOME session it drives, types into, and reaches at the greeter and
+  the lock screen) and [FR-45](../fr/FR-45-portal-capture.md) (the desktop
+  portal, for hosts with no scanout). RustDesk still covers more compositors and
+  more distro/session combinations out of the box, and its path has far more
+  field hours behind it.
 - **A large community**, translations, and a decade of accumulated recipes.
 
 If your problem is "I need to see and control a remote screen", RustDesk solves
@@ -62,9 +65,9 @@ live mesh graph — built in rather than assembled.
 | Remote desktop, self-hosted | yes | yes |
 | Viewer | browser tab, nothing to install | native clients + mobile |
 | Mobile viewer | **no** | yes |
-| Wayland capture | **no** ([FR-36](../fr/FR-36-wayland-capture.md)) | yes |
+| Wayland capture | yes ([FR-36](../fr/FR-36-wayland-capture.md) DRM/KMS + [FR-45](../fr/FR-45-portal-capture.md) portal) | yes, broader compositor coverage |
 | Hardware encoding | NVENC / QSV / AMF / Media Foundation, probe-and-rollback | yes |
-| Unattended / lock screen | yes (Windows SystemContext) | yes |
+| Unattended / lock screen | yes — Windows SystemContext, and Linux Wayland at the greeter and lock screen (FR-36) | yes |
 | WireGuard mesh between machines | **yes** | not in scope |
 | Port forwards / SOCKS5 | yes | limited |
 | SSH without `sshd` | yes | not in scope |
@@ -74,8 +77,9 @@ live mesh graph — built in rather than assembled.
 
 ## Choosing
 
-- **Use RustDesk** if you need mobile, Wayland, native viewers, or the safety of
-  the more battle-tested option for remote desktop specifically.
+- **Use RustDesk** if you need mobile, native viewers, broader Wayland compositor
+  coverage, or the safety of the more battle-tested option for remote desktop
+  specifically.
 - **Use Roomler** if the machines you want to reach are also machines you want on
   a private network — or if you want one agent, one policy model and one audit
   trail instead of two products.
@@ -84,7 +88,9 @@ live mesh graph — built in rather than assembled.
 
 ---
 
-*Checked 2026-08-29 against Roomler's own source and RustDesk's public
-documentation and release notes. If anything here is wrong or has aged,
+*Re-checked 2026-09-02 against Roomler's own source and RustDesk's public
+documentation and release notes. The Wayland row was **wrong in our own
+disfavour** until this pass — it still conceded a gap FR-36 had closed and
+field-verified on 2026-08-30. If anything here is wrong or has aged,
 [open an issue](https://github.com/gjovanov/roomler-ai/issues) — we would rather
 fix it than win on a stale fact.*
