@@ -899,7 +899,8 @@ pub struct AgentConfig {
     pub transit_hold: Option<bool>,
     /// FR-70 M1 — the encoder runs on its own OS thread per session behind a
     /// command channel instead of `block_in_place` on a runtime worker.
-    /// Default OFF for one release. See `media_thread`.
+    /// Default ON since 0.4.70 (M1c met its gate on 0.4.69); `false` restores
+    /// the inline encode. See `media_thread`.
     pub media_thread: Option<bool>,
     /// FR-65 P0 — the pump stall watch. Default ON. See `pump_stall_watch`.
     #[serde(default)]

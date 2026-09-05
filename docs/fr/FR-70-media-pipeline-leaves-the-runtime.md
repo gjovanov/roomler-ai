@@ -232,6 +232,28 @@ devices were returned to the default. ⚠️ Side finding, unrelated to M1:
 CORPLAP-2's encoder open takes **2.8–2.9 s** (av1_nvenc) on every session —
 finding 1's worst instance so far, and M2's strongest case.
 
+**The longer CORPLAP-2 pair (2026-09-05 18:41–18:54 UTC, ~4.5 min each,
+same relay path, lock screen with mouse motion):**
+
+| steady state (heartbeats 4+) | off (`6a9c6245`) | on (`6a9c640b`) |
+|---|---|---|
+| heartbeats | 133 | 144 |
+| `avg_encode_ms` avg / max | 10.84 / 12.16 | 10.63 / 12.41 |
+| `avg_capture_ms` | 1.78 | 2.59 |
+| `iter_ms_max` avg over windows | 30.5 | 36.6 |
+| windows with `iter_ms_max` > 50 ms | 29 of 133 (22 %) | 25 of 144 (17 %) |
+| windows > 100 ms | 0 | 2 — both the lock-screen click burst (121 budget-gate skips in that window, 957 ms) and its tail |
+| the open | 2910 ms | 2898 ms |
+
+The ambiguous counter resolves in the switch's favour over a longer run (22 %
+→ 17 % of windows over 50 ms); the two >100 ms windows on the on-arm are the
+burst the click produced, which the off-arm had inside its excluded opening
+heartbeats. Encode and capture equal within noise again. **The gate is met on
+all three hosts: `media_thread` flips to on for 0.4.70** (this PR), with
+`media_thread = false` per device as the way back; the fleet's
+`iter_ms_max` / `pump_stalls` in `agent_logs` after the roll is the check
+that the three short pairs did not mislead.
+
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
 thread while the current encoder keeps serving `Encode`, which is the whole
