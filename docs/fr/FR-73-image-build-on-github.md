@@ -121,12 +121,12 @@ projects. Nothing on the host is torn down by this FR.
 
 | Phase | What | PR | Kill switch | Status |
 |---|---|---|---|---|
-| P0 | This spec, the ledger row, the issue | | — | ✅ claim |
-| P1 | `.github/workflows/hosted-image.yml`: build on merge / dispatch, registry cache, smoke (`/health` = all six modules incl. `saas`, device route 401, SPA served), push `hosted-<date>-<sha7>` + `hosted`, attest, a summary with the measured build time | | `gh workflow disable hosted-image` | |
-| P1b | Dockerfile: `cargo chef` dependency layer + Rust stage copies only Rust sources; measured against P1's numbers (cold, warm-no-change, warm-Rust-change, warm-UI-only) | | revert the Dockerfile PR — the workflow is indifferent to the layering | |
+| P0 | This spec, the ledger row, the issue | [#1390](https://github.com/gjovanov/roomler-ai/pull/1390) | — | ✅ merged `5a9f357a1` |
+| P1 | `.github/workflows/hosted-image.yml`: build on merge / dispatch, registry cache, smoke (`/health` = all six modules incl. `saas`, device route 401, SPA served), push `hosted-<date>-<sha7>` + `hosted`, attest, a summary with the measured build time | [#1391](https://github.com/gjovanov/roomler-ai/pull/1391) | `gh workflow disable hosted-image` | ✅ merged `5ef003087` — its merge is the cold run |
+| P1b | Dockerfile: `cargo chef` dependency layer + Rust stage copies only Rust sources; base image matches the pinned toolchain; measured against P1's numbers (cold, warm-no-change, warm-Rust-change, warm-UI-only) | [#1392](https://github.com/gjovanov/roomler-ai/pull/1392) | revert the Dockerfile PR — the workflow is indifferent to the layering | dry-run validated on the branch (second attempt — see the field log) |
 | P2 | The cluster pulls from GHCR: deploy repo `newName: ghcr.io/gjovanov/roomler-ai`, `newTag: hosted-…`; one roll, field-verified from the fleet; per-node pull time recorded | deploy repo | revert `newName`/`newTag` — the build-host registry still holds the previous tag | |
-| P3 | `promote` dispatch: bump `newTag` in the deploy repo with `DEPLOY_REPO_TOKEN`; prints the bump when the secret is absent | | remove the secret | |
-| P4 | GHCR retention job; `CLAUDE.md` deploy section rewritten (Actions path first, build-host path as break-glass); `docs/self-hosting.md` on the `hosted-*` family; the e2e lane doc notes it can pin either registry | | — | |
+| P3 | `promote` dispatch: bump `newTag` in the deploy repo with `DEPLOY_REPO_TOKEN`; prints the bump when the secret is absent; refuses while `newName` is not GHCR | [#1393](https://github.com/gjovanov/roomler-ai/pull/1393) | remove the secret | |
+| P4 | GHCR retention job ([#1395](https://github.com/gjovanov/roomler-ai/pull/1395)); `CLAUDE.md` deploy section rewritten (Actions path first, build-host path as break-glass); `docs/self-hosting.md` on the `hosted-*` family; the e2e lane doc notes it can pin either registry | | — | |
 
 ## Acceptance criteria
 

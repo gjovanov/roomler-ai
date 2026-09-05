@@ -43,8 +43,15 @@ and `GET /health` on any of them lists the modules it actually mounts.
 
 Pick one by **tag** when you pull (`ROOMLER_IMAGE=ghcr.io/gjovanov/roomler-ai:<tag>-mesh`
 in `.env.selfhost`) or by **`ROOMLER_PROFILE`** when you build from source. No published
-image carries the hosted service's billing and newsletter module — that is what `roomler.ai`
+`v*` image carries the hosted service's billing and newsletter module — that is what `roomler.ai`
 runs, not what you run.
+
+> The same package also holds the **`hosted-<date>-<sha7>`** tags and the moving `hosted`
+> pointer: the image `roomler.ai` itself deploys, built from every merge to `master` by the
+> `hosted image` workflow (FR-73). It is the `full` composition **plus** the billing module,
+> holds no secret (everything is configuration), and is public because the source is — but it
+> is not a release: it is whatever `master` was an hour ago, with the Stripe webhook and the
+> newsletter routes mounted. Pull `latest` or a `v*` tag; leave `hosted-*` to the hosted service.
 
 > A profile does not reject configuration it does not use: a `mesh` image given MinIO
 > credentials simply never opens them. A web app built for `full` works against every
