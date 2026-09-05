@@ -1,0 +1,48 @@
+# Every commit's AUTHOR and COMMITTER email must appear in this list.
+#
+# ── Why an ALLOWLIST and not a denylist ────────────────────────────────────
+#
+# This repo is PUBLIC, and a commit identity is published permanently: the
+# email is in the object itself, it is in every clone, and GitHub renders it on
+# every commit page. An address from a corp mailbox therefore names an employer
+# beside a personal project, forever, and no amount of later editing removes it
+# from a fetch.
+#
+# A denylist cannot express that. It would have to enumerate the addresses
+# nobody wants published -- which means WRITING THEM DOWN IN A PUBLIC FILE,
+# publishing exactly what the guard exists to remove. It also only ever finds
+# the mistakes somebody already thought of. This is the same reasoning that
+# makes check_shapes.py shape-based rather than map-based, one layer over:
+#
+#   a denylist finds the identities you know about; an allowlist finds the class.
+#
+# So this file lists only identities that are ALREADY public -- the repo
+# owner's published commit address and GitHub's own web-flow committer -- and
+# anything else is refused without ever having to be named.
+#
+# ── Adding an entry ────────────────────────────────────────────────────────
+#
+# Unlike the machine-name allowlist (where an entry is always wrong), adding a
+# line here is legitimate: a new contributor, a bot that pushes commits, or the
+# owner enabling GitHub's private-email setting. It must be a DELIBERATE act,
+# in its own commit, by someone who has checked the address is one they are
+# content to publish.
+#
+# Matching is case-insensitive and exact -- whole address, no wildcards, no
+# domain patterns. A domain pattern is how this becomes useless: `*@gmail.com`
+# admits every address anyone ever mistypes, and the point is that an
+# unrecognised identity STOPS.
+
+# The repo owner's published commit address.
+goran.jovanov@gmail.com
+
+# GitHub's committer identity on anything merged or edited through the web UI
+# (`Goran Jovanov <owner-address>` authors it, `GitHub <noreply@github.com>`
+# commits it). Every squash-merge from the merge button lands this way.
+noreply@github.com
+
+# The owner's GitHub no-reply address. Listed BEFORE it is needed, on purpose:
+# it is what every commit switches to the moment "Keep my email address private"
+# is enabled in GitHub settings, and discovering that through a wall of refused
+# pushes is how a guard gets bypassed rather than understood.
+2255435+gjovanov@users.noreply.github.com

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Refuse a push that carries a commit identity this repo does not publish.
+#
+# The second half of the identity gate. `pre-commit` judges the identity the
+# NEXT commit would use; this judges what is actually about to leave the
+# machine -- which is the only one of the two that still holds after:
+#
+#   * `git commit --no-verify`
+#   * a commit made in a worktree or clone where core.hooksPath was never set
+#     (it is PER-CLONE config, so a fresh clone has no hooks until someone runs
+#     the line; measured 2026-09-04, the sibling guard was inert in ~53
+#     worktrees while working perfectly in the main clone)
+#   * a `git rebase`/`cherry-pick` that carried someone else's authorship in
+#   * a branch fetched from anywhere else
+#
+# ⚠️ It cannot see a merge made through the GitHub web UI -- that commit is
+# created on GitHub, from the commit email set on the ACCOUNT, and never passes
+# through any local hook. The repository ruleset is the layer for that one.
+#
+# Enable with:  git config core.hooksPath .githooks
+set -u
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+GUARD="$REPO/.githooks/check-identity.sh"
+[ -f "$GUARD" ] || exit 0          # tool absent (old checkout) -- do not block
+
+REMOTE_NAME="${1-origin}"
+ZERO='0000000000000000000000000000000000000000'
+
+rc_worst=0
+out_all=""
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  [ -n "${local_oid:-}" ] || continue
+  # A deletion pushes the zero oid: there are no commits to judge.
+  case "$local_oid" in ($ZERO|'') continue ;; esac
+
+  case "$remote_oid" in
+    ($ZERO)
+      # A branch the remote does not have yet. "Everything not already on the
+      # remote" is the honest range: the alternative, diffing against the
+      # default branch, silently exempts commits carried in from a side branch.
+      set -- "$local_oid" --not "--remotes=$REMOTE_NAME"
+      ;;
+    (*)
+      set -- "$remote_oid..$local_oid"
+      ;;
+  esac
+
+  out="$(bash "$GUARD" --commits "$@" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    out_all="$out_all$out
+"
+    [ "$rc" -gt "$rc_worst" ] && rc_worst=$rc
+  fi
+done
+
+if [ "$rc_worst" -eq 0 ]; then
+  exit 0
+fi
+
+printf '%s\n' "$out_all" >&2
+
+if [ "$rc_worst" -eq 1 ]; then
+  echo "PUSH REFUSED -- see above. (Amend the identity, or add the address" >&2
+  echo "to .githooks/allowed-identities.txt if it is one you mean to publish.)" >&2
+  exit 1
+fi
+
+# Could not RUN. Warn loudly and let the push through, for the reason recorded
+# at length in .githooks/pre-commit: blocking on a broken guard is how the
+# layer gets switched off permanently, and CI still refuses the merge. A guard
+# that says "foreign identity" when it means "I crashed" trains people to reach
+# for --no-verify.
+cat >&2 <<EOF
+
+------------------------------------------------------------------------
+WARNING: the commit-identity guard COULD NOT RUN (exit $rc_worst) -- push allowed.
+
+This is NOT a finding. Nothing was checked, so nothing was cleared either.
+The CI job still refuses the merge; fix the guard rather than living with it.
+------------------------------------------------------------------------
+EOF
+exit 0
