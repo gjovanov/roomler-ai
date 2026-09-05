@@ -513,7 +513,10 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       container cell (2026-09-05): the signed `roomlerd 0.4.65` enrolled, sent its hello,
       joined the overlay as `100.65.0.1` in userspace netstack mode and registered on the
       network module's `/derp` — the device listing and the overlay node list both showed it
-      online. Field log: "AC5, the daemon half". Still to see: the same across a real network.
+      online. Field log: "AC5, the daemon half". The same hop across a real network followed
+      the same day: the release daemon on the controller box enrolled, joined and registered
+      on `/derp` against the `mesh` server on the cluster's build host through a TLS front
+      (field log: "the daemon's own hop … the TLS cell").
 - [x] **AC6** Every `ClientMsg` variant has an owner in the namespace map, enforced by an
       exhaustive match and a locked test. — P5b #1332: `ClientMsg::namespace()` is exhaustive
       (a new variant does not compile until it names an owner), `CLIENT_MSG_OWNERS` is checked
@@ -524,8 +527,13 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       tiles, actions or navigation, the chat deep-link refused, the devices listing 200, zero
       console errors and zero failed `/api/` calls — after the three shell fixes it caught);
       the second half by construction (the spec skips itself where `chat` is mounted) and
-      confirmed by the next nightly. Field log: "AC7 on a local `mesh` stack". Still to see:
-      the same against a `mesh` server across a real network.
+      read on demand after the closing, because the nightly had stopped running: the whole
+      suite against the modular prod image gave 165 passed / 2 failed / 5 skipped in 4.5 min,
+      identical to the last nightly before the modular server (165 / 2 / 4) — the two failures
+      the expected `rc-vp9-444` pair, the extra skip the mesh spec skipping itself on `full`
+      (field log: "AC7's second reading"). Field log: "AC7 on a local `mesh` stack". The same
+      spec then passed against a `mesh` server across a real network (field log: "the detailed
+      post-deploy field test", §2 — `1 passed`).
 - [x] **AC8** Every phase's prod roll is field-verified from the fleet and recorded in the field
       log, wrong turns included. — The modular server's first prod roll:
       `v20260905-1c2753684ab9` of master `89ea3128` (every phase, P0–P9 and the device-listing
@@ -548,9 +556,14 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
 
 ## Open decisions
 
-- The fifth profile's name (working name `access`).
-- Whether the platform-admin stats pages belong to `saas` or stay in core (they read the core
-  metering sink; the question is only who mounts the routes).
+Both settled by what shipped:
+
+- The fifth profile's name — **`access`** (P8 made it `profile-access` in `crates/api/Cargo.toml`
+  and the publish workflow's `profile` input; the working name became the name).
+- Whether the platform-admin stats pages belong to `saas` or stay in core — **they stayed in
+  core**: the host mounts `/admin/stats` (`crates/api/src/lib.rs`) in every profile, and `saas`
+  mounts only the admin routes that are billing-shaped (`/admin/newsletter`,
+  `/admin/plan-compliance`). A self-host image therefore keeps its platform statistics.
 - Whether `remote` also owns the RC relay's cluster half (`ws/rc_cluster.rs` is today shared
   between the agent-nudge machinery, which is `fleet`, and session re-homing, which is `remote`).
 
@@ -1299,3 +1312,21 @@ The cell: the `mesh` image on the cluster's build host as above (bound to its ov
 | the server's view (read from this box) | the device listing: `tls-cell-node`, `os: linux`, `version: 0.4.65`, `status: online`, `overlay_ip: 100.65.0.1`, `magic_dns_name: tls-cell-node`; the overlay node list: online, `will_rejoin: true` |
 
 **Verdict: the `mesh` profile takes an enrollment, a control socket, an overlay join and a DERP registration from an unmodified release daemon on another machine, over TLS, across the WireGuard overlay.** With this, every refinement the closing summary named except the single-relay overlay pair has been seen on the deployed build; that one needs a network that blocks UDP but reaches TURN, and none of today's fleet is on one. Both cells (the build host's and this box's, including the throwaway CA key) were torn down afterwards.
+
+### 2026-09-05 — AC7's second reading: the whole e2e suite against the modular prod image
+
+AC7's second half ("against `full` the e2e nightly is unchanged") was still a claim by construction when #1307 closed: no nightly had yet run against a modular image. Reading it on demand (`scripts/e2e-run.sh v20260905-1c2753684ab9` from the cluster's build host) turned up two defects in the lane before it produced a number — both filed as #1385, neither in the product:
+
+- **The nightly is not running.** The build host's user crontab holds no roomler line any more (the e2e nightly, the registry-retention GC and the mediasoup RTC-forwarding audit are all absent); the last nightly log is 2026-09-04 01:30 UTC. The crontab was rewritten on 2026-09-04 13:48 UTC by another project's backup-cron install, and the `crontab -l` capture it kept from two minutes earlier was already empty — the roomler lines were gone before that install ran, and who removed them is not visible from the host. Restoring them is the operator's call, not this program's.
+- **The runner would have failed anyway.** The first run returned 146 failed / 21 passed in 45 s with one error for all 146: the `pwrunner` sidecar image pins Playwright v1.62.0's browsers, while the runner's `npm i` resolves `"@playwright/test": "^1.62.0"` from the registry at run time (`ui/package-lock.json` is a fossil pinning 1.58.2, so npm ignores it; the real lock is `bun.lock`, which npm does not read) — and Playwright 1.63.0 had just shipped. A product regression does not fail 146 browser specs faster than a page load. Ephemeral repair: `npx playwright install chromium` inside the sidecar (it lives as long as the pod), then the suite again with the stack still pinned.
+
+The reading — specs at master `b3ce69b1`, stack on `v20260905-1c2753684ab9`:
+
+| | last nightly before the modular server (2026-09-04, `v20260904-97ac185eecf0`) | on demand against the modular server (2026-09-05) |
+|---|---|---|
+| passed | 165 | 165 |
+| failed | 2 — both `rc-vp9-444` (needs an agent on the feature lane; in `e2e-expected-failures.txt`) | 2 — the same two |
+| skipped | 4 | 5 — the extra one is `mesh-profile.spec.ts`, which skips itself where `chat` is mounted, by design |
+| duration | 4.6 min | 4.5 min |
+
+**Unchanged.** AC7's second half is read, not inferred. With this, the issue body's ten boxes were ticked (they had stayed unticked at the closing while the spec carried the ticks) and its two open decisions closed out with what shipped.
