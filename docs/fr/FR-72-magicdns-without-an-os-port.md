@@ -46,6 +46,40 @@ unavailable, and the honest `resolver DOWN` in `roomler status` is the only
 thing that makes it visible at all. This FR is about removing the dependency
 that makes step 2 fatal.
 
+## ⚠️⚠️ There is a SECOND blocker, and P1 alone does not clear it
+
+Measured on the same host later the same day, after a restart that **won** the
+`:53` race:
+
+```
+Get-NetUDPEndpoint -LocalPort 53   ->  100.65.4.30   <- us; the bind SUCCEEDED
+                                       0.0.0.0
+
+Get-DnsClientNrptRule              ->  OK count=1  .grox.roomler.ai -> 100.65.4.30
+Get-DnsClientNrptPolicy -Effective ->  OK count=0
+
+Resolve-DnsName <peer>.<suffix>    ->  NO ANSWER
+```
+
+Both queries were run **without** `-ErrorAction SilentlyContinue`, so `count=0`
+is a genuinely empty table rather than a swallowed error.
+
+So even with the bind succeeding and the NRPT rule **written and stored**, the
+effective table is empty and the OS still does not send us the queries. It is
+not the GPO-override theory either — the unfiltered policy is also `0` and there
+is no GPO NRPT key. Why the rule is not applied is **not yet established**.
+
+🔑 **Consequence for this FR's scope, stated plainly: P1–P3 fix the bind, and on
+this host that is necessary but NOT sufficient.** Interception removes the
+dependency on owning an OS port; it does nothing about an NRPT rule that fails
+to take effect. A phase for the steer half is therefore part of the goal, not an
+afterthought, and the acceptance criteria are written against *resolution
+working*, not against *the resolver binding*.
+
+⚠️ The failure is also **intermittent** — the same host reported `resolver DOWN`
+and `active` hours apart, decided by who wins the `:53` race at daemon start. Any
+verification must state which of the two states it measured.
+
 ## ⚠️ The obvious fix does not work, and this was measured
 
 The operator's instinct was *"use another port, just like roomler SSH"*. Serving
@@ -100,7 +134,8 @@ a squatter on `0.0.0.0:53` becomes irrelevant.
 | P1 | A UDP arm in `SplitTun` (`dst == self_ip && proto == UDP && dport == 53`), serving the existing resolver over an `NsUdpSocket` | `overlay_dns_intercept`, default **OFF** |
 | P2 | The steer gate reads *"the resolver is reachable"* rather than *"the OS bind succeeded"*, so NRPT is installed when P1 is serving | inherits P1's switch |
 | P3 | DNS over **TCP** `:53` for truncated answers — reuses SplitTun's existing TCP arm rather than adding one | inherits P1's switch |
-| P4 | Field-verify on the affected host; only then consider the default | the switch itself |
+| P4 | **The steer half** — establish why a written NRPT rule is not in the effective table on the affected host, and make the guard **verify its own write** (`Get-DnsClientNrptPolicy -Effective`) rather than assume it. Without this, P1–P3 leave the OS still not sending us the queries | reporting-only first (#1363) |
+| P5 | Field-verify on the affected host, in **both** `:53`-race outcomes; only then consider the default | the switch itself |
 
 ## Acceptance criteria
 
@@ -149,7 +184,9 @@ a squatter on `0.0.0.0:53` becomes irrelevant.
 
 | date | build | host | result |
 |---|---|---|---|
-| 2026-09-05 | 0.4.66 | the affected corp laptop | Baseline: `resolver DOWN`; `Resolve-DnsName` and `ping <name>` both fail; `0.0.0.0:53` held by svchost; bind refused `AddressAlreadyInUse` with and without `SO_REUSEADDR`; NRPT drops `ip:port` silently |
+| 2026-09-05 | 0.4.66 | the affected corp laptop | Baseline, **bind-lost arm**: `resolver DOWN`; `Resolve-DnsName` and `ping <name>` both fail; `0.0.0.0:53` held by svchost; bind refused `AddressAlreadyInUse` with and without `SO_REUSEADDR`; NRPT drops `ip:port` silently |
+| 2026-09-05 | 0.4.66 | same host, later | **bind-won arm**: we hold `100.65.4.30:53`, status says `active`, the NRPT rule is stored (`count=1`) — and the **effective table is empty** (`count=0`, no error), so `Resolve-DnsName` still returns nothing. Second blocker; see #1363 |
+| — | — | fleet sweep | Every other host (2 Linux servers, a macOS/Asahi relay, two Windows laptops, this dev box) reports `active`, and the one checked resolves correctly — the failure is specific to the corp-managed host, not to the feature |
 
 ## Related
 
