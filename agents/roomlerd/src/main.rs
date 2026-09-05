@@ -595,6 +595,13 @@ enum Command {
         /// runs from the install dir itself.
         #[arg(long)]
         origin_exe: Option<PathBuf>,
+        /// The install already finished before this watcher started, so
+        /// there is nothing to wait for. Set by the Linux arms, whose
+        /// installs complete synchronously — the pid handed over is the
+        /// daemon's own or a corpse, and waiting on it means waiting for
+        /// the very event that kills this process. FR-67 (#1267).
+        #[arg(long)]
+        installer_already_exited: bool,
     },
 }
 
@@ -1294,9 +1301,16 @@ async fn daemon_main() -> Result<()> {
             installer_path,
             expected_version,
             origin_exe,
+            installer_already_exited,
         } => {
-            post_install_watch_cmd(installer_pid, installer_path, expected_version, origin_exe)
-                .await
+            post_install_watch_cmd(
+                installer_pid,
+                installer_path,
+                expected_version,
+                origin_exe,
+                installer_already_exited,
+            )
+            .await
         }
     };
 
@@ -1589,18 +1603,26 @@ async fn post_install_watch_cmd(
     installer_path: PathBuf,
     expected_version: String,
     origin_exe: Option<PathBuf>,
+    already_exited: bool,
 ) -> Result<()> {
     tracing::info!(
         installer_pid,
         path = %installer_path.display(),
         expected = %expected_version,
         origin = ?origin_exe,
+        already_exited,
         "post-install watcher started"
     );
     // `watch` is blocking — spin a blocking task so we don't hold
     // the tokio runtime busy-waiting on a sync OS sleep loop.
     let outcome = tokio::task::spawn_blocking(move || {
-        post_install::watch(installer_pid, installer_path, expected_version, origin_exe)
+        post_install::watch(
+            installer_pid,
+            installer_path,
+            expected_version,
+            origin_exe,
+            already_exited,
+        )
     })
     .await
     .context("post-install watcher join")??;
