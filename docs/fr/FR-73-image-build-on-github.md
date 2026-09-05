@@ -130,30 +130,53 @@ projects. Nothing on the host is torn down by this FR.
 | P1b | Dockerfile: `cargo chef` dependency layer + Rust stage copies only Rust sources; base image matches the pinned toolchain; measured against P1's numbers (cold, warm-no-change, warm-Rust-change, warm-UI-only) | [#1392](https://github.com/gjovanov/roomler-ai/pull/1392) | revert the Dockerfile PR — the workflow is indifferent to the layering | dry-run validated on the branch (second attempt — see the field log) |
 | P2 | The cluster pulls from GHCR: deploy repo `newName: ghcr.io/gjovanov/roomler-ai`, `newTag: hosted-…`; one roll, field-verified from the fleet; per-node pull time recorded | deploy repo `2efae23` | revert `newName`/`newTag` — the build-host registry still holds the previous tag | ✅ **rolled 2026-09-05 20:07Z**, field-verified (field log): pulls 3.3 s / 2.7 s per node, push → both pods 20 s |
 | P3 | `promote` dispatch: bump `newTag` in the deploy repo with `DEPLOY_REPO_TOKEN`; prints the bump when the secret is absent; refuses while `newName` is not GHCR | [#1393](https://github.com/gjovanov/roomler-ai/pull/1393) | remove the secret | |
-| P4 | GHCR retention job ([#1395](https://github.com/gjovanov/roomler-ai/pull/1395)); `CLAUDE.md` deploy section rewritten (Actions path first, build-host path as break-glass); `docs/self-hosting.md` on the `hosted-*` family; the e2e lane doc notes it can pin either registry | | — | |
+| P4 | GHCR retention job ([#1395](https://github.com/gjovanov/roomler-ai/pull/1395), fixed by [#1399](https://github.com/gjovanov/roomler-ai/pull/1399) after the first dry run: GHCR stores attestations UNTAGGED, so only BuildKit cache manifests may be deleted); `CLAUDE.md` deploy section rewritten (Actions path first, build-host path as break-glass, [#1398](https://github.com/gjovanov/roomler-ai/pull/1398)); `docs/self-hosting.md` on the `hosted-*` family ([#1396](https://github.com/gjovanov/roomler-ai/pull/1396)); **docs with diagrams**: the pipeline section of `docs/deployment.md` (the rule of CLAUDE.md § FR workflow step 5) | | — | ✅ retention merged + dry-run-verified; docs merged |
 
 ## Acceptance criteria
 
-- [ ] **AC1** A merge to `master` touching the server or the SPA produces
+- [x] **AC1** A merge to `master` touching the server or the SPA produces
       `ghcr.io/gjovanov/roomler-ai:hosted-<date>-<sha7>` with no human step; the smoke inside the
       workflow asserts `/health` mounts `chat conference fleet network remote saas`, the device
-      route answers 401, and `/` serves the SPA — before the push.
+      route answers 401, and `/` serves the SPA — before the push. — The merge of #1391 produced
+      `hosted-20260905-5ef0030` (run 33988344500): smoke healthy in ~20 s, modules asserted, device
+      route 401, `/` 200, then the push. Every later merge touching the paths has built (a burst is
+      cancelled down to the newest commit by the concurrency group — run 33989978860 was cancelled by
+      the P1b merge, by design).
 - [ ] **AC2** Build time on Actions recorded for four cases — cold; warm with no source change;
       warm after a Rust change; warm after a UI-only change — before and after P1b. Targets after
       P1b: Rust change ≤ 12 min, UI-only ≤ 4 min (the estimate this FR was opened against).
-- [ ] **AC3** Both prod pods run a `hosted-*` image pulled from GHCR; the per-node pull time is
+- [x] **AC3** Both prod pods run a `hosted-*` image pulled from GHCR; the per-node pull time is
       read from the pod events and recorded; the roll is field-verified from the fleet exactly as
       every roll (online-agent count unchanged, an RC session, an overlay pair, a tunnel forward).
+      — P2, 2026-09-05 20:07Z: pulls 3.3 s / 2.7 s per node, 20 s push → both pods, fleet checks in
+      the field log.
 - [ ] **AC4** A `promote` dispatch bumps the deploy repo and ArgoCD rolls; elapsed merge → pods on
       the new image recorded against the 10–15 min estimate.
-- [ ] **AC5** `latest` on GHCR still resolves to the self-host `full` image after the hosted lane
-      has run; the hosted lane has no code path that writes it.
-- [ ] **AC6** The hosted image carries a provenance attestation and
-      `org.opencontainers.image.revision` equal to the commit it was built from.
-- [ ] **AC7** Retention: `hosted-*` tags are pruned automatically to the newest N; `latest`, `v*`,
-      `*-<profile>` and `buildcache-*` are never touched (asserted in the job).
-- [ ] **AC8** The break-glass path is documented and was exercised once after the switch (a
-      build-host build pushed to the old registry, not deployed).
+- [x] **AC5** `latest` on GHCR still resolves to the self-host `full` image after the hosted lane
+      has run; the hosted lane has no code path that writes it. — After the first hosted push,
+      `latest`'s digest (`e19b3c72…`) differs from `hosted`'s (`386a25b8…`); the workflow tags only
+      the dated tag and `hosted`.
+- [x] **AC6** The hosted image carries a provenance attestation and
+      `org.opencontainers.image.revision` equal to the commit it was built from. — The workflow
+      asserts the label before the smoke (`revision=5ef0030875e1…` on the first run) and attests
+      after the push; the attestation is on GHCR as the untagged manifest behind the
+      `sha256-f0628ac8…` index (which is why AC7's job had to learn not to delete untagged versions).
+- [x] **AC7** Retention: `hosted-*` tags are pruned automatically to the newest N; `latest`, `v*`,
+      `*-<profile>` and `buildcache-*` are never touched (asserted in the job). — `ghcr-retention.yml`
+      (#1395); its first dry run (33989558475) listed 12 versions, 0 `hosted-*` beyond the newest 20,
+      and 3 untagged — one of them the hosted image's provenance, because GHCR stores attestations
+      untagged behind a `sha256-<subject>` index. #1399 narrows the untagged prune to BuildKit cache
+      manifests (each candidate's manifest is read back by digest); the protected-tag assertion is
+      unchanged. Scheduled Mondays 05:00 UTC.
+- [x] **AC8** The break-glass path is documented and was exercised once after the switch (a
+      build-host build pushed to the old registry, not deployed). — 2026-09-05 20:20–20:30Z: master
+      `70a279d` built on the build host in 9 min 38 s (warm), pushed to the build host's registry in
+      9 s (digest acknowledged in the push log), tag `bg-20260905-70a279d`, not deployed; the local
+      tag removed. `CLAUDE.md` keeps the recipe under "Break-glass" with the `newName` rule.
+- [ ] **AC9** Docs updated or created with diagrams, linked from `docs/README.md` (the rule of
+      `CLAUDE.md` § FR workflow step 5). — the pipeline section of `docs/deployment.md` (flowchart:
+      merge → build/smoke/push → GHCR → promote → deploy repo → ArgoCD → cluster → fleet
+      verification), the image section's three-layer build, `docs/README.md`'s row.
 
 ## Open decisions
 
