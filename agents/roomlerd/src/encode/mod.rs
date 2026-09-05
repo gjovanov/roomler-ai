@@ -492,6 +492,17 @@ pub fn transit_classify_enabled() -> bool {
     tunnel_core::env::flag("TRANSIT_CLASSIFY", true)
 }
 
+/// FR-71 T1b — ACT on a `transit-stalled` window: the opener's ramp neither
+/// steps nor ends, the FR-15 age loop does not fire, the FR-59 P3 clamp is
+/// held rather than re-armed, and the prior takes no push-back. The FR-59 P4
+/// drain still runs (a pause is a drain, not a cut). Default **off** for one
+/// release — a controller change ships behind the shadow's evidence (FR-63's
+/// rule). Needs `transit_classify`. Env `ROOMLERD_TRANSIT_HOLD` / config
+/// `transit_hold`.
+pub fn transit_hold_enabled() -> bool {
+    tunnel_core::env::flag("TRANSIT_HOLD", false)
+}
+
 /// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase
 /// breakdown. `ROOMLERD_PUMP_STALL_WARN_MS`.
 ///

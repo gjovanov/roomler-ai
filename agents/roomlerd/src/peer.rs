@@ -4194,6 +4194,7 @@ async fn media_pump_vp9_444_dc(
                 // here while `target_bps` shows the cut T1b will remove.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
+                transit_holds = governor.transit_holds(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
                 // FR-70 P1 — what stands in for a pipe measurement while
@@ -7163,6 +7164,7 @@ async fn media_pump_ffmpeg_dc(
                 // here while `target_bps` shows the cut T1b will remove.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
+                transit_holds = governor.transit_holds(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
                 // minimum. None = the flat floor stands, which on a slow
