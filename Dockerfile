@@ -60,8 +60,26 @@ COPY crates/vendored crates/vendored
 # packages: `derp-relay` has no features, so `--no-default-features` is
 # inert for it, and `roomler-ai-api/profile-…` names exactly the one crate
 # that composes the modules.
-RUN cargo chef cook --release --recipe-path recipe.json -p roomler-ai-api -p derp-relay --no-default-features \
+#
+# `cook --no-build` writes the skeleton (every workspace member reduced to
+# its manifest + an empty source file) and stops. The build is then ours,
+# because ONE member has to be real while the dependencies compile: the
+# vendored `webrtc-ice` patch (a real crate, not a skeleton) depends on
+# `crates/tcp-turn-conn`, and against the skeleton it fails with
+# "cannot find `TcpTurnConn` in `tcp_turn_conn`" (the second dry run). So
+# that member is overlaid with its real sources before the dependency build.
+# Afterwards every member's artefacts are removed, which is what `cook`
+# itself does after building: the real sources arrive by COPY with the
+# build context's OLDER mtimes, and cargo would otherwise keep the skeleton's
+# empty artefacts as "fresh" — a server whose main() is `{}`.
+RUN cargo chef cook --no-build --release --recipe-path recipe.json -p roomler-ai-api -p derp-relay --no-default-features \
       --features "roomler-ai-api/profile-${PROFILE}$( [ "$SAAS" = "1" ] && printf ',roomler-ai-api/saas' )"
+COPY crates/tcp-turn-conn crates/tcp-turn-conn
+RUN cargo build --release -p roomler-ai-api -p derp-relay --no-default-features \
+      --features "roomler-ai-api/profile-${PROFILE}$( [ "$SAAS" = "1" ] && printf ',roomler-ai-api/saas' )" \
+ && cargo metadata --no-deps --format-version 1 \
+      | python3 -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"]))' \
+      | xargs -n1 cargo clean --release -p
 # Only what the server build reads: the manifests, the crates, the agents
 # (workspace members — their manifests must exist for the workspace to
 # resolve, and nothing in them is compiled for these two packages) and the
