@@ -510,11 +510,12 @@ pub fn transit_hold_enabled() -> bool {
 /// (`rc-enc-<session>`) behind a command channel, instead of encoding under
 /// `block_in_place` on whichever runtime worker polls the pump. Every
 /// decision the pump makes is unchanged; a method call becomes a message.
-/// Default **off** for one release: the gate is FR-65's counters on the three
-/// CORPLAP hosts, unchanged or better. Env `ROOMLERD_MEDIA_THREAD` / config
-/// `media_thread`.
+/// Default **on** since 0.4.70: M1c met its gate on all three CORPLAP hosts on
+/// 0.4.69 (encode and capture averages unchanged, the worst pass per window down
+/// on every host); `media_thread = false` per device restores the inline path.
+/// Env `ROOMLERD_MEDIA_THREAD` / config `media_thread`.
 pub fn media_thread_enabled() -> bool {
-    tunnel_core::env::flag("MEDIA_THREAD", false)
+    tunnel_core::env::flag("MEDIA_THREAD", true)
 }
 
 /// FR-65 P0 — an iteration slower than this (ms) is logged once, with its phase
