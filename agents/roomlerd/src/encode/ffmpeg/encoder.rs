@@ -1587,6 +1587,12 @@ impl RebuiltEncoder {
     pub fn maxrate_bps(&self) -> usize {
         self.spec.maxrate_bps
     }
+
+    /// FR-70 M2 — the dims this replacement was opened at, so the pump can
+    /// tell a dims swap from a stale rate swap before adopting.
+    pub fn dims(&self) -> (u32, u32) {
+        (self.spec.width, self.spec.height)
+    }
 }
 
 impl FfmpegEncoder {
@@ -1650,6 +1656,22 @@ impl FfmpegEncoder {
         })
     }
 
+    /// FR-70 M2 — the spec for a replacement at NEW dims: the same backend,
+    /// fps, cq and chroma, the rate coarsened as `rebuild_spec` does. Never
+    /// `None` — a dims change always needs a fresh encoder.
+    pub(crate) fn rebuild_spec_at_dims(&self, width: u32, height: u32, bps: u32) -> RebuildSpec {
+        RebuildSpec {
+            name: self.encoder_name,
+            width,
+            height,
+            fps: self.fps,
+            maxrate_bps: crate::encode::aimd::coarsen_bitrate(bps) as usize,
+            cq: self.cq,
+            chroma444: self.chroma444,
+            constrained: self.constrained,
+        }
+    }
+
     /// P3 — BLOCKING open of the replacement encoder; run on
     /// `spawn_blocking`, never on the pump task. Mirrors the sync
     /// `set_bitrate` rebuild arm, including the P4 vp9_qsv
@@ -1682,14 +1704,18 @@ impl FfmpegEncoder {
     /// across the swap).
     pub(crate) fn adopt_rebuilt(&mut self, rebuilt: RebuiltEncoder) -> bool {
         let spec = rebuilt.spec;
-        if spec.width != self.width
-            || spec.height != self.height
-            || spec.name != self.encoder_name
-            || spec.chroma444 != self.chroma444
-        {
+        // FR-70 M2 — a replacement at other dims is adopted too: that is the
+        // dims make-before-break. The pump guards the one case this used to
+        // refuse (a rate swap opened for dims the session has since left) by
+        // comparing `RebuiltEncoder::dims` with what it expects before
+        // calling this. Backend and chroma still must match: the packets'
+        // codec cannot change under a live decoder.
+        if spec.name != self.encoder_name || spec.chroma444 != self.chroma444 {
             return false;
         }
         self.encoder = rebuilt.inner;
+        self.width = spec.width;
+        self.height = spec.height;
         self.maxrate_bps = spec.maxrate_bps;
         self.frame_count = 0;
         self.force_keyframe = true;
