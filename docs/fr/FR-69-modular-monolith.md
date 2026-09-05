@@ -1,6 +1,7 @@
 # FR-69: Modular monolith — pillar modules behind `roomler-core`, composed per build profile
 
-**Status**: P0 – P9 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 · #1323 ·
+**Status**: **CLOSED 2026-09-05** (#1307 — every acceptance criterion ticked; the first prod roll
+field-verified; reopens on evidence) · P0 – P9 shipped (#1309 · #1311 · #1312 · #1315 · #1317 · #1318 · #1320 · #1323 ·
 #1325 · #1329 · #1332 · #1336 · #1337 · #1339 · #1340 · #1347 · #1348 · #1351) — **every
 pillar is a module, the five profiles build and are checked for what they leave out, the SPA
 gates on what the server mounts** · the device-listing composition fix shipped (#1352, proven
