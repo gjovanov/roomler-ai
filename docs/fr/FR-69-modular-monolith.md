@@ -7,10 +7,12 @@ gates on what the server mounts** · the device-listing composition fix shipped 
 on both profile arms #1354) · **AC7 verified on a local `mesh` stack** (`ui/e2e/mesh-profile.spec.ts`; the same PR
 stopped the shell calling modules the server does not mount) · **AC5 verified in a local
 container cell** (the signed release daemon enrolled and joined the `mesh` image's overlay) ·
-AC4 measured · every phase's field gate (a
-prod roll watched from the fleet: no dip in online agents; for P6 one RC session per carrier
-class; for P7 the overlay/tunnel sweep; for P8 the `mesh` image's daemon cell and the
-build-time measurement; for P9 the full UI against a `mesh` server) is still to be run ·
+AC4 measured · **the first prod roll field-verified 2026-09-05** (`v20260905-1c2753684ab9` of
+master `89ea3128`: no dip in online agents, fleet RPC, RC sessions on two carrier classes,
+overlay pairs on LAN / srflx / DERP, tunnels, the SSH dispatch, the device listing, every
+pillar of the SPA) · **still to see across a real network**: a `mesh` server reached by a
+daemon and a browser from another machine, a single-relay overlay pair and a relay-class RC
+session ·
 **Owner**: server / architecture ·
 **Issue**: [#1307](https://github.com/gjovanov/roomler-ai/issues/1307) ·
 **PRs**: P0 claim [#1309](https://github.com/gjovanov/roomler-ai/pull/1309) · P0 rename
@@ -522,8 +524,15 @@ is the smallest and exercises the whole contract (`unlimited_routes` for the Str
       the second half by construction (the spec skips itself where `chat` is mounted) and
       confirmed by the next nightly. Field log: "AC7 on a local `mesh` stack". Still to see:
       the same against a `mesh` server across a real network.
-- [ ] **AC8** Every phase's prod roll is field-verified from the fleet and recorded in the field
-      log, wrong turns included.
+- [x] **AC8** Every phase's prod roll is field-verified from the fleet and recorded in the field
+      log, wrong turns included. — The modular server's first prod roll:
+      `v20260905-1c2753684ab9` of master `89ea3128` (every phase, P0–P9 and the device-listing
+      fix, in one image), deployed 2026-09-05 08:49 UTC, both pods with all six modules mounted
+      and zero errors; verified 09:00–09:20 UTC from the fleet — no dip in online agents, fleet
+      RPC and its audit, six RC sessions on two carrier classes, overlay pairs on LAN / srflx /
+      DERP with bytes through DERP, three tunnel forwards connecting through the new pods, the
+      SSH dispatch refusing with its enumerated reason, the device listing and every pillar of
+      the SPA on prod. Field log: "the first prod roll". Wrong turns recorded there.
 - [x] **AC9** No wire, socket URL, collection or index changed: the baseline proves the last two
       and the wire names, the fixed `/ws` and `/derp` paths the second. — `/ws` stays the
       host's (`crates/api/src/lib.rs`), `/derp` is mounted by the network module's
@@ -1230,3 +1239,26 @@ The cell: the `mesh` image built from master `89ea3128` through the self-host co
 Three things this proves at once: the `mesh` image (fleet + network, nothing else) takes an enrollment, a control socket and an overlay join from an unmodified release daemon; **`/derp` mounted by the network module's `UpgradeSpec` (P7b) serves a real daemon** — the log target is `roomler_ai_mod_network::derp`; and the device listing back in the host (#1352) reads the network module's overlay rows for that agent.
 
 Not covered: a second node and traffic between them (one node is what AC5 asks: enrol + join), and the same against a `mesh` server across a real network. The cell was torn down afterwards (`down -v`, the daemon container and its image removed).
+
+### 2026-09-05 — the first prod roll, field-verified
+
+
+**The roll.** Deployed 2026-09-05 08:49 UTC via `deploy-api.sh` from origin/master `89ea3128` (the last code commit of FR-69 — #1354/#1356 after it are docs only), by the FR-70 session's web deploy; both `roomler2` pods Ready at 08:49:35 / 08:49:52 UTC, `0` restarts, `RollingUpdate maxSurge 0 / maxUnavailable 1`. Nothing needed rebuilding for FR-69 — the image already carried everything, so this is the verification, taken 09:00–09:20 UTC.
+
+**Composition, both pods.** Each pod's log: `module mounted` × 6 (`saas`, `chat`, `conference`, `fleet`, `remote`, `network`) at boot; `/health` and `/api/capabilities` on both pods (the LB hashes — several hits): `modules` = `compiled` = the six, `switched_off: []`. **Zero `ERROR` / `panicked` lines on either pod in the 25 min after boot.**
+
+| Gate | Reading | Verdict |
+|---|---|---|
+| no dip in online agents | `agents`: 31 enrolled, **20 seen in the last 10 min**, 19 `status: online`, **0 online-but-stale**; the pod this browser hashed to: `agents_online 14`, `pods_alive 2`, cluster bus alive; version mix 0.4.65 ×18 · 0.4.66 ×2 · 0.4.63 ×4 (+ 7 long-offline legacy rows) | ✓ |
+| P5 fleet RPC | `roomler exec` `hostname` round-trips to mars, jupiter, zeus through the new pods; **65 `exec_audit` rows since the roll** (the FR-70 session's field test + these) | ✓ |
+| P6 remote control | **5 RC sessions served since the roll** (CORPLAP-1, LAN class, 08:55–09:02 UTC, `peak_fps` 15–16, clean `controller_hangup` ends) — the FR-70 session's field test on this deploy; **and one I drove myself at 09:13 UTC: MacBook-1 (macOS 0.4.65), WAN-direct class — the viewer chips read `connected · H.265 4:2:0 HW (hevc_videotoolbox) · direct · dec HW · 10.4 Mbps · 30 fps · 3024×1964 · ~8 ms`, ended by DISCONNECT (server row: 09:13:30 → 09:14:14 UTC, `controller_hangup`, `peak_fps 30`; the agent-side heartbeat read over `roomler exec` came back empty on the Mac, so the viewer chips and the row are the reading)** | ✓ (LAN + WAN-direct classes) |
+| P7 overlay — a pair on each carrier class | from this box's `roomler peers`: **LAN** CORPLAP-2 5 ms · CORPLAP-1 4 ms · CORPLAP-3 3 ms; **srflx/direct WAN** mars 39 ms · jupiter 40 ms · zeus 41 ms · Apple-Asahi 33 ms · MacBook-1-Daemon 48 ms; **DERP floor** NEO16-WSL-2 on `relay:derp/tcp`; the secondary org's four peers direct; the offline rows are long-offline desktops | ✓ (LAN, srflx, DERP; no pair is on the single-relay TURN tier right now) |
+| P7 — a DERP-floor host reaching a peer | the pod's `derp_bytes_relayed_total: 992 479` since boot, `derp_registrations 13` on that pod; (the pod-log census lines are below INFO on prod, so the gauge is the reading) | ✓ |
+| P7 — a tunnel opened | the seven declared routes on this box all `active` after the roll; **three TCP forwards connect and hold through the new pods** (a database forward and two RDP forwards into corporate networks — curl exit 28 = connected, idle); the pod reports `tunnel_sessions 21`. The two SOCKS routes refuse a remote-DNS `CONNECT` to a public site (`general SOCKS failure` within 45 ms) — the corp hosts' egress, not the pods, and the same as before the roll | ✓ |
+| P7 — an SSH session | `roomler ssh mars` → `this device does not accept SSH sessions (its policy is off)` — the enumerated refusal from the moved dispatch (`network`); no fleet device has an SSH policy, so a session cannot be opened without first enabling one (unchanged by the roll) | ✓ (dispatch) / not configured |
+| P7b device listing on prod | the Devices page lists **21 devices** with Overlay (v4 + ULA v6 + key epoch), MagicDNS and Tags columns and the Devices / Tunnels / Both filter — the listing that returned to the host in #1352, reading the network module's overlay rows | ✓ |
+| P8/P9 SPA against prod | every pillar renders: Dashboard, Devices (with the live device list), Network, Rooms, Files, Invites, Analytics, Observability, Settings; the remote view, the devices grid and the dashboard load with no gating regression; `mesh-profile.spec.ts` skips (prod mounts `chat`) | ✓ |
+
+**Wrong turns, recorded.** (1) `exec_audit` read as **0 since the roll** on the first query — the field is `at`, not `created_at`; the same query by `_id` time says 65. A zero makes you conclude; cross-check. (2) `overlay_nodes` "online" is not a stored field (the listing computes it), so `countDocuments({online:true})` = 0 means nothing; `last_seen_at` within 15 min = 18 of 27. (3) The SOCKS routes' 45 ms refusals looked like dead flows until the TCP forwards on the same flows connected.
+
+**Still open after this**: AC5 and AC7 against a `mesh` server across a real network (both verified on loopback cells); a single-relay (TURN) overlay pair and a relay-class RC session were not observable on today's fleet.

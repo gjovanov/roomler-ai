@@ -269,7 +269,7 @@ scripts/
   dev-xvfb.sh       → Run the agent's capture path against a virtual X framebuffer (headless smoke test)
 ```
 
-### Modular monolith — the FR-69 program (P0–P9 shipped 2026-09-04; the field gates remain)
+### Modular monolith — the FR-69 program (P0–P9 shipped 2026-09-04; first prod roll field-verified 2026-09-05)
 
 The server is decoupled into **`roomler-core` + six module crates** (`fleet`, `chat`, `conference`, `remote`, `network`, `saas`) behind ONE `Module` contract (`crates/core/src/module.rs`), statically composed under Cargo features into five profiles (`full` / `collab` / `remote` / `mesh` / `access`; `saas` is an add-on the self-host images never carry) and discovered at runtime via `GET /api/capabilities`. Spec with every decision's pros/cons: `docs/fr/FR-69-modular-monolith.md` (#1307). Rules while it is in flight:
 
