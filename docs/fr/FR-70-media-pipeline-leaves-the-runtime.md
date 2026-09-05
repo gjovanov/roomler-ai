@@ -74,7 +74,7 @@ overridden.
 
 `M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff
 → `M4` one controller (FR-63 B1/B2) → `M5` the deletions (FR-62 A4 + FR-63 B3) ·
-`T1` transport classification · `P1` priors decay + visible overrides.
+~~`T1` transport classification~~ (→ **FR-71 #1362**, 2026-09-05) · `P1` priors decay + visible overrides.
 
 ⚠️ **P1 first in value**: it is what the operator can see today and needs no
 threading work. **P1 landed 2026-09-04 in #1333** (kill switch `rate_prior_decay`) — see
@@ -114,10 +114,12 @@ HUD does not render the two new `HopWindow`s yet.
 - [ ] **AC3** — no rate or geometry decision remains in the media loop.
 - [ ] **AC4** — heuristics 34 → ≤ 10, kill switches 11 → ≤ 4, estimators 8 → 1,
       each retirement gated on a counter measured fleet-zero.
-- [ ] **AC5** — a transit stall is classified as such and does **not** cut the
-      rate; a repeat of finding 4 is attributable without reading source.
-      *The attribution half is instrumented (M0's `age_split`, 2026-09-04);
-      the "does not cut the rate" half is T1 and untouched.*
+- [x] **AC5 (attribution half)** — a repeat of finding 4 is attributable
+      without reading source. **Met by M0's `age_split`, field-verified
+      2026-09-05.**
+- [ ] ~~**AC5 (response half)** — a transit stall does not cut the rate~~ —
+      **moved to FR-71 (#1362) on 2026-09-05**, per the open question below;
+      it closes there.
 - [x] **AC6 (rate half)** — an unmeasured prior cannot hold a session at the
       floor. **Field-verified 2026-09-04 on 0.4.64** on the pair that failed:
       the prior decayed to `None` at 106 s and the target reached 3.9 Mbps with
@@ -262,8 +264,9 @@ task.
 ## Open decisions
 
 - Whether the media thread owns the scaler too, or scale stays with capture.
-- Whether `PipeState` classification lives agent-side or needs a viewer-side
-  report change (finding 4 needs arrival data the agent does not have today).
+- ~~Whether `PipeState` classification lives agent-side or needs a viewer-side
+  report change (finding 4 needs arrival data the agent does not have today).~~
+  **Moved to FR-71 (#1362)**; the arrival data exists since M0.
 - ~~Whether P1's decay replaces the FR-35 learner or bounds it.~~ **Answered by
   P1: bounds.** The learner only ever lifts a ceiling and was never the pin; the
   pin was the memory's use as a stand-in measurement, and that is what decays.
