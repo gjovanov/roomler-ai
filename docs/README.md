@@ -27,6 +27,7 @@ flowchart TB
         UC["use-cases.md"]
         ATA["agent-tunnel-architecture.md"]
         ARCH["architecture.md"]
+        MM["modular-monolith.md"]
     end
 
     subgraph rd["🖥️ 1 · Remote desktop"]
@@ -55,6 +56,8 @@ flowchart TB
     UC --> rd & net & collab
     ATA --> rd & net
     ARCH --> rd & net & collab
+    ARCH --> MM
+    MM --> ops
     rd & net --> ops
     rd & net & collab --> REF
 ```
@@ -68,6 +71,7 @@ flowchart TB
 | [compare/](compare/README.md) | Head-to-head against Tailscale, RustDesk, TeamViewer, MeshCentral and NetBird — each page naming what the other product does better, first |
 | [agent-tunnel-architecture.md](agent-tunnel-architecture.md) | The remote-access stack (daemon + CLI + coordination) in five minutes — written for end users and operators |
 | [architecture.md](architecture.md) | The whole system: control plane vs the three data planes, workspace crate map, deployment topology |
+| [modular-monolith.md](modular-monolith.md) | How the server is composed (FR-69): `roomler-core` + six modules behind one `Module` contract, the DAG, the five build profiles and what each leaves out, runtime capability gating, wire ownership, the hooks that carry the inverse cascades, and the composition baseline that gates every move |
 
 ## 🖥️ 1 · Desktop sharing & remote control
 
@@ -117,7 +121,7 @@ same accounts and server.*
 | [installation.md](installation.md) | Every install path: wizard, MSI flavours, `.deb`/`.pkg`, terminal installers, enrollment, service modes, self-update |
 | [code-signing.md](code-signing.md) | How every published artifact is signed: Azure Artifact Signing over GitHub OIDC, macOS notarisation, GPG + build provenance, and the operator scripts that (re)establish the credentials |
 | [linux-self-update.md](linux-self-update.md) | Design of the Linux self-update path (tarball as the universal artifact) |
-| [deployment.md](deployment.md) | Deploying the server: Docker image, dev compose stack, environment, health, release pipelines |
+| [deployment.md](deployment.md) | Deploying the server: Docker image and its profiles, the hosted-image pipeline (built on Actions, served from GHCR, promoted by a dispatch — FR-73), dev compose stack, environment, health, release pipelines |
 | [multi-pod-scale-out.md](multi-pod-scale-out.md) | The settled multi-pod architecture: identity, tenant-affinity routing, mediasoup scale ladder |
 | [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md) | Operator checklist: verifying Windows SystemContext (pre-logon control) on a field host |
 | [testing.md](testing.md) | Test suites and harnesses: integration, unit, E2E, capture smoke, k8s E2E lane |
