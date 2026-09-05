@@ -2294,6 +2294,8 @@ impl OverlayRuntime {
         // blackhole). Known before the first reconcile (awaited here), so there's
         // no late-bind race to chase.
         let mut dns_bound = false;
+        // Owned so the teardown can stop it; see the ⚠️ at the spawn below.
+        let mut dns_task: Option<tokio::task::JoinHandle<()>> = None;
         let dns_names: Option<dns::NameMap> = if let Some(magic_domain) = dns_magic.clone() {
             let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             sync_name_map(
@@ -2304,7 +2306,23 @@ impl OverlayRuntime {
             )
             .await;
             let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(dns::run(
+            // ⚠️ KEEP THIS HANDLE. `dns::run` serves until its socket errors, so
+            // a spawned-and-forgotten resolver outlives the runtime that made
+            // it and keeps `<self overlay ip>:53` bound. The runtime is scoped
+            // to ONE WS session, so every reconnect spawned another one and the
+            // new one lost the bind to its own predecessor — field-measured on
+            // a corp laptop, two starts 14 s apart in one daemon lifetime:
+            //
+            //   INFO magicdns: resolver up            bind=100.65.4.30:53
+            //   WARN magicdns: bind failed; resolver off  … AddressAlreadyInUse
+            //
+            // The survivor still answered, from the DEAD session's name map, so
+            // every MagicDNS name NXDOMAIN'd while `roomler status` reported
+            // whichever runtime's flag it happened to read — `active` or
+            // `resolver DOWN` on the same host hours apart. It reads as a
+            // third-party `:53` squatter and is not one: we were colliding with
+            // ourselves. Aborted in the teardown below, beside every other task.
+            dns_task = Some(tokio::spawn(dns::run(
                 dns::DnsConfig {
                     bind: SocketAddr::new(self_v4.into(), 53),
                     magic_domain: magic_domain.clone(),
@@ -2318,7 +2336,7 @@ impl OverlayRuntime {
                     answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
                 },
                 bound_tx,
-            ));
+            )));
             // The bind is a local UDP bind — microseconds; bound the wait so a hung
             // reactor can't stall the join. Timeout / send-error → not-bound.
             dns_bound = tokio::time::timeout(Duration::from_secs(2), bound_rx)
@@ -4117,6 +4135,14 @@ impl OverlayRuntime {
         outbound_pump.abort();
         // Phase C — stop the srflx keepalive task (if any) on runtime exit.
         if let Some(h) = srflx_keepalive {
+            h.abort();
+        }
+        // FR-72 — and the MagicDNS resolver, which owns `<self overlay ip>:53`.
+        // Without this it survives its own runtime and the NEXT session's
+        // resolver cannot bind, so MagicDNS dies on the first WS reconnect and
+        // stays dead until the process restarts. The socket is released when the
+        // task drops, so the successor binds cleanly.
+        if let Some(h) = dns_task {
             h.abort();
         }
     }
