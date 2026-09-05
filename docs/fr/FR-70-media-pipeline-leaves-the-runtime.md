@@ -159,6 +159,20 @@ all three CORPLAP hosts after a release with the switch on: `iter_ms_max`,
 the same session shape with the switch off — **the gate is "unchanged or
 better", and a regression on any host keeps the default off**.
 
+**Status.** M1a built 2026-09-05 ([#1375](https://github.com/gjovanov/roomler-ai/pull/1375)):
+`encode::thread::EncoderThread<E: EncoderOps>` (generic, unit-tested on the
+default build with a fake — in-order service on the named thread, the maxrate
+mirror exact after the await, destruction on the owning thread at drop, an
+encode error is the encoder's not the thread's, a dead thread fails the next
+command instead of blocking), `encode::ffmpeg::EncoderHandle` (`Inline` /
+`Threaded`, one call site per operation), fourteen pump sites rewired from a
+method call to a send, kill switch `media_thread` default off. A spawn
+failure hands the encoder back so the handle falls back to inline. Verified
+with the feature on in WSL against the vendored FFmpeg tree (rustc 1.95's
+diagnostic renderer panics on a pre-existing dead-code warning there — on
+master too — so `--message-format=short` is the form that answers). M1b and
+M1c open.
+
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
 thread while the current encoder keeps serving `Encode`, which is the whole
