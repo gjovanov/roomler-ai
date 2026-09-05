@@ -28,6 +28,10 @@ trap 'rm -f "$CANARY"' EXIT
 D="DESK""TOP-AB12XY9"; L="LAP""TOP-QR34ST78"; W="W""IN-ABC4EFGHIJK"
 P5="P""C51234";        P4="P""C5123";         C="CL""K00099887"
 X="Someone-X""MG-BOX9"; M="Someones-Mac""Book-Pro"
+# The GENERALISED three-letter tag (2026-09-05). Deliberately a prefix that is
+# not any real one, and whose letters are not all hex -- an all-hex prefix is
+# excluded on purpose, see the shape's comment.
+G="ZQ""X55555"
 
 # ⚠️⚠️ EVERY canary appears TWICE, upper and lower. A guard blind to lowercase
 # is not a hypothetical: on 2026-09-04 a field log wrote two asset tags in
@@ -38,9 +42,10 @@ X="Someone-X""MG-BOX9"; M="Someones-Mac""Book-Pro"
 d="desk""top-ab12xy9"; l="lap""top-qr34st78"; w="w""in-abc4efghijk"
 p5="p""c51234";        p4="p""c5123";         c="cl""k00099887"
 x="someone-x""mg-box9"; m="someones-mac""book-pro"
+g="zq""x55555"
 
-CAUGHT=("$D" "$L" "$W" "$P5" "$P4" "$C" "$X" "$M"
-        "$d" "$l" "$w" "$p5" "$p4" "$c" "$x" "$m")
+CAUGHT=("$D" "$L" "$W" "$P5" "$P4" "$C" "$X" "$M" "$G"
+        "$d" "$l" "$w" "$p5" "$p4" "$c" "$x" "$m" "$g")
 
 # Things the guard must NOT flag: our own alias forms (in both casings, since
 # prose writes them either way), and ordinary hyphenated words that fit the
@@ -49,7 +54,14 @@ CAUGHT=("$D" "$L" "$W" "$P5" "$P4" "$C" "$X" "$M"
 # requirement in SHAPES is what keeps them out, and this locks it.
 IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888"
          "win""host-a" "corp""lap-2"
-         "desk""top-classic" "desk""top-content" "desk""top-rebound")
+         "desk""top-classic" "desk""top-content" "desk""top-rebound"
+         # The three-letter shape's real false-positive families, measured
+         # across the whole history. The first two are hex — a GUID example
+         # from msi_guid.rs and the tail of a codecov UUID — and are excluded
+         # structurally by the shape's lookahead. The third is a spec number in
+         # an X11 font string and is allowlisted. If any of these ever trips,
+         # the shape has been loosened and a real GUID will start crying wolf.
+         "DEF""012345678" "dbf""342009340" "iso""10646" "ISO""10646")
 
 { printf '%s\n' "${CAUGHT[@]}"; printf 'must not trip: %s\n' "${IGNORED[*]}"; } > "$CANARY"
 
