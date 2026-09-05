@@ -34,10 +34,22 @@ git checkout --quiet --detach origin/master || note "could not detach at origin/
 note "specs at $(git log --oneline -1)"
 
 if [ -n "$TAG" ]; then
-  note "pinning the stack to $TAG"
-  kubectl -n "$NS" set image deploy/roomler2 "roomler2=registry.roomler.ai/roomler-ai:$TAG" >/dev/null \
+  # FR-73: a bare tag is resolved against the registry the deploy repo names
+  # (`newName` in the prod overlay — GHCR since P2, the build host's registry
+  # before), so `hosted-<date>-<sha7>` and the old `v<date>-<id>` tags both
+  # pin. A tag containing `/` is taken as a full image reference.
+  case "$TAG" in
+    */*) IMG="$TAG" ;;
+    *)
+      DEPLOY_REPO="${DEPLOY_REPO:-$HOME/roomler-ai-deploy}"
+      REG=$(awk '/newName:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml" 2>/dev/null)
+      [ -n "$REG" ] || { REG=ghcr.io/gjovanov/roomler-ai; note "no deploy repo at $DEPLOY_REPO — assuming $REG"; }
+      IMG="$REG:$TAG" ;;
+  esac
+  note "pinning the stack to $IMG"
+  kubectl -n "$NS" set image deploy/roomler2 "roomler2=$IMG" >/dev/null \
     || die "could not set the image"
-  kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >/dev/null || die "the stack did not roll to $TAG"
+  kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >/dev/null || die "the stack did not roll to $IMG"
 fi
 # ⚠️ Select the app container BY NAME. `containers[0]` is the sidecar now, and
 # this line reported the browser image as "the stack" the first time it ran.

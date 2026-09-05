@@ -62,11 +62,15 @@ git checkout --quiet --detach origin/master || note "could not detach at origin/
 note "specs at $(git log --oneline -1)"
 
 # ── 2. sync the e2e stack to the prod image ──────────────────────────
+# FR-73: the REGISTRY follows the deploy repo too (`newName`), not a literal —
+# since P2 prod pulls `ghcr.io/gjovanov/roomler-ai:hosted-<date>-<sha7>`, and a
+# hosted tag does not exist on the build host's registry.
+PRODNAME=$(awk '/newName:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml")
 PRODTAG=$(awk '/newTag:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml")
-[ -n "$PRODTAG" ] || fail_hard "could not read prod newTag"
-kubectl -n "$NS" set image deploy/roomler2 "roomler2=registry.roomler.ai/roomler-ai:$PRODTAG" >> "$LOG" 2>&1
-kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >> "$LOG" 2>&1 || fail_hard "e2e stack failed to roll to $PRODTAG"
-note "e2e stack on $PRODTAG"
+[ -n "$PRODNAME" ] && [ -n "$PRODTAG" ] || fail_hard "could not read prod newName/newTag"
+kubectl -n "$NS" set image deploy/roomler2 "roomler2=${PRODNAME}:${PRODTAG}" >> "$LOG" 2>&1
+kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >> "$LOG" 2>&1 || fail_hard "e2e stack failed to roll to ${PRODNAME}:${PRODTAG}"
+note "e2e stack on ${PRODNAME}:${PRODTAG}"
 
 # ── 3. the browser is IN the pod ─────────────────────────────────────
 # FR-37. There are no port-forwards any more, and that is the point.
