@@ -30,16 +30,72 @@ flowchart TB
 
 One multi-stage `Dockerfile`:
 
-1. `rust:1.88-bookworm` — builds `roomler-ai-api` (+ `derp-relay`). Two build
-   args select the composition (FR-69 P8): `PROFILE` (`full` | `collab` | `remote` |
-   `mesh` | `access`, the Cargo feature aggregate the api crate is built with) and
-   `SAAS` (`1` adds the hosted service's billing + newsletter module). **The hosted
-   build passes neither** — the defaults are `full` + `SAAS=1`, so the deploy recipe
-   below is unchanged; the self-host publish workflow passes `SAAS=0` and asserts it.
+1. `rust:1.95-bookworm` (the toolchain `rust-toolchain.toml` pins) — builds
+   `roomler-ai-api` (+ `derp-relay`) in three layers (FR-73 P1b): `chef` (toolchain +
+   `cargo-chef`), `planner` (the dependency recipe from the manifests) and `builder`
+   (`cargo chef cook` = every dependency, the mediasoup C++ worker included, as ONE
+   cached layer; then the real build over only the Rust sources — a UI-only change
+   never touches a Rust layer). Two build args select the composition (FR-69 P8):
+   `PROFILE` (`full` | `collab` | `remote` | `mesh` | `access`, the Cargo feature
+   aggregate the api crate is built with) and `SAAS` (`1` adds the hosted service's
+   billing + newsletter module). **The hosted build passes `PROFILE=full SAAS=1`** —
+   also the defaults; the self-host publish workflow passes `SAAS=0` and asserts it.
 2. `oven/bun:1` — builds the Vue SPA
 3. `debian:trixie-slim` — runtime: **nginx + the binary in one image**, SPA at
    `/var/www/roomler-ai`, nginx config from `files/nginx-pod.conf` (SPA fallback,
    API/WS proxy, security headers incl. HSTS + CSP), `EXPOSE 80`
+
+## The hosted image pipeline (FR-73)
+
+Since 2026-09-05 the hosted image is **built by GitHub Actions on every merge to `master`**,
+served from the public package on GHCR, and **promoted to prod by a dispatch** — the build host
+no longer builds or serves it ([FR-73](fr/FR-73-image-build-on-github.md)).
+
+```mermaid
+flowchart LR
+    M["merge to master<br/>(crates/**, ui/**, Dockerfile, files/**, config/**, Cargo.*)"]
+    subgraph gha["hosted-image.yml — GitHub Actions"]
+        B["docker build<br/>PROFILE=full SAAS=1<br/>registry-backed BuildKit cache<br/><i>buildcache-hosted</i>"]
+        L["label check<br/>revision = the commit"]
+        S["smoke boot with Mongo + Redis<br/>/health = all six modules · device route 401 · / 200"]
+        P["push hosted-&lt;date&gt;-&lt;sha7&gt;<br/>move <b>hosted</b> · attest provenance"]
+        B --> L --> S --> P
+    end
+    G[("ghcr.io/gjovanov/roomler-ai<br/>public · no pull secret")]
+    PR["promote.yml (dispatch)<br/>resolve the tag · refuse non-hosted<br/>bump newTag in the deploy repo"]
+    D["deploy repo · k8s/overlays/prod<br/>newName: ghcr.io/gjovanov/roomler-ai<br/>newTag: hosted-…"]
+    A["ArgoCD (webhook, automated + selfHeal)"]
+    K["cluster: RollingUpdate<br/>maxSurge 0 / maxUnavailable 1<br/>pull ≈ 3 s per node (81 MB)"]
+    F["field-verify from the fleet<br/>pods · online agents · an RC session<br/>an overlay pair · a tunnel"]
+    M --> gha
+    P --> G
+    PR --> D --> A --> K --> F
+    G -.->|"pulled by tag"| K
+    style G fill:#e8f0fe
+    style PR fill:#fff4e5
+```
+
+| Step | Who | Measured (first day) |
+|---|---|---|
+| build → tag on GHCR | the workflow, on every merge | cold 13 min 37 s build, 15 min 01 s merge → tag (the `COPY . .` Dockerfile); the chef layering (P1b) is measured in the FR's field log |
+| promote | a human, `gh workflow run promote.yml -f tag=…` (empty tag = the `hosted` pointer) | needs the repo secret `DEPLOY_REPO_TOKEN`; without it the job prints the exact bump |
+| roll | ArgoCD, one pod at a time | 20 s from the deploy-repo push to both pods on the new image; pulls 3.3 s / 2.7 s per node |
+| verify | from the fleet, after every roll | the workflow only proves the public `/health` kept answering |
+
+Two things the lane never does: it never writes `latest` (that is the self-host `full` image
+without `saas`, owned by `publish-selfhost-image.yml`), and it never deploys — a roll re-homes
+every long-lived socket on the replaced pod (agents, RC sessions, tunnels, DERP), so which merge
+becomes prod, and when, stays a decision. Retention on GHCR is `ghcr-retention.yml` (Mondays):
+untagged BuildKit cache manifests and `hosted-*` tags beyond the newest 20 — never `latest`, `v*`,
+a per-arch or per-profile tag, `buildcache-*`, or an attestation (GHCR stores those untagged,
+referenced by a `sha256-<subject>` index; the job reads each candidate's manifest back and deletes
+only cache configs).
+
+**Break-glass** (a GitHub outage, or a fix that must not wait for a runner): the build host's
+recipe in `CLAUDE.md` still works — build, push to the build host's own registry, then set **both**
+`newName: registry.roomler.ai/roomler-ai` and `newTag` in the deploy repo. `promote` refuses until
+`newName` is switched back to GHCR. Rehearsed after the switch on 2026-09-05: a warm build of
+master in 9 min 38 s, pushed in 9 s, not deployed.
 
 ## Development stack
 

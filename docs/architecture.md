@@ -163,12 +163,14 @@ is documented at the top of the root `Cargo.toml`):
 | `crates/vendored/webrtc` | exposes SCTP `a_rwnd` so native⇄native DataChannels advertise 8 MiB and stay link-bound at high BDP |
 | `crates/vendored/wintun-bindings` | keeps the Windows NetworkList registry entry on drop |
 
-## Modular monolith — the target shape (FR-69)
+## Modular monolith — the shipped shape (FR-69)
 
-The map above is the **current** server: one crate (`crates/api`) whose `AppState` carries every
-pillar and whose single `build_router` mounts every route. [FR-69](fr/FR-69-modular-monolith.md)
-decouples it into a **modular monolith** — the same process, the same container, the same wire —
-composed from a small core and six module crates:
+The server is a **modular monolith** — the same process, the same container, the same wire —
+composed from a small core and six module crates behind one `Module` contract, selected into
+build **profiles** by Cargo features and discovered at run time through `GET /api/capabilities`.
+[FR-69](fr/FR-69-modular-monolith.md) built it (P0–P9, closed 2026-09-05); the deep-dive with the
+contract, the profiles, the wire ownership, the hooks and the composition gate is
+**[modular-monolith.md](modular-monolith.md)**. The shape:
 
 ```mermaid
 flowchart BT
