@@ -204,6 +204,34 @@ longer carrying the encode. **Unchanged or better on this host.** One host, one
 short session per arm, low motion: the gate wants the same on CORPLAP-2 and
 CORPLAP-3 before the default flips. The device was returned to the default.
 
+**M1c — the other two hosts (2026-09-05 18:30–18:38 UTC, both on 0.4.69,
+sessions driven concurrently from neo16, switch off then on with a detached
+restart between; both switch-on sessions logged `threaded=true`).**
+
+| steady state (heartbeats 4+) | CORPLAP-3 off (`6a9c5fb3`) | CORPLAP-3 on (`…bf574`) | CORPLAP-2 off (`6a9c5fcd`) | CORPLAP-2 on (`…bf57d`) |
+|---|---|---|---|---|
+| encoder · path | av1_qsv · direct, 60 fps target, 9.7 Mbps, an unlocked desktop | same | av1_nvenc · relay (corp VPN), 6.8 / 5.8 Mbps, lock screen | same |
+| heartbeats | 44 | 45 | 31 | 39 |
+| `avg_encode_ms` avg / max | 13.64 / 17.85 | 13.51 / 16.17 | 10.83 / 11.96 | 10.97 / 12.33 |
+| `avg_capture_ms` | 4.81 | 3.26 | 3.36 | 3.31 |
+| `iter_ms_max` avg / worst | 27.3 / 51.2 | 21.9 / 32.1 | 56.3 / **785.7** | 37.2 / 84.3 |
+| windows with `iter_ms_max` > 50 ms | 2 | 0 | 4 of 31 | 8 of 39 |
+| `pump_stalls` / `send_stalls` | 0 / 0 | 0 / 0 | 0 / 1 | 0 / 1 |
+| the open, `open_ms` (unchanged by M1) | 632 | 684 | **2919** | **2846** |
+
+CORPLAP-3 — the encode-bound host — is better on every counter with the switch
+on. CORPLAP-2 is better on the averages and on the worst pass (786 → 84 ms)
+and equal on encode/capture, but its count of >50 ms windows went the other
+way (4 of 31 → 8 of 39) on a relay path whose off-arm carried a 786 ms
+outlier; that one counter on that one host is not a clear regression and not
+a clean pass either. **Verdict across the three hosts: no host regressed on
+averages or worst pass; one counter on CORPLAP-2 is ambiguous.** The default
+stays off for this release as the gate says; a longer CORPLAP-2 pair (or a
+week of the fleet with the switch on per device) decides the flip. Both
+devices were returned to the default. ⚠️ Side finding, unrelated to M1:
+CORPLAP-2's encoder open takes **2.8–2.9 s** (av1_nvenc) on every session —
+finding 1's worst instance so far, and M2's strongest case.
+
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
 thread while the current encoder keeps serving `Encode`, which is the whole
