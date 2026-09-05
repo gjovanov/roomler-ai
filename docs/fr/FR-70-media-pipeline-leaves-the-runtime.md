@@ -105,6 +105,65 @@ viewer, or a window with no age report. ⚠️ Telemetry only: no loop reads it
 yet — acting on it (a transit stall must not cut the rate) is T1, and the diag
 HUD does not render the two new `HopWindow`s yet.
 
+## M1 — the encoder thread, as designed (2026-09-05)
+
+Anchors verified against master `b4d12871`.
+
+**What the pump is today.** `media_pump_ffmpeg_dc` (`agents/roomlerd/src/peer.rs:4545–7244`,
+27 await points) runs on a tokio worker and does everything in one loop: the
+budget gate and rate applies (`:5763`, `:6639`, `:6677`, `:6740`, `:6991`), pacing
+(`:5799`), capture (`:5813`, already a handoff to capture's own thread), the
+encoder open (`:6237`, a `spawn_blocking` since FR-65), keyframe requests
+(`:6326`, `:6339`, `:6348`, `:6976`), the background rebuild's adoption
+(`:5410`, `adopt_rebuilt`), **the encode itself as
+`tokio::task::block_in_place(|| enc.encode_sync(&frame))` (`:6759`)**, and the
+hand-off to the dedicated send task (`:6892`). Scaling is inside the encoder
+(`encode/ffmpeg/encoder.rs`), not a stage of the loop. The encoder is therefore
+driven from whichever worker thread the pump task happens to be polled on, held
+there by `block_in_place`, and every `enc.*` call is a direct method call from
+the decision that wanted it.
+
+**M1's shape: the encoder gets a thread, the decisions stay where they are.**
+`encode::thread::EncoderThread` owns the `VideoEncoder` on one dedicated OS
+thread per session (named `rc-enc-<session>`; MF/COM and QSV affinity satisfied
+by construction) and serves a bounded command channel:
+
+| command | reply | replaces |
+|---|---|---|
+| `Encode(Arc<Frame>)` | `Result<Vec<EncodedPacket>>` over a oneshot | `block_in_place(encode_sync)` `:6759` |
+| `SetBitrate(bps)` | none (fire-and-forget, in order) | the five `set_bitrate` sites |
+| `RequestKeyframe` | none | the four `request_keyframe` sites |
+| `Adopt(RebuiltEncoder)` | `bool` | `adopt_rebuilt` `:5410` |
+| `Open(params)` / `Reopen(params)` | `Result<()>` | the `spawn_blocking` open `:6237` — the open happens ON the encoder thread, so M2's replacement encoder is built there too |
+| `Probe` (name, `supports_dynamic_bitrate`, `reconfig_forces_idr`) | a cached `EncoderCaps` snapshot | the `enc.name()` / capability reads (`:6266`, `:6629`, `:7190`) |
+
+The pump loop keeps its structure and every decision site; the only change at
+each site is that a method call becomes a send. `Encode` is awaited (the loop
+still consumes one frame at a time — cadence, pacing and the budget gate are
+unchanged), which is why M1 changes NO behaviour: the same frame, the same
+decision, the same packet, one thread hop later (~10 µs, measured before
+merge). The worker thread is never blocked again, so every other task on the
+runtime (signalling, the send task, the heartbeats, the control DC) stops
+sharing a thread with a 5–30 ms encode.
+
+**Kill switch** `media_thread` (config tribool + `ROOMLERD_MEDIA_THREAD`),
+**default OFF for one release**: off = today's `block_in_place` loop verbatim.
+Both paths share one `EncoderHandle` enum so the pump has exactly one call
+site per operation and the switch is a constructor choice, not a second loop.
+
+**Split.** M1a — the thread, the command channel and the switch, with the
+pump otherwise untouched; the B0 simulator is not involved (nothing about rate
+changes). M1b — the VP9-444 pump on the same handle. M1c — the measurement on
+all three CORPLAP hosts after a release with the switch on: `iter_ms_max`,
+`pump_stalls`, `apply_ms_max` (FR-65's counters) and the age split, against
+the same session shape with the switch off — **the gate is "unchanged or
+better", and a regression on any host keeps the default off**.
+
+**What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
+moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
+thread while the current encoder keeps serving `Encode`, which is the whole
+reason the open belongs there), no controller change (M4).
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
