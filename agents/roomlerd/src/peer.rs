@@ -4577,7 +4577,6 @@ async fn media_pump_ffmpeg_dc(
     chunk_framing: bool,
 ) {
     use crate::encode::VideoEncoder;
-    use crate::encode::ffmpeg::FfmpegEncoder;
 
     let codec_label = codec.label();
     // P7 — the session's ACTIVE chroma: starts as the request (HEVC only),
@@ -4755,7 +4754,12 @@ async fn media_pump_ffmpeg_dc(
     // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
     // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
     let mut reopen_backoff = capture::ReopenBackoff::new();
-    let mut encoder: Option<FfmpegEncoder> = None;
+    // FR-70 M1 — the encoder behind one handle: inline (today's
+    // `block_in_place` on a runtime worker) or on its own thread, chosen once
+    // per open from the `media_thread` switch. Every call below is the same
+    // on both paths.
+    let media_thread = crate::encode::media_thread_enabled();
+    let mut encoder: Option<crate::encode::ffmpeg::EncoderHandle> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
     // rc.93 — single keepalive clock, mirroring `media_pump`. The rc.92
     // pacing clock + pump-side floor sleep were REMOVED: the capture
@@ -5407,7 +5411,7 @@ async fn media_pump_ffmpeg_dc(
                     Ok(Ok(rebuilt)) => {
                         let maxrate = rebuilt.maxrate_bps();
                         if let Some(enc) = encoder.as_mut() {
-                            if timed_apply!(enc.adopt_rebuilt(rebuilt)) {
+                            if timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                                 // Stale pre-swap frames yield to the fresh
                                 // IDR, exactly like the sync rebuild path.
                                 send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5449,7 +5453,11 @@ async fn media_pump_ffmpeg_dc(
                 && last_swap_at.elapsed() >= SWAP_MIN_INTERVAL
             {
                 swap_wanted = None;
-                if let Some(spec) = encoder.as_ref().and_then(|e| e.rebuild_spec(bps)) {
+                let spec = match encoder.as_mut() {
+                    Some(e) => e.rebuild_spec(bps).await,
+                    None => None,
+                };
+                if let Some(spec) = spec {
                     pending_swap = Some(tokio::task::spawn_blocking(move || {
                         crate::encode::ffmpeg::FfmpegEncoder::open_rebuilt(spec)
                     }));
@@ -5761,7 +5769,7 @@ async fn media_pump_ffmpeg_dc(
                 // lump through the thin pipe; field 2026-08-27, CORPLAP-3 +
                 // CORPLAP-2 got WORSE) or defer (see `deferred_bps`).
                 if enc.supports_dynamic_bitrate() {
-                    timed_apply!(enc.set_bitrate(applied.bps));
+                    timed_apply!(enc.set_bitrate(applied.bps).await);
                 } else if bg_rebuild && !constrained {
                     swap_wanted = Some(applied.bps);
                 } else {
@@ -6290,7 +6298,22 @@ async fn media_pump_ffmpeg_dc(
                     // the control-DC open on relay sessions and lost the
                     // message — retry-until-delivered replaced it.
                     video_info_sent = false;
-                    encoder = Some(enc);
+                    // FR-70 M1 — the label is the session's tail, so the
+                    // thread reads `rc-enc-<6 hex>` in a profiler.
+                    let handle = crate::encode::ffmpeg::EncoderHandle::new(
+                        enc,
+                        media_thread,
+                        &session_id.to_hex()[18..],
+                    );
+                    if media_thread {
+                        info!(
+                            %session_id,
+                            codec_label,
+                            threaded = handle.is_threaded(),
+                            "FR-70 M1: encoder handed to its own thread"
+                        );
+                    }
+                    encoder = Some(handle);
                     encoder_dims = Some((w, h));
                     // Phase B — a fresh encoder starts at the full `ceiling`
                     // maxrate; force the AIMD to re-apply its current (possibly
@@ -6323,7 +6346,7 @@ async fn media_pump_ffmpeg_dc(
         if kf_gate.lock_edge(is_locked_now)
             && let Some(enc) = encoder.as_mut()
         {
-            enc.request_keyframe();
+            enc.request_keyframe().await;
             force_keyframe_this_iter = true;
         }
 
@@ -6336,7 +6359,7 @@ async fn media_pump_ffmpeg_dc(
         if (own_kf || shared_kf)
             && let Some(enc) = encoder.as_mut()
         {
-            enc.request_keyframe();
+            enc.request_keyframe().await;
             force_keyframe_this_iter = true;
         }
 
@@ -6345,7 +6368,7 @@ async fn media_pump_ffmpeg_dc(
         if kf_gate.backstop_due(std::time::Instant::now())
             && let Some(enc) = encoder.as_mut()
         {
-            enc.request_keyframe();
+            enc.request_keyframe().await;
             force_keyframe_this_iter = true;
             if kf_gate.take_backstop_log() {
                 info!(
@@ -6636,7 +6659,7 @@ async fn media_pump_ffmpeg_dc(
                 if constrained && relay_idr_thrift {
                     last_deferred_apply_at = Some(std::time::Instant::now());
                 }
-                timed_apply!(enc.set_bitrate(applied.bps));
+                timed_apply!(enc.set_bitrate(applied.bps).await);
             } else if bg_rebuild && !constrained {
                 swap_wanted = Some(applied.bps);
             } else if last_motion_at.elapsed() >= DEFER_QUIET {
@@ -6674,7 +6697,7 @@ async fn media_pump_ffmpeg_dc(
                     if bg_rebuild && bg_rebuild_constrained && !enc.supports_dynamic_bitrate() {
                         swap_wanted = Some(applied.bps);
                     } else {
-                        timed_apply!(enc.set_bitrate(applied.bps));
+                        timed_apply!(enc.set_bitrate(applied.bps).await);
                     }
                 } else {
                     deferred_bps = Some(applied.bps);
@@ -6737,7 +6760,7 @@ async fn media_pump_ffmpeg_dc(
                     if !enc.supports_dynamic_bitrate() {
                         send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    timed_apply!(enc.set_bitrate(bps));
+                    timed_apply!(enc.set_bitrate(bps).await);
                     info!(
                         %session_id,
                         codec_label,
@@ -6752,11 +6775,13 @@ async fn media_pump_ffmpeg_dc(
         // P5 (FR-1) — the 20-30 ms HW encode (including the BGRA→NV12
         // convert inside `encode_sync`) ran inline on an async worker,
         // stalling every task sharing the runtime — the DC send task's
-        // chunk pumping among them. `block_in_place` keeps the call
-        // synchronous-in-place but shifts other work off this worker for
-        // the duration (multi-thread runtime only, which the agent always
-        // runs; unit tests never drive this pump).
-        let packets = match tokio::task::block_in_place(|| enc.encode_sync(&frame)) {
+        // chunk pumping among them. The handle does `block_in_place` on the
+        // inline path (synchronous-in-place, other work shifted off this
+        // worker for the duration; multi-thread runtime only, which the
+        // agent always runs) and, under FR-70 M1's `media_thread`, sends the
+        // frame to the encoder's own thread and awaits the packets — the
+        // worker is free meanwhile.
+        let packets = match enc.encode(&frame).await {
             Ok(p) => {
                 err_ladder.on_success();
                 p
@@ -6973,7 +6998,7 @@ async fn media_pump_ffmpeg_dc(
                         // First frame through after a drop burst — make the
                         // NEXT one a keyframe so the browser resyncs the
                         // deltas it missed during congestion.
-                        enc.request_keyframe();
+                        enc.request_keyframe().await;
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -6988,7 +7013,7 @@ async fn media_pump_ffmpeg_dc(
                     // or defer.
                     if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
                         if enc.supports_dynamic_bitrate() {
-                            timed_apply!(enc.set_bitrate(applied.bps));
+                            timed_apply!(enc.set_bitrate(applied.bps).await);
                         } else if bg_rebuild && !constrained {
                             swap_wanted = Some(applied.bps);
                         } else {
@@ -7106,7 +7131,7 @@ async fn media_pump_ffmpeg_dc(
             // the IDR total, so the before/after of `encoder_inplace_rate` is
             // one grep; read `idr_count` against `keyframe_requests` to isolate
             // rate-caused IDRs.
-            let rate_stats = enc.rate_stats();
+            let rate_stats = enc.rate_stats().await;
             info!(
                 %session_id,
                 codec_label,
