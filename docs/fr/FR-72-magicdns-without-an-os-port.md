@@ -1,6 +1,6 @@
 # FR-72 — MagicDNS without an OS port
 
-**Issue:** TBD · **Status:** proposed · **Opened:** 2026-09-05
+**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** proposed · **Opened:** 2026-09-05
 
 ## Goal
 
