@@ -4187,6 +4187,13 @@ async fn media_pump_vp9_444_dc(
                 // FR-70 M0 — the fused age split by plane (transit is an
                 // upper bound here: this pump keeps no send-wait figure).
                 age_split = ?governor.viewer_age_split(None),
+                // FR-71 T1a — which plane was the limiter last window, in
+                // SHADOW (nothing acts on it until T1b), and windows per
+                // verdict: [unknown, clear, overproduced, transit_stalled,
+                // viewer_late]. A repeat of finding 4 reads `transit-stalled`
+                // here while `target_bps` shows the cut T1b will remove.
+                pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
+                pipe_states = ?governor.pipe_state_counts(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
                 // FR-70 P1 — what stands in for a pipe measurement while
@@ -4970,6 +4977,13 @@ async fn media_pump_ffmpeg_dc(
     // gap the epoch discard exists to erase.
     let send_wait_us_sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // FR-71 T1a — per-viewer-window deltas of the sender-side counters, so the
+    // governor's shadow classifier sees THIS window's sends, skips and waits
+    // rather than the heartbeat's or the session's totals.
+    let mut win_sent_last: u64 = 0;
+    let mut win_skips_last: u64 = 0;
+    let mut win_sw_sum_last: u64 = 0;
+    let mut win_sw_frames_last: u64 = 0;
     let send_wait_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // FR-35 P3 — the opener as a burst probe: bytes sent and the longest
     // queue-wait seen while the opening grace is on. Their ratio is the
@@ -6372,6 +6386,33 @@ async fn media_pump_ffmpeg_dc(
         // SLOWEST viewer: fold every follower's decode report in and take
         // the max divisor. Also steps the spill gate (a sustained large
         // deviation detaches the most deviant follower to its own encoder).
+        // FR-71 T1a — hand the governor this window's sender-side facts before
+        // it folds the viewer's report, so the plane verdict reads both sides
+        // of the same window. Deltas against the running counters (the
+        // heartbeat swaps some of them, so it reads the totals, not swaps).
+        {
+            let sent_now = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
+            let sw_sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
+            let sw_frames_now = send_wait_frames.load(std::sync::atomic::Ordering::Relaxed);
+            let sw_frames = sw_frames_now.saturating_sub(win_sw_frames_last);
+            let sw_avg_ms = (sw_frames > 0).then(|| {
+                sw_sum_now.saturating_sub(win_sw_sum_last) as f64 / sw_frames as f64 / 1000.0
+            });
+            governor.note_window_sender(crate::encode::governor::WindowSenderStats {
+                inflight_bytes: inflight_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                budget_bytes: queue_budget,
+                gate_skips: frames_skipped_backpressure.saturating_sub(win_skips_last) as u32,
+                send_wait_max_ms: send_wait_us_max.load(std::sync::atomic::Ordering::Relaxed)
+                    as f64
+                    / 1000.0,
+                send_wait_avg_ms: sw_avg_ms,
+                frames_sent: sent_now.saturating_sub(win_sent_last) as u32,
+            });
+            win_sent_last = sent_now;
+            win_skips_last = frames_skipped_backpressure;
+            win_sw_sum_last = sw_sum_now;
+            win_sw_frames_last = sw_frames_now;
+        }
         let viewer_window = governor.tick_viewer_window(
             std::time::Instant::now(),
             target_fps,
@@ -7115,6 +7156,13 @@ async fn media_pump_ffmpeg_dc(
                 // iter_max 28 ms) reads here as transit ≈ 4.9 s. None = a
                 // pre-M0 viewer, or a window with no age report.
                 age_split = ?governor.viewer_age_split(Some(send_wait_avg_ms)),
+                // FR-71 T1a — which plane was the limiter last window, in
+                // SHADOW (nothing acts on it until T1b), and windows per
+                // verdict: [unknown, clear, overproduced, transit_stalled,
+                // viewer_late]. A repeat of finding 4 reads `transit-stalled`
+                // here while `target_bps` shows the cut T1b will remove.
+                pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
+                pipe_states = ?governor.pipe_state_counts(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
                 // minimum. None = the flat floor stands, which on a slow

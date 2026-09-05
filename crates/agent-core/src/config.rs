@@ -889,6 +889,10 @@ pub struct AgentConfig {
     /// See `rate_prior_decay` in the config surface.
     #[serde(default)]
     pub rate_prior_decay: Option<bool>,
+    /// FR-71 T1a — classify each constrained viewer window by which plane is
+    /// the limiter, in shadow. Default ON. See `transit_classify`.
+    #[serde(default)]
+    pub transit_classify: Option<bool>,
     /// FR-65 P0 — the pump stall watch. Default ON. See `pump_stall_watch`.
     #[serde(default)]
     pub pump_stall_watch: Option<bool>,
@@ -2054,6 +2058,7 @@ pub fn test_fixture() -> AgentConfig {
         relay_max_kbps: None,
         rate_slow_start: None,
         rate_prior_decay: None,
+        transit_classify: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
         bg_rebuild_constrained: None,
@@ -2187,7 +2192,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 79] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 80] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2196,6 +2201,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 79]
         ("ICE_RELAY_TCP", cfg.ice_relay_tcp),
         ("RATE_SLOW_START", cfg.rate_slow_start),
         ("RATE_PRIOR_DECAY", cfg.rate_prior_decay),
+        ("TRANSIT_CLASSIFY", cfg.transit_classify),
         ("PUMP_STALL_WATCH", cfg.pump_stall_watch),
         ("BG_REBUILD_CONSTRAINED", cfg.bg_rebuild_constrained),
         ("SLOW_LINK_FLOOR", cfg.slow_link_floor),
