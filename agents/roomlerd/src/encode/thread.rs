@@ -61,8 +61,16 @@ pub trait EncoderOps: Send + 'static {
     type Rebuilt: Send + 'static;
     /// A pure description of how to rebuild this encoder at a new rate.
     type RebuildSpec: Send + 'static;
-    /// Counters the heartbeat prints.
-    type Stats: Send + 'static;
+    /// Counters the heartbeat prints. `Default` is what a dead thread
+    /// answers with.
+    type Stats: Default + Send + 'static;
+
+    /// How the INLINE path (the switch off) runs `encode_sync`: under
+    /// `tokio::task::block_in_place` (the FFmpeg pump, since FR-1 P5) or as
+    /// a plain call on the worker (the VP9-444 pump, which never had the
+    /// wrapper). The inline path must be today's behaviour verbatim, so each
+    /// encoder says which it was.
+    const INLINE_BLOCK_IN_PLACE: bool = true;
 
     fn encode_sync(&mut self, frame: &Frame) -> Result<Vec<crate::encode::EncodedPacket>>;
     fn set_bitrate(&mut self, bps: u32);
@@ -89,6 +97,9 @@ enum Cmd<E: EncoderOps> {
     Adopt(E::Rebuilt, oneshot::Sender<(bool, u32)>),
     RebuildSpec(u32, oneshot::Sender<Option<E::RebuildSpec>>),
     RateStats(oneshot::Sender<E::Stats>),
+    /// An encoder-specific operation the trait does not name (the VP9
+    /// pump's `set_speed`), run on the thread in order like the rest.
+    With(Box<dyn FnOnce(&mut E) + Send>, oneshot::Sender<()>),
 }
 
 /// Depth of the command channel. The pump awaits every command it sends, so
@@ -212,6 +223,12 @@ impl<E: EncoderOps> EncoderThread<E> {
         self.ask(Cmd::RateStats(tx), rx).await
     }
 
+    /// Run `f` on the encoder, on its thread, in order with everything else.
+    pub async fn with(&self, f: impl FnOnce(&mut E) + Send + 'static) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.ask(Cmd::With(Box::new(f), tx), rx).await
+    }
+
     /// Has the thread exited (an encoder panic)? The next command would fail
     /// either way; this lets a caller notice without sending one.
     pub fn is_alive(&self) -> bool {
@@ -256,9 +273,168 @@ fn serve<E: EncoderOps>(mut enc: E, rx: Receiver<Cmd<E>>) {
             Cmd::RateStats(reply) => {
                 let _ = reply.send(enc.rate_stats());
             }
+            Cmd::With(f, reply) => {
+                f(&mut enc);
+                let _ = reply.send(());
+            }
         }
     }
     // `enc` drops here, on this thread.
+}
+
+/// An encoder as a pump sees it: inline (today's path, verbatim) or on its
+/// own thread, chosen once per open from the `media_thread` switch. One call
+/// site per operation on both paths, so the switch is a constructor choice
+/// and never a second loop.
+pub enum EncoderHandle<E: EncoderOps> {
+    /// The encoder is a local of the pump; `encode` runs on the worker
+    /// (under `block_in_place` where the pump always did that).
+    Inline(E),
+    /// FR-70 M1: the encoder lives on `rc-enc-<label>`; every call below is
+    /// a message and an awaited reply.
+    Threaded(EncoderThread<E>),
+}
+
+impl<E: EncoderOps> EncoderHandle<E> {
+    /// `threaded` = the `media_thread` switch. A thread that cannot be
+    /// spawned hands the encoder back, so the handle falls back to the inline
+    /// path with a warning rather than failing an open the session paid for.
+    pub fn new(enc: E, threaded: bool, label: &str) -> Self {
+        if !threaded {
+            return Self::Inline(enc);
+        }
+        match EncoderThread::spawn(enc, label) {
+            Ok(t) => Self::Threaded(t),
+            Err((enc, e)) => {
+                tracing::warn!(%e, "FR-70 M1: encoder thread unavailable — encoding inline");
+                Self::Inline(enc)
+            }
+        }
+    }
+
+    pub fn is_threaded(&self) -> bool {
+        matches!(self, Self::Threaded(_))
+    }
+
+    fn caps(&self) -> EncoderCaps {
+        match self {
+            Self::Inline(e) => e.caps(),
+            Self::Threaded(t) => t.caps(),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.caps().name
+    }
+
+    pub fn supports_dynamic_bitrate(&self) -> bool {
+        self.caps().supports_dynamic_bitrate
+    }
+
+    pub fn reconfig_forces_idr(&self) -> bool {
+        self.caps().reconfig_forces_idr
+    }
+
+    pub fn chroma444(&self) -> bool {
+        self.caps().chroma444
+    }
+
+    pub fn current_maxrate_bps(&self) -> u32 {
+        match self {
+            Self::Inline(e) => e.current_maxrate_bps(),
+            Self::Threaded(t) => t.current_maxrate_bps(),
+        }
+    }
+
+    /// The encode. Inline: exactly as the pump always ran it — under
+    /// `block_in_place` where it did (multi-thread runtime only, which the
+    /// agent always runs), a plain call where it did not. Threaded: a
+    /// message and the awaited reply; the worker is free meanwhile.
+    pub async fn encode(
+        &mut self,
+        frame: &Arc<Frame>,
+    ) -> Result<Vec<crate::encode::EncodedPacket>> {
+        match self {
+            Self::Inline(e) => {
+                if E::INLINE_BLOCK_IN_PLACE {
+                    tokio::task::block_in_place(|| e.encode_sync(frame))
+                } else {
+                    e.encode_sync(frame)
+                }
+            }
+            Self::Threaded(t) => t.encode(frame.clone()).await,
+        }
+    }
+
+    /// Applied when the await returns, on both paths. A dead thread is logged
+    /// here and surfaces as the next encode's error, which the pump's ladder
+    /// already turns into a rebuild.
+    pub async fn set_bitrate(&mut self, bps: u32) {
+        match self {
+            Self::Inline(e) => e.set_bitrate(bps),
+            Self::Threaded(t) => {
+                if let Err(e) = t.set_bitrate(bps).await {
+                    tracing::warn!(%e, bps, "FR-70 M1: set_bitrate not applied");
+                }
+            }
+        }
+    }
+
+    pub async fn request_keyframe(&mut self) {
+        match self {
+            Self::Inline(e) => e.request_keyframe(),
+            Self::Threaded(t) => {
+                if let Err(e) = t.request_keyframe().await {
+                    tracing::warn!(%e, "FR-70 M1: keyframe request not applied");
+                }
+            }
+        }
+    }
+
+    /// `false` on a refused adoption AND on a dead thread — either way the
+    /// rebuilt encoder is dropped and the current one keeps serving.
+    pub async fn adopt_rebuilt(&mut self, rebuilt: E::Rebuilt) -> bool {
+        match self {
+            Self::Inline(e) => e.adopt_rebuilt(rebuilt),
+            Self::Threaded(t) => t.adopt_rebuilt(rebuilt).await.unwrap_or_else(|e| {
+                tracing::warn!(%e, "FR-70 M1: adoption not applied");
+                false
+            }),
+        }
+    }
+
+    pub async fn rebuild_spec(&mut self, bps: u32) -> Option<E::RebuildSpec> {
+        match self {
+            Self::Inline(e) => e.rebuild_spec(bps),
+            Self::Threaded(t) => t.rebuild_spec(bps).await.unwrap_or_else(|e| {
+                tracing::warn!(%e, "FR-70 M1: rebuild spec unavailable");
+                None
+            }),
+        }
+    }
+
+    pub async fn rate_stats(&mut self) -> E::Stats {
+        match self {
+            Self::Inline(e) => e.rate_stats(),
+            Self::Threaded(t) => t.rate_stats().await.unwrap_or_else(|e| {
+                tracing::warn!(%e, "FR-70 M1: rate stats unavailable");
+                E::Stats::default()
+            }),
+        }
+    }
+
+    /// An encoder-specific operation the trait does not name, run in order
+    /// with everything else (inline: right here).
+    pub async fn with(&mut self, f: impl FnOnce(&mut E) + Send + 'static) {
+        match self {
+            Self::Inline(e) => f(e),
+            Self::Threaded(t) => {
+                if let Err(e) = t.with(f).await {
+                    tracing::warn!(%e, "FR-70 M1: encoder operation not applied");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -472,5 +648,36 @@ mod tests {
         assert!(!t.is_alive());
         assert!(t.request_keyframe().await.is_err());
         assert!(t.encode(frame(2)).await.is_err());
+    }
+
+    /// M1b — an operation the trait does not name (`set_speed` on the VP9
+    /// pump) runs on the thread, in order with the commands around it, on
+    /// both paths of the handle.
+    #[tokio::test]
+    async fn with_runs_on_the_encoders_thread_in_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let dropped_on = Arc::new(Mutex::new(None));
+        let mut h = EncoderHandle::new(fake(&log, &dropped_on), true, "with");
+        assert!(h.is_threaded());
+        h.set_bitrate(300_000).await;
+        h.with(|e| {
+            let thread = std::thread::current().name().unwrap_or("?").to_string();
+            e.log.lock().unwrap().push(format!("speed@{thread}"));
+        })
+        .await;
+        h.encode(&frame(3)).await.unwrap();
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["rate:300000", "speed@rc-enc-with", "encode:3@rc-enc-with"]
+        );
+
+        // The inline path runs it right here, in the caller's thread.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut h = EncoderHandle::new(fake(&log, &dropped_on), false, "inline");
+        assert!(!h.is_threaded());
+        h.with(|e| e.log.lock().unwrap().push("inline-speed".into()))
+            .await;
+        assert_eq!(log.lock().unwrap().clone(), vec!["inline-speed"]);
+        assert_eq!(h.name(), "fake");
     }
 }

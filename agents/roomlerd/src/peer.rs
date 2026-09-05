@@ -3057,7 +3057,6 @@ async fn media_pump_vp9_444_dc(
             "media_pump_vp9_444_dc: SystemContext worker — lock overlay disabled"
         );
     }
-    use crate::encode::VideoEncoder; // brings encode/request_keyframe into scope
     use crate::encode::libvpx::Vp9Encoder;
 
     // rc.33: opt-in 60 fps via env var. Default 30 (the pre-rc.33
@@ -3083,7 +3082,10 @@ async fn media_pump_vp9_444_dc(
     // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
     // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
     let mut reopen_backoff = capture::ReopenBackoff::new();
-    let mut encoder: Option<Vp9Encoder> = None;
+    // FR-70 M1b — the same handle the FFmpeg pump got in M1a: inline
+    // (today's plain call on the worker, verbatim) or on its own thread.
+    let media_thread = crate::encode::media_thread_enabled();
+    let mut encoder: Option<crate::encode::thread::EncoderHandle<Vp9Encoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
     let mut last_capture_at = std::time::Instant::now();
     let mut last_good_frame: Option<std::sync::Arc<crate::capture::Frame>> = None;
@@ -3509,7 +3511,7 @@ async fn media_pump_vp9_444_dc(
             if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
                 && let Some(enc) = encoder.as_mut()
             {
-                enc.set_bitrate(applied.bps);
+                enc.set_bitrate(applied.bps).await;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
@@ -3723,7 +3725,19 @@ async fn media_pump_vp9_444_dc(
             info!(%session_id, w, h, target_fps, chroma = chroma.as_str(), chroma_source = if chroma_pref.is_some() { "session_request" } else { "env_var" }, "VP9-444 encoder rebuild for dims");
             match Vp9Encoder::new_with_fps_chroma(w, h, target_fps, chroma) {
                 Ok(e) => {
-                    encoder = Some(e);
+                    let handle = crate::encode::thread::EncoderHandle::new(
+                        e,
+                        media_thread,
+                        &session_id.to_hex()[18..],
+                    );
+                    if media_thread {
+                        info!(
+                            %session_id,
+                            threaded = handle.is_threaded(),
+                            "FR-70 M1: encoder handed to its own thread"
+                        );
+                    }
+                    encoder = Some(handle);
                     encoder_dims = Some((w, h));
                     // Badge-truth — record the ACTUAL chroma for the
                     // `rc:video-info` retry block and (re)announce it.
@@ -3774,13 +3788,13 @@ async fn media_pump_vp9_444_dc(
         let own_kf = keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed);
         let shared_kf = pipeline.take_keyframe_requested();
         if own_kf || shared_kf {
-            enc.request_keyframe();
+            enc.request_keyframe().await;
             force_keyframe_this_iter = true;
         }
         // Unanswered-force retry — see `kf_policy::KEYFRAME_BACKSTOP`
         // (rc.234: due ONLY while a force is armed, never a metronome).
         if kf_gate.backstop_due(std::time::Instant::now()) {
-            enc.request_keyframe();
+            enc.request_keyframe().await;
             force_keyframe_this_iter = true;
             if kf_gate.take_backstop_log() {
                 info!(
@@ -3899,7 +3913,7 @@ async fn media_pump_vp9_444_dc(
                 send_tx.capacity(),
                 std::time::Instant::now(),
             ) {
-                enc.set_bitrate(applied.bps);
+                enc.set_bitrate(applied.bps).await;
                 if q_now != last_applied_quality || applied.changed {
                     info!(
                         %session_id,
@@ -3914,7 +3928,7 @@ async fn media_pump_vp9_444_dc(
             last_applied_quality = q_now;
         }
 
-        let packets = match enc.encode(frame).await {
+        let packets = match enc.encode(&frame).await {
             Ok(p) => p,
             Err(e) => {
                 warn!(%session_id, %e, "VP9-444 encode error — pump exits");
@@ -4003,7 +4017,7 @@ async fn media_pump_vp9_444_dc(
                 // re-arms it; static periods let it expire and
                 // restore base quality.
                 if current_cpu_used != MOTION_BOOST_CPU_USED {
-                    enc.set_speed(MOTION_BOOST_CPU_USED);
+                    enc.with(|e| e.set_speed(MOTION_BOOST_CPU_USED)).await;
                     tracing::info!(
                         %session_id,
                         from = current_cpu_used,
@@ -4024,7 +4038,7 @@ async fn media_pump_vp9_444_dc(
             && frames_encoded >= motion_boost_until_frame
             && current_cpu_used != base_cpu_used
         {
-            enc.set_speed(base_cpu_used);
+            enc.with(move |e| e.set_speed(base_cpu_used)).await;
             tracing::info!(
                 %session_id,
                 from = current_cpu_used,
@@ -4077,7 +4091,7 @@ async fn media_pump_vp9_444_dc(
         let buffered = dc.buffered_amount().await as u64;
         if buffered > dc_buffered_high {
             if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
-                enc.set_bitrate(applied.bps);
+                enc.set_bitrate(applied.bps).await;
                 info!(
                     %session_id,
                     buffered,
