@@ -2,8 +2,15 @@
 # build host's weekly `registry-retention.sh` for the registry it replaces.
 #
 # Two prunes, both bounded by what they may NEVER touch:
-#   1. untagged versions — stale BuildKit cache manifests (every push of
-#      `buildcache-hosted` orphans the previous one) and dangling layers;
+#   1. untagged versions that are BuildKit CACHE manifests (every push of
+#      `buildcache-hosted` orphans the previous one) — and ONLY those. GHCR
+#      has no referrers API, so a provenance attestation is pushed as an
+#      UNTAGGED manifest plus a `sha256-<subject digest>` index that points at
+#      it: "delete everything untagged" deletes the attestations (the first
+#      dry run, 2026-09-05, would have taken the hosted image's). A version
+#      is deleted only when its own manifest says it is a cache
+#      (`config.mediaType` = `application/vnd.buildkit.cacheconfig.v0`);
+#      anything else, or anything unreadable, is kept;
 #   2. the hosted lane's dated tags beyond the newest KEEP — a version is a
 #      candidate ONLY if every tag it carries is `hosted-<YYYYMMDD>-<sha7>`.
 #      A version that also carries `hosted`, `latest`, `v*`, `*-<profile>`,
@@ -40,20 +47,43 @@ jobs:
       KEEP: ${{ inputs.keep || 20 }}
       DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
     steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Prune
         run: |
           set -euo pipefail
           OWNER="${GITHUB_REPOSITORY_OWNER}"
           PKG="${GITHUB_REPOSITORY#*/}"
+          IMAGE="ghcr.io/${OWNER}/${PKG}"
           API="/users/${OWNER}/packages/container/${PKG}/versions"
           echo "package ${OWNER}/${PKG}  keep=${KEEP}  dry_run=${DRY}"
           gh api --paginate "$API" > versions.json
           TOTAL="$(jq 'length' versions.json)"
           echo "versions: $TOTAL"
 
-          # 1. untagged
-          jq -r '.[] | select((.metadata.container.tags | length) == 0) | "\(.id) \(.created_at)"' versions.json > untagged.txt
-          echo "untagged: $(wc -l < untagged.txt)"
+          # 1. untagged — only the BuildKit cache manifests (see the header).
+          # Each candidate's manifest is read back from the registry by digest;
+          # a version whose manifest is not a cache config, or cannot be read,
+          # is kept. The attestations live here untagged, referenced by their
+          # `sha256-<subject>` index.
+          jq -r '.[] | select((.metadata.container.tags | length) == 0) | "\(.id) \(.name) \(.created_at)"' versions.json > untagged-all.txt
+          : > untagged.txt
+          while read -r ID DIGEST CREATED; do
+            MT="$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --raw 2>/dev/null | jq -r '.config.mediaType // .mediaType // "unreadable"' 2>/dev/null || echo unreadable)"
+            if [ "$MT" = "application/vnd.buildkit.cacheconfig.v0" ]; then
+              echo "$ID $CREATED" >> untagged.txt
+            else
+              echo "  keeping untagged $ID ($CREATED): $MT"
+            fi
+          done < untagged-all.txt
+          echo "untagged: $(wc -l < untagged-all.txt), of which cache manifests: $(wc -l < untagged.txt)"
 
           # 2. hosted-* beyond KEEP — candidates are versions whose EVERY tag is a dated hosted tag
           jq -r '
