@@ -411,6 +411,39 @@ the pin restores the cap is CPU-downscaled by the resampler, which is why
 the downward direction never showed the flaw. Gate criterion unchanged,
 now in both directions.
 
+**Third field contact (2026-09-06 12:23 UTC, CORPLAP-3 on 0.4.74 — both
+fixes in — same driver): every intended move adopts, and the frame-driven
+trigger is shown to be the wrong shape.** Four moves, four `dims swap
+adopted — the picture never froze` (1920→1214, 1214→1920, 1920→944,
+944→1920; `open_ms` 290 / 295 / 327 / 285 off the frame path, adoption
+17.9 / 16.7 ms in-path, `dims_swaps=4`). The downward moves are clean.
+But 7 ms after each UPWARD adoption a new `dims change` fires — back
+toward the small dims — followed by two inline re-opens (`STALL` 387 and
+416 ms, heartbeat `open=685 stalls=2`). What happens: the frames still in
+flight after the adoption were captured under the OLD (small) cap; the
+trigger read a frame's dims as the plan and opened a replacement toward
+those stale dims, `continue`d past the cap block, and on the next pass the
+same stale frame with a swap now pending took the inline path, whose
+`built_target` then pointed at the pinned Native while the encoder was
+small again — one more spawn, one more inline. The pattern says the
+trigger must not be frame-driven at all: a frame's dims are evidence of
+what the capturer WAS told, not of what the plan wants. **Fix**: the
+make-before-break is decided from the plan — a live encoder built for
+`built_target` that the plan has moved away from gets its replacement
+opened at the dims the plan's target will produce
+(`resample::target_dims`, the resampler's rule stated without a frame and
+locked to it by a test), and the target is pinned from that same pass, so
+the capture cap follows the pin and never runs ahead of the swap; a frame
+whose dims match neither the encoder's nor the pin's while a cap change
+is still propagating is stale and is skipped (bounded: three frames per
+cap change, then the inline open self-heals a backend that rounds the
+box differently). The inline path is left for what it was always for: the
+session's first encoder, a backend that cannot rebuild off the frame path,
+a host whose native dims changed. Gate criterion unchanged: a resize-driven
+session on the release carrying this reads `dims_swaps` equal to the
+number of moves, one `dims swap adopted` line per move, and no `open_ms`
+and no `STALL` after the session's first heartbeat.
+
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
 thread while the current encoder keeps serving `Encode`, which is the whole
