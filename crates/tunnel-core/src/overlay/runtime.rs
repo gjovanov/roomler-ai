@@ -2296,6 +2296,9 @@ impl OverlayRuntime {
         let mut dns_bound = false;
         // Owned so the teardown can stop it; see the ⚠️ at the spawn below.
         let mut dns_task: Option<tokio::task::JoinHandle<()>> = None;
+        // FR-72 P2 — watched for the WHOLE session, not read once: the resolver
+        // retries a failed bind, so it can come up long after the initial wait.
+        let mut dns_bound_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
         let dns_names: Option<dns::NameMap> = if let Some(magic_domain) = dns_magic.clone() {
             let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             sync_name_map(
@@ -2305,7 +2308,11 @@ impl OverlayRuntime {
                 self_v4,
             )
             .await;
-            let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+            // FR-72 P2 — a `watch`, not a `oneshot`: the resolver now retries a
+            // failed bind, so "bound" can arrive AFTER the wait below gives up,
+            // and the loop re-reads this to steer the OS late (see the tick arm).
+            let (bound_tx, mut bound_rx) = tokio::sync::watch::channel(false);
+            dns_bound_rx = Some(bound_rx.clone());
             // ⚠️ KEEP THIS HANDLE. `dns::run` serves until its socket errors, so
             // a spawned-and-forgotten resolver outlives the runtime that made
             // it and keeps `<self overlay ip>:53` bound. The runtime is scoped
@@ -2339,11 +2346,19 @@ impl OverlayRuntime {
             )));
             // The bind is a local UDP bind — microseconds; bound the wait so a hung
             // reactor can't stall the join. Timeout / send-error → not-bound.
-            dns_bound = tokio::time::timeout(Duration::from_secs(2), bound_rx)
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or(false);
+            dns_bound = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if *bound_rx.borrow_and_update() {
+                        return true;
+                    }
+                    // Sender gone ⇒ the resolver task is dead; not bound.
+                    if bound_rx.changed().await.is_err() {
+                        return false;
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
             // Point the OS resolver at us for `<magic_domain>` (reverted on Drop).
             //
             // Multi-org P2a: gated on `dns_bound` — steering the OS at a
@@ -2870,6 +2885,35 @@ impl OverlayRuntime {
                 // doesn't immediately re-upgrade it to direct).
                 _ = fallback.tick() => {
                     let t_arm = Instant::now();
+                    // FR-72 P2 — the resolver retries its bind, so it may come up
+                    // after the bring-up wait already concluded "not bound" and
+                    // WITHHELD the OS steer. Without this the retry is pointless:
+                    // a bound resolver nobody is steered at answers nothing, which
+                    // is exactly the state a corp laptop sat in for hours.
+                    //
+                    // ⚠️ One-way on purpose. This installs the steer when the bind
+                    // finally lands; it never REVOKES it, because the guard's Drop
+                    // already reverts on teardown and a flap must not repeatedly
+                    // rewrite the host-global NRPT.
+                    if _dns_os_guard.is_none()
+                        && let Some(rx) = dns_bound_rx.as_mut()
+                        && *rx.borrow_and_update()
+                        && let Some(magic_domain) = exit_state.dns_magic_domain.clone()
+                    {
+                        info!(%magic_domain, "magicdns: resolver bound late — steering the OS now");
+                        _dns_os_guard = Some(
+                            dns::configure_os(self_v4, &magic_domain, tun.os_name().as_deref()).await,
+                        );
+                        // The exit-DNS "." steer is gated on the same fact.
+                        exit_state.dns_bound = true;
+                        self.dns_status = Some(DnsStatus {
+                            magic_domain: magic_domain.clone(),
+                            resolver_bound: true,
+                            os_steer_active: _dns_os_guard.as_ref().is_some_and(|g| g.active()),
+                            upstream: dns_upstream.to_string(),
+                            answer_aaaa: crate::env::node_env("DNS_AAAA").as_deref() != Some("0"),
+                        });
+                    }
                     // FR-19 P4b — expire org-relay sessions past their lifetime
                     // and spawn the binds `request` decided on since the last
                     // pass (a bind is a network round trip: never on-loop).
@@ -4144,6 +4188,12 @@ impl OverlayRuntime {
         // task drops, so the successor binds cleanly.
         if let Some(h) = dns_task {
             h.abort();
+            // ⚠️ `abort()` only REQUESTS cancellation — the socket is released
+            // when the task is next polled and dropped, which is NOT guaranteed
+            // to have happened before the next session's resolver binds. Await
+            // it (bounded, so a wedged task can't stall a reconnect) so the
+            // successor cannot lose the race to its own aborted predecessor.
+            let _ = tokio::time::timeout(Duration::from_secs(1), h).await;
         }
     }
 }

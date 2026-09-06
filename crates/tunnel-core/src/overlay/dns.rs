@@ -63,25 +63,64 @@ pub fn parse_upstream(s: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, 53))
 }
 
-/// Serve until the socket errors (or the task is dropped). Best-effort: a bind
-/// failure (needs :53 privileges + the address on the NIC) logs and returns, so
-/// the overlay keeps working without DNS.
-pub async fn run(cfg: DnsConfig, bound: tokio::sync::oneshot::Sender<bool>) {
-    let sock = match UdpSocket::bind(cfg.bind).await {
-        Ok(s) => {
-            // P5 S4b — tell the runtime the resolver is actually listening, so it
-            // only steers the "." catch-all at this address when there IS a live
-            // resolver. Steering "." at a dead :53 would blackhole ALL DNS (worse
-            // than the leak we're closing), so the exit-DNS steer is gated on this.
-            let _ = bound.send(true);
-            Arc::new(s)
-        }
-        Err(e) => {
-            let _ = bound.send(false);
-            warn!(bind = %cfg.bind, %e, "magicdns: bind failed; resolver off");
-            return;
+/// Serve until the socket errors (or the task is dropped). Best-effort about the
+/// bind (it needs `:53` privileges + the address on the NIC) — but it RETRIES
+/// rather than giving up, so a transient holder cannot cost the whole process.
+///
+/// FR-72 P2. The bind used to log once and return, which made one momentary
+/// conflict permanent: the resolver stayed off for the daemon's entire lifetime,
+/// with nothing scheduled to try again. Field-measured on the dev box, where a
+/// daemon restart raced its own dying predecessor for the port and lost:
+///
+/// ```text
+/// 20:57:13  INFO magicdns: resolver up               bind=<a>:53   (org A)
+/// 20:57:13  INFO magicdns: resolver up               bind=<b>:53   (org B)
+/// 21:03:17  WARN magicdns: bind failed; resolver off bind=<b>:53   AddressAlreadyInUse
+/// 21:03:18  WARN magicdns: bind failed; resolver off bind=<a>:53   AddressAlreadyInUse
+/// ```
+///
+/// Both orgs, five hours dead — while a probe minutes later bound the same
+/// address on the first try. Nothing was holding it any more; nothing asked.
+pub async fn run(cfg: DnsConfig, bound: tokio::sync::watch::Sender<bool>) {
+    let sock = {
+        let mut attempt: u32 = 0;
+        loop {
+            match UdpSocket::bind(cfg.bind).await {
+                Ok(s) => break Arc::new(s),
+                Err(e) => {
+                    // WARN once, then DEBUG: a permanently-held port (a real DNS
+                    // server on the host) must not write a WARN every 30 s
+                    // forever, but the first failure is worth seeing.
+                    if attempt == 0 {
+                        // Report not-bound so the runtime withholds the OS steer.
+                        // Steering at a resolver that never bound blackholes the
+                        // magic domain host-wide (NRPT is registry-global).
+                        let _ = bound.send(false);
+                        warn!(bind = %cfg.bind, %e, "magicdns: bind failed; retrying");
+                    } else {
+                        debug!(bind = %cfg.bind, %e, attempt, "magicdns: bind still failing");
+                    }
+                    // Retry FOREVER, capped at 60 s. A squatter that goes away —
+                    // the case actually measured — then heals itself, and the
+                    // cost of being wrong is one timer per minute. The task is
+                    // aborted by the runtime teardown, so this cannot outlive it.
+                    let backoff = Duration::from_secs(2u64.saturating_pow(attempt.min(5)).min(60));
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(backoff).await;
+                }
+            }
         }
     };
+    // P5 S4b — tell the runtime the resolver is actually listening, so it only
+    // steers the "." catch-all at this address when there IS a live resolver.
+    // Steering "." at a dead :53 would blackhole ALL DNS (worse than the leak
+    // we're closing), so the exit-DNS steer is gated on this.
+    //
+    // ⚠️ This can now fire LATE — after the runtime's initial wait gave up. The
+    // runtime therefore keeps watching it and installs the steer when it flips,
+    // instead of reading it once. A `watch` (not a `oneshot`) is what makes the
+    // late arrival observable at all.
+    let _ = bound.send(true);
     info!(bind = %cfg.bind, domain = %cfg.magic_domain, "magicdns: resolver up");
     let mut buf = [0u8; 1500];
     loop {
@@ -756,31 +795,53 @@ mod tests {
             answer_aaaa: true,
         };
 
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        // The first value the resolver publishes about itself.
+        async fn first_report(rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+            rx.changed().await.expect("resolver dropped its reporter");
+            *rx.borrow_and_update()
+        }
+
+        let (tx1, mut rx1) = tokio::sync::watch::channel(false);
         let first = tokio::spawn(run(cfg(port), tx1));
-        assert!(rx1.await.unwrap(), "the first resolver should bind");
+        assert!(
+            first_report(&mut rx1).await,
+            "the first resolver should bind"
+        );
 
         // Negative control: while it lives, nobody else gets the port.
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let (tx2, mut rx2) = tokio::sync::watch::channel(false);
         let loser = tokio::spawn(run(cfg(port), tx2));
         assert!(
-            !rx2.await.unwrap(),
+            !first_report(&mut rx2).await,
             "a second resolver must NOT be able to bind while the first holds the \
              port — if this passes, the test cannot detect the leak it exists for"
         );
-        loser.abort();
 
         // The fix: the runtime aborts the task on teardown, and the port frees.
         first.abort();
         let _ = first.await;
 
-        let (tx3, rx3) = tokio::sync::oneshot::channel();
-        let successor = tokio::spawn(run(cfg(port), tx3));
+        // FR-72 P2 — the loser is still RETRYING, so it becomes the owner on its
+        // own. This is the whole point: before it, a resolver that lost the port
+        // once stayed off for the daemon's lifetime even after the holder left,
+        // and MagicDNS sat dead for hours with the port free the entire time.
+        let recovered = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if *rx2.borrow_and_update() {
+                    return true;
+                }
+                if rx2.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
         assert!(
-            rx3.await.unwrap(),
-            "after the owner is aborted the successor must bind — this is what \
-             makes a WS reconnect recover MagicDNS instead of killing it"
+            recovered,
+            "a resolver that lost the bind must retry and take the port once it \
+             frees — otherwise one momentary conflict is permanent"
         );
-        successor.abort();
+        loser.abort();
     }
 }
