@@ -69,6 +69,7 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
 | P0 | Spike: daemon spawns a GUI worker via `launchctl asuser`, worker answers a LocalAPI caps probe from the daemon. Measures the respawn latency and the TCC verdict. | n/a (spike, no ship) |
 | P1 | Daemon-as-supervisor: spawn + babysit + session-change respawn. Worker still enrolled — nothing changes for the server yet. | `macos_supervise_gui_worker` (default **off** ⇒ today's two independent halves) |
 | P2 | Session delegation: the daemon's WS accepts an rc session and drives the worker over LocalAPI. | per-session fallback — delegation failure re-serves from the worker's own enrollment |
+| P2c | The daemon's row advertises the WORKER's `permissions`, so the dashboard stops calling a working capture target "not a capture target". | caps are only ever sent when they CHANGE; absent field = today's behaviour |
 | P3 | Collapse the enrollment: installer mints ONE token; existing two-row Macs migrate. | `--daemon-token` keeps working (two-row install stays reachable for a release) |
 
 ## P2 design — session delegation over LocalAPI
@@ -243,6 +244,83 @@ touched: dispatch it on the branch before merging.
   a small per-session queue, or an explicit "not ready" refusal — silently dropping them
   would produce a session that half-works, which is worse than one that fails.
 
+## P2c design — the daemon's row stops calling itself "not a capture target"
+
+Measured against master `dfec6128` (2026-09-06).
+
+P2b made the daemon's row able to stream real pixels. It still advertises
+`permissions: ["no-gui-session"]`, so the dashboard renders it as *not a capture
+target* and the operator has to know the trick to use it. Until that is fixed
+the feature works and looks broken, which is close to not working.
+
+### The constraint that shapes everything: caps are announced ONCE
+
+The server takes caps from `rc:agent.hello` and nowhere else
+(`crates/modules/fleet/src/socket.rs:60`). `AgentHeartbeat` carries `rss_mb`,
+`cpu_pct`, `active_sessions` and `sys` — **no caps**
+(`crates/remote_control/src/signaling.rs:308`). There is no post-hello refresh
+path at all.
+
+That matters because the worker attaches on its own schedule: the supervisor
+spawns it at daemon start and it attaches ~260 ms later, but it also attaches
+after a console-user change, after a hand-back, and not at all when nobody is
+logged in. Whatever P2c does must cope with caps that become true *after* the
+WS is already up.
+
+### Rejected: wait for a worker before saying hello
+
+The obvious fix — delay the hello until a worker has attached, so the caps are
+right first time — is **wrong, and expensively so**. It couples the daemon's
+control WS to GUI-worker readiness, which destroys the one property the daemon
+half exists for: reachable *before anyone logs in*. A headless reboot would
+never connect at all, and `roomler ssh` / `exec` / the mesh would wait on a
+login that may never come. The daemon must say hello immediately and correct
+itself later.
+
+### Chosen: an optional `caps` on the heartbeat, sent only when it CHANGES
+
+- **Additive on the wire.** `AgentHeartbeat.caps: Option<AgentCaps>` with
+  `skip_serializing_if`, so an older server ignores it and an older agent simply
+  never sends it. No version gate, no capability verb.
+- **Sent on change, not every beat.** Caps are ~200 bytes and the heartbeat is
+  frequent; in steady state this costs nothing. The daemon keeps the last
+  announced value and sends when the effective caps differ.
+- **Self-healing.** The heartbeat is already on a timer, so a missed update
+  corrects itself rather than needing its own retry.
+
+The worker sends its caps over the existing delegation channel at attach
+(`DelegateFrame::WorkerCaps`), and the daemon computes *effective* caps.
+
+### What the worker's caps replace, and what they do not
+
+Only **`permissions`** and **`has_input_permission`** — the two that are false
+about the daemon and true about the worker, and the two the dashboard renders.
+
+⚠️ NOT `codecs` / `hw_encoders` / `transports`. Measured on the MacBook
+2026-09-01: both halves report **identical** values, so there is nothing to gain
+— and the P2b-3 lesson argues against it anyway. The daemon is the half that
+answers `rc:session.request`, so its resolution is what the server was told; if
+the two ever diverged, advertising the worker's list while resolving with the
+daemon's would produce exactly the class of bug P2b-3 was. Revisit only with a
+measurement showing they differ.
+
+### ⚠️ It must revert
+
+When the worker detaches — logout, hand-back to launchd, a crash — the row must
+go back to `no-gui-session`, or it claims a capture target that is gone and the
+next session gets the black screen P2b just fixed. Reconcile, do not toggle:
+compute effective caps from current state and send when they differ, the same
+shape as [`crate::power::PowerKeeper`].
+
+### Components
+
+| where | change |
+|---|---|
+| wire | `AgentHeartbeat.caps: Option<AgentCaps>` |
+| agent | `DelegateFrame::WorkerCaps`; effective-caps computation; send-on-change |
+| server | accept caps on a heartbeat, update the hub's `AgentConn` and the `agents` row |
+| UI | none — it already renders `permissions` |
+
 ## Acceptance criteria
 
 - [ ] A fresh install with **one** token produces **one** device row, and that row serves
@@ -254,6 +332,14 @@ touched: dispatch it on the branch before merging.
 - [ ] A remote-desktop session started while logged in streams real pixels and accepts
       input, with `caps` reporting `has_input_permission: true` and **no TCC re-prompt**.
 - [ ] `codesign -d -r-` on the bundle is byte-identical before and after the migration.
+- [ ] P2c: with a worker attached, the daemon's row reports `screen-capture` +
+      `input` and the dashboard stops calling it "not a capture target".
+- [ ] P2c: when the worker DETACHES, the row goes back to `no-gui-session`
+      within one heartbeat — a stale "capture target" is worse than an honest
+      "not one", because the next session gets a black screen.
+- [ ] P2c: a device with no worker (every non-macOS agent, and a macOS one with
+      the switch off) sends no `caps` on its heartbeats at all — measured on the
+      wire, not inferred from behaviour.
 - [ ] `kill -9` on the GUI worker respawns it within 10 s **without** the control WS
       dropping (measured: the device row never goes offline).
 - [ ] An existing two-row Mac migrates to one row keeping its overlay address, and the
