@@ -242,5 +242,71 @@ performance and scale (this is a *functional* matrix); upgrade/migration **betwe
 
 ## Field-verification log
 
-_(filled as cells run — every entry records what FAILED first, per the standing rule that a check
-which never failed first has not been shown to work)_
+Every entry records what **failed first**, per the standing rule that a check which never failed
+first has not been shown to work.
+
+### 2026-09-06 — bring-up, `full` cell on zeus
+
+Harness: `roomler-ai-deploy/profiletest/` (sibling of `vmtest/`), server golden
+`ubuntu-docker-noble.qcow2`, agents on FR-61's `ubuntu-gui-noble.qcow2`.
+
+**Findings against the product / the docs**
+
+| # | finding | evidence |
+|---|---|---|
+| 1 | **The four non-`full` profile images have never been published.** `ghcr.io/gjovanov/roomler-ai:latest-collab` does not resolve, and no `-remote`/`-mesh`/`-access` tag exists on any tag family. `publish-selfhost-image.yml` is dispatch-only with `profile` defaulting to `full`, and has only ever been dispatched that way | first cell, at the cheapest gate, before a browser booted |
+| 2 | **The one image that does exist predates the feature it is documented around.** `latest` = `v0.4.45` (2026-09-01); `/api/capabilities` + `/health .modules` landed 2026-09-04 (`d1f1be948`, FR-69 P8). `merge-base --is-ancestor` says false. The workspace is at 0.4.76 — 31 versions ahead | `/health` → `{"status":"ok","version":"0.4.45"}` with no `.modules`; `/api/capabilities` → **404** |
+| 3 | **Enrollment refuses plaintext off-loopback, and `docs/self-hosting.md` does not say so.** `normalize_server_url` upgrades `http://`→`https://` for any non-loopback host; loopback is exempt. So "Add your first machine" cannot work until the *later*, optional-looking "Putting it behind a real hostname" section has been done, and the error names nothing | `roomlerd enroll` → `POST https://…:8080/api/agent/enroll` → `SSL routines:ssl3_get_record:wrong version number` |
+
+Findings 1 and 2 are reported, not fixed: publishing puts a public package under the operator's
+account and is theirs to decide by the workflow's own design. The matrix therefore runs against a
+**`hosted-*` tag** as a current-code stand-in, with `saas` expected *present* and every verdict
+labelled so nobody mistakes it for a self-host image.
+
+**Harness faults (the majority, as predicted)**
+
+1. `curl -fsS … || echo '{}'` collapsed *"404, no such route"* into *"the field is missing"* — two
+   causes with different fixes, one message. Read the **status**.
+2. `--tag` was reverted in the child: `lib.sh` sources `~/profiletest/.env`, whose assignments are
+   unconditional, so an exported `PT_TAG` is clobbered the moment `cell.sh` re-sources it. The run
+   used `latest` **while looking perfectly healthy**. The tag now travels as an argument.
+3. `install.sh` needs `--server` **even with `--no-enroll`** — it resolves the release through
+   `$SERVER/api/agent/latest-release`, whose baked-in default named the agent's own loopback.
+4. `$?` inside `if ! cmd; then … "$?" …; fi` is the **negation's** status, always 0 — a genuinely
+   failed install reported `rc=0`. Same family as the standing "never branch on a piped exit
+   status" rule.
+5. `/api` is rate-limited **per client IP** (1 req/s, burst 60) and everything in a cell comes from
+   `127.0.0.1`: the SPA logged `/api/capabilities unavailable … API error 429` and the call test
+   timed out with nothing wrong on the server. The settings doc-comment already says the prod e2e
+   overlay bumps this for exactly this reason.
+6. `CI=1` makes `playwright.config` retry twice, so a **timeout** costs 3× — 18 minutes to prove
+   the same 429 three times.
+7. Tenant membership is not **room** membership: the `/ws` fan-out targets room members, so the
+   peer saw nothing and the realtime assertion read as a broken socket.
+8. **The daemon's two TLS stacks disagree.** Enrollment is reqwest/**native-tls (OpenSSL)**; the
+   signalling WebSocket is tokio-tungstenite/**rustls**. A self-signed cert that is its own CA is
+   accepted by the first and refused by the second
+   (`invalid peer certificate: CaUsedAsEndEntity`) — so the agent enrolled perfectly, retried its
+   socket forever, and the only visible verdict was *"no overlay self address within 120s"*, a
+   symptom three layers below its cause. Fixed with a real CA → leaf chain; an overlay timeout now
+   quotes the daemon's own last words.
+
+**Green so far** (`hosted-20260906-5aa3c43`, version 0.4.74), reproduced across runs:
+
+```
+install       PASS  compose pull + up, documented path; /health and / both answer
+capabilities  PASS  modules='chat conference fleet network remote saas', switched_off empty, /health agrees
+saas          PASS  billing present, as a hosted-* image must be
+probe/chat        PASS  401 (mounted)      probe/conference  PASS  401 (mounted)
+probe/fleet       PASS  401 (mounted)      probe/remote      PASS  401 (mounted)
+probe/network     PASS  401 (mounted)
+register      PASS  owner registered + org created through the public API
+tls           PASS  lab TLS front (CA → leaf, IP SAN)
+collab        PASS  chat over /ws AND a 2-party call with advancing decoded frames on BOTH sides
+agent1/install PASS  agent2/install PASS   (served install.sh, release resolved through the cell's own server)
+agent1/enroll  PASS  agent2/enroll  PASS
+```
+
+`collab` is the headline: the first time a Roomler call has been asserted end-to-end with a media
+oracle that **can fail** — `conference-multi.spec.ts` swallows its tile assertion by design, which
+is the same shape as the incident this FR cites.
