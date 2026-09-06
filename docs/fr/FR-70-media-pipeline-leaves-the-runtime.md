@@ -381,6 +381,36 @@ that: a window-resize-driven session on a 0.4.72+ host reads
 `dims_swaps ≥ 1`, the `dims swap adopted` line, and no `open_ms` after the
 session's first heartbeat.
 
+**Second field contact (2026-09-06 11:34 UTC, CORPLAP-3 on 0.4.73 — the
+cap-order fix in — sole viewer, av1_qsv, direct): half a pass, and the
+other half names the next bug.** Driver: Fit mode, then the stage element
+shrunk and restored from the page (`document.querySelector('.video-frame')
+.style.width = '900px'`, later `'700px'`; the viewer's `ResizeObserver`
+re-sends fit on each change) — the dropdown's option clicks do not land
+reliably through the browser extension, and `resize_window` cannot shrink
+a maximized window. **Downward moves work as designed**: native → 1214×758
+and native → 944×590 each logged `dims change — opening the replacement in
+the background` and, 300 ms later, `dims swap adopted — the picture never
+froze` (`open_ms=288` and `285`, off the frame path; the adoption itself
+cost `apply=16.6 ms` in-path), heartbeats with `open=0.0`, no `STALL`,
+`dims_swaps=2`. **Upward moves (small → native) still froze**: the
+trigger fired both times, then `encoder (re)built` + a 410 / 392 ms
+`STALL` — the inline path, the replacement dropped. Cause: on the pass
+where the plan moved to Native the frame still carried the old cap, so
+`need_rebuild` was false and the `!need_rebuild` branch refreshed
+`built_target` from the plan's NEW target although the live encoder was
+still 1214×758; the cap block then lifted the cap, the next native frame
+spawned the open, and the pass after that pinned to the corrupted
+`built_target` (Native) — native frames against a 1214 encoder,
+`need_rebuild` with a swap in flight, inline. **Fix**: `built_target` is
+set only where an encoder actually comes to exist — the inline open (from
+the target that produced the frame) and the adoption (from the target the
+replacement was opened for, now carried in `PendingDimsOpen`) — and never
+refreshed on a no-rebuild pass. The one native frame that arrives before
+the pin restores the cap is CPU-downscaled by the resampler, which is why
+the downward direction never showed the flaw. Gate criterion unchanged,
+now in both directions.
+
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
 thread while the current encoder keeps serving `Encode`, which is the whole
