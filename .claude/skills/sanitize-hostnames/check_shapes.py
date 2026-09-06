@@ -134,7 +134,19 @@ ALLOW = re.compile(
     # charset named in an X11 font string; it is the ONLY non-hex false
     # positive the generalised shape produced across the whole history, so it
     # is listed rather than weakening the shape.
-    r"|ISO[0-9]+",                                            # spec numbers
+    r"|ISO[0-9]+"                                             # spec numbers
+    # A RETIRED canary, not a machine -- it never named anything. Writing up
+    # this guard published it into a GitHub issue, so step 2b's scan of
+    # PUBLISHED content reported it on every run, and a standing "known
+    # benign" hit is how a check earns the noise that gets it deleted.
+    #
+    # ⚠️ It was rotated OUT of selftest.sh's CAUGHT list in the same commit,
+    # and into its IGNORED list. Both halves are load-bearing: allowlisting a
+    # value that is still asserted as CAUGHT makes the canary vacuous, and the
+    # selftest fails loudly if anyone tries (`MISSED:`, both casings). Listing
+    # it as IGNORED is what turns this line from an assumption into an
+    # assertion. Remove the two together or not at all.
+    r"|ZQX55555",                                             # retired canary
     re.I,
 )
 
