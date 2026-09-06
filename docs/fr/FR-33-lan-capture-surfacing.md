@@ -125,8 +125,11 @@ stays out of scope (operator's standing rule).
 - [x] `overlay_lan_capture_probe=false` removes the line, the reason and the pill text — 0.4.61,
       2026-09-04 on CORPLAP-3 (see the field log): status `clear`, `why` back to `penalty`
       with no CAPTURED paragraph, pill plain `· relay` with no `transport_reason`; restored
-      with `config clear` and everything returned. ⚠️ With the probe OFF the status line reads
-      `clear`, the same word as a genuinely clear host — a wording follow-up ("probe off")
+      with `config clear` and everything returned. ⚠️ With the probe OFF the status line read
+      `clear`, the same word as a genuinely clear host — fixed 2026-09-06: the daemon now
+      honours the wire contract (`lan_captures: None` when the probe is off) and sends
+      `lan_capture_probe: false`, which a current CLI prints as `lan probe OFF
+      (overlay_lan_capture_probe=false) — no capture verdict …`; an older CLI prints nothing
 
 ## Open decisions
 
