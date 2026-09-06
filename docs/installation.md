@@ -3,7 +3,8 @@
 Every way to put the Roomler node stack on a machine, on every supported platform.
 "Daemon" means `roomlerd` — the full node: remote-desktop target, tunnel exit, and
 overlay-mesh member. "Tunnel client" means just the `roomler` CLI for opening
-forwards/SOCKS5 from the machine you sit at. *As of 0.3.0-rc.381.*
+forwards/SOCKS5 from the machine you sit at. *Re-checked against master on
+2026-09-02 (0.4.47).*
 
 ## Which installer do I want?
 
@@ -97,15 +98,21 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 Same `install.sh` one-liner, but macOS is the one platform that needs **two
 processes**, and it is worth knowing why before you install:
 
-<!-- RETIRED-NAME-ANCHOR(5): /etc/roomler-agent is the REAL macOS daemon
-     config dir. The shipped com.roomler.daemon.plist passes it as its
-     config and the .pkg postinstall reads its opt out markers, so the
-     path is an input to code already on user machines. FR-21 D5. -->
+<!-- RETIRED-NAME-ANCHOR(1): /etc/roomler-agent is now the LEGACY macOS daemon
+     config dir, named only because the .pkg postinstall still reads it to
+     MIGRATE off it (`migrate_legacy_dir /etc/roomler-agent /etc/roomler`,
+     and it still honours a legacy `enable-daemon` marker there), so the
+     path remains an input to code on user machines. FR-21 D5.
+     ⚠️ This anchor's previous reason was FALSE and had been for some time:
+     it claimed com.roomler.daemon.plist passes /etc/roomler-agent as its
+     config. It does not — it passes /etc/roomler/config.toml. An anchor's
+     stated reason is a CLAIM and ages like any other; re-read the code it
+     names before trusting it (FR-46). -->
 | Half | Runs as | Does | Why it cannot do the other's job |
 |------|---------|------|----------------------------------|
 | LaunchAgent `com.roomler.agent` | you, inside your GUI login session | screen capture, input, clipboard | a root LaunchDaemon in session 0 has no WindowServer — capture and `CGEvent` injection do not work there |
 | LaunchDaemon `com.roomler.daemon` | root, from boot | overlay mesh, tunnels | creating a `utun` and installing routes require root |
-| LaunchDaemon `com.roomler.update` | root, on a 6 h timer + on demand | self-update: check, verify, `installer -pkg … -target /` | `installer -target /` needs root, and neither agent half should ever exec its own replacement (the exit-to-update dance is what used to knock Macs offline). Installed by DEFAULT; opt out with `sudo touch /etc/roomler-agent/disable-auto-update` + re-run the installer |
+| LaunchDaemon `com.roomler.update` | root, on a 6 h timer + on demand | self-update: check, verify, `installer -pkg … -target /` | `installer -target /` needs root, and neither agent half should ever exec its own replacement (the exit-to-update dance is what used to knock Macs offline). Installed by DEFAULT; opt out with `sudo touch /etc/roomler/disable-auto-update` + re-run the installer |
 
 They cannot share one enrollment: the hub keys sessions on `agent_id`, so a
 second control-WS connection displaces the first. **Each half is its own
@@ -141,11 +148,18 @@ are silently dropped.
      The whole macOS layout is FROZEN by FR-21 D5. The .app bundle name and
      path key the Screen Recording and Accessibility TCC grants; renaming
      either silently voids them, and the failure is a black screen with no
-     error. /etc/roomler-agent is what the shipped LaunchDaemon plist passes
-     as its config, and the published .deb asset name is matched by the
-     updater. Everything below names something a user can see today. -->
-- System Settings → Privacy & Security → **Screen Recording** → enable `roomler-agent`
-- System Settings → Privacy & Security → **Accessibility** → enable `roomler-agent`
+     error. The published .deb asset name is matched by the updater.
+     Everything below names something a user can see today.
+     ⚠️ This preamble also used to claim /etc/roomler-agent is what the
+     LaunchDaemon plist passes as its config. It is not — the plist passes
+     /etc/roomler/config.toml, and the old dir survives only as a migration
+     source in the .pkg postinstall. Corrected 2026-09-02. -->
+- System Settings → Privacy & Security → **Screen & System Audio Recording** → enable **Roomler Daemon**
+- System Settings → Privacy & Security → **Accessibility** → enable **Roomler Daemon**
+
+If a stale **Roomler Agent** entry is still listed from a pre-rename install,
+remove it — macOS does not carry a grant across a bundle rename, and the `.pkg`
+postinstall prints the same instruction when it detects one.
 
 You do not have to hunt for this: the **Roomler menu-bar app** names whichever
 grant is missing and gives you a button per permission that opens the right
@@ -165,7 +179,7 @@ both toggles need re-enabling.
 | | |
 |---|---|
 | `/Applications/Roomler.app` | the **menu-bar companion** — status, routes, and the permissions panel. `LSUIElement`, so no Dock tile. The only Roomler icon you should see |
-| `/Library/Roomler/roomler-agent.app` | the daemon. A background service with nothing to launch, so it is deliberately NOT in `/Applications`; still a bundle, because TCC attributes the two permissions to a bundle identity |
+| `/Library/Roomler/roomlerd.app` | the daemon. A background service with nothing to launch, so it is deliberately NOT in `/Applications`; still a bundle, because TCC attributes the two permissions to a bundle identity |
 | `/usr/local/bin/roomler` | the CLI (a small shim onto the daemon's own command surface) |
 | `/usr/local/bin/roomlerd` | the daemon on PATH, for `roomlerd enroll` / `--version` — a symlink into the bundle, not a second copy |
 
@@ -180,11 +194,11 @@ command reports "daemon not running", you are probably asking the wrong half.
 
 | | Path |
 |---|---|
-| App bundle | `/Library/Roomler/roomler-agent.app` (executable is `roomler-agent`, not `roomlerd` — renaming it would void the TCC grants) |
+| App bundle | `/Library/Roomler/roomlerd.app` (executable `roomlerd`). ⚠️ Renaming the bundle voids the TCC grants — FR-46 P5b did rename it, which is why the `.pkg` postinstall tells you to re-approve **Roomler Daemon** and delete a stale **Roomler Agent** entry |
 | Per-user config | `~/Library/Application Support/live.roomler.roomler/config.toml` |
-| Root config | `/etc/roomler-agent/config.toml` |
-| Per-user log | `/tmp/roomler-agent.err.log` |
-| Root log | `/var/log/roomler-agent/daemon.log` |
+| Root config | `/etc/roomler/config.toml` |
+| Per-user log | `/tmp/roomlerd.err.log` |
+| Root log | `/var/log/roomler/daemon.log` |
 
 Video is software-only on Apple Silicon (openh264 for H.264, libvpx for
 VP9-4:4:4): the encoder dispatch tables contain only NVIDIA/Intel/AMD names, so
@@ -201,7 +215,11 @@ sudo launchctl bootout system/com.roomler.update          # the update helper (i
 rm -f ~/Library/LaunchAgents/com.roomler.{agent,desktop}.plist
 sudo rm -f /Library/LaunchDaemons/com.roomler.{daemon,update}.plist
 sudo rm -rf /Library/Roomler /Applications/Roomler.app /Applications/roomler-agent.app \
-            /usr/local/bin/roomler /usr/local/bin/roomlerd /etc/roomler-agent
+            /usr/local/bin/roomler /usr/local/bin/roomlerd \
+            /etc/roomler /etc/roomler-agent
+# ⚠️ /etc/roomler is the CURRENT root config dir and holds the agent token.
+# This line used to remove only the legacy /etc/roomler-agent, so an uninstall
+# left a live credential on disk.
 # `sudo`, and both trees: an install done under sudo before rc.454 wrote the
 # config into your home owned by root, so a plain rm cannot remove it.
 # `live.roomler.roomler-agent` is the pre-rename path and may also be present.
@@ -233,7 +251,7 @@ Every release asset ships with a `.sha256` sidecar, a detached **GPG signature**
 provenance**:
 
 ```bash
-gh attestation verify roomler-agent-<v>-x86_64-unknown-linux-gnu.deb --repo gjovanov/roomler-ai
+gh attestation verify roomlerd-<v>-x86_64-unknown-linux-gnu.deb --repo gjovanov/roomler-ai
 ```
 <!-- RETIRED-NAME-ANCHOR-END -->
 

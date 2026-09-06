@@ -3,6 +3,6 @@
 # historical record and is pinned exactly. Both fail the guard if they move
 # without this file moving with them, in either direction.
 unclassified=0
-anchors=615
+anchors=611
 records=3
 paths=0
