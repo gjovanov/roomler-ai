@@ -6,8 +6,9 @@ lane follows the deploy repo's registry (#1396) · **P2 rolled 20:07Z and field-
 3.3 s / 2.7 s per node, 20 s from the deploy-repo push to both pods, fleet unchanged) · **P1b
 merged and AC2 measured** (Rust change 6 min 49 s, UI-only 1 min 04 s, no change 10 s — both
 targets met) · P1c merged (#1406 — daemon-only merges stop recompiling the server) · the break-glass path
-rehearsed · retention dry-run-verified · docs merged · **open: `DEPLOY_REPO_TOKEN` for `promote`
-(AC4)** ·
+rehearsed · retention dry-run-verified · docs merged · **the `promote` credential path verified
+2026-09-06** (#1416: the job runs in the `release` environment that holds `DEPLOY_REPO_TOKEN` and
+proves write access with a dry-run push; AC4 completes at the first real promote) ·
 **Owner**: deploy / build ·
 **Issue**: [#1389](https://github.com/gjovanov/roomler-ai/issues/1389) ·
 **Related**: FR-6 (build-speed SLO — this lane inherits its ≤10 min warm target as an aspiration, not a gate), FR-69 (the publish workflow this one copies its smoke from), FR-37 (the e2e lane, which pins by image tag and gains a second registry to pin from)
@@ -133,7 +134,7 @@ projects. Nothing on the host is torn down by this FR.
 | P1b | Dockerfile: `cargo chef` dependency layer + Rust stage copies only Rust sources; base image matches the pinned toolchain; measured against P1's numbers (cold, warm-no-change, warm-Rust-change, warm-UI-only) | [#1392](https://github.com/gjovanov/roomler-ai/pull/1392) | revert the Dockerfile PR — the workflow is indifferent to the layering | ✅ merged `3d2f31b23` after three dry runs (field log); measured: Rust change 6 min 49 s, UI-only 1 min 04 s |
 | P1c | The builder's final section keeps the agents' skeletons instead of copying `agents/` — a daemon-only merge no longer recompiles the server | [#1406](https://github.com/gjovanov/roomler-ai/pull/1406) | revert | ✅ merged `fb6f43ad7` after its dry run (33991818028); its own hosted build (a Dockerfile change, so the final layers rebuilt) 6 min 36 s |
 | P2 | The cluster pulls from GHCR: deploy repo `newName: ghcr.io/gjovanov/roomler-ai`, `newTag: hosted-…`; one roll, field-verified from the fleet; per-node pull time recorded | deploy repo `2efae23` | revert `newName`/`newTag` — the build-host registry still holds the previous tag | ✅ **rolled 2026-09-05 20:07Z**, field-verified (field log): pulls 3.3 s / 2.7 s per node, push → both pods 20 s |
-| P3 | `promote` dispatch: bump `newTag` in the deploy repo with `DEPLOY_REPO_TOKEN`; prints the bump when the secret is absent; refuses while `newName` is not GHCR | [#1393](https://github.com/gjovanov/roomler-ai/pull/1393) | remove the secret | |
+| P3 | `promote` dispatch: bump `newTag` in the deploy repo with `DEPLOY_REPO_TOKEN`; prints the bump when the secret is absent; refuses while `newName` is not GHCR | [#1393](https://github.com/gjovanov/roomler-ai/pull/1393), [#1416](https://github.com/gjovanov/roomler-ai/pull/1416) | remove the secret | ✅ merged; runs in the `release` environment; credential path verified 2026-09-06 (run 34030450507) |
 | P4 | GHCR retention job ([#1395](https://github.com/gjovanov/roomler-ai/pull/1395), fixed by [#1399](https://github.com/gjovanov/roomler-ai/pull/1399) after the first dry run: GHCR stores attestations UNTAGGED, so only BuildKit cache manifests may be deleted); `CLAUDE.md` deploy section rewritten (Actions path first, build-host path as break-glass, [#1398](https://github.com/gjovanov/roomler-ai/pull/1398)); `docs/self-hosting.md` on the `hosted-*` family ([#1396](https://github.com/gjovanov/roomler-ai/pull/1396)); **docs with diagrams**: the pipeline section of `docs/deployment.md` (the rule of CLAUDE.md § FR workflow step 5) | | — | ✅ retention merged + dry-run-verified; docs merged |
 
 ## Acceptance criteria
@@ -158,7 +159,12 @@ projects. Nothing on the host is torn down by this FR.
       — P2, 2026-09-05 20:07Z: pulls 3.3 s / 2.7 s per node, 20 s push → both pods, fleet checks in
       the field log.
 - [ ] **AC4** A `promote` dispatch bumps the deploy repo and ArgoCD rolls; elapsed merge → pods on
-      the new image recorded against the 10–15 min estimate.
+      the new image recorded against the 10–15 min estimate. — The credential path is verified
+      (2026-09-06, run 34030450507): the operator's `DEPLOY_REPO_TOKEN` lives on the `release`
+      environment, the job runs in it (#1416), cloned the private deploy repo, and the server
+      accepted a dry-run push (the write proof), then stopped at "already at
+      `hosted-20260905-5ef0030` — nothing to do". Ticks at the first real promote — a deploy
+      decision — when the bump, the roll and the elapsed are read.
 - [x] **AC5** `latest` on GHCR still resolves to the self-host `full` image after the hosted lane
       has run; the hosted lane has no code path that writes it. — After the first hosted push,
       `latest`'s digest (`e19b3c72…`) differs from `hosted`'s (`386a25b8…`); the workflow tags only

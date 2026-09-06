@@ -438,8 +438,11 @@ gh workflow run promote.yml -f tag=hosted-20260905-5ef0030   # empty tag = whate
 #    the public /health kept answering
 ```
 
-`promote` needs the repo secret `DEPLOY_REPO_TOKEN` (a fine-grained PAT, Contents read/write on
-the private deploy repo); without it the job prints the exact manual bump
+`promote` runs in the **`release` environment**, whose secret `DEPLOY_REPO_TOKEN` (a fine-grained
+PAT, Contents read/write on the private deploy repo — in place since 2026-09-06) it uses after
+proving write access with a dry-run push; ⚠️ an environment secret is invisible to a job that
+does not declare the environment, and the symptom is the job's "not set" branch, not an error.
+Without the secret the job prints the exact manual bump
 (`sed -i 's|newTag:.*|newTag: <tag>|' k8s/overlays/prod/kustomization.yaml` in the deploy repo,
 commit, push). It refuses anything that is not an existing `hosted-*` tag, and refuses while the
 deploy repo's `newName` is not `ghcr.io/gjovanov/roomler-ai`. The cluster pulls from GHCR with
