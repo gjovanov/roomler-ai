@@ -4781,14 +4781,23 @@ async fn media_pump_ffmpeg_dc(
     // (`open_rebuilt`, 0.4–2.9 s measured) while the current encoder keeps
     // serving at the OLD dims: the effective target stays pinned to the one
     // the current encoder was built for until the swap. `built_target` is
-    // that target; `pending_dims_open` is the open in flight with the dims
-    // it will produce and when it started.
+    // that target — set ONLY when an encoder is built (the inline open) or
+    // adopted (the swap, from the target the replacement was opened for),
+    // never refreshed from a pass that merely did not need a rebuild: the
+    // second field contact (CORPLAP-3, 0.4.73) had it refreshed from the
+    // plan's NEW target on the pass where the frame still carried the old
+    // cap, so the pin later named a target the live encoder was not built
+    // for and the upward move (small → native) fell into the inline open.
+    // `pending_dims_open` is the open in flight with the dims it will
+    // produce, when it started, and the target those dims came from.
     let mut built_target: Option<TargetResolution> = None;
-    /// The open in flight, the dims it will produce, and when it started.
+    /// The open in flight, the dims it will produce, when it started, and
+    /// the plan target it was opened for (`built_target` at the swap).
     type PendingDimsOpen = (
         tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
         (u32, u32),
         std::time::Instant,
+        TargetResolution,
     );
     let mut pending_dims_open: Option<PendingDimsOpen> = None;
     let mut dims_swaps: u32 = 0;
@@ -5429,10 +5438,10 @@ async fn media_pump_ffmpeg_dc(
         // target follow the plan again. A refused or failed open drops the
         // pending state and the next frame takes the inline path, exactly
         // as before M2.
-        if let Some((handle, _, _)) = pending_dims_open.as_ref()
+        if let Some((handle, _, _, _)) = pending_dims_open.as_ref()
             && handle.is_finished()
         {
-            let (handle, dims, started) = pending_dims_open.take().expect("checked above");
+            let (handle, dims, started, target) = pending_dims_open.take().expect("checked above");
             let open_ms = started.elapsed().as_millis() as u64;
             match handle.await {
                 Ok(Ok(rebuilt)) => {
@@ -5440,7 +5449,10 @@ async fn media_pump_ffmpeg_dc(
                         let from = encoder_dims.unwrap_or((0, 0));
                         if timed_apply!(enc.adopt_rebuilt(rebuilt).await) {
                             encoder_dims = Some(dims);
-                            built_target = None;
+                            // The adopted encoder was built for the target
+                            // the open was spawned with; the pin follows it
+                            // from here, and the capture cap below it.
+                            built_target = Some(target);
                             dims_swaps += 1;
                             send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             video_info_sent = false;
@@ -6275,10 +6287,13 @@ async fn media_pump_ffmpeg_dc(
         // — against the 0.4–2.9 s freeze the inline re-open costs. Falls
         // through to the inline open when nothing is live yet, when a swap
         // is already in flight, or when the backend cannot rebuild off the
-        // frame path.
-        if !need_rebuild {
-            built_target = Some(effective_target);
-        } else if let Some(enc) = encoder.as_mut()
+        // frame path. `built_target` is NOT touched here: a pass that needs
+        // no rebuild says nothing about what the encoder was built for (an
+        // upward move reaches this point with the frame still at the old
+        // cap), and refreshing it from the plan's target is exactly what
+        // made the pin lie on the second field contact.
+        if need_rebuild
+            && let Some(enc) = encoder.as_mut()
             && encoder_dims.is_some()
             && pending_dims_open.is_none()
             && built_target.is_some()
@@ -6304,6 +6319,7 @@ async fn media_pump_ffmpeg_dc(
                     }),
                     (w, h),
                     std::time::Instant::now(),
+                    effective_target,
                 ));
                 continue;
             }
@@ -6436,10 +6452,15 @@ async fn media_pump_ffmpeg_dc(
                     }
                     encoder = Some(handle);
                     encoder_dims = Some((w, h));
-                    // FR-70 M2 — an inline open supersedes any replacement
-                    // still opening in the background (the target moved
-                    // again, or nothing was live): dropping the handle
-                    // detaches that task and its result is never adopted.
+                    // FR-70 M2 — this encoder was built for the target that
+                    // produced this frame's dims (the pinned one if a swap
+                    // was in flight, the plan's otherwise); the pin and the
+                    // capture cap follow it from here. An inline open also
+                    // supersedes any replacement still opening in the
+                    // background (the target moved again, or nothing was
+                    // live): dropping the handle detaches that task and its
+                    // result is never adopted.
+                    built_target = Some(effective_target);
                     pending_dims_open = None;
                     // Phase B — a fresh encoder starts at the full `ceiling`
                     // maxrate; force the AIMD to re-apply its current (possibly
