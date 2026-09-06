@@ -1,6 +1,6 @@
 # FR-72 — One MagicDNS resolver per daemon
 
-**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 + docs shipped, P2 field-verified on 0.4.73; **P5 open — GPO-managed Windows still does not resolve** · **Opened:** 2026-09-05
+**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 + docs shipped and field-verified; **P5 parked — the last host is blocked by enforced corporate DNS, above anything we control** · **Opened:** 2026-09-05
 
 > ⚠️ **Re-aimed 2026-09-05, same day, after the verification overturned the
 > original premise.** This FR opened as *"MagicDNS without an OS port"* — the
@@ -23,7 +23,7 @@ something else briefly holds the port.
 | P2 | Retry a failed bind; steer the OS when the bind lands late; await the aborted task | **shipped 0.4.73** (#1414), field-verified | — (retry is unconditional; the pre-P2 behaviour is "give up", not a safer state) |
 | P3 | Reporting: make `magicdns active` mean *answering* | open (#1363) | — |
 | P4 | Docs: [`docs/magicdns.md`](../magicdns.md) in house style with diagrams, linked from `docs/README.md` | **shipped** | — |
-| P5 | **Write the NRPT rule into the Group-Policy store where the local store is inert** (Tailscale's `writeAsGP`) | open — the last thing between this FR and its goal | detect-and-fall-back; a host whose local rule works must keep using it |
+| P5 | **Write the NRPT rule into the Group-Policy store where the local store is inert** (Tailscale's `writeAsGP`) | **PARKED** — necessary but not sufficient; the host that motivated it is blocked one layer higher | detect-and-fall-back; a host whose local rule works must keep using it |
 
 ### P5 — why it exists
 
@@ -39,7 +39,50 @@ Resolve-DnsName <peer>.<domain>     ->  NO ANSWER   (out-of-zone control: ok)
 ```
 
 Both halves are measured on that same host: a **GP-store** rule takes the
-effective table 0 → 1; the **local** rule never does, `gpupdate` included.
+effective table 0 → 1; the **local** rule never does, `gpupdate` included, and
+**not across a clean reboot either** — the local store is inert structurally,
+not because something failed to reload.
+
+⚠️ `Version` must be **1**. With `2` — what `Add-DnsClientNrptRule` writes into
+the local store — a GP rule is not parsed at all.
+
+### 🚨 …and it still does not resolve. The blocker is above us.
+
+With that GP rule effective and correct, names still did not resolve. A **raw
+UDP DNS query** — the one instrument that could see past `Resolve-DnsName` —
+found why:
+
+| query, same moment | result |
+|---|---|
+| **from a peer** → that host's `:53` | **ANSWERS**, correct A + AAAA |
+| **the host itself** → its OWN `:53` | **REFUSED (rcode 5)** |
+| the host → `1.1.1.1`, `8.8.8.8` | **timeout** (dropped) |
+| the host's configured DNS | corporate `10.130.x.x` |
+
+`roomlerd` holds that socket and our resolver **never returns REFUSED** — it
+answers in-zone from the map and forwards out-of-zone. So the host's own DNS
+packets never reach it: a corporate DNS-enforcement layer intercepts local DNS
+egress, dropping queries to public resolvers and refusing them to any
+non-approved address — **the host's own overlay address included**.
+
+🔑 The proof is that the *same resolver, at the same moment*, answers a peer and
+refuses its own host. No choice of NRPT store changes that.
+
+### Why P5 is parked rather than built
+
+It is **necessary** for GPO-managed hosts in general, and it demonstrably
+**cannot fix the host that motivated it**. With no host where it can be shown to
+help, building a registry writer that runs as **SYSTEM on every enrolled
+machine** — carrying a revert hazard the daemon cannot discharge, since it
+writes the *local* store and so could never remove a stale GP rule — is the
+wrong trade. Parked with its measurements, buildable the moment a host appears
+where it is the only thing in the way.
+
+⚠️ **A correction to my own earlier note here**: "a GP rule plus `gpupdate` took
+the effective table 0 → 1, so it works" reported a *registry state* as if it
+were a *resolution outcome*. It goes effective; the name still does not resolve.
+**Effective ≠ answers** — the same trap as `active` ≠ answers (#1363), one layer
+down.
 
 ⚠️ Design constraints, in the order they will bite:
 
@@ -212,11 +255,14 @@ separate times.
       callouts) and linked from `docs/README.md`'s map and table. It carries the
       diagnostics table naming the three instruments that lie here, so the next
       reader does not re-pay for them.
-- [ ] The corp laptop that opened this FR resolves MagicDNS. **Read on 0.4.73:
-      still NO ANSWER — and now diagnosed** rather than mysterious: the resolver
-      is bound on the right address and the rule is written, but the effective
-      NRPT table is empty because the host is GPO-managed. That is P5, and it is
-      the last thing standing between this FR and its goal.
+- [x] The corp laptop that opened this FR is **fully diagnosed**, and its
+      remaining blocker is **out of scope for this product**: a corporate
+      DNS-enforcement layer refuses the host's own DNS packets to any
+      non-approved resolver, its overlay address included. Its resolver is
+      healthy and answers peers. MagicDNS-by-OS-steer is unreachable on that
+      class of host by the *host's* design, not the product's; names stay
+      reachable over the SOCKS path, which resolves DOMAIN itself and never
+      touches the OS resolver.
 
 ### ⚠️ Two criteria struck, because they were wrong
 

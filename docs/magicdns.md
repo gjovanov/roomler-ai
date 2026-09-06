@@ -107,8 +107,52 @@ Group-Policy store instead (Tailscale solves the same problem with
 [FR-72](fr/FR-72-magicdns-without-an-os-port.md).
 
 🔑 **Diagnostic rule of thumb**: `Get-DnsClientNrptRule` says *we wrote it*;
-`Get-DnsClientNrptPolicy -Effective` says *the OS will use it*. Only the second
-one predicts whether a name resolves, and on a managed host the two disagree.
+`Get-DnsClientNrptPolicy -Effective` says *the registry agrees*. **Neither
+predicts whether a name resolves** — see the next section for a host where the
+rule was effective and correct and nothing resolved anyway.
+
+### ⚠️ Enforced corporate DNS — where MagicDNS cannot work at all
+
+Some managed hosts run a DNS-enforcement layer that intercepts the machine's own
+DNS egress: queries to public resolvers are dropped, and queries to any
+non-approved address are refused — **including the host's own overlay address**.
+On such a host every layer we control is healthy and no name resolves.
+
+Measured, same resolver, same moment:
+
+| query | result |
+|---|---|
+| from a **peer** → the host's `:53` | **ANSWERS**, correct A + AAAA |
+| the **host itself** → its OWN `:53` | **REFUSED (rcode 5)** |
+| the host → `1.1.1.1` / `8.8.8.8` | **timeout** (dropped) |
+
+🔑 `roomlerd` holds that socket and this resolver **never returns REFUSED** — it
+answers in-zone from the map and forwards out-of-zone. A REFUSED coming back
+therefore proves the query never reached us.
+
+This is a property of the host, not of the product. Names remain reachable over
+the **SOCKS path**, which resolves DOMAIN itself and never consults the OS
+resolver. Do not spend time on NRPT stores here — no choice of store changes it.
+
+### 🔑 The raw-UDP probe — the only instrument that sees this
+
+`Resolve-DnsName` cannot distinguish "our resolver said no" from "your query
+never got there". A raw DNS packet can, and it is worth keeping:
+
+```powershell
+$n='<peer>.<magic domain>'; $b=New-Object System.Collections.Generic.List[byte]
+$b.AddRange([byte[]](0x12,0x34,0x01,0x00,0,1,0,0,0,0,0,0))
+foreach($l in $n.Split('.')){ $b.Add([byte]$l.Length); $b.AddRange([Text.Encoding]::ASCII.GetBytes($l)) }
+$b.Add(0); $b.AddRange([byte[]](0,1,0,1))
+$u=New-Object Net.Sockets.UdpClient; $u.Client.ReceiveTimeout=4000; $u.Connect('<resolver ip>',53)
+[void]$u.Send($b.ToArray(),$b.Count)
+$ep=New-Object Net.IPEndPoint ([Net.IPAddress]::Any),0; $r=$u.Receive([ref]$ep)
+"rcode=$($r[3] -band 0x0F)  answers=$($r[7])"      # 0=ok 3=NXDOMAIN 5=REFUSED
+```
+
+Run it **from the host and from a peer**. The two answers disagreeing is the
+whole diagnosis: a peer that gets answers while the host gets REFUSED means
+something on the host is eating its own DNS.
 
 ## Failure modes worth recognising
 
