@@ -2389,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "derp-relay"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -7949,7 +7949,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-api"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7997,7 +7997,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-config"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "config",
  "serde",
@@ -8007,7 +8007,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-db"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "bson",
  "chrono",
@@ -8022,7 +8022,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-chat"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8043,7 +8043,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-conference"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8070,7 +8070,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-fleet"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8099,7 +8099,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-network"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8126,7 +8126,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-remote"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8147,7 +8147,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-saas"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "axum",
@@ -8166,7 +8166,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-remote-control"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.1",
@@ -8189,7 +8189,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-services"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -8230,7 +8230,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tests"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "axum",
@@ -8269,7 +8269,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tunnel-core"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8310,7 +8310,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-cli"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8346,7 +8346,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-cli-shim"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "embed-resource",
  "libc",
@@ -8355,7 +8355,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-core"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8385,7 +8385,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-desktop"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "gethostname 0.5.0",
@@ -8406,7 +8406,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-localapi"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "async-trait",
  "serde",
@@ -8418,7 +8418,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-node-core"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "bson",
@@ -8443,7 +8443,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-setup"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "directories",
@@ -8468,7 +8468,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-setup-core"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8491,7 +8491,7 @@ dependencies = [
 
 [[package]]
 name = "roomlerd"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "anyhow",
  "arboard",
@@ -10451,7 +10451,7 @@ dependencies = [
 
 [[package]]
 name = "tcp-turn-conn"
-version = "0.4.74"
+version = "0.4.75"
 dependencies = [
  "async-trait",
  "log",
