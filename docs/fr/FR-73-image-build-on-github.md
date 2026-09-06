@@ -1,14 +1,17 @@
 # FR-73: The prod image is built by GitHub Actions, served from GHCR, and promoted by a dispatch
 
-**Status**: **in flight 2026-09-05** — P0 claim (#1390) · P1 the build lane (#1391, first cold run
+**Status**: **CLOSED 2026-09-06** (#1389 — every acceptance criterion met and field-verified; reopens
+on evidence) — P0 claim (#1390) · P1 the build lane (#1391, first cold run
 13 min 37 s build / 15 min merge → tag) · P3 `promote` (#1393) · P4 retention (#1395) · the e2e
 lane follows the deploy repo's registry (#1396) · **P2 rolled 20:07Z and field-verified** (pulls
 3.3 s / 2.7 s per node, 20 s from the deploy-repo push to both pods, fleet unchanged) · **P1b
 merged and AC2 measured** (Rust change 6 min 49 s, UI-only 1 min 04 s, no change 10 s — both
 targets met) · P1c merged (#1406 — daemon-only merges stop recompiling the server) · the break-glass path
-rehearsed · retention dry-run-verified · docs merged · **the `promote` credential path verified
-2026-09-06** (#1416: the job runs in the `release` environment that holds `DEPLOY_REPO_TOKEN` and
-proves write access with a dry-run push; AC4 completes at the first real promote) ·
+rehearsed · retention dry-run-verified · docs merged · the `promote` credential path verified
+2026-09-06 (#1416: the job runs in the `release` environment that holds `DEPLOY_REPO_TOKEN` and
+proves write access with a dry-run push) · **AC4 done 2026-09-06 12:14Z — the first real promote:
+`hosted-20260906-5aa3c43` (0.4.74) rolled by dispatch, both pods 33 s later, merge → pods
+8 min 51 s, fleet verified** · **every acceptance criterion met** ·
 **Owner**: deploy / build ·
 **Issue**: [#1389](https://github.com/gjovanov/roomler-ai/issues/1389) ·
 **Related**: FR-6 (build-speed SLO — this lane inherits its ≤10 min warm target as an aspiration, not a gate), FR-69 (the publish workflow this one copies its smoke from), FR-37 (the e2e lane, which pins by image tag and gains a second registry to pin from)
@@ -158,8 +161,11 @@ projects. Nothing on the host is torn down by this FR.
       every roll (online-agent count unchanged, an RC session, an overlay pair, a tunnel forward).
       — P2, 2026-09-05 20:07Z: pulls 3.3 s / 2.7 s per node, 20 s push → both pods, fleet checks in
       the field log.
-- [ ] **AC4** A `promote` dispatch bumps the deploy repo and ArgoCD rolls; elapsed merge → pods on
-      the new image recorded against the 10–15 min estimate. — The credential path is verified
+- [x] **AC4** A `promote` dispatch bumps the deploy repo and ArgoCD rolls; elapsed merge → pods on
+      the new image recorded against the 10–15 min estimate. — **Done 2026-09-06 12:14Z**
+      (field log: "AC4: the first real promote"): `hosted-20260906-5aa3c43` promoted by dispatch,
+      both pods on it 33 s later, merge → pods **8 min 51 s**, fleet verified. The credential path
+      had been verified first
       (2026-09-06, run 34030450507): the operator's `DEPLOY_REPO_TOKEN` lives on the `release`
       environment, the job runs in it (#1416), cloned the private deploy repo, and the server
       accepted a dry-run push (the write proof), then stopped at "already at
@@ -182,7 +188,10 @@ projects. Nothing on the host is torn down by this FR.
       manifests (each candidate's manifest is read back by digest); the protected-tag assertion is
       unchanged. The fixed job's dry run (33990772888) keeps all three — their manifests report
       `config.mediaType = application/vnd.oci.empty.v1+json`, the OCI artifact shape attestations
-      use — "untagged: 3, of which cache manifests: 0". Scheduled Mondays 05:00 UTC.
+      use — "untagged: 3, of which cache manifests: 0". **Run live once on 2026-09-06 12:33Z** (run
+      34033536786), after a day of builds: 45 versions, 22 untagged of which 12 were BuildKit
+      cache manifests — one per build's cache export — **all 12 deleted**, the 10 attestations
+      kept, 0 `hosted-*` pruned (7 dated, below the 20 kept). Scheduled Mondays 05:00 UTC.
 - [x] **AC8** The break-glass path is documented and was exercised once after the switch (a
       build-host build pushed to the old registry, not deployed). — 2026-09-05 20:20–20:30Z: master
       `70a279d` built on the build host in 9 min 38 s (warm), pushed to the build host's registry in
@@ -312,3 +321,32 @@ the band, the UI case well inside it. Two things the measurements taught:
 `agents/` — the cook's skeletons satisfy the workspace, and nothing in the agent crates is
 compiled for the two server packages — so a daemon-only merge, the commonest kind on this
 `master`, no longer touches a server layer at all.
+
+### 2026-09-06 — AC4: the first real promote, field-verified
+
+The operator asked for the latest hosted tag to be promoted and the roll verified. The latest
+was still building (the 0.4.74 version bump, #1422, merged 12:05:58Z — its hosted build ran
+6 min 50 s and tagged `hosted-20260906-5aa3c43` at 12:13:46Z), so the promote waited for it and
+rolled the actual newest master. Between the running image (0.4.70, 2026-09-05 19:50Z) and this
+one: version bumps 0.4.71–0.4.74, the FR-72 MagicDNS fixes (daemon-side code that the server
+links but never executes) and the P1b/P1c Dockerfile — a low-risk roll for a first promote.
+
+| | |
+|---|---|
+| `gh workflow run promote.yml -f tag=hosted-20260906-5aa3c43` | dispatched 12:14:16Z (run 34032507275); the job resolved the tag, proved write access, bumped `newTag` and pushed |
+| pods on the new image | 12:14:32Z and 12:14:49Z — **33 s from the dispatch to both pods** |
+| pull, per node | 2.9 s and 2.2 s for the whole 81 MB image |
+| **merge → pods on the new image** | **8 min 51 s** (12:05:58Z → 12:14:49Z: 7 min 48 s of it the build and tag, 33 s the roll) — against the 10–15 min estimate this FR opened with |
+| public `/health` | 200 on every sample through and after the roll, `version 0.4.74`, all six modules; the promote job's own ten-minute watch: **0 of 60 probes were not 200** |
+| fleet RPC | `roomler exec` to the cluster's build host answered through the new pods |
+| remote desktop | a session to a cluster node from this controller: connect attempt 1, **ttff 713 ms**, VP9 4:4:4 over the data channel on transport direct, first frame 1600 × 900 |
+| tunnels | this box's seven declared routes all `active` afterwards |
+| overlay | online peers unchanged (13 before, 13 after: 5 direct + 7 DERP + 1 `upgrading` at +5 min — the DERP pairs re-registered on the restarted pods and one pair was climbing back to direct, the make-before-break the carrier ladder is built for); the 7 offline rows were offline before |
+
+**AC4 met.** The lane's promise — a merge becomes a running pod without a human touching the
+build host — held on its first real use: the only human step was the dispatch, and the roll
+took 33 s. ⚠️ One thing the day's history rewrite taught about D7: the running image's tag named
+`5ef0030`, a commit that no longer exists on master after the sanitiser rewrote the history, so
+"a pod's tag names its commit" does not survive a rewrite. The OCI `revision` label still
+records what was built; compare deployments by the workflow runs and the registry, never by a
+`git log <old>..master`, which explodes into the whole history.
