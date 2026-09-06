@@ -248,6 +248,29 @@ impl AgentDao {
         self.base.find_by_id_in_tenant(tenant_id, agent_id).await
     }
 
+    /// FR-43 P2c — refresh only the capability blob, mid-connection.
+    ///
+    /// Caps otherwise arrive once, in `rc:agent.hello`, which is too early for
+    /// a macOS daemon: it must say hello immediately (being reachable before
+    /// anyone logs in is the whole reason its half exists), while the GUI
+    /// worker whose `permissions` it reports attaches later — or never, when
+    /// nobody is logged in.
+    ///
+    /// ⚠️ Deliberately narrower than [`Self::update_hello`]: it touches
+    /// `capabilities` and nothing else. A heartbeat is not a hello, and letting
+    /// it rewrite `agent_version` / `displays` / `ssh_host_pubkey` would let a
+    /// frequent message quietly restate things only a reconnect should.
+    pub async fn update_capabilities(
+        &self,
+        agent_id: ObjectId,
+        capabilities: &AgentCaps,
+    ) -> DaoResult<bool> {
+        let caps_bson = bson::to_bson(capabilities).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_by_id(agent_id, doc! { "$set": { "capabilities": caps_bson } })
+            .await
+    }
+
     pub async fn update_hello(
         &self,
         agent_id: ObjectId,

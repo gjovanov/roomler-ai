@@ -500,6 +500,7 @@ pub async fn handle_agent_socket(
                                 srflx_count,
                                 warm_relay,
                                 companion_version,
+                                caps,
                                 ..
                             } = &parsed
                             {
@@ -509,6 +510,7 @@ pub async fn handle_agent_socket(
                                     *srflx_count,
                                     warm_relay.clone(),
                                     companion_version.clone(),
+                                    caps.clone(),
                                 ))
                             } else {
                                 None
@@ -522,8 +524,24 @@ pub async fn handle_agent_socket(
                                 srflx_count,
                                 warm_relay,
                                 companion_version,
+                                caps,
                             )) = heartbeat_sessions
                             {
+                                // FR-43 P2c — an agent announces changed
+                                // capabilities here because caps otherwise
+                                // travel only in `rc:agent.hello`, and a macOS
+                                // daemon's GUI worker attaches after that.
+                                //
+                                // ⚠️ `None` means "no news", NOT "no
+                                // capabilities": the stored blob must be left
+                                // alone, the same rule as `permissions`' own
+                                // `None` vs `Some([])`.
+                                if let Some(caps) = caps.as_ref()
+                                    && let Err(e) =
+                                        state.agents.update_capabilities(agent_id, caps).await
+                                {
+                                    warn!(%agent_id, %e, "agent update_capabilities failed");
+                                }
                                 if let Err(e) = state
                                     .agents
                                     .touch_heartbeat(
