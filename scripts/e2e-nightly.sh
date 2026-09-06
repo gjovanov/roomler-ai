@@ -42,7 +42,7 @@ NS=roomler-ai-e2e
 # ⚠️ The runner image is pinned in the deploy repo's e2e overlay (the
 # `pwrunner` sidecar), NOT here: browser binaries are version-locked to the
 # image, so bumping @playwright/test means bumping that manifest too.
-STAMP=$(date -u +%Y%m%d-%H%M)
+STAMP="${E2E_NIGHTLY_STAMP:-$(date -u +%Y%m%d-%H%M)}"
 LOG="$OUT/$STAMP.log"
 mkdir -p "$OUT"
 
@@ -61,16 +61,36 @@ git fetch origin --quiet || note "git fetch failed — running with the existing
 git checkout --quiet --detach origin/master || note "could not detach at origin/master — running with the existing checkout"
 note "specs at $(git log --oneline -1)"
 
+# ── 1b. run the script step 1 just checked out, not the one bash opened ──────
+# bash reads a script as it executes it. When the checkout above changes THIS
+# file, the rest of the run can execute a mix of the old and the new text —
+# 2026-09-06: a pre-FR-73 copy of this script, invoked exactly as the cron line
+# does, pinned the stack to `registry.roomler.ai/…:hosted-…`, a tag that
+# registry never had, and the e2e pod sat in ImagePullBackOff. So the updated
+# file is copied out and exec'd once, with the update step skipped.
+if [ "${E2E_NIGHTLY_REEXEC:-}" != "1" ]; then
+  cp "$REPO/scripts/e2e-nightly.sh" "$OUT/e2e-nightly.current.sh" || fail_hard "could not stage the updated script"
+  E2E_NIGHTLY_REEXEC=1 E2E_NIGHTLY_STAMP="$STAMP" exec bash "$OUT/e2e-nightly.current.sh" "$@"
+fi
+
 # ── 2. sync the e2e stack to the prod image ──────────────────────────
-# FR-73: the REGISTRY follows the deploy repo too (`newName`), not a literal —
-# since P2 prod pulls `ghcr.io/gjovanov/roomler-ai:hosted-<date>-<sha7>`, and a
-# hosted tag does not exist on the build host's registry.
-PRODNAME=$(awk '/newName:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml")
-PRODTAG=$(awk '/newTag:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml")
-[ -n "$PRODNAME" ] && [ -n "$PRODTAG" ] || fail_hard "could not read prod newName/newTag"
-kubectl -n "$NS" set image deploy/roomler2 "roomler2=${PRODNAME}:${PRODTAG}" >> "$LOG" 2>&1
-kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >> "$LOG" 2>&1 || fail_hard "e2e stack failed to roll to ${PRODNAME}:${PRODTAG}"
-note "e2e stack on ${PRODNAME}:${PRODTAG}"
+# The image prod RUNS, read from the cluster — the truth, whatever registry it
+# came from and however it was promoted. Since FR-73 the promote pushes the
+# deploy repo on GitHub and nothing pulls the build host's clone, so that clone
+# is stale by construction; it is only the fallback, pulled first, when the
+# cluster cannot be read.
+PRODIMG=$(kubectl -n roomler-ai get deploy roomler2 -o jsonpath='{.spec.template.spec.containers[?(@.name=="roomler2")].image}' 2>/dev/null)
+if [ -z "$PRODIMG" ]; then
+  note "could not read the prod image from the cluster — falling back to the deploy repo's overlay"
+  git -C "$DEPLOY_REPO" pull --quiet --ff-only 2>/dev/null || note "deploy repo pull failed — its overlay may be stale"
+  PRODNAME=$(awk '/newName:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml")
+  PRODTAG=$(awk '/newTag:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml")
+  [ -n "$PRODNAME" ] && [ -n "$PRODTAG" ] || fail_hard "could not read the prod image from the cluster or the deploy repo"
+  PRODIMG="${PRODNAME}:${PRODTAG}"
+fi
+kubectl -n "$NS" set image deploy/roomler2 "roomler2=${PRODIMG}" >> "$LOG" 2>&1
+kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >> "$LOG" 2>&1 || fail_hard "e2e stack failed to roll to ${PRODIMG}"
+note "e2e stack on ${PRODIMG}"
 
 # ── 3. the browser is IN the pod ─────────────────────────────────────
 # FR-37. There are no port-forwards any more, and that is the point.

@@ -33,6 +33,15 @@ git fetch origin --quiet || note "git fetch failed — running with the existing
 git checkout --quiet --detach origin/master || note "could not detach at origin/master"
 note "specs at $(git log --oneline -1)"
 
+# Run the script the checkout just produced, not the one bash opened: bash
+# reads a script as it executes it, and a changed file mid-run executes a mix
+# of old and new text (see e2e-nightly.sh, 2026-09-06).
+if [ "${E2E_RUN_REEXEC:-}" != "1" ]; then
+  STAGED="$(mktemp)"
+  cp "$REPO/scripts/e2e-run.sh" "$STAGED" || die "could not stage the updated script"
+  E2E_RUN_REEXEC=1 exec bash "$STAGED" "$TAG" "${SPECS[@]}"
+fi
+
 if [ -n "$TAG" ]; then
   # FR-73: a bare tag is resolved against the registry the deploy repo names
   # (`newName` in the prod overlay — GHCR since P2, the build host's registry
@@ -41,9 +50,17 @@ if [ -n "$TAG" ]; then
   case "$TAG" in
     */*) IMG="$TAG" ;;
     *)
-      DEPLOY_REPO="${DEPLOY_REPO:-$HOME/roomler-ai-deploy}"
-      REG=$(awk '/newName:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml" 2>/dev/null)
-      [ -n "$REG" ] || { REG=ghcr.io/gjovanov/roomler-ai; note "no deploy repo at $DEPLOY_REPO — assuming $REG"; }
+      # The registry prod pulls from, read from the cluster's own Deployment —
+      # the deploy repo's clone on this host is stale by construction since
+      # FR-73 (promotes push GitHub, nothing pulls here), so it is only the
+      # fallback, pulled first.
+      REG=$(kubectl -n roomler-ai get deploy roomler2 -o jsonpath='{.spec.template.spec.containers[?(@.name=="roomler2")].image}' 2>/dev/null | sed -E 's/:[^:/]+$//')
+      if [ -z "$REG" ]; then
+        DEPLOY_REPO="${DEPLOY_REPO:-$HOME/roomler-ai-deploy}"
+        git -C "$DEPLOY_REPO" pull --quiet --ff-only 2>/dev/null || true
+        REG=$(awk '/newName:/ {print $2; exit}' "$DEPLOY_REPO/k8s/overlays/prod/kustomization.yaml" 2>/dev/null)
+        [ -n "$REG" ] || { REG=ghcr.io/gjovanov/roomler-ai; note "no cluster read and no deploy repo at $DEPLOY_REPO — assuming $REG"; }
+      fi
       IMG="$REG:$TAG" ;;
   esac
   note "pinning the stack to $IMG"
