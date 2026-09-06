@@ -5783,11 +5783,13 @@ async fn media_pump_ffmpeg_dc(
                 crate::encode::rate_profile::constrained_queue_budget_bytes(reference)
             }
         } else {
-            let rate = match governor.applied_bps() {
-                0 => last_ceiling_bps,
-                applied => applied,
-            };
-            crate::encode::rate_profile::direct_queue_budget_bytes(rate)
+            // FR-74 P1 — the path's ceiling, not the applied target: a budget
+            // denominated in the applied target shrank with every cut and
+            // then tripped on a single text frame (six cuts to 2.24 Mbps, then
+            // 2–3.7 Mbps for minutes on CORPLAP-3, 2026-09-06). Pre-first-pass
+            // the ceiling is still 0, which `direct_queue_budget_bytes` reads
+            // as "no gate yet".
+            crate::encode::rate_profile::direct_queue_budget_bytes(last_ceiling_bps)
         };
         let inflight_now = inflight_bytes.load(std::sync::atomic::Ordering::Relaxed);
         let byte_gate = inflight_now >= queue_budget;

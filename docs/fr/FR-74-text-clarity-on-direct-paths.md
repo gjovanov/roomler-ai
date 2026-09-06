@@ -136,6 +136,40 @@ shape, today constrained-only), so a burst the wire drains is not read as
 congestion. A path that does show congestion keeps today's behaviour byte for byte
 — the AIMD's cut and climb are the right response there.
 
+### P1 — as built (2026-09-06)
+
+Two changes, both on the direct branch of the FFmpeg pump, relay paths untouched
+byte for byte, no new switch:
+
+1. **The direct ceiling is a content-generous bound.** `ffmpeg_maxrate_bps_scaled`
+   uses 0.25 bpp/s on direct paths (34.6 Mbps at 1920×1200 @ 60), clamped to
+   [3, 48] Mbps per codec factor (H.264's ×1.5 lands at 51.8 Mbps; a 4K panel at
+   the 48 M top; small rungs stay on the 3 M floor). The constrained branch keeps
+   0.07 / [3, 12] and the relay clamp, so every relay session sees exactly what it
+   saw. The cap stays a ceiling, never a target: constant-quality rate control
+   spends what the content demands and the AIMD follows the pipe below the cap on
+   evidence (viewer age, the byte-budget gate).
+2. **The direct send-queue budget is denominated in the path's ceiling.**
+   `direct_queue_ms` (still 150 by default) is resolved against
+   `last_ceiling_bps` instead of the AIMD's applied target. The applied-target
+   reference was the self-reinforcing trap P0 measured: at 2.5 Mbps the budget
+   was ~47 KB, one text frame tripped the gate, and every climb was cut again.
+   A burst the wire drains now passes; a real backlog still trips the gate and
+   the AIMD still cuts on that evidence.
+
+Way back: `FFMPEG_MAXRATE_KBPS` (env) and `direct_queue_ms` (config) are the
+operator's overrides in both directions, as before. What P1 does not do: it does
+not measure the pipe on a direct path (there is no goodput estimate on an
+uncongested link); the "follow" half of the design is the AIMD's existing
+response to real congestion under a bound that no longer binds on screen
+content. Whether a measured direct pipe should also lower the bound (a thin
+Wi-Fi) is the open decision left to the field read.
+
+**Field gate.** The P0 knobs on CORPLAP-3 are cleared before the release carrying
+this rolls there, so the release's defaults are what is tested: the operator's
+Notepad++ scroll on AV1, VP9 4:2:0 and H.264 stays readable while it moves
+(AC1), the heartbeat shows no cuts and no gate skips through the scroll windows,
+and the relay hosts' counters are unchanged (AC3).
 ### P2 — fewer keyframes on QSV
 
 Hysteresis at the top of the bitrate ladder, so a target hovering near a rung
@@ -170,7 +204,7 @@ disagree. FSR helps only when upscaling.
 | phase | scope | kill switch | status |
 |---|---|---|---|
 | P0 | A/B with existing knobs on CORPLAP-3 | — (settings only) | **done 2026-09-06** — A + B2 remove the blur on AV1, VP9 4:2:0 and H.264 by the operator's read; the queue budget denominated in the applied target was a self-reinforcing trap, the cap the limiter; VP9 4:4:4 (software) remains |
-| P1 | content-following direct ceiling + measured queue budget | `direct_ceiling_follows` (one release default off) | next — confirmed by P0 |
+| P1 | direct ceiling 0.25 bpp / [3, 48] M; direct queue budget denominated in the ceiling | — (no switch: `FFMPEG_MAXRATE_KBPS` and `direct_queue_ms` are the way back) | **built 2026-09-06** (§"P1 — as built"); field gate on the release carrying it |
 | P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | proposed (P0 saw 37 → 0 swaps once the trap was gone; re-measure after P1) |
 | P3 | idle refine at native; the libvpx pump's per-real-frame budget (duration-aware rate control, no duplicate encodes at nominal fps) | `native_refine` | proposed — the software 4:4:4 blur is measured (`avg_qp` 184/255 on ~10 real fps) |
 | P4 | viewer display-scale pill + 1:1 guidance | — (UI) | proposed |
