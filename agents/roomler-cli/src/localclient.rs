@@ -1312,7 +1312,13 @@ fn print_status(s: &NodeStatus) {
     // "why is this LAN pair on relay?": the peer's handshakes arrive, ours
     // leave through the VPN. Absent field = a daemon without the probe, and
     // then NOTHING is printed (an old daemon must not read as "clear").
-    if let Some(caps) = &s.lan_captures {
+    // Probe switched OFF by the operator = say so: there is no verdict, and
+    // `why` / the RC pill cannot name a capture until it is back on.
+    if s.lan_capture_probe == Some(false) {
+        println!(
+            "  lan         probe OFF (overlay_lan_capture_probe=false) — no capture verdict; `why` and the RC pill cannot name a VPN capture until it is re-enabled"
+        );
+    } else if let Some(caps) = &s.lan_captures {
         if caps.is_empty() {
             println!("  lan         clear (own prefixes route on-link)");
         }

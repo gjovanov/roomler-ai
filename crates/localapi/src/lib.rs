@@ -144,6 +144,18 @@ pub struct NodeStatus {
     /// would read as "clear".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lan_captures: Option<Vec<LanCaptureStatus>>,
+    /// FR-33 — whether the capture probe is switched ON on this daemon
+    /// (`overlay_lan_capture_probe`, built-in default on). `Some(false)` =
+    /// the operator turned it off, so there is NO capture verdict: `why`
+    /// cannot say `lan-captured` and the RC pill cannot name a VPN. Field
+    /// 2026-09-04: with the probe off the daemon sent `lan_captures:
+    /// Some(empty)` and `status` printed `clear` — the same word as a
+    /// genuinely clear host, which is exactly the misreading FR-33 exists to
+    /// prevent. Now the daemon sends `lan_captures: None` + this flag, so an
+    /// old CLI prints nothing (the documented contract) and a new one prints
+    /// `probe OFF`. `None` from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan_capture_probe: Option<bool>,
     /// FR-47 — the last overlay join the server REFUSED, if any. `None` means
     /// no refusal has been seen this daemon lifetime (or the daemon predates
     /// the field). See [`JoinRefusalStatus`] for why it is not cleared once a
@@ -2477,6 +2489,32 @@ mod tests {
         assert_eq!(back.org_relay, s.org_relay);
     }
 
+    /// FR-33 — the probe-off state must be distinguishable on the wire from
+    /// both "probed, clear" and "old daemon": `lan_capture_probe: false`
+    /// travels, and a daemon that predates the field reads as `None` (so the
+    /// CLI keeps its old silence rather than inventing a verdict).
+    #[test]
+    fn lan_capture_probe_flag_is_additive_on_the_wire() {
+        let mut s = Mock.status();
+        s.lan_captures = None;
+        s.lan_capture_probe = Some(false);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""lan_capture_probe":false"#), "{json}");
+        assert!(
+            !json.contains("lan_captures"),
+            "probe off ⇒ no capture list at all, not an empty one: {json}"
+        );
+        let back: NodeStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lan_capture_probe, Some(false));
+        assert_eq!(back.lan_captures, None);
+
+        // An older daemon omits both fields.
+        let old: NodeStatus =
+            serde_json::from_str(&json.replace(r#","lan_capture_probe":false"#, "")).unwrap();
+        assert_eq!(old.lan_capture_probe, None);
+        assert_eq!(old.lan_captures, None);
+    }
+
     struct Mock;
     #[async_trait]
     impl LocalApiState for Mock {
@@ -2497,6 +2535,7 @@ mod tests {
                 srflx: None,
                 warm_relay: None,
                 lan_captures: None,
+                lan_capture_probe: None,
                 join_refusal: None,
                 orgs: Vec::new(),
                 direct_socks: Vec::new(),
