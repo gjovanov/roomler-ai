@@ -73,7 +73,7 @@ python3 $S/sanitize_github.py --map $M --apply        # or --check
 # 2b. GitHub by SHAPE, which step 2 cannot do. sanitize_github.py is
 #     map-driven, so it finds only names somebody already listed; nothing
 #     otherwise scans PUBLISHED content for the *class*. Dump the bodies and
-#     point check_shapes.py at them. (2026-09-05: 58k lines of issues, PRs,
+#     point check_shapes.py at them. (2026-09-06: 60k lines of issues, PRs,
 #     comments and releases — clean.)
 O=$(mktemp -d)
 gh api --paginate '/repos/<owner>/<repo>/issues?state=all&per_page=100' \
@@ -95,6 +95,27 @@ python3 ~/bin/git-filter-repo \
     --replace-refs delete-no-add --force
 git push --mirror https://github.com/<owner>/<repo>.git      # irreversible
 ```
+
+### When step 2b reports a canary
+
+Writing this guard up publishes its canaries: the write-up quotes the guard's own
+output, and step 2b then scans that write-up. The hit is real, benign, and
+recurs on every run — which is how a check earns the noise that gets it deleted.
+
+**Do not silence it by allowlisting a value that is still in `CAUGHT`.** That
+makes the canary vacuous, which is the one failure this whole directory exists
+to prevent, and `selftest.sh` refuses it immediately (`MISSED:`, both casings).
+
+Rotate instead, and move the retired value into **both** `ALLOW` and `IGNORED` —
+the allowlist entry is the exemption, the `IGNORED` entry is what asserts the
+exemption still works. Either alone rots: an entry with no assertion is an
+unguarded hole, an assertion with no entry fails the selftest. Confirm-RED both
+halves (break the entry ⇒ `FALSE POSITIVE`; plant the fresh value ⇒ it is named).
+
+⚠️ Rotation costs one canary value per write-up, so it does not scale. If it
+happens a second time, filter the dump at this boundary instead — the noise is
+in published content, and paying for it out of a shared allowlist buys read-quiet
+with a hole in the repo scan and CI too.
 
 ## Three layers, and only the first one is cheap
 
