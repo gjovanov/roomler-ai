@@ -466,10 +466,43 @@ from the log before the next fix — 0.4.71 inert, 0.4.73 downward only,
 0.4.74 every swap adopted but an oscillation after each upward one, 0.4.75
 clean — and the shape that survived is the one the design asked for: the
 media loop reads a plan and swaps encoders it did not have to wait for.
-**M2a is done.** What M2 still owes is the rate rebuild on the same path
-(the FR-62 P3 `bg_rebuild` already has the shape; it needs the same
-plan-driven decision and the same stale-frame rule) and the deletions
-that follow once nothing in-loop opens an encoder.
+**M2a is done.** The same afternoon (16:17 UTC) the strongest-case host
+passed too — CORPLAP-2, av1_nvenc, over the relay (`c=true`, age 74–92 ms),
+sole viewer: four moves (1920×1200 → 944×590 → 1920×1200 → 1214×758 →
+1920×1200), four `dims swap adopted`, `open_ms` 157 / 159 / 168 / 172 off
+the frame path, in-path adoption `apply=41–44 ms` (nvenc; QSV adopts in
+~15 ms), no `encoder (re)built` after the first open, no STALL after the
+first heartbeat, `dims_swaps=4`.
+
+**M2b — the rate rebuild — measured, and there is nothing to build.** On
+2026-09-06 CORPLAP-1 (hevc_qsv, which refuses in-place rate changes, so
+every AIMD move is a rebuild) ran up to **118 rate swaps in one session
+with zero inline opens**: 11 sessions, exactly 11 `(re)built` lines and
+11 open-STALLs, all session starts. The FR-62 P3 `bg_rebuild` already keeps
+the rate rebuild off the frame path, and a rate rebuild changes no dims,
+so there is no capture-cap change and no stale frame — the plan-driven
+decision M2a needed has nothing to decide there. What M2 still owes is
+only what its design excludes: the session-start open (0.17–2.9 s,
+measured as the first-frame latency, AC2's open half).
+
+**What the day's stalls say for M3.** With every rebuild off the frame
+path, the non-open pump stalls that remain are the loop body's, and the
+log can now name most of them. CORPLAP-3 (direct): 72 non-open stalls,
+65 dominated by `other_ms`, median 565 ms — a recurring ~600 ms pass with
+nothing in the frame path; they do NOT sit on the route guard (10,717
+route evictions that day, only 12 of 64 stalls within 2 s of one) but
+cluster around capture-backend resets (`DXGI AccessLost — recreating
+capturer`, a desktop transition) and tunnel-flow closes — work the loop
+body does between the timed phases. CORPLAP-1 (relay): 56 non-open
+stalls, 29 encode-dominant and 26 `other`, and the worst are multi-second
+passes on transport re-nomination — 8.4 s at 09:03:37 after four overlay
+`REKEY_TIMEOUT`s and failed direct probes, 5.5 s at 10:14:23 across a
+`PC Disconnected → selected pair changed → Connected` — each followed by
+the AIMD cutting 3.0 → 1.5 Mbps (FR-71 AC3's natural FAIL, recorded
+there). That is the case for M3 in the field's own words: a media loop
+that shares its worker with the capture reset, the tunnel bookkeeping and
+the transport's reconnect cannot tell a stalled pipe from a stolen
+thread, and the controller reads the difference as over-production.
 
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
