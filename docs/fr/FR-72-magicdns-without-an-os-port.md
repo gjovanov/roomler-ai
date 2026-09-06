@@ -1,6 +1,6 @@
 # FR-72 — One MagicDNS resolver per daemon
 
-**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 + docs shipped and field-verified; **P5 parked — the last host is blocked by enforced corporate DNS, above anything we control** · **Opened:** 2026-09-05
+**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 + P6 shipped and field-verified — **MagicDNS now resolves on the enforced-DNS host too**; P5 parked, P3 (#1363) open · **Opened:** 2026-09-05
 
 > ⚠️ **Re-aimed 2026-09-05, same day, after the verification overturned the
 > original premise.** This FR opened as *"MagicDNS without an OS port"* — the
@@ -24,6 +24,40 @@ something else briefly holds the port.
 | P3 | Reporting: make `magicdns active` mean *answering* | open (#1363) | — |
 | P4 | Docs: [`docs/magicdns.md`](../magicdns.md) in house style with diagrams, linked from `docs/README.md` | **shipped** | — |
 | P5 | **Write the NRPT rule into the Group-Policy store where the local store is inert** (Tailscale's `writeAsGP`) | **PARKED** — necessary but not sufficient; the host that motivated it is blocked one layer higher | detect-and-fall-back; a host whose local rule works must keep using it |
+| P6 | **A resolution ladder, with the hosts file as its last rung** | **shipped 0.4.76** (#1437), **field-verified** — the goal is met on the enforced-DNS host | `ROOMLERD_MAGICDNS_HOSTS`, default OFF |
+
+### P6 — the rung that is not on the DNS path
+
+P5 could not win because the blocker is not *which store the rule lives in* — it
+is that the host's own DNS packets never reach the resolver at all. The hosts
+file is not on the DNS path, which is the entire reason it survives.
+
+So the answer is a **ladder**, chosen by measurement rather than assumed — the
+rule the carrier cascade already follows:
+
+1. the **OS split-DNS steer** — preferred: dynamic, whole-zone, nothing on disk
+2. **probe whether it actually reaches us**
+3. **hosts-file entries** when it does not — and **climb back** when DNS returns
+
+🔑 **The probe is the load-bearing part.** `dns::PROBE_LABEL`
+(`_roomler-probe.<magic domain>`) is answered by our resolver and by nothing
+else, so resolving it *through the OS* succeeds exactly when the steer reaches
+us. ⚠️ The fallback must never write that name: it would then answer its own
+probe, and the ladder could never climb back — a check that cannot fail.
+
+⚠️ **The hazard is a stale entry, not the write.** Overlay addresses are
+recycled, so a line left behind can route to a *different machine* — the same
+class as pooling an address before its tombstone. Hence: a delimited block that
+preserves every foreign line byte for byte; an unterminated block (killed
+mid-write) **discarded, never adopted**; and the block cleared on teardown, on
+climbing back, **and at construction** — the boot reconciler for whatever a dead
+process left. ⚠️ **FQDNs only** — a bare `mars` would shadow a real corporate
+host.
+
+⚠️ **Known gap before the default flip**: `roomler config set magicdns_hosts` is
+**refused** — the key is in the config file and the env bridge but not in the S2
+config surface, so a fleet operator cannot flip it remotely. A feature that
+cannot be switched on from the dashboard is not yet usable at fleet scale.
 
 ### P5 — why it exists
 
@@ -270,14 +304,18 @@ separate times.
       callouts) and linked from `docs/README.md`'s map and table. It carries the
       diagnostics table naming the three instruments that lie here, so the next
       reader does not re-pay for them.
-- [x] The corp laptop that opened this FR is **fully diagnosed**, and its
-      remaining blocker is **out of scope for this product**: a corporate
+- [x] The corp laptop that opened this FR is **fully diagnosed**: a corporate
       DNS-enforcement layer refuses the host's own DNS packets to any
-      non-approved resolver, its overlay address included. Its resolver is
-      healthy and answers peers. MagicDNS-by-OS-steer is unreachable on that
-      class of host by the *host's* design, not the product's; names stay
-      reachable over the SOCKS path, which resolves DOMAIN itself and never
-      touches the OS resolver.
+      non-approved resolver, its overlay address included, so MagicDNS *by OS
+      steer* is unreachable there by the host's design.
+- [x] **…and it resolves anyway.** P6's hosts rung closes it: on 0.4.76 that
+      host answers `<peer>.<magic domain>` with the peer's overlay v4 + v6 and
+      pings it by name, where the same host answered nothing on every previous
+      build. Verified failing first (switch off ⇒ zero entries, NO ANSWER).
+- [x] **Cleanup verified in both directions** — switch off + restart removes the
+      block, restores the file's original 21 lines and leaves every foreign line
+      intact; switching back on re-establishes resolution. The removal path is
+      the one that matters, so it was tested rather than inferred.
 
 ### ⚠️ Two criteria struck, because they were wrong
 
@@ -319,3 +357,6 @@ them. Overlay IPv6 / AAAA behaviour is #1342's.
 | 2026-09-06 | 0.4.73 | dev box | ⚠️ Passive read is **not** evidence: host healthy, retry counter **0** — both binds won first try, exactly as an unfixed build would look |
 | 2026-09-06 | 0.4.73 | dev box | **P2 PASS, provoked**: port held across a restart ⇒ `bind failed; retrying`; released ⇒ `resolver up` 21 s later, `resolver bound late - steering the OS now`, NRPT installed, names resolve. Second org unheld throughout as the in-run control |
 | 2026-09-06 | 0.4.73 | corp laptop | Resolver bound on the correct address, local NRPT rule written — **effective table holds 0 rules**, `gpupdate` completed and changed nothing, query NO ANSWER with a passing out-of-zone control ⇒ **P5**, and the GP-store rejection withdrawn |
+| 2026-09-06 | 0.4.73 | corp laptop | A GP rule goes effective (0 → 1) and still does not resolve. **Raw UDP** finds why: a peer gets correct answers from that host's `:53` while the host itself gets **REFUSED (rcode 5, RA=0)** — which our resolver never emits ⇒ enforced corporate DNS, above anything we control |
+| 2026-09-06 | 0.4.76 | corp laptop | **P6 PASS.** Failed first with the switch off (0 entries, NO ANSWER); with it on, names resolve to overlay v4 + v6 and ping by name replies. Log shows the ladder: steer installed → probe fails → 17 entries written. Block well-formed (1 BEGIN / 1 END, 34 lines, all FQDN) |
+| 2026-09-06 | 0.4.76 | corp laptop | **Cleanup PASS.** Switch off + restart ⇒ block gone, file back to its original 21 lines, foreign lines intact, resolution back to baseline; switched on again and re-verified |
