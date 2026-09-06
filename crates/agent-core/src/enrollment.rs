@@ -162,6 +162,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_route_win: None,
         local_turn: None,
         dns_aaaa: None,
+        magicdns_hosts: None,
         auto_update: None,
         logs_upload_disabled: None,
         rate_factor_h264: None,

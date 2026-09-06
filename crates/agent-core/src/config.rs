@@ -630,6 +630,11 @@ pub struct AgentConfig {
     /// (`ROOMLERD_DNS_AAAA`). Built-in default: on.
     #[serde(default)]
     pub dns_aaaa: Option<bool>,
+    /// FR-72 P6 - the MagicDNS hosts-file fallback
+    /// (`ROOMLERD_MAGICDNS_HOSTS`). Built-in default: OFF. Only engages where
+    /// the OS DNS steer is MEASURED not to reach our resolver.
+    #[serde(default)]
+    pub magicdns_hosts: Option<bool>,
     /// The periodic self-updater (`ROOMLERD_AUTO_UPDATE`).
     /// Built-in default: on. Disabling also ignores web-pushed
     /// forced updates.
@@ -2027,6 +2032,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_iface_metric: None,
         local_turn: None,
         dns_aaaa: None,
+        magicdns_hosts: None,
         auto_update: None,
         logs_upload_disabled: None,
         rate_factor_h264: None,
@@ -2203,7 +2209,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 83] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2289,6 +2295,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82]
         ("OVERLAY_ROUTE_WIN", cfg.overlay_route_win),
         ("LOCAL_TURN", cfg.local_turn),
         ("DNS_AAAA", cfg.dns_aaaa),
+        ("MAGICDNS_HOSTS", cfg.magicdns_hosts),
         ("AUTO_UPDATE", cfg.auto_update),
         ("LOGS_UPLOAD_DISABLED", cfg.logs_upload_disabled),
         ("OVERLAY_TIER_DETECT", cfg.overlay_tier_detect),

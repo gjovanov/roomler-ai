@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 use super::WgKeypair;
 use super::direct;
 use super::dns;
+use super::hosts as dns_hosts;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator, RelayKind};
 use super::tun::TunIo;
@@ -2299,6 +2300,10 @@ impl OverlayRuntime {
         // FR-72 P2 — watched for the WHOLE session, not read once: the resolver
         // retries a failed bind, so it can come up long after the initial wait.
         let mut dns_bound_rx: Option<tokio::sync::watch::Receiver<bool>> = None;
+        // FR-72 P6 — the last rung: where the OS DNS path is MEASURED not to
+        // reach our resolver (a corporate DNS-enforcement layer refusing the
+        // host's own queries), put the names in the hosts file instead.
+        let mut dns_ladder: Option<dns_hosts::Ladder> = None;
         let dns_names: Option<dns::NameMap> = if let Some(magic_domain) = dns_magic.clone() {
             let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
             sync_name_map(
@@ -2379,6 +2384,13 @@ impl OverlayRuntime {
                      (would blackhole the magic domain); names resolve via SOCKS only"
                 );
             }
+            // FR-72 P6. Constructed even when the switch is off, because the
+            // constructor is also the BOOT RECONCILER: a block left by a
+            // previous process must be cleared whether or not we will write one.
+            dns_ladder = Some(dns_hosts::Ladder::new(
+                magic_domain.clone(),
+                crate::env::node_env("MAGICDNS_HOSTS").as_deref() == Some("1"),
+            ));
             Some(names)
         } else {
             None
@@ -2895,6 +2907,14 @@ impl OverlayRuntime {
                     // finally lands; it never REVOKES it, because the guard's Drop
                     // already reverts on teardown and a flap must not repeatedly
                     // rewrite the host-global NRPT.
+                    // FR-72 P6 — pick the resolution rung by measurement. Cheap
+                    // (one `getaddrinfo` a minute) and it climbs back to DNS on
+                    // its own, so a host that is only briefly enforced does not
+                    // keep hosts entries.
+                    if let (Some(l), Some(names)) = (dns_ladder.as_mut(), dns_names.as_ref()) {
+                        l.tick(names, crate::env::node_env("DNS_AAAA").as_deref() != Some("0"))
+                            .await;
+                    }
                     if _dns_os_guard.is_none()
                         && let Some(rx) = dns_bound_rx.as_mut()
                         && *rx.borrow_and_update()
@@ -4186,6 +4206,13 @@ impl OverlayRuntime {
         // resolver cannot bind, so MagicDNS dies on the first WS reconnect and
         // stays dead until the process restarts. The socket is released when the
         // task drops, so the successor binds cleanly.
+        // FR-72 P6 — give the hosts file back before anything else in the DNS
+        // teardown. A block that outlives the daemon points names at addresses
+        // nothing is serving, and overlay addresses are RECYCLED, so a stale
+        // line is not merely dead — it can route to a different machine.
+        if let Some(mut l) = dns_ladder.take() {
+            l.shutdown();
+        }
         if let Some(h) = dns_task {
             h.abort();
             // ⚠️ `abort()` only REQUESTS cancellation — the socket is released

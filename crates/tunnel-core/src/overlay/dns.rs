@@ -36,6 +36,15 @@ use tracing::{debug, info, warn};
 /// changes (includes the node itself).
 pub type NameMap = Arc<RwLock<HashMap<String, Ipv4Addr>>>;
 
+/// FR-72 P6 — the label this resolver answers for its own liveness probe:
+/// `<PROBE_LABEL>.<magic_domain>`. Underscore-prefixed so it can never collide
+/// with a node name (`dns_label` never produces one).
+///
+/// ⚠️ The hosts fallback must never write this name. Resolving it proves the OS
+/// reached THIS resolver; if the fallback could satisfy it, the probe would be
+/// answering itself and the ladder could never climb back to DNS.
+pub const PROBE_LABEL: &str = "_roomler-probe";
+
 /// Resolver configuration. Cheap to clone (the map is an `Arc`), so each query
 /// gets its own task without blocking the receive loop on a slow upstream.
 #[derive(Clone)]
@@ -168,6 +177,23 @@ async fn build_response(query: &[u8], cfg: &DnsConfig) -> Option<Vec<u8>> {
                 .filter(|p| !p.is_empty())
         };
         if let Some(label) = in_zone_label {
+            // FR-72 P6 — the ladder's probe. `<PROBE_LABEL>.<domain>` is
+            // answered by THIS resolver and by nothing else, so a runtime that
+            // resolves it through the OS knows its steer actually reaches us.
+            //
+            // ⚠️ It must be a name the hosts fallback never writes, or the
+            // probe would answer from its own fallback and the ladder could
+            // never climb back to DNS — a check that cannot fail.
+            if label == PROBE_LABEL {
+                let self_v4 = match cfg.bind.ip() {
+                    std::net::IpAddr::V4(v4) => v4,
+                    std::net::IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                };
+                return Some(match q.qtype {
+                    1 => build_a(query, q.qend, self_v4),
+                    _ => build_status(query, q.qend, 0), // NODATA for anything else
+                });
+            }
             let names = cfg.names.read().await;
             return Some(match names.get(label) {
                 Some(ip) if q.qtype == 1 => build_a(query, q.qend, *ip),
