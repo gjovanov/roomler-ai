@@ -88,6 +88,9 @@ if [ -z "$PRODIMG" ]; then
   [ -n "$PRODNAME" ] && [ -n "$PRODTAG" ] || fail_hard "could not read the prod image from the cluster or the deploy repo"
   PRODIMG="${PRODNAME}:${PRODTAG}"
 fi
+# The tag alone, for LATEST and the regression issue (the second hand-run of
+# 2026-09-06 died here under `set -u`: the summary lines still said $PRODTAG).
+PRODTAG="${PRODIMG##*:}"
 kubectl -n "$NS" set image deploy/roomler2 "roomler2=${PRODIMG}" >> "$LOG" 2>&1
 kubectl -n "$NS" rollout status deploy/roomler2 --timeout=300s >> "$LOG" 2>&1 || fail_hard "e2e stack failed to roll to ${PRODIMG}"
 note "e2e stack on ${PRODIMG}"
@@ -185,7 +188,7 @@ if [ -n "$UNEXPECTED" ]; then
   if command -v gh > /dev/null 2>&1 && gh auth status > /dev/null 2>&1; then
     gh issue create --repo gjovanov/roomler-ai \
       --title "e2e nightly regression ($STAMP)" \
-      --body "$(printf 'Image: %s\nSummary: %s\n\nRegressions (failed the main run AND the isolated re-run):\n```\n%s```\n' "$PRODTAG" "$SUMMARY" "$UNEXPECTED")" \
+      --body "$(printf 'Image: %s\nSummary: %s\n\nRegressions (failed the main run AND the isolated re-run):\n```\n%s```\n' "$PRODIMG" "$SUMMARY" "$UNEXPECTED")" \
       >> "$LOG" 2>&1 || note "gh issue creation failed"
   fi
   exit 1
