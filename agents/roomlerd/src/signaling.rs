@@ -1100,6 +1100,14 @@ async fn connect_once(
     }
     // FR-43 P2b-2 — the WORKER's ends. The receiver is borrowed for this
     // connection; the sender is cloned so a delegated session can hold it.
+    // FR-43 P2c — what we last told the server about our permissions.
+    //
+    // Per CONNECTION, not per process: a reconnect sends a fresh `rc:agent.hello`
+    // carrying our own caps, so the server's view resets and our memory of it
+    // must reset too — otherwise a worker that attached before a reconnect would
+    // never be re-announced, and the row would sit wrong until the worker
+    // happened to change.
+    let mut last_announced_permissions: Option<(Vec<String>, bool)> = None;
     let (mut delegated_in, delegated_out) = match delegation.worker_mut() {
         Some((rx, tx)) => (Some(rx), Some(tx.clone())),
         None => (None, None),
@@ -1533,6 +1541,33 @@ async fn connect_once(
                     .as_ref()
                     .filter(|w| w.state == "live")
                     .and_then(|w| w.relayed.clone());
+                // FR-43 P2c — announce capabilities only when they have
+                // CHANGED. Caps travel once in `rc:agent.hello`, which is too
+                // early for a macOS daemon: it must say hello immediately, and
+                // the GUI worker whose permissions it reports attaches later
+                // (or never, when nobody is logged in).
+                //
+                // ⚠️ Sending them every beat would be ~200 bytes of nothing on
+                // a frequent message. `None` means "no news", not "no caps".
+                let caps_now = delegate.as_ref().and_then(|d| d.effective_permissions());
+                let caps = if caps_now == last_announced_permissions {
+                    None
+                } else {
+                    last_announced_permissions = caps_now.clone();
+                    // Our own caps, with the worker's permissions substituted:
+                    // codecs and encoders stay OURS, because we are the half
+                    // that answers `rc:session.request` (the P2b-3 lesson).
+                    let mut c = crate::encode::caps::detect();
+                    if let Some((perms, has_input)) = caps_now {
+                        c.permissions = Some(perms);
+                        c.has_input_permission = has_input;
+                    }
+                    info!(
+                        permissions = ?c.permissions,
+                        "announcing changed capabilities on the heartbeat (FR-43 P2c)"
+                    );
+                    Some(Box::new(c))
+                };
                 let hb = ClientMsg::AgentHeartbeat {
                     rss_mb: sys.rss_mb,
                     cpu_pct: sys.cpu_pct,
@@ -1543,6 +1578,7 @@ async fn connect_once(
                     // FR-27 — cached for 10 min inside, so this is a map lookup
                     // on all but one heartbeat in twenty.
                     companion_version: crate::companion::installed_version(),
+                    caps,
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
