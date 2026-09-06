@@ -475,7 +475,11 @@ fn recover_wedged_install(
     match wait_for_pid(retry_pid, INSTALLER_BUDGET) {
         WaitOutcome::Exited(0) => {
             outcome.installer_exit_code = Some(0);
-            verify_new_binary(outcome, expected_version, origin);
+            // `false`: this is the wedge-recovery retry, where we genuinely
+            // waited on msiexec. That is exactly the case POST_INSTALL_SETTLE
+            // was written for — cargo-wix can fsync after process exit — so the
+            // pause is kept here.
+            verify_new_binary(outcome, expected_version, origin, false);
             outcome.note = format!(
                 "recovered by kill+retry after initial {}s wedge; {}",
                 INSTALLER_BUDGET.as_secs(),
