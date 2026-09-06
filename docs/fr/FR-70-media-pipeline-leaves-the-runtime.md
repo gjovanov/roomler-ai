@@ -444,6 +444,33 @@ session on the release carrying this reads `dims_swaps` equal to the
 number of moves, one `dims swap adopted` line per move, and no `open_ms`
 and no `STALL` after the session's first heartbeat.
 
+**Fourth field contact (2026-09-06 13:29 UTC, CORPLAP-3 on `agent-v0.4.75`
+— all three fixes in — sole viewer, av1_qsv, direct): the gate is met in
+both directions.** Driver: the settings dialog worked from the page (open
+the Resolution select, click the list item) with the stage shrunk to
+700 px first, because the Fit `ResizeObserver` did not attach in a fresh
+tab (a viewer race between the phase watcher and the stage's mount — its
+own small fix, not M2's). Picking Original while the encoder was already
+native produced no swap (`plan_dims == encoder dims`, correct). Then:
+
+| move | `dims change` | `dims swap adopted` | `open_ms` off-path | in-path adoption | `dims_swaps` |
+|---|---|---|---|---|---|
+| Fit: 1920×1200 → 944×590 | 13:29:07.600 | +285 ms, "the picture never froze" | 269 | `apply=15.1 ms` | 1 |
+| Original: 944×590 → 1920×1200 | 13:29:25.833 | +252 ms | 237 | `apply=14.9 ms` | 2 |
+
+No `encoder (re)built`, no `STALL`, no `open_ms` after the session's first
+heartbeat (the one STALL is the session-start open, `open=683`, the half M2
+leaves alone on purpose); heartbeats `open=0.0` and `stalls=0` throughout,
+`dims_swaps` equal to the moves. Four builds to get here, each failure read
+from the log before the next fix — 0.4.71 inert, 0.4.73 downward only,
+0.4.74 every swap adopted but an oscillation after each upward one, 0.4.75
+clean — and the shape that survived is the one the design asked for: the
+media loop reads a plan and swaps encoders it did not have to wait for.
+**M2a is done.** What M2 still owes is the rate rebuild on the same path
+(the FR-62 P3 `bg_rebuild` already has the shape; it needs the same
+plan-driven decision and the same stale-frame rule) and the deletions
+that follow once nothing in-loop opens an encoder.
+
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
 thread while the current encoder keeps serving `Encode`, which is the whole
@@ -455,6 +482,14 @@ reason the open belongs there), no controller change (M4).
       shows no media-path blocking under a canary that records its own lateness.
 - [ ] **AC2** — `open_ms` disappears from the frame path: first-frame latency
       drops by the measured open (0.29–0.96 s), before/after on the same host.
+      *(Rebuild half met 2026-09-06 on `agent-v0.4.75`: every open after the
+      session's first happens off the frame path — `open_ms` shows only in
+      the first heartbeat, and a dims move swaps encoders with a ~15 ms
+      in-path adoption instead of a 0.3–2.9 s freeze (M2 section, fourth
+      field contact). The session-start half is untouched by design: that
+      open IS the first-frame latency, 0.68 s on CORPLAP-3 and 2.9 s on
+      CORPLAP-2, and hiding it behind the setup buys ~0.9 s at most; the
+      criterion stays open for it.)*
 - [ ] **AC3** — no rate or geometry decision remains in the media loop.
 - [ ] **AC4** — heuristics 34 → ≤ 10, kill switches 11 → ≤ 4, estimators 8 → 1,
       each retirement gated on a counter measured fleet-zero.
