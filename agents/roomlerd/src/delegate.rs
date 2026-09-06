@@ -55,6 +55,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use roomler_ai_remote_control::models::AgentCaps;
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -115,6 +116,13 @@ pub enum DelegateFrame {
     ToWorker { msg: Box<ServerMsg> },
     /// Worker → daemon: an rc-session message to put on the control WS.
     FromWorker { msg: Box<ClientMsg> },
+    /// Worker → daemon: the worker's own capabilities, sent once at attach.
+    ///
+    /// FR-43 P2c. The daemon runs in session 0 and honestly reports
+    /// `no-gui-session`; the worker is in the GUI session and holds the real
+    /// grants. While a worker is attached, the DEVICE is a capture target, and
+    /// the row has to say so or the dashboard tells the operator it is not one.
+    WorkerCaps { caps: Box<AgentCaps> },
     /// Daemon → worker: everything the daemon resolved while answering
     /// `rc:session.request`, which the worker's `rc:sdp.offer` handler needs.
     SessionParams(Box<SessionParams>),
@@ -315,6 +323,12 @@ struct Inner {
     /// The socket path currently bound, so [`DelegateHost::revoke`] can unlink
     /// it. `None` = not listening.
     listening: Mutex<Option<std::path::PathBuf>>,
+    /// The attached worker's capabilities, when it has sent them.
+    ///
+    /// Cleared when the channel closes — a row that keeps claiming a capture
+    /// target which has gone hands the next session a black screen, which is
+    /// the bug P2b existed to fix.
+    worker_caps: Mutex<Option<AgentCaps>>,
     /// Where a worker's replies go: the control WS's outbound queue.
     ///
     /// Re-set on every WS (re)connect, because the sender belongs to the
@@ -501,6 +515,25 @@ impl DelegateHost {
         tx.try_send(frame).is_ok()
     }
 
+    /// The `permissions` this DEVICE should advertise, given who is attached.
+    ///
+    /// `None` = "nothing to override" — no worker, or one that has not sent its
+    /// caps — and the caller keeps its own. ⚠️ Deliberately returns only the
+    /// permission pair, not whole caps: codecs and encoders stay the DAEMON's,
+    /// because the daemon is the half that answers `rc:session.request` and
+    /// advertising one half's list while resolving with the other's is exactly
+    /// the class of bug P2b-3 was. Both halves were measured to report
+    /// identical codecs anyway (2026-09-01).
+    pub fn effective_permissions(&self) -> Option<(Vec<String>, bool)> {
+        let held = self.inner.worker_caps.lock().expect("worker caps mutex");
+        held.as_ref().map(|c| {
+            (
+                c.permissions.clone().unwrap_or_default(),
+                c.has_input_permission,
+            )
+        })
+    }
+
     /// Forget the current secret — the worker it belonged to is gone.
     ///
     /// [`crate::macos_supervisor`] calls this from `stop_worker`, which takes a
@@ -614,6 +647,14 @@ impl DelegateHost {
                     tracing::warn!("delegation: worker sent an `attached` frame; ignoring");
                 }
                 Ok(DelegateFrame::FromWorker { msg }) => self.relay_upstream(*msg),
+                Ok(DelegateFrame::WorkerCaps { caps }) => {
+                    tracing::info!(
+                        permissions = ?caps.permissions,
+                        has_input = caps.has_input_permission,
+                        "delegation: worker announced its capabilities"
+                    );
+                    *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(*caps);
+                }
                 Ok(DelegateFrame::ToWorker { .. } | DelegateFrame::SessionParams { .. }) => {
                     // Daemon → worker only. A worker sending one is confused
                     // about which end it is.
@@ -629,6 +670,10 @@ impl DelegateHost {
             }
         }
         *self.inner.to_worker.lock().expect("to_worker mutex") = None;
+        // ⚠️ Clear the caps with the channel. Keeping them would leave the row
+        // advertising a capture target that has gone, and the next session
+        // would get the black screen P2b existed to fix.
+        *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
         Ok(())
     }
 

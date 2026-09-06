@@ -219,6 +219,29 @@ async fn attach_once(
         }
     }
 
+    // FR-43 P2c — tell the daemon what THIS process can do, as the first thing
+    // after the handshake. The daemon is in session 0 and honestly reports
+    // `no-gui-session`; these are the grants that make the DEVICE a capture
+    // target, and without them its row tells the operator it is not one.
+    //
+    // Sent once per attach rather than on a timer: a permission change on macOS
+    // requires re-launching the process anyway (TCC grants are read at start),
+    // so a re-attach is exactly when it can differ.
+    {
+        let caps = crate::encode::caps::detect();
+        tracing::info!(
+            permissions = ?caps.permissions,
+            "delegation: announcing our capabilities to the daemon"
+        );
+        write_frame(
+            &mut wr,
+            &DelegateFrame::WorkerCaps {
+                caps: Box::new(caps),
+            },
+        )
+        .await?;
+    }
+
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -259,9 +282,10 @@ async fn attach_once(
                                 tracing::debug!(kind, "delegation: serving an rc message");
                             }
                         }
-                        Ok(DelegateFrame::FromWorker { .. }) => {
-                            // Worker → daemon only.
-                            tracing::warn!("delegation: daemon sent a `from_worker` frame; ignoring");
+                        Ok(DelegateFrame::FromWorker { .. } | DelegateFrame::WorkerCaps { .. }) => {
+                            // Worker → daemon only. A daemon sending one is
+                            // confused about which end it is.
+                            tracing::warn!("delegation: daemon sent a worker-only frame; ignoring");
                         }
                         // Skip, never close: a NEWER daemon may push a frame
                         // this worker has never heard of, and an additive

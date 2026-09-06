@@ -335,6 +335,34 @@ pub enum ClientMsg {
         /// agent→server like `srflx_count`, so no capability flag.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warm_relay: Option<String>,
+        /// FR-43 P2c — updated capabilities, when they have CHANGED since the
+        /// last announcement.
+        ///
+        /// Caps otherwise travel exactly once, in `rc:agent.hello`, and that is
+        /// too early for a macOS daemon: it must say hello immediately (the
+        /// whole point of the root half is being reachable before anyone logs
+        /// in), while the GUI worker whose `permissions` it reports attaches on
+        /// its own schedule — ~260 ms later at boot, but also after a
+        /// console-user change, after a hand-back, and never at all when nobody
+        /// is logged in.
+        ///
+        /// ⚠️ Sent ONLY on change, never on every beat: caps are ~200 bytes
+        /// against a frequent heartbeat, and the steady state must stay free.
+        /// `None` therefore means "nothing to report", NOT "no capabilities" —
+        /// a reader must leave the stored caps alone, exactly like
+        /// `AgentCaps::permissions`' own `None` vs `Some([])` rule.
+        ///
+        /// ⚠️ It must also carry the caps BACK DOWN when a worker detaches. A
+        /// row that keeps claiming a capture target which has gone hands the
+        /// next session a black screen, which is the bug P2b existed to fix.
+        ///
+        /// ⚠️ Boxed: `AgentCaps` is large, and inline it made this variant
+        /// ~536 bytes — a cost every frequent `AgentHeartbeat` and every other
+        /// variant would pay for a field that is almost always absent. Serde is
+        /// transparent through `Box`, so the wire is unchanged. Same reasoning
+        /// as `localapi::Response::Status`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caps: Option<Box<AgentCaps>>,
         /// FR-27 — the version of the `roomler-desktop` companion installed on
         /// this host, or `None` when none is installed / the probe failed /
         /// the agent predates the field. Additive agent→server like
@@ -3358,6 +3386,8 @@ mod tests {
             srflx_count: Some(2),
             warm_relay: Some("5.9.157.221:12586".into()),
             companion_version: Some("0.4.16".into()),
+            // FR-43 P2c — absent means "no news", which is the steady state.
+            caps: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.heartbeat""#));
@@ -3378,7 +3408,12 @@ mod tests {
                 srflx_count,
                 warm_relay,
                 companion_version,
+                caps,
             } => {
+                // FR-43 P2c — the steady state is ABSENT, and that is the
+                // property worth asserting: caps ride the heartbeat only when
+                // they change, so an ordinary beat must carry none.
+                assert!(caps.is_none(), "an ordinary heartbeat must not carry caps");
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
                 assert_eq!(active_sessions, 2);
@@ -3476,6 +3511,7 @@ mod tests {
             // server reading it cannot tell it apart from an old agent (both
             // mean "nothing to show").
             companion_version: None,
+            caps: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -5780,6 +5816,62 @@ mod tests {
                 assert_eq!(ice_servers.len(), 1);
             }
             other => panic!("expected OverlayRelayGrant, got {other:?}"),
+        }
+    }
+    /// FR-43 P2c — an absent `caps` must not appear on the wire at ALL.
+    ///
+    /// The whole design rests on caps riding the heartbeat only when they
+    /// CHANGE: they are ~200 bytes against a frequent message, so a steady
+    /// state that serialised `"caps":null` would cost every device every beat
+    /// for nothing. And a reader must be able to tell "no news" from "no
+    /// capabilities" — the same `None` vs `Some([])` rule `AgentCaps.permissions`
+    /// already carries.
+    #[test]
+    fn heartbeat_caps_are_absent_from_the_wire_unless_they_changed() {
+        let quiet = ClientMsg::AgentHeartbeat {
+            rss_mb: 10,
+            cpu_pct: 1.0,
+            active_sessions: 0,
+            sys: None,
+            srflx_count: None,
+            warm_relay: None,
+            companion_version: None,
+            caps: None,
+        };
+        let s = serde_json::to_string(&quiet).unwrap();
+        assert!(
+            !s.contains("caps"),
+            "a steady-state heartbeat must not mention caps at all: {s}"
+        );
+
+        // …and when they DO change, they travel whole.
+        let announcing = ClientMsg::AgentHeartbeat {
+            rss_mb: 10,
+            cpu_pct: 1.0,
+            active_sessions: 0,
+            sys: None,
+            srflx_count: None,
+            warm_relay: None,
+            companion_version: None,
+            caps: Some(Box::new(AgentCaps {
+                permissions: Some(vec!["screen-capture".into(), "input".into()]),
+                has_input_permission: true,
+                ..Default::default()
+            })),
+        };
+        let s = serde_json::to_string(&announcing).unwrap();
+        assert!(s.contains(r#""screen-capture""#), "got {s}");
+        let back: ClientMsg = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMsg::AgentHeartbeat { caps: Some(c), .. } => {
+                assert_eq!(
+                    c.permissions.as_deref(),
+                    Some(&["screen-capture".to_string(), "input".to_string()][..]),
+                    "the permissions a device announces must survive the round trip"
+                );
+                assert!(c.has_input_permission);
+            }
+            other => panic!("expected caps to survive, got {other:?}"),
         }
     }
 }
