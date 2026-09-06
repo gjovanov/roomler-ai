@@ -39,9 +39,24 @@ Resolve-DnsName <peer>.<domain>     ->  NO ANSWER   (out-of-zone control: ok)
 ```
 
 Both halves are measured on that same host: a **GP-store** rule takes the
-effective table 0 → 1; the **local** rule never does, `gpupdate` included, and
-**not across a clean reboot either** — the local store is inert structurally,
-not because something failed to reload.
+effective table 0 → 1; the **local** rule read 0 across repeated checks and a
+clean reboot.
+
+> ⚠️ **Correction, measured after the GP experiment was reverted.** With my
+> experimental key removed and the policy refreshed, the effective table now
+> shows **the daemon's own LOCAL rule**, matching its current address. So the
+> local store is **not inert** — on this host a locally-written rule is *not
+> effective until a policy refresh*, which is a different and much cheaper
+> problem.
+>
+> That weakens P5 further: if a refresh is what a local rule needs, the fix is to
+> **trigger one after writing**, not to write the Group-Policy store at all — no
+> SYSTEM-level registry writer, and none of its revert hazard. It also explains
+> the intermittency, since the daemon rewrites the rule on every reconnect while
+> the next scheduled refresh may be up to ~90 min away.
+>
+> ⚠️ This does **not** touch the enforced-DNS finding below, which was measured
+> independently and still holds with the local rule effective.
 
 ⚠️ `Version` must be **1**. With `2` — what `Add-DnsClientNrptRule` writes into
 the local store — a GP rule is not parsed at all.
