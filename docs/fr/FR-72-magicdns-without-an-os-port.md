@@ -1,6 +1,6 @@
 # FR-72 — One MagicDNS resolver per daemon
 
-**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 shipped; **P2 field-verified on 0.4.73** · **Opened:** 2026-09-05
+**Issue:** [#1382](https://github.com/gjovanov/roomler-ai/issues/1382) · **Status:** P1 + P2 + docs shipped, P2 field-verified on 0.4.73; **P5 open — GPO-managed Windows still does not resolve** · **Opened:** 2026-09-05
 
 > ⚠️ **Re-aimed 2026-09-05, same day, after the verification overturned the
 > original premise.** This FR opened as *"MagicDNS without an OS port"* — the
@@ -23,6 +23,35 @@ something else briefly holds the port.
 | P2 | Retry a failed bind; steer the OS when the bind lands late; await the aborted task | **shipped 0.4.73** (#1414), field-verified | — (retry is unconditional; the pre-P2 behaviour is "give up", not a safer state) |
 | P3 | Reporting: make `magicdns active` mean *answering* | open (#1363) | — |
 | P4 | Docs: [`docs/magicdns.md`](../magicdns.md) in house style with diagrams, linked from `docs/README.md` | **shipped** | — |
+| P5 | **Write the NRPT rule into the Group-Policy store where the local store is inert** (Tailscale's `writeAsGP`) | open — the last thing between this FR and its goal | detect-and-fall-back; a host whose local rule works must keep using it |
+
+### P5 — why it exists
+
+On a GPO-managed Windows host the local NRPT store is **ignored**, so every
+other part of the feature can be perfectly healthy and no query ever reaches the
+resolver. Measured on 0.4.73, on the host that opened this FR:
+
+```
+Get-NetUDPEndpoint 53               ->  <self overlay ip>  by roomlerd     ← bound, correct address
+Get-DnsClientNrptRule   (local)     ->  .<magic domain> -> <self ip>       ← we wrote it
+Get-DnsClientNrptPolicy -Effective  ->  0 rules                            ← nothing honours it
+Resolve-DnsName <peer>.<domain>     ->  NO ANSWER   (out-of-zone control: ok)
+```
+
+Both halves are measured on that same host: a **GP-store** rule takes the
+effective table 0 → 1; the **local** rule never does, `gpupdate` included.
+
+⚠️ Design constraints, in the order they will bite:
+
+1. **Detect, don't assume.** Writing GP unconditionally means re-asserting
+   against every policy refresh on hosts that never needed it. `detectWriteAsGP`
+   gates on whether unowned rules remain.
+2. **The revert path is the risk, not the write.** A GP rule that outlives the
+   daemon steers a domain at a resolver that no longer exists — host-wide, since
+   the NRPT is registry-global. `DnsOsGuard`'s `Drop` must reach the GP store,
+   and a boot reconciler must heal what a hard exit left behind. This is the
+   same "never self-wedge" rule the route guards follow.
+3. `nrptMaxDomainsPerRule = 50` is **domains per rule**, not a cap on rules.
 
 ## The bug, part 1 — we collided with ourselves (P1)
 
@@ -148,12 +177,21 @@ would have caught each of these before it reached a conclusion.
 |---|---|
 | **SplitTun UDP interception** (the original P1–P3) | Solves third-party port ownership, which does not happen here — re-confirmed in P2 by binding successfully alongside the wildcard holder. Real engineering against a problem we do not have, in the packet path of every overlay host. |
 | **An alternate port** (the first instinct, and the FR's original title) | NRPT nameservers carry no port: `Add-DnsClientNrptRule -NameServers 'ip:port'` **silently stores an empty list**. Measured. |
-| **Writing the Group-Policy NRPT store** (Tailscale's `writeAsGP`) | It *works* — a GP rule plus `gpupdate` took the effective table 0 → 1 on the affected host — but it is not needed: the **local** rule works there too, and writing into a GPO-owned key means re-asserting it against every policy refresh. |
+| ~~**Writing the Group-Policy NRPT store** (Tailscale's `writeAsGP`)~~ | ⚠️ **REJECTION WITHDRAWN 2026-09-06 — this is now P5.** It was rejected as "works, but not needed: the local rule works there too". The second half is **false on the host that motivated this FR**, measured on 0.4.73: the local rule is written correctly and the effective table holds **0 rules**, before *and* after a completed `gpupdate`. See P5. |
 | **A DNS-manager fallback ladder** | Designed for a policy environment we then failed to reproduce. Local NRPT works on the host that motivated it. Revisit only with a host where it demonstrably does not. |
 
 ⚠️ An earlier root cause — *"an empty policy NRPT table suppresses local rules"* —
-is **refuted**. It rested on one working host against one broken host, and the
-broken one's local rule became effective after a policy refresh.
+was recorded here as **refuted**, on the grounds that the broken host's local
+rule became effective after a policy refresh. ⚠️ **That refutation is itself
+withdrawn.** Re-measured on the same host on 0.4.73: the local rule is present
+and correct, `gpupdate /target:computer` runs to completion, and the effective
+table stays **empty**. The mechanism is real; what was wrong was the sentence it
+was written in, and the rejection that leaned on it.
+
+🔑 The generalisation worth keeping: **the unmanaged dev box does not model a
+GPO-managed one.** Local NRPT rules take effect immediately on the former and
+are inert on the latter, and this arc generalised the wrong way round three
+separate times.
 
 ## Acceptance criteria
 
@@ -174,9 +212,11 @@ broken one's local rule became effective after a policy refresh.
       callouts) and linked from `docs/README.md`'s map and table. It carries the
       diagnostics table naming the three instruments that lie here, so the next
       reader does not re-pay for them.
-- [ ] The corp laptop that opened this FR resolves MagicDNS on 0.4.73. It
-      converges by auto-update; it has had three distinct causes behind one
-      symptom, so it is not claimed until read.
+- [ ] The corp laptop that opened this FR resolves MagicDNS. **Read on 0.4.73:
+      still NO ANSWER — and now diagnosed** rather than mysterious: the resolver
+      is bound on the right address and the rule is written, but the effective
+      NRPT table is empty because the host is GPO-managed. That is P5, and it is
+      the last thing standing between this FR and its goal.
 
 ### ⚠️ Two criteria struck, because they were wrong
 
@@ -217,3 +257,4 @@ them. Overlay IPv6 / AAAA behaviour is #1342's.
 | 2026-09-06 | 0.4.71 | dev box | ICS holds `0.0.0.0:53`; a specific bind succeeds anyway, plain and with `SO_REUSEADDR` ⇒ the wildcard-squatter theory refuted a second time |
 | 2026-09-06 | 0.4.73 | dev box | ⚠️ Passive read is **not** evidence: host healthy, retry counter **0** — both binds won first try, exactly as an unfixed build would look |
 | 2026-09-06 | 0.4.73 | dev box | **P2 PASS, provoked**: port held across a restart ⇒ `bind failed; retrying`; released ⇒ `resolver up` 21 s later, `resolver bound late - steering the OS now`, NRPT installed, names resolve. Second org unheld throughout as the in-run control |
+| 2026-09-06 | 0.4.73 | corp laptop | Resolver bound on the correct address, local NRPT rule written — **effective table holds 0 rules**, `gpupdate` completed and changed nothing, query NO ANSWER with a passing out-of-zone control ⇒ **P5**, and the GP-store rejection withdrawn |
