@@ -34,6 +34,7 @@ pub mod dialer;
 pub mod direct;
 pub mod disco;
 pub mod dns;
+pub mod hosts;
 pub mod ingress;
 pub(crate) mod lifecycle;
 pub mod nat;
