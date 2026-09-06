@@ -265,7 +265,12 @@ pub fn watch(
                 outcome.note = format!("installer exited with {code}");
                 tracing::error!(exit = code, "installer failed");
             } else {
-                verify_new_binary(&mut outcome, &expected_version, origin_exe.as_deref());
+                verify_new_binary(
+                    &mut outcome,
+                    &expected_version,
+                    origin_exe.as_deref(),
+                    already_exited,
+                );
             }
         }
         WaitOutcome::Timeout => {
@@ -335,12 +340,38 @@ fn install_flavour(origin: Option<&std::path::Path>) -> crate::updater::WindowsI
 /// With `origin` set (staged-copy watcher) the probe targets the real
 /// install path directly — the watcher's own path is a %TEMP% copy of
 /// the OLD binary and would always report the pre-update version.
+/// How long to let the filesystem settle before probing the new binary.
+///
+/// The pause exists for ONE reason, stated at [`POST_INSTALL_SETTLE`]: a
+/// cargo-wix MSI sometimes fsyncs after the installer process exits. That is a
+/// Windows concern about an installer we watched exit.
+///
+/// ⚠️ When the install completed synchronously it finished BEFORE this watcher
+/// existed — there is nothing left to settle, and the wait is pure exposure.
+/// Field-measured 2026-09-06 on three hosts: with the wait skipped (P1) the
+/// watcher still died inside this 2 s sleep, killed by the cgroup teardown that
+/// follows the daemon's exit, leaving `last-install.json` at `InProgress` even
+/// though it had started and logged. Removing a sleep we never needed is the
+/// cheap half of closing that race — far cheaper than moving the watcher into a
+/// transient unit (FR-67 P6), which pays exit-path risk for the same outcome.
+fn settle_before_probe(already_exited: bool) -> Duration {
+    if already_exited {
+        Duration::ZERO
+    } else {
+        POST_INSTALL_SETTLE
+    }
+}
+
 fn verify_new_binary(
     outcome: &mut InstallOutcome,
     expected_version: &str,
     origin: Option<&std::path::Path>,
+    already_exited: bool,
 ) {
-    std::thread::sleep(POST_INSTALL_SETTLE);
+    let settle = settle_before_probe(already_exited);
+    if !settle.is_zero() {
+        std::thread::sleep(settle);
+    }
     let exe = origin
         .map(|p| p.to_path_buf())
         .or_else(|| std::env::current_exe().ok());
@@ -801,6 +832,37 @@ mod tests {
     /// ⚠️ The second pins what must NOT change — a genuinely asynchronous
     /// installer (msiexec, `installer -pkg`) is still waited on, because
     /// `recover_wedged_install` depends on observing its exit.
+    /// FR-67 — the settle is exposure, not safety, once the install is done.
+    ///
+    /// `POST_INSTALL_SETTLE` exists for one documented reason: a cargo-wix MSI
+    /// sometimes fsyncs after the installer process exits. That is a claim about
+    /// an installer we *watched exit*. When the install completed synchronously
+    /// it finished before this watcher existed, so there is nothing to settle.
+    ///
+    /// ⚠️ Field-measured on three hosts, 2026-09-06: with the wait skipped the
+    /// watcher STILL died inside this 2 s sleep — the cgroup teardown that
+    /// follows the daemon's exit landed first, and `last-install.json` stayed at
+    /// `InProgress` despite the watcher having started and logged. The sleep was
+    /// the whole remaining exposure window.
+    ///
+    /// ⚠️ The second assertion is the one that must not regress: an installer we
+    /// genuinely waited on keeps the pause, because that is the case the
+    /// constant was written for.
+    #[test]
+    fn a_synchronous_install_has_nothing_to_settle_for() {
+        assert_eq!(
+            settle_before_probe(true),
+            Duration::ZERO,
+            "the install finished before this process existed; the pause is pure              exposure to the teardown that is about to kill us"
+        );
+
+        assert_eq!(
+            settle_before_probe(false),
+            POST_INSTALL_SETTLE,
+            "an installer we watched exit keeps the pause — cargo-wix can fsync              after process exit, which is why the constant exists"
+        );
+    }
+
     #[test]
     fn the_watcher_never_waits_on_an_already_completed_install() {
         assert!(
