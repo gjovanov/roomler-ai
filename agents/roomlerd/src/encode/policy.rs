@@ -18,7 +18,7 @@
 //! Deliberately NOT here (yet): keyframe policy and fps/skip decisions
 //! (event-driven, stage 2 of this item per the approved plan), and the
 //! vp9 pump's bitrate formula (a real divergence — 0.20 bpp/s × quality
-//! dial vs this module's 0.07 bpp/s × codec/chroma factors — kept
+//! dial vs this module's 0.25 direct / 0.07 relay bpp/s × codec/chroma factors — kept
 //! visible as "vp9 doesn't call [`rate_plan`]" instead of papered over).
 //!
 //! Everything here is pure over its inputs (the P5 merges and the
@@ -529,12 +529,12 @@ mod tests {
         assert_eq!(p.ceiling_bps, 3_000_000);
         assert_eq!(p.cq_bias, 0);
 
-        // Direct HEVC at native 60 fps: raw 9.68 M × 1.25 = 12.096 M,
-        // inside the scaled [3.75, 15] M band, no relay clamp.
+        // Direct HEVC at native 60 fps (FR-74 P1): raw 34.56 M × 1.25 =
+        // 43.2 M, inside the scaled [3.75, 60] M band, no relay clamp.
         let p = rate_plan(
             1920, 1200, 1920, 1200, 60, false, "HEVC", false, 1.0, false, 100,
         );
-        assert_eq!(p.ceiling_bps, 12_096_000);
+        assert_eq!(p.ceiling_bps, 43_200_000);
 
         // Direct at the deep rung keeps the P7 sharpening ladder.
         let p = rate_plan(
@@ -570,11 +570,11 @@ mod tests {
             1920, 1200, 1920, 1200, 30, true, "HEVC", false, 1.0, false, 85,
         );
         assert_eq!(p.ceiling_bps, 2_550_000);
-        // Direct Smoother: 12.096 M × 70 % = 8.467 M — mild squeeze, no clamp.
+        // Direct Smoother: 43.2 M × 70 % = 30.24 M — mild squeeze, no clamp.
         let p = rate_plan(
             1920, 1200, 1920, 1200, 60, false, "HEVC", false, 1.0, false, 70,
         );
-        assert_eq!(p.ceiling_bps, 8_467_200);
+        assert_eq!(p.ceiling_bps, 30_240_000);
     }
 
     /// P8c invariant (accidental loop 2, refine→dims→ceiling): idle

@@ -165,6 +165,20 @@ pub fn chroma_rate_factor_pct(chroma444: bool) -> usize {
 ///
 /// P8b — lives here (not `ffmpeg/encoder.rs`) because it's pure math with
 /// no ffmpeg types, and `encode::policy` composes it on every build.
+///
+/// FR-74 P1 — the DIRECT ceiling is a content-generous bound, not the 0.07 bpp
+/// motion-video budget. The cap is a ceiling, never a target: constant-quality
+/// rate control spends what the content demands and the AIMD follows the pipe
+/// BELOW the cap on evidence (viewer age, the byte-budget gate). With the 0.07
+/// constant (9.68 Mbps at 1920×1200 @ 60) the operator's Notepad++ scroll on a
+/// 4 ms direct path was unreadable while it moved, and the controller cut its
+/// own cap as if it were congestion; at 40 Mbps (P0 cell B2) the same scroll
+/// could not be reproduced on AV1, VP9 4:2:0 or H.264 — 0 cuts, 0 skips,
+/// 15–23 Mbps sent, 26–43 fps. 0.25 bpp/s gives 34.6 Mbps at that geometry,
+/// clamped to [3, 48] Mbps per codec factor. The CONSTRAINED branch keeps the
+/// 0.07 / [3, 12] band (it is min'd with `relay_max_bps` anyway); relay paths
+/// are unchanged byte for byte. `FFMPEG_MAXRATE_KBPS` stays the operator's
+/// override in both directions.
 pub(crate) fn ffmpeg_maxrate_bps_scaled(
     width: u32,
     height: u32,
@@ -178,12 +192,20 @@ pub(crate) fn ffmpeg_maxrate_bps_scaled(
     {
         return kbps * 1000;
     }
-    const SCREEN_BPP_PER_SECOND: f64 = 0.07;
-    let raw = (width as f64 * height as f64 * fps as f64 * SCREEN_BPP_PER_SECOND) as usize;
+    /// Relay / constrained: the motion-video budget the relay clamp sits under.
+    const CONSTRAINED_BPP_PER_SECOND: f64 = 0.07;
+    /// Direct: a screen-content bound — text in motion needs 3–4× a video's bits.
+    const DIRECT_BPP_PER_SECOND: f64 = 0.25;
+    let (bpp, band_top) = if constrained {
+        (CONSTRAINED_BPP_PER_SECOND, 12_000_000_usize)
+    } else {
+        (DIRECT_BPP_PER_SECOND, 48_000_000_usize)
+    };
+    let raw = (width as f64 * height as f64 * fps as f64 * bpp) as usize;
     let raw = raw.saturating_mul(factor_pct) / 100;
     let clamped = raw.clamp(
         3_000_000_usize.saturating_mul(factor_pct) / 100,
-        12_000_000_usize.saturating_mul(factor_pct) / 100,
+        band_top.saturating_mul(factor_pct) / 100,
     );
     // rc.166 freeze fix — on a constrained relay-TCP transport (WSL / corp
     // UDP-blocked) even the low end of the [3, 12] Mbps HEVC/vp9_qsv maxrate
@@ -476,14 +498,19 @@ pub fn direct_queue_ms() -> u64 {
 }
 
 /// [`direct_queue_ms`] resolved against a REFERENCE RATE into a byte
-/// budget for the direct arm of the pump's backpressure gate. The
-/// reference is the AIMD's currently-applied target (it tracks
-/// congestion down within ~2 s even while a rebuild-bound encoder's
-/// actual maxrate is motion-deferred), falling back to the policy
-/// ceiling before the first apply; `0` for either input disables the
-/// gate (`usize::MAX`). Floored at 48 KiB so a post-IDR drain at a
-/// collapsed target doesn't stall production longer than the IDR's own
-/// transit.
+/// budget for the direct arm of the pump's backpressure gate.
+///
+/// FR-74 P1 — the reference is the path's rate CEILING, never the AIMD's
+/// applied target. It used to be the applied target, and that made the
+/// gate self-reinforcing: the operator's baseline on CORPLAP-3 (2026-09-06)
+/// took six ×0.85 cuts in 16 s, and at 2.5 Mbps the budget was ~47 KB — one
+/// text frame tripped it, every +605 kbps climb was cut again, and the
+/// session sat at 2–3.7 Mbps for minutes. With the ceiling as the reference
+/// the budget is a fixed amount of link time at the rate the path is
+/// allowed to carry; a burst the wire drains passes, a real backlog still
+/// trips the gate and the AIMD still cuts on that evidence. `0` for either
+/// input disables the gate (`usize::MAX`). Floored at 48 KiB so a post-IDR
+/// drain doesn't stall production longer than the IDR's own transit.
 pub fn direct_queue_budget_bytes(rate_bps: u32) -> usize {
     let ms = direct_queue_ms();
     if ms == 0 || rate_bps == 0 {
@@ -1335,6 +1362,48 @@ mod tests {
         assert_eq!(direct_queue_budget_bytes(0), usize::MAX);
         // Direct HRD default is 1× maxrate; constrained keeps the rc.234 2×.
         assert_eq!(direct_hrd_pct(), 100);
+    }
+
+    /// FR-74 P1 — the direct ceiling is the content-generous bound P0 measured
+    /// clean (40 Mbps on CORPLAP-3: 0 cuts, 0 skips on AV1 / VP9 4:2:0 /
+    /// H.264 scrolls); the constrained branch is unchanged, relay clamp and all.
+    #[test]
+    fn direct_ceiling_is_content_generous_and_the_relay_band_is_unchanged() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 1920×1200 @ 60, factor 100: 0.25 bpp/s = 34.56 Mbps, inside [3, 48].
+        assert_eq!(
+            ffmpeg_maxrate_bps_scaled(1920, 1200, 60, false, 100),
+            34_560_000
+        );
+        // H.264's 150 % factor scales the rate and the band together: 51.84 M
+        // inside [4.5, 72] M.
+        assert_eq!(
+            ffmpeg_maxrate_bps_scaled(1920, 1200, 60, false, 150),
+            51_840_000
+        );
+        // A 4K panel at 60 fps hits the 48 M top of the band.
+        assert_eq!(
+            ffmpeg_maxrate_bps_scaled(3840, 2160, 60, false, 100),
+            48_000_000
+        );
+        // A small rung stays on the 3 M floor.
+        assert_eq!(
+            ffmpeg_maxrate_bps_scaled(640, 400, 30, false, 100),
+            3_000_000
+        );
+        // Constrained: the 0.07 / [3, 12] band, then the relay clamp — the
+        // 2026-09-05 fleet's relay sessions see exactly what they saw.
+        let relay = crate::encode::relay_max_bps() as usize;
+        assert_eq!(
+            ffmpeg_maxrate_bps_scaled(1920, 1200, 60, true, 100),
+            9_676_800.min(relay)
+        );
+        assert_eq!(
+            ffmpeg_maxrate_bps_scaled(1920, 1200, 30, true, 125),
+            6_048_000.min(relay)
+        );
     }
 
     fn gate() -> SettleKeyframeGate {
