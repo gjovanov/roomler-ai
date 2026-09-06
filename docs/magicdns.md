@@ -83,17 +83,18 @@ to A-only without a rebuild.
 
 | Platform | Mechanism | Notes |
 |---|---|---|
-| **Windows** | `Add-DnsClientNrptRule -Namespace '.<domain>' -NameServers '<ip>'` (`dns.rs:356`) | ⚠️ The NRPT is **registry-global**, not per-interface — which is why a steer at a dead resolver breaks the domain for the whole host. ⚠️ NRPT nameservers carry **no port**: `-NameServers 'ip:port'` silently stores an *empty* list, so "just use another port" is not available here. ⚠️⚠️ **On a GPO-managed host the local store is ignored** — see below. |
+| **Windows** | `Add-DnsClientNrptRule -Namespace '.<domain>' -NameServers '<ip>'` (`dns.rs:356`) | ⚠️ The NRPT is **registry-global**, not per-interface — which is why a steer at a dead resolver breaks the domain for the whole host. ⚠️ NRPT nameservers carry **no port**: `-NameServers 'ip:port'` silently stores an *empty* list, so "just use another port" is not available here. ⚠️⚠️ **On a GPO-managed host a locally-written rule may not take effect until a policy refresh** — see below. |
 | **Linux** | `resolvectl dns/domain <link>` (`dns.rs:382`) | ⚠️ `resolvectl` **replaces** a link's settings, so multi-org hosts must write all orgs' entries together rather than one at a time. |
 | **macOS + everything else** | none — `setup_os` returns `false` (`dns.rs:405`) | Names still resolve through the SOCKS path (which does its own DOMAIN resolution); the OS itself is simply not steered, and `roomler status` reports `os_steer_active=false` honestly. |
 
 The rule is owned by a `DnsOsGuard` (`dns.rs:315`) that reverts it on `Drop`, so
 a teardown leaves no stale steer behind.
 
-### ⚠️ Windows: a locally-written rule is inert on a GPO-managed host
+### ⚠️ Windows: on a GPO-managed host a local rule waits for a policy refresh
 
-A domain-joined, policy-managed Windows host **ignores the local NRPT store**.
-Everything else looks perfect and no query ever reaches the resolver:
+On a domain-joined, policy-managed host a rule we write to the local store can
+sit there **without taking effect**. Everything else looks perfect and no query
+reaches the resolver:
 
 ```
 Get-NetUDPEndpoint 53               ->  <self overlay ip>  by roomlerd   ← bound
@@ -101,10 +102,16 @@ Get-DnsClientNrptRule   (local)     ->  .<magic domain> -> <self ip>     ← wri
 Get-DnsClientNrptPolicy -Effective  ->  0 rules                          ← honoured by nobody
 ```
 
-`gpupdate /target:computer` does **not** rescue it. The fix is to write into the
-Group-Policy store instead (Tailscale solves the same problem with
-`detectWriteAsGP`); tracked as **P5** of
-[FR-72](fr/FR-72-magicdns-without-an-os-port.md).
+⚠️ It is **pending, not ignored**: after a policy refresh the same local rule was
+observed effective and correct on the same host. So the likely fix is to
+*trigger* a refresh after writing, rather than to write the Group-Policy store
+(the `detectWriteAsGP` approach), which would mean a SYSTEM-level registry writer
+whose stale rules the daemon could never revert. Tracked as **P5** of
+[FR-72](fr/FR-72-magicdns-without-an-os-port.md), parked.
+
+🔑 This also explains the intermittency on such hosts: the daemon rewrites the
+rule on every WS reconnect, so it can sit perpetually "just written" while the
+next scheduled refresh is up to ~90 min away.
 
 🔑 **Diagnostic rule of thumb**: `Get-DnsClientNrptRule` says *we wrote it*;
 `Get-DnsClientNrptPolicy -Effective` says *the registry agrees*. **Neither
