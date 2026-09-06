@@ -1060,7 +1060,14 @@ pub fn spawn_installer_with_watch(
         // failure — the installer is already running and the agent
         // is about to exit; we lose the outcome JSON but the user
         // still gets the upgrade.
-        tracing::warn!(error = %e, "post-install watcher spawn failed");
+        // `{:#}` not `%e`: the anyhow *chain*. The bare display shows only
+        // "spawning post-install-watch subprocess" and hides the ENOENT that
+        // actually explains it — which is why 21 consecutive failures read as
+        // one uninformative line.
+        tracing::warn!(
+            error = format!("{e:#}"),
+            "post-install watcher spawn failed"
+        );
     }
     Ok(())
 }
@@ -1849,6 +1856,33 @@ fn install_path_before_rename(exe: &std::path::Path) -> Option<PathBuf> {
     Some(exe.with_extension(""))
 }
 
+/// Recover the real path when `/proc/self/exe` has picked up Linux's
+/// `" (deleted)"` marker.
+///
+/// ⚠️ This is why the `.deb` path has never had a post-install watcher. `apt`
+/// replaces `/usr/bin/roomlerd`, which unlinks the running image, so from that
+/// moment `current_exe()` reads `/usr/bin/roomlerd (deleted)` — a path that does
+/// not exist. `Command::spawn` on it fails ENOENT and the watcher is never born.
+/// Field-measured 2026-09-06: **21 `post-install watcher spawn failed` in 7 days
+/// and zero `post-install watcher started`**, with `last-install.json` frozen
+/// since August on every host on that path.
+///
+/// The marker is appended by the kernel to the readlink result, so stripping it
+/// is the exact inverse and the two cannot drift.
+///
+/// Returns `None` when there is no marker to strip — the caller then keeps the
+/// path it already had.
+#[cfg(not(target_os = "windows"))]
+fn strip_deleted_suffix(exe: &std::path::Path) -> Option<PathBuf> {
+    const MARKER: &str = " (deleted)";
+    let s = exe.to_str()?;
+    let stripped = s.strip_suffix(MARKER)?;
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(stripped))
+}
+
 fn spawn_watcher(
     spawned: InstallerSpawn,
     installer_path: &std::path::Path,
@@ -1868,6 +1902,29 @@ fn spawn_watcher(
     let (launch, staged) = stage_watcher_exe(&exe, installer_path);
     #[cfg(not(target_os = "windows"))]
     let (launch, staged) = (exe.clone(), false);
+    // The image we are about to re-exec may have been replaced by the install
+    // that just ran. Recover the real path, and refuse rather than hand
+    // `Command` something that is not there — an ENOENT here is silent apart
+    // from one context-less WARN, which is how this went unnoticed for months.
+    #[cfg(not(target_os = "windows"))]
+    let launch = match strip_deleted_suffix(&launch) {
+        Some(real) if real.is_file() => {
+            tracing::info!(
+                was = %launch.display(),
+                now = %real.display(),
+                "watcher exe was replaced by the install; using the new image"
+            );
+            real
+        }
+        _ => launch,
+    };
+    #[cfg(not(target_os = "windows"))]
+    if !launch.is_file() {
+        anyhow::bail!(
+            "watcher exe {} does not exist (the install replaced it and the path              could not be recovered)",
+            launch.display()
+        );
+    }
     let mut cmd = std::process::Command::new(&launch);
     cmd.arg("post-install-watch")
         .arg("--installer-pid")
@@ -2442,6 +2499,61 @@ mod tests {
     /// reported 0.4.45). The second guards the inverse — a path that was NOT
     /// renamed must yield `None` so the caller's existing behaviour is
     /// untouched on every other platform and flow.
+    /// FR-67 P2 — the `.deb` path had no watcher at all, and this is why.
+    ///
+    /// `apt` replaces `/usr/bin/roomlerd`, unlinking the running image, so from
+    /// that instant `current_exe()` reads `/usr/bin/roomlerd (deleted)`.
+    /// `Command::spawn` on that path fails ENOENT and the watcher is never born.
+    ///
+    /// Field-measured on a cluster node, 2026-09-06: **21 `post-install watcher
+    /// spawn failed` in seven days and ZERO `post-install watcher started`**,
+    /// with `last-install.json` untouched since 2026-08-29 while the host had
+    /// moved from 0.4.16 to 0.4.73.
+    ///
+    /// ⚠️ The suffix is appended by the kernel to the readlink result, so
+    /// stripping it is the exact inverse — the same coupling rule that keeps
+    /// `install_path_before_rename` honest against the installer's own rename.
+    ///
+    /// ⚠️ The negative cases matter as much: a path that merely *contains* the
+    /// word, or ends in it without the leading space, must be left alone.
+    /// Mangling a real path would turn a spawn failure into a spawn of the
+    /// wrong binary, which is worse.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_deleted_exe_path_is_recovered_so_the_watcher_can_spawn() {
+        use std::path::{Path, PathBuf};
+
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/usr/bin/roomlerd (deleted)")),
+            Some(PathBuf::from("/usr/bin/roomlerd")),
+            "the field case: apt replaced the image, so /proc/self/exe carries the marker"
+        );
+
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/usr/bin/roomlerd")),
+            None,
+            "an ordinary path has nothing to strip and must be left alone"
+        );
+
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/opt/my (deleted) tools/roomlerd")),
+            None,
+            "the marker only counts as a SUFFIX; a path that merely contains it is real"
+        );
+
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/usr/bin/roomlerd(deleted)")),
+            None,
+            "without the separating space this is a legitimate filename, not a marker"
+        );
+
+        assert_eq!(
+            strip_deleted_suffix(Path::new(" (deleted)")),
+            None,
+            "stripping must never yield an empty path"
+        );
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn watcher_verifies_the_install_path_not_its_own_renamed_path() {
