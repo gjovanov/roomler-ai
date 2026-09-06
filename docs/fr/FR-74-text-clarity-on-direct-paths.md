@@ -81,7 +81,6 @@ reproducing the FAIL on the current settings, then one change at a time:
 | A | `direct_queue_ms` (config) | 150 → 600 | the gate/AIMD reaction to a burst the wire drains |
 | B | `ROOMLERD_FFMPEG_MAXRATE_KBPS` (env) | 9677 → 24000 | the ceiling (the VP9 pump's bpp at this geometry) |
 | C | `ROOMLERD_FFMPEG_CQ` (env) | 22 → 16 | the still-text quality floor |
-| D | codec `vp9-444` (viewer picker) | av1 4:2:0 → VP9 4:4:4 SW | chroma, at the fps cost of a software encoder on an encode-bound host |
 
 Read from the heartbeat: `target_bps` trajectory through a scroll, `frames_skipped`,
 `swaps`, keyframes; from the operator: readable while moving, settle time, still
@@ -110,8 +109,13 @@ IDR. Coarser rungs above 8 Mbps where the bits/quality slope is flat. Measured b
 Extend the idle refine to native: once motion settles, one re-encode of the settled
 frame at a sharper CQ (a still frame costs nothing against the cap). Evaluate
 4:4:4 where the host can — QSV on Iris Xe advertises HEVC/AV1 4:2:0 only, so on
-CORPLAP-3 4:4:4 means libvpx VP9-444 software at ~12–25 fps: offered as an explicit
-"text" choice, never silently.
+CORPLAP-3 4:4:4 means libvpx VP9-444 software at ~12–25 fps. It is a side check for
+the residual chroma softness of SETTLED text only — the scrolling blur and the
+settle time are on the AV1 4:2:0 hardware path and are fixed there (P1, P2), not
+by changing codec.
+
+The P0 table therefore has three cells, all on the av1_qsv path the operator uses;
+a 4:4:4 comparison, if ever run, is a P3 cell with its fps cost stated up front.
 
 ### P4 — the viewer's pixel chain
 
@@ -126,7 +130,7 @@ disagree. FSR helps only when upscaling.
 | P0 | A/B with existing knobs on CORPLAP-3 | — (settings only) | proposed |
 | P1 | content-following direct ceiling + measured queue budget | `direct_ceiling_follows` (one release default off) | proposed |
 | P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | proposed |
-| P3 | idle refine at native; explicit 4:4:4 "text" choice | `native_refine` | proposed |
+| P3 | idle refine at native; 4:4:4 only as an optional, costed side check | `native_refine` | proposed |
 | P4 | viewer display-scale pill + 1:1 guidance | — (UI) | proposed |
 
 ## Acceptance criteria
@@ -147,7 +151,8 @@ disagree. FSR helps only when upscaling.
 
 - Whether the direct ceiling should stay bpp-scaled at all (a higher constant is
   still a constant) or be purely measured — probe-and-follow.
-- Where the 4:4:4 "text" choice lives: the Priority dial or the codec picker.
+- Whether a 4:4:4 "text" choice is worth offering at all on hosts whose hardware
+  encodes 4:2:0 only (software VP9 at a fraction of the frame rate).
 - Whether P1's ceiling lift needs the viewer's decode capacity as an input (a 24 Mbps
   AV1 stream on a laptop decoder).
 
