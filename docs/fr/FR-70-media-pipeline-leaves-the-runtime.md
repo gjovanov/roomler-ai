@@ -353,9 +353,33 @@ updating through each (frames keep flowing at the old dims while the open
 runs) and `dims_swaps` counts them; `open_ms` appears in the heartbeat only
 for the session's first open. The VP9-444 pump has no background rebuild
 and keeps its inline re-open (its libvpx open is milliseconds). **Released
-in `agent-v0.4.71` (2026-09-05 20:37 UTC), merged as #1388; the field gate
-is still open** — it needs CORPLAP-2 (the 2.9 s host) on 0.4.71 and a
-session driven through the resolution rungs.
+in `agent-v0.4.71` (2026-09-05 20:37 UTC), merged as #1388.**
+
+**First field contact (2026-09-06 01:06 UTC, CORPLAP-3 on 0.4.71, sole
+viewer, av1_qsv, direct): the gate FAILED, and the failure is the finding.**
+Two things about driving it first. The priority dial moves no dims
+(`priority_relay_cap`'s dims-caps are off by default), and "Fit to local
+viewport" at a DPR-2 stage asks for 2064×1234 — more than the host has —
+so it clamps to native; what moves dims is `rc:resolution`, which the
+viewer re-sends on a browser-window resize (a 1100 px window asked for
+1598×738, planned as 1180×738). The trigger did fire: `FR-70 M2: dims
+change — opening the replacement in the background`. But the same pass had
+already handed the NEW dims to the capture backend — the Phase-B
+`set_output_cap` sat above the resample and the make-before-break
+decision — so the very next frame arrived at 1180×738, the pinned target
+could only pass it through, `need_rebuild` was true again with a swap in
+flight, and the inline re-open ran anyway: a 628 ms `STALL` at 01:06:28.4,
+`encoder (re)built`, and the replacement — whose own open finished 20 ms
+later — dropped unadopted. `dims_swaps` stayed 0. Net behaviour on 0.4.71:
+exactly pre-M2a, plus one wasted background open per dims change. **Fix**:
+the capture backend's cap is handed over AFTER the make-before-break
+decision and the inline open (the spawning pass leaves by `continue` and
+never reaches it; every later pass sees the pinned target), so the
+capturer keeps producing the live encoder's dims until the swap adopts and
+the plan's target takes over. The gate re-runs on the release carrying
+that: a window-resize-driven session on a 0.4.72+ host reads
+`dims_swaps ≥ 1`, the `dims swap adopted` line, and no `open_ms` after the
+session's first heartbeat.
 
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
