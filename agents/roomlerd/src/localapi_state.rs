@@ -391,22 +391,35 @@ impl LocalApiState for DaemonState {
             srflx: self.overlay.borrow().srflx.clone(),
             // FR-33 — captured LAN prefixes, from the process-wide netstate
             // snapshot (a HOST property, like netcheck). `None` when the
-            // monitor is not running.
+            // monitor is not running — and, since 2026-09-06, also when the
+            // operator switched the probe OFF: an empty list read as `clear`
+            // in the field (CORPLAP-3, kill-switch cycle), the same word as a
+            // genuinely clear host. The probe flag travels separately so a
+            // new CLI can say "probe OFF" instead of going silent.
             #[cfg(feature = "overlay-l3")]
-            lan_captures: tunnel_core::overlay::netstate::handle().map(|h| {
-                h.snapshot()
-                    .lan_captures
-                    .iter()
-                    .map(|c| tunnel_core::localapi::LanCaptureStatus {
-                        prefix: c.prefix.clone(),
-                        owner: c.owner.clone(),
-                        via: c.via_ifref.clone(),
-                        via_name: c.via_name.clone(),
-                    })
-                    .collect()
-            }),
+            lan_captures: if tunnel_core::env::flag("OVERLAY_LAN_CAPTURE_PROBE", true) {
+                tunnel_core::overlay::netstate::handle().map(|h| {
+                    h.snapshot()
+                        .lan_captures
+                        .iter()
+                        .map(|c| tunnel_core::localapi::LanCaptureStatus {
+                            prefix: c.prefix.clone(),
+                            owner: c.owner.clone(),
+                            via: c.via_ifref.clone(),
+                            via_name: c.via_name.clone(),
+                        })
+                        .collect()
+                })
+            } else {
+                None
+            },
+            #[cfg(feature = "overlay-l3")]
+            lan_capture_probe: tunnel_core::overlay::netstate::handle()
+                .map(|_| tunnel_core::env::flag("OVERLAY_LAN_CAPTURE_PROBE", true)),
             #[cfg(not(feature = "overlay-l3"))]
             lan_captures: None,
+            #[cfg(not(feature = "overlay-l3"))]
+            lan_capture_probe: None,
             // FR-47 — the last join the server refused, if any. Read from the
             // process-wide slot rather than the overlay view: a refusal means
             // the runtime never came up, so there is no view to carry it.

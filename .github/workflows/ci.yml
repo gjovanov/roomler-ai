@@ -245,6 +245,22 @@ jobs:
           # this list changes, or the action serves the previously cached set.
           packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
           version: ci-vpx-v2
+      # 2026-09-04: the cache action restored NOTHING (its own manifest was
+      # missing: `cat: …/cache-apt-pkgs/manifest_all.log: No such file`) and
+      # did not fail the job — the vp9-444 test binary then died at LOAD with
+      # `libvpx.so.9: cannot open shared object file` (exit 127) on master
+      # and on every PR of that hour. The action's silence is the hazard, so
+      # the lane verifies the runtime lib is really there and installs the
+      # set directly when it is not. The check is the loader's own view
+      # (`ldconfig -p`), not the action's status.
+      - name: Verify libvpx really landed (fallback to apt-get)
+        run: |
+          if ! ldconfig -p | grep -q 'libvpx\.so'; then
+            echo "::warning::cached apt set did not deliver libvpx — installing directly"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
+          fi
+          ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
 
       # Pair `vp9-444` with `vp9-444-bindgen` on Linux so env-libvpx-sys
       # regenerates its FFI bindings via bindgen against the installed
@@ -577,6 +593,16 @@ jobs:
         with:
           packages: pkg-config libclang-dev libvpx-dev
           version: ci-ffmpeg-v2
+      # Same self-heal as the vp9-444 lane (2026-09-04: a silent empty cache
+      # restore left `libvpx.so.9` missing at test-binary load, exit 127).
+      - name: Verify libvpx really landed (fallback to apt-get)
+        run: |
+          if ! ldconfig -p | grep -q 'libvpx\.so'; then
+            echo "::warning::cached apt set did not deliver libvpx — installing directly"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libvpx-dev
+          fi
+          ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
       - name: Fetch vendored FFmpeg 8.1.2
         env:
           GH_TOKEN: ${{ github.token }}
