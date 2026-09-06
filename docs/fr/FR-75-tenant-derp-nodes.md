@@ -1,6 +1,6 @@
 # FR-75 — Tenant-owned DERP nodes: a floor the UDP-blocked population can reach *near them*
 
-**Issue:** TBD · **Status:** spec — not started · **Opened:** 2026-09-06
+**Issue:** [#1454](https://github.com/gjovanov/roomler-ai/issues/1454) · **Status:** spec — not started · **Opened:** 2026-09-06
 
 ## Goal
 
