@@ -39,6 +39,7 @@ flowchart TB
         OC["overlay-communication.md"]
         TUN["tunnels.md"]
         MO["multi-org.md"]
+        MDNS["magicdns.md"]
     end
 
     subgraph collab["💬 Bonus · Collaboration"]
@@ -100,6 +101,7 @@ port forwards, SOCKS5, SSH without sshd, and exit nodes on top.*
 | [tunnel-install.md](tunnel-install.md) | Step-by-step runbook: install, enroll, ACL policy, open and test a forward from a corporate network |
 | [fleet-rpc.md](fleet-rpc.md) | `roomler exec` remote command execution: transport, the four default-deny gates, audit |
 | [device-naming.md](device-naming.md) | Fleet name vs MagicDNS label, admin rename + overlay propagation, display_name/tags, the rehydrate-clobber rule, rename-proof exit-node pinning |
+| [magicdns.md](magicdns.md) | Resolving peers by name: the resolver and the OS steer as two halves that both must be live, why the steer is gated on the bind (a dead `:53` blackholes the domain host-wide), per-platform steering, the resolver-lifecycle failure modes — and the three diagnostic tools that give confident wrong answers here |
 | [ephemeral-nodes.md](ephemeral-nodes.md) | Devices that remove themselves (CI runners, containers): reusable enrollment keys with all four controls, the reaper, clean-stop self-removal, and why a restart is a new device |
 | [roomler-ssh.md](roomler-ssh.md) | SSH into any node by overlay address with no `sshd` and no bound port — why the packets are intercepted below the OS, the four default-deny gates, interactive shells on Unix and Windows, `sftp`/`scp`, port forwarding, and the audit + activity records |
 | [remote-config.md](remote-config.md) | **PLAN** — enabling exec / SSH from the dashboard without making gate 4 server-settable: the device-local opt-in, why server-derived state was rejected, primary-only under multi-org, and who may flip a switch they cannot themselves walk through |
