@@ -36,6 +36,7 @@ import {
   createTenantViaApi,
   createRoomViaApi,
   addTenantMemberViaApi,
+  joinRoomViaApi,
   startCallViaApi,
   sendMessageViaApi,
   loginViaUi,
@@ -158,6 +159,11 @@ test.describe('FR-75 collab pillar — chat and a call that carries media', () =
 
     const room = await createRoomViaApi(ownerToken, tenantId, 'FR75 Room')
     roomId = room.id
+    // ⚠️ Tenant membership is NOT room membership. The `/ws` fan-out targets
+    // ROOM members, so without this join the peer's page opens, subscribes to
+    // nothing, and the realtime assertion fails 30 s later with "element not
+    // found" — which reads as a broken socket rather than a missing join.
+    await joinRoomViaApi(peerToken, tenantId, roomId)
   })
 
   test('two users exchange chat in realtime', async ({ browser }) => {
