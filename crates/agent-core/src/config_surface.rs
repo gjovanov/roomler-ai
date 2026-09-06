@@ -412,6 +412,15 @@ const KEYS: &[(&str, &str, &str)] = &[
         "MagicDNS AAAA (IPv6) answers for overlay names. Built-in default: on.",
     ),
     (
+        "magicdns_hosts",
+        "tribool",
+        "MagicDNS hosts-file fallback: when the OS DNS path is MEASURED not to \
+         reach the local resolver (a corporate DNS-enforcement layer refusing \
+         the host's own queries), write overlay names into the hosts file \
+         instead, and remove them again as soon as DNS works. Built-in default: \
+         off.",
+    ),
+    (
         "auto_update",
         "tribool",
         "Periodic self-update checks (also gates web-pushed updates). Built-in default: on.",
@@ -892,6 +901,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_route_win" => cfg.overlay_route_win.map(fmt_bool),
         "local_turn" => cfg.local_turn.map(fmt_bool),
         "dns_aaaa" => cfg.dns_aaaa.map(fmt_bool),
+        "magicdns_hosts" => cfg.magicdns_hosts.map(fmt_bool),
         "auto_update" => cfg.auto_update.map(fmt_bool),
         "logs_upload_disabled" => cfg.logs_upload_disabled.map(fmt_bool),
         "rate_factor_h264" => cfg.rate_factor_h264.map(|p| p.to_string()),
@@ -1311,6 +1321,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_route_win" => cfg.overlay_route_win = parse_tribool(value)?,
         "local_turn" => cfg.local_turn = parse_tribool(value)?,
         "dns_aaaa" => cfg.dns_aaaa = parse_tribool(value)?,
+        "magicdns_hosts" => cfg.magicdns_hosts = parse_tribool(value)?,
         "auto_update" => cfg.auto_update = parse_tribool(value)?,
         "logs_upload_disabled" => cfg.logs_upload_disabled = parse_tribool(value)?,
         "rate_factor_h264" => cfg.rate_factor_h264 = parse_rate_factor(key, value)?,
