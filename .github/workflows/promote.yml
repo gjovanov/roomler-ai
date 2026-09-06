@@ -11,9 +11,15 @@
 # answers again.
 #
 # Needs ONE operator-created secret: `DEPLOY_REPO_TOKEN`, a fine-grained PAT
-# scoped to the private deploy repository with Contents: read and write.
-# Without it the job prints the exact bump it would have made and stops with
-# a warning — the manual bump (any machine with the deploy repo) still works.
+# scoped to the private deploy repository with Contents: read and write. It
+# lives on the `release` ENVIRONMENT (next to the signing credentials), so
+# the job declares that environment — an environment secret is invisible to
+# a job that does not. Without it the job prints the exact bump it would
+# have made and stops with a warning — the manual bump (any machine with the
+# deploy repo) still works. With it, the job first PROVES it can write (an
+# empty commit pushed with --dry-run: the server checks push permission on
+# receive-pack, nothing lands), so a read-only or expired token fails here
+# with a clear message rather than after the bump was computed.
 name: promote
 
 on:
@@ -40,6 +46,10 @@ jobs:
   promote:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The environment that holds DEPLOY_REPO_TOKEN (and the signing
+    # credentials the release workflows use). Its protection rules, if any,
+    # gate every promote — which is the right place for a deploy gate.
+    environment: release
     steps:
       # The tag must exist in the package and be a hosted-* tag: a typo must
       # not reach the deploy repo, where ArgoCD would roll to an image that
@@ -81,8 +91,26 @@ jobs:
             echo "bumped=no" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git clone --depth 1 "https://x-access-token:${DEPLOY_REPO_TOKEN}@github.com/${DEPLOY_REPO}.git" deploy
+          git clone --depth 1 "https://x-access-token:${DEPLOY_REPO_TOKEN}@github.com/${DEPLOY_REPO}.git" deploy \
+            || { echo "::error::could not clone ${DEPLOY_REPO} with DEPLOY_REPO_TOKEN — the token cannot READ the deploy repo (wrong repo scope, or expired)"; exit 1; }
           cd deploy
+          git config user.name  'roomler-promote[bot]'
+          git config user.email 'promote@roomler.ai'
+          # Prove WRITE access before touching anything: an empty commit pushed
+          # with --dry-run makes the server run its receive-pack permission
+          # check and update nothing. A Contents:read-only token dies here.
+          git commit -q --allow-empty -m 'promote: write-access probe (never lands)'
+          set +e
+          PROBE="$(git push --dry-run origin HEAD:master 2>&1)"
+          PROBE_RC=$?
+          set -e
+          git reset -q --hard HEAD~1
+          if [ "$PROBE_RC" -ne 0 ]; then
+            echo "$PROBE" | sed -E 's#x-access-token:[^@]+@#x-access-token:***@#g' | tail -5
+            echo "::error::DEPLOY_REPO_TOKEN can read ${DEPLOY_REPO} but cannot PUSH to master — it needs Contents: write (and master must accept pushes from it)"
+            exit 1
+          fi
+          echo "  write access to ${DEPLOY_REPO} confirmed (dry-run push accepted by the server)"
           # The registry switch is FR-73 P2's commit, made once by hand. Until
           # it is there, a hosted-* tag would point the cluster at the OLD
           # registry, which has no such tag: refuse rather than roll a 404.
@@ -98,8 +126,6 @@ jobs:
             exit 0
           fi
           sed -i "s|^\(\s*newTag:\).*|\1 ${TAG}|" "$KUSTOMIZATION"
-          git config user.name  'roomler-promote[bot]'
-          git config user.email 'promote@roomler.ai'
           git commit -am "chore(k8s): bump roomler-ai to ${TAG} (was ${OLD}) — promoted by ${GITHUB_ACTOR} via FR-73"
           git push
           echo "bumped=yes" >> "$GITHUB_OUTPUT"
