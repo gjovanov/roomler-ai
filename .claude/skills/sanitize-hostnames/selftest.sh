@@ -28,10 +28,23 @@ trap 'rm -f "$CANARY"' EXIT
 D="DESK""TOP-AB12XY9"; L="LAP""TOP-QR34ST78"; W="W""IN-ABC4EFGHIJK"
 P5="P""C51234";        P4="P""C5123";         C="CL""K00099887"
 X="Someone-X""MG-BOX9"; M="Someones-Mac""Book-Pro"
-# The GENERALISED three-letter tag (2026-09-05). Deliberately a prefix that is
-# not any real one, and whose letters are not all hex -- an all-hex prefix is
-# excluded on purpose, see the shape's comment.
-G="ZQ""X55555"
+# The GENERALISED three-letter tag. Deliberately a prefix that is not any real
+# one, and whose letters are not all hex -- an all-hex prefix is excluded on
+# purpose, see the shape's comment.
+#
+# ⚠️ ROTATED 2026-09-06. The previous value is now in IGNORED, not gone: writing
+# up the guard published the canary into a GitHub issue, so step 2b's scan of
+# published content reported it on every run. A standing "known benign" hit is
+# how a check earns the noise that gets it deleted -- but ALLOWLISTING a value
+# that is still in CAUGHT makes the canary vacuous, and the selftest says so
+# immediately (`MISSED:` in both casings). Rotating is what lets both hold: the
+# retired value moves to the allowlist AND to IGNORED, so the exemption is
+# itself locked, and this fresh value carries the catch assertion.
+#
+# 🔑 The cost is one canary value per write-up. If that recurs, do NOT keep
+# rotating -- filter the dump at the step 2b boundary instead, which is where
+# the noise actually is. See SKILL.md.
+G="QV""Z77777"
 
 # ⚠️⚠️ EVERY canary appears TWICE, upper and lower. A guard blind to lowercase
 # is not a hypothetical: on 2026-09-04 a field log wrote two asset tags in
@@ -42,7 +55,7 @@ G="ZQ""X55555"
 d="desk""top-ab12xy9"; l="lap""top-qr34st78"; w="w""in-abc4efghijk"
 p5="p""c51234";        p4="p""c5123";         c="cl""k00099887"
 x="someone-x""mg-box9"; m="someones-mac""book-pro"
-g="zq""x55555"
+g="qv""z77777"
 
 CAUGHT=("$D" "$L" "$W" "$P5" "$P4" "$C" "$X" "$M" "$G"
         "$d" "$l" "$w" "$p5" "$p4" "$c" "$x" "$m" "$g")
@@ -61,7 +74,14 @@ IGNORED=("WIN""HOST-A" "CORP""LAP-2" "Mac""Book-1" "ARGB""2101010" "XRGB""8888"
          # structurally by the shape's lookahead. The third is a spec number in
          # an X11 font string and is allowlisted. If any of these ever trips,
          # the shape has been loosened and a real GUID will start crying wolf.
-         "DEF""012345678" "dbf""342009340" "iso""10646" "ISO""10646")
+         "DEF""012345678" "dbf""342009340" "iso""10646" "ISO""10646"
+         # The RETIRED canary (rotated 2026-09-06). It is allowlisted because
+         # writing up the guard published it, so it now appears only in
+         # documentation -- and it lives HERE so that exemption is asserted
+         # rather than assumed. Delete this pair and the allowlist entry
+         # together, never one alone: the entry with no assertion is an
+         # unguarded hole, and the assertion with no entry fails the selftest.
+         "ZQ""X55555" "zq""x55555")
 
 { printf '%s\n' "${CAUGHT[@]}"; printf 'must not trip: %s\n' "${IGNORED[*]}"; } > "$CANARY"
 
