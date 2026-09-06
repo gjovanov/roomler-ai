@@ -1,7 +1,11 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** P0 + P1 **complete and field-verified** (0.4.33 → 0.4.36, see the field-verification log); P2 next. Tracking issue: `FR-43`. Anchors verified against
-master `0bfdc263`.
+**Status:** P0 + P1 + **P2 complete and field-verified** (0.4.33 → 0.4.43) — the daemon's row streams real pixels; P2c/P3 next. Tracking issue: `FR-43`.
+
+⚠️ Anchors RE-VERIFIED against master `dfec6128` on 2026-09-06, when this record was
+landed 27 releases after the field run. `remote_control`'s hub moved to
+`crates/modules/fleet/src/hub.rs` in the interim and every citation to it was stale —
+which is exactly why the convention asks for a master sha rather than a bare line number.
 
 ## Goal
 
@@ -33,7 +37,7 @@ That is the whole asymmetry.
 
 **What is NOT forced is two enrollments.** That comes from us: the hub keys a device's
 control WS on `agent_id` and a second connection displaces the first
-(`crates/remote_control/src/hub.rs:89`), so we gave each half its own identity and the
+(`crates/modules/fleet/src/hub.rs:91`), so we gave each half its own identity and the
 Mac became two rows. Cost, paid daily: every `roomler exec` / `roomler ssh` must target
 the *right* row (the GUI row cannot reach root, the root row cannot see the screen), the
 install needs two tokens, and Devices shows one machine twice.
@@ -47,7 +51,7 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
   the launchd analogue of `spawn_in_session`. Console-user changes (login, logout, fast
   user switch) drive respawn, mirroring `decide_spawn`'s session-change handling.
 - **Transport**: the LocalAPI unix socket, which already solves exactly this addressing
-  problem — `crates/localapi/src/lib.rs:1704-1720` documents `/var/run/roomler` as the
+  problem — `crates/localapi/src/lib.rs:1810-1820` documents `/var/run/roomler` as the
   root daemon's well-known socket precisely because "a per-user path cannot serve a root
   daemon … that is the trap the macOS LaunchDaemon split walks into".
 - **Division**: signalling + consent + policy in the daemon; the rc session's WebRTC
@@ -92,9 +96,9 @@ the session has to reach the worker some other way.
 ### Why not "let the worker open its own WS for the session"
 
 Tempting, and it would remove the IPC entirely. It cannot work as-is: `Hub::register_agent`
-(`crates/remote_control/src/hub.rs:278`) is keyed on `agent_id`, and a second connection
+(`crates/modules/fleet/src/hub.rs:280`) is keyed on `agent_id`, and a second connection
 **displaces** the first — the displaced socket is cancelled within milliseconds by design
-(`hub.rs:88-94`). A worker dialling in as the same device would knock the daemon's control
+(`hub.rs:91-96`). A worker dialling in as the same device would knock the daemon's control
 WS off the air, which is precisely the login/displace/relaunch loop P1's stand-down exists
 to prevent. Making it work would mean teaching the server about session-scoped secondary
 connections: a server change, a new authenticated surface, and a new way for a compromised
@@ -120,8 +124,8 @@ session setup and then nothing.
 ### The transport problem, stated honestly
 
 LocalAPI is **strictly request→response**: `serve_connection` reads newline-delimited JSON,
-answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1393-1401`); `TailLog`'s
-own doc calls itself "poll-based follow (no streaming)" (`lib.rs:939`). There is no server
+answers each line, and loops to EOF (`crates/localapi/src/lib.rs:1505`); `TailLog`'s
+own doc calls itself "poll-based follow (no streaming)" (`lib.rs:1043`). There is no server
 push, and delegation needs it in both directions — trickle ICE arrives whenever the network
 decides, not when someone asks.
 
@@ -148,7 +152,7 @@ screen appears".
 ⚠️ `RcAttach` must be **daemon-only**, not something any local process can call: it would
 otherwise let any user-session process on the box volunteer to serve remote-control
 sessions. The socket's own ACL is the trust boundary today
-(`lib.rs:1704-1720` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
+(`lib.rs:1810-1820` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
 because the worker is an ordinary user process and so is an attacker's. The attach must
 carry the one-shot secret the daemon passed to the worker in its spawn environment, and the
 daemon must accept exactly one attached worker at a time.
@@ -419,3 +423,58 @@ the session has no user half. Bounded and self-healing; noted, not tuned.
 
 **P1 is complete.** The switch stays default-off until P2 gives the daemon something to
 delegate to.
+
+### 2026-09-01 — P2b: the daemon's row streams real pixels
+
+The goal of this FR, demonstrated on `agent-v0.4.43`. A session opened against the
+**root daemon's device row** — session 0, no WindowServer, never able to show a
+screen — streams the real desktop and accepts input, served by the GUI worker:
+
+```
+6a96be11  delegated  hevc_videotoolbox  viewer_age_ms 26, 5, 6
+6a96bed9  delegated  hevc_videotoolbox  viewer_age_ms 5, 13, 8
+6a96bf00  delegated  hevc_videotoolbox  viewer_age_ms 6, 8, 10
+```
+
+5–13 ms, indistinguishable from a direct session on the user's own row.
+
+**The negative arm came for free.** Before delegation was armed, the same row gave a
+black screen — and reproduced this FR's premise exactly:
+
+```
+WARN scrap capture unavailable — falling back to NoopCapture
+     error=creating scrap::Capturer: other error
+```
+
+Session established, consent auto-granted, encoder running, ICE direct: everything
+worked except the picture.
+
+**Two bugs the field found and CI could not.**
+
+1. **The delegated session was missing everything `Request` resolved** (#1137). First
+   attempt: input worked — the operator unlocked macOS and dragged a window from the
+   browser — and the screen stayed black. `Request` is not delegable, but it is the arm
+   that RESOLVES the session and stashes seven values `SdpOffer` CONSUMES. `transport`
+   defaults to `None` = the legacy RTP track, so the worker wrote 13 MB to a pipe the
+   browser was not reading. The whitelist was chosen by asking which messages a session
+   HANDLES; the miss was that one of them carries state another consumes.
+
+2. **A latency finding that was NOT delegation** (#1152). 230–600 ms frame age vs 5–9 ms
+   direct. Delegation and codec were perfectly confounded — every delegated session
+   H.264 and slow, every direct one HEVC and fast — and breaking that needed one
+   controlled run: among DELEGATED sessions, HEVC gives 5–13 ms and H.264 gives 139 ms.
+   Ruled out first, each by measurement: ICE relay (`relay=false`, Host↔Host), the media
+   path (`send_wait_avg 0.04 ms`, zero drops/errors), the daemon negotiating on weaker
+   caps (both halves report identical caps), B-frame reordering (`max_b_frames(0)` is
+   applied to every encoder). ⚠️ The UI auto-selected H.264, so the slow path was the
+   DEFAULT.
+
+⚠️ **Instrumentation lesson.** The delegation trace shipped at `debug!`, so the field
+logs could not answer *"did it cross?"* — the first diagnosis had to correlate session
+ids across two log files. Now `info!`, and the serving line should also carry
+`session_id`: establishing WHICH sessions were delegated still took three queries.
+A feature whose whole question is "did this reach the other side" must answer it at the
+level the field runs at.
+
+**P2b is complete.** P2c is next: the daemon's row still advertises `no-gui-session`, so
+the UI presents it as "not a capture target" even though it now is one.
