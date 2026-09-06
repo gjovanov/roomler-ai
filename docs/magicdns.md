@@ -137,9 +137,53 @@ Measured, same resolver, same moment:
 answers in-zone from the map and forwards out-of-zone. A REFUSED coming back
 therefore proves the query never reached us.
 
-This is a property of the host, not of the product. Names remain reachable over
-the **SOCKS path**, which resolves DOMAIN itself and never consults the OS
-resolver. Do not spend time on NRPT stores here — no choice of store changes it.
+This is a property of the host, not of the product. Do not spend time on NRPT
+stores here — no choice of store changes it.
+
+**The answer is the ladder's last rung**: the hosts file is not on the DNS path
+at all, so it works where every DNS mechanism fails. See below.
+
+## The resolution ladder
+
+MagicDNS picks its mechanism **by measurement, never by assumption** — the same
+rule the carrier cascade follows:
+
+```mermaid
+flowchart TD
+    S["steer the OS at our resolver<br/>(NRPT / resolvectl)"] --> P{"probe:<br/>does <code>_roomler-probe.&lt;domain&gt;</code><br/>resolve through the OS?"}
+    P -- yes --> D["✅ DNS rung — nothing written to disk"]
+    P -- no --> H["hosts-file block:<br/>one FQDN per peer, A + AAAA"]
+    H --> R{"re-probe every 60 s"}
+    R -- "DNS came back" --> C["clear the block, climb back"]
+    R -- "still blocked" --> H
+    C --> D
+```
+
+🔑 **The probe is what makes this safe.** `_roomler-probe.<magic domain>` is
+answered by our resolver and by **nothing else**, so resolving it through the OS
+succeeds exactly when the steer reaches us. ⚠️ The hosts fallback must never
+write that name — it would answer its own probe, and the ladder could never
+climb back. A check that cannot fail is not a check.
+
+### The hosts rung, and what it is careful about
+
+Enabled by `ROOMLERD_MAGICDNS_HOSTS` (default off). ⚠️ **The hazard is a stale
+entry, not the write**: overlay addresses are recycled, so a line left behind
+can route to a *different machine* — the same class of bug as pooling an address
+before its tombstone.
+
+| guard | why |
+|---|---|
+| a **delimited block** | every foreign line (a VPN's, an operator's) is preserved byte for byte |
+| an **unterminated block is discarded** | a process killed mid-write must not have its half-block adopted as live entries |
+| cleared on teardown, on climb-back, **and at construction** | the boot reconciler: what a dead process left is removed and re-derived, never trusted |
+| **FQDNs only** | a bare `mars` would shadow a real corporate host of that name |
+| temp + rename, falling back to a direct write | refusing to write when an AV holds a handle would silently disable the fallback on exactly the hosts it exists for |
+
+Field-verified on an enforced-DNS corporate laptop: with the switch off, zero
+entries and no resolution; with it on, names resolve to overlay v4 + v6 and
+`ping <name>` replies — then switching off restores the file to its original
+lines with every foreign entry intact.
 
 ### 🔑 The raw-UDP probe — the only instrument that sees this
 
