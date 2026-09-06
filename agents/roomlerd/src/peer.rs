@@ -6157,17 +6157,9 @@ async fn media_pump_ffmpeg_dc(
             (Some(_), Some(pinned)) => pinned,
             _ => effective_target,
         };
-        // Phase B — hand the effective box to the capture backend so a
-        // GPU-capable one can scale BEFORE the readback (applies from the
-        // next frame; the CPU resample below stays the fallback + truth).
-        let backend_cap = match effective_target {
-            TargetResolution::Native => None,
-            TargetResolution::Fixed { width, height } => Some((width, height)),
-        };
-        if backend_cap != last_output_cap {
-            last_output_cap = backend_cap;
-            capturer.set_output_cap(backend_cap);
-        }
+        // The capture backend's cap (Phase B) is handed over BELOW, after
+        // the make-before-break decision — see the note there. Handing it
+        // over here, before that decision, was M2a's field failure.
         // Quiet-tick eligibility (same terms as the keepalive arm, from the
         // SAME plan — see the post-encode site). Computed here where the
         // plan and the frame's native dims are in scope.
@@ -6465,6 +6457,31 @@ async fn media_pump_ffmpeg_dc(
                     return;
                 }
             }
+        }
+        // Phase B — hand the effective box to the capture backend so a
+        // GPU-capable one can scale BEFORE the readback (applies from the
+        // next frame; the CPU resample above stays the fallback + truth).
+        //
+        // FR-70 M2 — this sits AFTER the make-before-break decision on
+        // purpose. The first field read of M2a (CORPLAP-3 on 0.4.71,
+        // 2026-09-06) had it above the resample: the pass that spawned the
+        // background open had already handed the NEW dims to the capturer,
+        // so the very next frame arrived at those dims, the pinned target
+        // could only pass it through, `need_rebuild` was true again with a
+        // swap in flight, and the inline re-open ran anyway — a 628 ms
+        // freeze that also dropped the replacement it had just opened
+        // (`dims_swaps` stayed 0). The pass that spawns the open leaves by
+        // `continue` above and never reaches this point, and every later
+        // pass sees the pinned target, so the capturer keeps producing the
+        // live encoder's dims until the swap adopts and the plan's target
+        // takes over here.
+        let backend_cap = match effective_target {
+            TargetResolution::Native => None,
+            TargetResolution::Fixed { width, height } => Some((width, height)),
+        };
+        if backend_cap != last_output_cap {
+            last_output_cap = backend_cap;
+            capturer.set_output_cap(backend_cap);
         }
 
         // A keyframe requested THIS iteration must never be dropped by the
