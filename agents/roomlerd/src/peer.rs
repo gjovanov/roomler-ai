@@ -4801,6 +4801,11 @@ async fn media_pump_ffmpeg_dc(
     );
     let mut pending_dims_open: Option<PendingDimsOpen> = None;
     let mut dims_swaps: u32 = 0;
+    /// Frames the pump may skip after a capture-cap change before it treats
+    /// a dims mismatch as real: the backend applies a cap "from the next
+    /// frame", so one or two frames at the old dims are still in flight.
+    const STALE_FRAME_SKIPS: u32 = 3;
+    let mut stale_skips_left: u32 = 0;
     // rc.93 — single keepalive clock, mirroring `media_pump`. The rc.92
     // pacing clock + pump-side floor sleep were REMOVED: the capture
     // backend is the single pacer (scrap sleeps to `1000/target_fps`;
@@ -6161,17 +6166,83 @@ async fn media_pump_ffmpeg_dc(
             refined_cap: crate::encode::idle_refine_cap_long_edge(),
             soft_cap: governor.auto_res_cap(),
         });
-        let effective_target = dims_plan.effective_target;
-        // FR-70 M2 — while a replacement opens at the new dims, keep the
-        // capturer's cap and the resampler on the dims the live encoder was
-        // built for; the plan's target takes over at the swap.
+        let plan_target = dims_plan.effective_target;
+        // FR-70 M2 — the make-before-break is decided from the PLAN, never
+        // from a frame: a live encoder built for `built_target` that the
+        // plan has moved away from gets its replacement opened in the
+        // background NOW, at the dims the plan's target will produce, while
+        // this and every later frame keep being served at the old dims —
+        // the target is pinned to `built_target` from this very pass, so
+        // the capture cap never moves ahead of the swap. The fourth field
+        // contact (CORPLAP-3 on 0.4.74) showed why a frame-driven trigger
+        // could not be made right: after an upward swap the frames still in
+        // flight carried the OLD cap, and reading a frame's dims as the plan
+        // opened a replacement toward those stale dims, then fell into two
+        // inline re-opens on top of a swap that had just been adopted. A
+        // backend that cannot rebuild off the frame path leaves the pin
+        // unset and takes the inline open below, exactly as before M2.
+        if let Some(built) = built_target
+            && pending_dims_open.is_none()
+            && let Some(enc_dims) = encoder_dims
+            && plan_target != built
+        {
+            let plan_dims = crate::encode::resample::target_dims(frame.native_dims(), plan_target);
+            if plan_dims != enc_dims
+                && let Some(enc) = encoder.as_mut()
+            {
+                let bps = match governor.applied_bps() {
+                    0 => governor
+                        .open_seed_bps()
+                        .map_or(last_ceiling_bps, |s| last_ceiling_bps.min(s)),
+                    applied => last_ceiling_bps.min(applied),
+                };
+                if let Some(spec) = enc
+                    .rebuild_spec_at_dims(plan_dims.0, plan_dims.1, bps)
+                    .await
+                {
+                    info!(
+                        %session_id,
+                        codec_label,
+                        from_w = enc_dims.0,
+                        from_h = enc_dims.1,
+                        to_w = plan_dims.0,
+                        to_h = plan_dims.1,
+                        "FR-70 M2: dims change — opening the replacement in the background, serving at the old dims meanwhile"
+                    );
+                    pending_dims_open = Some((
+                        tokio::task::spawn_blocking(move || {
+                            crate::encode::ffmpeg::FfmpegEncoder::open_rebuilt(spec)
+                        }),
+                        plan_dims,
+                        std::time::Instant::now(),
+                        plan_target,
+                    ));
+                }
+            }
+        }
+        // While a replacement opens, the capturer's cap and the resampler
+        // stay on the dims the live encoder was built for; the plan's
+        // target takes over at the swap.
         let effective_target = match (&pending_dims_open, built_target) {
             (Some(_), Some(pinned)) => pinned,
-            _ => effective_target,
+            _ => plan_target,
         };
-        // The capture backend's cap (Phase B) is handed over BELOW, after
-        // the make-before-break decision — see the note there. Handing it
-        // over here, before that decision, was M2a's field failure.
+        // Phase B — hand the effective box to the capture backend so a
+        // GPU-capable one can scale BEFORE the readback (applies from the
+        // next frame; the CPU resample below stays the fallback + truth).
+        // Sits right after the pin, which already knows about a swap
+        // spawned on this pass, so the capturer never moves ahead of the
+        // live encoder. A cap change leaves a frame or two in flight at the
+        // old dims; the stale-frame skip below absorbs them.
+        let backend_cap = match effective_target {
+            TargetResolution::Native => None,
+            TargetResolution::Fixed { width, height } => Some((width, height)),
+        };
+        if backend_cap != last_output_cap {
+            last_output_cap = backend_cap;
+            capturer.set_output_cap(backend_cap);
+            stale_skips_left = STALE_FRAME_SKIPS;
+        }
         // Quiet-tick eligibility (same terms as the keepalive arm, from the
         // SAME plan — see the post-encode site). Computed here where the
         // plan and the frame's native dims are in scope.
@@ -6279,50 +6350,20 @@ async fn media_pump_ffmpeg_dc(
             Some((ew, eh)) => ew != w || eh != h,
             None => true,
         };
-        // FR-70 M2 — a dims change with a live encoder becomes a
-        // make-before-break: open the replacement in the background at the
-        // new dims and keep serving at the old ones (the target is pinned to
-        // `built_target` above until the swap). The frame that revealed the
-        // change is at the new dims already, so it is the one frame skipped
-        // — against the 0.4–2.9 s freeze the inline re-open costs. Falls
-        // through to the inline open when nothing is live yet, when a swap
-        // is already in flight, or when the backend cannot rebuild off the
-        // frame path. `built_target` is NOT touched here: a pass that needs
-        // no rebuild says nothing about what the encoder was built for (an
-        // upward move reaches this point with the frame still at the old
-        // cap), and refreshing it from the plan's target is exactly what
-        // made the pin lie on the second field contact.
-        if need_rebuild
-            && let Some(enc) = encoder.as_mut()
-            && encoder_dims.is_some()
-            && pending_dims_open.is_none()
-            && built_target.is_some()
-        {
-            let bps = match governor.applied_bps() {
-                0 => governor.open_seed_bps().map_or(ceiling, |s| ceiling.min(s)),
-                applied => ceiling.min(applied),
-            };
-            if let Some(spec) = enc.rebuild_spec_at_dims(w, h, bps).await {
-                let from = encoder_dims.unwrap_or((0, 0));
-                info!(
-                    %session_id,
-                    codec_label,
-                    from_w = from.0,
-                    from_h = from.1,
-                    to_w = w,
-                    to_h = h,
-                    "FR-70 M2: dims change — opening the replacement in the background, serving at the old dims meanwhile"
-                );
-                pending_dims_open = Some((
-                    tokio::task::spawn_blocking(move || {
-                        crate::encode::ffmpeg::FfmpegEncoder::open_rebuilt(spec)
-                    }),
-                    (w, h),
-                    std::time::Instant::now(),
-                    effective_target,
-                ));
-                continue;
-            }
+        // FR-70 M2 — a frame whose dims are not the live encoder's while a
+        // cap change is still propagating (a frame or two in flight at the
+        // old dims after a swap, an adoption, or any cap move) is STALE:
+        // skip it, never rebuild for it. Bounded by `stale_skips_left`
+        // (reset at every cap change), so a backend that rounds the box
+        // differently from the plan self-heals through the inline open
+        // below instead of starving the encoder. The make-before-break
+        // itself was decided from the plan above; what reaches the inline
+        // open here is the first encoder of the session, a backend that
+        // cannot rebuild off the frame path, or a host whose native dims
+        // changed under a live session.
+        if need_rebuild && encoder_dims.is_some() && stale_skips_left > 0 {
+            stale_skips_left -= 1;
+            continue;
         }
         if need_rebuild {
             let cq_bias = rate.cq_bias;
@@ -6479,31 +6520,8 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
         }
-        // Phase B — hand the effective box to the capture backend so a
-        // GPU-capable one can scale BEFORE the readback (applies from the
-        // next frame; the CPU resample above stays the fallback + truth).
-        //
-        // FR-70 M2 — this sits AFTER the make-before-break decision on
-        // purpose. The first field read of M2a (CORPLAP-3 on 0.4.71,
-        // 2026-09-06) had it above the resample: the pass that spawned the
-        // background open had already handed the NEW dims to the capturer,
-        // so the very next frame arrived at those dims, the pinned target
-        // could only pass it through, `need_rebuild` was true again with a
-        // swap in flight, and the inline re-open ran anyway — a 628 ms
-        // freeze that also dropped the replacement it had just opened
-        // (`dims_swaps` stayed 0). The pass that spawns the open leaves by
-        // `continue` above and never reaches this point, and every later
-        // pass sees the pinned target, so the capturer keeps producing the
-        // live encoder's dims until the swap adopts and the plan's target
-        // takes over here.
-        let backend_cap = match effective_target {
-            TargetResolution::Native => None,
-            TargetResolution::Fixed { width, height } => Some((width, height)),
-        };
-        if backend_cap != last_output_cap {
-            last_output_cap = backend_cap;
-            capturer.set_output_cap(backend_cap);
-        }
+        // (The capture backend's cap — Phase B — is handed over right after
+        // the make-before-break pin, above the resample; see there.)
 
         // A keyframe requested THIS iteration must never be dropped by the
         // decode-pressure frame-skip below (the browser needs the IDR to

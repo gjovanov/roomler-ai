@@ -398,6 +398,28 @@ fn downscale_bgra_box(
     dst
 }
 
+/// The dims `apply_target_resolution` produces for a frame of `native`
+/// dims under `target` — the resampler's rule stated without a frame:
+/// `Native` is the frame; a `Fixed` box at or above the frame is a no-op
+/// (no upscaling); a zero box is a no-op; anything else is the box.
+///
+/// FR-70 M2 — the FFmpeg pump opens a make-before-break replacement at
+/// these dims BEFORE any frame at them exists, so this and the function
+/// below must agree; `target_dims_agrees_with_apply` locks them.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub(crate) fn target_dims(native: (u32, u32), target: TargetResolution) -> (u32, u32) {
+    match target {
+        TargetResolution::Native => native,
+        TargetResolution::Fixed { width, height } => {
+            if (width >= native.0 && height >= native.1) || width == 0 || height == 0 {
+                native
+            } else {
+                (width, height)
+            }
+        }
+    }
+}
+
 /// Downscale `frame` to the controller/policy-chosen resolution.
 /// `TargetResolution::Native` is a no-op; `Fixed` sizes larger or equal
 /// to the capture are also no-ops (upscaling serves no purpose — the
@@ -461,6 +483,143 @@ pub(crate) fn apply_target_resolution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::Damage;
+
+    /// FR-70 M2 — `target_dims` is the resampler's rule without a frame;
+    /// the pump opens the make-before-break replacement at what it returns.
+    #[test]
+    fn target_dims_is_native_for_native_zero_and_oversized_boxes() {
+        let native = (1920, 1200);
+        assert_eq!(target_dims(native, TargetResolution::Native), native);
+        assert_eq!(
+            target_dims(
+                native,
+                TargetResolution::Fixed {
+                    width: 0,
+                    height: 738
+                }
+            ),
+            native
+        );
+        assert_eq!(
+            target_dims(
+                native,
+                TargetResolution::Fixed {
+                    width: 1214,
+                    height: 0
+                }
+            ),
+            native
+        );
+        // Fit on a stage larger than the host (2064×1150 at DPR 1.35) —
+        // the box is at or above the frame on both axes: a no-op.
+        assert_eq!(
+            target_dims(
+                native,
+                TargetResolution::Fixed {
+                    width: 2064,
+                    height: 1200
+                }
+            ),
+            native
+        );
+        assert_eq!(
+            target_dims(
+                native,
+                TargetResolution::Fixed {
+                    width: 1920,
+                    height: 1200
+                }
+            ),
+            native
+        );
+    }
+
+    #[test]
+    fn target_dims_is_the_box_when_it_is_below_the_frame() {
+        let native = (1920, 1200);
+        assert_eq!(
+            target_dims(
+                native,
+                TargetResolution::Fixed {
+                    width: 1214,
+                    height: 758
+                }
+            ),
+            (1214, 758)
+        );
+        assert_eq!(
+            target_dims(
+                native,
+                TargetResolution::Fixed {
+                    width: 944,
+                    height: 590
+                }
+            ),
+            (944, 590)
+        );
+        // One axis below the frame is enough to resample (the resampler
+        // only passes through when BOTH are at or above it).
+        assert_eq!(
+            target_dims(
+                native,
+                TargetResolution::Fixed {
+                    width: 2064,
+                    height: 1150
+                }
+            ),
+            (2064, 1150)
+        );
+    }
+
+    /// The two functions must agree, or the replacement opens at dims no
+    /// frame will ever have. Uses the real resampler on a small BGRA frame.
+    #[test]
+    fn target_dims_agrees_with_apply() {
+        let (w, h) = (64u32, 40u32);
+        let frame = Arc::new(Frame {
+            width: w,
+            height: h,
+            stride: w * 4,
+            pixel_format: PixelFormat::Bgra,
+            data: vec![0u8; (w * h * 4) as usize],
+            monotonic_us: 0,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        });
+        let mut rs = Resampler::new();
+        for target in [
+            TargetResolution::Native,
+            TargetResolution::Fixed {
+                width: 32,
+                height: 20,
+            },
+            TargetResolution::Fixed {
+                width: 64,
+                height: 40,
+            },
+            TargetResolution::Fixed {
+                width: 128,
+                height: 80,
+            },
+            TargetResolution::Fixed {
+                width: 128,
+                height: 20,
+            },
+            TargetResolution::Fixed {
+                width: 0,
+                height: 20,
+            },
+        ] {
+            let out = apply_target_resolution(&mut rs, frame.clone(), target);
+            assert_eq!(
+                (out.width, out.height),
+                target_dims((w, h), target),
+                "target {target:?}"
+            );
+        }
+    }
 
     /// The pre-Phase-A reference implementation (fresh taps, alpha
     /// resampled, per-frame buffers) — kept ONLY to pin the Resampler's
@@ -607,7 +766,7 @@ mod tests {
     fn pooled_state_survives_rung_flips() {
         let src_a = noise_frame(192, 120);
         let src_b = noise_frame(160, 100);
-        let mut rs = Resampler::default();
+        let mut rs = Resampler::new();
         let first = rs.lanczos3(&src_a, 192, 120, 192 * 4, 102, 64);
         let _other = rs.lanczos3(&src_b, 160, 100, 160 * 4, 80, 50);
         let again = rs.lanczos3(&src_a, 192, 120, 192 * 4, 102, 64);
