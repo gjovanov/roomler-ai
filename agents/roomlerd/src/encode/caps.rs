@@ -25,6 +25,10 @@
 //! `rc:agent.hello`.
 
 use roomler_ai_remote_control::models::AgentCaps;
+// FR-77 — the cell vocabulary. Which of these a build uses depends on its
+// encoder features, so the import is allowed to be partly idle.
+#[allow(unused_imports)]
+use roomler_ai_remote_control::models::{ChromaFormat, VideoBackend, VideoCell, VideoCodec};
 use std::sync::OnceLock;
 
 static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
@@ -159,11 +163,17 @@ mod child {
 
         let line = out.lines().find_map(|l| l.trim().strip_prefix(MARKER))?;
         match serde_json::from_str::<AgentCaps>(line) {
-            Ok(caps) => {
+            Ok(mut caps) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                // FR-77 — stamped by the PARENT so it covers the whole cost
+                // the daemon paid (spawn + every open + parse), the number the
+                // fleet gets to judge the matrix probe by.
+                caps.probe_ms = Some(u32::try_from(elapsed_ms).unwrap_or(u32::MAX));
                 tracing::info!(
-                    elapsed_ms = started.elapsed().as_millis(),
+                    elapsed_ms,
                     codecs = ?caps.codecs,
                     hw_encoders = ?caps.hw_encoders,
+                    cells = caps.video_cells.len(),
                     "caps probe: child reported"
                 );
                 Some(caps)
@@ -327,11 +337,24 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
     let mut codecs: Vec<String> = Vec::new();
     #[allow(unused_mut)]
     let mut hw_encoders: Vec<String> = Vec::new();
+    // FR-77 — every cell (codec × chroma) this host OPENED, one entry per
+    // encoder (codec × backend). Filled next to the legacy fields, which keep
+    // their exact pre-FR-77 meaning; the cells carry the whole matrix.
+    #[allow(unused_mut)]
+    let mut video_cells: Vec<VideoCell> = Vec::new();
 
     #[cfg(feature = "openh264-encoder")]
     {
         codecs.push("h264".into());
         hw_encoders.push("openh264-sw".into());
+        // Software by definition — needs no driver, so it is a cell even when
+        // the hardware probes are not run.
+        video_cells.push(VideoCell::new(
+            VideoCodec::H264,
+            VideoBackend::Openh264,
+            &[ChromaFormat::Yuv420],
+            false,
+        ));
     }
 
     #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
@@ -346,6 +369,18 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
             && adapters > 0
         {
             hw_encoders.push("mf-h264-hw".into());
+            // FR-77 — the cell must say whether the cascade lands on
+            // silicon, and only an activation knows (the legacy label above
+            // is enumeration-only and says `-hw` even for the SW MFT).
+            let probe = activates(CodecProbe::H264);
+            if !matches!(probe, ProbeResult::Failed) {
+                video_cells.push(VideoCell::new(
+                    VideoCodec::H264,
+                    VideoBackend::MediaFoundation,
+                    &[ChromaFormat::Yuv420],
+                    matches!(probe, ProbeResult::Hardware),
+                ));
+            }
         }
 
         let allow_sw = allow_sw_heavy_override();
@@ -369,6 +404,12 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
             if advertise(probe) {
                 codecs.push("h265".into());
                 hw_encoders.push("mf-h265-hw".into());
+                video_cells.push(VideoCell::new(
+                    VideoCodec::Hevc,
+                    VideoBackend::MediaFoundation,
+                    &[ChromaFormat::Yuv420],
+                    matches!(probe, ProbeResult::Hardware),
+                ));
             }
         }
 
@@ -385,6 +426,12 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
             if advertise(probe) {
                 codecs.push("av1".into());
                 hw_encoders.push("mf-av1-hw".into());
+                video_cells.push(VideoCell::new(
+                    VideoCodec::Av1,
+                    VideoBackend::MediaFoundation,
+                    &[ChromaFormat::Yuv420],
+                    matches!(probe, ProbeResult::Hardware),
+                ));
             }
         }
     }
@@ -423,6 +470,16 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
         // `name()` is on the `VideoEncoder` trait — need the trait in
         // scope at the call site for method-resolution.
         use super::VideoEncoder;
+        use crate::encode::ffmpeg::FfmpegEncoder;
+
+        // FR-77 — cells this build will not even TRY (the kill switch), and
+        // whether a QSV open proves hardware on this build (see
+        // `qsv_is_hardware_by_construction`).
+        let deny = denied_cells();
+        let qsv_hw = FfmpegEncoder::qsv_is_hardware_by_construction();
+        if !deny.is_empty() {
+            tracing::info!(denied = ?deny, "caps probe: cells on the denylist are not opened");
+        }
 
         // rc.83 — probe vp9_qsv to surface in caps + heartbeat whether
         // this host can use Intel HW VP9. The transport advertisement
@@ -444,6 +501,35 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
                         "caps probe: ffmpeg VP9 (vp9_qsv) encoder activates — runtime peer dispatch will prefer it over libvpx SW on data-channel-vp9-444 sessions"
                     );
                     hw_encoders.push(format!("ffmpeg-{name}"));
+                    // FR-77 — the VP9 cell. 4:4:4 (profile 1) is attempted
+                    // when the FFmpeg source matrix allows it for this name
+                    // and the cell is not denylisted; today the open asks for
+                    // planar yuv444p, which vp9_qsv refuses (it wants packed
+                    // VUYX) — an honest failure until P3 teaches the pump
+                    // that format. The session pump keeps vp9_qsv 4:2:0-only
+                    // regardless (`peer.rs`).
+                    let mut chroma = vec![ChromaFormat::Yuv420];
+                    if let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(name) {
+                        if ffmpeg_444_capable(name)
+                            && !cell_denied(&deny, name, ChromaFormat::Yuv444)
+                        {
+                            match FfmpegEncoder::new_named_probe(
+                                name,
+                                PROBE_WIDTH,
+                                PROBE_HEIGHT,
+                                true,
+                            ) {
+                                Ok(e) => {
+                                    drop(e);
+                                    chroma.push(ChromaFormat::Yuv444);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(encoder = name, %e, "caps probe: 4:4:4 cell did not open")
+                                }
+                            }
+                        }
+                        video_cells.push(VideoCell::new(cell_codec, backend, &chroma, qsv_hw));
+                    }
                     // P4 — measure whether THIS host's vp9_qsv honours
                     // runtime forced IDRs, per low_power mode. Hosts that
                     // do get GOP 64800 + on-demand-only keys (kills the
@@ -478,111 +564,146 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
             }
         }
 
-        let start = std::time::Instant::now();
-        match crate::encode::ffmpeg::FfmpegEncoder::new_hevc(PROBE_WIDTH, PROBE_HEIGHT) {
-            Ok(enc) => {
-                let name = enc.name();
-                drop(enc);
+        // FR-77 — the MATRIX pass for HEVC / AV1 / H.264. Every backend in
+        // cascade order is opened (not just the first that works) so
+        // `video_cells` carries the host's whole encoder × chroma matrix, and
+        // every winner the FFmpeg source matrix says can do 4:4:4 is re-opened
+        // in that format — asked for, never asserted by name (P7 used to
+        // advertise HEVC 4:4:4 for `hevc_nvenc` without opening it). The
+        // legacy fields (`codecs`, `transports`, `hw_encoders`, `hevc_chroma`)
+        // keep their exact pre-FR-77 meaning: the FIRST backend in cascade
+        // order that opens, because a session still cascades in that order
+        // and a viewer older than FR-77 reads nothing else.
+        //
+        // P2 (Parsec-class plan) — H.264 over DataChannel joins the reliable-
+        // DC + WebCodecs + canvas pipeline (the RTP track + <video> path stays
+        // as the universal fallback). The bitstream is Annex-B with in-band
+        // SPS/PPS — the contract the HEVC path ships. `ROOMLERD_DC_H264=0`
+        // stops that advertisement without a rebuild; the H.264 cells are
+        // then not probed either (a cell nobody can negotiate is noise).
+        let dc_h264 = tunnel_core::env::node_env("DC_H264").as_deref() != Some("0");
+        for codec in [VideoCodec::Hevc, VideoCodec::Av1, VideoCodec::H264] {
+            if codec == VideoCodec::H264 && !dc_h264 {
                 tracing::info!(
-                    encoder = name,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    "caps probe: ffmpeg HEVC encoder activates — advertising h265 + data-channel-hevc"
+                    "caps probe: data-channel-h264 advertisement disabled (ROOMLERD_DC_H264=0)"
                 );
-                if !codecs.iter().any(|c| c == "h265") {
-                    codecs.push("h265".into());
+                continue;
+            }
+            let start = std::time::Instant::now();
+            let mut winner: Option<&'static str> = None;
+            let mut winner_has_444 = false;
+            for name in FfmpegEncoder::cascade_names(codec) {
+                // A table name outside the vocabulary would open and then
+                // advertise nothing; `every_cascade_name_is_in_the_cell_vocabulary`
+                // makes that a test failure rather than a silent hole.
+                let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(name) else {
+                    continue;
+                };
+                let t = std::time::Instant::now();
+                match FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, false) {
+                    Ok(enc) => {
+                        drop(enc);
+                        let mut chroma = vec![ChromaFormat::Yuv420];
+                        if ffmpeg_444_capable(name)
+                            && !cell_denied(&deny, name, ChromaFormat::Yuv444)
+                        {
+                            match FfmpegEncoder::new_named_probe(
+                                name,
+                                PROBE_WIDTH,
+                                PROBE_HEIGHT,
+                                true,
+                            ) {
+                                Ok(e) => {
+                                    drop(e);
+                                    chroma.push(ChromaFormat::Yuv444);
+                                }
+                                Err(e) => tracing::info!(
+                                    encoder = name,
+                                    %e,
+                                    "caps probe: 4:4:4 cell did not open — advertising 4:2:0 only"
+                                ),
+                            }
+                        }
+                        let hw = match backend {
+                            VideoBackend::Qsv => qsv_hw,
+                            _ => true,
+                        };
+                        tracing::info!(
+                            encoder = name,
+                            chroma = ?chroma.iter().map(|c| c.wire()).collect::<Vec<_>>(),
+                            hw,
+                            elapsed_ms = t.elapsed().as_millis(),
+                            "caps probe: ffmpeg encoder cell opened"
+                        );
+                        if winner.is_none() {
+                            winner = Some(name);
+                            winner_has_444 = chroma.contains(&ChromaFormat::Yuv444);
+                        }
+                        video_cells.push(VideoCell::new(cell_codec, backend, &chroma, hw));
+                    }
+                    Err(e) => {
+                        // A backend the host lacks failing is the matrix doing
+                        // its job — DEBUG, like the cascade's own candidates.
+                        tracing::debug!(encoder = name, %e, "caps probe: ffmpeg encoder cell did not open");
+                    }
                 }
-                transports.push("data-channel-hevc".into());
-                hw_encoders.push(format!("ffmpeg-{name}"));
-                // P7 — HEVC 4:4:4 (Rext) is nvenc-only in v1 (NVENC has
-                // supported it since Maxwell-gen2; QSV Rext ENCODE is
-                // unreliable and AMF has none). Advertise both chromas so
-                // the browser can offer its "crisp text (4:4:4)" pick; the
-                // session-time open still falls back to 4:2:0 if the Rext
-                // open is rejected (driver / GPU-generation surprise).
-                hevc_chroma.push("yuv420".into());
-                if name == "hevc_nvenc" {
-                    hevc_chroma.push("yuv444".into());
-                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    %e,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    "caps probe: ffmpeg HEVC encoder failed to init — NOT advertising data-channel-hevc"
-                );
-            }
-        }
-
-        // rc.190 — AV1 over DataChannel. HW-only encode silicon (NVIDIA
-        // Ada+ / Intel Arc / AMD RDNA3+); on the current fleet only the
-        // RTX 5090 host passes. Probe-gated exactly like HEVC so a host
-        // without AV1 encode (or with the MF-era NVENC activation bug
-        // resurfacing through FFmpeg) never advertises the transport.
-        // The browser gates its side on WebCodecs AV1 decode support —
-        // universal in Chromium (dav1d SW fallback) with HW decode on
-        // Gen12+ Iris Xe / RTX / RDNA2+ viewers.
-        let start_av1 = std::time::Instant::now();
-        match crate::encode::ffmpeg::FfmpegEncoder::new_av1(PROBE_WIDTH, PROBE_HEIGHT) {
-            Ok(enc) => {
-                let name = enc.name();
-                drop(enc);
-                tracing::info!(
-                    encoder = name,
-                    elapsed_ms = start_av1.elapsed().as_millis(),
-                    "caps probe: ffmpeg AV1 encoder activates — advertising av1 + data-channel-av1"
-                );
-                if !codecs.iter().any(|c| c == "av1") {
-                    codecs.push("av1".into());
-                }
-                transports.push("data-channel-av1".into());
-                hw_encoders.push(format!("ffmpeg-{name}"));
-            }
-            Err(e) => {
-                tracing::info!(
-                    %e,
-                    elapsed_ms = start_av1.elapsed().as_millis(),
-                    "caps probe: ffmpeg AV1 encoder not available (no AV1 encode silicon on this host) — NOT advertising data-channel-av1"
-                );
-            }
-        }
-
-        // P2 (Parsec-class plan) — H.264 over DataChannel: the fourth codec
-        // joins the reliable-DC + WebCodecs + canvas pipeline (the RTP track
-        // + <video> path stays as the universal fallback for old agents /
-        // non-WebCodecs browsers). HW-only cascade like HEVC/AV1; the
-        // bitstream is Annex-B with in-band SPS/PPS (FFmpeg default without
-        // GLOBAL_HEADER — the exact contract the HEVC path already ships and
-        // WebCodecs decodes description-less). The "h264" codec entry is
-        // already pushed by the openh264/MF blocks above — only the
-        // transport + hw_encoders entries are new. Escape hatch
-        // ROOMLERD_DC_H264=0 stops the advertisement without a rebuild
-        // (browsers then negotiate the legacy RTP H.264 path).
-        if tunnel_core::env::node_env("DC_H264").as_deref() != Some("0") {
-            let start_h264 = std::time::Instant::now();
-            match crate::encode::ffmpeg::FfmpegEncoder::new_h264(PROBE_WIDTH, PROBE_HEIGHT) {
-                Ok(enc) => {
-                    let name = enc.name();
-                    drop(enc);
+            let elapsed_ms = start.elapsed().as_millis();
+            match (codec, winner) {
+                (VideoCodec::Hevc, Some(name)) => {
                     tracing::info!(
                         encoder = name,
-                        elapsed_ms = start_h264.elapsed().as_millis(),
+                        elapsed_ms,
+                        "caps probe: ffmpeg HEVC encoder activates — advertising h265 + data-channel-hevc"
+                    );
+                    if !codecs.iter().any(|c| c == "h265") {
+                        codecs.push("h265".into());
+                    }
+                    transports.push("data-channel-hevc".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                    // P7 — the session's 4:4:4 (Rext) path tries `hevc_nvenc`
+                    // only, so the legacy field says 4:4:4 only when THAT
+                    // backend won AND its 4:4:4 open succeeded just now.
+                    hevc_chroma.push("yuv420".into());
+                    if name == "hevc_nvenc" && winner_has_444 {
+                        hevc_chroma.push("yuv444".into());
+                    }
+                }
+                (VideoCodec::Hevc, None) => tracing::warn!(
+                    elapsed_ms,
+                    "caps probe: ffmpeg HEVC encoder failed to init — NOT advertising data-channel-hevc"
+                ),
+                (VideoCodec::Av1, Some(name)) => {
+                    tracing::info!(
+                        encoder = name,
+                        elapsed_ms,
+                        "caps probe: ffmpeg AV1 encoder activates — advertising av1 + data-channel-av1"
+                    );
+                    if !codecs.iter().any(|c| c == "av1") {
+                        codecs.push("av1".into());
+                    }
+                    transports.push("data-channel-av1".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                }
+                (VideoCodec::Av1, None) => tracing::info!(
+                    elapsed_ms,
+                    "caps probe: ffmpeg AV1 encoder not available (no AV1 encode silicon on this host) — NOT advertising data-channel-av1"
+                ),
+                (VideoCodec::H264, Some(name)) => {
+                    tracing::info!(
+                        encoder = name,
+                        elapsed_ms,
                         "caps probe: ffmpeg H.264 encoder activates — advertising data-channel-h264"
                     );
                     transports.push("data-channel-h264".into());
                     hw_encoders.push(format!("ffmpeg-{name}"));
                 }
-                Err(e) => {
-                    tracing::info!(
-                        %e,
-                        elapsed_ms = start_h264.elapsed().as_millis(),
-                        "caps probe: ffmpeg H.264 HW encoder not available — H.264 sessions stay on the RTP track"
-                    );
-                }
+                (VideoCodec::H264, None) => tracing::info!(
+                    elapsed_ms,
+                    "caps probe: ffmpeg H.264 HW encoder not available — H.264 sessions stay on the RTP track"
+                ),
+                (VideoCodec::Vp9, _) => {}
             }
-        } else {
-            tracing::info!(
-                "caps probe: data-channel-h264 advertisement disabled (ROOMLERD_DC_H264=0)"
-            );
         }
     }
 
@@ -604,6 +725,28 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
                 );
                 transports.push("data-channel-vp9-444".into());
                 hw_encoders.push("libvpx-vp9-444-sw".into());
+                // FR-77 — the libvpx cell: profile 0 (4:2:0) is opened for
+                // real too, so the cell claims only what opened.
+                let mut chroma = Vec::new();
+                match crate::encode::libvpx::Vp9Encoder::new_with_fps_chroma(
+                    PROBE_WIDTH,
+                    PROBE_HEIGHT,
+                    30,
+                    crate::encode::libvpx::Vp9Chroma::Yuv420,
+                ) {
+                    Ok(e) => {
+                        drop(e);
+                        chroma.push(ChromaFormat::Yuv420);
+                    }
+                    Err(e) => tracing::debug!(%e, "caps probe: libvpx 4:2:0 cell did not open"),
+                }
+                chroma.push(ChromaFormat::Yuv444);
+                video_cells.push(VideoCell::new(
+                    VideoCodec::Vp9,
+                    VideoBackend::Libvpx,
+                    &chroma,
+                    false,
+                ));
             }
             Err(e) => {
                 tracing::warn!(
@@ -766,6 +909,10 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
         apps,
         clipboard,
         layout,
+        video_cells,
+        // Stamped by the PARENT after the child reports (`child::probe`);
+        // the driver-free fallback has no probe to time.
+        probe_ms: None,
         // P6 — the InputArbiter runs on every build (injection degrades to
         // Noop without enigo-input, but the arbitration/floor semantics
         // hold), so the server can safely lift the P3 single-INPUT-holder
@@ -866,12 +1013,72 @@ pub(crate) fn rc_max_sessions() -> u8 {
         .unwrap_or(2)
 }
 
+/// FR-77 — FFmpeg encoder names whose 4:4:4 open the probe ATTEMPTS. Taken
+/// from the FFmpeg n9.0 sources, not from vendor marketing: `h264_nvenc` and
+/// `hevc_nvenc` list yuv444p (runtime-gated by `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE`),
+/// `hevc_qsv` and `vp9_qsv` list a 4:4:4 form (packed VUYX/XV30, which the
+/// pump does not produce yet — P3), `hevc_vaapi`/`vp9_vaapi` carry the
+/// Main444 / profile-1 rows (P4). Every AV1 encoder, every AMF encoder,
+/// VideoToolbox and Media Foundation cannot, so they are never asked and
+/// never cost a failed open. Locked by a test against the vocabulary.
+#[allow(dead_code)]
+const FFMPEG_444_CAPABLE: &[&str] = &[
+    "h264_nvenc",
+    "hevc_nvenc",
+    "hevc_qsv",
+    "vp9_qsv",
+    "hevc_vaapi",
+    "vp9_vaapi",
+];
+
+/// FR-77 — cells this build will not open or advertise until a field test
+/// takes them off the list: the kill switch of the matrix. `name:chroma`.
+/// HEVC 4:4:4 on QSV and VAAPI start here (the code called QSV Rext encode
+/// unreliable before it was ever opened); the operator's
+/// `ROOMLERD_ENCODER_CELLS_DENY` (comma-separated, an empty value = deny
+/// nothing) REPLACES this default.
+#[allow(dead_code)]
+const DEFAULT_DENIED_CELLS: &[&str] = &["hevc_qsv:yuv444", "hevc_vaapi:yuv444"];
+
+#[allow(dead_code)]
+fn ffmpeg_444_capable(name: &str) -> bool {
+    FFMPEG_444_CAPABLE.contains(&name)
+}
+
+/// The effective denylist: the env override when set, else the built-in.
+#[allow(dead_code)]
+fn denied_cells() -> Vec<String> {
+    match tunnel_core::env::node_env("ENCODER_CELLS_DENY") {
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => DEFAULT_DENIED_CELLS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[allow(dead_code)]
+fn cell_denied(
+    deny: &[String],
+    name: &str,
+    chroma: roomler_ai_remote_control::models::ChromaFormat,
+) -> bool {
+    let key = format!("{name}:{}", chroma.wire());
+    deny.iter().any(|d| d == &key)
+}
+
 /// Codec to probe. We only probe codecs that fail closed on activation
 /// error (HEVC + AV1 today); H.264 has a working triple-fallback path
 /// and is not gated.
 #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
 #[derive(Debug, Clone, Copy)]
 enum CodecProbe {
+    /// FR-77 — probed for the CELL only (`video_cells` must say whether the
+    /// cascade lands on silicon); the legacy `mf-h264-hw` label stays
+    /// enumeration-gated as it always was.
+    H264,
     Hevc,
     Av1,
 }
@@ -906,6 +1113,7 @@ enum ProbeResult {
 fn activates(codec: CodecProbe) -> ProbeResult {
     let start = std::time::Instant::now();
     let result = match codec {
+        CodecProbe::H264 => super::mf::MfEncoder::new_h264(PROBE_WIDTH, PROBE_HEIGHT),
         CodecProbe::Hevc => super::mf::MfEncoder::new_hevc(PROBE_WIDTH, PROBE_HEIGHT),
         CodecProbe::Av1 => super::mf::MfEncoder::new_av1(PROBE_WIDTH, PROBE_HEIGHT),
     };
@@ -1122,6 +1330,81 @@ mod tests {
             caps.files
         );
         assert!(caps.max_simultaneous_sessions > 0);
+
+        // FR-77 — no hardware cell without a probe, and no probe time either
+        // (the parent stamps it only when the child came back).
+        assert!(
+            caps.video_cells.iter().all(|c| !c.hw),
+            "a hardware cell was advertised without a probe: {:?}",
+            caps.video_cells
+        );
+        assert!(caps.probe_ms.is_none());
+        // Whatever software cells survive must speak the vocabulary.
+        for cell in &caps.video_cells {
+            assert!(cell.typed().is_some(), "{cell:?} is outside the vocabulary");
+        }
+    }
+
+    /// FR-77 — the 4:4:4 attempt list names only encoders the FFmpeg n9.0
+    /// sources can actually open in 4:4:4: nothing AV1 (`av1_nvenc` hard-errors
+    /// "AV1 High Profile not supported"; every other AV1 backend lists 4:2:0
+    /// only), nothing AMF, nothing VideoToolbox — and every entry must be a
+    /// name the vocabulary can split, or the probe would open it for nothing.
+    #[test]
+    fn ffmpeg_444_attempt_list_matches_the_source_matrix() {
+        for name in FFMPEG_444_CAPABLE {
+            let (codec, backend) = VideoBackend::from_ffmpeg_name(name)
+                .unwrap_or_else(|| panic!("{name} is outside the cell vocabulary"));
+            assert_ne!(
+                codec,
+                VideoCodec::Av1,
+                "{name}: no AV1 encoder can do 4:4:4"
+            );
+            assert!(
+                !matches!(backend, VideoBackend::Amf | VideoBackend::VideoToolbox),
+                "{name}: AMF and VideoToolbox have no 4:4:4 surface"
+            );
+        }
+        assert!(ffmpeg_444_capable("hevc_nvenc"));
+        assert!(ffmpeg_444_capable("h264_nvenc"));
+        assert!(!ffmpeg_444_capable("av1_nvenc"));
+        assert!(!ffmpeg_444_capable("hevc_amf"));
+        assert!(!ffmpeg_444_capable("hevc_videotoolbox"));
+    }
+
+    /// FR-77 — the denylist is the kill switch: the built-in default keeps the
+    /// unproven cells closed, the env override replaces it wholesale, and an
+    /// explicitly EMPTY override denies nothing.
+    #[test]
+    fn denylist_default_env_override_and_empty_override() {
+        use tunnel_core::env::test_env::Saved;
+        let _saved = Saved::cleared("ENCODER_CELLS_DENY");
+
+        let deny = denied_cells();
+        assert!(cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv444));
+        assert!(cell_denied(&deny, "hevc_vaapi", ChromaFormat::Yuv444));
+        assert!(!cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv420));
+        assert!(!cell_denied(&deny, "hevc_nvenc", ChromaFormat::Yuv444));
+
+        unsafe {
+            tunnel_core::env::test_env::set(
+                "ENCODER_CELLS_DENY",
+                " h264_nvenc:yuv444 ,vp9_qsv:yuv444,",
+            )
+        };
+        let deny = denied_cells();
+        assert!(cell_denied(&deny, "h264_nvenc", ChromaFormat::Yuv444));
+        assert!(cell_denied(&deny, "vp9_qsv", ChromaFormat::Yuv444));
+        assert!(
+            !cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv444),
+            "the override REPLACES the default, it does not add to it"
+        );
+
+        unsafe { tunnel_core::env::test_env::set("ENCODER_CELLS_DENY", "") };
+        assert!(
+            denied_cells().is_empty(),
+            "an empty override denies nothing"
+        );
     }
 
     /// The child's output has to survive the round trip, or the parent falls
@@ -1138,6 +1421,10 @@ mod tests {
         assert_eq!(back.codecs, caps.codecs);
         assert_eq!(back.transports, caps.transports);
         assert_eq!(back.hw_encoders, caps.hw_encoders);
+        assert_eq!(
+            back.video_cells, caps.video_cells,
+            "FR-77 cells must survive the round trip"
+        );
     }
 
     #[test]

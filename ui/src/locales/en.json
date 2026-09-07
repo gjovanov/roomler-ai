@@ -2,6 +2,48 @@
   "app": {
     "name": "Roomler"
   },
+  "remote": {
+    "codec": {
+      "label": "Codec",
+      "chromaLabel": "Colour detail",
+      "appliesNext": "applies on next Connect",
+      "codecs": {
+        "auto": "Auto (recommended)",
+        "av1": "AV1",
+        "hevc": "HEVC (H.265)",
+        "vp9": "VP9",
+        "h264": "H.264"
+      },
+      "chromas": {
+        "auto": "Auto (follows Priority)",
+        "yuv420": "Standard (4:2:0)",
+        "yuv444": "Crisp text (4:4:4)"
+      },
+      "reason": {
+        "auto": "Best codec for this device and browser, picked at Connect",
+        "autoChroma": "Sharper takes full colour detail when both ends can do it",
+        "av1": "Best quality per bit — hardware on both ends",
+        "browserNoAv1": "This browser can’t decode AV1",
+        "agentNoAv1": "This device has no AV1 hardware encoder",
+        "av1NoHw444": "No hardware encoder can produce AV1 in 4:4:4",
+        "hevc": "Hardware H.265 on the device (NVENC / QSV / AMF / VideoToolbox)",
+        "hevc444": "Sharpest text on the hardware pipeline, ~1.5× bitrate",
+        "browserNoHevc": "This browser lacks a hardware HEVC decoder",
+        "browserNoHevcRext": "This browser can’t decode HEVC 4:4:4 (Chrome ≥137 with NVIDIA driver ≥572.16, or Intel Gen11+)",
+        "agentNoHevc": "This device has no HEVC encoder",
+        "agentNoHevc444": "This device has no HEVC 4:4:4 encoder (NVENC only today)",
+        "vp9420": "Lower bitrate — decodes everywhere",
+        "vp9444": "Sharpest text, ~1.5× bitrate — software decode",
+        "browserNoVp9": "This browser can’t decode VP9 profile 1",
+        "agentNoVp9": "This device has no VP9 encoder",
+        "h264": "Works everywhere — softer text",
+        "h264444Later": "H.264 4:4:4 sessions arrive with a later release",
+        "failedBefore": "Failed to decode on this browser earlier — retried after a browser or driver update",
+        "no444Anywhere": "No 4:4:4 cell exists for this device and browser",
+        "no420Anywhere": "Nothing decodes here"
+      }
+    }
+  },
   "auth": {
     "login": "Login",
     "orLoginWith": "Or login with",

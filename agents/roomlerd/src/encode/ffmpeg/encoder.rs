@@ -307,8 +307,17 @@ fn encoder_options(
         // ever set on the hevc_nvenc + chroma444 path (the pump's Rext
         // opt-in); a rejection fails the base-tier open and the caller's
         // 4:2:0 fallback takes over.
+        // FR-77 — H.264's 4:4:4 profile is `high444p` (High 4:4:4
+        // Predictive); `rext` is HEVC's Range Extensions and h264_nvenc
+        // REJECTS it at open, which would have made the probe read
+        // "h264_nvenc cannot do 4:4:4" for a driver that can.
         if chroma444 {
-            base.push(("profile".into(), "rext".into()));
+            let profile = if name.starts_with("h264") {
+                "high444p"
+            } else {
+                "rext"
+            };
+            base.push(("profile".into(), profile.into()));
         }
         base.push(("rc-lookahead".into(), "0".into()));
         base.push(("bf".into(), "0".into()));
@@ -886,6 +895,63 @@ impl FfmpegEncoder {
             false,
             constrained,
         )
+    }
+
+    /// FR-77 — the cascade table for `codec`, in the order a session tries
+    /// the backends. The capability probe walks the WHOLE table (every cell),
+    /// a session stops at the first that opens; both read the same list, so
+    /// what the probe advertises and what a session can reach cannot drift.
+    pub(crate) fn cascade_names(
+        codec: roomler_ai_remote_control::models::VideoCodec,
+    ) -> &'static [&'static str] {
+        use roomler_ai_remote_control::models::VideoCodec;
+        match codec {
+            VideoCodec::Hevc => HEVC_ENCODER_NAMES,
+            VideoCodec::Av1 => AV1_ENCODER_NAMES,
+            VideoCodec::H264 => H264_ENCODER_NAMES,
+            VideoCodec::Vp9 => VP9_ENCODER_NAMES,
+        }
+    }
+
+    /// FR-77 — open ONE named encoder at the probe's settings (30 fps, the
+    /// standard ceiling, no CQ bias) in the requested chroma format. This is
+    /// the capability probe's per-cell open; a session never calls it — it
+    /// goes through the `*_adaptive` cascades, which stay untouched.
+    pub fn new_named_probe(
+        name: &'static str,
+        width: u32,
+        height: u32,
+        chroma444: bool,
+    ) -> Result<Self> {
+        let constrained = crate::encode::transport_is_constrained();
+        let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
+        Self::new_with_dispatch(
+            &[name],
+            width,
+            height,
+            DEFAULT_ENCODER_FPS,
+            maxrate,
+            0,
+            chroma444,
+            constrained,
+        )
+    }
+
+    /// FR-77 — is a successful `*_qsv` open PROOF of hardware encode?
+    ///
+    /// Yes on the oneVPL (libvpl) build, and only there: FFmpeg's internal
+    /// MFX session filters `mfxImplDescription.Impl = MFX_IMPL_TYPE_HARDWARE`
+    /// (n9.0.1 `libavcodec/qsv.c:518-522`), so the dispatcher never enumerates
+    /// Intel's CPU runtime — an open either lands on silicon or fails. The
+    /// legacy libmfx build asks `MFX_IMPL_AUTO_ANY`, which CAN pick a software
+    /// library. The two are told apart by `av1_qsv`, which configure only
+    /// compiles under libvpl (`av1_qsv_encoder_deps="libvpl"`), so its mere
+    /// registration is the flavour check — no FFI into libvpl needed.
+    pub fn qsv_is_hardware_by_construction() -> bool {
+        if ffmpeg_next::init().is_err() {
+            return false;
+        }
+        codec::encoder::find_by_name("av1_qsv").is_some()
     }
 
     /// P4 — explicit-config vp9_qsv constructor for the IDR probe. Bypasses
@@ -2174,6 +2240,43 @@ mod tests {
             !summary.contains("profile"),
             "4:2:0 must not set a profile, got: {summary}"
         );
+    }
+
+    /// FR-77 — H.264's 4:4:4 profile is `high444p`, never `rext` (HEVC's):
+    /// h264_nvenc rejects `profile=rext` at open, so the old code would have
+    /// read "this driver cannot do H.264 4:4:4" for a driver that can.
+    #[test]
+    fn h264_nvenc_444_uses_high444p_not_rext() {
+        let (_, _, summary) = encoder_options("h264_nvenc", 3_000_000, 22, true, true, false);
+        assert!(
+            summary.contains("profile=high444p"),
+            "h264 chroma444 must set profile=high444p, got: {summary}"
+        );
+        assert!(
+            !summary.contains("rext"),
+            "rext is HEVC-only, got: {summary}"
+        );
+        let (_, _, summary) = encoder_options("h264_nvenc", 3_000_000, 22, true, false, false);
+        assert!(
+            !summary.contains("profile"),
+            "4:2:0 must not set a profile, got: {summary}"
+        );
+    }
+
+    /// FR-77 — every name in every cascade table must be one the cell
+    /// vocabulary can name, or the probe would open it and then advertise
+    /// nothing for it (`from_ffmpeg_name` returns `None`), which reads as
+    /// "this host cannot do that codec" on a host that can.
+    #[test]
+    fn every_cascade_name_is_in_the_cell_vocabulary() {
+        use roomler_ai_remote_control::models::{VideoBackend, VideoCodec};
+        for codec in VideoCodec::ALL {
+            for name in FfmpegEncoder::cascade_names(codec) {
+                let (c, _) = VideoBackend::from_ffmpeg_name(name)
+                    .unwrap_or_else(|| panic!("{name} is not in the cell vocabulary"));
+                assert_eq!(c, codec, "{name} sits in the {codec:?} table");
+            }
+        }
     }
 
     /// HRD windows per transport (2026-08-26 drag-latency work): DIRECT

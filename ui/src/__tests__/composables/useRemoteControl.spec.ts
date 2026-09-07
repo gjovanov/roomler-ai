@@ -2942,25 +2942,22 @@ describe('settingsToCodecChoice (rc.199 reverse map)', () => {
     expect(settingsToCodecChoice('data-channel-hevc', 'yuv420')).toBe('hevc')
     expect(settingsToCodecChoice('data-channel-vp9-444', 'yuv444')).toBe('vp9-444')
     expect(settingsToCodecChoice('data-channel-vp9-444', 'yuv420')).toBe('vp9-420')
-    // Legacy vp9-444 sessions stored chroma 'auto' → read as the efficient
-    // 4:2:0 choice (never silently promoted to the heavier 4:4:4).
-    expect(settingsToCodecChoice('data-channel-vp9-444', 'auto')).toBe('vp9-420')
+    // FR-77 — a vp9-444 transport with chroma 'auto' is the dial-following
+    // VP9 choice (it used to read as 4:2:0 while the agent, given no
+    // chroma_pref, actually ran profile 1: the display lied).
+    expect(settingsToCodecChoice('data-channel-vp9-444', 'auto')).toBe('vp9')
     expect(settingsToCodecChoice('webrtc', 'auto')).toBe('h264')
     // P2 — both H.264 transports read back as the single picker choice.
     expect(settingsToCodecChoice('data-channel-h264', 'auto')).toBe('h264')
+    // FR-77 — codec Auto remembers an explicit chroma.
+    expect(settingsToCodecChoice('auto', 'yuv444')).toBe('auto-444')
+    expect(settingsToCodecChoice('auto', 'yuv420')).toBe('auto-420')
   })
 
   it('round-trips every choice through settings and back', () => {
-    const choices: RcCodecChoice[] = [
-      'auto',
-      'av1',
-      'hevc',
-      'hevc-444',
-      'vp9-444',
-      'vp9-420',
-      'h264',
-    ]
-    for (const c of choices) {
+    // FR-77 — EVERY value of the single list, so a choice added to it
+    // without a settings mapping fails here instead of in the picker.
+    for (const c of RC_CODEC_CHOICES) {
       const s = codecChoiceToSettings(c)
       expect(settingsToCodecChoice(s.videoTransport, s.chroma)).toBe(c)
     }
@@ -4174,5 +4171,70 @@ describe('translateModifierForHost (FR-13 mac Ctrl→Cmd)', () => {
       expect(translateModifierForHost(code, true, true, state)).toBe(code)
       expect(translateModifierForHost(code, false, true, state)).toBe(code)
     }
+  })
+})
+
+describe('FR-77 — pickAutoTransport honours the chroma axis', () => {
+  const pair = {
+    agentTransports: ['data-channel-av1', 'data-channel-hevc', 'data-channel-vp9-444', 'data-channel-h264'],
+    agentHwEncoders: ['ffmpeg-av1_nvenc', 'ffmpeg-hevc_nvenc', 'ffmpeg-h264_nvenc', 'libvpx-vp9-444-sw'],
+    viewerAv1Hw: true,
+    viewerHevcHw: true,
+    viewerHevcDecodable: true,
+    viewerVp9Hw: true,
+    viewerVp9Decodable: true,
+    viewerH264Hw: true,
+  }
+
+  it('an explicit 4:4:4 takes the HEVC Rext cell ahead of the AV1 HW×HW pair', () => {
+    const pick = pickAutoTransport({ ...pair, chromaPref: 'yuv444', agentHevc444: true, viewerHevcRext: true })
+    expect(pick.transport).toBe('data-channel-hevc')
+    expect(pick.chromaOverride).toBe('yuv444')
+  })
+
+  it('an explicit 4:4:4 settles for VP9 profile 1 when the pair has no HEVC Rext', () => {
+    const pick = pickAutoTransport({ ...pair, chromaPref: 'yuv444', agentHevc444: false, viewerHevcRext: true })
+    expect(pick.transport).toBe('data-channel-vp9-444')
+    expect(pick.chromaOverride).toBe('yuv444')
+    const noBrowser = pickAutoTransport({ ...pair, chromaPref: 'yuv444', agentHevc444: true, viewerHevcRext: false })
+    expect(noBrowser.transport).toBe('data-channel-vp9-444')
+    expect(noBrowser.chromaOverride).toBe('yuv444')
+  })
+
+  it('an explicit 4:4:4 with no 4:4:4 cell at all falls back to the normal rank', () => {
+    const pick = pickAutoTransport({ ...pair, chromaPref: 'yuv444', agentHevc444: false, viewerHevcRext: false, viewerVp9Decodable: false })
+    expect(pick.transport).toBe('data-channel-av1')
+    expect(pick.chromaOverride).toBeNull()
+  })
+
+  it('Sharper on chroma Auto takes the HEVC Rext cell when both ends have it, and nothing else', () => {
+    const rext = pickAutoTransport({ ...pair, priority: 'sharper', chromaPref: 'auto', agentHevc444: true, viewerHevcRext: true })
+    expect(rext.transport).toBe('data-channel-hevc')
+    expect(rext.chromaOverride).toBe('yuv444')
+    // Without the Rext cell, Sharper keeps today's rank (AV1 HW×HW first)…
+    const noRext = pickAutoTransport({ ...pair, priority: 'sharper', chromaPref: 'auto', agentHevc444: false, viewerHevcRext: true })
+    expect(noRext.transport).toBe('data-channel-av1')
+    // …and Balanced never reaches for Rext.
+    const balanced = pickAutoTransport({ ...pair, priority: 'balanced', chromaPref: 'auto', agentHevc444: true, viewerHevcRext: true })
+    expect(balanced.transport).toBe('data-channel-av1')
+  })
+
+  it('an explicit 4:2:0 pins the libvpx rung to profile 0 even under Sharper', () => {
+    const swOnly = {
+      ...pair,
+      agentTransports: ['data-channel-vp9-444'],
+      agentHwEncoders: ['libvpx-vp9-444-sw'],
+      viewerAv1Hw: false,
+      viewerHevcHw: false,
+      viewerH264Hw: false,
+    }
+    expect(pickAutoTransport({ ...swOnly, priority: 'sharper', chromaPref: 'auto' }).chromaOverride).toBe('yuv444')
+    expect(pickAutoTransport({ ...swOnly, priority: 'sharper', chromaPref: 'yuv420' }).chromaOverride).toBe('yuv420')
+  })
+
+  it('callers that predate the chroma axis get exactly the rc.190 rank', () => {
+    const pick = pickAutoTransport(pair)
+    expect(pick.transport).toBe('data-channel-av1')
+    expect(pick.chromaOverride).toBeNull()
   })
 })

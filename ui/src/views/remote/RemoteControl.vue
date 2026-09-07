@@ -919,18 +919,38 @@
             <span class="text-subtitle-2 font-weight-medium">Video</span>
             <v-chip size="x-small" variant="tonal" color="info" label>applies on next Connect</v-chip>
           </div>
-          <v-select
-            v-model="codecChoice"
-            :items="codecChoiceOptions"
-            item-title="title"
-            item-value="value"
-            density="comfortable"
-            variant="outlined"
-            hide-details="auto"
-            prepend-inner-icon="mdi-video-outline"
-            label="Codec"
-            class="mb-4"
-          />
+          <!-- FR-77 — the codec picker is TWO independent axes, codec × colour
+               detail (chroma format). Validity is a matrix: an entry that cannot
+               pair with the other dropdown's value is greyed with the reason, and
+               "Auto" on either axis lets the Priority dial decide. -->
+          <div class="d-flex flex-column flex-sm-row ga-2 mb-4">
+            <v-select
+              v-model="pickerCodec"
+              :items="codecOptions"
+              item-title="title"
+              item-value="value"
+              density="comfortable"
+              variant="outlined"
+              hide-details="auto"
+              prepend-inner-icon="mdi-video-outline"
+              :label="t('remote.codec.label')"
+              class="flex-grow-1"
+              data-testid="rc-picker-codec"
+            />
+            <v-select
+              v-model="pickerChroma"
+              :items="chromaOptions"
+              item-title="title"
+              item-value="value"
+              density="comfortable"
+              variant="outlined"
+              hide-details="auto"
+              prepend-inner-icon="mdi-palette-outline"
+              :label="t('remote.codec.chromaLabel')"
+              class="flex-grow-1"
+              data-testid="rc-picker-chroma"
+            />
+          </div>
           <v-select
             v-model="resolutionPresetValue"
             :items="resolutionOptions"
@@ -1573,10 +1593,24 @@ import {
   type RcScaleMode,
   type RcResolutionSetting,
   type RcPriority,
-  type RcCodecChoice,
   resolutionCapAnnotation,
   resolutionOverrideHint,
 } from '@/composables/useRemoteControl'
+import {
+  PICKER_CHROMAS,
+  PICKER_CODECS,
+  cellAvailability,
+  cellsFromCaps,
+  choiceFromPicker,
+  chromaSelectable,
+  codecSelectable,
+  pickerFromChoice,
+  rememberedCellFailures,
+  type Availability,
+  type PickerChroma,
+  type PickerCodec,
+} from '@/composables/videoCells'
+import { useI18n } from 'vue-i18n'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useDisplay } from 'vuetify'
 import MobileKeyboard from '@/components/remote/MobileKeyboard.vue'
@@ -1594,6 +1628,7 @@ const agent = ref<Agent | null>(null)
 // useRemoteControl's `supportsResume` computed reactively
 // flips when the load lands.
 const rc = useRemoteControl(agent)
+const { t } = useI18n()
 const { showSuccess, showError } = useSnackbar()
 // rc.199 — Vuetify viewport helper; drives the Settings dialog's
 // fullscreen-on-phone behaviour so one panel serves every viewport.
@@ -2287,42 +2322,10 @@ const videoIntrinsicH = rc.mediaIntrinsicH
 // instead of mounting an empty canvas.
 const isWebCodecsRender = computed<boolean>(() => rc.webcodecsActive.value)
 
-// rc.190 — whether the AGENT has AV1 encode silicon (NVIDIA RTX 40xx+,
-// Intel Arc, AMD RDNA3+). Gates the AV1 option in the rc.199 Codec picker.
-const agentHasAv1 = computed<boolean>(() => {
-  const caps = agent.value?.capabilities
-  // Caps not loaded yet → optimistic; the agent falls back to the WebRTC
-  // track if it can't honour the transport (same contract as HEVC).
-  if (!caps) return true
-  return (
-    (caps.transports ?? []).includes('data-channel-av1')
-    || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-av1_'))
-  )
-})
-// Whether the AGENT can encode HEVC. The HEVC option used to be gated on
-// the BROWSER's decoder alone, so a Chrome with HW H.265 offered HEVC on
-// an agent that cannot produce it (an aarch64 Linux agent advertising
-// only h264 + data-channel-vp9-444 still showed HEVC selectable, while
-// AV1 — which checks both ends — correctly greyed out).
-const agentHasHevc = computed<boolean>(() => {
-  const caps = agent.value?.capabilities
-  // Caps not loaded yet → optimistic, same contract as AV1.
-  if (!caps) return true
-  return (
-    (caps.transports ?? []).includes('data-channel-hevc')
-    || (caps.codecs ?? []).includes('h265')
-    || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-hevc_'))
-  )
-})
-// P7 — whether the AGENT can emit HEVC Rext 4:4:4 (hevc_nvenc only; the
-// caps probe advertises hevc_chroma). NOT optimistic when caps are absent —
-// unlike the transport fallback, a 4:4:4/4:2:0 codec-string mismatch
-// black-screens the decoder, so the picker entry demands positive proof
-// from BOTH ends (connect() re-gates anyway; this just avoids offering a
-// pick that would silently downgrade).
-const agentHasHevc444 = computed<boolean>(
-  () => agent.value?.capabilities?.hevc_chroma?.includes('yuv444') === true,
-)
+// FR-77 — what the AGENT can encode is read through the ONE cell derivation
+// (`cellsFromCaps`: the agent's `video_cells`, or the legacy fields for an
+// older agent) inside `cellAvail` below; the per-codec computeds this used to
+// carry are gone with the single-axis picker.
 // Opt-in "receive host audio" toggle. Same "takes effect on next
 // Connect" shape as the transport toggles above (the recvonly audio
 // transceiver + `audio_enabled` request flag are fixed at offer time),
@@ -2454,73 +2457,62 @@ const codecChoice = rc.codecChoice
 // old toggles gated on (`av1Supported`+`agentHasAv1`, `hevcSupported`,
 // `vp9_444Supported`); an unsupported choice is disabled with the reason as a
 // subtitle. `props` is spread onto the v-list-item Vuetify renders.
-const codecChoiceOptions = computed(() => {
-  const av1Ok = rc.av1Supported.value && agentHasAv1.value
-  const av1Reason = !rc.av1Supported.value
-    ? 'This browser can’t decode AV1'
-    : !agentHasAv1.value
-      ? 'This agent has no AV1 hardware encoder'
-      : 'Best quality per bit — needs HW on both ends'
-  const hevcOk = rc.hevcSupported.value && agentHasHevc.value
-  const hevcReason = !rc.hevcSupported.value
-    ? 'This browser lacks a HW HEVC decoder'
-    : !agentHasHevc.value
-      ? 'This agent has no HEVC encoder'
-      : 'HW H.265 encode on the agent (NVENC/QSV/AMF)'
-  // P7 — HEVC Rext 4:4:4 needs positive proof on BOTH ends (no SW HEVC
-  // fallback exists in Chrome; a mismatch black-screens).
-  const hevc444Ok = rc.hevcSupported.value && rc.hevcRextSupported.value && agentHasHevc444.value
-  const hevc444Reason = !rc.hevcSupported.value
-    ? 'This browser lacks a HW HEVC decoder'
-    : !rc.hevcRextSupported.value
-      ? 'This browser lacks HEVC Rext 4:4:4 decode (Chrome ≥137 + NVIDIA driver ≥572.16, or Intel Gen11+)'
-      : !agentHasHevc444.value
-        ? 'This agent has no NVENC HEVC 4:4:4 encoder'
-        : 'Sharpest text on the HW pipeline, ~1.5× bitrate (NVENC Rext)'
-  const vp9Reason = rc.vp9_444Supported.value
-    ? 'Software VP9 — universally decodable'
-    : 'This browser can’t decode VP9 profile 1'
-  return [
-    {
-      title: 'Auto (recommended)',
-      value: 'auto',
-      props: { subtitle: 'Best hardware codec for this agent + browser, picked at Connect' },
+// FR-77 — the validity matrix behind the two dropdowns: the agent's cells
+// (one derivation for new and old agents) crossed with this browser's decode
+// probes and the decode failures remembered for this device. 4:2:0 cells stay
+// optimistic until the device record arrives (the rc.190 contract — the agent
+// falls back when it cannot honour a pick); every 4:4:4 cell demands proof
+// from both ends, because a chroma mismatch is a black screen.
+const cellAvail = computed<Availability>(() =>
+  cellAvailability({
+    cells: cellsFromCaps(agent.value?.capabilities),
+    capsLoaded: !!agent.value?.capabilities,
+    browser: {
+      av1: rc.av1Supported.value,
+      hevc: rc.hevcSupported.value,
+      hevcRext: rc.hevcRextSupported.value,
+      vp9: rc.vp9_444Supported.value,
     },
-    {
-      title: 'AV1',
-      value: 'av1',
-      props: { disabled: !av1Ok, subtitle: av1Reason },
-    },
-    {
-      title: 'HEVC (H.265)',
-      value: 'hevc',
-      props: { disabled: !hevcOk, subtitle: hevcReason },
-    },
-    {
-      title: 'HEVC · crisp text (4:4:4)',
-      value: 'hevc-444',
-      props: {
-        disabled: !hevc444Ok,
-        subtitle: hevc444Reason,
-      },
-    },
-    {
-      title: 'VP9 · crisp text (4:4:4)',
-      value: 'vp9-444',
-      props: { disabled: !rc.vp9_444Supported.value, subtitle: `Sharpest text, ~1.5× bitrate — ${vp9Reason}` },
-    },
-    {
-      title: 'VP9 · efficient (4:2:0)',
-      value: 'vp9-420',
-      props: { disabled: !rc.vp9_444Supported.value, subtitle: `Lower bitrate — ${vp9Reason}` },
-    },
-    {
-      title: 'H.264 · max compatibility',
-      value: 'h264',
-      props: { subtitle: 'Legacy WebRTC path — works everywhere, softer text' },
-    },
-  ] as { title: string; value: RcCodecChoice; props: { disabled?: boolean; subtitle: string } }[]
+    failed: agent.value?.id
+      ? rememberedCellFailures(agent.value.id, globalThis.navigator?.userAgent ?? '')
+      : new Set<string>(),
+  }),
+)
+/** The codec axis, written through to the stored choice with the chroma
+ *  axis left as it is (and vice versa), so both persist per agent exactly as
+ *  the single choice did. */
+const pickerCodec = computed<PickerCodec>({
+  get: () => pickerFromChoice(codecChoice.value).codec,
+  set: (codec) => {
+    codecChoice.value = choiceFromPicker(codec, pickerFromChoice(codecChoice.value).chroma)
+  },
 })
+const pickerChroma = computed<PickerChroma>({
+  get: () => pickerFromChoice(codecChoice.value).chroma,
+  set: (chroma) => {
+    codecChoice.value = choiceFromPicker(pickerFromChoice(codecChoice.value).codec, chroma)
+  },
+})
+const codecOptions = computed(() =>
+  PICKER_CODECS.map((codec) => {
+    const v = codecSelectable(cellAvail.value, codec, pickerChroma.value)
+    return {
+      title: t(`remote.codec.codecs.${codec}`),
+      value: codec,
+      props: { disabled: !v.ok, subtitle: t(`remote.codec.reason.${v.reason}`) },
+    }
+  }),
+)
+const chromaOptions = computed(() =>
+  PICKER_CHROMAS.map((chroma) => {
+    const v = chromaSelectable(cellAvail.value, pickerCodec.value, chroma)
+    return {
+      title: t(`remote.codec.chromas.${chroma}`),
+      value: chroma,
+      props: { disabled: !v.ok, subtitle: t(`remote.codec.reason.${v.reason}`) },
+    }
+  }),
+)
 
 // Priority dial — the visible lever over the per-session relay resolution cap
 // (sent LIVE via rc:priority). Replaces the old Quality dropdown, which only

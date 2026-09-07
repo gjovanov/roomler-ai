@@ -140,6 +140,27 @@ export interface AgentCapabilities {
    *  Empty / unset on older agents / non-Windows hosts — the browser
    *  hides the layout chip + picker. Mirrors `AgentCaps.layout`. */
   layout?: string[]
+  /** FR-77 — every cell (codec × chroma format) the host can produce, one
+   *  entry per encoder (codec × backend) the start-up probe actually opened.
+   *  Absent on agents older than FR-77: `cellsFromCaps()` then derives the
+   *  cells from the legacy fields above, which the agent keeps filling
+   *  forever. Mirrors `AgentCaps.video_cells`. */
+  video_cells?: VideoCell[]
+  /** FR-77 — wall-clock ms the start-up capability probe took (child spawn to
+   *  parsed result). Absent on older agents or when the probe child died. */
+  probe_ms?: number
+}
+
+/** FR-77 — one encoder and the chroma formats it opened in. Wire strings:
+ *  codec `h264` · `hevc` · `av1` · `vp9`; backend `nvenc` · `qsv` · `amf` ·
+ *  `videotoolbox` · `vaapi` · `mf` · `openh264` · `libvpx`; chroma `yuv420` ·
+ *  `yuv444`. A newer agent may send names this bundle does not know — they are
+ *  ignored, never an error. */
+export interface VideoCell {
+  codec: string
+  backend: string
+  chroma: string[]
+  hw: boolean
 }
 
 export interface Agent {
