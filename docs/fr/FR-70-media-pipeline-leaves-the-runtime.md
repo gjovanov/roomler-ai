@@ -472,7 +472,10 @@ sole viewer: four moves (1920×1200 → 944×590 → 1920×1200 → 1214×758 �
 1920×1200), four `dims swap adopted`, `open_ms` 157 / 159 / 168 / 172 off
 the frame path, in-path adoption `apply=41–44 ms` (nvenc; QSV adopts in
 ~15 ms), no `encoder (re)built` after the first open, no STALL after the
-first heartbeat, `dims_swaps=4`.
+first heartbeat, `dims_swaps=4`. *Re-confirmed 2026-09-07 18:48 UTC on 0.4.80
+by the operator (session `6a9f06df`, sole viewer, av1_nvenc relay): one move
+Original → 1152×720, `dims_swaps=1`, `pump_stalls=0`, `other_ms_max=0`,
+`iter_ms_max` 197 ms (the adoption pass), viewer age ≤ 86 ms, no freeze seen.*
 
 **M2b — the rate rebuild — measured, and there is nothing to build.** On
 2026-09-06 CORPLAP-1 (hevc_qsv, which refuses in-place rate changes, so
