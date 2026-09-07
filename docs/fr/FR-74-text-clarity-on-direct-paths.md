@@ -3,7 +3,8 @@
 **Issue:** [#1442](https://github.com/gjovanov/roomler-ai/issues/1442) · **Status:** P0 done 2026-09-06;
 P1 (0.4.77) + P1b (0.4.79) + P3 (0.4.80) released and **field-verified 2026-09-07 on all four
 codecs** by the operator's read and the heartbeat; P2 retired by measurement (0 rate swaps);
-AC3 ticked; open: AC1's pixel comparison, the thin-direct-path read of the q-cap, P4 (UI) ·
+AC3 ticked; the thin-direct-path read of the q-cap done 2026-09-07 (sharp but laggy below the
+cap's ~10 Mbps floor — an open decision, §P3); open: AC1's pixel comparison, P4 (UI) ·
 **Parent:** the RC quality program (FR-17/16/14); rides on FR-59's measured pipe and FR-70's
 pump instrumentation.
 
@@ -278,6 +279,21 @@ sharpest; `avg_qp` / `max_qp` in the heartbeat are the instrument.
 with the bitrate inside the target (the pre-P3 shape was max 255 at 8–13 Mbps of
 20.7); settled text still refines to q 0.
 
+
+**Thin direct path — measured (2026-09-07 20:08 UTC, field log).** The P1b/P3
+expectation ("on a thinner direct path the DC buffered-bytes gate sheds frames
+rather than sharpness") is refuted for a pipe throttled below the socket: with
+`roomlerd.exe` egress capped at 15 Mbps by a Windows QoS policy (two viewers,
+~7.5 Mbps each) the cap held q at ≤ 64 and the encoder kept emitting 10–19 Mbps
+— the cap's floor for a full-screen 4:4:4 text scroll — while the AIMD cut the
+target to 4.6–5.1 Mbps to no effect, the gate shed nothing (the queue lived in
+the OS pacer, invisible to the DC's buffered amount), and the viewer ran
+160–380 ms behind. A thin Wi-Fi queues in the driver the same way. So on a pipe
+thinner than the cap's floor the trade is **sharp but laggy**, and the open
+decision is whether the cap should yield when the AIMD is pinned below that
+floor with viewer age high (a measured-pipe relaxation) or whether 200–400 ms at
+full sharpness is the right answer for a mode chosen for text. Recorded, not
+built: no controller is added on this evidence alone.
 ### P4 — the viewer's pixel chain
 
 Show the display scale beside the encode dims in the pill (`shown at 0.9×`), verify
@@ -292,7 +308,7 @@ disagree. FSR helps only when upscaling.
 | P1 | direct ceiling 0.25 bpp / [3, 48] M; direct queue budget denominated in the ceiling | — (no switch: `FFMPEG_MAXRATE_KBPS` and `direct_queue_ms` are the way back) | **built 2026-09-06** (§"P1 — as built"); field gate on the release carrying it |
 | P1b | the direct gate is the measured send wait's call below the encoder's HRD reservoir (EMA of completed waits ∨ live head-of-queue age); bytes alone gate only at the reservoir | — (no switch; `direct_queue_ms` keeps its meaning as the lag bound, `0` disables) | **field-verified 2026-09-07 on 0.4.79** — operator: "not seeing the blurring anymore" on AV1, VP9 4:2:0 and H.264; heartbeats of those sessions: 0 cuts, 0 gate skips, 0 gate lines. VP9 4:4:4 (the libvpx pump) still blurs ⇒ P3 |
 | P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | **retired by measurement 2026-09-07** — after P1 the rate ladder no longer fires on direct paths: 0 rate swaps in all 17 sessions on the three hosts today (QSV direct on CORPLAP-1/-3, nvenc relay on CORPLAP-2; the 2026-09-06 baseline had 37 in 11 min). Reopen only if a relay-path QSV session shows swaps |
-| P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07, released in 0.4.80 (11:01 UTC on CORPLAP-3)** — offline: every notch frame at q 64 instead of 255, refine to lossless kept, 14.5 of 20.7 Mbps; field gate: **instrument PASS 13:25 UTC** (`max_qp` 64 in every scroll window, was 255; settles to q 0; 0 skips; 22–52 Mbps on the LAN) and **operator PASS** ("scrolling large texts seems much better") ⇒ **field-verified 2026-09-07** |
+| P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07, released in 0.4.80** — offline: every notch frame at q 64 instead of 255, refine to lossless kept; field gate: **instrument PASS 13:25 UTC** (`max_qp` 64 in every scroll window, was 255; settles to q 0; 0 skips) and **operator PASS** ("scrolling large texts seems much better") ⇒ **field-verified 2026-09-07**; thin direct path measured 20:08 UTC — sharp but laggy below the cap's ~10 Mbps floor (§P3), an open decision |
 | P4 | viewer display-scale pill + 1:1 guidance | — (UI) | proposed |
 
 ## Acceptance criteria
@@ -356,3 +372,4 @@ program FR-17 / 16 / 14.
 | 2026-09-07 09:20–10:44 UTC | 0.4.79 | CORPLAP-1 + CORPLAP-2, every session since the 07:29 restart | **AC3 read.** CORPLAP-2 relay (av1_nvenc, `constrained=true`): a 66-min session at 0 → 7.45 Mbps, 15 backpressure skips, 0 gate lines, `pipe_states` [1, 3761, 1, 53, 0] (1.4 % transit-stalled — the FR-71 gap mix of every previous read); a 7.8-min session 0.2 → 3.0 M, 4 skips; three short ones 0 skips. CORPLAP-1 ran **direct** today (hevc_qsv / vp9_qsv at 43.2 M, 0 skips, 0 gate lines, `pipe_states` all 0). The constrained branch is untouched by P1/P1b/P3 and the counters agree ⇒ AC3 holds. |
 | 2026-09-07 10:59–11:04 UTC | 0.4.80 | release | P3 (#1463 → `64bee350`, bump #1464 → `ad3fc039`, 28 assets). CORPLAP-3 pid 7968 (11:01:47), CORPLAP-1 pid 5320 (11:02:30), CORPLAP-2 pid 15416 (11:03:33), each updated while idle. Field gate open: the operator's VP9 4:4:4 wheel scroll on CORPLAP-3. |
 | 2026-09-07 13:25 UTC | 0.4.80 | CORPLAP-3, VP9 4:4:4 (libvpx), direct, the operator's scroll | **P3 gate — instrument PASS.** The session opened with `worst-quality cap applied max_q=16`; through the 17 s scroll every 1 s window had **`max_qp` = 64** (0.4.79: max 255, avg 113–192), avg 45–64 while moving, then 4 → 0 within ~2 s of stopping (refine to lossless intact); 0 skips; viewer age ≤ 39 ms. Bitrate 22–52 Mbps in the scroll windows — **above the 20.7 M target**: with q pinned at ≤ 64 the CBR target is a soft bound on content that needs more at that quality; on this direct path it cost nothing, and on a thinner one the DC buffered-bytes gate sheds frames rather than sharpness (the intended trade for a mode chosen for text). Operator's read pending. |
+| 2026-09-07 20:06–20:09 UTC | 0.4.82 | CORPLAP-3, VP9 4:4:4, direct, **two viewers** (the operator's tab + the automation tab, `shared ×2`), a Notepad++ copy of the day's log, wheel input by `SendInput` at 15 notches/s (15 s down, 15 s up) from a one-shot task in the interactive session | **Thin direct path, measured.** Control (20:06:58–20:07:29): 30 captures/s, 13–21 Mbps at q 0–2 on the down leg, one ×0.85 cut at the direction change (a 55 Mbps window, q 15/64, +2 skips), up leg 18–35 Mbps at q 0–32, viewer age 19–60 ms. **Throttled** (a Windows QoS policy capping `roomlerd.exe` egress at 15 Mbps — ~7.5 Mbps per viewer; 20:08:26–20:08:57): seven AIMD cuts in 9 s (9.95 → 5.68 M, then 4.6–5.1 M), the encoder still emitting **10–19 Mbps at avg q 56–60 / max 64** — the cap's floor for a full-screen 4:4:4 text scroll is ~10 Mbps and the target below it is inert — **zero new gate skips** (the OS pacer queues below the socket, so the DC buffered-bytes gate never saw a queue) and **viewer age 160–380 ms**. The cost of the cap on a pipe thinner than its floor is lag, not blur. |
