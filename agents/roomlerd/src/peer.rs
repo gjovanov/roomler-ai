@@ -3115,6 +3115,11 @@ async fn media_pump_vp9_444_dc(
     // than reading the process-wide env flag. The env flag still wins as an
     // explicit override (see `detect_constrained_transport`).
     let mut constrained_transport = detect_constrained_transport(&pc, session_id).await;
+    // FR-74 P3 — the worst quality libvpx may pick on a DIRECT transport
+    // (`rc_max_quantizer`; relay keeps the uncapped 63). Resolved once: the
+    // env is process-stable. See `Vp9Encoder::set_max_quantizer` for why a
+    // cap and not a rate mode.
+    let vp9_direct_max_q = crate::encode::libvpx::vp9_direct_max_q_from_env();
     let mut bitrate_cap: u32 = if constrained_transport {
         crate::encode::relay_max_bps()
     } else {
@@ -3419,6 +3424,23 @@ async fn media_pump_vp9_444_dc(
                     } else {
                         DC_BUFFERED_HIGH_BYTES
                     };
+                    // FR-74 P3 — the worst-quality cap follows the transport:
+                    // uncapped on a relay (the rate cap rules there), capped
+                    // on a direct path.
+                    if let Some(h) = encoder.as_mut() {
+                        let q = if relay {
+                            crate::encode::libvpx::VP9_MAX_Q_UNCAPPED
+                        } else {
+                            vp9_direct_max_q
+                        };
+                        h.with(move |e| e.set_max_quantizer(q)).await;
+                        info!(
+                            %session_id,
+                            relay,
+                            max_q = q,
+                            "FR-74 P3: VP9-444 worst-quality cap re-applied after a transport flip"
+                        );
+                    }
                     // Badge-truth: refresh the browser badge with the new
                     // transport via the retry block below.
                     video_info_sent = false;
@@ -3756,6 +3778,23 @@ async fn media_pump_vp9_444_dc(
                     // boost properly logs the from-value.
                     current_cpu_used = base_cpu_used;
                     motion_boost_until_frame = 0;
+                    // FR-74 P3 — on a direct transport, cap the worst quality
+                    // libvpx may pick: its one-pass CBR resets q to 255 on
+                    // every wheel notch of a text scroll and walks it down
+                    // ~7 per frame, so a choppy scroll was rendered at the
+                    // worst quality while spending a fifth of its target.
+                    // The cap holds the notch frames at a readable quality;
+                    // everything else (refine to lossless, the target as an
+                    // average bound) stays. Relay keeps libvpx's 63.
+                    if !constrained_transport && let Some(h) = encoder.as_mut() {
+                        let q = vp9_direct_max_q;
+                        h.with(move |e| e.set_max_quantizer(q)).await;
+                        info!(
+                            %session_id,
+                            max_q = q,
+                            "FR-74 P3: VP9-444 worst quality capped on the direct path"
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!(%session_id, %e, "Vp9Encoder::new failed — pump exits");

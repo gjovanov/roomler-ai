@@ -236,7 +236,17 @@ first encode. `encode/libvpx.rs` therefore binds `env-libvpx-sys` directly:
   (`VPX_IMG_FMT_I444`, zero chroma shift), `VPX_EFLAG_FORCE_KF` on the first
   frame and on keyframe requests, drained via `vpx_codec_get_cx_data`;
 - runtime bitrate by mutating `rc_target_bitrate` +
-  `vpx_codec_enc_config_set` (a no-op in the old wrapper).
+  `vpx_codec_enc_config_set` (a no-op in the old wrapper);
+- **FR-74 P3 — a worst-quality cap on direct transports**: `rc_max_quantizer`
+  16 (q-index 64) via `Vp9Encoder::set_max_quantizer`, applied at encoder open
+  and re-applied on every transport flip (relay keeps libvpx's 63). libvpx's
+  one-pass CBR + screen tune treats every mouse-wheel notch of a text scroll as
+  a scene change, resets q to 255 and walks it back ~7 q-index per frame, so a
+  choppy scroll was rendered at the worst quality while spending a fifth of its
+  target (measured offline against the real encoder, four rounds; spec §P3).
+  The cap holds the notch frames at q 64; the steady scroll still refines to
+  q 0 inside the budget and idle stays lossless. Env
+  `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3).
 
 Bindgen (`vp9-444-bindgen` feature) generates bindings against system headers on
 Linux/macOS; Windows links the vendored prebuilt libvpx.

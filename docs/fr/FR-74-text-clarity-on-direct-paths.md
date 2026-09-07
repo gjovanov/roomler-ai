@@ -1,8 +1,9 @@
 # FR-74 — Text clarity on direct paths: the bitrate ceiling follows the content, not a constant
 
-**Issue:** [#1442](https://github.com/gjovanov/roomler-ai/issues/1442) · **Status:** P0 done 2026-09-06
-(cells A + B2 remove the blur on the hardware pump — AV1, VP9 4:2:0, H.264 — by the operator's
-own read; VP9 4:4:4, the libvpx software pump, still blurs and is P3's item); P1 next ·
+**Issue:** [#1442](https://github.com/gjovanov/roomler-ai/issues/1442) · **Status:** P0 done 2026-09-06;
+P1 (0.4.77) + P1b (0.4.79) released and **field-verified 2026-09-07** — the hardware pump
+(AV1, VP9 4:2:0, H.264) no longer blurs by the operator's read; P3 (the libvpx VP9 4:4:4
+pump) **built 2026-09-07** from four offline rounds, field gate pending; P2 / P4 proposed ·
 **Parent:** the RC quality program (FR-17/16/14); rides on FR-59's measured pipe and FR-70's
 pump instrumentation.
 
@@ -219,21 +220,63 @@ boundary does not cross it every few seconds; each crossing is a rebuild and an
 IDR. Coarser rungs above 8 Mbps where the bits/quality slope is flat. Measured by
 `swaps` and keyframes per minute in a scroll session.
 
-### P3 — a still-text floor at native
+### P3 — the libvpx pump: cap the worst quality on direct paths (2026-09-07)
 
-Extend the idle refine to native: once motion settles, one re-encode of the settled
-frame at a sharper CQ (a still frame costs nothing against the cap).
+**What the field showed after P1b.** With AV1, VP9 4:2:0 and H.264 clean by the
+operator's read, VP9 4:4:4 still blurred on the same scroll. Its heartbeat (1 s
+windows, session `6a9e8145`) had this shape: 30 encodes/s in motion, 15/s at idle
+(the 60 ms keepalive re-encodes the same frame at ~6 kbps), and in the scroll
+windows **8–13 Mbps spent of the 20.7 Mbps CBR target at avg q 113–192 / max
+255** — under budget and at the worst quality at the same time. A steady short
+scroll at the end converged to q 14–23 at 10 Mbps. So the hypothesis that opened
+this phase (a 30-fps budget spread over ~10 real captures) did not fit: the
+encoder was not out of bits, it was choosing not to spend them.
 
-**The libvpx VP9-444 pump has its own blur, measured in P0.** On CORPLAP-3 the
-software encoder captures ~7–19 real frames per second at 1920×1200 4:4:4 but the
-pump repeat-encodes at the nominal 30 fps (`cpu_used=6`, target 20.7 Mbps =
-0.20 bpp × 1.5), so libvpx hands every encoded frame 1/30 of the target and the
-real full-screen text deltas arrive at ~10 fps to spend it — `avg_qp` 108 → 184
-of 255 while scrolling, 5 at rest. The remedy on that pump is duration-aware rate
-control (a frame that took 100 ms gets 100 ms of bits) or no duplicate encodes at
-the nominal rate, and on encode-bound hosts a lower rung for software 4:4:4 —
-never a bigger constant. Until then the codec picker's 4:4:4 on a 4:2:0-only host
-is the one remaining way to reproduce the operator's blur.
+**Measured offline, not argued** — an ignored test in `encode/libvpx.rs`
+(`fr74_p3_offline_scroll_rate_control`) feeds the real encoder a synthetic
+1920×1200 text page: 20 warm frames, 3 s of idle keepalive duplicates (or none),
+a 90-frame steady scroll at 24 px/frame, a stop, and a **wheel pattern** (a 54 px
+notch, then four repeat frames at the keepalive cadence, ×12). Per-frame q and
+bytes, per arm. (WSL: build the harness with
+`cargo rustc -p roomlerd --lib --profile test --features ffmpeg-encoder,vp9-444 -- -A warnings`
+and run the deps binary — a plain `cargo test` under `vp9-444` alone crashes
+rustc's diagnostic renderer on a governor dead-code warning, not on the test.)
+
+| round | arm | steady scroll | wheel notches | reading |
+|---|---|---|---|---|
+| 1 | as shipped (CBR, cpu-used 6, idle dups fed) | first frame **q 255**, then −7/frame to 0 by ~frame 40; 17.3 Mbps | — | a scene change resets q to the worst and libvpx walks it back over ~1 s |
+| 1 | no idle duplicates | identical | — | the keepalive duplicates are innocent (the rate-factor theory refuted) |
+| 1 | VBR / CQ modes | q 16 → **255 and pinned**, 2 Mbps | — | one-pass VBR/CQ go into "debt" and stay there — unusable here |
+| 1 | cpu-used 5 / target ×2 | identical descent | — | neither speed nor budget enters into it |
+| 2 | as shipped | — | **every notch q 255**, mean 231, **4 Mbps** | the field reproduced: worst quality at a fifth of the budget |
+| 2 | content tune default / overshoot 100 / cyclic refresh | — | 255/193 alternating · no change · no change | no knob on the rate control fixes it |
+| 2 | `rc_max_quantizer` 40 / 32 | descends from the cap | notches AT the cap (q-index 160 / 128) | the cap is the one lever that bounds the damage |
+| 3 | constant quality (`VPX_Q`) cq 12–32 | q ≤ 48–128 by construction, **~9 Mbps** | ~8 Mbps | sharp, cheap — but no refine to lossless at idle, no rate bound at all |
+| 4 | **CBR + `rc_max_quantizer` 16 / 20 / 24** | cap → 42 → 39 → 33 → … → **0 within ~1 s**, 14.0–14.7 Mbps | **all notches at 64 / 80 / 96**, 7.2–7.5 Mbps | notches readable, refine to lossless kept, the target still an average bound |
+
+**Mechanism.** libvpx's one-pass CBR with the screen-content tune treats each
+wheel notch (54 px = most pixels change) as a scene change: `high_source_sad` →
+`calc_active_worst_quality_one_pass_cbr` returns `worst_quality` and the ambient
+q is reset to it, after which q can only fall as fast as the ambient average
+moves (~7 q-index per frame). A steady scroll gets there in a second; a wheel
+scroll restarts the walk at every notch and is rendered at q 255 throughout —
+while the encoder sits far below its target, because the reset is not a budget
+decision at all.
+
+**Built.** `Vp9Encoder::set_max_quantizer` (a runtime `vpx_codec_enc_config_set`,
+no IDR) and `vp9_direct_max_q_from_env` (default **16** = q-index 64, env
+`ROOMLERD_VP9_DIRECT_MAX_Q`, clamp 0–63, **63 = the pre-P3 behaviour** — the way
+back). The pump applies the cap on a DIRECT transport at encoder open and
+re-applies it on every transport flip (uncapped again on a relay, where the rate
+cap is what matters). Nothing else changes: CBR, the target, the AIMD, the idle
+keepalive, the settle keyframe, `cpu_used` — all as before. 16 rather than 20 or
+24 because the three cost the same bytes on the synthetic scroll and 16 is the
+sharpest; `avg_qp` / `max_qp` in the heartbeat are the instrument.
+
+**Field gate.** The operator's Notepad++ wheel scroll on CORPLAP-3 with VP9
+4:4:4: readable while it moves; the heartbeat's scroll windows show `max_qp` ≤ 64
+with the bitrate inside the target (the pre-P3 shape was max 255 at 8–13 Mbps of
+20.7); settled text still refines to q 0.
 
 ### P4 — the viewer's pixel chain
 
@@ -247,9 +290,9 @@ disagree. FSR helps only when upscaling.
 |---|---|---|---|
 | P0 | A/B with existing knobs on CORPLAP-3 | — (settings only) | **done 2026-09-06** — A + B2 remove the blur on AV1, VP9 4:2:0 and H.264 by the operator's read; the queue budget denominated in the applied target was a self-reinforcing trap, the cap the limiter; VP9 4:4:4 (software) remains |
 | P1 | direct ceiling 0.25 bpp / [3, 48] M; direct queue budget denominated in the ceiling | — (no switch: `FFMPEG_MAXRATE_KBPS` and `direct_queue_ms` are the way back) | **built 2026-09-06** (§"P1 — as built"); field gate on the release carrying it |
-| P1b | the direct gate is the measured send wait's call below the encoder's HRD reservoir (EMA of completed waits ∨ live head-of-queue age); bytes alone gate only at the reservoir | — (no switch; `direct_queue_ms` keeps its meaning as the lag bound, `0` disables) | **built 2026-09-07** after the 0.4.77 read tripped P1's budget on a burst AV1 was configured to emit; field gate pending |
+| P1b | the direct gate is the measured send wait's call below the encoder's HRD reservoir (EMA of completed waits ∨ live head-of-queue age); bytes alone gate only at the reservoir | — (no switch; `direct_queue_ms` keeps its meaning as the lag bound, `0` disables) | **field-verified 2026-09-07 on 0.4.79** — operator: "not seeing the blurring anymore" on AV1, VP9 4:2:0 and H.264; heartbeats of those sessions: 0 cuts, 0 gate skips, 0 gate lines. VP9 4:4:4 (the libvpx pump) still blurs ⇒ P3 |
 | P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | proposed (P0 saw 37 → 0 swaps once the trap was gone; re-measure after P1) |
-| P3 | idle refine at native; the libvpx pump's per-real-frame budget (duration-aware rate control, no duplicate encodes at nominal fps) | `native_refine` | proposed — the software 4:4:4 blur is measured (`avg_qp` 184/255 on ~10 real fps) |
+| P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07** — offline: every notch frame at q 64 instead of 255, refine to lossless kept, 14.5 of 20.7 Mbps; field gate = the operator's 4:4:4 wheel scroll on the release |
 | P4 | viewer display-scale pill + 1:1 guidance | — (UI) | proposed |
 
 ## Acceptance criteria
@@ -294,4 +337,6 @@ program FR-17 / 16 / 14.
 | 2026-09-06 19:51 UTC | 0.4.76 | CORPLAP-3, av1_qsv, direct, Sharper, no P0 keys | **Baseline #2 (FAIL first)**: six ×0.85 cuts in 16 s (9.68 → 2.24 Mbps), 49 gate-skipped frames, then 2.1–3.7 Mbps for minutes — the queue budget (150 ms of the applied target, ~47 KB at 2.5 Mbps) tripping on every text frame |
 | 2026-09-06 20:10–20:31 UTC | 0.4.76 | CORPLAP-3, av1_qsv, direct | **Cell A** (`direct_queue_ms` 600): one cut, back in 28 s, 0 rate swaps (was 37); operator: still blurred, especially the gutter. **Cell B** (+ cap 24 Mbps): 40 s scroll at 24 Mbps, 0 cuts / 0 skips, 12–25 Mbps, 25–40 fps; operator: clear, then blurred after 4–5 s (the 2× VBV draining), clears ~1 s after stopping, the second stop within 5 s stays blurred (settle-keyframe gap) |
 | 2026-09-06 21:25–21:28 UTC | 0.4.76 | CORPLAP-3, direct, all four codecs | **Cell B2** (A + cap 40 Mbps): operator — "could not reproduce it with AV1, VP9 4:2:0 and H.264 — only with VP9 4:4:4". AV1 0 cuts / 0 skips / 15.6–22 Mbps / 31–43 fps (a 55 Mbps burst window absorbed); vp9_qsv 0 cuts / 15.7 Mbps / 26 fps; h264_qsv 0 cuts / 23 Mbps / 32 fps. VP9-444 (libvpx SW) `avg_qp` 108 → 184/255 in the scroll on ~10 real captures/s repeat-encoded at 30, target 20.7 Mbps — its own mechanism (P3) |
-| 2026-09-07 06:34–06:40 UTC | 0.4.77 | CORPLAP-3, av1_qsv 1920×1200, direct, defaults (P0 knobs cleared 22:23 UTC the day before) | **P1 gate read**, session `6a9e5b03`: ceiling 34,560,000 confirmed; scroll windows 20–36 Mbps at 30–47 fps, viewer age ≤ 20 ms; **residual** — the 150 ms budget (648 KB) tripped once on the AV1 VBV burst (HRD floored at 200 % = 8.6 MB reservoir): 54 skips (~8 %), two ×0.85 cuts 34.56 → 29.38 → 26.8 Mbps, back within ~10 s; `set_bitrate: 7 swaps: 0 settle-KF: 10 gate: 1`. Operator's read of this session pending. ⇒ P1b |
+| 2026-09-07 06:34–06:40 UTC | **0.4.78** (the auto-updater had rolled it at 06:19; same pump code as 0.4.77) | CORPLAP-3, av1_qsv 1920×1200, direct, defaults (P0 knobs cleared 22:23 UTC the day before) | **P1 gate read**, session `6a9e5b03`: ceiling 34,560,000 confirmed; scroll windows 20–36 Mbps at 30–47 fps, viewer age ≤ 20 ms; **residual** — the 150 ms budget (648 KB) tripped once on the AV1 VBV burst (HRD floored at 200 % = 8.6 MB reservoir): 54 skips (~8 %), two ×0.85 cuts 34.56 → 29.38 → 26.8 Mbps, back within ~10 s; `set_bitrate: 7 swaps: 0 settle-KF: 10 gate: 1`. Operator's read of this session pending. ⇒ P1b |
+| 2026-09-07 09:12–09:20 UTC | 0.4.79 | CORPLAP-3, direct, defaults, the operator judging | **P1b gate — PASS on the HW codecs, the 4:4:4 pump is P3.** Operator: "still only with VP9 4:4:4 … it gets blurred. In the other codecs like AV1, VP9 4:2:0 and H.264 I'm not seeing the blurring anymore." Heartbeats: av1_qsv `6a9e8017` (29.4 M opening climb → 34.56 M, 0 skips, 0 gate lines, 29 MB), vp9_qsv `6a9e806b` (43.2 M flat, 0 / 0, 22 MB), h264_qsv `6a9e8087` (44.1 → 50.5 M, 0 / 0, 44 MB). VP9 4:4:4 (libvpx SW) `6a9e8039` + `6a9e8145`: 20.7 M target flat, **8–13 Mbps actually spent in the scroll windows at avg QP 113–192 / max 255**, encodes at 30/s in motion and 15/s at idle (the 60 ms keepalive re-encodes the same frame at ~6 kbps for the whole idle), 1830 encodes for 481 captures; the last short scroll converged to QP 14–23 at 10 Mbps. |
+| 2026-09-07 09:30–10:00 UTC | offline (libvpx 1.14, WSL) | the real encoder on a synthetic 1920×1200 text page | **P3 rounds 1–4** (table in §P3): as shipped, every wheel-notch frame is encoded at **q 255** while spending 4 Mbps of 20.7; idle duplicates innocent; VBR/CQ pinned at 255; content tune / overshoot / cyclic refresh / cpu-used / target ×2 change nothing; `rc_max_quantizer` 16 holds every notch at q 64 and keeps the refine to lossless (14.5 Mbps of 20.7 on the steady scroll); constant-quality mode is sharp and cheap (~9 Mbps) but loses the idle refine and the rate bound. ⇒ P3 = the cap. |

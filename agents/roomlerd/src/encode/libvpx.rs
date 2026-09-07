@@ -458,6 +458,50 @@ impl Vp9Encoder {
         );
     }
 
+    /// FR-74 P3 — cap the WORST quality libvpx may pick (`rc_max_quantizer`,
+    /// 0-63; 63 = q-index 255 = the libvpx default and the relay setting).
+    ///
+    /// Why a cap and not a mode: libvpx's one-pass CBR treats every mouse-wheel
+    /// notch of a text scroll as a scene change — it resets its ambient q to
+    /// the worst quality and walks it back down ~7 q-index per frame — so a
+    /// choppy scroll is rendered at q 255 throughout while the encoder spends
+    /// a fifth of its target (offline rounds 1-4, `fr74_p3_offline_*`; the
+    /// same shape as CORPLAP-3's 8-13 Mbps at avg q 170-190 in the field).
+    /// The target does not enter into it (a doubled target descends
+    /// identically), VBR/CQ pin q at 255 for seconds of "debt", and cyclic
+    /// refresh, overshoot and the content tune change nothing. Capping the
+    /// worst quality is the one lever that bounds the damage without giving
+    /// up the rest: notches sit AT the cap, a steady scroll still refines
+    /// toward q 0 inside the budget, idle stays lossless, the target stays a
+    /// real average bound (14.5 Mbps of 20.7 on the synthetic scroll at cap
+    /// 16 vs 17 uncapped). A runtime config change; no IDR is forced.
+    pub fn set_max_quantizer(&mut self, max_q: u32) {
+        let max_q: c_uint = max_q.min(63);
+        if self.cfg.rc_max_quantizer == max_q {
+            return;
+        }
+        let min_q = self.cfg.rc_min_quantizer.min(max_q);
+        self.cfg.rc_min_quantizer = min_q;
+        self.cfg.rc_max_quantizer = max_q;
+        // SAFETY: ctx is alive; cfg is the one libvpx accepted at init with
+        // only the two quantizer bounds changed, which are runtime-settable.
+        let err = unsafe { vpx::vpx_codec_enc_config_set(&mut self.ctx, &self.cfg) };
+        if err != vpx::VPX_CODEC_OK {
+            tracing::warn!(
+                ?err,
+                max_q,
+                "vp9-444: vpx_codec_enc_config_set (max quantizer) failed"
+            );
+        } else {
+            tracing::info!(max_q, min_q, "vp9-444: worst-quality cap applied");
+        }
+    }
+
+    /// The current `rc_max_quantizer` (0-63).
+    pub fn max_quantizer(&self) -> u32 {
+        self.cfg.rc_max_quantizer
+    }
+
     /// Uses `dcv_color_primitives` AVX2 path on x86_64 with SSE2
     /// fallback. In-place into `self.{y,u,v}_plane`.
     ///
@@ -810,6 +854,25 @@ pub(crate) fn cpu_used_from_env() -> c_int {
     raw.clamp(4, 9) as c_int
 }
 
+/// FR-74 P3 — the worst quality (`rc_max_quantizer`, 0-63) the libvpx pump
+/// allows on a DIRECT transport. Default 16 (q-index 64): the sharpest of the
+/// caps measured offline (16/20/24 cost the same bytes on a text scroll,
+/// 14.0-14.7 Mbps of a 20.7 Mbps target) and the one that holds every
+/// wheel-notch frame at a quality a reader can use. Relay/constrained
+/// sessions keep libvpx's 63 — there the rate cap is what matters. Env
+/// `ROOMLERD_VP9_DIRECT_MAX_Q` overrides in both directions (63 restores the
+/// pre-P3 behaviour); clamp [0, 63].
+pub(crate) fn vp9_direct_max_q_from_env() -> u32 {
+    const DEFAULT_DIRECT_MAX_Q: u32 = 16;
+    node_env("VP9_DIRECT_MAX_Q")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|v| v.min(63))
+        .unwrap_or(DEFAULT_DIRECT_MAX_Q)
+}
+
+/// The libvpx default and what constrained (relay) sessions run.
+pub(crate) const VP9_MAX_Q_UNCAPPED: u32 = 63;
+
 /// Seconds between periodic keyframes (IDRs) on the reliable-DC VP9 path.
 ///
 /// rc.234 — `None` (the default, env unset) disables periodic IDRs
@@ -992,5 +1055,359 @@ mod tests {
 
         let mut enc = Vp9Encoder::new(w, h).expect("encoder init");
         assert!(enc.bgra_to_yuv(&frame).is_err());
+    }
+
+    /// FR-74 P3 — the worst-quality cap round-trips through libvpx's config
+    /// at runtime (no rebuild), clamps to the 0-63 scale, and never leaves
+    /// `rc_min_quantizer` above it.
+    #[test]
+    fn max_quantizer_cap_round_trips_and_clamps() {
+        let mut enc = Vp9Encoder::new(320, 240).expect("encoder init");
+        assert_eq!(enc.max_quantizer(), 63, "libvpx default = uncapped");
+        enc.set_max_quantizer(16);
+        assert_eq!(enc.max_quantizer(), 16);
+        enc.set_max_quantizer(99);
+        assert_eq!(enc.max_quantizer(), 63, "clamped to the 0-63 scale");
+        enc.set_max_quantizer(0);
+        assert_eq!(enc.max_quantizer(), 0);
+        assert!(enc.cfg.rc_min_quantizer <= enc.cfg.rc_max_quantizer);
+        // A capped encoder still encodes, and its packets report q at or
+        // under the cap's q-index (16 -> 64).
+        enc.set_max_quantizer(16);
+        let f = synth_bgra(320, 240);
+        let packets = enc.encode_sync(&f).expect("encode ok");
+        assert!(!packets.is_empty());
+        for p in &packets {
+            if let Some(q) = p.qp {
+                assert!(q <= 64, "q-index {q} above the cap");
+            }
+        }
+    }
+
+    /// FR-74 P3 — the direct-path default is 16 and the env override clamps.
+    #[test]
+    fn direct_max_q_default_and_override() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { tunnel_core::env::test_env::clear("VP9_DIRECT_MAX_Q") };
+        assert_eq!(vp9_direct_max_q_from_env(), 16);
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "VP9_DIRECT_MAX_Q", "24") };
+        assert_eq!(vp9_direct_max_q_from_env(), 24);
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "VP9_DIRECT_MAX_Q", "200") };
+        assert_eq!(vp9_direct_max_q_from_env(), 63);
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "VP9_DIRECT_MAX_Q", "junk") };
+        assert_eq!(vp9_direct_max_q_from_env(), 16);
+        unsafe { tunnel_core::env::test_env::clear("VP9_DIRECT_MAX_Q") };
+        assert_eq!(VP9_MAX_Q_UNCAPPED, 63);
+    }
+
+    /// FR-74 P3 - an OFFLINE measurement of libvpx's rate control on the
+    /// pattern the field shows: a long idle (duplicate frames at the 60 ms
+    /// keepalive cadence, ~0 bits each), then a text scroll at 30 fps, then a
+    /// stop. Per-frame q + bytes per arm, so the mechanism behind "8-13 Mbps
+    /// spent of a 20.7 Mbps target at q 170-190" is read from numbers rather
+    /// than argued. Ignored: it takes minutes and prints a report.
+    /// `FR74_ARMS` picks the arms (comma-separated), default all. An arm name
+    /// is a dash-separated list of knobs: `cbr`/`vbr`/`cq` (rc mode), `dups`/
+    /// `nodups` (idle frames fed or not), `cpu5`, `x2` (double target),
+    /// `tune0` (VP9E_CONTENT_DEFAULT instead of SCREEN), `aq3` (cyclic
+    /// refresh), `maxq<N>` (rc_max_quantizer), `os<N>` (rc_overshoot_pct).
+    #[test]
+    #[ignore]
+    fn fr74_p3_offline_scroll_rate_control() {
+        use crate::encode::VideoEncoder;
+        const W: u32 = 1920;
+        const H: u32 = 1200;
+        const TARGET_BPS: u32 = 20_736_000;
+        const SCROLL_FRAMES: usize = 90;
+        const SCROLL_PX: u32 = 24;
+        const CHOPPY_NOTCHES: u32 = 12; // wheel notches: 54 px, then 4 repeat frames
+        const CHOPPY_PX: u32 = 54;
+        const IDLE_FRAMES: usize = 45; // 3 s at the 15/s keepalive cadence
+        struct Page {
+            w: u32,
+            rows: u32,
+            px: Vec<u8>, // grey (0 = black ink, 255 = paper), rows x w
+        }
+        impl Page {
+            fn new(w: u32, rows: u32, seed: u64) -> Self {
+                let mut s = seed;
+                let mut rnd = move || {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s
+                };
+                let mut px = vec![255u8; (w * rows) as usize];
+                let line_h = 18u32;
+                let glyph_h = 12u32;
+                let cell_w = 8u32;
+                let mut y = 6u32;
+                let mut line_no = 1u32;
+                while y + glyph_h < rows {
+                    // line-number gutter: 6 cells, the digits as dense glyphs.
+                    let mut x = 4u32;
+                    for d in 0..6u32 {
+                        let digit = (line_no / 10u32.pow(5 - d)) % 10;
+                        Self::glyph(
+                            &mut px,
+                            w,
+                            x,
+                            y,
+                            cell_w,
+                            glyph_h,
+                            0x9E37_79B9 ^ (digit as u64 + 1),
+                        );
+                        x += cell_w;
+                    }
+                    x += 2 * cell_w;
+                    // words of 2..10 cells separated by a blank cell.
+                    while x + cell_w * 10 < w {
+                        let len = 2 + (rnd() % 9) as u32;
+                        for _ in 0..len {
+                            Self::glyph(&mut px, w, x, y, cell_w, glyph_h, rnd());
+                            x += cell_w;
+                        }
+                        x += cell_w;
+                    }
+                    y += line_h;
+                    line_no += 1;
+                }
+                Self { w, rows, px }
+            }
+            /// A glyph-like cell: a hash-driven mix of 1-2 px strokes, high
+            /// contrast, lots of edges - what a ClearType page looks like to
+            /// an encoder.
+            fn glyph(px: &mut [u8], w: u32, x0: u32, y0: u32, cw: u32, gh: u32, h: u64) {
+                for yy in 0..gh {
+                    for xx in 1..cw - 1 {
+                        let bit = (h >> ((yy * 5 + xx * 3) % 61)) & 1;
+                        let stroke =
+                            ((h >> ((xx + yy) % 63)) & 1) == 1 && (yy % 3 != 1 || bit == 1);
+                        if stroke {
+                            let i = ((y0 + yy) * w + x0 + xx) as usize;
+                            px[i] = if bit == 1 { 0 } else { 40 };
+                        }
+                    }
+                }
+            }
+            fn frame(&self, top: u32, h: u32, t_us: i64) -> Frame {
+                let mut data = vec![0u8; (self.w * h * 4) as usize];
+                for yy in 0..h {
+                    let src = ((top + yy) % self.rows) * self.w;
+                    for xx in 0..self.w {
+                        let g = self.px[(src + xx) as usize];
+                        let i = ((yy * self.w + xx) * 4) as usize;
+                        data[i] = g;
+                        data[i + 1] = g;
+                        data[i + 2] = g;
+                        data[i + 3] = 255;
+                    }
+                }
+                Frame {
+                    width: self.w,
+                    height: h,
+                    stride: self.w * 4,
+                    pixel_format: PixelFormat::Bgra,
+                    data,
+                    monotonic_us: t_us as _,
+                    monitor: 0,
+                    damage: crate::capture::Damage::Unknown,
+                    source: None,
+                }
+            }
+        }
+        let page = Page::new(
+            W,
+            H + SCROLL_FRAMES as u32 * SCROLL_PX + CHOPPY_NOTCHES * CHOPPY_PX + 64,
+            0xC0FF_EE11,
+        );
+        let arms: Vec<String> = std::env::var("FR74_ARMS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.split(',').map(|a| a.trim().to_string()).collect())
+            .unwrap_or_else(|| {
+                [
+                    "cbr-dups",
+                    "cbr-nodups",
+                    "vbr-dups",
+                    "cq-dups",
+                    "cbr-dups-cpu5",
+                    "cbr-nodups-x2",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+            });
+        for arm in arms {
+            let knobs: Vec<&str> = arm.split('-').collect();
+            let has = |k: &str| knobs.contains(&k);
+            let num = |prefix: &str| -> Option<u32> {
+                knobs
+                    .iter()
+                    .find_map(|x| x.strip_prefix(prefix).and_then(|n| n.parse::<u32>().ok()))
+            };
+            let rc = if has("vbr") {
+                "vbr"
+            } else if has("cq") {
+                "cq"
+            } else {
+                "cbr"
+            };
+            let cpu = if has("cpu5") { "5" } else { "6" };
+            let dups = !has("nodups");
+            let target = if has("x2") {
+                TARGET_BPS * 2
+            } else {
+                TARGET_BPS
+            };
+            unsafe {
+                tunnel_core::env::test_env::set_as("ROOMLERD_", "VP9_RC_MODE", rc);
+                tunnel_core::env::test_env::set_as("ROOMLERD_", "VP9_CPU_USED", cpu);
+            }
+            let mut enc = Vp9Encoder::new_with_fps(W, H, 30).expect("encoder init");
+            VideoEncoder::set_bitrate(&mut enc, target);
+            if has("tune0") {
+                enc.set_ctrl(
+                    vpx::vp8e_enc_control_id::VP9E_SET_TUNE_CONTENT as c_int,
+                    vpx::vp9e_tune_content::VP9E_CONTENT_DEFAULT as c_int,
+                    "VP9E_SET_TUNE_CONTENT (arm)",
+                );
+            }
+            if has("aq3") {
+                enc.set_ctrl(
+                    vpx::vp8e_enc_control_id::VP9E_SET_AQ_MODE as c_int,
+                    3 as c_uint,
+                    "VP9E_SET_AQ_MODE (arm)",
+                );
+            }
+            let mut cfg_changed = false;
+            if let Some(q) = num("maxq") {
+                enc.cfg.rc_max_quantizer = q as c_uint;
+                cfg_changed = true;
+            }
+            if let Some(os) = num("os") {
+                enc.cfg.rc_overshoot_pct = os as c_uint;
+                cfg_changed = true;
+            }
+            // `q<N>`: constant-quality mode (VPX_Q) at CQ level N on the
+            // 0-63 scale - no rate control at all, bytes follow content.
+            let cq_level = num("q");
+            if cq_level.is_some() {
+                enc.cfg.rc_end_usage = vpx::vpx_rc_mode::VPX_Q;
+                cfg_changed = true;
+            }
+            if cfg_changed {
+                let err = unsafe { vpx::vpx_codec_enc_config_set(&mut enc.ctx, &enc.cfg) };
+                assert_eq!(err, vpx::VPX_CODEC_OK, "config_set for arm {arm}");
+            }
+            if let Some(q) = cq_level {
+                enc.set_ctrl(
+                    vpx::vp8e_enc_control_id::VP8E_SET_CQ_LEVEL as c_int,
+                    q as c_uint,
+                    "VP8E_SET_CQ_LEVEL (arm)",
+                );
+            }
+            let mut t_us: i64 = 1_000;
+            let mut idx = 0usize;
+            let arm_name = arm.clone();
+            let run = |enc: &mut Vp9Encoder, phase: &str, frame: &Frame, idx: &mut usize| {
+                let pkts = enc.encode_sync(frame).expect("encode");
+                let bytes: usize = pkts.iter().map(|p| p.data.len()).sum();
+                let q = pkts.iter().filter_map(|p| p.qp).max().unwrap_or(-1);
+                let kf = pkts.iter().any(|p| p.is_keyframe);
+                println!(
+                    "F arm={arm_name} phase={phase} idx={} q={q} bytes={bytes} kf={kf}",
+                    *idx
+                );
+                *idx += 1;
+                (q, bytes)
+            };
+            let mut phases: Vec<(&str, Vec<(i32, usize)>)> = Vec::new();
+            // warm: the session opening, 20 real frames of the static page.
+            let mut acc = Vec::new();
+            for _ in 0..20 {
+                let f = page.frame(0, H, t_us);
+                acc.push(run(&mut enc, "warm", &f, &mut idx));
+                t_us += 33_333;
+            }
+            phases.push(("warm", acc));
+            // idle: the keepalive cadence feeds the SAME frame at 15/s, or
+            // (nodups) nothing at all while the clock advances the same 3 s.
+            let mut acc = Vec::new();
+            if dups {
+                for _ in 0..IDLE_FRAMES {
+                    let f = page.frame(0, H, t_us);
+                    acc.push(run(&mut enc, "idle", &f, &mut idx));
+                    t_us += 66_667;
+                }
+            } else {
+                t_us += 66_667 * IDLE_FRAMES as i64;
+            }
+            phases.push(("idle", acc));
+            // scroll: 30 fps, 24 px per frame - every frame is new content.
+            let mut acc = Vec::new();
+            for i in 0..SCROLL_FRAMES as u32 {
+                let f = page.frame((i + 1) * SCROLL_PX, H, t_us);
+                acc.push(run(&mut enc, "scroll", &f, &mut idx));
+                t_us += 33_333;
+            }
+            phases.push(("scroll", acc));
+            // stop: the scrolled page held still, keepalive cadence (refine).
+            let mut acc = Vec::new();
+            let mut top = SCROLL_FRAMES as u32 * SCROLL_PX;
+            for _ in 0..30 {
+                let f = page.frame(top, H, t_us);
+                acc.push(run(&mut enc, "stop", &f, &mut idx));
+                t_us += 66_667;
+            }
+            phases.push(("stop", acc));
+            // choppy: a mouse-wheel scroll - one 54 px notch, then four frames
+            // of the same image (the 60 ms keepalive between notches), 12x.
+            let mut acc = Vec::new();
+            for _ in 0..CHOPPY_NOTCHES {
+                top += CHOPPY_PX;
+                let f = page.frame(top, H, t_us);
+                acc.push(run(&mut enc, "choppy", &f, &mut idx));
+                t_us += 33_333;
+                for _ in 0..4 {
+                    let f = page.frame(top, H, t_us);
+                    acc.push(run(&mut enc, "choppy", &f, &mut idx));
+                    t_us += 66_667;
+                }
+            }
+            phases.push(("choppy", acc));
+            for (name, rows) in &phases {
+                if rows.is_empty() {
+                    println!("S arm={arm} phase={name} (not fed)");
+                    continue;
+                }
+                let n = rows.len() as f64;
+                let mean_q = rows.iter().map(|r| r.0 as f64).sum::<f64>() / n;
+                let max_q = rows.iter().map(|r| r.0).max().unwrap_or(-1);
+                let total: usize = rows.iter().map(|r| r.1).sum();
+                let secs = match *name {
+                    "scroll" | "warm" => n / 30.0,
+                    "choppy" => (CHOPPY_NOTCHES as f64) * (0.033_333 + 4.0 * 0.066_667),
+                    _ => n / 15.0,
+                };
+                let first: Vec<i32> = rows.iter().take(10).map(|r| r.0).collect();
+                let last: Vec<i32> = rows.iter().rev().take(5).map(|r| r.0).collect();
+                // choppy: the q of the NOTCH frames only (every 5th) - the
+                // frames a viewer sees the moving text on.
+                let notch_q: Vec<i32> = if *name == "choppy" {
+                    rows.iter().step_by(5).map(|r| r.0).collect()
+                } else {
+                    Vec::new()
+                };
+                println!(
+                    "S arm={arm} phase={name} n={} mean_q={mean_q:.0} max_q={max_q} mean_kb={:.0} kbps={:.0} first10_q={first:?} last5_q={last:?} notch_q={notch_q:?}",
+                    rows.len(),
+                    total as f64 / n / 1000.0,
+                    total as f64 * 8.0 / secs / 1000.0
+                );
+            }
+        }
     }
 }
