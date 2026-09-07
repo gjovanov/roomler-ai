@@ -46,6 +46,9 @@ function watchForTrouble(page: Page) {
   return trouble
 }
 
+/** Whether this server mounts `network` — decided once, in `beforeAll`. */
+let hasNetwork = false
+
 test.describe('mesh profile — the SPA gates on what the server mounts (FR-69 AC7)', () => {
   test.beforeAll(async () => {
     const modules = await serverModules()
@@ -54,6 +57,13 @@ test.describe('mesh profile — the SPA gates on what the server mounts (FR-69 A
       `this server mounts chat (${modules.join(',')}) — the spec asserts a server without it`,
     )
     expect(modules).toContain('fleet')
+    // ⚠️ Three profiles mount no chat — `mesh` (fleet+network), `remote`
+    // (fleet+remote) and `access` (all three) — and the spec is meaningful on
+    // all of them. Only the NETWORK-owned surfaces may be asserted
+    // unconditionally on `mesh`: `remote` has no tunnels, so demanding a
+    // "Tunnels" tile there fails the SPA for doing exactly the right thing.
+    // (Measured by FR-75's `remote` cell, #1447.)
+    hasNetwork = modules.includes('network')
   })
 
   test('no chat or conference surfaces, no console errors, no failed API calls', async ({
@@ -75,7 +85,7 @@ test.describe('mesh profile — the SPA gates on what the server mounts (FR-69 A
     await expect(page.getByRole('heading', { name: 'Mesh Org' })).toBeVisible({ timeout: 10000 })
     await expect(page.getByText('Devices Online', { exact: true })).toBeVisible()
     // `exact`: the Network card's description also says "tunnels".
-    await expect(page.getByText('Tunnels', { exact: true })).toBeVisible()
+    if (hasNetwork) await expect(page.getByText('Tunnels', { exact: true })).toBeVisible()
     await expect(page.getByText(/new room/i)).toHaveCount(0)
     await expect(page.getByText(/start call/i)).toHaveCount(0)
     await expect(page.getByText(/upload file/i)).toHaveCount(0)
@@ -86,7 +96,7 @@ test.describe('mesh profile — the SPA gates on what the server mounts (FR-69 A
     // The navigation: Devices + Network groups, no Rooms / Explore / Files.
     const nav = page.locator('nav, .v-navigation-drawer').first()
     await expect(nav.getByText('Devices', { exact: true }).first()).toBeVisible()
-    await expect(nav.getByText('Network', { exact: true }).first()).toBeVisible()
+    if (hasNetwork) await expect(nav.getByText('Network', { exact: true }).first()).toBeVisible()
     await expect(nav.locator(`a[href$="/tenant/${tenant.id}/files"]`)).toHaveCount(0)
     await expect(nav.locator(`a[href$="/tenant/${tenant.id}/explore"]`)).toHaveCount(0)
     await expect(nav.locator(`a[href$="/tenant/${tenant.id}/rooms"]`)).toHaveCount(0)
