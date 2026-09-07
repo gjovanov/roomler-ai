@@ -25,6 +25,56 @@ both on the same LAN, both on 0.4.76:
 for these hosts — it is the only carrier that can exist.** The cascade is already
 choosing correctly; there is nothing left to choose.
 
+### The same three blockers, as a picture
+
+The overlay normally tries four ways to reach a peer, cheapest and fastest
+first. On these laptops the first three are each blocked by a *different* thing,
+which is why no single fix helps:
+
+```mermaid
+flowchart TD
+    L["💻 Corporate laptop<br/>LAN 192.168.8.108<br/>Check Point full tunnel"]
+
+    L --> T1{"1 · LAN<br/>talk straight to the machine<br/>in the same room"}
+    T1 -->|"❌ route CAPTURED"| X1["The VPN claims our own LAN.<br/>It installs 192.168.8.0/<b>25</b>, which beats<br/>the real on-link /<b>24</b> by longest prefix —<br/>so even the laptop next to us is sent<br/>into the tunnel and never comes back.<br/><i>FR-33 / #905</i>"]
+
+    L --> T2{"2 · Hole-punch<br/>learn my public address<br/>from a STUN server"}
+    T2 -->|"❌ srflx NONE"| X2["No public candidate at all —<br/>3 vantage points plus the<br/>public-dial fallback, nothing.<br/>Without one there is no<br/>address for a peer to punch to."]
+
+    L --> T3{"3 · Direct to a peer<br/>at its public address<br/>over UDP"}
+    T3 -->|"❌ UDP dropped"| X3["The corp gateway forwards<br/><b>no UDP to the internet</b>.<br/>The packets leave the laptop<br/>and die at the egress."]
+
+    L --> T4{"4 · DERP relay<br/>over TLS :443"}
+    T4 -->|"✅ the only one that works"| OK["<b>Not a fallback — the floor.</b><br/>And today that floor is always<br/>wherever the API pods are,<br/>however far away that is."]
+
+    style X1 fill:#fde8e8,stroke:#d33
+    style X2 fill:#fde8e8,stroke:#d33
+    style X3 fill:#fde8e8,stroke:#d33
+    style OK fill:#e6f4ea,stroke:#2a7
+```
+
+🔑 **Why blocker 3 is the corp network and not the laptop** — the same host, the
+same socket, four destinations:
+
+```mermaid
+flowchart LR
+    H["the laptop's own<br/>UDP + TCP stack"]
+    H --> A["UDP → corp DNS :53"] --> AR["✅ replies, 383 B"]
+    H --> B["UDP → 1.1.1.1:53"] --> BR["❌ timeout"]
+    H --> C["UDP → STUN :19302 / :3478"] --> CR["❌ timeout"]
+    H --> D["TCP → :443"] --> DR["✅ connects"]
+
+    style AR fill:#e6f4ea,stroke:#2a7
+    style DR fill:#e6f4ea,stroke:#2a7
+    style BR fill:#fde8e8,stroke:#d33
+    style CR fill:#fde8e8,stroke:#d33
+```
+
+UDP works perfectly *into* the corporate network and dies only on the way *out*
+to the internet, while TCP 443 passes. So the host is not blocking anything —
+**the policy is at the corporate egress**, and nothing we ship on the laptop can
+change it.
+
 🔑 **This is exactly the population FR-19 cannot serve.** Org relays run on UDP
 **3478**, chosen because the symmetric-NAT corp population was *measured* to
 reach it — but that population is NAT'd, not UDP-blocked. Here 3478 is as dead
