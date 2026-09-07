@@ -1185,7 +1185,12 @@ function persistResolution(agentId: string, s: RcResolutionSetting) {
  *  into every agent's default. */
 export const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
 
-const CODEC_CHOICE_VALUES = ['auto', 'av1', 'hevc', 'vp9-444', 'vp9-420', 'h264'] as const
+/** Every value the Codec picker can hold. The ONE list both the type and the
+ *  storage allow-list derive from: `RcCodecChoice` is `typeof` this array, so a
+ *  picker value that is not in it does not type-check anywhere. Before this the
+ *  allow-list was a second, hand-maintained copy that missed `hevc-444`, so a
+ *  per-agent HEVC 4:4:4 override was written and never read back. */
+export const RC_CODEC_CHOICES = ['auto', 'av1', 'hevc', 'hevc-444', 'vp9-444', 'vp9-420', 'h264'] as const
 
 export function readStoredCodecChoice(agentId: string): RcCodecChoice | null {
   try {
@@ -1193,7 +1198,7 @@ export function readStoredCodecChoice(agentId: string): RcCodecChoice | null {
     if (
       raw &&
       raw !== 'auto' &&
-      (CODEC_CHOICE_VALUES as readonly string[]).includes(raw)
+      (RC_CODEC_CHOICES as readonly string[]).includes(raw)
     ) {
       return raw as RcCodecChoice
     }
@@ -2304,7 +2309,7 @@ export function priorityWireMessage(mode: RcPriority): { t: 'rc:priority'; mode:
  *  toggle buttons + the codec-override + VP9-chroma dropdowns. Each choice
  *  maps to a full (transport, chroma, preferredCodec, renderPath) tuple so the
  *  picker fully determines the previously-scattered controls. */
-export type RcCodecChoice = 'auto' | 'av1' | 'hevc' | 'hevc-444' | 'vp9-444' | 'vp9-420' | 'h264'
+export type RcCodecChoice = (typeof RC_CODEC_CHOICES)[number]
 
 export interface CodecChoiceSettings {
   videoTransport: RcVideoTransport

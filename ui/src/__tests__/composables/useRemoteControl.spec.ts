@@ -88,6 +88,7 @@ import {
   CODEC_STORAGE_PREFIX,
   readStoredCodecChoice,
   persistCodecChoice,
+  RC_CODEC_CHOICES,
   codecConnectAction,
   parseLocalRelayDescriptor,
   localRelayIceServer,
@@ -3004,6 +3005,20 @@ describe('per-agent codec override (2026-07-28)', () => {
     persistCodecChoice(A, 'auto')
     expect(readStoredCodecChoice(A)).toBeNull()
     expect(readStoredCodecChoice(B)).toBe('vp9-444')
+  })
+
+  it('every explicit picker value survives the storage round-trip', () => {
+    // Regression: the storage allow-list was a hand-maintained copy of the
+    // RcCodecChoice union and omitted 'hevc-444', so a per-agent HEVC 4:4:4
+    // override was persisted and then rejected on read. The list is now the
+    // single source both derive from, and this walks every value of it.
+    for (const choice of RC_CODEC_CHOICES) {
+      if (choice === 'auto') continue
+      persistCodecChoice(A, choice)
+      expect(readStoredCodecChoice(A)).toBe(choice)
+    }
+    persistCodecChoice(B, 'hevc-444')
+    expect(readStoredCodecChoice(B)).toBe('hevc-444')
   })
 
   it('connect precedence: fresh pick beats stored override beats nothing', () => {
