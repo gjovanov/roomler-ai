@@ -519,6 +519,49 @@ pub fn direct_queue_budget_bytes(rate_bps: u32) -> usize {
     (((rate_bps as u64).saturating_mul(ms) / 8000) as usize).max(48 * 1024)
 }
 
+/// FR-74 P1b — the HARD byte ceiling of the direct gate: the larger of the
+/// link-time budget above and the encoder's own HRD/VBV reservoir
+/// (`maxrate × hrd_pct / 100`, in bytes). A burst inside the reservoir is
+/// one the encoder was CONFIGURED to emit (AV1 is floored at 200 % because
+/// Intel's VDENC hangs otherwise — the rc.443 incident), so gating it on
+/// bytes alone made the controller cut on a burst it had itself legalised:
+/// the 0.4.77 gate read on CORPLAP-3 (2026-09-07, session `6a9e5b03`)
+/// tripped once on an AV1 scroll at viewer age ≤ 20 ms and took two ×0.85
+/// cuts for it. Below this ceiling the gate is the MEASURED wait's call
+/// (`direct_gate_trips`); at or above it the gate trips on bytes regardless.
+/// `0` for the rate disables the gate, like the soft budget.
+pub fn direct_queue_hard_budget_bytes(rate_bps: u32, hrd_pct: usize) -> usize {
+    let soft = direct_queue_budget_bytes(rate_bps);
+    if soft == usize::MAX {
+        return usize::MAX;
+    }
+    let reservoir = (rate_bps as u64).saturating_mul(hrd_pct as u64) / 100 / 8;
+    soft.max(reservoir as usize)
+}
+
+/// FR-74 P1b — the direct gate's decision. `inflight` trips the gate when it
+/// reaches the hard ceiling, or when it reaches the soft (link-time) budget
+/// AND the measured send wait — enqueue→wire-complete of recent frames, or
+/// the live age of the frame at the head of the queue, whichever is larger —
+/// has crossed the lag bound `direct_queue_ms` denominates. Bytes on their
+/// own cannot tell a burst the wire is draining (a scroll on a LAN: 30+ Mbps
+/// at 10–20 ms of wait) from a backlog the viewer feels (the same bytes at
+/// 150+ ms on a thin Wi-Fi); the wait can, and it is the quantity the bound
+/// was always meant to cap. A budget of `usize::MAX` (no reference rate yet)
+/// never trips.
+pub fn direct_gate_trips(
+    inflight: usize,
+    soft_budget: usize,
+    hard_budget: usize,
+    measured_wait_ms: f64,
+    lag_bound_ms: u64,
+) -> bool {
+    if hard_budget != usize::MAX && inflight >= hard_budget {
+        return true;
+    }
+    soft_budget != usize::MAX && inflight >= soft_budget && measured_wait_ms >= lag_bound_ms as f64
+}
+
 /// HRD/VBV window for DIRECT sessions, as a percent of `maxrate`.
 /// Default 100 — HALF the rc.234 2× window. Field 2026-08-26 (neo16
 /// viewing Rozalina, hevc_qsv 2880×1800 direct): the 2× reservoir
@@ -1362,6 +1405,50 @@ mod tests {
         assert_eq!(direct_queue_budget_bytes(0), usize::MAX);
         // Direct HRD default is 1× maxrate; constrained keeps the rc.234 2×.
         assert_eq!(direct_hrd_pct(), 100);
+    }
+
+    /// FR-74 P1b — the hard ceiling is the encoder's reservoir when that is
+    /// larger than the link-time budget, and the gate below it is the
+    /// measured wait's call: a LAN scroll (bytes over the soft budget, wait
+    /// small) passes; a thin-wire backlog (same bytes, wait over the bound)
+    /// trips; the reservoir trips on bytes alone; no reference rate never trips.
+    #[test]
+    fn direct_gate_is_the_measured_waits_call_below_the_reservoir() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 34.56 Mbps AV1 direct (0.4.77 defaults on CORPLAP-3): soft = 150 ms
+        // = 648,000 bytes; the AV1 reservoir (200 %) = 8,640,000 bytes.
+        let soft = direct_queue_budget_bytes(34_560_000);
+        assert_eq!(soft, 648_000);
+        let hard = direct_queue_hard_budget_bytes(34_560_000, 200);
+        assert_eq!(hard, 8_640_000);
+        // A codec at 100 % on a small rung: the reservoir (375 KB at 3 Mbps)
+        // still exceeds the 56 KB soft budget, so the hard ceiling is it.
+        assert_eq!(direct_queue_hard_budget_bytes(3_000_000, 100), 375_000);
+        // ... and where the reservoir is SMALLER than the soft budget, the
+        // soft budget stays the ceiling (the gate can never be stricter than P1).
+        assert_eq!(direct_queue_hard_budget_bytes(8_000_000, 25), 250_000);
+        assert_eq!(direct_queue_budget_bytes(8_000_000), 150_000);
+        assert_eq!(direct_queue_hard_budget_bytes(0, 200), usize::MAX);
+        let bound = direct_queue_ms();
+        assert_eq!(bound, 150);
+        // The 0.4.77 residual: 1.2 MB in flight on the scroll, 20 ms of wait.
+        assert!(!direct_gate_trips(1_200_000, soft, hard, 20.0, bound));
+        // The same bytes on a wire that is not keeping up.
+        assert!(direct_gate_trips(1_200_000, soft, hard, 150.0, bound));
+        // Below the soft budget the wait alone never gates.
+        assert!(!direct_gate_trips(600_000, soft, hard, 400.0, bound));
+        // At the reservoir, bytes gate regardless of the wait.
+        assert!(direct_gate_trips(8_640_000, soft, hard, 0.0, bound));
+        // No reference rate yet: nothing gates.
+        assert!(!direct_gate_trips(
+            50_000_000,
+            usize::MAX,
+            usize::MAX,
+            5_000.0,
+            bound
+        ));
     }
 
     /// FR-74 P1 — the direct ceiling is the content-generous bound P0 measured

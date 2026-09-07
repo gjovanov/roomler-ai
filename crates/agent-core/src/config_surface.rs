@@ -578,7 +578,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "direct_queue_ms",
         "string",
-        "DIRECT-path send-queue byte budget (ms of the path's rate ceiling, 0-2000; it was ms of the AIMD's live target until FR-74 P1 measured that as a self-reinforcing trap): frame production skips while more than this much link time is queued, bounding the standing lag a drag burst can build on a direct session (field 2026-08-26: 100-345 KB queued = the sluggish, rubber-band drag). Empty = built-in 150; 0 = unbounded (pre-P1 posture). Env: ROOMLERD_DIRECT_QUEUE_MS. Restart required.",
+        "DIRECT-path send-queue byte budget (ms of the path's rate ceiling, 0-2000, and since FR-74 P1b also the lag bound: bytes over the budget gate only once the MEASURED send wait has crossed this many ms, while bytes alone gate at the encoder's HRD reservoir; it was ms of the AIMD's live target until FR-74 P1 measured that as a self-reinforcing trap): frame production skips while more than this much link time is queued, bounding the standing lag a drag burst can build on a direct session (field 2026-08-26: 100-345 KB queued = the sluggish, rubber-band drag). Empty = built-in 150; 0 = unbounded (pre-P1 posture). Env: ROOMLERD_DIRECT_QUEUE_MS. Restart required.",
     ),
     (
         "direct_hrd_pct",

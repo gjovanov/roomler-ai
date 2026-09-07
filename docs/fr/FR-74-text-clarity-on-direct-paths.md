@@ -170,6 +170,48 @@ this rolls there, so the release's defaults are what is tested: the operator's
 Notepad++ scroll on AV1, VP9 4:2:0 and H.264 stays readable while it moves
 (AC1), the heartbeat shows no cuts and no gate skips through the scroll windows,
 and the relay hosts' counters are unchanged (AC3).
+
+### P1b — the gate judges the measured wait (2026-09-07)
+
+The 0.4.77 gate read (session `6a9e5b03`, CORPLAP-3, av1_qsv 1920×1200 direct,
+the release's defaults, P0 knobs cleared) showed both halves of P1 working —
+ceiling 34.56 Mbps, scroll windows at 20–36 Mbps and 30–47 fps, viewer age
+≤ 20 ms throughout — and one residual: the 150 ms budget (648 KB at that
+ceiling) still tripped on the AV1 scroll burst. AV1's HRD window is floored at
+200 % of maxrate (8.6 MB) because Intel's VDENC hangs on a forced IDR larger
+than its reservoir (the rc.443 incident), so the encoder was *configured* to
+burst far past a budget the controller then read as congestion: gate ×1, 54
+skipped frames (~8 % of the scroll), two ×0.85 cuts 34.56 → 26.8 Mbps and
+~10 s of additive climb back — while the wire drained every byte at ≤ 20 ms of
+age. A controller cutting on a burst it had itself legalised.
+
+P1b makes the direct gate the **measured wait's** call:
+
+- **Measure.** The send task already records enqueue→wire-complete per frame
+  (`send_wait_us_*`, the P7 telemetry). The pump now keeps an EMA (α = 0.3 per
+  pass) of the per-pass average of those waits and — new — the *live age of the
+  frame the send task is writing* (`send_head_enqueued_us`): a stalled pipe
+  completes nothing, so a completion-based estimate reads stale-low exactly
+  when the queue is growing. The gate's wait is the larger of the two.
+- **Rule** (`rate_profile::direct_gate_trips`): bytes over the P1 budget gate
+  only when the measured wait has also crossed `direct_queue_ms`; bytes alone
+  gate at the hard ceiling `max(budget, reservoir)`, where the reservoir is the
+  encoder's own HRD window in bytes (`direct_queue_hard_budget_bytes`, with the
+  codec's effective `open_hrd_pct` — AV1's 200 % floor included). A LAN scroll
+  (1.2 MB in flight at 20 ms) passes; the same bytes at 150 ms on a thin wire
+  trip, the AIMD cuts on that evidence as before. Relay paths are untouched
+  byte for byte; `0` still disables the gate; no new switch — `direct_queue_ms`
+  keeps its meaning, which was always the lag bound.
+
+What it deletes: the byte count as a *proxy* for lag on direct paths. What it
+does not do: a standing lag the viewer feels stays the viewer age's call
+(FR-15) — this gate bounds the sender-side queue only. The first-time gate log
+line now carries `hard_budget` and `measured_wait_ms`, so a field read can tell
+which arm tripped.
+
+**Field gate.** The same Notepad++ scroll on the release's defaults: the
+heartbeat's scroll windows show `gate: 0`, no `frames_skipped` growth and no
+cuts, and the "direct byte-budget gate engaged" line is absent from the session.
 ### P2 — fewer keyframes on QSV
 
 Hysteresis at the top of the bitrate ladder, so a target hovering near a rung
@@ -205,6 +247,7 @@ disagree. FSR helps only when upscaling.
 |---|---|---|---|
 | P0 | A/B with existing knobs on CORPLAP-3 | — (settings only) | **done 2026-09-06** — A + B2 remove the blur on AV1, VP9 4:2:0 and H.264 by the operator's read; the queue budget denominated in the applied target was a self-reinforcing trap, the cap the limiter; VP9 4:4:4 (software) remains |
 | P1 | direct ceiling 0.25 bpp / [3, 48] M; direct queue budget denominated in the ceiling | — (no switch: `FFMPEG_MAXRATE_KBPS` and `direct_queue_ms` are the way back) | **built 2026-09-06** (§"P1 — as built"); field gate on the release carrying it |
+| P1b | the direct gate is the measured send wait's call below the encoder's HRD reservoir (EMA of completed waits ∨ live head-of-queue age); bytes alone gate only at the reservoir | — (no switch; `direct_queue_ms` keeps its meaning as the lag bound, `0` disables) | **built 2026-09-07** after the 0.4.77 read tripped P1's budget on a burst AV1 was configured to emit; field gate pending |
 | P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | proposed (P0 saw 37 → 0 swaps once the trap was gone; re-measure after P1) |
 | P3 | idle refine at native; the libvpx pump's per-real-frame budget (duration-aware rate control, no duplicate encodes at nominal fps) | `native_refine` | proposed — the software 4:4:4 blur is measured (`avg_qp` 184/255 on ~10 real fps) |
 | P4 | viewer display-scale pill + 1:1 guidance | — (UI) | proposed |
@@ -251,3 +294,4 @@ program FR-17 / 16 / 14.
 | 2026-09-06 19:51 UTC | 0.4.76 | CORPLAP-3, av1_qsv, direct, Sharper, no P0 keys | **Baseline #2 (FAIL first)**: six ×0.85 cuts in 16 s (9.68 → 2.24 Mbps), 49 gate-skipped frames, then 2.1–3.7 Mbps for minutes — the queue budget (150 ms of the applied target, ~47 KB at 2.5 Mbps) tripping on every text frame |
 | 2026-09-06 20:10–20:31 UTC | 0.4.76 | CORPLAP-3, av1_qsv, direct | **Cell A** (`direct_queue_ms` 600): one cut, back in 28 s, 0 rate swaps (was 37); operator: still blurred, especially the gutter. **Cell B** (+ cap 24 Mbps): 40 s scroll at 24 Mbps, 0 cuts / 0 skips, 12–25 Mbps, 25–40 fps; operator: clear, then blurred after 4–5 s (the 2× VBV draining), clears ~1 s after stopping, the second stop within 5 s stays blurred (settle-keyframe gap) |
 | 2026-09-06 21:25–21:28 UTC | 0.4.76 | CORPLAP-3, direct, all four codecs | **Cell B2** (A + cap 40 Mbps): operator — "could not reproduce it with AV1, VP9 4:2:0 and H.264 — only with VP9 4:4:4". AV1 0 cuts / 0 skips / 15.6–22 Mbps / 31–43 fps (a 55 Mbps burst window absorbed); vp9_qsv 0 cuts / 15.7 Mbps / 26 fps; h264_qsv 0 cuts / 23 Mbps / 32 fps. VP9-444 (libvpx SW) `avg_qp` 108 → 184/255 in the scroll on ~10 real captures/s repeat-encoded at 30, target 20.7 Mbps — its own mechanism (P3) |
+| 2026-09-07 06:34–06:40 UTC | 0.4.77 | CORPLAP-3, av1_qsv 1920×1200, direct, defaults (P0 knobs cleared 22:23 UTC the day before) | **P1 gate read**, session `6a9e5b03`: ceiling 34,560,000 confirmed; scroll windows 20–36 Mbps at 30–47 fps, viewer age ≤ 20 ms; **residual** — the 150 ms budget (648 KB) tripped once on the AV1 VBV burst (HRD floored at 200 % = 8.6 MB reservoir): 54 skips (~8 %), two ×0.85 cuts 34.56 → 29.38 → 26.8 Mbps, back within ~10 s; `set_bitrate: 7 swaps: 0 settle-KF: 10 gate: 1`. Operator's read of this session pending. ⇒ P1b |
