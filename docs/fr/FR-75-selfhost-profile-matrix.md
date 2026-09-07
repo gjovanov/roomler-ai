@@ -206,9 +206,8 @@ screenshot or a log before reporting it as one.
 
 ## Acceptance criteria
 
-- [x] **AC1** each of the five profiles installs on a clean VM by the documented self-host path.
-      ⚠️ Four from real self-host images (`v0.4.76-*`); `full` from a `hosted-*` stand-in, because
-      `latest` still predates FR-69 P8 (Finding 2). One more dispatch closes it.
+- [x] **AC1** each of the five profiles installs on a clean VM by the documented self-host path —
+      all five from published self-host images (`v0.4.81` + `v0.4.81-{collab,remote,mesh,access}`).
 - [x] **AC2** `/api/capabilities` matches the profile exactly (`modules` == expected,
       `switched_off` empty) for all five, and agrees with `/health`.
 - [x] **AC3** `collab`: two browsers exchange chat **and** complete a call with decoded, advancing
@@ -368,3 +367,52 @@ the fix named and the condition for deleting the entry — until the next self-h
 and a *Network* nav group unconditionally, which fails on `remote` for doing exactly the right
 thing. Three profiles mount no chat and the spec is meaningful on all of them; only the
 network-owned surfaces are conditional. Fixed in `b63bbd178`.
+
+### 2026-09-07 (second half) — clean sweep on `v0.4.81`, both open items closed
+
+```
+2026-09-07T15:56:30Z PASS pass=80 fail=0 warn=0 na=5 total=85
+image=ghcr.io/gjovanov/roomler-ai:v0.4.81   run=20260907-141658
+```
+
+| cell | image | result |
+|---|---|---|
+| `collab` | `v0.4.81-collab` | 10 PASS / 0 FAIL / 2 NA |
+| `remote` | `v0.4.81-remote` | 14 PASS / 0 FAIL / 2 NA |
+| `mesh` | `v0.4.81-mesh` | 18 PASS / 0 FAIL / 1 NA |
+| `access` | `v0.4.81-access` | 19 PASS / 0 FAIL |
+| `full` | `v0.4.81` | 19 PASS / 0 FAIL |
+
+No VM left on zeus; the five `NA`s are the by-design ones.
+
+**Finding 2 closed.** `v0.4.81` was published with `also_latest=true`, so `latest` and `v0.4.81`
+resolve to the same digest and the `full` cell no longer needs a `hosted-*` stand-in. The workspace
+was bumped to `0.4.81` first, so every image reports the number on its own tag — the `v0.4.76`
+family reported `0.4.79`, which was harmless but read as a discrepancy.
+
+**Finding 4 closed — and the first fix was only HALF of it.** `b720001c6` gated `AgentsSection`'s
+loads, which killed the `overlay-node` fetch and *two of the three* `tunnel-client` ones. The third
+came from the org dashboard, which guarded it on **`showFleet`** — and `fleet` is a different
+module, so a `remote` profile (fleet yes, network no) fired it anyway. A per-caller gate leaks the
+moment one caller reaches for the wrong predicate; `2f83a3cfc` (#1466) moves the guard **into the
+two stores**, where there is no predicate for a caller to get wrong. `has()` is fail-open until the
+server answers, so both guards are inert before first paint and in unit tests (1209 pass unchanged).
+
+⚠️ The lesson worth keeping: **the partial fix passed review and read as complete.** Only running
+the matrix against the published image showed it was not. That is the whole argument for this FR in
+one paragraph.
+
+**The absence matrix, from the final run** — five profiles, one probe set, each row matching that
+profile's claim:
+
+```
+                chat   conference   fleet   remote   network
+collab           401       401       404     404      404
+remote           404       404       401     401      404
+mesh             404       404       401     404      401
+access           404       404       401     401      401
+full             401       401       401     401      401     ← the control
+```
+
+`expected-failures.txt` is empty again and issue-filing is back on, so the next unexpected red
+opens an issue by itself.
