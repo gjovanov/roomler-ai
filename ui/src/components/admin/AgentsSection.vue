@@ -2576,20 +2576,34 @@ async function saveRoutes() {
   }
 }
 
+/** The two network-owned stores, loaded only where the server mounts `network`.
+ *
+ *  ⚠️ The TEMPLATE has always been gated (`v-if="caps.has('network')"`), but
+ *  these fetches were not — so on a `remote` profile the devices page fired
+ *  `/tenant/{id}/tunnel-client` and `/tenant/{id}/overlay-node` at a server
+ *  that correctly does not mount them, collecting four 404s and four console
+ *  errors on every visit. The server was right; the client was asking for
+ *  doors it had already decided not to draw. FR-69 P9's rule is that the SPA
+ *  gates on `/api/capabilities` — that has to cover what it FETCHES, not only
+ *  what it renders. (Found by the FR-75 profile matrix, #1447.) */
+function loadNetworkStores(tid: string) {
+  if (!caps.has('network')) return
+  overlayStore.fetchNodes(tid)
+  tunnelClientStore.fetchTunnelClients(tid)
+}
+
 onMounted(() => {
   // The GRID's own fetch fires from @update:options on mount — these load
   // the rich per-device stores the action menus and mobile cards read.
   agentStore.fetchAgents(props.tenantId)
   agentStore.fetchTenantMembers(props.tenantId)
-  overlayStore.fetchNodes(props.tenantId)
-  tunnelClientStore.fetchTunnelClients(props.tenantId)
+  loadNetworkStores(props.tenantId)
 })
 
 watch(() => props.tenantId, (tid) => {
   if (tid) {
     agentStore.fetchAgents(tid)
-    overlayStore.fetchNodes(tid)
-    tunnelClientStore.fetchTunnelClients(tid)
+    loadNetworkStores(tid)
     // Reset the grid to a clean first page for the new org.
     gridSearch.value = ''
     if (gridPage.value !== 1) gridPage.value = 1
