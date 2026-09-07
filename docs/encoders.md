@@ -245,6 +245,39 @@ security gate, since it only ever removes cells. The device reports it as
 `rate_factor_{h264,hevc,vp9}_444` (built-in 150, applied on top of the codec
 factor for a 4:4:4 cell; 4:2:0 is always 100).
 
+### The new cells (FR-77 P3b)
+
+```mermaid
+flowchart LR
+    R[rc:session.request<br/>chroma_pref = yuv444] --> C{codec}
+    C -- HEVC --> H["names_444(Hevc)<br/>hevc_nvenc → planar yuv444p<br/>hevc_qsv → VUYX (denylisted until its field test)"]
+    C -- H.264 --> A["names_444(H264)<br/>h264_nvenc → yuv444p, profile high444p"]
+    C -- VP9 --> V["names_444(Vp9)<br/>vp9_qsv → VUYX, profile1"]
+    H -- rejected --> H2[4:2:0 cascade,<br/>video-info says yuv420]
+    A -- rejected --> A2[4:2:0 cascade,<br/>video-info says yuv420]
+    V -- rejected --> V2[libvpx profile 1<br/>the software cell]
+```
+
+| Cell | Backend input | Browser decode | Auto-rank (explicit 4:4:4 only) |
+|---|---|---|---|
+| HEVC 4:4:4 | NVENC planar `yuv444p`, profile `rext`; QSV packed **VUYX**, profile `rext` — behind the denylist | hardware (Chrome ≥137 + NVIDIA, Intel Gen11+) | first: hardware on both ends |
+| H.264 4:4:4 | NVENC planar `yuv444p`, profile `high444p` | software (`avc1.F4xxxx`, High 4:4:4 Predictive) | second |
+| VP9 4:4:4 (hardware) | QSV packed **VUYX**, profile `profile1` | software (`vp09.01`) | third |
+| VP9 4:4:4 (software) | libvpx profile 1 | software | last — the only rung Sharper-on-Auto upgrades to |
+
+**VUYX** is why the P1 probe's 4:4:4 open of `vp9_qsv` failed: FFmpeg n9's
+QSV encoders list packed VUYX/XV30 and never planar 4:4:4. The pump keeps
+dcv's BT.601 I444 planes and interleaves them into one packed plane (V, U, Y,
+0xFF per pixel), so the packed path renders exactly as the planar one. The
+QSV profile is set explicitly in the `base` option tier; a driver that rejects
+the key falls to the defaults tier, where the runtime derives it from the
+frames. **VP9 has no 4:2:0 fallback on a rejected 4:4:4 open** — the viewer
+configured its decoder for profile 1 and a VP9 profile mismatch is a blank
+canvas, so the session dispatch probes the exact cell first and runs libvpx
+when it cannot open. HEVC and H.264 fall back to 4:2:0 and report the truth
+(`rc:video-info chroma`). A 4:4:4 session never shares a pipeline with a
+4:2:0 one of the same codec (`FfmpegDcCodec::pipeline_label`).
+
 ## Capture backends
 
 Cascade (first that works wins): synthetic (CI, env-gated) → **SystemContext**
