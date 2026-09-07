@@ -12,7 +12,7 @@ reconfig_idr option (default 1).
 ---
 --- a/libavcodec/nvenc.c
 +++ b/libavcodec/nvenc.c
-@@ -3010,9 +3010,12 @@
+@@ -2850,9 +2850,12 @@
          }
  
          if (reconfig_bitrate) {

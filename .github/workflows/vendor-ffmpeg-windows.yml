@@ -14,9 +14,9 @@ name: Vendor FFmpeg (Windows x64 MSVC static-md, LGPL)
 # ffmpeg-next (Phase 2) removed the avdevice/avfilter registration; this
 # build removes the registry's payload itself.
 #
-# The result uploads as `…-minimal.zip` NEXT TO the old full asset on the
-# vendored-ffmpeg-8.1.2 release — rollback in release-agent.yml is flipping
-# one filename back. Manifest keeps `avformat` (ffmpeg-next's `format`
+# The result uploads as `…-minimal.zip` to the
+# vendored-ffmpeg-9.0.1 release — rollback in release-agent.yml is flipping the
+# fetch back to the vendored-ffmpeg-8.1.2 assets. Manifest keeps `avformat` (ffmpeg-next's `format`
 # feature needs the lib + .pc to exist; rc.71 proved codec-alone doesn't
 # compile) and `swresample` (avcodec's .pc Requires it); avfilter/avdevice/
 # swscale/vpx are dropped at the PORT level — the agent's VP9 encoder is
@@ -42,7 +42,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $baseline = 'ccab4e210cbfb237aab29423a63108958949ef3c'
+          $baseline = '2e6b92385d891ae14291b7b926863f74ed59a7ad'
           # Same manifest/baseline lineage as the retired full build; the
           # component trim happens in the overlay portfile, not here.
           $manifest = @"
@@ -181,7 +181,7 @@ jobs:
           # NEW NAME next to the old full asset: release-agent.yml picks by
           # filename, so rollback = flip the pattern back to the non-minimal
           # zip (kept on the release untouched).
-          $zip = "$env:RUNNER_TEMP\ffmpeg-8.1.2-win64-msvc-static-md-lgpl-minimal.zip"
+          $zip = "$env:RUNNER_TEMP\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal.zip"
           # FR-62 A2 — carry the patch manifest inside the asset so
           # release-agent can prove the vendored libs match the committed
           # patches (see the build step). Present iff the build applied patches.
@@ -195,8 +195,8 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           "$hash  $(Split-Path $zip -Leaf)" | Out-File -Encoding ascii "$zip.sha256"
           Write-Host "zip: $([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB  sha256=$hash"
-          gh release upload vendored-ffmpeg-8.1.2 $zip "$zip.sha256" --repo "${{ github.repository }}" --clobber
-          Write-Host "uploaded $(Split-Path $zip -Leaf) to vendored-ffmpeg-8.1.2"
+          gh release upload vendored-ffmpeg-9.0.1 $zip "$zip.sha256" --repo "${{ github.repository }}" --clobber
+          Write-Host "uploaded $(Split-Path $zip -Leaf) to vendored-ffmpeg-9.0.1"
 
   # ────────────────────────────────────────────────────────────────────────
   # P3e: the Linux twin of the minimal build. The old linux64 asset was a
@@ -232,12 +232,12 @@ jobs:
           cmake --build /tmp/vpl/build -j"$(nproc)"
           sudo cmake --install /tmp/vpl/build --prefix /usr/local
           # amf: header-only.
-          git clone --depth 1 --branch v1.4.36 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git /tmp/amf
+          git clone --depth 1 --branch v1.5.2 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git /tmp/amf
           sudo mkdir -p /usr/local/include/AMF
           sudo cp -r /tmp/amf/amf/public/include/* /usr/local/include/AMF/
           sudo ldconfig
 
-          curl -sL -o /tmp/ffmpeg.tar.gz https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n8.1.2.tar.gz
+          curl -sL -o /tmp/ffmpeg.tar.gz https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n9.0.1.tar.gz
           mkdir -p /tmp/ffsrc && tar xf /tmp/ffmpeg.tar.gz -C /tmp/ffsrc --strip-components=1
           cd /tmp/ffsrc
           # FR-62 A2 — apply every roomler FFmpeg source patch (patch -p1 from
@@ -250,7 +250,7 @@ jobs:
           shopt -s nullglob
           for p in "$GITHUB_WORKSPACE"/.github/ffmpeg-patches/*.patch; do
             echo "ffmpeg patch: applying $(basename "$p")"
-            patch -p1 --no-backup-if-mismatch < "$p" || { echo "::error::patch $(basename "$p") failed to apply to n8.1.2"; exit 1; }
+            patch -p1 --no-backup-if-mismatch < "$p" || { echo "::error::patch $(basename "$p") failed to apply to n9.0.1"; exit 1; }
           done
           ( cd "$GITHUB_WORKSPACE" && sha256sum .github/ffmpeg-patches/*.patch 2>/dev/null | sed 's#\.github/ffmpeg-patches/##' ) > /tmp/ROOMLER-PATCHES.txt || true
           echo "roomler patch manifest:"; cat /tmp/ROOMLER-PATCHES.txt
@@ -330,9 +330,9 @@ jobs:
           # release-agent can prove the vendored libs match the committed
           # patches before it ships them.
           cp /tmp/ROOMLER-PATCHES.txt "$staging/ROOMLER-PATCHES.txt"
-          tar cJf /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz -C /tmp/stage ffmpeg-minimal
-          sha256sum /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz | tee /tmp/min.sha256
-          ls -la /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz
-          gh release upload vendored-ffmpeg-8.1.2 \
-            /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz \
+          tar cJf /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz -C /tmp/stage ffmpeg-minimal
+          sha256sum /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz | tee /tmp/min.sha256
+          ls -la /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz
+          gh release upload vendored-ffmpeg-9.0.1 \
+            /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz \
             --repo "${{ github.repository }}" --clobber

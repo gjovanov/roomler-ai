@@ -1,7 +1,7 @@
 name: Vendor FFmpeg (macOS arm64, LGPL)
 
 # One-off (workflow_dispatch) builder for a prebuilt LGPL FFmpeg on Apple
-# Silicon, uploaded to the `vendored-ffmpeg-8.1.2` GitHub Release so the
+# Silicon, uploaded to the `vendored-ffmpeg-9.0.1` GitHub Release so the
 # agent's `build-macos` job can FETCH it instead of compiling FFmpeg on
 # every release (the same prebuild-once model as the Linux BtbN build).
 #
@@ -25,8 +25,8 @@ on:
   workflow_dispatch:
     inputs:
       ffmpeg_ref:
-        description: 'FFmpeg git tag to build (must be an 8.1.x that maps to 8.1.2)'
-        default: 'n8.1.2'
+        description: 'FFmpeg git tag to build (must be an 9.0.x that maps to 9.0.1)'
+        default: 'n9.0.1'
         required: true
 
 permissions:
@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   build:
-    name: Build + upload FFmpeg 8.1.2 (macOS arm64, LGPL)
+    name: Build + upload FFmpeg 9.0.1 (macOS arm64, LGPL)
     runs-on: macos-14
     timeout-minutes: 90
     steps:
@@ -195,19 +195,19 @@ jobs:
         run: |
           set -euo pipefail
           cd "$OUT"
-          TAR="ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz"
+          TAR="ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz"
           tar cJf "$RUNNER_TEMP/$TAR" lib include
           cd "$RUNNER_TEMP"
           shasum -a 256 "$TAR" | tee "$TAR.sha256"
           echo "TAR=$RUNNER_TEMP/$TAR" >> "$GITHUB_ENV"
           echo "size: $(du -h "$TAR" | cut -f1)"
 
-      - name: Upload to the vendored-ffmpeg-8.1.2 release
+      - name: Upload to the vendored-ffmpeg-9.0.1 release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release upload vendored-ffmpeg-8.1.2 \
+          gh release upload vendored-ffmpeg-9.0.1 \
             "$TAR" "$TAR.sha256" \
             --repo "${{ github.repository }}" --clobber
-          echo "uploaded $(basename "$TAR") to vendored-ffmpeg-8.1.2"
+          echo "uploaded $(basename "$TAR") to vendored-ffmpeg-9.0.1"

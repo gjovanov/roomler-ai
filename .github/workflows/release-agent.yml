@@ -327,20 +327,20 @@ jobs:
         # release run died on exactly this in all three build jobs).
         run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
 
-      - name: Fetch vendored FFmpeg 8.1.2 (for the ffmpeg-encoder HEVC backend)
+      - name: Fetch vendored FFmpeg 9.0.1 (for the ffmpeg-encoder HEVC backend)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Prebuilt LGPL FFmpeg 8.1.2 (nvenc/qsv/amf/vaapi/vulkan HEVC + the
+          # Prebuilt LGPL FFmpeg 9.0.1 (nvenc/qsv/amf/vaapi/vulkan HEVC + the
           # LGPL libkvazaar SW encoder; NO GPL libx265 → the MIT agent stays
           # license-clean, matching the Windows vcpkg policy). Published once
-          # at the `vendored-ffmpeg-8.1.2` release and reused by every build
+          # at the `vendored-ffmpeg-9.0.1` release and reused by every build
           # instead of compiling FFmpeg from source: Ubuntu apt ships only
-          # FFmpeg 6.1, but `ffmpeg-next = 8.1` needs 8.x.
-          gh release download vendored-ffmpeg-8.1.2 \
+          # FFmpeg 6.1, but `ffmpeg-next = 9.0` needs 9.x.
+          gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz' \
             --dir /tmp/ffdl
           # P3e lever B (Linux twin): the MINIMAL from-source build — the ten
           # HW encoders + their parsers, nothing else (whole lib dir 2.5 MB
@@ -349,7 +349,7 @@ jobs:
           # vaapi/every-decoder were unreachable). Vendor job's runtime probe
           # asserts the encoder set; rollback = drop the `-minimal` suffix.
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # BtbN's pkgconfig files hardcode the build-machine prefix; rewrite
           # it to our extract path so pkg-config emits correct -L/-I flags.
@@ -410,7 +410,7 @@ jobs:
         # `ROOMLERD_OVERLAY_NETSTACK_SOCKS=<port>` — so shipping both
         # everywhere is inert until an operator opts a host in.
         # `ffmpeg-encoder` adds the FFmpeg HEVC backend (hevc_nvenc / qsv / amf
-        # / vaapi / vulkan) via the vendored FFmpeg 8.1.2 fetched above — the
+        # / vaapi / vulkan) via the vendored FFmpeg 9.0.1 fetched above — the
         # Linux/WSL counterpart to the Windows MF/vcpkg HEVC path.
         # `full` now includes `audio` (system-audio Opus track) → pulls cpal
         # (ALSA, libasound2-dev above) + audiopus (bundled libopus via CMake).
@@ -439,7 +439,7 @@ jobs:
         run: |
           set -euo pipefail
           # Ubuntu 24.04 ships FFmpeg 6.1 (libavcodec.so.60) but the agent links
-          # 8.1.2 (libavcodec.so.62), so the .deb must CARRY its own FFmpeg or it
+          # 9.0.1 (libavcodec.so.63), so the .deb must CARRY its own FFmpeg or it
           # won't start on a stock box. Ship each lib under its SONAME as a real
           # file (no symlinks) into /usr/lib/roomler-agent; RPATH wires it up.
           sudo apt-get update -qq && sudo apt-get install -y patchelf
@@ -664,7 +664,7 @@ jobs:
   # case 2026-08-15 on a Fedora Asahi Remix host (Apple M2) that meshes and
   # screen-shares fine but could never self-update.
   #
-  # Deliberately WITHOUT `ffmpeg-encoder`: the vendored FFmpeg 8.1.2 tree is
+  # Deliberately WITHOUT `ffmpeg-encoder`: the vendored FFmpeg 9.0.1 tree is
   # published for linux64/macos-arm64 only, there is no linux-arm64 build to
   # fetch, and the backend it feeds dispatches to nvenc/qsv/amf — none of
   # which exist on the Apple-silicon and Ampere hosts this targets. Dropping
@@ -1013,10 +1013,10 @@ jobs:
       # LRU-evicted by the repo's blown 10 GB cache budget — rc.176
       # measured a 29-min rebuild on a miss. Now built ONCE by
       # vendor-ffmpeg-windows.yml (identical manifest/baseline/triplet,
-      # LGPL-verified) and fetched from the vendored-ffmpeg-8.1.2 release
+      # LGPL-verified) and fetched from the vendored-ffmpeg-9.0.1 release
       # in seconds. Re-dispatch that workflow when bumping FFmpeg.
       # =======================================================================
-      - name: Fetch vendored FFmpeg 8.1.2 (win64 static-md, LGPL, minimal)
+      - name: Fetch vendored FFmpeg 9.0.1 (win64 static-md, LGPL, minimal)
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1028,9 +1028,9 @@ jobs:
           # vendor-ffmpeg-windows.yml's verify step asserts the symbol set).
           # Rollback = drop the `-minimal` suffix here; the full zip stays on
           # the same release untouched.
-          gh release download vendored-ffmpeg-8.1.2 --repo "${{ github.repository }}" `
-            --pattern 'ffmpeg-8.1.2-win64-msvc-static-md-lgpl-minimal.zip*' --dir $dl
-          $zip = "$dl\ffmpeg-8.1.2-win64-msvc-static-md-lgpl-minimal.zip"
+          gh release download vendored-ffmpeg-9.0.1 --repo "${{ github.repository }}" `
+            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal.zip*' --dir $dl
+          $zip = "$dl\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal.zip"
           $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           if ($actual -ne $expected) { Write-Host "::error::vendored FFmpeg sha256 mismatch (got $actual, want $expected)"; exit 1 }
@@ -1157,7 +1157,7 @@ jobs:
         # rc.65: `ffmpeg-encoder` adds the ffmpeg-next dep and exercises
         # the FFmpeg link via `linked_libavcodec_version()`. The actual
         # encoder backend lands in rc.66 — for now this RC verifies:
-        # (a) ffmpeg-next 8.x compiles against vcpkg's FFmpeg
+        # (a) ffmpeg-next 9.x compiles against vcpkg's FFmpeg
         # (b) hevc_qsv + vp9_qsv symbols are reachable (asserted by the
         #     unit test `libavcodec_version_is_ffmpeg_7_or_newer`)
         # (c) MSI size delta vs rc.64 is within budget (≤ +8 MB; HARD
@@ -1988,7 +1988,7 @@ jobs:
                   target/aarch64-apple-darwin/release/build/*vpx_sys* 2>/dev/null || true
           echo "stale libvpx build artefacts cleared"
 
-      - name: Fetch vendored FFmpeg 8.1.2 (macOS arm64 — VideoToolbox)
+      - name: Fetch vendored FFmpeg 9.0.1 (macOS arm64 — VideoToolbox)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -2011,15 +2011,15 @@ jobs:
           # against ~20 MB for the untrimmed tree that would have doubled
           # the .pkg.
           mkdir -p /tmp/ffdl "$RUNNER_TEMP/roomler-ffmpeg"
-          gh release download vendored-ffmpeg-8.1.2 \
+          gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz' \
             --dir /tmp/ffdl --clobber
           # NOTE: no --strip-components. The macOS tarball is packed as
           # `tar cJf … lib include` from the install prefix, so lib/ and
           # include/ are already at the root — unlike the Linux one, which
           # has a wrapping directory and does strip 1.
-          tar xf /tmp/ffdl/ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz \
+          tar xf /tmp/ffdl/ffmpeg-9.0.1-macos-arm64-lgpl-shared.tar.xz \
             -C "$RUNNER_TEMP/roomler-ffmpeg"
           # BSD sed needs an explicit (empty) backup suffix; GNU `sed -i`
           # would silently create files named after the next argument.
@@ -2225,7 +2225,7 @@ jobs:
           mkdir -p "$FW"
           # Where an `@rpath/…` dependency can actually be found. A dylib built
           # with `--install-name-dir=@rpath` (the vendored FFmpeg) advertises
-          # itself as `@rpath/libavcodec.62.dylib`, so `otool -L` on our binary
+          # itself as `@rpath/libavcodec.63.dylib`, so `otool -L` on our binary
           # reports that and NOT a filesystem path.
           #
           # ⚠️ Treating `@…` as "already handled" is wrong and was caught by the
@@ -2233,7 +2233,7 @@ jobs:
           # libvpx came from Homebrew with an absolute install name and got
           # bundled, while the four FFmpeg dylibs were skipped as already-@rpath
           # and NOTHING copied them — the staged binary then died
-          # `Library not loaded: @rpath/libavcodec.62.dylib`. `@rpath` says how
+          # `Library not loaded: @rpath/libavcodec.63.dylib`. `@rpath` says how
           # to LOOK for a library, never that it is present.
           RPATH_SEARCH="${FFMPEG_DIR:+$FFMPEG_DIR/lib}"
           bundle_deps() {
