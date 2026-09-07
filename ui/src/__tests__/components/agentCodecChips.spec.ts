@@ -156,3 +156,56 @@ describe('permissionWarnings', () => {
     expect(permissionWarnings(makeAgent(caps(['no-gui-session'])))).toEqual([])
   })
 })
+
+describe('FR-77 — codecChips reads video_cells when the agent sends them', () => {
+  it('marks a codec HW when any cell is verified hardware, and shows a 4:4:4 cell', () => {
+    const agent = {
+      id: 'a',
+      name: 'x',
+      capabilities: {
+        codecs: ['h264', 'h265', 'av1'],
+        hw_encoders: ['openh264-sw', 'ffmpeg-hevc_nvenc', 'ffmpeg-av1_nvenc', 'libvpx-vp9-444-sw'],
+        has_input_permission: true,
+        supports_clipboard: true,
+        supports_file_transfer: true,
+        max_simultaneous_sessions: 2,
+        video_cells: [
+          { codec: 'h264', backend: 'openh264', chroma: ['yuv420'], hw: false },
+          { codec: 'h264', backend: 'nvenc', chroma: ['yuv420', 'yuv444'], hw: true },
+          { codec: 'hevc', backend: 'nvenc', chroma: ['yuv420', 'yuv444'], hw: true },
+          { codec: 'av1', backend: 'nvenc', chroma: ['yuv420'], hw: true },
+          { codec: 'vp9', backend: 'libvpx', chroma: ['yuv420', 'yuv444'], hw: false },
+        ],
+      },
+    } as unknown as Parameters<typeof codecChips>[0]
+    const labels = codecChips(agent).map((c) => c.label)
+    expect(labels).toEqual(['H.264 HW 4:4:4', 'H.265 HW 4:4:4', 'AV1 HW', 'VP9 SW 4:4:4'])
+    const hevc = codecChips(agent).find((c) => c.label.startsWith('H.265'))
+    expect(hevc?.color).toBe('primary')
+    expect(hevc?.tooltip).toContain('nvenc')
+  })
+
+  it('an ffmpeg-only HEVC host used to chip as software; the cells fix that', () => {
+    const legacy = {
+      id: 'a',
+      name: 'x',
+      capabilities: {
+        codecs: ['h265'],
+        hw_encoders: ['ffmpeg-hevc_qsv'],
+        has_input_permission: true,
+        supports_clipboard: true,
+        supports_file_transfer: true,
+        max_simultaneous_sessions: 2,
+      },
+    } as unknown as Parameters<typeof codecChips>[0]
+    expect(codecChips(legacy).map((c) => c.label)).toEqual(['H.265 SW'])
+    const withCells = {
+      ...legacy,
+      capabilities: {
+        ...legacy.capabilities,
+        video_cells: [{ codec: 'hevc', backend: 'qsv', chroma: ['yuv420'], hw: true }],
+      },
+    } as unknown as Parameters<typeof codecChips>[0]
+    expect(codecChips(withCells).map((c) => c.label)).toEqual(['H.265 HW'])
+  })
+})

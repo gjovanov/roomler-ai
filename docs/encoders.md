@@ -155,6 +155,37 @@ Implementation notes worth keeping:
 - Verified by fault injection before shipping: with the child aborting, the
   parent logged `the probe child DIED`, fell back to no-HW caps and exited 0.
 
+### The cell matrix (FR-77 P1)
+
+The probe no longer stops at the first backend that works per codec. It opens
+**every encoder** (codec × backend) in cascade order and, for the names the
+FFmpeg n9.0 sources can open in 4:4:4 (`h264_nvenc`, `hevc_nvenc`, `hevc_qsv`,
+`vp9_qsv`, `hevc_vaapi`, `vp9_vaapi`), opens the 4:4:4 form too. What opened
+is the host's **cell matrix**, advertised in the hello as
+`AgentCaps.video_cells` — `{codec, backend, chroma[], hw}` per encoder, wire
+strings from `models::{VideoCodec, VideoBackend, ChromaFormat}`, unknown names
+ignored by older readers — plus `probe_ms`, the parent-measured cost of the
+whole probe (spawn to parsed result), so the fleet can measure what the
+matrix costs instead of assuming it.
+
+| Rule | Why |
+|---|---|
+| The legacy fields (`hw_encoders`, `codecs`, `transports`, `hevc_chroma`, `vp9_chroma`) keep their exact pre-FR-77 meaning — the FIRST backend in cascade order that opens | a session still cascades in that order, and a viewer older than FR-77 reads nothing else; `data-channel-vp9-444` stays on the wire although it carries both chroma formats |
+| `hw` is verified, never assumed | NVENC / AMF / VideoToolbox / VAAPI are hardware by construction; a QSV open proves hardware only on the oneVPL build (FFmpeg's internal MFX session filters `MFX_IMPL_TYPE_HARDWARE`, `qsv.c:518-522`), which `FfmpegEncoder::qsv_is_hardware_by_construction` detects by `av1_qsv` being registered (libvpl-only); the native MF cell reports what its cascade landed on |
+| HEVC 4:4:4 is **opened**, not asserted by name | P7 advertised `hevc_chroma: yuv444` for any `hevc_nvenc`; the legacy field now says 4:4:4 only when the `hevc_nvenc` 4:4:4 open succeeded |
+| `h264_nvenc` 4:4:4 sets `profile=high444p` | `rext` is HEVC's profile and h264_nvenc rejects it at open, which would read as "cannot do 4:4:4" |
+| **Denylist** = the kill switch: `name:chroma` cells never opened nor advertised; built-in default `hevc_qsv:yuv444,hevc_vaapi:yuv444` | the code called QSV Rext encode unreliable before ever opening it; each cell leaves the list on a field pass. `ROOMLERD_ENCODER_CELLS_DENY` (comma-separated; an EMPTY value denies nothing) **replaces** the default |
+| AV1, AMF, VideoToolbox and Media Foundation are never asked for 4:4:4 | `av1_nvenc` hard-errors on it and every other AV1 backend lists 4:2:0 only; AMF has no 4:4:4 surface; VideoToolbox HEVC has only Main / Main10 / Main42210; `*_mf` takes NV12 — a failed open they cannot pass would cost probe time for nothing (locked by test against the vocabulary) |
+
+Measured on the dev box (RTX 5090 Laptop + Radeon 610M, 2026-09-07): 8 cells —
+`h264/openh264`, `h264/mf` (hw), `hevc/nvenc` **4:2:0+4:4:4**, `hevc/amf`,
+`av1/nvenc`, `h264/nvenc` **4:2:0+4:4:4**, `h264/amf`, `vp9/libvpx` 4:2:0+4:4:4
+— in **3.5 s** (2.2–2.6 s before the matrix); the AMF cells were invisible until
+now because the cascade stopped at NVENC. The viewer reads cells through ONE
+derivation (`ui/src/composables/videoCells.ts`: `video_cells` when present, else
+the legacy fields as the rc.199 picker read them), for both the codec picker and
+the admin codec chips.
+
 ## Capture backends
 
 Cascade (first that works wins): synthetic (CI, env-gated) → **SystemContext**

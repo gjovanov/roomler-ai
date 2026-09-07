@@ -5,6 +5,13 @@ import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
 import type { Agent } from '@/stores/agents'
 import {
+  cellCodecOfTransport,
+  cellsFromCaps,
+  rememberCellFailure,
+  rememberedCellFailures,
+  resolveChroma,
+} from '@/composables/videoCells'
+import {
   bestClockSample,
   clockSample,
   epochNowUs,
@@ -1190,7 +1197,19 @@ export const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
  *  picker value that is not in it does not type-check anywhere. Before this the
  *  allow-list was a second, hand-maintained copy that missed `hevc-444`, so a
  *  per-agent HEVC 4:4:4 override was written and never read back. */
-export const RC_CODEC_CHOICES = ['auto', 'av1', 'hevc', 'hevc-444', 'vp9-444', 'vp9-420', 'h264'] as const
+export const RC_CODEC_CHOICES = [
+  'auto',
+  'av1',
+  'hevc',
+  'hevc-444',
+  'vp9',
+  'vp9-444',
+  'vp9-420',
+  'h264',
+  // FR-77 — the two-axis picker: codec "Auto" with an explicit chroma format.
+  'auto-444',
+  'auto-420',
+] as const
 
 export function readStoredCodecChoice(agentId: string): RcCodecChoice | null {
   try {
@@ -2141,6 +2160,18 @@ export interface AutoTransportInputs {
    *  Optional so existing callers/tests keep their meaning (absent =
    *  `balanced` = the pre-existing 4:2:0 behaviour). */
   priority?: RcPriority
+  /** FR-77 — the chroma dropdown. `yuv444` puts the 4:4:4 cells first (HEVC
+   *  Rext on a HW×HW pair, then VP9 profile 1) and falls back to the normal
+   *  rank when the pair has none; `yuv420` pins every rung to 4:2:0; `auto`
+   *  (or absent) lets the Priority dial decide — `sharper` then takes the
+   *  HEVC 4:4:4 cell when the pair has it. */
+  chromaPref?: 'auto' | 'yuv420' | 'yuv444'
+  /** FR-77 — the agent advertises an HEVC 4:4:4 cell (`video_cells`, or the
+   *  legacy `hevc_chroma`). Never optimistic: a chroma mismatch is a black
+   *  screen. */
+  agentHevc444?: boolean
+  /** FR-77 — WebCodecs accepts the HEVC Rext codec string here. */
+  viewerHevcRext?: boolean
 }
 
 /** rc.190 Ã¢ÂÂ pure HWÃÂHW transport rank for `videoTransport === 'auto'`.
@@ -2196,6 +2227,37 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
   // there are no older agent rows with the encoder but not the transport).
   const hasH264Dc = t.includes('data-channel-h264')
 
+  // FR-77 — chroma before codec. An explicit 4:4:4 (or Sharper with chroma on
+  // Auto) reaches for the one 4:4:4 cell that is hardware on BOTH ends —
+  // HEVC Rext — ahead of every 4:2:0 pair, because that is what the dropdown
+  // (or the dial) asked for. An explicit 4:4:4 then settles for VP9 profile 1
+  // (software encode, software decode) before giving up on full chroma;
+  // Sharper-on-Auto does NOT, since the SW rung below already knows how to
+  // trade for it. Both gates are the picker's: the agent must have OPENED the
+  // cell and this browser must accept the Rext string.
+  const want444 = inputs.chromaPref === 'yuv444'
+    || (inputs.chromaPref !== 'yuv420' && inputs.priority === 'sharper')
+  const force420 = inputs.chromaPref === 'yuv420'
+  const hevc444Pair = hasHevcDc
+    && inputs.viewerHevcHw
+    && inputs.viewerHevcDecodable
+    && inputs.viewerHevcRext === true
+    && inputs.agentHevc444 === true
+  if (want444 && hevc444Pair) {
+    return {
+      transport: 'data-channel-hevc',
+      chromaOverride: 'yuv444',
+      reason: 'HEVC 4:4:4: HW Rext encode on agent + HW Rext decode here',
+    }
+  }
+  if (inputs.chromaPref === 'yuv444' && hasVp9Dc && inputs.viewerVp9Decodable) {
+    return {
+      transport: 'data-channel-vp9-444',
+      chromaOverride: 'yuv444',
+      reason: 'VP9 4:4:4: the only full-chroma cell this pair has (SW encode, SW decode)',
+    }
+  }
+
   if (hasAv1Dc && inputs.viewerAv1Hw) {
     return {
       transport: 'data-channel-av1',
@@ -2230,7 +2292,8 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
   if (hasVp9Dc && inputs.viewerVp9Decodable) {
     // Sharper => full chroma. Safe here and ONLY here: libvpx always has
     // profile 1, and this rung's own guard IS the profile-1 decode probe.
-    if (inputs.priority === 'sharper') {
+    // FR-77 — an explicit 4:2:0 in the chroma dropdown overrides the dial.
+    if (inputs.priority === 'sharper' && !force420) {
       return {
         transport: 'data-channel-vp9-444',
         chromaOverride: 'yuv444',
@@ -2366,6 +2429,25 @@ export function codecChoiceToSettings(
         preferredCodec: null,
         renderPath: 'webcodecs',
       }
+    case 'vp9':
+      // FR-77 — VP9 with chroma "Auto": connect() resolves the chroma from
+      // the Priority dial (`resolveChroma`), so this is the one VP9 choice
+      // that follows the dial instead of pinning a profile.
+      return {
+        videoTransport: 'data-channel-vp9-444',
+        chroma: 'auto',
+        preferredCodec: null,
+        renderPath: 'webcodecs',
+      }
+    case 'auto-444':
+      // FR-77 — codec "Auto" + chroma 4:4:4: the auto-rank tries the 4:4:4
+      // cells first (HEVC Rext on a HW×HW pair, then VP9 profile 1) and
+      // falls back to the normal rank when this pair has none.
+      return { videoTransport: 'auto', chroma: 'yuv444', preferredCodec: null, renderPath: 'webcodecs' }
+    case 'auto-420':
+      // FR-77 — codec "Auto" + chroma 4:2:0: the normal rank, with the
+      // libvpx rung pinned to profile 0 whatever the Priority dial says.
+      return { videoTransport: 'auto', chroma: 'yuv420', preferredCodec: null, renderPath: 'webcodecs' }
     case 'h264':
       if (opts?.h264Rtp) {
         return { videoTransport: 'webrtc', chroma: 'auto', preferredCodec: 'h264', renderPath: 'video' }
@@ -2399,13 +2481,17 @@ export function settingsToCodecChoice(
       // pick; everything else (incl. the legacy 'auto') reads as plain HEVC.
       return chroma === 'yuv444' ? 'hevc-444' : 'hevc'
     case 'data-channel-vp9-444':
-      return chroma === 'yuv444' ? 'vp9-444' : 'vp9-420'
+      // FR-77 — an explicit chroma keeps its VP9 profile; `auto` is the
+      // dial-following `vp9` choice (it used to read as 4:2:0, which hid that
+      // the agent's default for an unstated chroma is profile 1).
+      return chroma === 'yuv444' ? 'vp9-444' : chroma === 'yuv420' ? 'vp9-420' : 'vp9'
     case 'data-channel-h264':
     case 'webrtc':
       return 'h264'
     case 'auto':
     default:
-      return 'auto'
+      // FR-77 — codec Auto remembers an explicit chroma.
+      return chroma === 'yuv444' ? 'auto-444' : chroma === 'yuv420' ? 'auto-420' : 'auto'
   }
 }
 
@@ -3643,6 +3729,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  misleading noise on DC sessions (the track is a dormant placeholder
    *  there â the DC worker path IS WebCodecs; field 2026-07-28). */
   let sessionDcTransport: string | null = null
+  /** FR-77 — the chroma format the current session's cell runs in, so a
+   *  decode failure is remembered against the right cell (`hevc:yuv444`
+   *  failing must not ban HEVC 4:2:0). Set where the request is built. */
+  let sessionCellChroma: 'yuv420' | 'yuv444' = 'yuv420'
   /** FR-17 — true when THIS session negotiated per-chunk framing: the
    *  agent advertised `chunk-framing` in `AgentCaps.video` and we asked
    *  for it in `rc:session.request`. Read by `startVp9_444Path` /
@@ -5734,6 +5824,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         stopVp9_444Path()
         if (vp9NeverDecoded && failedTransport && failedTransport !== 'auto' && failedTransport !== 'webrtc') {
           failedDcTransports.add(failedTransport)
+          // FR-77 — remembered per device × cell across page loads.
+          const failedCodec = cellCodecOfTransport(failedTransport)
+          if (codecAgentId && failedCodec) {
+            rememberCellFailure(codecAgentId, failedCodec, sessionCellChroma, globalThis.navigator?.userAgent ?? '')
+          }
           console.warn(`[rc] ${failedTransport} banned for this page (decoder failed before first frame) - reconnecting on the next-best transport`)
           if (lastConnectArgs) scheduleReconnect()
         }
@@ -6004,6 +6099,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         stopHevcPath()
         if (hevcNeverDecoded) {
           failedDcTransports.add('data-channel-hevc')
+          // FR-77 — remembered per device × cell (a Rext failure bans only
+          // the 4:4:4 cell; the 4:2:0 path is a different decoder profile).
+          if (codecAgentId) {
+            rememberCellFailure(codecAgentId, 'hevc', sessionCellChroma, globalThis.navigator?.userAgent ?? '')
+          }
           console.warn('[rc] data-channel-hevc banned for this page (decoder failed before first frame) - reconnecting on the next-best transport')
           if (lastConnectArgs) scheduleReconnect()
         }
@@ -7900,6 +8000,21 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // chroma_pref field.
     let hevcRextPick = false
     viewerDecodeHw.value = null
+    // FR-77 — cells whose decoder failed on real bytes for THIS device in
+    // this browser build stay out of every rank and pick, across page loads
+    // (the page-scoped `failedDcTransports` alone re-picked a proven-bad
+    // decoder on the next visit). A 4:2:0 failure bans the transport; a
+    // 4:4:4 failure only bans the 4:4:4 cell, since 4:2:0 on the same codec
+    // is a different decoder path.
+    const remembered = codecAgentId
+      ? rememberedCellFailures(codecAgentId, globalThis.navigator?.userAgent ?? '')
+      : new Set<string>()
+    if (remembered.has('av1:yuv420')) failedDcTransports.add('data-channel-av1')
+    if (remembered.has('hevc:yuv420')) failedDcTransports.add('data-channel-hevc')
+    if (remembered.has('h264:yuv420')) failedDcTransports.add('data-channel-h264')
+    if (remembered.has('vp9:yuv420')) failedDcTransports.add('data-channel-vp9-444')
+    const hevc444Remembered = remembered.has('hevc:yuv444')
+    const vp9_444Remembered = remembered.has('vp9:yuv444')
     if (videoTransport.value === 'auto') {
       // rc.190 (A3) Ã¢ÂÂ HWÃÂHW auto-rank. A codec is only smooth when it's
       // hardware on BOTH ends (field: VP9 is SW-encoded on non-Intel
@@ -7907,7 +8022,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // agent's advertised encoders with this browser's MediaCapabilities
       // and pick the best pair; explicit user picks skip this entirely.
       const caps = agent?.value?.capabilities
-      const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec] = await Promise.all([
+      const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec, hevcRext] = await Promise.all([
         probeAv1Hw(),
         probeHevcHw(),
         probeHevcDec(),
@@ -7915,10 +8030,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         probeVp9_444(),
         probeH264Hw(),
         probeH264Dc(),
+        probeHevcRext(),
       ])
       vp9_444Supported.value = vp9Dec
       hevcSupported.value = hevcDec
+      hevcRextSupported.value = hevcRext
+      // FR-77 — the agent's HEVC 4:4:4 cell, read through the one derivation
+      // (new `video_cells` or the legacy `hevc_chroma`), never optimistic.
+      const agentHevc444 = cellsFromCaps(caps).some(
+        (c) => c.codec === 'hevc' && c.chroma.includes('yuv444'),
+      )
       const pick = pickAutoTransport({
+        chromaPref: vp9_444Remembered && vp9Chroma.value !== 'yuv420' ? 'auto' : vp9Chroma.value,
+        agentHevc444: agentHevc444 && !hevc444Remembered,
+        viewerHevcRext: hevcRext && !hevc444Remembered,
         agentTransports: caps?.transports ?? [],
         agentHwEncoders: caps?.hw_encoders ?? [],
         viewerAv1Hw: av1Hw && !failedDcTransports.has('data-channel-av1'),
@@ -7939,6 +8064,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       preferredTransport = pick.transport
       chromaOverride = pick.chromaOverride
       if (pick.transport === 'data-channel-h264') h264DcCodec = h264Codec
+      // FR-77 — the rank picked the HEVC Rext cell: the request carries
+      // chroma_pref yuv444 exactly as an explicit hevc-444 pick would.
+      if (pick.transport === 'data-channel-hevc' && pick.chromaOverride === 'yuv444') {
+        hevcRextPick = true
+      }
       viewerDecodeHw.value =
         pick.transport === 'data-channel-av1'
           ? av1Hw
@@ -8003,6 +8133,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (supported && !failedDcTransports.has('data-channel-vp9-444')) {
         preferredTransport = 'data-channel-vp9-444'
         viewerDecodeHw.value = await isVp9HwDecodeSupported()
+        // FR-77 — chroma "Auto" on an explicit VP9 pick follows the Priority
+        // dial (it used to send nothing, which the agent reads as profile 1);
+        // a remembered profile-1 decode failure pins 4:2:0.
+        if (vp9_444Remembered) {
+          chromaOverride = 'yuv420'
+        } else if (vp9Chroma.value === 'auto') {
+          chromaOverride = resolveChroma('auto', priority.value, true)
+        }
+        if ((chromaOverride ?? vp9Chroma.value) === 'yuv444') {
+          // Profile 1 has no fixed-function decode anywhere.
+          viewerDecodeHw.value = false
+        }
       } else if (failedDcTransports.has('data-channel-vp9-444')) {
         console.info(
           '[rc] data-channel-vp9-444 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to webrtc.',
@@ -8034,11 +8176,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // honour it only when BOTH ends do Rext — this browser's probe AND
         // the agent's advertised hevc_chroma. Either missing → silently run
         // the normal 4:2:0 HEVC session (no chroma_pref sent).
-        if (vp9Chroma.value === 'yuv444') {
+        // FR-77 — chroma "Auto" on an explicit HEVC pick follows the Priority
+        // dial (Sharper ⇒ try Rext); a remembered Rext decode failure keeps
+        // the session on 4:2:0 without re-trying the broken cell.
+        if (
+          resolveChroma(vp9Chroma.value, priority.value, true) === 'yuv444'
+          && !hevc444Remembered
+        ) {
           const rext = hevcRextSupported.value || (await probeHevcRext())
           hevcRextSupported.value = rext
-          const agentRext =
-            agent?.value?.capabilities?.hevc_chroma?.includes('yuv444') === true
+          const agentRext = cellsFromCaps(agent?.value?.capabilities).some(
+            (c) => c.codec === 'hevc' && c.chroma.includes('yuv444'),
+          )
           if (rext && agentRext) {
             hevcRextPick = true
           } else {
@@ -8137,6 +8286,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       requestPayload.local_relay = localRelay
     }
     sessionDcTransport = preferredTransport
+    // FR-77 — which chroma cell this session runs in (mirrors the chroma_pref
+    // logic below; an unstated VP9 chroma is profile 1 on the agent).
+    sessionCellChroma =
+      preferredTransport === 'data-channel-vp9-444'
+        ? (chromaOverride ?? (vp9Chroma.value !== 'auto' ? vp9Chroma.value : 'yuv444')) === 'yuv444'
+          ? 'yuv444'
+          : 'yuv420'
+        : preferredTransport === 'data-channel-hevc' && hevcRextPick
+          ? 'yuv444'
+          : 'yuv420'
     if (preferredTransport) {
       requestPayload.preferred_transport = preferredTransport
       // rc.62 Ã¢ÂÂ chroma_pref is only meaningful on the

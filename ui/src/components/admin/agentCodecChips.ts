@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import type { Agent } from '@/stores/agents'
+import { cellsFromCaps, type CellCodec } from '@/composables/videoCells'
 
 export interface CodecChip {
   label: string
@@ -18,6 +19,29 @@ export interface CodecChip {
 export function codecChips(a: Agent): CodecChip[] {
   const caps = a.capabilities
   if (!caps) return []
+  // FR-77 — an agent that sends `video_cells` is read through the ONE
+  // derivation the picker uses, so the chips and the picker cannot disagree:
+  // a codec is HW when any of its cells is a verified hardware backend, and a
+  // 4:4:4 cell is shown, since that is what the operator hunting for crisp
+  // text needs to know. Older agents fall through to the legacy labels below.
+  if (Array.isArray(caps.video_cells) && caps.video_cells.length > 0) {
+    const cells = cellsFromCaps(caps)
+    const order: CellCodec[] = ['h264', 'hevc', 'av1', 'vp9']
+    return order
+      .filter((codec) => cells.some((c) => c.codec === codec))
+      .map((codec) => {
+        const mine = cells.filter((c) => c.codec === codec)
+        const isHw = mine.some((c) => c.hw)
+        const has444 = mine.some((c) => c.chroma.includes('yuv444'))
+        const display = codec === 'hevc' ? 'H.265' : codec === 'h264' ? 'H.264' : codec.toUpperCase()
+        const backends = [...new Set(mine.map((c) => c.backend).filter(Boolean))].join(', ')
+        return {
+          label: `${display} ${isHw ? 'HW' : 'SW'}${has444 ? ' 4:4:4' : ''}`,
+          color: isHw ? 'primary' : 'default',
+          tooltip: `${isHw ? 'Hardware-accelerated' : 'Software'} ${display} encoder${backends ? ` (${backends})` : ''}${has444 ? ' — can emit 4:4:4 (full colour resolution)' : ''}`,
+        }
+      })
+  }
   // Group hw_encoders by codec stem ("h264", "h265", "av1") so we can
   // tell HW from SW. "openh264-sw" → h264 SW; "mf-h264-hw" → h264 HW;
   // "mf-h265-hw" → h265 HW; etc.

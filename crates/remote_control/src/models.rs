@@ -247,6 +247,218 @@ pub struct AgentCaps {
     /// involvement.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layout: Vec<String>,
+    /// FR-77 — every **cell** (codec × chroma format) this host can produce,
+    /// one entry per *encoder* (codec × backend) the start-up probe actually
+    /// OPENED, with the chroma formats that open succeeded for. Additive: an
+    /// agent older than FR-77 sends nothing and a viewer derives cells from
+    /// the legacy fields (`hw_encoders`, `transports`, `hevc_chroma`,
+    /// `vp9_chroma`), which keep being filled forever — renaming or dropping
+    /// them would strand every deployed agent.
+    ///
+    /// The wire stays strings ([`VideoCell`]); both sides go through
+    /// [`VideoCodec`], [`VideoBackend`] and [`ChromaFormat`] so the vocabulary
+    /// lives in one place. Unknown codecs, backends or chroma formats from a
+    /// NEWER agent are ignored by an older reader, never an error — the
+    /// additive-list rule the `rpc` verbs follow.
+    ///
+    /// `hw` is VERIFIED, never assumed: NVENC, AMF, VideoToolbox and VAAPI are
+    /// hardware by construction; a QSV open is hardware only on the oneVPL
+    /// build, whose dispatcher filters `MFX_IMPL_TYPE_HARDWARE` and never
+    /// enumerates the CPU runtime; Media Foundation reports what its cascade
+    /// landed on; `openh264` and `libvpx` are software.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video_cells: Vec<VideoCell>,
+    /// FR-77 — wall-clock milliseconds the start-up capability probe took
+    /// (child spawn to parsed result), so the fleet can MEASURE what opening
+    /// every cell costs instead of assuming it. `None` when the probe child did
+    /// not come back (the caps are then the driver-free fallback) or from an
+    /// agent older than FR-77.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_ms: Option<u32>,
+}
+
+/// FR-77 — one encoder (codec × backend) and the chroma formats it produced
+/// when the probe opened it. See [`AgentCaps::video_cells`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct VideoCell {
+    /// A [`VideoCodec`] wire name: `h264` · `hevc` · `av1` · `vp9`.
+    pub codec: String,
+    /// A [`VideoBackend`] wire name: `nvenc` · `qsv` · `amf` · `videotoolbox`
+    /// · `vaapi` · `mf` · `openh264` · `libvpx`.
+    pub backend: String,
+    /// [`ChromaFormat`] wire names the open succeeded for, `yuv420` first.
+    #[serde(default)]
+    pub chroma: Vec<String>,
+    /// Verified hardware encode (see [`AgentCaps::video_cells`]).
+    #[serde(default)]
+    pub hw: bool,
+}
+
+/// FR-77 — a codec the agent can produce. Same contract as [`RpcCap`]: the
+/// wire is a string, the vocabulary is this enum, unknown strings are ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VideoCodec {
+    H264,
+    Hevc,
+    Av1,
+    Vp9,
+}
+
+impl VideoCodec {
+    /// Exactly what crosses the wire. ⚠️ A compatibility surface — see
+    /// [`RpcCap::wire`].
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+            Self::Av1 => "av1",
+            Self::Vp9 => "vp9",
+        }
+    }
+
+    pub const ALL: [VideoCodec; 4] = [Self::H264, Self::Hevc, Self::Av1, Self::Vp9];
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.wire() == s)
+    }
+}
+
+/// FR-77 — the implementation that produced a codec's bitstream. A property of
+/// the HOST, discovered at runtime, never chosen by the controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VideoBackend {
+    Nvenc,
+    Qsv,
+    Amf,
+    VideoToolbox,
+    Vaapi,
+    /// The agent's native Media Foundation module (Windows), not FFmpeg's
+    /// `*_mf` wrappers, which are deliberately not built.
+    MediaFoundation,
+    Openh264,
+    Libvpx,
+}
+
+impl VideoBackend {
+    /// Exactly what crosses the wire. ⚠️ A compatibility surface.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Nvenc => "nvenc",
+            Self::Qsv => "qsv",
+            Self::Amf => "amf",
+            Self::VideoToolbox => "videotoolbox",
+            Self::Vaapi => "vaapi",
+            Self::MediaFoundation => "mf",
+            Self::Openh264 => "openh264",
+            Self::Libvpx => "libvpx",
+        }
+    }
+
+    pub const ALL: [VideoBackend; 8] = [
+        Self::Nvenc,
+        Self::Qsv,
+        Self::Amf,
+        Self::VideoToolbox,
+        Self::Vaapi,
+        Self::MediaFoundation,
+        Self::Openh264,
+        Self::Libvpx,
+    ];
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|b| b.wire() == s)
+    }
+
+    /// Split an FFmpeg encoder name (`hevc_nvenc`, `h264_videotoolbox`) into
+    /// its codec and backend. `None` for a name this build does not know —
+    /// which is how a NEW backend fails loudly in a test instead of being
+    /// advertised under a name nobody parses.
+    pub fn from_ffmpeg_name(name: &str) -> Option<(VideoCodec, VideoBackend)> {
+        let (codec, backend) = name.split_once('_')?;
+        let codec = VideoCodec::from_wire(codec)?;
+        let backend = match backend {
+            "nvenc" => Self::Nvenc,
+            "qsv" => Self::Qsv,
+            "amf" => Self::Amf,
+            "videotoolbox" => Self::VideoToolbox,
+            "vaapi" => Self::Vaapi,
+            _ => return None,
+        };
+        Some((codec, backend))
+    }
+}
+
+/// FR-77 — how much colour resolution an encoded stream keeps. A property of
+/// the STREAM that both the encoder and the decoder must support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChromaFormat {
+    /// Colour at quarter resolution — the video default, every backend.
+    Yuv420,
+    /// Full colour resolution — what keeps coloured text and thin lines sharp.
+    Yuv444,
+}
+
+impl ChromaFormat {
+    /// Exactly what crosses the wire — the same spellings `vp9_chroma`,
+    /// `hevc_chroma` and `chroma_pref` have carried since rc.61.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Yuv420 => "yuv420",
+            Self::Yuv444 => "yuv444",
+        }
+    }
+
+    pub const ALL: [ChromaFormat; 2] = [Self::Yuv420, Self::Yuv444];
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.wire() == s)
+    }
+}
+
+/// FR-77 — a [`VideoCell`] read back through the vocabulary. Anything the
+/// reader does not know is simply not here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedCell {
+    pub codec: VideoCodec,
+    pub backend: VideoBackend,
+    pub chroma: Vec<ChromaFormat>,
+    pub hw: bool,
+}
+
+impl VideoCell {
+    /// Build a wire cell from the vocabulary — the producer side.
+    pub fn new(
+        codec: VideoCodec,
+        backend: VideoBackend,
+        chroma: &[ChromaFormat],
+        hw: bool,
+    ) -> Self {
+        Self {
+            codec: codec.wire().to_string(),
+            backend: backend.wire().to_string(),
+            chroma: chroma.iter().map(|c| c.wire().to_string()).collect(),
+            hw,
+        }
+    }
+
+    /// Parse a wire cell. `None` when the codec or backend is unknown to this
+    /// build (a NEWER agent), and unknown chroma strings are dropped — the
+    /// additive-list rule.
+    pub fn typed(&self) -> Option<TypedCell> {
+        let codec = VideoCodec::from_wire(&self.codec)?;
+        let backend = VideoBackend::from_wire(&self.backend)?;
+        let chroma = self
+            .chroma
+            .iter()
+            .filter_map(|c| ChromaFormat::from_wire(c))
+            .collect();
+        Some(TypedCell {
+            codec,
+            backend,
+            chroma,
+            hw: self.hw,
+        })
+    }
 }
 
 /// A verb in [`AgentCaps::rpc`] — "this agent understands this frame".
@@ -385,6 +597,26 @@ impl AgentCaps {
     /// error.
     pub fn has_rpc(&self, cap: RpcCap) -> bool {
         self.rpc.iter().any(|v| v == cap.wire())
+    }
+
+    /// FR-77 — the cells this reader can name. Entries from a newer agent
+    /// whose codec or backend this build does not know are skipped, and a
+    /// pre-FR-77 agent yields an empty list — callers then fall back to the
+    /// legacy fields, never to an error.
+    pub fn typed_cells(&self) -> Vec<TypedCell> {
+        self.video_cells
+            .iter()
+            .filter_map(VideoCell::typed)
+            .collect()
+    }
+
+    /// FR-77 — can this host produce `codec` in `chroma` on ANY backend?
+    /// Reads only [`Self::video_cells`]; an agent that predates them answers
+    /// `false` here and is judged by the legacy fields instead.
+    pub fn has_cell(&self, codec: VideoCodec, chroma: ChromaFormat) -> bool {
+        self.typed_cells()
+            .iter()
+            .any(|c| c.codec == codec && c.chroma.contains(&chroma))
     }
 }
 
@@ -3750,6 +3982,155 @@ mod tests {
         for cap in RpcCap::ALL {
             assert!(!old.has_rpc(cap), "{cap:?} must not be implied by silence");
         }
+    }
+
+    /// FR-77 — the cell vocabulary follows the `RpcCap` contract: every wire
+    /// string is unique and round-trips, and the spellings are LOCKED because
+    /// changing one silently un-advertises a cell on every deployed agent.
+    #[test]
+    fn video_cell_vocabulary_is_unique_locked_and_round_trips() {
+        assert_eq!(
+            VideoCodec::ALL.map(VideoCodec::wire),
+            ["h264", "hevc", "av1", "vp9"]
+        );
+        assert_eq!(
+            VideoBackend::ALL.map(VideoBackend::wire),
+            [
+                "nvenc",
+                "qsv",
+                "amf",
+                "videotoolbox",
+                "vaapi",
+                "mf",
+                "openh264",
+                "libvpx"
+            ]
+        );
+        assert_eq!(
+            ChromaFormat::ALL.map(ChromaFormat::wire),
+            ["yuv420", "yuv444"]
+        );
+        for c in VideoCodec::ALL {
+            assert_eq!(VideoCodec::from_wire(c.wire()), Some(c));
+        }
+        for b in VideoBackend::ALL {
+            assert_eq!(VideoBackend::from_wire(b.wire()), Some(b));
+        }
+        for c in ChromaFormat::ALL {
+            assert_eq!(ChromaFormat::from_wire(c.wire()), Some(c));
+        }
+        assert_eq!(
+            VideoCodec::from_wire("h265"),
+            None,
+            "the wire name is hevc, not h265"
+        );
+    }
+
+    /// Every FFmpeg name the agent's dispatch tables carry must parse, and a
+    /// name this build does not know must NOT parse — that is how a backend
+    /// added to a table without a vocabulary entry fails in a test instead
+    /// of shipping under a name no viewer understands.
+    #[test]
+    fn ffmpeg_names_split_into_codec_and_backend() {
+        use VideoBackend as B;
+        use VideoCodec as C;
+        for (name, want) in [
+            ("hevc_nvenc", (C::Hevc, B::Nvenc)),
+            ("h264_qsv", (C::H264, B::Qsv)),
+            ("av1_amf", (C::Av1, B::Amf)),
+            ("vp9_qsv", (C::Vp9, B::Qsv)),
+            ("h264_videotoolbox", (C::H264, B::VideoToolbox)),
+            ("hevc_vaapi", (C::Hevc, B::Vaapi)),
+        ] {
+            assert_eq!(B::from_ffmpeg_name(name), Some(want), "{name}");
+        }
+        for unknown in [
+            "hevc_mf",
+            "h264_vulkan",
+            "av1_d3d12va",
+            "libx264",
+            "hevc",
+            "",
+        ] {
+            assert_eq!(
+                B::from_ffmpeg_name(unknown),
+                None,
+                "{unknown:?} must not parse"
+            );
+        }
+    }
+
+    /// The additive-list rule for cells: a newer agent's unknown codec /
+    /// backend / chroma is skipped, never an error, and a pre-FR-77 agent
+    /// (no `video_cells` key at all) yields no cells and `has_cell == false`.
+    #[test]
+    fn unknown_cells_are_ignored_and_absent_cells_advertise_nothing() {
+        let caps = AgentCaps {
+            video_cells: vec![
+                VideoCell::new(
+                    VideoCodec::Hevc,
+                    VideoBackend::Nvenc,
+                    &[ChromaFormat::Yuv420, ChromaFormat::Yuv444],
+                    true,
+                ),
+                VideoCell {
+                    codec: "vvc".into(),
+                    backend: "nvenc".into(),
+                    chroma: vec!["yuv420".into()],
+                    hw: true,
+                },
+                VideoCell {
+                    codec: "av1".into(),
+                    backend: "vulkan".into(),
+                    chroma: vec!["yuv420".into()],
+                    hw: true,
+                },
+                VideoCell {
+                    codec: "vp9".into(),
+                    backend: "libvpx".into(),
+                    chroma: vec!["yuv420".into(), "yuv422".into(), "yuv444".into()],
+                    hw: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let typed = caps.typed_cells();
+        assert_eq!(
+            typed.len(),
+            2,
+            "the vvc and vulkan cells are unknown here: {typed:?}"
+        );
+        assert_eq!(
+            typed[1].chroma,
+            vec![ChromaFormat::Yuv420, ChromaFormat::Yuv444]
+        );
+        assert!(caps.has_cell(VideoCodec::Hevc, ChromaFormat::Yuv444));
+        assert!(
+            !caps.has_cell(VideoCodec::Av1, ChromaFormat::Yuv420),
+            "the vulkan cell is unreadable here"
+        );
+        assert!(!caps.has_cell(VideoCodec::H264, ChromaFormat::Yuv420));
+
+        // The pre-FR-77 shape: the six bare fields only.
+        let old: AgentCaps = serde_json::from_str(
+            r#"{"hw_encoders":["ffmpeg-hevc_nvenc"],"codecs":["h264","h265"],"has_input_permission":true,"supports_clipboard":true,"supports_file_transfer":true,"max_simultaneous_sessions":2}"#,
+        )
+        .unwrap();
+        assert!(old.video_cells.is_empty());
+        assert!(old.probe_ms.is_none());
+        assert!(!old.has_cell(VideoCodec::Hevc, ChromaFormat::Yuv420));
+
+        // Empty cells and an absent probe time stay OFF the wire.
+        let wire = serde_json::to_string(&AgentCaps::default()).unwrap();
+        assert!(
+            !wire.contains("video_cells") && !wire.contains("probe_ms"),
+            "{wire}"
+        );
+
+        // And a full round trip keeps every field of a cell.
+        let wire = serde_json::to_string(&caps).unwrap();
+        let back: AgentCaps = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.video_cells, caps.video_cells);
     }
 
     #[test]
