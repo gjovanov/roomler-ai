@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-77 P3 — the encoder probe cache.
 //!
 //! The matrix probe opens every encoder × chroma cell for real (P1): 3.9 s on
