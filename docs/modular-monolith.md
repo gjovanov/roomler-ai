@@ -167,6 +167,71 @@ wherever fleet is mounted.
 
 ---
 
+## 4b. Proving a profile *works* — FR-75
+
+Everything above establishes what a profile **links** and what string it **advertises**. Neither
+says it can carry traffic, and that gap has a precedent worth stating plainly: the 2026-08-26
+mediasoup RTC-range incident had *flawless signalling* — join, transports, producers and consumers
+all green — and **zero media**, for weeks, on a subset of tenants, with nothing logged. A
+`/health` line saying `conference` would have been true and useless.
+
+So [FR-75](fr/FR-75-selfhost-profile-matrix.md) adds a cell per profile that installs the published
+image the documented self-host way and then makes the pillar **do its job**. The ladder is
+cheapest-first, so a build that cannot pass a gate never boots a browser:
+
+```mermaid
+flowchart TD
+    I["<b>install</b><br/>clone → .env.selfhost → compose pull → up -d<br/>/health AND / both answer"]
+    C["<b>gate 1 — composition</b><br/>/api/capabilities .modules == the profile's set<br/>switched_off empty · /health agrees · no saas"]
+    P["<b>gate 2 — the doors</b><br/>five unauthenticated GETs<br/><b>401 = mounted · 404 = dropped</b> · 500 is a failure"]
+    R["<b>register</b><br/>owner + org through the public API<br/>(there is no seeded account)"]
+    subgraph T["traffic — the part only a cell can prove"]
+        direction LR
+        CO["<b>collab</b><br/>chat over /ws +<br/>a 2-party call, decoded<br/>frames advancing BOTH sides"]
+        RD["<b>remote</b><br/>an enrolled agent streams<br/>advancing frames"]
+        ME["<b>mesh</b><br/>TWO agents in peers,<br/>ping round-trips BOTH ways"]
+    end
+    I --> C --> P --> R --> T
+    style P fill:#e8f0fe
+    style T fill:#e6f4ea
+```
+
+| profile | must WORK | must be ABSENT | VMs in the cell |
+|---|---|---|---|
+| `full` | all three | — (**the 401 control** for every absence probe) | server + 2 agents |
+| `collab` | chat + a real call | fleet · remote · network | server only |
+| `remote` | remote-desktop frames | chat · conference · network | server + 1 agent |
+| `mesh` | `peers` + `ping` both ways | chat · conference · remote | server + 2 agents |
+| `access` | remote desktop **and** mesh | chat · conference | server + 2 agents |
+
+The five probes, each verified against `crates/tests/fixtures/composition.baseline.json`:
+`chat` → `/api/tenant/{tid}/room` · `conference` → `…/room/{rid}/call/participant` ·
+`fleet` → `…/agent` · `remote` → `/api/turn/credentials` · `network` → `…/tunnel-client`.
+
+Three properties of the design are load-bearing:
+
+- **Absence is asserted positively, with a control.** A 404 is the claim; the *same probe on
+  `full` answering 401* is what makes the 404 mean something. A grep that matches nothing is not
+  evidence — the FR-46 lesson, where an audit died silently at the moment it succeeded.
+- **A dropped module answers 404, never 500.** 500 would mean a route mounted onto absent state.
+- **The browser runs inside the server VM**, against loopback. RTP does not survive a
+  port-forward; a LAN URL is not a secure context, so `navigator.mediaDevices` is `undefined`; and
+  `ROOMLER__APP__FRONTEND_URL` must **equal** the browser's Origin or the cookie-authenticated
+  `/ws` upgrade is 403'd. The prod e2e lane uses an in-pod sidecar for the same three reasons.
+
+⚠️ **A second machine needs TLS.** `roomlerd enroll` rewrites `http://` to `https://` for any
+non-loopback host — enrollment tokens must travel over TLS — so a plain-HTTP self-host can only
+enrol devices from its own box. ⚠️ And the daemon's two TLS stacks disagree about a self-signed
+certificate that is its own CA: enrollment (OpenSSL) accepts it, the signalling WebSocket (rustls)
+refuses it as `CaUsedAsEndEntity`. The visible symptom is an agent that enrols perfectly and never
+comes online.
+
+**Verified 2026-09-07** on `v0.4.76-{collab,remote,mesh,access}` and a current-code `full`: all
+five cells green, 79 checks. The harness is `roomler-ai-deploy/profiletest/` plus the
+`profiletest` skill.
+
+---
+
 ## 5. Runtime gating — one predicate for navigation and routes
 
 ```mermaid
