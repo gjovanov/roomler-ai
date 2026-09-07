@@ -746,6 +746,8 @@ pub struct DesiredConfigView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder_cells_deny: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -768,6 +770,7 @@ impl From<roomler_ai_remote_control::models::DesiredConfig> for DesiredConfigVie
             ssh_authorized_keys: d.ssh_authorized_keys,
             ssh_account_mode: d.ssh_account_mode,
             ssh_port: d.ssh_port,
+            encoder_cells_deny: d.encoder_cells_deny,
             updated_by: d.updated_by.map(|i| i.to_hex()),
             updated_at: d.updated_at.map(fmt_dt),
         }

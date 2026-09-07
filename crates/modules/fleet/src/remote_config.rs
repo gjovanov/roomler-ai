@@ -33,6 +33,8 @@ pub struct DesiredConfigBody {
     pub ssh_account_mode: Option<String>,
     #[serde(default)]
     pub ssh_port: Option<u16>,
+    #[serde(default)]
+    pub encoder_cells_deny: Option<String>,
 }
 
 /// ⚠️ `desired` is the SAME projection the listing returns
@@ -166,6 +168,7 @@ pub async fn set_desired_config(
         ssh_authorized_keys: body.ssh_authorized_keys,
         ssh_account_mode: body.ssh_account_mode,
         ssh_port: body.ssh_port,
+        encoder_cells_deny: body.encoder_cells_deny,
         revision: agent.desired_config.revision + 1,
         updated_by: Some(auth.user_id),
         updated_at: Some(DateTime::now()),
@@ -475,5 +478,24 @@ mod tests {
             ..Default::default()
         };
         decide(DEFAULT_ADMIN, &current, &DesiredConfig::default()).unwrap();
+    }
+
+    /// FR-77 P3 — the cell denylist is the matrix's kill switch, not a
+    /// security gate: it only ever REMOVES cells, so a device admin without
+    /// either grant bit may push it, and pushing it grants nothing.
+    #[test]
+    fn the_encoder_denylist_needs_only_manage_agents() {
+        let deny = DesiredConfig {
+            encoder_cells_deny: Some("hevc_qsv:yuv444,vp9_qsv:yuv444".into()),
+            ..Default::default()
+        };
+        decide(DEFAULT_ADMIN, &DesiredConfig::default(), &deny)
+            .expect("MANAGE_AGENTS alone may set the denylist");
+        assert!(!deny.touches_exec() && !deny.touches_ssh());
+        assert!(!deny.is_empty(), "a denylist-only request is a request");
+        assert_eq!(
+            decide(0, &DesiredConfig::default(), &deny),
+            Err(ConfigDenyReason::NotDeviceAdmin)
+        );
     }
 }

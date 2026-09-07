@@ -146,13 +146,24 @@ pub fn codec_rate_factor_pct(codec_label: &str) -> usize {
     }
 }
 
-/// P7 — chroma ceiling factor, composed multiplicatively with
-/// [`codec_rate_factor_pct`]: 4:4:4 carries 2× the chroma samples, so give
-/// it the same ×1.5 band the libvpx VP9-444 pump ships. The relay clamp
-/// still applies AFTER the composed factor (pipe physics don't grow with
-/// the chroma), so a relayed 4:4:4 session stays at `relay_max_bps`.
-pub fn chroma_rate_factor_pct(chroma444: bool) -> usize {
-    if chroma444 { 150 } else { 100 }
+/// FR-77 P3 — the chroma column of the ceiling table: the factor a 4:4:4
+/// cell applies ON TOP of [`codec_rate_factor_pct`]. Built-in 150 for every
+/// codec — what the libvpx 4:4:4 pump used before the column existed —
+/// until a cell's field test sets its own through
+/// `ROOMLERD_RATE_FACTOR_<CODEC>_444` (config `rate_factor_<codec>_444`),
+/// clamped 50–400 like the codec factors. Always 100 for 4:2:0.
+pub fn chroma_rate_factor_pct(codec_label: &str, chroma444: bool) -> usize {
+    if !chroma444 {
+        return 100;
+    }
+    const BUILTIN: usize = 150;
+    match tunnel_core::env::node_env(&format!("RATE_FACTOR_{codec_label}_444")) {
+        Some(v) => match v.trim().parse::<usize>() {
+            Ok(pct) => pct.clamp(50, 400),
+            Err(_) => BUILTIN,
+        },
+        None => BUILTIN,
+    }
 }
 
 /// P3 — codec-factor-aware ceiling. `factor_pct` scales the bpp-derived rate
@@ -1207,6 +1218,37 @@ mod tests {
         assert_eq!(codec_rate_factor_pct("H264"), 150);
     }
 
+    /// FR-77 P3 — the chroma column: 100 for 4:2:0 always; 150 built-in for
+    /// a 4:4:4 cell, per-codec override through the `_444` twin of the codec
+    /// factor, clamped and garbage-tolerant like it. One fn on purpose: env.
+    #[test]
+    fn chroma_column_defaults_and_env_override() {
+        for codec in ["H264", "HEVC", "VP9"] {
+            assert_eq!(chroma_rate_factor_pct(codec, false), 100);
+            assert_eq!(chroma_rate_factor_pct(codec, true), 150);
+        }
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_VP9_444", "120") };
+        assert_eq!(chroma_rate_factor_pct("VP9", true), 120);
+        assert_eq!(
+            chroma_rate_factor_pct("VP9", false),
+            100,
+            "4:2:0 never reads the column"
+        );
+        assert_eq!(
+            chroma_rate_factor_pct("HEVC", true),
+            150,
+            "another codec's column is untouched"
+        );
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_VP9_444", "10") };
+        assert_eq!(chroma_rate_factor_pct("VP9", true), 50);
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_VP9_444", "9000") };
+        assert_eq!(chroma_rate_factor_pct("VP9", true), 400);
+        unsafe { tunnel_core::env::test_env::set_as("ROOMLERD_", "RATE_FACTOR_VP9_444", "crisp") };
+        assert_eq!(chroma_rate_factor_pct("VP9", true), 150);
+        unsafe { tunnel_core::env::test_env::clear("RATE_FACTOR_VP9_444") };
+        assert_eq!(chroma_rate_factor_pct("VP9", true), 150);
+    }
+
     #[test]
     fn qsv_config_grants_long_gop_only_for_a_measured_honouring_mode() {
         // Unprobed → rc.219 containment.
@@ -1241,14 +1283,14 @@ mod tests {
     // P7 — chroma factor composes multiplicatively with the codec factor.
     #[test]
     fn chroma_factor_composes_with_codec_factor() {
-        assert_eq!(chroma_rate_factor_pct(true), 150);
-        assert_eq!(chroma_rate_factor_pct(false), 100);
+        assert_eq!(chroma_rate_factor_pct("HEVC", true), 150);
+        assert_eq!(chroma_rate_factor_pct("HEVC", false), 100);
         // The pump's compose rule at the HEVC built-in (125): 4:4:4 → 187 %
         // of the base band; 4:2:0 leaves it unchanged. Literals only — the
         // codec-factor env test above mutates ROOMLERD_RATE_FACTOR_HEVC
         // and cargo runs tests in parallel threads.
-        assert_eq!(125 * chroma_rate_factor_pct(true) / 100, 187);
-        assert_eq!(125 * chroma_rate_factor_pct(false) / 100, 125);
+        assert_eq!(125 * chroma_rate_factor_pct("HEVC", true) / 100, 187);
+        assert_eq!(125 * chroma_rate_factor_pct("HEVC", false) / 100, 125);
     }
 
     #[test]
