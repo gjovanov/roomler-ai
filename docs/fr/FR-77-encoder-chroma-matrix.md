@@ -260,6 +260,49 @@ flowchart LR
   `names_444(codec)` = the cascade minus the denylist) so the probe's advertisement and
   the pump's 4:4:4 cascade (P3b) can never disagree.
 
+### P3b — as built (#1489): the cells
+
+- **VUYX is the 4:4:4 input for QSV and VAAPI** (`chroma444_pixel(name)`): FFmpeg n9's
+  `vp9_qsv` / `hevc_qsv` list packed VUYX and XV30 and never planar 4:4:4 — the reason
+  the P1 probe's 4:4:4 open of `vp9_qsv` failed on CORPLAP-3 while the name was on the
+  attempt list. The pump keeps dcv's BT.601 I444 planes and interleaves them
+  (`pack_vuyx`: V, U, Y, 0xFF per pixel — `AV_PIX_FMT_VUYX` byte order) into ONE packed
+  plane the frame is built from, so the packed path renders identically to the planar
+  one. NVENC keeps planar `yuv444p`. QSV's profile is set explicitly (`rext` for HEVC,
+  `profile1` for VP9) in the `base` tier: a driver that rejects the key falls to the
+  defaults tier, where the runtime derives the profile from the VUYX frames itself.
+- **The 4:4:4 cascade is `cells::names_444(codec)`** — the source matrix minus the
+  denylist, in cascade order — in every constructor: `new_hevc_adaptive` (hevc_nvenc,
+  then hevc_qsv once the denylist lets it), `new_h264_adaptive` (h264_nvenc, High 4:4:4
+  Predictive), `new_vp9_adaptive` (vp9_qsv profile 1). HEVC and H.264 fall back to the
+  4:2:0 cascade on rejection and the pump reports the truth (`cell_444` from
+  `enc.chroma444()`, `rc:video-info chroma`); **VP9 deliberately does not** — the
+  viewer configured its decoder for profile 1 and a VP9 profile mismatch is a blank
+  canvas, so a rejected `vp9_qsv` 4:4:4 returns `Err` and the session dispatch, which
+  probes the exact cell first, runs libvpx (the software profile-1 path) instead.
+- **The pump is chroma-generic**: `hevc_444` became `cell_444` (any codec but AV1), the
+  shared-pipeline key is `FfmpegDcCodec::pipeline_label(chroma444)` (`HEVC-444`,
+  `VP9-444`, `H264-444` — a 4:4:4 session never shares a pump with a 4:2:0 one of the
+  same codec, the viewers configured different decoders), and the chroma column applies
+  to every 4:4:4 cell through `rate_plan(…, cell_444, …)`.
+- **The H.264 data-channel session honours `chroma_pref`** exactly as the HEVC one has
+  since P7: sent only when both gates pass — the agent's `h264/nvenc yuv444` cell and the
+  browser's `VideoDecoder.isConfigSupported` on the High 4:4:4 Predictive ladder
+  (`avc1.F40034` / `F40033` / `F4002A`, profile_idc 244, the same Annex-B no-description
+  contract). Chrome decodes High 4:4:4 in software only, which the rank prices in.
+- **The viewer**: `SESSION_SUPPORTS_444.h264 = true`; `h264-444` is a stored choice
+  (`choiceFromPicker('h264','yuv444')`, round-trips through the settings); the H.264
+  4:4:4 cell's verdicts are `h264444` / `browserNoH264High444` / `agentNoH264_444`; a
+  VP9 4:4:4 cell with a hardware backend reads `vp9444hw`. **The auto-rank** gains two
+  rungs for an EXPLICIT 4:4:4 only, after the HEVC Rext pair and before the libvpx cell:
+  H.264 High 4:4:4 (HW encode, SW decode), then VP9 profile 1 on `vp9_qsv` (HW encode,
+  SW decode). Sharper-on-Auto does not take them: it trades hardware decode for chroma
+  only at the libvpx rung, where nothing is lost. A remembered `h264:yuv444` decode
+  failure bans the cell like the others.
+- **HEVC 4:4:4 on QSV stays behind the denylist** — the code path exists (VUYX + `rext`),
+  the cell opens only once `encoder_cells_deny` is pushed to a host without
+  `hevc_qsv:yuv444`, which is P3's field test on CORPLAP-3.
+
 ## Phases
 
 | # | Phase | Kill switch | Status |
@@ -267,7 +310,7 @@ flowchart LR
 | P0 | FFmpeg **9.0.1** on all three vendoring lanes (vcpkg baseline `2e6b9238`, AMF headers `v1.5.2`, `ffmpeg-next = "9.0"`, dylib names → 63, the NVENC patch re-based) + `scripts/dev-ffmpeg-windows.ps1`, the native Windows dev loop | flip the three asset patterns back to `vendored-ffmpeg-8.1.2` (kept one release) | **shipped** #1472 → `agent-v0.4.82` (bump #1477), **field-verified 2026-09-07** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) |
 | P1 | `video_cells` + the matrix probe + verified `hw` + probe duration in the hello; server passthrough | legacy fields stay filled; a viewer ignoring the field sees today | **shipped** #1480 → `agent-v0.4.83`, **field-verified 2026-09-07** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) |
 | P2 | Picker: codec × chroma dropdowns, i18n, Auto rules, remembered trial failures, the shared derivation | ships with P1 | **shipped** with P1 (viewer `hosted-20260907-602396d`), **field-verified 2026-09-07** |
-| P3 | **P3a** the probe cache · the `ProbeReport` envelope (the lost vp9_qsv IDR verdict) · `encoder_cells_deny` config key + remote-config push · the chroma column · `cells.rs`; **P3b** the cells: VP9 4:4:4 hardware (QSV/VAAPI profile 1, VUYX), H.264 4:4:4 (NVENC + software decode), HEVC 4:4:4 on QSV/VAAPI behind the denylist | the cell denylist; `caps_cache = false` | **P3a built** #1488; P3b next |
+| P3 | **P3a** the probe cache · the `ProbeReport` envelope (the lost vp9_qsv IDR verdict) · `encoder_cells_deny` config key + remote-config push · the chroma column · `cells.rs`; **P3b** the cells: VP9 4:4:4 hardware (QSV/VAAPI profile 1, VUYX), H.264 4:4:4 (NVENC + software decode), HEVC 4:4:4 on QSV/VAAPI behind the denylist | the cell denylist; `caps_cache = false` | **P3a built** #1488 · **P3b built** #1489; field tests next (dev box H.264 4:4:4, CORPLAP-3 VP9 4:4:4 on vp9_qsv, then HEVC 4:4:4 on QSV with the denylist pushed) |
 | P4 | VAAPI on Linux x86_64 | `ROOMLERD_USE_FFMPEG=0` / the denylist | — |
 | P5 | `docs/encoders.md` rewritten with diagrams (the cell resolution, the probe lifecycle); stale "macOS ships no FFmpeg" lines corrected in `CLAUDE.md`, `THIRD-PARTY-NOTICES.md`, `docs/lgpl-relink.md`; `docs/README.md` row | — | — |
 | next | FR for D3D12 video encode (Windows) + Vulkan video encode (Linux/Windows) | — | — |

@@ -1898,7 +1898,7 @@ async fn media_pump(
                     encoded_dims,
                     viewer_report,
                     priority,
-                    false,
+                    matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
                 )
                 .await;
@@ -1937,14 +1937,30 @@ async fn media_pump(
         #[cfg(feature = "ffmpeg-encoder")]
         {
             let wants_444 = matches!(chroma_pref.as_deref(), Some("yuv444"));
-            if !wants_444 && crate::encode::ffmpeg::available() {
-                // Quick probe at the standard caps probe resolution. If
-                // it succeeds the host has a working vp9_qsv path.
-                if let Ok(probe) = crate::encode::ffmpeg::FfmpegEncoder::new_vp9(480, 270) {
-                    drop(probe);
+            if crate::encode::ffmpeg::available() {
+                use crate::encode::ffmpeg::FfmpegEncoder;
+                // FR-77 P3b — a 4:4:4 session tries the HARDWARE profile-1
+                // cell first (vp9_qsv over packed VUYX, `cells::names_444`);
+                // a 4:2:0 session takes vp9_qsv exactly as before (rc.83).
+                // The quick probe opens the exact cell at the caps-probe
+                // resolution, so a host that cannot open it falls to libvpx —
+                // the path that emits profile 1 in software — transparently.
+                let probe = if wants_444 {
+                    crate::encode::cells::names_444(
+                        roomler_ai_remote_control::models::VideoCodec::Vp9,
+                    )
+                    .first()
+                    .copied()
+                    .and_then(|name| FfmpegEncoder::new_named_probe(name, 480, 270, true).ok())
+                } else {
+                    FfmpegEncoder::new_vp9(480, 270).ok()
+                };
+                if let Some(enc) = probe {
+                    drop(enc);
                     tracing::info!(
                         %session_id,
-                        "media pump: VP9 over DataChannel via FFmpeg vp9_qsv (Intel HW; rc.83 Iris Xe fps unlock)"
+                        chroma444 = wants_444,
+                        "media pump: VP9 over DataChannel via FFmpeg vp9_qsv (Intel HW; rc.83 Iris Xe fps unlock; FR-77 P3b profile 1 over VUYX)"
                     );
                     return run_ffmpeg_dc_session(
                         FfmpegDcCodec::Vp9,
@@ -1960,7 +1976,7 @@ async fn media_pump(
                         encoded_dims,
                         viewer_report,
                         priority,
-                        false,
+                        wants_444,
                         chunk_framing,
                     )
                     .await;
@@ -2860,11 +2876,7 @@ async fn run_ffmpeg_dc_session(
 ) {
     // P7 — chroma-discriminated hard-profile label (HEVC only; every other
     // codec ignores the flag).
-    let profile_label: &'static str = if chroma444 && matches!(codec, FfmpegDcCodec::Hevc) {
-        "HEVC-444"
-    } else {
-        codec.label()
-    };
+    let profile_label: &'static str = codec.pipeline_label(chroma444);
     loop {
         let sink = crate::media_share::FollowerSink {
             session_id,
@@ -4344,15 +4356,27 @@ impl FfmpegDcCodec {
                 chroma444,
                 constrained,
             ),
-            Self::Vp9 => {
-                FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps, cq_bias, constrained)
-            }
+            Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(
+                w,
+                h,
+                fps,
+                maxrate_bps,
+                cq_bias,
+                chroma444,
+                constrained,
+            ),
             Self::Av1 => {
                 FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps, cq_bias, constrained)
             }
-            Self::H264 => {
-                FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps, cq_bias, constrained)
-            }
+            Self::H264 => FfmpegEncoder::new_h264_adaptive(
+                w,
+                h,
+                fps,
+                maxrate_bps,
+                cq_bias,
+                chroma444,
+                constrained,
+            ),
         }
     }
 
@@ -4362,6 +4386,18 @@ impl FfmpegDcCodec {
             Self::Vp9 => "VP9",
             Self::Av1 => "AV1",
             Self::H264 => "H264",
+        }
+    }
+
+    /// FR-77 P3b — the shared-pipeline key. A 4:4:4 session must never share
+    /// a pump with a 4:2:0 one of the same codec: the bitstreams carry
+    /// different profiles and the viewers configured different decoders.
+    fn pipeline_label(self, chroma444: bool) -> &'static str {
+        match (self, chroma444) {
+            (Self::Hevc, true) => "HEVC-444",
+            (Self::Vp9, true) => "VP9-444",
+            (Self::H264, true) => "H264-444",
+            _ => self.label(),
         }
     }
 
@@ -4636,7 +4672,7 @@ async fn media_pump_ffmpeg_dc(
     // P7 — the session's ACTIVE chroma: starts as the request (HEVC only),
     // downgraded by the open-time fallback; drives the maxrate chroma
     // factor + the video-info chroma string.
-    let mut hevc_444 = chroma444 && matches!(codec, FfmpegDcCodec::Hevc);
+    let mut cell_444 = chroma444 && !matches!(codec, FfmpegDcCodec::Av1);
     // P5 — shared-floor pipeline: this pump is the OWNER for its hard
     // profile (transport codec). Same-profile sessions join as followers
     // through `run_ffmpeg_dc_session`; their inputs merge into this loop as
@@ -4652,7 +4688,7 @@ async fn media_pump_ffmpeg_dc(
     // the same requested profile, and a Rext-configured viewer decoder
     // accepts a Main-profile bitstream if the open fell back.
     let pipeline = crate::media_share::Pipeline::register(
-        crate::media_share::PipelineKey::FfmpegDc(if hevc_444 { "HEVC-444" } else { codec_label }),
+        crate::media_share::PipelineKey::FfmpegDc(codec.pipeline_label(cell_444)),
         session_id,
     );
     let mut last_viewers: usize = 0;
@@ -5747,7 +5783,7 @@ async fn media_pump_ffmpeg_dc(
                     true,
                     // P7 — report the ACTIVE chroma (the 4:4:4 request may
                     // have fallen back to 4:2:0 at open time).
-                    if hevc_444 {
+                    if cell_444 {
                         "yuv444"
                     } else {
                         codec.wire_chroma()
@@ -6442,7 +6478,7 @@ async fn media_pump_ffmpeg_dc(
             target_fps,
             constrained,
             codec.label(),
-            hevc_444,
+            cell_444,
             governor.encode_factor(),
             matches!(
                 dims_plan.reason,
@@ -6554,7 +6590,7 @@ async fn media_pump_ffmpeg_dc(
                     target_fps,
                     open_rate as usize,
                     cq_bias,
-                    hevc_444,
+                    cell_444,
                     constrained,
                     last_encoder_name,
                 )
@@ -6585,14 +6621,14 @@ async fn media_pump_ffmpeg_dc(
                     // P7 — record the ACTIVE chroma (a 4:4:4 request may have
                     // fallen back to 4:2:0 inside new_hevc_adaptive); feeds
                     // the maxrate chroma factor and the video-info truth.
-                    hevc_444 = enc.chroma444();
+                    cell_444 = enc.chroma444();
                     info!(
                         %session_id,
                         codec_label,
                         width = w,
                         height = h,
                         cq_bias,
-                        chroma444 = hevc_444,
+                        chroma444 = cell_444,
                         encoder = encoder_name,
                         "FFmpeg DC pump: encoder (re)built"
                     );

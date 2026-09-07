@@ -38,7 +38,10 @@
         "browserNoVp9": "This browser can’t decode VP9 profile 1",
         "agentNoVp9": "This device has no VP9 encoder",
         "h264": "Works everywhere — softer text",
-        "h264444Later": "H.264 4:4:4 sessions arrive with a later release",
+        "h264444": "Sharpest text via H.264 High 4:4:4 — hardware encode, software decode",
+        "browserNoH264High444": "This browser can’t decode H.264 High 4:4:4",
+        "agentNoH264_444": "This device has no H.264 4:4:4 encoder (NVENC only today)",
+        "vp9444hw": "Sharpest text, ~1.5× bitrate — hardware encode (Intel), software decode",
         "failedBefore": "Failed to decode on this browser earlier — retried after a browser or driver update",
         "no444Anywhere": "No 4:4:4 cell exists for this device and browser",
         "no420Anywhere": "Nothing decodes here"
