@@ -43,13 +43,13 @@ pub mod handle;
 pub use handle::EncoderHandle;
 
 /// rc.66 link probe. Returns libavcodec's compile-time version (e.g.
-/// `0x3E0000` for libavcodec 62.x = FFmpeg 8.1). Forces the linker to
+/// `0x3F0000` for libavcodec 63.x = FFmpeg 9.0). Forces the linker to
 /// keep the FFmpeg static libs in the final binary so a missing or
 /// version-mismatched FFmpeg fails at link time, not at encoder
 /// construction time.
 ///
 /// Encoded as `(major << 16) | (minor << 8) | micro`. FFmpeg 7.x uses
-/// libavcodec 61.x; FFmpeg 8.x uses libavcodec 62.x. We assert >= 61
+/// libavcodec 61.x; FFmpeg 8.x 62.x; FFmpeg 9.x 63.x. We assert >= 61
 /// in the test so a binding regression to FFmpeg 6.x fails CI.
 #[cfg(feature = "ffmpeg-encoder")]
 pub fn linked_libavcodec_version() -> u32 {

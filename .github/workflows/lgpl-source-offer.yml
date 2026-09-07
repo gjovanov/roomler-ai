@@ -22,11 +22,11 @@ on:
       ffmpeg_version:
         description: 'Upstream FFmpeg tag (must match the vendored build)'
         required: true
-        default: 'n8.1.2'
+        default: 'n9.0.1'
       release_tag:
         description: 'Release to attach the bundle to'
         required: true
-        default: 'vendored-ffmpeg-8.1.2'
+        default: 'vendored-ffmpeg-9.0.1'
 
 permissions:
   contents: write

@@ -223,7 +223,7 @@ audiopus = { version = "0.3.0-rc.0", optional = true }
 # feature-gated internally: no device/filter feature = no registration
 # call). The vendored FFmpeg zip still SHIPS all the .lib files; the
 # linker just stops being told to pull the registries in.
-ffmpeg-next = { version = "8.1", optional = true, default-features = false, features = [
+ffmpeg-next = { version = "9.0", optional = true, default-features = false, features = [
     "codec",
     "format",
 ] }
@@ -689,7 +689,7 @@ peer-to-peer; the server never sees raw pixels or keystrokes."""
 # INVARIANT: a name in this zone must match something dpkg, the linker or a
 # release URL already refers to. docs/fr/FR-21
 # The agent binary is built on ubuntu-22.04 (glibc 2.34) and links libvpx.so.7.
-# The CI "Bundle FFmpeg" step ships FFmpeg 8.1.2's libav* AND libvpx.so.7 inside
+# The CI "Bundle FFmpeg" step ships FFmpeg 9.0.1's libav* AND libvpx.so.7 inside
 # usr/lib/roomler-agent (binary RPATH + $ORIGIN), so the .deb is self-contained
 # and runs on BOTH Ubuntu 22.04 (native libvpx.so.7) and 24.04 (which ships only
 # libvpx.so.9 — the bundled .so.7 is exactly what makes 24.04 work). Hence NO
@@ -766,7 +766,7 @@ assets = [
     # inside roomlerd, so it can never version-skew from the daemon again
     # (a stale shim is harmless — it's a version-agnostic re-exec).
     ["target/release/roomler-shim", "usr/bin/roomler", "755"],
-    # Bundled FFmpeg 8.1.2 (LGPL) for the ffmpeg-encoder HEVC backend. Populated
+    # Bundled FFmpeg 9.0.1 (LGPL) for the ffmpeg-encoder HEVC backend. Populated
     # by the "Bundle FFmpeg" CI step (SONAME-named real files, $ORIGIN RPATH) so
     # the .deb is self-contained — stock Ubuntu ships an ABI-incompatible FFmpeg
     # 6.1. This glob is CI-only (the Linux .deb is never built locally).

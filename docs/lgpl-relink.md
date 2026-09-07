@@ -27,7 +27,7 @@ Both halves are satisfied by publication, not by request:
 
 | §6(a) requires | Where it is |
 |---|---|
-| Complete source of **the Library** | [`vendored-ffmpeg-8.1.2`](https://github.com/gjovanov/roomler-ai/releases/tag/vendored-ffmpeg-8.1.2) → `ffmpeg-<version>-corresponding-source.tar.xz` (pristine upstream + the full build recipe) |
+| Complete source of **the Library** | [`vendored-ffmpeg-9.0.1`](https://github.com/gjovanov/roomler-ai/releases/tag/vendored-ffmpeg-9.0.1) → `ffmpeg-<version>-corresponding-source.tar.xz` (pristine upstream + the full build recipe) |
 | The **"work that uses the Library"**, as **source code** | This repository. The agent is MPL-2.0; `agents/roomlerd` and every crate it depends on are public. |
 | Terms permitting modification and debugging | MPL-2.0 for our code; upstream licences for vendored crates |
 
@@ -44,10 +44,10 @@ set, which selects components; it is in the build recipe.
 ### 1. Get the FFmpeg corresponding source
 
 ```bash
-gh release download vendored-ffmpeg-8.1.2 --repo gjovanov/roomler-ai \
+gh release download vendored-ffmpeg-9.0.1 --repo gjovanov/roomler-ai \
   --pattern 'ffmpeg-*-corresponding-source.tar.xz*'
-sha256sum -c ffmpeg-n8.1.2-corresponding-source.tar.xz.sha256
-tar xf ffmpeg-n8.1.2-corresponding-source.tar.xz
+sha256sum -c ffmpeg-n9.0.1-corresponding-source.tar.xz.sha256
+tar xf ffmpeg-n9.0.1-corresponding-source.tar.xz
 ```
 
 You now have the pristine upstream tarball and `recipe/`, which contains the
