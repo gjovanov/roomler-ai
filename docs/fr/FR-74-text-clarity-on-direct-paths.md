@@ -1,9 +1,9 @@
 # FR-74 — Text clarity on direct paths: the bitrate ceiling follows the content, not a constant
 
 **Issue:** [#1442](https://github.com/gjovanov/roomler-ai/issues/1442) · **Status:** P0 done 2026-09-06;
-P1 (0.4.77) + P1b (0.4.79) released and **field-verified 2026-09-07** — the hardware pump
-(AV1, VP9 4:2:0, H.264) no longer blurs by the operator's read; P3 (the libvpx VP9 4:4:4
-pump) **built 2026-09-07** from four offline rounds, field gate pending; P2 / P4 proposed ·
+P1 (0.4.77) + P1b (0.4.79) + P3 (0.4.80) released and **field-verified 2026-09-07 on all four
+codecs** by the operator's read and the heartbeat; P2 retired by measurement (0 rate swaps);
+AC3 ticked; open: AC1's pixel comparison, the thin-direct-path read of the q-cap, P4 (UI) ·
 **Parent:** the RC quality program (FR-17/16/14); rides on FR-59's measured pipe and FR-70's
 pump instrumentation.
 
