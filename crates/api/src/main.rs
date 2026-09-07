@@ -13,9 +13,45 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize tracing
     tracing_subscriber::registry()
+        // ⚠️ The bare `warn` at the front is load-bearing, and it is the whole
+        // point of this list's shape. Without it an `EnvFilter` built only from
+        // `target=level` directives is an ALLOWLIST: a crate nobody named is
+        // silent at every level, with nothing anywhere saying so.
+        //
+        // That is not hypothetical. FR-69 moved the pillars out of
+        // `roomler_ai_api` into `roomler-ai-mod-*` + `roomler-core`, and this
+        // default was not moved with them — so in prod, where `RUST_LOG` is
+        // unset (checked: absent from the deployment env AND the
+        // `roomler2-config` configmap, `printenv RUST_LOG` in the pod says
+        // UNSET), **425 of the server's 522 log statements were dropped**:
+        // the whole overlay engine, the DERP cluster, the ephemeral reaper,
+        // the org-relay mint, the agent socket, fleet RPC, the Hub. Measured
+        // 2026-09-07: zero `roomler_ai_mod_network` lines in three hours while
+        // `roomler_ai_api` and `tower_http` logged normally, on a pod that was
+        // demonstrably reaping devices at the time.
+        //
+        // It surfaced because a reap left no trace: the reaper's own comment
+        // calls its line "the record that this removal happened and why", and
+        // that record was going nowhere. A `warn` floor makes the next
+        // omission merely quiet instead of invisible.
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "roomler_ai_api=debug,roomler_ai_services=debug,roomler_ai_db=debug,tower_http=debug"
-                .into()
+            concat!(
+                "warn",
+                ",roomler_ai_api=debug",
+                ",roomler_ai_services=debug",
+                ",roomler_ai_db=debug",
+                ",roomler_core=debug",
+                ",roomler_ai_mod_fleet=debug",
+                ",roomler_ai_mod_network=debug",
+                ",roomler_ai_mod_remote=debug",
+                ",roomler_ai_mod_chat=debug",
+                ",roomler_ai_mod_conference=debug",
+                ",roomler_ai_mod_saas=debug",
+                ",roomler_ai_remote_control=debug",
+                ",tunnel_core=debug",
+                ",tower_http=debug",
+            )
+            .into()
         }))
         .with(tracing_subscriber::fmt::layer())
         .init();
