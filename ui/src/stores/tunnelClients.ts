@@ -3,6 +3,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { useCapabilitiesStore } from '@/stores/capabilities'
 
 // Snake-case to match the Rust wire shape — see
 // `crates/api/src/routes/tunnel.rs::TunnelClientResponse`.
@@ -54,6 +55,19 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
   const error = ref<string | null>(null)
 
   async function fetchTunnelClients(tenantId: string) {
+    // ⚠️ The gate belongs HERE, not at each call site. `/tenant/…/tunnel-client`
+    // is a `network`-module route, and a server that drops the module answers
+    // 404 — correctly. Gating it per-caller was tried and leaked: the org
+    // dashboard guarded this fetch on `showFleet`, and `fleet` is a DIFFERENT
+    // module, so a `remote` profile (fleet yes, network no) fired it anyway.
+    // One guard in the store makes that class unrepresentable.
+    // `has()` is FAIL-OPEN while the server has not answered, so this is inert
+    // before first paint and in unit tests. (FR-75, #1447.)
+    if (!useCapabilitiesStore().has('network')) {
+      clients.value = []
+      total.value = 0
+      return
+    }
     loading.value = true
     error.value = null
     try {
