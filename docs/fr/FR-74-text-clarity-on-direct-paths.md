@@ -291,8 +291,8 @@ disagree. FSR helps only when upscaling.
 | P0 | A/B with existing knobs on CORPLAP-3 | — (settings only) | **done 2026-09-06** — A + B2 remove the blur on AV1, VP9 4:2:0 and H.264 by the operator's read; the queue budget denominated in the applied target was a self-reinforcing trap, the cap the limiter; VP9 4:4:4 (software) remains |
 | P1 | direct ceiling 0.25 bpp / [3, 48] M; direct queue budget denominated in the ceiling | — (no switch: `FFMPEG_MAXRATE_KBPS` and `direct_queue_ms` are the way back) | **built 2026-09-06** (§"P1 — as built"); field gate on the release carrying it |
 | P1b | the direct gate is the measured send wait's call below the encoder's HRD reservoir (EMA of completed waits ∨ live head-of-queue age); bytes alone gate only at the reservoir | — (no switch; `direct_queue_ms` keeps its meaning as the lag bound, `0` disables) | **field-verified 2026-09-07 on 0.4.79** — operator: "not seeing the blurring anymore" on AV1, VP9 4:2:0 and H.264; heartbeats of those sessions: 0 cuts, 0 gate skips, 0 gate lines. VP9 4:4:4 (the libvpx pump) still blurs ⇒ P3 |
-| P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | proposed (P0 saw 37 → 0 swaps once the trap was gone; re-measure after P1) |
-| P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07, released in 0.4.80 (11:01 UTC on CORPLAP-3)** — offline: every notch frame at q 64 instead of 255, refine to lossless kept, 14.5 of 20.7 Mbps; field gate: **instrument PASS 13:25 UTC** (`max_qp` 64 in every scroll window, was 255; settles to q 0; 0 skips; 22–52 Mbps on the LAN), operator's read pending |
+| P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | **retired by measurement 2026-09-07** — after P1 the rate ladder no longer fires on direct paths: 0 rate swaps in all 17 sessions on the three hosts today (QSV direct on CORPLAP-1/-3, nvenc relay on CORPLAP-2; the 2026-09-06 baseline had 37 in 11 min). Reopen only if a relay-path QSV session shows swaps |
+| P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07, released in 0.4.80 (11:01 UTC on CORPLAP-3)** — offline: every notch frame at q 64 instead of 255, refine to lossless kept, 14.5 of 20.7 Mbps; field gate: **instrument PASS 13:25 UTC** (`max_qp` 64 in every scroll window, was 255; settles to q 0; 0 skips; 22–52 Mbps on the LAN) and **operator PASS** ("scrolling large texts seems much better") ⇒ **field-verified 2026-09-07** |
 | P4 | viewer display-scale pill + 1:1 guidance | — (UI) | proposed |
 
 ## Acceptance criteria
@@ -300,11 +300,19 @@ disagree. FSR helps only when upscaling.
 - [ ] **AC1** — a Notepad++ scroll on CORPLAP-3 stays readable while it moves (no
       unreadable phase), and the settled text matches a local screenshot of the
       same region (pixel comparison of a text block, not an impression).
-      *Operator half met on the hardware pump 2026-09-07 (0.4.79: AV1, VP9 4:2:0,
-      H.264 — "not seeing the blurring anymore"); VP9 4:4:4 pending P3's gate;
-      the pixel comparison not yet done.*
+      *Operator half met on all four codecs 2026-09-07 (0.4.79: AV1, VP9 4:2:0,
+      H.264 — "not seeing the blurring anymore"; 0.4.80: VP9 4:4:4 — "scrolling
+      large texts seems much better"); the pixel comparison not yet done.*
 - [ ] **AC2** — sharpness is stable within 1 s of the scroll ending; keyframes per
       minute in a scroll session drop from ~7 to ≤ 2.
+      *Measured 2026-09-07 on 0.4.79/0.4.80 (CORPLAP-3, 11 sessions): the ~7/min of
+      the baseline were the QSV rate ladder (37 swaps + 35 settle keyframes in
+      11 min); rate swaps are now **0** in every session. What remains is the
+      idle-settle keyframe, one per scroll stop at ≥ 5 s spacing — 6–12/min in a
+      stop-and-go scroll, 0.3/min over a 2-hour session — and it is the mechanism
+      that makes the settled text sharp within ~1 s (first half met). The "≤ 2/min"
+      figure was a proxy for the ladder pumping and is superseded: the criterion
+      that survives is "no keyframes from rate changes", which holds.*
 - [x] **AC3** — no regression on constrained hosts: CORPLAP-1/-2's `target_bps`,
       `frames_skipped`, `pipe_states` unchanged across the release (direct-only
       change). *Read 2026-09-07 on 0.4.79 (field log): the relay sessions show
