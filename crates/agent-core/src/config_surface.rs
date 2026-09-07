@@ -451,6 +451,21 @@ const KEYS: &[(&str, &str, &str)] = &[
         "AV1 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_AV1. Empty = built-in 100. Restart required.",
     ),
     (
+        "rate_factor_h264_444",
+        "string",
+        "FR-77 P3 - the chroma column: H.264 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_h264. Env: ROOMLERD_RATE_FACTOR_H264_444. Empty = built-in 150. Restart required.",
+    ),
+    (
+        "rate_factor_hevc_444",
+        "string",
+        "FR-77 P3 - the chroma column: HEVC 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_hevc. Env: ROOMLERD_RATE_FACTOR_HEVC_444. Empty = built-in 150. Restart required.",
+    ),
+    (
+        "rate_factor_vp9_444",
+        "string",
+        "FR-77 P3 - the chroma column: VP9 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_vp9. Env: ROOMLERD_RATE_FACTOR_VP9_444. Empty = built-in 150. Restart required.",
+    ),
+    (
         "lanczos_min_pct",
         "string",
         "P7 - minimum linear downscale (percent, 0-100) at which the Lanczos-3 text-sharp filter engages; shallower shrinks use box. Empty = built-in 34 (covers the Smoother rungs; 56 restores the pre-P7 gate; 0 = always). Env: ROOMLERD_LANCZOS_MIN_PCT. Restart required.",
@@ -781,6 +796,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "KeyText typing: temporarily release physically-held Shift/Ctrl/Alt the remote layout does not want around each character tap (fixes wrong/dead symbols on non-US layouts). Built-in default: on. Env: ROOMLERD_TEXT_MOD_NEUTRALIZE. Restart required.",
     ),
     (
+        "caps_cache",
+        "tribool",
+        "FR-77 P3 - cache the hardware encoder probe across daemon restarts, keyed by GPU + driver + OS build + roomlerd build; re-probed on any change or after 7 days. Built-in default: on. Env: ROOMLERD_CAPS_CACHE.",
+    ),
+    (
+        "encoder_cells_deny",
+        "string",
+        "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444); `none` = deny nothing. Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
+    ),
+    (
         "forward_acl",
         "json",
         "Agent-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
@@ -908,6 +933,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "rate_factor_hevc" => cfg.rate_factor_hevc.map(|p| p.to_string()),
         "rate_factor_vp9" => cfg.rate_factor_vp9.map(|p| p.to_string()),
         "rate_factor_av1" => cfg.rate_factor_av1.map(|p| p.to_string()),
+        "rate_factor_h264_444" => cfg.rate_factor_h264_444.map(|p| p.to_string()),
+        "rate_factor_hevc_444" => cfg.rate_factor_hevc_444.map(|p| p.to_string()),
+        "rate_factor_vp9_444" => cfg.rate_factor_vp9_444.map(|p| p.to_string()),
         "lanczos_min_pct" => cfg.lanczos_min_pct.map(|p| p.to_string()),
         "nvenc_spatial_aq" => cfg.nvenc_spatial_aq.map(fmt_bool),
         "scale_cq_boost" => cfg.scale_cq_boost.map(|p| p.to_string()),
@@ -980,6 +1008,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_upward_probe" => cfg.overlay_upward_probe.map(fmt_bool),
         "relay_probe" => cfg.relay_probe.map(fmt_bool),
         "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
+        "caps_cache" => cfg.caps_cache.map(fmt_bool),
+        "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -1328,6 +1358,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "rate_factor_hevc" => cfg.rate_factor_hevc = parse_rate_factor(key, value)?,
         "rate_factor_vp9" => cfg.rate_factor_vp9 = parse_rate_factor(key, value)?,
         "rate_factor_av1" => cfg.rate_factor_av1 = parse_rate_factor(key, value)?,
+        "rate_factor_h264_444" => cfg.rate_factor_h264_444 = parse_rate_factor(key, value)?,
+        "rate_factor_hevc_444" => cfg.rate_factor_hevc_444 = parse_rate_factor(key, value)?,
+        "rate_factor_vp9_444" => cfg.rate_factor_vp9_444 = parse_rate_factor(key, value)?,
         "lanczos_min_pct" => cfg.lanczos_min_pct = parse_u32_range(key, value, 0, 100)?,
         "nvenc_spatial_aq" => cfg.nvenc_spatial_aq = parse_tribool(value)?,
         "scale_cq_boost" => cfg.scale_cq_boost = parse_u32_range(key, value, 0, 12)?,
@@ -1420,6 +1453,16 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_upward_probe" => cfg.overlay_upward_probe = parse_tribool(value)?,
         "relay_probe" => cfg.relay_probe = parse_tribool(value)?,
         "text_mod_neutralize" => cfg.text_mod_neutralize = parse_tribool(value)?,
+        "caps_cache" => cfg.caps_cache = parse_tribool(value)?,
+        "encoder_cells_deny" => {
+            cfg.encoder_cells_deny = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    validate_denylist(v)?;
+                    Some(v.to_string())
+                }
+            }
+        }
         "forward_acl" => {
             cfg.forward_acl = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => Default::default(),
@@ -1476,6 +1519,39 @@ fn parse_rate_factor(key: &str, value: Option<&str>) -> Result<Option<u32>, Stri
             Ok(Some(pct))
         }
     }
+}
+
+/// FR-77 — `encoder_cells_deny` entries are `name:chroma` with a plain
+/// FFmpeg encoder name and one of the two chroma formats, or the single word
+/// `none`. Validated here so a typo cannot silently deny nothing (an entry
+/// that matches no cell is inert, and the operator would read the built-in
+/// list as still in force while it is not).
+pub fn validate_denylist(v: &str) -> Result<(), String> {
+    if v.trim().eq_ignore_ascii_case("none") {
+        return Ok(());
+    }
+    for entry in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((name, chroma)) = entry.split_once(':') else {
+            return Err(format!(
+                "encoder_cells_deny entry {entry:?} must be name:chroma (e.g. hevc_qsv:yuv444)"
+            ));
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(format!(
+                "encoder_cells_deny entry {entry:?}: the encoder name must be a plain FFmpeg name (lowercase, digits, underscores)"
+            ));
+        }
+        if !matches!(chroma, "yuv420" | "yuv444") {
+            return Err(format!(
+                "encoder_cells_deny entry {entry:?}: chroma must be yuv420 or yuv444"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn fmt_bool(b: bool) -> String {
@@ -2457,6 +2533,94 @@ mod tests {
         assert!(apply(&mut cfg, "update_check_interval_h", Some("nope")).is_err());
         apply(&mut cfg, "update_check_interval_h", None).unwrap();
         assert_eq!(cfg.update_check_interval_h, None);
+    }
+
+    /// FR-77 P3 — the denylist key validates its shape (a typo would deny
+    /// nothing while reading as if the built-in list were still in force),
+    /// echoes, clears, and accepts the `none` spelling.
+    #[test]
+    fn encoder_cells_deny_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "encoder_cells_deny"), None);
+        apply(
+            &mut cfg,
+            "encoder_cells_deny",
+            Some(" hevc_qsv:yuv444, vp9_qsv:yuv444 "),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.encoder_cells_deny.as_deref(),
+            Some("hevc_qsv:yuv444, vp9_qsv:yuv444")
+        );
+        assert_eq!(
+            entry_for(&cfg, "encoder_cells_deny")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("hevc_qsv:yuv444, vp9_qsv:yuv444")
+        );
+        apply(&mut cfg, "encoder_cells_deny", Some("none")).unwrap();
+        assert_eq!(cfg.encoder_cells_deny.as_deref(), Some("none"));
+        apply(&mut cfg, "encoder_cells_deny", None).unwrap();
+        assert_eq!(cfg.encoder_cells_deny, None);
+        apply(&mut cfg, "encoder_cells_deny", Some("")).unwrap();
+        assert_eq!(cfg.encoder_cells_deny, None, "blank clears to the built-in");
+        for bad in [
+            "hevc_qsv",
+            "hevc_qsv:yuv422",
+            "HEVC_QSV:yuv444",
+            ":yuv444",
+            "a b:yuv444",
+        ] {
+            assert!(
+                apply(&mut cfg, "encoder_cells_deny", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn caps_cache_is_a_tribool_that_bridges() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(entry_for(&cfg, "caps_cache").unwrap().kind, "tribool");
+        apply(&mut cfg, "caps_cache", Some("0")).unwrap();
+        assert_eq!(cfg.caps_cache, Some(false));
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(s, v)| *s == "CAPS_CACHE" && *v == Some(false)),
+            "the kill switch must reach the daemon through the S2 bridge"
+        );
+        apply(&mut cfg, "caps_cache", None).unwrap();
+        assert_eq!(cfg.caps_cache, None);
+    }
+
+    /// The chroma column keys ride the numeric bridge like the codec factors.
+    #[test]
+    fn chroma_column_rate_factors_bridge_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        for key in [
+            "rate_factor_h264_444",
+            "rate_factor_hevc_444",
+            "rate_factor_vp9_444",
+        ] {
+            apply(&mut cfg, key, Some("120")).unwrap();
+            assert_eq!(entry_for(&cfg, key).unwrap().value.as_deref(), Some("120"));
+            assert!(apply(&mut cfg, key, Some("10")).is_err(), "{key}: below 50");
+        }
+        let bridged: Vec<&str> = crate::config::env_bridge_numerics(&cfg)
+            .iter()
+            .filter(|(_, v)| *v == Some(120))
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(
+            bridged,
+            vec![
+                "RATE_FACTOR_H264_444",
+                "RATE_FACTOR_HEVC_444",
+                "RATE_FACTOR_VP9_444"
+            ]
+        );
     }
 }
 

@@ -172,6 +172,18 @@ impl RemoteConfigServices {
                 cfg.ssh_port = Some(want);
                 applied.needs_restart.push("ssh_port");
             }
+            // FR-77 P3 — the cell denylist. A blank push clears the key back
+            // to the built-in list; `none` denies nothing. Read once per
+            // process by the probe child, hence `needs_restart`.
+            if let Some(want) = desired.encoder_cells_deny.as_deref() {
+                let next = Some(want.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if cfg.encoder_cells_deny != next {
+                    cfg.encoder_cells_deny = next;
+                    applied.needs_restart.push("encoder_cells_deny");
+                }
+            }
 
             if applied.is_noop() {
                 return Ok(applied);

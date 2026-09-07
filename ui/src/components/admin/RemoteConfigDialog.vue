@@ -138,6 +138,27 @@
           just as much as flipping the switch is.
         </div>
 
+        <!-- ── Video encoders (FR-77) ───────────────────────────────────── -->
+        <div class="text-subtitle-2 mb-1 mt-2">Video encoders</div>
+        <v-text-field
+          v-model="encoderDenyText"
+          label="Encoder cells to deny (encoder_cells_deny)"
+          placeholder="hevc_qsv:yuv444, hevc_vaapi:yuv444"
+          density="compact"
+          variant="outlined"
+          hide-details
+          persistent-placeholder
+          class="mb-1"
+        />
+        <div class="text-caption text-medium-emphasis mb-4 ml-1">
+          Comma-separated <code>name:chroma</code> cells the device must not
+          open or advertise — the cell matrix's kill switch. Blank = not
+          managed (the device keeps its own list, built-in
+          <code>hevc_qsv:yuv444, hevc_vaapi:yuv444</code>);
+          <code>none</code> = deny nothing. It only ever removes cells, so no
+          extra permission bit; takes effect at the next daemon restart.
+        </div>
+
         <!-- The combination checks. Each of these produces a device that is
              "on" and reaches nobody — the exact silent-nothing this feature
              exists to remove, so it must be caught here rather than discovered
@@ -410,6 +431,17 @@ const sshPortText = computed({
   },
 })
 
+
+/** FR-77 — the cell denylist. A blank box is "not managed" (undefined), so
+ *  clearing it hands the key back to the device; the word `none` is how an
+ *  operator says "deny nothing" (a config key cannot carry an empty list). */
+const encoderDenyText = computed({
+  get: () => draft.value.encoder_cells_deny ?? '',
+  set: (v: string) => {
+    const t = v.trim()
+    draft.value.encoder_cells_deny = t === '' ? undefined : t
+  },
+})
 const accountOptions = [
   { title: 'The signed-in user at the device', value: 'console_user' },
   { title: 'The daemon account (SYSTEM / root)', value: 'daemon' },
@@ -430,6 +462,7 @@ watch(
       ssh_authorized_keys: d?.ssh_authorized_keys,
       ssh_account_mode: d?.ssh_account_mode,
       ssh_port: d?.ssh_port,
+      encoder_cells_deny: d?.encoder_cells_deny,
     }
     original.value = JSON.stringify(draft.value)
     if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)

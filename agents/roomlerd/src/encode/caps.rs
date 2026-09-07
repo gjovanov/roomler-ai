@@ -31,6 +31,9 @@ use roomler_ai_remote_control::models::AgentCaps;
 use roomler_ai_remote_control::models::{ChromaFormat, VideoBackend, VideoCell, VideoCodec};
 use std::sync::OnceLock;
 
+#[allow(unused_imports)]
+use super::cells::{cell_denied, denied_cells, ffmpeg_444_capable};
+
 static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 
 /// Running the hardware probes in a CHILD PROCESS.
@@ -55,6 +58,22 @@ static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 mod child {
     use super::AgentCaps;
 
+    /// What the child hands back: the caps, plus the per-host verdicts the
+    /// probe measured that are NOT wire capabilities.
+    ///
+    /// The vp9_qsv runtime-IDR verdict (P4) used to be set in a `OnceLock`
+    /// — in the CHILD, where nothing ever read it again. rc.433 moved the
+    /// probe out of process and the verdict never crossed back: every
+    /// vp9_qsv session since ran the GOP-60 containment the probe existed to
+    /// lift. It rides this envelope now and the parent installs it
+    /// (`install_vp9_qsv_idr`), and the cache keeps it with the caps.
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+    pub(super) struct ProbeReport {
+        pub(super) caps: AgentCaps,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) vp9_qsv_idr: Option<(bool, bool)>,
+    }
+
     /// Marks the line carrying the child's JSON, so log output on the same
     /// stream cannot be mistaken for the result. Parsing the last line, or
     /// all of stdout, would break the first time anything logged there.
@@ -74,11 +93,11 @@ mod child {
     /// Probe in a child. `None` = no usable answer, for ANY reason (spawn
     /// failed, non-zero exit, killed by a signal, timed out, unparseable
     /// output) — the caller treats every one of them the same way.
-    pub(super) fn probe() -> Option<AgentCaps> {
+    pub(super) fn probe() -> Option<ProbeReport> {
         if std::env::var_os(CHILD_ENV).is_some() {
             // We ARE the child (or something re-entered). Probing in-process
             // is what this process was started to do.
-            return Some(super::compute_caps(true));
+            return Some(super::in_process_report());
         }
         let exe = match std::env::current_exe() {
             Ok(p) => p,
@@ -161,28 +180,40 @@ mod child {
             return None;
         }
 
+        let report = parse_line(&out, started.elapsed())?;
+        tracing::info!(
+            elapsed_ms = report.caps.probe_ms.unwrap_or(0),
+            codecs = ?report.caps.codecs,
+            hw_encoders = ?report.caps.hw_encoders,
+            cells = report.caps.video_cells.len(),
+            vp9_qsv_idr = ?report.vp9_qsv_idr,
+            "caps probe: child reported"
+        );
+        Some(report)
+    }
+
+    /// The child's marked line → the report, with `probe_ms` stamped by the
+    /// PARENT (spawn + every open + parse: the whole cost the daemon paid,
+    /// the number the fleet judges the matrix probe by). A bare `AgentCaps`
+    /// line (the P1 shape) still parses, so the two halves of a binary can
+    /// never disagree on the envelope.
+    pub(super) fn parse_line(out: &str, elapsed: std::time::Duration) -> Option<ProbeReport> {
         let line = out.lines().find_map(|l| l.trim().strip_prefix(MARKER))?;
-        match serde_json::from_str::<AgentCaps>(line) {
-            Ok(mut caps) => {
-                let elapsed_ms = started.elapsed().as_millis();
-                // FR-77 — stamped by the PARENT so it covers the whole cost
-                // the daemon paid (spawn + every open + parse), the number the
-                // fleet gets to judge the matrix probe by.
-                caps.probe_ms = Some(u32::try_from(elapsed_ms).unwrap_or(u32::MAX));
-                tracing::info!(
-                    elapsed_ms,
-                    codecs = ?caps.codecs,
-                    hw_encoders = ?caps.hw_encoders,
-                    cells = caps.video_cells.len(),
-                    "caps probe: child reported"
-                );
-                Some(caps)
-            }
-            Err(e) => {
-                tracing::warn!(%e, "caps probe: child output was not parseable — no HW advertisement");
-                None
-            }
-        }
+        let mut report = match serde_json::from_str::<ProbeReport>(line) {
+            Ok(r) => r,
+            Err(e) => match serde_json::from_str::<AgentCaps>(line) {
+                Ok(caps) => ProbeReport {
+                    caps,
+                    vp9_qsv_idr: None,
+                },
+                Err(_) => {
+                    tracing::warn!(%e, "caps probe: child output was not parseable — no HW advertisement");
+                    return None;
+                }
+            },
+        };
+        report.caps.probe_ms = Some(u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX));
+        Some(report)
     }
 
     /// `wait` with a deadline. `None` = still running when time ran out.
@@ -214,8 +245,8 @@ mod child {
 /// stdout — a library that logs there, a driver that prints a banner — cannot
 /// be mistaken for the result.
 pub fn print_probe_result() {
-    let caps = detect_in_process();
-    match serde_json::to_string(&caps) {
+    let report = in_process_report();
+    match serde_json::to_string(&report) {
         Ok(json) => println!("{}{json}", child::MARKER),
         Err(e) => {
             tracing::error!(%e, "caps probe: could not serialise caps");
@@ -243,24 +274,145 @@ const PROBE_HEIGHT: u32 = 270;
 /// cached result.
 pub fn detect() -> AgentCaps {
     CACHED_CAPS
-        .get_or_init(|| match child::probe() {
-            Some(mut caps) => {
-                // The RPC verbs are config-derived, not driver-probed: compute
-                // them HERE, where the config fallbacks are registered,
-                // whatever the child saw.
-                caps.rpc = rpc_caps();
-                caps
-            }
-            None => {
-                // The child died, hung, or could not be launched. "Codec
-                // unavailable" is the only honest reading: we have no
-                // evidence this host can encode with any of them, and
-                // advertising one we cannot produce costs a black session.
-                // Everything that needs no driver still stands.
-                compute_caps(false)
-            }
+        .get_or_init(|| {
+            let mut caps = cached_or_probed();
+            // The RPC verbs are config-derived, not driver-probed: compute
+            // them HERE, where the config fallbacks are registered,
+            // whatever the child (or the cache) saw.
+            caps.rpc = rpc_caps();
+            caps
         })
         .clone()
+}
+
+/// FR-77 P3 — the probe cache in front of the child probe. A hit reuses the
+/// last probe's encoder matrix (see `caps_cache` for exactly which fields);
+/// a miss probes and, when the answer is worth keeping, stores it. Every
+/// outcome is one log line, because "why did this host re-probe" is the
+/// question the cache will be asked.
+fn cached_or_probed() -> AgentCaps {
+    use super::caps_cache as cache;
+
+    let now = cache::now_unix();
+    let enabled = cache::enabled();
+    let key = if enabled { cache::current_key() } else { None };
+    let path = cache::path();
+    match (&key, &path) {
+        (Some(key), Some(path)) => match cache::load_matching(path, key, now) {
+            Ok(hit) => {
+                tracing::info!(
+                    path = %path.display(),
+                    age_secs = now.saturating_sub(hit.probed_at_unix),
+                    probe_ms = hit.probe_ms,
+                    cells = hit.caps.video_cells.len(),
+                    hardware = %key.hardware,
+                    "caps probe: cache hit — reusing the last probe's encoder matrix"
+                );
+                install_vp9_qsv_idr(hit.vp9_qsv_idr);
+                return merge_cached(hit);
+            }
+            Err(miss) => tracing::info!(
+                path = %path.display(),
+                reason = %miss.reason(),
+                "caps probe: cache miss — probing"
+            ),
+        },
+        _ if !enabled => {
+            tracing::info!("caps probe: cache disabled (ROOMLERD_CAPS_CACHE=0) — probing")
+        }
+        (Some(_), None) => {
+            tracing::debug!("caps probe: no directory to cache in — probing")
+        }
+        _ => tracing::debug!("caps probe: no cache key on this platform — probing"),
+    }
+
+    match child::probe() {
+        Some(report) => {
+            install_vp9_qsv_idr(report.vp9_qsv_idr);
+            if let (Some(key), Some(path)) = (key, path) {
+                if cache::worth_caching(&report.caps) {
+                    let file = cache::CacheFile::new(
+                        key,
+                        now,
+                        report.caps.probe_ms.unwrap_or(0),
+                        report.caps.clone(),
+                        report.vp9_qsv_idr,
+                    );
+                    match cache::store(&path, &file) {
+                        Ok(()) => tracing::info!(
+                            path = %path.display(),
+                            "caps probe: result cached for the next start"
+                        ),
+                        Err(e) => tracing::warn!(
+                            %e,
+                            path = %path.display(),
+                            "caps probe: could not write the cache — harmless, the next start probes again"
+                        ),
+                    }
+                } else {
+                    tracing::info!(
+                        "caps probe: no hardware cell opened — not cached (a boot-time driver race must not be frozen for a week)"
+                    );
+                }
+            }
+            report.caps
+        }
+        None => {
+            // The child died, hung, or could not be launched. "Codec
+            // unavailable" is the only honest reading: we have no
+            // evidence this host can encode with any of them, and
+            // advertising one we cannot produce costs a black session.
+            // Everything that needs no driver still stands.
+            compute_caps(false)
+        }
+    }
+}
+
+/// A cache hit: the driver-derived fields from the cache, everything else
+/// computed fresh by THIS process (permissions, the GUI session, the file /
+/// clipboard / app verbs change without any driver changing).
+fn merge_cached(hit: super::caps_cache::CacheFile) -> AgentCaps {
+    let mut fresh = compute_caps(false);
+    let cached = hit.caps;
+    fresh.hw_encoders = cached.hw_encoders;
+    fresh.codecs = cached.codecs;
+    fresh.transports = cached.transports;
+    fresh.hevc_chroma = cached.hevc_chroma;
+    fresh.vp9_chroma = cached.vp9_chroma;
+    fresh.video_cells = cached.video_cells;
+    fresh.probe_ms = Some(hit.probe_ms);
+    fresh.probe_cached = true;
+    fresh
+}
+
+#[cfg(feature = "ffmpeg-encoder")]
+fn install_vp9_qsv_idr(verdict: Option<(bool, bool)>) {
+    if let Some(v) = verdict {
+        crate::encode::ffmpeg::FfmpegEncoder::set_vp9_qsv_idr_verdict(v);
+    }
+}
+
+#[cfg(not(feature = "ffmpeg-encoder"))]
+fn install_vp9_qsv_idr(_verdict: Option<(bool, bool)>) {}
+
+#[cfg(feature = "ffmpeg-encoder")]
+fn vp9_qsv_idr_verdict() -> Option<(bool, bool)> {
+    crate::encode::ffmpeg::FfmpegEncoder::vp9_qsv_idr_verdict()
+}
+
+#[cfg(not(feature = "ffmpeg-encoder"))]
+fn vp9_qsv_idr_verdict() -> Option<(bool, bool)> {
+    None
+}
+
+/// The in-process probe as a report: what the `caps-probe` child computes
+/// and prints, and what a process that IS the child answers directly.
+fn in_process_report() -> child::ProbeReport {
+    let caps = detect_in_process();
+    child::ProbeReport {
+        caps,
+        vp9_qsv_idr: vp9_qsv_idr_verdict(),
+    }
 }
 
 /// Compute caps IN THIS PROCESS, running the hardware probes. This is what
@@ -913,6 +1065,7 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
         // Stamped by the PARENT after the child reports (`child::probe`);
         // the driver-free fallback has no probe to time.
         probe_ms: None,
+        probe_cached: false,
         // P6 — the InputArbiter runs on every build (injection degrades to
         // Noop without enigo-input, but the arbitration/floor semantics
         // hold), so the server can safely lift the P3 single-INPUT-holder
@@ -1011,62 +1164,6 @@ pub(crate) fn rc_max_sessions() -> u8 {
         .and_then(|v| v.trim().parse::<u8>().ok())
         .map(|n| n.clamp(1, 8))
         .unwrap_or(2)
-}
-
-/// FR-77 — FFmpeg encoder names whose 4:4:4 open the probe ATTEMPTS. Taken
-/// from the FFmpeg n9.0 sources, not from vendor marketing: `h264_nvenc` and
-/// `hevc_nvenc` list yuv444p (runtime-gated by `NV_ENC_CAPS_SUPPORT_YUV444_ENCODE`),
-/// `hevc_qsv` and `vp9_qsv` list a 4:4:4 form (packed VUYX/XV30, which the
-/// pump does not produce yet — P3), `hevc_vaapi`/`vp9_vaapi` carry the
-/// Main444 / profile-1 rows (P4). Every AV1 encoder, every AMF encoder,
-/// VideoToolbox and Media Foundation cannot, so they are never asked and
-/// never cost a failed open. Locked by a test against the vocabulary.
-#[allow(dead_code)]
-const FFMPEG_444_CAPABLE: &[&str] = &[
-    "h264_nvenc",
-    "hevc_nvenc",
-    "hevc_qsv",
-    "vp9_qsv",
-    "hevc_vaapi",
-    "vp9_vaapi",
-];
-
-/// FR-77 — cells this build will not open or advertise until a field test
-/// takes them off the list: the kill switch of the matrix. `name:chroma`.
-/// HEVC 4:4:4 on QSV and VAAPI start here (the code called QSV Rext encode
-/// unreliable before it was ever opened); the operator's
-/// `ROOMLERD_ENCODER_CELLS_DENY` (comma-separated, an empty value = deny
-/// nothing) REPLACES this default.
-#[allow(dead_code)]
-const DEFAULT_DENIED_CELLS: &[&str] = &["hevc_qsv:yuv444", "hevc_vaapi:yuv444"];
-
-#[allow(dead_code)]
-fn ffmpeg_444_capable(name: &str) -> bool {
-    FFMPEG_444_CAPABLE.contains(&name)
-}
-
-/// The effective denylist: the env override when set, else the built-in.
-#[allow(dead_code)]
-fn denied_cells() -> Vec<String> {
-    match tunnel_core::env::node_env("ENCODER_CELLS_DENY") {
-        Some(v) => v
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => DEFAULT_DENIED_CELLS.iter().map(|s| s.to_string()).collect(),
-    }
-}
-
-#[allow(dead_code)]
-fn cell_denied(
-    deny: &[String],
-    name: &str,
-    chroma: roomler_ai_remote_control::models::ChromaFormat,
-) -> bool {
-    let key = format!("{name}:{}", chroma.wire());
-    deny.iter().any(|d| d == &key)
 }
 
 /// Codec to probe. We only probe codecs that fail closed on activation
@@ -1345,88 +1442,6 @@ mod tests {
         }
     }
 
-    /// FR-77 — the 4:4:4 attempt list names only encoders the FFmpeg n9.0
-    /// sources can actually open in 4:4:4: nothing AV1 (`av1_nvenc` hard-errors
-    /// "AV1 High Profile not supported"; every other AV1 backend lists 4:2:0
-    /// only), nothing AMF, nothing VideoToolbox — and every entry must be a
-    /// name the vocabulary can split, or the probe would open it for nothing.
-    #[test]
-    fn ffmpeg_444_attempt_list_matches_the_source_matrix() {
-        for name in FFMPEG_444_CAPABLE {
-            let (codec, backend) = VideoBackend::from_ffmpeg_name(name)
-                .unwrap_or_else(|| panic!("{name} is outside the cell vocabulary"));
-            assert_ne!(
-                codec,
-                VideoCodec::Av1,
-                "{name}: no AV1 encoder can do 4:4:4"
-            );
-            assert!(
-                !matches!(backend, VideoBackend::Amf | VideoBackend::VideoToolbox),
-                "{name}: AMF and VideoToolbox have no 4:4:4 surface"
-            );
-        }
-        assert!(ffmpeg_444_capable("hevc_nvenc"));
-        assert!(ffmpeg_444_capable("h264_nvenc"));
-        assert!(!ffmpeg_444_capable("av1_nvenc"));
-        assert!(!ffmpeg_444_capable("hevc_amf"));
-        assert!(!ffmpeg_444_capable("hevc_videotoolbox"));
-    }
-
-    /// FR-77 — the denylist is the kill switch: the built-in default keeps the
-    /// unproven cells closed, the env override replaces it wholesale, and an
-    /// explicitly EMPTY override denies nothing.
-    #[test]
-    fn denylist_default_env_override_and_empty_override() {
-        use tunnel_core::env::test_env::Saved;
-        let _saved = Saved::cleared("ENCODER_CELLS_DENY");
-
-        let deny = denied_cells();
-        assert!(cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv444));
-        assert!(cell_denied(&deny, "hevc_vaapi", ChromaFormat::Yuv444));
-        assert!(!cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv420));
-        assert!(!cell_denied(&deny, "hevc_nvenc", ChromaFormat::Yuv444));
-
-        unsafe {
-            tunnel_core::env::test_env::set(
-                "ENCODER_CELLS_DENY",
-                " h264_nvenc:yuv444 ,vp9_qsv:yuv444,",
-            )
-        };
-        let deny = denied_cells();
-        assert!(cell_denied(&deny, "h264_nvenc", ChromaFormat::Yuv444));
-        assert!(cell_denied(&deny, "vp9_qsv", ChromaFormat::Yuv444));
-        assert!(
-            !cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv444),
-            "the override REPLACES the default, it does not add to it"
-        );
-
-        unsafe { tunnel_core::env::test_env::set("ENCODER_CELLS_DENY", "") };
-        assert!(
-            denied_cells().is_empty(),
-            "an empty override denies nothing"
-        );
-    }
-
-    /// The child's output has to survive the round trip, or the parent falls
-    /// back on every host and the probe silently stops meaning anything.
-    #[test]
-    fn the_marked_json_line_round_trips() {
-        let caps = compute_caps(false);
-        let line = format!("{}{}", child::MARKER, serde_json::to_string(&caps).unwrap());
-        let payload = line
-            .trim()
-            .strip_prefix(child::MARKER)
-            .expect("the marker must be recoverable");
-        let back: AgentCaps = serde_json::from_str(payload).expect("caps must parse back");
-        assert_eq!(back.codecs, caps.codecs);
-        assert_eq!(back.transports, caps.transports);
-        assert_eq!(back.hw_encoders, caps.hw_encoders);
-        assert_eq!(
-            back.video_cells, caps.video_cells,
-            "FR-77 cells must survive the round trip"
-        );
-    }
-
     #[test]
     fn picks_av1_when_both_sides_support() {
         let chosen = pick_best_codec(
@@ -1577,5 +1592,97 @@ mod tests {
             "rc.19 caps.files must include \"resume\"; got {:?}",
             caps.files
         );
+    }
+
+    /// The child's output has to survive the round trip, or the parent falls
+    /// back on every host and the probe silently stops meaning anything.
+    /// FR-77 P3 — the envelope carries the vp9_qsv IDR verdict, and the P1
+    /// bare-caps line still parses.
+    #[test]
+    fn the_marked_json_line_round_trips() {
+        let caps = compute_caps(false);
+        let report = child::ProbeReport {
+            caps: caps.clone(),
+            vp9_qsv_idr: Some((true, false)),
+        };
+        let line = format!(
+            "{}{}",
+            child::MARKER,
+            serde_json::to_string(&report).unwrap()
+        );
+        let out = format!("some driver banner\n{line}\n");
+        let back = child::parse_line(&out, std::time::Duration::from_millis(1234))
+            .expect("the report must parse back");
+        assert_eq!(back.caps.codecs, caps.codecs);
+        assert_eq!(back.caps.transports, caps.transports);
+        assert_eq!(back.caps.hw_encoders, caps.hw_encoders);
+        assert_eq!(
+            back.caps.video_cells, caps.video_cells,
+            "FR-77 cells must survive the round trip"
+        );
+        assert_eq!(back.vp9_qsv_idr, Some((true, false)));
+        assert_eq!(back.caps.probe_ms, Some(1234), "stamped by the parent");
+
+        // A P1-shaped line (bare caps, no envelope) is still a valid answer.
+        let bare = format!("{}{}", child::MARKER, serde_json::to_string(&caps).unwrap());
+        let back =
+            child::parse_line(&bare, std::time::Duration::from_millis(7)).expect("bare caps");
+        assert_eq!(back.caps.video_cells, caps.video_cells);
+        assert_eq!(back.vp9_qsv_idr, None);
+        assert_eq!(back.caps.probe_ms, Some(7));
+
+        assert!(
+            child::parse_line("no marker here\n", std::time::Duration::ZERO).is_none(),
+            "without the marker there is no answer"
+        );
+    }
+
+    /// FR-77 P3 — a cache hit takes the encoder matrix from the cache and
+    /// NOTHING else: permissions, files, verbs are this process's own.
+    #[test]
+    fn a_cache_hit_takes_only_the_driver_derived_fields() {
+        let mut cached = compute_caps(false);
+        cached.hw_encoders = vec!["ffmpeg-hevc_nvenc".into()];
+        cached.codecs = vec!["h265".into()];
+        cached.transports = vec!["data-channel-hevc".into()];
+        cached.hevc_chroma = vec!["yuv420".into(), "yuv444".into()];
+        cached.video_cells = vec![VideoCell::new(
+            VideoCodec::Hevc,
+            VideoBackend::Nvenc,
+            &[ChromaFormat::Yuv420, ChromaFormat::Yuv444],
+            true,
+        )];
+        // Poison the fields that must NOT come from the cache.
+        cached.files = vec!["stale".into()];
+        cached.permissions = Some(vec!["stale".into()]);
+        cached.rpc = vec!["stale".into()];
+        let hit = super::super::caps_cache::CacheFile::new(
+            super::super::caps_cache::CacheKey {
+                build: "b".into(),
+                hardware: "h".into(),
+                knobs: "k".into(),
+            },
+            1,
+            3986,
+            cached,
+            None,
+        );
+        let merged = merge_cached(hit);
+        assert_eq!(merged.hw_encoders, vec!["ffmpeg-hevc_nvenc".to_string()]);
+        assert_eq!(merged.transports, vec!["data-channel-hevc".to_string()]);
+        assert_eq!(merged.video_cells.len(), 1);
+        assert!(merged.video_cells[0].hw);
+        assert_eq!(merged.probe_ms, Some(3986));
+        assert!(merged.probe_cached);
+        assert!(
+            merged.files.iter().any(|f| f == "upload"),
+            "files are recomputed, never cached: {:?}",
+            merged.files
+        );
+        assert_ne!(
+            merged.permissions.as_deref(),
+            Some(&["stale".to_string()][..])
+        );
+        assert!(!merged.rpc.iter().any(|r| r == "stale"));
     }
 }
