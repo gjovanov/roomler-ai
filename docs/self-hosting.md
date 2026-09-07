@@ -139,16 +139,25 @@ is the next step, not part of the same form.
 
 ## Add your first machine
 
+> ⚠️ **Do the TLS step below first if the machine is not this one.** Enrollment
+> tokens must travel over TLS, so the agent **rewrites `http://` to `https://`**
+> for any address that is not loopback (`crates/agent-core/src/enrollment.rs`).
+> Against a plain-HTTP server that produces
+> `SSL routines:ssl3_get_record:wrong version number` — an error that names
+> neither the cause nor the fix. `http://localhost:8080` is exempt and works, so
+> enrolling *this* machine needs nothing extra; every other machine needs
+> [a real hostname with TLS](#putting-it-behind-a-real-hostname).
+
 Mint an enrollment token in the web app (**Devices → Enroll device**), then on
 the machine you want to reach:
 
 ```bash
 # Linux / macOS
-curl -fsSL http://<your-host>:8080/api/setup/install.sh | sh -s -- \
+curl -fsSL https://<your-host>/api/setup/install.sh | sh -s -- \
     --role daemon --token <enrollment-jwt>
 
 # Windows (PowerShell, elevated)
-& ([scriptblock]::Create((irm http://<your-host>:8080/api/setup/install.ps1))) `
+& ([scriptblock]::Create((irm https://<your-host>/api/setup/install.ps1))) `
     -Role daemon-system -Token <enrollment-jwt>
 ```
 
@@ -185,9 +194,18 @@ roomler forward --agent <name> --local 127.0.0.1:5432 --remote db.internal:5432
 
 ## Putting it behind a real hostname
 
+Optional while you are trying it out on one machine, **required the moment you
+add a second** — enrollment refuses plaintext to anything but loopback, as the
+warning above explains.
+
 Terminate TLS in front of the stack and point it at `ROOMLER_HTTP_PORT`. The app
 needs WebSocket upgrades on `/ws` and `/derp`, and both are long-lived — set
 generous read timeouts or sessions will be cut every 60 seconds.
+
+⚠️ Whatever you put in front must **forward `Upgrade` and `Connection`**. A
+proxy that drops them leaves a device that enrolls successfully and is then
+never seen online again, because the agent's control socket can never open —
+and nothing in the UI distinguishes that from a machine that is switched off.
 
 ```caddy
 roomler.example.com {
