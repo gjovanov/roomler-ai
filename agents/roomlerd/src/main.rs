@@ -2505,6 +2505,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         if let Some(ms) = cfg.overlay_netmon_debounce_ms {
             fallbacks.insert("OVERLAY_NETMON_DEBOUNCE_MS".to_string(), ms.to_string());
         }
+        // FR-77 — the cell denylist is a string key: it reaches the probe
+        // child through `config_fallbacks_for_child` like every other knob.
+        if let Some(v) = &cfg.encoder_cells_deny {
+            fallbacks.insert("ENCODER_CELLS_DENY".to_string(), v.clone());
+        }
         if !fallbacks.is_empty() {
             tracing::info!(keys = ?fallbacks.keys().collect::<Vec<_>>(),
                 "config-backed env fallbacks registered");

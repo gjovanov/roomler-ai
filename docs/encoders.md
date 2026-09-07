@@ -186,6 +186,65 @@ derivation (`ui/src/composables/videoCells.ts`: `video_cells` when present, else
 the legacy fields as the rc.199 picker read them), for both the codec picker and
 the admin codec chips.
 
+### The probe cache (FR-77 P3)
+
+The matrix probe costs 3.9 s on the dev box and 5.4 s on the corp laptop, paid
+on every daemon start for an answer that changes only when the GPU, its
+driver, the OS build or the roomlerd build changes. Since P3 the child probe's
+answer is kept in **`caps-cache.json`** next to the daemon's logs and reused
+under an unchanged key:
+
+```mermaid
+flowchart TD
+    S([daemon start]) --> K{cache key?<br/>build × hardware × knobs}
+    K -- "macOS: no fingerprint" --> P
+    K -- "ROOMLERD_CAPS_CACHE=0" --> P
+    K --> L{caps-cache.json<br/>same key, < 7 days?}
+    L -- hit --> M[merge: driver-derived fields from the cache,<br/>permissions / verbs recomputed now<br/>probe_cached = true]
+    L -- "miss (reason logged)" --> P[spawn `roomlerd caps-probe`]
+    P --> R{child reported?}
+    R -- no --> F[driver-free caps,<br/>no hardware advertised]
+    R -- yes --> H{any hardware cell?}
+    H -- no --> N[not cached: a boot-time<br/>driver race must not be frozen]
+    H -- yes --> W[store atomically]
+    M --> A([hello])
+    W --> A
+    N --> A
+    F --> A
+```
+
+| Key part | What it is | Why |
+|---|---|---|
+| **build** | crate version + the executable's length and mtime | a dev build with the same version number is a different build |
+| **hardware** (`hwid.rs`) | Windows: every display-class driver instance's `DriverDesc` / `DriverVersion` / `MatchingDeviceId` from the registry + the OS build and UBR. Linux: sysfs DRM ids + kernel driver per card, the NVIDIA module version, the kernel release, size + mtime of the userspace driver libraries the backends dlopen. macOS: none | NVENC, the Intel media runtime and AMF all ship inside the display driver; Media Foundation's codec set is the OS build's. macOS's probe is ~120 ms and VideoToolbox is the OS — no key, no cache |
+| **knobs** | SHA-256 of every `ROOMLERD_*` knob (env + the config fallbacks the child receives) | a denylist edit or `ROOMLERD_DC_H264=0` changes the answer; hashed because an env block can carry a token |
+
+Rules that are load-bearing: only a result with a **hardware** cell is cached
+(a no-hardware answer is the cheap case, and the one a service starting before
+the display driver produces); a hit takes **only** the driver-derived fields
+(`hw_encoders`, `codecs`, `transports`, `hevc_chroma`, `vp9_chroma`,
+`video_cells`, the vp9_qsv IDR verdict) and recomputes permissions, the
+GUI-session state and every verb list; the hello then says `probe_cached: true`
+with `probe_ms` = the cached probe's duration, so the fleet read of probe cost
+keeps its meaning. Kill switch `caps_cache = false` / `ROOMLERD_CAPS_CACHE=0`
+(read and write). Every miss logs its reason — "why did this host re-probe" is
+the question the cache will be asked.
+
+**Found on the way — the vp9_qsv IDR verdict never left the child.** The P4
+probe of whether `vp9_qsv` honours a forced IDR set a `OnceLock` in the probe
+child, which rc.433 had moved out of process; nothing in the daemon ever read
+it, so every vp9_qsv session since ran the GOP-60 containment the probe existed
+to lift. The child now prints a `ProbeReport` envelope (`{caps, vp9_qsv_idr}`)
+and the parent installs the verdict; the cache keeps it with the caps.
+
+**The denylist is a config key** — `encoder_cells_deny` (`name:chroma` entries
+or `none`; `roomler config set` validates the shape) — and is pushable through
+remote config with `MANAGE_AGENTS` alone: it is the matrix's kill switch, not a
+security gate, since it only ever removes cells. The device reports it as
+`needs_restart`. **The ceiling table has a chroma column**:
+`rate_factor_{h264,hevc,vp9}_444` (built-in 150, applied on top of the codec
+factor for a 4:4:4 cell; 4:2:0 is always 100).
+
 ## Capture backends
 
 Cascade (first that works wins): synthetic (CI, env-gated) → **SystemContext**

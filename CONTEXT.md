@@ -44,3 +44,7 @@ _Avoid_: codec (when read off a transport name), channel, lane
 **Probe**:
 The agent's start-up discovery of which encoders and cells the host can open, run in a child process so a faulty driver cannot take the daemon down.
 _Avoid_: caps detection, capability scan, encoder test
+
+**Probe cache**:
+The remembered answer of the last probe, kept only under the build, hardware, drivers and settings that produced it; a change in any of them re-probes, and an answer that found no hardware is never remembered.
+_Avoid_: caps cache file, cached capabilities, hardware cache

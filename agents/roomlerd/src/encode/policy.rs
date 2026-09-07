@@ -227,7 +227,7 @@ pub(crate) fn rate_plan(
     dial_pct: usize,
 ) -> RatePlan {
     let rate_factor_pct = crate::encode::rate_profile::codec_rate_factor_pct(codec_label)
-        * crate::encode::rate_profile::chroma_rate_factor_pct(chroma444)
+        * crate::encode::rate_profile::chroma_rate_factor_pct(codec_label, chroma444)
         / 100;
     let base_ceiling = crate::encode::rate_profile::ffmpeg_maxrate_bps_scaled(
         encode_w,

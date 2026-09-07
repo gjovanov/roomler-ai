@@ -1006,6 +1006,21 @@ impl FfmpegEncoder {
         Some(v)
     }
 
+    /// FR-77 P3 — the vp9_qsv runtime-IDR verdict as measured, by the probe
+    /// child (which ships it in its report envelope) or read back from the
+    /// probe cache. `None` = never measured in this process.
+    pub fn vp9_qsv_idr_verdict() -> Option<(bool, bool)> {
+        VP9_QSV_IDR_VERDICT.get().copied()
+    }
+
+    /// FR-77 P3 — install a verdict measured elsewhere. First writer wins,
+    /// exactly as the probe itself behaves. Before this existed the verdict
+    /// lived only in the CHILD process (rc.433 moved the probe out of
+    /// process) and every vp9_qsv session ran the GOP-60 containment.
+    pub fn set_vp9_qsv_idr_verdict(verdict: (bool, bool)) {
+        let _ = VP9_QSV_IDR_VERDICT.set(verdict);
+    }
+
     fn vp9_qsv_idr_probe_variant(low_power: bool) -> bool {
         const W: u32 = 480;
         const H: u32 = 270;

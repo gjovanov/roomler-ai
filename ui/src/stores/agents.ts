@@ -149,6 +149,8 @@ export interface AgentCapabilities {
   /** FR-77 — wall-clock ms the start-up capability probe took (child spawn to
    *  parsed result). Absent on older agents or when the probe child died. */
   probe_ms?: number
+  /** FR-77 P3 — the cells came from the daemon's probe cache (probe_ms is the cached probe's duration). */
+  probe_cached?: boolean
 }
 
 /** FR-77 — one encoder and the chroma formats it opened in. Wire strings:
@@ -370,6 +372,8 @@ export interface DesiredConfig {
   ssh_authorized_keys?: string[]
   ssh_account_mode?: string
   ssh_port?: number
+  /** FR-77 P3 — the cell denylist (`name:chroma` list or `none`); MANAGE_AGENTS only. */
+  encoder_cells_deny?: string
   updated_by?: string
   updated_at?: string
 }

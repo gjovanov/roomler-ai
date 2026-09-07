@@ -275,6 +275,12 @@ pub struct AgentCaps {
     /// agent older than FR-77.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_ms: Option<u32>,
+    /// FR-77 P3 — true when the cells above came from the daemon's probe
+    /// cache rather than a fresh probe this start (`probe_ms` is then the
+    /// cached probe's duration). Absent on the wire when false, so a
+    /// pre-P3 reader sees nothing new.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probe_cached: bool,
 }
 
 /// FR-77 — one encoder (codec × backend) and the chroma formats it produced
@@ -1294,6 +1300,14 @@ pub struct DesiredConfig {
     pub ssh_account_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_port: Option<u16>,
+    /// FR-77 P3 — the encoder-cell denylist (`encoder_cells_deny`): the kill
+    /// switch of the cell matrix, comma-separated `name:chroma` entries or
+    /// `none`. Pushable because it is NOT a security gate — it only ever
+    /// REMOVES cells a device would otherwise open — so `MANAGE_AGENTS` is
+    /// enough. Applied at the next daemon start (the probe runs once per
+    /// process), which the device reports as `needs_restart`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_cells_deny: Option<String>,
     /// Bumped on every write. The agent reports the revision it has applied,
     /// so "asked for" and "actually running" can be told apart in the UI —
     /// without it, a device that refused the config and one that never heard
@@ -1315,6 +1329,7 @@ impl DesiredConfig {
             && self.ssh_authorized_keys.is_none()
             && self.ssh_account_mode.is_none()
             && self.ssh_port.is_none()
+            && self.encoder_cells_deny.is_none()
     }
 
     /// Whether this request touches the Fleet-RPC grant. Drives the
@@ -1355,6 +1370,9 @@ impl DesiredConfig {
             ssh_authorized_keys,
             ssh_account_mode,
             ssh_port,
+            // FR-77 P3 — neither exec nor SSH: the cell denylist only removes
+            // encoder cells and needs MANAGE_AGENTS alone (see `remote_config::decide`).
+            encoder_cells_deny: _,
             revision: _,
             updated_by: _,
             updated_at: _,
@@ -3812,6 +3830,7 @@ mod tests {
             ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
             ssh_account_mode: Some("console_user".into()),
             ssh_port: Some(2222),
+            encoder_cells_deny: Some("none".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -4123,7 +4142,9 @@ mod tests {
         // Empty cells and an absent probe time stay OFF the wire.
         let wire = serde_json::to_string(&AgentCaps::default()).unwrap();
         assert!(
-            !wire.contains("video_cells") && !wire.contains("probe_ms"),
+            !wire.contains("video_cells")
+                && !wire.contains("probe_ms")
+                && !wire.contains("probe_cached"),
             "{wire}"
         );
 
@@ -4518,6 +4539,7 @@ mod tests {
             ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
             ssh_account_mode: Some("daemon".into()),
             ssh_port: Some(2222),
+            encoder_cells_deny: Some("none".into()),
             revision: 1,
             updated_by: Some(ObjectId::new()),
             updated_at: Some(DateTime::now()),

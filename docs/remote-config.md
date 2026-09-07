@@ -195,6 +195,17 @@ decision function should return `Result<Applied, Reason>` and one call site
 should record both arms, so "a new refusal that forgets to audit itself" stays
 unrepresentable.
 
+
+**A non-security key on the same surface (FR-77 P3).** `encoder_cells_deny`
+— the cell matrix's denylist, comma-separated `name:chroma` entries or `none`
+— is pushable through the same `desired_config` document, reported the same
+way (`needs_restart`: the probe runs once per process), and audited the same
+way. It needs only `MANAGE_AGENTS`: unlike every other key here it is NOT a
+gate — it only ever *removes* encoder cells a device would otherwise open, so
+pushing it cannot grant anything. The device's opt-in (`remote_config_enabled`)
+still applies, because the opt-in is about accepting pushed config at all, not
+about any one key. ⚠️ A blank value from the dialog is "not managed"; a pushed
+empty string CLEARS the device's key back to the built-in list.
 ## 7. What this does not do
 
 - **No bootstrapping problem.** Enabling `exec_enabled` remotely does not

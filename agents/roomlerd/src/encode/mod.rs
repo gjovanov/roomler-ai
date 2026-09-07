@@ -20,7 +20,10 @@ use tunnel_core::env::node_env;
 use crate::capture::{DirtyRect, Frame};
 
 pub mod caps;
+pub mod caps_cache;
+pub mod cells;
 pub mod color;
+pub mod hwid;
 
 #[cfg(feature = "openh264-encoder")]
 pub mod openh264_backend;
