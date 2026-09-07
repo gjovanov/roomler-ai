@@ -278,6 +278,33 @@ when it cannot open. HEVC and H.264 fall back to 4:2:0 and report the truth
 (`rc:video-info chroma`). A 4:4:4 session never shares a pipeline with a
 4:2:0 one of the same codec (`FfmpegDcCodec::pipeline_label`).
 
+### The probe runs in two children (FR-77 P3c)
+
+```mermaid
+sequenceDiagram
+    participant D as daemon (parent)
+    participant B as child: phase base
+    participant F as child: phase 444
+    D->>B: roomlerd caps-probe (ROOMLERD_CAPS_PHASE=base)
+    B-->>D: ROOMLER_CAPS_JSON:{caps: every 4:2:0 cell + software cells, vp9_qsv_idr}
+    D->>D: candidates_444 = hardware NVENC/QSV/VAAPI cells on the source list, minus the denylist
+    D->>F: roomlerd caps-probe (PHASE=444, ROOMLERD_CAPS_444_NAMES=hevc_nvenc,h264_nvenc,…)
+    F-->>D: ROOMLER_CAPS_PROGRESS:hevc_nvenc:yuv444 (before each open)
+    F-->>D: ROOMLER_CAPS_444:["hevc_nvenc","h264_nvenc"]
+    D->>D: merge_444 — the named cells gain yuv444; hevc_chroma follows the P7 rule
+    Note over D,F: F dies or hangs → the 4:2:0 matrix is advertised and the log names the last open
+```
+
+Why: on the 0.4.84 roll CORPLAP-3's Intel media runtime died with `0xc0000005`
+on the first `vp9_qsv` 4:4:4 open over VUYX, and with ONE child that meant the
+daemon advertised no hardware at all — `av1_qsv`, `h264_qsv`, `vp9_qsv` 4:2:0
+gone for a cell no session needed. A faulting 4:4:4 open now costs only the
+4:4:4 forms. The child announces every open on stdout first
+(`ROOMLER_CAPS_PROGRESS:`, line-buffered so it survives the crash) because on a
+service host its stderr reaches no log; the parent's verdict quotes the last
+one, which is the entry to add to `encoder_cells_deny`. `vp9_qsv:yuv444` is on
+the built-in denylist since that day; `probe_ms` is both children's cost.
+
 ## Capture backends
 
 Cascade (first that works wins): synthetic (CI, env-gated) → **SystemContext**

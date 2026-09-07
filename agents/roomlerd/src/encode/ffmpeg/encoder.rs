@@ -1007,6 +1007,19 @@ impl FfmpegEncoder {
         }
     }
 
+    /// FR-77 P3c — the cascade tables' own `&'static str` for a name that
+    /// arrived as a runtime string (the 4:4:4 probe child reads its list
+    /// from the environment). `None` for a name no table carries.
+    pub fn static_name(name: &str) -> Option<&'static str> {
+        HEVC_ENCODER_NAMES
+            .iter()
+            .chain(VP9_ENCODER_NAMES.iter())
+            .chain(AV1_ENCODER_NAMES.iter())
+            .chain(H264_ENCODER_NAMES.iter())
+            .copied()
+            .find(|n| *n == name)
+    }
+
     /// FR-77 — open ONE named encoder at the probe's settings (30 fps, the
     /// standard ceiling, no CQ bias) in the requested chroma format. This is
     /// the capability probe's per-cell open; a session never calls it — it
