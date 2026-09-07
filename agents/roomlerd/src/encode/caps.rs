@@ -57,6 +57,36 @@ static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 /// this host its HW advertisement and nothing more.
 mod child {
     use super::AgentCaps;
+    use roomler_ai_remote_control::models::{ChromaFormat, VideoBackend, VideoCodec};
+
+    /// Marks the line carrying the child's JSON, so log output on the same
+    /// stream cannot be mistaken for the result. Parsing the last line, or
+    /// all of stdout, would break the first time anything logged there.
+    pub(super) const MARKER: &str = "ROOMLER_CAPS_JSON:";
+    /// FR-77 P3c — the 4:4:4 phase's answer: a JSON array of the encoder
+    /// names whose 4:4:4 form opened.
+    pub(super) const MARKER_444: &str = "ROOMLER_CAPS_444:";
+    /// FR-77 P3c — printed by the child BEFORE each open it attempts. On a
+    /// service host the child's stderr reaches no log, so this is the only
+    /// record of which open a dying child was inside; the parent quotes the
+    /// last one in its verdict.
+    pub(super) const PROGRESS: &str = "ROOMLER_CAPS_PROGRESS:";
+
+    /// Set in the child's environment. A belt-and-braces recursion guard:
+    /// `detect()` in a process carrying this must never spawn again.
+    pub(super) const CHILD_ENV: &str = "ROOMLERD_CAPS_CHILD";
+    /// FR-77 P3c — which phase the child runs: `base` (every 4:2:0 open, no
+    /// FFmpeg 4:4:4 attempt) or `444` (only the 4:4:4 forms named in
+    /// [`NAMES_444_ENV`]). Unset = the pre-P3c single-phase probe.
+    pub(super) const PHASE_ENV: &str = "ROOMLERD_CAPS_PHASE";
+    pub(super) const NAMES_444_ENV: &str = "ROOMLERD_CAPS_444_NAMES";
+
+    /// Generous, because a cold GPU driver init on a loaded corp laptop is
+    /// genuinely slow (~300 ms per codec, several codecs, plus process
+    /// start). This is a backstop against a HUNG driver, not a performance
+    /// budget — and even at the ceiling it beats the in-process behaviour it
+    /// replaces, which was to hang forever.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// What the child hands back: the caps, plus the per-host verdicts the
     /// probe measured that are NOT wire capabilities.
@@ -74,31 +104,133 @@ mod child {
         pub(super) vp9_qsv_idr: Option<(bool, bool)>,
     }
 
-    /// Marks the line carrying the child's JSON, so log output on the same
-    /// stream cannot be mistaken for the result. Parsing the last line, or
-    /// all of stdout, would break the first time anything logged there.
-    pub(super) const MARKER: &str = "ROOMLER_CAPS_JSON:";
+    /// FR-77 P3c — which phase THIS process was started for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase {
+        /// The pre-P3c shape: everything in one process (a bare
+        /// `roomlerd caps-probe`).
+        Full,
+        /// Every 4:2:0 open, the software cells, the IDR verdict — and NO
+        /// FFmpeg 4:4:4 attempt.
+        Base,
+        /// Only the 4:4:4 forms of the names in [`NAMES_444_ENV`].
+        Only444,
+    }
 
-    /// Set in the child's environment. A belt-and-braces recursion guard:
-    /// `detect()` in a process carrying this must never spawn again.
-    const CHILD_ENV: &str = "ROOMLERD_CAPS_CHILD";
+    pub(super) fn phase_from_env() -> Phase {
+        match std::env::var(PHASE_ENV).as_deref() {
+            Ok("base") => Phase::Base,
+            Ok("444") => Phase::Only444,
+            _ => Phase::Full,
+        }
+    }
 
-    /// Generous, because a cold GPU driver init on a loaded corp laptop is
-    /// genuinely slow (~300 ms per codec, several codecs, plus process
-    /// start). This is a backstop against a HUNG driver, not a performance
-    /// budget — and even at the ceiling it beats the in-process behaviour it
-    /// replaces, which was to hang forever.
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    pub(super) fn names_444_from_env() -> Vec<String> {
+        std::env::var(NAMES_444_ENV)
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
-    /// Probe in a child. `None` = no usable answer, for ANY reason (spawn
-    /// failed, non-zero exit, killed by a signal, timed out, unparseable
-    /// output) — the caller treats every one of them the same way.
+    /// What one child run came back with. `stdout` is everything it printed
+    /// (the progress lines survive a crash: Rust's stdout is line-buffered).
+    struct Run {
+        ok: bool,
+        stdout: String,
+        elapsed: std::time::Duration,
+    }
+
+    /// Probe in two children. `None` = no usable answer from the BASE phase,
+    /// for ANY reason (spawn failed, non-zero exit, killed by a signal, timed
+    /// out, unparseable output) — the caller treats every one of them the
+    /// same way. A failure of the 4:4:4 phase costs only the 4:4:4 cells:
+    /// the base matrix is advertised, with the last open the child reported
+    /// named in the log so the operator can denylist it.
+    ///
+    /// Why two processes (FR-77 P3c, field 2026-09-08): CORPLAP-3's Intel
+    /// media runtime died with 0xc0000005 on the first `vp9_qsv` 4:4:4 open
+    /// over VUYX, and one child meant the daemon advertised NO hardware at
+    /// all — `av1_qsv`, `h264_qsv`, `vp9_qsv` 4:2:0 all gone for a cell the
+    /// session pump would never have needed.
     pub(super) fn probe() -> Option<ProbeReport> {
         if std::env::var_os(CHILD_ENV).is_some() {
             // We ARE the child (or something re-entered). Probing in-process
             // is what this process was started to do.
-            return Some(super::in_process_report());
+            return Some(super::in_process_report(phase_from_env() != Phase::Base));
         }
+        let started = std::time::Instant::now();
+
+        let base = run_child(&[(PHASE_ENV, "base".to_string())])?;
+        if !base.ok {
+            return None;
+        }
+        let mut report = parse_line(&base.stdout, base.elapsed)?;
+
+        let names = candidates_444(&report.caps);
+        if names.is_empty() {
+            tracing::info!(
+                elapsed_ms = base.elapsed.as_millis(),
+                "caps probe: no 4:4:4 candidate on this host — single phase"
+            );
+        } else {
+            match run_child(&[
+                (PHASE_ENV, "444".to_string()),
+                (NAMES_444_ENV, names.join(",")),
+            ]) {
+                Some(run) if run.ok => match parse_444_line(&run.stdout) {
+                    Some(ok) => {
+                        tracing::info!(
+                            elapsed_ms = run.elapsed.as_millis(),
+                            tried = ?names,
+                            opened = ?ok,
+                            "caps probe: 4:4:4 phase reported"
+                        );
+                        merge_444(&mut report, &ok);
+                    }
+                    None => tracing::warn!(
+                        tried = ?names,
+                        "caps probe: 4:4:4 phase printed no answer — advertising the 4:2:0 matrix"
+                    ),
+                },
+                other => {
+                    let last = other
+                        .as_ref()
+                        .and_then(|r| last_progress(&r.stdout))
+                        .unwrap_or_else(|| "(none reported)".to_string());
+                    tracing::error!(
+                        tried = ?names,
+                        last_open = %last,
+                        "caps probe: the 4:4:4 probe child DIED or hung — advertising the \
+                         4:2:0 matrix only. The open it was inside is the cell to add to \
+                         `encoder_cells_deny` (`<name>:yuv444`); the daemon is unaffected."
+                    );
+                }
+            }
+        }
+
+        // The whole cost the daemon paid: both spawns, every open, both parses.
+        report.caps.probe_ms =
+            Some(u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX));
+        tracing::info!(
+            elapsed_ms = report.caps.probe_ms.unwrap_or(0),
+            codecs = ?report.caps.codecs,
+            hw_encoders = ?report.caps.hw_encoders,
+            cells = report.caps.video_cells.len(),
+            vp9_qsv_idr = ?report.vp9_qsv_idr,
+            "caps probe: child reported"
+        );
+        Some(report)
+    }
+
+    /// Spawn one `caps-probe` child with `extra` on top of the recursion
+    /// guard and the S2 config fallbacks; read its stdout on a thread while
+    /// waiting, bounded by [`TIMEOUT`]. `None` = could not spawn / hung.
+    fn run_child(extra: &[(&str, String)]) -> Option<Run> {
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => {
@@ -106,7 +238,6 @@ mod child {
                 return None;
             }
         };
-
         let started = std::time::Instant::now();
         let mut cmd = std::process::Command::new(exe);
         cmd.arg("caps-probe")
@@ -115,11 +246,12 @@ mod child {
             // real env vars, or every knob it reads falls to its built-in
             // default (FR-19 P4c: `relay-server` was never advertised).
             .envs(tunnel_core::env::config_fallbacks_for_child())
+            .envs(extra.iter().map(|(k, v)| (*k, v.as_str())))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            // Inherited on purpose: the child's own probe logging is the
-            // diagnostic record of WHICH codec it died on, and it belongs in
-            // the daemon's log next to the verdict.
+            // Inherited on purpose: on an attended host the child's own
+            // probe logging lands next to the verdict. On a service host it
+            // reaches no log — which is what the PROGRESS lines are for.
             .stderr(std::process::Stdio::inherit());
         #[cfg(windows)]
         {
@@ -152,20 +284,25 @@ mod child {
         let status = match wait_bounded(&mut childp) {
             Some(s) => s,
             None => {
-                // A hung driver. Kill it and carry on without HW.
+                // A hung driver. Kill it and carry on without this phase.
                 let _ = childp.kill();
                 let _ = childp.wait();
-                let _ = reader.join();
+                let stdout = reader.join().unwrap_or_default();
                 tracing::warn!(
                     timeout_s = TIMEOUT.as_secs(),
-                    "caps probe: the probe child hung — treating every hardware codec as \
-                     unavailable. The daemon is unaffected; this is the process boundary \
-                     doing its job."
+                    phase = ?extra.iter().find(|(k, _)| *k == PHASE_ENV).map(|(_, v)| v.as_str()),
+                    last_open = %last_progress(&stdout).unwrap_or_default(),
+                    "caps probe: the probe child hung — the daemon is unaffected; this is \
+                     the process boundary doing its job."
                 );
-                return None;
+                return Some(Run {
+                    ok: false,
+                    stdout,
+                    elapsed: started.elapsed(),
+                });
             }
         };
-        let out = reader.join().unwrap_or_default();
+        let stdout = reader.join().unwrap_or_default();
 
         if !status.success() {
             // THE case this module exists for. A signal death here is a
@@ -173,30 +310,98 @@ mod child {
             tracing::error!(
                 status = %status,
                 elapsed_ms = started.elapsed().as_millis(),
-                "caps probe: the probe child DIED — treating every hardware codec as \
-                 unavailable. Before this ran out-of-process the same fault crash-looped \
-                 the daemon; see the child's own log lines above for which codec it was."
+                phase = ?extra.iter().find(|(k, _)| *k == PHASE_ENV).map(|(_, v)| v.as_str()),
+                last_open = %last_progress(&stdout).unwrap_or_default(),
+                "caps probe: the probe child DIED. Before this ran out-of-process the same \
+                 fault crash-looped the daemon."
             );
-            return None;
+            return Some(Run {
+                ok: false,
+                stdout,
+                elapsed: started.elapsed(),
+            });
         }
+        Some(Run {
+            ok: true,
+            stdout,
+            elapsed: started.elapsed(),
+        })
+    }
 
-        let report = parse_line(&out, started.elapsed())?;
-        tracing::info!(
-            elapsed_ms = report.caps.probe_ms.unwrap_or(0),
-            codecs = ?report.caps.codecs,
-            hw_encoders = ?report.caps.hw_encoders,
-            cells = report.caps.video_cells.len(),
-            vp9_qsv_idr = ?report.vp9_qsv_idr,
-            "caps probe: child reported"
-        );
-        Some(report)
+    /// The last `PROGRESS` line in a child's output: the open it was inside
+    /// when it stopped answering.
+    pub(super) fn last_progress(out: &str) -> Option<String> {
+        out.lines()
+            .rev()
+            .find_map(|l| l.trim().strip_prefix(PROGRESS))
+            .map(|s| s.trim().to_string())
+    }
+
+    /// FR-77 P3c — the FFmpeg encoder names whose 4:4:4 form the second
+    /// phase should try: every hardware cell of the base matrix whose name
+    /// the source matrix lists for 4:4:4, minus the denylist. Cells the base
+    /// phase could not open are never asked (no `vp9_qsv` 4:4:4 on a host
+    /// without `vp9_qsv`).
+    pub(super) fn candidates_444(caps: &AgentCaps) -> Vec<String> {
+        let deny = crate::encode::cells::denied_cells();
+        let mut names: Vec<String> = Vec::new();
+        for cell in caps.typed_cells() {
+            let backend = match cell.backend {
+                VideoBackend::Nvenc | VideoBackend::Qsv | VideoBackend::Vaapi => {
+                    cell.backend.wire()
+                }
+                _ => continue,
+            };
+            if cell.codec == VideoCodec::Av1 {
+                continue;
+            }
+            let name = format!("{}_{}", cell.codec.wire(), backend);
+            if crate::encode::cells::ffmpeg_444_capable(&name)
+                && !crate::encode::cells::cell_denied(&deny, &name, ChromaFormat::Yuv444)
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// FR-77 P3c — fold the 4:4:4 phase's answer into the base report: the
+    /// named cells gain `yuv444`, and the legacy `hevc_chroma` says 4:4:4
+    /// exactly when the HEVC winner is `hevc_nvenc` and it opened (the P7
+    /// contract the viewer's legacy derivation reads).
+    pub(super) fn merge_444(report: &mut ProbeReport, ok: &[String]) {
+        for name in ok {
+            let Some((codec, backend)) = VideoBackend::from_ffmpeg_name(name) else {
+                continue;
+            };
+            for cell in report.caps.video_cells.iter_mut() {
+                if cell.codec == codec.wire() && cell.backend == backend.wire() {
+                    let c444 = ChromaFormat::Yuv444.wire().to_string();
+                    if !cell.chroma.contains(&c444) {
+                        cell.chroma.push(c444);
+                    }
+                }
+            }
+            let hevc_winner_is_nvenc = report
+                .caps
+                .hw_encoders
+                .iter()
+                .find(|h| h.starts_with("ffmpeg-hevc_"))
+                .is_some_and(|h| h == "ffmpeg-hevc_nvenc");
+            if name == "hevc_nvenc"
+                && hevc_winner_is_nvenc
+                && !report.caps.hevc_chroma.iter().any(|c| c == "yuv444")
+            {
+                report.caps.hevc_chroma.push("yuv444".into());
+            }
+        }
     }
 
     /// The child's marked line → the report, with `probe_ms` stamped by the
-    /// PARENT (spawn + every open + parse: the whole cost the daemon paid,
-    /// the number the fleet judges the matrix probe by). A bare `AgentCaps`
-    /// line (the P1 shape) still parses, so the two halves of a binary can
-    /// never disagree on the envelope.
+    /// PARENT (the caller overwrites it with the whole two-phase cost). A
+    /// bare `AgentCaps` line (the P1 shape) still parses, so the two halves
+    /// of a binary can never disagree on the envelope.
     pub(super) fn parse_line(out: &str, elapsed: std::time::Duration) -> Option<ProbeReport> {
         let line = out.lines().find_map(|l| l.trim().strip_prefix(MARKER))?;
         let mut report = match serde_json::from_str::<ProbeReport>(line) {
@@ -214,6 +419,14 @@ mod child {
         };
         report.caps.probe_ms = Some(u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX));
         Some(report)
+    }
+
+    /// The 4:4:4 phase's marked line → the names that opened.
+    pub(super) fn parse_444_line(out: &str) -> Option<Vec<String>> {
+        let line = out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(MARKER_444))?;
+        serde_json::from_str::<Vec<String>>(line).ok()
     }
 
     /// `wait` with a deadline. `None` = still running when time ran out.
@@ -245,14 +458,73 @@ mod child {
 /// stdout — a library that logs there, a driver that prints a banner — cannot
 /// be mistaken for the result.
 pub fn print_probe_result() {
-    let report = in_process_report();
-    match serde_json::to_string(&report) {
-        Ok(json) => println!("{}{json}", child::MARKER),
-        Err(e) => {
-            tracing::error!(%e, "caps probe: could not serialise caps");
-            std::process::exit(2);
+    match child::phase_from_env() {
+        child::Phase::Only444 => {
+            let names = child::names_444_from_env();
+            let opened = probe_444(&names);
+            match serde_json::to_string(&opened) {
+                Ok(json) => println!("{}{json}", child::MARKER_444),
+                Err(e) => {
+                    tracing::error!(%e, "caps probe: could not serialise the 4:4:4 answer");
+                    std::process::exit(2);
+                }
+            }
+        }
+        phase => {
+            let report = in_process_report(phase != child::Phase::Base);
+            match serde_json::to_string(&report) {
+                Ok(json) => println!("{}{json}", child::MARKER),
+                Err(e) => {
+                    tracing::error!(%e, "caps probe: could not serialise caps");
+                    std::process::exit(2);
+                }
+            }
         }
     }
+}
+
+/// FR-77 P3c — the 4:4:4 phase: open the 4:4:4 form of each named encoder,
+/// announcing every attempt on stdout first so a dying process leaves the
+/// name of the open it was inside. Returns the names that opened.
+#[cfg(feature = "ffmpeg-encoder")]
+fn probe_444(names: &[String]) -> Vec<String> {
+    use crate::encode::ffmpeg::FfmpegEncoder;
+    let mut opened = Vec::new();
+    if !crate::encode::ffmpeg::available() {
+        return opened;
+    }
+    for name in names {
+        // The cascade tables own the `&'static str`; a name outside them is
+        // not something this build can open anyway.
+        let Some(name) = FfmpegEncoder::static_name(name) else {
+            continue;
+        };
+        println!("{}{name}:yuv444", child::PROGRESS);
+        let t = std::time::Instant::now();
+        match FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, true) {
+            Ok(enc) => {
+                drop(enc);
+                tracing::info!(
+                    encoder = name,
+                    elapsed_ms = t.elapsed().as_millis(),
+                    "caps probe: 4:4:4 cell opened"
+                );
+                opened.push(name.to_string());
+            }
+            Err(e) => tracing::info!(
+                encoder = name,
+                %e,
+                elapsed_ms = t.elapsed().as_millis(),
+                "caps probe: 4:4:4 cell did not open — advertising 4:2:0 only"
+            ),
+        }
+    }
+    opened
+}
+
+#[cfg(not(feature = "ffmpeg-encoder"))]
+fn probe_444(_names: &[String]) -> Vec<String> {
+    Vec::new()
 }
 
 /// Probe dimensions for codec activation checks (HEVC, AV1, VP9-444).
@@ -363,7 +635,7 @@ fn cached_or_probed() -> AgentCaps {
             // evidence this host can encode with any of them, and
             // advertising one we cannot produce costs a black session.
             // Everything that needs no driver still stands.
-            compute_caps(false)
+            compute_caps(false, false)
         }
     }
 }
@@ -372,7 +644,7 @@ fn cached_or_probed() -> AgentCaps {
 /// computed fresh by THIS process (permissions, the GUI session, the file /
 /// clipboard / app verbs change without any driver changing).
 fn merge_cached(hit: super::caps_cache::CacheFile) -> AgentCaps {
-    let mut fresh = compute_caps(false);
+    let mut fresh = compute_caps(false, false);
     let cached = hit.caps;
     fresh.hw_encoders = cached.hw_encoders;
     fresh.codecs = cached.codecs;
@@ -407,8 +679,11 @@ fn vp9_qsv_idr_verdict() -> Option<(bool, bool)> {
 
 /// The in-process probe as a report: what the `caps-probe` child computes
 /// and prints, and what a process that IS the child answers directly.
-fn in_process_report() -> child::ProbeReport {
-    let caps = detect_in_process();
+/// `attempt_444` = false is the BASE phase (FR-77 P3c): every 4:2:0 open
+/// and the software cells, with no FFmpeg 4:4:4 attempt — those run in the
+/// second child so a faulting driver costs only the 4:4:4 form.
+fn in_process_report(attempt_444: bool) -> child::ProbeReport {
+    let caps = compute_caps(true, attempt_444);
     child::ProbeReport {
         caps,
         vp9_qsv_idr: vp9_qsv_idr_verdict(),
@@ -419,7 +694,7 @@ fn in_process_report() -> child::ProbeReport {
 /// the `caps-probe` child executes; nothing else should call it, because a
 /// vendor driver that faults takes the whole process with it.
 pub fn detect_in_process() -> AgentCaps {
-    compute_caps(true)
+    compute_caps(true, true)
 }
 
 /// Whether the OS will let this process capture the screen.
@@ -479,7 +754,7 @@ fn input_permission_granted() -> bool {
 /// behind a `#[cfg]` (mf-encoder / ffmpeg-encoder / vp9-444); a default-feature
 /// build probes nothing and legitimately never reads it.
 #[allow(unused_variables)]
-fn compute_caps(run_hw_probes: bool) -> AgentCaps {
+fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
     // `mut` is only consumed inside the cfg-gated push blocks below
     // (openh264-encoder / mf-encoder). Default-feature builds skip
     // both blocks and the vecs stay empty; silence the unused-mut
@@ -662,7 +937,8 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
                     // regardless (`peer.rs`).
                     let mut chroma = vec![ChromaFormat::Yuv420];
                     if let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(name) {
-                        if ffmpeg_444_capable(name)
+                        if attempt_444
+                            && ffmpeg_444_capable(name)
                             && !cell_denied(&deny, name, ChromaFormat::Yuv444)
                         {
                             match FfmpegEncoder::new_named_probe(
@@ -756,7 +1032,8 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
                     Ok(enc) => {
                         drop(enc);
                         let mut chroma = vec![ChromaFormat::Yuv420];
-                        if ffmpeg_444_capable(name)
+                        if attempt_444
+                            && ffmpeg_444_capable(name)
                             && !cell_denied(&deny, name, ChromaFormat::Yuv444)
                         {
                             match FfmpegEncoder::new_named_probe(
@@ -1341,7 +1618,7 @@ mod tests {
     /// asserts the reporting contract rather than the contents.
     #[test]
     fn caps_always_report_permission_state() {
-        let caps = compute_caps(false);
+        let caps = compute_caps(false, false);
         let perms = caps
             .permissions
             .expect("a current agent must report permissions, so None can keep meaning 'unknown'");
@@ -1368,7 +1645,7 @@ mod tests {
     /// dropping every event. Without the feature it must stay false regardless.
     #[test]
     fn input_permission_is_not_merely_a_compile_flag() {
-        let caps = compute_caps(false);
+        let caps = compute_caps(false, false);
         if !cfg!(feature = "enigo-input") {
             assert!(!caps.has_input_permission);
         }
@@ -1383,12 +1660,12 @@ mod tests {
     /// cannot be trusted still produces usable caps, and never claims a codec
     /// it has no evidence for.
     ///
-    /// `compute_caps(false)` is exactly what `detect()` falls back to when the
+    /// `compute_caps(false, false)` is exactly what `detect()` falls back to when the
     /// probe child dies, so this is the shape a driver fault now yields —
     /// where before it yielded a crash-looping daemon.
     #[test]
     fn a_failed_probe_still_yields_usable_caps_and_advertises_no_hardware() {
-        let caps = compute_caps(false);
+        let caps = compute_caps(false, false);
 
         // Nothing that required asking a driver.
         for name in ["mf-h264-hw", "mf-h265-hw", "mf-av1-hw"] {
@@ -1507,7 +1784,7 @@ mod tests {
         // Probing ENABLED on purpose: the claim is that a build without the
         // feature never advertises the transport even when probes run. (The
         // vp9 probe itself is cfg'd out here, so nothing is actually opened.)
-        let caps = compute_caps(true);
+        let caps = compute_caps(true, true);
         assert!(
             !caps.transports.iter().any(|t| t == "data-channel-vp9-444"),
             "default-feature build advertised vp9-444 transport: {:?}",
@@ -1535,7 +1812,7 @@ mod tests {
         // Probing ENABLED: this test's whole claim is that the probe runs and
         // succeeds. libvpx is our own software encoder, not a vendor driver,
         // so running it in-process here is safe.
-        let caps = compute_caps(true);
+        let caps = compute_caps(true, true);
         assert!(
             caps.transports.iter().any(|t| t == "data-channel-vp9-444"),
             "vp9-444 transport must be advertised when libvpx probe succeeds; got {:?}",
@@ -1554,7 +1831,7 @@ mod tests {
     #[test]
     fn detect_advertises_opus_audio_when_feature_enabled() {
         // Feature-gated, never probe-gated — no driver call needed.
-        let caps = compute_caps(false);
+        let caps = compute_caps(false, false);
         assert!(
             caps.audio.iter().any(|c| c == "opus"),
             "audio-feature build must advertise opus; got {:?}",
@@ -1571,7 +1848,7 @@ mod tests {
     fn detect_omits_audio_when_feature_disabled() {
         // Audio advertisement is feature-gated, never probe-gated, so this
         // needs no driver call.
-        let caps = compute_caps(false);
+        let caps = compute_caps(false, false);
         assert!(
             caps.audio.is_empty(),
             "default build must not advertise audio; got {:?}",
@@ -1586,7 +1863,7 @@ mod tests {
     #[test]
     fn detect_advertises_resume_files_cap() {
         // File caps never depended on a probe — and must survive one failing.
-        let caps = compute_caps(false);
+        let caps = compute_caps(false, false);
         assert!(
             caps.files.iter().any(|s| s == "resume"),
             "rc.19 caps.files must include \"resume\"; got {:?}",
@@ -1600,7 +1877,7 @@ mod tests {
     /// bare-caps line still parses.
     #[test]
     fn the_marked_json_line_round_trips() {
-        let caps = compute_caps(false);
+        let caps = compute_caps(false, false);
         let report = child::ProbeReport {
             caps: caps.clone(),
             vp9_qsv_idr: Some((true, false)),
@@ -1641,7 +1918,7 @@ mod tests {
     /// NOTHING else: permissions, files, verbs are this process's own.
     #[test]
     fn a_cache_hit_takes_only_the_driver_derived_fields() {
-        let mut cached = compute_caps(false);
+        let mut cached = compute_caps(false, false);
         cached.hw_encoders = vec!["ffmpeg-hevc_nvenc".into()];
         cached.codecs = vec!["h265".into()];
         cached.transports = vec!["data-channel-hevc".into()];
@@ -1684,5 +1961,203 @@ mod tests {
             Some(&["stale".to_string()][..])
         );
         assert!(!merged.rpc.iter().any(|r| r == "stale"));
+    }
+
+    /// FR-77 P3c — the 4:4:4 phase asks only for hardware cells the base
+    /// phase opened whose name the source matrix lists, minus the denylist:
+    /// no AV1, no AMF/VideoToolbox/MF, nothing denied, and nothing the host
+    /// never opened in 4:2:0.
+    #[test]
+    fn candidates_444_are_the_hardware_cells_the_matrix_allows_minus_the_denylist() {
+        use tunnel_core::env::test_env::Saved;
+        let _saved = Saved::cleared("ENCODER_CELLS_DENY");
+        let caps = AgentCaps {
+            video_cells: vec![
+                VideoCell::new(
+                    VideoCodec::Hevc,
+                    VideoBackend::Nvenc,
+                    &[ChromaFormat::Yuv420],
+                    true,
+                ),
+                VideoCell::new(
+                    VideoCodec::H264,
+                    VideoBackend::Nvenc,
+                    &[ChromaFormat::Yuv420],
+                    true,
+                ),
+                VideoCell::new(
+                    VideoCodec::Av1,
+                    VideoBackend::Nvenc,
+                    &[ChromaFormat::Yuv420],
+                    true,
+                ),
+                VideoCell::new(
+                    VideoCodec::Hevc,
+                    VideoBackend::Amf,
+                    &[ChromaFormat::Yuv420],
+                    true,
+                ),
+                VideoCell::new(
+                    VideoCodec::Vp9,
+                    VideoBackend::Qsv,
+                    &[ChromaFormat::Yuv420],
+                    true,
+                ),
+                VideoCell::new(
+                    VideoCodec::Hevc,
+                    VideoBackend::Qsv,
+                    &[ChromaFormat::Yuv420],
+                    true,
+                ),
+                VideoCell::new(
+                    VideoCodec::Vp9,
+                    VideoBackend::Libvpx,
+                    &[ChromaFormat::Yuv420],
+                    false,
+                ),
+            ],
+            ..AgentCaps::default()
+        };
+        // Built-in denylist: hevc_qsv, hevc_vaapi AND vp9_qsv (CORPLAP-3, 2026-09-08).
+        assert_eq!(
+            child::candidates_444(&caps),
+            vec!["hevc_nvenc".to_string(), "h264_nvenc".to_string()]
+        );
+        unsafe { tunnel_core::env::test_env::set("ENCODER_CELLS_DENY", "none") };
+        assert_eq!(
+            child::candidates_444(&caps),
+            vec!["hevc_nvenc", "h264_nvenc", "vp9_qsv", "hevc_qsv"]
+        );
+        assert!(child::candidates_444(&AgentCaps::default()).is_empty());
+    }
+
+    /// FR-77 P3c — the merge adds `yuv444` to exactly the named cells, and
+    /// the legacy `hevc_chroma` follows the P7 rule (hevc_nvenc won AND opened).
+    #[test]
+    fn merge_444_marks_the_cells_and_the_legacy_hevc_chroma() {
+        let mut report = child::ProbeReport {
+            caps: AgentCaps {
+                hw_encoders: vec![
+                    "openh264-sw".into(),
+                    "ffmpeg-hevc_nvenc".into(),
+                    "ffmpeg-h264_nvenc".into(),
+                ],
+                hevc_chroma: vec!["yuv420".into()],
+                video_cells: vec![
+                    VideoCell::new(
+                        VideoCodec::Hevc,
+                        VideoBackend::Nvenc,
+                        &[ChromaFormat::Yuv420],
+                        true,
+                    ),
+                    VideoCell::new(
+                        VideoCodec::H264,
+                        VideoBackend::Nvenc,
+                        &[ChromaFormat::Yuv420],
+                        true,
+                    ),
+                    VideoCell::new(
+                        VideoCodec::Vp9,
+                        VideoBackend::Qsv,
+                        &[ChromaFormat::Yuv420],
+                        true,
+                    ),
+                ],
+                ..AgentCaps::default()
+            },
+            vp9_qsv_idr: None,
+        };
+        child::merge_444(
+            &mut report,
+            &["hevc_nvenc".to_string(), "vp9_qsv".to_string()],
+        );
+        let cell = |r: &child::ProbeReport, codec: &str, backend: &str| {
+            r.caps
+                .video_cells
+                .iter()
+                .find(|c| c.codec == codec && c.backend == backend)
+                .unwrap()
+                .chroma
+                .clone()
+        };
+        assert_eq!(cell(&report, "hevc", "nvenc"), vec!["yuv420", "yuv444"]);
+        assert_eq!(cell(&report, "vp9", "qsv"), vec!["yuv420", "yuv444"]);
+        assert_eq!(
+            cell(&report, "h264", "nvenc"),
+            vec!["yuv420"],
+            "not named — untouched"
+        );
+        assert_eq!(report.caps.hevc_chroma, vec!["yuv420", "yuv444"]);
+        // Idempotent.
+        child::merge_444(&mut report, &["hevc_nvenc".to_string()]);
+        assert_eq!(cell(&report, "hevc", "nvenc"), vec!["yuv420", "yuv444"]);
+        assert_eq!(report.caps.hevc_chroma, vec!["yuv420", "yuv444"]);
+        // A QSV HEVC winner never makes the legacy field say 4:4:4 (the P7
+        // session path is hevc_nvenc's).
+        let mut qsv = child::ProbeReport {
+            caps: AgentCaps {
+                hw_encoders: vec!["ffmpeg-hevc_qsv".into()],
+                hevc_chroma: vec!["yuv420".into()],
+                video_cells: vec![VideoCell::new(
+                    VideoCodec::Hevc,
+                    VideoBackend::Qsv,
+                    &[ChromaFormat::Yuv420],
+                    true,
+                )],
+                ..AgentCaps::default()
+            },
+            vp9_qsv_idr: None,
+        };
+        child::merge_444(&mut qsv, &["hevc_qsv".to_string()]);
+        assert_eq!(qsv.caps.hevc_chroma, vec!["yuv420"]);
+        assert_eq!(qsv.caps.video_cells[0].chroma, vec!["yuv420", "yuv444"]);
+    }
+
+    /// FR-77 P3c — the 4:4:4 phase's answer and the progress trail parse; a
+    /// crashed child leaves the name of the open it was inside.
+    #[test]
+    fn the_444_phase_lines_and_the_progress_trail_parse() {
+        let out = format!(
+            "{}hevc_nvenc:yuv444\nsome driver banner\n{}h264_nvenc:yuv444\n{}[\"hevc_nvenc\"]\n",
+            child::PROGRESS,
+            child::PROGRESS,
+            child::MARKER_444
+        );
+        assert_eq!(
+            child::parse_444_line(&out),
+            Some(vec!["hevc_nvenc".to_string()])
+        );
+        assert_eq!(
+            child::last_progress(&out).as_deref(),
+            Some("h264_nvenc:yuv444")
+        );
+        let died = format!("{}vp9_qsv:yuv444\n", child::PROGRESS);
+        assert_eq!(child::parse_444_line(&died), None);
+        assert_eq!(
+            child::last_progress(&died).as_deref(),
+            Some("vp9_qsv:yuv444")
+        );
+        assert_eq!(child::last_progress(""), None);
+    }
+
+    /// FR-77 P3c — the child reads its phase from the environment; unset is
+    /// the pre-P3c single-phase probe.
+    #[test]
+    fn the_phase_is_read_from_the_environment() {
+        // These env vars are private to the probe child, so the plain
+        // std::env API is the contract (no ROOMLERD_ prefix bridging).
+        // SAFETY: no other test in this crate touches ROOMLERD_CAPS_PHASE.
+        unsafe { std::env::remove_var(child::PHASE_ENV) };
+        assert_eq!(child::phase_from_env(), child::Phase::Full);
+        unsafe { std::env::set_var(child::PHASE_ENV, "base") };
+        assert_eq!(child::phase_from_env(), child::Phase::Base);
+        unsafe { std::env::set_var(child::PHASE_ENV, "444") };
+        assert_eq!(child::phase_from_env(), child::Phase::Only444);
+        unsafe { std::env::set_var(child::NAMES_444_ENV, " hevc_nvenc, vp9_qsv ,") };
+        assert_eq!(child::names_444_from_env(), vec!["hevc_nvenc", "vp9_qsv"]);
+        unsafe {
+            std::env::remove_var(child::PHASE_ENV);
+            std::env::remove_var(child::NAMES_444_ENV);
+        }
     }
 }

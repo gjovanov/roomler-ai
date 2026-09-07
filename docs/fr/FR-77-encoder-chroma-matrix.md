@@ -303,6 +303,38 @@ flowchart LR
   the cell opens only once `encoder_cells_deny` is pushed to a host without
   `hevc_qsv:yuv444`, which is P3's field test on CORPLAP-3.
 
+### P3c — as built (#PR3C): the probe in two children, and what the 0.4.84 roll found
+
+- **What the roll found (2026-09-08).** On CORPLAP-3 the first 0.4.84 probe child died
+  with `0xc0000005` 3.5 s in, and the daemon advertised **no hardware at all** — the
+  driver-free fallback is `h264/openh264` only. The one open P3b added on that host is
+  `vp9_qsv` in 4:4:4 over VUYX; every other open was unchanged since 0.4.83. The process
+  boundary did its job (the daemon never crashed), but a single child made the price of
+  one faulting cell the WHOLE matrix: `av1_qsv`, `h264_qsv` and `vp9_qsv` 4:2:0 all gone
+  for a cell no session needed. And on a service host the child's own log lines reach
+  nothing — the error's "see the child's log lines above" was empty.
+- **The probe runs in two children.** Phase `base` (`ROOMLERD_CAPS_PHASE=base`) is every
+  4:2:0 open, the software cells and the vp9_qsv IDR verdict — no FFmpeg 4:4:4 attempt.
+  Phase `444` opens only the 4:4:4 forms of the names the parent computes from the base
+  matrix (`candidates_444`: hardware NVENC/QSV/VAAPI cells, not AV1, on the source
+  matrix's list, minus the denylist), and answers with the names that opened
+  (`ROOMLER_CAPS_444:[…]`); the parent folds them in (`merge_444`: the cells gain
+  `yuv444`, and the legacy `hevc_chroma` says 4:4:4 exactly when `hevc_nvenc` won and
+  opened). A dying or hanging 4:4:4 child now costs only the 4:4:4 forms: the 4:2:0
+  matrix is advertised and the log names the cell. `probe_ms` is both children's cost.
+- **The child announces every open on stdout** (`ROOMLER_CAPS_PROGRESS:<name>:yuv444`,
+  line-buffered so it survives a crash), and the parent quotes the last one in its
+  verdict — "which open died" is answered on service hosts too, and the line tells the
+  operator what to add to `encoder_cells_deny`.
+- **`vp9_qsv:yuv444` joins the built-in denylist** until a driver proves it; the cell is
+  one push away on any host (`encoder_cells_deny` without it).
+- **Field-verified on the same roll**: the cache (dev box: `cache hit — reusing the last
+  probe's encoder matrix age_secs=708 probe_ms=3629 cells=8` 0.5 s after `agent
+  starting`; the hello says `probe_cached: true` with `hevc_chroma` intact) and the
+  denylist push (CORPLAP-3: opt-in over Fleet RPC → `PUT desired-config` with the key
+  alone, 200 with `MANAGE_AGENTS` → restart → `applied` + `needs_restart:
+  ["encoder_cells_deny"]` → restart → 6 cells back in 3032 ms, `applied` / `noop`).
+
 ## Phases
 
 | # | Phase | Kill switch | Status |
@@ -310,7 +342,7 @@ flowchart LR
 | P0 | FFmpeg **9.0.1** on all three vendoring lanes (vcpkg baseline `2e6b9238`, AMF headers `v1.5.2`, `ffmpeg-next = "9.0"`, dylib names → 63, the NVENC patch re-based) + `scripts/dev-ffmpeg-windows.ps1`, the native Windows dev loop | flip the three asset patterns back to `vendored-ffmpeg-8.1.2` (kept one release) | **shipped** #1472 → `agent-v0.4.82` (bump #1477), **field-verified 2026-09-07** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) |
 | P1 | `video_cells` + the matrix probe + verified `hw` + probe duration in the hello; server passthrough | legacy fields stay filled; a viewer ignoring the field sees today | **shipped** #1480 → `agent-v0.4.83`, **field-verified 2026-09-07** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) |
 | P2 | Picker: codec × chroma dropdowns, i18n, Auto rules, remembered trial failures, the shared derivation | ships with P1 | **shipped** with P1 (viewer `hosted-20260907-602396d`), **field-verified 2026-09-07** |
-| P3 | **P3a** the probe cache · the `ProbeReport` envelope (the lost vp9_qsv IDR verdict) · `encoder_cells_deny` config key + remote-config push · the chroma column · `cells.rs`; **P3b** the cells: VP9 4:4:4 hardware (QSV/VAAPI profile 1, VUYX), H.264 4:4:4 (NVENC + software decode), HEVC 4:4:4 on QSV/VAAPI behind the denylist | the cell denylist; `caps_cache = false` | **P3a built** #1488 · **P3b built** #1489; field tests next (dev box H.264 4:4:4, CORPLAP-3 VP9 4:4:4 on vp9_qsv, then HEVC 4:4:4 on QSV with the denylist pushed) |
+| P3 | **P3a** the probe cache · the `ProbeReport` envelope (the lost vp9_qsv IDR verdict) · `encoder_cells_deny` config key + remote-config push · the chroma column · `cells.rs`; **P3b** the cells: VP9 4:4:4 hardware (QSV/VAAPI profile 1, VUYX), H.264 4:4:4 (NVENC + software decode), HEVC 4:4:4 on QSV/VAAPI behind the denylist | the cell denylist; `caps_cache = false` | **P3a + P3b shipped** `agent-v0.4.84` #1488 #1489 — the cache and the push **field-verified 2026-09-08**; the roll found the one-child cost on CORPLAP-3 (a faulting `vp9_qsv` 4:4:4 open took the whole matrix) ⇒ **P3c** #PR3C: the two-child probe, `vp9_qsv:yuv444` default-denied; the cell field tests (H.264 4:4:4 on the dev box, VP9 and HEVC 4:4:4 on QSV) follow 0.4.85 |
 | P4 | VAAPI on Linux x86_64 | `ROOMLERD_USE_FFMPEG=0` / the denylist | — |
 | P5 | `docs/encoders.md` rewritten with diagrams (the cell resolution, the probe lifecycle); stale "macOS ships no FFmpeg" lines corrected in `CLAUDE.md`, `THIRD-PARTY-NOTICES.md`, `docs/lgpl-relink.md`; `docs/README.md` row | — | — |
 | next | FR for D3D12 video encode (Windows) + Vulkan video encode (Linux/Windows) | — | — |
@@ -368,3 +400,7 @@ multi-GPU adapter selection for Windows backends (unchanged).
 | 2026-09-07 | dev box → dev box, Sharper, chroma Auto | P2 | `[rc] auto transport — data-channel-hevc (HEVC 4:4:4: HW Rext encode on agent + HW Rext decode here)`; decoder `hev1.4.10.L153.B0`; `rc:video-info {encoder: hevc_nvenc, hardware: true, chroma: yuv444, transport: direct}`; first keyframe acquired, 1588×992 at ~18 ms — the chroma axis reaches the session end to end |
 | 2026-09-08 | dev box, P3a branch built natively against the 9.0.1 tree | P3a | **The probe cache round trip.** Run 1 (no file): `cache miss — probing (no cache file)` → child reported 8 cells in **3229 ms** → `result cached for the next start`. Run 2: `cache hit — reusing the last probe's encoder matrix` (age 4 s, `probe_ms=3229`, 8 cells), no child spawned, the whole `caps` answer in under a second of process start. Run 3 (`ROOMLERD_CAPS_CACHE=0`): `cache disabled — probing`, 3329 ms. Stored key: build `0.4.83/<exe len>/<exe mtime>`; hardware `windows;os=26200.9278;hw=AMD Radeon(TM) 610M\|32.0.13034.7001\|PCI\VEN_1002&DEV_13C0…;NVIDIA GeForce RTX 5090 Laptop GPU\|32.0.16.1088\|pci\ven_10de&dev_2c18…` (both adapters with driver versions + the OS build and UBR — what a driver or Windows update rewrites); knobs = SHA-256 of the `ROOMLERD_*` set; `vp9_qsv_idr` absent on an NVIDIA host. 3 KB pretty JSON next to the logs |
 | 2026-09-08 | code read while building the cache | P3a | **The vp9_qsv IDR verdict never left the probe child.** `probe_and_cache_vp9_qsv_idr` stores its verdict in a `OnceLock` that rc.433's out-of-process probe left in the CHILD; `vp9_qsv_runtime_config` in the parent always read `None` ⇒ `vp9_qsv_config(None, None)` = `(false, true)` = the GOP-60 containment, on every vp9_qsv session since. Nothing logged, nothing failed. Fixed by the `ProbeReport` envelope; CORPLAP-3's next session is the field check (expect `honors_low_power` / the long GOP in its log) |
+| 2026-09-08 | release | P3a/P3b | `agent-v0.4.84` (bump #1490 → `f7352cb9`, release run 34168755016, 28 assets); viewer `hosted-20260907-ee34ca0` (the P3b merge) promoted, both pods rolled |
+| 2026-09-08 | dev box, the 0.4.84 update + a restart | P3a | **The cache, in the field.** First 0.4.84 start: `cache miss — probing (roomlerd build changed)` → 8 cells in **3629 ms** → `result cached` (the WORKER's dir, `%LOCALAPPDATA%\roomler\roomler\data\logs\caps-cache.json` — the worker runs the probe, the SCM supervisor never does). A `Restart-Service` 12 min later: `cache hit — reusing the last probe's encoder matrix age_secs=708 probe_ms=3629 cells=8` **0.5 s** after `agent starting`; the hello then carries `probe_cached: true`, `probe_ms: 3629`, 8 cells, `hevc_chroma: [yuv420, yuv444]`. ⚠️ The MSI upgrade itself took **7.5 min** (service stopped 23:17:55 → running 23:25:27; RestartManager in "Shutting down application or service 'Roomler'"), vs 10 s for 0.4.83 — not this FR's, noted for the updater |
+| 2026-09-08 | CORPLAP-3, the 0.4.84 update | P3b | **REGRESSION.** First 0.4.84 start: `cache miss` → **`the probe child DIED status=exit code: 0xc0000005 elapsed_ms=3490`** → the hello advertised `h264/openh264` only: `vp9_qsv`, `av1_qsv`, `h264_qsv` 4:2:0 all gone. The only new open on this host is `vp9_qsv` 4:4:4 over VUYX (P3b); the child's own log lines never reach a service host's log, so the log cannot name the open. One child = one faulting cell costs the whole matrix → P3c |
+| 2026-09-08 | CORPLAP-3, restored through the push | P3a | **`encoder_cells_deny`, in the field.** `roomler config set remote_config_enabled true` over Fleet RPC ("in effect now — no restart needed"); `PUT …/desired-config {"encoder_cells_deny": "hevc_qsv:yuv444,hevc_vaapi:yuv444,vp9_qsv:yuv444"}` from the dashboard session → 200, revision 1, the only key on the row; `Restart-Service` → the device reported **`applied`, `needs_restart: ["encoder_cells_deny"]`** (state `needs_restart`); a second restart → the probe ran with the cell denied: **6 cells in 3032 ms** (`vp9/qsv` `av1/qsv` `h264/qsv` hw, `h264/mf`, `h264/openh264`, `vp9/libvpx` 4:2:0+4:4:4), report `noop`, state `applied`. ⚠️ `roomler exec` on a host that restarts its own service answers "no answer within 45s" — the command ran |
