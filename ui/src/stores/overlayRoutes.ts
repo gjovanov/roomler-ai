@@ -3,6 +3,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { useCapabilitiesStore } from '@/stores/capabilities'
 
 // Matches `crates/api/src/routes/overlay_route.rs::OverlayNodeResponse`.
 export interface OverlayNode {
@@ -73,6 +74,15 @@ export const useOverlayRoutesStore = defineStore('overlayRoutes', () => {
   const error = ref<string | null>(null)
 
   async function fetchNodes(tenantId: string) {
+    // `/tenant/…/overlay-node` is a `network`-module route; a profile that
+    // drops the module answers 404. Guarded in the STORE for the same reason
+    // as `tunnelClients.fetchTunnelClients` — a per-caller gate leaks the
+    // moment one caller reaches for the wrong predicate. Fail-open until the
+    // server answers, so it is inert before first paint. (FR-75, #1447.)
+    if (!useCapabilitiesStore().has('network')) {
+      nodes.value = []
+      return
+    }
     loading.value = true
     error.value = null
     try {
