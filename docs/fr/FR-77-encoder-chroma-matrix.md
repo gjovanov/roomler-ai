@@ -1,6 +1,6 @@
 # FR-77 — Encoder × chroma matrix: every backend compiled in, one runtime-probed build, an honest codec picker
 
-**Issue:** [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) · **Status:** proposed 2026-09-07, design settled in a grill session, P0 in flight · **Opened:** 2026-09-07 · **Glossary:** [`CONTEXT.md`](../../CONTEXT.md) · **ADR:** [0001](../adr/0001-encoder-backends-compiled-in-discovered-at-runtime.md) · **Related:** [#1468](https://github.com/gjovanov/roomler-ai/pull/1468) · [FR-16](FR-16-rc-quality-benchmark.md) · [FR-62](FR-62-encoder-rate-changes-without-an-idr.md) · [FR-74](FR-74-text-clarity-on-direct-paths.md)
+**Issue:** [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) · **Status:** P0 released as `agent-v0.4.82` and field-verified 2026-09-07 on NVENC, QSV and VideoToolbox; P1 next · **Opened:** 2026-09-07 · **Glossary:** [`CONTEXT.md`](../../CONTEXT.md) · **ADR:** [0001](../adr/0001-encoder-backends-compiled-in-discovered-at-runtime.md) · **Related:** [#1468](https://github.com/gjovanov/roomler-ai/pull/1468) · [FR-16](FR-16-rc-quality-benchmark.md) · [FR-62](FR-62-encoder-rate-changes-without-an-idr.md) · [FR-74](FR-74-text-clarity-on-direct-paths.md)
 
 ## Goal
 
@@ -189,7 +189,7 @@ flowchart LR
 
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
-| P0 | FFmpeg **9.0.1** on all three vendoring lanes (vcpkg baseline `2e6b9238`, AMF headers `v1.5.2`, `ffmpeg-next = "9.0"`, dylib names → 63, the NVENC patch re-based) + `scripts/dev-ffmpeg-windows.ps1`, the native Windows dev loop | flip the three asset patterns back to `vendored-ffmpeg-8.1.2` (kept one release) | in flight |
+| P0 | FFmpeg **9.0.1** on all three vendoring lanes (vcpkg baseline `2e6b9238`, AMF headers `v1.5.2`, `ffmpeg-next = "9.0"`, dylib names → 63, the NVENC patch re-based) + `scripts/dev-ffmpeg-windows.ps1`, the native Windows dev loop | flip the three asset patterns back to `vendored-ffmpeg-8.1.2` (kept one release) | **shipped** #1472 → `agent-v0.4.82` (bump #1477), **field-verified 2026-09-07** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) |
 | P1 | `video_cells` + the matrix probe + verified `hw` + probe duration in the hello; server passthrough | legacy fields stay filled; a viewer ignoring the field sees today | — |
 | P2 | Picker: codec × chroma dropdowns, i18n, Auto rules, remembered trial failures, the shared derivation | ships with P1 | — |
 | P3 | New cells: VP9 4:4:4 hardware (QSV/VAAPI profile 1), H.264 4:4:4 (NVENC + software decode), HEVC 4:4:4 on QSV/VAAPI behind the denylist; the chroma column | the cell denylist | — |
@@ -199,10 +199,13 @@ flowchart LR
 
 ## Acceptance criteria
 
-- [ ] **P0** — `roomlerd encoder-smoke` passes on the dev box against the 9.0.1 tree
+- [x] **P0** — `roomlerd encoder-smoke` passes on the dev box against the 9.0.1 tree
       (native Windows build via the script) before any tag; after the roll, one session
       each on NVENC (dev box), QSV (CORPLAP-3) and VideoToolbox (the MacBook) with
       heartbeats unchanged from 0.4.80; the FR-62 drift gate green on the 9.0.1 assets.
+      *Ticked 2026-09-07 on `agent-v0.4.82`: smoke `hevc_nvenc` PASS before the tag; three
+      sessions with 0 skipped frames, 0 rebuilds, ages ≤ 49 ms; MSI size unchanged — the
+      table is in the field log and on #1470.*
 - [ ] **P1** — the hello carries `video_cells` on the dev box and CORPLAP-3; the probe
       duration is reported; a viewer built before this FR sees no change.
 - [ ] **P2** — the picker greys every impossible cell with its reason; a stored
@@ -235,3 +238,8 @@ multi-GPU adapter selection for Windows backends (unchanged).
 | 2026-09-07 | dev box (RTX 5090 Laptop + Radeon 610M) | baseline | shipped 0.4.79 probe: `mf-h264-hw`, `ffmpeg-{hevc,av1,h264}_nvenc`, `libvpx-vp9-444-sw`, `hevc_chroma: [yuv420, yuv444]`, 2.6 s; no AMF cell (the probe stops at the first opener per codec) |
 | 2026-09-07 | vendor lanes | P0 | `vendored-ffmpeg-9.0.1` published from the P0 branch: win64 static-md minimal 11.95 MB (`avcodec.lib` 12.1 MB — unchanged from 8.1.2; 10 encoders present, registry payload gone), linux minimal 1.1 MB, macos 790 KB, corresponding source 17.2 MB; `ROOMLER-PATCHES.txt` = the re-based NVENC patch |
 | 2026-09-07 | dev box, native Windows build via `scripts/dev-ffmpeg-windows.ps1` | P0 | roomlerd from the P0 branch against the 9.0.1 tree: build 3 m 05 s incremental; link check libavcodec **63**; `encoder-smoke --codec hevc` → `hevc_nvenc` **PASS**, `--codec h264` → `mf-h264` PASS, `--codec av1` fails on the Media Foundation AV1 MFT (ActivateObject — the known NVENC-MFT issue, no FFmpeg involved); caps probe advertises the **same set as 0.4.79** (`openh264-sw`, `mf-h264-hw`, `ffmpeg-{hevc,av1,h264}_nvenc`, `libvpx-vp9-444-sw`, `hevc_chroma` yuv420+yuv444) in 2.2 s. Three recipe traps found and fixed: pkgconf's DLL, `CMAKE_POLICY_VERSION_MINIMUM`, `FFMPEG_DIR` bypassing pkg-config |
+| 2026-09-07 | release | P0 | `agent-v0.4.82` (bump #1477 → `95c1c717`; run 34147777709 green). Sizes vs 0.4.80: MSI **15.03 → 15.03 MB**, .deb 12.77 → 12.79, .pkg 20.58 → 20.62 |
+| 2026-09-07 | dev box · `av1_nvenc` (direct, 1880×1176) | P0 | 39 heartbeats / 1871 frames: target 33.2–38.1 M, 0 skipped, send_wait max 46 ms, viewer age max 49 ms, 6 IDR, 0 rebuilds, encode avg 8.6 ms (0.4.78 before: 10.0 ms, age 37 ms). Pill `AV1 4:2:0 HW (av1_nvenc) · direct · dec HW · 31 fps · ~25 ms` |
+| 2026-09-07 | CORPLAP-3 · `av1_qsv` (direct, 1920×1200) | P0 | 24 heartbeats / 487 frames: target 27.6–34.56 M (0.4.80: 34.56 M), 0 skipped, send_wait max 1.4 ms, age max 18 ms, 1 IDR, 0 rebuilds. Screen was black/locked (capture 74 ms, 6–13 fps) so encode avg 17.6 ms vs 13.4 and `iter_ms_max` 1.5 s vs 0.76 s (the open) are **to be re-read attended** |
+| 2026-09-07 | MacBook (attended agent) · `hevc_videotoolbox` (direct, 3024×1964) | P0 | 20 heartbeats / 1239 frames: target 51–60 M, 0 skipped, send_wait max 31 ms, age max 27 ms, 1 IDR, 0 rebuilds, encode avg 5.7 ms (0.4.76 before: 5.3 ms). Pill `H.265 4:2:0 HW (hevc_videotoolbox) · direct · dec HW · 31.1 Mbps · 30 fps · ~12 ms` |
+| 2026-09-07 | MacBook (`-daemon` agent) | note | Has never had screen capture on any version (`scrap capture unavailable — falling back to NoopCapture` on 0.4.42 / 0.4.48 / 0.4.82); a session against it reads `connected · video stalled`. The attended agent is the remote-desktop target. Not a regression |
