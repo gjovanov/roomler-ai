@@ -34,25 +34,27 @@ async fn main() -> anyhow::Result<()> {
         // calls its line "the record that this removal happened and why", and
         // that record was going nowhere. A `warn` floor makes the next
         // omission merely quiet instead of invisible.
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            concat!(
-                "warn",
-                ",roomler_ai_api=debug",
-                ",roomler_ai_services=debug",
-                ",roomler_ai_db=debug",
-                ",roomler_core=debug",
-                ",roomler_ai_mod_fleet=debug",
-                ",roomler_ai_mod_network=debug",
-                ",roomler_ai_mod_remote=debug",
-                ",roomler_ai_mod_chat=debug",
-                ",roomler_ai_mod_conference=debug",
-                ",roomler_ai_mod_saas=debug",
-                ",roomler_ai_remote_control=debug",
-                ",tunnel_core=debug",
-                ",tower_http=debug",
-            )
-            .into()
-        }))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                concat!(
+                    "warn",
+                    ",roomler_ai_api=debug",
+                    ",roomler_ai_services=debug",
+                    ",roomler_ai_db=debug",
+                    ",roomler_core=debug",
+                    ",roomler_ai_mod_fleet=debug",
+                    ",roomler_ai_mod_network=debug",
+                    ",roomler_ai_mod_remote=debug",
+                    ",roomler_ai_mod_chat=debug",
+                    ",roomler_ai_mod_conference=debug",
+                    ",roomler_ai_mod_saas=debug",
+                    ",roomler_ai_remote_control=debug",
+                    ",tunnel_core=debug",
+                    ",tower_http=debug",
+                )
+                .into()
+            }),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
