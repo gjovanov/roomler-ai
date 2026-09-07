@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-77 — the cell matrix's shared vocabulary: which FFmpeg encoders are
 //! ever ASKED for 4:4:4, and the denylist that is the matrix's kill switch.
 //!

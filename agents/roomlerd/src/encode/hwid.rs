@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-77 P3 — the hardware + driver fingerprint the probe cache is keyed by.
 //!
 //! What the encoder probe's answer depends on, and nothing else: the GPUs
