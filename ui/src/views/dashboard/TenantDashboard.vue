@@ -345,7 +345,11 @@ onMounted(() => {
     if (showChat.value) roomStore.fetchRooms(tenantId.value)
     if (showFleet.value) {
       agentStore.fetchAgents(tenantId.value).catch(() => {})
-      tunnelClientStore.fetchTunnelClients(tenantId.value)
+      // ⚠️ Tunnel clients are the `network` module's, not `fleet`'s. Gating
+      // them on `showFleet` fired the fetch on a `remote` profile (fleet yes,
+      // network no) at a route that correctly 404s. The store now refuses it
+      // too — this line states the intent, the store enforces it. (FR-75.)
+      if (caps.has('network')) tunnelClientStore.fetchTunnelClients(tenantId.value)
     }
   }
 })
