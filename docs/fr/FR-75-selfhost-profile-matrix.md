@@ -1,6 +1,6 @@
 # FR-75: Self-host **profile** install & verify matrix — every profile does the job it advertises
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
+**Issue:** [#1447](https://github.com/gjovanov/roomler-ai/issues/1447) ·
 **Status:** proposed 2026-09-06 ·
 **Handover this came from:** `docs/handover/modular-monolith.md`
 
