@@ -36,7 +36,11 @@ pub(crate) const FFMPEG_444_CAPABLE: &[&str] = &[
 /// (the code called QSV Rext encode unreliable before it was ever opened);
 /// the operator's `ROOMLERD_ENCODER_CELLS_DENY` / the `encoder_cells_deny`
 /// config key REPLACES this default.
-pub(crate) const DEFAULT_DENIED_CELLS: &[&str] = &["hevc_qsv:yuv444", "hevc_vaapi:yuv444"];
+// `vp9_qsv:yuv444` joined on 2026-09-08: CORPLAP-3's Intel media runtime died
+// with 0xc0000005 on the first VUYX open (FR-77 P3b field read) — the cell
+// opens only once a driver proves it, through `encoder_cells_deny`.
+pub(crate) const DEFAULT_DENIED_CELLS: &[&str] =
+    &["hevc_qsv:yuv444", "hevc_vaapi:yuv444", "vp9_qsv:yuv444"];
 
 /// The value that means "deny nothing". An EMPTY override means the same
 /// (the P1 env contract); the word exists because a config key cannot carry
@@ -137,6 +141,10 @@ mod tests {
         let deny = denied_cells();
         assert!(cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv444));
         assert!(cell_denied(&deny, "hevc_vaapi", ChromaFormat::Yuv444));
+        assert!(
+            cell_denied(&deny, "vp9_qsv", ChromaFormat::Yuv444),
+            "CORPLAP-3, 2026-09-08"
+        );
         assert!(!cell_denied(&deny, "hevc_qsv", ChromaFormat::Yuv420));
         assert!(!cell_denied(&deny, "hevc_nvenc", ChromaFormat::Yuv444));
 
@@ -186,10 +194,14 @@ mod tests {
             vec!["hevc_nvenc"],
             "hevc_qsv is denied by default"
         );
-        assert_eq!(names_444(VideoCodec::Vp9), vec!["vp9_qsv"]);
+        assert!(
+            names_444(VideoCodec::Vp9).is_empty(),
+            "vp9_qsv 4:4:4 is denied by default"
+        );
         assert_eq!(names_444(VideoCodec::H264), vec!["h264_nvenc"]);
         assert!(names_444(VideoCodec::Av1).is_empty());
         unsafe { tunnel_core::env::test_env::set("ENCODER_CELLS_DENY", "none") };
         assert_eq!(names_444(VideoCodec::Hevc), vec!["hevc_nvenc", "hevc_qsv"]);
+        assert_eq!(names_444(VideoCodec::Vp9), vec!["vp9_qsv"]);
     }
 }
