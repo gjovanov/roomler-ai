@@ -656,6 +656,17 @@ pub struct AgentConfig {
     pub rate_factor_vp9: Option<u32>,
     #[serde(default)]
     pub rate_factor_av1: Option<u32>,
+    /// FR-77 P3 — the chroma column of the ceiling table: the factor a
+    /// 4:4:4 cell applies ON TOP of the codec factor, percent (50–400)
+    /// (`ROOMLERD_RATE_FACTOR_H264_444` etc.). Built-in 150 for every codec —
+    /// what the libvpx 4:4:4 pump used before the column existed — until a
+    /// cell's field test sets its own. AV1 has no 4:4:4 cell, so no key.
+    #[serde(default)]
+    pub rate_factor_h264_444: Option<u32>,
+    #[serde(default)]
+    pub rate_factor_hevc_444: Option<u32>,
+    #[serde(default)]
+    pub rate_factor_vp9_444: Option<u32>,
     /// P7 — minimum linear downscale (percent) at which the Lanczos-3
     /// filter engages; shallower shrinks fall back to box
     /// (`ROOMLERD_LANCZOS_MIN_PCT`). Built-in default: 34 — covers the
@@ -1110,6 +1121,21 @@ pub struct AgentConfig {
     /// Built-in default: on (kill switch).
     #[serde(default)]
     pub text_mod_neutralize: Option<bool>,
+    /// FR-77 P3 — cache the hardware encoder probe across daemon restarts
+    /// (`ROOMLERD_CAPS_CACHE`): keyed by GPU + driver + OS build + roomlerd
+    /// build, re-probed on any change or after 7 days, and only ever a
+    /// result that opened a hardware cell. Built-in: on.
+    #[serde(default)]
+    pub caps_cache: Option<bool>,
+    /// FR-77 — encoder cells this device must not open or advertise,
+    /// comma-separated `name:chroma` (`hevc_qsv:yuv444`). Unset = the
+    /// built-in list; `none` = deny nothing. Env
+    /// `ROOMLERD_ENCODER_CELLS_DENY`. Pushable through remote config: it is
+    /// the matrix's kill switch, not a security gate — it only ever REMOVES
+    /// cells, so `MANAGE_AGENTS` is enough and no opt-in beyond
+    /// `remote_config_enabled` is needed.
+    #[serde(default)]
+    pub encoder_cells_deny: Option<String>,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2039,6 +2065,9 @@ pub fn test_fixture() -> AgentConfig {
         rate_factor_hevc: None,
         rate_factor_vp9: None,
         rate_factor_av1: None,
+        rate_factor_h264_444: None,
+        rate_factor_hevc_444: None,
+        rate_factor_vp9_444: None,
         lanczos_min_pct: None,
         nvenc_spatial_aq: None,
         scale_cq_boost: None,
@@ -2104,6 +2133,8 @@ pub fn test_fixture() -> AgentConfig {
         overlay_rtt_q: None,
         relay_probe: None,
         text_mod_neutralize: None,
+        caps_cache: None,
+        encoder_cells_deny: None,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,
@@ -2209,7 +2240,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 83] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 84] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2303,18 +2334,22 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 83]
         ("OVERLAY_UPWARD_PROBE", cfg.overlay_upward_probe),
         ("RELAY_PROBE", cfg.relay_probe),
         ("TEXT_MOD_NEUTRALIZE", cfg.text_mod_neutralize),
+        ("CAPS_CACHE", cfg.caps_cache),
     ]
 }
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 29] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 32] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
         ("RATE_FACTOR_HEVC", cfg.rate_factor_hevc),
         ("RATE_FACTOR_VP9", cfg.rate_factor_vp9),
         ("RATE_FACTOR_AV1", cfg.rate_factor_av1),
+        ("RATE_FACTOR_H264_444", cfg.rate_factor_h264_444),
+        ("RATE_FACTOR_HEVC_444", cfg.rate_factor_hevc_444),
+        ("RATE_FACTOR_VP9_444", cfg.rate_factor_vp9_444),
         ("LANCZOS_MIN_PCT", cfg.lanczos_min_pct),
         ("SCALE_CQ_BOOST", cfg.scale_cq_boost),
         ("IDLE_REFINE_MAX_EDGE", cfg.idle_refine_max_edge),
