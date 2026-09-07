@@ -2471,6 +2471,7 @@ const cellAvail = computed<Availability>(() =>
       av1: rc.av1Supported.value,
       hevc: rc.hevcSupported.value,
       hevcRext: rc.hevcRextSupported.value,
+      h264High444: rc.h264High444Supported.value,
       vp9: rc.vp9_444Supported.value,
     },
     failed: agent.value?.id

@@ -1206,6 +1206,8 @@ export const RC_CODEC_CHOICES = [
   'vp9-444',
   'vp9-420',
   'h264',
+  // FR-77 P3b — H.264 High 4:4:4 (NVENC encode, software decode).
+  'h264-444',
   // FR-77 — the two-axis picker: codec "Auto" with an explicit chroma format.
   'auto-444',
   'auto-420',
@@ -2044,6 +2046,31 @@ export async function isH264DcDecodeSupported(): Promise<string | null> {
   return null
 }
 
+/** FR-77 P3b — H.264 High 4:4:4 Predictive (profile_idc 244 = 0xF4) over the
+ *  same Annex-B, description-less contract as the 4:2:0 DC path, at the same
+ *  declared-max level ladder. Chrome decodes it in SOFTWARE only (no D3D11 /
+ *  VT profile for High 4:4:4), which the auto-rank prices in. */
+export const H264_HIGH444_CODEC_CANDIDATES = ['avc1.F40034', 'avc1.F40033', 'avc1.F4002A'] as const
+
+/** FR-77 P3b — first High 4:4:4 avc1 codec string this browser's
+ *  VideoDecoder accepts, or null (the caller keeps the session on 4:2:0). */
+export async function isH264High444DecodeSupported(): Promise<string | null> {
+  const g = globalThis as unknown as {
+    VideoDecoder?: { isConfigSupported?: (cfg: { codec: string }) => Promise<{ supported?: boolean }> }
+  }
+  const isConfigSupported = g.VideoDecoder?.isConfigSupported
+  if (typeof isConfigSupported !== 'function') return null
+  for (const codec of H264_HIGH444_CODEC_CANDIDATES) {
+    try {
+      const res = await isConfigSupported({ codec })
+      if (res?.supported === true) return codec
+    } catch {
+      /* try the next level down */
+    }
+  }
+  return null
+}
+
 /** P2 Ã¢ÂÂ HARDWARE-and-smooth H.264 decode probe (MediaCapabilities
  *  `smooth` + `powerEfficient`, same contract as the HEVC/AV1 HW probes).
  *  H.264 HW decode is near-universal, but the gate keeps the auto-rank
@@ -2131,6 +2158,7 @@ const probeH264Hw = memoProbe(isH264HwDecodeSupported)
 const probeH264Dc = memoProbe(isH264DcDecodeSupported)
 const probeAv1Dec = memoProbe(isAv1DecodeSupported)
 const probeHevcRext = memoProbe(isHevcRextDecodeSupported)
+const probeH264High444 = memoProbe(isH264High444DecodeSupported)
 
 /** rc.190 Ã¢ÂÂ inputs to the pure transport auto-rank. `agentTransports` /
  *  `agentHwEncoders` come from `Agent.capabilities` (the agent's caps
@@ -2172,6 +2200,12 @@ export interface AutoTransportInputs {
   agentHevc444?: boolean
   /** FR-77 — WebCodecs accepts the HEVC Rext codec string here. */
   viewerHevcRext?: boolean
+  /** FR-77 P3b — the agent opened H.264 4:4:4 (NVENC High 4:4:4). */
+  agentH264_444?: boolean
+  /** FR-77 P3b — this browser decodes H.264 High 4:4:4 (software). */
+  viewerH264High444?: boolean
+  /** FR-77 P3b — the agent opened a HARDWARE VP9 4:4:4 cell (vp9_qsv profile 1). */
+  agentVp9Hw444?: boolean
 }
 
 /** rc.190 Ã¢ÂÂ pure HWÃÂHW transport rank for `videoTransport === 'auto'`.
@@ -2248,6 +2282,27 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
       transport: 'data-channel-hevc',
       chromaOverride: 'yuv444',
       reason: 'HEVC 4:4:4: HW Rext encode on agent + HW Rext decode here',
+    }
+  }
+  // FR-77 P3b — an EXPLICIT 4:4:4 keeps reaching for hardware-ENCODED full
+  // chroma before the software-encoded libvpx cell: H.264 High 4:4:4 on
+  // NVENC, then VP9 profile 1 on vp9_qsv. Both decode in software here, which
+  // is why Sharper-on-Auto does not take them (it trades decode for chroma
+  // only at the libvpx rung, where nothing is lost).
+  if (inputs.chromaPref === 'yuv444' && hasH264Dc && inputs.agentH264_444 === true
+    && inputs.viewerH264High444 === true) {
+    return {
+      transport: 'data-channel-h264',
+      chromaOverride: 'yuv444',
+      reason: 'H.264 4:4:4: HW High 4:4:4 encode on agent + software decode here',
+    }
+  }
+  if (inputs.chromaPref === 'yuv444' && hasVp9Dc && inputs.agentVp9Hw444 === true
+    && inputs.viewerVp9Decodable) {
+    return {
+      transport: 'data-channel-vp9-444',
+      chromaOverride: 'yuv444',
+      reason: 'VP9 4:4:4: HW profile-1 encode (vp9_qsv) on agent + software decode here',
     }
   }
   if (inputs.chromaPref === 'yuv444' && hasVp9Dc && inputs.viewerVp9Decodable) {
@@ -2448,6 +2503,13 @@ export function codecChoiceToSettings(
       // FR-77 — codec "Auto" + chroma 4:2:0: the normal rank, with the
       // libvpx rung pinned to profile 0 whatever the Priority dial says.
       return { videoTransport: 'auto', chroma: 'yuv420', preferredCodec: null, renderPath: 'webcodecs' }
+    case 'h264-444':
+      return {
+        videoTransport: 'data-channel-h264',
+        chroma: 'yuv444',
+        preferredCodec: 'h264',
+        renderPath: 'webcodecs',
+      }
     case 'h264':
       if (opts?.h264Rtp) {
         return { videoTransport: 'webrtc', chroma: 'auto', preferredCodec: 'h264', renderPath: 'video' }
@@ -2486,6 +2548,7 @@ export function settingsToCodecChoice(
       // the agent's default for an unstated chroma is profile 1).
       return chroma === 'yuv444' ? 'vp9-444' : chroma === 'yuv420' ? 'vp9-420' : 'vp9'
     case 'data-channel-h264':
+      return chroma === 'yuv444' ? 'h264-444' : 'h264'
     case 'webrtc':
       return 'h264'
     case 'auto':
@@ -3944,6 +4007,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const hevcRextSupported = ref<boolean>(false)
   void isHevcRextDecodeSupported().then((ok) => {
     hevcRextSupported.value = ok
+  })
+  /** FR-77 P3b — whether this browser's VideoDecoder accepts H.264 High 4:4:4 (software decode). */
+  const h264High444Supported = ref<boolean>(false)
+  void isH264High444DecodeSupported().then((codec) => {
+    h264High444Supported.value = codec !== null
   })
   /** `true` once the HEVC worker has been spun up and the DC opened.
    *  Same semantics as `vp9_444Active`. */
@@ -7999,6 +8067,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // probe + agent hevc_chroma); drives the worker codec override + the
     // chroma_pref field.
     let hevcRextPick = false
+    // FR-77 P3b — the H.264 High 4:4:4 pick (both gates passed).
+    let h264_444Pick = false
     viewerDecodeHw.value = null
     // FR-77 — cells whose decoder failed on real bytes for THIS device in
     // this browser build stay out of every rank and pick, across page loads
@@ -8015,6 +8085,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (remembered.has('vp9:yuv420')) failedDcTransports.add('data-channel-vp9-444')
     const hevc444Remembered = remembered.has('hevc:yuv444')
     const vp9_444Remembered = remembered.has('vp9:yuv444')
+    const h264_444Remembered = remembered.has('h264:yuv444')
     if (videoTransport.value === 'auto') {
       // rc.190 (A3) Ã¢ÂÂ HWÃÂHW auto-rank. A codec is only smooth when it's
       // hardware on BOTH ends (field: VP9 is SW-encoded on non-Intel
@@ -8022,7 +8093,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // agent's advertised encoders with this browser's MediaCapabilities
       // and pick the best pair; explicit user picks skip this entirely.
       const caps = agent?.value?.capabilities
-      const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec, hevcRext] = await Promise.all([
+      const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec, hevcRext, h264High444] = await Promise.all([
         probeAv1Hw(),
         probeHevcHw(),
         probeHevcDec(),
@@ -8031,19 +8102,29 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         probeH264Hw(),
         probeH264Dc(),
         probeHevcRext(),
+        probeH264High444(),
       ])
       vp9_444Supported.value = vp9Dec
       hevcSupported.value = hevcDec
       hevcRextSupported.value = hevcRext
+      h264High444Supported.value = h264High444 !== null
       // FR-77 — the agent's HEVC 4:4:4 cell, read through the one derivation
       // (new `video_cells` or the legacy `hevc_chroma`), never optimistic.
       const agentHevc444 = cellsFromCaps(caps).some(
         (c) => c.codec === 'hevc' && c.chroma.includes('yuv444'),
       )
+      // FR-77 P3b — the H.264 4:4:4 cell (NVENC High 4:4:4) and a HARDWARE
+      // VP9 4:4:4 cell (vp9_qsv profile 1), for the explicit-4:4:4 rungs.
+      const cellsNow = cellsFromCaps(caps)
+      const agentH264_444 = cellsNow.some((c) => c.codec === 'h264' && c.chroma.includes('yuv444'))
+      const agentVp9Hw444 = cellsNow.some((c) => c.codec === 'vp9' && c.hw && c.chroma.includes('yuv444'))
       const pick = pickAutoTransport({
         chromaPref: vp9_444Remembered && vp9Chroma.value !== 'yuv420' ? 'auto' : vp9Chroma.value,
         agentHevc444: agentHevc444 && !hevc444Remembered,
         viewerHevcRext: hevcRext && !hevc444Remembered,
+        agentH264_444: agentH264_444 && !h264_444Remembered,
+        viewerH264High444: h264High444 !== null && !h264_444Remembered,
+        agentVp9Hw444: agentVp9Hw444 && !vp9_444Remembered,
         agentTransports: caps?.transports ?? [],
         agentHwEncoders: caps?.hw_encoders ?? [],
         viewerAv1Hw: av1Hw && !failedDcTransports.has('data-channel-av1'),
@@ -8063,7 +8144,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       })
       preferredTransport = pick.transport
       chromaOverride = pick.chromaOverride
-      if (pick.transport === 'data-channel-h264') h264DcCodec = h264Codec
+      if (pick.transport === 'data-channel-h264') {
+        // FR-77 P3b — the High 4:4:4 pick configures the worker with the
+        // High 4:4:4 string and sends chroma_pref yuv444.
+        h264_444Pick = pick.chromaOverride === 'yuv444'
+        h264DcCodec = h264_444Pick ? h264High444 : h264Codec
+      }
       // FR-77 — the rank picked the HEVC Rext cell: the request carries
       // chroma_pref yuv444 exactly as an explicit hevc-444 pick would.
       if (pick.transport === 'data-channel-hevc' && pick.chromaOverride === 'yuv444') {
@@ -8082,7 +8168,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
                 ? false
                 : vp9Hw
               : pick.transport === 'data-channel-h264'
-                ? h264Hw
+                ? (h264_444Pick ? false : h264Hw)
                 : null
       console.info(`[rc] auto transport Ã¢ÂÂ ${pick.transport ?? 'webrtc'} (${pick.reason})`)
     } else if (videoTransport.value === 'data-channel-h264') {
@@ -8099,6 +8185,31 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         preferredTransport = 'data-channel-h264'
         h264DcCodec = codec
         viewerDecodeHw.value = await probeH264Hw()
+        // FR-77 P3b — explicit 4:4:4 (or Sharper on chroma Auto) on H.264:
+        // High 4:4:4 Predictive when this browser's VideoDecoder accepts the
+        // string AND the agent opened the cell. Either missing → the normal
+        // 4:2:0 session, said so in the console.
+        if (
+          resolveChroma(vp9Chroma.value, priority.value, true) === 'yuv444'
+          && !h264_444Remembered
+        ) {
+          const high444 = await probeH264High444()
+          h264High444Supported.value = high444 !== null
+          const agent444 = cellsFromCaps(h264Caps).some(
+            (c) => c.codec === 'h264' && c.chroma.includes('yuv444'),
+          )
+          if (high444 && agent444) {
+            h264DcCodec = high444
+            h264_444Pick = true
+            viewerDecodeHw.value = false
+          } else {
+            console.info(
+              high444
+                ? '[rc] H.264 4:4:4 dropped — the agent has no H.264 4:4:4 cell (non-NVENC host / older agent). Running H.264 4:2:0.'
+                : '[rc] H.264 4:4:4 dropped — this browser lacks WebCodecs High 4:4:4 decode. Running H.264 4:2:0.',
+            )
+          }
+        }
       } else if (failedDcTransports.has('data-channel-h264')) {
         console.info(
           '[rc] data-channel-h264 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to the RTP track.',
@@ -8295,7 +8406,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           : 'yuv420'
         : preferredTransport === 'data-channel-hevc' && hevcRextPick
           ? 'yuv444'
-          : 'yuv420'
+          : preferredTransport === 'data-channel-h264' && h264_444Pick
+            ? 'yuv444'
+            : 'yuv420'
     if (preferredTransport) {
       requestPayload.preferred_transport = preferredTransport
       // rc.62 Ã¢ÂÂ chroma_pref is only meaningful on the
@@ -8317,6 +8430,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // hevc_nvenc). Sent ONLY when both ends passed the Rext gate above;
       // older agents ignore the field entirely.
       if (preferredTransport === 'data-channel-hevc' && hevcRextPick) {
+        requestPayload.chroma_pref = 'yuv444'
+      }
+      // FR-77 P3b — the H.264 transport honours chroma_pref too (High 4:4:4
+      // via h264_nvenc); sent only when both gates passed above.
+      if (preferredTransport === 'data-channel-h264' && h264_444Pick) {
         requestPayload.chroma_pref = 'yuv444'
       }
       // FR-17 — ask the agent to prefix every `video-bytes` message with
@@ -10480,6 +10598,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  "HEVC · crisp text (4:4:4)" picker entry with the agent's
      *  hevc_chroma caps). */
     hevcRextSupported,
+    h264High444Supported,
     /** rc.78 — HEVC over DataChannel (Option B). Same shape as the
      *  VP9-444 fields above; view can branch on which is active to
      *  decide which canvas/HUD to render. */

@@ -141,13 +141,13 @@ export const PICKER_CHROMAS = ['auto', 'yuv420', 'yuv444'] as const
 export type PickerChroma = (typeof PICKER_CHROMAS)[number]
 
 /** Which cells the SESSION pump can actually run today, independent of the
- *  device and the browser. `h264` 4:4:4 exists as a probed cell (NVENC) but
- *  the H.264 data-channel pump still hard-wires 4:2:0 — that path is P3; AV1
+ *  device and the browser. H.264 4:4:4 runs since P3b (NVENC High 4:4:4 encode, software
+ *  decode in the browser); AV1
  *  4:4:4 has no hardware encoder anywhere (`av1_nvenc` hard-errors on it). */
 export const SESSION_SUPPORTS_444: Record<CellCodec, boolean> = {
   hevc: true,
   vp9: true,
-  h264: false,
+  h264: true,
   av1: false,
 }
 
@@ -165,7 +165,7 @@ export function choiceFromPicker(codec: PickerCodec, chroma: PickerChroma): RcCo
       return chroma === 'yuv444' ? 'vp9-444' : chroma === 'yuv420' ? 'vp9-420' : 'vp9'
     case 'h264':
     default:
-      return 'h264'
+      return chroma === 'yuv444' ? 'h264-444' : 'h264'
   }
 }
 
@@ -188,6 +188,8 @@ export function pickerFromChoice(choice: RcCodecChoice): { codec: PickerCodec; c
       return { codec: 'vp9', chroma: 'yuv420' }
     case 'h264':
       return { codec: 'h264', chroma: 'auto' }
+    case 'h264-444':
+      return { codec: 'h264', chroma: 'yuv444' }
     case 'auto-444':
       return { codec: 'auto', chroma: 'yuv444' }
     case 'auto-420':
@@ -220,6 +222,8 @@ export interface BrowserDecode {
    *  from 4:2:2 — only a real-bytes trial proves it, and a failed trial is
    *  remembered (see `failed`). */
   hevcRext: boolean
+  /** FR-77 P3b — VideoDecoder accepts an avc1 High 4:4:4 string (software decode). */
+  h264High444?: boolean
   /** WebCodecs accepts VP9 profile 1 (4:4:4); implies profile 0 too. */
   vp9: boolean
 }
@@ -260,7 +264,7 @@ export function cellAvailability(i: AvailabilityInputs): Availability {
       return { ok: false, reason: 'failedBefore', hw }
     }
     if (chroma === 'yuv444' && !SESSION_SUPPORTS_444[codec]) {
-      return { ok: false, reason: codec === 'av1' ? 'av1NoHw444' : 'h264444Later', hw }
+      return { ok: false, reason: 'av1NoHw444', hw }
     }
     switch (codec) {
       case 'av1': {
@@ -281,11 +285,19 @@ export function cellAvailability(i: AvailabilityInputs): Availability {
       case 'vp9': {
         if (!i.browser.vp9) return { ok: false, reason: 'browserNoVp9', hw }
         if (i.capsLoaded && !agent.ok) return { ok: false, reason: 'agentNoVp9', hw }
-        return { ok: true, reason: chroma === 'yuv444' ? 'vp9444' : 'vp9420', hw }
+        return { ok: true, reason: chroma === 'yuv444' ? (agent.hw ? 'vp9444hw' : 'vp9444') : 'vp9420', hw }
       }
       case 'h264':
-      default:
-        // The legacy RTP track makes 4:2:0 H.264 reachable on every agent.
+      default: {
+        if (chroma === 'yuv444') {
+          // FR-77 P3b — High 4:4:4 Predictive: hardware encode (NVENC) on
+          // the agent, software decode here; both ends must say yes.
+          if (!i.browser.h264High444) return { ok: false, reason: 'browserNoH264High444', hw }
+          if (!agent.ok) return { ok: false, reason: 'agentNoH264_444', hw }
+          return { ok: true, reason: 'h264444', hw }
+        }
+        return { ok: true, reason: 'h264', hw }
+      }
         return { ok: true, reason: 'h264', hw }
     }
   }

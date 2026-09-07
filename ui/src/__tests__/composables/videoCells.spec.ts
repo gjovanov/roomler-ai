@@ -118,10 +118,10 @@ describe('FR-77 the two-axis picker ↔ the stored choice', () => {
         expect(RC_CODEC_CHOICES).toContain(choice)
         const back = pickerFromChoice(choice)
         expect(back.codec).toBe(codec)
-        // Codecs with a single chroma (AV1, H.264) and the auto/420 HEVC
-        // pair read back as "auto" chroma — the choice never carried one.
+        // AV1 (a single chroma) and the auto/420 HEVC and H.264 pairs (FR-77 P3b:
+        // H.264 has its 4:4:4 choice now) read back as "auto" chroma.
         const collapses =
-          codec === 'av1' || codec === 'h264' || (codec === 'hevc' && chroma !== 'yuv444')
+          codec === 'av1' || ((codec === 'hevc' || codec === 'h264') && chroma !== 'yuv444')
         expect(back.chroma).toBe(collapses ? 'auto' : chroma)
       }
     }
@@ -166,7 +166,7 @@ describe('FR-77 cellAvailability — validity is a matrix', () => {
     expect(a.vp9.yuv420.ok).toBe(true)
     expect(a.vp9.yuv444).toMatchObject({ ok: true, hw: false })
     expect(a.h264.yuv420.ok).toBe(true)
-    expect(a.h264.yuv444).toMatchObject({ ok: false, reason: 'h264444Later' })
+    expect(a.h264.yuv444).toMatchObject({ ok: false, reason: 'browserNoH264High444' })
   })
 
   it('4:4:4 demands proof from both ends; 4:2:0 stays optimistic until caps arrive', () => {
@@ -272,5 +272,60 @@ describe('FR-77 picker subtitles read from the live site (2026-09-07)', () => {
     const a = cellAvailability({ cells: corplap3, capsLoaded: true, browser: browserAll, failed: new Set() })
     expect(chromaSelectable(a, 'auto', 'yuv420')).toMatchObject({ ok: true, reason: 'chroma420' })
     expect(chromaSelectable(a, 'auto', 'yuv444')).toMatchObject({ ok: true, reason: 'vp9444' })
+  })
+})
+
+describe('FR-77 P3b — H.264 4:4:4 and hardware VP9 4:4:4 cells', () => {
+  const browserAll = { av1: true, hevc: true, hevcRext: true, vp9: true, h264High444: true }
+  const nvidiaHost = cellsFromCaps({
+    ...base,
+    video_cells: [
+      { codec: 'h264', backend: 'nvenc', chroma: ['yuv420', 'yuv444'], hw: true },
+      { codec: 'hevc', backend: 'nvenc', chroma: ['yuv420', 'yuv444'], hw: true },
+      { codec: 'vp9', backend: 'libvpx', chroma: ['yuv420', 'yuv444'], hw: false },
+    ],
+  })
+  const intelHost = cellsFromCaps({
+    ...base,
+    video_cells: [
+      { codec: 'h264', backend: 'qsv', chroma: ['yuv420'], hw: true },
+      { codec: 'vp9', backend: 'qsv', chroma: ['yuv420', 'yuv444'], hw: true },
+      { codec: 'vp9', backend: 'libvpx', chroma: ['yuv420', 'yuv444'], hw: false },
+    ],
+  })
+
+  it('H.264 4:4:4 needs the browser High 4:4:4 probe AND the agent cell', () => {
+    const a = cellAvailability({ cells: nvidiaHost, capsLoaded: true, browser: browserAll, failed: new Set() })
+    expect(a.h264.yuv444).toMatchObject({ ok: true, reason: 'h264444', hw: true })
+    const noProbe = cellAvailability({
+      cells: nvidiaHost,
+      capsLoaded: true,
+      browser: { ...browserAll, h264High444: false },
+      failed: new Set(),
+    })
+    expect(noProbe.h264.yuv444).toMatchObject({ ok: false, reason: 'browserNoH264High444' })
+    const intel = cellAvailability({ cells: intelHost, capsLoaded: true, browser: browserAll, failed: new Set() })
+    expect(intel.h264.yuv444).toMatchObject({ ok: false, reason: 'agentNoH264_444' })
+    // A browser that never reported the probe (older view, undefined) reads as no.
+    const silent = cellAvailability({
+      cells: nvidiaHost,
+      capsLoaded: true,
+      browser: { av1: true, hevc: true, hevcRext: true, vp9: true },
+      failed: new Set(),
+    })
+    expect(silent.h264.yuv444.ok).toBe(false)
+  })
+
+  it('VP9 4:4:4 says hardware encode when a hardware profile-1 cell exists', () => {
+    const intel = cellAvailability({ cells: intelHost, capsLoaded: true, browser: browserAll, failed: new Set() })
+    expect(intel.vp9.yuv444).toMatchObject({ ok: true, reason: 'vp9444hw', hw: true })
+    const nvidia = cellAvailability({ cells: nvidiaHost, capsLoaded: true, browser: browserAll, failed: new Set() })
+    expect(nvidia.vp9.yuv444).toMatchObject({ ok: true, reason: 'vp9444', hw: false })
+  })
+
+  it('the picker maps H.264 + 4:4:4 to its own stored choice and back', () => {
+    expect(choiceFromPicker('h264', 'yuv444')).toBe('h264-444')
+    expect(choiceFromPicker('h264', 'yuv420')).toBe('h264')
+    expect(pickerFromChoice('h264-444')).toEqual({ codec: 'h264', chroma: 'yuv444' })
   })
 })

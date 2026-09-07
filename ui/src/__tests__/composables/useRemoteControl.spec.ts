@@ -4238,3 +4238,74 @@ describe('FR-77 — pickAutoTransport honours the chroma axis', () => {
     expect(pick.chromaOverride).toBeNull()
   })
 })
+
+describe('FR-77 P3b — pickAutoTransport reaches hardware-encoded 4:4:4 before libvpx', () => {
+  const nvidia = {
+    agentTransports: ['data-channel-hevc', 'data-channel-h264', 'data-channel-vp9-444'],
+    agentHwEncoders: ['ffmpeg-hevc_nvenc', 'ffmpeg-h264_nvenc', 'libvpx-vp9-444-sw'],
+    viewerAv1Hw: false,
+    viewerHevcHw: true,
+    viewerHevcDecodable: true,
+    viewerVp9Hw: true,
+    viewerVp9Decodable: true,
+    viewerH264Hw: true,
+  }
+
+  it('explicit 4:4:4 without HEVC Rext decode takes H.264 High 4:4:4 (HW encode, SW decode)', () => {
+    const pick = pickAutoTransport({
+      ...nvidia,
+      chromaPref: 'yuv444',
+      agentHevc444: true,
+      viewerHevcRext: false,
+      agentH264_444: true,
+      viewerH264High444: true,
+    })
+    expect(pick.transport).toBe('data-channel-h264')
+    expect(pick.chromaOverride).toBe('yuv444')
+  })
+
+  it('explicit 4:4:4 on an Intel host takes VP9 profile 1 on vp9_qsv before libvpx', () => {
+    const pick = pickAutoTransport({
+      ...nvidia,
+      agentTransports: ['data-channel-h264', 'data-channel-vp9-444'],
+      agentHwEncoders: ['ffmpeg-h264_qsv', 'ffmpeg-vp9_qsv', 'libvpx-vp9-444-sw'],
+      chromaPref: 'yuv444',
+      agentVp9Hw444: true,
+      viewerH264High444: true,
+      agentH264_444: false,
+    })
+    expect(pick.transport).toBe('data-channel-vp9-444')
+    expect(pick.chromaOverride).toBe('yuv444')
+    expect(pick.reason).toContain('vp9_qsv')
+  })
+
+  it('the HEVC Rext pair still wins, and Sharper-on-Auto does not take the software-decode cells', () => {
+    const rext = pickAutoTransport({
+      ...nvidia,
+      chromaPref: 'yuv444',
+      agentHevc444: true,
+      viewerHevcRext: true,
+      agentH264_444: true,
+      viewerH264High444: true,
+    })
+    expect(rext.transport).toBe('data-channel-hevc')
+    const sharper = pickAutoTransport({
+      ...nvidia,
+      priority: 'sharper',
+      chromaPref: 'auto',
+      agentHevc444: false,
+      agentH264_444: true,
+      viewerH264High444: true,
+    })
+    expect(sharper.transport).toBe('data-channel-hevc')
+    expect(sharper.chromaOverride).toBeNull()
+  })
+
+  it('h264-444 is a stored choice that round-trips through the settings', () => {
+    const s = codecChoiceToSettings('h264-444')
+    expect(s).toMatchObject({ videoTransport: 'data-channel-h264', chroma: 'yuv444' })
+    expect(settingsToCodecChoice('data-channel-h264', 'yuv444')).toBe('h264-444')
+    expect(settingsToCodecChoice('data-channel-h264', 'auto')).toBe('h264')
+    expect(settingsToCodecChoice('webrtc', 'yuv444')).toBe('h264')
+  })
+})

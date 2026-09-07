@@ -348,6 +348,19 @@ fn encoder_options(
         // driver default (its behaviour on the low_power VDENC path is
         // unverified) — aligned with the nvenc spatial-aq-off default.
         base.push(("global_quality".into(), cq_s.clone()));
+        // FR-77 P3b — QSV's 4:4:4 profiles, set explicitly rather than left
+        // to the runtime's derivation from the input format: `rext` for HEVC
+        // (Range Extensions, Main 4:4:4) and `profile1` for VP9 (8-bit
+        // 4:4:4). In `base` (tiers 1 and 2): a driver that rejects the key
+        // falls to the defaults tier, where the runtime derives the profile
+        // from the VUYX frames itself.
+        if chroma444 {
+            if name.starts_with("hevc") {
+                base.push(("profile".into(), "rext".into()));
+            } else if name.starts_with("vp9") {
+                base.push(("profile".into(), "profile1".into()));
+            }
+        }
         if let Some(p) = preset.as_deref() {
             base.push(("preset".into(), p.into()));
         }
@@ -497,6 +510,14 @@ pub struct FfmpegEncoder {
     /// `profile=rext`, hevc_nvenc only). Drives the convert/build format
     /// branches and is surfaced to the pump for `rc:video-info` truth.
     chroma444: bool,
+    /// FR-77 P3b — the 4:4:4 input is the packed VUYX layout (QSV / VAAPI)
+    /// rather than planar I444 (NVENC, software). Fixed at open from the
+    /// encoder name; `adopt_rebuilt` only swaps in an encoder of the same
+    /// name and chroma, so it never changes underneath a session.
+    packed444: bool,
+    /// The VUYX buffer (`w × h × 4`), filled from the I444 planes per frame
+    /// when `packed444`; empty otherwise.
+    packed: Vec<u8>,
 
     /// Target fps this session runs at — threaded from the DC pump's
     /// `target_fps` (Phase B). Reused on the QSV/AMF bitrate REBUILD so the
@@ -705,21 +726,35 @@ impl FfmpegEncoder {
         constrained: bool,
     ) -> Result<Self> {
         if chroma444 {
-            match Self::new_with_dispatch(
-                &["hevc_nvenc"],
-                width,
-                height,
-                fps.max(1) as i32,
-                maxrate_bps,
-                cq_bias,
-                true,
-                constrained,
-            ) {
-                Ok(enc) => return Ok(enc),
-                Err(e) => tracing::warn!(
-                    %e,
-                    "HEVC 4:4:4 (Rext) open failed — falling back to 4:2:0 Main"
-                ),
+            // FR-77 P3b — every backend the source matrix can open in 4:4:4,
+            // minus the denylist (`cells::names_444`): hevc_nvenc (planar
+            // yuv444p) and hevc_qsv (packed VUYX, denied by default until its
+            // field test takes it off the list).
+            let names = crate::encode::cells::names_444(
+                roomler_ai_remote_control::models::VideoCodec::Hevc,
+            );
+            if names.is_empty() {
+                tracing::info!(
+                    "HEVC 4:4:4 requested but no backend is allowed to try it — running 4:2:0"
+                );
+            } else {
+                match Self::new_with_dispatch(
+                    &names,
+                    width,
+                    height,
+                    fps.max(1) as i32,
+                    maxrate_bps,
+                    cq_bias,
+                    true,
+                    constrained,
+                ) {
+                    Ok(enc) => return Ok(enc),
+                    Err(e) => tracing::warn!(
+                        %e,
+                        tried = ?names,
+                        "HEVC 4:4:4 (Rext) open failed — falling back to 4:2:0 Main"
+                    ),
+                }
             }
         }
         Self::new_with_dispatch(
@@ -736,14 +771,38 @@ impl FfmpegEncoder {
 
     /// Phase B — DataChannel-pump VP9 (`vp9_qsv`) constructor. See
     /// [`Self::new_hevc_adaptive`].
+    ///
+    /// FR-77 P3b — `chroma444`: the HARDWARE profile-1 cell (`vp9_qsv` over
+    /// packed VUYX, `cells::names_444`). Deliberately NO 4:2:0 fallback on
+    /// rejection: the caller's libvpx path is the one that emits profile 1,
+    /// and the viewer configured its decoder for the profile it asked for —
+    /// a VP9 profile mismatch is a blank canvas, not a softer picture.
     pub fn new_vp9_adaptive(
         width: u32,
         height: u32,
         fps: u32,
         maxrate_bps: usize,
         cq_bias: i32,
+        chroma444: bool,
         constrained: bool,
     ) -> Result<Self> {
+        if chroma444 {
+            let names =
+                crate::encode::cells::names_444(roomler_ai_remote_control::models::VideoCodec::Vp9);
+            if names.is_empty() {
+                return Err(anyhow!("no VP9 backend is allowed to open 4:4:4"));
+            }
+            return Self::new_with_dispatch(
+                &names,
+                width,
+                height,
+                fps.max(1) as i32,
+                maxrate_bps,
+                cq_bias,
+                true,
+                constrained,
+            );
+        }
         Self::new_with_dispatch(
             VP9_ENCODER_NAMES,
             width,
@@ -824,14 +883,49 @@ impl FfmpegEncoder {
     /// HEVC/AV1). The bitstream is Annex-B with in-band SPS/PPS (FFmpeg
     /// default without `GLOBAL_HEADER` — the same contract the HEVC path
     /// ships and WebCodecs decodes description-less).
+    /// P2 — DataChannel-pump H.264 constructor (see [`Self::new_hevc_adaptive`]).
+    ///
+    /// FR-77 P3b — `chroma444`: High 4:4:4 Predictive on the backends the
+    /// source matrix allows (`h264_nvenc` today, `cells::names_444`). Like
+    /// HEVC, a rejection falls back to the 4:2:0 cascade and the pump reports
+    /// the truth through [`Self::chroma444`].
     pub fn new_h264_adaptive(
         width: u32,
         height: u32,
         fps: u32,
         maxrate_bps: usize,
         cq_bias: i32,
+        chroma444: bool,
         constrained: bool,
     ) -> Result<Self> {
+        if chroma444 {
+            let names = crate::encode::cells::names_444(
+                roomler_ai_remote_control::models::VideoCodec::H264,
+            );
+            if names.is_empty() {
+                tracing::info!(
+                    "H.264 4:4:4 requested but no backend is allowed to try it — running 4:2:0"
+                );
+            } else {
+                match Self::new_with_dispatch(
+                    &names,
+                    width,
+                    height,
+                    fps.max(1) as i32,
+                    maxrate_bps,
+                    cq_bias,
+                    true,
+                    constrained,
+                ) {
+                    Ok(enc) => return Ok(enc),
+                    Err(e) => tracing::warn!(
+                        %e,
+                        tried = ?names,
+                        "H.264 4:4:4 (High 4:4:4 Predictive) open failed — falling back to 4:2:0 High"
+                    ),
+                }
+            }
+        }
         Self::new_with_dispatch(
             H264_ENCODER_NAMES,
             width,
@@ -975,6 +1069,8 @@ impl FfmpegEncoder {
             plane_u: vec![0u8; plane_pixels / 2],
             plane_v: Vec::new(),
             chroma444: false,
+            packed444: false,
+            packed: Vec::new(),
             fps: 30,
             cq,
             maxrate_bps: 3_000_000,
@@ -1167,6 +1263,8 @@ impl FfmpegEncoder {
                         ],
                         plane_v: vec![0u8; if chroma444 { plane_pixels } else { 0 }],
                         chroma444,
+                        packed444: chroma444 && packed444_name(name),
+                        packed: Vec::new(),
                         fps,
                         cq,
                         maxrate_bps,
@@ -1233,7 +1331,7 @@ impl FfmpegEncoder {
             // P7 — HEVC Rext 4:4:4 takes planar yuv444p; everything else
             // stays on the HW-native NV12 4:2:0.
             enc.set_format(if chroma444 {
-                format::Pixel::YUV444P
+                chroma444_pixel(name)
             } else {
                 format::Pixel::NV12
             });
@@ -1447,6 +1545,7 @@ impl FfmpegEncoder {
                 }
                 Ok(())
             })?;
+            self.pack_if_needed();
             return Ok(());
         }
 
@@ -1479,6 +1578,7 @@ impl FfmpegEncoder {
                 &mut dst_planes,
             )
             .map_err(|e| anyhow!("dcv BGRA→NV12 convert failed: {:?}", e))?;
+            self.pack_if_needed();
             return Ok(());
         }
 
@@ -1549,9 +1649,27 @@ impl FfmpegEncoder {
         cuts
     }
 
+    /// FR-77 P3b — for a packed-4:4:4 backend, interleave the I444 planes
+    /// into the VUYX buffer the frame is built from. A no-op on every other
+    /// path.
+    fn pack_if_needed(&mut self) {
+        if self.packed444 {
+            pack_vuyx(
+                &self.plane_y,
+                &self.plane_u,
+                &self.plane_v,
+                &mut self.packed,
+            );
+        }
+    }
+
     fn build_av_frame(&self, monotonic_us: u64) -> Result<frame::Video> {
         let format = if self.chroma444 {
-            format::Pixel::YUV444P
+            if self.packed444 {
+                format::Pixel::VUYX
+            } else {
+                format::Pixel::YUV444P
+            }
         } else {
             format::Pixel::NV12
         };
@@ -1577,17 +1695,22 @@ impl FfmpegEncoder {
         let w = self.width as usize;
         let rows = self.height as usize;
         let y_stride = av.stride(0);
-        copy_plane_into_av(av.data_mut(0), y_stride, &self.plane_y, w, rows);
-        if self.chroma444 {
-            // P7 — planar I444: three full-resolution planes.
-            let u_stride = av.stride(1);
-            copy_plane_into_av(av.data_mut(1), u_stride, &self.plane_u, w, rows);
-            let v_stride = av.stride(2);
-            copy_plane_into_av(av.data_mut(2), v_stride, &self.plane_v, w, rows);
+        if self.chroma444 && self.packed444 {
+            // FR-77 P3b — VUYX: ONE packed plane, four bytes per pixel.
+            copy_plane_into_av(av.data_mut(0), y_stride, &self.packed, w * 4, rows);
         } else {
-            // NV12: interleaved UV at half height.
-            let uv_stride = av.stride(1);
-            copy_plane_into_av(av.data_mut(1), uv_stride, &self.plane_u, w, rows / 2);
+            copy_plane_into_av(av.data_mut(0), y_stride, &self.plane_y, w, rows);
+            if self.chroma444 {
+                // P7 — planar I444: three full-resolution planes.
+                let u_stride = av.stride(1);
+                copy_plane_into_av(av.data_mut(1), u_stride, &self.plane_u, w, rows);
+                let v_stride = av.stride(2);
+                copy_plane_into_av(av.data_mut(2), v_stride, &self.plane_v, w, rows);
+            } else {
+                // NV12: interleaved UV at half height.
+                let uv_stride = av.stride(1);
+                copy_plane_into_av(av.data_mut(1), uv_stride, &self.plane_u, w, rows / 2);
+            }
         }
 
         Ok(av)
@@ -2024,6 +2147,39 @@ impl Drop for FfmpegEncoder {
     }
 }
 
+/// FR-77 P3b — the pixel format a backend takes for 4:4:4. NVENC (and the
+/// software cascade) take planar `yuv444p`; QSV and VAAPI take the PACKED
+/// `VUYX` 4:4:4 — FFmpeg n9's `vp9_qsv` / `hevc_qsv` list VUYX and XV30 and
+/// never planar 4:4:4, which is exactly why the P1 probe's 4:4:4 open of
+/// `vp9_qsv` failed on CORPLAP-3.
+fn chroma444_pixel(name: &str) -> format::Pixel {
+    if packed444_name(name) {
+        format::Pixel::VUYX
+    } else {
+        format::Pixel::YUV444P
+    }
+}
+
+/// Backends whose 4:4:4 input is the packed VUYX layout.
+fn packed444_name(name: &str) -> bool {
+    name.contains("qsv") || name.contains("vaapi")
+}
+
+/// Interleave three full-resolution planes into VUYX — V, U, Y, X per pixel,
+/// FFmpeg's `AV_PIX_FMT_VUYX` byte order; X is undefined and written 0xFF.
+/// The BT.601 I444 planes dcv produced are the source, so the packed path
+/// renders identically to the planar one.
+fn pack_vuyx(y: &[u8], u: &[u8], v: &[u8], packed: &mut Vec<u8>) {
+    let n = y.len().min(u.len()).min(v.len());
+    packed.resize(n * 4, 0xFF);
+    for (i, px) in packed.chunks_exact_mut(4).enumerate().take(n) {
+        px[0] = v[i];
+        px[1] = u[i];
+        px[2] = y[i];
+        px[3] = 0xFF;
+    }
+}
+
 fn copy_plane_into_av(
     dst: &mut [u8],
     dst_stride: usize,
@@ -2365,5 +2521,67 @@ mod tests {
             },
             None => unsafe { tunnel_core::env::test_env::clear("NVENC_SPATIAL_AQ") },
         }
+    }
+
+    /// FR-77 P3b — the 4:4:4 pixel format follows the backend: NVENC and the
+    /// software names take planar yuv444p, QSV and VAAPI the packed VUYX the
+    /// FFmpeg n9 sources list for them (never planar 4:4:4).
+    #[test]
+    fn chroma444_pixel_format_follows_the_backend() {
+        assert_eq!(chroma444_pixel("hevc_nvenc"), format::Pixel::YUV444P);
+        assert_eq!(chroma444_pixel("h264_nvenc"), format::Pixel::YUV444P);
+        assert_eq!(chroma444_pixel("vp9_qsv"), format::Pixel::VUYX);
+        assert_eq!(chroma444_pixel("hevc_qsv"), format::Pixel::VUYX);
+        assert_eq!(chroma444_pixel("hevc_vaapi"), format::Pixel::VUYX);
+        assert!(!packed444_name("hevc_nvenc"));
+        assert!(packed444_name("vp9_qsv"));
+    }
+
+    /// FR-77 P3b — VUYX byte order (FFmpeg's `AV_PIX_FMT_VUYX`): V, U, Y, X per
+    /// pixel, X written 0xFF; the buffer is resized to the plane length and
+    /// a stale larger buffer is shrunk.
+    #[test]
+    fn vuyx_packing_layout_and_sizing() {
+        let y = [10u8, 11, 12];
+        let u = [20u8, 21, 22];
+        let v = [30u8, 31, 32];
+        let mut packed = vec![0u8; 64];
+        pack_vuyx(&y, &u, &v, &mut packed);
+        assert_eq!(packed.len(), 12);
+        assert_eq!(&packed[..4], &[30, 20, 10, 0xFF]);
+        assert_eq!(&packed[4..8], &[31, 21, 11, 0xFF]);
+        assert_eq!(&packed[8..], &[32, 22, 12, 0xFF]);
+        // Mismatched plane lengths pack the common prefix only.
+        pack_vuyx(&y[..2], &u, &v, &mut packed);
+        assert_eq!(packed.len(), 8);
+    }
+
+    /// FR-77 P3b — QSV's 4:4:4 profile keys appear exactly when 4:4:4 is
+    /// requested, per codec, and never on the nvenc branch (which has its
+    /// own `rext` / `high444p` keys).
+    #[test]
+    fn qsv_444_profiles_per_codec_only_with_chroma444() {
+        let (_, _, s) = encoder_options("hevc_qsv", 3_000_000, 22, true, true, false);
+        assert!(
+            s.contains("profile=rext"),
+            "hevc_qsv 4:4:4 must set rext, got: {s}"
+        );
+        let (_, _, s) = encoder_options("vp9_qsv", 3_000_000, 22, true, true, false);
+        assert!(
+            s.contains("profile=profile1"),
+            "vp9_qsv 4:4:4 must set profile1, got: {s}"
+        );
+        for name in ["hevc_qsv", "vp9_qsv", "h264_qsv", "av1_qsv"] {
+            let (_, _, s) = encoder_options(name, 3_000_000, 22, true, false, false);
+            assert!(
+                !s.contains("profile"),
+                "{name} 4:2:0 must not set a profile, got: {s}"
+            );
+        }
+        let (_, _, s) = encoder_options("h264_qsv", 3_000_000, 22, true, true, false);
+        assert!(
+            !s.contains("profile"),
+            "h264_qsv has no 4:4:4 profile to set, got: {s}"
+        );
     }
 }
