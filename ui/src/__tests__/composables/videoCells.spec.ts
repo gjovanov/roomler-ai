@@ -245,3 +245,32 @@ describe('FR-77 remembered decode failures', () => {
     expect(rememberedCellFailures(A, 'UA/1')).toEqual(new Set())
   })
 })
+
+describe('FR-77 picker subtitles read from the live site (2026-09-07)', () => {
+  const browserAll = { av1: true, hevc: true, hevcRext: true, vp9: true }
+  // CORPLAP-3's 0.4.83 cells: no HEVC cell at all.
+  const corplap3 = cellsFromCaps({
+    ...base,
+    video_cells: [
+      { codec: 'h264', backend: 'openh264', chroma: ['yuv420'], hw: false },
+      { codec: 'h264', backend: 'mf', chroma: ['yuv420'], hw: false },
+      { codec: 'vp9', backend: 'qsv', chroma: ['yuv420'], hw: true },
+      { codec: 'av1', backend: 'qsv', chroma: ['yuv420'], hw: true },
+      { codec: 'h264', backend: 'qsv', chroma: ['yuv420'], hw: true },
+      { codec: 'vp9', backend: 'libvpx', chroma: ['yuv420', 'yuv444'], hw: false },
+    ],
+  })
+
+  it('a codec greyed on both chroma formats quotes the 4:2:0 reason, not the 4:4:4 one', () => {
+    const a = cellAvailability({ cells: corplap3, capsLoaded: true, browser: browserAll, failed: new Set() })
+    expect(codecSelectable(a, 'hevc', 'auto')).toMatchObject({ ok: false, reason: 'agentNoHevc' })
+    // …while a codec that opens only in 4:4:4 (never the case today) would still surface that cell.
+    expect(codecSelectable(a, 'vp9', 'auto').ok).toBe(true)
+  })
+
+  it('the 4:2:0 entry under codec Auto describes the format, not whichever codec passed first', () => {
+    const a = cellAvailability({ cells: corplap3, capsLoaded: true, browser: browserAll, failed: new Set() })
+    expect(chromaSelectable(a, 'auto', 'yuv420')).toMatchObject({ ok: true, reason: 'chroma420' })
+    expect(chromaSelectable(a, 'auto', 'yuv444')).toMatchObject({ ok: true, reason: 'vp9444' })
+  })
+})

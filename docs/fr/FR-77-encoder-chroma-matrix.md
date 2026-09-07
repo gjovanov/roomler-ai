@@ -216,8 +216,8 @@ flowchart LR
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
 | P0 | FFmpeg **9.0.1** on all three vendoring lanes (vcpkg baseline `2e6b9238`, AMF headers `v1.5.2`, `ffmpeg-next = "9.0"`, dylib names → 63, the NVENC patch re-based) + `scripts/dev-ffmpeg-windows.ps1`, the native Windows dev loop | flip the three asset patterns back to `vendored-ffmpeg-8.1.2` (kept one release) | **shipped** #1472 → `agent-v0.4.82` (bump #1477), **field-verified 2026-09-07** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) |
-| P1 | `video_cells` + the matrix probe + verified `hw` + probe duration in the hello; server passthrough | legacy fields stay filled; a viewer ignoring the field sees today | **built** #1480 — dev-box matrix 8 cells / 3.5 s; field verification pending the 0.4.83 roll |
-| P2 | Picker: codec × chroma dropdowns, i18n, Auto rules, remembered trial failures, the shared derivation | ships with P1 | **built** #1480, ships with P1 |
+| P1 | `video_cells` + the matrix probe + verified `hw` + probe duration in the hello; server passthrough | legacy fields stay filled; a viewer ignoring the field sees today | **shipped** #1480 → `agent-v0.4.83`, **field-verified 2026-09-07** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) |
+| P2 | Picker: codec × chroma dropdowns, i18n, Auto rules, remembered trial failures, the shared derivation | ships with P1 | **shipped** with P1 (viewer `hosted-20260907-602396d`), **field-verified 2026-09-07** |
 | P3 | New cells: VP9 4:4:4 hardware (QSV/VAAPI profile 1), H.264 4:4:4 (NVENC + software decode), HEVC 4:4:4 on QSV/VAAPI behind the denylist; the chroma column | the cell denylist | — |
 | P4 | VAAPI on Linux x86_64 | `ROOMLERD_USE_FFMPEG=0` / the denylist | — |
 | P5 | `docs/encoders.md` rewritten with diagrams (the cell resolution, the probe lifecycle); stale "macOS ships no FFmpeg" lines corrected in `CLAUDE.md`, `THIRD-PARTY-NOTICES.md`, `docs/lgpl-relink.md`; `docs/README.md` row | — | — |
@@ -232,9 +232,9 @@ flowchart LR
       *Ticked 2026-09-07 on `agent-v0.4.82`: smoke `hevc_nvenc` PASS before the tag; three
       sessions with 0 skipped frames, 0 rebuilds, ages ≤ 49 ms; MSI size unchanged — the
       table is in the field log and on #1470.*
-- [ ] **P1** — the hello carries `video_cells` on the dev box and CORPLAP-3; the probe
+- [x] **P1** — the hello carries `video_cells` on the dev box and CORPLAP-3; the probe
       duration is reported; a viewer built before this FR sees no change.
-- [ ] **P2** — the picker greys every impossible cell with its reason; a stored
+- [x] **P2** — the picker greys every impossible cell with its reason; a stored
       `hevc-444` override survives reconnect (#1468); the derivation reproduces today's
       picker for a recorded 0.4.79 hello.
 - [ ] **P3** — the FR-74 Notepad++ scroll on each new cell, operator-judged, with the
@@ -270,3 +270,7 @@ multi-GPU adapter selection for Windows backends (unchanged).
 | 2026-09-07 | MacBook (attended agent) · `hevc_videotoolbox` (direct, 3024×1964) | P0 | 20 heartbeats / 1239 frames: target 51–60 M, 0 skipped, send_wait max 31 ms, age max 27 ms, 1 IDR, 0 rebuilds, encode avg 5.7 ms (0.4.76 before: 5.3 ms). Pill `H.265 4:2:0 HW (hevc_videotoolbox) · direct · dec HW · 31.1 Mbps · 30 fps · ~12 ms` |
 | 2026-09-07 | MacBook (`-daemon` agent) | note | Has never had screen capture on any version (`scrap capture unavailable — falling back to NoopCapture` on 0.4.42 / 0.4.48 / 0.4.82); a session against it reads `connected · video stalled`. The attended agent is the remote-desktop target. Not a regression |
 | 2026-09-07 | dev box, the P1 branch built natively against the 9.0.1 tree | P1 | `roomlerd caps-probe`: **8 cells in 3.5 s** (`probe_ms` 3478; 2.2–2.6 s before the matrix) — `hevc/nvenc` 4:2:0+4:4:4 (299 ms), `h264/nvenc` 4:2:0+4:4:4 (309 ms; needed `profile=high444p`), `av1/nvenc` (158 ms), **`hevc/amf` (59 ms) + `h264/amf` (56 ms)** on the Radeon 610M — cells nobody had seen, the cascade always stopped at NVENC — `h264/mf` hw, `h264/openh264`, `vp9/libvpx` 4:2:0+4:4:4. Legacy fields byte-identical to the 0.4.82 hello |
+| 2026-09-07 | release | P1/P2 | `agent-v0.4.83` (bump #1482 → `fe218499`; run 34158473705 green, 28 assets); viewer `hosted-20260907-602396d` promoted (the P1+P2 merge `602396d9`) |
+| 2026-09-07 | dev box · CORPLAP-3 · MacBook, server record after the roll | P1 | `video_cells` + `probe_ms` on all three: dev box **8 cells / 3986 ms** (`hevc/nvenc` + `h264/nvenc` both 4:2:0+4:4:4, `av1/nvenc`, `hevc/amf`, `h264/amf`, `h264/mf` sw, `h264/openh264`, `vp9/libvpx`); CORPLAP-3 **6 cells / 5432 ms** (`vp9/qsv`, `av1/qsv`, `h264/qsv`, `h264/mf` sw, `h264/openh264`, `vp9/libvpx` — no HEVC cell, and none on any version since 0.4.71); MacBook **4 cells / 120 ms** (`hevc/videotoolbox`, `h264/videotoolbox`, `h264/openh264`, `vp9/libvpx`). Legacy fields byte-identical to the 0.4.82 hellos. ⚠️ Both Windows hosts sit above the ~3 s cache line — open decision, decided by a fleet-wide `probe_ms` read |
+| 2026-09-07 | dev box ↔ Chrome on the dev box; CORPLAP-3 ↔ the same Chrome (live DOM) | P2 | dev box: every codec and both chroma entries selectable, 4:4:4 explained as the HEVC Rext cell; CORPLAP-3: **HEVC greyed** (no HEVC cell), 4:4:4 explained as software decode (VP9 profile 1). Two subtitles read wrong (a greyed HEVC quoted the 4:4:4 reason; 4:2:0 under codec Auto borrowed H.264's line) — fixed in the follow-up |
+| 2026-09-07 | dev box → dev box, Sharper, chroma Auto | P2 | `[rc] auto transport — data-channel-hevc (HEVC 4:4:4: HW Rext encode on agent + HW Rext decode here)`; decoder `hev1.4.10.L153.B0`; `rc:video-info {encoder: hevc_nvenc, hardware: true, chroma: yuv444, transport: direct}`; first keyframe acquired, 1588×992 at ~18 ms — the chroma axis reaches the session end to end |

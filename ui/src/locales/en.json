@@ -22,6 +22,7 @@
       "reason": {
         "auto": "Best codec for this device and browser, picked at Connect",
         "autoChroma": "Sharper takes full colour detail when both ends can do it",
+        "chroma420": "Colour at quarter resolution — the video default, decodes everywhere",
         "av1": "Best quality per bit — hardware on both ends",
         "browserNoAv1": "This browser can’t decode AV1",
         "agentNoAv1": "This device has no AV1 hardware encoder",

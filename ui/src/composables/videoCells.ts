@@ -302,7 +302,11 @@ export function codecSelectable(a: Availability, codec: PickerCodec, chroma: Pic
   if (chroma === 'auto') {
     // Any chroma will do; report the best-looking cell.
     const c420 = a[codec].yuv420
-    return c420.ok ? c420 : a[codec].yuv444
+    if (c420.ok) return c420
+    const c444 = a[codec].yuv444
+    if (c444.ok) return c444
+    // Neither opens: the 4:2:0 reason is the one that explains the codec itself.
+    return c420
   }
   return a[codec][chroma]
 }
@@ -312,7 +316,9 @@ export function chromaSelectable(a: Availability, codec: PickerCodec, chroma: Pi
   if (chroma === 'auto') return { ok: true, reason: 'autoChroma' }
   if (codec === 'auto') {
     const any = CELL_CODECS.map((c) => a[c][chroma]).find((v) => v.ok)
-    return any ?? { ok: false, reason: chroma === 'yuv444' ? 'no444Anywhere' : 'no420Anywhere' }
+    if (!any) return { ok: false, reason: chroma === 'yuv444' ? 'no444Anywhere' : 'no420Anywhere' }
+    // Under codec Auto the 4:2:0 entry describes the FORMAT, not whichever codec happened to pass first.
+    return chroma === 'yuv420' ? { ok: true, reason: 'chroma420' } : any
   }
   return a[codec][chroma]
 }
