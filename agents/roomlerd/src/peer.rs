@@ -5020,6 +5020,9 @@ async fn media_pump_ffmpeg_dc(
     // the MEASURED rate instead of the nominal relay ceiling. Resolved once
     // (env/config are process-stable) and read at the gate every iteration.
     let constrained_queue_measured = crate::encode::constrained_queue_measured_enabled();
+    // FR-74 P1b — the lag bound the direct gate judges the measured wait
+    // against, resolved once like the line above (env/config are process-stable).
+    let direct_lag_bound_ms = crate::encode::rate_profile::direct_queue_ms();
     // 2026-08-26 — queue-wait telemetry (P7 of the drag-latency design):
     // enqueue→wire-complete per frame, accumulated by the send task and
     // drained by the heartbeat. Sent frames only — a stale-dropped frame
@@ -5048,6 +5051,21 @@ async fn media_pump_ffmpeg_dc(
     // report drained every 2 s — sharing it would make the rate loop's
     // reaction depend on the logging cadence.
     let send_stall_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // FR-74 P1b — the enqueue instant (µs since `head_wait_epoch`, +1 so 0
+    // means "nothing at the head") of the frame the send task is writing
+    // RIGHT NOW. The completion-based waits above only learn about a frame
+    // once it has left the wire, so on a stalled pipe they read stale-low
+    // while the queue grows; this cell lets the gate see the live age of
+    // the head frame instead. Cleared by the send task after each write.
+    let send_head_enqueued_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let head_wait_epoch = std::time::Instant::now();
+    // The gate's own view of the measured send wait: an EMA over the
+    // per-pass average of completed frames' waits (α = 0.3) — separate
+    // "last" cursors from the FR-71 window deltas so the two readers never
+    // race each other for the same counters.
+    let mut direct_wait_ema_ms: f64 = 0.0;
+    let mut gate_sw_sum_last: u64 = 0;
+    let mut gate_sw_frames_last: u64 = 0;
     // The direct byte gate's reference rate: the last policy ceiling (the
     // AIMD's applied target takes over once it exists). One-shot log the
     // first time the direct gate actually sheds, so a field read can tell
@@ -5196,6 +5214,7 @@ async fn media_pump_ffmpeg_dc(
         let send_wait_us_max = send_wait_us_max.clone();
         let send_wait_frames = send_wait_frames.clone();
         let send_stall_us = send_stall_us.clone();
+        let send_head_enqueued_us = send_head_enqueued_us.clone();
         let opener_wait_us_max = opener_wait_us_max.clone();
         let opener_bytes = opener_bytes.clone();
         let in_opener_grace = in_opener_grace.clone();
@@ -5232,6 +5251,15 @@ async fn media_pump_ffmpeg_dc(
                     // is dropped but must still leave the in-flight ledger below.
                     if !stale && let Some(dc) = video_bytes_dc.lock().await.clone() {
                         let ser_start = std::time::Instant::now();
+                        // FR-74 P1b — publish the head frame's enqueue instant
+                        // so the pump's gate can age it while it is on the wire.
+                        send_head_enqueued_us.store(
+                            enqueued_at
+                                .saturating_duration_since(head_wait_epoch)
+                                .as_micros() as u64
+                                + 1,
+                            Relaxed,
+                        );
                         let mut off = 0usize;
                         let mut ok = true;
                         // Ceiling division, floored at one: a zero-length frame
@@ -5292,6 +5320,8 @@ async fn media_pump_ffmpeg_dc(
                             }
                         }
                     }
+                    // FR-74 P1b — nothing is on the wire between frames.
+                    send_head_enqueued_us.store(0, Relaxed);
                     // Byte-budget ledger: the frame left the queue (delivered
                     // into SCTP, failed, or dropped on a closed DC). Increments
                     // strictly precede the frame's entry into the channel, so
@@ -5792,7 +5822,61 @@ async fn media_pump_ffmpeg_dc(
             crate::encode::rate_profile::direct_queue_budget_bytes(last_ceiling_bps)
         };
         let inflight_now = inflight_bytes.load(std::sync::atomic::Ordering::Relaxed);
-        let byte_gate = inflight_now >= queue_budget;
+        // FR-74 P1b — on a direct path the byte budget is the MEASURED wait's
+        // call below the encoder's own reservoir: the 0.4.77 read (CORPLAP-3,
+        // AV1, 2026-09-07) tripped the P1 budget on a scroll burst the wire
+        // was draining at ≤ 20 ms of viewer age and cut the ceiling twice for
+        // it. The wait is the larger of the EMA of completed frames' waits and
+        // the live age of the frame on the wire (a stalled pipe completes
+        // nothing, so the EMA alone would read stale-low while the queue grew).
+        let (hard_budget, measured_wait_ms) = if constrained {
+            (queue_budget, 0.0)
+        } else {
+            {
+                let sum_now = send_wait_us_sum.load(std::sync::atomic::Ordering::Relaxed);
+                let frames_now = send_wait_frames.load(std::sync::atomic::Ordering::Relaxed);
+                let frames = frames_now.saturating_sub(gate_sw_frames_last);
+                if frames > 0 {
+                    let avg_ms =
+                        sum_now.saturating_sub(gate_sw_sum_last) as f64 / frames as f64 / 1000.0;
+                    direct_wait_ema_ms = 0.7 * direct_wait_ema_ms + 0.3 * avg_ms;
+                }
+                gate_sw_sum_last = sum_now;
+                gate_sw_frames_last = frames_now;
+            }
+            let head = send_head_enqueued_us.load(std::sync::atomic::Ordering::Relaxed);
+            let head_wait_ms = if head == 0 {
+                0.0
+            } else {
+                head_wait_epoch
+                    .elapsed()
+                    .as_micros()
+                    .saturating_sub((head - 1) as u128) as f64
+                    / 1000.0
+            };
+            let hrd_pct = encoder
+                .as_ref()
+                .map(|e| crate::encode::ffmpeg::encoder::open_hrd_pct(e.name(), false))
+                .unwrap_or_else(crate::encode::rate_profile::direct_hrd_pct);
+            (
+                crate::encode::rate_profile::direct_queue_hard_budget_bytes(
+                    last_ceiling_bps,
+                    hrd_pct,
+                ),
+                direct_wait_ema_ms.max(head_wait_ms),
+            )
+        };
+        let byte_gate = if constrained {
+            inflight_now >= queue_budget
+        } else {
+            crate::encode::rate_profile::direct_gate_trips(
+                inflight_now,
+                queue_budget,
+                hard_budget,
+                measured_wait_ms,
+                direct_lag_bound_ms,
+            )
+        };
         // FR-35 P3b — the opener is draining whenever the ledger dips below half
         // the budget; reset the stuck timer so only a genuinely pinned queue
         // (inflight held high, not falling) is read as "seed too hot".
@@ -5813,6 +5897,8 @@ async fn media_pump_ffmpeg_dc(
                     codec_label,
                     inflight = inflight_now,
                     budget = queue_budget,
+                    hard_budget,
+                    measured_wait_ms = format_args!("{measured_wait_ms:.1}"),
                     "FFmpeg DC pump: direct byte-budget gate engaged (bounding queue lag; first time this session)"
                 );
             }
