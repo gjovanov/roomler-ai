@@ -483,7 +483,11 @@ the rate rebuild off the frame path, and a rate rebuild changes no dims,
 so there is no capture-cap change and no stale frame — the plan-driven
 decision M2a needed has nothing to decide there. What M2 still owes is
 only what its design excludes: the session-start open (0.17–2.9 s,
-measured as the first-frame latency, AC2's open half).
+measured as the first-frame latency, AC2's open half). *Re-measured
+2026-09-07 after FR-74 P1 raised the direct ceiling: **0 rate swaps in all
+17 sessions on the three hosts** (QSV direct on CORPLAP-1 and -3 at
+43 Mbps, nvenc relay on CORPLAP-2) — the rate ladder no longer fires on a
+direct path at all, so the rate half of M2 has no case left to build.*
 
 **What the day's stalls say for M3.** With every rebuild off the frame
 path, the non-open pump stalls that remain are the loop body's, and the
