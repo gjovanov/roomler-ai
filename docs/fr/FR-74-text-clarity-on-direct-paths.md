@@ -4,7 +4,7 @@
 P1 (0.4.77) + P1b (0.4.79) + P3 (0.4.80) released and **field-verified 2026-09-07 on all four
 codecs** by the operator's read and the heartbeat; P2 retired by measurement (0 rate swaps);
 AC3 ticked; the thin-direct-path read of the q-cap done 2026-09-07 (sharp but laggy below the
-cap's ~10 Mbps floor — an open decision, §P3); open: AC1's pixel comparison, P4 (UI) ·
+cap's ~10 Mbps floor — an open decision, §P3); AC1 ticked (pixel half: faithful on 4:4:4, not on 4:2:0 — measured); open: P4 (UI) ·
 **Parent:** the RC quality program (FR-17/16/14); rides on FR-59's measured pipe and FR-70's
 pump instrumentation.
 
@@ -313,12 +313,12 @@ disagree. FSR helps only when upscaling.
 
 ## Acceptance criteria
 
-- [ ] **AC1** — a Notepad++ scroll on CORPLAP-3 stays readable while it moves (no
+- [x] **AC1** — a Notepad++ scroll on CORPLAP-3 stays readable while it moves (no
       unreadable phase), and the settled text matches a local screenshot of the
       same region (pixel comparison of a text block, not an impression).
       *Operator half met on all four codecs 2026-09-07 (0.4.79: AV1, VP9 4:2:0,
       H.264 — "not seeing the blurring anymore"; 0.4.80: VP9 4:4:4 — "scrolling
-      large texts seems much better"); the pixel comparison not yet done.*
+      large texts seems much better"). Pixel half measured 2026-09-07 (field log): **met on VP9 4:4:4** (mean |Δ| 1.4, 100 % within ±16) and **not met on the 4:2:0 HW path** (AV1 ICQ 22: 13.6 % of a text block's pixels more than 32 off) — a chroma/ICQ property of 4:2:0, not a defect; "crystal clear" is a 4:4:4 property, which FR-77's colour-detail picker now offers on hardware.*
 - [ ] **AC2** — sharpness is stable within 1 s of the scroll ending; keyframes per
       minute in a scroll session drop from ~7 to ≤ 2.
       *Measured 2026-09-07 on 0.4.79/0.4.80 (CORPLAP-3, 11 sessions): the ~7/min of
@@ -373,3 +373,5 @@ program FR-17 / 16 / 14.
 | 2026-09-07 10:59–11:04 UTC | 0.4.80 | release | P3 (#1463 → `64bee350`, bump #1464 → `ad3fc039`, 28 assets). CORPLAP-3 pid 7968 (11:01:47), CORPLAP-1 pid 5320 (11:02:30), CORPLAP-2 pid 15416 (11:03:33), each updated while idle. Field gate open: the operator's VP9 4:4:4 wheel scroll on CORPLAP-3. |
 | 2026-09-07 13:25 UTC | 0.4.80 | CORPLAP-3, VP9 4:4:4 (libvpx), direct, the operator's scroll | **P3 gate — instrument PASS.** The session opened with `worst-quality cap applied max_q=16`; through the 17 s scroll every 1 s window had **`max_qp` = 64** (0.4.79: max 255, avg 113–192), avg 45–64 while moving, then 4 → 0 within ~2 s of stopping (refine to lossless intact); 0 skips; viewer age ≤ 39 ms. Bitrate 22–52 Mbps in the scroll windows — **above the 20.7 M target**: with q pinned at ≤ 64 the CBR target is a soft bound on content that needs more at that quality; on this direct path it cost nothing, and on a thinner one the DC buffered-bytes gate sheds frames rather than sharpness (the intended trade for a mode chosen for text). Operator's read pending. |
 | 2026-09-07 20:06–20:09 UTC | 0.4.82 | CORPLAP-3, VP9 4:4:4, direct, **two viewers** (the operator's tab + the automation tab, `shared ×2`), a Notepad++ copy of the day's log, wheel input by `SendInput` at 15 notches/s (15 s down, 15 s up) from a one-shot task in the interactive session | **Thin direct path, measured.** Control (20:06:58–20:07:29): 30 captures/s, 13–21 Mbps at q 0–2 on the down leg, one ×0.85 cut at the direction change (a 55 Mbps window, q 15/64, +2 skips), up leg 18–35 Mbps at q 0–32, viewer age 19–60 ms. **Throttled** (a Windows QoS policy capping `roomlerd.exe` egress at 15 Mbps — ~7.5 Mbps per viewer; 20:08:26–20:08:57): seven AIMD cuts in 9 s (9.95 → 5.68 M, then 4.6–5.1 M), the encoder still emitting **10–19 Mbps at avg q 56–60 / max 64** — the cap's floor for a full-screen 4:4:4 text scroll is ~10 Mbps and the target below it is inert — **zero new gate skips** (the OS pacer queues below the socket, so the DC buffered-bytes gate never saw a queue) and **viewer age 160–380 ms**. The cost of the cap on a pipe thinner than its floor is lag, not blur. |
+| 2026-09-07 21:34 UTC | 0.4.83 | CORPLAP-3, AV1 4:2:0 (av1_qsv, ICQ 22), sole viewer, settled text | **AC1 pixel comparison, HW path.** Host truth = a DPI-aware `CopyFromScreen` PNG from a one-shot task in the interactive session; viewer side = the decoded frame read from the viewer's canvas with the scale mode at `original` (1:1, 1920×1200 — in `adaptive` the canvas is the FSR-upscaled 2018×1261); a 260×160 text block at (100,400), the two captures 6 s apart on a static screen, compared in-page, alignment best at dx=dy=0: **mean \|Δ\| 12.6, 54 % of pixels within ±2, 73 % within ±8, 82 % within ±16, 13.6 % more than 32 off, max 123.** The settled 4:2:0 picture is not pixel-faithful on ClearType text — finding 4, quantified. |
+| 2026-09-07 21:42 UTC | 0.4.83 | CORPLAP-3, VP9 4:4:4 (libvpx, settled at q 0), sole viewer, same text block | **AC1 pixel comparison, 4:4:4.** Same method and block: **mean \|Δ\| 1.37, 85 % within ±2, 96.8 % within ±8, 100 % within ±16, max 15, none more than 32 off.** Pixel-faithful up to the BGRA↔YUV 4:4:4 rounding. The two host shots taken 8 min apart differed by mean 5.3 (a caret-line highlight toggling with window focus), so a comparison is only valid when both captures are seconds apart. |
