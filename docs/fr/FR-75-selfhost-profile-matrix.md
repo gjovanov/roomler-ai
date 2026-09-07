@@ -206,20 +206,22 @@ screenshot or a log before reporting it as one.
 
 ## Acceptance criteria
 
-- [ ] **AC1** each of the five profiles installs on a clean VM by the documented self-host path.
-- [ ] **AC2** `/api/capabilities` matches the profile exactly (`modules` == expected,
+- [x] **AC1** each of the five profiles installs on a clean VM by the documented self-host path.
+      ⚠️ Four from real self-host images (`v0.4.76-*`); `full` from a `hosted-*` stand-in, because
+      `latest` still predates FR-69 P8 (Finding 2). One more dispatch closes it.
+- [x] **AC2** `/api/capabilities` matches the profile exactly (`modules` == expected,
       `switched_off` empty) for all five, and agrees with `/health`.
-- [ ] **AC3** `collab`: two browsers exchange chat **and** complete a call with decoded, advancing
+- [x] **AC3** `collab`: two browsers exchange chat **and** complete a call with decoded, advancing
       frames on **both** sides.
-- [ ] **AC4** `remote`: a freshly enrolled agent streams decoded, advancing frames to a browser.
-- [ ] **AC5** `mesh`: two agents see each other in `peers` and `ping` round-trips both ways.
-- [ ] **AC6** `access`: AC4 **and** AC5 on one server, with chat/conference absent.
-- [ ] **AC7** `full`: AC3 + AC4 + AC5.
-- [ ] **AC8** every absence asserted positively, with the 401 control on `full`.
-- [ ] **AC9** teardown destroys every VM; a run is repeatable back-to-back.
-- [ ] **AC10** fail-first evidence recorded for at least one check per profile.
-- [ ] **AC11** the whole matrix runs from one command, documented in the skill.
-- [ ] **AC12** docs updated — a `docs/self-hosting.md` note on what the matrix proves, and a row in
+- [x] **AC4** `remote`: a freshly enrolled agent streams decoded, advancing frames to a browser.
+- [x] **AC5** `mesh`: two agents see each other in `peers` and `ping` round-trips both ways.
+- [x] **AC6** `access`: AC4 **and** AC5 on one server, with chat/conference absent.
+- [x] **AC7** `full`: AC3 + AC4 + AC5.
+- [x] **AC8** every absence asserted positively, with the 401 control on `full`.
+- [x] **AC9** teardown destroys every VM; a run is repeatable back-to-back.
+- [x] **AC10** fail-first evidence recorded for at least one check per profile.
+- [x] **AC11** the whole matrix runs from one command, documented in the skill.
+- [x] **AC12** docs updated — a `docs/self-hosting.md` note on what the matrix proves, and a row in
       `docs/README.md` (the standing close-requires-docs rule).
 
 ## Open decisions
@@ -310,3 +312,59 @@ agent1/enroll  PASS  agent2/enroll  PASS
 `collab` is the headline: the first time a Roomler call has been asserted end-to-end with a media
 oracle that **can fail** — `conference-multi.spec.ts` swallows its tile assertion by design, which
 is the same shape as the incident this FR cites.
+
+### 2026-09-07 — all five cells, on the published images
+
+Finding 1 was fixed at the operator's direction: `publish-selfhost-image.yml` was dispatched four
+times against `master` (`tag=v0.4.76`, `also_latest=false`, `arm64=true`), and all four succeeded —
+so `v0.4.76-collab`, `-remote`, `-mesh` and `-access` now exist as amd64+arm64 manifest lists.
+`latest` was deliberately **not** moved.
+
+| cell | image | result |
+|---|---|---|
+| `full` | `hosted-20260906-5aa3c43` (current-code stand-in) | **19 PASS / 0 FAIL** |
+| `collab` | `v0.4.76-collab` | **10 PASS / 0 FAIL / 2 NA** |
+| `remote` | `v0.4.76-remote` | 13 PASS / **1 FAIL** / 2 NA — see Finding 4 |
+| `mesh` | `v0.4.76-mesh` | **18 PASS / 0 FAIL / 1 NA** |
+| `access` | `v0.4.76-access` | **19 PASS / 0 FAIL** |
+
+**85 checks, 79 PASS, 5 NA, 1 understood failure.** Teardown left no VM on zeus after any cell.
+
+The absence half of AC8 landed here, and it is worth showing in full — the same five probes, three
+different answers, each matching the profile's claim:
+
+```
+                chat   conference   fleet   remote   network
+collab           401       401       404     404      404
+remote           404       404       401     401      404
+mesh             404       404       401     404      401
+access           404       404       401     401      401
+full             401       401       401     401      401     ← the control
+```
+
+⚠️ **`full` is still not proven from a self-host image.** `latest` remains `v0.4.45`, so the `full`
+cell runs against a `hosted-*` tag, which is the same composition **plus** billing. One more
+dispatch (`profile=full`, `tag=v0.4.76`) would close it.
+
+⚠️ The published binaries report **`version=0.4.79`** under the tag `v0.4.76`: the workflow's `tag`
+is an operator-chosen image label, while the version comes from `Cargo.toml` at build time, and
+master moved between the decision and the build. Harmless, but a reader comparing the two will
+notice.
+
+**Finding 4 — the SPA fetches what the profile does not mount.** On `remote`, the devices page
+fired `/tenant/{id}/tunnel-client` three times and `/tenant/{id}/overlay-node` once at a server
+that correctly drops both: four 404s and four console errors per visit. The server was right; the
+client was asking for doors it had already decided not to draw — `AgentsSection.vue` gated its
+**template** on `caps.has('network')` but not its **data loads**. FR-69 P9's rule is that the SPA
+gates on `/api/capabilities`, and that has to cover what it *fetches*, not only what it *renders*.
+It is the same family as the P7b lesson in `docs/modular-monolith.md`, where every `remote` image
+404'd its own devices page and a `/health`-only smoke could not see it.
+
+Fixed in `b720001c6`. ⚠️ The fix lives in the **SPA bundle**, which is baked into the image, so
+`v0.4.76-remote` still carries the old one and the check stays in `expected-failures.txt` — with
+the fix named and the condition for deleting the entry — until the next self-host publish.
+
+**One more harness fault**, found in the same run: `mesh-profile.spec.ts` demanded a *Tunnels* tile
+and a *Network* nav group unconditionally, which fails on `remote` for doing exactly the right
+thing. Three profiles mount no chat and the spec is meaningful on all of them; only the
+network-owned surfaces are conditional. Fixed in `b63bbd178`.

@@ -72,7 +72,7 @@ flowchart TB
 | [compare/](compare/README.md) | Head-to-head against Tailscale, RustDesk, TeamViewer, MeshCentral and NetBird — each page naming what the other product does better, first |
 | [agent-tunnel-architecture.md](agent-tunnel-architecture.md) | The remote-access stack (daemon + CLI + coordination) in five minutes — written for end users and operators |
 | [architecture.md](architecture.md) | The whole system: control plane vs the three data planes, workspace crate map, deployment topology |
-| [modular-monolith.md](modular-monolith.md) | How the server is composed (FR-69): `roomler-core` + six modules behind one `Module` contract, the DAG, the five build profiles and what each leaves out, runtime capability gating, wire ownership, the hooks that carry the inverse cascades, and the composition baseline that gates every move |
+| [modular-monolith.md](modular-monolith.md) | How the server is composed (FR-69): `roomler-core` + six modules behind one `Module` contract, the DAG, the five build profiles and what each leaves out, runtime capability gating, wire ownership, the hooks that carry the inverse cascades, and the composition baseline that gates every move — and (FR-75) how each profile is proven to CARRY TRAFFIC rather than merely link: a throwaway cell per profile whose 404-vs-401 door probes assert every absence positively, then chat + a real call, remote-desktop frames, and a two-agent overlay ping |
 
 ## 🖥️ 1 · Desktop sharing & remote control
 
