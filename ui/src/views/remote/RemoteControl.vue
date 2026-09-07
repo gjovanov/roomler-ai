@@ -2983,8 +2983,19 @@ watch(
 // rc:resolution change rebuilds the encoder on the agent side.
 let fitResizeTimer: ReturnType<typeof setTimeout> | null = null
 let fitResizeObserver: ResizeObserver | null = null
+// #1435 — the element the observer is bound to. The stage is a `v-else-if`
+// branch, so it is a NEW element every time the phase re-enters `connected`
+// (and once more when the first render replaces the placeholder in a fresh
+// tab); an observer that survived on the previous element watched a node no
+// longer in the document and Fit mode silently stopped following resizes
+// until the mode was re-selected. Start is idempotent per ELEMENT, not per
+// call: a different stage re-targets the observer.
+let fitObservedEl: HTMLElement | null = null
 function startFitResizeObserver() {
-  if (fitResizeObserver || !stageEl.value || !('ResizeObserver' in window)) return
+  const el = stageEl.value
+  if (!el || !('ResizeObserver' in window)) return
+  if (fitResizeObserver && fitObservedEl === el) return
+  stopFitResizeObserver()
   fitResizeObserver = new ResizeObserver(() => {
     if (rc.resolution.value.mode !== 'fit') return
     if (fitResizeTimer) clearTimeout(fitResizeTimer)
@@ -2992,7 +3003,8 @@ function startFitResizeObserver() {
       applyFitResolution()
     }, 250)
   })
-  fitResizeObserver.observe(stageEl.value)
+  fitResizeObserver.observe(el)
+  fitObservedEl = el
 }
 function stopFitResizeObserver() {
   if (fitResizeTimer) {
@@ -3003,7 +3015,22 @@ function stopFitResizeObserver() {
     fitResizeObserver.disconnect()
     fitResizeObserver = null
   }
+  fitObservedEl = null
 }
+// #1435 — and re-arm from the DOM side too: the template ref is assigned in
+// the render's post-flush, after the phase watcher (pre-flush) has already
+// seen `connected` with a null stage. Watching the element itself, post-flush,
+// makes the attach independent of that ordering.
+watch(
+  stageEl,
+  (el) => {
+    if (el && rc.phase.value === 'connected') {
+      startFitResizeObserver()
+      if (rc.resolution.value.mode === 'fit') applyFitResolution()
+    }
+  },
+  { flush: 'post' },
+)
 
 // Stats readout formatters. Pure computeds — the composable already
 // polls getStats() every 500 ms and updates rc.stats.value.
