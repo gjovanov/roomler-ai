@@ -118,7 +118,8 @@ So V2 is condition 3 plus the honest denominator:
 |---|---|---|---|
 | **V1** | the gate + every in-session consumer; **delete** `transit_hold`, `transit_classify`, T2's quarantine, T2b's shadow, and their four counters (one `evidence_rejected` replaces them) | **none — and none is the point**; what it replaces had two | **built 2026-09-08** (AC1–AC3 met); field gate on the release carrying it |
 | **V2** | the write-back and the seed: the opener measured like every other window (the estimator, not `bytes / max_single_wait`), and the memory keyed by CARRIER — `100.65.0.5|relay:derp/tcp` is not `100.65.0.5|direct` | — | **built 2026-09-08**; field gate on the release |
-| **V3** | one pipe estimator: goodput, the viewer's arrival rate and the prior behind ONE type with one accessor; delete the rest (FR-70 AC4's 8 → 1) | — | proposed |
+| **V3a** | ONE belief (`pipe_bps`) composed in one place + one named source (`blocked_send_bps`); delete `remembered_candidate_bps`, the inlined third copy, and the `rate_prior_decay` switch | — | **built 2026-09-08** |
+| **V3b** | the three sources behind one `Pipe` type (encapsulation, no behaviour change) | — | proposed |
 
 ## Acceptance criteria
 
@@ -166,8 +167,21 @@ So V2 is condition 3 plus the honest denominator:
       the carrier's measured range, with no 1.26 M opener and no 6.8 M opener.
       *Met on `agent-v0.4.93`, 2026-09-08 19:12–19:18 UTC (field log): openers
       2.55 / 2.55 / 1.44 / 2.55 / 2.82 M against a measured 1.09–6.13 M.*
-- [ ] **AC6 (V3)** — one estimator type; the count of distinct "how fast is the
-      pipe" accessors in `encode/` is 1.
+- [x] **AC6 (V3a)** — ONE belief, composed in one place. `pipe_bps` is the
+      session's answer to "how fast is the pipe" and the only place the sources
+      are combined; `blocked_send_bps` is the one named SOURCE accessor, read
+      by the opener's write-back alone. Deleted with it: `remembered_candidate_bps`
+      (the same law under a second name — the two bodies were identical but for
+      a flag), the THIRD copy inlined in `pre_encode_tick`, and the
+      `rate_prior_decay` kill switch (flag, env accessor, config key, three
+      config-surface entries, the enrollment default and its control test) — the
+      prior always decays now, which FR-70 P1 field-verified on 0.4.64 with its
+      own same-build FAIL control. Net −92 lines; 996 agent tests and 175
+      agent-core tests pass. ⚠️ Not claimed: the three SOURCES (blocked-send
+      goodput, the viewer's arrival rate, the decaying prior) are still three
+      fields on the governor rather than one `Pipe` type. That move is
+      mechanical and buys encapsulation, not behaviour; it is V3b, and this AC
+      does not pretend to have done it.
 - [ ] **AC7** — docs updated with diagrams and a `docs/README.md` row
       (`docs/rate-control.md` gains the gate as its first section).
 

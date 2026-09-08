@@ -205,7 +205,6 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         ice_relay_tcp: None,
         relay_max_kbps: None,
         rate_slow_start: None,
-        rate_prior_decay: None,
         media_thread: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,

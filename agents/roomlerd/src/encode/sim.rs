@@ -883,7 +883,7 @@ impl GovernorLaw {
 
     /// FR-70 P1 — what the floor relief and the queue budget read: a live
     /// measurement, else (under the shipped rule) the prior's stand-in.
-    fn measured_pipe_bps(&self) -> Option<u32> {
+    fn pipe_bps(&self) -> Option<u32> {
         match self.measure {
             MeasureRule::EveryWindow => self.measured_bps,
             MeasureRule::OnPushBack => self.measured_bps.or(self.prior.stand_in_bps()),
@@ -941,7 +941,7 @@ impl RateLaw for GovernorLaw {
 
         // FR-59 P1 — the legibility floor descends toward a measured pipe
         // (FR-70 P1: or toward the remembered rate standing in for one).
-        let mut floor = match self.measured_pipe_bps() {
+        let mut floor = match self.pipe_bps() {
             Some(g) if self.floor_relief => {
                 super::goodput::measured_floor_bps(g, self.nominal_floor_bps, HARD_MIN_BPS)
             }
@@ -1022,7 +1022,7 @@ impl RateLaw for GovernorLaw {
         // `constrained_queue_budget_bytes`, with the constants explicit
         // (450 ms, 16 KiB minimum) so the result cannot depend on the
         // environment.
-        let reference = match self.measured_pipe_bps() {
+        let reference = match self.pipe_bps() {
             Some(g) if g > 0 => self.nominal_ceiling_bps.min(g),
             _ => self.nominal_ceiling_bps,
         };

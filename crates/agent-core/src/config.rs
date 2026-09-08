@@ -900,11 +900,6 @@ pub struct AgentConfig {
     /// See `rate_slow_start` in the config surface.
     #[serde(default)]
     pub rate_slow_start: Option<bool>,
-    /// FR-70 P1 — a remembered rate standing in for a pipe measurement
-    /// decays toward the band instead of pinning the session. Default ON.
-    /// See `rate_prior_decay` in the config surface.
-    #[serde(default)]
-    pub rate_prior_decay: Option<bool>,
     /// FR-70 M1 — the encoder runs on its own OS thread per session behind a
     /// command channel instead of `block_in_place` on a runtime worker.
     /// Default ON since 0.4.70 (M1c met its gate on 0.4.69); `false` restores
@@ -2109,7 +2104,6 @@ pub fn test_fixture() -> AgentConfig {
         ice_relay_tcp: None,
         relay_max_kbps: None,
         rate_slow_start: None,
-        rate_prior_decay: None,
         media_thread: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
@@ -2249,7 +2243,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 81] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2257,7 +2251,6 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82]
         ("ENCODER_INPLACE_RATE", cfg.encoder_inplace_rate),
         ("ICE_RELAY_TCP", cfg.ice_relay_tcp),
         ("RATE_SLOW_START", cfg.rate_slow_start),
-        ("RATE_PRIOR_DECAY", cfg.rate_prior_decay),
         ("MEDIA_THREAD", cfg.media_thread),
         ("PUMP_STALL_WATCH", cfg.pump_stall_watch),
         ("BG_REBUILD_CONSTRAINED", cfg.bg_rebuild_constrained),
