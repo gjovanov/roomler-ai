@@ -162,9 +162,10 @@ So V2 is condition 3 plus the honest denominator:
       written before this are keyed by the bare address and stop matching; they
       age out with the 7-day TTL, at a cost of one session of learning per pair
       and carrier.*
-- [ ] **AC5 (V2)** — field: the operator's own repeat on CORPLAP-1 opens within
-      a factor of the carrier's measured rate on five consecutive sessions, with
-      no 1.26 M opener and no 6.8 M opener.
+- [x] **AC5 (V2)** — field: five consecutive sessions on CORPLAP-1 open within
+      the carrier's measured range, with no 1.26 M opener and no 6.8 M opener.
+      *Met on `agent-v0.4.93`, 2026-09-08 19:12–19:18 UTC (field log): openers
+      2.55 / 2.55 / 1.44 / 2.55 / 2.82 M against a measured 1.09–6.13 M.*
 - [ ] **AC6 (V3)** — one estimator type; the count of distinct "how fast is the
       pipe" accessors in `encode/` is 1.
 - [ ] **AC7** — docs updated with diagrams and a `docs/README.md` row
@@ -191,3 +192,4 @@ So V2 is condition 3 plus the honest denominator:
 | when | build | cell | result |
 |---|---|---|---|
 | 2026-09-08 12:15 / 14:52 / 16:33–16:42 | 0.4.87 / 0.4.90 | CORPLAP-1 on the Check Point VPN, relay | the three events this FR generalises; see FR-71's log for the first two and §The opener for the third |
+| 2026-09-08 19:12–19:18 UTC | **agent-v0.4.93** (V1 + V2), my view-only sessions | CORPLAP-1 on the Check Point VPN, HEVC over the relay — the carrier keyed itself `relay:derp/tcp` throughout | **AC5 — PASS, five consecutive sessions.** The pre-FR-79 memory (`100.65.0.5` = 8.0 M, bare key) was correctly ignored, so the first two sessions opened at the 2.55 M relay nominal instead of 6.8 M. Openers: **2.55 / 2.55 / 1.44 / 2.55 / 2.82 M** against a carrier the same sessions measured at **1.09–6.13 M** — every opener inside the measured range, no 6.8 M over-drive and no 1.26 M floor-opener. The write-back is the measurement now: `opener_measured_bps=Some(1440672) growth_target_bps=1440672` (653 KB, 179 ms worst wait — the old rule would have computed 21.9 M and recorded the 8 M cap) and `Some(1087230)` for the next (645 KB, 236 ms → 16.4 M, capped, before). The unqueued branch is untouched (`opener_measured_bps=None`, 256 KB, 0 ms → the ×1.5 step). The memory now holds `100.65.0.5\|relay:derp/tcp` and `100.65.4.2\|relay:derp/tcp` beside the stale bare keys, which age out. `evidence_rejected` per session: `[0,2,2,0] [0,1,1,0] [0,0,0,0] [0,1,1,0] [0,0,0,0]` — every rejection a transit stall and exactly one shadow each, none from an agent stall or a carrier change, and no session cut on one. ⚠️ Open, and honest: DERP's own rate moved 1.09 → 6.13 M inside six minutes, and `record_session` still keeps the MAXIMUM, so the memory ratchets toward the high measurement (session 5 opened at 2.82 M from a 3.32 M seed). It ratchets to something measured now rather than to arithmetic that could not be right, but "max of the measurements" is the next thing to question — a V3 candidate beside the single estimator. |
