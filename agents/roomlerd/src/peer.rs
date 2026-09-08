@@ -1486,49 +1486,42 @@ struct RateMemoryGuard {
     path: Option<std::path::PathBuf>,
     peer: Option<String>,
     stable: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// AIMD decreases seen this session — a LOWER stable rate is only written
-    /// back when this is non-zero (an idle session must not decay the memory).
-    decreases: std::sync::Arc<std::sync::atomic::AtomicU32>,
-    /// FR-35 P3 — the memory target the opening burst implied
-    /// (`rate_memory::opener_growth_target_bps`, already capped at `hi`);
-    /// `0` = nothing to learn. A clean session grows the memory to it, so a
-    /// pair converges in a few sessions instead of needing minutes of drag.
-    opener_drain: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// FR-79 V4 — what the OPENER measured about this carrier, when its burst
+    /// queued enough for the estimator to say anything. Second-choice
+    /// evidence: the session belief above is the whole session's answer.
+    opener_measured: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 impl Drop for RateMemoryGuard {
     fn drop(&mut self) {
-        let stable = self.stable.load(std::sync::atomic::Ordering::Relaxed);
         let (Some(path), Some(peer)) = (self.path.as_ref(), self.peer.as_ref()) else {
             return;
         };
-        let had_decrease = self.decreases.load(std::sync::atomic::Ordering::Relaxed) > 0;
-        let opener_drain = self.opener_drain.load(std::sync::atomic::Ordering::Relaxed);
-        // NOT gated on `stable != 0`: the ceiling learner only reports a stable
-        // rate above the nominal, so a short static session (the common case)
-        // has `stable == 0` yet still carries opener growth evidence. Let
-        // `record_session` decide — it returns 0 (and we skip the save) only
-        // when there is genuinely nothing to remember.
+        // FR-79 V4 — a session writes what it MEASURED about this carrier, or
+        // nothing at all. The belief the validity gate accepted is the
+        // session's own answer; the opener's measurement stands in for a
+        // session too short to have produced one. With neither, the entry
+        // keeps its value AND its age, because refreshing a timestamp on no
+        // evidence would keep a stale number alive past its TTL.
+        let evidence = [
+            self.stable.load(std::sync::atomic::Ordering::Relaxed),
+            self.opener_measured
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ]
+        .into_iter()
+        .find(|v| *v > 0);
         let mut mem = crate::encode::rate_memory::RateMemory::load(path);
-        let kept = mem.record_session(
-            peer,
-            stable,
-            had_decrease,
-            opener_drain,
-            crate::encode::rate_memory::now_unix(),
-        );
+        let kept = mem.record_session(peer, evidence, crate::encode::rate_memory::now_unix());
         if kept == 0 {
             return;
         }
         match mem.save(path) {
             Ok(()) => info!(
                 peer,
-                stable_bps = stable,
+                evidence_bps = ?evidence,
                 kept_bps = kept,
-                had_decrease,
-                growth_target_bps = opener_drain,
-                "FR-35 rate memory: stable rate remembered for the pair"
+                "FR-79 V4 rate memory: the carrier's measured rate remembered for the pair"
             ),
             Err(e) => {
                 warn!(peer, %e, "FR-35 rate memory: could not persist (memory stays off for this pair)")
@@ -4916,8 +4909,8 @@ async fn media_pump_ffmpeg_dc(
         path: rate_memory_path,
         peer: rate_peer_key,
         stable: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        decreases: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        opener_drain: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+
+        opener_measured: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
     };
     // P3 — persisted-flip rebuild: a relay↔direct renomination that holds for
     // 2 consecutive rechecks (and outside the 60 s cooldown) rebuilds the
@@ -7000,12 +6993,12 @@ async fn media_pump_ffmpeg_dc(
                 governor
                     .stable_bps()
                     .or_else(|| governor.pipe_bps(std::time::Instant::now(), constrained))
-                    .unwrap_or_else(|| governor.applied_bps()),
+                    // FR-79 V4 — evidence only: the applied rate used to stand in
+                    // here when nothing measured, which is the memory learning
+                    // from itself.
+                    .unwrap_or(0),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            rate_memory_guard
-                .decreases
-                .store(governor.decreases(), std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(vw) = viewer_window
             && (vw.changed
@@ -7080,16 +7073,15 @@ async fn media_pump_ffmpeg_dc(
             // estimator, like every other window, and only from windows the
             // validity gate accepted.
             let measured = governor.blocked_send_bps(std::time::Instant::now());
-            let target = crate::encode::rate_memory::opener_growth_target_bps(
-                bytes,
-                wait_us,
-                opener_maxrate,
-                measured,
-                rate_hi_bps,
-            );
+            // FR-79 V4 — the measurement is the whole contribution. A burst the
+            // socket absorbed proves nothing and writes nothing: its old "not
+            // slower than this" step ratcheted the memory to the `hi` cap on
+            // every host whose opener never queues (CORPLAP-2, all of
+            // 2026-09-08 — every opener there had a 0 ms worst wait).
+            let target = measured.unwrap_or(0).min(rate_hi_bps.max(1));
             if constrained {
                 rate_memory_guard
-                    .opener_drain
+                    .opener_measured
                     .store(target, std::sync::atomic::Ordering::Relaxed);
                 info!(
                     %session_id,
