@@ -367,6 +367,15 @@ pub trait ScreenCapture: Send {
     fn frames_unchanged(&self) -> u64 {
         0
     }
+
+    /// FR-80 — why this backend will never produce a frame, when it knows.
+    /// `None` from every real backend: a capturer that yields frames has no
+    /// reason to give, and the pumps read this exactly once at open to tell
+    /// the controller what the operator would otherwise have to find in the
+    /// host's log.
+    fn unavailable(&self) -> Option<&CaptureUnavailable> {
+        None
+    }
 }
 
 /// P8a — re-project tracked damage through a downscale. Per-EDGE
@@ -412,10 +421,132 @@ pub(crate) fn scale_damage(
     Damage::Tracked(out)
 }
 
+/// FR-80 — why a capture backend produced nothing, when the answer is
+/// knowable. A closed set: the controller keys its message off this, so it is
+/// a compatibility surface like every other `rc:*` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureUnavailableCode {
+    /// The OS can capture and this process is not permitted to: a macOS
+    /// Screen Recording (TCC) grant that does not match, a denied portal
+    /// request. The operator can fix it, which is why it is worth naming.
+    Permission,
+    /// Nothing to capture — a headless host, no `DISPLAY`/`WAYLAND_DISPLAY`.
+    NoDisplay,
+    /// This build carries no capture backend at all (signalling-only agent).
+    NotBuilt,
+    /// The backend failed and we did not attribute it. `detail` carries its
+    /// own words; "we do not know" is a better answer than a guess.
+    BackendError,
+}
+
+impl CaptureUnavailableCode {
+    /// The wire spelling. ⚠️ Renaming one does not fail loudly — it changes
+    /// what an operator reads on a screen that exists to explain a failure.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::NoDisplay => "no_display",
+            Self::NotBuilt => "not_built",
+            Self::BackendError => "backend_error",
+        }
+    }
+
+    /// The operator-facing sentence. Built HERE and sent on the wire, not
+    /// composed in the viewer, because only the agent knows which OS it is
+    /// on — the same reason the consent surface names itself (FR-27).
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Permission => {
+                if cfg!(target_os = "macos") {
+                    "Grant Screen Recording to Roomler in System Settings → Privacy & Security, \
+                     then reconnect. A macOS update or a change to the app's code signature \
+                     invalidates an existing grant."
+                } else {
+                    "The host denied this agent permission to capture the screen. Grant it on \
+                     the host, then reconnect."
+                }
+            }
+            Self::NoDisplay => {
+                if cfg!(target_os = "macos") {
+                    "This agent runs as a system daemon, which has no desktop session and \
+                     therefore no screen to capture. Connect to this machine's user-session \
+                     agent instead. Remote shell and file transfer work here."
+                } else {
+                    "This host has no display to capture (headless, or no desktop session). \
+                     Remote shell and file transfer still work."
+                }
+            }
+            Self::NotBuilt => {
+                "This agent was built without a capture backend — it can signal, but never \
+                 send pixels. Install a full agent build."
+            }
+            Self::BackendError => {
+                "The host's capture backend failed to start. Its own error is in the detail; \
+                 the agent log has the full line."
+            }
+        }
+    }
+}
+
+/// FR-80 — the reason a session will produce no pixels, carried by the
+/// fallback capturer so every pump can ask instead of each one re-deriving it.
+#[derive(Debug, Clone)]
+pub struct CaptureUnavailable {
+    pub code: CaptureUnavailableCode,
+    /// The backend's own words, capped. A quote, never a paraphrase.
+    pub detail: String,
+}
+
+impl CaptureUnavailable {
+    /// The cap keeps one backend's verbose error from dominating a control
+    /// message the viewer renders inline. Truncates on a char boundary.
+    const DETAIL_MAX: usize = 200;
+
+    pub fn new(code: CaptureUnavailableCode, detail: impl Into<String>) -> Self {
+        let detail: String = detail.into();
+        let detail = if detail.chars().count() > Self::DETAIL_MAX {
+            detail.chars().take(Self::DETAIL_MAX).collect()
+        } else {
+            detail
+        };
+        Self { code, detail }
+    }
+}
+
 /// A capture backend that never produces frames. Used when no display is
 /// available (headless host, CI with no $DISPLAY) so higher layers can keep
 /// ticking without panicking.
-pub struct NoopCapture;
+///
+/// FR-80 — it carries WHY. Before that this was a unit struct and
+/// `open_default` logged the backend's error and dropped it, so a host that
+/// could not capture told the controller nothing and the viewer could only
+/// show a stall (2026-09-08: a macOS Screen Recording grant lost to a
+/// signing-identity change read as "the codec picker is broken").
+pub struct NoopCapture {
+    reason: Option<CaptureUnavailable>,
+}
+
+impl NoopCapture {
+    /// A frameless capturer with no reason to give — the shape the older
+    /// unit struct had. Kept for callers that mean "nothing here" rather
+    /// than "here is what went wrong".
+    pub fn new() -> Self {
+        Self { reason: None }
+    }
+
+    /// A frameless capturer that knows why it is frameless.
+    pub fn unavailable(reason: CaptureUnavailable) -> Self {
+        Self {
+            reason: Some(reason),
+        }
+    }
+}
+
+impl Default for NoopCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait::async_trait]
 impl ScreenCapture for NoopCapture {
@@ -428,6 +559,50 @@ impl ScreenCapture for NoopCapture {
     fn monitor_count(&self) -> u8 {
         0
     }
+    fn unavailable(&self) -> Option<&CaptureUnavailable> {
+        self.reason.as_ref()
+    }
+}
+
+/// FR-80 — attribute a capture-open failure, or admit we cannot.
+///
+/// The macOS arm asks the OS through the existing TCC preflight
+/// (`tcc::screen_recording_granted`, the same probe `scrap_backend` uses to
+/// warn) rather than pattern-matching the backend's error: scrap reports a
+/// bare `other error` for a denied grant and for a broken display alike, so a
+/// guess would replace one unattributable failure with another. Preflight
+/// only — never the prompting variant, which belongs at capture-open where it
+/// already lives, not in a classifier.
+///
+/// Only the scrap arm calls it today (scrap is the cascade's last real
+/// backend), so a build without that feature has nothing to classify.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+pub(crate) fn classify_capture_failure(detail: String) -> CaptureUnavailable {
+    #[cfg(target_os = "macos")]
+    {
+        // ORDER IS THE ANSWER. A root LaunchDaemon is in session 0, which has
+        // no WindowServer and never will, and its TCC preflight can still
+        // answer "granted" — so asking about permission first would tell the
+        // operator to go flip a toggle that changes nothing. `tcc`'s own
+        // doctrine, and the shape of the MacBook's daemon row: same machine,
+        // one agent captures and one cannot, for different reasons.
+        if !crate::tcc::has_gui_session() {
+            return CaptureUnavailable::new(CaptureUnavailableCode::NoDisplay, detail);
+        }
+        if !crate::tcc::screen_recording_granted() {
+            return CaptureUnavailable::new(CaptureUnavailableCode::Permission, detail);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Only reached once every backend has already failed, so "no display
+        // variables and nothing opened" is a fair attribution rather than a
+        // guess. A DRM or portal host that got this far has a real error.
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return CaptureUnavailable::new(CaptureUnavailableCode::NoDisplay, detail);
+        }
+    }
+    CaptureUnavailable::new(CaptureUnavailableCode::BackendError, detail)
 }
 
 /// Open the best-available capture backend for the current host. Falls
@@ -654,33 +829,44 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
         }
     }
 
+    // FR-80 — the reason the fallback exists, kept for the controller. scrap
+    // is the last real backend in the cascade, so its error is the last word.
+    // Each arm BINDS the reason rather than assigning into a pre-declared
+    // `None`: on the success path this function returns, so an initial value
+    // would be one no path ever reads.
     #[cfg(feature = "scrap-capture")]
-    {
-        match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
-            Ok(c) => {
-                tracing::info!(
-                    width = c.width(),
-                    height = c.height(),
-                    "capture: backend=scrap (DXGI/XShm/CoreGraphics)"
-                );
-                return Box::new(c);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %format!("{e:#}"),
-                    "scrap capture unavailable — falling back to NoopCapture"
-                );
-            }
+    let reason = match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
+        Ok(c) => {
+            tracing::info!(
+                width = c.width(),
+                height = c.height(),
+                "capture: backend=scrap (DXGI/XShm/CoreGraphics)"
+            );
+            return Box::new(c);
         }
-    }
+        Err(e) => {
+            let detail = format!("{e:#}");
+            let classified = classify_capture_failure(detail.clone());
+            tracing::warn!(
+                error = %detail,
+                code = classified.code.wire(),
+                "scrap capture unavailable — falling back to NoopCapture"
+            );
+            classified
+        }
+    };
     #[cfg(not(feature = "scrap-capture"))]
-    {
+    let reason = {
         tracing::info!(
             "built without scrap-capture feature — using NoopCapture. \
              Rebuild with `--features scrap-capture` for real screen capture."
         );
-    }
-    Box::new(NoopCapture)
+        CaptureUnavailable::new(
+            CaptureUnavailableCode::NotBuilt,
+            "this build carries no capture backend",
+        )
+    };
+    Box::new(NoopCapture::unavailable(reason))
 }
 
 /// Escape hatch: `ROOMLERD_CAPTURE=scrap` (case-insensitive) forces
