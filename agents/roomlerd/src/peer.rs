@@ -2079,6 +2079,12 @@ async fn media_pump(
         "media pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
+    // FR-80 — a capturer that cannot capture says so, and the controller is
+    // told once, here, instead of the operator reading a stall. Every real
+    // backend answers `None`, so a healthy session sends nothing.
+    if let Some(reason) = capturer.unavailable() {
+        spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
+    }
     // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
     // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
     let mut reopen_backoff = capture::ReopenBackoff::new();
@@ -3120,6 +3126,12 @@ async fn media_pump_vp9_444_dc(
         "VP9-444 DC pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
+    // FR-80 — a capturer that cannot capture says so, and the controller is
+    // told once, here, instead of the operator reading a stall. Every real
+    // backend answers `None`, so a healthy session sends nothing.
+    if let Some(reason) = capturer.unavailable() {
+        spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
+    }
     // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
     // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
     let mut reopen_backoff = capture::ReopenBackoff::new();
@@ -4521,6 +4533,91 @@ fn video_info_payload(
     )
 }
 
+/// FR-80 — `rc:media-unavailable`: this session will produce no pixels, and
+/// here is why. The sibling of [`video_info_payload`], and deliberately a
+/// separate message rather than a field on it: `rc:video-info` is built from
+/// a frame that has been captured, so a session with no capture never reaches
+/// it — which is exactly the hole this closes.
+///
+/// JSON escaping: `code` is a closed vocabulary and `hint` is a literal, so
+/// only `detail` (a backend's own error text) can carry a quote or a
+/// backslash. It is escaped rather than trusted.
+///
+/// Always compiled (the pump features gate the CALLERS) so the default-build
+/// unit test locks the wire shape, mirroring `video_info_payload`.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn capture_unavailable_payload(reason: &crate::capture::CaptureUnavailable) -> String {
+    let mut detail = String::with_capacity(reason.detail.len() + 8);
+    for ch in reason.detail.chars() {
+        match ch {
+            '"' => detail.push_str("\\\""),
+            '\\' => detail.push_str("\\\\"),
+            // Any control character, not just the two that usually appear:
+            // a backend's error text is not ours to trust, and one stray
+            // byte must not produce a payload the viewer cannot parse.
+            c if (c as u32) < 0x20 => detail.push(' '),
+            c => detail.push(c),
+        }
+    }
+    format!(
+        r#"{{"t":"rc:media-unavailable","code":"{}","detail":"{detail}","hint":"{}"}}"#,
+        reason.code.wire(),
+        reason.code.hint(),
+    )
+}
+
+/// FR-80 — deliver [`capture_unavailable_payload`] to the controller, retrying
+/// until it lands.
+///
+/// Spawned rather than folded into the pump loop for two reasons. The control
+/// DC is usually NOT open yet when capture is opened (it is opened first, and
+/// on a relay session the DC lags by seconds) — the rc.87 race that made
+/// `rc:video-info` retry in the first place. And the pump loop's own
+/// retry-until-delivered state hangs off a captured frame, which a pump with
+/// no capture never has.
+///
+/// Bounded: a session that never opens its control DC must not leave a task
+/// spinning for the life of the process.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn spawn_capture_unavailable_notice(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    reason: crate::capture::CaptureUnavailable,
+) {
+    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    let payload = capture_unavailable_payload(&reason);
+    warn!(
+        %session_id,
+        code = reason.code.wire(),
+        detail = %reason.detail,
+        "capture unavailable — this session will produce no pixels; telling the controller"
+    );
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        while started.elapsed() < DEADLINE {
+            let cdc = control_dc.lock().await.clone();
+            if let Some(cdc) = cdc
+                && cdc.send_text(payload.clone()).await.is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(RETRY_EVERY).await;
+        }
+        warn!(
+            %session_id,
+            "capture-unavailable notice never reached the controller — its control channel \
+             did not open within the deadline"
+        );
+    });
+}
+
 /// FR-33 P3 — the pure half of [`lan_capture_reason`]: name the capture as
 /// the transport reason only when BOTH (a) this session runs on a real relay
 /// and (b) the viewer offered a host / peer-reflexive candidate whose
@@ -4882,6 +4979,12 @@ async fn media_pump_ffmpeg_dc(
         "FFmpeg DC pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
+    // FR-80 — a capturer that cannot capture says so, and the controller is
+    // told once, here, instead of the operator reading a stall. Every real
+    // backend answers `None`, so a healthy session sends nothing.
+    if let Some(reason) = capturer.unavailable() {
+        spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
+    }
     // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
     // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
     let mut reopen_backoff = capture::ReopenBackoff::new();
@@ -10733,6 +10836,63 @@ mod codec_cap_tests {
         let cap = build_video_codec_cap("av1");
         assert_eq!(cap.mime_type, "video/AV1");
         assert_eq!(cap.sdp_fmtp_line, "profile-id=0");
+    }
+
+    /// FR-80 — the `rc:media-unavailable` wire shape, locked like
+    /// `rc:video-info`'s. The viewer keys its message off `code`, so the
+    /// vocabulary is a compatibility surface: a renamed code does not fail,
+    /// it changes what an operator reads on the screen that exists to
+    /// explain the failure.
+    #[test]
+    fn capture_unavailable_payload_wire_shape() {
+        use crate::capture::{CaptureUnavailable, CaptureUnavailableCode};
+        let payload = super::capture_unavailable_payload(&CaptureUnavailable::new(
+            CaptureUnavailableCode::Permission,
+            "creating scrap::Capturer: other error",
+        ));
+        assert!(
+            payload.starts_with(r#"{"t":"rc:media-unavailable","code":"permission","#),
+            "{payload}"
+        );
+        assert!(
+            payload.contains(r#""detail":"creating scrap::Capturer: other error""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""hint":"#), "{payload}");
+
+        for (code, wire) in [
+            (CaptureUnavailableCode::Permission, "permission"),
+            (CaptureUnavailableCode::NoDisplay, "no_display"),
+            (CaptureUnavailableCode::NotBuilt, "not_built"),
+            (CaptureUnavailableCode::BackendError, "backend_error"),
+        ] {
+            assert_eq!(code.wire(), wire);
+            assert!(!code.hint().is_empty(), "{wire} has no operator sentence");
+        }
+    }
+
+    /// A backend error is the backend's own words, and those words are not
+    /// ours to trust: a quote or a newline in them must not produce a
+    /// payload the viewer cannot parse.
+    #[test]
+    fn capture_unavailable_detail_is_escaped_and_capped() {
+        use crate::capture::{CaptureUnavailable, CaptureUnavailableCode};
+        let payload = super::capture_unavailable_payload(&CaptureUnavailable::new(
+            CaptureUnavailableCode::BackendError,
+            "he said \"no\"\nand a \\ too",
+        ));
+        assert!(
+            payload.contains(r#"he said \"no\" and a \\ too"#),
+            "{payload}"
+        );
+        serde_json::from_str::<serde_json::Value>(&payload).expect("payload must be valid JSON");
+
+        let long = CaptureUnavailable::new(CaptureUnavailableCode::BackendError, "é".repeat(400));
+        assert_eq!(
+            long.detail.chars().count(),
+            200,
+            "capped on a CHAR boundary, so a multi-byte error text cannot split a code point"
+        );
     }
 
     #[test]
