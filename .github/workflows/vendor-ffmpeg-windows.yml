@@ -25,7 +25,13 @@ name: Vendor FFmpeg (Windows x64 MSVC static-md, LGPL)
 # Re-run when bumping the FFmpeg version / vcpkg baseline / encoder list.
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "which trees to rebuild (each job re-uploads its asset with --clobber)"
+        type: choice
+        default: all
+        options: [all, windows, linux]
 
 permissions:
   contents: write
@@ -33,6 +39,7 @@ permissions:
 jobs:
   build:
     name: vcpkg overlay-port FFmpeg (minimal, encoders-only) + upload
+    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'windows' || inputs.jobs == '' }}
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -210,6 +217,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────
   build-linux-minimal:
     name: from-source minimal FFmpeg (linux64 shared, LGPL) + upload
+    if: ${{ inputs.jobs == 'all' || inputs.jobs == 'linux' || inputs.jobs == '' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -220,7 +228,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y nasm pkg-config cmake
+          sudo apt-get install -y nasm pkg-config cmake ninja-build python3-pip
+          # meson from pip, SYSTEM-wide: libdrm/libva want a newer floor than
+          # 22.04's apt, and `sudo ninja install` re-runs meson as root — a
+          # `--user` install is invisible there (measured: the first run died
+          # in `meson install` with "No module named 'mesonbuild'").
+          sudo python3 -m pip install -q meson
           # nvenc: header-only SDK, versioned; 12.1 supports Blackwell-era
           # drivers while keeping the driver floor reasonable.
           git clone --depth 1 --branch n13.1.15.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
@@ -236,6 +249,41 @@ jobs:
           sudo mkdir -p /usr/local/include/AMF
           sudo cp -r /tmp/amf/amf/public/include/* /usr/local/include/AMF/
           sudo ldconfig
+          # FR-77 P4 — libdrm + libva are BUNDLED (both MIT), built into the
+          # same prefix as the FFmpeg libs so release-agent's ldd-fixpoint
+          # bundler carries them like any other vendored lib. Deliberately
+          # NOT the system's: `--enable-vaapi` makes libva.so.2 a DT_NEEDED
+          # of libavutil, i.e. a LOAD-time requirement of the daemon
+          # binary. A hard `Depends: libva2` satisfies that only where apt
+          # can reach a mirror — the updater's offline fallback is
+          # `dpkg --install`, which REPLACES the binary before the
+          # dependency failure and leaves a host whose daemon cannot start
+          # on its next restart: a fleet freeze, not an error. The VA
+          # DRIVER (iHD / radeonsi / nouveau) stays the host's — libva is
+          # only the dispatcher that dlopens it, and its one coupling to a
+          # driver is the `__vaDriverInit_1_<minor>` lookup, which walks
+          # DOWN from the loader's own minor: the NEWEST libva loads every
+          # driver built against an older one, and a driver built against
+          # a newer libva than ours fails to load (no VAAPI cells, not a
+          # crash) until the next re-vendor. `driverdir` names the distros'
+          # driver dirs (Debian multiarch, Fedora, Arch; the loader splits
+          # on ':') because the default would point INTO this prefix, where
+          # no driver ever lives; LIBVA_DRIVERS_PATH still overrides.
+          curl -sL -o /tmp/libdrm.tar.xz https://dri.freedesktop.org/libdrm/libdrm-2.4.134.tar.xz
+          mkdir -p /tmp/libdrm && tar xf /tmp/libdrm.tar.xz -C /tmp/libdrm --strip-components=1
+          meson setup /tmp/libdrm/build /tmp/libdrm --prefix=/opt/ffout --libdir=lib --buildtype=release \
+            -Dtests=false -Dman-pages=disabled -Dvalgrind=disabled -Dcairo-tests=disabled
+          ninja -C /tmp/libdrm/build
+          sudo ninja -C /tmp/libdrm/build install
+          curl -sL -o /tmp/libva.tar.gz https://github.com/intel/libva/archive/refs/tags/2.24.1.tar.gz
+          mkdir -p /tmp/libva && tar xf /tmp/libva.tar.gz -C /tmp/libva --strip-components=1
+          PKG_CONFIG_PATH=/opt/ffout/lib/pkgconfig meson setup /tmp/libva/build /tmp/libva \
+            --prefix=/opt/ffout --libdir=lib --buildtype=release \
+            -Dwith_x11=no -Dwith_glx=no -Dwith_wayland=no -Denable_docs=false \
+            -Ddriverdir=/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri
+          ninja -C /tmp/libva/build
+          sudo ninja -C /tmp/libva/build install
+          test -f /opt/ffout/lib/libva-drm.so.2 || { echo "::error::libva-drm did not build — libdrm not found by libva's meson?"; exit 1; }
 
           curl -sL -o /tmp/ffmpeg.tar.gz https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n9.0.1.tar.gz
           mkdir -p /tmp/ffsrc && tar xf /tmp/ffmpeg.tar.gz -C /tmp/ffsrc --strip-components=1
@@ -254,10 +302,12 @@ jobs:
           done
           ( cd "$GITHUB_WORKSPACE" && sha256sum .github/ffmpeg-patches/*.patch 2>/dev/null | sed 's#\.github/ffmpeg-patches/##' ) > /tmp/ROOMLER-PATCHES.txt || true
           echo "roomler patch manifest:"; cat /tmp/ROOMLER-PATCHES.txt
-          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}
+          # /opt/ffout first: configure must find the BUNDLED libva/libdrm
+          # (FR-77 P4), never the runner's own copies.
+          export PKG_CONFIG_PATH=/opt/ffout/lib/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}
           # Same trim as the Windows overlay port: --disable-everything wipes
-          # every component; the explicit enables restore exactly the ten HW
-          # encoders the agent dispatches. Library-level: avformat kept
+          # every component; the explicit enables restore exactly the fourteen
+          # HW encoders the agent dispatches. Library-level: avformat kept
           # (ffmpeg-next's `format` feature probes its .pc; rc.71),
           # swresample kept (avcodec requires it); avdevice/avfilter/swscale
           # dropped. --disable-autodetect keeps host libs out so the result
@@ -270,8 +320,8 @@ jobs:
             --disable-demuxers --disable-muxers --disable-decoders \
             --disable-encoders --disable-hwaccels \
             --disable-avdevice --disable-avfilter --disable-swscale \
-            --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc,h264_qsv,hevc_qsv,av1_qsv,vp9_qsv,h264_amf,hevc_amf,av1_amf \
-            --enable-nvenc --enable-ffnvcodec --enable-cuda --enable-libvpl --enable-amf \
+            --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc,h264_qsv,hevc_qsv,av1_qsv,vp9_qsv,h264_amf,hevc_amf,av1_amf,h264_vaapi,hevc_vaapi,av1_vaapi,vp9_vaapi \
+            --enable-nvenc --enable-ffnvcodec --enable-cuda --enable-libvpl --enable-amf --enable-vaapi \
             --enable-parser=h264,hevc,av1 \
             || { echo "=== configure failed; last errors in config.log ==="; grep -n -B 25 "^ERROR:" ffbuild/config.log | tail -80; grep -nE "error:" ffbuild/config.log | tail -10; exit 1; }
           make -j"$(nproc)"
@@ -288,19 +338,30 @@ jobs:
           #include <string.h>
           int main(void) {
             const char *want[] = {"h264_nvenc","hevc_nvenc","av1_nvenc","h264_qsv","hevc_qsv",
-                                  "av1_qsv","vp9_qsv","h264_amf","hevc_amf","av1_amf"};
+                                  "av1_qsv","vp9_qsv","h264_amf","hevc_amf","av1_amf",
+                                  "h264_vaapi","hevc_vaapi","av1_vaapi","vp9_vaapi"};
             for (unsigned i = 0; i < sizeof(want)/sizeof(*want); i++) {
               if (!avcodec_find_encoder_by_name(want[i])) { fprintf(stderr, "MISSING encoder %s\n", want[i]); return 1; }
             }
             if (avcodec_find_decoder_by_name("h264")) { fprintf(stderr, "h264 DECODER present — trim did not take\n"); return 1; }
             if (avcodec_find_encoder_by_name("libkvazaar")) { fprintf(stderr, "libkvazaar present — trim did not take\n"); return 1; }
-            printf("probe OK: 10 encoders present, registry trimmed\n");
+            printf("probe OK: 14 encoders present, registry trimmed\n");
             return 0;
           }
           EOC
+          # -rpath-link: ld resolves the avcodec/avutil DT_NEEDED chain (now
+          # the BUNDLED libva, FR-77 P4) from rpath-link dirs, never from -L —
+          # without it the probe link dies on `undefined reference to
+          # vaErrorStr` while the libs themselves are fine (measured).
           gcc /tmp/probe.c -o /tmp/probe \
-            -I/opt/ffout/include -L/opt/ffout/lib -lavcodec -lavutil
+            -I/opt/ffout/include -L/opt/ffout/lib -Wl,-rpath-link,/opt/ffout/lib -lavcodec -lavutil
           LD_LIBRARY_PATH=/opt/ffout/lib /tmp/probe
+          # FR-77 P4 — every VAAPI call must go through the BUNDLED libva
+          # (the runner has a system copy too, from its preinstalled ffmpeg),
+          # and that libva must look for drivers where the distros put them.
+          LD_LIBRARY_PATH=/opt/ffout/lib ldd /opt/ffout/lib/libavutil.so | grep -E "libva(-drm)?\.so\.2|libdrm\.so\.2" | tee /tmp/va-ldd.txt
+          [ "$(grep -c "=> /opt/ffout/lib/" /tmp/va-ldd.txt)" -eq 3 ] || { echo "::error::libva / libva-drm / libdrm do not all resolve from the vendored tree"; exit 1; }
+          strings /opt/ffout/lib/libva.so.2 | grep -q "x86_64-linux-gnu/dri" || { echo "::error::the bundled libva does not search the distro driver dir (driverdir)"; exit 1; }
           # LGPL-clean + no unexpected external deps beyond glibc/vpl.
           ldd /opt/ffout/lib/libavcodec.so | grep -E "x264|x265" && { echo "::error::GPL lib linked"; exit 1; } || true
           du -sh /opt/ffout/lib | cut -f1
@@ -323,6 +384,12 @@ jobs:
           # ldd-fixpoint bundler pick it up like any other vendored lib.
           find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name 'libvpl.so*' -exec cp -a {} "$staging/lib/" \; 2>/dev/null || true
           ls "$staging/lib/" | grep -q "libvpl.so.2" || { echo "::error::libvpl runtime not staged — the .deb would fail to load on stock hosts"; exit 1; }
+          # FR-77 P4 — the bundled VA loader chain (built into /opt/ffout
+          # above, so `cp -a` already staged it); asserted because a tree
+          # without it would make libva.so.2 a SYSTEM requirement again.
+          for l in libva.so.2 libva-drm.so.2 libdrm.so.2; do
+            ls "$staging/lib/" | grep -q "^$l" || { echo "::error::$l not staged — the daemon would need the system's libva (FR-77 P4 bundles it)"; exit 1; }
+          done
           # Belt-and-braces: every DT_NEEDED of the staged avcodec must
           # resolve from the staging dir or glibc-family alone.
           LD_LIBRARY_PATH="$staging/lib" ldd "$staging"/lib/libavcodec.so | grep "not found" && { echo "::error::unresolvable DT_NEEDED in staged libavcodec"; exit 1; } || true
@@ -330,9 +397,9 @@ jobs:
           # release-agent can prove the vendored libs match the committed
           # patches before it ships them.
           cp /tmp/ROOMLER-PATCHES.txt "$staging/ROOMLER-PATCHES.txt"
-          tar cJf /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz -C /tmp/stage ffmpeg-minimal
-          sha256sum /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz | tee /tmp/min.sha256
-          ls -la /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz
+          tar cJf /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz -C /tmp/stage ffmpeg-minimal
+          sha256sum /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz | tee /tmp/min.sha256
+          ls -la /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz
           gh release upload vendored-ffmpeg-9.0.1 \
-            /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz \
+            /tmp/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz \
             --repo "${{ github.repository }}" --clobber

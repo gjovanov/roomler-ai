@@ -697,7 +697,15 @@ peer-to-peer; the server never sees raw pixels or keystrokes."""
 # .so.7, not .so.9) and `libc6 (>= 2.39)` wrongly blocked 22.04 (binary is glibc
 # 2.34). `libasound2` backs the Opus system-audio capture track; libxcb* are the
 # always-present X11 client libs.
+# FR-77 P4 — VAAPI adds NO `depends`: libva/libva-drm/libdrm ride in the bundle
+# with the libav* (a `Depends: libva2` is unsatisfiable on the updater's offline
+# `dpkg --install` path, which replaces the binary BEFORE the dependency
+# failure — a host that cannot start its daemon on the next restart). The VA
+# DRIVER stays the host's, and it is a `suggests`, not `recommends`: apt
+# installs recommends by default, and Mesa's VA driver drags LLVM (~100 MB)
+# onto every headless server on the next agent update.
 depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
+suggests = "mesa-va-drivers, intel-media-va-driver"
 section = "net"
 priority = "optional"
 # One script, `postinst`, and all it does is `systemctl daemon-reload`.

@@ -614,10 +614,10 @@ jobs:
           # dispatches, whole lib dir ~2.5 MB.
           gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz' \
             --dir /tmp/ffdl
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # The .pc files hardcode the vendor machine's prefix.
           sudo sed -i "s|^prefix=.*|prefix=/opt/roomler-ffmpeg|" \

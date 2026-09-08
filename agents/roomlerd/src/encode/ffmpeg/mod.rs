@@ -35,6 +35,8 @@
 
 #[cfg(feature = "ffmpeg-encoder")]
 pub mod encoder;
+/// FR-77 P4 — the VAAPI device + frame pools (`*_vaapi` encoders only).
+pub(crate) mod vaapi;
 
 #[cfg(feature = "ffmpeg-encoder")]
 pub use encoder::{FfmpegEncoder, RebuiltEncoder};

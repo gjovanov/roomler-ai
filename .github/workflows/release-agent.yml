@@ -340,7 +340,7 @@ jobs:
           # FFmpeg 6.1, but `ffmpeg-next = 9.0` needs 9.x.
           gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz' \
             --dir /tmp/ffdl
           # P3e lever B (Linux twin): the MINIMAL from-source build — the ten
           # HW encoders + their parsers, nothing else (whole lib dir 2.5 MB
@@ -348,8 +348,14 @@ jobs:
           # cascade is locked to nvenc/qsv/amf by a unit test, so kvazaar/
           # vaapi/every-decoder were unreachable). Vendor job's runtime probe
           # asserts the encoder set; rollback = drop the `-minimal` suffix.
+          # FR-77 P4 added `-vaapi`: `--enable-vaapi` + the four `*_vaapi`
+          # encoders, with libva/libva-drm/libdrm BUILT INTO the tree (the
+          # bundler below carries them; no `Depends` on the system's libva,
+          # which the offline `dpkg --install` fallback could not satisfy
+          # without leaving a daemon that fails to load). Rollback = drop
+          # that suffix.
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # BtbN's pkgconfig files hardcode the build-machine prefix; rewrite
           # it to our extract path so pkg-config emits correct -L/-I flags.
@@ -522,7 +528,12 @@ jobs:
           docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
             apt-get update -qq
             apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2t64 >/dev/null
-            LD_LIBRARY_PATH=/w/agents/roomlerd/vendor-ffmpeg /w/target/release/roomlerd --version'
+            LD_LIBRARY_PATH=/w/agents/roomlerd/vendor-ffmpeg /w/target/release/roomlerd --version
+            # FR-77 P4 — the VA loader chain must come from the bundle: a stock
+            # host has no libva2, and the daemon must still start there.
+            for l in libva.so.2 libva-drm.so.2 libdrm.so.2; do
+              test -f /w/agents/roomlerd/vendor-ffmpeg/$l || { echo "::error::$l missing from the bundle — the daemon would need the system libva"; exit 1; }
+            done'
 
       - name: Build .deb
         working-directory: agents/roomlerd

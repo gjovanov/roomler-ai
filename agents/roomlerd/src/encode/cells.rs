@@ -39,8 +39,13 @@ pub(crate) const FFMPEG_444_CAPABLE: &[&str] = &[
 // `vp9_qsv:yuv444` joined on 2026-09-08: CORPLAP-3's Intel media runtime died
 // with 0xc0000005 on the first VUYX open (FR-77 P3b field read) — the cell
 // opens only once a driver proves it, through `encoder_cells_deny`.
-pub(crate) const DEFAULT_DENIED_CELLS: &[&str] =
-    &["hevc_qsv:yuv444", "hevc_vaapi:yuv444", "vp9_qsv:yuv444"];
+pub(crate) const DEFAULT_DENIED_CELLS: &[&str] = &[
+    "hevc_qsv:yuv444",
+    "hevc_vaapi:yuv444",
+    "vp9_qsv:yuv444",
+    // P4: the packed 4:4:4 open on VAAPI is as unproven as it was on QSV.
+    "vp9_vaapi:yuv444",
+];
 
 /// The value that means "deny nothing". An EMPTY override means the same
 /// (the P1 env contract); the word exists because a config key cannot carry
@@ -136,6 +141,9 @@ mod tests {
     #[test]
     fn denylist_default_env_override_empty_and_none() {
         use tunnel_core::env::test_env::Saved;
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _saved = Saved::cleared("ENCODER_CELLS_DENY");
 
         let deny = denied_cells();
@@ -188,6 +196,9 @@ mod tests {
     #[test]
     fn names_444_follow_the_cascade_minus_the_denylist() {
         use tunnel_core::env::test_env::Saved;
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _saved = Saved::cleared("ENCODER_CELLS_DENY");
         assert_eq!(
             names_444(VideoCodec::Hevc),
@@ -201,7 +212,10 @@ mod tests {
         assert_eq!(names_444(VideoCodec::H264), vec!["h264_nvenc"]);
         assert!(names_444(VideoCodec::Av1).is_empty());
         unsafe { tunnel_core::env::test_env::set("ENCODER_CELLS_DENY", "none") };
-        assert_eq!(names_444(VideoCodec::Hevc), vec!["hevc_nvenc", "hevc_qsv"]);
-        assert_eq!(names_444(VideoCodec::Vp9), vec!["vp9_qsv"]);
+        assert_eq!(
+            names_444(VideoCodec::Hevc),
+            vec!["hevc_nvenc", "hevc_qsv", "hevc_vaapi"]
+        );
+        assert_eq!(names_444(VideoCodec::Vp9), vec!["vp9_qsv", "vp9_vaapi"]);
     }
 }

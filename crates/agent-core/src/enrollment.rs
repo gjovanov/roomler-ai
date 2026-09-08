@@ -239,6 +239,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         text_mod_neutralize: None,
         caps_cache: None,
         encoder_cells_deny: None,
+        vaapi_device: None,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,
