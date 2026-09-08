@@ -10,10 +10,12 @@ in [deny.toml](deny.toml)) or `cargo license`.
 ## FFmpeg — LGPL-2.1-or-later
 
 The Roomler agent uses FFmpeg for hardware video encoding (NVENC, Intel QSV,
-AMD AMF). We build it ourselves from unmodified upstream source with a reduced
-component set; **we apply no patches to FFmpeg**, and we do **not** build with
-`--enable-gpl` or `--enable-nonfree`. No GPL-only component (x264, x265, …) is
-present — CI fails the build if one appears.
+AMD AMF, VAAPI on Linux, Apple VideoToolbox on macOS). We build it ourselves
+from upstream source with a reduced component set and the source patches
+recorded in `.github/ffmpeg-patches/` (each shipped tree carries its
+`ROOMLER-PATCHES.txt` manifest); we do **not** build with `--enable-gpl` or
+`--enable-nonfree`. No GPL-only component (x264, x265, …) is present — CI fails
+the build if one appears.
 
 ### Linkage, and what follows from it
 
@@ -21,7 +23,7 @@ present — CI fails the build if one appears.
 |---|---|---|
 | **Windows** (`roomlerd.exe`) | **static** (`x64-windows-static-md`) | LGPL-2.1 **§6** — recipients must be able to relink |
 | **Linux** (`.deb`) | shared (`--enable-shared --disable-static`) | §6(b) satisfied by the shared-library mechanism |
-| **macOS** | FFmpeg is not shipped | none |
+| **macOS** (`.pkg`, since 2026-08-25) | shared (`--enable-shared`; the three `*_videotoolbox` encoders as dylibs inside the app bundle) | §6(b) satisfied by the shared-library mechanism |
 
 ### Written offer
 
