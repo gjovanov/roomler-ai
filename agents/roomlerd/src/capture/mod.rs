@@ -831,44 +831,42 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
 
     // FR-80 — the reason the fallback exists, kept for the controller. scrap
     // is the last real backend in the cascade, so its error is the last word.
-    #[allow(unused_mut)]
-    let mut reason: Option<CaptureUnavailable> = None;
+    // Each arm BINDS the reason rather than assigning into a pre-declared
+    // `None`: on the success path this function returns, so an initial value
+    // would be one no path ever reads.
     #[cfg(feature = "scrap-capture")]
-    {
-        match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
-            Ok(c) => {
-                tracing::info!(
-                    width = c.width(),
-                    height = c.height(),
-                    "capture: backend=scrap (DXGI/XShm/CoreGraphics)"
-                );
-                return Box::new(c);
-            }
-            Err(e) => {
-                let detail = format!("{e:#}");
-                let classified = classify_capture_failure(detail.clone());
-                tracing::warn!(
-                    error = %detail,
-                    code = classified.code.wire(),
-                    "scrap capture unavailable — falling back to NoopCapture"
-                );
-                reason = Some(classified);
-            }
+    let reason = match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
+        Ok(c) => {
+            tracing::info!(
+                width = c.width(),
+                height = c.height(),
+                "capture: backend=scrap (DXGI/XShm/CoreGraphics)"
+            );
+            return Box::new(c);
         }
-    }
+        Err(e) => {
+            let detail = format!("{e:#}");
+            let classified = classify_capture_failure(detail.clone());
+            tracing::warn!(
+                error = %detail,
+                code = classified.code.wire(),
+                "scrap capture unavailable — falling back to NoopCapture"
+            );
+            classified
+        }
+    };
     #[cfg(not(feature = "scrap-capture"))]
-    {
+    let reason = {
         tracing::info!(
             "built without scrap-capture feature — using NoopCapture. \
              Rebuild with `--features scrap-capture` for real screen capture."
         );
-    }
-    Box::new(NoopCapture::unavailable(reason.unwrap_or_else(|| {
         CaptureUnavailable::new(
             CaptureUnavailableCode::NotBuilt,
             "this build carries no capture backend",
         )
-    })))
+    };
+    Box::new(NoopCapture::unavailable(reason))
 }
 
 /// Escape hatch: `ROOMLERD_CAPTURE=scrap` (case-insensitive) forces
