@@ -1868,7 +1868,7 @@ jobs:
     name: Build .pkg (macOS arm64)
     needs: validate-version
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
       # Mirror the signing secrets into env once so the `if:` guards below can
@@ -2684,10 +2684,33 @@ jobs:
           # run that ever had credentials failed here, and diagnosing it needed
           # the workflow source rather than the log, which is the wrong way round.
           set +e
+          # `--timeout` is NOT optional, and the value is load-bearing in BOTH
+          # directions.
+          #
+          # Without it, `--wait` polls until something else kills it -- and that
+          # something is the JOB timeout, which takes the runner down mid-poll:
+          # no verdict, no `notarytool log`, and the whole diagnostic below
+          # unreachable in exactly the case you most want it.
+          #
+          # Set it too LOW and it kills legitimate work. Measured 2026-09-08,
+          # the first successful notarisation this project ever had: Apple's
+          # queue took **71 minutes** to return `Accepted`, on a run whose
+          # signing steps had all passed and with no incident on Apple's status
+          # page. The job finished in 84 of its 90 allotted minutes -- six to
+          # spare. An earlier draft of this fix used `--timeout 25m` and would
+          # have aborted that run as a failure.
+          #
+          # So: job budget 180m (was 90 -- a 6-minute margin is not a margin),
+          # notary bound 120m below it. A genuinely stuck submission now fails
+          # with a REASON and ~60m of budget left to report it, while a merely
+          # slow one still completes. For contrast, a structurally-invalid
+          # package is refused in ~25 SECONDS -- fast rejection, slow
+          # acceptance, so a long wait is evidence FOR the payload, not against.
           out=$(xcrun notarytool submit "${{ steps.pkg.outputs.artifact }}" \
                   --key "$KEY" \
                   --key-id "$APPLE_API_KEY_ID" \
                   --issuer "$APPLE_API_ISSUER_ID" \
+                  --timeout 120m \
                   --wait 2>&1)
           rc=$?
           set -e
@@ -2695,7 +2718,15 @@ jobs:
 
           if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -q 'status: Accepted'; then
             sub=$(printf '%s\n' "$out" | awk '/^ *id: /{print $2; exit}')
-            echo "::error::notarisation refused -- per-file reasons follow (submission ${sub:-unknown})"
+            # Do not call this "refused": a timeout and a rejection both land
+            # here and they need different responses -- re-submit vs fix the
+            # payload. Say which, and always print the id so the submission can
+            # be re-queried by hand after the runner is gone.
+            if printf '%s\n' "$out" | grep -qi 'timed out\|timeout'; then
+              echo "::error::notarisation did not return a verdict within the timeout (submission ${sub:-unknown}) -- Apple's queue, not necessarily the payload. Re-query: xcrun notarytool info ${sub:-<id>}"
+            else
+              echo "::error::notarisation did not reach Accepted (submission ${sub:-unknown}) -- per-file reasons follow"
+            fi
             if [ -n "$sub" ]; then
               xcrun notarytool log "$sub" \
                 --key "$KEY" \
