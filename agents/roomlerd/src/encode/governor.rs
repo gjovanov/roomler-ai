@@ -315,6 +315,16 @@ pub struct RateGovernor {
     /// keeps no such figures (the VP9-444 pump), so the sender side reads as
     /// quiet and only the split and the viewer's report classify.
     window_sender: Option<WindowSenderStats>,
+    /// FR-71 T2 — hard stalls the next window revealed as a PAUSE of the pipe
+    /// (nothing moved) and hard stalls it CONFIRMED (the ×0.5 applied, the
+    /// measurement folded). Heartbeat `hard_stalls_paused` / `hard_stalls_confirmed`.
+    hard_stalls_paused: u32,
+    /// FR-71 T2 — a send blocked ≥ `HARD_STALL` awaits the next reported
+    /// window's verdict; its blocked-send samples wait with it.
+    hard_stall_reported: bool,
+    quarantine_pending: bool,
+    quarantine: Vec<super::goodput::BlockedSend>,
+    hard_stalls_confirmed: u32,
     /// FR-71 T1b — windows on which the hold engaged (heartbeat `transit_holds`).
     transit_holds: u32,
     /// FR-63 — the opener's ramp. Lazily built at the first CONSTRAINED tick
@@ -425,6 +435,11 @@ impl RateGovernor {
             pipe: super::pipe_state::PipeClassifier::new(),
             window_sender: None,
             transit_holds: 0,
+            hard_stalls_paused: 0,
+            hard_stall_reported: false,
+            quarantine_pending: false,
+            quarantine: Vec::new(),
+            hard_stalls_confirmed: 0,
             slow_start: None,
             slow_start_logged: false,
             slow_start_congested: false,
@@ -899,14 +914,17 @@ impl RateGovernor {
         self.slow_start_congested = true;
         // FR-70 P1 — and the pipe pushing back, for the prior's window verdict.
         self.stall_seen = true;
-        // FR-35 — a send blocked ≥ 1 s is a HARD stall: ×0.5 at once.
+        // FR-35 — a send blocked ≥ 1 s is a HARD stall: ×0.5. FR-71 T2 — but
+        // not at once: the field (2026-09-08 12:15) showed the same blocked
+        // send on a pipe that was merely PAUSED, so the ×0.5 waits for the next
+        // reported window to say whether the pipe still pushes back (see the
+        // fold in `tick_viewer_window`). The learner still notes the stall (it
+        // vetoes growth for a while either way).
         let hard = self.learner.on_stall(wait, now);
-        if let Some(ctrl) = self.aimd.as_mut() {
-            if hard {
-                ctrl.apply_hard_md(now);
-            } else {
-                ctrl.note_buffer_overflow(now);
-            }
+        if hard {
+            self.hard_stall_reported = true;
+        } else if let Some(ctrl) = self.aimd.as_mut() {
+            ctrl.note_buffer_overflow(now);
         }
     }
 
@@ -974,8 +992,6 @@ impl RateGovernor {
         // aggregate. Deliberately inside the window gate rather than per
         // frame — the send task is a different task, and this is the
         // existing once-a-second rendezvous.
-        let samples = self.goodput_sink.drain();
-        self.goodput.observe_window(&samples, now);
         let raw_report = take_report();
         let (reported_fps, struggling) = viewer_rate::unpack_report(raw_report);
         // FR-15 — the viewer's paint age is the only sensor that sees the
@@ -996,6 +1012,47 @@ impl RateGovernor {
         // FR-59 P3 — the viewer's own view of the link, taken here so the
         // verdict below can see whether the viewer said anything at all.
         let link = viewer_rate::unpack_link(take_link());
+        // FR-71 T2 — fold the window's blocked-send samples, unless a hard
+        // stall (a send blocked ≥ `HARD_STALL`) makes them a DEFERRED verdict:
+        // quarantined until the next REPORTED window, which either confirms
+        // them (its own sends still block: fold everything, apply the pending
+        // ×0.5 — FR-35's reaction, one window late) or reveals a pause
+        // (nothing blocked: discard, drop the ×0.5, nothing else moves). A
+        // window the viewer never reported decides nothing. Deliberately
+        // inside the window gate rather than per frame — the send task is a
+        // different task, and this is the existing once-a-second rendezvous.
+        let samples = self.goodput_sink.drain();
+        let blocked_sends_n = samples.len() as u32;
+        let reported = raw_report != 0 || report.is_some() || link.is_some();
+        let hard_seen = std::mem::take(&mut self.hard_stall_reported)
+            || samples
+                .iter()
+                .any(|s| s.elapsed >= super::ceiling_learn::HARD_STALL);
+        if hard_seen {
+            self.quarantine.extend(samples);
+            self.quarantine_pending = true;
+        } else if self.quarantine_pending {
+            if !reported {
+                self.quarantine.extend(samples);
+            } else {
+                let blocked: Duration = samples.iter().map(|s| s.elapsed).sum();
+                let held = std::mem::take(&mut self.quarantine);
+                self.quarantine_pending = false;
+                if blocked >= super::goodput::MIN_WINDOW_BLOCKED {
+                    self.hard_stalls_confirmed = self.hard_stalls_confirmed.saturating_add(1);
+                    self.goodput.observe_window(&held, now);
+                    self.goodput.observe_window(&samples, now);
+                    if let Some(ctrl) = self.aimd.as_mut() {
+                        ctrl.apply_hard_md(now);
+                    }
+                } else {
+                    self.hard_stalls_paused = self.hard_stalls_paused.saturating_add(1);
+                    self.goodput.observe_window(&samples, now);
+                }
+            }
+        } else {
+            self.goodput.observe_window(&samples, now);
+        }
         // FR-71 — one verdict per window on which plane is the limiter,
         // taken BEFORE any loop acts on the window. T1a: the heartbeat
         // prints it and the counters accumulate. T1b (`transit_hold`): a
@@ -1032,7 +1089,7 @@ impl RateGovernor {
                 inflight_bytes: sender.map_or(0, |s| s.inflight_bytes),
                 budget_bytes: sender.map_or(0, |s| s.budget_bytes),
                 gate_skips: sender.map_or(0, |s| s.gate_skips),
-                blocked_sends: samples.len() as u32,
+                blocked_sends: blocked_sends_n,
                 send_wait_max_ms: sender.map_or(0.0, |s| s.send_wait_max_ms),
                 frames_sent: sender.map_or(0, |s| s.frames_sent),
                 struggling,
@@ -1285,6 +1342,19 @@ impl RateGovernor {
     /// the P3 clamp and the prior all left the window alone.
     pub fn transit_holds(&self) -> u32 {
         self.transit_holds
+    }
+
+    /// FR-71 T2 — hard stalls the following window revealed as a pause of
+    /// the pipe: nothing halved, nothing abandoned, no floor relieved.
+    pub fn hard_stalls_paused(&self) -> u32 {
+        self.hard_stalls_paused
+    }
+
+    /// FR-71 T2 — hard stalls the following window confirmed: the ×0.5
+    /// applied then, one window later than FR-35 applied it, and the
+    /// blocked-send measurement folded.
+    pub fn hard_stalls_confirmed(&self) -> u32 {
+        self.hard_stalls_confirmed
     }
 
     /// FR-15 P2 — count of floor samples rejected as below the path's
@@ -3145,5 +3215,153 @@ mod tests {
             "sustained saturation left the factor at full quality"
         );
         assert!(g.encode_factor() >= crate::encode::encode_pressure::FACTOR_FLOOR);
+    }
+
+    /// FR-71 T2 — a send blocked ≥ `HARD_STALL` followed by a window in which
+    /// the pipe pushed back on NOTHING is a pause of the pipe, not its
+    /// capacity: nothing halves, no ceiling is abandoned, no floor is relieved.
+    /// Field 2026-09-08 12:15 UTC (CORPLAP-1 on the corp VPN, `6a9fed1d`): an
+    /// overlay rekey storm blocked two sends for 2.9 s and 7.4 s on a pipe that
+    /// carried 6.6 M at 50 ms twenty seconds later, and four movers read those
+    /// blocked sends as a 1.6 M pipe — 6.60 → 0.68 M in 36 s, three minutes
+    /// back. The hold (T1b) masked none of them.
+    fn t2_governor(now: Instant) -> RateGovernor {
+        RateGovernor::new(
+            30,
+            DEPTH,
+            GovernorFlags {
+                floor_relief: true,
+                seed_contradiction: true,
+                measured_ceiling: true,
+                age_feedback: true,
+                slow_start: false,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            Some(6_600_000),
+            now,
+        )
+    }
+
+    fn t2_sender(frames_sent: u32) -> WindowSenderStats {
+        WindowSenderStats {
+            inflight_bytes: 0,
+            budget_bytes: 128_000,
+            gate_skips: 0,
+            send_wait_max_ms: 0.1,
+            send_wait_avg_ms: Some(0.05),
+            frames_sent,
+        }
+    }
+
+    /// One reported, unblocked window at 50 ms age, then the pump's tick.
+    fn t2_clean_window(g: &mut RateGovernor, t: Instant) {
+        g.note_window_sender(t2_sender(30));
+        g.tick_viewer_window(
+            t,
+            30,
+            || viewer_rate::pack_report(30, false),
+            || viewer_rate::pack_age_with_arrival(50, 49, 80, 50),
+            || 0,
+            true,
+            |o| o,
+            0,
+        )
+        .expect("window due");
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+    }
+
+    #[test]
+    fn a_hard_stall_followed_by_a_clean_window_is_a_pause_and_cuts_nothing() {
+        let start = Instant::now();
+        let mut g = t2_governor(start);
+        let mut t = start;
+        for _ in 0..4 {
+            t += Duration::from_millis(1100);
+            t2_clean_window(&mut g, t);
+        }
+        let before = g.applied_bps();
+        let ceiling_before = g.learned_ceiling_bps();
+        // The opener runs at 85 % of the remembered 6.6 M.
+        assert!(
+            ceiling_before >= 5_000_000,
+            "the seeded ceiling stands: {ceiling_before}"
+        );
+        assert!(
+            before > 3_000_000,
+            "the session runs above the nominal: {before}"
+        );
+
+        // The stall: one send blocked 2.9 s (the send task's own report and
+        // its goodput sample), inside a window the viewer never reported.
+        g.goodput_sink().record(25_000, Duration::from_millis(2900));
+        t += Duration::from_millis(2900);
+        g.note_send_stall(Duration::from_millis(2900), t);
+        g.note_window_sender(t2_sender(2));
+        g.tick_viewer_window(t, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+
+        // The next window: reported, nothing blocked, age at the floor — the
+        // pipe is back exactly as it was.
+        t += Duration::from_millis(1100);
+        t2_clean_window(&mut g, t);
+
+        assert_eq!(g.applied_bps(), before, "a pause must not halve the rate");
+        assert_eq!(
+            g.learned_ceiling_bps(),
+            ceiling_before,
+            "a pause is not a measurement that contradicts the learned ceiling"
+        );
+        assert_eq!(g.relieved_floor_bps(), None, "a pause relieves no floor");
+        assert_eq!(g.hard_stalls_paused(), 1);
+        assert_eq!(g.hard_stalls_confirmed(), 0);
+    }
+
+    /// …and the same stall followed by a window in which sends STILL block is
+    /// the pipe's capacity after all: FR-35's ×0.5 applies then, one window
+    /// later than before, and the measurement folds.
+    #[test]
+    fn a_hard_stall_followed_by_a_blocked_window_is_confirmed_and_halves() {
+        let start = Instant::now();
+        let mut g = t2_governor(start);
+        let mut t = start;
+        for _ in 0..4 {
+            t += Duration::from_millis(1100);
+            t2_clean_window(&mut g, t);
+        }
+        let before = g.applied_bps();
+        g.goodput_sink().record(25_000, Duration::from_millis(2900));
+        t += Duration::from_millis(2900);
+        g.note_send_stall(Duration::from_millis(2900), t);
+        g.note_window_sender(t2_sender(2));
+        g.tick_viewer_window(t, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        // Nothing has moved yet: the verdict is deferred to the next window.
+        assert_eq!(
+            g.applied_bps(),
+            before,
+            "the hard stall is a deferred verdict"
+        );
+
+        // The next window: reported, and the sends keep blocking (a thin pipe).
+        for _ in 0..6 {
+            g.goodput_sink().record(25_000, Duration::from_millis(150));
+        }
+        t += Duration::from_millis(1100);
+        t2_clean_window(&mut g, t);
+
+        assert!(
+            g.applied_bps() <= before / 2 + 1_000,
+            "a confirmed hard stall halves: {} vs {before}",
+            g.applied_bps()
+        );
+        assert_eq!(g.hard_stalls_paused(), 0);
+        assert_eq!(g.hard_stalls_confirmed(), 1);
+        assert!(
+            g.relieved_floor_bps().is_some(),
+            "a confirmed measurement relieves the floor"
+        );
     }
 }
