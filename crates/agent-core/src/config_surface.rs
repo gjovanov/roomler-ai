@@ -656,11 +656,6 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Slow-start the session opener (2026-09-03, FR-63). Default OFF. A session commits to a bitrate before it has any evidence about the pipe, and the same host over-drove from BOTH directions on one day: opened at a REMEMBERED 6134627 -> 6287ms of viewer paint age; opened at the NOMINAL relay cap 2550000 into a path measured at ~213000 -> 444ms of queue, 1550ms paint, and six windows collapsing back down. No constant is safe, because a constant is an assumption about a band. ON: open at 300000 (lifted by any PROVEN floor, e.g. the FR-59 P8 remembered-slow-pair open) and DOUBLE per clean window until the ceiling; the first congestion evidence ends the ramp and hands control back to the normal controller. A fast pair reaches a 6.1 Mbps ceiling in 5 windows. Only ever LOWERS the opening commitment - it can never raise a rate above what the controller already allows. Env: ROOMLERD_RATE_SLOW_START. Restart required.",
     ),
     (
-        "rate_prior_decay",
-        "tribool",
-        "A remembered rate is a prior, not a pin (2026-09-04, FR-70 P1). Default ON. The rate memory's number for a pair opens the session (FR-59 P8) and, until something measures the pipe, also stands in for the measurement: the legibility floor is relieved to 85% of it and the send-queue byte budget is denominated in it. Field 2026-09-04 (CORPLAP-1 -> neo16): a 200 kbps memory held a session at 200 kbps for four minutes with goodput=None, zero send stalls and zero viewer-congested windows - the queue budget (16 KB) tripped on every drag frame, each trip was an AIMD decrease, and a queue that never forms is a pipe that can never be measured, so nothing could ever contradict the memory. ON: while no live measurement exists the stand-in climbs x1.25 per 10 clean windows (+12.5% per 5 s, the AIMD's own slow-band step) toward the 1.5 Mbps band, the floor and the budget follow it up, and a live measurement (blocked-send goodput or the viewer's arrival rate while its queue grows) becomes the new base at once. A genuinely slow pipe is over-driven by no more than the AIMD would have and gets MEASURED within a window or two; a misremembered fast pair reaches the band in ~100 s. The session end records the measurement or the decayed prior instead of the last window's applied rate, which on a lumpy relay is wherever the last decrease left it. false = FR-59 P8 verbatim (the seed is a constant for the session). Env: ROOMLERD_RATE_PRIOR_DECAY. Restart required.",
-    ),
-    (
         "media_thread",
         "tribool",
         "The encoder runs on its own OS thread per session (2026-09-05, FR-70 M1). Default ON since 0.4.70 - M1c met its gate on all three CORPLAP hosts on 0.4.69 (encode and capture averages unchanged, the loop's worst pass per window down on every host, the >50 ms windows fewer). ON: the FFmpeg encoder lives on a dedicated thread named rc-enc-<session> behind a command channel - the pump sends each frame and awaits the packets, and every rate move, keyframe request and background-rebuild adoption is a message applied in order - instead of encoding under block_in_place on whichever async worker happens to poll the pump. Nothing the pump decides changes: same frame, same decision, same packet, one thread hop later. What changes is that the async runtime is never held for the 5-30 ms of an encode (the send task, the control channel and the heartbeats stop sharing a worker with it) and hardware encoders that are thread-affine (Media Foundation per-thread COM, QSV sessions) are driven from one thread for the whole session. A thread that cannot be spawned falls back to the inline path with a warning; a thread that dies surfaces as the next encode's error, which the existing error ladder turns into a rebuild. Gate for flipping the default: FR-65's iter_ms_max / pump_stalls / apply_ms_max on the three CORPLAP hosts, unchanged or better. false = the inline encode, the pre-0.4.70 path. Env: ROOMLERD_MEDIA_THREAD. Restart required.",
@@ -978,7 +973,6 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ice_relay_tcp" => cfg.ice_relay_tcp.map(fmt_bool),
         "relay_max_kbps" => cfg.relay_max_kbps.map(|p| p.to_string()),
         "rate_slow_start" => cfg.rate_slow_start.map(fmt_bool),
-        "rate_prior_decay" => cfg.rate_prior_decay.map(fmt_bool),
         "media_thread" => cfg.media_thread.map(fmt_bool),
         "pump_stall_watch" => cfg.pump_stall_watch.map(fmt_bool),
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms.map(|p| p.to_string()),
@@ -1408,7 +1402,6 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "ice_relay_tcp" => cfg.ice_relay_tcp = parse_tribool(value)?,
         "relay_max_kbps" => cfg.relay_max_kbps = parse_u32_range(key, value, 100, 100_000)?,
         "rate_slow_start" => cfg.rate_slow_start = parse_tribool(value)?,
-        "rate_prior_decay" => cfg.rate_prior_decay = parse_tribool(value)?,
         "media_thread" => cfg.media_thread = parse_tribool(value)?,
         "pump_stall_watch" => cfg.pump_stall_watch = parse_tribool(value)?,
         "pump_stall_warn_ms" => cfg.pump_stall_warn_ms = parse_u32_range(key, value, 10, 5000)?,
