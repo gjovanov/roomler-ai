@@ -74,6 +74,8 @@ impl HwKind {
         }
     }
 
+    // The stub (macOS) never opens a device, so these are dead there.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     fn hw_type(self) -> ff::AVHWDeviceType {
         match self {
             Self::Vaapi => ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
@@ -115,6 +117,8 @@ impl HwKind {
     /// key; `exists` answers for a path so the VAAPI order is testable
     /// without a `/dev`. A `None` entry = "let FFmpeg pick" (Vulkan's
     /// default device).
+    // The stub (macOS) never opens a device, so these are dead there.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     pub(crate) fn candidates(
         self,
         pinned: Option<&str>,
@@ -138,6 +142,8 @@ impl HwKind {
 
     /// The config key (as the `ROOMLERD_*` suffix) that pins this kind's
     /// device.
+    // The stub (macOS) never opens a device, so these are dead there.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     pub(crate) fn pin_key(self) -> &'static str {
         match self {
             Self::Vaapi => "VAAPI_DEVICE",
@@ -149,6 +155,8 @@ impl HwKind {
     /// Which kinds this OS can open at all. The other kinds' names fail in
     /// one line before any FFI: VAAPI is Linux's, D3D12 is Windows's, Vulkan
     /// is both (macOS is VideoToolbox's, and its FFmpeg tree carries none).
+    // The stub (macOS) never opens a device, so these are dead there.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     pub(crate) fn supported_here(self) -> bool {
         match self {
             Self::Vaapi => cfg!(target_os = "linux"),
@@ -158,6 +166,7 @@ impl HwKind {
     }
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 pub(crate) fn pinned_device(kind: HwKind) -> Option<String> {
     tunnel_core::env::node_env(kind.pin_key()).filter(|v| !v.trim().is_empty())
 }
