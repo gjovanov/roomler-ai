@@ -212,6 +212,54 @@ This hybrid is exactly the `WorkerPool + RoomManager` pattern already in roomler
 
 The portal/SCK paths produce a system permission prompt the *first* time. That's a feature, not a bug — it's the user consent layer.
 
+### 5.1a When capture cannot open, the session says why (FR-80)
+
+A capture backend that cannot open does not fail the session: the cascade
+falls through to `NoopCapture`, the pump starts normally and encodes nothing.
+The controller sees a black canvas and a stall, which describes the symptom
+and names no cause. Since FR-80 the agent sends the cause instead.
+
+```mermaid
+sequenceDiagram
+    participant V as Viewer
+    participant A as Agent pump
+    participant C as capture::open_default
+    participant OS as the host OS
+
+    A->>C: open_default(fps, downscale)
+    C->>OS: try each backend in cascade order
+    OS-->>C: every backend refuses
+    Note over C: the LAST error is classified, not guessed —<br/>macOS asks the TCC preflight, Linux checks<br/>DISPLAY/WAYLAND_DISPLAY, the rest stay honest
+    C-->>A: NoopCapture carrying CaptureUnavailable{code, detail}
+    A->>V: rc:media-unavailable {code, detail, hint}
+    Note over A,V: retried until the control DC opens —<br/>on a relay session it opens seconds late
+    V-->>V: canvas shows the cause + the fix,<br/>the pill reads "no screen capture"
+```
+
+| `code` | Means | What the operator does |
+|---|---|---|
+| `permission` | The OS can capture; this process may not. macOS Screen Recording (TCC), a denied portal grant | Grant it on the host and reconnect. ⚠️ A macOS grant is bound to the binary's **code signature** — a signing-identity change invalidates it silently (2026-09-08: the Developer ID move did exactly that fleet-wide) |
+| `no_display` | Nothing to capture — headless, no desktop session | Nothing. Shell, files and tunnels are unaffected |
+| `not_built` | A signalling-only agent build, no capture backend compiled in | Install a full agent build |
+| `backend_error` | The backend failed and the agent did not attribute it | Read `detail` (the backend's own words) and the agent log |
+
+⚠️ **The `hint` sentence is composed by the AGENT, not the viewer**, because
+only the host knows which OS it is on — the same reason the consent surface
+names itself (FR-27). An older viewer that does not know a newer `code` still
+shows its `hint`.
+
+⚠️ **`rc:media-unavailable` is not a field on `rc:video-info`.** `video-info`
+is built from a captured frame, so a session with no capture never reaches
+it — which is exactly the hole this closes. Both are peer-to-peer control-DC
+JSON, not `ClientMsg`/`ServerMsg` variants, so neither touches the server wire
+or the composition baseline.
+
+⚠️ **macOS fails this two different ways** and both are handled. Without the
+grant, older macOS opened `CGDisplayStream` fine and delivered wallpaper-only
+frames (`scrap_backend::primary` preflights and warns for that shape);
+current macOS fails the open outright, which is what reaches the classifier
+here.
+
 ### 5.2 Encoder selection
 
 Picked at agent startup, redetected on GPU change:
