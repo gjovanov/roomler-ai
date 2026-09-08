@@ -34,8 +34,13 @@ Both halves are satisfied by publication, not by request:
 The written offer in [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) stands
 in addition to this, not instead of it.
 
-We apply **no patches to FFmpeg**. The only customisation is the configure flag
-set, which selects components; it is in the build recipe.
+Our customisation is the configure flag set, which selects components, plus the
+source patches in [`.github/ffmpeg-patches/`](../.github/ffmpeg-patches/) (since
+FR-62: one NVENC patch so a bitrate change does not force an IDR). Every shipped
+tree carries a `ROOMLER-PATCHES.txt` manifest (sha256 per patch) that the
+release lane checks against the committed patches, and the corresponding-source
+tarball's `recipe/` applies them the same way — so "the Library as used in that
+binary" is reproducible from what is published.
 
 ---
 
@@ -105,10 +110,12 @@ cargo build -p roomlerd --release \
 
 The result is `target/release/roomlerd(.exe)`, linked against **your** FFmpeg.
 
-⚠️ Use the feature list for the platform you are reproducing — they differ, and
-`ffmpeg-encoder` is deliberately **absent** on macOS (that build ships no FFmpeg
-at all). The authoritative lists are the `cargo build` lines in
-`.github/workflows/release-agent.yml`.
+⚠️ Use the feature list for the platform you are reproducing — they differ. macOS
+ships FFmpeg again since 2026-08-25 (a `--disable-everything` tree with only the
+three `*_videotoolbox` encoders, as shared dylibs built with `--disable-autodetect`
+so nothing Homebrew is baked in), and Linux x86_64's tree carries libva + libdrm
+built into it since FR-77 P4. The authoritative lists are the `cargo build` lines
+in `.github/workflows/release-agent.yml`.
 
 ⚠️ Windows also needs libvpx for the VP9-4:4:4 path; the workflow vendors it the
 same way (`vendor-libvpx-windows.yml`) and appends it to `PKG_CONFIG_PATH`. If

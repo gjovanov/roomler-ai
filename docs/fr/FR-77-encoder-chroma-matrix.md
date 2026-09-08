@@ -427,7 +427,7 @@ flowchart LR
 | P2 | Picker: codec × chroma dropdowns, i18n, Auto rules, remembered trial failures, the shared derivation | ships with P1 | **shipped** with P1 (viewer `hosted-20260907-602396d`), **field-verified 2026-09-07** |
 | P3 | **P3a** the probe cache · the `ProbeReport` envelope (the lost vp9_qsv IDR verdict) · `encoder_cells_deny` config key + remote-config push · the chroma column · `cells.rs`; **P3b** the cells: VP9 4:4:4 hardware (QSV/VAAPI profile 1, VUYX), H.264 4:4:4 (NVENC + software decode), HEVC 4:4:4 on QSV/VAAPI behind the denylist | the cell denylist; `caps_cache = false` | **P3a + P3b shipped** `agent-v0.4.84` #1488 #1489 — the cache and the push **field-verified 2026-09-08**; the roll found the one-child cost on CORPLAP-3 (a faulting `vp9_qsv` 4:4:4 open took the whole matrix) ⇒ **P3c** #1491: the two-child probe, `vp9_qsv:yuv444` default-denied; the cell field tests (H.264 4:4:4 on the dev box, VP9 and HEVC 4:4:4 on QSV) follow 0.4.85 |
 | P4 | VAAPI on Linux x86_64 | `ROOMLERD_USE_FFMPEG=0` / the denylist / `vaapi_device` | **shipped** #1494 (+ #1495) → `agent-v0.4.86`, **P4b** #1498 → `agent-v0.4.87` (bump #1499), **field-verified 2026-09-08** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470): jupiter + zeus advertise `hevc/vaapi` + `h264/vaapi` (probe 100 ms), real bytes through the pump, WSL and mars the negative cells; 0.4.86's probe crash (a flush of an unfed encoder) closed by P4b; Intel (iHD) has no fleet host yet |
-| P5 | `docs/encoders.md` rewritten with diagrams (the cell resolution, the probe lifecycle); stale "macOS ships no FFmpeg" lines corrected in `CLAUDE.md`, `THIRD-PARTY-NOTICES.md`, `docs/lgpl-relink.md`; `docs/README.md` row | — | — |
+| P5 | `docs/encoders.md` rewritten with diagrams (the cell resolution, the probe lifecycle); stale "macOS ships no FFmpeg" lines corrected in `CLAUDE.md`, `THIRD-PARTY-NOTICES.md`, `docs/lgpl-relink.md`; `docs/README.md` row | — | **done** #1502 — `docs/encoders.md` rewritten around the cell matrix, the cell-resolution and probe-lifecycle diagrams, the per-platform cascade (VideoToolbox + VAAPI wired, libva bundled), the fleet's 0.4.87 cells and a configuration table; `THIRD-PARTY-NOTICES.md` (macOS ships FFmpeg as shared dylibs; VAAPI/VideoToolbox named; the patch manifest) and `docs/lgpl-relink.md` corrected; `CLAUDE.md` already carried no stale macOS line on master |
 | next | FR for D3D12 video encode (Windows) + Vulkan video encode (Linux/Windows) | — | — |
 
 ## Acceptance criteria
@@ -454,7 +454,10 @@ flowchart LR
       as what it measured to be, a NEGATIVE cell (no `/dev/dri`; libva refuses `/dev/dxg` —
       the criterion as first written assumed Mesa's D3D12 driver was reachable from a
       daemon, and it is not); bare-metal Intel (iHD) stays honestly pending — no fleet host.
-- [ ] **Docs** updated/created with diagrams, linked from `docs/README.md`.
+- [x] **Docs** updated/created with diagrams, linked from `docs/README.md` —
+      `docs/encoders.md` (P5, #1502): the cell-resolution and probe-lifecycle diagrams,
+      the per-platform cascade and vendored-tree tables, the VAAPI flow; the index row
+      says what the doc now covers.
 
 ## Open decisions
 

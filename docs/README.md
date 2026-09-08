@@ -82,7 +82,7 @@ side, consent-gated, end-to-end encrypted.*
 | Doc | What it covers |
 |---|---|
 | [remote-control.md](remote-control.md) | Full design: topology, agent internals, `rc:*` signalling, consent/security model, latency budget |
-| [encoders.md](encoders.md) | Codec × platform × backend matrix, the hardware-encoder cascade, rate control, capture backends, viewer decode paths |
+| [encoders.md](encoders.md) | The cell matrix a host advertises (codec × backend × chroma) and how the viewer resolves it into a session; the probe lifecycle (child processes, the cache, the denylist); the hardware-encoder cascade per platform (NVENC · QSV · AMF · VideoToolbox · VAAPI, with libva bundled on Linux); rate control, capture backends, viewer decode paths |
 | [rate-control.md](rate-control.md) | How a session spends its bits: the Priority dial, the per-session control loops, why resolution never flips mid-motion (rc.445), crisp-at-rest, config reference |
 
 ## 🔐 2 · Your own secure private network
