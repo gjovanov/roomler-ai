@@ -352,16 +352,22 @@ a 4:4:4 cell; 4:2:0 is always 100).
 NVENC, QSV and AMF open their own device behind the encoder and take software
 frames. The three vendor-neutral backends take **hardware frames** from a pool
 bound to a device, and `encode/ffmpeg/hwframes.rs` is the one module that owns
-that for all of them — one `HwKind` per name suffix, one device per kind per
-process, one `Frames` shape, one upload:
+that for all of them — one `HwKind` per name suffix, the kind's candidate
+devices opened lazily and kept for the process, one `Frames` shape, one upload.
+**The open decides the device**: the encoder's whole configure-and-open runs
+against the preferred device first and then the rest until one succeeds, and
+the winner is remembered. Which device can run a codec is a per-codec,
+per-driver fact — on the dev box Vulkan device 0 (the iGPU) has no
+`VK_KHR_video_encode_queue` while the RTX does, and an RDNA2 iGPU opens HEVC
+but not AV1 — so only the encoder's own open can answer it:
 
 ```mermaid
 flowchart LR
-    subgraph once["once per process, per kind — hwframes::device(kind)"]
+    subgraph once["per kind — candidate devices, opened lazily and kept"]
         K{HwKind::of(name)} -- "_vaapi (Linux)" --> V["pinned vaapi_device,<br/>then /dev/dri/renderD128 … 135"]
         K -- "_d3d12va (Windows)" --> D["pinned d3d12_adapter,<br/>then DXGI adapters 0 … 3"]
-        K -- "_vulkan (both)" --> W["pinned vulkan_device (index or name),<br/>else the loader's default"]
-        V & D & W --> O[av_hwdevice_ctx_create<br/>first candidate FFmpeg accepts]
+        K -- "_vulkan (both)" --> W["pinned vulkan_device (index or name),<br/>then physical devices 0 … 3"]
+        V & D & W --> O["open_on_some_device: preferred first,<br/>then the rest, until the encoder opens"]
     end
     subgraph enc["per encoder open — build_encoder"]
         F["hwframes::Frames — av_hwframe_ctx_alloc<br/>format = the kind's (VAAPI / D3D12 / VULKAN)<br/>sw_format NV12, or VUYX (VAAPI 4:4:4) / yuv444p (Vulkan 4:4:4)"] --> C[codec context: pix_fmt = the kind's,<br/>hw_frames_ctx = a ref to the pool]

@@ -455,12 +455,14 @@ fn encoder_options(
         }
     } else if name.ends_with("_d3d12va") {
         // FR-78 P1 — D3D12 video encode (Windows, the graphics driver's own
-        // encode DDI). Same rate-control shape as VAAPI: `rc_mode=vbr` on
-        // `b:v` = the cap with the HRD window, no `qp` on top. FFmpeg's
-        // d3d12va encoders default to `bf=2`: two B-frames of reordering
-        // delay, which a remote desktop cannot carry — every frame is a
-        // P-frame here, as on every other backend.
-        base.push(("rc_mode".into(), "vbr".into()));
+        // encode DDI). Same rate-control shape as VAAPI: `rc_mode=VBR` on
+        // `b:v` = the cap with the HRD window, no `qp` on top — the d3d12va
+        // constants are UPPERCASE like VAAPI's (`vbr` reads as an undefined
+        // constant and drops the whole tier; measured on the dev box).
+        // FFmpeg's d3d12va encoders default to `bf=2`: two B-frames of
+        // reordering delay, which a remote desktop cannot carry — every
+        // frame is a P-frame here, as on every other backend.
+        base.push(("rc_mode".into(), "VBR".into()));
         base.push(("maxrate".into(), cap.clone()));
         base.push(("bufsize".into(), buf.clone()));
         base.push(("bf".into(), "0".into()));
@@ -1416,25 +1418,22 @@ impl FfmpegEncoder {
         let codec = codec::encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("ffmpeg encoder not registered: {}", name))?;
 
-        // FR-77 P4 / FR-78 P1 — a `*_vaapi` / `*_d3d12va` / `*_vulkan`
-        // encoder takes HARDWARE frames: open the kind's process-wide device
-        // and a frame pool in the software format the pump produces (NV12,
-        // or the kind's 4:4:4 form). No device on this host = this name
-        // fails in one line and the cascade moves on.
-        let hw_frames = if let Some(kind) = hwframes::HwKind::of(name) {
-            let dev = hwframes::device(kind)
-                .ok_or_else(|| anyhow!("{name}: no {} device on this host", kind.label()))?;
-            Some(hwframes::Frames::new(
-                dev,
-                kind,
-                kind.sw_format(chroma444),
-                width,
-                height,
-            )?)
-        } else {
-            None
-        };
+        let (base, lowlat, opt_summary) =
+            encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444, constrained);
 
+        // FR-77 P4 / FR-78 P1 — a `*_vaapi` / `*_d3d12va` / `*_vulkan`
+        // encoder takes HARDWARE frames from a pool on one of the kind's
+        // devices, and which device is decided by the OPEN: on a two-GPU
+        // laptop the loader's device 0 is the iGPU, which may lack the
+        // codec (no AV1 on an RDNA2 iGPU) or the video-encode queue
+        // altogether (measured on the dev box: Vulkan device 0 had no
+        // `VK_KHR_video_encode_queue`, the RTX did). So the whole
+        // configure-and-open below runs once per candidate device until one
+        // succeeds, and the winner is remembered for the next open.
+        let open_with = |hw_frames: Option<hwframes::Frames>| -> Result<(
+            codec::encoder::Video,
+            Option<hwframes::Frames>,
+        )> {
         // rc.86 — configure an unopened encoder. Factored into a closure
         // so we can rebuild it for the fallback path (open_*_with consumes
         // the encoder, so a failed open can't be retried on the same one).
@@ -1502,9 +1501,6 @@ impl FfmpegEncoder {
             Ok(enc)
         };
 
-        let (base, lowlat, opt_summary) =
-            encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444, constrained);
-
         // TIERED open. The encoder's option dict is ALL-OR-NOTHING: if the
         // driver rejects any single private option, the WHOLE dict is
         // dropped. So the low-latency knobs (`delay`/`async_depth`/…) get
@@ -1569,6 +1565,16 @@ impl FfmpegEncoder {
             }
         };
         Ok((opened, hw_frames))
+        };
+
+        match hwframes::HwKind::of(name) {
+            Some(kind) => hwframes::open_on_some_device(kind, |dev| {
+                let frames =
+                    hwframes::Frames::new(dev, kind, kind.sw_format(chroma444), width, height)?;
+                open_with(Some(frames))
+            }),
+            None => open_with(None),
+        }
     }
 
     fn convert_bgra(&mut self, frame: &Frame) -> Result<()> {
@@ -2822,7 +2828,7 @@ mod tests {
     #[test]
     fn d3d12_and_vulkan_options_vbr_no_bframes() {
         let (base, lowlat, s) = encoder_options("hevc_d3d12va", 3_000_000, 22, true, false, false);
-        assert!(s.contains("rc_mode=vbr"), "{s}");
+        assert!(s.contains("rc_mode=VBR"), "{s}");
         assert!(s.contains("maxrate=3000000"), "{s}");
         assert!(base.iter().any(|(k, v)| k == "bf" && v == "0"), "{base:?}");
         assert!(

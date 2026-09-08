@@ -19,15 +19,20 @@
 //! |---|---|---|
 //! | VAAPI (Linux) | a DRM render node | pinned `vaapi_device`, then `/dev/dri/renderD128`…`135` that exist |
 //! | D3D12 (Windows) | a DXGI adapter by index | pinned `d3d12_adapter`, then `0`…`3` |
-//! | Vulkan (Linux, Windows) | a physical device by index or name | pinned `vulkan_device`, then the loader's default |
+//! | Vulkan (Linux, Windows) | a physical device by index or name | pinned `vulkan_device`, then `0`…`3` |
 //!
-//! Each kind's device is opened ONCE per process and shared (a `OnceLock`
-//! per kind): every encoder, probe and rebuild uses the same device, which
-//! is also what makes the caps probe's answer describe the session's device.
-//! A kind with no usable device says so once and every name of that kind
-//! fails in one line; the cascade moves on. Both D3D12 and Vulkan are
-//! dlopen'd by FFmpeg itself (`d3d12.dll` / `vulkan-1.dll` /
-//! `libvulkan.so.1`), so a host without them loses cells, never the daemon.
+//! Each candidate device is opened lazily and ONCE per process and kept;
+//! which device an encoder lands on is decided by its OPEN
+//! (`open_on_some_device`: the preferred device first, then the rest), because
+//! that is a per-codec, per-driver fact — on a two-GPU laptop device 0 is the
+//! iGPU, which may lack the codec (no AV1 on an RDNA2 iGPU) or the video-encode
+//! queue altogether (measured: the dev box's Vulkan device 0 had no
+//! `VK_KHR_video_encode_queue`, the RTX did). The winner is remembered, so a
+//! session lands where the probe proved. A kind with no usable device says so
+//! once and every name of that kind fails in one line; the cascade moves on.
+//! Both D3D12 and Vulkan are dlopen'd by FFmpeg itself (`d3d12.dll` /
+//! `vulkan-1.dll` / `libvulkan.so.1`), so a host without them loses cells,
+//! never the daemon.
 //!
 //! `/dev/dxg` (WSL2's GPU device) is deliberately NOT a VAAPI candidate,
 //! measured 2026-09-08: a WSL2 distro has no `/dev/dri` at all, `/dev/dxg` is
@@ -124,8 +129,10 @@ impl HwKind {
                 .filter(|p| exists(p))
                 .map(Some)
                 .collect(),
-            Self::D3d12 => (0..=3).map(|n| Some(n.to_string())).collect(),
-            Self::Vulkan => vec![None],
+            // Both by index, 0..3: on a two-GPU laptop device 0 is the iGPU
+            // and the dGPU is 1 — the open decides which one can encode
+            // (`open_on_some_device`), so every index is a candidate.
+            Self::D3d12 | Self::Vulkan => (0..=3).map(|n| Some(n.to_string())).collect(),
         }
     }
 
@@ -171,7 +178,8 @@ fn ff_err(rc: i32) -> String {
 mod real {
     use super::*;
     use std::ffi::CString;
-    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     /// A process-wide hardware device: an `AVBufferRef` to the
     /// `AVHWDeviceContext`. The candidate it was opened on is logged at open;
@@ -185,58 +193,142 @@ mod real {
     unsafe impl Send for Device {}
     unsafe impl Sync for Device {}
 
-    static VAAPI: OnceLock<Option<Device>> = OnceLock::new();
-    static D3D12: OnceLock<Option<Device>> = OnceLock::new();
-    static VULKAN: OnceLock<Option<Device>> = OnceLock::new();
+    /// One candidate device of a kind: opened lazily, once, and kept for
+    /// the process (a device that failed to open stays failed — the
+    /// hardware does not change under a running daemon).
+    struct Slot {
+        cand: Option<String>,
+        state: SlotState,
+    }
 
-    /// Open (once per kind) the first candidate FFmpeg accepts. `None` =
-    /// no such device on this host; logged once with every candidate tried.
-    pub(crate) fn device(kind: HwKind) -> Option<&'static Device> {
+    enum SlotState {
+        Untried,
+        Failed,
+        Open(Arc<Device>),
+    }
+
+    struct Kind {
+        slots: Mutex<Vec<Slot>>,
+        /// The index of the device the last successful open used: tried
+        /// first next time, so a session lands on the device the probe
+        /// proved without re-walking the failures.
+        preferred: AtomicUsize,
+    }
+
+    static VAAPI: OnceLock<Kind> = OnceLock::new();
+    static D3D12: OnceLock<Kind> = OnceLock::new();
+    static VULKAN: OnceLock<Kind> = OnceLock::new();
+
+    fn kind_state(kind: HwKind) -> &'static Kind {
         let slot = match kind {
             HwKind::Vaapi => &VAAPI,
             HwKind::D3d12 => &D3D12,
             HwKind::Vulkan => &VULKAN,
         };
         slot.get_or_init(|| {
-            if !kind.supported_here() {
-                return None;
-            }
             let exists = |p: &str| std::path::Path::new(p).exists();
-            let cands = kind.candidates(pinned_device(kind).as_deref(), &exists);
+            let cands = if kind.supported_here() {
+                kind.candidates(pinned_device(kind).as_deref(), &exists)
+            } else {
+                Vec::new()
+            };
             if cands.is_empty() {
                 tracing::info!(
                     backend = kind.label(),
-                    "hwframes: no device candidate on this host (no /dev/dri/renderD*) — no cells for this backend"
+                    "hwframes: no device candidate on this host — no cells for this backend"
                 );
-                return None;
             }
-            for cand in &cands {
-                match open_device(kind, cand.as_deref()) {
-                    Ok(buf) => {
+            Kind {
+                slots: Mutex::new(
+                    cands
+                        .into_iter()
+                        .map(|cand| Slot {
+                            cand,
+                            state: SlotState::Untried,
+                        })
+                        .collect(),
+                ),
+                preferred: AtomicUsize::new(0),
+            }
+        })
+    }
+
+    /// Run `open` against the kind's candidate devices — the preferred one
+    /// first, then the rest in order — until it succeeds. Each device is
+    /// opened lazily and once; each failure (of the device, or of `open` on
+    /// it) is logged and the next candidate tried. The error of the last
+    /// attempt comes back when none worked.
+    ///
+    /// Why the OPEN decides and not the device: which physical device can
+    /// run a given encoder is a per-codec, per-driver fact (an RDNA2 iGPU
+    /// has HEVC but no AV1; a Vulkan device may lack the video-encode
+    /// queue entirely), and the only honest probe of it is the encoder's
+    /// own open.
+    pub(crate) fn open_on_some_device<T>(
+        kind: HwKind,
+        mut open: impl FnMut(&Device) -> Result<T>,
+    ) -> Result<T> {
+        let state = kind_state(kind);
+        let n = state.slots.lock().unwrap_or_else(|e| e.into_inner()).len();
+        if n == 0 {
+            return Err(anyhow!("no {} device on this host", kind.label()));
+        }
+        let start = state.preferred.load(Ordering::Relaxed) % n;
+        let mut last_err: Option<anyhow::Error> = None;
+        for step in 0..n {
+            let idx = (start + step) % n;
+            let (cand, dev) = {
+                let mut slots = state.slots.lock().unwrap_or_else(|e| e.into_inner());
+                let slot = &mut slots[idx];
+                if let SlotState::Untried = slot.state {
+                    slot.state = match open_device(kind, slot.cand.as_deref()) {
+                        Ok(buf) => {
+                            tracing::info!(
+                                backend = kind.label(),
+                                device = slot.cand.as_deref().unwrap_or("(default)"),
+                                "hwframes: device opened"
+                            );
+                            SlotState::Open(Arc::new(Device { buf }))
+                        }
+                        Err(e) => {
+                            tracing::info!(
+                                backend = kind.label(),
+                                device = slot.cand.as_deref().unwrap_or("(default)"),
+                                %e,
+                                "hwframes: device did not open"
+                            );
+                            SlotState::Failed
+                        }
+                    };
+                }
+                match &slot.state {
+                    SlotState::Open(dev) => (slot.cand.clone(), Arc::clone(dev)),
+                    _ => continue,
+                }
+            };
+            match open(&dev) {
+                Ok(v) => {
+                    if state.preferred.swap(idx, Ordering::Relaxed) != idx {
                         tracing::info!(
                             backend = kind.label(),
                             device = cand.as_deref().unwrap_or("(default)"),
-                            tried = ?cands,
-                            "hwframes: device opened"
+                            "hwframes: encoder opened on this device — preferred from now on"
                         );
-                        return Some(Device { buf });
                     }
-                    Err(e) => tracing::info!(
+                    return Ok(v);
+                }
+                Err(e) => {
+                    tracing::debug!(
                         backend = kind.label(),
                         device = cand.as_deref().unwrap_or("(default)"),
                         %e,
-                        "hwframes: device did not open"
-                    ),
+                        "hwframes: open failed on this device — trying the next"
+                    );
+                    last_err = Some(e);
                 }
             }
-            tracing::info!(
-                backend = kind.label(),
-                tried = ?cands,
-                "hwframes: no candidate device opened — no cells for this backend"
-            );
-            None
-        })
-        .as_ref()
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no {} device opened on this host", kind.label())))
     }
 
     fn open_device(kind: HwKind, device: Option<&str>) -> Result<*mut ff::AVBufferRef> {
@@ -358,7 +450,7 @@ mod real {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[allow(unused_imports)]
-pub(crate) use real::{Device, Frames, device};
+pub(crate) use real::{Device, Frames, open_on_some_device};
 
 /// macOS: no hardware-frame backend at all (its FFmpeg tree carries only
 /// VideoToolbox, which takes software frames). The types exist so the
@@ -369,8 +461,14 @@ mod stub {
 
     pub(crate) struct Device;
 
-    pub(crate) fn device(_kind: HwKind) -> Option<&'static Device> {
-        None
+    pub(crate) fn open_on_some_device<T>(
+        kind: HwKind,
+        _open: impl FnMut(&Device) -> Result<T>,
+    ) -> Result<T> {
+        Err(anyhow!(
+            "no {} device on this host (hardware frames are Linux/Windows-only)",
+            kind.label()
+        ))
     }
 
     pub(crate) struct Frames;
@@ -396,7 +494,7 @@ mod stub {
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 #[allow(unused_imports)]
-pub(crate) use stub::{Device, Frames, device};
+pub(crate) use stub::{Device, Frames, open_on_some_device};
 
 #[cfg(test)]
 mod tests {
@@ -446,7 +544,7 @@ mod tests {
             vec![Some("1".to_string())]
         );
 
-        assert_eq!(HwKind::Vulkan.candidates(None, &all), vec![None]);
+        assert_eq!(HwKind::Vulkan.candidates(None, &all).len(), 4);
         assert_eq!(
             HwKind::Vulkan.candidates(Some("NVIDIA GeForce RTX 5090"), &all),
             vec![Some("NVIDIA GeForce RTX 5090".to_string())]
