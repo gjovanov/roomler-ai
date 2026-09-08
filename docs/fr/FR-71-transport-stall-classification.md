@@ -1,6 +1,6 @@
 # FR-71 — Transport stall classification: a transit stall is not an over-production signal
 
-**Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** proposed 2026-09-05; T1a+T1b+T1c shipped (hold default off); AC2 days 1–4 read (96 % gaps); **AC3 field hold-on half FAILED 2026-09-08 — the hold masks the wrong mover; deletion proposed (§Open decisions)** ·
+**Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** proposed 2026-09-05; T1a+T1b+T1c shipped (hold default off); AC2 days 1–4 read (96 % gaps); **AC3 field hold-on half FAILED 2026-09-08 — the hold masks the wrong mover; deletion proposed (§Open decisions)**; **T1b, T2 and T2b were superseded 2026-09-08 by [FR-79](FR-79-one-validity-gate.md)'s one validity gate, which deleted all three and their switches** ·
 **Parent:** split out of FR-70 (#1330) on its own open question; FR-70's M0 is this FR's instrument.
 
 ## Goal

@@ -905,14 +905,6 @@ pub struct AgentConfig {
     /// See `rate_prior_decay` in the config surface.
     #[serde(default)]
     pub rate_prior_decay: Option<bool>,
-    /// FR-71 T1a — classify each constrained viewer window by which plane is
-    /// the limiter, in shadow. Default ON. See `transit_classify`.
-    #[serde(default)]
-    pub transit_classify: Option<bool>,
-    /// FR-71 T1b — ACT on a `transit-stalled` window (ramp frozen, age loop
-    /// and P3 clamp masked, prior held). Default OFF for one release. See
-    /// `transit_hold`.
-    pub transit_hold: Option<bool>,
     /// FR-70 M1 — the encoder runs on its own OS thread per session behind a
     /// command channel instead of `block_in_place` on a runtime worker.
     /// Default ON since 0.4.70 (M1c met its gate on 0.4.69); `false` restores
@@ -2118,8 +2110,6 @@ pub fn test_fixture() -> AgentConfig {
         relay_max_kbps: None,
         rate_slow_start: None,
         rate_prior_decay: None,
-        transit_classify: None,
-        transit_hold: None,
         media_thread: None,
         pump_stall_watch: None,
         pump_stall_warn_ms: None,
@@ -2259,7 +2249,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 84] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 82] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -2268,8 +2258,6 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 84]
         ("ICE_RELAY_TCP", cfg.ice_relay_tcp),
         ("RATE_SLOW_START", cfg.rate_slow_start),
         ("RATE_PRIOR_DECAY", cfg.rate_prior_decay),
-        ("TRANSIT_CLASSIFY", cfg.transit_classify),
-        ("TRANSIT_HOLD", cfg.transit_hold),
         ("MEDIA_THREAD", cfg.media_thread),
         ("PUMP_STALL_WATCH", cfg.pump_stall_watch),
         ("BG_REBUILD_CONSTRAINED", cfg.bg_rebuild_constrained),

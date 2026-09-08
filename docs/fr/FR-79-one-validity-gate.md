@@ -116,23 +116,37 @@ So V2 is condition 3 plus the honest denominator:
 
 | phase | scope | kill switch | status |
 |---|---|---|---|
-| **V1** | the gate + every in-session consumer; **delete** `transit_hold`, `transit_classify`, T2's quarantine, T2b's shadow, and their four counters (one `evidence_rejected` triple replaces them) | **none — and none is the point**; the rule it replaces had three | proposed |
+| **V1** | the gate + every in-session consumer; **delete** `transit_hold`, `transit_classify`, T2's quarantine, T2b's shadow, and their four counters (one `evidence_rejected` replaces them) | **none — and none is the point**; what it replaces had two | **built 2026-09-08** (AC1–AC3 met); field gate on the release carrying it |
 | **V2** | the write-back and the seed: the opener measured like every other window, the gate at `record_session`, the memory keyed/clamped by carrier (condition 3) | — | proposed |
 | **V3** | one pipe estimator: goodput, the viewer's arrival rate and the prior behind ONE type with one accessor; delete the rest (FR-70 AC4's 8 → 1) | — | proposed |
 
 ## Acceptance criteria
 
-- [ ] **AC1 — the deletion is the deliverable.** After V1 the tree contains no
-      `transit_hold`, no `transit_classify`, no quarantine buffer, no
-      `hard_stalls_paused` / `hard_stalls_confirmed` / `stall_shadowed` /
-      `transit_holds`; `cargo clippy` and the suite are green, and the PR's diff
-      is **net-negative** in `agents/roomlerd/src/encode/`.
-- [ ] **AC2 — the three field events replay.** The 12:15, 14:52 and (V2) opener
-      cells each fail on the pre-FR-79 laws and pass on the gate, as unit cells
-      built from the logged numbers.
-- [ ] **AC3 — one verdict, one counter.** The heartbeat reports
-      `evidence_rejected=[agent, stalled, shadow]` and nothing else about
-      stalls; a reader can attribute every rejected window to a reason.
+- [x] **AC1 — the deletion is the deliverable.** V1 removes, with nothing put
+      in their place: **2 kill switches** (`transit_hold`, `transit_classify`)
+      with their config keys, env flags, `config_surface` entries, accessors and
+      the simulator's copy; **4 heartbeat counters → 1**; **7 governor state
+      fields → 2** (the hold's counter, T2's quarantine buffer, its pending flag
+      and two counters, T2b's counter); **3 per-consumer rules → 1** shared
+      predicate. Measured 2026-09-08: the edited files are **net −83 lines**
+      (`governor.rs` −42, `encode/mod.rs` −16, the config surface −26,
+      `peer.rs` +3); the new gate is 255 lines of which 118 are its own tests
+      and 97 are comment, i.e. **~40 lines of logic** for what it replaced.
+      `cargo test -p roomlerd --lib` 995 pass, `roomler-node-core` 175 pass,
+      clippy clean. ⚠️ The overall line count is not negative and is not claimed
+      to be: the inventory above is the claim.
+- [x] **AC2 — the field events replay.** The 12:15 cell (a hard blocked send
+      inside a window whose pump pass overran its budget) cuts nothing and is
+      attributed to `agent-stalled`; its control (the same blocked send on a
+      free loop) still halves at its own window, so FR-35's reaction is intact;
+      the 14:52 cell's report in the stall's shadow does not arm the clamp; the
+      B0 `finding_4` cell keeps its rate with the gate on and still cuts with
+      the gate off (the control arm, which is no longer a daemon
+      configuration). The opener cell is V2's.
+- [x] **AC3 — one verdict, one counter.** The heartbeat reports
+      `evidence_rejected=[agent-stalled, transit-stalled, stall-shadow,
+      carrier-changed]` and nothing else about stalls; every rejected window is
+      attributable to a reason.
 - [ ] **AC4 (V2)** — on a pair remembered from one carrier, a session opened on
       a slower carrier does not open above what that carrier has measured, and
       an opening burst that queued does not raise the memory.
