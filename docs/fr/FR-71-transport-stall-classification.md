@@ -1,6 +1,6 @@
 # FR-71 — Transport stall classification: a transit stall is not an over-production signal
 
-**Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** proposed 2026-09-05 ·
+**Issue:** [#1362](https://github.com/gjovanov/roomler-ai/issues/1362) · **Status:** proposed 2026-09-05; T1a+T1b+T1c shipped (hold default off); AC2 days 1–4 read (96 % gaps); **AC3 field hold-on half FAILED 2026-09-08 — the hold masks the wrong mover; deletion proposed (§Open decisions)** ·
 **Parent:** split out of FR-70 (#1330) on its own open question; FR-70's M0 is this FR's instrument.
 
 ## Goal
@@ -210,6 +210,18 @@ places; each is recorded here because the next phase depends on it.
       4's class, recurring on its own. `transit_hold = true` is set on
       CORPLAP-1 from that day — effective at its next daemon restart — and
       the hold-on half waits for the next natural reconnection there.)*
+      *(Field hold-on half 2026-09-08, 0.4.87, CORPLAP-1 on the Check Point VPN
+      over the relay, `transit_hold` on, session `6a9fed1d`: **FAIL** — the
+      repeat came at 12:15:18 (an overlay `REKEY_TIMEOUT` storm with
+      make-before-break probes, two pump passes stalled entirely in `other`,
+      2.9 s and 7.4 s) and the rate went 6.60 → 3.30 → 3.00 → 2.55 → 1.35 → 0.68 M
+      in 36 s, back at 3.0 M only ~3 min later. The hold engaged on its three
+      windows and prevented nothing: it masks the age loop on `transit-stalled`
+      windows, and none of the four movers that cut is the age loop — the hard
+      halving on a blocked send ≥ 1 s (`note_send_stall` → `apply_hard_md`),
+      FR-59 P6's seed contradiction and P1's floor relief fed by the goodput
+      measured FROM those blocked sends, and the over-budget ×0.85. See the
+      field log and the open decision below.)*
 - [ ] **AC4** — no regression on the LAN, direct and thin-pipe cells (peak
       paint, settle time, over-drive integral unchanged within noise).
       *(Sim half met 2026-09-05: the thin pipe, the LAN burst and the genuinely
@@ -223,6 +235,20 @@ places; each is recorded here because the next phase depends on it.
 
 ## Open decisions
 
+- **Whether T1b's hold should be deleted, and what replaces it (2026-09-08).** The
+  field's finding-4 shape on the corp-VPN host is not the simulated one (post-ack
+  paint age with a tiny queue): it is a pump pass stalled in `other` by the overlay's
+  rekey storm and probe waits, during which the DC send blocks for seconds — and
+  the blocked send is then read as a MEASUREMENT of the pipe by four movers (the
+  FR-35 hard halving, FR-59 P6's contradiction, FR-59 P1's floor relief, and the
+  over-budget AIMD). The hold masks only the age loop, which never fired. On four
+  days of fleet data the hold engaged 30+ times on one-window report gaps and
+  prevented no cut. Direction that removes reasons for code rather than adding
+  one: (a) ONE validity rule shared by every estimator — a blocked send that spans a
+  pump STALL pass is not a measurement of the pipe (the goodput sink discards it), so
+  P6, the floor relief and the hard halving see no false evidence; (b) FR-70 M3 for
+  the stolen thread itself; (c) then delete `transit_hold` (T1b), keeping T1a's
+  classifier as the instrument.
 - Whether the viewer should report stalls directly (a gap in arrivals with a
   non-empty decode queue) so the agent does not infer them from the split alone.
 - Whether `TransitStalled` should also suppress the FR-35 learner's decrease
@@ -275,3 +301,4 @@ consumes `PipeState`), FR-64 #1244, FR-19 #805.
 | 2026-09-06 09:03 + 10:14 UTC | **0.4.75** (classify on, hold off), the operator's session | CORPLAP-1 relay `6a9d2bfa`, HEVC, `c=true` | **AC3's field FAIL, found naturally**: overlay `REKEY_TIMEOUT` ×4 + direct probes that kept the relay → an 8.4 s pump pass entirely in `other_ms` → `set_bitrate ceiling 3.0M target 1.5M`; then a `PC Disconnected → selected pair changed → Connected` re-nomination → a 5.5 s pass → the same cut. A re-nomination sends no frames, so the viewer goes silent and the classifier reads a **gap** — on these hosts a gap-hold may be the right action, which reframes the one-vs-two-silent-windows question. `transit_hold = true` set on CORPLAP-1 (effective at its next restart) for the hold-on half |
 | 2026-09-07 (read 16:12 UTC) | **0.4.79** (classify on, hold off on this host), the operator's sessions | CORPLAP-2 relay, av1_nvenc, `constrained=true`: a 66-min session (3,816 windows) and a 7.8-min one (454) | **AC2 day 3**: 53 `transit-stalled` of 3,816, **52 report gaps**; 24 of 454, 20 gaps. The 4–5 non-gap stalls are viewer-age spikes (~50 → 390 ms) with the sender idle — inflight 0, send wait ≤ 0.7 ms — i.e. finding 4's shape beyond the ack point, and the target held 3.0 M through them: the split rule classified them and the AIMD did not cut. ⚠️ The heartbeat's `pipe_state` (current window) and the `pipe_states` histogram are offset by one window when read side by side — count from the histogram deltas. Days 1–3: gaps are 94 % of classified stalls. CORPLAP-1 (hold on) ran direct all day, so AC3's hold-on repeat still needs a relay day there. |
 | 2026-09-08 07:48–09:13 UTC (read 09:20) | **0.4.85** (classify on, hold off on this host), the operator's sessions | CORPLAP-2 relay, hevc_nvenc, `constrained=true`: 8 sessions, six of 2.5–23 min (685 / 345 / 302 / 265 / 633 / 76 heartbeats) | **AC2 day 4**: 86 `transit-stalled` verdicts, **82 report gaps**, 4 by the split rule. Days 1–4: 209 of 218 (96 %) are gaps. **The split-rule verdicts include a natural repeat of finding 4 with the hold off** (`6a9fca12`, 08:48:11–21): age 50 → 127 → 368 ms with the sender idle (0 bytes in flight, send wait 0.03 ms; split transit 342 / viewer 26 ms), `transit-stalled` at :13 → the AIMD cut 3.0 → 2.55 M at :14; two silent windows (gaps); +187.5 k at :19 (the additive increase through the stall); then cuts to 2.33 M at :20.5 and 1.98 M at :21.5 on a second split-rule verdict (age 256 → 230, transit 229, still 0 in flight) — **−34 % in 7 s for a transit spike the classifier had named, and a 30 s climb back** (3.0 M again at 08:48:52). That is AC3's FAIL in the age-cut flavour, on the split-present host; with the hold on, each of those windows was a hold. Two side notes. `6a9fc69f` (08:26) opened **unconstrained** for 4 s (`c=false`, target 54.9 M) before the relay verdict set 3.0 M — the opening burst took 7.7 s to drain (age 7,679 ms, send wait max 434 ms) and the `overproduced` verdict cut, correctly: a transport-known-late class, one instance. And `6a9fca12` opened at 200 k from a pair remembered at 145 k (`5.9.157.226`), reached 3.0 M in 130 s, and closed the memory at 3.0 M (`rate_memory.json`, 08:49:50) — FR-70 P1's decay plus FR-35 P3's growth working; the seven neo16-pair sessions opened at 2.7–6.8 M and were at ≥ 2.9 M within 6 s. CORPLAP-1 (hold on) ran direct all day again. |
+| 2026-09-08 12:15:18–12:16:03 UTC | **0.4.87** (classify on, **hold on**), my view-only session `6a9fed1d` (a hidden automation tab) | CORPLAP-1 on the Check Point VPN, HEVC hevc_qsv, pill `relay · VPN captures the host's LAN`, steady at age 50 ms with the learned ceiling at 6.60 M and 0 B in flight | **AC3's field repeat with the hold on — FAIL.** An overlay `REKEY_TIMEOUT` storm (≈20 lines 12:15:21–12:16:16) with make-before-break LAN probes waiting 8–12 s stalled two pump passes with every timed phase at 0 ms (`other_ms` 2,884 at :21 and 7,386 at :55); the send task's blocked sends read 2,900 / 7,404 / 1,872 ms; viewer age 1.5 s / 1.25 s / 2.2 s (8.7 s by the viewer's own report at :58); 170 frames skipped at the budget gate. The rate: 6.60 → **3.30 M** at :21 (a blocked send ≥ 1 s is a HARD stall — `note_send_stall` → `apply_hard_md`, ×0.5 at once, `deferred=false`) → **3.00 M** 16 ms later (FR-59 P6: the goodput measured FROM those blocked sends, 1.58 M, "contradicts the learned ceiling — abandoning it"; the learner's step-ups to 3.19 M at :32, :37 and :42 were each abandoned within 30 ms while that goodput stood) → 2.55 M at :46 (over-budget ×0.85) → **1,345,142** at :55 (the second hard halving, pinned at the RELIEVED FLOOR = 85 % of the same goodput, FR-59 P1) → **677,760** at :57 (a third blocked send ≥ 1 s) — **−90 % from 6.6 M in 36 s**, then +12.5 % per 5 s from 762 k, 3.0 M again only at ~12:19 and the 6.6 M ceiling gone for the rest of the session. The hold engaged on its three windows (`transit_holds` 24 → 27: one gap, two split verdicts with age 1,253 and 2,172 ms) and prevented nothing — every cut came from a mover the hold does not mask. Earlier in the same session and the one before it (10:41–12:15, both hold on): 35 report-gap verdicts, 35 holds, zero cuts from them; one −15 % age-loop cut at 10:59:46 on a 151 ms age blip with 0 B in flight, below the classifier's 200 ms stall rule, back in 15 s. |
