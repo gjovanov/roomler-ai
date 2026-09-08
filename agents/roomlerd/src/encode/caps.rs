@@ -1027,6 +1027,18 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
                 let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(name) else {
                     continue;
                 };
+                // FR-77 P4 — the denylist is the kill switch for BOTH chroma
+                // forms. Until this arm it gated only the 4:4:4 open, so
+                // `hevc_vaapi:yuv420` in `encoder_cells_deny` still opened the
+                // cell (measured on jupiter): an operator's one lever against
+                // a driver that faults on open did nothing for 4:2:0.
+                if cell_denied(&deny, name, ChromaFormat::Yuv420) {
+                    tracing::info!(
+                        encoder = name,
+                        "caps probe: 4:2:0 cell on the denylist — not opened, not advertised"
+                    );
+                    continue;
+                }
                 let t = std::time::Instant::now();
                 match FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, false) {
                     Ok(enc) => {

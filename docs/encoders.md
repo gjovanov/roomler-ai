@@ -344,6 +344,26 @@ core there anyway). So the WSL sibling is the NEGATIVE cell: the opener logs
 real). The positive cells are bare-metal Linux with a render node: jupiter
 (AMD Raphael, `radeonsi`) is the fleet's.
 
+**Never flush an encoder that never took a frame.** The 0.4.86 roll to jupiter
+opened `hevc_vaapi` in the probe and the child died with SIGSEGV on every
+start, so the host advertised no hardware at all. gdb: `FfmpegEncoder::drop` →
+`send_eof` → `avcodec_send_frame(NULL)` → a NULL field load inside libavcodec's
+VAAPI encoder, because no picture had ever been issued (the probe opens a cell
+and drops it; `encoder-smoke`, which encodes ten frames first, passed on the
+same host). The flush on drop is cosmetic — the drained packets go nowhere —
+so it now runs only when `frame_count > 0`, which is reset on every rebuild
+and therefore counts frames sent to *this* inner encoder. In a session the
+same drop runs in the daemon: a rebuild torn down before its first frame would
+have taken the whole agent with it. Validated on jupiter before the release
+by breaking on `send_eof` under gdb and returning without it: the child then
+advertised `hevc/vaapi` and `h264/vaapi` and exited normally.
+
+**The denylist gates both chroma forms.** Until 0.4.87 `encoder_cells_deny`
+gated only the 4:4:4 open — `hevc_vaapi:yuv420` still opened the cell — so an
+operator's one lever against a driver that faults on open did nothing for
+4:2:0. The base phase now skips a denied `name:yuv420` (logged, not
+advertised).
+
 ## Capture backends
 
 Cascade (first that works wins): synthetic (CI, env-gated) → **SystemContext**

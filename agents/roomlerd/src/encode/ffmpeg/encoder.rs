@@ -2241,6 +2241,20 @@ impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
         // Best-effort flush — send EOF and drain any held packets so the
         // encoder doesn't log warnings about un-drained state.
+        //
+        // FR-77 P4 — ONLY for an encoder that has taken a frame. `frame_count`
+        // is reset on every rebuild, so it counts frames sent to THIS inner
+        // encoder. Flushing one that never got a frame has nothing to drain
+        // and, on VAAPI, is not survivable: `hevc_vaapi` on jupiter (Mesa
+        // 25.2.8 radeonsi, FFmpeg 9.0.1) SEGVs inside `avcodec_send_frame(NULL)`
+        // when no picture was ever issued — measured under gdb 2026-09-08, the
+        // caps-probe child (open, then drop) died on every start, so the host
+        // advertised no hardware at all. In a session the same drop runs in
+        // the daemon: a rebuild torn down before its first frame would take
+        // the whole agent with it.
+        if self.frame_count == 0 {
+            return;
+        }
         let _ = self.encoder.send_eof();
         let _ = self.drain_packets();
     }
