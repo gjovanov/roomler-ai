@@ -161,8 +161,30 @@ fn build_identity() -> String {
     format!("{}/{exe}", env!("CARGO_PKG_VERSION"))
 }
 
+/// FR-78 P2 — driver-facing environment that changes what the drivers
+/// answer without changing anything the `ROOMLERD_*` knobs or the hardware
+/// fingerprint see. Measured on jupiter: RADV lists no video extensions
+/// without `RADV_PERFTEST=video_encode` and three with it, and a restart that
+/// added the flag replayed the cached no-Vulkan answer until the cache was
+/// cleared by hand. The Vulkan loader's ICD selection and libva's driver
+/// name / path are the same class of input.
+const DRIVER_ENV: &[&str] = &[
+    "RADV_PERFTEST",
+    "RADV_DEBUG",
+    "ANV_DEBUG",
+    "MESA_LOADER_DRIVER_OVERRIDE",
+    "VK_ICD_FILENAMES",
+    "VK_DRIVER_FILES",
+    "VK_LOADER_DRIVERS_SELECT",
+    "VK_LOADER_DRIVERS_DISABLE",
+    "LIBVA_DRIVER_NAME",
+    "LIBVA_DRIVERS_PATH",
+    "CUDA_VISIBLE_DEVICES",
+];
+
 /// Every `ROOMLERD_*` knob the probe child could read, env AND config
-/// fallbacks (the child receives both as real env), hashed.
+/// fallbacks (the child receives both as real env), plus the driver-facing
+/// variables in [`DRIVER_ENV`], hashed.
 fn knobs_hash() -> String {
     let mut knobs: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for (name, value) in tunnel_core::env::config_fallbacks_for_child() {
@@ -170,11 +192,17 @@ fn knobs_hash() -> String {
     }
     for (name, value) in std::env::vars_os() {
         let name = name.to_string_lossy();
-        if name.starts_with("ROOMLERD_") {
+        if knob_selected(&name) {
             knobs.insert(name.into_owned(), value.to_string_lossy().into_owned());
         }
     }
     hash_knobs(&knobs)
+}
+
+/// Which environment variables are part of the key: every `ROOMLERD_*`
+/// knob and the driver-facing names in [`DRIVER_ENV`].
+fn knob_selected(name: &str) -> bool {
+    name.starts_with("ROOMLERD_") || DRIVER_ENV.contains(&name)
 }
 
 fn hash_knobs(knobs: &std::collections::BTreeMap<String, String>) -> String {
@@ -254,6 +282,23 @@ pub(crate) fn worth_caching(caps: &AgentCaps) -> bool {
 mod tests {
     use super::*;
     use roomler_ai_remote_control::models::{ChromaFormat, VideoBackend, VideoCell, VideoCodec};
+
+    /// FR-78 P2 — the driver-facing variables are part of the key: a
+    /// `RADV_PERFTEST` edit re-probes, an unrelated variable does not.
+    #[test]
+    fn driver_env_is_part_of_the_key() {
+        assert!(knob_selected("ROOMLERD_ENCODER_CELLS_DENY"));
+        assert!(knob_selected("RADV_PERFTEST"));
+        assert!(knob_selected("LIBVA_DRIVERS_PATH"));
+        assert!(knob_selected("VK_ICD_FILENAMES"));
+        assert!(!knob_selected("PATH"));
+        assert!(!knob_selected("HOME"));
+        let mut a = std::collections::BTreeMap::new();
+        a.insert("ROOMLERD_X".to_string(), "1".to_string());
+        let mut b = a.clone();
+        b.insert("RADV_PERFTEST".to_string(), "video_encode".to_string());
+        assert_ne!(hash_knobs(&a), hash_knobs(&b));
+    }
 
     fn key() -> CacheKey {
         CacheKey {

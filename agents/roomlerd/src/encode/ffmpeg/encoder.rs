@@ -677,7 +677,11 @@ pub(crate) enum RateReconfig {
 /// FR-62 A1 — resolve the apply path for a backend. NVENC is always in-place
 /// (that is the pre-A1 behaviour); QSV goes in-place only when the flag is on,
 /// else it rebuilds as before; AMF/VideoToolbox always rebuild (unmeasured /
-/// no runtime path in FFmpeg n8.1.2).
+/// no runtime path in FFmpeg n8.1.2). FR-78 P2 — VAAPI, D3D12 and Vulkan
+/// rebuild too, and for the last two that is MEASURED (the A0 ladder on the
+/// dev box: 20/20 rate-caused IDRs, 42–77 ms per apply, on `hevc_vulkan` and
+/// `hevc_d3d12va`) — FFmpeg's `vulkan_encode` / `d3d12va_encode` set rate
+/// control at session init and never re-read `rc_max_rate`.
 pub(crate) fn resolve_rate_mode(name: &str, inplace_rate: bool) -> RateReconfig {
     if name.contains("nvenc") {
         RateReconfig::InPlaceVbr
@@ -2393,6 +2397,20 @@ mod tests {
             RateReconfig::InPlaceCbr
         );
         assert_eq!(resolve_rate_mode("vp9_qsv", true), RateReconfig::InPlaceCbr);
+        // FR-78 P2 — D3D12 and Vulkan rebuild, MEASURED (the A0 ladder on the
+        // dev box: 20/20 rate-caused IDRs); VAAPI by construction.
+        for name in ["hevc_d3d12va", "hevc_vulkan", "av1_vulkan", "h264_vaapi"] {
+            assert_eq!(
+                resolve_rate_mode(name, true),
+                RateReconfig::Rebuild,
+                "{name}"
+            );
+            assert_eq!(
+                resolve_rate_mode(name, false),
+                RateReconfig::Rebuild,
+                "{name}"
+            );
+        }
         // AMF is unmeasured — Rebuild even with the flag; so is VideoToolbox.
         assert_eq!(resolve_rate_mode("hevc_amf", true), RateReconfig::Rebuild);
         assert_eq!(

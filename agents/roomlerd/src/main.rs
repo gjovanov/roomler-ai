@@ -249,6 +249,13 @@ enum Command {
         /// ration. Best with `--codec hevc`/`av1` and `--encoder hardware`.
         #[arg(long)]
         reconfigure_sweep: bool,
+        /// FR-78 P2 — open exactly this FFmpeg encoder name (`hevc_d3d12va`,
+        /// `av1_vulkan`, `h264_vaapi`, …) instead of the cascade, so a
+        /// backend the vendor SDK outranks on this host can be driven with
+        /// real bytes (and swept, with `--reconfigure-sweep`). `--encoder`
+        /// and `--codec` are ignored when set.
+        #[arg(long)]
+        name: Option<String>,
         /// Sweep frame geometry (A0). Corp-laptop default.
         #[arg(long, default_value_t = 1280)]
         width: u32,
@@ -1215,6 +1222,7 @@ async fn daemon_main() -> Result<()> {
             encoder,
             codec,
             reconfigure_sweep,
+            name,
             width,
             height,
             frames_per_rung,
@@ -1225,6 +1233,7 @@ async fn daemon_main() -> Result<()> {
                 encoder_reconfigure_sweep_cmd(
                     &encoder,
                     &codec,
+                    name.as_deref(),
                     width,
                     height,
                     frames_per_rung,
@@ -1233,7 +1242,7 @@ async fn daemon_main() -> Result<()> {
                 )
                 .await
             } else {
-                encoder_smoke_cmd(&encoder, &codec).await
+                encoder_smoke_cmd(&encoder, &codec, name.as_deref()).await
             }
         }
         Command::AppsProbe => apps_probe_cmd(),
@@ -4146,7 +4155,7 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
 /// assert at least one keyframe comes out. Used in CI to catch MF init
 /// regressions before shipping an MSI. Exits with a non-zero code on
 /// any failure so a failed smoke check fails the release build.
-async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
+async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str, name: Option<&str>) -> Result<()> {
     use roomlerd::encode::{open_default, open_for_codec};
 
     // The CI release lane runs `encoder-smoke` on the freshly built EXE, so
@@ -4179,7 +4188,16 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
     // logging + behaviour that CI smoke output is pinned to). For any
     // other codec, go through `open_for_codec` which runs the codec-
     // specific cascade and reports whether a demotion happened.
-    let (mut enc, actual_codec) = if codec == "h264" {
+    let (mut enc, actual_codec) = if let Some(name) = name {
+        // FR-78 P2 — a named backend, past every cascade: the same open the
+        // capability probe runs, so what the probe advertised opens here.
+        let (e, actual) = roomlerd::encode::open_named(name, w, h).ok_or_else(|| {
+            anyhow::anyhow!(
+                "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
+            )
+        })?;
+        (e, actual.to_string())
+    } else if codec == "h264" {
         (open_default(w, h, pref), "h264".to_string())
     } else {
         let (e, actual) = open_for_codec(&codec, w, h, pref);
@@ -4256,9 +4274,11 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
 /// The content is a moving block over a high-frequency stripe band so P-frames
 /// carry real residual and the maxrate genuinely clamps quality (solid colours
 /// — the plain smoke's content — encode to ~0 bytes and hide the effect).
+#[allow(clippy::too_many_arguments)]
 async fn encoder_reconfigure_sweep_cmd(
     pref_raw: &str,
     codec_raw: &str,
+    name: Option<&str>,
     w: u32,
     h: u32,
     frames_per_rung: u32,
@@ -4277,7 +4297,16 @@ async fn encoder_reconfigure_sweep_cmd(
              (the IDR-on-reconfigure question is independent of HRD %; burst sizes may differ)"
         );
     }
-    let (mut enc, actual_codec) = if codec == "h264" {
+    let (mut enc, actual_codec) = if let Some(name) = name {
+        // FR-78 P2 — a named backend, past every cascade: the same open the
+        // capability probe runs, so what the probe advertised opens here.
+        let (e, actual) = roomlerd::encode::open_named(name, w, h).ok_or_else(|| {
+            anyhow::anyhow!(
+                "encoder {name} did not open on this host (not a cascade name, no FFmpeg in this build, or no device accepts it)"
+            )
+        })?;
+        (e, actual.to_string())
+    } else if codec == "h264" {
         (open_default(w, h, pref), "h264".to_string())
     } else {
         let (e, actual) = open_for_codec(&codec, w, h, pref);

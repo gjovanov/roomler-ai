@@ -1298,6 +1298,43 @@ pub fn open_default(
 /// (via `set_codec_preferences`) which codec to expect — demotion at
 /// this layer means the peer must re-advertise H.264 in the SDP
 /// answer, which the caller in `peer.rs` handles.
+/// FR-78 P2 — open ONE named FFmpeg encoder (`hevc_d3d12va`, `av1_vulkan`,
+/// `h264_vaapi`, …) at the probe's settings, bypassing every cascade, so a
+/// backend that never wins the cascade on a host (the vendor SDK sits above
+/// it) can still be driven with real bytes by `encoder-smoke --name` and the
+/// FR-62 ladder. `None` when the name is not one of the tables', the build
+/// carries no FFmpeg, or no device on this host accepts it — the same open
+/// the capability probe runs, so a cell the probe advertised opens here too.
+/// Returns the codec's wire name with the encoder.
+pub fn open_named(
+    name: &str,
+    width: u32,
+    height: u32,
+) -> Option<(Box<dyn VideoEncoder>, &'static str)> {
+    #[cfg(feature = "ffmpeg-encoder")]
+    {
+        use roomler_ai_remote_control::models::VideoBackend;
+        let Some(name) = ffmpeg::FfmpegEncoder::static_name(name) else {
+            tracing::warn!(name, "open_named: not a cascade-table encoder name");
+            return None;
+        };
+        let codec = VideoBackend::from_ffmpeg_name(name).map(|(c, _)| c.wire())?;
+        match ffmpeg::FfmpegEncoder::new_named_probe(name, width, height, false) {
+            Ok(enc) => Some((Box::new(enc), codec)),
+            Err(e) => {
+                tracing::warn!(name, %e, "open_named: the encoder did not open on this host");
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "ffmpeg-encoder"))]
+    {
+        let _ = (name, width, height);
+        tracing::warn!("open_named: this build carries no FFmpeg backend");
+        None
+    }
+}
+
 pub fn open_for_codec(
     codec: &str,
     width: u32,
