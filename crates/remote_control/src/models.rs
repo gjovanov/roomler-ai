@@ -338,6 +338,12 @@ pub enum VideoBackend {
     Amf,
     VideoToolbox,
     Vaapi,
+    /// FR-78 — D3D12 video encode (Windows): FFmpeg's `*_d3d12va`, the
+    /// graphics driver's own encode DDI, no vendor SDK.
+    D3d12,
+    /// FR-78 — Vulkan video encode (Linux, Windows): FFmpeg's `*_vulkan`,
+    /// `VK_KHR_video_encode_*` through whichever ICD the loader finds.
+    Vulkan,
     /// The agent's native Media Foundation module (Windows), not FFmpeg's
     /// `*_mf` wrappers, which are deliberately not built.
     MediaFoundation,
@@ -354,18 +360,22 @@ impl VideoBackend {
             Self::Amf => "amf",
             Self::VideoToolbox => "videotoolbox",
             Self::Vaapi => "vaapi",
+            Self::D3d12 => "d3d12",
+            Self::Vulkan => "vulkan",
             Self::MediaFoundation => "mf",
             Self::Openh264 => "openh264",
             Self::Libvpx => "libvpx",
         }
     }
 
-    pub const ALL: [VideoBackend; 8] = [
+    pub const ALL: [VideoBackend; 10] = [
         Self::Nvenc,
         Self::Qsv,
         Self::Amf,
         Self::VideoToolbox,
         Self::Vaapi,
+        Self::D3d12,
+        Self::Vulkan,
         Self::MediaFoundation,
         Self::Openh264,
         Self::Libvpx,
@@ -388,6 +398,8 @@ impl VideoBackend {
             "amf" => Self::Amf,
             "videotoolbox" => Self::VideoToolbox,
             "vaapi" => Self::Vaapi,
+            "d3d12va" => Self::D3d12,
+            "vulkan" => Self::Vulkan,
             _ => return None,
         };
         Some((codec, backend))
@@ -4020,6 +4032,8 @@ mod tests {
                 "amf",
                 "videotoolbox",
                 "vaapi",
+                "d3d12",
+                "vulkan",
                 "mf",
                 "openh264",
                 "libvpx"

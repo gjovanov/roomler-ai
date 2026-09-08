@@ -14,7 +14,7 @@ The bitstream standard a video stream is encoded in: H.264, HEVC (H.265), AV1, V
 _Avoid_: encoder, format, video type
 
 **Backend**:
-The implementation on the controlled host that produces a codec's bitstream: a vendor or OS video engine (NVENC, QSV, AMF, VideoToolbox, VAAPI, Media Foundation) or a software library (openh264, libvpx). A property of the host, discovered at runtime, never chosen by the controller.
+The implementation on the controlled host that produces a codec's bitstream: a vendor or OS video engine (NVENC, QSV, AMF, VideoToolbox, VAAPI, D3D12, Vulkan, Media Foundation) or a software library (openh264, libvpx). A property of the host, discovered at runtime, never chosen by the controller.
 _Avoid_: encoder, vendor path, hardware, accelerator
 
 **Encoder**:
