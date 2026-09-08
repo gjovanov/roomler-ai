@@ -1136,6 +1136,12 @@ pub struct AgentConfig {
     /// `remote_config_enabled` is needed.
     #[serde(default)]
     pub encoder_cells_deny: Option<String>,
+    /// FR-77 P4 — pin the VAAPI render node (`ROOMLERD_VAAPI_DEVICE`,
+    /// e.g. `/dev/dri/renderD129`). Unset = the first node libva opens, in
+    /// order `/dev/dri/renderD128`…`renderD135`. Read once per process at
+    /// the first VAAPI open.
+    #[serde(default)]
+    pub vaapi_device: Option<String>,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2135,6 +2141,7 @@ pub fn test_fixture() -> AgentConfig {
         text_mod_neutralize: None,
         caps_cache: None,
         encoder_cells_deny: None,
+        vaapi_device: None,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

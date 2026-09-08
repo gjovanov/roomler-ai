@@ -305,6 +305,45 @@ service host its stderr reaches no log; the parent's verdict quotes the last
 one, which is the entry to add to `encoder_cells_deny`. `vp9_qsv:yuv444` is on
 the built-in denylist since that day; `probe_ms` is both children's cost.
 
+### VAAPI on Linux (FR-77 P4)
+
+```mermaid
+flowchart LR
+    subgraph once["once per process — vaapi::device()"]
+        P[vaapi_device pinned?] -- yes --> O
+        P -- no --> N["/dev/dri/renderD128 … 135<br/>(the ones that exist)"] --> O[av_hwdevice_ctx_create VAAPI<br/>first node libva accepts]
+    end
+    subgraph enc["per encoder open — build_encoder"]
+        F["vaapi::Frames — av_hwframe_ctx_alloc<br/>sw_format NV12 (4:2:0) or VUYX (4:4:4), pool 20"] --> C[codec context: format VAAPI,<br/>hw_frames_ctx = a ref to the pool]
+    end
+    subgraph frame["per frame — encode_sync"]
+        S[software frame: dcv BGRA→NV12/VUYX] --> U[av_hwframe_get_buffer + transfer_data<br/>+ copy_props (pts, forced I)] --> E[send_frame]
+    end
+    O --> F
+```
+
+| Piece | Where | Note |
+|---|---|---|
+| FFmpeg | the Linux vendor asset `…-minimal-vaapi.tar.xz` | `--enable-vaapi` + `h264/hevc/av1/vp9_vaapi` (14 encoders verified); a new asset NAME because the tree's load-time needs changed |
+| libva + libdrm | **bundled** — built into the vendor tree (libva 2.24.1, libdrm 2.4.134, both MIT), carried by the `.deb`'s ldd-fixpoint bundler; no `Depends` | `--enable-vaapi` makes `libva.so.2` a DT_NEEDED of libavutil, a LOAD-time need of the daemon; a `Depends: libva2` holds only where apt reaches a mirror, and the updater's offline `dpkg --install` replaces the binary before the dependency failure — a daemon that cannot start on its next restart. The bundled loader looks for drivers in the distros' `dri` dirs (`driverdir`, `LIBVA_DRIVERS_PATH` overrides) |
+| the VA driver | the host's (`Suggests: mesa-va-drivers, intel-media-va-driver` — suggests, because Mesa's drags LLVM onto headless servers) | libva's one coupling to a driver is the `__vaDriverInit_1_<minor>` lookup, which walks DOWN from the loader's minor: the newest libva loads every older driver; a driver newer than the bundle fails to load (no VAAPI cells, not a crash) until the next re-vendor |
+| the device | `vaapi::device()` — a `OnceLock` | pinned `vaapi_device` → `/dev/dri/renderD128`…`135` that exist; every encoder, probe and rebuild in the process uses the same node |
+| options | `rc_mode=VBR` on `b:v` = the cap, HRD window, `profile=rext` for HEVC 4:4:4, `async_depth=1` (tier-protected) | no `qp`/`quality` on top of the driver's VBR; a forced I picture is an IDR in `vaapi_encode` |
+| cells | `*_vaapi` after the vendor names, `hw: true` by construction | `hevc_vaapi:yuv444` and `vp9_vaapi:yuv444` on the built-in denylist until a driver proves the packed 4:4:4 open |
+
+**WSL2 has no VAAPI for a daemon, measured.** A WSL2 distro has no `/dev/dri`
+(kernel 6.6.87, FR-45 recorded the same on 2026-08-31); its GPU device is
+`/dev/dxg`, a misc-major node (10:125), and libva's DRM display refuses it
+with nothing but an `fstat` — `vainfo --display drm --device /dev/dxg` says
+"Failed to a DRM display for the given device" even with
+`LIBVA_DRIVER_NAME=d3d12` and Mesa's `d3d12_drv_video.so` installed. The
+D3D12 VA driver is reachable only through a Wayland/X11 display, which a root
+daemon on a headless host does not have (and `vainfo --display wayland` dumps
+core there anyway). So the WSL sibling is the NEGATIVE cell: the opener logs
+`no render node on this host` once and the NVENC cells stay (WSL's libcuda is
+real). The positive cells are bare-metal Linux with a render node: jupiter
+(AMD Raphael, `radeonsi`) is the fleet's.
+
 ## Capture backends
 
 Cascade (first that works wins): synthetic (CI, env-gated) → **SystemContext**

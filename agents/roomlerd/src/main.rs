@@ -2510,6 +2510,10 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         if let Some(v) = &cfg.encoder_cells_deny {
             fallbacks.insert("ENCODER_CELLS_DENY".to_string(), v.clone());
         }
+        // FR-77 P4 — the pinned VAAPI render node reaches the probe child too.
+        if let Some(v) = &cfg.vaapi_device {
+            fallbacks.insert("VAAPI_DEVICE".to_string(), v.clone());
+        }
         if !fallbacks.is_empty() {
             tracing::info!(keys = ?fallbacks.keys().collect::<Vec<_>>(),
                 "config-backed env fallbacks registered");

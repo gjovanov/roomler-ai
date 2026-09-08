@@ -61,7 +61,7 @@ release), measured 2026-09-07:
 Every wrapper on every platform is **under 1 MB** against a 35 MiB `roomlerd.exe`, a
 13.13 MB MSI and a 10.44 MiB `.deb`. The whole full library is 21.7 MB linkable, which
 reproduces the P3e finding ("23 MiB linked where the ten encoders' closure is 0.29").
-The real per-backend costs are elsewhere: a hard runtime dependency (VAAPI → `libva`),
+The real per-backend costs are elsewhere: a runtime dependency (VAAPI → `libva`, bundled since P4),
 probe fault surface, rate-control behaviour (FR-62: AMF and VideoToolbox rebuild on
 every bitrate change), and test hardware.
 
@@ -174,9 +174,11 @@ flowchart LR
 8. **Rate control gets a chroma column.** The per-codec ceiling factor table (FR-74 P1,
    `ffmpeg_maxrate_bps_scaled`) gains a chroma column, initialised to what the libvpx
    4:4:4 pump uses today, set by each cell's field test. No constant invented at the desk.
-9. **VAAPI.** `--enable-vaapi` in the Linux vendor job; `libva2` + `libva-drm2` as
-   package `Depends` (system, so it matches the host's drivers), driver packages as
-   `Recommends`; render nodes iterated in order with a config key to pin one; arm64
+9. **VAAPI.** `--enable-vaapi` in the Linux vendor job; libva + libdrm BUILT INTO the
+   vendor tree and bundled (the P4 build measured why: a `Depends: libva2` is a load-time
+   need the updater's offline `dpkg --install` cannot satisfy, and the binary is replaced
+   before the failure); the VA driver stays the host's, as `Suggests` (Mesa's drags LLVM
+   onto headless servers); render nodes iterated in order with a config key to pin one; arm64
    stays without FFmpeg. Names in the dispatch tables: `h264/hevc/av1/vp9_vaapi` after
    the vendor names.
 10. **Backends deliberately not added.** FFmpeg's `*_mf`: the native Media Foundation
@@ -335,6 +337,68 @@ flowchart LR
   alone, 200 with `MANAGE_AGENTS` → restart → `applied` + `needs_restart:
   ["encoder_cells_deny"]` → restart → 6 cells back in 3032 ms, `applied` / `noop`).
 
+### P4 — as built (#1494): VAAPI on Linux x86_64
+
+- **The vendor build gains VAAPI**: the Linux job of `vendor-ffmpeg-windows.yml`
+  configures `--enable-vaapi` with the four `*_vaapi` encoders on top of the ten vendor
+  ones, verifies fourteen names in its runtime probe, and publishes the tree as
+  **`ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz`** on the same
+  `vendored-ffmpeg-9.0.1` release — a new asset name, because the tree's load-time needs
+  changed. Rollback = drop the `-vaapi` suffix in `release-agent.yml`'s download pattern.
+- **libva and libdrm are BUNDLED, the VA driver is the host's** — a correction to
+  decision 9 as first written ("libva stays the system's, `Depends: libva2`"), made on the
+  measurements of the build day. `--enable-vaapi` makes `libva.so.2` a DT_NEEDED of
+  libavutil, i.e. a LOAD-time requirement of the daemon binary; a `Depends` satisfies it
+  only where apt reaches a mirror, and the updater's offline fallback is `dpkg --install`
+  (`updater.rs::linux_install_candidates`), which replaces the binary BEFORE the
+  dependency failure — the host runs on the old inode until its next restart and then
+  cannot start its daemon at all (the class the caps-probe and `/etc/roomler` entries in
+  `CLAUDE.md` describe: a freeze, not an error; jupiter and zeus lacked `libva-drm2`,
+  a stock 24.04 server lacks both). The reason decision 9 gave for the system's libva was
+  a conflation: the thing that must match the host's kernel is the VA **driver**
+  (`iHD` / `radeonsi` / `nouveau`), and libva is only the dispatcher that dlopens it; its
+  one coupling to a driver is the `__vaDriverInit_1_<minor>` lookup, which walks DOWN
+  from the loader's own minor — so the NEWEST libva loads every driver built against an
+  older one, and a driver built against a newer libva than the bundle fails to load (no
+  VAAPI cells, not a crash) until the next re-vendor. The vendor job therefore builds
+  libdrm 2.4.134 + libva 2.24.1 (both MIT) into the FFmpeg prefix with
+  `driverdir=/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri` (the loader
+  splits on `:`; the default would point INTO the prefix), asserts that libva /
+  libva-drm / libdrm resolve from the tree and that the loader names the multiarch dri
+  dir, and the `.deb`'s ldd-fixpoint bundler carries the three like any vendored lib —
+  the stock-24.04 load check installs NO libva and asserts the three files are in the
+  bundle. Driver packages are `Suggests`, not `Recommends`: apt installs recommends by
+  default, and `mesa-va-drivers` drags `libgallium` + LLVM (~100 MB) onto every headless
+  server on the next agent update.
+- **The pump owns the hardware contexts** (`encode/ffmpeg/vaapi.rs`): ffmpeg-next 9 wraps
+  none of `av_hwdevice_ctx_create` / `av_hwframe_ctx_*` / `av_hwframe_transfer_data`, so
+  the raw `ffmpeg_sys_next` calls live in one file. The device opens ONCE per process
+  (`vaapi::device()`, a `OnceLock`) on the first candidate libva accepts — the pinned
+  `vaapi_device` config key, then `/dev/dri/renderD128`…`135` that exist. `/dev/dxg` was
+  in that list as written and is NOT a candidate: WSL2 has no `/dev/dri` (kernel 6.6.87;
+  FR-45 recorded the same on 2026-08-31, which this phase's reconnaissance should have
+  read), `/dev/dxg` is a misc-major node (10:125), and libva's DRM display refuses it
+  with nothing but an `fstat` — `vainfo --display drm --device /dev/dxg` prints "Failed
+  to a DRM display for the given device" with `LIBVA_DRIVER_NAME=d3d12` and Mesa's
+  `d3d12_drv_video.so` installed; the D3D12 VA driver is reachable only through a
+  Wayland/X11 display, which a root daemon does not have. WSL is the negative cell. Every
+  encoder gets its own frame pool (`vaapi::Frames`, `sw_format` NV12 or packed VUYX for
+  4:4:4, pool 20) whose ref is handed to the codec context before `open`; each software
+  frame the pump built is uploaded (`av_hwframe_get_buffer` + `av_hwframe_transfer_data`
+  + `av_frame_copy_props`, so the pts and the forced-I type ride along) and the hardware
+  frame is what `send_frame` gets. `build_encoder` returns the pool with the encoder;
+  a rebuild carries it; a swap replaces it.
+- **The names close every cascade** (`*_vaapi` after the vendor names, so an Intel box with
+  both QSV and iHD keeps its vendor path first), VAAPI is hardware by construction
+  (`hw: true`), and the cells stay probe-proven: `hevc_vaapi:yuv444` was on the denylist
+  from P1, **`vp9_vaapi:yuv444` joins it** — the VUYX form on VAAPI is as unproven as it was
+  on QSV, and CORPLAP-3 showed what an unproven packed-4:4:4 open can do to a runtime.
+- **Options**: `rc_mode=VBR` anchored on `b:v` = the cap with the HRD window (no `qp` /
+  `quality` on top — the driver's VBR owns quality, the governor the ceiling), `profile=rext`
+  for HEVC 4:4:4, `async_depth=1` in the tier-protected group. Forced keyframes need no
+  twin of `forced-idr`: `vaapi_encode` turns a forced I picture into an IDR.
+- **arm64 stays without FFmpeg**, unchanged.
+
 ## Phases
 
 | # | Phase | Kill switch | Status |
@@ -343,7 +407,7 @@ flowchart LR
 | P1 | `video_cells` + the matrix probe + verified `hw` + probe duration in the hello; server passthrough | legacy fields stay filled; a viewer ignoring the field sees today | **shipped** #1480 → `agent-v0.4.83`, **field-verified 2026-09-07** — result on [#1470](https://github.com/gjovanov/roomler-ai/issues/1470) |
 | P2 | Picker: codec × chroma dropdowns, i18n, Auto rules, remembered trial failures, the shared derivation | ships with P1 | **shipped** with P1 (viewer `hosted-20260907-602396d`), **field-verified 2026-09-07** |
 | P3 | **P3a** the probe cache · the `ProbeReport` envelope (the lost vp9_qsv IDR verdict) · `encoder_cells_deny` config key + remote-config push · the chroma column · `cells.rs`; **P3b** the cells: VP9 4:4:4 hardware (QSV/VAAPI profile 1, VUYX), H.264 4:4:4 (NVENC + software decode), HEVC 4:4:4 on QSV/VAAPI behind the denylist | the cell denylist; `caps_cache = false` | **P3a + P3b shipped** `agent-v0.4.84` #1488 #1489 — the cache and the push **field-verified 2026-09-08**; the roll found the one-child cost on CORPLAP-3 (a faulting `vp9_qsv` 4:4:4 open took the whole matrix) ⇒ **P3c** #1491: the two-child probe, `vp9_qsv:yuv444` default-denied; the cell field tests (H.264 4:4:4 on the dev box, VP9 and HEVC 4:4:4 on QSV) follow 0.4.85 |
-| P4 | VAAPI on Linux x86_64 | `ROOMLERD_USE_FFMPEG=0` / the denylist | — |
+| P4 | VAAPI on Linux x86_64 | `ROOMLERD_USE_FFMPEG=0` / the denylist / `vaapi_device` | **built** #1494 — WSL measured as the NEGATIVE cell (no `/dev/dri`; libva refuses `/dev/dxg`); the positive cell is jupiter (AMD Raphael, `radeonsi`, `renderD128`) after the roll; Intel (iHD) has no fleet host yet |
 | P5 | `docs/encoders.md` rewritten with diagrams (the cell resolution, the probe lifecycle); stale "macOS ships no FFmpeg" lines corrected in `CLAUDE.md`, `THIRD-PARTY-NOTICES.md`, `docs/lgpl-relink.md`; `docs/README.md` row | — | — |
 | next | FR for D3D12 video encode (Windows) + Vulkan video encode (Linux/Windows) | — | — |
 
@@ -408,3 +472,4 @@ multi-GPU adapter selection for Windows backends (unchanged).
 | 2026-09-08 | dev box, the P3c branch built natively | P3c | **The two-child probe.** Cache cleared: `cache miss` → base child → **`4:4:4 phase reported elapsed_ms=1313 tried=["hevc_nvenc","h264_nvenc"] opened=["hevc_nvenc","h264_nvenc"]`** → `child reported elapsed_ms=4541 … cells=8` (the same matrix as the one-child probe, both 4:4:4 cells merged in) → cached; the next start hit the cache in < 1 s. An Intel host with the default denylist has no 4:4:4 candidate and runs a single phase |
 | 2026-09-08 | release | P3c | `agent-v0.4.85` (bump #1492 → `26c050cf`; release run 34172553308, 28 assets) — the two-child probe and `vp9_qsv:yuv444` default-denied reach the fleet |
 | 2026-09-08 | dev box · CORPLAP-3 · MacBook, server record after the 0.4.85 roll | P3c | Dev box **8 cells / 5200 ms** (base + 4:4:4 phase; `hevc/nvenc` + `h264/nvenc` both 4:2:0+4:4:4, `hevc_chroma` yuv420+yuv444) — stored, `probe_cached: false` on the first start of the build. CORPLAP-3 **6 cells / 5710 ms, hardware back BY DEFAULT** (`vp9/qsv` `av1/qsv` `h264/qsv` hw + `h264/mf` `h264/openh264` `vp9/libvpx` 4:2:0+4:4:4): with `vp9_qsv:yuv444` on the built-in list there is no 4:4:4 candidate and the probe ran a single phase; the pushed denylist (revision 1) is now redundant and reports `noop`. MacBook **4 cells / 112 ms**, no cache by design. Still owed: the operator-judged Notepad++ scroll on the H.264 4:4:4 cell; the QSV 4:4:4 cells stay denied until a driver survives the VUYX open |
+| 2026-09-08 | the dev box's WSL2 (Ubuntu 24.04, kernel 6.6.87, libva 2.20, Mesa 25.2.8 with `d3d12_drv_video.so`), the P4 branch built against the first `-vaapi` tree | P4 | **WSL2 is the NEGATIVE cell, and the first P4 design was wrong twice.** (1) The probe opened `/dev/dxg` as a DRM device and got `AVERROR_EXTERNAL` — libva's `vaGetDisplayDRM` returned NULL: `/dev/dxg` is misc-major (10:125), not DRM-major, and `vainfo --display drm --device /dev/dxg` refuses it with only an `fstat` (no ioctl), `LIBVA_DRIVER_NAME=d3d12` or not; `--display x11` has no auth from a service context and `--display wayland` dumps core. There is no `/dev/dri` in WSL2 (FR-45 recorded it 2026-08-31). `/dev/dxg` is out of the candidates; the opener logs `no render node on this host` once; the NVENC cells (`hevc/av1/h264_nvenc`) are unaffected. (2) The fleet survey for a positive cell found that jupiter and zeus (AMD Raphael iGPU, `renderD128`, `mesa-va-drivers` already installed) lack `libva-drm2`, and that the updater's offline fallback is `dpkg --install` — so the as-written `Depends: libva2, libva-drm2` would have left an offline host with a daemon that cannot load `libva.so.2` after its next restart. Corrected before any release: libva 2.24.1 + libdrm 2.4.134 are built into the vendor tree and bundled; drivers are `Suggests` (Mesa's drags LLVM). mars (no `/dev/dri`, an SM750) is a second negative cell. **Re-proven against the refreshed tree** (vendor run 34197700870): the daemon's transitive needs are `libavcodec.so.63`, `libavutil.so.61`, `libva.so.2`, `libva-drm.so.2`, `libdrm.so.2` — all from the tree; the bundled loader's driver dir is the distro list; `vaapi: no render node on this host` once; `hevc/av1/h264_nvenc` 4:2:0 + the 4:4:4 phase unchanged, `probe_ms` 2005 |

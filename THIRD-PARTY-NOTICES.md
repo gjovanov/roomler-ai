@@ -148,6 +148,9 @@ its **upstream licence, unmodified**, and is excluded from our SPDX header sweep
 | russh | Apache-2.0 | Roomler SSH server |
 | Wintun | third-party binary | redistributed unmodified, original signature preserved |
 | Microsoft VC++ runtime | Microsoft redistributable | shipped per redistribution terms, original signatures preserved |
+| libva + libdrm | MIT | bundled in the Linux `.deb` next to the vendored FFmpeg (FR-77 P4): the VA-API dispatcher the `*_vaapi` encoders need at load time; the VA driver itself is the host's and never redistributed |
+| Intel oneVPL dispatcher (libvpl) | MIT | bundled in the Linux `.deb` (the QSV encoders' dispatcher; the runtime is the host's) |
+| libvpx | BSD-3-Clause | the VP9 4:4:4 software encoder; bundled in the Linux `.deb`, dynamically linked elsewhere |
 
 ---
 

@@ -803,7 +803,12 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "encoder_cells_deny",
         "string",
-        "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444); `none` = deny nothing. Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
+        "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444); `none` = deny nothing. Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
+    ),
+    (
+        "vaapi_device",
+        "string",
+        "FR-77 P4 - pin the VAAPI render node the Linux daemon opens (e.g. /dev/dri/renderD129). Empty = the first node libva accepts, /dev/dri/renderD128..135 in order. Env: ROOMLERD_VAAPI_DEVICE. Restart required.",
     ),
     (
         "forward_acl",
@@ -1010,6 +1015,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
         "caps_cache" => cfg.caps_cache.map(fmt_bool),
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
+        "vaapi_device" => cfg.vaapi_device.clone(),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -1454,6 +1460,12 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "relay_probe" => cfg.relay_probe = parse_tribool(value)?,
         "text_mod_neutralize" => cfg.text_mod_neutralize = parse_tribool(value)?,
         "caps_cache" => cfg.caps_cache = parse_tribool(value)?,
+        "vaapi_device" => {
+            cfg.vaapi_device = value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }
         "encoder_cells_deny" => {
             cfg.encoder_cells_deny = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
