@@ -71,7 +71,7 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
    IDR is measured with FR-62's `encoder-smoke --ladder` before a cell leaves the
    denylist, never assumed.
 
-## P0 + P1 — as built (#PR78)
+## P0 + P1 — as built (#1506)
 
 - **The vendor trees.** Windows: the vcpkg overlay port takes the port's own `vulkan`
   feature (vcpkg's `vulkan-headers` 1.4.357 ≥ the 1.4.317 `av1_vulkan` needs), re-states
@@ -120,8 +120,8 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
 
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
-| P0 | Vendor builds with `--enable-d3d12va` (Windows) and `--enable-vulkan` (Windows + Linux); the runtime probe asserts the new names; new asset names | the asset pattern in `release-agent.yml` | **built** #PR78 (vendor run 34217171639): Windows `…-minimal-d3d12-vulkan.zip` (16 encoder symbols, no `vulkan-1.lib` / `d3d12.lib` directive in `avutil.lib`), Linux `…-minimal-vaapi-vulkan.tar.xz` (17 encoders in the runtime probe, no `libvulkan` DT_NEEDED, Vulkan-Headers 1.4.362 in the tree) |
-| P1 | The hardware-frame module generalised over the device type; D3D12 and Vulkan device + pool + upload; `encoder-smoke` real bytes on the dev box (NVIDIA, both), CORPLAP-3 (Intel D3D12) and jupiter (RADV Vulkan) | `ROOMLERD_USE_FFMPEG=0` / the denylist | **built** #PR78 — `encode/ffmpeg/hwframes.rs` (`HwKind::{Vaapi, D3d12, Vulkan}`, one device per kind, one `Frames` shape); the cascade tables close `… → vaapi → d3d12va → vulkan`; `VideoBackend::{D3d12, Vulkan}`; `hevc_vulkan:yuv444` denied; `d3d12_adapter` / `vulkan_device` keys; field reads pending the roll |
+| P0 | Vendor builds with `--enable-d3d12va` (Windows) and `--enable-vulkan` (Windows + Linux); the runtime probe asserts the new names; new asset names | the asset pattern in `release-agent.yml` | **built** #1506 (vendor run 34217171639): Windows `…-minimal-d3d12-vulkan.zip` (16 encoder symbols, no `vulkan-1.lib` / `d3d12.lib` directive in `avutil.lib`), Linux `…-minimal-vaapi-vulkan.tar.xz` (17 encoders in the runtime probe, no `libvulkan` DT_NEEDED, Vulkan-Headers 1.4.362 in the tree) |
+| P1 | The hardware-frame module generalised over the device type; D3D12 and Vulkan device + pool + upload; `encoder-smoke` real bytes on the dev box (NVIDIA, both), CORPLAP-3 (Intel D3D12) and jupiter (RADV Vulkan) | `ROOMLERD_USE_FFMPEG=0` / the denylist | **built** #1506 — `encode/ffmpeg/hwframes.rs` (`HwKind::{Vaapi, D3d12, Vulkan}`, one device per kind, one `Frames` shape); the cascade tables close `… → vaapi → d3d12va → vulkan`; `VideoBackend::{D3d12, Vulkan}`; `hevc_vulkan:yuv444` denied; `d3d12_adapter` / `vulkan_device` keys; field reads pending the roll |
 | P2 | Cells, cascade positions, the probe's 4:4:4 candidates for `hevc/av1_vulkan`, the FR-62 ladder read per cell | the denylist | — |
 | P3 | Field: sessions on each backend from the viewer, the operator-judged text scroll on the 4:4:4 cells that open | — | — |
 | P4 | `docs/encoders.md` (the tables and the cascade diagram), `docs/README.md` row | — | — |
