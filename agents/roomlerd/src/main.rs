@@ -2510,9 +2510,16 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
         if let Some(v) = &cfg.encoder_cells_deny {
             fallbacks.insert("ENCODER_CELLS_DENY".to_string(), v.clone());
         }
-        // FR-77 P4 — the pinned VAAPI render node reaches the probe child too.
+        // FR-77 P4 / FR-78 P1 — the pinned hardware-frame devices reach the
+        // probe child too.
         if let Some(v) = &cfg.vaapi_device {
             fallbacks.insert("VAAPI_DEVICE".to_string(), v.clone());
+        }
+        if let Some(v) = &cfg.d3d12_adapter {
+            fallbacks.insert("D3D12_ADAPTER".to_string(), v.clone());
+        }
+        if let Some(v) = &cfg.vulkan_device {
+            fallbacks.insert("VULKAN_DEVICE".to_string(), v.clone());
         }
         if !fallbacks.is_empty() {
             tracing::info!(keys = ?fallbacks.keys().collect::<Vec<_>>(),

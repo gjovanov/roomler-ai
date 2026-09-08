@@ -29,7 +29,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context as _, Result, anyhow};
 use ffmpeg_next::{codec, format, frame, util};
 
-use super::vaapi;
+use super::hwframes;
 
 use crate::capture::{DirtyRect, Frame, PixelFormat};
 use crate::encode::{EncodedPacket, VideoEncoder};
@@ -100,6 +100,8 @@ const HEVC_ENCODER_NAMES: &[&str] = &[
     "hevc_amf",
     "hevc_videotoolbox",
     "hevc_vaapi",
+    "hevc_d3d12va",
+    "hevc_vulkan",
 ];
 
 /// rc.83 — Codec dispatch order for VP9. Intel oneVPL only — NVIDIA
@@ -144,6 +146,8 @@ const AV1_ENCODER_NAMES: &[&str] = &[
     "av1_amf",
     "av1_videotoolbox",
     "av1_vaapi",
+    "av1_d3d12va",
+    "av1_vulkan",
 ];
 
 /// P2 (Parsec-class plan) — Codec dispatch order for H.264 over the
@@ -165,6 +169,8 @@ const H264_ENCODER_NAMES: &[&str] = &[
     "h264_amf",
     "h264_videotoolbox",
     "h264_vaapi",
+    "h264_d3d12va",
+    "h264_vulkan",
 ];
 
 /// rc.86 — constant-quality target (lower = sharper, more bits).
@@ -447,6 +453,45 @@ fn encoder_options(
         if let Some(v) = lowlat_knob("FFMPEG_VAAPI_ASYNC_DEPTH", "1") {
             lowlat.push(("async_depth".into(), v));
         }
+    } else if name.ends_with("_d3d12va") {
+        // FR-78 P1 — D3D12 video encode (Windows, the graphics driver's own
+        // encode DDI). Same rate-control shape as VAAPI: `rc_mode=VBR` on
+        // `b:v` = the cap with the HRD window, no `qp` on top — the d3d12va
+        // constants are UPPERCASE like VAAPI's (`vbr` reads as an undefined
+        // constant and drops the whole tier; measured on the dev box).
+        // FFmpeg's d3d12va encoders default to `bf=2`: two B-frames of
+        // reordering delay, which a remote desktop cannot carry — every
+        // frame is a P-frame here, as on every other backend.
+        base.push(("rc_mode".into(), "VBR".into()));
+        base.push(("maxrate".into(), cap.clone()));
+        base.push(("bufsize".into(), buf.clone()));
+        base.push(("bf".into(), "0".into()));
+        if let Some(v) = lowlat_knob("FFMPEG_D3D12_ASYNC_DEPTH", "1") {
+            lowlat.push(("async_depth".into(), v));
+        }
+    } else if name.ends_with("_vulkan") {
+        // FR-78 P1 — Vulkan video encode (Linux + Windows, whichever ICD
+        // the loader finds). `rc_mode=vbr` on the cap with the HRD window;
+        // the Vulkan tuning / usage hints are the closest thing this API has
+        // to a low-latency preset, so they sit in the tier-protected group
+        // with `async_depth`, where a driver that rejects them costs only
+        // the knob, never the open. No B-frames, as above.
+        base.push(("rc_mode".into(), "vbr".into()));
+        base.push(("maxrate".into(), cap.clone()));
+        base.push(("bufsize".into(), buf.clone()));
+        base.push(("bf".into(), "0".into()));
+        if chroma444 && name.starts_with("hevc") {
+            base.push(("profile".into(), "rext".into()));
+        }
+        if let Some(v) = lowlat_knob("FFMPEG_VULKAN_TUNE", "ull") {
+            lowlat.push(("tune".into(), v));
+        }
+        if let Some(v) = lowlat_knob("FFMPEG_VULKAN_USAGE", "stream") {
+            lowlat.push(("usage".into(), v));
+        }
+        if let Some(v) = lowlat_knob("FFMPEG_VULKAN_ASYNC_DEPTH", "1") {
+            lowlat.push(("async_depth".into(), v));
+        }
     } else if name.contains("videotoolbox") {
         // Apple VideoToolbox (macOS). This branch exists because the chain
         // above has NO `else`: without it a `*_videotoolbox` name reached the
@@ -561,7 +606,7 @@ pub struct FfmpegEncoder {
     packed: Vec<u8>,
     /// FR-77 P4 — the VAAPI frame pool of a `*_vaapi` encoder (`None` for
     /// every other backend); replaced together with the encoder on a rebuild.
-    vaapi: Option<vaapi::Frames>,
+    hw: Option<hwframes::Frames>,
 
     /// Target fps this session runs at — threaded from the DC pump's
     /// `target_fps` (Phase B). Reused on the QSV/AMF bitrate REBUILD so the
@@ -1111,7 +1156,7 @@ impl FfmpegEncoder {
     fn new_vp9_qsv_probe(width: u32, height: u32, low_power: bool, gop: i32) -> Result<Self> {
         ffmpeg_next::init().context("ffmpeg_next::init failed")?;
         let cq = ffmpeg_cq();
-        let (encoder, vaapi) = Self::build_encoder(
+        let (encoder, hw) = Self::build_encoder(
             "vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop, false, false,
         )?;
         let plane_pixels = (width as usize) * (height as usize);
@@ -1128,7 +1173,7 @@ impl FfmpegEncoder {
             chroma444: false,
             packed444: false,
             packed: Vec::new(),
-            vaapi,
+            hw,
             fps: 30,
             cq,
             maxrate_bps: 3_000_000,
@@ -1288,7 +1333,7 @@ impl FfmpegEncoder {
                 chroma444,
                 constrained,
             ) {
-                Ok((encoder, vaapi)) => {
+                Ok((encoder, hw)) => {
                     tracing::info!(
                         encoder = name,
                         width,
@@ -1323,7 +1368,7 @@ impl FfmpegEncoder {
                         chroma444,
                         packed444: chroma444 && packed444_name(name),
                         packed: Vec::new(),
-                        vaapi,
+                        hw,
                         fps,
                         cq,
                         maxrate_bps,
@@ -1369,27 +1414,26 @@ impl FfmpegEncoder {
         qsv_gop: i32,
         chroma444: bool,
         constrained: bool,
-    ) -> Result<(codec::encoder::Video, Option<vaapi::Frames>)> {
+    ) -> Result<(codec::encoder::Video, Option<hwframes::Frames>)> {
         let codec = codec::encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("ffmpeg encoder not registered: {}", name))?;
 
-        // FR-77 P4 — a `*_vaapi` encoder takes HARDWARE frames: open the
-        // process-wide device and a frame pool in the software format the
-        // pump produces (NV12, or packed VUYX for 4:4:4). No device on this
-        // host = this name fails in one line and the cascade moves on.
-        let vaapi_frames = if is_vaapi(name) {
-            let dev =
-                vaapi::device().ok_or_else(|| anyhow!("{name}: no VAAPI device on this host"))?;
-            Some(vaapi::Frames::new(
-                dev,
-                vaapi::sw_format(chroma444),
-                width,
-                height,
-            )?)
-        } else {
-            None
-        };
+        let (base, lowlat, opt_summary) =
+            encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444, constrained);
 
+        // FR-77 P4 / FR-78 P1 — a `*_vaapi` / `*_d3d12va` / `*_vulkan`
+        // encoder takes HARDWARE frames from a pool on one of the kind's
+        // devices, and which device is decided by the OPEN: on a two-GPU
+        // laptop the loader's device 0 is the iGPU, which may lack the
+        // codec (no AV1 on an RDNA2 iGPU) or the video-encode queue
+        // altogether (measured on the dev box: Vulkan device 0 had no
+        // `VK_KHR_video_encode_queue`, the RTX did). So the whole
+        // configure-and-open below runs once per candidate device until one
+        // succeeds, and the winner is remembered for the next open.
+        let open_with = |hw_frames: Option<hwframes::Frames>| -> Result<(
+            codec::encoder::Video,
+            Option<hwframes::Frames>,
+        )> {
         // rc.86 — configure an unopened encoder. Factored into a closure
         // so we can rebuild it for the fallback path (open_*_with consumes
         // the encoder, so a failed open can't be retried on the same one).
@@ -1404,14 +1448,18 @@ impl FfmpegEncoder {
             let mut enc = ctx.encoder().video().context("encoder().video() failed")?;
             enc.set_width(width);
             enc.set_height(height);
-            if let Some(frames) = &vaapi_frames {
-                // FR-77 P4 — the encoder sees VAAPI surfaces; the pool's
-                // sw_format carries the real layout. A fresh ref per open
-                // attempt: a rejected context frees the one it was given.
-                enc.set_format(format::Pixel::VAAPI);
+            if let Some(frames) = &hw_frames {
+                // FR-77 P4 / FR-78 P1 — the encoder sees the kind's hardware
+                // surfaces (VAAPI / D3D12 / Vulkan); the pool's sw_format
+                // carries the real layout. A fresh ref per open attempt: a
+                // rejected context frees the one it was given. The pixel
+                // format goes in raw — ffmpeg-next's `Pixel` enum has no
+                // D3D12 variant.
+                let kind = hwframes::HwKind::of(name).expect("hw_frames exist only for a kind");
                 // SAFETY: `enc` is an unopened, exclusively owned context;
                 // `new_ref` hands over a reference FFmpeg unrefs on free.
                 unsafe {
+                    (*enc.as_mut_ptr()).pix_fmt = kind.pixel();
                     (*enc.as_mut_ptr()).hw_frames_ctx = frames.new_ref();
                 }
             } else {
@@ -1452,9 +1500,6 @@ impl FfmpegEncoder {
             enc.set_max_b_frames(0); // low-latency: no B-frames
             Ok(enc)
         };
-
-        let (base, lowlat, opt_summary) =
-            encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444, constrained);
 
         // TIERED open. The encoder's option dict is ALL-OR-NOTHING: if the
         // driver rejects any single private option, the WHOLE dict is
@@ -1519,7 +1564,17 @@ impl FfmpegEncoder {
                 }
             }
         };
-        Ok((opened, vaapi_frames))
+        Ok((opened, hw_frames))
+        };
+
+        match hwframes::HwKind::of(name) {
+            Some(kind) => hwframes::open_on_some_device(kind, |dev| {
+                let frames =
+                    hwframes::Frames::new(dev, kind, kind.sw_format(chroma444), width, height)?;
+                open_with(Some(frames))
+            }),
+            None => open_with(None),
+        }
     }
 
     fn convert_bgra(&mut self, frame: &Frame) -> Result<()> {
@@ -1875,7 +1930,7 @@ pub struct RebuildSpec {
 pub struct RebuiltEncoder {
     spec: RebuildSpec,
     inner: codec::encoder::Video,
-    vaapi: Option<vaapi::Frames>,
+    hw: Option<hwframes::Frames>,
 }
 
 impl RebuiltEncoder {
@@ -1975,7 +2030,7 @@ impl FfmpegEncoder {
     /// with).
     pub(crate) fn open_rebuilt(spec: RebuildSpec) -> Result<RebuiltEncoder> {
         let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
-        let (inner, vaapi) = Self::build_encoder(
+        let (inner, hw) = Self::build_encoder(
             spec.name,
             spec.width,
             spec.height,
@@ -1987,7 +2042,7 @@ impl FfmpegEncoder {
             spec.chroma444,
             spec.constrained,
         )?;
-        Ok(RebuiltEncoder { spec, inner, vaapi })
+        Ok(RebuiltEncoder { spec, inner, hw })
     }
 
     /// P3 — adopt a background-opened encoder between frames. Refuses
@@ -2009,7 +2064,7 @@ impl FfmpegEncoder {
             return false;
         }
         self.encoder = rebuilt.inner;
-        self.vaapi = rebuilt.vaapi;
+        self.hw = rebuilt.hw;
         self.width = spec.width;
         self.height = spec.height;
         self.maxrate_bps = spec.maxrate_bps;
@@ -2042,7 +2097,7 @@ impl FfmpegEncoder {
         let av = self.build_av_frame(frame.monotonic_us)?;
         // FR-77 P4 — a VAAPI encoder takes the pool's hardware frame, not the
         // software one it was built from.
-        let av = match &self.vaapi {
+        let av = match &self.hw {
             Some(frames) => frames.upload(&av)?,
             None => av,
         };
@@ -2193,9 +2248,9 @@ impl VideoEncoder for FfmpegEncoder {
                     self.chroma444,
                     self.constrained,
                 ) {
-                    Ok((enc, vaapi)) => {
+                    Ok((enc, hw)) => {
                         self.encoder = enc;
-                        self.vaapi = vaapi;
+                        self.hw = hw;
                         self.maxrate_bps = target;
                         self.frame_count = 0;
                         self.force_keyframe = true;
@@ -2275,12 +2330,12 @@ fn chroma444_pixel(name: &str) -> format::Pixel {
 
 /// Backends whose 4:4:4 input is the packed VUYX layout.
 fn packed444_name(name: &str) -> bool {
-    name.contains("qsv") || name.contains("vaapi")
-}
-
-/// FR-77 P4 — the backends that take hardware frames from a VAAPI pool.
-fn is_vaapi(name: &str) -> bool {
-    name.ends_with("_vaapi")
+    // QSV takes VUYX straight from the pump; the hardware-frame kinds say
+    // for themselves (VAAPI packed, Vulkan planar, D3D12 never 4:4:4).
+    match hwframes::HwKind::of(name) {
+        Some(kind) => kind.packed444(),
+        None => name.contains("qsv"),
+    }
 }
 
 /// Interleave three full-resolution planes into VUYX — V, U, Y, X per pixel,
@@ -2432,11 +2487,13 @@ mod tests {
     /// Verify the dispatch order matches RustDesk's pattern + our docs.
     /// Locks the order so a refactor doesn't accidentally reorder.
     #[test]
-    fn av1_dispatch_order_is_nvenc_qsv_amf_videotoolbox_vaapi() {
+    fn av1_dispatch_order_is_nvenc_qsv_amf_videotoolbox_vaapi_d3d12_vulkan() {
         // rc.190 — same vendor order as HEVC (NVIDIA → Intel → AMD), with
-        // Apple last. The videotoolbox entry is expected to FAIL to open on
-        // current Macs (no AV1 encode silicon announced); it is present so
-        // the caps probe answers the question instead of a code comment.
+        // Apple after them. The videotoolbox entry is expected to FAIL to
+        // open on current Macs (no AV1 encode silicon announced); it is
+        // present so the caps probe answers the question instead of a code
+        // comment. FR-77 P4 / FR-78 P1: the vendor-neutral rungs close the
+        // table — VAAPI, then D3D12, then Vulkan.
         assert_eq!(
             AV1_ENCODER_NAMES,
             &[
@@ -2444,13 +2501,15 @@ mod tests {
                 "av1_qsv",
                 "av1_amf",
                 "av1_videotoolbox",
-                "av1_vaapi"
+                "av1_vaapi",
+                "av1_d3d12va",
+                "av1_vulkan"
             ]
         );
     }
 
     #[test]
-    fn hevc_dispatch_order_is_nvenc_qsv_amf_videotoolbox_vaapi() {
+    fn hevc_dispatch_order_is_nvenc_qsv_amf_videotoolbox_vaapi_d3d12_vulkan() {
         assert_eq!(
             HEVC_ENCODER_NAMES,
             &[
@@ -2458,13 +2517,15 @@ mod tests {
                 "hevc_qsv",
                 "hevc_amf",
                 "hevc_videotoolbox",
-                "hevc_vaapi"
+                "hevc_vaapi",
+                "hevc_d3d12va",
+                "hevc_vulkan"
             ]
         );
     }
 
     #[test]
-    fn h264_dispatch_order_is_nvenc_qsv_amf_videotoolbox_vaapi() {
+    fn h264_dispatch_order_is_nvenc_qsv_amf_videotoolbox_vaapi_d3d12_vulkan() {
         assert_eq!(
             H264_ENCODER_NAMES,
             &[
@@ -2472,30 +2533,38 @@ mod tests {
                 "h264_qsv",
                 "h264_amf",
                 "h264_videotoolbox",
-                "h264_vaapi"
+                "h264_vaapi",
+                "h264_d3d12va",
+                "h264_vulkan"
             ]
         );
     }
 
     /// The vendor encoders are appended-to, never reordered: an existing
     /// fleet must keep resolving to exactly the encoder it resolved to
-    /// before, so `*_videotoolbox` may only ever be LAST.
+    /// before, so `*_videotoolbox` and the vendor-neutral rungs may only
+    /// ever be appended, in the order they arrived.
     #[test]
-    fn videotoolbox_and_vaapi_are_appended_never_prepended() {
+    fn videotoolbox_and_the_hw_frame_rungs_are_appended_never_prepended() {
         for names in [HEVC_ENCODER_NAMES, H264_ENCODER_NAMES, AV1_ENCODER_NAMES] {
-            let vt = names
-                .iter()
-                .position(|n| n.contains("videotoolbox"))
-                .expect("every table should offer a videotoolbox rung");
+            let pos = |suffix: &str| {
+                names
+                    .iter()
+                    .position(|n| n.ends_with(suffix))
+                    .unwrap_or_else(|| panic!("every table should offer a {suffix} rung"))
+            };
+            let vt = pos("_videotoolbox");
             assert_eq!(
                 vt,
-                names.len() - 2,
-                "videotoolbox must sit right before vaapi in {names:?} — prepending it would \
-                 change dispatch for every non-Apple host in the fleet"
+                names.len() - 4,
+                "videotoolbox must sit right before the hw-frame rungs in {names:?} — \
+                 prepending it would change dispatch for every non-Apple host in the fleet"
             );
-            // FR-77 P4 — vaapi closes every table, after the vendor names.
+            // FR-77 P4 / FR-78 P1 — vaapi, then d3d12va, then vulkan close
+            // every table, after the vendor names.
+            assert!(pos("_vaapi") < pos("_d3d12va") && pos("_d3d12va") < pos("_vulkan"));
             assert!(
-                names.last().is_some_and(|l| l.ends_with("_vaapi")),
+                names.last().is_some_and(|l| l.ends_with("_vulkan")),
                 "{names:?}"
             );
         }
@@ -2752,27 +2821,71 @@ mod tests {
         assert!(s.contains("rc_mode=VBR") && !s.contains("profile"), "{s}");
     }
 
-    /// FR-77 P4 — the VAAPI names sit AFTER the vendor names in every table,
-    /// so a host with both (an Intel box with QSV and iHD) keeps its vendor
-    /// path first, and the vocabulary can split each of them.
+    /// FR-78 P1 — D3D12 and Vulkan take the same rate-control shape as
+    /// VAAPI (VBR on the cap, an HRD window, no `qp`), never B-frames (two
+    /// frames of reordering delay is FFmpeg's d3d12va default), and the
+    /// Vulkan tuning / usage hints ride the tier-protected group.
     #[test]
-    fn vaapi_names_close_every_cascade() {
+    fn d3d12_and_vulkan_options_vbr_no_bframes() {
+        let (base, lowlat, s) = encoder_options("hevc_d3d12va", 3_000_000, 22, true, false, false);
+        assert!(s.contains("rc_mode=VBR"), "{s}");
+        assert!(s.contains("maxrate=3000000"), "{s}");
+        assert!(base.iter().any(|(k, v)| k == "bf" && v == "0"), "{base:?}");
+        assert!(
+            lowlat.iter().any(|(k, v)| k == "async_depth" && v == "1"),
+            "{lowlat:?}"
+        );
+        assert!(
+            !base.iter().any(|(k, _)| k == "qp" || k == "quality"),
+            "{base:?}"
+        );
+
+        let (base, lowlat, s) = encoder_options("hevc_vulkan", 3_000_000, 22, true, true, false);
+        assert!(s.contains("rc_mode=vbr"), "{s}");
+        assert!(s.contains("profile=rext"), "{s}");
+        assert!(base.iter().any(|(k, v)| k == "bf" && v == "0"), "{base:?}");
+        assert!(
+            lowlat.iter().any(|(k, v)| k == "tune" && v == "ull"),
+            "{lowlat:?}"
+        );
+        assert!(
+            lowlat.iter().any(|(k, v)| k == "usage" && v == "stream"),
+            "{lowlat:?}"
+        );
+        let (_, _, s) = encoder_options("h264_vulkan", 3_000_000, 22, true, false, false);
+        assert!(s.contains("rc_mode=vbr") && !s.contains("profile"), "{s}");
+    }
+
+    /// FR-77 P4 / FR-78 P1 — the hardware-frame names sit AFTER the vendor
+    /// names in every table (VAAPI, then D3D12, then Vulkan), so a host with
+    /// both a vendor SDK and a vendor-neutral path keeps its vendor path
+    /// first, and the vocabulary can split each of them.
+    #[test]
+    fn hw_frame_names_close_every_cascade() {
+        use super::super::hwframes::HwKind;
         use roomler_ai_remote_control::models::{VideoBackend, VideoCodec};
-        for (codec, name) in [
-            (VideoCodec::Hevc, "hevc_vaapi"),
-            (VideoCodec::Av1, "av1_vaapi"),
-            (VideoCodec::H264, "h264_vaapi"),
-            (VideoCodec::Vp9, "vp9_vaapi"),
+        for (codec, last, kind) in [
+            (VideoCodec::Hevc, "hevc_vulkan", HwKind::Vulkan),
+            (VideoCodec::Av1, "av1_vulkan", HwKind::Vulkan),
+            (VideoCodec::H264, "h264_vulkan", HwKind::Vulkan),
+            (VideoCodec::Vp9, "vp9_vaapi", HwKind::Vaapi),
         ] {
             let names = FfmpegEncoder::cascade_names(codec);
-            assert_eq!(names.last().copied(), Some(name), "{codec:?}: {names:?}");
-            assert!(is_vaapi(name));
+            assert_eq!(names.last().copied(), Some(last), "{codec:?}: {names:?}");
+            assert_eq!(HwKind::of(last), Some(kind));
+        }
+        for (name, backend) in [
+            ("hevc_vaapi", VideoBackend::Vaapi),
+            ("h264_d3d12va", VideoBackend::D3d12),
+            ("av1_vulkan", VideoBackend::Vulkan),
+        ] {
             assert_eq!(
                 VideoBackend::from_ffmpeg_name(name).map(|(_, b)| b),
-                Some(VideoBackend::Vaapi)
+                Some(backend),
+                "{name}"
             );
+            assert_eq!(FfmpegEncoder::static_name(name), Some(name));
         }
-        assert!(!is_vaapi("hevc_nvenc") && !is_vaapi("vp9_qsv"));
-        assert_eq!(FfmpegEncoder::static_name("av1_vaapi"), Some("av1_vaapi"));
+        assert!(HwKind::of("hevc_nvenc").is_none() && HwKind::of("vp9_qsv").is_none());
     }
 }

@@ -12,7 +12,7 @@ the words below are the glossary's ([`CONTEXT.md`](../CONTEXT.md)).
 | Word | Meaning | Example |
 |---|---|---|
 | **codec** | the bitstream family | H.264 · HEVC · AV1 · VP9 |
-| **backend** | what produces it | NVENC · QSV · AMF · VideoToolbox · VAAPI · Media Foundation · openh264 · libvpx |
+| **backend** | what produces it | NVENC · QSV · AMF · VideoToolbox · VAAPI · D3D12 · Vulkan · Media Foundation · openh264 · libvpx |
 | **encoder** | codec × backend, an FFmpeg name | `hevc_nvenc`, `vp9_vaapi` |
 | **chroma format** | how much colour the bitstream keeps | 4:2:0 (`yuv420`) · 4:4:4 (`yuv444`, "crisp text") |
 | **cell** | codec × chroma format — what a session actually asks for | HEVC 4:4:4 |
@@ -68,22 +68,24 @@ open. That was decided by a measurement, not a preference — every wrapper is u
 
 | Codec | Windows | Linux x86_64 | macOS arm64 | Notes |
 |---|---|---|---|---|
-| **H.264** | MF HW MFTs → MF SW MFT · FFmpeg `h264_nvenc → h264_qsv → h264_amf` · OpenH264 | FFmpeg `h264_nvenc → h264_qsv → h264_amf → h264_vaapi` · OpenH264 | FFmpeg `h264_videotoolbox` · OpenH264 | the universal baseline; RTP or DC; 4:4:4 on NVENC (`high444p`) |
-| **HEVC** | FFmpeg `hevc_nvenc → hevc_qsv → hevc_amf` · MF HEVC | FFmpeg `… → hevc_vaapi` | FFmpeg `hevc_videotoolbox` | DC-only; 4:4:4 on NVENC (RExt), on QSV/VAAPI behind the denylist |
-| **AV1** | FFmpeg `av1_nvenc → av1_qsv → av1_amf` · MF AV1 | FFmpeg `… → av1_vaapi` | — (`av1_videotoolbox` is not in the registry on current SDKs) | DC-only; 4:2:0 only, every backend; fail-closed |
+| **H.264** | MF HW MFTs → MF SW MFT · FFmpeg `h264_nvenc → h264_qsv → h264_amf → h264_d3d12va → h264_vulkan` · OpenH264 | FFmpeg `h264_nvenc → h264_qsv → h264_amf → h264_vaapi → h264_vulkan` · OpenH264 | FFmpeg `h264_videotoolbox` · OpenH264 | the universal baseline; RTP or DC; 4:4:4 on NVENC (`high444p`) |
+| **HEVC** | FFmpeg `hevc_nvenc → hevc_qsv → hevc_amf → hevc_d3d12va → hevc_vulkan` · MF HEVC | FFmpeg `… → hevc_vaapi → hevc_vulkan` | FFmpeg `hevc_videotoolbox` | DC-only; 4:4:4 on NVENC (RExt), on QSV/VAAPI/Vulkan behind the denylist |
+| **AV1** | FFmpeg `av1_nvenc → av1_qsv → av1_amf → av1_d3d12va → av1_vulkan` · MF AV1 | FFmpeg `… → av1_vaapi → av1_vulkan` | — (`av1_videotoolbox` is not in the registry on current SDKs) | DC-only; 4:2:0 only, every backend; fail-closed |
 | **VP9** | FFmpeg `vp9_qsv` · libvpx | FFmpeg `vp9_qsv → vp9_vaapi` · libvpx | libvpx | 4:4:4 on QSV/VAAPI (profile 1, packed VUYX) behind the denylist; libvpx profile 1 is the software 4:4:4 cell everywhere |
 | **Opus (audio)** | WASAPI loopback → Opus | PulseAudio monitor → Opus | not implemented | opt-in per session; 48 kHz stereo, 20 ms |
 
 The cascade order is one table per codec in `encode/ffmpeg/encoder.rs`
 (`HEVC_ENCODER_NAMES` …): the vendor SDKs first, then `*_videotoolbox`, then
-`*_vaapi` — a name that is not in the platform's FFmpeg registry, or whose
-device is absent, fails in one line and the next rung is tried. Locked by tests
-(`vaapi_names_close_every_cascade`, `videotoolbox_and_vaapi_are_appended_never_prepended`).
+the vendor-neutral rungs `*_vaapi → *_d3d12va → *_vulkan` (FR-78) — a name that
+is not in the platform's FFmpeg registry, or whose device is absent, fails in
+one line and the next rung is tried. Locked by tests
+(`hw_frame_names_close_every_cascade`,
+`videotoolbox_and_the_hw_frame_rungs_are_appended_never_prepended`).
 
 | Platform | The vendored FFmpeg 9.0.1 (LGPL, `--disable-everything` + exactly the encoders the tables name) | Linkage |
 |---|---|---|
-| Windows x86_64 | the ten vendor encoders (`h264/hevc/av1 × nvenc/qsv/amf` + `vp9_qsv`), an overlay port over the pinned vcpkg baseline | static (`x64-windows-static-md`) — see [`lgpl-relink.md`](lgpl-relink.md) |
-| Linux x86_64 | the same ten + `h264/hevc/av1/vp9_vaapi` (fourteen), from source; **libva + libdrm built into the tree** and bundled with the libav* in the `.deb` (no `Depends` on the system's libva — why is under *VAAPI on Linux*) | shared, the agent's private lib dir via RPATH; the VA driver is the host's |
+| Windows x86_64 | the ten vendor encoders (`h264/hevc/av1 × nvenc/qsv/amf` + `vp9_qsv`) + `h264/hevc/av1_d3d12va` + `h264/hevc/av1_vulkan` (sixteen), an overlay port over the pinned vcpkg baseline; D3D12 and Vulkan are dlopen'd by FFmpeg (`d3d12.dll`, `vulkan-1.dll`), so the static tree carries no import for either | static (`x64-windows-static-md`) — see [`lgpl-relink.md`](lgpl-relink.md) |
+| Linux x86_64 | the same ten + `h264/hevc/av1/vp9_vaapi` + `h264/hevc/av1_vulkan` (seventeen), from source; **libva + libdrm built into the tree** and bundled with the libav* in the `.deb` (no `Depends` on the system's libva — why is under *Hardware frames*); `libvulkan.so.1` is dlopen'd, never a DT_NEEDED | shared, the agent's private lib dir via RPATH; the VA driver and the Vulkan ICD are the host's |
 | macOS arm64 | `h264/hevc/av1_videotoolbox` only (~1.8 MB of dylibs), built with `--disable-autodetect` so nothing Homebrew is baked in | shared dylibs in the app bundle |
 | Linux arm64 | no FFmpeg — OpenH264 + libvpx | — |
 
@@ -272,7 +274,7 @@ flowchart TB
     PROBE -->|"fail / async-required"| NEXT["next MFT / next adapter"]
     NEXT --> SWMFT["MS software MFT (default adapter)"]
     MFQ -->|"no (or MF exhausted)"| FF{"FFmpeg available?"}
-    FF -->|yes| CASC["the codec's table in order<br/>nvenc → qsv → amf → videotoolbox → vaapi"]
+    FF -->|yes| CASC["the codec's table in order<br/>nvenc → qsv → amf → videotoolbox<br/>→ vaapi → d3d12va → vulkan"]
     FF -->|no| SW
     CASC -->|none opened| SW
     SW -->|"H.264 track"| OK
@@ -345,22 +347,49 @@ the truth (`rc:video-info chroma`). The ceiling table has a chroma column:
 `rate_factor_{h264,hevc,vp9}_444` (built-in 150 % on top of the codec factor for
 a 4:4:4 cell; 4:2:0 is always 100).
 
-## VAAPI on Linux (FR-77 P4)
+## Hardware frames: VAAPI, D3D12, Vulkan (FR-77 P4, FR-78 P1)
+
+NVENC, QSV and AMF open their own device behind the encoder and take software
+frames. The three vendor-neutral backends take **hardware frames** from a pool
+bound to a device, and `encode/ffmpeg/hwframes.rs` is the one module that owns
+that for all of them — one `HwKind` per name suffix, the kind's candidate
+devices opened lazily and kept for the process, one `Frames` shape, one upload.
+**The open decides the device**: the encoder's whole configure-and-open runs
+against the preferred device first and then the rest until one succeeds, and
+the winner is remembered. Which device can run a codec is a per-codec,
+per-driver fact — on the dev box Vulkan device 0 (the iGPU) has no
+`VK_KHR_video_encode_queue` while the RTX does, and an RDNA2 iGPU opens HEVC
+but not AV1 — so only the encoder's own open can answer it:
 
 ```mermaid
 flowchart LR
-    subgraph once["once per process — vaapi::device()"]
-        P[vaapi_device pinned?] -- yes --> O
-        P -- no --> N["/dev/dri/renderD128 … 135<br/>(the ones that exist)"] --> O[av_hwdevice_ctx_create VAAPI<br/>first node libva accepts]
+    subgraph once["per kind — candidate devices, opened lazily and kept"]
+        K{HwKind::of(name)} -- "_vaapi (Linux)" --> V["pinned vaapi_device,<br/>then /dev/dri/renderD128 … 135"]
+        K -- "_d3d12va (Windows)" --> D["pinned d3d12_adapter,<br/>then DXGI adapters 0 … 3"]
+        K -- "_vulkan (both)" --> W["pinned vulkan_device (index or name),<br/>then physical devices 0 … 3"]
+        V & D & W --> O["open_on_some_device: preferred first,<br/>then the rest, until the encoder opens"]
     end
     subgraph enc["per encoder open — build_encoder"]
-        F["vaapi::Frames — av_hwframe_ctx_alloc<br/>sw_format NV12 (4:2:0) or VUYX (4:4:4), pool 20"] --> C[codec context: format VAAPI,<br/>hw_frames_ctx = a ref to the pool]
+        F["hwframes::Frames — av_hwframe_ctx_alloc<br/>format = the kind's (VAAPI / D3D12 / VULKAN)<br/>sw_format NV12, or VUYX (VAAPI 4:4:4) / yuv444p (Vulkan 4:4:4)"] --> C[codec context: pix_fmt = the kind's,<br/>hw_frames_ctx = a ref to the pool]
     end
     subgraph frame["per frame — encode_sync"]
-        S[software frame: dcv BGRA→NV12/VUYX] --> U[av_hwframe_get_buffer + transfer_data<br/>+ copy_props (pts, forced I)] --> E[send_frame]
+        S[software frame: dcv BGRA→NV12/VUYX/I444] --> U[av_hwframe_get_buffer + transfer_data<br/>+ copy_props (pts, forced I)] --> E[send_frame]
     end
     O --> F
 ```
+
+D3D12 and Vulkan cost the host nothing it does not already have: FFmpeg
+dlopens `d3d12.dll` / `vulkan-1.dll` / `libvulkan.so.1` itself, so a box without
+a Vulkan loader or a D3D12 video driver loses those cells in one line per name
+and keeps the daemon. D3D12 video encode is 4:2:0 only (NV12 / P010), so it is
+never asked for 4:4:4; Vulkan HEVC lists 4:4:4 as runtime-decided and its cell
+sits on the built-in denylist until a driver proves it. FFmpeg's d3d12va
+encoders default to two B-frames — the pump sets `bf=0` on both new backends,
+as a remote desktop cannot carry reordering delay — and the Vulkan tuning hints
+(`tune=ull`, `usage=stream`) ride the tier-protected option group so a driver
+that rejects them costs the knob, never the open.
+
+### VAAPI on Linux (FR-77 P4)
 
 | Piece | Where | Note |
 |---|---|---|
@@ -408,6 +437,8 @@ then advertised `hevc/vaapi` and `h264/vaapi` and exited normally.
 | `encoder_cells_deny` | `ROOMLERD_ENCODER_CELLS_DENY` | the built-in list | `name:chroma` cells never opened nor advertised; `none` = deny nothing; pushable through remote config (`MANAGE_AGENTS`), `needs_restart` |
 | `caps_cache` | `ROOMLERD_CAPS_CACHE` | on | the probe cache (read and write) |
 | `vaapi_device` | `ROOMLERD_VAAPI_DEVICE` | unset | pin the render node; unset = `/dev/dri/renderD128`…`135` in order |
+| `d3d12_adapter` | `ROOMLERD_D3D12_ADAPTER` | unset | pin the DXGI adapter index for D3D12 video encode (Windows); unset = adapters `0`…`3` in order |
+| `vulkan_device` | `ROOMLERD_VULKAN_DEVICE` | unset | pin the Vulkan physical device by index or name; unset = the loader's default |
 | `rate_factor_{h264,hevc,vp9}_444` | `ROOMLERD_RATE_FACTOR_<CODEC>_444` | 150 | the 4:4:4 ceiling factor (%), 50–400 |
 | — | `ROOMLERD_HW_AUTO=0` | — | `auto` becomes software-first |
 | — | `ROOMLERD_USE_FFMPEG=0` | — | no FFmpeg backends at all |

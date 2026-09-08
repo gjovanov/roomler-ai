@@ -240,6 +240,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         caps_cache: None,
         encoder_cells_deny: None,
         vaapi_device: None,
+        d3d12_adapter: None,
+        vulkan_device: None,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

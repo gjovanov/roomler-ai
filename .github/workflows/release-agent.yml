@@ -340,7 +340,7 @@ jobs:
           # FFmpeg 6.1, but `ffmpeg-next = 9.0` needs 9.x.
           gh release download vendored-ffmpeg-9.0.1 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz' \
+            --pattern 'ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz' \
             --dir /tmp/ffdl
           # P3e lever B (Linux twin): the MINIMAL from-source build — the ten
           # HW encoders + their parsers, nothing else (whole lib dir 2.5 MB
@@ -353,9 +353,10 @@ jobs:
           # bundler below carries them; no `Depends` on the system's libva,
           # which the offline `dpkg --install` fallback could not satisfy
           # without leaving a daemon that fails to load). Rollback = drop
-          # that suffix.
+          # that suffix. FR-78 P0 added `-vulkan` (three Vulkan encoders,
+          # dlopen'd — no new DT_NEEDED); rollback = drop that one.
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi-vulkan.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # BtbN's pkgconfig files hardcode the build-machine prefix; rewrite
           # it to our extract path so pkg-config emits correct -L/-I flags.
@@ -1038,10 +1039,12 @@ jobs:
           # ten HW encoders the agent dispatches (avcodec.lib 139.3 -> 12.1 MB;
           # vendor-ffmpeg-windows.yml's verify step asserts the symbol set).
           # Rollback = drop the `-minimal` suffix here; the full zip stays on
-          # the same release untouched.
+          # the same release untouched. FR-78 P0 added `-d3d12-vulkan` (six
+          # more encoders, both backends dlopen'd by FFmpeg — no new import);
+          # rollback = drop that suffix.
           gh release download vendored-ffmpeg-9.0.1 --repo "${{ github.repository }}" `
-            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal.zip*' --dir $dl
-          $zip = "$dl\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal.zip"
+            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip*' --dir $dl
+          $zip = "$dl\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip"
           $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           if ($actual -ne $expected) { Write-Host "::error::vendored FFmpeg sha256 mismatch (got $actual, want $expected)"; exit 1 }
