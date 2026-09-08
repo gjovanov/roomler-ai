@@ -260,7 +260,15 @@ flowchart LR
   50–400). No AV1 key: no AV1 encoder does 4:4:4.
 - **`cells.rs`** now holds the shared vocabulary (the 4:4:4 attempt list, the denylist,
   `names_444(codec)` = the cascade minus the denylist) so the probe's advertisement and
-  the pump's 4:4:4 cascade (P3b) can never disagree.
+  the pump's 4:4:4 cascade (P3b) can never disagree. ⚠️ **The 4:2:0 cascades did not
+  read it until 0.4.90** — FR-78 P3 (jupiter, 2026-09-08) denied `hevc_vaapi:yuv420`,
+  the probe advertised only the Vulkan cells, and a HEVC session opened `hevc_vaapi`
+  anyway: every `new_*` / `new_*_adaptive` 4:2:0 arm handed the static table to the
+  dispatcher. `names_420(codec)` (the whole cascade minus the list) now feeds them all,
+  and `new_preferred` refuses a denied name; `encoder-smoke --name` keeps bypassing the
+  list by design. The invariant the paragraph above claimed — a denied cell is never
+  opened — held for the child process and not for the daemon, which is the process the
+  kill switch exists to protect.
 
 ### P3b — as built (#1489): the cells
 
@@ -506,3 +514,4 @@ multi-GPU adapter selection for Windows backends (unchanged).
 | 2026-09-08 | release + the roll | P4b | `agent-v0.4.87` (P4b #1498, bump #1499 → `17aabc211`; release run 34204447091, 28 assets). Rolled to jupiter, zeus, mars, the WSL sibling, the dev box, CORPLAP-3 and the MacBook through the update route; the Linux four back within 5 min (ssh to mars over the overlay times out for ~4 min while mars's own daemon restarts — not a fault) |
 | 2026-09-08 | jupiter + zeus, 0.4.87 | P4 | **The positive cell.** Probe child `elapsed_ms=100`, server record **`hevc/vaapi` hw + `h264/vaapi` hw**, `codecs=["h264","h265"]`, `probe_ms=100` on both; `vp9_vaapi` / `av1_vaapi` refused by the driver (`No usable encoding entrypoint found for profile VAProfileVP9Profile0 (19)` / `VAProfileAV1Profile0 (32)` — VCN 3.1 has neither) and not advertised; no 4:4:4 phase (`hevc_vaapi:yuv444` denied, `h264_vaapi` not 4:4:4-capable). `encoder-smoke --codec hevc` PASSED again (keyframes=2, 1401 B). `dpkg -s`: `0.4.87-1`, the pre-P4 `Depends`, the two driver packages as `Suggests`, the three loader libs in the bundle, still no `libva-drm2` on the host |
 | 2026-09-08 | mars · the WSL sibling · the dev box · CORPLAP-3, 0.4.87 (server record) | P4 | mars: `openh264-sw` + `libvpx-vp9-444-sw`, 100 ms. WSL: the three NVENC cells (HEVC/H.264 with 4:4:4), 2508 ms, no VAAPI. Dev box: NVENC + AMF cells, 4327 ms — unchanged from 0.4.85. CORPLAP-3: the QSV cells, 5660 ms — unchanged. The `_vaapi` cascade tails are inert off Linux |
+| 2026-09-08 | jupiter, 0.4.88, `encoder_cells_deny = hevc_vaapi:yuv420,h264_vaapi:yuv420` + restart, then a HEVC session from the viewer (the FR-78 P3 Vulkan session read) | P3 (the denylist) | **The denylist was probe-only.** The restart re-probed (`cache miss — a ROOMLERD_* knob changed`) and the hello advertised `hevc_vulkan` + `h264_vulkan` only — the list worked where it was read. The session then ran on **`hevc_vaapi`** (`rc:video-info encoder:"hevc_vaapi"`, heartbeats `encoder="hevc_vaapi"`): the 4:2:0 session cascades never consulted the list. So a cell the device had refused to advertise was opened in the daemon's own process, where the probe's child-process protection does not reach — for a cell like `vp9_qsv:yuv444` on CORPLAP-3 (the Intel runtime dies on the open) that is a daemon crash the switch was flipped to prevent. Fixed the same day (`cells::names_420` in every 4:2:0 constructor, `new_preferred` refuses a denied name), the fix re-tested on jupiter with the same denylist: the session must land on `hevc_vulkan` |
