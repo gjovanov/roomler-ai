@@ -2549,6 +2549,29 @@ jobs:
                    --options runtime --timestamp \
                    "target/aarch64-apple-darwin/release/roomler-shim"
 
+          # The desktop companion ships in the SAME .pkg (payload/Applications),
+          # and it was sealed earlier with $SIGN_ID -- the stable SELF-SIGNED
+          # identity, `--timestamp=none`, no hardened runtime. That is correct
+          # for an unsigned-fallback build and FATAL here: Apple's notary
+          # service refuses a nested bundle on any one of those three counts,
+          # and this payload tripped all three. Re-seal it with the real
+          # identity, inside-out, BEFORE `cp -R stage/Roomler.app` runs.
+          #
+          # Field evidence (2026-09-08, the first run that ever had Apple
+          # credentials): roomlerd.app and roomler-shim were correctly
+          # Developer-ID-signed and the .pkg itself carried "Developer ID
+          # Installer: G ROX EOOD", yet notarisation still returned
+          # `status: Invalid` -- because Roomler.app inside it was self-signed.
+          find "stage/Roomler.app/Contents" -type f -name '*.dylib' -print0 2>/dev/null \
+            | while IFS= read -r -d '' nested; do
+                codesign --force --sign "Developer ID Application" \
+                         --options runtime --timestamp "$nested"
+              done
+          codesign --force --sign "Developer ID Application" \
+                   --options runtime --timestamp \
+                   "stage/Roomler.app"
+          codesign --verify --strict "stage/Roomler.app"
+
       - name: Build component + product pkg
         id: pkg
         shell: bash
@@ -2650,14 +2673,37 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.appstoreconnect/private_keys
-          echo "$APPLE_API_KEY_P8_BASE64" | base64 -d \
-            > "$HOME/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          KEY="$HOME/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 -d > "$KEY"
 
-          xcrun notarytool submit "${{ steps.pkg.outputs.artifact }}" \
-            --key "$HOME/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8" \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID" \
-            --wait
+          # Capture the submission id, because `--wait` prints "status: Invalid"
+          # and NOT ONE WORD about why. The per-file reasons live only in the
+          # notarisation log, which is reachable solely by that id -- so without
+          # this, a refusal is unfalsifiable: you know Apple said no, and cannot
+          # tell which of a dozen causes it was. Measured 2026-09-08: the first
+          # run that ever had credentials failed here, and diagnosing it needed
+          # the workflow source rather than the log, which is the wrong way round.
+          set +e
+          out=$(xcrun notarytool submit "${{ steps.pkg.outputs.artifact }}" \
+                  --key "$KEY" \
+                  --key-id "$APPLE_API_KEY_ID" \
+                  --issuer "$APPLE_API_ISSUER_ID" \
+                  --wait 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+
+          if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -q 'status: Accepted'; then
+            sub=$(printf '%s\n' "$out" | awk '/^ *id: /{print $2; exit}')
+            echo "::error::notarisation refused -- per-file reasons follow (submission ${sub:-unknown})"
+            if [ -n "$sub" ]; then
+              xcrun notarytool log "$sub" \
+                --key "$KEY" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER_ID" /dev/stdout || true
+            fi
+            exit 1
+          fi
 
           xcrun stapler staple "${{ steps.pkg.outputs.artifact }}"
 
