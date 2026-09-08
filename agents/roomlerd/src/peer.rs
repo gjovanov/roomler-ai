@@ -4259,10 +4259,7 @@ async fn media_pump_vp9_444_dc(
                 // here while `target_bps` shows the cut T1b will remove.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
-                transit_holds = governor.transit_holds(),
-                hard_stalls_paused = governor.hard_stalls_paused(),
-                hard_stalls_confirmed = governor.hard_stalls_confirmed(),
-                stall_shadowed = governor.stall_shadowed(),
+                evidence_rejected = ?governor.evidence_rejected(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
@@ -4997,6 +4994,9 @@ async fn media_pump_ffmpeg_dc(
     // FR-65 P0 — worst single loop pass in the window, and how many overran.
     let mut iter_us_max: u64 = 0;
     let mut pump_stalls: u32 = 0;
+    // FR-79 — `pump_stalls` at the last viewer window, so the window's own
+    // stalled-pass count is a delta rather than a running total.
+    let mut win_stalls_last: u32 = 0;
     let stall_watch = crate::encode::pump_stall_watch_enabled();
     let stall_warn = Duration::from_millis(crate::encode::pump_stall_warn_ms());
     // Measured at the TOP of the NEXT pass, so every `continue` path in this
@@ -6787,7 +6787,13 @@ async fn media_pump_ffmpeg_dc(
                     / 1000.0,
                 send_wait_avg_ms: sw_avg_ms,
                 frames_sent: sent_now.saturating_sub(win_sent_last) as u32,
+                // FR-79 — the gate's first condition: was the agent's own loop
+                // free this window? A pass that overran its budget means the
+                // send task waited on something this window cannot attribute
+                // to the pipe.
+                stalled_passes: pump_stalls.saturating_sub(win_stalls_last),
             });
+            win_stalls_last = pump_stalls;
             win_sent_last = sent_now;
             win_skips_last = frames_skipped_backpressure;
             win_sw_sum_last = sw_sum_now;
@@ -7545,10 +7551,7 @@ async fn media_pump_ffmpeg_dc(
                 // here while `target_bps` shows the cut T1b will remove.
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
-                transit_holds = governor.transit_holds(),
-                hard_stalls_paused = governor.hard_stalls_paused(),
-                hard_stalls_confirmed = governor.hard_stalls_confirmed(),
-                stall_shadowed = governor.stall_shadowed(),
+                evidence_rejected = ?governor.evidence_rejected(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility

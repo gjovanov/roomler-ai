@@ -633,8 +633,8 @@ pub trait RateLaw {
     fn pipe_state(&self) -> Option<super::pipe_state::PipeState> {
         None
     }
-    /// FR-71 T1b — windows the law held (`RateGovernor::transit_holds`).
-    fn transit_holds(&self) -> u32 {
+    /// FR-79 — windows the validity gate rejected (`RateGovernor::evidence_rejected`).
+    fn rejected_windows(&self) -> u32 {
         0
     }
     /// FR-70 P1 — the pump skipped a frame at the FR-59 P2 byte-budget gate
@@ -776,9 +776,13 @@ pub struct GovernorLaw {
     /// and FR-70 conclusions were taken without it).
     age_loop: super::viewer_rate::AgeLoop,
     age_cut: bool,
-    /// FR-71 T1b — hold a `TransitStalled` window (`transit_hold`).
-    transit_hold: bool,
+    /// FR-79 - run the validity gate (the shipped law). `false` is the
+    /// pre-FR-79 control arm, kept so a cell can show the difference.
+    stall_gate: bool,
+    /// Windows the gate rejected.
     holds: u32,
+    /// FR-79 - the previous window's verdict, the gate's shadow input.
+    prev_state: Option<PipeState>,
 }
 
 impl GovernorLaw {
@@ -801,7 +805,8 @@ impl GovernorLaw {
             gate_skips_window: 0,
             age_loop: super::viewer_rate::AgeLoop::new(),
             age_cut: false,
-            transit_hold: false,
+            stall_gate: true,
+            prev_state: None,
             holds: 0,
             depth: CONSTRAINED_DEPTH,
             aimd: None,
@@ -848,13 +853,14 @@ impl GovernorLaw {
         self
     }
 
-    /// FR-71 T1b — hold a `TransitStalled` window: no ramp step, no age
-    /// cut, no measurement, no prior push-back.
-    pub fn with_transit_hold(mut self, on: bool) -> Self {
-        self.transit_hold = on;
+    /// FR-79 - the validity gate: a window that is not evidence about the pipe
+    /// moves nothing (no ramp step, no age cut, no measurement, no prior
+    /// push-back). ON is the shipped law; OFF is the pre-FR-79 control arm,
+    /// which is not a configuration the daemon has.
+    pub fn with_stall_gate(mut self, on: bool) -> Self {
+        self.stall_gate = on;
         self
     }
-
     /// FR-70 P1 — the scenario's frame rate (the steady-window test in
     /// [`MeasureRule::OnPushBack`] needs it).
     pub fn with_fps(mut self, fps: u32) -> Self {
@@ -995,7 +1001,7 @@ impl RateLaw for GovernorLaw {
         self.pipe.last()
     }
 
-    fn transit_holds(&self) -> u32 {
+    fn rejected_windows(&self) -> u32 {
         self.holds
     }
 
@@ -1038,9 +1044,9 @@ impl RateLaw for GovernorLaw {
         // same signals the shipped governor holds: the M0 split (the sim's
         // viewer decodes instantly, so its share is 0), the send channel's
         // occupancy against the budget, the gate's skips and the window's
-        // worst send wait. T1a records the verdict; T1b (`transit_hold`)
-        // holds a `TransitStalled` window — no ramp step, no age cut, no
-        // measurement, no prior push-back.
+        // worst send wait. FR-79 then decides whether the window was evidence
+        // about the pipe at all — a rejected one moves nothing: no ramp step,
+        // no age cut, no measurement, no prior push-back.
         let split = (w.frames_rx > 0).then(|| super::pipe_state::SplitMs {
             sender_ms: Some(f64::from(w.sender_ms)),
             transit_ms: w.transit_ms.min(u32::from(u16::MAX)) as u16,
@@ -1057,7 +1063,14 @@ impl RateLaw for GovernorLaw {
             frames_sent: w.frames_sent,
             struggling: false,
         });
-        let hold = self.transit_hold && state == PipeState::TransitStalled;
+        let rejected = super::evidence::rejected(super::evidence::WindowFacts {
+            state,
+            prev_state: self.prev_state.replace(state),
+            // The sim has no pump passes and one carrier per scenario.
+            agent_stalled: false,
+            carrier_changed: false,
+        });
+        let hold = self.stall_gate && rejected.is_some();
         if hold {
             self.holds += 1;
         }
@@ -1425,7 +1438,7 @@ pub fn run_opts(scenario: &Scenario, law: &mut dyn RateLaw, opts: SimOptions) ->
         rows,
         gate_skips: gate_skips_total,
         rebuild_idrs: enc.rebuild_idrs,
-        holds: law.transit_holds(),
+        holds: law.rejected_windows(),
         remembered_bps: law.remembered_candidate_bps(),
     }
 }
@@ -2256,15 +2269,19 @@ mod tests {
             .unwrap_or_else(|| panic!("no windows in [{from_s},{to_s}){}", tr.render()))
     }
 
-    /// FR-71 AC3, the FAIL recorded first — the finding-4 cell with the FR-15
-    /// age loop's cut modelled and the hold OFF: the backlog windows fire the
-    /// age loop and the AIMD cuts a rate the pipe never asked for.
+    /// FR-79 AC2, the control — finding 4's cell with the FR-15 age loop's cut
+    /// modelled and the validity gate OFF, i.e. the law as it stood before
+    /// FR-71 T1b: the backlog windows fire the age loop and the AIMD cuts a
+    /// rate the pipe never asked for. The gate is unconditional in the daemon,
+    /// so this arm exists only to keep the failure on record.
     #[test]
-    fn t1c_finding_4_cuts_the_rate_with_the_hold_off() {
+    fn finding_4_cuts_the_rate_without_the_validity_gate() {
         let sc = finding4_transit_stall();
         let tr = run_shipped(
             &sc,
-            arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS).with_age_cut(true),
+            arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS)
+                .with_age_cut(true)
+                .with_stall_gate(false),
         );
         let before = target_at(&tr, 11);
         let after_min = min_target_between(&tr, 16, 22);
@@ -2276,17 +2293,18 @@ mod tests {
         assert_eq!(tr.holds, 0, "{}", tr.render());
     }
 
-    /// FR-71 AC3 — the same cell with the hold ON: no cut during or after
+    /// FR-79 AC2 — the same cell with the validity gate on (the shipped law):
+    /// no cut during or after
     /// the stall, the ramp frozen through it, the path reading clear again
     /// within the stall's own length.
     #[test]
-    fn t1b_finding_4_hold_keeps_the_rate() {
+    fn finding_4_keeps_the_rate_with_the_validity_gate() {
         let sc = finding4_transit_stall();
         let tr = run_shipped(
             &sc,
             arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS)
                 .with_age_cut(true)
-                .with_transit_hold(true),
+                .with_stall_gate(true),
         );
         let before = target_at(&tr, 11);
         let during_min = min_target_between(&tr, 12, 22);
@@ -2342,7 +2360,7 @@ mod tests {
                 &sc,
                 arm_b(FLAT_FLOOR_BPS, RELAY_CEILING_BPS)
                     .with_age_cut(true)
-                    .with_transit_hold(true),
+                    .with_stall_gate(true),
             );
             let off_t: Vec<u32> = off.rows.iter().map(|r| r.target_bps).collect();
             let on_t: Vec<u32> = on.rows.iter().map(|r| r.target_bps).collect();
