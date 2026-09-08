@@ -152,15 +152,15 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
       the vendor jobs); the Linux `.deb`'s `Depends` and bundle are unchanged (no new
       load-time library — asserted: no `libvulkan` DT_NEEDED, no `vulkan-1.lib` /
       `d3d12.lib` directive); the Windows MSI grew by 254 KB on `agent-v0.4.88`.
-- [ ] **P1** — the cells open on real silicon: the dev box advertises `hevc/h264` on
+- [x] **P1** — the cells open on real silicon: the dev box advertises `hevc/h264` on
       D3D12 and `hevc/h264/av1` on Vulkan (the RTX 5090, after the iGPU refused), and
       CORPLAP-3's Intel iGPU advertises `hevc/d3d12` — both from the probe's real open;
       a host without a Vulkan encode queue or a D3D12 video driver fails the open in one
       line and keeps its other cells (CORPLAP-3's Vulkan, WSL's software ICDs, mars).
       jupiter's RADV advertises `hevc/vulkan` + `h264/vulkan` under
-      `RADV_PERFTEST=video_encode` (a systemd drop-in). Still owed: `encoder-smoke` real
-      bytes through the new backends — the cascade picks the vendor SDK first, so the
-      smoke needs a way to name the backend (P2).
+      `RADV_PERFTEST=video_encode` (a systemd drop-in). Real bytes: `encoder-smoke --name`
+      PASSED through `hevc_d3d12va`, `h264_d3d12va`, `hevc_vulkan`, `av1_vulkan` and
+      `h264_vulkan` on the dev box (P2).
 - [ ] **P2** — the server records of the dev box, CORPLAP-3 and jupiter carry the
       new cells with `hw: true` and unchanged vendor cells; the picker offers them
       with the right reasons; a session on each cell reports its chroma in `rc:video-info`.
