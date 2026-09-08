@@ -21,58 +21,6 @@ use serde::{Deserialize, Serialize};
 /// A remembered rate older than this is ignored (and dropped on the next save).
 pub const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// Below this many bytes the opening burst says nothing about the pipe.
-pub const OPENER_MIN_BYTES: u64 = 100_000;
-/// Below this queue-wait the burst never queued — it fit the transport's own
-/// send buffer (SCTP's, on a DataChannel) and drained at whatever rate
-/// without telling us. Field 2026-08-30: a 238 KB opener with a 0 ms wait on
-/// the same coturn path that a 451 KB opener had just measured at 4.5 Mbps.
-pub const OPENER_QUEUED_MIN_US: u64 = 100_000;
-/// A burst that never queued proves only "not slower than this": grow by a
-/// bounded step per clean session instead — the next, larger opener then
-/// queues and measures.
-pub const OPENER_UNQUEUED_STEP_PCT: u64 = 150;
-
-/// FR-79 V2 — the memory target the opening burst implies, capped at `hi`.
-///
-/// A burst that **never queued** (`wait_us` under [`OPENER_QUEUED_MIN_US`])
-/// fit inside the transport's own send buffer and drained at whatever rate
-/// without telling us: it proves only "not slower than this", so the memory
-/// grows by a bounded step and the next, larger opener does the measuring.
-///
-/// A burst that **did** queue is measured the way every other window is
-/// measured — the goodput estimator's byte-weighted bytes-over-blocked-time,
-/// passed in as `measured_bps` and already gated by [`super::evidence`], so a
-/// stall cannot contribute to it. `None` there means the estimator had no
-/// confidence yet, and the honest target is then nothing at all.
-///
-/// ⚠️ Until FR-79 this divided the WHOLE burst by the LONGEST SINGLE frame's
-/// wait, which is a rate only if that frame waited for the entire burst.
-/// Measured on CORPLAP-1, 2026-09-08 (the operator's six trials): 829 KB with
-/// an 829 ms worst wait read as 8.0 Mbps and recorded 6.0 M; 1.19 MB with a
-/// 440 ms wait recorded the 8 M cap. The pipe measured 1.79–3.41 M in those
-/// same sessions. `record_session` keeps the maximum, so the memory ratcheted
-/// to the cap and the next session opened 2–4× over the relay, dropped
-/// hundreds of frames at the byte gate and had its ceiling abandoned a second
-/// in — the other half of the operator's "starts very blurred".
-pub fn opener_growth_target_bps(
-    bytes: u64,
-    wait_us: u64,
-    opener_maxrate_bps: u32,
-    measured_bps: Option<u32>,
-    hi_bps: u32,
-) -> u32 {
-    if bytes < OPENER_MIN_BYTES || hi_bps == 0 {
-        return 0;
-    }
-    let target = if wait_us < OPENER_QUEUED_MIN_US {
-        (opener_maxrate_bps as u64) * OPENER_UNQUEUED_STEP_PCT / 100
-    } else {
-        u64::from(measured_bps.unwrap_or(0))
-    };
-    target.min(hi_bps as u64) as u32
-}
-
 /// FR-79 V2 — the carrier half of the memory key.
 ///
 /// The key was the nominated pair's remote address alone, which on an overlay
@@ -120,6 +68,23 @@ pub fn memory_key(remote_addr: &str, carrier: Option<&str>) -> String {
         None => remote_addr.to_string(),
     }
 }
+
+/// FR-79 V4 — move a remembered rate toward a measurement: fast down, slow up.
+/// The two errors do not cost the same. Opening UNDER what the carrier
+/// carries costs an AIMD climb the ceiling learner shortens; opening OVER it
+/// costs a flooded opener, frames dropped at the byte gate, an abandoned
+/// ceiling and a visible stall — the operator's own report on 2026-09-08.
+/// The weights are `goodput`'s, not a second pair: one asymmetry, used inside
+/// a session and across them.
+pub fn damp(old: u32, measured: u32) -> u32 {
+    let alpha = if measured < old {
+        super::goodput::ALPHA_DOWN
+    } else {
+        super::goodput::ALPHA_UP
+    };
+    let next = f64::from(old) + alpha * (f64::from(measured) - f64::from(old));
+    next.clamp(0.0, f64::from(u32::MAX)) as u32
+}
 const FILE_NAME: &str = "rate_memory.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,51 +121,40 @@ impl RateMemory {
         );
     }
 
-    /// Record a SESSION's stable rate. An idle session's "stable rate" is
-    /// just the seed it opened at (85 % of what was remembered), so writing it
-    /// back would decay the memory by 15 % per idle session until it sits at
-    /// the nominal — measured on the first field run (3.60 → 3.06 Mbps after a
-    /// 14-s idle session). The rule: a LOWER value is only accepted when the
-    /// session saw a decrease (real evidence the pair could not carry the old
-    /// memory); otherwise the old value is kept and its timestamp refreshed.
-    /// Returns the value now on record.
+    /// FR-79 V4 — record what this session MEASURED about the carrier.
     ///
-    /// P3 — growth without drag. The opening burst is a free probe of the
-    /// pipe's burst capacity (`opener_growth_target_bps`); a session that saw no
-    /// decrease grows the memory toward it, capped at `hi`, so a pair reaches
-    /// its crisp opener in a few sessions instead of after minutes of sustained
-    /// drag (the first field runs: ≈3 learner steps per minute of drag, and the
-    /// operator's sessions last seconds). ⚠️ The learner only reports a stable
-    /// rate ABOVE the nominal, so the common short session lands here with
-    /// `stable_bps == 0` — the write-back must run on the opener evidence ALONE,
-    /// which is why the guard's Drop no longer short-circuits on `stable == 0`
-    /// (P3b, field 2026-08-30: a clean session measured 7.3 Mbps and discarded
-    /// it). A decrease from a real learner rate still lowers to it.
-    pub fn record_session(
-        &mut self,
-        peer: &str,
-        stable_bps: u32,
-        had_decrease: bool,
-        growth_target_bps: u32,
-        now_unix: u64,
-    ) -> u32 {
-        // The ceiling learner only reports a stable rate ABOVE the nominal, so a
-        // short static session — the common case — arrives here with
-        // `stable_bps == 0`. That is NOT evidence to lower anything: the memory
-        // stays at least what was remembered, and the opener still grows it.
-        // A decrease from a real learner rate (`stable_bps > 0`) is the one
-        // path allowed to lower.
-        let old = self.seed_for(peer, now_unix).unwrap_or(0);
-        let value = if had_decrease && stable_bps > 0 {
-            stable_bps
-        } else {
-            stable_bps.max(old).max(growth_target_bps)
+    /// `evidence` is the session's own measurement — the belief the validity
+    /// gate accepted (`RateGovernor::pipe_bps`), or the rate the ceiling
+    /// learner proved the pair carried. `None` (or zero) means the session
+    /// measured nothing, and then **nothing is written**: not the value, not
+    /// the timestamp, because refreshing a timestamp on no evidence keeps a
+    /// stale number alive past its TTL.
+    ///
+    /// A measurement moves the entry in EITHER direction, damped with the same
+    /// asymmetry the goodput estimator uses inside a session — believe a drop
+    /// quickly, a rise slowly. Returns the value now on record.
+    ///
+    /// ⚠️ Until FR-79 V4 this kept the **maximum** of the old value, the
+    /// learner's rate and an opener "growth target", and a lower value needed a
+    /// `had_decrease` flag to be accepted at all. That rule was a proxy for
+    /// "do not let a non-measurement lower the memory", written when the code
+    /// could not tell a measurement from a non-measurement; the gate now can,
+    /// so the proxy goes. It had two measured costs: a carrier whose capacity
+    /// moved 1.09 → 6.13 Mbps in six minutes was remembered at 6.13 (2026-09-08,
+    /// `100.65.4.2|relay:derp/tcp`), and the opener's "a burst that never
+    /// queued proves not-slower-than-this" step ratcheted to the `hi` cap on any
+    /// host whose socket absorbs the burst — every opener on CORPLAP-2 that day.
+    pub fn record_session(&mut self, peer: &str, evidence: Option<u32>, now_unix: u64) -> u32 {
+        let Some(measured) = evidence.filter(|m| *m > 0) else {
+            return self.seed_for(peer, now_unix).unwrap_or(0);
         };
-        if value == 0 {
-            // Nothing to remember (empty memory, idle session, no growth) — do
-            // not write a zero entry.
-            return 0;
-        }
+        let value = match self.seed_for(peer, now_unix) {
+            // First evidence for this pair and carrier: adopt it outright.
+            // Seeding from a constant would bias every later reading toward a
+            // number nothing measured.
+            None => measured,
+            Some(old) => damp(old, measured),
+        };
         self.record(peer, value, now_unix);
         value
     }
@@ -281,127 +235,6 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_session_never_lowers_the_memory_but_a_decrease_does() {
-        let now = 1_788_000_000u64;
-        let mut m = RateMemory::default();
-        assert_eq!(m.record_session("p", 3_598_387, false, 0, now), 3_598_387);
-        // Idle session opened at 85 % and held it: no evidence, keep the old.
-        assert_eq!(
-            m.record_session("p", 3_058_628, false, 0, now + 60),
-            3_598_387
-        );
-        assert_eq!(m.entries["p"].at_unix, now + 60, "timestamp refreshed");
-        // A session that saw a decrease may lower it.
-        assert_eq!(
-            m.record_session("p", 3_058_628, true, 0, now + 120),
-            3_058_628
-        );
-        // A higher value always replaces, decrease or not.
-        assert_eq!(
-            m.record_session("p", 4_000_000, false, 0, now + 180),
-            4_000_000
-        );
-        assert_eq!(
-            m.record_session("p", 4_100_000, true, 0, now + 240),
-            4_100_000
-        );
-    }
-
-    /// P3 — the opener grows the memory in ONE clean session, never past `hi`,
-    /// never on a session that saw a decrease, and never below what the
-    /// session itself proved.
-    #[test]
-    fn a_clean_session_grows_the_memory_from_the_opener() {
-        const HI: u32 = 8_000_000;
-        let now = 1_788_000_000u64;
-        // Field 2026-08-30, coturn path: a 451 KB opener that queued, with the
-        // estimator measuring 4.5 Mbps over the blocked sends — the target IS
-        // the measurement (FR-79 V2; before it, the whole burst over the
-        // longest single wait, which is not a rate).
-        let measured = opener_growth_target_bps(451_464, 802_000, 2_550_000, Some(4_504_000), HI);
-        assert_eq!(measured, 4_504_000);
-        let mut m = RateMemory::default();
-        assert_eq!(
-            m.record_session("p", 2_709_375, false, measured, now),
-            4_504_000
-        );
-        // Same path, next session: a 238 KB opener that never queued (0 ms —
-        // it fit SCTP's buffer) is NOT a fat pipe: a bounded ×1.5 step on the
-        // opener's own maxrate, so the next, larger opener measures.
-        let unqueued = opener_growth_target_bps(238_306, 0, 2_870_000, None, HI);
-        assert_eq!(unqueued, 4_305_000);
-        // …and it is BELOW what the pair already proved, so the memory keeps
-        // what it held: the step grows a memory, it never shrinks one.
-        assert_eq!(
-            m.record_session("p", 2_870_000, false, unqueued, now + 60),
-            4_504_000
-        );
-        // A thin pipe: the estimator measured 1.5 Mbps, below the session's own
-        // 3 Mbps — the memory does not go below what was held.
-        let thin = opener_growth_target_bps(131_000, 524_000, 3_000_000, Some(1_500_000), HI);
-        assert_eq!(thin, 1_500_000);
-        let mut t = RateMemory::default();
-        assert_eq!(
-            t.record_session("q", 3_000_000, false, thin, now),
-            3_000_000
-        );
-        // A measured fat pipe saturates at `hi`.
-        let fat = opener_growth_target_bps(2_000_000, 200_000, 3_000_000, Some(60_000_000), HI);
-        assert_eq!(fat, HI);
-        assert_eq!(t.record_session("q", 3_000_000, false, fat, now + 60), HI);
-        // A decrease in the session wins over the evidence.
-        assert_eq!(
-            t.record_session("q", 3_400_000, true, fat, now + 120),
-            3_400_000
-        );
-        // 🔑 The COMMON case: a short static session reports stable=0 (the
-        // learner never rose above the nominal). The opener evidence alone must
-        // still grow the memory — before P3b the guard's Drop discarded it.
-        let mut u = RateMemory::default();
-        assert_eq!(u.record_session("z", 5_000_000, false, 0, now), 5_000_000);
-        assert_eq!(
-            u.record_session("z", 0, false, 7_307_342, now + 60),
-            7_307_342
-        );
-        // stable=0 with NO growth keeps the memory (idle keep-alive), never zeroes it.
-        assert_eq!(u.record_session("z", 0, false, 0, now + 120), 7_307_342);
-        assert_eq!(
-            u.entries["z"].at_unix,
-            now + 120,
-            "timestamp refreshed on idle"
-        );
-        // stable=0 + a decrease flag must NOT lower a learned memory (a decrease
-        // is only real evidence when the learner had a rate above the nominal).
-        assert_eq!(u.record_session("z", 0, true, 0, now + 180), 7_307_342);
-        // An empty memory with no evidence at all records nothing (returns 0).
-        let mut e = RateMemory::default();
-        assert_eq!(e.record_session("none", 0, false, 0, now), 0);
-        assert!(!e.entries.contains_key("none"));
-        // Learning off (hi = 0): nothing to learn.
-        assert_eq!(
-            opener_growth_target_bps(451_464, 802_000, 2_550_000, Some(4_504_000), 0),
-            0
-        );
-    }
-
-    #[test]
-    fn a_small_opening_burst_is_not_evidence() {
-        assert_eq!(
-            opener_growth_target_bps(30_000, 5_000, 3_000_000, None, 8_000_000),
-            0
-        );
-        assert_eq!(
-            opener_growth_target_bps(99_999, 900_000, 3_000_000, Some(2_000_000), 8_000_000),
-            0
-        );
-        // The bounded step never passes hi either.
-        assert_eq!(
-            opener_growth_target_bps(100_000, 0, 7_000_000, None, 8_000_000),
-            8_000_000
-        );
-    }
-
-    #[test]
     fn record_replaces_and_prunes() {
         let now = 1_788_000_000u64;
         let mut m = RateMemory::default();
@@ -413,35 +246,6 @@ mod tests {
         );
         m.record("b", 3, now + 1);
         assert_eq!(m.entries["b"].stable_bps, 3);
-    }
-
-    /// FR-79 V2, the operator's 2026-09-08 trials — a burst that queued is
-    /// worth what the estimator measured, not what dividing it by one frame's
-    /// wait suggested. CORPLAP-1 16:41:51: 829 KB with an 829 ms worst wait on
-    /// a relay the same session then measured at 3.41 Mbps. The old rule
-    /// recorded 6.0 M (and 8.0 M twice more that hour), so the next session
-    /// opened at 6.8 M into a 3.4 M pipe, dropped 212 frames at the byte gate
-    /// in two seconds and had its ceiling abandoned — one half of "starts very
-    /// blurred". The other half is the same memory after a P6 abandonment
-    /// wrote back the stall's own number.
-    #[test]
-    fn a_queued_opener_is_worth_what_the_estimator_measured() {
-        const HI: u32 = 8_000_000;
-        let target = opener_growth_target_bps(829_241, 829_000, 6_800_000, Some(3_408_128), HI);
-        assert_eq!(target, 3_408_128, "the measurement, not the arithmetic");
-        // With no confidence yet the honest target is nothing: the session
-        // learns from its own windows instead.
-        assert_eq!(
-            opener_growth_target_bps(829_241, 829_000, 6_800_000, None, HI),
-            0
-        );
-        // …and the unqueued branch is untouched: a burst that never queued
-        // still proves "not slower than this" and grows by its bounded step.
-        assert_eq!(
-            opener_growth_target_bps(1_156_688, 0, 6_800_000, None, HI),
-            HI,
-            "6.8 M x 1.5, capped at hi"
-        );
     }
 
     /// FR-79 V2 — the carrier is part of the key, and a DERP day is not a
@@ -475,9 +279,7 @@ mod tests {
         let mut m = RateMemory::default();
         m.record_session(
             &memory_key("100.65.0.5", Some("direct")),
-            0,
-            false,
-            8_000_000,
+            Some(8_000_000),
             now,
         );
         assert_eq!(
@@ -488,5 +290,52 @@ mod tests {
             m.seed_for(&memory_key("100.65.0.5", Some("direct")), now),
             Some(8_000_000)
         );
+    }
+
+    /// FR-79 V4, the field series that questioned the rule — CORPLAP-1 on
+    /// `100.65.4.2|relay:derp/tcp`, five sessions inside six minutes on
+    /// 2026-09-08: 1.44, 1.09, (a session that measured nothing), 3.32, 6.13
+    /// Mbps. The MAXIMUM keeps 6.13 and opens the next session at 5.2 M into a
+    /// path that measured 1.09 M five minutes earlier; damped, the memory ends
+    /// near where that carrier actually lived.
+    #[test]
+    fn the_memory_follows_the_measurements_instead_of_their_maximum() {
+        let now = 1_788_000_000u64;
+        let key = memory_key("100.65.4.2", Some("relay:derp/tcp"));
+        let mut m = RateMemory::default();
+        // First evidence is adopted outright.
+        assert_eq!(m.record_session(&key, Some(1_440_672), now), 1_440_672);
+        // A drop is believed quickly (ALPHA_DOWN = 0.5).
+        assert_eq!(m.record_session(&key, Some(1_087_230), now + 50), 1_263_951);
+        // A session that measured nothing writes nothing at all — not the
+        // value, not the timestamp.
+        let before = m.entries[&key].clone();
+        assert_eq!(m.record_session(&key, None, now + 100), 1_263_951);
+        assert_eq!(m.entries[&key], before, "no evidence, no write");
+        // A rise is believed slowly (ALPHA_UP = 0.1), twice.
+        assert_eq!(
+            m.record_session(&key, Some(3_322_780), now + 150),
+            1_469_833
+        );
+        assert_eq!(
+            m.record_session(&key, Some(6_131_302), now + 200),
+            1_935_979
+        );
+        // The old rule would have kept the best minute of the six.
+        assert!(
+            m.seed_for(&key, now + 200).unwrap() < 2_000_000,
+            "the maximum would have remembered 6.13 M"
+        );
+    }
+
+    /// A pair with no entry and a session that measured nothing leaves the
+    /// memory empty rather than writing a zero.
+    #[test]
+    fn a_session_that_measured_nothing_writes_no_entry() {
+        let now = 1_788_000_000u64;
+        let mut m = RateMemory::default();
+        assert_eq!(m.record_session("p", None, now), 0);
+        assert_eq!(m.record_session("p", Some(0), now), 0);
+        assert!(m.entries.is_empty());
     }
 }
