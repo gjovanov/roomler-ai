@@ -496,6 +496,13 @@ flowchart LR
 - A confirmed relay⇄direct transport flip rebuilds capture+encoder on a debounce
   (2 consecutive confirmations, 60 s cooldown) so the profile matches the path.
   The full picture is [`rate-control.md`](rate-control.md).
+- How a backend takes a bitrate move (`resolve_rate_mode`): NVENC in place
+  (the FR-62 patch removes the IDR it used to force), QSV in place behind the
+  `inplace_rate` flag, everything else — AMF, VideoToolbox, VAAPI, D3D12,
+  Vulkan — **rebuilds** the encoder on a coarsened ladder. D3D12 and Vulkan are
+  measured (FR-78 P2, the A0 ladder on the dev box): every rung forced an IDR,
+  42–77 ms per apply. `encoder-smoke --reconfigure-sweep --name <encoder>` is
+  the read for any host.
 
 ## Building the FFmpeg backend locally on Windows (FR-77 P0)
 
@@ -530,9 +537,13 @@ line** for experiments is a different thing: `winget install Gyan.FFmpeg` (a GPL
 build, never shipped) gives `ffmpeg -encoders` for a quick look at what a box's
 drivers expose.
 
-On Linux the same recipe is the release lane's: extract the `-minimal-vaapi`
+On Linux the same recipe is the release lane's: extract the `-minimal-vaapi-vulkan`
 asset, rewrite the `.pc` prefixes, set `FFMPEG_DIR` / `PKG_CONFIG_PATH` /
 `LD_LIBRARY_PATH` at the tree, and build with `--features ffmpeg-encoder,vp9-444`.
+To drive one backend past the cascade on any host — a cell the vendor SDK
+outranks there — `roomlerd encoder-smoke --name hevc_vulkan` (real bytes) and
+`--reconfigure-sweep --name hevc_vulkan --codec hevc` (the FR-62 ladder) open
+exactly that encoder, the same open the capability probe runs.
 The Linux-only code (`encode/ffmpeg/vaapi.rs`) is linted by nothing on Windows —
 run `cargo clippy … --all-targets -- -D warnings` under WSL before pushing it.
 

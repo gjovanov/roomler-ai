@@ -116,13 +116,33 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
   joins the built-in denylist. The cascade tables close `… → videotoolbox → vaapi →
   d3d12va → vulkan` (locked by the order tests).
 
+### P2 — as built (#PR78P2)
+
+- **`encoder-smoke --name <ffmpeg encoder>`** opens exactly that encoder through
+  `encode::open_named` — `FfmpegEncoder::static_name` + `new_named_probe`, the same open
+  the capability probe runs, past every cascade — so a backend the vendor SDK outranks on
+  a host can be driven with real bytes, and `--reconfigure-sweep --name` runs the FR-62
+  ladder on it. `--encoder` / `--codec` are ignored when `--name` is set.
+- **The probe cache key sees the driver environment**: `caps_cache::DRIVER_ENV`
+  (`RADV_PERFTEST`, `RADV_DEBUG`, `ANV_DEBUG`, `MESA_LOADER_DRIVER_OVERRIDE`, the Vulkan
+  loader's `VK_ICD_FILENAMES` / `VK_DRIVER_FILES` / `VK_LOADER_DRIVERS_SELECT` /
+  `VK_LOADER_DRIVERS_DISABLE`, `LIBVA_DRIVER_NAME` / `LIBVA_DRIVERS_PATH`,
+  `CUDA_VISIBLE_DEVICES`) is hashed next to the `ROOMLERD_*` knobs, so the jupiter drop-in
+  re-probes on its own; locked by `driver_env_is_part_of_the_key`.
+- **Rate control, measured**: the A0 ladder on the dev box says D3D12 and Vulkan are the
+  **rebuild** class (every `set_bitrate` rung forced an IDR: 20/20, 42–77 ms per apply)
+  — exactly the branch `resolve_rate_mode` already gives every non-NVENC, non-QSV name,
+  now stated as measured in its doc. FFmpeg's `vulkan_encode` / `d3d12va_encode` set rate
+  control at session init and never re-read `rc_max_rate`; an in-place path there would
+  be an FFmpeg patch, not an option, and stays out of scope.
+
 ## Phases
 
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
 | P0 | Vendor builds with `--enable-d3d12va` (Windows) and `--enable-vulkan` (Windows + Linux); the runtime probe asserts the new names; new asset names | the asset pattern in `release-agent.yml` | **shipped** #1506 → `agent-v0.4.88` (vendor run 34217171639): Windows `…-minimal-d3d12-vulkan.zip` (16 encoder symbols, no `vulkan-1.lib` / `d3d12.lib` directive in `avutil.lib`), Linux `…-minimal-vaapi-vulkan.tar.xz` (17 encoders in the runtime probe, no `libvulkan` DT_NEEDED, Vulkan-Headers 1.4.362 in the tree); MSI +254 KB |
 | P1 | The hardware-frame module generalised over the device type; D3D12 and Vulkan device + pool + upload; the cells on the dev box (NVIDIA, both), CORPLAP-3 (Intel D3D12) and jupiter (RADV Vulkan) | `ROOMLERD_USE_FFMPEG=0` / the denylist | **shipped** #1506 → `agent-v0.4.88`, **field-read 2026-09-08**: the dev box advertises 13 cells (D3D12 hevc/h264, Vulkan hevc/av1/h264 on the RTX after the iGPU refused), CORPLAP-3's Intel iGPU `hevc/d3d12` (its H.264/AV1 D3D12 and its Vulkan refused by the driver), **jupiter `hevc/vulkan` + `h264/vulkan` on RADV under `RADV_PERFTEST=video_encode`** (a drop-in; open decision on setting it from the daemon), WSL / zeus / mars / the MacBook unchanged |
-| P2 | Cells, cascade positions, the probe's 4:4:4 candidates for `hevc/av1_vulkan`, the FR-62 ladder read per cell | the denylist | — |
+| P2 | Cells, cascade positions, the probe's 4:4:4 candidates for `hevc/av1_vulkan`, the FR-62 ladder read per cell | the denylist | **built** #PR78P2 — the cells and positions shipped with P1; `encoder-smoke --name` for real bytes past the cascade; the driver environment in the cache key; the ladder measured on the dev box (rebuild class, both backends); the 4:4:4 candidates stay denied (`hevc_vulkan:yuv444`) |
 | P3 | Field: sessions on each backend from the viewer, the operator-judged text scroll on the 4:4:4 cells that open | — | — |
 | P4 | `docs/encoders.md` (the tables and the cascade diagram), `docs/README.md` row | — | — |
 
@@ -145,7 +165,9 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
       new cells with `hw: true` and unchanged vendor cells; the picker offers them
       with the right reasons; a session on each cell reports its chroma in `rc:video-info`.
 - [ ] **P3** — the FR-62 ladder read per new cell (IDR on bitrate change: yes/no)
-      recorded; the operator-judged scroll on every 4:4:4 cell that opens.
+      recorded — **yes** for `hevc_d3d12va` and `hevc_vulkan` on the dev box (20/20
+      rate-caused IDRs, the rebuild class); the operator-judged scroll on every 4:4:4 cell
+      that opens is still owed (none has left the denylist).
 - [ ] **Docs** updated with the new backends in the tables and diagrams, linked
       from `docs/README.md`.
 
