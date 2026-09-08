@@ -79,6 +79,16 @@ operator's to restore; the product's job is to say so.
    — it delivers wallpaper-only frames") is now half-stale: on this macOS the
    open fails outright. Both shapes must stay handled — the warn covers the
    silent one, this covers the failing one.
+
+   ⚠️ **On macOS the session question comes before the permission question.**
+   A root LaunchDaemon lives in session 0, which has no WindowServer and never
+   will, and its TCC preflight can still answer "granted" — so asking about
+   permission first would send the operator to a toggle that changes nothing.
+   `tcc::has_gui_session` is checked first, and `no_display` names it. The
+   MacBook is the proof, and the reason this ordering is not theoretical: the
+   same machine runs two agents, and after the grant was restored the
+   user-session row captures (`capture: backend=scrap 3024×1964`) while the
+   daemon row still cannot — one host, two rows, two different true answers.
 3. **One new control-DC message**, `rc:media-unavailable`, built by a sibling of
    `video_info_payload` (`peer.rs:4475`) and sent with the same
    retry-until-delivered discipline both pumps already use for `rc:video-info`
