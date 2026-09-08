@@ -68,3 +68,12 @@ scripts/signing/gpg/*
 # Linux — as the WSL backend lane does — and committing it would put a local
 # build artifact in every such session's diff. FR-27.
 agents/*/gen/schemas/linux-schema.json
+
+# Session handover notes, written to the repo root by convention and never
+# meant to be published. This repo is PUBLIC, and an untracked file here is
+# one `git add -A` away from being in it — which already nearly happened with
+# `apple-authority-letter.md` (a signed company document naming a private
+# address and phone number), caught only because someone looked. Three more
+# were sitting in the same position when this rule landed. The pattern is the
+# guard, not anyone's diligence.
+HANDOVER-*.md
