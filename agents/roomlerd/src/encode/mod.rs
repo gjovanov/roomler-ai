@@ -55,8 +55,13 @@ pub mod ffmpeg;
 pub mod aimd;
 /// FR-35 — the constrained ceiling learns the pair (pure controller).
 pub mod ceiling_learn;
+/// FR-79 — the validity gate every estimator consumes: was this window
+/// evidence about the PIPE? (pure; no clock, no I/O, and no kill switch —
+/// it replaced three).
+pub mod evidence;
 /// FR-71 T1a — which plane is the limiter this window: sender, path or
-/// browser (pure; shadow — nothing acts on it until T1b).
+/// browser (pure). FR-79 made it load-bearing: the gate reads its verdict,
+/// so it runs on every constrained window.
 pub mod pipe_state;
 /// FR-70 P1 — the remembered rate as a PRIOR that decays while nothing
 /// measures (pure; no clock, no I/O).
@@ -491,27 +496,6 @@ pub fn rate_slow_start_enabled() -> bool {
 /// verbatim (the seed is a constant for the session).
 pub fn rate_prior_decay_enabled() -> bool {
     tunnel_core::env::flag("RATE_PRIOR_DECAY", true)
-}
-
-/// FR-71 T1a kill switch (2026-09-05): when on (default), every constrained
-/// viewer window is classified — sender / path / browser as the limiter
-/// (`encode::pipe_state`) — and the verdict is logged in the heartbeat as
-/// `pipe_state` with per-state counts. **Shadow only**: nothing acts on the
-/// verdict until T1b (`transit_hold`). `0` = no classification, no counters.
-/// Env `ROOMLERD_TRANSIT_CLASSIFY` / config `transit_classify`.
-pub fn transit_classify_enabled() -> bool {
-    tunnel_core::env::flag("TRANSIT_CLASSIFY", true)
-}
-
-/// FR-71 T1b — ACT on a `transit-stalled` window: the opener's ramp neither
-/// steps nor ends, the FR-15 age loop does not fire, the FR-59 P3 clamp is
-/// held rather than re-armed, and the prior takes no push-back. The FR-59 P4
-/// drain still runs (a pause is a drain, not a cut). Default **off** for one
-/// release — a controller change ships behind the shadow's evidence (FR-63's
-/// rule). Needs `transit_classify`. Env `ROOMLERD_TRANSIT_HOLD` / config
-/// `transit_hold`.
-pub fn transit_hold_enabled() -> bool {
-    tunnel_core::env::flag("TRANSIT_HOLD", false)
 }
 
 /// FR-70 M1 — the FFmpeg encoder lives on its own OS thread per session
