@@ -52,6 +52,16 @@ pub(crate) const DEFAULT_DENIED_CELLS: &[&str] = &[
     // FR-78 — as unproven as every other non-NVENC 4:4:4 form: denied
     // until a driver survives the open on a fleet host.
     "hevc_vulkan:yuv444",
+    // FR-78 P3 (the dev box, RTX 5090, 2026-09-08) — the one 4:2:0 entry.
+    // The cell opens, encodes and reports nothing wrong, and its frames
+    // cannot be decoded: dav1d fails every frame header ("Error parsing
+    // frame header"), libaom aborts, Chrome paints garbage where the picture
+    // changed. Reproduced with the FFmpeg CLI's own `av1_vulkan` on the same
+    // GPU, with no roomler code in the loop — an FFmpeg 9.0.1 / NVIDIA
+    // driver defect, not our packaging (the missing temporal delimiter WAS
+    // ours to fix, and is). Leaves the list when a driver or FFmpeg release
+    // decodes; the read is on the FR-78 spec.
+    "av1_vulkan:yuv420",
 ];
 
 /// The value that means "deny nothing". An EMPTY override means the same
@@ -269,18 +279,23 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _saved = Saved::cleared("ENCODER_CELLS_DENY");
-        for codec in [
-            VideoCodec::Hevc,
-            VideoCodec::Av1,
-            VideoCodec::H264,
-            VideoCodec::Vp9,
-        ] {
+        for codec in [VideoCodec::Hevc, VideoCodec::H264, VideoCodec::Vp9] {
             assert_eq!(
                 names_420(codec),
                 FfmpegEncoder::cascade_names(codec).to_vec(),
-                "the built-in denylist names only 4:4:4 cells"
+                "the built-in denylist names no 4:2:0 cell of this codec"
             );
         }
+        let av1 = names_420(VideoCodec::Av1);
+        assert!(
+            !av1.contains(&"av1_vulkan"),
+            "av1_vulkan:yuv420 is denied by default (its frames do not decode): {av1:?}"
+        );
+        assert_eq!(
+            av1.len(),
+            FfmpegEncoder::cascade_names(VideoCodec::Av1).len() - 1,
+            "and it is the only AV1 cell the built-in list removes"
+        );
         unsafe {
             tunnel_core::env::test_env::set(
                 "ENCODER_CELLS_DENY",
