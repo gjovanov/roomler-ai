@@ -171,6 +171,7 @@ pub(crate) static RELAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 /// FR-77 — `ROOMLERD_ENCODER_CELLS_DENY` has the same shape: three tests set
 /// it (`cells.rs` x2, `caps.rs`), `test_env` serialises nothing, and the
 /// harness runs them in parallel — it flaked once in four native runs.
+#[cfg(test)]
 pub(crate) static DENY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ---------------------------------------------------------------------
