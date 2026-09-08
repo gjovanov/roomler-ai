@@ -10,7 +10,8 @@ in [deny.toml](deny.toml)) or `cargo license`.
 ## FFmpeg — LGPL-2.1-or-later
 
 The Roomler agent uses FFmpeg for hardware video encoding (NVENC, Intel QSV,
-AMD AMF, VAAPI on Linux, Apple VideoToolbox on macOS). We build it ourselves
+AMD AMF, VAAPI and Vulkan video encode on Linux, D3D12 and Vulkan video encode
+on Windows, Apple VideoToolbox on macOS). We build it ourselves
 from upstream source with a reduced component set and the source patches
 recorded in `.github/ffmpeg-patches/` (each shipped tree carries its
 `ROOMLER-PATCHES.txt` manifest); we do **not** build with `--enable-gpl` or

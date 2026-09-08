@@ -155,7 +155,7 @@ export interface AgentCapabilities {
 
 /** FR-77 — one encoder and the chroma formats it opened in. Wire strings:
  *  codec `h264` · `hevc` · `av1` · `vp9`; backend `nvenc` · `qsv` · `amf` ·
- *  `videotoolbox` · `vaapi` · `mf` · `openh264` · `libvpx`; chroma `yuv420` ·
+ *  `videotoolbox` · `vaapi` · `d3d12` · `vulkan` · `mf` · `openh264` · `libvpx`; chroma `yuv420` ·
  *  `yuv444`. A newer agent may send names this bundle does not know — they are
  *  ignored, never an error. */
 export interface VideoCell {

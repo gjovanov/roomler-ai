@@ -1142,6 +1142,16 @@ pub struct AgentConfig {
     /// the first VAAPI open.
     #[serde(default)]
     pub vaapi_device: Option<String>,
+    /// FR-78 P1 — pin the DXGI adapter index the D3D12 video-encode device
+    /// opens on (`ROOMLERD_D3D12_ADAPTER`, e.g. `1`). Unset = adapters
+    /// `0`…`3` in order, the first FFmpeg accepts. Windows only.
+    #[serde(default)]
+    pub d3d12_adapter: Option<String>,
+    /// FR-78 P1 — pin the Vulkan physical device by index or name
+    /// (`ROOMLERD_VULKAN_DEVICE`, e.g. `1` or `NVIDIA GeForce RTX 5090`).
+    /// Unset = the loader's default device.
+    #[serde(default)]
+    pub vulkan_device: Option<String>,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLERD_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -2142,6 +2152,8 @@ pub fn test_fixture() -> AgentConfig {
         caps_cache: None,
         encoder_cells_deny: None,
         vaapi_device: None,
+        d3d12_adapter: None,
+        vulkan_device: None,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

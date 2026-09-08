@@ -29,6 +29,10 @@ pub(crate) const FFMPEG_444_CAPABLE: &[&str] = &[
     "vp9_qsv",
     "hevc_vaapi",
     "vp9_vaapi",
+    // FR-78 — Vulkan HEVC lists 4:4:4 as runtime-decided (planar yuv444p
+    // against the driver's format list); AV1 stays 4:2:0 by the AV1 rule
+    // and D3D12 video encode is NV12/P010 only.
+    "hevc_vulkan",
 ];
 
 /// Cells this build will not open or advertise until a field test takes
@@ -45,6 +49,9 @@ pub(crate) const DEFAULT_DENIED_CELLS: &[&str] = &[
     "vp9_qsv:yuv444",
     // P4: the packed 4:4:4 open on VAAPI is as unproven as it was on QSV.
     "vp9_vaapi:yuv444",
+    // FR-78 — as unproven as every other non-NVENC 4:4:4 form: denied
+    // until a driver survives the open on a fleet host.
+    "hevc_vulkan:yuv444",
 ];
 
 /// The value that means "deny nothing". An EMPTY override means the same
@@ -214,7 +221,7 @@ mod tests {
         unsafe { tunnel_core::env::test_env::set("ENCODER_CELLS_DENY", "none") };
         assert_eq!(
             names_444(VideoCodec::Hevc),
-            vec!["hevc_nvenc", "hevc_qsv", "hevc_vaapi"]
+            vec!["hevc_nvenc", "hevc_qsv", "hevc_vaapi", "hevc_vulkan"]
         );
         assert_eq!(names_444(VideoCodec::Vp9), vec!["vp9_qsv", "vp9_vaapi"]);
     }
