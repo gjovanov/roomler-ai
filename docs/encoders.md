@@ -106,7 +106,7 @@ plus `probe_ms` and `probe_cached`.
 | `hw` is verified, never assumed | NVENC / AMF / VideoToolbox / VAAPI are hardware by construction; a QSV open proves hardware only on the oneVPL build (FFmpeg's internal MFX session filters `MFX_IMPL_TYPE_HARDWARE`), which `qsv_is_hardware_by_construction` detects by `av1_qsv` being registered (libvpl-only); the native MF cell reports what its cascade landed on |
 | A 4:4:4 cell is **opened**, never asserted by name | the pre-FR-77 code advertised `hevc_chroma: yuv444` for any `hevc_nvenc`; now the legacy field says 4:4:4 only when that open succeeded |
 | `h264_nvenc` 4:4:4 sets `profile=high444p` | `rext` is HEVC's profile and h264_nvenc rejects it at open, which would read as "cannot do 4:4:4" |
-| **The denylist** = the kill switch, both chroma forms: a `name:chroma` cell on it is never opened nor advertised — by the probe AND by a session (`cells::names_420` / `names_444` are the cascade minus the list; the probe and every session constructor read them). Built-in: `hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444, hevc_vulkan:yuv444` | each unproven 4:4:4 cell leaves the list on a field pass; CORPLAP-3's Intel runtime died on the first VUYX open. `encoder_cells_deny` (config, env `ROOMLERD_ENCODER_CELLS_DENY`, pushable through remote config; a change takes effect at the next daemon start) **replaces** the default; `none` denies nothing. Until 0.4.87 it gated only the 4:4:4 open; until 0.4.90 only the probe and the 4:4:4 list read it at all — a 4:2:0 session cascade opened a denied `hevc_vaapi` on jupiter while the hello advertised only the Vulkan cells (FR-78 P3) |
+| **The denylist** = the kill switch, both chroma forms: a `name:chroma` cell on it is never opened nor advertised — by the probe AND by a session (`cells::names_420` / `names_444` are the cascade minus the list; the probe and every session constructor read them). Built-in: `hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444, hevc_vulkan:yuv444`, and one 4:2:0 cell, `av1_vulkan:yuv420` — its frames do not decode (dav1d fails every frame header, libaom aborts, Chrome paints garbage), reproduced with the FFmpeg CLI's own `av1_vulkan` on the same NVIDIA GPU: an FFmpeg 9.0.1 / driver defect, §Hardware frames | each unproven 4:4:4 cell leaves the list on a field pass; CORPLAP-3's Intel runtime died on the first VUYX open. `encoder_cells_deny` (config, env `ROOMLERD_ENCODER_CELLS_DENY`, pushable through remote config; a change takes effect at the next daemon start) **replaces** the default; `none` denies nothing. Until 0.4.87 it gated only the 4:4:4 open; until 0.4.90 only the probe and the 4:4:4 list read it at all — a 4:2:0 session cascade opened a denied `hevc_vaapi` on jupiter while the hello advertised only the Vulkan cells (FR-78 P3) |
 | AV1, AMF, VideoToolbox and Media Foundation are never asked for 4:4:4 | `av1_nvenc` hard-errors on it and every other AV1 backend lists 4:2:0 only; AMF has no 4:4:4 surface; VideoToolbox HEVC has only Main / Main10 / Main42210; `*_mf` takes NV12 — locked by a test against the vocabulary |
 
 What the fleet advertised on 0.4.88 (server records, 2026-09-08; the D3D12 and
@@ -446,9 +446,16 @@ start of every temporal unit, every other AV1 encoder we ship writes (`av1_nvenc
 `TD · SeqHdr · Frame · TD · Frame …`) and Chrome's decoders require; the same bytes
 with `12 00` inserted before each unit decode 10/10. `FfmpegEncoder::drain_packets`
 therefore prepends the delimiter to any AV1 packet whose first OBU is not one
-(`with_av1_temporal_delimiter`, for every AV1 backend). The `--dump` flag stays: a
-cell whose session looks wrong is attributed offline before anyone touches the
-denylist, and the raw dump of a healthy build decodes as-is.
+(`with_av1_temporal_delimiter`, for every AV1 backend). That was necessary and not
+sufficient: on the repaired build the session's keyframes decode and every changed
+region smears — correct keyframes, corrupt inter frames — and the FFmpeg CLI's own
+`av1_vulkan` on the same GPU (testsrc2, the `ivf` muxer inserting the delimiters
+itself) produces frames dav1d refuses at the header (`Error parsing frame header`,
+29 of 29) and libaom aborts on. An FFmpeg 9.0.1 / NVIDIA driver defect with no
+roomler code in the loop, so the cell sits on the built-in denylist
+(`av1_vulkan:yuv420`) until a driver or FFmpeg release decodes. The `--dump` flag
+stays: a cell whose session looks wrong is attributed offline before anyone touches
+the denylist, and the raw dump of a healthy build decodes as-is.
 
 ## Configuration
 
