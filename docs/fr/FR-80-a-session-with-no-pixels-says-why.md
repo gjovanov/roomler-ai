@@ -1,6 +1,6 @@
 # FR-80 — a session with no pixels says why
 
-**Issue:** [#1532](https://github.com/gjovanov/roomler-ai/issues/1532) · **Status:** proposed 2026-09-08 · **Glossary:** [`CONTEXT.md`](../../CONTEXT.md) · **Related:** [FR-27](FR-27-host-consent-prompt-surfaces.md) · [FR-77](FR-77-encoder-chroma-matrix.md) · [`docs/remote-control.md`](../remote-control.md)
+**Issue:** [#1532](https://github.com/gjovanov/roomler-ai/issues/1532) · **Status:** **closed 2026-09-08** — shipped `agent-v0.4.94` + `hosted-20260908-aa36044`; both halves field-verified, with the failure cell created deliberately · **Glossary:** [`CONTEXT.md`](../../CONTEXT.md) · **Related:** [FR-27](FR-27-host-consent-prompt-surfaces.md) · [FR-77](FR-77-encoder-chroma-matrix.md) · [`docs/remote-control.md`](../remote-control.md)
 
 ## Goal
 
@@ -84,11 +84,11 @@ operator's to restore; the product's job is to say so.
    A root LaunchDaemon lives in session 0, which has no WindowServer and never
    will, and its TCC preflight can still answer "granted" — so asking about
    permission first would send the operator to a toggle that changes nothing.
-   `tcc::has_gui_session` is checked first, and `no_display` names it. The
-   MacBook is the proof, and the reason this ordering is not theoretical: the
-   same machine runs two agents, and after the grant was restored the
-   user-session row captures (`capture: backend=scrap 3024×1964`) while the
-   daemon row still cannot — one host, two rows, two different true answers.
+   `tcc::has_gui_session` is checked first, and `no_display` names it. ⚠️ This
+   rests on `tcc`'s own documented reasoning, **not** on a host: an earlier
+   draft of this spec cited the MacBook's daemon row as the proof, and that row
+   turned out to have a GUI session and to capture fine. The ordering is right;
+   the evidence for it was wrong, and no fleet host currently exercises it.
 3. **One new control-DC message**, `rc:media-unavailable`, built by a sibling of
    `video_info_payload` (`peer.rs:4475`) and sent with the same
    retry-until-delivered discipline both pumps already use for `rc:video-info`
@@ -109,27 +109,27 @@ operator's to restore; the product's job is to say so.
 
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
-| P1 | `CaptureUnavailable` on `NoopCapture` + the trait accessor; the macOS/Linux derivation | — (a pure addition; absent reason = today's behaviour) | **built** — the reason is classified once at `open_default` and carried by the fallback capturer; macOS reuses the TCC preflight the agent already owns |
-| P2 | `rc:media-unavailable` on the control DC, retry-until-delivered, from all three pumps | an old viewer ignores the message | **built** — a spawned, deadline-bounded notice, because the control DC opens after capture and the pumps' own retry hangs off a captured frame |
-| P3 | The viewer: the reason on the canvas, and the pill's fallback stops naming VP9 | pure UI | **built** — the pill reads the DECODER's own config string (`codecLabelFromDecoderConfig`), the canvas shows the cause and the fix, and the health label says "no screen capture" instead of "video stalled" |
-| P4 | Docs — `docs/remote-control.md` §5.1a (the sequence, the code table), the FR spec | — | **built** |
+| P1 | `CaptureUnavailable` on `NoopCapture` + the trait accessor; the macOS/Linux derivation | — (a pure addition; absent reason = today's behaviour) | **shipped** — the reason is classified once at `open_default` and carried by the fallback capturer; macOS reuses the TCC preflight the agent already owns |
+| P2 | `rc:media-unavailable` on the control DC, retry-until-delivered, from all three pumps | an old viewer ignores the message | **shipped** — a spawned, deadline-bounded notice, because the control DC opens after capture and the pumps' own retry hangs off a captured frame |
+| P3 | The viewer: the reason on the canvas, and the pill's fallback stops naming VP9 | pure UI | **shipped** — the pill reads the DECODER's own config string (`codecLabelFromDecoderConfig`), the canvas shows the cause and the fix, and the health label says "no screen capture" instead of "video stalled" |
+| P4 | Docs — `docs/remote-control.md` §5.1a (the sequence, the code table), the FR spec | — | **shipped** |
 
 ## Acceptance criteria
 
-- [ ] **P1** — a host whose capture cannot open reports a `code` that matches
+- [x] **P1** — a host whose capture cannot open reports a `code` that matches
       the actual cause, with a positive control: the same host with capture
       working reports no reason at all.
-- [ ] **P2** — the message arrives at the viewer on a session that never
+- [x] **P2** — the message arrives at the viewer on a session that never
       produces a frame, including on a relay session where the control DC opens
       late (the rc.87 race the retry exists for).
-- [ ] **P3** — an H.264 session that never delivers a frame **never** displays
+- [x] **P3** — an H.264 session that never delivers a frame **never** displays
       "VP9" anywhere in the viewer; a libvpx VP9 session still reads VP9; a
       healthy session is unchanged and still names its real encoder.
-- [ ] **Field** — reproduced on a host with no capture (a headless Linux fleet
+- [x] **Field** — reproduced on a host with no capture (a headless Linux fleet
       node is the natural negative cell) and read in the viewer; and the
       MacBook, permission restored, streams with the pill naming the real
       encoder.
-- [ ] **Docs** updated in the house style and linked from `docs/README.md`.
+- [x] **Docs** updated in the house style and linked from `docs/README.md`.
 
 ## Out of scope
 
@@ -140,3 +140,28 @@ operator's to restore; the product's job is to say so.
 - Re-signing or pinning the macOS identity so TCC grants survive a
   certificate change. That is FR-7's ground, and the answer there is that a
   Developer ID move is a one-time cost.
+
+## Field-verification log
+
+| Date | Where | Phase | Read |
+|---|---|---|---|
+| 2026-09-08 | release + deploy | P1–P4 | `agent-v0.4.94` (#1534 → bump #1536 → `bba7c793a`; release run 34274486566, 28 assets) rolled to all seven hosts in 6 min. The viewer half went to production as `hosted-20260908-aa36044` (promote run 34273234756; both pods confirmed on the image, `/health` 200) |
+| 2026-09-08 | MacBook-1 (macOS, grant restored), an H.264 session — **the positive control** | P3 | **PASS, and it is the string that started this.** Pill: `H.264 4:2:0 HW (h264_videotoolbox) · direct · dec HW · FSR`, 17.7 Mbps, 31 fps, real picture at 1940×1260 of a 3024×1964 desktop; `rc:video-info` names `h264_videotoolbox`; **no `rc:media-unavailable` at all** — a healthy session says nothing. The same session on 0.4.92 reported `VP9 4:4:4` |
+| 2026-09-08 | zeus, `ROOMLERD_VIRTUAL_DESKTOP=0` via a drop-in — **the failure cell, created deliberately** | P1–P3 | **PASS on every half.** Agent: `scrap capture unavailable — falling back to NoopCapture error=no primary display: connection refused code="no_display"` → `capture unavailable — this session will produce no pixels; telling the controller … code="no_display"`. Wire: `{"t":"rc:media-unavailable","code":"no_display","detail":"no primary display: connection refused","hint":"This host has no display to capture…"}`. Viewer: the canvas reads *This device cannot capture its screen*, the hint, `Reported by the device as no_display`, scrap's own words, and *Remote shell, file transfer and the other channels are unaffected*; the health label reads **`connected · no screen capture`**, not "video stalled"; and **the word VP9 appears nowhere** (the pill names H.265, the codec its decoder was configured with). The classification is the right one of four: `no_display`, not `permission` and not `backend_error` |
+| 2026-09-08 | zeus, drop-in removed | — | Restored and re-verified: `ROOMLERD_VIRTUAL_DESKTOP=1`, only `virtual-desktop.conf` remains, and a session streams `H.265 4:2:0 HW (hevc_vaapi) · relay`, 1600×900, with no overlay. The host was left exactly as it was found |
+
+⚠️ **The cell had to be created, and that is worth recording.** The plan was to
+use the MacBook's daemon row, which could not capture that afternoon. By
+evening it could — the grant restoration covered both rows — and with every
+Linux node running a virtual desktop the fleet had **no host that fails
+capture**. Rather than assume the path worked, one host was made to fail it
+reversibly. A failure path with no host that exercises it is a path nobody has
+run.
+
+⚠️ **A correction to this spec's own earlier reasoning.** The `has_gui_session`
+ordering was justified here by "the MacBook's daemon row still cannot capture".
+That row has a GUI session and captures fine. The ordering is still right — a
+session-0 daemon genuinely cannot capture and its TCC preflight can still
+answer "granted" — but it stands on `tcc`'s documented reasoning, not on that
+host. The `permission` code therefore remains **unproven in the field**: it was
+the original incident's cause, and no host now reproduces it.
