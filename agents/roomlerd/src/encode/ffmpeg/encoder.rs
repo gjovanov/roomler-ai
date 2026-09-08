@@ -1891,6 +1891,15 @@ impl FfmpegEncoder {
             match self.encoder.receive_packet(&mut packet) {
                 Ok(()) => {
                     let data = packet.data().unwrap_or(&[]).to_vec();
+                    // FR-78 P3 — `av1_vulkan` emits temporal units without the
+                    // temporal delimiter OBU every other AV1 encoder starts
+                    // with; the viewer's decoders (Chrome's hardware AV1 and
+                    // dav1d) cannot consume them. See the helper.
+                    let data = if self.encoder_name.starts_with("av1_") {
+                        with_av1_temporal_delimiter(data)
+                    } else {
+                        data
+                    };
                     let is_keyframe = packet.is_key();
                     // FR-62 A1 — count every IDR emitted (heartbeat); read
                     // against `keyframe_requests` to isolate rate-caused ones.
@@ -1921,6 +1930,35 @@ impl FfmpegEncoder {
         }
         Ok(out)
     }
+}
+
+/// The two bytes of an AV1 temporal delimiter OBU: header `0x12` (type 2,
+/// `obu_has_size_field` set) and a zero-length payload.
+const AV1_TEMPORAL_DELIMITER: [u8; 2] = [0x12, 0x00];
+
+/// FR-78 P3 (the dev box, RTX 5090, 2026-09-08) — an AV1 packet is one
+/// temporal unit, and the AV1 spec starts every temporal unit with a temporal
+/// delimiter OBU. `av1_nvenc` (and libaom, QSV, AMF) emit it; FFmpeg 9.0.1's
+/// `av1_vulkan` on NVIDIA emits `sequence header · 240 B of padding · frame`
+/// with no delimiter at all — and the viewer's decoders refuse the stream:
+/// Chrome's hardware AV1 paints garbage, dav1d stalls, FFmpeg's own `obu`
+/// demuxer does not even recognise the file. The same bytes with a delimiter
+/// inserted before each unit decode cleanly (10/10 frames, dav1d), which is
+/// the whole diagnosis. So every AV1 packet leaves the encoder with one:
+/// prepended when the first OBU is anything else, untouched when it is
+/// already there (the two-byte check reads the OBU header, not a magic
+/// string — a delimiter carries no payload, so its size byte is `0x00`).
+pub(crate) fn with_av1_temporal_delimiter(data: Vec<u8>) -> Vec<u8> {
+    // `obu_type` is bits 6..3 of the header byte; a temporal delimiter is
+    // type 2. The extension and size flags may vary, so mask the type only.
+    let first_is_delimiter = data.first().is_some_and(|h| (h >> 3) & 0xF == 2);
+    if data.is_empty() || first_is_delimiter {
+        return data;
+    }
+    let mut out = Vec::with_capacity(data.len() + AV1_TEMPORAL_DELIMITER.len());
+    out.extend_from_slice(&AV1_TEMPORAL_DELIMITER);
+    out.extend_from_slice(&data);
+    out
 }
 
 /// P3 (2026-08-27) — the parameters a BACKGROUND maxrate rebuild needs,
@@ -2536,6 +2574,38 @@ mod tests {
                 "av1_vulkan"
             ]
         );
+    }
+
+    /// FR-78 P3 — the temporal-delimiter repair for `av1_vulkan`'s packets:
+    /// a unit that starts with a sequence header (the `av1_vulkan` shape) or
+    /// a frame gets the delimiter prepended, one that already starts with a
+    /// delimiter (the `av1_nvenc` shape — `12 00 0a 0b …`) is untouched, and
+    /// the type check reads the OBU header bits, so a delimiter with the
+    /// extension flag set still counts.
+    #[test]
+    fn av1_packets_start_with_a_temporal_delimiter() {
+        let vulkan_shape = vec![0x0a, 0x0b, 0x00, 0x00, 0x00, 0x0c, 0x7a, 0xf0, 0x01, 0xaa];
+        let repaired = with_av1_temporal_delimiter(vulkan_shape.clone());
+        assert_eq!(&repaired[..2], &[0x12, 0x00]);
+        assert_eq!(&repaired[2..], &vulkan_shape[..]);
+        let nvenc_shape = vec![0x12, 0x00, 0x0a, 0x0b, 0x00, 0x00, 0x00, 0xbe];
+        assert_eq!(
+            with_av1_temporal_delimiter(nvenc_shape.clone()),
+            nvenc_shape,
+            "a unit that already starts with a delimiter is not doubled"
+        );
+        let frame_first = vec![0x32, 0x34, 0x10, 0x01];
+        assert_eq!(
+            &with_av1_temporal_delimiter(frame_first)[..2],
+            &[0x12, 0x00]
+        );
+        let with_extension = vec![0x16, 0x00, 0x00, 0x32, 0x04];
+        assert_eq!(
+            with_av1_temporal_delimiter(with_extension.clone()),
+            with_extension,
+            "the type is read from the header bits, not a byte compare"
+        );
+        assert!(with_av1_temporal_delimiter(Vec::new()).is_empty());
     }
 
     /// FR-78 P3 — no session constructor may hand a raw cascade table to the

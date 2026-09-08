@@ -70,7 +70,7 @@ open. That was decided by a measurement, not a preference — every wrapper is u
 |---|---|---|---|---|
 | **H.264** | MF HW MFTs → MF SW MFT · FFmpeg `h264_nvenc → h264_qsv → h264_amf → h264_d3d12va → h264_vulkan` · OpenH264 | FFmpeg `h264_nvenc → h264_qsv → h264_amf → h264_vaapi → h264_vulkan` · OpenH264 | FFmpeg `h264_videotoolbox` · OpenH264 | the universal baseline; RTP or DC; 4:4:4 on NVENC (`high444p`) |
 | **HEVC** | FFmpeg `hevc_nvenc → hevc_qsv → hevc_amf → hevc_d3d12va → hevc_vulkan` · MF HEVC | FFmpeg `… → hevc_vaapi → hevc_vulkan` | FFmpeg `hevc_videotoolbox` | DC-only; 4:4:4 on NVENC (RExt), on QSV/VAAPI/Vulkan behind the denylist |
-| **AV1** | FFmpeg `av1_nvenc → av1_qsv → av1_amf → av1_d3d12va → av1_vulkan` · MF AV1 | FFmpeg `… → av1_vaapi → av1_vulkan` | — (`av1_videotoolbox` is not in the registry on current SDKs) | DC-only; 4:2:0 only, every backend; fail-closed |
+| **AV1** | FFmpeg `av1_nvenc → av1_qsv → av1_amf → av1_d3d12va → av1_vulkan` · MF AV1 | FFmpeg `… → av1_vaapi → av1_vulkan` | — (`av1_videotoolbox` is not in the registry on current SDKs) | DC-only; 4:2:0 only, every backend; fail-closed; every packet leaves with a temporal-delimiter OBU (`av1_vulkan` omits it — §Hardware frames) |
 | **VP9** | FFmpeg `vp9_qsv` · libvpx | FFmpeg `vp9_qsv → vp9_vaapi` · libvpx | libvpx | 4:4:4 on QSV/VAAPI (profile 1, packed VUYX) behind the denylist; libvpx profile 1 is the software 4:4:4 cell everywhere |
 | **Opus (audio)** | WASAPI loopback → Opus | PulseAudio monitor → Opus | not implemented | opt-in per session; 48 kHz stereo, 20 ms |
 
@@ -433,6 +433,22 @@ same host). The flush on drop is cosmetic — the drained packets go nowhere —
 so it now runs only when `frame_count > 0`. Validated on jupiter before the
 release by breaking on `send_eof` under gdb and returning without it: the child
 then advertised `hevc/vaapi` and `h264/vaapi` and exited normally.
+
+**A probe proves an open; only a session proves a cell.** FR-78 P3 ran one viewer
+session per new cell (CORPLAP-3, jupiter, the dev box — the denylist steering each
+session onto the cell under test). Six decoded cleanly; the dev box's `av1_vulkan`
+opened, encoded, reported nothing wrong, and painted garbage under Chrome's
+hardware AV1 decoder — under dav1d (`localStorage roomler-rc-decode-pref=software`)
+it stalled outright. `encoder-smoke --name av1_vulkan --dump <file>` and the FFmpeg
+CLI's decoders attributed it in one run: the stream is `SeqHdr · 240 B of padding ·
+Frame · Frame …` with **no temporal-delimiter OBU**, which the AV1 spec puts at the
+start of every temporal unit, every other AV1 encoder we ship writes (`av1_nvenc`:
+`TD · SeqHdr · Frame · TD · Frame …`) and Chrome's decoders require; the same bytes
+with `12 00` inserted before each unit decode 10/10. `FfmpegEncoder::drain_packets`
+therefore prepends the delimiter to any AV1 packet whose first OBU is not one
+(`with_av1_temporal_delimiter`, for every AV1 backend). The `--dump` flag stays: a
+cell whose session looks wrong is attributed offline before anyone touches the
+denylist, and the raw dump of a healthy build decodes as-is.
 
 ## Configuration
 
