@@ -91,11 +91,11 @@ pub const MEASURED_CEILING_PCT: u64 = 85;
 
 /// EWMA weight for a window BELOW the current estimate — the pipe
 /// shrank, believe it quickly.
-const ALPHA_DOWN: f64 = 0.50;
+pub(super) const ALPHA_DOWN: f64 = 0.50;
 
 /// EWMA weight for a window ABOVE it — the pipe may have grown, or we
 /// may have caught one good burst. Move slowly.
-const ALPHA_UP: f64 = 0.10;
+pub(super) const ALPHA_UP: f64 = 0.10;
 
 /// Most samples the sink will hold before dropping the oldest. Bounds
 /// the memory if the folding side ever stops draining; the estimator
