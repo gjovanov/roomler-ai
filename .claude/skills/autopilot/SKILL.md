@@ -68,7 +68,7 @@ never edits a spec, never touches an issue.
 | # | phase | what happens | leaves the card in |
 |---|---|---|---|
 | 0 | **orient** | fetch master, `scan`, read the board | — |
-| 1 | **triage** | admit by `autopilot` label; sort anything needing a human call | `admitted` / `judgement` |
+| 1 | **triage** | admit by `autopilot` label; trace work in flight; sort anything needing a human call | `admitted` / `judgement` / `in_progress` |
 | 2 | **pick** | `next` — highest ticked-AC fraction, `priority` overrides | `in_progress` |
 | 3 | **build** | own worktree `ap-<issue>`, implement the next phase, CI green | `in_progress` |
 | 4 | **docs** | mermaid + a `docs/README.md` row, **in the same PR** | `pr_open` |
@@ -86,14 +86,20 @@ never edits a spec, never touches an issue.
 4. **Never adopt a bare branch.** An open PR is adoptable (its diff is reviewable, its
    intent stated). A branch is not. This is the #1144 shape: a merged, field-verified fix
    silently reverted, green CI, no conflict.
-5. **Never delete a worktree or branch it did not create.** 62 worktrees and 1043 local
+5. **Work already in flight is TRACED, never picked up.** `scan` marks a card `hands_off`
+   when its FR has an open PR, a branch whose last commit is inside `--fresh-days`
+   (default 14), or a worktree with uncommitted changes — and records which. `next` and
+   the column derivation skip those cards entirely. ⚠️ The reason is on the board *with
+   the branch's age*, because the judgement "that branch is dead, work it" is the
+   operator's: 1043 local branches exist, and staleness is not something this can infer.
+6. **Never delete a worktree or branch it did not create.** 62 worktrees and 1043 local
    branches predate this skill. Report them; prune nothing.
-6. **Pillar work runs at the top tier.** Anything touching remote desktop, the overlay or
+7. **Pillar work runs at the top tier.** Anything touching remote desktop, the overlay or
    WebRTC is `CLAUDE.md` §3 work. Budget decides *whether a worker starts and when it
    stops* — never *which model runs it*. A worker that exhausts its budget parks the card
    saying so, visibly. It never finishes on a weaker model.
-7. **One worker per card, its own worktree, 2–3 in flight.** The card is the claim.
-8. **`BOARD.md` is generated.** A hand edit is overwritten without warning.
+8. **One worker per card, its own worktree, 2–3 in flight.** The card is the claim.
+9. **`BOARD.md` is generated.** A hand edit is overwritten without warning.
 
 ## Traps
 
