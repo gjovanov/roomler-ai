@@ -510,6 +510,7 @@ there). That is the case for M3 in the field's own words: a media loop
 that shares its worker with the capture reset, the tunnel bookkeeping and
 the transport's reconnect cannot tell a stalled pipe from a stolen
 thread, and the controller reads the difference as over-production.
+n*Nuance from 2026-09-08 (FR-71's hold-on repeat, 12:15 UTC): the two `other`-dominated passes there (2.9 s, 7.4 s) coincided with DC sends blocked for the same lengths and with 0 B in flight once each block ended — the pump was waiting on its full send channel while the PIPE paused for the overlay's rekey, which the stall watch cannot tell from a stolen thread. M3's case stands (a loop that cannot name its own wait is the problem either way), but the 12:15 event is evidence of a paused pipe, not of a stolen worker; FR-71 T2 answers the rate half of it by deferring the verdict one window.*
 
 **What M1 does not do**, on purpose: no `Plan` (M3), no in-loop decision
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
