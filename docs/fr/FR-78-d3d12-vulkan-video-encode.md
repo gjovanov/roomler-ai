@@ -120,21 +120,27 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
 
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
-| P0 | Vendor builds with `--enable-d3d12va` (Windows) and `--enable-vulkan` (Windows + Linux); the runtime probe asserts the new names; new asset names | the asset pattern in `release-agent.yml` | **built** #1506 (vendor run 34217171639): Windows `…-minimal-d3d12-vulkan.zip` (16 encoder symbols, no `vulkan-1.lib` / `d3d12.lib` directive in `avutil.lib`), Linux `…-minimal-vaapi-vulkan.tar.xz` (17 encoders in the runtime probe, no `libvulkan` DT_NEEDED, Vulkan-Headers 1.4.362 in the tree) |
-| P1 | The hardware-frame module generalised over the device type; D3D12 and Vulkan device + pool + upload; `encoder-smoke` real bytes on the dev box (NVIDIA, both), CORPLAP-3 (Intel D3D12) and jupiter (RADV Vulkan) | `ROOMLERD_USE_FFMPEG=0` / the denylist | **built** #1506 — `encode/ffmpeg/hwframes.rs` (`HwKind::{Vaapi, D3d12, Vulkan}`, one device per kind, one `Frames` shape); the cascade tables close `… → vaapi → d3d12va → vulkan`; `VideoBackend::{D3d12, Vulkan}`; `hevc_vulkan:yuv444` denied; `d3d12_adapter` / `vulkan_device` keys; field reads pending the roll |
+| P0 | Vendor builds with `--enable-d3d12va` (Windows) and `--enable-vulkan` (Windows + Linux); the runtime probe asserts the new names; new asset names | the asset pattern in `release-agent.yml` | **shipped** #1506 → `agent-v0.4.88` (vendor run 34217171639): Windows `…-minimal-d3d12-vulkan.zip` (16 encoder symbols, no `vulkan-1.lib` / `d3d12.lib` directive in `avutil.lib`), Linux `…-minimal-vaapi-vulkan.tar.xz` (17 encoders in the runtime probe, no `libvulkan` DT_NEEDED, Vulkan-Headers 1.4.362 in the tree); MSI +254 KB |
+| P1 | The hardware-frame module generalised over the device type; D3D12 and Vulkan device + pool + upload; the cells on the dev box (NVIDIA, both), CORPLAP-3 (Intel D3D12) and jupiter (RADV Vulkan) | `ROOMLERD_USE_FFMPEG=0` / the denylist | **shipped** #1506 → `agent-v0.4.88`, **field-read 2026-09-08**: the dev box advertises 13 cells (D3D12 hevc/h264, Vulkan hevc/av1/h264 on the RTX after the iGPU refused), CORPLAP-3's Intel iGPU `hevc/d3d12` (its H.264/AV1 D3D12 and its Vulkan refused by the driver), **jupiter `hevc/vulkan` + `h264/vulkan` on RADV under `RADV_PERFTEST=video_encode`** (a drop-in; open decision on setting it from the daemon), WSL / zeus / mars / the MacBook unchanged |
 | P2 | Cells, cascade positions, the probe's 4:4:4 candidates for `hevc/av1_vulkan`, the FR-62 ladder read per cell | the denylist | — |
 | P3 | Field: sessions on each backend from the viewer, the operator-judged text scroll on the 4:4:4 cells that open | — | — |
 | P4 | `docs/encoders.md` (the tables and the cascade diagram), `docs/README.md` row | — | — |
 
 ## Acceptance criteria
 
-- [ ] **P0** — both vendored trees carry the new names; the Linux `.deb`'s `Depends`
-      and bundle are unchanged (no new load-time library); the Windows MSI grows by
-      less than 1 MB.
-- [ ] **P1** — `encoder-smoke` produces real bytes through `hevc_d3d12va` on the dev
-      box and CORPLAP-3, and through `hevc_vulkan` on the dev box and jupiter; a host
-      without a Vulkan loader or a D3D12 video driver fails the open in one line and
-      keeps its other cells.
+- [x] **P0** — both vendored trees carry the new names (16 / 17 encoders asserted by
+      the vendor jobs); the Linux `.deb`'s `Depends` and bundle are unchanged (no new
+      load-time library — asserted: no `libvulkan` DT_NEEDED, no `vulkan-1.lib` /
+      `d3d12.lib` directive); the Windows MSI grew by 254 KB on `agent-v0.4.88`.
+- [ ] **P1** — the cells open on real silicon: the dev box advertises `hevc/h264` on
+      D3D12 and `hevc/h264/av1` on Vulkan (the RTX 5090, after the iGPU refused), and
+      CORPLAP-3's Intel iGPU advertises `hevc/d3d12` — both from the probe's real open;
+      a host without a Vulkan encode queue or a D3D12 video driver fails the open in one
+      line and keeps its other cells (CORPLAP-3's Vulkan, WSL's software ICDs, mars).
+      jupiter's RADV advertises `hevc/vulkan` + `h264/vulkan` under
+      `RADV_PERFTEST=video_encode` (a systemd drop-in). Still owed: `encoder-smoke` real
+      bytes through the new backends — the cascade picks the vendor SDK first, so the
+      smoke needs a way to name the backend (P2).
 - [ ] **P2** — the server records of the dev box, CORPLAP-3 and jupiter carry the
       new cells with `hw: true` and unchanged vendor cells; the picker offers them
       with the right reasons; a session on each cell reports its chroma in `rc:video-info`.
@@ -145,6 +151,18 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
 
 ## Open decisions
 
+- **RADV exposes Vulkan video encode only under `RADV_PERFTEST=video_encode`** (Mesa
+  25.2.8 on jupiter: zero video extensions without it, `VK_KHR_video_encode_{queue,h264,h265}`
+  with it — measured with `vulkaninfo`). The daemon could set that in its own
+  environment before the first Vulkan open and light the cells on every AMD Linux host;
+  it does not, deliberately — an experimental driver path enabled fleet-wide on k8s
+  bare-metal hosts is the operator's call, not the probe's. The lever today is a systemd
+  drop-in (`Environment=RADV_PERFTEST=video_encode`); a config key that makes the daemon
+  set it is the P2 candidate.
+- **The probe cache key does not see driver environment.** It hashes the `ROOMLERD_*`
+  knobs; `RADV_PERFTEST` / `LIBVA_DRIVERS_PATH` change the answer and do not change the
+  key, so an operator who edits the drop-in must clear `caps-cache.json` or the old answer
+  is reused. P2: add the driver-facing variables to the knob hash.
 - Whether `*_d3d12va` should sit BEFORE Media Foundation for H.264 on Windows: MF
   is the older path with the RTX 5090 quirk, D3D12 reaches the same silicon — the
   answer is a measurement (latency and IDR behaviour on the dev box), not a design.
@@ -167,3 +185,9 @@ uploads the pump does not have yet. Nothing about how a session is chosen change
 | 2026-09-08 | vendor run 34217171639 | P0 | Windows: the vcpkg port's `vulkan` feature + `--enable-d3d12va` (already the port's) → `…-minimal-d3d12-vulkan.zip`, sixteen encoder symbols, no `vulkan-1.lib` / `d3d12.lib` directive in `avutil.lib`; `avcodec.lib` 12.1 → 21.8 MB (the CBS writers + the two wrappers, static — the MSI delta is the number that matters, read after the release). Linux: Vulkan-Headers 1.4.362 into the prefix, `--enable-vulkan`, seventeen encoders in the runtime probe, no `libvulkan` DT_NEEDED; the tree 1.64 → 1.84 MB packed (the headers ride along) |
 | 2026-09-08 | the dev box's WSL2 (Mesa 25.2.8, `libvulkan1` 1.3.275, ICDs incl. `dzn`), the P1 build against the new tree | P1 | **The Vulkan device path works up to the frames pool, and WSL is a negative cell for Vulkan encode.** `hwframes: device opened backend="vulkan" device="(default)"` — the loader picked Mesa's `dzn` (D3D12-backed, "not a conformant Vulkan implementation, testing use only"), then `av_hwframe_ctx_init(vulkan)` failed `Operation not supported (-95)`: no video frames on dzn, the name fails in one line, the NVENC cells are untouched. The dzn device open costs ~2.5 s in the probe (`probe_ms` 2005 → 4665 on this box; the probe cache pays it once per build). `*_d3d12va` on Linux: `not registered` before any device attempt, as designed |
 | 2026-09-08 | the dev box (RTX 5090 Laptop + Radeon 610M, Windows 11), the P1 build against the new tree, native | P1 | **Both backends open on real silicon, and the open had to choose the device.** D3D12: adapter `0` opened; `hevc_d3d12va` opened with the full low-latency tier (`rc_mode=VBR maxrate bufsize bf=0 async_depth=1`) → cell in 83 ms; `h264_d3d12va` → cell in 16 ms; `av1_d3d12va`: adapter 0 (the RDNA2 iGPU) "does not support VBR RC mode" / no compatible RC mode, adapter 1 (the RTX) "Driver does not support requested features … Codec configuration not supported", adapter 3 (WARP) no RC mode ⇒ not advertised, correctly. Vulkan: device `0` opened and `hevc_vulkan` refused it three tiers deep — `Device does not support the VK_KHR_video_encode_queue extension!` (the iGPU) — then device `1` (the RTX) opened with the full tier (`rc_mode=vbr … tune=ull usage=stream async_depth=1`) → **preferred from now on**; `hevc_vulkan` 474 ms, **`av1_vulkan` 13 ms**, `h264_vulkan` 12 ms. The matrix: **13 cells** (the 0.4.87 eight + `hevc/d3d12`, `hevc/vulkan`, `av1/vulkan`, `h264/d3d12`, `h264/vulkan`), probe 5550 ms (4327 on 0.4.87; the device walk is the difference, paid once per build by the cache); the 4:4:4 phase unchanged (`hevc_vulkan:yuv444` denied). First run also found the `rc_mode` spelling: `vbr` is "Undefined constant" to d3d12va (uppercase `VBR`, as VAAPI) — the open fell to defaults and still succeeded, which is what the tiers are for |
+| 2026-09-08 | release + the fleet roll | P0 / P1 | `agent-v0.4.88` (bump #1507 → `cc180d979`; release run 34223695163, 28 assets). **Sizes**: MSI 15,822,848 → 16,076,800 B (**+254 KB**, the < 1 MB criterion met), x86_64 `.deb` 13,721,956 → 13,804,128 B (+82 KB), arm64 unchanged; the `.deb`'s `Depends` and bundle unchanged (the vendor jobs' no-DT_NEEDED asserts hold). Rolled to all seven hosts through the update route; six came back on 0.4.88 within minutes — jupiter's install collided with an `apt-get` I was running on it for `vulkan-tools` (`Could not get lock /var/lib/dpkg/lock-frontend`; both `apt-get` and `dpkg` candidates failed, the daemon stayed alive and the re-push hit the install cooldown), retried below |
+| 2026-09-08 | the dev box, 0.4.88 (server record) | P1 / P2 | **13 cells advertised**: `hevc/nvenc` 4:2:0+4:4:4 · `hevc/amf` · **`hevc/d3d12`** · **`hevc/vulkan`** · `av1/nvenc` · **`av1/vulkan`** · `h264/nvenc` 4:2:0+4:4:4 · `h264/amf` · **`h264/d3d12`** · **`h264/vulkan`** · `h264/mf` · `h264/openh264` · `vp9/libvpx`; `probe_ms` 6051 (4327 on 0.4.87 — the device walk, cached after the first start) |
+| 2026-09-08 | CORPLAP-3 (Intel Meteor Lake iGPU `8086:7d45`, Windows), 0.4.88 — the server record + the probe child by hand under `roomler exec` | P1 / P2 | **`hevc/d3d12` is a new cell on Intel** — `Using device 8086:7d45 (Intel(R) Graphics)`, `hevc_d3d12va` opened with the full low-latency tier in 84 ms, and the host now advertises `h265` (QSV never offered HEVC there). `h264_d3d12va`: `Failed to check encoder support (887a0020)` on the first tier, then `Failed to check rate control support / Driver does not support VBR RC mode`, then no compatible RC mode — the Intel D3D12 driver refuses FFmpeg's H.264 configuration; the QSV cell covers H.264. `av1_d3d12va`: `Driver does not support VBR RC mode` on the iGPU, adapter 1 = the Basic Render Driver refuses to open (`-22`), adapters 2–3 the same RC refusal — QSV covers AV1. Vulkan: device 0 (the Intel driver) has no `VK_KHR_video_encode_queue`, devices 1–3 do not exist — no Vulkan cells on Intel Windows, correctly. `probe_ms` 6811 (5660 on 0.4.87) |
+| 2026-09-08 | the WSL sibling · zeus · mars · the MacBook, 0.4.88 (server records) | P1 | WSL: the three NVENC cells unchanged, `probe_ms` 5866 (2508 on 0.4.87 — four software Vulkan ICDs opened and refused; cached after the first start). zeus (RADV without `RADV_PERFTEST=video_encode`): `hevc/vaapi` + `h264/vaapi` unchanged, `probe_ms` 200 — no Vulkan cell, as the extension list predicts. mars: `openh264` + `libvpx`, 501 ms. MacBook: `hevc/videotoolbox` + `h264/videotoolbox` unchanged, 120 ms — the new names are inert on the platform whose FFmpeg carries none of them |
+| 2026-09-08 | jupiter, `vulkaninfo` | P1 | **RADV exposes video encode only under `RADV_PERFTEST=video_encode`**: Mesa 25.2.8 (`RADV RAPHAEL_MENDOCINO`, Vulkan 1.4.318) lists zero `VK_KHR_video_*` extensions by default and `VK_KHR_video_encode_{queue,h264,h265}` with the flag. The positive Linux Vulkan cell therefore needs the daemon's environment (a systemd drop-in) — see *Open decisions* |
+| 2026-09-08 | jupiter, 0.4.88 + `roomlerd.service.d/radv-video-encode.conf` (`Environment=RADV_PERFTEST=video_encode`), the probe cache cleared, restart | P1 | **The Linux positive Vulkan cell.** Server record: **`hevc/vulkan` hw + `h264/vulkan` hw** next to `hevc/vaapi` + `h264/vaapi` (six cells), `probe_ms` 150 — RADV's Vulkan encode on VCN 3.1 costs the probe nothing. `av1_vulkan`: `Device does not support encoding av1` on RADV (VCN 3.1 has no AV1 encode; the correct refusal) and no encode queue on the second device (llvmpipe). The same restart WITHOUT clearing `caps-cache.json` would have replayed the four-cell answer — the cache key's blindness to driver environment, as recorded above. Note for the roll itself: jupiter's first install attempt failed on the dpkg lock held by an `apt-get` I was running on it (`vulkan-tools`), and the re-push hit the 300 s install cooldown — never run apt on a host during its roll |
