@@ -72,7 +72,7 @@ overridden.
 
 ## Phases
 
-`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff
+`M0` measurement → `M1` media thread → `M2` make-before-break → `M3` plan handoff (**designed 2026-09-08**, §"M3 — the plan handoff, as designed"; not built)
 → `M4` one controller (FR-63 B1/B2) → `M5` the deletions (FR-62 A4 + FR-63 B3) ·
 ~~`T1` transport classification~~ (→ **FR-71 #1362**, 2026-09-05) · `P1` priors decay + visible overrides.
 
@@ -516,6 +516,100 @@ n*Nuance from 2026-09-08 (FR-71's hold-on repeat, 12:15 UTC): the two `other`-do
 moves (M3), no make-before-break (M2 — but it becomes a `Open` on the same
 thread while the current encoder keeps serving `Encode`, which is the whole
 reason the open belongs there), no controller change (M4).
+
+## M3 — the plan handoff, as designed (2026-09-08)
+
+Anchors verified against master `64170b659`.
+
+**What the pump is today, after M1 and M2.** The encoder lives on its own OS
+thread behind a command channel (`encode::thread`: `encode`, `set_bitrate`,
+`request_keyframe`, `adopt_rebuilt`, `rebuild_spec{,_at_dims}`, `rate_stats`,
+`with`), and a replacement is built on that thread while the current one keeps
+producing. What did **not** move is the deciding. `media_pump_ffmpeg_dc`
+(`agents/roomlerd/src/peer.rs:4664–7672`) still computes, inside the frame path:
+
+| what it decides | where | reads |
+|---|---|---|
+| the send-queue byte budget, and since FR-74 P1b the wait that qualifies it | `:5916`, `:5951` | the governor, the transport verdict, the ceiling |
+| whether to skip this frame | `:5989`–`:6033` | the budget vs the live in-flight bytes |
+| the encoder's target rate | `:6077` (`enc.set_bitrate`) | `governor.pre_encode_tick` per frame |
+| how long to sleep before the next frame | `:6100`–`:6113` | `governor.paced_fps()` |
+| the geometry to encode at | `:6255`, `:6353` (`merged_target`) | a `Mutex<TargetResolution>` shared with the control DC |
+| when to rebuild, and when to adopt | `:5604`, `:5661` | dims/chroma/backend changes |
+
+So the media loop reads shared state and decides, per frame, in the same pass
+that captures and encodes. That is the coupling M0's stall watch keeps
+attributing: a decision that needs a lock, an await, or a governor tick is a
+decision that can stall the frame path, and a loop that stalls cannot tell a
+stalled pipe from a stolen thread (FR-71's three field events, and FR-79's gate
+exists because of them).
+
+**M3's shape: the control plane publishes a plan; the media loop reads it.**
+
+```rust
+/// FR-70 M3 — everything the media loop is allowed to know. Computed by the
+/// control plane, published whole, read once at the top of a frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Plan {
+    /// The encoder's target, already coarsened to the ladder the pump applies.
+    pub bitrate_bps: u32,
+    /// The geometry to encode at — the user's pick already merged with the
+    /// caps and the rungs, so the loop never merges anything.
+    pub dims: (u32, u32),
+    /// Frames per second the loop may produce (the pacer's only input).
+    pub fps: u32,
+    /// FR-59 P2 / FR-74 P1b — the byte budget the gate compares the send
+    /// queue against, and the measured-wait bound that qualifies it.
+    pub queue_budget_bytes: usize,
+    pub queue_lag_bound_ms: u64,
+    /// Monotonic. The loop adopts a plan only when this moves, so a plan
+    /// recomputed with identical fields costs nothing.
+    pub epoch: u64,
+}
+```
+
+One writer (the control plane, on the tokio task that already runs the viewer
+window), one reader (the media thread), published through a single
+`watch`/`ArcSwap` cell. The loop's pass becomes: **read plan → pace → capture →
+scale → encode → hand to the send task → report facts**.
+
+**The other half of the handoff is the facts.** The control plane cannot decide
+without what the loop saw, and those already exist as the atomics and the sink
+FR-71 and FR-79 read: `WindowSenderStats` (in-flight bytes, gate skips, send
+waits, frames sent, and since FR-79 the window's stalled passes), the goodput
+sink's blocked sends, and the encoder's `rate_stats`. M3 does not invent a
+telemetry path; it names the one that exists as the loop's only output.
+
+**What M3 deliberately does NOT do.** No controller change (M4), no new
+estimator (FR-79 V3 did that consolidation), and **no behaviour change**: a plan
+whose fields are computed exactly as the pump computes them today produces
+byte-identical decisions. That is what makes it provable.
+
+**Why it is worth doing at all** — it is the precondition for the deletions:
+
+- the budget arithmetic, the pacer's choice and the resolution merge stop being
+  three inline computations in a frame path and become three fields of one
+  struct, computed in one place;
+- M4 can then replace the several controllers with one, because there is a
+  single place a decision is written down;
+- M5's deletions become safe: nothing inside `encode/` is reachable from the
+  media loop except through the plan, so removing a lever cannot silently
+  change what the loop does.
+
+**Acceptance for M3** (to be written into the criteria when it is built):
+
+1. The media loop contains no call that decides — no governor tick, no budget
+   arithmetic, no `merged_target`, no lock taken in the frame path.
+2. The B0 cells and a field session produce the SAME targets, skips and dims as
+   the pre-M3 build: a boundary move with a behaviour diff is a bug, not a
+   refactor.
+3. The diff deletes more from `peer.rs` than the plan adds, and the pump's
+   line count falls.
+
+⚠️ **Sequencing**: M3 is a wide change to a 3,000-line function, and this FR's
+own rule is that the reasoning before the code is the verification budget.
+It ships as its own PR with no other change riding along, and the field gate is
+a session whose heartbeat is indistinguishable from the release before it.
 
 ## Acceptance criteria
 
