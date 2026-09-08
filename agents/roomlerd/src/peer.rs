@@ -4260,6 +4260,8 @@ async fn media_pump_vp9_444_dc(
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 transit_holds = governor.transit_holds(),
+                hard_stalls_paused = governor.hard_stalls_paused(),
+                hard_stalls_confirmed = governor.hard_stalls_confirmed(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
@@ -7543,6 +7545,8 @@ async fn media_pump_ffmpeg_dc(
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 transit_holds = governor.transit_holds(),
+                hard_stalls_paused = governor.hard_stalls_paused(),
+                hard_stalls_confirmed = governor.hard_stalls_confirmed(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
