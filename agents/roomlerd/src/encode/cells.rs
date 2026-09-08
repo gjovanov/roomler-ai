@@ -97,9 +97,6 @@ pub(crate) fn cell_denied(deny: &[String], name: &str, chroma: ChromaFormat) -> 
 /// Empty when no backend of this codec does 4:4:4 (AV1) or every one is
 /// denied — the caller then runs the 4:2:0 cascade and reports the truth.
 #[cfg(feature = "ffmpeg-encoder")]
-// The caller is P3b (the pump's 4:4:4 cascade); until it lands the fn is
-// vocabulary only.
-#[allow(dead_code)]
 pub(crate) fn names_444(codec: roomler_ai_remote_control::models::VideoCodec) -> Vec<&'static str> {
     let deny = denied_cells();
     crate::encode::ffmpeg::FfmpegEncoder::cascade_names(codec)
@@ -107,6 +104,38 @@ pub(crate) fn names_444(codec: roomler_ai_remote_control::models::VideoCodec) ->
         .copied()
         .filter(|name| ffmpeg_444_capable(name) && !cell_denied(&deny, name, ChromaFormat::Yuv444))
         .collect()
+}
+
+/// The encoder names a 4:2:0 session may try for `codec`, in cascade order:
+/// the whole table minus the denylist. Empty when every cell of the codec is
+/// denied — the open then fails with the dispatcher's "no candidates" error,
+/// which is the truth (the hello advertised nothing either), never a quiet
+/// fallback to the raw table.
+///
+/// FR-78 P3 field read (jupiter, 2026-09-08): with `hevc_vaapi:yuv420` denied
+/// the probe advertised only the Vulkan cells, and a HEVC session then opened
+/// `hevc_vaapi` anyway — the 4:2:0 constructors handed the static table to the
+/// dispatcher, and only the probe and the 4:4:4 list read the denylist. A kill
+/// switch the probe honours and a session ignores is not a kill switch: the
+/// probe opens in a child process, a session opens in the daemon — the crash
+/// the list exists to keep out of the daemon was the one thing it did not
+/// keep out.
+#[cfg(feature = "ffmpeg-encoder")]
+pub(crate) fn names_420(codec: roomler_ai_remote_control::models::VideoCodec) -> Vec<&'static str> {
+    let deny = denied_cells();
+    let names: Vec<&'static str> = crate::encode::ffmpeg::FfmpegEncoder::cascade_names(codec)
+        .iter()
+        .copied()
+        .filter(|name| !cell_denied(&deny, name, ChromaFormat::Yuv420))
+        .collect();
+    if names.is_empty() {
+        tracing::warn!(
+            ?codec,
+            ?deny,
+            "every 4:2:0 cell of this codec is on the device denylist — nothing to open"
+        );
+    }
+    names
 }
 
 #[cfg(test)]
@@ -224,5 +253,66 @@ mod tests {
             vec!["hevc_nvenc", "hevc_qsv", "hevc_vaapi", "hevc_vulkan"]
         );
         assert_eq!(names_444(VideoCodec::Vp9), vec!["vp9_qsv", "vp9_vaapi"]);
+    }
+
+    /// FR-78 P3 (jupiter, 2026-09-08): with `hevc_vaapi:yuv420` denied the
+    /// probe advertised only the Vulkan cells and a session opened
+    /// `hevc_vaapi` anyway — the 4:2:0 cascades never read the list. The
+    /// session's 4:2:0 list is the cascade minus the denylist, like the 4:4:4
+    /// one, so what the hello advertises is all a session can reach.
+    #[cfg(feature = "ffmpeg-encoder")]
+    #[test]
+    fn names_420_follow_the_cascade_minus_the_denylist() {
+        use crate::encode::ffmpeg::FfmpegEncoder;
+        use tunnel_core::env::test_env::Saved;
+        let _guard = crate::encode::DENY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _saved = Saved::cleared("ENCODER_CELLS_DENY");
+        for codec in [
+            VideoCodec::Hevc,
+            VideoCodec::Av1,
+            VideoCodec::H264,
+            VideoCodec::Vp9,
+        ] {
+            assert_eq!(
+                names_420(codec),
+                FfmpegEncoder::cascade_names(codec).to_vec(),
+                "the built-in denylist names only 4:4:4 cells"
+            );
+        }
+        unsafe {
+            tunnel_core::env::test_env::set(
+                "ENCODER_CELLS_DENY",
+                "hevc_vaapi:yuv420,h264_vaapi:yuv420",
+            )
+        };
+        let hevc = names_420(VideoCodec::Hevc);
+        assert!(!hevc.contains(&"hevc_vaapi"), "{hevc:?}");
+        assert!(
+            hevc.contains(&"hevc_nvenc") && hevc.contains(&"hevc_vulkan"),
+            "{hevc:?}"
+        );
+        assert_eq!(
+            hevc.last(),
+            Some(&"hevc_vulkan"),
+            "the order is the cascade's"
+        );
+        assert!(!names_420(VideoCodec::H264).contains(&"h264_vaapi"));
+        assert_eq!(
+            names_420(VideoCodec::Av1),
+            FfmpegEncoder::cascade_names(VideoCodec::Av1).to_vec(),
+            "a deny names ONE cell, not a backend"
+        );
+        unsafe {
+            tunnel_core::env::test_env::set(
+                "ENCODER_CELLS_DENY",
+                "hevc_nvenc:yuv420,hevc_qsv:yuv420,hevc_amf:yuv420,hevc_videotoolbox:yuv420,hevc_vaapi:yuv420,hevc_d3d12va:yuv420,hevc_vulkan:yuv420",
+            )
+        };
+        assert!(
+            names_420(VideoCodec::Hevc).is_empty(),
+            "every cell denied ⇒ nothing to try, never a fallback to the raw table"
+        );
     }
 }

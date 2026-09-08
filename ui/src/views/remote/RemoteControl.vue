@@ -3121,7 +3121,8 @@ const statsCodecLabel = computed(() => {
     return `VP9 ${chroma}`
   }
   // rc.80 — HEVC over DataChannel. Always HW on the agent (FFmpeg
-  // dispatches to NVENC / QSV / AMF).
+  // dispatches to NVENC / QSV / AMF / VideoToolbox / VAAPI / D3D12 / Vulkan —
+  // the encoder name rides in `rc:video-info` and is appended to the pill).
   if (rc.hevcActive.value) return 'H.265 4:2:0 HW'
   const raw = rc.stats.value.codec
   if (!raw) return ''
