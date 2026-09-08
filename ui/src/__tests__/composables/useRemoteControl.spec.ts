@@ -114,6 +114,7 @@ import {
   resolutionCapAnnotation,
   displayScale,
   resolutionOverrideHint,
+  codecLabelFromDecoderConfig,
 } from '@/composables/useRemoteControl'
 import {
   computeRenderTarget,
@@ -4366,5 +4367,40 @@ describe("FR-74 P4 — the viewer's pixel chain (displayScale)", () => {
     expect(displayScale({ ...frame, stageW: 0, stageH: 0, dpr: 1, mode: 'adaptive', customPct: 100 }).scale).toBeNull()
     // A bogus devicePixelRatio reads as 1 rather than poisoning the label.
     expect(displayScale({ ...frame, stageW: 1920, stageH: 1200, dpr: Number.NaN, mode: 'adaptive', customPct: 100 }).label).toBe('1:1 pixels')
+  })
+})
+
+/** FR-80 — the status pill's pre-`video-info` label.
+ *
+ *  The regression this locks: the pill hardcoded "VP9" for any active
+ *  DataChannel worker, and that worker decodes VP9, AV1 and H.264 alike. A
+ *  session whose host could not capture never receives `rc:video-info`, so an
+ *  H.264 session reported "VP9 4:4:4" and sent the operator to the codec
+ *  picker instead of the host's screen-recording permission (field,
+ *  2026-09-08). */
+describe('codecLabelFromDecoderConfig', () => {
+  it('names the codec the DECODER was configured with, not the worker', () => {
+    // The exact strings the three DC paths configure.
+    expect(codecLabelFromDecoderConfig('avc1.640034')).toBe('H.264')
+    expect(codecLabelFromDecoderConfig('av01.0.13M.08')).toBe('AV1')
+    expect(codecLabelFromDecoderConfig('vp09.00.10.08')).toBe('VP9')
+    expect(codecLabelFromDecoderConfig('hev1.1.6.L153.B0')).toBe('H.265')
+    // The H.264 4:4:4 profile string is still H.264.
+    expect(codecLabelFromDecoderConfig('avc1.f40034')).toBe('H.264')
+    expect(codecLabelFromDecoderConfig('hvc1.1.6.L120.B0')).toBe('H.265')
+  })
+
+  it('says nothing rather than guessing', () => {
+    // Before a decoder is configured there is no codec to name, and naming
+    // one anyway is the whole defect.
+    expect(codecLabelFromDecoderConfig(null)).toBe('')
+    expect(codecLabelFromDecoderConfig(undefined)).toBe('')
+    expect(codecLabelFromDecoderConfig('')).toBe('')
+    expect(codecLabelFromDecoderConfig('something-new.1')).toBe('')
+  })
+
+  it('is case-insensitive, because the string comes from a browser API', () => {
+    expect(codecLabelFromDecoderConfig('AVC1.640034')).toBe('H.264')
+    expect(codecLabelFromDecoderConfig('AV01.0.13M.08')).toBe('AV1')
   })
 })

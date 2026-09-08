@@ -720,7 +720,26 @@
              OUT of the video canvas into the toolbar (2026-07-21) — over the
              video it covered a maximized remote window's caption/close
              buttons. See the `.stats-readout` block in the toolbar above. -->
-        <div v-if="!rc.hasMedia.value" class="no-media-overlay">
+        <!-- FR-80 — the host told us it cannot capture. This takes the place
+             of the generic "waiting for a video track" text, because that
+             text describes a different failure and reading it while the real
+             cause sits in the host's log is how an operator loses an hour. -->
+        <div v-if="rc.mediaUnavailable.value" class="no-media-overlay">
+          <v-icon size="72" color="warning">mdi-monitor-off</v-icon>
+          <p class="text-body-1 mt-3">This device cannot capture its screen.</p>
+          <p v-if="rc.mediaUnavailable.value.hint" class="text-body-2 text-medium-emphasis mt-2 mx-auto no-media-hint">
+            {{ rc.mediaUnavailable.value.hint }}
+          </p>
+          <p class="text-caption text-medium-emphasis mt-2">
+            Reported by the device as
+            <code>{{ rc.mediaUnavailable.value.code }}</code>.
+            <span v-if="rc.mediaUnavailable.value.detail">{{ rc.mediaUnavailable.value.detail }}</span>
+          </p>
+          <p class="text-caption text-medium-emphasis mt-1">
+            Remote shell, file transfer and the other channels are unaffected.
+          </p>
+        </div>
+        <div v-else-if="!rc.hasMedia.value" class="no-media-overlay">
           <v-icon size="72" color="grey-lighten-1">mdi-video-off</v-icon>
           <p class="text-body-1 mt-3">Connected — waiting for agent to publish a video track.</p>
           <p class="text-caption text-medium-emphasis mt-1">
@@ -1611,6 +1630,7 @@ import {
   type RcPriority,
   resolutionCapAnnotation,
   resolutionOverrideHint,
+  codecLabelFromDecoderConfig,
 } from '@/composables/useRemoteControl'
 import {
   PICKER_CHROMAS,
@@ -3111,19 +3131,19 @@ const statsCodecLabel = computed(() => {
     const fsr = rc.renderInfo.value && rc.renderInfo.value.mode !== '2d' ? ' · FSR' : ''
     return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec + shared + fsr
   }
-  // Fallback when the agent hasn't sent video-info (legacy track /
-  // libvpx VP9-444 path). Derive chroma from the USER's selection
-  // (`vp9Chroma`) instead of hardcoding — so a 4:2:0 selection no
-  // longer mislabels as 4:4:4. We can't know HW/SW without the
-  // agent telling us, so omit that claim.
-  if (rc.vp9_444Active.value) {
-    const chroma = rc.vp9Chroma.value === 'yuv420' ? '4:2:0' : '4:4:4'
-    return `VP9 ${chroma}`
+  // FR-80 — no video-info yet. Name the codec the viewer's own DECODER was
+  // configured with, and claim nothing else: no chroma, no HW/SW, because
+  // the agent has not told us either.
+  //
+  // ⚠️ This block used to return `VP9 <chroma>` for ANY active DataChannel
+  // worker, and that worker serves VP9, AV1 and H.264 alike. A session whose
+  // host could not capture never sends video-info, so an H.264 session
+  // reported "VP9 4:4:4" and the operator went looking at the codec picker
+  // instead of the capture failure (field, 2026-09-08). A pill must not name
+  // a codec nobody told it.
+  if (rc.vp9_444Active.value || rc.hevcActive.value) {
+    return codecLabelFromDecoderConfig(rc.dcDecoderCodec.value)
   }
-  // rc.80 — HEVC over DataChannel. Always HW on the agent (FFmpeg
-  // dispatches to NVENC / QSV / AMF / VideoToolbox / VAAPI / D3D12 / Vulkan —
-  // the encoder name rides in `rc:video-info` and is appended to the pill).
-  if (rc.hevcActive.value) return 'H.265 4:2:0 HW'
   const raw = rc.stats.value.codec
   if (!raw) return ''
   const lower = raw.toLowerCase()
@@ -3464,6 +3484,11 @@ const phaseColor = computed(() => {
 })
 // S3 — human wording for the sub-connected health states.
 const degradedLabel = computed(() => {
+  // FR-80 — when the host has told us it cannot capture, say THAT instead of
+  // "video stalled". The stall is the symptom; the agent sent the cause, and
+  // an operator reading "video stalled" has no idea the fix is a permission
+  // on the far machine.
+  if (rc.mediaUnavailable.value) return 'connected · no screen capture'
   switch (rc.degraded.value) {
     case 'transport_unstable': return 'connected · unstable link'
     case 'media_stalled': return 'connected · video stalled'
@@ -4074,6 +4099,11 @@ onBeforeUnmount(() => {
   color: #fff;
   text-align: center;
   padding: 24px;
+}
+/* FR-80 — the capture-failure hint is a sentence, not a label: hold it to a
+   readable measure instead of letting it span a 4K canvas. */
+.no-media-hint {
+  max-width: 52ch;
 }
 /* Keyboard-lock affordances (locked fullscreen). Inside .video-frame
    so they survive fullscreen; never intercept pointer events. */

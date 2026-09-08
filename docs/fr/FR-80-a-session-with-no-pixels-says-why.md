@@ -60,11 +60,25 @@ operator's to restore; the product's job is to say so.
    `None`, so no call site changes shape and every pump can ask.
 2. **The code is derived, never guessed.** `code` is a small closed set —
    `permission` · `no_display` · `not_built` · `backend_error`. On macOS a
-   failed open asks the OS (`CGPreflightScreenCaptureAccess`) rather than
-   pattern-matching an error string, because scrap reports a bare
-   `other error` and a guess would be a second lie. On Linux an absent
+   failed open asks the OS through the TCC preflight the agent already owns
+   (`roomler_node_core::tcc::screen_recording_granted`, the same probe
+   `scrap_backend` warns from) rather than pattern-matching an error string,
+   because scrap reports a bare `other error` for a denied grant and a broken
+   display alike and a guess would be a second lie. On Linux an absent
    `DISPLAY`/`WAYLAND_DISPLAY` is `no_display`. Anything unattributed stays
    `backend_error` with the backend's own text — an honest "we do not know".
+
+   ⚠️ **The agent already knew.** `scrap_backend::primary` preflights the
+   grant and logs `macOS Screen Recording permission MISSING — … Grant it
+   under System Settings → Privacy & Security`, naming the exact fix. On the
+   MacBook it logged that **34 times** on the day of the incident. Every word
+   the operator needed existed, in a file on the far machine, and nothing
+   carried it the one hop to the person looking at the black rectangle. This
+   FR is not about learning the cause; it is about the cause being reachable.
+   ⚠️ That backend's comment ("a missing grant does NOT fail `Capturer::new`
+   — it delivers wallpaper-only frames") is now half-stale: on this macOS the
+   open fails outright. Both shapes must stay handled — the warn covers the
+   silent one, this covers the failing one.
 3. **One new control-DC message**, `rc:media-unavailable`, built by a sibling of
    `video_info_payload` (`peer.rs:4475`) and sent with the same
    retry-until-delivered discipline both pumps already use for `rc:video-info`
@@ -85,10 +99,10 @@ operator's to restore; the product's job is to say so.
 
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
-| P1 | `CaptureUnavailable` on `NoopCapture` + the trait accessor; the macOS/Linux derivation | — (a pure addition; absent reason = today's behaviour) | — |
-| P2 | `rc:media-unavailable` on the control DC, retry-until-delivered, from both pumps | an old viewer ignores the message | — |
-| P3 | The viewer: the reason on the canvas, and the pill's fallback stops naming VP9 | pure UI | — |
-| P4 | Docs — `docs/remote-control.md` (the message + the reason table), `docs/encoders.md` cross-ref | — | — |
+| P1 | `CaptureUnavailable` on `NoopCapture` + the trait accessor; the macOS/Linux derivation | — (a pure addition; absent reason = today's behaviour) | **built** — the reason is classified once at `open_default` and carried by the fallback capturer; macOS reuses the TCC preflight the agent already owns |
+| P2 | `rc:media-unavailable` on the control DC, retry-until-delivered, from all three pumps | an old viewer ignores the message | **built** — a spawned, deadline-bounded notice, because the control DC opens after capture and the pumps' own retry hangs off a captured frame |
+| P3 | The viewer: the reason on the canvas, and the pill's fallback stops naming VP9 | pure UI | **built** — the pill reads the DECODER's own config string (`codecLabelFromDecoderConfig`), the canvas shows the cause and the fix, and the health label says "no screen capture" instead of "video stalled" |
+| P4 | Docs — `docs/remote-control.md` §5.1a (the sequence, the code table), the FR spec | — | **built** |
 
 ## Acceptance criteria
 

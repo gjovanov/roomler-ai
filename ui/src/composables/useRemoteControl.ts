@@ -414,6 +414,50 @@ export type RcLogsFetchReply = {
  *  "relay"/"direct" Ã¢ÂÂ WHICH ICE path this session took; the agent
  *  re-sends the message when the path changes mid-session. '' from
  *  agents older than the field. */
+/** FR-80 — the codec a WebCodecs configuration string names, for the status
+ *  pill's label before `rc:video-info` arrives. Pure + exported so the tests
+ *  lock it.
+ *
+ *  Before this the pill hardcoded `VP9` whenever the DataChannel worker was
+ *  active — and that worker serves VP9, AV1 and H.264 alike (its log prefix is
+ *  a legacy name, not a codec). So an H.264 session that never received a
+ *  frame reported "VP9 4:4:4", and the operator chasing a black screen was
+ *  sent to the codec picker instead of the host's capture failure (field,
+ *  2026-09-08). The decoder's own configuration is the one codec fact the
+ *  viewer owns before the agent speaks; everything else it must be told. */
+export function codecLabelFromDecoderConfig(codec: string | null | undefined): string {
+  if (!codec) return ''
+  const c = codec.toLowerCase()
+  if (c.startsWith('avc1') || c.startsWith('avc3')) return 'H.264'
+  if (c.startsWith('hev1') || c.startsWith('hvc1')) return 'H.265'
+  if (c.startsWith('av01')) return 'AV1'
+  if (c.startsWith('vp09') || c === 'vp9') return 'VP9'
+  if (c.startsWith('vp8')) return 'VP8'
+  return ''
+}
+
+/** FR-80 — the agent's answer to "why is there no picture?".
+ *
+ *  Sent once per session, as soon as the host knows its capture backend will
+ *  produce nothing — which is BEFORE any frame, and therefore before
+ *  `rc:video-info`, the message a pump with no frames never reaches. That gap
+ *  is the whole reason this type exists: on 2026-09-08 a macOS Screen
+ *  Recording grant invalidated by a signing-identity change produced a black
+ *  canvas, a stall, and no explanation anywhere the operator could see.
+ *
+ *  `code` is a closed vocabulary today (`permission`, `no_display`,
+ *  `not_built`, `backend_error`) but is typed as a string on purpose: a newer
+ *  agent may name a cause this bundle has never heard of, and its `hint` is
+ *  still worth showing. */
+export interface RcMediaUnavailable {
+  code: string
+  /** The backend's own error text, capped agent-side. May be empty. */
+  detail: string
+  /** The operator-facing sentence, composed by the agent because only it
+   *  knows which OS it is on. May be empty from an older agent. */
+  hint: string
+}
+
 export interface RcVideoInfo {
   codec: string
   encoder: string
@@ -689,6 +733,7 @@ export type RcControlInbound =
   | { kind: 'clock_echo'; t0: number; agentUs: number }
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
+  | { kind: 'media_unavailable'; reason: RcMediaUnavailable }
   | { kind: 'control_state'; state: RcControlState }
   | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
   | { kind: 'logs_fetch_start'; id: string | null; path?: string; totalLines?: number; truncated?: boolean }
@@ -762,6 +807,20 @@ export function parseControlInbound(data: unknown): RcControlInbound {
                 : {}),
             }
           : {}),
+      },
+    }
+  }
+  // FR-80 — the agent says this session will produce no pixels, and why.
+  // `code` is a closed vocabulary but an unknown one is kept, not dropped:
+  // a newer agent's code still carries a usable `hint`, and inventing
+  // "unknown" here would repeat the mistake this message exists to fix.
+  if (obj.t === 'rc:media-unavailable' && typeof obj.code === 'string') {
+    return {
+      kind: 'media_unavailable',
+      reason: {
+        code: obj.code,
+        detail: typeof obj.detail === 'string' ? obj.detail : '',
+        hint: typeof obj.hint === 'string' ? obj.hint : '',
       },
     }
   }
@@ -3742,6 +3801,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  don't send it yet Ã¢ÂÂ badge falls back to a selection-derived
    *  label). The stats badge reads this for an honest readout. */
   const videoInfo = ref<RcVideoInfo | null>(null)
+  /** FR-80 — set when the agent tells us it cannot capture; cleared on every
+   *  new connect so a fixed host stops showing yesterday's reason. */
+  const mediaUnavailable = ref<RcMediaUnavailable | null>(null)
+  /** FR-80 — the WebCodecs config string the active DataChannel decoder was
+   *  built with (`avc1.640034`, `av01.0.13M.08`, …). The pill's honest label
+   *  until `rc:video-info` names the agent's real encoder. */
+  const dcDecoderCodec = ref<string | null>(null)
   /** P6 — the agent's InputArbiter state (participants, mode, floor
    *  holder). Null until the first `rc:control.state` broadcast; old
    *  agents never send it, so the multi-user UI self-hides. */
@@ -5950,6 +6016,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       } else if (msg.type === 'decoder-configured') {
         // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
         // configure() Ã¢ÂÂ proves whether the roomler-rc-decode-pref A/B took.
+        // FR-80 — the worker's log prefix is a legacy name; `msg.codec` is
+        // the truth (this worker decodes VP9, AV1 and H.264). The pill reads
+        // it until the agent names its encoder.
+        dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
         console.info('[rc] vp9-444 decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference')
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
@@ -6227,6 +6297,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         )
       } else if (msg.type === 'decoder-configured') {
         // `pref` (round 3) Ã¢ÂÂ see the vp9-444 handler.
+        dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
         console.info('[rc] hevc decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference')
       } else if (msg.type === 'decoder-error'
         || msg.type === 'decoder-configure-error'
@@ -7002,6 +7073,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     hostLocked.value = false
     currentDesktop.value = 'Default'
     videoInfo.value = null
+    // FR-80 — a host whose permission was restored must not keep showing
+    // yesterday's reason, and the pill must not carry the last session's
+    // codec into one that has not named its own yet.
+    mediaUnavailable.value = null
+    dcDecoderCodec.value = null
     remoteLayout.value = null
     localClipboardBridge.value = null
     localClipboardBridgePort.value = null
@@ -8064,6 +8140,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // honest stats badge (replaces the hardcoded "VP9 4:4:4 SW").
         videoInfo.value = parsed.info
         console.info('[rc] video-info', parsed.info)
+      } else if (parsed?.kind === 'media_unavailable') {
+        // FR-80 — the host cannot capture. Surfaced on the canvas, because
+        // the alternative the operator had was a black rectangle and a
+        // stall that names nothing.
+        mediaUnavailable.value = parsed.reason
+        console.warn(
+          `[rc] the host cannot capture its screen (${parsed.reason.code}) — ${parsed.reason.hint}`,
+          parsed.reason.detail,
+        )
       } else if (parsed?.kind === 'control_state') {
         // P6 - arbiter state: participants rail + exclusive floor. Prune
         // ghost cursors of sessions that left.
@@ -10511,6 +10596,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  Null on the legacy track / libvpx paths (no message); the
      *  badge falls back to a selection-derived label then. */
     videoInfo,
+    mediaUnavailable,
+    dcDecoderCodec,
     // P6 — multi-user: arbiter state, ghost cursors, floor control.
     controlState,
     peerCursors,
