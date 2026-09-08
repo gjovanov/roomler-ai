@@ -1,7 +1,11 @@
 # FR-23: Company identity on the site, and one product on both domains
 
 **Issue:** [#827](https://github.com/gjovanov/roomler-ai/issues/827)
-**Status:** in progress
+**Status:** **CLOSED 2026-09-08** — Apple enrolment 5XS5WN8R99 resolved (Team `4TG7586MY5`,
+G ROX EOOD); every criterion met or explicitly withdrawn (phase 4 skipped, phase 5 shipped
+as a 301). ⚠️ Apple states no reason for a review clearing, so the wrong phone number is the
+best available explanation for the fourteen-day silence, **not a proven cause** — both
+defects were real and are fixed, which is what this FR can claim.
 **Related:** [FR-7](FR-7-signed-releases.md) (signed releases — the Apple half is what this unblocks)
 
 ## Goal
@@ -193,7 +197,7 @@ deliberately, so deleting `apps/roomler-old.yaml` does not cascade.
 | 1 | Imprint page + company blocks + footer | revert; route is additive | ✅ shipped |
 | 2 | FR + PR | — | ✅ shipped |
 | 3 | Deploy | previous image tag | ✅ shipped + field-verified (`v20260828-de59383da2fe`) |
-| 3b | Send Apple the correction | — | ⬜ operator action; letter + PDF prepared |
+| 3b | Send Apple the correction | — | ✅ done — enrolment cleared 2026-09-08 |
 | 4 | Delete the obsolete `roomler-old` app | — | 🚫 **SKIPPED** by the operator — the old app keeps running; its `janus`/`coturn` subdomains still depend on it |
 | 5 | `roomler.live` → **301** to `roomler.ai` | restore `roomler.live.conf.bak-pre301-*`, `nginx -t`, reload | ✅ shipped + field-verified |
 | 6 | Legal pages describe all three pillars | revert one commit | ✅ shipped (#835) |
@@ -207,11 +211,12 @@ deliberately, so deleting `apps/roomler-old.yaml` does not cascade.
 - [x] The landing footer links the imprint and names the operating company
 - [x] `bun run build` (incl. `vue-tsc --noEmit`) and `bun run test:unit` pass
 - [x] `https://roomler.ai/imprint` is live — verified against the **shipped bundle**, not the source
-- [ ] Apple has the corrected number and the imprint URL
+- [x] Apple has the corrected number and the imprint URL
 - [x] ~~The `roomler-old` namespace … are gone~~ — **withdrawn**: the operator chose to skip the teardown, and `janus.roomler.live` / `coturn.roomler.live` still depend on that namespace
 - [x] `https://roomler.live` **301s to `roomler.ai`**; `roomler.ai` verified unaffected (200, title `Roomler`), and every co-hosted vhost re-checked
 - [x] Terms and Privacy describe **all three pillars**, and the Privacy Policy's false `localStorage` claim is gone
-- [ ] Apple enrolment 5XS5WN8R99 resolves (this FR closes on that, or on a documented unrelated cause)
+- [x] Apple enrolment 5XS5WN8R99 resolves — **2026-09-08**, Team `4TG7586MY5`. Both Developer ID certificates issued; `agent-v0.4.92`'s `.pkg` notarised, stapled, and Gatekeeper-accepted on a real MacBook **with the quarantine attribute set** (the Finder path — `curl | install.sh` never sets quarantine and so proves nothing)
+- [x] **Docs** — this FR's deliverable *is* user-facing documentation (`/imprint`, Terms, Privacy), so the "docs before close" standing rule is satisfied by the pages themselves; there is no `docs/*.md` subsystem to describe and none was invented to tick a box
 
 ## Open decisions
 
@@ -313,3 +318,7 @@ discipline the repealed-ODR-link defect earned.
 | 2026-08-28 | `$tls1_3_early_data` map | was defined **twice** across `conf.d`; the surviving definition is `asterisk.roomler.live.conf`, the file that uses it |
 | 2026-08-28 | Legal-page facts checked against code | `"microsoft"` is a real provider; `localStorage` holds only `SIGNED_IN` + grid prefs (so the policy's JWT claim was **false**); 90-day and 7-day TTLs exist in `crates/db/src/indexes.rs`; crash reports carry `hostname`, `pid`, `log_tail` |
 | 2026-08-28 | Live legal chunks **before** the phase-6 deploy | privacy `JSON Web Token` → **1** (the false claim was live); `HttpOnly` → 0; terms `exit node` → 0; `Microsoft` → 0 |
+| 2026-09-08 | **Apple enrolment 5XS5WN8R99 resolved.** Team `4TG7586MY5`, G ROX EOOD | Both Developer ID certificates issued; six `APPLE_*` secrets set; `agent-v0.4.92` `.pkg` notarised + stapled |
+| 2026-09-08 | Gatekeeper on a real MacBook (26.6.2 arm64), **quarantine attribute set** | `accepted` · `source=Notarized Developer ID` · `origin=Developer ID Installer: G ROX EOOD (4TG7586MY5)` · `stapler validate` OK · `pkgutil` → *trusted by the Apple notary service* |
+| 2026-09-08 | Close-out re-check of the **shipped bundle** (not the route) | `index-CWf4GqhQ.js` → 1 × `imprint`; `ImprintView-BJDZ-oN2.js` → `205174895`, `G ROX EOOD`, `711 8883`, `roomler.live` |
+| 2026-09-08 | Close-out re-check of the redirect | `https://roomler.live/` → `301 Location: https://roomler.ai/`; `roomler.ai/` 200, `roomler.ai/health` 200 |
