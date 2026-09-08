@@ -137,6 +137,53 @@ places; each is recorded here because the next phase depends on it.
    cell reproduces the field: the backlog spans three windows, the second
    fires the age loop, and the AIMD cuts.
 
+### T2 — a hard stall is a deferred verdict (2026-09-08)
+
+The field's finding-4 shape on the corp-VPN host (§Field-verification log,
+2026-09-08 12:15) is not the simulated one. It is a send that BLOCKS for seconds
+while the overlay's carrier re-establishes itself — a rekey storm, a re-nomination
+— on a pipe that carries exactly what it carried once the pause ends. Four movers
+read that blocked send as the pipe's CAPACITY, and each is right about its own
+input: FR-35's hard halving (`note_send_stall` → `apply_hard_md`: a send blocked
+≥ `HARD_STALL` = 1 s is ×0.5 at once — written for a 7.9 s stall the P0 field
+measurement read as a collapsed pipe), the goodput fold that turns the blocked
+send into an estimate, FR-59 P6's contradiction that abandons the learned
+ceiling on that estimate, and FR-59 P1's floor relief that pins the floor to 85 %
+of it. The T1b hold masks the age loop, which never fired.
+
+What separates a pause from a collapsed pipe is not visible in the blocked send
+itself; it is visible one window later. A collapsed pipe keeps pushing back —
+the next window's sends block too. A pause pushes back on nothing: the next
+reported window has no blocked send and the age sits on its floor. So the rule
+is the make-before-break principle the carrier ladder already follows, applied
+to a measurement: **a blocked send ≥ `HARD_STALL` is a verdict deferred to the
+next reported window.** The sample is quarantined instead of folded and the
+×0.5 is held pending. The next window that carries a viewer report decides:
+if its sends blocked (≥ `MIN_WINDOW_BLOCKED` of blocked time, the estimator's
+own qualifying rule), the stall is CONFIRMED — the quarantined samples fold, the
+×0.5 applies, P6 and the floor relief see what they always saw, one window
+later than FR-35 applied it; if nothing blocked, the stall was a PAUSE — the
+samples are discarded, the pending ×0.5 is dropped, and nothing else moves. A
+window without a report (a gap) decides nothing; the quarantine waits.
+
+What this is not. Not a new controller: every mover keeps its law, and only the
+window in which a hard stall's evidence is READ moves by one. Not a switch: the
+next window's own measurement gates it, which is the evidence FR-35 wanted and
+did not have at the moment of the stall. The collapsed-pipe case FR-35 built the
+halving for reacts one window later (≤ 2 s; the ordinary ×0.85 ladder on send-
+channel occupancy still runs from the first frame). The thin-pipe cases FR-59
+built the relief for are untouched: a thin pipe blocks sends in every window,
+which is exactly the confirmation. Telemetry: `hard_stalls_paused` /
+`hard_stalls_confirmed` on the heartbeat, so the field can read which of the two
+a host's stalls were — and after a week of both counters, whether T1b's hold has
+anything left to do.
+
+Fail-first: `a_hard_stall_followed_by_a_clean_window_is_a_pause_and_cuts_nothing`
+(governor unit test, the 2026-09-08 numbers: a 6.6 M learned ceiling, one send
+blocked 2.9 s, then a clean reported window) against the shipped laws, then
+against T2; `…_followed_by_a_blocked_window_is_confirmed_and_halves` is the
+control that keeps FR-35's reaction.
+
 ## Phases
 
 | Phase | What | Kill switch | Status |
@@ -144,6 +191,7 @@ places; each is recorded here because the next phase depends on it.
 | **T1a** | `encode::pipe_state` + heartbeat `pipe_state` + per-state counters; the B0 fixtures classified under the shipped-rule harness | `transit_classify` | **built 2026-09-05** ([#1366](https://github.com/gjovanov/roomler-ai/pull/1366)), shadow only — AC1's sim/unit half met (see *What the T1a cell taught*); the fleet half (AC2) waits for the next agent release |
 | **T1b** | the hold: no MD, no age-loop fire, clamp held on `TransitStalled` | `transit_hold` (default off) | **built 2026-09-05** — the verdict precedes every loop in the tick; ramp frozen, age loop masked + streak reset, clamp held, prior held, `transit_holds` in the heartbeat; default **off** |
 | **T1c** | the cells: `finding4_transit_stall` in B0 (the law), then the corp-VPN DERP path (the field), each shown to FAIL with the hold off first | — | **sim half done 2026-09-05**: the FAIL recorded (`t1c_finding_4_cuts_the_rate_with_the_hold_off`), the hold's cell green (`t1b_finding_4_hold_keeps_the_rate`), the no-stall cells byte-identical with the hold on and off; the field half waits for the release |
+| **T2** | a hard stall is a deferred verdict: a blocked send ≥ 1 s is quarantined and the ×0.5 held pending until the next REPORTED window — sends still blocking confirm it (fold + halve, one window late), nothing blocking is a pause (discard, no move) | — (the next window's own measurement gates it) | **built 2026-09-08**, test-first on the 12:15 numbers; field gate on the release carrying it |
 
 ## Acceptance criteria
 
@@ -232,6 +280,8 @@ places; each is recorded here because the next phase depends on it.
       with one benign gap-hold — see the field log.)*
 - [ ] **AC5** — FR-70's AC5 closes here, and FR-63 B1's controller consumes
       `PipeState` rather than re-deriving it.
+- [ ] **AC6** — with T2 live, a repeat of the 2026-09-08 12:15 shape (a blocked send ≥ 1 s inside a rekey storm on the corp-VPN relay, the pipe intact after) shows `hard_stalls_paused` counting, no ×0.5, the learned ceiling kept and the floor unrelieved — and a genuinely thin pipe (the FR-59 hotspot cell or its B0 fixture) still confirms and halves one window late.
+
 
 ## Open decisions
 
