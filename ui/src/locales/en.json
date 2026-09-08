@@ -27,7 +27,7 @@
         "browserNoAv1": "This browser can’t decode AV1",
         "agentNoAv1": "This device has no AV1 hardware encoder",
         "av1NoHw444": "No hardware encoder can produce AV1 in 4:4:4",
-        "hevc": "Hardware H.265 on the device (NVENC / QSV / AMF / VideoToolbox)",
+        "hevc": "Hardware H.265 on the device (NVENC / QSV / AMF / VideoToolbox / VAAPI / D3D12 / Vulkan)",
         "hevc444": "Sharpest text on the hardware pipeline, ~1.5× bitrate",
         "browserNoHevc": "This browser lacks a hardware HEVC decoder",
         "browserNoHevcRext": "This browser can’t decode HEVC 4:4:4 (Chrome ≥137 with NVIDIA driver ≥572.16, or Intel Gen11+)",
