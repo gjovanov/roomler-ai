@@ -242,12 +242,18 @@ stopped doing.
 - [ ] **AC7** — docs updated with diagrams and a `docs/README.md` row
       (`docs/rate-control.md` gains the gate as its first section).
 
-- [ ] **AC8 (V4)** — field: the memory MOVES DOWN. On a carrier measured well
+- [~] **AC8 (V4)** — field, HALF met. The memory MOVES DOWN on a carrier measured well
       below what is remembered, the next write lowers the entry (before V4 it
       could only rise), and the openers that follow stay inside the carrier's
       measured range. On a host whose opener never queues — CORPLAP-2, every
       opener on 2026-09-08 — the memory stops climbing to the `hi` cap, because
       an absorbed burst now writes nothing at all.
+      *First half met on `agent-v0.4.95`, 2026-09-08 22:14–22:17 (field log): two
+      idle sessions measured nothing and wrote nothing — value and timestamp
+      untouched — where the pre-V4 rule would have recorded 3,825,000 from an
+      absorbed burst, a 69 % rise on no evidence, twice. The moving-down half
+      waits for a session whose sends block; `100.65.4.2|relay:derp/tcp` still
+      holds 6,131,302 from the max rule as its target.*
 ## Open decisions
 
 - Whether a `ViewerLate` window is evidence about the pipe. Today it is (only
@@ -270,3 +276,4 @@ stopped doing.
 |---|---|---|---|
 | 2026-09-08 12:15 / 14:52 / 16:33–16:42 | 0.4.87 / 0.4.90 | CORPLAP-1 on the Check Point VPN, relay | the three events this FR generalises; see FR-71's log for the first two and §The opener for the third |
 | 2026-09-08 19:12–19:18 UTC | **agent-v0.4.93** (V1 + V2), my view-only sessions | CORPLAP-1 on the Check Point VPN, HEVC over the relay — the carrier keyed itself `relay:derp/tcp` throughout | **AC5 — PASS, five consecutive sessions.** The pre-FR-79 memory (`100.65.0.5` = 8.0 M, bare key) was correctly ignored, so the first two sessions opened at the 2.55 M relay nominal instead of 6.8 M. Openers: **2.55 / 2.55 / 1.44 / 2.55 / 2.82 M** against a carrier the same sessions measured at **1.09–6.13 M** — every opener inside the measured range, no 6.8 M over-drive and no 1.26 M floor-opener. The write-back is the measurement now: `opener_measured_bps=Some(1440672) growth_target_bps=1440672` (653 KB, 179 ms worst wait — the old rule would have computed 21.9 M and recorded the 8 M cap) and `Some(1087230)` for the next (645 KB, 236 ms → 16.4 M, capped, before). The unqueued branch is untouched (`opener_measured_bps=None`, 256 KB, 0 ms → the ×1.5 step). The memory now holds `100.65.0.5\|relay:derp/tcp` and `100.65.4.2\|relay:derp/tcp` beside the stale bare keys, which age out. `evidence_rejected` per session: `[0,2,2,0] [0,1,1,0] [0,0,0,0] [0,1,1,0] [0,0,0,0]` — every rejection a transit stall and exactly one shadow each, none from an agent stall or a carrier change, and no session cut on one. ⚠️ Open, and honest: DERP's own rate moved 1.09 → 6.13 M inside six minutes, and `record_session` still keeps the MAXIMUM, so the memory ratchets toward the high measurement (session 5 opened at 2.82 M from a 3.32 M seed). It ratchets to something measured now rather than to arithmetic that could not be right, but "max of the measurements" is the next thing to question — a V3 candidate beside the single estimator. |
+| 2026-09-08 22:14–22:17 UTC | **agent-v0.4.95** (V3a + V4) | CORPLAP-1 on the Check Point VPN, two view-only sessions over `relay:derp/tcp`, an idle desktop | **AC8, first half — PASS: a session that measured nothing wrote nothing.** Both openers were absorbed by the socket (203 KB and 330 KB, `opener_wait_max_ms=0`, `opener_measured_bps=None` ⇒ `growth_target_bps=0`), the goodput estimator held no confidence for the whole of either session (`goodput_bps=None`, send waits 0.08–0.15 ms, age 51–67 ms, `evidence_rejected=[0,0,0,0]`), and the write-back logged `evidence_bps=None kept_bps=2264993` — the entry kept its value **and its timestamp**. The counterfactual is exact: the pre-V4 rule would have taken the unqueued branch (`opener_maxrate 2,550,000 × 150 %`) and `max(old 2,264,993, 3,825,000)`, writing **3,825,000** — a 69 % rise recorded by a session that measured nothing, twice in three minutes. That is the ratchet this phase removed, caught in the act. **Second half still open**: the memory has not yet been observed MOVING DOWN, because neither session pushed back on the pipe (an idle 1.3–1.4 Mbps desktop over a carrier that carries it). It needs a session whose sends block — the ones that measured earlier this evening had 179–236 ms opener waits on a busier screen — and CORPLAP-1's `100.65.4.2|relay:derp/tcp` still holds **6,131,302** from the max rule as the standing target for it. |
