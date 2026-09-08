@@ -1,6 +1,6 @@
 # FR-81: Overlay stress matrix — latency, throughput and carrier stability from a throwaway VM
 
-**Issue:** [#TBD](https://github.com/gjovanov/roomler-ai/issues) ·
+**Issue:** [#1546](https://github.com/gjovanov/roomler-ai/issues/1546) ·
 **Status:** proposed 2026-09-08
 
 ## Goal
@@ -106,3 +106,38 @@ throwaway VM, no org-setting changes, no conclusions about corp-network policy b
 ## Field-verification log
 
 _(filled as runs land — every entry records what failed first)_
+
+### 2026-09-08 — first full run, 22 PASS / 0 FAIL
+
+Run `20260908-210103` on zeus, both arms, five targets each. No VM left; fleet org back to 21
+devices (baseline 21) on both arms. Full table on #1546.
+
+**`carrier_transitions=0` on all ten (target × arm) pairs** — no carrier flapped during either
+sweep. That is the stability answer, and the first number that distinguishes a mesh which connects
+once from one that holds.
+
+**The forcing knob is proven**: mars measured `direct` at p50 **0 ms**, then `relay:derp/tcp` at
+p50 **2 ms** under `overlay_direct=false`. Same host, same sweep. Without forcing, never-ratchet
+would have made the relay arm a second direct arm.
+
+Corp-laptop latency over DERP is **p50 47–57 ms**, p95 tail 55–116 ms, loss 0–2.5 % — usable, and
+the tail is the number to watch across releases.
+
+**Findings:** a VM running *on* zeus reaches zeus over DERP rather than LAN (2 ms, so cheap here,
+but the lan tier never won); CORPLAP-3 and mars report `ssh_enabled: true` while having never
+published an SSH host key, so `roomler ssh` correctly refuses and SSH reads as enabled-but-unusable;
+and a grant-issued session gets a shell but **cannot `scp`**, because `roomler proxy` carries no
+client identity.
+
+**Five harness defects, each found only by running it:**
+
+1. `roomler peers` CONN is field **5**, not 4 (a status bullet is field 1) — `$4` reported the IPv6
+   *address* as a carrier. It looked like data.
+2. The ssh arm swallowed stderr and reported a bare `ssh_ok=0`; the real answer was a POLICY gate.
+3. That gate is `SshPolicy.can_originate`, default false — which forced the guest lane into
+   `--phase enroll` / `--phase sweep`, since the row does not exist until enrol has run.
+4. Corp-laptop SSH lands in **PowerShell**, so `echo ok` returns `ok\r` and `grep '^ok$'` failed on
+   a session that worked — the metric read `ssh_ok=0 ssh_err="ok"`, contradicting itself.
+5. The cleanup check grepped for the payload **path**, and PowerShell's not-found error quotes the
+   path back — so a clean machine reported `LEFT_BEHIND`. It failed safe; the same shape inverted
+   is how real leftovers get reported as gone. It now probes for a token.
