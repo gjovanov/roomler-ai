@@ -4,7 +4,7 @@
 P1 (0.4.77) + P1b (0.4.79) + P3 (0.4.80) released and **field-verified 2026-09-07 on all four
 codecs** by the operator's read and the heartbeat; P2 retired by measurement (0 rate swaps);
 AC3 ticked; the thin-direct-path read of the q-cap done 2026-09-07 (sharp but laggy below the
-cap's ~10 Mbps floor — an open decision, §P3); AC1 ticked (pixel half: faithful on 4:4:4, not on 4:2:0 — measured); open: P4 (UI) ·
+cap's ~10 Mbps floor — an open decision, §P3); AC1 ticked (pixel half: faithful on 4:4:4, not on 4:2:0 — measured); P4 built 2026-09-08 (field gate on the promote) ·
 **Parent:** the RC quality program (FR-17/16/14); rides on FR-59's measured pipe and FR-70's
 pump instrumentation.
 
@@ -300,6 +300,31 @@ Show the display scale beside the encode dims in the pill (`shown at 0.9×`), ve
 the 1:1 case, and point at "Match remote display" when the stage and the frame
 disagree. FSR helps only when upscaling.
 
+**As built (2026-09-08).** The last resample in the chain is the browser's, after
+the codec, and no encoder setting can undo it — AC1's pixel comparison had to switch
+the stage to a 1:1 canvas before it meant anything, because in `Adaptive` the
+operator's 1920×1200 frame lands on a 2018×1261 FSR canvas (a 1345×841 CSS stage at
+150 % display scaling): every remote pixel spread over 1.05 screen pixels. `Original`
+is worse there, not better — it is 1:1 in **CSS** pixels, i.e. 1.5× on screen.
+
+- `displayScale()` (`ui/src/composables/useRemoteControl.ts`, pure, unit-tested) computes
+  screen pixels per frame pixel the way the FSR sizing policy computes its fit factor
+  (`computeRenderTarget`): the `object-fit: contain` factor in `Adaptive`, the element's
+  own CSS box in `Original`/`Custom`, × `devicePixelRatio`.
+- A new pill after the resolution one — `1:1 pixels` (within 0.1 %) or `shown at 1.05×` —
+  with the explanation and the way to 1:1 in its tooltip: `Custom zoom 100/dpr %`
+  (66.7 % at 150 %; the custom zoom now keeps one decimal so that value is reachable) or
+  "Match remote display so the host renders at your window's W×H". The same text is the
+  hint under Display → *Fit in my window* while connected. Its own metrics checkbox,
+  default on; older stored toggle sets read it as on (per-key fallback, tested).
+- The stage's CSS box is fed by the existing Fit-mode `ResizeObserver` (measured on every
+  resize, whatever the resolution mode), so window drags and browser zoom re-evaluate it
+  without a second observer; the 1 s worker stats tick re-evaluates the rest.
+
+Nothing about the encoder or the transport changes. The pill is the verification
+"Match remote display" never had: the button asks the host to switch modes, and until
+now nothing on screen said whether the frame that came back actually matched the window.
+
 ## Phases
 
 | phase | scope | kill switch | status |
@@ -309,7 +334,7 @@ disagree. FSR helps only when upscaling.
 | P1b | the direct gate is the measured send wait's call below the encoder's HRD reservoir (EMA of completed waits ∨ live head-of-queue age); bytes alone gate only at the reservoir | — (no switch; `direct_queue_ms` keeps its meaning as the lag bound, `0` disables) | **field-verified 2026-09-07 on 0.4.79** — operator: "not seeing the blurring anymore" on AV1, VP9 4:2:0 and H.264; heartbeats of those sessions: 0 cuts, 0 gate skips, 0 gate lines. VP9 4:4:4 (the libvpx pump) still blurs ⇒ P3 |
 | P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | **retired by measurement 2026-09-07** — after P1 the rate ladder no longer fires on direct paths: 0 rate swaps in all 17 sessions on the three hosts today (QSV direct on CORPLAP-1/-3, nvenc relay on CORPLAP-2; the 2026-09-06 baseline had 37 in 11 min). Reopen only if a relay-path QSV session shows swaps |
 | P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07, released in 0.4.80** — offline: every notch frame at q 64 instead of 255, refine to lossless kept; field gate: **instrument PASS 13:25 UTC** (`max_qp` 64 in every scroll window, was 255; settles to q 0; 0 skips) and **operator PASS** ("scrolling large texts seems much better") ⇒ **field-verified 2026-09-07**; thin direct path measured 20:08 UTC — sharp but laggy below the cap's ~10 Mbps floor (§P3), an open decision |
-| P4 | viewer display-scale pill + 1:1 guidance | — (UI) | proposed |
+| P4 | viewer display-scale pill + 1:1 guidance: screen pixels per remote pixel, `1:1 pixels` or `shown at 1.05×`, the way to 1:1 in the tooltip and the Display tab (§P4) | — (UI; the pill has its own metrics checkbox) | **built 2026-09-08**; field gate on the hosted promote carrying it |
 
 ## Acceptance criteria
 

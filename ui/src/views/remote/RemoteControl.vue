@@ -224,6 +224,12 @@
         <span v-if="metrics.bitrate" class="stats-pill">{{ statsBitrateLabel }}</span>
         <span v-if="metrics.fps" class="stats-pill">{{ statsFpsLabel }}</span>
         <span v-if="metrics.resolution && statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
+        <!-- FR-74 P4 — the viewer's own pixel chain: screen pixels per
+             remote pixel. `1:1 pixels` is the verified Match-remote-display
+             case; anything else is a browser/FSR resample AFTER the codec,
+             which no encoder setting can undo. The title says how to reach
+             1:1 (Custom zoom 100/dpr %, or Match remote display). -->
+        <span v-if="metrics.scale && statsScaleLabel" class="stats-pill" :title="statsScaleHint">{{ statsScaleLabel }}</span>
         <!-- FR-1 P7 — end-to-end frame age (agent framing → canvas paint),
              the RustDesk-"Delay" analogue. Appears once the rc:clock probe
              locks; absent on old agents and the classic video-tag path. -->
@@ -996,6 +1002,8 @@
             hide-details="auto"
             prepend-inner-icon="mdi-image-size-select-actual"
             label="Fit in my window"
+            :hint="displayScaleSettingHint"
+            persistent-hint
             class="mb-4"
           />
           <v-text-field
@@ -1079,6 +1087,13 @@
             hide-details
             label="Resolution"
             :messages="statsResolutionLabel || 'e.g. 2880×1800'"
+          />
+          <v-checkbox
+            v-model="metrics.scale"
+            density="compact"
+            hide-details
+            label="Display scale (1:1 check)"
+            :messages="statsScaleLabel || 'e.g. shown at 1.05× — 1:1 pixels when the host renders at your window size'"
           />
           <v-checkbox
             v-model="metrics.age"
@@ -1588,6 +1603,7 @@ import {
   isKeyboardLockSupported,
   diagHudEnabled,
   storedMetricToggles,
+  displayScale,
   persistMetricToggles,
   remoteCursorCssFor,
   type RcScaleMode,
@@ -2984,12 +3000,21 @@ let fitResizeObserver: ResizeObserver | null = null
 // until the mode was re-selected. Start is idempotent per ELEMENT, not per
 // call: a different stage re-targets the observer.
 let fitObservedEl: HTMLElement | null = null
+// FR-74 P4 — the stage's CSS box, for the display-scale pill. Fed by the
+// same ResizeObserver as Fit mode (every resize, whatever the resolution
+// mode), so the scale follows window drags and browser zoom without a
+// second observer.
+const stageCss = ref({ w: 0, h: 0 })
+function measureStage(el: HTMLElement) {
+  stageCss.value = { w: el.clientWidth, h: el.clientHeight }
+}
 function startFitResizeObserver() {
   const el = stageEl.value
   if (!el || !('ResizeObserver' in window)) return
   if (fitResizeObserver && fitObservedEl === el) return
   stopFitResizeObserver()
   fitResizeObserver = new ResizeObserver(() => {
+    if (fitObservedEl) measureStage(fitObservedEl)
     if (rc.resolution.value.mode !== 'fit') return
     if (fitResizeTimer) clearTimeout(fitResizeTimer)
     fitResizeTimer = setTimeout(() => {
@@ -2998,6 +3023,7 @@ function startFitResizeObserver() {
   })
   fitResizeObserver.observe(el)
   fitObservedEl = el
+  measureStage(el)
 }
 function stopFitResizeObserver() {
   if (fitResizeTimer) {
@@ -3189,6 +3215,34 @@ const decodedDims = computed(() => {
       ? rc.vp9_444Stats.value.height
       : rc.mediaIntrinsicH.value
   return { w, h }
+})
+/** FR-74 P4 — screen pixels per remote pixel, from the decoded frame, the
+ *  stage's CSS box, the scale mode and devicePixelRatio. `renderInfo` is
+ *  read so the 1 s worker tick re-evaluates it (devicePixelRatio itself is
+ *  not reactive; a zoom change also resizes the stage, which re-measures). */
+const statsScale = computed(() => {
+  const { w, h } = decodedDims.value
+  const r = rc.renderInfo.value
+  return displayScale({
+    frameW: w,
+    frameH: h,
+    stageW: stageCss.value.w,
+    stageH: stageCss.value.h,
+    dpr: window.devicePixelRatio || 1,
+    mode: rc.scaleMode.value,
+    customPct: rc.scaleCustomPercent.value,
+    sharpened: !!(r && r.mode !== '2d'),
+  })
+})
+const statsScaleLabel = computed(() => statsScale.value.label)
+const statsScaleHint = computed(() => statsScale.value.hint)
+/** The Display tab's hint under "Fit in my window": the live scale and the
+ *  way to 1:1 while connected; what the modes mean before that. */
+const displayScaleSettingHint = computed<string>(() => {
+  if (rc.phase.value === 'connected' && statsScale.value.scale !== null) {
+    return `${statsScaleLabel.value} — ${statsScaleHint.value}`
+  }
+  return 'Adaptive fits the frame to this window; Original is 1:1 in CSS pixels (not on a scaled display); Custom sets the zoom'
 })
 
 // Remote cursor overlay (1E.3). Requires both a position and a

@@ -1127,6 +1127,43 @@ and `apply_target_resolution` downscales the captured frame via
 encode. GPU `VideoProcessorMFT` path stays in the deferred 1C.3
 bucket.
 
+### 18.6.1 The viewer's pixel chain (FR-74 P4)
+
+The codec is not the last thing that touches a remote pixel. After decoding, the
+browser paints the frame into a CSS box and the compositor scales that box by
+`devicePixelRatio`; in `adaptive` mode the FSR pass (`rc-fsr-render.ts`) renders
+straight at the resulting screen size. Every step but the middle one is a resample,
+and no encoder setting can undo a resample that happens after the encoder — which is
+why "the text is blurry" was hunted as an encoder regression for a week when, on the
+reporting laptop, a native 1920×1200 frame was being spread over 2018×1261 screen
+pixels (a 1345×841 CSS stage at 150 % scaling).
+
+```mermaid
+flowchart LR
+    F["decoded frame<br/>1920×1200"] --> B["CSS box<br/>adaptive: contain-fit to the stage<br/>original: frame size<br/>custom: frame × zoom"]
+    B --> D["× devicePixelRatio<br/>(display scaling, browser zoom)"]
+    D --> S["screen pixels<br/>2018×1261 → shown at 1.05×"]
+    S -. "FSR (EASU+RCAS) sharpens<br/>an UPscale only" .-> S
+```
+
+The viewer now reports that factor as a pill beside the resolution — `1:1 pixels`
+(within 0.1 %) or `shown at 1.05×` — computed by `displayScale()` in
+`ui/src/composables/useRemoteControl.ts` (pure, unit-tested) exactly the way the FSR
+sizing policy (`computeRenderTarget`) computes its fit factor, so the two never
+disagree. Its tooltip, and the hint under Display → *Fit in my window*, say what the
+number means and how to reach 1:1:
+
+| you see | it means | 1:1 needs |
+|---|---|---|
+| `shown at 1.05×` | each remote pixel spread over 1.05 screen pixels (an upscale; FSR sharpens it) | **Custom zoom 100/dpr %** (66.7 % at 150 % scaling — the zoom keeps one decimal for this), or **Match remote display** so the host renders at the window's W×H |
+| `shown at 1.50×` in `Original` | `Original` is 1:1 in **CSS** pixels; at 150 % display scaling that is 1.5× on screen — worse than `Adaptive` there, not better | as above |
+| `shown at 0.53×` | the frame is larger than the window; fine detail is lost in the downscale | Custom zoom 100/dpr % (the frame will scroll), Resolution → Fit, or Match remote display |
+| `1:1 pixels` | pixel-exact — the only state in which a settled frame can be compared to the host pixel for pixel (FR-74 AC1's method) | — |
+
+⚠️ "1:1 Match host display" is a *request*: the host switches to the largest mode
+that fits the window, which on a panel smaller than the window cannot match it. The
+pill is the verification that button never had — read it after toggling.
+
 ### 18.7 Diagnostics (0.1.34)
 
 Added in response to the field-reported 7-8 fps case on a hybrid

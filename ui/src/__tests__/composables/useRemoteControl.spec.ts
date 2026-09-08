@@ -112,6 +112,7 @@ import {
   type KeyDecision,
   type RcCodecChoice,
   resolutionCapAnnotation,
+  displayScale,
   resolutionOverrideHint,
 } from '@/composables/useRemoteControl'
 import {
@@ -4076,6 +4077,7 @@ describe('P7 — FSR localStorage knobs', () => {
       fps: true,
       resolution: true,
       age: true,
+      scale: true,
       paint: false,
     })
     expect(m).toEqual(DEFAULT_RC_METRICS)
@@ -4094,6 +4096,7 @@ describe('P7 — FSR localStorage knobs', () => {
       fps: true,
       resolution: true,
       age: true,
+      scale: true,
       paint: true,
     })
   })
@@ -4307,5 +4310,61 @@ describe('FR-77 P3b — pickAutoTransport reaches hardware-encoded 4:4:4 before 
     expect(settingsToCodecChoice('data-channel-h264', 'yuv444')).toBe('h264-444')
     expect(settingsToCodecChoice('data-channel-h264', 'auto')).toBe('h264')
     expect(settingsToCodecChoice('webrtc', 'yuv444')).toBe('h264')
+  })
+})
+
+describe("FR-74 P4 — the viewer's pixel chain (displayScale)", () => {
+  // The operator's 2026-09-07 setup: a 1920×1200 native frame on a
+  // 1345.33×840.67 CSS stage at 150 % display scaling — a 2018×1261 FSR
+  // canvas, i.e. every remote pixel spread over 1.05 screen pixels. That
+  // resample happens AFTER the codec, which is why AC1's pixel comparison
+  // had to switch the stage to a 1:1 canvas before it meant anything.
+  const stage = { stageW: 1345.33, stageH: 840.67, dpr: 1.5 }
+  const frame = { frameW: 1920, frameH: 1200 }
+
+  it('names the adaptive upscale and the way to 1:1', () => {
+    const s = displayScale({ ...frame, ...stage, mode: 'adaptive', customPct: 100, sharpened: true })
+    expect(s.scale).toBeCloseTo(1.051, 3)
+    expect(s.label).toBe('shown at 1.05×')
+    expect(s.hint).toContain('spread over 1.05 screen pixels')
+    expect(s.hint).toContain('FSR sharpens')
+    expect(s.hint).toContain('Custom zoom 66.7 %')
+    expect(s.hint).toContain("Match remote display so the host renders at your window's 2018×1261")
+    // 150 % scaling is named, because Original is then 1.5× on screen.
+    expect(s.hint).toContain('your display scaling is 1.5×')
+  })
+
+  it('Original is 1:1 in CSS pixels only — 1.5× on screen at 150 % scaling', () => {
+    const s = displayScale({ ...frame, ...stage, mode: 'original', customPct: 100 })
+    expect(s.label).toBe('shown at 1.50×')
+  })
+
+  it('Custom zoom 66.7 % at 150 % scaling IS pixel-exact, and 67 % is not', () => {
+    const exact = displayScale({ ...frame, ...stage, mode: 'custom', customPct: 66.7 })
+    expect(exact.label).toBe('1:1 pixels')
+    expect(exact.hint).toContain('Pixel-exact')
+    const near = displayScale({ ...frame, ...stage, mode: 'custom', customPct: 67 })
+    expect(near.label).toBe('shown at 1.01×')
+  })
+
+  it('Match remote display verified: a frame at the window size is 1:1 in adaptive', () => {
+    const s = displayScale({ frameW: 2018, frameH: 1261, ...stage, mode: 'adaptive', customPct: 100 })
+    expect(s.label).toBe('1:1 pixels')
+  })
+
+  it('a frame larger than the window is a downscale, and the recipe says it will scroll', () => {
+    const s = displayScale({ frameW: 2560, frameH: 1600, stageW: 1345.33, stageH: 840.67, dpr: 1, mode: 'adaptive', customPct: 100 })
+    expect(s.scale).toBeCloseTo(0.5255, 3)
+    expect(s.label).toBe('shown at 0.53×')
+    expect(s.hint).toContain('fine detail is lost')
+    expect(s.hint).toContain('Custom zoom 100 %')
+    expect(s.hint).toContain('will scroll')
+  })
+
+  it('is silent until both the frame and the stage are known', () => {
+    expect(displayScale({ frameW: 0, frameH: 0, ...stage, mode: 'adaptive', customPct: 100 }).label).toBe('')
+    expect(displayScale({ ...frame, stageW: 0, stageH: 0, dpr: 1, mode: 'adaptive', customPct: 100 }).scale).toBeNull()
+    // A bogus devicePixelRatio reads as 1 rather than poisoning the label.
+    expect(displayScale({ ...frame, stageW: 1920, stageH: 1200, dpr: Number.NaN, mode: 'adaptive', customPct: 100 }).label).toBe('1:1 pixels')
   })
 })
