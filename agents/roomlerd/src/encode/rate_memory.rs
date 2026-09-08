@@ -21,8 +21,6 @@ use serde::{Deserialize, Serialize};
 /// A remembered rate older than this is ignored (and dropped on the next save).
 pub const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// P3 — the memory grows to this fraction of the opener's MEASURED drain rate.
-pub const OPENER_DRAIN_PCT: u64 = 75;
 /// Below this many bytes the opening burst says nothing about the pipe.
 pub const OPENER_MIN_BYTES: u64 = 100_000;
 /// Below this queue-wait the burst never queued — it fit the transport's own
@@ -35,16 +33,33 @@ pub const OPENER_QUEUED_MIN_US: u64 = 100_000;
 /// queues and measures.
 pub const OPENER_UNQUEUED_STEP_PCT: u64 = 150;
 
-/// The memory target implied by the opening burst, already capped at `hi`:
-/// `bytes` sent and the longest queue-wait a frame saw while draining it,
-/// with the opener's own `maxrate` as the base for the bounded step. The
-/// last frame of a burst waits for everything before it, so `bytes / wait`
-/// is the rate the pipe drained at — an over-estimate by one frame's share,
-/// which [`OPENER_DRAIN_PCT`] absorbs. `0` = nothing to learn from.
+/// FR-79 V2 — the memory target the opening burst implies, capped at `hi`.
+///
+/// A burst that **never queued** (`wait_us` under [`OPENER_QUEUED_MIN_US`])
+/// fit inside the transport's own send buffer and drained at whatever rate
+/// without telling us: it proves only "not slower than this", so the memory
+/// grows by a bounded step and the next, larger opener does the measuring.
+///
+/// A burst that **did** queue is measured the way every other window is
+/// measured — the goodput estimator's byte-weighted bytes-over-blocked-time,
+/// passed in as `measured_bps` and already gated by [`super::evidence`], so a
+/// stall cannot contribute to it. `None` there means the estimator had no
+/// confidence yet, and the honest target is then nothing at all.
+///
+/// ⚠️ Until FR-79 this divided the WHOLE burst by the LONGEST SINGLE frame's
+/// wait, which is a rate only if that frame waited for the entire burst.
+/// Measured on CORPLAP-1, 2026-09-08 (the operator's six trials): 829 KB with
+/// an 829 ms worst wait read as 8.0 Mbps and recorded 6.0 M; 1.19 MB with a
+/// 440 ms wait recorded the 8 M cap. The pipe measured 1.79–3.41 M in those
+/// same sessions. `record_session` keeps the maximum, so the memory ratcheted
+/// to the cap and the next session opened 2–4× over the relay, dropped
+/// hundreds of frames at the byte gate and had its ceiling abandoned a second
+/// in — the other half of the operator's "starts very blurred".
 pub fn opener_growth_target_bps(
     bytes: u64,
     wait_us: u64,
     opener_maxrate_bps: u32,
+    measured_bps: Option<u32>,
     hi_bps: u32,
 ) -> u32 {
     if bytes < OPENER_MIN_BYTES || hi_bps == 0 {
@@ -53,11 +68,58 @@ pub fn opener_growth_target_bps(
     let target = if wait_us < OPENER_QUEUED_MIN_US {
         (opener_maxrate_bps as u64) * OPENER_UNQUEUED_STEP_PCT / 100
     } else {
-        bytes.saturating_mul(8).saturating_mul(1_000_000) / wait_us * OPENER_DRAIN_PCT / 100
+        u64::from(measured_bps.unwrap_or(0))
     };
     target.min(hi_bps as u64) as u32
 }
 
+/// FR-79 V2 — the carrier half of the memory key.
+///
+/// The key was the nominated pair's remote address alone, which on an overlay
+/// pair is the peer's overlay IP — one key for a path whose carrier moves
+/// underneath it between direct, a UDP relay and DERP over TLS, with four
+/// times the capacity between the ends of that range. FR-59 P6's own comment
+/// named the consequence ("relay-keyed rate memory can carry a fast day onto a
+/// slow one") and 2026-09-08 measured it: six demote-follows onto DERP in one
+/// day on CORPLAP-1, a memory holding 8 Mbps, and sessions opening at 6.8 M
+/// into a pipe that measured 1.8–3.4 M.
+///
+/// So the carrier is part of the key. `None` = do not qualify the key (the
+/// carrier is mid-churn or unknown), which leaves exactly the pre-FR-79
+/// behaviour for that session.
+///
+/// ⚠️ Entries written before this are keyed by the bare address and simply
+/// stop matching; they age out with [`TTL`]. The cost is one session of
+/// learning per pair and carrier, once.
+pub fn carrier_tag(
+    connection: &str,
+    relay_kind: Option<&str>,
+    relay_transport: Option<&str>,
+) -> Option<String> {
+    match connection {
+        "direct" => Some("direct".to_string()),
+        "tunnel" => Some("tunnel".to_string()),
+        "relay" => Some(match (relay_kind, relay_transport) {
+            // `relay:derp/tcp` and `relay:turn/udp` are different pipes, and
+            // the whole point of the key is that they are not the same day.
+            (Some(k), Some(t)) if !k.is_empty() && !t.is_empty() => format!("relay:{k}/{t}"),
+            (Some(k), _) if !k.is_empty() => format!("relay:{k}"),
+            _ => "relay".to_string(),
+        }),
+        // `blocked` / `offline` are the carrier mid-churn: not a pipe to
+        // remember anything about.
+        _ => None,
+    }
+}
+
+/// The memory key for a pair on a carrier. Without a tag it is the bare
+/// address, which is what every entry written before FR-79 V2 used.
+pub fn memory_key(remote_addr: &str, carrier: Option<&str>) -> String {
+    match carrier {
+        Some(tag) => format!("{remote_addr}|{tag}"),
+        None => remote_addr.to_string(),
+    }
+}
 const FILE_NAME: &str = "rate_memory.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,27 +314,31 @@ mod tests {
     fn a_clean_session_grows_the_memory_from_the_opener() {
         const HI: u32 = 8_000_000;
         let now = 1_788_000_000u64;
-        // Field 2026-08-30, coturn path: a 451 KB opener queued 802 ms ⇒ the
-        // pipe drained at 4.5 Mbps ⇒ target 75 % of it.
-        let measured = opener_growth_target_bps(451_464, 802_000, 2_550_000, HI);
-        assert_eq!(measured, 3_377_535);
+        // Field 2026-08-30, coturn path: a 451 KB opener that queued, with the
+        // estimator measuring 4.5 Mbps over the blocked sends — the target IS
+        // the measurement (FR-79 V2; before it, the whole burst over the
+        // longest single wait, which is not a rate).
+        let measured = opener_growth_target_bps(451_464, 802_000, 2_550_000, Some(4_504_000), HI);
+        assert_eq!(measured, 4_504_000);
         let mut m = RateMemory::default();
         assert_eq!(
             m.record_session("p", 2_709_375, false, measured, now),
-            3_377_535
+            4_504_000
         );
         // Same path, next session: a 238 KB opener that never queued (0 ms —
         // it fit SCTP's buffer) is NOT a fat pipe: a bounded ×1.5 step on the
         // opener's own maxrate, so the next, larger opener measures.
-        let unqueued = opener_growth_target_bps(238_306, 0, 2_870_000, HI);
+        let unqueued = opener_growth_target_bps(238_306, 0, 2_870_000, None, HI);
         assert_eq!(unqueued, 4_305_000);
+        // …and it is BELOW what the pair already proved, so the memory keeps
+        // what it held: the step grows a memory, it never shrinks one.
         assert_eq!(
             m.record_session("p", 2_870_000, false, unqueued, now + 60),
-            4_305_000
+            4_504_000
         );
-        // A thin pipe: 131 KB in 524 ms ⇒ 2 Mbps ⇒ 1.5 Mbps target < the
-        // session's own 3 Mbps — the memory does not go below what was held.
-        let thin = opener_growth_target_bps(131_000, 524_000, 3_000_000, HI);
+        // A thin pipe: the estimator measured 1.5 Mbps, below the session's own
+        // 3 Mbps — the memory does not go below what was held.
+        let thin = opener_growth_target_bps(131_000, 524_000, 3_000_000, Some(1_500_000), HI);
         assert_eq!(thin, 1_500_000);
         let mut t = RateMemory::default();
         assert_eq!(
@@ -280,7 +346,7 @@ mod tests {
             3_000_000
         );
         // A measured fat pipe saturates at `hi`.
-        let fat = opener_growth_target_bps(2_000_000, 200_000, 3_000_000, HI);
+        let fat = opener_growth_target_bps(2_000_000, 200_000, 3_000_000, Some(60_000_000), HI);
         assert_eq!(fat, HI);
         assert_eq!(t.record_session("q", 3_000_000, false, fat, now + 60), HI);
         // A decrease in the session wins over the evidence.
@@ -312,22 +378,25 @@ mod tests {
         assert_eq!(e.record_session("none", 0, false, 0, now), 0);
         assert!(!e.entries.contains_key("none"));
         // Learning off (hi = 0): nothing to learn.
-        assert_eq!(opener_growth_target_bps(451_464, 802_000, 2_550_000, 0), 0);
+        assert_eq!(
+            opener_growth_target_bps(451_464, 802_000, 2_550_000, Some(4_504_000), 0),
+            0
+        );
     }
 
     #[test]
     fn a_small_opening_burst_is_not_evidence() {
         assert_eq!(
-            opener_growth_target_bps(30_000, 5_000, 3_000_000, 8_000_000),
+            opener_growth_target_bps(30_000, 5_000, 3_000_000, None, 8_000_000),
             0
         );
         assert_eq!(
-            opener_growth_target_bps(99_999, 900_000, 3_000_000, 8_000_000),
+            opener_growth_target_bps(99_999, 900_000, 3_000_000, Some(2_000_000), 8_000_000),
             0
         );
         // The bounded step never passes hi either.
         assert_eq!(
-            opener_growth_target_bps(100_000, 0, 7_000_000, 8_000_000),
+            opener_growth_target_bps(100_000, 0, 7_000_000, None, 8_000_000),
             8_000_000
         );
     }
@@ -344,5 +413,80 @@ mod tests {
         );
         m.record("b", 3, now + 1);
         assert_eq!(m.entries["b"].stable_bps, 3);
+    }
+
+    /// FR-79 V2, the operator's 2026-09-08 trials — a burst that queued is
+    /// worth what the estimator measured, not what dividing it by one frame's
+    /// wait suggested. CORPLAP-1 16:41:51: 829 KB with an 829 ms worst wait on
+    /// a relay the same session then measured at 3.41 Mbps. The old rule
+    /// recorded 6.0 M (and 8.0 M twice more that hour), so the next session
+    /// opened at 6.8 M into a 3.4 M pipe, dropped 212 frames at the byte gate
+    /// in two seconds and had its ceiling abandoned — one half of "starts very
+    /// blurred". The other half is the same memory after a P6 abandonment
+    /// wrote back the stall's own number.
+    #[test]
+    fn a_queued_opener_is_worth_what_the_estimator_measured() {
+        const HI: u32 = 8_000_000;
+        let target = opener_growth_target_bps(829_241, 829_000, 6_800_000, Some(3_408_128), HI);
+        assert_eq!(target, 3_408_128, "the measurement, not the arithmetic");
+        // With no confidence yet the honest target is nothing: the session
+        // learns from its own windows instead.
+        assert_eq!(
+            opener_growth_target_bps(829_241, 829_000, 6_800_000, None, HI),
+            0
+        );
+        // …and the unqueued branch is untouched: a burst that never queued
+        // still proves "not slower than this" and grows by its bounded step.
+        assert_eq!(
+            opener_growth_target_bps(1_156_688, 0, 6_800_000, None, HI),
+            HI,
+            "6.8 M x 1.5, capped at hi"
+        );
+    }
+
+    /// FR-79 V2 — the carrier is part of the key, and a DERP day is not a
+    /// relay day. CORPLAP-1, 2026-09-08: one overlay address, six demotions
+    /// onto DERP, and a memory that carried 8 Mbps onto a 1.8 M pipe.
+    #[test]
+    fn the_carrier_is_part_of_the_key() {
+        assert_eq!(
+            carrier_tag("relay", Some("derp"), Some("tcp")).as_deref(),
+            Some("relay:derp/tcp")
+        );
+        assert_eq!(
+            carrier_tag("relay", Some("turn"), Some("udp")).as_deref(),
+            Some("relay:turn/udp")
+        );
+        assert_eq!(carrier_tag("relay", None, None).as_deref(), Some("relay"));
+        assert_eq!(carrier_tag("direct", None, None).as_deref(), Some("direct"));
+        assert_eq!(carrier_tag("tunnel", None, None).as_deref(), Some("tunnel"));
+        // Mid-churn is not a pipe: no tag, so the session keeps the bare key.
+        assert_eq!(carrier_tag("blocked", None, None), None);
+        assert_eq!(carrier_tag("offline", None, None), None);
+
+        assert_eq!(
+            memory_key("100.65.0.5", Some("relay:derp/tcp")),
+            "100.65.0.5|relay:derp/tcp"
+        );
+        assert_eq!(memory_key("100.65.0.5", None), "100.65.0.5");
+        // The two carriers keep their own memories: a fast day cannot open a
+        // slow one.
+        let now = 1_788_000_000u64;
+        let mut m = RateMemory::default();
+        m.record_session(
+            &memory_key("100.65.0.5", Some("direct")),
+            0,
+            false,
+            8_000_000,
+            now,
+        );
+        assert_eq!(
+            m.seed_for(&memory_key("100.65.0.5", Some("relay:derp/tcp")), now),
+            None
+        );
+        assert_eq!(
+            m.seed_for(&memory_key("100.65.0.5", Some("direct")), now),
+            Some(8_000_000)
+        );
     }
 }
