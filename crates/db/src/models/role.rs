@@ -215,9 +215,205 @@ impl Role {
     pub const COLLECTION: &'static str = "roles";
 }
 
+/// The definition of one system-managed role.
+///
+/// FR-82 — this table is the SINGLE place a seeded role's mask is written
+/// down. Before it there were two divergent copies (`TenantDao::
+/// create_default_roles`, which ran, and a dead `RoleDao::seed_defaults`
+/// whose `Moderator` carried `MANAGE_MEETINGS` and no `REMOTE_CONTROL` — the
+/// reverse of the one that shipped) and NOTHING that reconciled a live tenant
+/// when a definition changed. The consequence was measured on the hosted
+/// deployment: 63 of 72 orgs still carried `owner = 0xffffff`,
+/// `admin = 0x7ffff7`, `moderator = 0x7ef91` — every mask frozen at the
+/// permission set that existed on the day that org was created, so the seven
+/// bits added since (`MANAGE_AGENTS` .. `VIEW_SSH_AUDIT`) reached nobody but
+/// the newest seven tenants.
+///
+/// ⚠️ A role is `is_managed` because the SYSTEM owns its definition — the
+/// product refuses to delete one for exactly that reason. A managed role that
+/// silently diverges from its definition is therefore the defect, and the
+/// reconcile that closes it is the contract being honoured, not a migration.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedRole {
+    /// Stored lowercase. `TenantDao::get_role_by_name` resolves the default
+    /// role for every invite by this string, so renaming one orphans the
+    /// invite path rather than renaming anything.
+    pub name: &'static str,
+    pub description: &'static str,
+    pub color: Option<u32>,
+    pub position: u32,
+    pub permissions: u64,
+    pub is_default: bool,
+    pub is_mentionable: bool,
+    pub is_hoisted: bool,
+}
+
+/// Every system-managed role, in position order. Seeded from here at tenant
+/// creation, reconciled from here at startup.
+///
+/// ⚠️ `EXEC_DEVICE` and `SSH_DEVICE` appear in no row BELOW the
+/// `ADMINISTRATOR` bypass, deliberately: they run as SYSTEM/root with nobody
+/// watching, so they stay grants an owner makes on purpose. (`owner` carries
+/// them only as part of `ALL`, where the bypass already answered true for
+/// every bit — they confer nothing there.) The reconcile hands out exactly
+/// what this table says, so a bit added to a row here is a bit granted to
+/// every existing org on the next boot — which is the point, and the reason
+/// the omission has to be deliberate rather than incidental.
+pub const MANAGED_ROLES: &[ManagedRole] = &[
+    ManagedRole {
+        name: "owner",
+        description: "Full control over the tenant",
+        color: Some(0xE91E63),
+        position: 0,
+        permissions: permissions::ALL,
+        is_default: false,
+        is_mentionable: false,
+        is_hoisted: true,
+    },
+    ManagedRole {
+        name: "admin",
+        description: "Administrative access",
+        color: Some(0x2196F3),
+        position: 1,
+        permissions: permissions::DEFAULT_ADMIN,
+        is_default: false,
+        is_mentionable: true,
+        is_hoisted: true,
+    },
+    ManagedRole {
+        name: "moderator",
+        description: "Moderate channels/messages; remote-control operator",
+        color: Some(0x4CAF50),
+        position: 2,
+        permissions: permissions::DEFAULT_MEMBER
+            | permissions::MANAGE_MESSAGES
+            | permissions::MUTE_MEMBERS
+            | permissions::KICK_MEMBERS
+            | permissions::REMOTE_CONTROL,
+        is_default: false,
+        is_mentionable: true,
+        is_hoisted: true,
+    },
+    ManagedRole {
+        name: "member",
+        description: "Default member role",
+        color: None,
+        position: 3,
+        permissions: permissions::DEFAULT_MEMBER,
+        is_default: true,
+        is_mentionable: false,
+        is_hoisted: false,
+    },
+    ManagedRole {
+        name: "guest",
+        description: "Limited guest access",
+        color: None,
+        position: 4,
+        permissions: permissions::VIEW_CHANNELS | permissions::READ_HISTORY,
+        is_default: false,
+        is_mentionable: false,
+        is_hoisted: false,
+    },
+];
+
+impl ManagedRole {
+    /// The definition for `name`, or `None` for a role this table does not
+    /// own — a tenant's own custom role, or a managed row whose name drifted.
+    /// The reconcile leaves both alone and says so.
+    pub fn by_name(name: &str) -> Option<&'static ManagedRole> {
+        MANAGED_ROLES.iter().find(|r| r.name == name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::permissions::*;
+    use super::{MANAGED_ROLES, ManagedRole};
+
+    #[test]
+    fn no_managed_role_below_administrator_seeds_a_root_shell() {
+        // FR-82's load-bearing test. The startup reconcile grants whatever
+        // this table says to EVERY existing org, so `DEFAULT_ADMIN |=
+        // EXEC_DEVICE` — a one-token edit that reads as tidying — would open
+        // exec-as-SYSTEM on the whole deployment at the next boot, with no
+        // migration to review and no admin action to audit. `DEFAULT_ADMIN`'s
+        // own test guards that constant; this one guards every SEEDED row,
+        // including a future mask written here directly.
+        //
+        // ⚠️ `owner` is exempt, and the exemption is precise rather than
+        // convenient: it carries ADMINISTRATOR, so `has()` already answers
+        // true for EVERY bit by the bypass. Its `ALL` mask therefore grants
+        // nothing the row did not already confer, which is why the check is
+        // "no role BELOW the bypass" rather than "no role". Aiming it at
+        // every row (the first draft) fails on `owner` for a reason that
+        // says nothing about the risk this guards.
+        for r in MANAGED_ROLES {
+            if r.permissions & ADMINISTRATOR != 0 {
+                continue;
+            }
+            assert_eq!(
+                r.permissions & EXEC_DEVICE,
+                0,
+                "managed role `{}` seeds EXEC_DEVICE without the ADMINISTRATOR bypass",
+                r.name
+            );
+            assert_eq!(
+                r.permissions & SSH_DEVICE,
+                0,
+                "managed role `{}` seeds SSH_DEVICE without the ADMINISTRATOR bypass",
+                r.name
+            );
+        }
+    }
+
+    #[test]
+    fn owner_is_the_only_seeded_administrator() {
+        // ADMINISTRATOR is the bypass in `has`, so a second row carrying it
+        // would hand every future permission to that role forever — silently,
+        // and without ever appearing in a diff of the bits below it.
+        for r in MANAGED_ROLES {
+            let is_admin_bit = r.permissions & ADMINISTRATOR != 0;
+            assert_eq!(
+                is_admin_bit,
+                r.name == "owner",
+                "managed role `{}` and the ADMINISTRATOR bypass disagree",
+                r.name
+            );
+        }
+    }
+
+    #[test]
+    fn managed_role_names_are_unique_and_positions_are_dense() {
+        for (i, r) in MANAGED_ROLES.iter().enumerate() {
+            assert_eq!(r.position as usize, i, "`{}` is out of position", r.name);
+            assert_eq!(
+                r.name,
+                r.name.to_lowercase(),
+                "`{}` is not lowercase",
+                r.name
+            );
+            assert!(
+                MANAGED_ROLES.iter().filter(|o| o.name == r.name).count() == 1,
+                "`{}` is defined twice",
+                r.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_role_the_invite_path_resolves_by_name_exists_and_is_the_default() {
+        // Both invite paths (`invite::accept`, `auth::register_with_invite`)
+        // do `get_role_by_name(tid, "member")` and `.unwrap()` its id when the
+        // invite names no role. Renaming the row breaks joining an org, and
+        // the break is a 500 on someone else's signup.
+        let member = ManagedRole::by_name("member").expect("no `member` role to seed invites with");
+        assert!(member.is_default);
+        assert_eq!(
+            MANAGED_ROLES.iter().filter(|r| r.is_default).count(),
+            1,
+            "exactly one managed role may be the default"
+        );
+    }
 
     #[test]
     fn all_contains_every_named_permission() {

@@ -111,10 +111,14 @@ test.describe('Platform observability', () => {
     const { user } = await newOrgOwner(page)
     await page.goto('/observability')
 
-    // Fail-closed: the page renders its notice and — critically — does
-    // NOT bounce to /login. A 403 from the API would wipe the session,
-    // which is exactly why these endpoints answer 404 and the view
-    // gates client-side before fetching.
+    // Fail-closed: the page renders its notice and does NOT bounce to
+    // /login. These endpoints answer 404 so a non-operator cannot even tell
+    // the surface exists, and the view gates client-side before fetching.
+    //
+    // ⚠️ This used to say "a 403 from the API would wipe the session". It
+    // would have, and that rule was the FR-82 defect — a 403 is an answer,
+    // not an expired credential, and the client no longer ends a session on
+    // one. The 404 here is about not leaking the surface, nothing more.
     await expect(page.getByText(/limited to platform operators/i)).toBeVisible({ timeout: 15000 })
     await expect(page).toHaveURL(/\/observability/)
 
@@ -132,10 +136,14 @@ test.describe('Platform observability', () => {
   })
 
   test('per-user usage endpoints answer 404, never 403, for a non-admin', async ({ page }) => {
-    // 403 is the dangerous answer: ui/src/api/client.ts wipes tokens and
-    // force-logs-out on ANY 403, so a mis-typed gate on a usage endpoint
-    // would eject a legitimate member from the whole app. Asserted at the
-    // HTTP layer because the UI gates client-side and would never issue it.
+    // The platform surface answers 404 because a non-operator must not be
+    // able to distinguish "not for you" from "does not exist" — the
+    // allowlist itself is the thing being hidden. Asserted at the HTTP
+    // layer because the UI gates client-side and would never issue it.
+    //
+    // ⚠️ This used to be justified as "403 is the dangerous answer, because
+    // the api client force-logs-out on ANY 403". That rule is gone (FR-82);
+    // the 404 stands on its own reason, which is the better one anyway.
     const { tenant, token } = await newOrgOwner(page)
     const base = process.env.E2E_API_URL || 'http://localhost:5001'
     const headers = { Authorization: `Bearer ${token}` }

@@ -176,7 +176,7 @@ pub async fn list_overlay_nodes(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     let network = state.overlay_networks.get_or_create(tid).await?;
     let Some(network_id) = network.id else {
@@ -475,7 +475,7 @@ pub async fn get_magic_dns(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     let tenant = state.tenants.base.find_by_id(tid).await?;
     Ok(Json(MagicDnsResponse {
@@ -495,7 +495,7 @@ pub async fn set_magic_dns(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     // Normalize: blank domain → None (off); lowercase, strip surrounding dots.
     let domain = body

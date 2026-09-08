@@ -859,7 +859,7 @@ pub async fn list_agents(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let page = state.agents.list_for_tenant(tid, &params).await?;
@@ -893,7 +893,7 @@ pub async fn get_agent(
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let agent = state.agents.find_in_tenant(tid, aid).await?;

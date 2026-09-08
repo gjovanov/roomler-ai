@@ -100,7 +100,7 @@ pub async fn list(
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let (sort, desc) = file_sort_args(&params)?;
@@ -136,7 +136,7 @@ pub async fn list_tenant_files(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let (sort, desc) = file_sort_args(&params)?;
@@ -259,7 +259,7 @@ pub async fn upload(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let mut file_data: Option<(String, String, Vec<u8>)> = None;
@@ -338,7 +338,7 @@ pub async fn get(
         .map_err(|_| ApiError::BadRequest("Invalid file_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let file = state.files.base.find_by_id_in_tenant(tid, fid).await?;
@@ -356,7 +356,7 @@ pub async fn download(
         .map_err(|_| ApiError::BadRequest("Invalid file_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let file = state.files.base.find_by_id_in_tenant(tid, fid).await?;
@@ -453,7 +453,7 @@ pub async fn delete(
         .map_err(|_| ApiError::BadRequest("Invalid file_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     state.files.soft_delete(tid, fid).await?;
@@ -473,7 +473,7 @@ pub async fn upload_room(
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let mut file_data: Option<(String, String, Vec<u8>)> = None;

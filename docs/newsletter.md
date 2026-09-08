@@ -20,8 +20,13 @@ consent record, and re-subscribing after a withdrawal always requires confirming
 
 Everything under `/api/admin/newsletter/*` is gated by the existing
 `ROOMLER__STATS__PLATFORM_ADMINS` ObjectId allowlist and answers **404** on missing
-authority (never 403 — the web client force-logs-out on 403). Allowlist unset ⇒ the whole
+authority (never 403 — the allowlist is itself what is being hidden, and a 403 would
+confirm the surface exists). Allowlist unset ⇒ the whole
 surface does not exist; that inherent gate is the kill switch.
+
+> ⚠️ This 404 was once *also* justified by "the web client force-logs-out on 403".
+> It does not any more — see [permissions.md](permissions.md) (FR-82). The reason
+> above is the one that was always the real one.
 
 | Route | What it does |
 |---|---|

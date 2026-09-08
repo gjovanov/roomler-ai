@@ -215,7 +215,7 @@ pub async fn list_for_agent(
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let limit = q.limit.clamp(1, 500);

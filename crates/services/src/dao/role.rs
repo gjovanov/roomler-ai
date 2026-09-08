@@ -3,7 +3,6 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_db::models::Role;
-use roomler_ai_db::models::role::permissions;
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
@@ -112,39 +111,11 @@ impl RoleDao {
         Ok(result.deleted_count > 0)
     }
 
-    /// Seed default roles for a new tenant. Returns the created roles.
-    pub async fn seed_defaults(&self, tenant_id: ObjectId) -> DaoResult<Vec<Role>> {
-        let defaults = [
-            ("Owner", permissions::ALL, 0u32),
-            ("Admin", permissions::DEFAULT_ADMIN, 1),
-            (
-                "Moderator",
-                permissions::VIEW_CHANNELS
-                    | permissions::SEND_MESSAGES
-                    | permissions::SEND_THREADS
-                    | permissions::EMBED_LINKS
-                    | permissions::ATTACH_FILES
-                    | permissions::READ_HISTORY
-                    | permissions::ADD_REACTIONS
-                    | permissions::CONNECT_VOICE
-                    | permissions::SPEAK
-                    | permissions::STREAM_VIDEO
-                    | permissions::MANAGE_MESSAGES
-                    | permissions::KICK_MEMBERS
-                    | permissions::MUTE_MEMBERS
-                    | permissions::MANAGE_MEETINGS,
-                2,
-            ),
-            ("Member", permissions::DEFAULT_MEMBER, 3),
-        ];
-
-        let mut roles = Vec::new();
-        for (name, perms, pos) in defaults {
-            let role = self
-                .create(tenant_id, name.into(), None, None, perms, true, true, pos)
-                .await?;
-            roles.push(role);
-        }
-        Ok(roles)
-    }
+    // FR-82 — `seed_defaults` lived here: a SECOND set of managed-role
+    // definitions, Titlecased, with no `guest`, and with a `Moderator` that
+    // carried `MANAGE_MEETINGS` and not `REMOTE_CONTROL` — the reverse of the
+    // copy that actually ran (`TenantDao::create_default_roles`). It had no
+    // callers, so the divergence was invisible and would have shipped a
+    // different org the day someone wired it up. The definitions now live
+    // once, in `roomler_ai_db::models::role::MANAGED_ROLES`.
 }

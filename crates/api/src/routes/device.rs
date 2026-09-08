@@ -134,7 +134,7 @@ pub async fn list_devices(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     let Some(fleet) = state.modules.fleet.as_ref() else {
         return Err(ApiError::ServiceUnavailable(

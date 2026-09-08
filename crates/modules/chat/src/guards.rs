@@ -24,7 +24,7 @@ pub async fn resolve_room_in_tenant_with(
     user_id: ObjectId,
 ) -> Result<Room, ApiError> {
     if !tenants.is_member(tenant_id, user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     Ok(rooms.base.find_by_id_in_tenant(tenant_id, room_id).await?)
 }
@@ -116,7 +116,7 @@ pub async fn require_message_in_tenant(
     user_id: ObjectId,
 ) -> Result<Message, ApiError> {
     if !state.tenants.is_member(tenant_id, user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     Ok(state
         .messages

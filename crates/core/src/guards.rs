@@ -23,9 +23,16 @@ pub fn require_platform_admin(state: &Core, auth: &AuthUser) -> Result<(), ApiEr
     }
 }
 
-/// Tenant-scope gate: membership (+ optionally MANAGE_AGENTS). Failures
-/// are 404, not 403 — the web client wipes tokens on 403, and a member
-/// removed from the org mid-poll must not be logged out of everything.
+/// Tenant-scope gate: membership (+ optionally MANAGE_AGENTS). Failures are
+/// 404, not 403 — these are polled dashboards, and a caller who has just lost
+/// the bit should see an empty panel rather than an error on every tick.
+///
+/// ⚠️ The reason recorded here used to be "the web client wipes tokens on
+/// 403, and a member removed from the org mid-poll must not be logged out of
+/// everything". It no longer does (FR-82): a 403 is an answer, not an expired
+/// credential, and only the server-sent `not_a_member` code moves the client —
+/// out of the tenant, never out of the session. Keep the 404; it is right for
+/// the reason above, not for the one it was written for.
 pub async fn require_tenant_stats(
     state: &Core,
     tenant_id: ObjectId,

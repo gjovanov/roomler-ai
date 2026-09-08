@@ -54,7 +54,7 @@ pub async fn get_session(
         .map_err(|_| ApiError::BadRequest("Invalid session_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let session = state.remote_sessions.find_in_tenant(tid, sid).await?;
@@ -72,7 +72,7 @@ pub async fn terminate_session(
         .map_err(|_| ApiError::BadRequest("Invalid session_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     // P3 security — bare tenant membership no longer suffices: only the
