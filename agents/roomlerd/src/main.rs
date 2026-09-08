@@ -256,6 +256,15 @@ enum Command {
         /// and `--codec` are ignored when set.
         #[arg(long)]
         name: Option<String>,
+        /// FR-78 P3 — write every packet's bytes, back to back, to this file:
+        /// an Annex B stream for H.264 / HEVC, a raw OBU stream for AV1
+        /// (`ffmpeg -i <file>` reads both). A cell whose SESSION decodes to
+        /// garbage in the viewer (the dev box's `av1_vulkan`, 2026-09-08) is
+        /// attributed offline this way — FFmpeg's own decoder on the encoder's
+        /// bytes says whether the bitstream or the viewer's packaging is at
+        /// fault. Not with `--reconfigure-sweep`.
+        #[arg(long)]
+        dump: Option<String>,
         /// Sweep frame geometry (A0). Corp-laptop default.
         #[arg(long, default_value_t = 1280)]
         width: u32,
@@ -1223,6 +1232,7 @@ async fn daemon_main() -> Result<()> {
             codec,
             reconfigure_sweep,
             name,
+            dump,
             width,
             height,
             frames_per_rung,
@@ -1242,7 +1252,7 @@ async fn daemon_main() -> Result<()> {
                 )
                 .await
             } else {
-                encoder_smoke_cmd(&encoder, &codec, name.as_deref()).await
+                encoder_smoke_cmd(&encoder, &codec, name.as_deref(), dump.as_deref()).await
             }
         }
         Command::AppsProbe => apps_probe_cmd(),
@@ -4155,8 +4165,23 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
 /// assert at least one keyframe comes out. Used in CI to catch MF init
 /// regressions before shipping an MSI. Exits with a non-zero code on
 /// any failure so a failed smoke check fails the release build.
-async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str, name: Option<&str>) -> Result<()> {
+async fn encoder_smoke_cmd(
+    pref_raw: &str,
+    codec_raw: &str,
+    name: Option<&str>,
+    dump: Option<&str>,
+) -> Result<()> {
     use roomlerd::encode::{open_default, open_for_codec};
+    use std::io::Write as _;
+
+    // FR-78 P3 — the raw bitstream, for an offline decode (see the flag's doc).
+    let mut dump_file = match dump {
+        Some(path) => Some(
+            std::fs::File::create(path)
+                .with_context(|| format!("encoder smoke: cannot create --dump file {path}"))?,
+        ),
+        None => None,
+    };
 
     // The CI release lane runs `encoder-smoke` on the freshly built EXE, so
     // assert the FFmpeg link contract here instead of paying a separate
@@ -4249,7 +4274,19 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str, name: Option<&str>) 
             if p.is_keyframe {
                 keyframes += 1;
             }
+            if let Some(f) = dump_file.as_mut() {
+                f.write_all(&p.data)
+                    .context("encoder smoke: --dump write failed")?;
+            }
         }
+    }
+    if let Some(mut f) = dump_file.take() {
+        f.flush().context("encoder smoke: --dump flush failed")?;
+        tracing::info!(
+            path = dump.unwrap_or(""),
+            total_bytes,
+            "encoder smoke: bitstream dumped"
+        );
     }
     tracing::info!(backend, keyframes, total_bytes, "encoder smoke: done");
     if backend == "noop" {
