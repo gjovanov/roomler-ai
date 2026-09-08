@@ -467,8 +467,14 @@ impl CaptureUnavailableCode {
                 }
             }
             Self::NoDisplay => {
-                "This host has no display to capture (headless, or no desktop session). \
-                 Remote shell and file transfer still work."
+                if cfg!(target_os = "macos") {
+                    "This agent runs as a system daemon, which has no desktop session and \
+                     therefore no screen to capture. Connect to this machine's user-session \
+                     agent instead. Remote shell and file transfer work here."
+                } else {
+                    "This host has no display to capture (headless, or no desktop session). \
+                     Remote shell and file transfer still work."
+                }
             }
             Self::NotBuilt => {
                 "This agent was built without a capture backend — it can signal, but never \
@@ -574,6 +580,15 @@ impl ScreenCapture for NoopCapture {
 pub(crate) fn classify_capture_failure(detail: String) -> CaptureUnavailable {
     #[cfg(target_os = "macos")]
     {
+        // ORDER IS THE ANSWER. A root LaunchDaemon is in session 0, which has
+        // no WindowServer and never will, and its TCC preflight can still
+        // answer "granted" — so asking about permission first would tell the
+        // operator to go flip a toggle that changes nothing. `tcc`'s own
+        // doctrine, and the shape of the MacBook's daemon row: same machine,
+        // one agent captures and one cannot, for different reasons.
+        if !crate::tcc::has_gui_session() {
+            return CaptureUnavailable::new(CaptureUnavailableCode::NoDisplay, detail);
+        }
         if !crate::tcc::screen_recording_granted() {
             return CaptureUnavailable::new(CaptureUnavailableCode::Permission, detail);
         }
