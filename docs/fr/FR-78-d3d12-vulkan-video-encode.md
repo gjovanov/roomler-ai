@@ -1,6 +1,6 @@
 # FR-78 — D3D12 and Vulkan video encode: vendor-neutral hardware cells on Windows and Linux
 
-**Issue:** [#1503](https://github.com/gjovanov/roomler-ai/issues/1503) · **Status:** proposed 2026-09-08 — spec, not started · **Opened:** 2026-09-08 · **Glossary:** [`CONTEXT.md`](../../CONTEXT.md) · **ADR:** [0001](../adr/0001-encoder-backends-compiled-in-discovered-at-runtime.md) · **Related:** [FR-77](FR-77-encoder-chroma-matrix.md) · [FR-62](FR-62-encoder-rate-changes-without-an-idr.md) · [`docs/encoders.md`](../encoders.md)
+**Issue:** [#1503](https://github.com/gjovanov/roomler-ai/issues/1503) · **Status:** P0 + P1 built (#1506) — the dev box advertises 13 cells; the roll and the field reads on CORPLAP-3 (Intel D3D12) and jupiter (RADV Vulkan) follow · **Opened:** 2026-09-08 · **Glossary:** [`CONTEXT.md`](../../CONTEXT.md) · **ADR:** [0001](../adr/0001-encoder-backends-compiled-in-discovered-at-runtime.md) · **Related:** [FR-77](FR-77-encoder-chroma-matrix.md) · [FR-62](FR-62-encoder-rate-changes-without-an-idr.md) · [`docs/encoders.md`](../encoders.md)
 
 ## Goal
 
