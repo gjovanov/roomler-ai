@@ -86,7 +86,7 @@ pub async fn get(
 
     // Verify membership
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let tenant = state.tenants.base.find_by_id(tid).await?;

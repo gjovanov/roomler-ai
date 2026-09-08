@@ -41,6 +41,30 @@ function endSessionLocally(): void {
 }
 
 /**
+ * Leave the tenant in the URL, keeping the session.
+ *
+ * FR-82 — the answer to the ONE case the old "any GET 403 ⇒ log out" rule
+ * was defending: membership revoked, or a tenant switched underneath, so
+ * every read in this org 403s and the page would otherwise sit there broken.
+ * That is a tenant-scope problem, not an authentication one — the credential
+ * is fine and the user is still signed in to every OTHER org they belong to,
+ * so the correct destination is the org picker, not `/login`.
+ *
+ * Guarded against a redundant push: several in-flight requests for the same
+ * dead tenant all land here, and the dashboard is not tenant-scoped, so
+ * arriving once is enough to stop the traffic that got us here.
+ */
+function leaveTenant(): void {
+  if (router.currentRoute.value.name === 'dashboard') return
+  // Say why. An unexplained bounce to the org picker is the same confusion
+  // the old logout caused, one screen further in — and this is the one case
+  // where the user genuinely needs to know something changed.
+  const { showError } = useSnackbar()
+  showError('You are no longer a member of that organisation.')
+  router.push({ name: 'dashboard' })
+}
+
+/**
  * Turn a 429 into something a user can act on. The server sends `Retry-After`
  * in seconds; without it we can only say "too many requests".
  */
@@ -155,22 +179,38 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       }
     }
 
-    if (
-      resp.status === 403 &&
-      method === 'GET' &&
-      !AUTH_PATHS.some((p) => path.startsWith(p))
-    ) {
-      // 403 is an AUTHORIZATION verdict, not an authentication one — the
-      // token was accepted and the server then made a policy decision. The
-      // logout exists for the navigation case (membership revoked, tenant
-      // switched under you ⇒ every GET 403s and the UI would sit there
-      // broken), so it stays on GET only.
-      //
-      // On a MUTATION it is actively wrong: the role editor refusing to
-      // grant a permission the caller doesn't hold is a normal, expected
-      // answer that the dialog already knows how to display. Logging the
-      // user out instead would make a deliberate refusal look like a crash.
-      endSessionLocally()
+    // ── 403 ────────────────────────────────────────────────────────────
+    //
+    // A 403 NEVER ends the session, on any method. It is an authorization
+    // verdict on a credential the server just accepted — the opposite of a
+    // 401 — and treating the two alike is what turned "you may not read this
+    // one thing" into "you are logged out".
+    //
+    // FR-82, field 2026-09-08: the Devices page mounts a card that fetches
+    // `/tenant/{id}/ephemeral-key-settings`, which needs MANAGE_TENANT. Every
+    // non-OWNER in the org — including its admins, since DEFAULT_ADMIN
+    // deliberately excludes that bit — was logged out by opening the page.
+    // The store had a `catch` that carefully left the switch `null`; it never
+    // ran on the branch that mattered, because the logout fired one layer
+    // below it, before the throw. Three fail-closed nav predicates in
+    // `utils/permissions.ts` exist only to route around this rule, and each
+    // was written after the same bug in a different corner (analytics,
+    // invites, now enrollment keys). The rule was the defect.
+    //
+    // The only 403 with a navigation is the one that says you are not in this
+    // tenant at all, and the SERVER says which it is (`ApiError::NotAMember`
+    // ⇒ `error: "not_a_member"`) rather than the client guessing from a
+    // message string — `chat`'s "Not a member of this room" is a 403 with the
+    // same shape and must not evict anyone from their org.
+    //
+    // ⚠️ Default direction matters more than either branch: an UNCLASSIFIED
+    // 403 does nothing but throw. That is what makes a newly-added
+    // permission-gated route inert here by construction, instead of
+    // dangerous until someone remembers to add a predicate for it.
+    if (resp.status === 403 && !AUTH_PATHS.some((p) => path.startsWith(p))) {
+      if ((data as Record<string, string> | null)?.error === 'not_a_member') {
+        leaveTenant()
+      }
     }
 
     if (resp.status >= 500) {

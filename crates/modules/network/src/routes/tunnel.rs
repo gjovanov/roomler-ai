@@ -59,7 +59,7 @@ pub async fn issue_tunnel_enrollment_token(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let (token, jti) =
@@ -293,7 +293,7 @@ pub async fn list_tunnel_clients(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let page = state.tunnel_clients.list_for_tenant(tid, &params).await?;
@@ -578,7 +578,7 @@ pub async fn create_tunnel_policy(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     validate_policy_input(&body.name, &body.subjects, &body.targets, &body.allowlist)?;
 
@@ -608,7 +608,7 @@ pub async fn list_tunnel_policies(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     let page = state.tunnel_policies.list_for_tenant(tid, &params).await?;
     let items: Vec<TunnelPolicyResponse> = page.items.into_iter().map(Into::into).collect();
@@ -632,7 +632,7 @@ pub async fn get_tunnel_policy(
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     let policy = state.tunnel_policies.find_in_tenant(tid, pid).await?;
     Ok(Json(policy.into()))
@@ -651,7 +651,7 @@ pub async fn update_tunnel_policy(
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     // Validate only the fields that ARE being updated.
     if let Some(n) = &body.name
@@ -723,7 +723,7 @@ pub async fn delete_tunnel_policy(
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
     let deleted = state.tunnel_policies.soft_delete(tid, pid).await?;
     if !deleted {

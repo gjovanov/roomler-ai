@@ -13,11 +13,36 @@ vi.mock('@/api/client', () => ({
 }))
 
 import { useAgentStore, type Agent } from '@/stores/agents'
+import { useTenantStore } from '@/stores/tenant'
 import { api } from '@/api/client'
 
 const mockApi = vi.mocked(api)
 
 const TENANT_ID = 'ten_1'
+
+/**
+ * FR-82 — the three org-switch fetches are gated on `MANAGE_TENANT` in the
+ * store, so a test that wants one to FIRE has to say who is asking. Seeding
+ * `myPermissionsTenantId` short-circuits `ensureMyMembership`, so the gate
+ * costs no `/member/me` round-trip and cannot consume a mocked response
+ * meant for the request under test.
+ */
+function asOwner() {
+  const t = useTenantStore()
+  t.isOwner = true
+  t.myPermissions = 0
+  t.myPermissionsTenantId = TENANT_ID
+}
+
+/** A member with a real mask that simply lacks `MANAGE_TENANT`. */
+function asMemberWithoutManageTenant() {
+  const t = useTenantStore()
+  t.isOwner = false
+  // MANAGE_AGENTS | REMOTE_CONTROL — the exact mask the field report's user
+  // held: enough for the Devices nav to appear, not enough for org settings.
+  t.myPermissions = (1 << 24) | (1 << 25)
+  t.myPermissionsTenantId = TENANT_ID
+}
 
 function mkAgent(over: Partial<Agent> = {}): Agent {
   return {
@@ -314,6 +339,7 @@ describe('useAgentStore', () => {
     // facts. Collapsing the former into the latter would have the console
     // tell a non-admin something false about their org.
     mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    asOwner()
     const s = useAgentStore()
     await s.fetchOrgExecEnabled(TENANT_ID)
     expect(s.orgExecEnabled).toBeNull()
@@ -321,6 +347,7 @@ describe('useAgentStore', () => {
 
   it('fetchOrgExecEnabled stores the flag', async () => {
     mockApi.get.mockResolvedValueOnce({ remote_exec_enabled: true })
+    asOwner()
     const s = useAgentStore()
     await s.fetchOrgExecEnabled(TENANT_ID)
     expect(s.orgExecEnabled).toBe(true)
@@ -392,6 +419,7 @@ describe('useAgentStore', () => {
     // Two independent decisions server-side; the store must not let one
     // fetch populate the other's flag.
     mockApi.get.mockResolvedValueOnce({ remote_ssh_enabled: true })
+    asOwner()
     const s = useAgentStore()
     await s.fetchOrgSshEnabled(TENANT_ID)
     expect(s.orgSshEnabled).toBe(true)
@@ -401,15 +429,58 @@ describe('useAgentStore', () => {
 
   it('a 403 on the ssh org switch leaves it UNKNOWN, not "off"', async () => {
     mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    asOwner()
     const s = useAgentStore()
     await s.fetchOrgSshEnabled(TENANT_ID)
     expect(s.orgSshEnabled).toBeNull()
+  })
+
+  // ── FR-82 — the org switches are never asked for without the bit ───
+  //
+  // The field bug, 2026-09-08: the Devices page mounts EnrollKeysSection
+  // unconditionally, that card fetched `ephemeral-key-settings` on mount,
+  // and the route needs MANAGE_TENANT — which `DEFAULT_ADMIN` deliberately
+  // withholds. Every non-owner who opened the page collected a 403, and the
+  // api client turned that into a logout. The client no longer does; this
+  // makes sure the request is not sent in the first place.
+
+  it.each([
+    ['exec', 'fetchOrgExecEnabled', 'orgExecEnabled'],
+    ['ssh', 'fetchOrgSshEnabled', 'orgSshEnabled'],
+    ['ephemeral-keys', 'fetchOrgEphemeralKeysEnabled', 'orgEphemeralKeysEnabled'],
+  ] as const)(
+    'the %s org switch is NOT fetched without MANAGE_TENANT',
+    async (_label, method, flag) => {
+      asMemberWithoutManageTenant()
+      const s = useAgentStore()
+      await s[method](TENANT_ID)
+      expect(mockApi.get).not.toHaveBeenCalled()
+      // ⚠️ And it stays UNKNOWN, never `false`: "you may not read this
+      // switch" is not "your org has it off", and the console renders the
+      // two differently.
+      expect(s[flag]).toBeNull()
+    },
+  )
+
+  it('an unknown mask blocks the org switches rather than guessing', async () => {
+    // Fail-closed on `null`, unlike the fleet NAV predicate. The membership
+    // fetch is awaited, so `null` here means it FAILED — and firing a
+    // request whose authorization is unknown is how the original bug ran.
+    const t = useTenantStore()
+    t.isOwner = false
+    t.myPermissions = null
+    t.myPermissionsTenantId = TENANT_ID
+    const s = useAgentStore()
+    await s.fetchOrgEphemeralKeysEnabled(TENANT_ID)
+    expect(mockApi.get).not.toHaveBeenCalled()
+    expect(s.orgEphemeralKeysEnabled).toBeNull()
   })
 
   // ── FR-51 — ephemeral enrollment keys ──────────────────────────────
 
   it('the ephemeral-keys org switch is its own flag and its own route', async () => {
     mockApi.get.mockResolvedValueOnce({ ephemeral_keys_enabled: true })
+    asOwner()
     const s = useAgentStore()
     await s.fetchOrgEphemeralKeysEnabled(TENANT_ID)
     expect(s.orgEphemeralKeysEnabled).toBe(true)
@@ -421,6 +492,7 @@ describe('useAgentStore', () => {
 
   it('a 403 on the ephemeral-keys switch leaves it UNKNOWN, not "off"', async () => {
     mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    asOwner()
     const s = useAgentStore()
     await s.fetchOrgEphemeralKeysEnabled(TENANT_ID)
     expect(s.orgEphemeralKeysEnabled).toBeNull()

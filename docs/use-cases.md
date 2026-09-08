@@ -111,7 +111,9 @@ everything (see [permission system](#permission-system)).
 ## Permission System
 
 A **u64 bitfield** per role; a member's effective permissions are the union of
-their assigned roles. 29 flags today:
+their assigned roles. 31 flags today (bits 0–30). The engineering reference,
+including how the seeded roles are kept up to date and what a `403` means, is
+[permissions.md](permissions.md).
 
 | Bit | Flag | Grants |
 |-----|------|--------|
@@ -125,12 +127,14 @@ their assigned roles. 29 flags today:
 | 15–20 | `CONNECT_VOICE` · `SPEAK` · `STREAM_VIDEO` · `MUTE_MEMBERS` · `DEAFEN_MEMBERS` · `MOVE_MEMBERS` | Voice/video |
 | 21 | `MANAGE_MEETINGS` | Start/end conferences |
 | 22 | `MANAGE_DOCUMENTS` | File management |
-| 23 | `ADMINISTRATOR` | Bypasses every check below 24 |
+| 23 | `ADMINISTRATOR` | Bypasses **every** check — `has()` short-circuits on it, so this grants bits 24–30 too |
 | 24 | `MANAGE_AGENTS` | Enroll/manage devices, tunnel policies, overlay approvals |
 | 25 | `REMOTE_CONTROL` | Open remote-desktop sessions |
 | 26 | `VIEW_REMOTE_AUDIT` | Read session audit |
 | 27 | `EXEC_DEVICE` | Fleet RPC — deliberately **not** in the default admin set |
 | 28 | `VIEW_EXEC_AUDIT` | Read the exec audit log |
+| 29 | `SSH_DEVICE` | Open a roomler-SSH session — also **not** in the default admin set |
+| 30 | `VIEW_SSH_AUDIT` | Read the SSH audit log |
 
 ```
 has(perms, flag) = (perms & ADMINISTRATOR != 0) || (perms & flag == flag)
@@ -138,7 +142,16 @@ has(perms, flag) = (perms & ADMINISTRATOR != 0) || (perms & flag == flag)
 
 Rooms can overwrite per-role/per-user: `effective = (base & ~deny) | allow`.
 Default roles: **member** gets the everyday chat/voice bits; **admin** adds
-management bits (but not `EXEC_DEVICE`); the **owner** role has all bits.
+management bits (but neither `EXEC_DEVICE` nor `SSH_DEVICE` — and not
+`MANAGE_TENANT`, so org-level settings stay the owner's); the **owner** role
+has all bits, and carries `ADMINISTRATOR` besides.
+
+⚠️ These five roles are **system-managed**: their masks are defined once in
+`role::MANAGED_ROLES` and reconciled to every existing organisation at
+startup, so a permission bit added to the code reaches orgs that already
+exist. Before FR-82 they were written once at tenant creation and never
+again — 63 of 72 hosted orgs were still frozen at their creation-day masks.
+See [permissions.md](permissions.md).
 
 ## Authentication
 

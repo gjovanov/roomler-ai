@@ -5,8 +5,9 @@
 //!
 //! Every handler's first line is `require_platform_admin` — the existing
 //! ObjectId allowlist, answering **404** on missing authority (never 403: the
-//! web client force-logs-out on 403, and a hidden surface beats an
-//! acknowledged one). `platform_admins` unset ⇒ this entire surface 404s;
+//! allowlist is itself the thing being hidden, and a hidden surface beats an
+//! acknowledged one — the client's old "any 403 ⇒ log out" rule was a second
+//! reason and is gone, FR-82). `platform_admins` unset ⇒ this entire surface 404s;
 //! that inherent gate is the kill switch, and a second config flag guarding
 //! the same door would just be a second switch to forget.
 //!
