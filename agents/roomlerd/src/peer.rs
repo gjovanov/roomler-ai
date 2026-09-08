@@ -6022,8 +6022,8 @@ async fn media_pump_ffmpeg_dc(
             // goodput estimate at all (field 2026-09-02: `None` in every
             // window of a 47-window run at 150 kbit), and this gate could
             // never engage while P1's floor relief — reading the same
-            // evidence through `measured_pipe_bps` — did.
-            let measured = governor.measured_pipe_bps(std::time::Instant::now(), constrained);
+            // evidence through `pipe_bps` — did.
+            let measured = governor.pipe_bps(std::time::Instant::now(), constrained);
             let reference = crate::encode::rate_profile::constrained_queue_reference_bps(
                 crate::encode::relay_max_bps(),
                 measured,
@@ -6967,7 +6967,7 @@ async fn media_pump_ffmpeg_dc(
                 %session_id,
                 codec_label,
                 abandoned_bps = dropped,
-                measured_bps = ?governor.measured_goodput_bps(std::time::Instant::now()),
+                measured_bps = ?governor.blocked_send_bps(std::time::Instant::now()),
                 "FR-59 P6: the measured pipe contradicts the learned ceiling — abandoning it \
                  (relay-keyed rate memory can carry a fast day onto a slow one)"
             );
@@ -6999,9 +6999,7 @@ async fn media_pump_ffmpeg_dc(
             rate_memory_guard.stable.store(
                 governor
                     .stable_bps()
-                    .or_else(|| {
-                        governor.remembered_candidate_bps(std::time::Instant::now(), constrained)
-                    })
+                    .or_else(|| governor.pipe_bps(std::time::Instant::now(), constrained))
                     .unwrap_or_else(|| governor.applied_bps()),
                 std::sync::atomic::Ordering::Relaxed,
             );
@@ -7081,7 +7079,7 @@ async fn media_pump_ffmpeg_dc(
             // FR-79 V2 — a burst that queued is measured by the goodput
             // estimator, like every other window, and only from windows the
             // validity gate accepted.
-            let measured = governor.measured_goodput_bps(std::time::Instant::now());
+            let measured = governor.blocked_send_bps(std::time::Instant::now());
             let target = crate::encode::rate_memory::opener_growth_target_bps(
                 bytes,
                 wait_us,
@@ -7677,7 +7675,7 @@ async fn media_pump_ffmpeg_dc(
                 // of it. None = no confidence (nothing blocked lately —
                 // an unbound link shows counts (0, 0)); rejected counts
                 // windows whose blocked time was too thin to trust.
-                goodput_bps = ?governor.measured_goodput_bps(std::time::Instant::now()),
+                goodput_bps = ?governor.blocked_send_bps(std::time::Instant::now()),
                 goodput_samples = ?governor.goodput_samples(),
                 // FR-15 — the viewer's own paint age (window avg) and the
                 // learned path floor. The excess between them is what the

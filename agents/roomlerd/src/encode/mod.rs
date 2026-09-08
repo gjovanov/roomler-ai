@@ -484,20 +484,6 @@ pub fn rate_slow_start_enabled() -> bool {
     tunnel_core::env::node_env("RATE_SLOW_START").as_deref() == Some("1")
 }
 
-/// FR-70 P1 kill switch (2026-09-04): when on (default), a remembered rate
-/// standing in for a pipe measurement DECAYS toward the nominal band on
-/// clean windows (`encode::prior`) instead of holding the floor relief and
-/// the queue budget at the memory for the whole session. Field 2026-09-04
-/// (CORPLAP-1 → neo16, `6a9abc30`): a 200 kbps memory held a session at
-/// 200 kbps for four minutes while nothing ever measured the pipe — the
-/// queue budget denominated in the memory tripped on every drag frame, and
-/// a queue that never forms is a pipe that can never be measured. Env
-/// `ROOMLERD_RATE_PRIOR_DECAY` / config `rate_prior_decay`. `0` = FR-59 P8
-/// verbatim (the seed is a constant for the session).
-pub fn rate_prior_decay_enabled() -> bool {
-    tunnel_core::env::flag("RATE_PRIOR_DECAY", true)
-}
-
 /// FR-70 M1 — the FFmpeg encoder lives on its own OS thread per session
 /// (`rc-enc-<session>`) behind a command channel, instead of encoding under
 /// `block_in_place` on whichever runtime worker polls the pump. Every
