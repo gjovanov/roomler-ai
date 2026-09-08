@@ -507,6 +507,83 @@ export function resolutionOverrideHint(vi: RcVideoInfo | null | undefined, w: nu
   }
 }
 
+/** FR-74 P4 — the viewer's own pixel chain: how many SCREEN pixels one
+ *  decoded frame pixel lands on, computed the way the FSR sizing policy
+ *  computes its fit factor (`computeRenderTarget`: the `object-fit: contain`
+ *  factor in adaptive mode, the element's own CSS box in original/custom,
+ *  × `devicePixelRatio`). `1` is pixel-exact; anything else is a resample
+ *  the browser (or FSR) does AFTER the codec, which no encoder setting can
+ *  undo — the pill exists so an upscale is never again hunted as encoder
+ *  blur, and so "1:1 Match host display" can be VERIFIED rather than
+ *  trusted. `Original` is 1:1 in CSS pixels, which on a scaled display is
+ *  NOT 1:1 on screen (1.5× at 150 % scaling) — the hint says so. */
+export interface RcDisplayScale {
+  /** Screen pixels per frame pixel (1 = pixel-exact); `null` until the
+   *  frame and the stage are both known. */
+  scale: number | null
+  /** The pill text: `1:1 pixels`, `shown at 1.05×`, or `''` when unknown. */
+  label: string
+  /** The tooltip / Display-tab explanation, with the way to 1:1. */
+  hint: string
+}
+
+export function displayScale(args: {
+  frameW: number
+  frameH: number
+  /** The stage's CSS box (what `object-fit: contain` fits into). */
+  stageW: number
+  stageH: number
+  dpr: number
+  mode: RcScaleMode
+  customPct: number
+  /** Whether the FSR pass is active (the hint then names it). */
+  sharpened?: boolean
+}): RcDisplayScale {
+  const { frameW, frameH, stageW, stageH, mode, customPct } = args
+  const known = (n: number) => Number.isFinite(n) && n > 0
+  if (!known(frameW) || !known(frameH) || !known(stageW) || !known(stageH)) {
+    return { scale: null, label: '', hint: 'Display scale surfaces after the first decoded frame' }
+  }
+  const dpr = known(args.dpr) ? args.dpr : 1
+  // The CSS box the frame is painted into, per scale mode (mirrors
+  // `videoScaleStyle` + the adaptive contain-fit in the view).
+  const cssFactor =
+    mode === 'original'
+      ? 1
+      : mode === 'custom'
+        ? Math.max(5, Math.min(1000, customPct)) / 100
+        : Math.min(stageW / frameW, stageH / frameH)
+  const scale = cssFactor * dpr
+  const exact = Math.abs(scale - 1) <= 0.001
+  const label = exact ? '1:1 pixels' : `shown at ${scale.toFixed(2)}×`
+  const stageDevW = Math.round(stageW * dpr)
+  const stageDevH = Math.round(stageH * dpr)
+  const fits = frameW <= stageDevW && frameH <= stageDevH
+  // The zoom that makes CSS × dpr land on exactly one screen pixel per
+  // frame pixel; one decimal, because 150 % scaling needs 66.7 %.
+  const onePct = Math.round((100 / dpr) * 10) / 10
+  const zoomNote = dpr !== 1 ? ` (your display scaling is ${dpr}×, so Original is ${dpr.toFixed(2)}× on screen)` : ''
+  const recipe =
+    `For 1:1 use Display → Custom zoom ${onePct} %${fits ? '' : ' (the frame is larger than your window and will scroll)'}` +
+    `, or Match remote display so the host renders at your window's ${stageDevW}×${stageDevH}${zoomNote}.`
+  if (exact) {
+    return { scale, label, hint: 'Pixel-exact: each remote pixel lands on exactly one screen pixel.' }
+  }
+  if (scale > 1) {
+    const fsr = args.sharpened ? ' — FSR sharpens the result' : ''
+    return {
+      scale,
+      label,
+      hint: `Each remote pixel is spread over ${scale.toFixed(2)} screen pixels, so text is resampled after decoding${fsr}. ${recipe}`,
+    }
+  }
+  return {
+    scale,
+    label,
+    hint: `The ${frameW}×${frameH} frame is squeezed to ${scale.toFixed(2)} screen pixels per remote pixel, so fine detail is lost after decoding. ${recipe}`,
+  }
+}
+
 /** P6 — one participant on the agent's InputArbiter rail. */
 export interface RcParticipant {
   session: string
@@ -1472,6 +1549,8 @@ export interface RcMetricToggles {
   fps: boolean
   resolution: boolean
   age: boolean
+  /** FR-74 P4 — the display-scale pill (1:1 check). */
+  scale: boolean
   paint: boolean
 }
 
@@ -1481,6 +1560,7 @@ export const DEFAULT_RC_METRICS: RcMetricToggles = {
   fps: true,
   resolution: true,
   age: true,
+  scale: true,
   paint: false,
 }
 
@@ -1510,6 +1590,7 @@ export function storedMetricToggles(): RcMetricToggles {
     fps: pick('fps'),
     resolution: pick('resolution'),
     age: pick('age'),
+    scale: pick('scale'),
     paint: typeof parsed.paint === 'boolean' ? parsed.paint : diagHudEnabled(),
   }
 }
@@ -5289,7 +5370,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  effect immediately even when `scaleMode !== 'custom'`; switching
    *  back to custom picks up the latest value. */
   function setScaleCustomPercent(n: number) {
-    const clamped = Math.round(Math.max(5, Math.min(1000, n)))
+    // One decimal: FR-74 P4 — exact 1:1 at 150 % display scaling is 66.7 %.
+    const clamped = Math.round(Math.max(5, Math.min(1000, n)) * 10) / 10
     scaleCustomPercent.value = clamped
     persistScalePct(clamped)
   }
