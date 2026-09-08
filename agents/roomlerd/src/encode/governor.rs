@@ -321,6 +321,9 @@ pub struct RateGovernor {
     hard_stalls_paused: u32,
     /// FR-71 T2 — a send blocked ≥ `HARD_STALL` awaits the next reported
     /// window's verdict; its blocked-send samples wait with it.
+    /// FR-71 T2b — reported windows whose viewer link report was discarded because
+    /// the previous window was `transit-stalled` (the report describes the stall).
+    stall_shadowed: u32,
     hard_stall_reported: bool,
     quarantine_pending: bool,
     quarantine: Vec<super::goodput::BlockedSend>,
@@ -436,6 +439,7 @@ impl RateGovernor {
             window_sender: None,
             transit_holds: 0,
             hard_stalls_paused: 0,
+            stall_shadowed: 0,
             hard_stall_reported: false,
             quarantine_pending: false,
             quarantine: Vec::new(),
@@ -973,6 +977,13 @@ impl RateGovernor {
             return None;
         }
         self.viewer_window_at = now;
+        // FR-71 T2b — the previous window's verdict, read BEFORE this window is
+        // classified: a viewer link report that lands in the first window after
+        // a `transit-stalled` one describes the stall (70 kbps of arrivals while
+        // nothing moved), not the pipe, and the arrival-rate clamp must not
+        // read it. Field 2026-09-08 14:52 (CORPLAP-1, 0.4.90): the hold kept
+        // 7.45 M through the stall and that one report then set 834,800.
+        let stall_shadow = self.pipe.last() == Some(super::pipe_state::PipeState::TransitStalled);
         // FR-63 — one verdict per window for the opener's ramp: double if
         // nothing congested since the last one, otherwise END it. Taking the
         // flag first keeps the borrow of `self.slow_start` clean.
@@ -1163,8 +1174,12 @@ impl RateGovernor {
             .map(|(rx_bps, queue_ms)| self.link_loop.observe(rx_bps, queue_ms))
             .unwrap_or_default();
         // FR-71 T1b — on a held window the clamp is neither armed nor
-        // released: whatever it held before the stall, it still holds.
-        let link_acts = constrained && self.slow_link.viewer_rate_clamp && !hold;
+        // released: whatever it held before the stall, it still holds. T2b —
+        // and neither on the window in the stall's shadow (see `stall_shadow`).
+        if stall_shadow && constrained && link.is_some() {
+            self.stall_shadowed = self.stall_shadowed.saturating_add(1);
+        }
+        let link_acts = constrained && self.slow_link.viewer_rate_clamp && !hold && !stall_shadow;
         // FR-59 P4 — a queue too deep to cut our way out of. A rate cut
         // drains at `capacity − inflow`, which on a converged session is
         // nearly nothing: at 90 % of a 400 kbps pipe a 2 s backlog clears
@@ -1355,6 +1370,13 @@ impl RateGovernor {
     /// blocked-send measurement folded.
     pub fn hard_stalls_confirmed(&self) -> u32 {
         self.hard_stalls_confirmed
+    }
+
+    /// FR-71 T2b — reported windows in the shadow of a `transit-stalled`
+    /// window: their viewer link report described the stall, not the pipe,
+    /// and the arrival-rate clamp did not read it.
+    pub fn stall_shadowed(&self) -> u32 {
+        self.stall_shadowed
     }
 
     /// FR-15 P2 — count of floor samples rejected as below the path's
@@ -3363,5 +3385,120 @@ mod tests {
             g.relieved_floor_bps().is_some(),
             "a confirmed measurement relieves the floor"
         );
+    }
+
+    /// FR-71 T2b — the viewer's arrival-rate report that lands in the first
+    /// window AFTER a `transit-stalled` run describes the stall, not the pipe.
+    /// Field 2026-09-08 14:52 UTC (CORPLAP-1, 0.4.90 with T2): a carrier
+    /// demotion stalled the relay for six seconds; the hold kept 7.45 M through
+    /// three stalled windows with 0 B in flight, then the viewer reported
+    /// 70 kbps of arrivals with a growing queue and the P3 clamp set the
+    /// target to 834,800 while the sender's queue read over budget — no send
+    /// had blocked for a second, so T2 had nothing to defer.
+    #[test]
+    fn a_link_report_in_the_shadow_of_a_transit_stall_does_not_arm_the_clamp() {
+        let start = Instant::now();
+        let mut g = t2_governor(start);
+        g.slow_link.transit_classify = true;
+        g.slow_link.transit_hold = true;
+        g.slow_link.viewer_rate_clamp = true;
+        let mut t = start;
+        for _ in 0..4 {
+            t += Duration::from_millis(1100);
+            t2_clean_window(&mut g, t);
+        }
+        let before = g.applied_bps();
+        assert!(before > 3_000_000, "runs above the nominal: {before}");
+        // The stall: a silent window, then two whose transit share is seconds
+        // — the sender idle throughout.
+        t += Duration::from_millis(1100);
+        g.note_window_sender(t2_sender(30));
+        g.tick_viewer_window(t, 30, || 0, || 0, || 0, true, |o| o, 0)
+            .expect("window due");
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        for (age, arrival, link) in [
+            (2135u16, 2134u16, 0u64),
+            (3626, 3624, viewer_rate::pack_link(70_340, 300)),
+        ] {
+            t += Duration::from_millis(1100);
+            g.note_window_sender(t2_sender(30));
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(1, false),
+                || viewer_rate::pack_age_with_arrival(age, age - 30, 80, arrival),
+                || link,
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due");
+            assert_eq!(
+                g.pipe_state(),
+                Some(crate::encode::pipe_state::PipeState::TransitStalled)
+            );
+            g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        }
+        assert_eq!(
+            g.applied_bps(),
+            before,
+            "the hold keeps the rate through the stall"
+        );
+        // The window after: the backlog lands (age 5.8 s), the queue reads
+        // over budget, and the viewer's link report says 70 kbps arrived
+        // while its queue grew — the stall's own numbers.
+        t += Duration::from_millis(1100);
+        g.note_window_sender(WindowSenderStats {
+            inflight_bytes: 200_000,
+            budget_bytes: 128_000,
+            gate_skips: 83,
+            send_wait_max_ms: 278.0,
+            send_wait_avg_ms: Some(19.9),
+            frames_sent: 12,
+        });
+        g.tick_viewer_window(
+            t,
+            30,
+            || viewer_rate::pack_report(7, false),
+            || viewer_rate::pack_age_with_arrival(5785, 5700, 80, 5760),
+            || viewer_rate::pack_link(834_800, 600),
+            true,
+            |o| o,
+            0,
+        )
+        .expect("window due");
+        g.pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t);
+        assert!(
+            !g.link_loop_holding(),
+            "a link report in the stall's shadow must not arm the arrival-rate clamp"
+        );
+        // Two shadowed reports: the second stalled window carried one too.
+        assert_eq!(g.stall_shadowed(), 2);
+        assert!(
+            g.applied_bps() > before / 2,
+            "no clamp to the stall's arrival rate: {} vs {before}",
+            g.applied_bps()
+        );
+        // The windows after THAT are the pipe again: growing reports there act.
+        for q in [900i16, 1200] {
+            t += Duration::from_millis(1100);
+            g.note_window_sender(t2_sender(30));
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || viewer_rate::pack_age_with_arrival(60, 50, 80, 59),
+                || viewer_rate::pack_link(400_000, q),
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due");
+        }
+        assert!(
+            g.link_loop_holding(),
+            "out of the shadow the clamp reads the reports again"
+        );
+        assert_eq!(g.stall_shadowed(), 2);
     }
 }
