@@ -112,6 +112,62 @@ So V2 is condition 3 plus the honest denominator:
 - the memory is keyed (or the seed clamped) by the **carrier in force**, which
   the pump already knows at session start and logs every 5 s.
 
+### V4 — the memory keeps what was measured, not the maximum (2026-09-08)
+
+V2 made the opener's contribution a measurement. The rule that consumes it is
+still `record_session`'s **maximum**:
+
+```rust
+let value = if had_decrease && stable_bps > 0 { stable_bps }
+            else { stable_bps.max(old).max(growth_target_bps) };
+```
+
+Two measurements say that rule has outlived its reason.
+
+**1. A carrier's capacity is not a constant, and max keeps the best minute of
+it.** On `100.65.4.2|relay:derp/tcp`, five sessions inside six minutes measured
+**1.44, 1.09, (unqueued), 3.32, 6.13 Mbps** (2026-09-08 19:12–19:18). The
+maximum keeps 6.13, so the next session opens at 85 % of it — 5.2 M — into a
+path that measured 1.09 M five minutes earlier. That is the over-drive this FR
+exists to stop, rebuilt out of honest inputs.
+
+**2. The unqueued branch still grows the memory on no evidence at all.** A burst
+that never queued gets `maxrate × 150 %`, and with the maximum that is a
+one-way ratchet to the `hi` cap. Measured over 2026-09-08: **every** opener on
+CORPLAP-2 had `opener_wait_max_ms=0` (its SCTP buffer absorbs the burst), and its
+memory sat at the 8 M cap all day; CORPLAP-1 recorded the cap in nine of
+nineteen openers before V2. The branch's own comment says what it proves —
+*"only 'not slower than this'"* — and the ratchet turns that into "this fast".
+
+**The rule the gate makes possible.** The whole FR is one sentence: only
+evidence moves a belief. The memory is a belief about a carrier, so:
+
+> A session writes the memory **only if it measured the carrier**, and a
+> measurement is allowed to move the number **in either direction**, damped —
+> fast down, slow up, the asymmetry the goodput estimator already uses inside a
+> session (`ALPHA_DOWN` 0.50, `ALPHA_UP` 0.10). A session that measured nothing
+> leaves the entry exactly as it was.
+
+What that deletes:
+
+- the **maximum** composition, and with it `had_decrease` — the flag exists only
+  to stop a non-measurement (an idle session's seed echoed back) from lowering
+  the memory, and a session that measures nothing now writes nothing at all;
+- the **unqueued growth step** and `OPENER_UNQUEUED_STEP_PCT`: a burst the
+  socket absorbed is not a measurement. Convergence for a fast pair is already
+  the learner's job — it steps the ceiling up when the pair *carries* it and its
+  stable rate is written back, which is evidence rather than a guess;
+- `record_session`'s three value parameters collapse to one: the session's
+  evidence, or `None`.
+
+**Why damped rather than last-wins.** One unlucky window would otherwise pin a
+pair for a week (the TTL), and one lucky burst would re-create the over-drive.
+Down-fast/up-slow biases the opener toward the safe side, because the two errors
+do not cost the same: opening under costs an AIMD climb the learner shortens,
+while opening over costs dropped frames, an abandoned ceiling and a visible
+stall — which is what the operator reported and what tonight's five sessions
+stopped doing.
+
 ## Phases
 
 | phase | scope | kill switch | status |
@@ -120,6 +176,7 @@ So V2 is condition 3 plus the honest denominator:
 | **V2** | the write-back and the seed: the opener measured like every other window (the estimator, not `bytes / max_single_wait`), and the memory keyed by CARRIER — `100.65.0.5|relay:derp/tcp` is not `100.65.0.5|direct` | — | **built 2026-09-08**; field gate on the release |
 | **V3a** | ONE belief (`pipe_bps`) composed in one place + one named source (`blocked_send_bps`); delete `remembered_candidate_bps`, the inlined third copy, and the `rate_prior_decay` switch | — | **built 2026-09-08** |
 | **V3b** | the three sources behind one `Pipe` type (encapsulation, no behaviour change) | — | proposed |
+| **V4** | the memory keeps what was MEASURED, damped down-fast/up-slow, and writes nothing when a session measured nothing; deletes the `max` rule, `had_decrease`, the opener arithmetic and its three constants | — | **built 2026-09-08** (net −159 lines); field gate on the release |
 
 ## Acceptance criteria
 
@@ -185,6 +242,12 @@ So V2 is condition 3 plus the honest denominator:
 - [ ] **AC7** — docs updated with diagrams and a `docs/README.md` row
       (`docs/rate-control.md` gains the gate as its first section).
 
+- [ ] **AC8 (V4)** — field: the memory MOVES DOWN. On a carrier measured well
+      below what is remembered, the next write lowers the entry (before V4 it
+      could only rise), and the openers that follow stay inside the carrier's
+      measured range. On a host whose opener never queues — CORPLAP-2, every
+      opener on 2026-09-08 — the memory stops climbing to the `hi` cap, because
+      an absorbed burst now writes nothing at all.
 ## Open decisions
 
 - Whether a `ViewerLate` window is evidence about the pipe. Today it is (only
