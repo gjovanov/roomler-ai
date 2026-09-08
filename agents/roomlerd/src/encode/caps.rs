@@ -347,9 +347,10 @@ mod child {
         let mut names: Vec<String> = Vec::new();
         for cell in caps.typed_cells() {
             let backend = match cell.backend {
-                VideoBackend::Nvenc | VideoBackend::Qsv | VideoBackend::Vaapi => {
-                    cell.backend.wire()
-                }
+                VideoBackend::Nvenc
+                | VideoBackend::Qsv
+                | VideoBackend::Vaapi
+                | VideoBackend::Vulkan => cell.backend.wire(),
                 _ => continue,
             };
             if cell.codec == VideoCodec::Av1 {

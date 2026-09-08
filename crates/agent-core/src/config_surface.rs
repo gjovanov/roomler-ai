@@ -811,6 +811,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "FR-77 P4 - pin the VAAPI render node the Linux daemon opens (e.g. /dev/dri/renderD129). Empty = the first node libva accepts, /dev/dri/renderD128..135 in order. Env: ROOMLERD_VAAPI_DEVICE. Restart required.",
     ),
     (
+        "d3d12_adapter",
+        "string",
+        "FR-78 P1 - pin the DXGI adapter index the D3D12 video-encode device opens on (Windows; e.g. 1). Empty = adapters 0..3 in order, the first FFmpeg accepts. Env: ROOMLERD_D3D12_ADAPTER. Restart required.",
+    ),
+    (
+        "vulkan_device",
+        "string",
+        "FR-78 P1 - pin the Vulkan physical device by index or name (e.g. 1, or NVIDIA GeForce RTX 5090). Empty = the loader's default device. Env: ROOMLERD_VULKAN_DEVICE. Restart required.",
+    ),
+    (
         "forward_acl",
         "json",
         "Agent-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
@@ -1016,6 +1026,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "caps_cache" => cfg.caps_cache.map(fmt_bool),
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
+        "d3d12_adapter" => cfg.d3d12_adapter.clone(),
+        "vulkan_device" => cfg.vulkan_device.clone(),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -1462,6 +1474,18 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "caps_cache" => cfg.caps_cache = parse_tribool(value)?,
         "vaapi_device" => {
             cfg.vaapi_device = value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }
+        "d3d12_adapter" => {
+            cfg.d3d12_adapter = value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        }
+        "vulkan_device" => {
+            cfg.vulkan_device = value
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)

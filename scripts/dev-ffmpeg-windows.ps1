@@ -42,7 +42,7 @@
 [CmdletBinding()]
 param(
   [string]$FfmpegRelease = 'vendored-ffmpeg-9.0.1',
-  [string]$FfmpegAsset   = 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal.zip',
+  [string]$FfmpegAsset   = 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan.zip',
   [string]$LibvpxRelease = 'vendored-libvpx-1.12.0',
   [string]$LibvpxAsset   = 'libvpx-1.12.0-win64-msvc.zip',
   [string]$Root          = 'C:\ffmpeg-pin',
