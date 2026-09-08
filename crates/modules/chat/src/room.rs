@@ -63,7 +63,7 @@ pub async fn list(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let search_mode = params
@@ -136,7 +136,7 @@ pub async fn create(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     // FR-32 P1b — plan `max_channels` cap. Counts live rooms only, so an
@@ -420,7 +420,7 @@ pub async fn explore(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let rooms = state.rooms.explore(tid, &query.q).await?;

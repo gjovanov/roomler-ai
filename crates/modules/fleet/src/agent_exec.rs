@@ -541,7 +541,7 @@ async fn member_tenant(
 ) -> Result<ObjectId, ApiError> {
     let tid = tenant_of(tenant_id).await?;
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".into()));
+        return Err(ApiError::NotAMember);
     }
     Ok(tid)
 }

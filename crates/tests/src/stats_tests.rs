@@ -504,8 +504,8 @@ async fn admin_stats_gate_is_objectid_allowlist_with_404_miss() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 200);
 
-    // Any other authed user → 404 (NEVER 403: the web client wipes
-    // tokens and force-logs-out on 403).
+    // Any other authed user → 404 (NEVER 403: the platform-admin allowlist
+    // is itself what is being hidden, so a 403 would confirm the surface).
     let user = app
         .register_user(
             "nobody@test.io",
@@ -844,8 +844,8 @@ async fn page_view_beacon_normalizes_paths_and_admin_reads_them_back() {
         "normalised page should be reported: {pages:?}"
     );
 
-    // A non-admin must not see the platform analytics (404, never 403 —
-    // the web client force-logs-out on 403).
+    // A non-admin must not see the platform analytics (404, never 403 — a
+    // 403 would confirm the surface exists).
     let r = app
         .auth_get("/api/admin/stats/users?range=24h", &user.access_token)
         .send()

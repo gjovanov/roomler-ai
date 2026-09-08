@@ -291,12 +291,37 @@ export function canSeeFleetNav(mask: number | null, isOwner: boolean): boolean {
 }
 
 /**
+ * May this caller read the ORG-level switches — `exec-settings`,
+ * `ssh-settings`, `ephemeral-key-settings`? Server gate on all three:
+ * `MANAGE_TENANT` (owner/ADMINISTRATOR bypass included).
+ *
+ * ⚠️ `MANAGE_TENANT` is deliberately NOT in `DEFAULT_ADMIN`, so this is
+ * false for an org's own admins and true only for its owner. That is the
+ * server's policy, not an accident — configuring the organisation is the
+ * owner's job — and it is why the Devices page's enrollment-keys card is
+ * invisible to almost everyone.
+ *
+ * FAIL-CLOSED on `mask === null`, and the callers `await
+ * ensureMyMembership` so `null` means "the fetch failed", not "too early".
+ */
+export function canManageOrgSettings(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_TENANT']))
+}
+
+/**
  * Gate for the org Analytics queries (stats PR-4). Unlike
  * `canSeeFleetNav` this is deliberately FAIL-CLOSED on `mask === null`:
- * the stats endpoints answer 404 to a caller without MANAGE_AGENTS, and
- * more importantly the api client force-logs-out on any 403 — so the UI
- * must never fire an analytics request it isn't sure is authorized.
+ * the stats endpoints answer 404 to a caller without MANAGE_AGENTS, so the
+ * UI would draw a page whose every query came back empty.
  * Server gate: `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass included).
+ *
+ * ⚠️ The reason recorded here used to be "the api client force-logs-out on
+ * any 403". It no longer does (FR-82) — a 403 is an answer, not a dead
+ * session. These predicates are UX now: don't draw a door that opens onto a
+ * refusal, and don't spend a round-trip learning what the mask already says.
+ * Keep them; just don't believe they are load-bearing for the session.
  */
 export function canQueryAnalytics(mask: number | null, isOwner: boolean): boolean {
   if (isOwner) return true
@@ -307,10 +332,12 @@ export function canQueryAnalytics(mask: number | null, isOwner: boolean): boolea
 /**
  * Nav gate for the Invites surface (sidebar item + dashboard card).
  * Deliberately FAIL-CLOSED on `mask === null`, like {@link canQueryAnalytics}
- * and unlike {@link canSeeFleetNav}: `list_invites` requires INVITE_MEMBERS
- * and the api client force-logs-out on any GET 403 — so an ungated entry
- * turned a plain member's click into a logout, which users read as "the
- * invite page disappeared". Server gate: `INVITE_MEMBERS`
+ * and unlike {@link canSeeFleetNav}: `list_invites` requires INVITE_MEMBERS,
+ * so an ungated entry leads a plain member to an empty page.
+ *
+ * ⚠️ This helper was originally added because an ungated entry turned that
+ * member's click into a LOGOUT. It doesn't any more (FR-82) — see the note
+ * on {@link canQueryAnalytics}. Server gate: `INVITE_MEMBERS`
  * (owner/ADMINISTRATOR bypass included).
  */
 export function canManageInvites(mask: number | null, isOwner: boolean): boolean {
@@ -321,9 +348,9 @@ export function canManageInvites(mask: number | null, isOwner: boolean): boolean
 
 /**
  * Nav gates for the Audit pages. FAIL-CLOSED like {@link canQueryAnalytics}
- * and for the same reason: the audit endpoints 403 without their bit and the
- * api client force-logs-out on GET 403. Two separate helpers because the
- * server deliberately splits the bits — reviewing command history
+ * and for the same reason: the audit endpoints 403 without their bit, so the
+ * page would render nothing but its own error. Two separate helpers because
+ * the server deliberately splits the bits — reviewing command history
  * (VIEW_EXEC_AUDIT) and reviewing SSH sessions (VIEW_SSH_AUDIT) are
  * different jobs.
  */
