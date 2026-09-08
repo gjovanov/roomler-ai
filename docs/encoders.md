@@ -109,16 +109,20 @@ plus `probe_ms` and `probe_cached`.
 | **The denylist** = the kill switch, both chroma forms: a `name:chroma` cell on it is never opened nor advertised. Built-in: `hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444` | each unproven packed-4:4:4 cell leaves the list on a field pass; CORPLAP-3's Intel runtime died on the first VUYX open. `encoder_cells_deny` (config, env `ROOMLERD_ENCODER_CELLS_DENY`, pushable through remote config) **replaces** the default; `none` denies nothing. Until 0.4.87 it gated only the 4:4:4 open |
 | AV1, AMF, VideoToolbox and Media Foundation are never asked for 4:4:4 | `av1_nvenc` hard-errors on it and every other AV1 backend lists 4:2:0 only; AMF has no 4:4:4 surface; VideoToolbox HEVC has only Main / Main10 / Main42210; `*_mf` takes NV12 — locked by a test against the vocabulary |
 
-What the fleet advertised on 0.4.87 (server records, 2026-09-08):
+What the fleet advertised on 0.4.88 (server records, 2026-09-08; the D3D12 and
+Vulkan cells are FR-78's):
 
 | Host | Cells | Probe |
 |---|---|---|
-| dev box (RTX 5090 Laptop + Radeon 610M, Windows) | `h264/openh264` · `h264/mf` · `hevc/nvenc` 4:2:0+**4:4:4** · `hevc/amf` · `av1/nvenc` · `h264/nvenc` 4:2:0+**4:4:4** · `h264/amf` · `vp9/libvpx` 4:2:0+4:4:4 | 4.3 s |
-| CORPLAP-3 (Iris Xe, Windows) | `h264/openh264` · `h264/mf` · `vp9/qsv` · `av1/qsv` · `h264/qsv` · `vp9/libvpx` | 5.7 s |
+| dev box (RTX 5090 Laptop + Radeon 610M, Windows) | `h264/openh264` · `h264/mf` · `hevc/nvenc` 4:2:0+**4:4:4** · `hevc/amf` · `hevc/d3d12` · `hevc/vulkan` · `av1/nvenc` · `av1/vulkan` · `h264/nvenc` 4:2:0+**4:4:4** · `h264/amf` · `h264/d3d12` · `h264/vulkan` · `vp9/libvpx` 4:2:0+4:4:4 | 6.1 s |
+| CORPLAP-3 (Intel Meteor Lake iGPU, Windows) | `h264/openh264` · `h264/mf` · `vp9/qsv` · `hevc/d3d12` · `av1/qsv` · `h264/qsv` · `vp9/libvpx` — the Intel driver refuses FFmpeg's D3D12 H.264/AV1 configuration and has no Vulkan encode queue | 6.8 s |
 | MacBook (M-series) | `h264/openh264` · `hevc/videotoolbox` · `h264/videotoolbox` · `vp9/libvpx` | 0.1 s |
-| jupiter, zeus (AMD Raphael / VCN 3.1, Linux) | `h264/openh264` · `hevc/vaapi` · `h264/vaapi` · `vp9/libvpx` | 0.1 s |
-| the WSL sibling (RTX through WSL's libcuda) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `av1/nvenc` · `h264/nvenc` 4:2:0+4:4:4 · `vp9/libvpx` | 2.5 s |
-| mars (no GPU, Linux) | `h264/openh264` · `vp9/libvpx` | 0.1 s |
+| jupiter, zeus (AMD Raphael / VCN 3.1, Linux) | `h264/openh264` · `hevc/vaapi` · `h264/vaapi` · `vp9/libvpx` — RADV exposes Vulkan encode only under `RADV_PERFTEST=video_encode` | 0.2 s |
+| the WSL sibling (RTX through WSL's libcuda) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `av1/nvenc` · `h264/nvenc` 4:2:0+4:4:4 · `vp9/libvpx` — its four software Vulkan ICDs open and refuse | 5.9 s |
+| mars (no GPU, Linux) | `h264/openh264` · `vp9/libvpx` | 0.5 s |
+
+The probe's cost grew with the device walk (the dev box 4.3 → 6.1 s, WSL 2.5 →
+5.9 s); the cache pays it once per build, driver and hardware.
 
 ## The cell resolution — from the matrix to a session
 
