@@ -1449,6 +1449,35 @@ async fn nominated_remote_ip(pc: &Arc<RTCPeerConnection>) -> Option<String> {
     None
 }
 
+/// FR-79 V2 — the carrier under an overlay pair, as the memory key's second
+/// half. Asks the same LocalAPI the constrained-transport probe asks; a
+/// non-overlay remote (a TURN server's own address, say) is already its own
+/// key, and anything unknown or mid-churn returns `None`, which leaves the
+/// bare-address key this had before.
+#[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
+async fn overlay_carrier_tag(remote_addr: &str) -> Option<String> {
+    if !addr_is_overlay_range(remote_addr) {
+        return None;
+    }
+    let query = async {
+        let mut client = tunnel_core::localapi::connect().await.ok()?;
+        let peers = client.peers().await.ok()?;
+        peers.into_iter().find(|p| {
+            p.overlay_ip.as_deref() == Some(remote_addr)
+                || p.overlay_ip6.as_deref() == Some(remote_addr)
+        })
+    };
+    let peer = tokio::time::timeout(Duration::from_millis(400), query)
+        .await
+        .ok()??;
+    let connection = format!("{:?}", peer.connection).to_lowercase();
+    crate::encode::rate_memory::carrier_tag(
+        &connection,
+        peer.relay_kind.as_deref(),
+        peer.relay_transport.as_deref(),
+    )
+}
+
 /// FR-35 P2 — persists the session's stable rate for its peer when the pump
 /// ends, whichever way it ends. The pump stores the governor's current stable
 /// rate into `stable` once per viewer window; `0` = nothing worth keeping.
@@ -4754,7 +4783,19 @@ async fn media_pump_ffmpeg_dc(
                 "FR-35 rate memory: no nominated pair within 4 s of pump start — memory off for this session"
             );
         }
-        key
+        // FR-79 V2 — the carrier is half the key: one overlay address can be
+        // carried by a direct path, a UDP relay or DERP over TLS on different
+        // days, with four times the capacity between the ends of that range.
+        match key {
+            Some(addr) => {
+                let tag = overlay_carrier_tag(&addr).await;
+                Some(crate::encode::rate_memory::memory_key(
+                    &addr,
+                    tag.as_deref(),
+                ))
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -6934,10 +6975,15 @@ async fn media_pump_ffmpeg_dc(
             let bytes = opener_bytes.load(std::sync::atomic::Ordering::Relaxed);
             let wait_us = opener_wait_us_max.load(std::sync::atomic::Ordering::Relaxed);
             let opener_maxrate = enc.current_maxrate_bps();
+            // FR-79 V2 — a burst that queued is measured by the goodput
+            // estimator, like every other window, and only from windows the
+            // validity gate accepted.
+            let measured = governor.measured_goodput_bps(std::time::Instant::now());
             let target = crate::encode::rate_memory::opener_growth_target_bps(
                 bytes,
                 wait_us,
                 opener_maxrate,
+                measured,
                 rate_hi_bps,
             );
             if constrained {
@@ -6950,6 +6996,7 @@ async fn media_pump_ffmpeg_dc(
                     opener_bytes = bytes,
                     opener_wait_max_ms = wait_us / 1000,
                     opener_maxrate_bps = opener_maxrate,
+                    opener_measured_bps = ?measured,
                     growth_target_bps = target,
                     grace_soft_stalls,
                     grace_bp_skips,

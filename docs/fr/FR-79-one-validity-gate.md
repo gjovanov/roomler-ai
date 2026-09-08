@@ -117,7 +117,7 @@ So V2 is condition 3 plus the honest denominator:
 | phase | scope | kill switch | status |
 |---|---|---|---|
 | **V1** | the gate + every in-session consumer; **delete** `transit_hold`, `transit_classify`, T2's quarantine, T2b's shadow, and their four counters (one `evidence_rejected` replaces them) | **none — and none is the point**; what it replaces had two | **built 2026-09-08** (AC1–AC3 met); field gate on the release carrying it |
-| **V2** | the write-back and the seed: the opener measured like every other window, the gate at `record_session`, the memory keyed/clamped by carrier (condition 3) | — | proposed |
+| **V2** | the write-back and the seed: the opener measured like every other window (the estimator, not `bytes / max_single_wait`), and the memory keyed by CARRIER — `100.65.0.5|relay:derp/tcp` is not `100.65.0.5|direct` | — | **built 2026-09-08**; field gate on the release |
 | **V3** | one pipe estimator: goodput, the viewer's arrival rate and the prior behind ONE type with one accessor; delete the rest (FR-70 AC4's 8 → 1) | — | proposed |
 
 ## Acceptance criteria
@@ -147,9 +147,21 @@ So V2 is condition 3 plus the honest denominator:
       `evidence_rejected=[agent-stalled, transit-stalled, stall-shadow,
       carrier-changed]` and nothing else about stalls; every rejected window is
       attributable to a reason.
-- [ ] **AC4 (V2)** — on a pair remembered from one carrier, a session opened on
+- [x] **AC4 (V2)** — on a pair remembered from one carrier, a session opened on
       a slower carrier does not open above what that carrier has measured, and
       an opening burst that queued does not raise the memory.
+      *Built 2026-09-08: `carrier_tag` puts the carrier in the key (`direct` /
+      `tunnel` / `relay:<kind>/<transport>`, from the LocalAPI peer record's
+      `relay_kind` and `relay_transport`, so DERP and a UDP relay are different
+      memories), with `None` for a mid-churn carrier leaving the pre-FR-79 bare
+      key; `opener_growth_target_bps` takes the goodput estimator's measurement
+      for a burst that queued, and the bounded step is unchanged for one that
+      did not. Cells: the 16:41:51 burst records 3.41 M (the measurement) where
+      it recorded 6.0 M before, records nothing when the estimator has no
+      confidence, and a direct memory does not seed a DERP session. ⚠️ Entries
+      written before this are keyed by the bare address and stop matching; they
+      age out with the 7-day TTL, at a cost of one session of learning per pair
+      and carrier.*
 - [ ] **AC5 (V2)** — field: the operator's own repeat on CORPLAP-1 opens within
       a factor of the carrier's measured rate on five consecutive sessions, with
       no 1.26 M opener and no 6.8 M opener.
