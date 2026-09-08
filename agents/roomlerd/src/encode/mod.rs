@@ -1305,7 +1305,10 @@ pub fn open_default(
 /// FR-62 ladder. `None` when the name is not one of the tables', the build
 /// carries no FFmpeg, or no device on this host accepts it — the same open
 /// the capability probe runs, so a cell the probe advertised opens here too.
-/// Returns the codec's wire name with the encoder.
+/// Returns the codec's wire name with the encoder. Bypasses the denylist as
+/// well, by design: the name is the operator's explicit request, and a
+/// denied cell is exactly what `--name` exists to drive under the harness
+/// before it is allowed back.
 pub fn open_named(
     name: &str,
     width: u32,

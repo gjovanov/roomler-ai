@@ -764,7 +764,7 @@ impl FfmpegEncoder {
         let constrained = crate::encode::transport_is_constrained();
         let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
         Self::new_with_dispatch(
-            HEVC_ENCODER_NAMES,
+            &crate::encode::cells::names_420(roomler_ai_remote_control::models::VideoCodec::Hevc),
             width,
             height,
             DEFAULT_ENCODER_FPS,
@@ -784,7 +784,7 @@ impl FfmpegEncoder {
         let constrained = crate::encode::transport_is_constrained();
         let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
         Self::new_with_dispatch(
-            VP9_ENCODER_NAMES,
+            &crate::encode::cells::names_420(roomler_ai_remote_control::models::VideoCodec::Vp9),
             width,
             height,
             DEFAULT_ENCODER_FPS,
@@ -851,7 +851,7 @@ impl FfmpegEncoder {
             }
         }
         Self::new_with_dispatch(
-            HEVC_ENCODER_NAMES,
+            &crate::encode::cells::names_420(roomler_ai_remote_control::models::VideoCodec::Hevc),
             width,
             height,
             fps.max(1) as i32,
@@ -897,7 +897,7 @@ impl FfmpegEncoder {
             );
         }
         Self::new_with_dispatch(
-            VP9_ENCODER_NAMES,
+            &crate::encode::cells::names_420(roomler_ai_remote_control::models::VideoCodec::Vp9),
             width,
             height,
             fps.max(1) as i32,
@@ -915,7 +915,7 @@ impl FfmpegEncoder {
         let constrained = crate::encode::transport_is_constrained();
         let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
         Self::new_with_dispatch(
-            AV1_ENCODER_NAMES,
+            &crate::encode::cells::names_420(roomler_ai_remote_control::models::VideoCodec::Av1),
             width,
             height,
             DEFAULT_ENCODER_FPS,
@@ -938,7 +938,7 @@ impl FfmpegEncoder {
         constrained: bool,
     ) -> Result<Self> {
         Self::new_with_dispatch(
-            AV1_ENCODER_NAMES,
+            &crate::encode::cells::names_420(roomler_ai_remote_control::models::VideoCodec::Av1),
             width,
             height,
             fps.max(1) as i32,
@@ -956,7 +956,7 @@ impl FfmpegEncoder {
         let constrained = crate::encode::transport_is_constrained();
         let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
         Self::new_with_dispatch(
-            H264_ENCODER_NAMES,
+            &crate::encode::cells::names_420(roomler_ai_remote_control::models::VideoCodec::H264),
             width,
             height,
             DEFAULT_ENCODER_FPS,
@@ -1020,7 +1020,7 @@ impl FfmpegEncoder {
             }
         }
         Self::new_with_dispatch(
-            H264_ENCODER_NAMES,
+            &crate::encode::cells::names_420(roomler_ai_remote_control::models::VideoCodec::H264),
             width,
             height,
             fps.max(1) as i32,
@@ -1072,6 +1072,18 @@ impl FfmpegEncoder {
         cq_bias: i32,
         constrained: bool,
     ) -> Result<Self> {
+        // FR-78 P3 — a rebuild may only reuse a name the denylist allows. The
+        // cascade that produced `name` was filtered and the list cannot change
+        // under a running daemon, so this restates the invariant "a denied
+        // cell is never opened" at the one entry the cascade does not cover;
+        // it is not a live decision.
+        if crate::encode::cells::cell_denied(
+            &crate::encode::cells::denied_cells(),
+            name,
+            roomler_ai_remote_control::models::ChromaFormat::Yuv420,
+        ) {
+            anyhow::bail!("{name}:yuv420 is on the device denylist");
+        }
         Self::new_with_dispatch(
             &[name],
             width,
@@ -2523,6 +2535,33 @@ mod tests {
                 "av1_d3d12va",
                 "av1_vulkan"
             ]
+        );
+    }
+
+    /// FR-78 P3 — no session constructor may hand a raw cascade table to the
+    /// dispatcher: every 4:2:0 list goes through `cells::names_420` and every
+    /// 4:4:4 list through `names_444`, which is where the denylist lives.
+    /// Read from the source because the constructors open real encoders and
+    /// cannot be unit-tested for the list they were handed; on the 0.4.88
+    /// tree this finds eight offenders (the jupiter session that ran on a
+    /// denied `hevc_vaapi`).
+    #[test]
+    fn no_constructor_dispatches_a_raw_cascade_table() {
+        let src = include_str!("encoder.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let offenders: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_end().ends_with("Self::new_with_dispatch("))
+            .filter_map(|(i, _)| {
+                let next = lines.get(i + 1)?.trim();
+                next.ends_with("_ENCODER_NAMES,")
+                    .then(|| format!("line {}: {next}", i + 2))
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "raw cascade tables handed to the dispatcher (the denylist is bypassed): {offenders:?}"
         );
     }
 
