@@ -169,6 +169,43 @@ enigo = { workspace = true, optional = true }
 # an RSA host or user key is not something we need to accept.
 russh = { version = "0.62", default-features = false, features = ["ring"], optional = true }
 
+# FR-52 gate 4 (`external-access` feature) — the OPAQUE aPAKE that lets a
+# device verify a password held ONLY here, against a proof relayed by a server
+# that must not be able to learn or replay it. facebook/opaque-ke is the
+# reference Rust implementation; 4.0.1 is the stable release (4.1.0-pre.2 is
+# published but is a PRE-release, and this binary runs as SYSTEM/root on every
+# enrolled machine and updates itself).
+#
+# Measured cost: **+7 crates** on roomlerd's normal graph (366 -> 373), because
+# the RustCrypto stack it wants — argon2, curve25519-dalek, elliptic-curve,
+# digest/hmac/hkdf — is already linked. The genuinely new ones are opaque-ke,
+# voprf and serdect. Far below the ~99 `ssh-server` costs, which is why this is
+# a cheap feature rather than a debated one.
+#
+# `argon2` is ON deliberately: it is OPAQUE's key-stretching function, and what
+# makes a STOLEN registration record expensive to attack offline. Without it the
+# record is only as strong as the password. `default-features = false` keeps the
+# ecdsa / ed25519 / ml-kem suites out.
+opaque-ke = { version = "4", default-features = false, features = [
+    "ristretto255",
+    "serde",
+    "argon2",
+    "std",
+], optional = true }
+
+# The KSF behind opaque-ke's `argon2` feature, named directly because
+# `Suite::Ksf = argon2::Argon2<'static>` needs the type in scope.
+argon2 = { workspace = true, optional = true }
+
+# ⚠️ opaque-ke is on `rand 0.8` (rand_core 0.6) while the workspace is on
+# `rand 0.9`, and the two `RngCore` traits are DIFFERENT types — passing the
+# workspace `OsRng` to any opaque-ke call fails to compile with a bound error
+# that names `rand_core` only in a footnote. Aliased rather than switched:
+# rand 0.8 is already in this graph transitively (as are 0.9 and 0.10), so
+# naming it here costs nothing and makes the split explicit at the one place
+# it matters.
+rand_opaque = { package = "rand", version = "0.8", optional = true }
+
 # Opus audio encoder for the system/desktop-audio WebRTC track (`audio`
 # feature). Bundles libopus and builds it from C source on first build,
 # so there's no runtime lib dependency and it's independent of the
@@ -635,6 +672,25 @@ overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack", "roomler-node-cor
 # second, parallel primitive stack and ~99 extra crates. That is the honest
 # price of the feature and the reason it is opt-in per build.
 ssh-server = ["dep:russh", "overlay-netstack"]
+
+# FR-52 — cross-org remote access: the device half of gate 4. Opt-in per build
+# like `ssh-server`. +7 crates (see the opaque-ke dep comment).
+#
+# ⚠️ Deliberately NOT in any release feature set yet, and that is the honest
+# state rather than an oversight: nothing CONSUMES the credential until the P3
+# handshake lands, so shipping the OPAQUE stack to the fleet today would add
+# weight to every agent for a gate no session can reach. It joins the release
+# sets with P3 — the `ssh-server` rule (ship it with its gates closed so a
+# device can be opted in without waiting for a release) applies once there is
+# something to opt in TO.
+#
+# ⚠️ Advertising `RpcCap::ExternalAccess` is deliberately NOT gated on this
+# feature. The verb means "this build can tell the person at the machine that a
+# controller is from outside the org" — the consent-prompt property, not the
+# password one. Gating the verb here would make a build without the feature
+# un-approvable AND indistinguishable from an agent too old to have it: two
+# different fixes behind one symptom, which is the split P2a exists to keep.
+external-access = ["dep:opaque-ke", "dep:argon2", "dep:rand_opaque"]
 
 # build.rs embeds a Windows VERSIONINFO resource into roomlerd.exe.
 # `[target.'cfg(windows)'.build-dependencies]` resolves against the HOST
