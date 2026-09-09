@@ -611,6 +611,49 @@ own rule is that the reasoning before the code is the verification budget.
 It ships as its own PR with no other change riding along, and the field gate is
 a session whose heartbeat is indistinguishable from the release before it.
 
+### ⚠️ Re-scoped 2026-09-09 — two assumptions in the design above do not hold
+
+Anchors re-verified against master `18ab3fb82`; the pump is now
+`media_pump_ffmpeg_dc` at `peer.rs:4754` and its frame loop opens at `:5555`.
+
+**1. There is no control-plane task to publish from.** The design says the plan
+is "computed by the control plane, published whole… on the tokio task that
+already runs the viewer window". That task does not exist: `tick_viewer_window`
+is called at **`peer.rs:6939`, inside the frame loop**, and self-limits to once
+per `VIEWER_WINDOW` by returning `None`. M1 moved the ENCODER to its own thread;
+it did not move the deciding off the frame path, which is what M3 is for. So M3
+does not *publish across* an existing seam — it has to **create** the seam.
+
+**2. `pre_encode_tick` runs on EVERY frame** (`peer.rs:7125`), not once per
+window. A `Plan.bitrate_bps` recomputed per window therefore changes the
+rate-update cadence, which contradicts M3's own claim that "a plan whose fields
+are computed exactly as the pump computes them today produces byte-identical
+decisions". Either the plan's epoch bumps on exactly the condition
+`pre_encode_tick` moves the target — in which case the plan is a per-frame
+object and the "one writer, one reader, one cell" shape buys less than it looks
+— or M3 accepts a cadence change and stops being a pure refactor. **This is the
+crux to settle before any code moves**, and it is not settled here.
+
+**3. Some plan fields carry per-frame mutable state.** The direct-path branch of
+the byte budget (`:6047`+) maintains `direct_wait_ema_ms` and the
+`gate_sw_{sum,frames}_last` cursors from atomics *in the frame path*. The wait
+is a FACT (it stays with the loop, per the design's own split); only the BOUND
+is the plan's. Worth stating explicitly, because the EMA reads like a decision.
+
+**Proposed first PR — M3a, the plan in SHADOW.** Compute the `Plan` where the
+window tick already runs, publish it, and have the pump compare its own inline
+values against it per frame **without reading it**: one counter,
+`plan_divergences`, per field. No behaviour change, nothing deleted, and the
+retirement gate is the operator's standing rule — the counter must read
+**fleet-zero** before M3b flips the loop to read the plan and deletes the inline
+arithmetic. A divergence is then a measured bug in the plan rather than a
+regression in the field, which is the only way "byte-identical" is provable
+rather than asserted.
+
+⚠️ M3a is also where crux (2) gets answered empirically: publish the plan at the
+window cadence, and the divergence counter measures exactly how often a
+per-window bitrate would differ from the per-frame one.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
