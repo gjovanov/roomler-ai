@@ -1040,9 +1040,20 @@ impl RateGovernor {
         // ramped to 1,928,555; eleven windows stalled, paint age reached
         // 7,784 ms, and the rate ended HIGHER than it started — because every
         // loop below that can lower it reads `valid`.
+        // ⚠️ `pipe_bps`, NOT `blocked_send_bps` — the invariant that accessor's
+        // own doc states, and V5 shipped on the wrong side of it for one
+        // release. The agent's sends only block when the queue is LOCAL; on a
+        // relay-TCP path the queue is downstream, so the blocked-send source is
+        // silent exactly where this rule is needed. Measured on 0.4.96,
+        // 2026-09-09: CORPLAP-3 read `goodput_bps=None` with
+        // `goodput_samples=(0, 5)` — every window's blocked time under
+        // `MIN_WINDOW_BLOCKED` — so a goodput-only comparison could never fire
+        // and V5 was inert on that host. `pipe_bps` composes the same goodput
+        // with the viewer's arrival rate and falls back to the decaying prior,
+        // which is what "how fast is the link" has meant since FR-59 P3.
         let stall_is_ours = rejection.is_some_and(|r| r.is_congestion())
             && match (
-                self.goodput.estimate_bps(now),
+                self.pipe_bps(now, constrained),
                 self.aimd.as_ref().map(|c| c.desired()),
             ) {
                 // A fifth of slack so a session parked at the measurement does
