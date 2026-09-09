@@ -10,6 +10,10 @@ pub struct TenantDao {
     pub base: BaseDao<Tenant>,
     pub members: BaseDao<TenantMember>,
     pub roles: BaseDao<Role>,
+    /// The durable record of what [`TenantDao::reconcile_managed_roles`]
+    /// granted. Held here rather than reached for through a `Database` handle
+    /// because `BaseDao` deliberately owns only its collection.
+    pub reconcile_audit: BaseDao<role::RoleReconcileEvent>,
 }
 
 /// One `(role name, stored mask)` group [`TenantDao::reconcile_managed_roles`]
@@ -43,6 +47,7 @@ impl TenantDao {
             base: BaseDao::new(db, Tenant::COLLECTION),
             members: BaseDao::new(db, TenantMember::COLLECTION),
             roles: BaseDao::new(db, Role::COLLECTION),
+            reconcile_audit: BaseDao::new(db, role::RoleReconcileEvent::COLLECTION),
         }
     }
 
@@ -322,6 +327,38 @@ impl TenantDao {
                         } },
                     )
                     .await?;
+                // The durable record, written HERE rather than at the call
+                // site so it cannot drift from the write it describes: the
+                // two are one statement apart and share `stored`/`reconciled`
+                // directly. FR-82 shipped with only an INFO line, and the
+                // measurement afterwards was that it survived ~10 minutes —
+                // `kubectl logs` serves the current container, the pod rolled,
+                // and a one-way grant across 63 orgs had no record left.
+                //
+                // ⚠️ Best-effort, exactly like `config_audit`: a failed insert
+                // is logged and the reconcile continues. The roles are already
+                // correct at this point, and refusing to finish the migration
+                // because its receipt could not be filed would trade a real
+                // outage for a bookkeeping one.
+                let event = role::RoleReconcileEvent {
+                    id: None,
+                    at: DateTime::now(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    role: name.clone(),
+                    rows: rows as i64,
+                    stored: stored as i64,
+                    granted: reconciled as i64,
+                    gained: (reconciled & !stored) as i64,
+                    gained_names: role::permissions::names(reconciled & !stored),
+                };
+                if let Err(e) = self.reconcile_audit.insert_one(&event).await {
+                    tracing::warn!(
+                        role = %name,
+                        error = %e,
+                        "managed-role reconcile: the roles were updated but the audit row \
+                         could not be written — the grant is applied and unrecorded"
+                    );
+                }
             }
             groups.push(RoleReconcileGroup {
                 name,

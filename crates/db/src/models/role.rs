@@ -325,6 +325,57 @@ impl ManagedRole {
     }
 }
 
+/// One stratum the startup reconcile actually changed — the durable record of
+/// a permission grant nobody asked for.
+///
+/// FR-82 shipped with the arithmetic at INFO and a comment saying it "has to
+/// be readable in `kubectl logs` afterwards". Measured on the roll: ~10
+/// minutes later it was readable nowhere. `kubectl logs` serves only the
+/// CURRENT container, the emitting pod had been replaced, and the sole record
+/// of a one-way grant across 63 organisations existed only because somebody
+/// happened to be watching live. A log line is a notification, not an audit
+/// trail.
+///
+/// ⚠️ **Deliberately NOT tenant-scoped**, unlike every other audit collection
+/// here (`config_audit`, `ssh_audit`, `exec_audit` …). Those record a request
+/// by a user against a device. This records a deployment-wide migration with
+/// no tenant, no device and no requester — one row covers every organisation
+/// that shared a stale mask, which is exactly the grouping the write used.
+///
+/// ⚠️ **Deliberately NOT TTL-indexed**, also unlike the others. Those bound an
+/// append-only stream of routine decisions; this is bounded already — one row
+/// per changed stratum, only on the boot that changes anything, so a
+/// deployment's whole history is ~12 rows and then nothing, forever. Expiring
+/// them after 90 days would delete the only record of an irreversible grant
+/// and re-create the exact gap this type exists to close, just more slowly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleReconcileEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub at: DateTime,
+    /// The build that ran it, so a row explains itself without a join against
+    /// a deployment history nobody kept.
+    pub version: String,
+    /// The managed role's name (`admin`, `owner`, …).
+    pub role: String,
+    /// How many role rows — i.e. how many organisations — carried `stored`.
+    pub rows: i64,
+    /// The mask before, after, and the difference. All three are stored rather
+    /// than derived, because the point of the row is to be readable years
+    /// later by someone who will not re-run the bitwise arithmetic.
+    pub stored: i64,
+    pub granted: i64,
+    pub gained: i64,
+    /// The permission NAMES the grant added. The masks above are the record;
+    /// this is the part a human reads. ⚠️ Resolved at write time against the
+    /// build's own table — a bit renamed later does not rewrite history.
+    pub gained_names: Vec<String>,
+}
+
+impl RoleReconcileEvent {
+    pub const COLLECTION: &'static str = "role_reconcile_audit";
+}
+
 #[cfg(test)]
 mod tests {
     use super::permissions::*;
