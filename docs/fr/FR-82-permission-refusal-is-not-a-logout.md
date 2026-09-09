@@ -127,6 +127,14 @@ OR-ing cannot. **The cost, stated so nobody rediscovers it: a bit REMOVED from
 a definition — a tightening — does not propagate**, and needs its own migration
 that says out loud whose permissions it takes away.
 
+⚠️ **The mirror case is the surprising one: a bit an ORG removed comes back.**
+One stored mask cannot distinguish *"never had it"* from *"took it away on
+purpose"*, so an org that narrowed a managed role sees it silently widened at
+the next boot. Accepted deliberately — the alternative (replace) silently
+revokes instead, and revoking is the worse failure — but it means **narrowing a
+managed role is not a supported way to restrict a team**: a custom role is, and
+the aggregation's `is_managed: true` match never sees one.
+
 ⚠️ Grouped by `(name, permissions)`, one `update_many` per group — 12 writes
 for the whole deployment, not 360. Matching the exact stored value also makes
 it idempotent and safe against a concurrent editor: a role changed underneath
