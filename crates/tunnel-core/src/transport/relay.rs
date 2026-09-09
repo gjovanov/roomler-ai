@@ -329,9 +329,19 @@ pub struct TurnRelayConn {
     transport: RelayTransport,
     server: String,
     /// Kept alive on purpose: the client's `listen()` task is what feeds
-    /// `relay`'s `recv_from`. Never touched after construction; dropping
-    /// it closes the allocation on coturn.
-    _client: Client,
+    /// `relay`'s `recv_from`.
+    ///
+    /// ⚠️ **Dropping this closes NOTHING** — the comment here used to claim it
+    /// closed the allocation, and that was false in the way that leaks: `turn`
+    /// has no `Drop` impl anywhere, and `listen()` spawned a task that owns a
+    /// clone of the underlay socket `Arc` and exits only when `close_notify` is
+    /// cancelled, which only [`Client::close`] does. So the socket outlives the
+    /// struct, forever. The [`Drop`] below is what actually frees it, and every
+    /// early return after `listen()` must close too (FR-48 / #1086).
+    ///
+    /// Same ownership trap as `TunnelPeer` (2026-08-22): the sockets belong to
+    /// tasks the client spawned, not to the value you are holding.
+    client: Arc<Client>,
     relay: Arc<dyn UtilConn + Send + Sync>,
     /// Cached relayed address (fixed for the allocation's life) so the
     /// sync [`RelayConn::local_addr`] needn't re-query + re-map errors.
@@ -343,6 +353,61 @@ impl fmt::Debug for TurnRelayConn {
         f.debug_struct("TurnRelayConn")
             .field("relayed_addr", &self.relayed_addr)
             .finish_non_exhaustive()
+    }
+}
+
+/// FR-48 — closes a TURN client on **every** way out of an allocation attempt,
+/// including the one that matters most: **cancellation**.
+///
+/// Every caller wraps `allocate_turn_relay_*` in `tokio::time::timeout`
+/// (`UDP_ALLOC_TIMEOUT` / `TLS_ALLOC_TIMEOUT`), so the common failure is not an
+/// `Err` that a `?` can catch — it is the whole future being **dropped**
+/// mid-`allocate()`. Closing only on the error paths would leave exactly that
+/// case leaking, which on a node that cannot reach coturn is *most* attempts.
+/// A guard held across the awaits turns cancellation into a close, because drop
+/// runs whether the future completed or was thrown away.
+///
+/// `disarm()` on success hands the client to [`TurnRelayConn`], whose own `Drop`
+/// takes over.
+struct ClientCloseGuard(Option<Arc<Client>>);
+
+impl ClientCloseGuard {
+    fn disarm(mut self) -> Arc<Client> {
+        self.0.take().expect("guard armed exactly once")
+    }
+}
+
+impl Drop for ClientCloseGuard {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                let _ = client.close().await;
+            });
+        }
+    }
+}
+
+/// FR-48 — the only thing that actually frees the underlay socket.
+///
+/// `turn`'s `Client` has no `Drop`, and the task `listen()` spawned owns a clone
+/// of the underlay `Arc`, so letting this struct fall out of scope leaves the
+/// socket bound for the life of the process. `close()` is async and `drop` is
+/// not, so the close is spawned — mirroring `TunnelPeer`'s net, for the same
+/// reason and after the same class of field leak.
+///
+/// ⚠️ Off a runtime (`try_current` fails) there is nothing to spawn onto and the
+/// socket is released by process exit instead; that is the teardown path, not a
+/// live-fleet one.
+impl Drop for TurnRelayConn {
+    fn drop(&mut self) {
+        let client = Arc::clone(&self.client);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = client.close().await;
+            });
+        }
     }
 }
 
@@ -462,8 +527,14 @@ pub async fn allocate_turn_relay_from(
 
     // Spawns the background read loop that demuxes inbound TURN messages
     // onto the allocation — must run before `allocate()`.
-    client.listen().await.context("TURN client listen")?;
+    let client = Arc::new(client);
+    // FR-48 — armed BEFORE `listen()` spawns the read loop that owns a clone of
+    // `underlay`. From here every exit closes: `?`, a panic, and above all the
+    // caller's `timeout` dropping this future mid-allocate. Field-traced on
+    // 0.4.71 — every leaked socket on a quiet overlay node came from here.
+    let guard = ClientCloseGuard(Some(Arc::clone(&client)));
 
+    client.listen().await.context("TURN client listen")?;
     let relay = client.allocate().await.context("TURN allocate")?;
     let relayed_addr = relay
         .local_addr()
@@ -474,7 +545,7 @@ pub async fn allocate_turn_relay_from(
     Ok(TurnRelayConn {
         transport: RelayTransport::Udp,
         server: turn_server.to_string(),
-        _client: client,
+        client: guard.disarm(),
         relay: Arc::new(relay),
         relayed_addr,
     })
@@ -914,6 +985,13 @@ pub async fn allocate_turn_relay_tls(
     .await
     .context("TURNS client::new")?;
 
+    let client = Arc::new(client);
+    // Same FR-48 guard as the UDP path. The underlay here is the TLS connection
+    // rather than a UDP socket, so a stranded attempt costs a TCP connection and
+    // its read task instead of an ephemeral port — invisible to `ss -uanp`, same
+    // ownership bug, and this path has a timeout over it too.
+    let guard = ClientCloseGuard(Some(Arc::clone(&client)));
+
     client.listen().await.context("TURNS client listen")?;
     let relay = client.allocate().await.context("TURNS allocate")?;
     let relayed_addr = relay
@@ -925,7 +1003,7 @@ pub async fn allocate_turn_relay_tls(
     Ok(TurnRelayConn {
         transport: RelayTransport::Tcp,
         server: format!("{host}:{port}"),
-        _client: client,
+        client: guard.disarm(),
         relay: Arc::new(relay),
         relayed_addr,
     })
@@ -1327,6 +1405,63 @@ mod turn_tests {
         .await
         .expect("in-process turn server");
         (server, turn_addr)
+    }
+
+    /// FR-48 (#1086) — a TURN allocate that is **cancelled by its caller's
+    /// timeout** must not strand its underlay socket.
+    ///
+    /// This is the shape the field leak actually had: `listen()` spawns a read
+    /// loop owning a clone of the underlay `Arc`, `turn::Client` has no `Drop`,
+    /// and every caller wraps the allocate in `tokio::time::timeout` — so the
+    /// dominant path is the future being *dropped*, not returning `Err`. A fix
+    /// that only closed on the error paths passes a happy-path test and leaks
+    /// exactly here.
+    ///
+    /// ⚠️ Counts `/proc/self/fd`, so Linux only — this asserts about process
+    /// file descriptors, which is the property that broke (ephemeral-port
+    /// exhaustion), not a proxy for it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_cancelled_turn_allocate_does_not_strand_its_underlay_socket() {
+        fn open_fds() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .map(|d| d.count())
+                .unwrap_or(0)
+        }
+        // Discard port: reachable enough to bind/send toward, never answers, so
+        // `allocate()` is still in flight when the timeout fires.
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let attempt = || async move {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(250),
+                allocate_turn_relay_from(
+                    dead,
+                    "u".to_string(),
+                    "p".to_string(),
+                    "r".to_string(),
+                    None,
+                ),
+            )
+            .await;
+        };
+        // Warm up first: the first attempt can open lazily-initialised state
+        // (resolver, runtime bits) that never closes and is not the leak.
+        attempt().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let before = open_fds();
+
+        for _ in 0..6 {
+            attempt().await;
+        }
+        // The close is spawned (drop is sync, close is async) — give it a turn.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let after = open_fds();
+
+        assert!(
+            after <= before + 1,
+            "cancelled TURN allocates stranded file descriptors: {before} -> {after} \
+             (6 attempts; each leaked underlay socket shows up here)"
+        );
     }
 
     /// Corp-VPN rescue contract: an explicit egress binds the TURN client
