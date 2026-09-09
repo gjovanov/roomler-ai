@@ -611,6 +611,87 @@ own rule is that the reasoning before the code is the verification budget.
 It ships as its own PR with no other change riding along, and the field gate is
 a session whose heartbeat is indistinguishable from the release before it.
 
+### ⚠️ Re-scoped 2026-09-09 — two assumptions in the design above do not hold
+
+Anchors re-verified against master `18ab3fb82`; the pump is now
+`media_pump_ffmpeg_dc` at `peer.rs:4754` and its frame loop opens at `:5555`.
+
+**1. There is no control-plane task to publish from.** The design says the plan
+is "computed by the control plane, published whole… on the tokio task that
+already runs the viewer window". That task does not exist: `tick_viewer_window`
+is called at **`peer.rs:6939`, inside the frame loop**, and self-limits to once
+per `VIEWER_WINDOW` by returning `None`. M1 moved the ENCODER to its own thread;
+it did not move the deciding off the frame path, which is what M3 is for. So M3
+does not *publish across* an existing seam — it has to **create** the seam.
+
+**2. `pre_encode_tick` runs on EVERY frame** (`peer.rs:7125`), not once per
+window. A `Plan.bitrate_bps` recomputed per window therefore changes the
+rate-update cadence, which contradicts M3's own claim that "a plan whose fields
+are computed exactly as the pump computes them today produces byte-identical
+decisions". Either the plan's epoch bumps on exactly the condition
+`pre_encode_tick` moves the target — in which case the plan is a per-frame
+object and the "one writer, one reader, one cell" shape buys less than it looks
+— or M3 accepts a cadence change and stops being a pure refactor. **This is the
+crux to settle before any code moves**, and it is not settled here.
+
+**3. Some plan fields carry per-frame mutable state.** The direct-path branch of
+the byte budget (`:6047`+) maintains `direct_wait_ema_ms` and the
+`gate_sw_{sum,frames}_last` cursors from atomics *in the frame path*. The wait
+is a FACT (it stays with the loop, per the design's own split); only the BOUND
+is the plan's. Worth stating explicitly, because the EMA reads like a decision.
+
+**Proposed first PR — M3a, the plan in SHADOW.** Compute the `Plan` where the
+window tick already runs, publish it, and have the pump compare its own inline
+values against it per frame **without reading it**: one counter,
+`plan_divergences`, per field. No behaviour change, nothing deleted, and the
+retirement gate is the operator's standing rule — the counter must read
+**fleet-zero** before M3b flips the loop to read the plan and deletes the inline
+arithmetic. A divergence is then a measured bug in the plan rather than a
+regression in the field, which is the only way "byte-identical" is provable
+rather than asserted.
+
+⚠️ M3a is also where crux (2) gets answered empirically: publish the plan at the
+window cadence, and the divergence counter measures exactly how often a
+per-window bitrate would differ from the per-frame one.
+
+### Crux (2) resolved, and what M3 actually contains
+
+**The arithmetic is already extracted.** `encode::rate_profile` exposes 33 pure
+functions, and every piece of the byte gate is among them —
+`constrained_queue_reference_bps`, `constrained_queue_budget_bytes`,
+`direct_queue_budget_bytes`, `direct_queue_hard_budget_bytes`, and
+`direct_gate_trips` (the gate verdict itself). What sits in the frame path is
+not the arithmetic; it is **calling those functions once per frame against live
+shared state** — `governor.pipe_bps(Instant::now(), …)`, the atomics behind the
+wait EMA, and `*target_resolution.lock().unwrap()`.
+
+So the design's stated payoff — "three inline computations become three fields
+of one struct, computed in one place" — overstates the change. The computations
+are already one-liners over pure functions. **M3's real content is ownership and
+cadence: who calls them, on which thread, how often.**
+
+**Which means M3 cannot be a pure refactor, and its two criteria are in tension
+unless the seam is built a particular way.** Criterion 1 wants no governor tick
+in the frame path; criterion 2 wants byte-identical targets. `pre_encode_tick`
+runs per frame and the AIMD's additive increase is a per-frame step, so a plan
+recomputed once per WINDOW necessarily produces different targets — you cannot
+have both.
+
+**The resolution: the control plane must tick at FRAME cadence, not window
+cadence.** The decision moves off the media loop onto its own task, and that
+task runs at the rate the pump produces frames; the loop reads the published
+plan and never ticks anything. Criterion 1 is then about *where* the decision
+runs, not *how often* — and criterion 2 survives, because the cadence is
+preserved. The `Plan` is therefore a ~30 Hz object, not a ~1 Hz one; the
+`epoch` field earns its place (most republishes are identical and cost the
+reader nothing), and "one writer, one reader, one cell" still holds.
+
+⚠️ **Consequence for M3a**: the shadow must compare at FRAME cadence, and it is
+a PURITY check — call the extracted producer with the inputs the pump has at
+that instant and assert it equals the inline value — not a cadence check. A
+window-cadence shadow would diverge by construction, so its counter could never
+reach fleet-zero and would gate nothing.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
