@@ -40,6 +40,11 @@ pub mod displays;
 pub mod dpi;
 pub mod encode;
 pub mod exec;
+/// FR-52 gate 4 — the device-held external-access password. Feature-gated
+/// (`external-access`): the OPAQUE stack is +7 crates, and only a build that
+/// serves cross-org access needs it.
+#[cfg(feature = "external-access")]
+pub mod external_access;
 pub mod files;
 pub mod fp16;
 pub mod gpu_clock;
