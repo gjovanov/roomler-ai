@@ -2657,8 +2657,29 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     // fingerprints, which is precisely the habit that makes SSH host
     // verification worthless. Better to serve nothing than to serve a new
     // identity every restart.
+    // ⚠️ The condition is "not USABLE", not "absent". A key that is present but
+    // unparseable is the state this guard used to walk straight past, and it is
+    // strictly worse than having none: the daemon refuses to serve SSH (right)
+    // and publishes no host pubkey (right), and then never mints a replacement —
+    // so the device is wedged permanently and every restart repeats the same
+    // warning into a log nobody reads. Found in the field on a 0.4.96 corp
+    // laptop whose stored PEM had picked up literal `\r` escape text; see
+    // `ssh::stored_host_key_is_usable`.
+    //
+    // Replacing it is safe precisely BECAUSE it was unreadable: the daemon never
+    // served with it and never published it, so no client ever verified against
+    // it. There is no identity to preserve — which is what separates this from
+    // the "never serve a key that changes every restart" rule below.
     #[cfg(feature = "ssh-server")]
-    if cfg.ssh_enabled && cfg.ssh_host_key.is_none() {
+    if cfg.ssh_enabled && !roomlerd::ssh::stored_host_key_is_usable(&cfg) {
+        if cfg.ssh_host_key.is_some() {
+            tracing::warn!(
+                "ssh: the stored host key is unreadable — replacing it. Nothing ever \
+                 verified against it (the daemon refused to serve SSH with it), so there \
+                 is no identity to preserve"
+            );
+            cfg.ssh_host_key = None;
+        }
         match roomlerd::ssh::generate_host_key() {
             Ok(pem) => {
                 cfg.ssh_host_key = Some(pem);
