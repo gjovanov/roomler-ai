@@ -201,6 +201,59 @@ pub struct AgentConfig {
     #[serde(default)]
     pub external_access_enabled: bool,
 
+    /// FR-52 gate 4 — the OPAQUE **server setup**, base64.
+    ///
+    /// Long-lived, per-device, and minted once on the first
+    /// `rc password set`. OPAQUE needs it for both registration and every
+    /// later login, so losing it invalidates the stored password record — it
+    /// travels with [`Self::external_access_verifier`] and neither is useful
+    /// alone.
+    ///
+    /// ⚠️ **A secret.** Deliberately absent from the config SURFACE, so
+    /// `roomler config get` cannot print it and `roomler config set` cannot
+    /// paste one in: a settable verifier would let anyone who can write the
+    /// config choose the password, which is the property gate 4 exists to
+    /// deny. It is written by `rc password set` and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_access_setup: Option<String>,
+
+    /// FR-52 gate 4 — the OPAQUE **registration record** for this device's
+    /// external-access password, base64. `None` = no password is set, which is
+    /// what every device has until its owner sets one.
+    ///
+    /// ⚠️ This is a VERIFIER, not the password: OPAQUE's registration record
+    /// is not password-equivalent, and (with the `argon2` KSF) recovering the
+    /// password from a stolen record costs a full offline attack against a
+    /// memory-hard function. That is the property that makes it safe to keep
+    /// on the device at all — and the reason the server is never given a copy.
+    ///
+    /// ⚠️ Same surface exclusion as [`Self::external_access_setup`], and the
+    /// same persistence rule as `ssh_host_key`: if it cannot be written
+    /// durably the feature stays OFF rather than running on a value that
+    /// disappears at reboot, because a password that silently stops working is
+    /// worse than one that was never set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_access_verifier: Option<String>,
+
+    /// FR-52 gate 5 — how consent is obtained for an EXTERNAL controller.
+    ///
+    /// `None` = `prompt`, the attended default, and deliberately not
+    /// `AccessPolicy.consent_mode`: the org's answer for a colleague is not
+    /// automatically its answer for a stranger. `auto` is reachable — an
+    /// unattended headless box is the case the password exists for — but it
+    /// has to be chosen here, on the device, by whoever holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_consent_mode: Option<String>,
+
+    /// FR-52 — the device's OWN ceiling on what an external session may be
+    /// granted, in the pipe-separated form (`"VIEW | INPUT"`).
+    ///
+    /// `None` = defer to the org's ceiling. Where both are set the session
+    /// gets the INTERSECTION: a device may narrow what its org allows, never
+    /// widen it, which is the same direction every other gate runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_max_permissions: Option<String>,
+
     /// Serve SSH on this node's overlay address, in-process.
     ///
     /// Default **`false`**, for the same reason as [`Self::exec_enabled`] and
@@ -2044,6 +2097,10 @@ pub fn test_fixture() -> AgentConfig {
         power_policy: String::new(),
         remote_config_enabled: false,
         external_access_enabled: false,
+        external_access_setup: None,
+        external_access_verifier: None,
+        external_consent_mode: None,
+        external_max_permissions: None,
         ssh_enabled: false,
         ssh_port: None,
         ssh_authorized_keys: Vec::new(),

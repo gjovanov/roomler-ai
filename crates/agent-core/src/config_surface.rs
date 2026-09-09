@@ -113,6 +113,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Let someone OUTSIDE this device's organization control it (FR-52 gate 3). NEVER settable by the server — the whole `external_*` surface is absent from remote config, because a server able to set this could admit a stranger to a machine whose owner never agreed. Opens nothing on its own: an org admin must also approve this device, the outsider must prove the password held HERE, and whoever is at the machine is still asked. Default: OFF.",
     ),
     (
+        "external_consent_mode",
+        "prompt|auto",
+        "How consent is obtained when the controller is from OUTSIDE this organization (FR-52 gate 5). Deliberately separate from the org's consent setting: its answer for a colleague is not automatically its answer for a stranger. `auto` is the unattended case the password exists for, and has to be chosen HERE, on this device. Default: prompt.",
+    ),
+    (
+        "external_max_permissions",
+        "VIEW | INPUT | CLIPBOARD | FILES",
+        "This device's OWN ceiling on what an external session may do. Unset defers to the org's ceiling; where both are set a session gets the INTERSECTION, so a device can narrow what its org allows but never widen it. NOTE: the external-access PASSWORD is not settable here - use `roomler rc password set`, which never writes it anywhere readable.",
+    ),
+    (
         "ssh_enabled",
         "bool",
         "Serve SSH in-process on this node's overlay address (intercepted before the OS; sessions inherit the daemon's SYSTEM/root identity). Default: OFF.",
@@ -868,6 +878,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         }),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
         "external_access_enabled" => Some(fmt_bool(cfg.external_access_enabled)),
+        "external_consent_mode" => cfg.external_consent_mode.clone(),
+        "external_max_permissions" => cfg.external_max_permissions.clone(),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
@@ -1067,6 +1079,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // be one push away from meaningless. See `docs/remote-config.md`.
         "remote_config_enabled" => cfg.remote_config_enabled = parse_bool_or(value, false)?,
         "external_access_enabled" => cfg.external_access_enabled = parse_bool_or(value, false)?,
+        "external_consent_mode" => cfg.external_consent_mode = value.map(str::to_string),
+        "external_max_permissions" => cfg.external_max_permissions = value.map(str::to_string),
         // Same fail-safe direction as `exec_enabled`: clearing the key means
         // OFF. An SSH session is strictly more than a bounded command.
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
