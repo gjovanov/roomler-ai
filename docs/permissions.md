@@ -143,9 +143,33 @@ out of its group's filter instead of being clobbered.
 Visible drift beats drift corrected by guesswork.
 
 ⚠️ It is logged at INFO with the arithmetic, never silently — this grants
-permissions across every tenant on the deployment, so the one run that does
-something has to be readable in `kubectl logs` afterwards. Every later boot
-prints *"managed roles already match their definitions"*.
+permissions across every tenant on the deployment. Every later boot prints
+*"managed roles already match their definitions"*.
+
+### The record that outlives the pod — `role_reconcile_audit`
+
+⚠️⚠️ **A log line is a notification, not an audit trail.** This paragraph used
+to end *"…so the one run that does something has to be readable in `kubectl
+logs` afterwards"*. Measured on the 2026-09-09 roll: **~10 minutes later it was
+readable nowhere.** `kubectl logs` serves only the *current* container, the
+emitting pod had been replaced, and the sole record of a one-way grant across
+63 organisations survived purely because somebody was watching live and had
+captured a before-state. Neither is guaranteed next time.
+
+So each **changed** stratum also writes a row: role, how many organisations it
+covered, `stored` → `granted`, the `gained` mask, and the permission **names**
+added — the masks are the record, the names are what a human reads years later
+without re-deriving a bitfield. Written from inside the reconcile, one statement
+after the `update_many` it describes, so the two cannot drift.
+
+| property | here | every other audit collection | why |
+|---|---|---|---|
+| scope | deployment-wide | tenant + device + user | there is no tenant, no device and no requester — one row covers every org that shared a stale mask |
+| TTL | **none** | 90 days | already bounded: ~12 rows once per deployment, then nothing. A TTL would delete the only record of an irreversible grant and re-create the gap |
+| on failure | logged, reconcile continues | same | the roles are already correct; failing a migration over its receipt trades a real outage for a bookkeeping one |
+
+⚠️ An idempotent run writes **nothing** — otherwise every restart buries the one
+row that matters.
 
 **Kill switch:** `ROOMLER__AUTH__RECONCILE_MANAGED_ROLES=false` (default on;
 the daemon warns at startup when it is off). Two legitimate uses and no

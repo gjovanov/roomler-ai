@@ -282,3 +282,90 @@ async fn the_reconcile_leaves_a_role_it_does_not_define_alone() {
         .expect("an untouched managed role must still be REPORTED — silent drift is the defect");
     assert_eq!(reported.gained(), 0);
 }
+
+#[tokio::test]
+async fn the_grant_leaves_a_record_that_outlives_the_pod_that_made_it() {
+    // FR-82 shipped with the arithmetic at INFO and a comment promising it
+    // would be "readable in `kubectl logs` afterwards". Measured on the real
+    // roll: ~10 minutes later it was readable nowhere — `kubectl logs` serves
+    // only the current container and the emitting pod had been replaced, so
+    // the sole record of a one-way grant across 63 organisations survived
+    // purely because somebody was watching live. This is the durable half.
+    use roomler_ai_db::models::role::{ManagedRole, RoleReconcileEvent, permissions};
+
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("fr82audit").await;
+
+    const STALE_ADMIN: u64 = 0x7ffff7;
+    set_mask(&app, &tenant.tenant_id, "admin", STALE_ADMIN).await;
+
+    let audit = app
+        .db
+        .collection::<bson::Document>(RoleReconcileEvent::COLLECTION);
+    assert_eq!(
+        audit.count_documents(doc! {}).await.unwrap(),
+        0,
+        "precondition: nothing has been reconciled yet"
+    );
+
+    app.state.tenants.reconcile_managed_roles().await.unwrap();
+
+    let row = audit
+        .find_one(doc! { "role": "admin", "stored": STALE_ADMIN as i64 })
+        .await
+        .unwrap()
+        .expect("the admin grant left no record");
+
+    let admin_def = ManagedRole::by_name("admin").unwrap().permissions;
+    assert_eq!(
+        row.get_i64("granted").unwrap() as u64,
+        STALE_ADMIN | admin_def,
+        "the row must say what the mask became"
+    );
+    assert_eq!(
+        row.get_i64("gained").unwrap() as u64,
+        admin_def & !STALE_ADMIN,
+        "the row must say what the grant actually added"
+    );
+    assert!(
+        row.get_i64("rows").unwrap() >= 1,
+        "the row must say how many organisations it covered"
+    );
+
+    // The masks are the record; the names are the part a human reads years
+    // later without re-deriving a bitfield.
+    let names: Vec<String> = row
+        .get_array("gained_names")
+        .unwrap()
+        .iter()
+        .filter_map(|b| b.as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "MANAGE_AGENTS"),
+        "gained_names should name the grant in words, got {names:?}"
+    );
+
+    // ⚠️ And the bit that must NEVER appear in one of these rows below the
+    // ADMINISTRATOR bypass. `no_managed_role_below_administrator_seeds_a_root_shell`
+    // guards the table; this guards what the migration actually handed out.
+    assert!(
+        !names.iter().any(|n| n == "EXEC_DEVICE" || n == "SSH_DEVICE"),
+        "the reconcile granted a root shell to every org: {names:?}"
+    );
+    assert_eq!(
+        row.get_i64("gained").unwrap() as u64 & (permissions::EXEC_DEVICE | permissions::SSH_DEVICE),
+        0
+    );
+
+    let after_first = audit.count_documents(doc! {}).await.unwrap();
+
+    // Every pod boot runs this. A run that changes nothing must file nothing,
+    // or the collection grows on every restart and buries the one row that
+    // matters.
+    app.state.tenants.reconcile_managed_roles().await.unwrap();
+    assert_eq!(
+        audit.count_documents(doc! {}).await.unwrap(),
+        after_first,
+        "an idempotent run still wrote an audit row"
+    );
+}
