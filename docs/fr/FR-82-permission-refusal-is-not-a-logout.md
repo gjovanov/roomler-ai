@@ -143,6 +143,36 @@ falls out of its group's filter instead of being clobbered.
 ⚠️ A managed row whose name is not in the table is **reported and left alone**.
 Visible drift beats drift corrected by guesswork.
 
+### 4. The grant leaves a row, not just a log line
+
+`role_reconcile_audit`, written from inside `reconcile_managed_roles` one
+statement after the `update_many` it describes — so the receipt and the write
+share `stored`/`reconciled` directly and cannot drift. One row per **changed**
+stratum: role, rows covered, `stored` → `granted`, the `gained` mask, and the
+permission **names** it added.
+
+⚠️ **Not tenant-scoped**, unlike every other audit collection here
+(`config_audit`, `ssh_audit`, `exec_audit`, …). Those record a request by a
+user against a device. This records a deployment-wide migration with no tenant,
+no device and no requester; one row covers every organisation that shared a
+stale mask, which is exactly the grouping the write used.
+
+⚠️ **Not TTL-indexed**, also unlike the others — the one deliberate deviation
+from the 90-day convention. Those bound an append-only stream of routine
+decisions. This is bounded already: one row per changed stratum, only on the
+boot that changes anything, so a deployment's entire history is ~12 rows and
+then nothing forever. A TTL would delete the only record of an irreversible
+grant and re-create this very gap, just more slowly.
+
+⚠️ **Best-effort**, like `config_audit`: a failed insert is logged and the
+reconcile continues. The roles are already correct by then, and refusing to
+finish a migration because its receipt could not be filed trades a real outage
+for a bookkeeping one.
+
+⚠️ It carries no index and no `index_plan` entry **on purpose** — a collection
+of ~12 rows needs none, and adding one would re-record the composition baseline
+for no query it would ever serve.
+
 ### The measured drift
 
 | role | stored | → target | gains | orgs |
@@ -263,6 +293,14 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
       *`docs/permissions.md` (7 sections, 3 mermaid diagrams: the bit catalogue,
       the reconcile's additive merge, and what each refusal means), with its row
       in `docs/README.md`'s reference table.*
+- [x] **AC11** The grant leaves a durable record: one `role_reconcile_audit`
+      row per changed stratum with its arithmetic and the permission names,
+      and an idempotent run writes none.
+      *`the_grant_leaves_a_record_that_outlives_the_pod_that_made_it`, which
+      also asserts no row ever names `EXEC_DEVICE`/`SSH_DEVICE` — the table's
+      guard covers the definition, this covers what the migration handed out.
+      Added after the roll, because the INFO line the FR shipped with was gone
+      from every surviving pod ten minutes later.*
 
 ## Open decisions
 
@@ -272,18 +310,23 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
   not see the Devices page's enrollment-keys card. Revisit if operators ask.
 - **A bit removed from a definition** does not propagate (see §3). No mechanism
   proposed until there is a real tightening to carry.
-- **The grant's only record is a log line with a pod's lifetime.** Measured
-  after the fact: ~10 minutes post-roll the seven `managed role reconciled`
-  lines were gone from both surviving pods, because `kubectl logs` holds only
-  the current container and the emitting pod had been replaced. The reconcile
-  is one-shot per deployment and self-evidencing in the data *if* someone
-  captured a before-state — but nobody has to, and next time nobody may. The
-  cheap fix is an `audit_logs` row per changed stratum (the collection, its
-  90-day TTL and the writer all already exist); the honest alternative is to
-  drop the comment's promise that the arithmetic is *"readable in `kubectl
-  logs` afterwards"*, because it is not. Not fixed here: this FR shipped, and
-  the choice belongs with whoever wants the audit trail, not with a follow-up
-  that quietly widens the change.
+- ~~**The grant's only record is a log line with a pod's lifetime.**~~
+  **RESOLVED — see §4.** Measured after the fact: ~10 minutes post-roll the
+  seven `managed role reconciled` lines were gone from both surviving pods,
+  because `kubectl logs` holds only the current container and the emitting pod
+  had been replaced. The reconcile is one-shot per deployment and
+  self-evidencing in the data *if* someone captured a before-state — but nobody
+  has to, and next time nobody may.
+
+  ⚠️ **This entry first proposed "an `audit_logs` row (the collection, its
+  90-day TTL and the writer all already exist)". That was wrong, and wrong in
+  this FR's own signature way** — `audit_logs` is named in `CLAUDE.md`'s
+  collection list and in a comment in `ephemeral.rs` (*"the P4 surface adds it
+  to `audit_logs`"*), and there is **no such model, collection, index or
+  writer** anywhere in the tree. It was reasoned from a doc line instead of
+  checked, which is precisely the *"a false invariant in a comment is what the
+  next reader reasons from"* failure this FR was written about. §4 builds the
+  collection instead of assuming it.
 
 ## Out of scope
 
@@ -307,14 +350,21 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
 | 2026-09-09 | Idempotence | a later leader logged `managed roles already match their definitions groups=5`. ⚠️ A restart is **not** automatically a second run: the first replacement booted inside the previous leader's 120 s lease and correctly skipped |
 | 2026-09-09 | ⚠️⚠️ **The arithmetic no longer exists anywhere** — searched both surviving pods' full logs ~10 min later: zero `managed role reconciled` lines, only the one `already match` | The code's own comment asks for it to be *"readable in `kubectl logs` afterwards"* because this **grants permissions across every tenant**. `kubectl logs` holds only the current container, so the sole record of a one-way, fleet-wide grant has a pod's lifetime. It survived here only because someone was watching live and because a before-state had been captured. See "Open decisions" |
 
-⚠️ **AC8 is still owed and the issue was closed without it.** It needs a member
-who lacks `MANAGE_TENANT`; the owner is the one member of any org the defect
-never hit, so the owner cannot verify it. GROX has **8 non-owner members**, all
-on `member` (`0x3cf81`), any of whom reproduces the original path by opening
-the Devices page. Note the reconcile does **not** make this pass — `MANAGE_TENANT`
-stays out of `DEFAULT_ADMIN` deliberately, so the `ephemeral-key-settings` GET
-still answers 403; AC8 passes because the client no longer treats that as a
-dead session.
+| 2026-09-09 | **AC8 — the reporting member, on the shipped build** | `goran.jovanov@roomler.ai` opened `/tenant/69a1dbba…/devices`: the grid rendered and the session survived |
+| 2026-09-09 | ⚠️ **AC8's negative control**, checked BEFORE believing the pass | not the tenant owner; effective mask `0x303cf81` = `member 0x3cf81` + custom `Remote Operator 0x3000000`; `MANAGE_TENANT` **absent**, `ADMINISTRATOR` **absent** — so it is a seat that could falsify the criterion, unlike the owner's. (A pass from a seat holding either bit would have proved nothing, which is exactly how this defect survived a week.) |
+| 2026-09-09 | ⚠️⚠️ **Correction to the row above, and to what I first said about it** | I wrote that "the 403 still happened and the old rule would still have fired". **It did not.** AC7's store-level gate (`fetchOrgEphemeralKeysEnabled` short-circuits on `mayReadOrgSettings`) means that seat never fires the request at all, so the pass exercises AC7's gate rather than AC1's branch. The symptom is genuinely gone; the `forbidden` flavour of the 403 branch stays field-unproven, and only the unit tests cover it. Two fixes shipped together and the field test reaches the outer one — a real limit on what AC8 establishes, not a quibble |
+
+~~⚠️ **AC8 is still owed and the issue was closed without it.**~~ **Done
+2026-09-09, above.** It needed a member who lacks `MANAGE_TENANT`; the owner is
+the one member of any org the defect never hit, so the owner could not verify
+it. GROX has **8 non-owner members** on `member` (`0x3cf81`), and the seat used
+was the reporting one.
+
+⚠️ The reconcile does **not** make AC8 pass — `MANAGE_TENANT` stays out of
+`DEFAULT_ADMIN` deliberately. ⚠️⚠️ Nor does AC1's branch, which is the part
+worth reading twice: **AC7's gate means the request is never fired**, so from
+that seat there is no 403 to mishandle. The page works, and the reason it works
+is the fix one layer out from the one AC8's wording implies.
 
 ### The client half — the 403 that no longer ends a session
 
