@@ -8,6 +8,15 @@
 # rather than by rule; this makes it a rule.
 agents/roomlerd/packaging/linux/debian/* text eol=lf
 
+# The macOS half of exactly the same hazard, which the rule above missed: the
+# .pkg's `postinstall` is run by PackageKit, so `#!/bin/bash\r` is a
+# nonexistent interpreter there too and the install fails on EVERY Mac. It sat
+# unprotected only because it has no extension, so the `scripts/*.sh` pattern
+# never covered it. The .plists are LF for tidiness; CFPropertyList itself
+# tolerates CRLF.
+agents/roomlerd/packaging/macos/postinstall text eol=lf
+agents/roomlerd/packaging/macos/*.plist text eol=lf
+
 # Same reasoning, lower stakes: systemd refuses to parse a unit whose lines
 # end in CR, and the shell scripts are run on Linux hosts.
 agents/roomlerd/packaging/linux/*.service text eol=lf
