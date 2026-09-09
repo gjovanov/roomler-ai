@@ -104,6 +104,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // (`docs/remote-config.md`). Joining an org must never turn it on —
         // that would let enrollment itself hand the server the local veto.
         remote_config_enabled: false,
+        external_access_enabled: false,
         // Same rule for SSH, which grants strictly more than a bounded command.
         // `preserve_operator_config` keeps all three across a RE-enrollment
         // (they sit in the `..existing` tail), so a device that opted in stays

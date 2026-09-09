@@ -494,6 +494,18 @@ pub struct AgentResponse {
     /// default is reported as absent instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_policy: Option<roomler_ai_remote_control::models::SshPolicyBody>,
+    /// FR-52 gate 2 as stored, with the same replace-on-save warning as
+    /// [`Self::exec_policy`]: the dialog PUTs the WHOLE shape, so without
+    /// this a save would silently drop a narrowed permission ceiling or an
+    /// expiry — and here that widens what an OUTSIDER may do.
+    ///
+    /// ⚠️ The device's **connect code** is deliberately NOT here. This route
+    /// needs only tenant membership, and the code is the address a stranger
+    /// dials; handing it to every member is a wider audience than the admin
+    /// who is supposed to be handing it out. It is read from
+    /// `GET /tenant/{id}/external-access`, behind `MANAGE_AGENTS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_access_policy: Option<crate::external_access::ExternalAccessPolicyBody>,
     /// Remote config — what an operator has ASKED this device to run, and what
     /// the device SAID it did (`docs/remote-config.md`).
     ///
@@ -1459,6 +1471,7 @@ fn to_agent_response(
         relay_home: a.relay_home,
         exec_policy: configured_only(a.exec_policy),
         ssh_policy: configured_only(a.ssh_policy),
+        external_access_policy: configured_only(a.external_access_policy),
         remote_config,
         overlay_public_key,
         overlay_key_epoch,
