@@ -2,7 +2,7 @@
 
 **Issue:** [#1100](https://github.com/gjovanov/roomler-ai/issues/1100) ·
 **Status:** proposed · **Owner:** remote-control (pillar 1) + control plane ·
-**Anchors verified against master `46cdfc42`**
+**Anchors verified against master `8a03ff0d`** (re-verified after FR-69)
 
 The gap TeamViewer and AnyDesk fill and roomler does not: someone **outside the
 organization** views and controls a device, authorised by a password the device
@@ -37,17 +37,17 @@ Four properties, stated as the acceptance bar rather than as a description:
 ## 1. The gap, measured in the code
 
 Every remote-desktop session passes through **one** function:
-`resolve_session_authz` — `crates/api/src/ws/remote_control.rs:1708`. After the
+`resolve_session_authz` — `crates/modules/remote/src/controller.rs:375`. After the
 self-control shortcut, the whole of the cross-org story is three lines:
 
 ```rust
-// crates/api/src/ws/remote_control.rs:1782
+// crates/modules/remote/src/controller.rs (the membership read)
 let perms = state.tenants
     .get_member_permissions(agent.tenant_id, controller_user_id)
     .await
     .unwrap_or(0);            // ← non-member ⇒ Forbidden ⇒ 0
 ...
-// :1804
+// :471
 if !permissions::has(perms, permissions::REMOTE_CONTROL) {
     return Err("you don't have permission to control others' devices".to_string());
 }
@@ -109,6 +109,22 @@ therefore a *compound* of existing bits — `MANAGE_AGENTS` **+** `REMOTE_CONTRO
 exactly as FR-19 used `MANAGE_AGENTS` + `EXEC_DEVICE`. Clearing an approval needs
 only `MANAGE_AGENTS`: revocation is not a grant.
 
+## 2d. Where this lives after FR-69
+
+The modular monolith (FR-69, #1307) landed between this spec and its first
+phase, so the FR now spans **two** module crates, split on the line FR-69 draws:
+
+* **`modules/fleet`** owns P1 — the org switch, the per-device approval, the
+  connect code on the `agents` row, and the decision log. That is device
+  MANAGEMENT, and it is the exact shape of `agent_exec`, which is fleet's.
+* **`modules/remote`** will own P4 — the external branch of
+  `resolve_session_authz` and the consent path, because `remote` is *what a
+  CONTROLLER reaches* (`crates/modules/remote/src/lib.rs`).
+
+That is the same split exec and SSH already have, and it means P1's routes are
+mounted by fleet's `Module::routes` and its collections declared in fleet's
+`Module::indexes` — never in `crates/db/src/indexes.rs`, per FR-69 rule 7.
+
 ## 3. The gate chain
 
 Five gates, each owned by a different party, each default-deny, every decision
@@ -117,8 +133,8 @@ never consulted, and never leak that they exist.
 
 | # | Gate | Owner | Mechanism |
 |---|---|---|---|
-| 1 | Org kill-switch | org admin | `TenantSettings.external_rc_mode`, default `off` — the twin of `remote_exec_enabled` / `remote_ssh_enabled` (`crates/db/src/models/tenant.rs:128`) and deliberately separate from both. Off ⇒ a connect code does not resolve. |
-| 2 | Per-device approval | org admin | `Agent.external_access_policy`, shaped on `PeerRelayPolicy` (`crates/remote_control/src/models.rs:1678`): default closed, set by `MANAGE_AGENTS` + `REMOTE_CONTROL`. Carries a **permission ceiling** (an org may allow external *view* without external *input*) and an optional expiry. |
+| 1 | Org kill-switch | org admin | `TenantSettings.external_rc_enabled`, default `false` — the twin of `remote_exec_enabled` / `remote_ssh_enabled` (`crates/db/src/models/tenant.rs:147`) and deliberately separate from both. Off ⇒ a connect code does not resolve. |
+| 2 | Per-device approval | org admin | `Agent.external_access_policy`, shaped on `PeerRelayPolicy` (`crates/remote_control/src/models.rs:2107`): default closed, set by `MANAGE_AGENTS` + `REMOTE_CONTROL`. Carries a **permission ceiling** (an org may allow external *view* without external *input*) and an optional expiry. |
 | 3 | Device opt-in | device owner, locally | `external_access_enabled` in the agent's own config, default off, **absent from `DesiredConfig`**. Alongside: `external_consent_mode`, `external_max_permissions`. The refusal that survives a compromised server. |
 | 4 | The password proof | device verifies, outsider proves | §4. The substitute for tenant membership, and the only gate the outsider can satisfy by their own action. |
 | 5 | Host consent | whoever is at the machine | The existing `ConsentMode` path, resolved from `external_consent_mode` rather than `AccessPolicy.consent_mode` (`:430`), defaulting to `Prompt`. |
@@ -255,7 +271,7 @@ CAS. P6 follows it rather than inventing one.
 
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
-| P1 | Addressing + policy, **no access path**: connect code (unique, live-scoped, rotatable), `external_rc_mode`, `external_access_policy`, admin UI, `external_rc_audit` (90 d TTL). `decide()` returns `Result<Granted, DenyReason>` so one place records both arms. | `external_rc_mode = off` (default) | not started |
+| P1 | Addressing + policy, **no access path**: connect code (globally unique, rotatable), the org switch, `external_access_policy`, admin UI, `external_rc_audit` (90 d TTL). `decide_approval()` returns `Result<(), ExternalRcDenyReason>` so one place records both arms. | `external_rc_enabled = false` (default) | **SHIPPED** — 19 unit + 10 route + 6 integration tests, two guards falsified |
 | P2 | Device-side credential: `external_access_enabled`, the OPAQUE record, `external_consent_mode`, `external_max_permissions`; `roomler rc password set\|clear\|status`; companion UI; `RpcCap::ExternalAccess` on the hello. Test asserts none of the keys can appear in a `DesiredConfig` push. | `external_access_enabled = false` (default) | not started |
 | P3 | The handshake: `rc:extauth.*` frames, server as blind relay, agent-side verify + backoff. **Proven on loopback against the real agent first**, as FR-19's bind handshake was. | P2's flag; no client surface ships | not started |
 | P4 | Session establishment: the external branch in `resolve_session_authz`, transport binding at offer time, external consent path, public `/connect` page. Permission ceiling enforced **at the agent**, not merely offered by the server. | revert the authz branch; gates 1–3 still refuse | not started |
@@ -280,11 +296,19 @@ CAS. P6 follows it rather than inventing one.
 - [ ] An external controller's `local_relay` is rejected (F4), with a log line.
 - [ ] The host consent prompt names the controller as **outside the organization**,
       verified on a real device with a real second account.
-- [ ] Every refusal reason appears in `external_rc_audit`, and the audit read is
-      gated on `VIEW_REMOTE_AUDIT`.
+- [x] Every refusal reason appears in `external_rc_audit`, and the audit read is
+      gated on `VIEW_REMOTE_AUDIT`. **P1** — `approval_is_compound_clearing_is_not_and_both_arms_are_audited`
+      asserts 2 refusals + 1 approve + 1 clear = 4 rows, and that a plain member gets 403
+      from the reader. Falsified: dropping half the gate turns it red.
 - [ ] Relay bytes from an external session appear against the **device's** org in the
       FR-20 ledger (F3), with a direct-path arm metering zero.
-- [ ] Rotating a connect code invalidates the old one immediately.
+- [x] Rotating a connect code invalidates the old one immediately. **P1** — one route
+      mints and rotates, and the row holds exactly one code, so the old value is gone
+      rather than retired (`a_connect_code_is_minted_on_demand_…`).
+- [x] A connect code never reaches the ordinary device list, which needs only tenant
+      MEMBERSHIP. **P1**, and the criterion was missing from this list until the
+      implementation surfaced it — `…never_reaches_the_device_list`, falsified by
+      adding the field to `AgentResponse` and watching it go red.
 - [ ] `docs/compare/vs-teamviewer.md:63` is updated — and only after the field run,
       not on merge.
 
@@ -305,6 +329,17 @@ CAS. P6 follows it rather than inventing one.
 4. **Plan tier.** This is the feature that replaces a paid TeamViewer seat
    (`docs/business-model.md`), so it is a pricing lever, not just a limit. Needs a
    decision before P5, not after.
+5. **Gate 2 is weaker than FR-19's, and P1 says so rather than implying otherwise.**
+   The spec called `MANAGE_AGENTS` + `REMOTE_CONTROL` "the FR-19 shape". It is not:
+   FR-19 pairs `MANAGE_AGENTS` with `EXEC_DEVICE`, which `DEFAULT_ADMIN` deliberately
+   does NOT carry, so it is a real extra grant — whereas `DEFAULT_ADMIN` **does** carry
+   `REMOTE_CONTROL`, so this pair is no hurdle for the seeded `admin` role and bites
+   only on a custom role built without it. Shipped as-is deliberately: the design does
+   not lean on gate 2 as the security boundary (the org switch, the device opt-in and
+   the device-held password are), and borrowing `EXEC_DEVICE` would exclude the natural
+   approver — a fleet admin holding no root-command grant — to buy a hurdle nothing
+   depends on. A dedicated bit waits on the BigInt migration. Locked by
+   `the_compound_gate_does_not_restrict_a_default_admin`, so the claim cannot rot.
 
 ## 10. Out of scope
 
@@ -334,4 +369,6 @@ CAS. P6 follows it rather than inventing one.
 
 | date | version | what was tested | result |
 |---|---|---|---|
-| — | — | nothing yet — spec only | — |
+| 2026-09-01 | branch `fr52-cross-org-remote-access` | P1 on the dev box: `cargo test -p roomler-ai-remote-control --lib` (223 pass, 19 new), `cargo test -p roomler-ai-api --lib` (290 pass; the one failure, `auth_rate_limit::tokens_refill_over_time`, is a load-timing flake — 3/3 green in isolation, and the file is untouched by this branch), `cargo test -p roomler-ai-tests -- external_access_tests` (6/6), `bun run build` + `bun run test:unit` (949 pass), `cargo fmt --check` and `cargo clippy --all-targets -D warnings` on the four touched crates | PASS |
+| 2026-09-01 | same | **Falsification.** Removed the `REMOTE_CONTROL` half of gate 2 and added `connect_code` to `AgentResponse`, then re-ran: exactly `approval_is_compound_…` and `…never_reaches_the_device_list` went red with the intended messages, the other four stayed green. Reverted; all 6 green again. A test that has never failed proves nothing. | PASS |
+| — | — | Nothing has run in the FIELD. P1 ships no access path, so there is nothing to field-verify yet; the first field row belongs to P3. | — |
