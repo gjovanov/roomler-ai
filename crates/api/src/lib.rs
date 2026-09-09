@@ -275,7 +275,9 @@ pub fn build_router(state: AppState) -> Router {
     // Stats PR-3 — observability queries. The /admin family is gated by
     // the platform_admins ObjectId allowlist (404 on miss); the tenant
     // family gates in-handler (member for overview, MANAGE_AGENTS for
-    // the queryable series — also 404, the client logs out on 403).
+    // the queryable series — also 404, so a polled panel degrades to
+    // empty rather than erroring; see stats.rs for why it is not the
+    // "the client logs out on 403" reason this used to give, FR-82).
     let admin_stats_routes = Router::new()
         .route("/relay/current", get(routes::stats::admin_relay_current))
         .route("/relay/history", get(routes::stats::admin_relay_history))

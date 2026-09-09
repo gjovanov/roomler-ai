@@ -2,9 +2,10 @@
 // Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
-// Mock router
+// Mock router. `currentRoute` is read by the api client's tenant-eviction
+// guard, so it has to exist or the 403 branch throws instead of navigating.
 vi.mock('@/plugins/router', () => ({
-  default: { push: vi.fn() },
+  default: { push: vi.fn(), currentRoute: { value: { name: 'devices' } } },
 }))
 
 // Mock snackbar
@@ -165,17 +166,55 @@ describe('api client', () => {
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
 
-    it('should redirect to login on a 403 GET for non-auth paths', async () => {
-      // The navigation case the logout exists for: membership revoked or the
-      // tenant switched underneath, so every read 403s and the UI would
-      // otherwise sit there broken.
+    // FR-82 — the field bug this replaced a passing test with. The Devices
+    // page mounts a card that GETs `ephemeral-key-settings` (MANAGE_TENANT),
+    // a bit `DEFAULT_ADMIN` deliberately withholds, so opening the page
+    // logged out every non-owner in the org. The old rule made that the
+    // CORRECT behaviour, which is why nothing caught it.
+    it('a permission 403 on a GET does NOT end the session', async () => {
+      localStorage.setItem('roomler-signed-in', '1')
+      mockFetch.mockResolvedValueOnce(
+        mockJsonResponse(
+          403,
+          { error: 'forbidden', message: 'Missing MANAGE_TENANT permission' },
+          false,
+        ),
+      )
+
+      await expect(api.get('/tenant/123/ephemeral-key-settings')).rejects.toThrow(
+        'Missing MANAGE_TENANT permission',
+      )
+
+      expect(localStorage.getItem('roomler-signed-in')).toBe('1')
+      expect(mockRouter.push).not.toHaveBeenCalled()
+    })
+
+    // The default direction is the point: a 403 the server did not classify
+    // does NOTHING but throw. That is what keeps a newly-added
+    // permission-gated route inert here without anyone remembering it.
+    it('an UNCLASSIFIED 403 neither logs out nor navigates', async () => {
       localStorage.setItem('roomler-signed-in', '1')
       mockFetch.mockResolvedValueOnce(mockJsonResponse(403, {}, false))
 
       await expect(api.get('/tenant/123/room')).rejects.toThrow()
 
-      expect(localStorage.getItem('roomler-signed-in')).toBeNull()
-      expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
+      expect(localStorage.getItem('roomler-signed-in')).toBe('1')
+      expect(mockRouter.push).not.toHaveBeenCalled()
+    })
+
+    // The one 403 that HAS a navigation — and it is out of the tenant, not
+    // out of the session: the credential is fine and the user is still in
+    // every other org they belong to.
+    it('a not_a_member 403 leaves the tenant and KEEPS the session', async () => {
+      localStorage.setItem('roomler-signed-in', '1')
+      mockFetch.mockResolvedValueOnce(
+        mockJsonResponse(403, { error: 'not_a_member', message: 'Not a member' }, false),
+      )
+
+      await expect(api.get('/tenant/123/device')).rejects.toThrow('Not a member')
+
+      expect(localStorage.getItem('roomler-signed-in')).toBe('1')
+      expect(mockRouter.push).toHaveBeenCalledWith({ name: 'dashboard' })
     })
 
     // A 403 on a MUTATION is a policy verdict on a perfectly valid session —

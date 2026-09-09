@@ -393,7 +393,7 @@ impl Default for RcSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AuthSettings {
     /// When true, `register` sets `is_verified: true` on the new user
     /// directly, bypassing the email activation flow. Default false —
@@ -404,6 +404,40 @@ pub struct AuthSettings {
     /// + a helper that pulls the activation token from the inbox.
     #[serde(default)]
     pub auto_verify: bool,
+
+    /// FR-82 — reconcile every system-managed role to its definition at
+    /// startup, so a permission bit added to the code reaches organisations
+    /// that already exist. Default **on**: without it a managed role stays
+    /// frozen at the mask it was seeded with, which is the defect this
+    /// closes (63 of 72 hosted orgs were).
+    ///
+    /// The kill switch (`ROOMLER__AUTH__RECONCILE_MANAGED_ROLES=false`) is
+    /// for two cases and no others: a deployment that has deliberately
+    /// hand-edited a managed role DOWN and wants it left alone (the
+    /// reconcile is additive, so it would put the bit back on every boot),
+    /// and stopping the job without rolling back an image if it ever
+    /// misbehaves.
+    #[serde(default = "default_true")]
+    pub reconcile_managed_roles: bool,
+}
+
+/// ⚠️ Hand-written, NOT derived. `AuthSettings` carries a field whose serde
+/// default is `true`, and a derived `Default` would answer `false` for it —
+/// two "defaults" that disagree, where one of them is reached by config
+/// parsing and the other by `AuthSettings::default()` in the test fixture.
+/// The reconcile would then be silently off for every test that builds
+/// settings that way, which is precisely the seam a bug would hide in.
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self {
+            auto_verify: false,
+            reconcile_managed_roles: default_true(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]

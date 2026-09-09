@@ -3,7 +3,7 @@
 use roomler_ai_api::{build_router, state, state::AppState};
 use roomler_ai_config::{DEFAULT_FRONTEND_URL, Settings};
 use roomler_ai_db::{connect, indexes::ensure_indexes};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -207,6 +207,59 @@ async fn main() -> anyhow::Result<()> {
     // conference's leader-gated job now. A failing job is logged, not fatal —
     // exactly what the inline block did with its `.ok()`.
     app_state.modules.run_startup_jobs(startup_leader).await;
+
+    // FR-82 — bring every system-managed role up to its definition.
+    //
+    // A managed role's mask was written once, at tenant creation, and never
+    // again: adding a permission bit reached only orgs created afterwards.
+    // Measured on the hosted deployment before this landed — 63 of 72 orgs
+    // carried `admin = 0x7ffff7`, i.e. no MANAGE_AGENTS, no REMOTE_CONTROL
+    // and neither audit view — every fleet feature shipped since those orgs
+    // were created, invisible to their own admins. Additive
+    // (`stored | definition`), grouped, and a no-op on every boot after the
+    // first.
+    //
+    // Logged at INFO with the arithmetic, never silently: this GRANTS
+    // permissions across every tenant on the deployment, so the one run that
+    // does something has to be readable in `kubectl logs` afterwards.
+    if startup_leader {
+        if !settings.auth.reconcile_managed_roles {
+            // Say so out loud. Off, a role stays frozen at the mask it was
+            // seeded with, and the symptom (an admin who cannot see the
+            // fleet) looks nothing like a config switch.
+            warn!(
+                "managed-role reconcile is OFF (auth.reconcile_managed_roles=false) — \
+                 roles seeded before a permission bit existed will not gain it"
+            );
+        } else {
+            match app_state.tenants.reconcile_managed_roles().await {
+                Ok(groups) => {
+                    let changed: Vec<_> = groups.iter().filter(|g| g.gained() != 0).collect();
+                    if changed.is_empty() {
+                        info!(
+                            groups = groups.len(),
+                            "managed roles already match their definitions"
+                        );
+                    } else {
+                        for g in &changed {
+                            info!(
+                                role = %g.name,
+                                rows = g.rows,
+                                stored = format!("{:#x}", g.stored),
+                                gained = format!("{:#x}", g.gained()),
+                                granted = ?roomler_ai_db::models::role::permissions::names(g.gained()),
+                                "managed role reconciled to its definition"
+                            );
+                        }
+                    }
+                }
+                // Not fatal, exactly like the maintenance below it: a
+                // deployment that cannot reconcile its roles is one with
+                // stale permissions, not one that should refuse to serve.
+                Err(e) => warn!(error = %e, "managed-role reconcile failed"),
+            }
+        }
+    }
 
     // Fix thread metadata for existing thread roots with null metadata
     // (bug: MongoDB $inc fails on null subdocuments, so reply_count was never set)

@@ -297,9 +297,10 @@
         <!-- Top-level again (2026-08-26): the S4 IA pivot demoted Invites
              into a collapsible group and users read that as "the invite
              page disappeared". FAIL-CLOSED gate (canManageInvites) — the
-             list endpoint needs INVITE_MEMBERS and the api client logs out
-             on GET 403, so this item must never show for a caller who can't
-             make the request it leads to. -->
+             list endpoint needs INVITE_MEMBERS, so this item must never
+             show for a caller who can't make the request it leads to.
+             (It used to say "the api client logs out on GET 403". It no
+             longer does — FR-82 — so this is UX, not session safety.) -->
         <v-list-item
           v-if="canInvite"
           :to="`/tenant/${tenantId}/invites`"
@@ -310,9 +311,9 @@
         <!-- ── Insights section ─────────────────────────────────── -->
         <v-divider v-if="showAnalyticsNav || isPlatformAdmin" class="my-1" />
         <!-- Analytics (stats PR-4): FAIL-CLOSED gating (canQueryAnalytics)
-             — the stats query endpoints 404 without MANAGE_AGENTS and the
-             api client logs out on 403, so this nav never leads a plain
-             member to a request they can't make. -->
+             — the stats query endpoints 404 without MANAGE_AGENTS, so this
+             nav never leads a plain member to a page whose every panel
+             comes back empty. (FR-82: no longer a logout risk.) -->
         <v-list-item
           v-if="showAnalyticsNav"
           :to="`/tenant/${tenantId}/analytics`"

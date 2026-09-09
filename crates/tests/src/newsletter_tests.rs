@@ -4,8 +4,8 @@
 //! against a real server and a real MongoDB.
 //!
 //! The load-bearing assertions: the platform-admin gate answers **404** for
-//! both an unset allowlist and a non-listed caller (never 403 — the web
-//! client force-logs-out on 403); a slug is claimed by the unique index (409,
+//! both an unset allowlist and a non-listed caller (never 403 — the allowlist
+//! is itself what is being hidden); a slug is claimed by the unique index (409,
 //! never a second issue); an issue that left `draft` is not editable; the
 //! preview is the branded send-path bytes with raw operator HTML structurally
 //! absent; and test-send refuses loudly when no mailer is configured.
@@ -77,7 +77,7 @@ async fn every_admin_newsletter_route_is_404_without_authority() {
     assert_eq!(
         r.status().as_u16(),
         404,
-        "a non-listed caller must get 404, NEVER 403 (the client logs out on 403)"
+        "a non-listed caller must get 404, NEVER 403 — a 403 would confirm the surface exists"
     );
     let admin = token_for(&app, admin_id);
     let r = app

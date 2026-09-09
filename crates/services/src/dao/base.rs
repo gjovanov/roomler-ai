@@ -20,6 +20,13 @@ pub enum DaoError {
     DuplicateKey(String),
     #[error("Forbidden: {0}")]
     Forbidden(String),
+    /// FR-82 — "not in this tenant", distinct from a permission refusal all
+    /// the way to the wire (`ApiError::NotAMember` ⇒ `error: "not_a_member"`).
+    /// A variant rather than a magic string, because the client's behaviour
+    /// forks on it and a `Forbidden("Not a member of this room")` must not be
+    /// swept into the same branch by a substring match.
+    #[error("Forbidden: Not a member")]
+    NotAMember,
     #[error("Validation: {0}")]
     Validation(String),
 }

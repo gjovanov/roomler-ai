@@ -3,6 +3,36 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { useTenantStore } from '@/stores/tenant'
+import { canManageOrgSettings } from '@/utils/permissions'
+
+/**
+ * The three org-level switches (`exec-settings`, `ssh-settings`,
+ * `ephemeral-key-settings`) all sit behind `MANAGE_TENANT`, which
+ * `DEFAULT_ADMIN` deliberately does not carry — so for everyone but an
+ * owner these GETs are a guaranteed 403.
+ *
+ * FR-82 — the gate lives in the STORE, not at each call site, which is the
+ * rule FR-75 (#1447) paid for on the `network` module's routes: a per-caller
+ * predicate leaks the moment one caller reaches for the wrong one, and the
+ * `ephemeral-key-settings` fetch had NO caller-side gate at all (the Devices
+ * page mounts its card unconditionally). One guard here makes the class
+ * unrepresentable.
+ *
+ * ⚠️ It AWAITS the membership rather than reading the mask: AppLayout's
+ * `/member/me` is in flight while this page mounts, so a synchronous read
+ * would be a coin-flip between "hidden from the owner" and "fires anyway".
+ *
+ * ⚠️ This is no longer a session-safety gate — after FR-82 a 403 here would
+ * be harmless. It is why the request is not sent at all: a fetch whose
+ * refusal is known in advance is a round-trip, a red line in the browser
+ * console and a 403 in the server log that make the REAL ones harder to see.
+ */
+async function mayReadOrgSettings(tenantId: string): Promise<boolean> {
+  const tenants = useTenantStore()
+  await tenants.ensureMyMembership(tenantId)
+  return canManageOrgSettings(tenants.myPermissions, tenants.isOwner)
+}
 
 export type AgentOs = 'linux' | 'macos' | 'windows'
 export type AgentStatusValue = 'online' | 'offline' | 'unenrolled' | 'quarantined'
@@ -924,6 +954,10 @@ export const useAgentStore = defineStore('agents', () => {
   const orgExecEnabled = ref<boolean | null>(null)
 
   async function fetchOrgExecEnabled(tenantId: string) {
+    if (!(await mayReadOrgSettings(tenantId))) {
+      orgExecEnabled.value = null
+      return
+    }
     try {
       const resp = await api.get<{ remote_exec_enabled: boolean }>(
         `/tenant/${tenantId}/exec-settings`,
@@ -965,6 +999,10 @@ export const useAgentStore = defineStore('agents', () => {
   const orgSshEnabled = ref<boolean | null>(null)
 
   async function fetchOrgSshEnabled(tenantId: string) {
+    if (!(await mayReadOrgSettings(tenantId))) {
+      orgSshEnabled.value = null
+      return
+    }
     try {
       const resp = await api.get<{ remote_ssh_enabled: boolean }>(
         `/tenant/${tenantId}/ssh-settings`,
@@ -996,6 +1034,10 @@ export const useAgentStore = defineStore('agents', () => {
   const orgEphemeralKeysEnabled = ref<boolean | null>(null)
 
   async function fetchOrgEphemeralKeysEnabled(tenantId: string) {
+    if (!(await mayReadOrgSettings(tenantId))) {
+      orgEphemeralKeysEnabled.value = null
+      return
+    }
     try {
       const resp = await api.get<{ ephemeral_keys_enabled: boolean }>(
         `/tenant/${tenantId}/ephemeral-key-settings`,

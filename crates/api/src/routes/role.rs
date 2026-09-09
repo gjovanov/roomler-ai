@@ -135,7 +135,7 @@ pub async fn list(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     let roles = state.roles.find_for_tenant(tid).await?;
