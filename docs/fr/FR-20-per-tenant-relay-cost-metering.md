@@ -192,6 +192,7 @@ must not be logged out of everything (`stats.rs:45-47`).
 | **P4** | `sfu_participant_seconds` folded in — mostly a rollup over existing `stats_call_user` | rollup-only |
 | **P5** | `relay-costs.toml` + `/observability` Cost & usage section | UI-only |
 | **P6** | `/tenant/{tid}/analytics` Usage section | UI-only |
+| **P7** | **Docs** — [`docs/relay-cost-metering.md`](../relay-cost-metering.md) in house style with diagrams, linked from `docs/README.md`'s map and table | docs-only |
 
 ## Acceptance criteria
 
@@ -221,6 +222,16 @@ must not be logged out of everything (`stats.rs:45-47`).
   minute this deployment has ever recorded. See the log below; the numbers
   come from `bench_add_network_bytes_cost`, not from an argument about how
   cheap an atomic is.
+- [x] **Docs updated/created with diagrams, linked from `docs/README.md`** —
+  [`docs/relay-cost-metering.md`](../relay-cost-metering.md), house style with
+  three mermaid diagrams (the provenance split that decides what may enter the
+  ledger, the hot-path/flush sequence, the two surfaces and why only one renders
+  money), plus a node in the README map and a row in *Install & operate*.
+  ⚠️ This criterion was **added retroactively**: FR-20 predates the 2026-09-05
+  standing rule that makes docs part of an FR's close, so its original ten
+  criteria carried none — and no page under `docs/` covered relay cost metering
+  at all. Recorded rather than backdated, because a spec that looks like it
+  always complied teaches the next reader nothing.
 
 ## Open decisions
 
