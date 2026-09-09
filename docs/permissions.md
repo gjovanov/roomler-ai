@@ -126,6 +126,15 @@ org may legitimately have added a bit; overwriting would silently revoke it.
 tightening — does not propagate**, and needs its own migration that says out
 loud whose permissions it takes away.
 
+⚠️ **The mirror case is the surprising one: a bit an ORG removed comes back.**
+OR-ing cannot tell *"this org never had `REMOTE_CONTROL`"* from *"this org took
+it away on purpose"* — one stored mask, both read as absent — so an org that
+narrowed a managed role sees it silently widened at the next boot. That is the
+price of protecting org-ADDED bits, and it means **narrowing a managed role is
+not a supported way to restrict a team**: make a custom role instead. The
+reconcile matches `is_managed: true` only, so a custom role is never in its
+aggregation at all.
+
 ⚠️ Matching the **exact stored value** in the filter makes the update idempotent
 *and* safe against a concurrent editor: a role changed underneath simply falls
 out of its group's filter instead of being clobbered.
