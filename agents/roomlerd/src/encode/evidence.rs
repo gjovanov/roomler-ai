@@ -72,6 +72,38 @@ impl Reason {
         }
     }
 
+    /// FR-79 V5 — does this rejection ALSO say the send rate is too high?
+    ///
+    /// The gate answers one question: *is this window a measurement of the
+    /// pipe?* V1 let every consumer read that answer as *does this window say
+    /// anything at all*, and the two differ for exactly one reason. A stalled
+    /// transport is not a measurement — but it is the transport pushing back,
+    /// which is the only push-back a relay-TCP session produces at all.
+    ///
+    /// The other three say nothing about the rate, and each would be a
+    /// regression if it cut:
+    ///
+    /// - `AgentStalled` implicates the LOOP, not the pipe. Cutting on it is
+    ///   the 2026-09-08 12:15 defect exactly: 6.60 → 0.68 Mbps on a path that
+    ///   carried 6.6 Mbps twenty seconds later.
+    /// - `StallShadow` is the same stall seen a second time. Cutting on both
+    ///   double-counts one event, which is how FR-35's halving overshot.
+    /// - `CarrierChanged` measured a different path — that is a re-anchor to
+    ///   the new carrier's memory, not a cut.
+    ///
+    /// ⚠️ True here is NOT "cut". A transit stall on a path we are NOT
+    /// overdriving is FR-71's finding 4 (an 8 Mbps relay leg
+    /// head-of-line-blocked for 4.9 s with 1485 bytes queued), where a cut
+    /// costs quality for an event the sender did not cause. The governor
+    /// makes that call against the measured pipe; this only says the window
+    /// is admissible evidence for it.
+    pub fn is_congestion(self) -> bool {
+        match self {
+            Reason::TransitStalled => true,
+            Reason::AgentStalled | Reason::StallShadow | Reason::CarrierChanged => false,
+        }
+    }
+
     fn index(self) -> usize {
         match self {
             Reason::AgentStalled => 0,
@@ -242,6 +274,22 @@ mod tests {
             ..facts(PipeState::Clear)
         };
         assert_eq!(rejected(f), Some(Reason::CarrierChanged));
+    }
+
+    /// FR-79 V5 — exactly ONE rejection also says the rate is too high, and
+    /// which one is load-bearing in both directions. Adding `AgentStalled`
+    /// here re-creates the 2026-09-08 12:15 defect (6.60 → 0.68 Mbps on a path
+    /// that carried 6.6 Mbps twenty seconds later); adding `StallShadow`
+    /// double-counts one stall; adding `CarrierChanged` cuts for a path the
+    /// session is no longer on. Removing `TransitStalled` restores the
+    /// CORPLAP-2 defect, where a session sending 1.8× its measured pipe
+    /// stalled eleven times and ended at a HIGHER rate.
+    #[test]
+    fn only_a_transit_stall_also_speaks_about_the_rate() {
+        assert!(Reason::TransitStalled.is_congestion());
+        assert!(!Reason::AgentStalled.is_congestion());
+        assert!(!Reason::StallShadow.is_congestion());
+        assert!(!Reason::CarrierChanged.is_congestion());
     }
 
     /// The first window of a session has no predecessor and is not in anyone's
