@@ -6,14 +6,19 @@
 //!
 //! - `/api/admin/stats/*` — platform-operator dashboards (relay fleet,
 //!   cross-org). Gated by the `platform_admins` ObjectId allowlist and
-//!   answering **404** (never 403) on missing authority: the web client
-//!   force-logs-out on any 403, and a hidden surface beats an
+//!   answering **404** (never 403) on missing authority: the allowlist is
+//!   itself the thing being hidden, and a hidden surface beats an
 //!   acknowledged one.
 //! - `/api/tenant/{tid}/stats/*` — org dashboards. `overview` is
 //!   member-visible (powers the dashboard Insights panel); the queryable
 //!   series (`machines`/`calls`/`tunnels`) require `MANAGE_AGENTS` (the
 //!   fleet bit seeded Admin roles hold) — permission failures are also
-//!   404 for the same logout reason.
+//!   404, so a polled panel degrades to empty instead of erroring on
+//!   every tick.
+//!
+//! ⚠️ Both 404s were once justified as "the web client force-logs-out on any
+//! 403". It does not any more (FR-82) — a 403 is an answer, not an expired
+//! credential. The 404s stay; their real reasons are the ones above.
 //!
 //! Series contract: every pipeline projects `t` (unix SECONDS) plus plain
 //! numbers/strings only — no BSON dates or ObjectIds leak into the JSON

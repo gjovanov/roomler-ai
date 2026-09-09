@@ -301,9 +301,11 @@ pub async fn admin_cost(
 /// # Membership, and 404 on failure
 ///
 /// `require_tenant_stats(.., need_manage = false)`: every member may see what
-/// their own org consumed. Failures are 404 rather than 403 because the web
-/// client wipes tokens on 403 — a member removed from the org mid-poll must
-/// not be logged out of everything.
+/// their own org consumed. Failures are 404 rather than 403 so a polled panel
+/// degrades to empty instead of erroring on every tick.
+///
+/// ⚠️ Not, as this once said, "because the web client wipes tokens on 403" —
+/// it does not any more (FR-82).
 pub async fn tenant_resources(
     State(state): State<Core>,
     auth: AuthUser,

@@ -38,6 +38,12 @@ export const useTenantStore = defineStore('tenant', () => {
   const myPermissions = ref<number | null>(null)
   const isOwner = ref(false)
 
+  /** Which tenant `myPermissions` describes. Without it, "the mask is
+   *  loaded" and "the mask is loaded FOR THIS ORG" are the same check, and
+   *  the second is the one a gate needs. */
+  const myPermissionsTenantId = ref<string | null>(null)
+  let membershipInFlight: Promise<void> | null = null
+
   /**
    * Load the caller's own membership for `tenantId`. Resets to the
    * unknown state first so a tenant switch never shows the previous
@@ -46,13 +52,45 @@ export const useTenantStore = defineStore('tenant', () => {
   async function fetchMyMembership(tenantId: string) {
     myPermissions.value = null
     isOwner.value = false
+    myPermissionsTenantId.value = null
+    const run = (async () => {
+      try {
+        const m = await api.get<MyMembership>(`/tenant/${tenantId}/member/me`)
+        myPermissions.value = m.permissions
+        isOwner.value = m.is_owner
+        myPermissionsTenantId.value = tenantId
+      } catch {
+        /* fail open — nav gating treats null as "show" */
+      }
+    })()
+    membershipInFlight = run
     try {
-      const m = await api.get<MyMembership>(`/tenant/${tenantId}/member/me`)
-      myPermissions.value = m.permissions
-      isOwner.value = m.is_owner
-    } catch {
-      /* fail open — nav gating treats null as "show" */
+      await run
+    } finally {
+      if (membershipInFlight === run) membershipInFlight = null
     }
+  }
+
+  /**
+   * Resolve the caller's mask for `tenantId` and RETURN when it is known.
+   *
+   * FR-82 — a gate that reads `myPermissions` synchronously is racing the
+   * `/member/me` round-trip AppLayout kicked off, so it gets `null` on first
+   * paint and has to pick a side of a coin-flip. Awaiting turns the gate
+   * deterministic: joins the in-flight fetch, starts one if nothing did, and
+   * returns immediately once the mask belongs to this org.
+   *
+   * ⚠️ Still fails OPEN if the fetch itself failed — `myPermissions` stays
+   * `null` and every consumer's own rule decides. This makes the answer
+   * timely, not certain.
+   */
+  async function ensureMyMembership(tenantId: string): Promise<void> {
+    if (myPermissionsTenantId.value === tenantId) return
+    if (membershipInFlight) {
+      await membershipInFlight
+      if (myPermissionsTenantId.value === tenantId) return
+    }
+    await fetchMyMembership(tenantId)
   }
 
   // Persist the active org across reloads (`current` used to silently
@@ -106,9 +144,11 @@ export const useTenantStore = defineStore('tenant', () => {
     current,
     loading,
     myPermissions,
+    myPermissionsTenantId,
     isOwner,
     fetchTenants,
     fetchMyMembership,
+    ensureMyMembership,
     createTenant,
     setCurrent,
   }

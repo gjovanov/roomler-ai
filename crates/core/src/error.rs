@@ -15,6 +15,22 @@ pub enum ApiError {
     BadRequest(String),
     Unauthorized(String),
     Forbidden(String),
+    /// 403, but specifically "you are not in this tenant" — as opposed to
+    /// "you are, and you may not do that" ([`ApiError::Forbidden`]).
+    ///
+    /// FR-82 — the two are the same status code and were the same string, so
+    /// the SPA could not tell them apart and treated every 403 as a dead
+    /// session: it wiped the login and bounced to `/login`. That is wrong for
+    /// both halves — a permission refusal is an answer, not an expired
+    /// credential — but only ONE of them has a sensible navigation, which is
+    /// why the distinction has to reach the client instead of being inferred
+    /// there. Serialises as `error: "not_a_member"`; the client leaves the
+    /// tenant and keeps the session.
+    ///
+    /// ⚠️ TENANT membership only. A room refusal is not this — `chat`'s
+    /// "Not a member of this room" stays a plain `Forbidden`, because
+    /// leaving the org over a private channel would be absurd.
+    NotAMember,
     Conflict(String),
     Internal(String),
     Validation(String),
@@ -28,6 +44,7 @@ impl std::fmt::Display for ApiError {
             ApiError::BadRequest(msg) => write!(f, "Bad request: {msg}"),
             ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             ApiError::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
+            ApiError::NotAMember => write!(f, "Forbidden: Not a member"),
             ApiError::Conflict(msg) => write!(f, "Conflict: {msg}"),
             ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
             ApiError::Validation(msg) => write!(f, "Validation: {msg}"),
@@ -60,6 +77,11 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg),
             ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg),
             ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg),
+            ApiError::NotAMember => (
+                StatusCode::FORBIDDEN,
+                "not_a_member",
+                "Not a member".to_string(),
+            ),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", msg),
             ApiError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, "validation", msg),
@@ -83,6 +105,7 @@ impl From<DaoError> for ApiError {
             DaoError::NotFound => ApiError::NotFound("Resource not found".to_string()),
             DaoError::DuplicateKey(msg) => ApiError::Conflict(msg),
             DaoError::Forbidden(msg) => ApiError::Forbidden(msg),
+            DaoError::NotAMember => ApiError::NotAMember,
             DaoError::Validation(msg) => ApiError::Validation(msg),
             DaoError::Mongo(e) => ApiError::Internal(e.to_string()),
             DaoError::BsonSer(e) => ApiError::Internal(e.to_string()),

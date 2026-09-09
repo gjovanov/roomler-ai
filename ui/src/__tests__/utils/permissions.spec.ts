@@ -204,8 +204,8 @@ describe('canQueryAnalytics (org analytics gating — stats PR-4)', () => {
 
   it('fails CLOSED while the membership has not loaded (null mask)', () => {
     // Opposite convention to canSeeFleetNav — the analytics endpoints
-    // 404 without MANAGE_AGENTS and the api client logs out on 403, so
-    // the UI must never optimistically fire a query.
+    // 404 without MANAGE_AGENTS, so an optimistic nav entry leads to a
+    // page of empty panels. (FR-82: it is no longer also a logout.)
     expect(canQueryAnalytics(null, false)).toBe(false)
   })
 
@@ -259,8 +259,9 @@ describe('canManageInvites (invites nav gating)', () => {
 
   it('fails CLOSED while the membership has not loaded (null mask)', () => {
     // Same convention as canQueryAnalytics: list_invites needs
-    // INVITE_MEMBERS and the api client logs out on GET 403 — an
-    // optimistic nav entry turns a member's click into a logout.
+    // INVITE_MEMBERS, so an optimistic nav entry leads a member to a page
+    // that can only refuse them. (Until FR-82 it turned their click into a
+    // LOGOUT — which is why this helper exists at all.)
     expect(canManageInvites(null, false)).toBe(false)
   })
 
