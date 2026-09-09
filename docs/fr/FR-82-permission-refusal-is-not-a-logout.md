@@ -1,6 +1,6 @@
 # FR-82: A permission refusal is not a logout, and a managed role is not frozen at its birthday
 
-**Issue:** [#1540](https://github.com/gjovanov/roomler-ai/issues/1540) · **Status:** **shipped + field-verified 2026-09-09** (`786f016bf`, image `hosted-20260909-786f016`) — **9 of 10 criteria met; AC8 owed and operator-only, and the issue was closed without it** ·
+**Issue:** [#1540](https://github.com/gjovanov/roomler-ai/issues/1540) · **Status:** **shipped + field-verified 2026-09-09** (`786f016bf`, image `hosted-20260909-786f016`) — **all 10 criteria met; AC8 closed by the operator from the reporting seat on 2026-09-09** ·
 **Field report:** a GROX member opened `/tenant/69a1dbba…/devices`, got a 403 and
 was signed out of the product.
 
@@ -236,13 +236,23 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
       and the flag stays `null` (unknown) rather than `false`.
       *`ui/src/__tests__/stores/agents.spec.ts`: "an unknown mask blocks the org
       switches rather than guessing".*
-- [ ] **AC8** Field: the reporting member opens the GROX Devices page, the grid
-      renders, and the session survives. **Owed, and operator-only** — every
-      seat an agent can reach on this deployment holds the `ADMINISTRATOR`
-      bypass, which is the very reason the defect went unreported for a week,
-      so a pass from such a seat would be indistinguishable from a pass on the
-      broken build. The `not_a_member` flavour of the same branch *is*
-      field-proven (§The client half); the `forbidden` flavour is not.
+- [x] **AC8** Field: the reporting member opens the GROX Devices page, the grid
+      renders, and the session survives. *Done by the operator on
+      `hosted-20260909-786f016`, from the reporting seat itself — the account's
+      effective mask in GROX reads `0x303cf81` (`member 0x3cf81` + the
+      hand-made `Remote Operator 0x3000000`), it is **not** the tenant owner,
+      and bits 3 (`MANAGE_TENANT`) and 23 (`ADMINISTRATOR`) are both **clear**
+      — so it is the one seat that could falsify this, and the page rendered
+      with the session intact. Verified against prod Mongo rather than assumed;
+      the before-run is the original field report, same account, same page.*
+      ⚠️⚠️ **It passes through AC7's gate, not AC1's branch, and that is not
+      what the criterion's wording implies.** `fetchOrgEphemeralKeysEnabled`
+      now short-circuits on `mayReadOrgSettings` (`ui/src/stores/agents.ts`),
+      so from a seat without `MANAGE_TENANT` the `ephemeral-key-settings` GET
+      **is never fired** — the 403 that used to end the session no longer
+      happens on that page at all. Two independent fixes shipped together and
+      the field test only exercises the outer one; the symptom is genuinely
+      gone, but see the note under §The client half for what stays unproven.
 - [x] **AC9** Field: prod logs show the reconcile's arithmetic once, and a
       second pod restart reports "already match their definitions".
       *Verified twice, independently — the arithmetic read live from the leader
@@ -318,11 +328,28 @@ the same way, before and after.
 | **AFTER** — `index-CxPcVy01.js` | still one site, now `o.status===403&&!Tr.some(…)&&i?.error==="not_a_member"&&Gl()`: the method test gone, the logout gone, the navigation conditioned on the server's own code |
 | the server's half, by raw `fetch` from the signed-in SPA (deliberately bypassing the interceptor) | a non-member tenant GET answers **403 `{"error":"not_a_member"}`** on both `/room` and `/agent` — the machine-readable code `ApiError::NotAMember` was added for, not a message string |
 | the page shape that produced the report | navigating to a **non-member org's Devices page** landed on `/`, **not** `/login`; the dashboard rendered with its org list, and an authenticated GET on the caller's own tenant answered **200 with 21 agents** immediately after — the session was never touched |
+| **AC8**, by the operator — the reporting seat itself, on the GROX Devices page | the page rendered and the session survived. The seat was verified against prod Mongo, not assumed: effective mask `0x303cf81` (`member` + the hand-made `Remote Operator`), **not** the tenant owner, bits 3 (`MANAGE_TENANT`) and 23 (`ADMINISTRATOR`) both clear — the one seat that could have falsified it. The before-run is the original report: same account, same page, signed out |
 
 ⚠️ This proves the `not_a_member` arm end to end and the *absence* of the old
-expression from the shipped bytes. It does **not** prove AC8, which is the
-`forbidden` arm: that one needs a seat without `MANAGE_TENANT` and without the
-`ADMINISTRATOR` bypass, and there is none an agent can reach here.
+expression from the shipped bytes.
+
+⚠️⚠️ **The `forbidden` arm is still not exercised in the field, and after this
+fix it cannot be from the page that reported it.** AC8 passed — the operator
+opened the Devices page from the reporting seat (`0x303cf81`, not the owner,
+bits 3 and 23 clear) and the page rendered with the session intact — but it
+passed through **AC7's store gate**: `fetchOrgEphemeralKeysEnabled` now
+short-circuits on `mayReadOrgSettings`, so that seat never fires the
+`ephemeral-key-settings` GET and the 403 never reaches the interceptor. Both
+fixes are real and the symptom is gone; the point is that the field pass
+attributes to the outer one. What carries the inner one is the unit tests
+(AC1–AC3), the shipped bytes above, and the `not_a_member` navigation — **not**
+a field observation. A future reader must not cite AC8 as evidence that a
+`forbidden` 403 no longer ends a session.
+
+⚠️ Defence in depth is the right outcome here, but it has a cost worth naming:
+with the store gate in front of it, a regression in `client.ts` alone would be
+invisible from this page. The unit tests are the only thing standing under that
+branch now.
 
 ⚠️ Worth keeping about the prediction that gated this roll: §The measured drift
 was written from production *before* the merge, and `DEFAULT_ADMIN =
