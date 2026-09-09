@@ -12,7 +12,7 @@
 // The cards are the run state. The GitHub issue and the FR spec remain authoritative for
 // engineering truth — this never writes to either.
 
-import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, existsSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, basename } from 'node:path';
 
@@ -382,6 +382,22 @@ function scan() {
     for (const a of card.acs) (seen.has(a.id) ? dup : seen).add(a.id);
     if (dup.size) console.warn(`  ⚠️  ${card.id} labels two criteria ${[...dup].join(', ')} — fix ${card.spec}`);
   }
+  // A card whose issue has been CLOSED must leave the board. Skipping the ledger row is not
+  // enough — the card file already exists, so the board would keep rendering a finished FR
+  // for ever, and "44 cards" would quietly stop meaning "44 things to do". Archived rather
+  // than deleted: the run state is the only record of how the card was worked.
+  const open = new Set(issues.map((i) => i.number));
+  const archiveDir = join(DOCS, 'kanban', 'archive');
+  for (const card of allCards()) {
+    if (open.has(card.issue)) continue;
+    mkdirSync(archiveDir, { recursive: true });
+    card.column = 'closed';
+    card.closed_at = new Date().toISOString();
+    writeFileSync(join(archiveDir, `${card.id}.json`), JSON.stringify(card, null, 2) + '\n', 'utf8');
+    rmSync(cardPath(card.id));
+    console.log(`  ✓ ${card.id} (#${card.issue}) closed — card archived`);
+  }
+
   const carded = new Set(ledger.filter((r) => byNumber.has(r.issue)).map((r) => r.issue));
   for (const i of issues) {
     if (/^FR-\d+/.test(i.title) && !carded.has(i.number)) {
