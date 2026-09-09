@@ -198,23 +198,48 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
 
 ## Acceptance criteria
 
-- [ ] **AC1** A permission 403 on a GET leaves the session intact — locked by a
+- [x] **AC1** A permission 403 on a GET leaves the session intact — locked by a
       unit test that replaces the one asserting the opposite.
-- [ ] **AC2** An *unclassified* 403 neither logs out nor navigates.
-- [ ] **AC3** A `not_a_member` 403 leaves the tenant and keeps the session.
-- [ ] **AC4** A non-member's tenant-scoped GET answers `error: "not_a_member"`;
+      *`ui/src/__tests__/api/client.spec.ts`: "a permission 403 on a GET does NOT
+      end the session". The test it replaces asserted the logout as correct,
+      which is why nothing caught this for as long as it stood.*
+- [x] **AC2** An *unclassified* 403 neither logs out nor navigates.
+      *Same file: "an UNCLASSIFIED 403 neither logs out nor navigates" — the
+      default direction is the guarantee, so a newly-gated route is inert on the
+      client by construction.*
+- [x] **AC3** A `not_a_member` 403 leaves the tenant and keeps the session.
+      *Same file: "a not_a_member 403 leaves the tenant and KEEPS the session".*
+- [x] **AC4** A non-member's tenant-scoped GET answers `error: "not_a_member"`;
       a member-without-the-bit answers `error: "forbidden"` naming it.
-- [ ] **AC5** `reconcile_managed_roles` raises a stale mask to its definition,
+      *`role_reconcile_tests::{a_non_member_is_refused_as_not_a_member,
+      a_member_without_the_bit_is_refused_as_forbidden_naming_the_permission,
+      a_membership_gated_read_tells_a_non_member_apart_from_a_member}` — all
+      three ran `ok` in the green integration lane (run 34321311457, the lane
+      that needs real MongoDB + Redis), not merely present in the tree.*
+- [x] **AC5** `reconcile_managed_roles` raises a stale mask to its definition,
       **preserves a bit an org added itself**, and is a no-op on a second run.
-- [ ] **AC6** No managed role below the `ADMINISTRATOR` bypass seeds
+      *`role_reconcile_tests::{the_reconcile_raises_a_stale_mask_and_keeps_what_the_org_added,
+      the_reconcile_is_a_no_op_on_a_second_run,
+      the_reconcile_leaves_a_role_it_does_not_define_alone}`, same run.*
+- [x] **AC6** No managed role below the `ADMINISTRATOR` bypass seeds
       `EXEC_DEVICE` or `SSH_DEVICE`.
-- [ ] **AC7** The three org-switch GETs are not fired without `MANAGE_TENANT`,
+      *`crates/db/src/models/role.rs::no_managed_role_below_administrator_seeds_a_root_shell`,
+      re-run locally 2026-09-09 (8 passed). This is the guard that makes
+      `DEFAULT_ADMIN |= EXEC_DEVICE` — a one-token edit that reads as tidying —
+      fail the suite instead of opening exec-as-SYSTEM fleet-wide at the next
+      boot, because the reconcile grants what the table says to EVERY org.*
+- [x] **AC7** The three org-switch GETs are not fired without `MANAGE_TENANT`,
       and the flag stays `null` (unknown) rather than `false`.
+      *`ui/src/__tests__/stores/agents.spec.ts`: "an unknown mask blocks the org
+      switches rather than guessing".*
 - [ ] **AC8** Field: the reporting member opens the GROX Devices page, the grid
       renders, and the session survives.
 - [ ] **AC9** Field: prod logs show the reconcile's arithmetic once, and a
       second pod restart reports "already match their definitions".
-- [ ] **AC10** Docs updated/created with diagrams, linked from `docs/README.md`.
+- [x] **AC10** Docs updated/created with diagrams, linked from `docs/README.md`.
+      *`docs/permissions.md` (7 sections, 3 mermaid diagrams: the bit catalogue,
+      the reconcile's additive merge, and what each refusal means), with its row
+      in `docs/README.md`'s reference table.*
 
 ## Open decisions
 
