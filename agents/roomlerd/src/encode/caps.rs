@@ -1403,11 +1403,27 @@ fn rpc_caps() -> Vec<String> {
     // "reports back" out of `config` would wait forever for an answer from
     // most of the fleet — the identical trap `ssh` / `ssh-consent` exists to
     // avoid, recurring exactly as that doc predicted it would.
+    // FR-52 — `external-access` is unconditional for the same reason `Config`
+    // is: it says this build UNDERSTANDS cross-org access, which for the
+    // server means one specific thing — that a consent prompt raised by this
+    // agent can tell the person at the machine the controller is from OUTSIDE
+    // their organization. That is why the server gates the ADMIN APPROVAL on
+    // the verb and not just the session: approving a device that cannot say it
+    // would put a promise on screen the device does not keep, and consent
+    // given under it would not be informed consent.
+    //
+    // ⚠️ It says NOTHING about `external_access_enabled` (gate 3). Deriving
+    // the verb from the opt-in would collapse "too old to be approved" and
+    // "approved but opted out" into one state, and those have different fixes
+    // — the first needs an agent update, the second a line in the device's own
+    // config. The fleet view renders them apart, which it can only do because
+    // these two facts arrive separately.
     let mut caps = vec![
         RpcCap::Exec,
         RpcCap::Originate,
         RpcCap::Config,
         RpcCap::ConfigReport,
+        RpcCap::ExternalAccess,
     ];
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
@@ -1619,6 +1635,21 @@ mod tests {
             advertised.iter().any(|v| v == RpcCap::Ssh.wire()),
             cfg!(feature = "ssh-server"),
             "the ssh verbs must track the ssh-server feature, not the version"
+        );
+
+        // FR-52 — build-independent, like `config`, and NOT derived from
+        // `external_access_enabled`. The server gates the admin approval on
+        // this verb, so an agent that stopped sending it would make every
+        // device in the fleet un-approvable for cross-org access — a silent
+        // fleet-wide close, not an error anyone would see.
+        assert!(
+            advertised
+                .iter()
+                .any(|v| v == RpcCap::ExternalAccess.wire()),
+            "external-access must be advertised by every build: it says this \
+             agent can tell the person at the machine that a controller is \
+             from outside their organization, which is what makes gate 2 \
+             approvable at all"
         );
     }
 

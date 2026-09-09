@@ -167,6 +167,40 @@ pub struct AgentConfig {
     #[serde(default)]
     pub remote_config_enabled: bool,
 
+    /// FR-52 gate 3 — let someone **outside this device's organization**
+    /// control it.
+    ///
+    /// Default **`false`**, and the strictest member of the
+    /// `exec_enabled` / `ssh_enabled` / `remote_config_enabled` family: those
+    /// decide what a COLLEAGUE may do, this decides whether a stranger may do
+    /// anything at all. Turning it on still opens nothing by itself — an org
+    /// admin must approve the device (gate 2), the outsider must prove the
+    /// password this device holds (gate 4), and whoever is at the machine is
+    /// still asked (gate 5).
+    ///
+    /// ⚠️ **Not server-settable, structurally.** Like `remote_config_enabled`,
+    /// this key is absent from `DesiredConfig` and a test matches the whole
+    /// `external_*` PREFIX so the next key added to the surface inherits the
+    /// guard rather than needing to remember it. A server able to set this
+    /// could admit a stranger to a machine whose owner never agreed, which is
+    /// the single move FR-52's design exists to prevent.
+    ///
+    /// ⚠️ Advertising [`RpcCap::ExternalAccess`] is a property of the BUILD and
+    /// says nothing about this key — the server reads the verb to know the
+    /// device could *explain* an outside controller to the person at the
+    /// machine, and reads nothing at all about whether it has opted in. The
+    /// two are deliberately independent so "too old to be approved" and
+    /// "approved but opted out" stay different states on the fleet view.
+    ///
+    /// Inert on its own for now: the session path that reads it is FR-52 P4.
+    /// The key lands first for the reason `remote_config_enabled`'s did — a
+    /// device can be opted in before the mechanism exists, rather than the
+    /// mechanism arriving to find every device closed.
+    ///
+    /// [`RpcCap::ExternalAccess`]: roomler_ai_remote_control::models::RpcCap::ExternalAccess
+    #[serde(default)]
+    pub external_access_enabled: bool,
+
     /// Serve SSH on this node's overlay address, in-process.
     ///
     /// Default **`false`**, for the same reason as [`Self::exec_enabled`] and
@@ -2009,6 +2043,7 @@ pub fn test_fixture() -> AgentConfig {
         macos_supervise_gui_worker: false,
         power_policy: String::new(),
         remote_config_enabled: false,
+        external_access_enabled: false,
         ssh_enabled: false,
         ssh_port: None,
         ssh_authorized_keys: Vec::new(),

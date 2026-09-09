@@ -1350,6 +1350,16 @@ pub enum SshAccountMode {
 /// because the feature will grow more keys (`relay_max_sessions`,
 /// `relay_static_endpoints`), and a per-name test would silently fail to cover
 /// the one someone adds later.
+///
+/// ⚠️ **The whole `external_*` surface (FR-52) is ABSENT**, under the same
+/// prefix rule and for the sharpest version of the same reason. Gate 3
+/// (`external_access_enabled`) is the device owner's opt-in to being reachable
+/// by someone *outside the org*, and gate 4 is the password the device holds
+/// and this server never sees. A server able to push either could admit a
+/// stranger to a machine whose owner never agreed — the whole point of FR-52
+/// is that it cannot. The surface will grow (`external_access_verifier`,
+/// `external_consent_mode`, `external_max_permissions`), which is exactly why
+/// the guard matches the prefix rather than today's one name.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct DesiredConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4350,6 +4360,57 @@ mod tests {
         assert!(
             !serde_json::to_string(&back).unwrap().contains("relay_"),
             "a relay_* key survived a decode/encode round trip"
+        );
+    }
+
+    /// FR-52 gates 3 and 4: **no `external_*` key may ever be
+    /// server-pushable.**
+    ///
+    /// The `relay_*` rule above, applied to the surface where it bites
+    /// hardest. `external_access_enabled` is the device owner's opt-in to
+    /// being reachable by someone OUTSIDE the org, and the password behind
+    /// gate 4 is held by the device precisely so this server cannot use it. A
+    /// server that could push either would be able to admit a stranger to a
+    /// machine whose owner never agreed — which is the single move FR-52's
+    /// design exists to prevent.
+    ///
+    /// ⚠️ Prefix, not name: the surface grows (`external_access_verifier`,
+    /// `external_consent_mode`, `external_max_permissions`), and the key that
+    /// matters is always the one added after the test was written.
+    ///
+    /// ⚠️ The literal is spelled out in full for the reason the relay test's
+    /// is — adding a field to [`DesiredConfig`] must stop this compiling, so
+    /// whoever adds it reads why an `external_*` key must not be the one.
+    #[test]
+    fn no_external_key_is_server_pushable_via_desired_config() {
+        let full = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
+            ssh_account_mode: Some("console_user".into()),
+            ssh_port: Some(2222),
+            encoder_cells_deny: Some("none".into()),
+            revision: 7,
+            updated_by: None,
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(
+            !json.contains("external_"),
+            "an external_* key reached DesiredConfig -- that is a server \
+             opting a device in to being reachable by strangers, which is the \
+             one move FR-52's design exists to prevent: {json}"
+        );
+        // And the round trip cannot smuggle one in either.
+        let back: DesiredConfig = serde_json::from_str(
+            r#"{"exec_enabled":true,"external_access_enabled":true,
+                "external_access_verifier":"x","revision":1}"#,
+        )
+        .expect("unknown keys must be ignored, not fail the frame");
+        assert_eq!(back.exec_enabled, Some(true));
+        assert!(
+            !serde_json::to_string(&back).unwrap().contains("external_"),
+            "an external_* key survived a decode/encode round trip"
         );
     }
 
