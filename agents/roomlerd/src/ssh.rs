@@ -1000,9 +1000,40 @@ mod sshd {
                     }
                 }
                 // Reap before closing so the child cannot outlive the channel
-                // as a zombie holding the user's files open.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                // as a zombie holding the user's files open — but WAIT for it
+                // first rather than killing it. It closed stdout because it is
+                // finishing, and a kill here would throw away the exit code the
+                // client is about to be told.
+                //
+                // ⚠️ That status is not a nicety: `scp` reads it as the verdict
+                // on the whole transfer. Without an `exit-status` message
+                // OpenSSH reports `Exit status -1` and exits 1 — so before this
+                // every scp against a roomler device FAILED on the caller's
+                // side while the file arrived complete and byte-correct on the
+                // device (measured 2026-09-09 from mars to a corp laptop: 2 MiB
+                // uploaded, SHA matched on the far end, `scp rc=1`). A script
+                // that branches on that status retries a transfer that already
+                // worked. Every other channel path here — pty, exec, and each
+                // refusal — sends it; the sftp subsystem was the one that did
+                // not.
+                let status = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    child.wait(),
+                )
+                .await
+                {
+                    Ok(Ok(st)) => st.code().unwrap_or(0).max(0) as u32,
+                    Ok(Err(_)) => 1,
+                    Err(_) => {
+                        // Only now, and the status is the timeout's, not the
+                        // child's — a hung sftp-server must not hang the
+                        // channel too.
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        1
+                    }
+                };
+                let _ = handle.exit_status_request(channel, status).await;
                 let _ = handle.eof(channel).await;
                 let _ = handle.close(channel).await;
             });
