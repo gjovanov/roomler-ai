@@ -1,6 +1,6 @@
 # FR-82: A permission refusal is not a logout, and a managed role is not frozen at its birthday
 
-**Issue:** [#1540](https://github.com/gjovanov/roomler-ai/issues/1540) · **Status:** proposed 2026-09-08 ·
+**Issue:** [#1540](https://github.com/gjovanov/roomler-ai/issues/1540) · **Status:** **shipped + field-verified 2026-09-09** (`786f016bf`, image `hosted-20260909-786f016`) — **9 of 10 criteria met; AC8 owed and operator-only, and the issue was closed without it** ·
 **Field report:** a GROX member opened `/tenant/69a1dbba…/devices`, got a 403 and
 was signed out of the product.
 
