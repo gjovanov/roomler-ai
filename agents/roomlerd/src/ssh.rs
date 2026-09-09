@@ -381,6 +381,37 @@ pub fn host_public_key(_cfg: &crate::config::AgentConfig) -> String {
     String::new()
 }
 
+/// Whether the stored host key can actually be used — parsed, not merely
+/// present.
+///
+/// The distinction is the whole point. `Some(garbage)` and `None` look the same
+/// to every caller that only asks whether a key is configured, and they are
+/// opposite states: `None` is a device that has not started SSH yet and will
+/// mint one, while `Some(garbage)` is a device that believes it is done and
+/// serves nothing, forever.
+///
+/// Measured in the field 2026-09-09 on a corp laptop running 0.4.96: its stored
+/// key had picked up literal `\r` escape text inside the PEM, so its BEGIN line
+/// was not newline-terminated (`PEM error in pre-encapsulation boundary`). The
+/// daemon correctly refused to serve SSH and correctly published no host
+/// pubkey — and then never recovered, because the mint in `main.rs` was gated
+/// on `is_none()`. Every restart re-logged the same warning. Nothing surfaced
+/// it: not `roomler status`, not `roomler config ls`, not the dashboard; and
+/// what a caller saw was *"has not published an SSH host key … needs an agent
+/// that has had SSH enabled at least once (rc.444+)"*, i.e. advice to upgrade an
+/// agent that was already current.
+#[cfg(feature = "ssh-server")]
+pub fn stored_host_key_is_usable(cfg: &crate::config::AgentConfig) -> bool {
+    cfg.ssh_host_key
+        .as_deref()
+        .is_some_and(|pem| russh::keys::ssh_key::PrivateKey::from_openssh(pem).is_ok())
+}
+
+#[cfg(not(feature = "ssh-server"))]
+pub fn stored_host_key_is_usable(_cfg: &crate::config::AgentConfig) -> bool {
+    true
+}
+
 #[cfg(feature = "ssh-server")]
 pub fn generate_host_key() -> anyhow::Result<String> {
     use russh::keys::ssh_key::LineEnding;
@@ -2177,6 +2208,43 @@ mod tests {
         // one genuinely dangerous outcome.
         cfg.ssh_host_key = Some("-----BEGIN OPENSSH PRIVATE KEY-----\nnope\n".into());
         assert_eq!(super::host_public_key(&cfg), "");
+    }
+
+    #[test]
+    fn an_unreadable_stored_key_counts_as_no_key_so_the_daemon_can_heal() {
+        // The bug this locks: `main.rs` minted only when the key was ABSENT, so
+        // a key that was present-but-garbage wedged SSH on that device forever —
+        // refusing to serve, publishing nothing, and never replacing it. The
+        // device was one restart away from being fine and could not take it.
+        //
+        // Field case, 0.4.96 on a corp laptop: the stored PEM had picked up
+        // literal `\r` escape text, so the BEGIN line was not newline-terminated
+        // and the parse failed with `PEM error in pre-encapsulation boundary`.
+        // That exact shape is the first case below, because a test written
+        // around a tidily-invalid key would not have caught it.
+        let mut cfg = cfg_with(vec![]);
+
+        cfg.ssh_host_key = Some(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\\r\\r\\\nAAAA\n\
+             -----END OPENSSH PRIVATE KEY-----\n"
+                .into(),
+        );
+        assert!(
+            !super::stored_host_key_is_usable(&cfg),
+            "a PEM whose boundary line is mangled must read as unusable, not as present"
+        );
+
+        cfg.ssh_host_key = None;
+        assert!(!super::stored_host_key_is_usable(&cfg));
+
+        cfg.ssh_host_key = Some(String::new());
+        assert!(!super::stored_host_key_is_usable(&cfg));
+
+        // …and the positive control, without which the three above would pass
+        // on a function that simply always returned false.
+        cfg.ssh_host_key = Some(super::generate_host_key().unwrap());
+        assert!(super::stored_host_key_is_usable(&cfg));
+        assert_ne!(super::host_public_key(&cfg), "");
     }
 
     struct TestClient;
