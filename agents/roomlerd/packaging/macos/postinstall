@@ -164,32 +164,102 @@ replace_launchd_service() {
   return 1
 }
 
+# Is the root LaunchDaemon opted in on this Mac?
+#
+# FR-46 — dual-read while a Mac may still be mid-migration. The migration at
+# the top normally makes the legacy arm dead, but if the move could not happen
+# this must NOT read false: one caller BOOTS OUT the daemon on a false, so
+# reading one path only would turn a failed rename into a silent removal of the
+# overlay and the SSH server. docs/fr/FR-46
+#
+# ⚠️ ONE function, two callers, on purpose. The other caller
+# (`daemon_supervises_gui_worker`) decides whether to REMOVE the LaunchAgent,
+# and the two answers have to agree: a copy that drifted into saying "enabled"
+# while the gate below said "not" would strip the GUI worker off a Mac that
+# then installs no daemon either — no capture, no input, nothing to supervise.
+# RETIRED-NAME-ANCHOR(2): the legacy marker path, read as a fallback only.
+daemon_is_enabled() {
+  [ -f /etc/roomler/enable-daemon ] || [ -f /etc/roomler-agent/enable-daemon ]
+}
+
+# FR-43 P2 — does the root daemon own the GUI-session worker on this Mac?
+#
+# `macos_supervise_gui_worker = true` makes the daemon spawn and babysit the
+# worker itself so that ONE device row both holds the enrollment and serves the
+# screen. The supervisor deliberately stands down whenever
+# `gui/<uid>/com.roomler.agent` is loaded — the loser of that race must be the
+# supervisor, never the enrolled agent (`macos_supervisor::decide`) — so
+# bootstrapping the LaunchAgent here does not merely add a second worker: it
+# DISARMS delegation, and the daemon's row goes back to advertising a capture
+# target it cannot serve. A controller that connects to it gets a black screen
+# with working input, which is the exact symptom FR-43 P2 exists to remove.
+#
+# That is what gave P2 a one-release half-life: the operator boots the plist
+# out by hand (the daemon's own log tells them to), and the very next package
+# update quietly puts it back. An update is precisely when nobody is watching.
+#
+# Read the daemon's OWN config rather than inventing a marker file: the key
+# below is the one `decide()` acts on, so the installer and the supervisor
+# cannot disagree about who owns the worker. A marker would be a second source
+# of truth for one fact.
+#
+# ⚠️ Interlocked with the daemon opt-in on purpose. Supervision only means
+# anything if a root daemon is actually there to supervise; honouring the key
+# without it would remove the LaunchAgent and leave the Mac with NO GUI worker.
+daemon_supervises_gui_worker() {
+  daemon_is_enabled || return 1
+  [ -f /etc/roomler/config.toml ] || return 1
+  grep -qE '^[[:space:]]*macos_supervise_gui_worker[[:space:]]*=[[:space:]]*true' \
+    /etc/roomler/config.toml
+}
+
 LAUNCH_AGENTS_DIR="$CONSOLE_HOME/Library/LaunchAgents"
 PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.agent.plist"
 PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.agent.plist"
 
-mkdir -p "$LAUNCH_AGENTS_DIR"
-cp "$PLIST_SOURCE" "$PLIST_TARGET"
-chown "$CONSOLE_USER":staff "$PLIST_TARGET"
-chmod 644 "$PLIST_TARGET"
-
-# Load the agent into the user's launchd domain — via the drain-aware
-# replacement above, because on a self-update the previous instance is still
-# dying when this runs (see replace_launchd_service).
-#
-# A final failure is reported, not fatal: the plist is in ~/Library/LaunchAgents,
-# so launchd starts it at the next login regardless. Trading a working install
-# for a launchctl edge case (a session that exists but will not accept a
-# bootstrap) is the wrong way round.
-if replace_launchd_service "gui/$CONSOLE_UID" com.roomler.agent "$PLIST_TARGET"; then
-  echo "roomlerd installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
+if daemon_supervises_gui_worker; then
+  # FR-43 P2 — the root daemon owns the worker here, so the LaunchAgent must
+  # not exist. Note this REMOVES the plist rather than merely skipping the
+  # bootstrap: a plist left in ~/Library/LaunchAgents is loaded by launchd at
+  # the next login, so skipping alone would postpone the breakage by one
+  # login instead of fixing it.
+  #
+  # Booting the job out is not a new hazard — `replace_launchd_service` has
+  # always booted this exact label out as its first act. The change is that we
+  # no longer bootstrap it back.
+  launchctl bootout "gui/$CONSOLE_UID/com.roomler.agent" 2>/dev/null || true
+  rm -f "$PLIST_TARGET"
+  echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID); the GUI worker"
+  echo "  is owned by the ROOT DAEMON (macos_supervise_gui_worker = true in"
+  echo "  /etc/roomler/config.toml), so the per-user LaunchAgent was NOT loaded."
+  echo "  The daemon spawns and babysits the worker itself; one device row both"
+  echo "  holds the enrollment and serves the screen."
+  echo "  To go back to the per-user LaunchAgent, set that key false (or remove"
+  echo "  it) and re-run the installer."
 else
-  echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
-  echo "  bootstrap failed after retries: $(cat /tmp/roomler-bootstrap.err 2>/dev/null)"
-  echo "  The plist is in place, so it will start at the next login, or now via:"
-  echo "    launchctl bootstrap gui/$CONSOLE_UID $PLIST_TARGET"
+  mkdir -p "$LAUNCH_AGENTS_DIR"
+  cp "$PLIST_SOURCE" "$PLIST_TARGET"
+  chown "$CONSOLE_USER":staff "$PLIST_TARGET"
+  chmod 644 "$PLIST_TARGET"
+
+  # Load the agent into the user's launchd domain — via the drain-aware
+  # replacement above, because on a self-update the previous instance is still
+  # dying when this runs (see replace_launchd_service).
+  #
+  # A final failure is reported, not fatal: the plist is in ~/Library/LaunchAgents,
+  # so launchd starts it at the next login regardless. Trading a working install
+  # for a launchctl edge case (a session that exists but will not accept a
+  # bootstrap) is the wrong way round.
+  if replace_launchd_service "gui/$CONSOLE_UID" com.roomler.agent "$PLIST_TARGET"; then
+    echo "roomlerd installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
+  else
+    echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
+    echo "  bootstrap failed after retries: $(cat /tmp/roomler-bootstrap.err 2>/dev/null)"
+    echo "  The plist is in place, so it will start at the next login, or now via:"
+    echo "    launchctl bootstrap gui/$CONSOLE_UID $PLIST_TARGET"
+  fi
+  rm -f /tmp/roomler-bootstrap.err
 fi
-rm -f /tmp/roomler-bootstrap.err
 
 # The desktop companion (menu-bar app), same user domain. It is a UI surface,
 # not a service: it holds no session and captures nothing, so a failure to
@@ -248,13 +318,10 @@ echo "(the Roomler menu-bar app shows which of the two is missing, with a button
 DAEMON_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.daemon.plist"
 DAEMON_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.daemon.plist"
 
-# FR-46 — dual-read while a Mac may still be mid-migration. The migration at
-# the top normally makes the legacy arm dead, but if the move could not happen
-# this gate must NOT fall through to the else branch, which BOOTS OUT the
-# daemon. Reading one path here would turn a failed rename into a silent
-# removal of the overlay and the SSH server. docs/fr/FR-46
-# RETIRED-NAME-ANCHOR(2): the legacy marker path, read as a fallback only.
-if [ -f /etc/roomler/enable-daemon ] || [ -f /etc/roomler-agent/enable-daemon ]; then
+# The dual-read (and why the else branch makes it load-bearing) lives in
+# `daemon_is_enabled` above, which the FR-43 LaunchAgent guard also calls — the
+# two must never disagree about whether a root daemon is coming.
+if daemon_is_enabled; then
   if [ ! -f "$DAEMON_PLIST_SOURCE" ]; then
     echo "WARNING: daemon requested but $DAEMON_PLIST_SOURCE is missing; skipping"
   else
