@@ -221,6 +221,10 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
       *`role_reconcile_tests::{the_reconcile_raises_a_stale_mask_and_keeps_what_the_org_added,
       the_reconcile_is_a_no_op_on_a_second_run,
       the_reconcile_leaves_a_role_it_does_not_define_alone}`, same run.*
+      ⚠️ The **preservation** half is test-proven only, and cannot be otherwise
+      here: after the reconcile every managed role on prod collapsed to exactly
+      one mask, so no organisation carries a bit of its own for the additive
+      path to keep. A production that cannot exhibit the case cannot prove it.
 - [x] **AC6** No managed role below the `ADMINISTRATOR` bypass seeds
       `EXEC_DEVICE` or `SSH_DEVICE`.
       *`crates/db/src/models/role.rs::no_managed_role_below_administrator_seeds_a_root_shell`,
@@ -233,7 +237,12 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
       *`ui/src/__tests__/stores/agents.spec.ts`: "an unknown mask blocks the org
       switches rather than guessing".*
 - [ ] **AC8** Field: the reporting member opens the GROX Devices page, the grid
-      renders, and the session survives.
+      renders, and the session survives. **Owed, and operator-only** — every
+      seat an agent can reach on this deployment holds the `ADMINISTRATOR`
+      bypass, which is the very reason the defect went unreported for a week,
+      so a pass from such a seat would be indistinguishable from a pass on the
+      broken build. The `not_a_member` flavour of the same branch *is*
+      field-proven (§The client half); the `forbidden` flavour is not.
 - [x] **AC9** Field: prod logs show the reconcile's arithmetic once, and a
       second pod restart reports "already match their definitions".
       *Verified twice, independently — the arithmetic read live from the leader
@@ -296,3 +305,28 @@ the Devices page. Note the reconcile does **not** make this pass — `MANAGE_TEN
 stays out of `DEFAULT_ADMIN` deliberately, so the `ephemeral-key-settings` GET
 still answers 403; AC8 passes because the client no longer treats that as a
 dead session.
+
+### The client half — the 403 that no longer ends a session
+
+The log above is entirely about defect 2. Defect 1 lives in the **bundle**, so
+nothing about it is verifiable until prod serves the new one; it was measured
+the same way, before and after.
+
+| read | result |
+|---|---|
+| **BEFORE** — the bundle prod was serving, `index-CWf4GqhQ.js` | exactly **one** `status===403` site, and it was the defect: `.status===403&&n==="GET"&&!Tr.some(c=>e.startsWith(c))&&Or()` — method-gated, unconditional logout |
+| **AFTER** — `index-CxPcVy01.js` | still one site, now `o.status===403&&!Tr.some(…)&&i?.error==="not_a_member"&&Gl()`: the method test gone, the logout gone, the navigation conditioned on the server's own code |
+| the server's half, by raw `fetch` from the signed-in SPA (deliberately bypassing the interceptor) | a non-member tenant GET answers **403 `{"error":"not_a_member"}`** on both `/room` and `/agent` — the machine-readable code `ApiError::NotAMember` was added for, not a message string |
+| the page shape that produced the report | navigating to a **non-member org's Devices page** landed on `/`, **not** `/login`; the dashboard rendered with its org list, and an authenticated GET on the caller's own tenant answered **200 with 21 agents** immediately after — the session was never touched |
+
+⚠️ This proves the `not_a_member` arm end to end and the *absence* of the old
+expression from the shipped bytes. It does **not** prove AC8, which is the
+`forbidden` arm: that one needs a seat without `MANAGE_TENANT` and without the
+`ADMINISTRATOR` bypass, and there is none an agent can reach here.
+
+⚠️ Worth keeping about the prediction that gated this roll: §The measured drift
+was written from production *before* the merge, and `DEFAULT_ADMIN =
+0x577ffff7` has bits 27 (`EXEC_DEVICE`) and 29 (`SSH_DEVICE`) clear — so the
+63-org group's move was **falsifiable**, and anything other than a gain of
+`0x57000000` would have been exec-as-SYSTEM spreading across 63 organisations
+at one boot. A prediction that could not have failed would have proved nothing.
