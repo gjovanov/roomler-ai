@@ -379,7 +379,7 @@ pub async fn delete(
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     // Verify ownership: only the author can delete their message (tenant-scoped)
@@ -459,7 +459,7 @@ pub async fn toggle_pin(
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
     if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
+        return Err(ApiError::NotAMember);
     }
 
     state.messages.toggle_pin(tid, mid, body.pinned).await?;

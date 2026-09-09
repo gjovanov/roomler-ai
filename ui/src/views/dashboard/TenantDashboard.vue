@@ -198,7 +198,9 @@
         </v-card>
       </v-col>
       <!-- Same FAIL-CLOSED gate as the sidebar item: the invites list needs
-           INVITE_MEMBERS and the api client logs out on GET 403. -->
+           INVITE_MEMBERS, so a member without it is not offered a tile whose
+           page can only refuse them. (Was "and the api client logs out on
+           GET 403" — no longer true, FR-82.) -->
       <v-col v-if="canInvite" cols="12" sm="6" md="3">
         <v-card :to="`/tenant/${tenantId}/invites`" hover>
           <v-card-text>

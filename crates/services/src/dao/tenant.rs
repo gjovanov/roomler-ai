@@ -2,7 +2,7 @@
 // Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
-use roomler_ai_db::models::{Plan, Role, Tenant, TenantMember, TenantSettings, role::permissions};
+use roomler_ai_db::models::{Plan, Role, Tenant, TenantMember, TenantSettings, role};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
@@ -10,6 +10,31 @@ pub struct TenantDao {
     pub base: BaseDao<Tenant>,
     pub members: BaseDao<TenantMember>,
     pub roles: BaseDao<Role>,
+}
+
+/// One `(role name, stored mask)` group [`TenantDao::reconcile_managed_roles`]
+/// decided about. Returned rather than merely logged so the caller can report
+/// what actually changed, and so the arithmetic is assertable without a
+/// database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleReconcileGroup {
+    pub name: String,
+    pub stored: u64,
+    /// The definition's mask, or `stored` for a managed row the table does
+    /// not own (nothing is owed, and nothing is written).
+    pub target: u64,
+    /// `stored | target` — what the rows were set to. Equal to `stored` when
+    /// nothing was owed.
+    pub reconciled: u64,
+    pub rows: u64,
+}
+
+impl RoleReconcileGroup {
+    /// The bits this group gained. Zero for a group already at its
+    /// definition, which is what every group reads on a second run.
+    pub fn gained(&self) -> u64 {
+        self.reconciled & !self.stored
+    }
 }
 
 impl TenantDao {
@@ -166,94 +191,32 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
+    /// Seed the system-managed roles for a brand-new tenant.
+    ///
+    /// FR-82 — built from `MANAGED_ROLES`, which is now the only place these
+    /// masks are written down. The five `Role` literals that used to live
+    /// here were one of two divergent copies, and neither of them was ever
+    /// re-applied to a tenant that already existed.
     async fn create_default_roles(&self, tenant_id: ObjectId) -> DaoResult<()> {
         let now = DateTime::now();
-        let roles = vec![
-            Role {
-                id: None,
-                tenant_id,
-                name: "owner".to_string(),
-                description: Some("Full control over the tenant".to_string()),
-                color: Some(0xE91E63),
-                position: 0,
-                permissions: permissions::ALL,
-                is_default: false,
-                is_managed: true,
-                is_mentionable: false,
-                is_hoisted: true,
-                created_at: now,
-                updated_at: now,
-            },
-            Role {
-                id: None,
-                tenant_id,
-                name: "admin".to_string(),
-                description: Some("Administrative access".to_string()),
-                color: Some(0x2196F3),
-                position: 1,
-                permissions: permissions::DEFAULT_ADMIN,
-                is_default: false,
-                is_managed: true,
-                is_mentionable: true,
-                is_hoisted: true,
-                created_at: now,
-                updated_at: now,
-            },
-            Role {
-                id: None,
-                tenant_id,
-                name: "moderator".to_string(),
-                description: Some(
-                    "Moderate channels/messages; remote-control operator".to_string(),
-                ),
-                color: Some(0x4CAF50),
-                position: 2,
-                permissions: permissions::DEFAULT_MEMBER
-                    | permissions::MANAGE_MESSAGES
-                    | permissions::MUTE_MEMBERS
-                    | permissions::KICK_MEMBERS
-                    | permissions::REMOTE_CONTROL,
-                is_default: false,
-                is_managed: true,
-                is_mentionable: true,
-                is_hoisted: true,
-                created_at: now,
-                updated_at: now,
-            },
-            Role {
-                id: None,
-                tenant_id,
-                name: "member".to_string(),
-                description: Some("Default member role".to_string()),
-                color: None,
-                position: 3,
-                permissions: permissions::DEFAULT_MEMBER,
-                is_default: true,
-                is_managed: true,
-                is_mentionable: false,
-                is_hoisted: false,
-                created_at: now,
-                updated_at: now,
-            },
-            Role {
-                id: None,
-                tenant_id,
-                name: "guest".to_string(),
-                description: Some("Limited guest access".to_string()),
-                color: None,
-                position: 4,
-                permissions: permissions::VIEW_CHANNELS | permissions::READ_HISTORY,
-                is_default: false,
-                is_managed: true,
-                is_mentionable: false,
-                is_hoisted: false,
-                created_at: now,
-                updated_at: now,
-            },
-        ];
-
-        for role in &roles {
-            self.roles.insert_one(role).await?;
+        for def in role::MANAGED_ROLES {
+            self.roles
+                .insert_one(&Role {
+                    id: None,
+                    tenant_id,
+                    name: def.name.to_string(),
+                    description: Some(def.description.to_string()),
+                    color: def.color,
+                    position: def.position,
+                    permissions: def.permissions,
+                    is_default: def.is_default,
+                    is_managed: true,
+                    is_mentionable: def.is_mentionable,
+                    is_hoisted: def.is_hoisted,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await?;
         }
         Ok(())
     }
@@ -263,6 +226,114 @@ impl TenantDao {
             .find_one(doc! { "tenant_id": tenant_id, "name": name })
             .await?
             .ok_or(DaoError::NotFound)
+    }
+
+    /// Bring every system-managed role in EVERY tenant up to its definition
+    /// in `MANAGED_ROLES` (FR-82).
+    ///
+    /// ⚠️ **Additive: `new = stored | definition`, never a replace.** A
+    /// managed role's mask is editable through `PUT …/role/{id}` (only
+    /// *deletion* is refused), so an org may legitimately have added a bit to
+    /// one. Overwriting would silently revoke that; OR-ing cannot. The cost
+    /// of the choice, stated so nobody has to rediscover it: a bit REMOVED
+    /// from a definition — a tightening — does not propagate, and needs its
+    /// own migration that says out loud whose permissions it is taking away.
+    ///
+    /// ⚠️ Groups by `(name, permissions)` and issues one `update_many` per
+    /// group, so the whole deployment costs as many writes as it has distinct
+    /// drift strata (measured: 12 across 72 orgs / 360 managed roles), not
+    /// one per role. Matching on the exact stored value also makes it a
+    /// no-op on a second run and safe against a concurrent editor: a role
+    /// changed underneath us simply falls out of its group's filter.
+    ///
+    /// A managed row whose name is not in the table is left alone and
+    /// reported — drift that is visible beats drift that is corrected by
+    /// guesswork.
+    pub async fn reconcile_managed_roles(&self) -> DaoResult<Vec<RoleReconcileGroup>> {
+        use futures::TryStreamExt;
+
+        let mut cursor = self
+            .roles
+            .collection()
+            .aggregate(vec![
+                doc! { "$match": { "is_managed": true } },
+                doc! { "$group": {
+                    "_id": { "name": "$name", "permissions": "$permissions" },
+                    "rows": { "$sum": 1 },
+                } },
+            ])
+            .await?;
+
+        // Drain the cursor BEFORE writing anything: the updates below target
+        // the collection this aggregation reads, and "iterate and mutate the
+        // same collection" is a shape worth not having, whatever the server
+        // happens to guarantee about a `$group` cursor's batches.
+        let mut strata: Vec<(String, u64, u64)> = Vec::new();
+        while let Some(doc) = cursor.try_next().await? {
+            let Ok(id) = doc.get_document("_id") else {
+                continue;
+            };
+            let Ok(name) = id.get_str("name") else {
+                continue;
+            };
+            // `permissions` is written as i64 (see `RoleDao::update`), but a
+            // row seeded before that cast could be an i32 — read both rather
+            // than skipping a whole stratum on a type mismatch.
+            let stored = id
+                .get_i64("permissions")
+                .ok()
+                .or_else(|| id.get_i32("permissions").ok().map(i64::from))
+                .unwrap_or(0)
+                .max(0) as u64;
+            // `$sum: 1` is an Int32 today; read Int64 too rather than
+            // reporting `rows = 0` for a real group if that ever changes.
+            let rows = doc
+                .get_i32("rows")
+                .map(i64::from)
+                .or_else(|_| doc.get_i64("rows"))
+                .unwrap_or(0)
+                .max(0) as u64;
+            strata.push((name.to_string(), stored, rows));
+        }
+
+        let mut groups = Vec::with_capacity(strata.len());
+        for (name, stored, rows) in strata {
+            let Some(def) = role::ManagedRole::by_name(&name) else {
+                // Not ours to define. Report it; do not touch it.
+                groups.push(RoleReconcileGroup {
+                    name,
+                    stored,
+                    target: stored,
+                    reconciled: stored,
+                    rows,
+                });
+                continue;
+            };
+
+            let reconciled = stored | def.permissions;
+            if reconciled != stored {
+                self.roles
+                    .collection()
+                    .update_many(
+                        doc! { "is_managed": true, "name": &name, "permissions": stored as i64 },
+                        doc! { "$set": {
+                            "permissions": reconciled as i64,
+                            "updated_at": DateTime::now(),
+                        } },
+                    )
+                    .await?;
+            }
+            groups.push(RoleReconcileGroup {
+                name,
+                stored,
+                target: def.permissions,
+                reconciled,
+                rows,
+            });
+        }
+
+        groups.sort_by(|a, b| a.name.cmp(&b.name).then(a.stored.cmp(&b.stored)));
+        Ok(groups)
     }
 
     pub async fn add_member(
@@ -388,7 +459,7 @@ impl TenantDao {
             .members
             .find_one(doc! { "tenant_id": tenant_id, "user_id": user_id })
             .await?
-            .ok_or(DaoError::Forbidden("Not a member".to_string()))?;
+            .ok_or(DaoError::NotAMember)?;
 
         let roles = self
             .roles
