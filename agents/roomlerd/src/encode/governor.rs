@@ -972,7 +972,7 @@ impl RateGovernor {
         // shadow the moment the gate was built on it, so `transit_classify`
         // went with them. `samples` is this window's blocked sends; the
         // sender's other figures arrive from the pump via `note_window_sender`.
-        let valid = if constrained {
+        let rejection = if constrained {
             let sender = self.window_sender.take();
             let split = match (report, self.last_viewer_arrival) {
                 (Some((avg, _, _)), Some(arrival)) => {
@@ -1015,12 +1015,41 @@ impl RateGovernor {
             if let Some(r) = rejected {
                 self.evidence.note(r);
             }
-            rejected.is_none()
+            rejected
         } else {
             // A direct transport has the measured-ceiling clamp for this job and
             // no classifier verdict to gate on.
-            true
+            None
         };
+        let valid = rejection.is_none();
+        // FR-79 V5 — the gate says whether this window MEASURES the pipe. It
+        // was also being read as whether the window says anything at all, and
+        // for a stalled transport those differ: the stall is the pipe pushing
+        // back, and on a relay-TCP session it is the only push-back there is.
+        //
+        // That alone does not make it OUR fault. FR-71's finding 4 is the
+        // other case — an 8 Mbps leg head-of-line-blocked for 4.9 s with 1485
+        // bytes queued — where a cut costs quality for an event the sender did
+        // not cause. The estimator is the discriminator: a stall while we are
+        // sending above the last MEASURED capacity is the rate's doing; at or
+        // below it, it is the transport's and T1b's answer still stands. With
+        // nothing measured yet there is no claim to contradict, so no cut.
+        //
+        // Field 2026-09-09, CORPLAP-2 AV1 over DERP/TCP: the goodput estimator
+        // accepted ONE sample all session (1,058,145 bps) while the target
+        // ramped to 1,928,555; eleven windows stalled, paint age reached
+        // 7,784 ms, and the rate ended HIGHER than it started — because every
+        // loop below that can lower it reads `valid`.
+        let stall_is_ours = rejection.is_some_and(|r| r.is_congestion())
+            && match (
+                self.goodput.estimate_bps(now),
+                self.aimd.as_ref().map(|c| c.desired()),
+            ) {
+                // A fifth of slack so a session parked at the measurement does
+                // not chatter in and out of cutting on rounding alone.
+                (Some(pipe), Some(desired)) => desired > pipe.saturating_add(pipe / 5),
+                _ => false,
+            };
         // FR-79 — the fold is the gate's first consumer: an invalid window's
         // blocked sends are DROPPED, not held. What they measured was the
         // stall, and the next valid window measures the pipe on its own merits.
@@ -1043,14 +1072,22 @@ impl RateGovernor {
         // nothing congested since the last one, otherwise END it. Neither on
         // a held window (FR-71 T1b): a stall is not a clean window, and it is
         // not congestion either.
-        if valid
-            && let Some(ss) = self.slow_start.as_mut()
+        if let Some(ss) = self.slow_start.as_mut()
             && !ss.done()
         {
-            if congested {
+            if valid {
+                if congested {
+                    ss.on_congestion();
+                } else {
+                    ss.on_clean_window();
+                }
+            } else if stall_is_ours {
+                // FR-79 V5 — the ramp must END on a stall it caused. Reading
+                // only valid windows, it saw a run of clean ones (an idle
+                // screen produces those: nothing is offered, so nothing
+                // congests) and kept doubling into a pipe it had already
+                // overrun.
                 ss.on_congestion();
-            } else {
-                ss.on_clean_window();
             }
         }
         let mut age_over = false;
@@ -1075,8 +1112,11 @@ impl RateGovernor {
             let triggered = self.age_loop.observe(avg, min, rtt / 2);
             // FR-71 T1b — the loop still LEARNS on a held window (a stall
             // never lowers a floor that is a minimum), it just does not fire.
-            age_over = triggered && constrained && self.age_feedback && valid;
-            if !valid {
+            age_over = triggered && constrained && self.age_feedback && (valid || stall_is_ours);
+            // FR-79 V5 — a stall we caused must not ERASE the streak that
+            // would have cut for it. T1b's reset stands for every other
+            // rejection, where the age is real but unattributable.
+            if !valid && !stall_is_ours {
                 self.age_loop.reset_streak();
             }
             // Same floor the age loop learned, falling back to the path's
@@ -1180,7 +1220,15 @@ impl RateGovernor {
         // FR-59 P3 — same treatment for a growing transit queue. This is
         // the arm the field case needed: the send channel was never full,
         // so nothing else in the loop could produce a decrease.
-        if (age_over || link_over)
+        // FR-79 V5 — and the same treatment for a transit stall we caused.
+        // This is the arm the CORPLAP-2 session needed: the send channel was
+        // never full (`bytes_inflight=0`, `send_wait_max_ms=0.3`), the viewer's
+        // age report landed in a rejected window, so NOTHING in the loop could
+        // produce a decrease while the transport stalled eleven times.
+        // `note_buffer_overflow` is the rate-limited ×0.85 with its 500 ms
+        // spacing — deliberately not `apply_hard_md`, which has no spacing at
+        // all and would halve once per stalled window.
+        if (age_over || link_over || stall_is_ours)
             && let Some(ctrl) = self.aimd.as_mut()
         {
             ctrl.note_buffer_overflow(now);
@@ -1205,6 +1253,12 @@ impl RateGovernor {
             let pushed_back =
                 age_over || age_elevated || link_over || drain_for_ms.is_some() || stall_seen;
             self.prior.on_window(live, pushed_back);
+        } else if constrained && stall_is_ours {
+            // FR-79 V5 — no measurement (the stall's own numbers are not the
+            // pipe's: that is the 14:52 defect), but the push-back is real, so
+            // the prior re-anchors instead of decaying toward the band as it
+            // would on a window where the pipe simply did not push back.
+            self.prior.on_window(None, true);
         }
         // FR-35 — hand the learner this window's evidence.
         let ceiling_grown = if constrained {
@@ -2630,6 +2684,122 @@ mod tests {
             g.effective_ceiling(3_000_000, true),
             3_000_000,
             "back to the nominal band"
+        );
+    }
+
+    /// FR-79 V5 — the WIRING (the per-reason law is unit-tested in
+    /// `encode::evidence`, and finding 4's opposite cell is the B0 sim's).
+    ///
+    /// A session that has MEASURED its pipe and is sending above it must come
+    /// DOWN when the transport stalls. Before V5 every loop that can lower the
+    /// rate read `valid` — the goodput fold, the hard MD, the ramp verdict,
+    /// the age cut and the viewer clamp alike — so a `TransitStalled` window
+    /// reached none of them. Measured with this change reverted: two stalled
+    /// windows against a 1.0 Mbps measurement move a 3.0 Mbps target by
+    /// nothing at all.
+    ///
+    /// Field 2026-09-09, CORPLAP-2 AV1 over DERP/TCP (`6aa10d91`): the
+    /// estimator accepted ONE sample all session (1,058,145 bps) while the
+    /// target ramped to 1,928,555; eleven windows stalled, paint age reached
+    /// 7,784 ms, and the rate ENDED HIGHER than it started.
+    #[test]
+    fn a_transit_stall_above_the_measured_pipe_cuts_the_rate() {
+        use crate::encode::pipe_state::PipeState;
+        let start = Instant::now();
+        let mut g = RateGovernor::new(
+            30,
+            DEPTH,
+            // ⚠️ `measured_ceiling` OFF on purpose. With it on, the
+            // measurement itself clamps the ceiling and the rate falls for
+            // that reason alone — the cell would pass with this whole change
+            // reverted, proving nothing. Off, the only thing left in the loop
+            // that can lower the rate on a rejected window is V5.
+            GovernorFlags {
+                measured_ceiling: false,
+                age_feedback: true,
+                ..GovernorFlags::default()
+            },
+            8_000_000,
+            None,
+            start,
+        );
+        let mut t = start;
+        let sender = |frames_sent: u32| WindowSenderStats {
+            inflight_bytes: 1_500,
+            budget_bytes: 128_000,
+            gate_skips: 0,
+            send_wait_max_ms: 1.0,
+            send_wait_avg_ms: Some(0.5),
+            frames_sent,
+            stalled_passes: 0,
+        };
+        // Three clean windows learn the floors, then the session's ONE
+        // measurement folds on the fourth: 1500 bytes per 12 ms = 1.0 Mbps.
+        // (12 ms, not 8: `goodput::MIN_BLOCKED_SEND` drops anything under
+        // 10 ms at the source, as headroom rather than evidence.)
+        let sink = g.goodput_sink();
+        for i in 0..4 {
+            if i == 3 {
+                for _ in 0..12 {
+                    sink.record(1_500, Duration::from_millis(12));
+                }
+            }
+            t += Duration::from_millis(1100);
+            g.note_window_sender(sender(30));
+            g.tick_viewer_window(
+                t,
+                30,
+                || viewer_rate::pack_report(30, false),
+                || viewer_rate::pack_age_with_arrival(42, 40, 80, 41),
+                || 0,
+                true,
+                |o| o,
+                0,
+            )
+            .expect("window due");
+            // The measuring window carries blocked sends, so it reads
+            // `Overproduced` — still VALID evidence, which is how the fold
+            // gets its sample at all.
+            if i < 3 {
+                assert_eq!(g.pipe_state(), Some(PipeState::Clear));
+            }
+        }
+        assert_eq!(
+            g.blocked_send_bps(t),
+            Some(1_000_000),
+            "the one measurement"
+        );
+        // The rate sits at 3 Mbps — three times what the pipe measured.
+        // ⚠️ A real send capacity, not 0: a zero reads as a saturated channel
+        // and fires the backpressure MD, which would cut the rate here for a
+        // reason that has nothing to do with the stall.
+        let before = g
+            .pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t)
+            .map(|a| a.bps)
+            .expect("a first target");
+        assert!(before > 1_200_000, "the premise: above the measurement");
+        // Two silent windows with the pump still sending: the transport
+        // stalled, and it is OUR rate that is above the measurement.
+        for _ in 0..2 {
+            t += Duration::from_millis(1100);
+            g.note_window_sender(sender(30));
+            g.tick_viewer_window(t, 30, || 0, || 0, || 0, true, |o| o, 0)
+                .expect("window due");
+            assert_eq!(g.pipe_state(), Some(PipeState::TransitStalled));
+        }
+        let after = g
+            .pre_encode_tick(3_000_000, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t)
+            .map(|a| a.bps)
+            .unwrap_or(before);
+        assert!(
+            after < before,
+            "a transit stall above the measured pipe did not cut the rate \
+             (before {before}, after {after})"
+        );
+        assert_eq!(
+            g.evidence_rejected(),
+            [0, 2, 0, 0],
+            "both rejections were transit stalls"
         );
     }
 
