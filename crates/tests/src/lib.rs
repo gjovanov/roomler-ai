@@ -142,6 +142,8 @@ mod growth_setup_diagnostics_tests;
 #[cfg(test)]
 mod growth_tests;
 #[cfg(test)]
+mod external_access_tests;
+#[cfg(test)]
 mod hive_tests;
 /// FR-102 P3 — the install trace: the token ledger (AC11), the fetch
 /// counters by client class with the updater never counted (AC10), and the
