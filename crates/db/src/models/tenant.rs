@@ -127,6 +127,25 @@ pub struct TenantSettings {
     #[serde(default)]
     pub remote_ssh_enabled: bool,
 
+    /// FR-52 — cross-org remote access: the org-wide kill-switch (gate 1 of
+    /// five). `false` by default and for every pre-feature row, and while it
+    /// is false a connect code does not resolve at all — no device in this org
+    /// can be reached by anyone outside it, whatever its own
+    /// `ExternalAccessPolicy` says and whatever its owner enabled locally.
+    ///
+    /// A THIRD switch beside [`Self::remote_exec_enabled`] and
+    /// [`Self::remote_ssh_enabled`], and separate from both for the reason
+    /// those two are separate from each other — more so, in fact: those govern
+    /// what a MEMBER of this org may do, and this one governs whether a
+    /// stranger may do anything at all. Nothing about allowing employees to
+    /// run commands implies allowing outsiders onto a screen.
+    ///
+    /// ⚠️ Flipping it on opens nothing on its own: each device still needs an
+    /// admin's approval (gate 2), its owner's local opt-in (gate 3), the
+    /// device-held password (gate 4) and consent (gate 5).
+    #[serde(default)]
+    pub external_rc_enabled: bool,
+
     /// FR-51 — org-wide switch for EPHEMERAL ENROLLMENT KEYS (gate 1 of the
     /// key path). `false` (the default, and what every pre-feature row
     /// deserialises to) means the mint route refuses and — deliberately —
@@ -164,6 +183,7 @@ impl Default for TenantSettings {
             magic_dns_nameservers: Vec::new(),
             remote_exec_enabled: false,
             remote_ssh_enabled: false,
+            external_rc_enabled: false,
             ephemeral_keys_enabled: false,
             plan_enforcement: PlanEnforcement::default(),
         }
