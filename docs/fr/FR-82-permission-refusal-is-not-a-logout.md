@@ -234,8 +234,12 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
       switches rather than guessing".*
 - [ ] **AC8** Field: the reporting member opens the GROX Devices page, the grid
       renders, and the session survives.
-- [ ] **AC9** Field: prod logs show the reconcile's arithmetic once, and a
+- [x] **AC9** Field: prod logs show the reconcile's arithmetic once, and a
       second pod restart reports "already match their definitions".
+      *Verified twice, independently — the arithmetic read live from the leader
+      pod, and the outcome re-measured from Mongo against a before-state taken
+      on the previous image (log below). ⚠️ The two halves did NOT come from
+      the same place, and could not have: see the log's last row.*
 - [x] **AC10** Docs updated/created with diagrams, linked from `docs/README.md`.
       *`docs/permissions.md` (7 sections, 3 mermaid diagrams: the bit catalogue,
       the reconcile's additive merge, and what each refusal means), with its row
@@ -249,6 +253,18 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
   not see the Devices page's enrollment-keys card. Revisit if operators ask.
 - **A bit removed from a definition** does not propagate (see §3). No mechanism
   proposed until there is a real tightening to carry.
+- **The grant's only record is a log line with a pod's lifetime.** Measured
+  after the fact: ~10 minutes post-roll the seven `managed role reconciled`
+  lines were gone from both surviving pods, because `kubectl logs` holds only
+  the current container and the emitting pod had been replaced. The reconcile
+  is one-shot per deployment and self-evidencing in the data *if* someone
+  captured a before-state — but nobody has to, and next time nobody may. The
+  cheap fix is an `audit_logs` row per changed stratum (the collection, its
+  90-day TTL and the writer all already exist); the honest alternative is to
+  drop the comment's promise that the arithmetic is *"readable in `kubectl
+  logs` afterwards"*, because it is not. Not fixed here: this FR shipped, and
+  the choice belongs with whoever wants the audit trail, not with a follow-up
+  that quietly widens the change.
 
 ## Out of scope
 
@@ -260,4 +276,23 @@ read is a coin-flip between "hidden from the owner" and "fires anyway".
 
 ## Field-verification log
 
-_(to be filled — AC8/AC9 need a promoted hosted image.)_
+| Date | What | Result |
+|---|---|---|
+| 2026-09-09 | **BEFORE**, measured on prod Mongo (`roomler2.roles`) while the *previous* image was still serving — so the pass below means something | 72 tenants · 360 managed rows · **12 drift strata**: `admin 0x7ffff7 ×63`, `owner 0xffffff ×63`, `moderator 0x07ef91 ×63`, plus 6 singleton/small strata. The defect reproduced exactly as surveyed |
+| 2026-09-09 | Pre-flight, with a **positive control** (an absent key and a broken `kubectl` look identical) | control `ROOMLER__APP__ENVIRONMENT` → `production`; `RUST_LOG` **absent** ⇒ the compiled `EnvFilter` default applies ⇒ `roomler_ai_api=debug` ⇒ the reconcile's INFO lines can actually reach the log; `ROOMLER__AUTH__RECONCILE_MANAGED_ROLES` **absent** ⇒ defaults on |
+| 2026-09-09 07:35 | Promoted `hosted-20260909-786f016` (from `786f016bf`) | both pods on it, `/health` 200 |
+| 2026-09-09 07:37 | **The arithmetic**, read live from the leader pod | 7 `managed role reconciled to its definition` lines; `admin rows=63 stored=0x7ffff7 gained=0x57000000` ⇒ `MANAGE_AGENTS, REMOTE_CONTROL, VIEW_REMOTE_AUDIT, VIEW_EXEC_AUDIT, VIEW_SSH_AUDIT`. The other pod: `lease held elsewhere` — the leader gate held |
+| 2026-09-09 | **AFTER**, re-measured from Mongo against the before-state | **12 strata → 5**, every managed role at all 72 orgs: `owner 0x7fffffff`, `admin 0x577ffff7`, `moderator 0x207ef91`, `member 0x3cf81`, `guest 0x801` |
+| 2026-09-09 | **AC6 in the field, not just in a unit test** | the granted mask `0x57000000` is bits 24,25,26,28,30 — **bits 27 (`EXEC_DEVICE`) and 29 (`SSH_DEVICE`) are CLEAR**. The one-shot grant across 63 orgs handed out the audit/agent bits and no root shell |
+| 2026-09-09 | The additive rule, on a real custom role | GROX's hand-made `Remote Operator` **untouched at `0x3000000`** — it is not `is_managed`, so it never enters the aggregation |
+| 2026-09-09 | Idempotence | a later leader logged `managed roles already match their definitions groups=5`. ⚠️ A restart is **not** automatically a second run: the first replacement booted inside the previous leader's 120 s lease and correctly skipped |
+| 2026-09-09 | ⚠️⚠️ **The arithmetic no longer exists anywhere** — searched both surviving pods' full logs ~10 min later: zero `managed role reconciled` lines, only the one `already match` | The code's own comment asks for it to be *"readable in `kubectl logs` afterwards"* because this **grants permissions across every tenant**. `kubectl logs` holds only the current container, so the sole record of a one-way, fleet-wide grant has a pod's lifetime. It survived here only because someone was watching live and because a before-state had been captured. See "Open decisions" |
+
+⚠️ **AC8 is still owed and the issue was closed without it.** It needs a member
+who lacks `MANAGE_TENANT`; the owner is the one member of any org the defect
+never hit, so the owner cannot verify it. GROX has **8 non-owner members**, all
+on `member` (`0x3cf81`), any of whom reproduces the original path by opening
+the Devices page. Note the reconcile does **not** make this pass — `MANAGE_TENANT`
+stays out of `DEFAULT_ADMIN` deliberately, so the `ephemeral-key-settings` GET
+still answers 403; AC8 passes because the client no longer treats that as a
+dead session.
