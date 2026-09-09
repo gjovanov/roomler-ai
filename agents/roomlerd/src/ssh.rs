@@ -1016,23 +1016,21 @@ mod sshd {
                 // worked. Every other channel path here — pty, exec, and each
                 // refusal — sends it; the sftp subsystem was the one that did
                 // not.
-                let status = match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    child.wait(),
-                )
-                .await
-                {
-                    Ok(Ok(st)) => st.code().unwrap_or(0).max(0) as u32,
-                    Ok(Err(_)) => 1,
-                    Err(_) => {
-                        // Only now, and the status is the timeout's, not the
-                        // child's — a hung sftp-server must not hang the
-                        // channel too.
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                        1
-                    }
-                };
+                let status =
+                    match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+                        .await
+                    {
+                        Ok(Ok(st)) => st.code().unwrap_or(0).max(0) as u32,
+                        Ok(Err(_)) => 1,
+                        Err(_) => {
+                            // Only now, and the status is the timeout's, not the
+                            // child's — a hung sftp-server must not hang the
+                            // channel too.
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            1
+                        }
+                    };
                 let _ = handle.exit_status_request(channel, status).await;
                 let _ = handle.eof(channel).await;
                 let _ = handle.close(channel).await;
