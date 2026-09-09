@@ -349,11 +349,14 @@ async fn the_grant_leaves_a_record_that_outlives_the_pod_that_made_it() {
     // ADMINISTRATOR bypass. `no_managed_role_below_administrator_seeds_a_root_shell`
     // guards the table; this guards what the migration actually handed out.
     assert!(
-        !names.iter().any(|n| n == "EXEC_DEVICE" || n == "SSH_DEVICE"),
+        !names
+            .iter()
+            .any(|n| n == "EXEC_DEVICE" || n == "SSH_DEVICE"),
         "the reconcile granted a root shell to every org: {names:?}"
     );
     assert_eq!(
-        row.get_i64("gained").unwrap() as u64 & (permissions::EXEC_DEVICE | permissions::SSH_DEVICE),
+        row.get_i64("gained").unwrap() as u64
+            & (permissions::EXEC_DEVICE | permissions::SSH_DEVICE),
         0
     );
 
