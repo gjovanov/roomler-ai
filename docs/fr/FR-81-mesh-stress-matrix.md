@@ -141,3 +141,108 @@ client identity.
 5. The cleanup check grepped for the payload **path**, and PowerShell's not-found error quotes the
    path back — so a clean machine reported `LEFT_BEHIND`. It failed safe; the same shape inverted
    is how real leftovers get reported as gone. It now probes for a token.
+
+### 2026-09-09 — round two: the transfer arm, and two product bugs
+
+The operator enabled SSH on all three corp laptops and placed a client public key in each device's
+`ssh_authorized_keys` — precisely what round one's third finding asked for. Re-running against that
+turned the transfer arm from an accepted `NA` into a measurement, and found two defects in the
+product on the way.
+
+#### Round one's conclusion was only a third right
+
+Round one recorded *"a grant session cannot `scp`, because `roomler proxy` carries no client
+identity."* True as a mechanism — but it was **reasoning, not measurement**: the lane discarded
+scp's stderr, so the missing identity was an inference from the docs rather than something the run
+had seen. With the key in place and stderr kept, **four** independent things had to be right, and
+the identity was one of them.
+
+| # | wall | what it looked like |
+|---|---|---|
+| 1 | **`scp` dials 22; roomler SSH listens on 2222** | `Error: connecting to <ip>:22 … Connection timed out`. OpenSSH hands its port to the ProxyCommand as `%p`, so `roomler proxy` faithfully dialled `:22`. ⚠️ `roomler proxy --help`'s own example has this gap. |
+| 2 | **an identity** | with `-i` + `IdentitiesOnly`: `Authenticated to … (via proxy) using "publickey"`, and the device logs `sftp session started … run_as=daemon privileged=true`. |
+| 3 | **the verdict must be the file, not scp's status** | see the first product bug below |
+| 4 | **`/C:/…` on Windows** | a bare relative destination lands in the sftp default cwd, which is `C:\WINDOWS\system32`. |
+
+#### Product bug 1 — `scp` exits 1 on a transfer that fully succeeded (#1559, merged)
+
+`roomlerd`'s sftp subsystem was the only channel path that never sent an `exit-status`; the pty,
+exec and every refusal do. OpenSSH reads it as the verdict on the transfer, logs `Exit status -1`
+and exits 1:
+
+```
+scp rc=1
+### did it land? (asked over SFTP, SAME identity that wrote it)
+-rw-------    ? 0  0   2097152 Sep  9 21:30 /C:/Windows/Temp/rl-decide.bin
+### sftp GET it back and compare
+SHA MATCH — the upload was COMPLETE and CORRECT
+```
+
+`sftp` was unaffected — it never consults the channel status — which is exactly why this stayed
+invisible. Anything that branches on scp's status retries or aborts work that is already done.
+
+#### Product bug 2 — a corrupt host key wedges a device permanently (#1564 / #1565, merged)
+
+CORPLAP-3 refused every SSH attempt with *"has not published an SSH host key … needs an agent that
+has had SSH enabled at least once (rc.444+)"* — on a device running **0.4.96**, with
+`ssh_enabled = true` and a key present in its config. The stored PEM is corrupt; its boundary line
+against a working sibling:
+
+| device | len | content |
+|---|---|---|
+| CORPLAP-3 | 41 | `-----BEGIN OPENSSH PRIVATE KEY-----\r\r\` |
+| CORPLAP-1 | 35 | `-----BEGIN OPENSSH PRIVATE KEY-----` |
+
+The daemon detects it and fails closed — correct — but the mint was gated on `is_none()`, and
+`Some(garbage)` is not `None`, so it never replaced it. Two restarts (operator-approved) changed
+nothing. ⚠️ The one WARN that explains it sits past the ≤64 KiB tail `roomler logs --grep` reads;
+it took a whole-file `Select-String` to surface.
+
+#### 🔑🔑 The cleanup check has now been wrong in three ways, and all three printed green
+
+1. a path the checker was not looking in (sftp cwd ≠ shell cwd);
+2. a not-found error that **quoted the path back**, so grepping for the path counted the error as a
+   hit;
+3. **an account that could not see the directory at all** — the transfer authenticates from the key
+   list, so it runs as `ssh_account_mode = daemon` (SYSTEM) and writes `C:\Windows\Temp`, while a
+   `roomler ssh` verification is a *grant* session that policy resolves to `console_user`:
+
+```
+--- did it land? ---
+ABSENT
+Test-Path : Zugriff verweigert
+```
+
+Removal and proof now run over SFTP on the transfer's own identity, and an unreadable listing is a
+**third state** (`cleanup=UNVERIFIED`), never scored clean. That state then earned itself on the
+very next run: with no identity the listing could not be read, the check refused to say "gone", and
+a manual SFTP probe with the operator's key confirmed `not found` on both laptops — nothing left
+behind. Under the previous code that situation printed `verified_gone`.
+
+#### Two more harness defects, in this round's own code
+
+6. **`sftp -b` echoes each command**, so its output opens with `sftp> ls -l <path>` — a line whose
+   last field is *also* the path. Matching on the path alone matched the echo first, and `$(NF-4)`
+   on a four-field line is `$0`, so every successful upload would have read `up=no`. Caught by
+   unit-testing the awk against real sftp output before the run produced numbers.
+7. **A readability test asked as the wrong user.** The lane runs as unprivileged `vmtest` while
+   every consumer of the client key runs under `sudo`, and the key is staged 0600 root-only — so
+   `[ -r "$CLIENT_KEY" ]` was false about a key that works. Measured in the live VM:
+   `plain -r : FALSE` / `sudo -r : TRUE`. The same shape as defect 3 above, twenty lines away in
+   the same file: **a permission answer read as an existence answer**, found once and not carried
+   across. Both sites now call one `key_usable()` predicate.
+
+#### Rail change, with operator approval
+
+The standing *"nothing on a corp laptop is configured, restarted, or left behind"* was suspended
+once, explicitly, to restart CORPLAP-3's daemon. The skill now records that enabling SSH on a
+target, or restarting its daemon, is an **operator decision every time** — never inferred from the
+fact that the matrix would be greener.
+
+#### Known limit
+
+CORPLAP-3 cannot transfer files even once #1565 ships: it has no `sftp-server.exe`. roomler spawns
+the platform's binary rather than embedding one, so that a transfer runs as the session's account
+instead of as the daemon — and on Windows that binary ships with the OpenSSH **Server** optional
+feature, which a corp-managed laptop need not have. `Test-Path` reads `False` there and `True` on
+both other laptops.
