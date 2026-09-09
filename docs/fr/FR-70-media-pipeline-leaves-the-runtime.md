@@ -654,6 +654,44 @@ rather than asserted.
 window cadence, and the divergence counter measures exactly how often a
 per-window bitrate would differ from the per-frame one.
 
+### Crux (2) resolved, and what M3 actually contains
+
+**The arithmetic is already extracted.** `encode::rate_profile` exposes 33 pure
+functions, and every piece of the byte gate is among them —
+`constrained_queue_reference_bps`, `constrained_queue_budget_bytes`,
+`direct_queue_budget_bytes`, `direct_queue_hard_budget_bytes`, and
+`direct_gate_trips` (the gate verdict itself). What sits in the frame path is
+not the arithmetic; it is **calling those functions once per frame against live
+shared state** — `governor.pipe_bps(Instant::now(), …)`, the atomics behind the
+wait EMA, and `*target_resolution.lock().unwrap()`.
+
+So the design's stated payoff — "three inline computations become three fields
+of one struct, computed in one place" — overstates the change. The computations
+are already one-liners over pure functions. **M3's real content is ownership and
+cadence: who calls them, on which thread, how often.**
+
+**Which means M3 cannot be a pure refactor, and its two criteria are in tension
+unless the seam is built a particular way.** Criterion 1 wants no governor tick
+in the frame path; criterion 2 wants byte-identical targets. `pre_encode_tick`
+runs per frame and the AIMD's additive increase is a per-frame step, so a plan
+recomputed once per WINDOW necessarily produces different targets — you cannot
+have both.
+
+**The resolution: the control plane must tick at FRAME cadence, not window
+cadence.** The decision moves off the media loop onto its own task, and that
+task runs at the rate the pump produces frames; the loop reads the published
+plan and never ticks anything. Criterion 1 is then about *where* the decision
+runs, not *how often* — and criterion 2 survives, because the cadence is
+preserved. The `Plan` is therefore a ~30 Hz object, not a ~1 Hz one; the
+`epoch` field earns its place (most republishes are identical and cost the
+reader nothing), and "one writer, one reader, one cell" still holds.
+
+⚠️ **Consequence for M3a**: the shadow must compare at FRAME cadence, and it is
+a PURITY check — call the extracted producer with the inputs the pump has at
+that instant and assert it equals the inline value — not a cadence check. A
+window-cadence shadow would diverge by construction, so its counter could never
+reach fleet-zero and would gate nothing.
+
 ## Acceptance criteria
 
 - [ ] **AC1** — capture/scale/encode run on a dedicated thread; the async runtime
