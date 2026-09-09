@@ -70,6 +70,7 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
 | P1 | Daemon-as-supervisor: spawn + babysit + session-change respawn. Worker still enrolled — nothing changes for the server yet. | `macos_supervise_gui_worker` (default **off** ⇒ today's two independent halves) |
 | P2 | Session delegation: the daemon's WS accepts an rc session and drives the worker over LocalAPI. | per-session fallback — delegation failure re-serves from the worker's own enrollment |
 | P2c | The daemon's row advertises the WORKER's `permissions`, so the dashboard stops calling a working capture target "not a capture target". | caps are only ever sent when they CHANGE; absent field = today's behaviour |
+| P2d | The installer stops reverting P2 on every update: with the daemon supervising, the `.pkg` no longer re-bootstraps the per-user LaunchAgent. | the guard needs BOTH the daemon opt-in and `macos_supervise_gui_worker = true`; either absent = today's behaviour byte-for-byte |
 | P3 | Collapse the enrollment: installer mints ONE token; existing two-row Macs migrate. | `--daemon-token` keeps working (two-row install stays reachable for a release) |
 
 ## P2 design — session delegation over LocalAPI
@@ -321,6 +322,58 @@ shape as [`crate::power::PowerKeeper`].
 | server | accept caps on a heartbeat, update the hub's `AgentConn` and the `agents` row |
 | UI | none — it already renders `permissions` |
 
+## P2d — the installer stopped reverting P2 on every update
+
+**P2 had a half-life of one release, and the release was the thing that ended
+it.** `macos_supervisor::decide` stands down whenever
+`gui/<uid>/com.roomler.agent` is loaded — correctly, since the loser of that
+race must be the supervisor rather than the enrolled agent. The `.pkg`'s
+`postinstall` then re-bootstrapped that exact label unconditionally, so every
+package update handed the GUI worker back to launchd and disarmed delegation.
+The daemon's row went back to advertising a capture target it cannot serve, and
+a controller connecting to it got the black-screen-with-working-input symptom
+this FR exists to remove.
+
+The operator's remedy (`launchctl bootout gui/<uid>/com.roomler.agent`, which
+the daemon's own log tells them to run) survived exactly until the next update —
+and an update is precisely when nobody is watching.
+
+Neither half was wrong on its own; nothing connected them. The supervisor knew
+about the LaunchAgent, and the installer had never heard of the supervisor.
+
+**The guard** (`agents/roomlerd/packaging/macos/postinstall`): when the root
+daemon is opted in **and** its config carries
+`macos_supervise_gui_worker = true`, the LaunchAgent is booted out and its plist
+removed, and the daemon owns the worker.
+
+- It reads the daemon's **own config** rather than a marker file of the
+  installer's own. That key is the one `decide()` acts on, so the installer and
+  the supervisor cannot disagree about who owns the worker; a marker would be a
+  second source of truth for one fact.
+- It **removes the plist** rather than merely skipping the bootstrap. A plist
+  left in `~/Library/LaunchAgents` is loaded by launchd at the next login, so
+  skipping alone would postpone the breakage by one login instead of ending it.
+- ⚠️ It is **interlocked with the daemon opt-in**, and that interlock is the
+  load-bearing half. Honouring the config key without a daemon to supervise
+  would strip the LaunchAgent off a Mac that then installs no daemon either —
+  no capture, no input, nothing to supervise. Only one of the six
+  daemon × key states changes behaviour; the other five are today's path
+  byte-for-byte.
+- The dual-read behind the daemon opt-in is now **one function with two
+  callers** (`daemon_is_enabled`). Two copies that drifted into disagreeing
+  would produce exactly the stripped-worker Mac above — the same
+  two-divergent-definitions shape that froze every managed role in FR-82.
+- Booting the job out is **not a new hazard**: `replace_launchd_service` has
+  always booted this label out as its first act. The change is that it is no
+  longer bootstrapped back.
+
+⚠️ `agents/roomlerd/packaging/macos/postinstall` had **no `.gitattributes`
+rule**, only `core.autocrlf` on one developer's box. It has no extension, so
+`scripts/*.sh` never matched it, and the rule written for the dpkg maintainer
+scripts — *"`#!/bin/sh\r` … fails to configure on EVERY host"* — had no macOS
+counterpart despite the identical failure mode under PackageKit. Pinned
+`text eol=lf` alongside this change.
+
 ## Acceptance criteria
 
 - [ ] A fresh install with **one** token produces **one** device row, and that row serves
@@ -340,6 +393,14 @@ shape as [`crate::power::PowerKeeper`].
 - [ ] P2c: a device with no worker (every non-macOS agent, and a macOS one with
       the switch off) sends no `caps` on its heartbeats at all — measured on the
       wire, not inferred from behaviour.
+- [ ] P2d: a supervised Mac takes a package **update** and delegation is still
+      armed afterwards — `gui/<uid>/com.roomler.agent` is not loaded, the plist
+      is gone from `~/Library/LaunchAgents`, and a session started after the
+      update streams real pixels. This is the criterion the old build fails, so
+      measure it on the CURRENT release first.
+- [ ] P2d: a Mac with the daemon opted in but the supervise key **absent** takes
+      the same update and keeps its LaunchAgent — the five unchanged states are
+      what makes this safe to ship to every Mac, not just the supervised one.
 - [ ] `kill -9` on the GUI worker respawns it within 10 s **without** the control WS
       dropping (measured: the device row never goes offline).
 - [ ] An existing two-row Mac migrates to one row keeping its overlay address, and the
