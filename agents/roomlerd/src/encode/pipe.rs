@@ -47,12 +47,42 @@
 //! collapse target was a 6 Mbps capacity sample on a path that had just
 //! delivered far more.
 //!
-//! So: a floor is never allowed to lower the belief, and the belief is never
+//! So: a floor is never allowed to lower the anchor, and the anchor is never
 //! `None` once anything has been delivered.
 //!
 //! ⚠️ The floor is a MAX over a recent window, not an average. An average of
 //! delivered rates measures the CONTENT (an idle desktop sends ~300 kbps
 //! through a gigabit path); only the peak says anything about the path.
+//!
+//! # ⚠️⚠️ The two questions are NOT interchangeable, and the API says so
+//!
+//! There is deliberately no single `believed_bps()`. The first shadow session
+//! showed why, within minutes of shipping — CORPLAP-1 on `relay:derp/tcp`,
+//! `0.4.98`, an idle desktop:
+//!
+//! ```text
+//! goodput_bps=None  goodput_samples=(0, 0)
+//! pipe_belief=(Some(1802656), Some(1802656), None)   pipe_belief_n=(35, 0)
+//! target_bps=3000000   viewer_age_ms=Some(59)
+//! ```
+//!
+//! 35 deliveries, ZERO capacity samples, nothing congested, paint age 59 ms —
+//! a perfectly healthy session. A rule that read `1,802,656` as "the pipe"
+//! would have computed `3.0 M > 1.2 × 1.8 M` and concluded the session was
+//! overdriving. It was not: 1.8 Mbps is what an idle desktop WEIGHS, and the
+//! path was never asked for more.
+//!
+//! So each consumer must name its question:
+//!
+//! | question | accessor | `None` means |
+//! |---|---|---|
+//! | *"am I sending more than this path will take?"* (FR-79 V5) | [`Pipe::capacity_bps`] | no push-back ⇒ **no claim to contradict** ⇒ do not cut |
+//! | *"what may the ceiling be?"* (FR-74 P5) | [`Pipe::ceiling_anchor_bps`] | nothing measured ⇒ fall back to the bpp bound |
+//! | *"what has this path already proven?"* | [`Pipe::floor_bps`] | — |
+//!
+//! A floor is a LOWER BOUND. It says the path carried at least X. It never
+//! says the path would refuse X + 1, and no amount of idle delivery makes it
+//! say that.
 
 use std::time::{Duration, Instant};
 
@@ -122,12 +152,27 @@ impl Pipe {
             .map(|(bps, _)| bps)
     }
 
-    /// What the path carries, best available answer.
+    /// The anchor a CEILING may be built on: the most this path has been shown
+    /// to be worth, from either kind of evidence.
     ///
     /// ⚠️ `max`, never `min`. A capacity estimate below something the path has
     /// just been shown to deliver is the estimate being wrong, not the
     /// delivery: the bytes arrived. Reading it the other way is symptom 2.
-    pub fn believed_bps(&self, now: Instant) -> Option<u32> {
+    ///
+    /// ⚠️⚠️ **This is NOT the number to compare a target against when asking
+    /// "am I sending more than this path can take?"** — use
+    /// [`Self::capacity_bps`] for that, and accept `None` as "no claim to
+    /// contradict". A floor is a LOWER BOUND: it says the path carried at
+    /// least X, never that it would refuse X + 1.
+    ///
+    /// Measured the day this type shipped, CORPLAP-1 on `relay:derp/tcp`,
+    /// `0.4.98`: an idle desktop gave `floor = 1,802,656` from 35 deliveries
+    /// and ZERO capacity samples, while the target sat at 3,000,000. Nothing
+    /// had pushed back and nothing was wrong — but a rule reading this as
+    /// "the pipe" would have found 3.0 M > 1.2 × 1.8 M and cut a session that
+    /// was never overdriving anything. The floor was the CONTENT's weight, not
+    /// the path's limit.
+    pub fn ceiling_anchor_bps(&self, now: Instant) -> Option<u32> {
         match (self.capacity_bps(now), self.floor_bps(now)) {
             (Some(c), Some(f)) => Some(c.max(f)),
             (c, f) => c.or(f),
@@ -161,7 +206,7 @@ mod tests {
         p.observe_delivered(1_200_000, now + Duration::from_secs(1));
         assert_eq!(p.capacity_bps(now + Duration::from_secs(1)), None);
         assert_eq!(
-            p.believed_bps(now + Duration::from_secs(1)),
+            p.ceiling_anchor_bps(now + Duration::from_secs(1)),
             Some(1_200_000),
             "the belief falls back to what was demonstrably delivered"
         );
@@ -177,7 +222,7 @@ mod tests {
         p.observe_delivered(20_000_000, now);
         p.observe_capacity(6_028_814, now + Duration::from_secs(1));
         assert_eq!(
-            p.believed_bps(now + Duration::from_secs(1)),
+            p.ceiling_anchor_bps(now + Duration::from_secs(1)),
             Some(20_000_000),
             "the bytes arrived; the estimate is what is wrong"
         );
@@ -192,7 +237,7 @@ mod tests {
         p.observe_delivered(1_050_000, now);
         p.observe_capacity(1_058_145, now + Duration::from_secs(1));
         assert_eq!(
-            p.believed_bps(now + Duration::from_secs(1)),
+            p.ceiling_anchor_bps(now + Duration::from_secs(1)),
             Some(1_058_145)
         );
     }
@@ -237,11 +282,42 @@ mod tests {
         );
     }
 
+    /// The first shadow session, verbatim: CORPLAP-1 on `relay:derp/tcp`,
+    /// `0.4.98`, an idle desktop. 35 deliveries, ZERO capacity samples, target
+    /// 3,000,000, paint age 59 ms — healthy.
+    ///
+    /// The anchor has a number (a ceiling may be built on it), but the
+    /// over-drive question must still answer `None`: nothing pushed back, so
+    /// there is no claim to contradict. Reading the anchor instead would have
+    /// cut a session that was never overdriving — the floor is what the
+    /// CONTENT weighed.
+    #[test]
+    fn a_healthy_idle_session_offers_a_ceiling_anchor_but_no_overdrive_verdict() {
+        let now = t0();
+        let mut p = Pipe::default();
+        for i in 0..35 {
+            p.observe_delivered(1_802_656, now + Duration::from_millis(i * 500));
+        }
+        let t = now + Duration::from_millis(35 * 500);
+        assert_eq!(p.counts(), (35, 0), "35 deliveries, no push-back");
+        assert_eq!(
+            p.ceiling_anchor_bps(t),
+            Some(1_802_656),
+            "a ceiling may be anchored on what was demonstrably delivered"
+        );
+        assert_eq!(
+            p.capacity_bps(t),
+            None,
+            "but NOTHING pushed back, so there is no capacity claim — and a \
+             target of 3,000,000 here is not evidence of overdriving"
+        );
+    }
+
     /// Nothing observed at all is still `None` — the honest answer before the
     /// first frame, and the one FR-79 V5 reads as "no claim to contradict".
     #[test]
     fn an_untouched_pipe_believes_nothing() {
-        assert_eq!(Pipe::default().believed_bps(t0()), None);
+        assert_eq!(Pipe::default().ceiling_anchor_bps(t0()), None);
         assert_eq!(Pipe::default().counts(), (0, 0));
     }
 
@@ -253,7 +329,7 @@ mod tests {
         let mut p = Pipe::default();
         p.observe_delivered(0, now);
         p.observe_capacity(0, now);
-        assert_eq!(p.believed_bps(now), None);
+        assert_eq!(p.ceiling_anchor_bps(now), None);
         assert_eq!(p.counts(), (0, 0));
     }
 }
