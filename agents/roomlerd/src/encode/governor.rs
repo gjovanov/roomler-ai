@@ -472,7 +472,7 @@ impl RateGovernor {
     /// which on the relay hosts is most of them.
     pub fn belief_bps(&self, now: Instant) -> (Option<u32>, Option<u32>, Option<u32>) {
         (
-            self.belief.believed_bps(now),
+            self.belief.ceiling_anchor_bps(now),
             self.belief.floor_bps(now),
             self.belief.capacity_bps(now),
         )
