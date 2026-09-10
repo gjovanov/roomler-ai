@@ -4294,6 +4294,13 @@ async fn media_pump_vp9_444_dc(
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 evidence_rejected = ?governor.evidence_rejected(),
+                // FR-79 V3b (SHADOW) — the ONE belief beside the old composition:
+                // believed / demonstrated floor / pushed-back capacity, and the
+                // (deliveries, capacities) that produced them. Nothing reads these
+                // yet; they exist so the field can say whether the belief is sane
+                // before a loop acts on it.
+                pipe_belief = ?governor.belief_bps(std::time::Instant::now()),
+                pipe_belief_n = ?governor.belief_counts(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
                 // FR-59 P1 — see the FFmpeg pump's heartbeat.
                 slow_link_floor_bps = ?governor.relieved_floor_bps(),
@@ -7692,6 +7699,13 @@ async fn media_pump_ffmpeg_dc(
                 pipe_state = ?governor.pipe_state().map(|s| s.as_str()),
                 pipe_states = ?governor.pipe_state_counts(),
                 evidence_rejected = ?governor.evidence_rejected(),
+                // FR-79 V3b (SHADOW) — the ONE belief beside the old composition:
+                // believed / demonstrated floor / pushed-back capacity, and the
+                // (deliveries, capacities) that produced them. Nothing reads these
+                // yet; they exist so the field can say whether the belief is sane
+                // before a loop acts on it.
+                pipe_belief = ?governor.belief_bps(std::time::Instant::now()),
+                pipe_belief_n = ?governor.belief_counts(),
                 pipe_gap_stalls = governor.pipe_gap_stalls(),
                 // FR-59 P1 — the floor actually in force once the measured
                 // pipe has been shown to sit under the nominal legibility
