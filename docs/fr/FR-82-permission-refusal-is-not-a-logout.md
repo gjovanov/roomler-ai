@@ -407,3 +407,39 @@ was written from production *before* the merge, and `DEFAULT_ADMIN =
 63-org group's move was **falsifiable**, and anything other than a gain of
 `0x57000000` would have been exec-as-SYSTEM spreading across 63 organisations
 at one boot. A prediction that could not have failed would have proved nothing.
+
+## AC11 in production — deployed 2026-09-10, and what it cannot show
+
+`hosted-20260910-dc54fc9` (master `dc54fc98a`, version `0.4.97`) promoted and
+rolled; both pods ready, `/health` 200 with all six modules, 17 fleet peers back
+on the overlay after the WS cycle, and the shipped bundle still carries the
+fixed 403 rule (`status===403 && …==="GET"` → **0 occurrences**,
+`not_a_member` branch present).
+
+| | before the roll | after |
+|---|---|---|
+| image | `hosted-20260909-786f016` | `hosted-20260910-dc54fc9` |
+| `role_reconcile_audit` | **does not exist** | **does not exist** |
+| managed-role strata | 5, all 72 orgs | 5, all 72 orgs |
+| leader pod | — | `managed roles already match their definitions groups=5` |
+| other pod | — | `Startup maintenance lease held elsewhere` |
+
+⚠️⚠️ **The zero rows are the predicted result, and they are also the limit of
+this test.** The deployment had already converged on 2026-09-09, so there was
+nothing for the reconcile to grant and therefore nothing to record — the
+collection is not merely empty, it does not exist, because Mongo creates
+lazily on first insert. So this roll proves the code is live, the leader gate
+holds and the idempotent path is quiet; it proves **nothing about the writer**.
+
+That is the same shape as AC8's caveat above, and it is stated for the same
+reason: a reader seeing AC11 ticked should not infer it was field-exercised the
+way AC9 was. The writer's evidence is
+`the_grant_leaves_a_record_that_outlives_the_pod_that_made_it`, which runs
+against real MongoDB in the integration lane. Its **field** exercise is
+deferred, by design, to the next boot after a bit is added to `MANAGED_ROLES` —
+and manufacturing a permission grant across 72 production organisations to test
+the audit of permission grants would cost more than the evidence is worth.
+
+🔑 Two acceptance criteria in one FR now carry "green, but through a different
+path than the wording implies". Neither was caught by the test that produced
+the green; both were caught by asking *which layer actually made this pass*.
