@@ -74,6 +74,7 @@ never edits a spec, never touches an issue.
 | 4 | **docs** | mermaid + a `docs/README.md` row, **in the same PR** | `pr_open` |
 | 5 | **verify** | the real field read — the skill that covers this pillar | `field` |
 | 6 | **park** | tick agent ACs with evidence links, update card, push board | `ready` |
+| 7 | **reap** | on the next `scan` after the issue closes: archive the card, then remove its `ap-` worktree once **every** issue that used it is closed | `closed` |
 
 ## Safety rails (do not violate)
 
@@ -94,6 +95,14 @@ never edits a spec, never touches an issue.
    operator's: 1043 local branches exist, and staleness is not something this can infer.
 6. **Never delete a worktree or branch it did not create.** 62 worktrees and 1043 local
    branches predate this skill. Report them; prune nothing.
+   **The one exception is reaping its own**, and it is narrow by construction: `scan`
+   removes a worktree only when *all three* hold — the basename starts with `ap-`, a card
+   records that exact path in `run.worktree` (proof this skill made it, rather than a
+   guess from a name anyone could pick), and **every** issue that used it is closed. It
+   then calls `git worktree remove` **without `--force`**, so git itself refuses on
+   uncommitted changes and the refusal is reported rather than overridden. ⚠️ A worktree
+   can serve several FRs — one still-open issue keeps it. Branches are never deleted, only
+   worktrees: a branch costs nothing and may be the only record of an abandoned attempt.
 7. **Pillar work runs at the top tier.** Anything touching remote desktop, the overlay or
    WebRTC is `CLAUDE.md` §3 work. Budget decides *whether a worker starts and when it
    stops* — never *which model runs it*. A worker that exhausts its budget parks the card
