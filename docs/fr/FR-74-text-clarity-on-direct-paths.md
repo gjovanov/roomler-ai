@@ -335,6 +335,7 @@ now nothing on screen said whether the frame that came back actually matched the
 | P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | **retired by measurement 2026-09-07** — after P1 the rate ladder no longer fires on direct paths: 0 rate swaps in all 17 sessions on the three hosts today (QSV direct on CORPLAP-1/-3, nvenc relay on CORPLAP-2; the 2026-09-06 baseline had 37 in 11 min). Reopen only if a relay-path QSV session shows swaps |
 | P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07, released in 0.4.80** — offline: every notch frame at q 64 instead of 255, refine to lossless kept; field gate: **instrument PASS 13:25 UTC** (`max_qp` 64 in every scroll window, was 255; settles to q 0; 0 skips) and **operator PASS** ("scrolling large texts seems much better") ⇒ **field-verified 2026-09-07**; thin direct path measured 20:08 UTC — sharp but laggy below the cap's ~10 Mbps floor (§P3), an open decision |
 | P4 | viewer display-scale pill + 1:1 guidance: screen pixels per remote pixel, `1:1 pixels` or `shown at 1.05×`, the way to 1:1 in the tooltip and the Display tab (§P4) | — (UI; the pill has its own metrics checkbox) | **built 2026-09-08 (#1497), field-verified the same morning** on `hosted-20260908-a6257b8`: `shown at 1.05×` in Adaptive = the FSR canvas exactly (2018 ÷ 1920), `1:1 pixels` at Custom zoom 100/dpr % with FSR disengaging on its own; docs `docs/remote-control.md` §18.6.1 |
+| P5 | **the direct ceiling FOLLOWS the measured path** — `clamp(believed × HEADROOM, legibility_floor, bpp_bound)`; the bpp product stops being the operating point and becomes a cap (§"P5 — the ceiling follows the path") | — (the belief itself is the way back: with no belief the bound still applies, which is today's behaviour byte for byte) | **decided 2026-09-10, not built.** Gated on FR-79 V3b's belief reading sane in the field first — the shadow ships before the law |
 
 ## Acceptance criteria
 
@@ -365,12 +366,125 @@ now nothing on screen said whether the frame that came back actually matched the
 
 ## Open decisions
 
-- Whether the direct ceiling should stay bpp-scaled at all (a higher constant is
-  still a constant) or be purely measured — probe-and-follow.
+- ~~Whether the direct ceiling should stay bpp-scaled at all (a higher constant is
+  still a constant) or be purely measured — probe-and-follow.~~
+  **DECIDED 2026-09-10: probe-and-follow. The constant becomes a BOUND, never
+  the operating point.** See §"P5 — the ceiling follows the path" below.
 - Whether a 4:4:4 "text" choice is worth offering at all on hosts whose hardware
   encodes 4:2:0 only (software VP9 at a fraction of the frame rate).
 - Whether P1's ceiling lift needs the viewer's decode capacity as an input (a 24 Mbps
   AV1 stream on a laptop decoder).
+
+## P5 — the ceiling follows the path (decided 2026-09-10, not yet built)
+
+### The field case that decides it
+
+**Regal-Elena-PZ, 2026-09-10, session `6aa286e4`** — 1920×1080 HEVC over a
+DIRECT carrier, paint age 6–11 ms the whole way, reported by the operator as
+*"started very blurred and it took maybe over 5s to clear up"*.
+
+Two things were wrong, and only the second is this FR's.
+
+**The opener (~6 s).** The session opened `constrained=true` and was clamped to
+the 2,550,000 relay nominal, because the ICE pair nominated the OVERLAY
+addresses and the overlay carrier under them was DERP at that instant — a
+demote-follow had fired six seconds earlier and the direct probes had just
+missed their deadline:
+
+```
+10:30:54  overlay: peer is relaying to us over /derp … following it onto DERP (demote-follow)
+10:30:59  overlay: direct probe did not handshake within deadline; kept relay
+10:31:01  selected pair: 100.65.4.26:50695 <-> 100.65.4.2:51996     ← overlay addresses
+10:31:01  overlay carrier under the nominated pair is not direct — treating transport as constrained
+10:31:07  constrained=false
+```
+
+The clamp is correct *given* the verdict; the verdict was stale by the time
+pixels flowed. That belongs to the carrier plane, not here.
+
+**The sawtooth (the rest of the session).** After the flip, the target
+oscillated for hours:
+
+| time | target | note |
+|---|---|---|
+| 10:31:33 | 4,471,680 | climbing |
+| 10:33:04 | 34,284,491 | |
+| 10:33:34 | **5,281,379** | collapse |
+| 10:35:36 | 38,880,000 | ceiling — **4.5 minutes** after session start |
+| 10:40:10 | **6,063,469** | collapse again |
+
+`goodput_bps` for that session: **6,028,814**. The collapses land on it almost
+exactly. The ceiling resolved to **38,880,000** — a product of constants
+(`ffmpeg_maxrate_bps_scaled`: geometry × fps × 0.25 bpp/s, scaled by the codec
+and chroma factors and clamped into [3, 48] M × factor) with **no measurement
+anywhere in it**. It sat ~6.5× above what the path delivered.
+
+So the additive increase climbs to a constant the path cannot serve, the sends
+block, the decrease collapses to the measurement, and it repeats every two to
+three minutes. **Every collapse is a visible softening** — the operator's
+report is the opening instance of a recurring pattern, not a one-off.
+
+That is this FR's own open decision, in the field: *a higher constant is still
+a constant.* P1 raised it from 0.07 to 0.25 bpp/s and that removed the blur on
+the hosts P1 was measured on; it could not remove the class, because the number
+still owes nothing to the path.
+
+### The decision
+
+**The ceiling FOLLOWS the measured path. The bpp product becomes a safety
+bound it may never exceed, not the operating point.**
+
+```
+ceiling = clamp(believed × HEADROOM,          // follow
+                legibility_floor,             // FR-59 P1's relief
+                bpp_bound)                    // today's constant, now a CAP
+```
+
+- `believed` is `encode::pipe::Pipe::believed_bps()` (FR-79 V3b) — the
+  demonstrated floor when nothing has pushed back, the pushed-back capacity
+  when something has, and never `None` once bytes have arrived.
+- `HEADROOM` is the probe: enough above the belief to discover growth, not
+  enough to flood. The sawtooth's amplitude becomes the headroom (tens of
+  percent) instead of 650 %.
+- `bpp_bound` still protects the decoder and the TURN path — a laptop decoder
+  is a real limit (see the third open decision) and a constant is the right
+  shape for a bound. It is simply not the right shape for a target.
+
+⚠️ **Why the belief's FLOOR half is load-bearing here.** A ceiling that
+followed the blocked-send goodput alone would have pinned this session at
+6,028,814 — pessimistic on a path that had demonstrably delivered far more, and
+the mirror of the current defect. Following `believed` (which takes the MAX of
+capacity and demonstrated delivery) cannot make that mistake.
+
+⚠️ **Probing is not optional.** With no probe the ceiling can only ever ratchet
+down: the encoder never offers more than the ceiling, so the path never
+demonstrates more, so the belief never rises. The headroom IS the probe, and it
+must survive a quiet stretch — which is why the belief's floor is a max over a
+window rather than an average.
+
+### Sequencing — and why P5 is NOT built in the same breath
+
+FR-79 V3b ships the belief in **shadow** first: computed, reported in both pump
+heartbeats as `pipe_belief=(believed, floor, capacity)`, read by nothing. P5
+flips the ceiling onto it only once the field says the belief is sane —
+specifically that on a direct session `believed` tracks what the path carries
+rather than the content, and that on the relay hosts it stops being `None`.
+
+Shipping a new ceiling law on an unvalidated estimate would be the same mistake
+twice in two days: FR-79 V5 shipped a rule whose input (`blocked_send_bps`) was
+silent on the hosts that needed it, and the fleet had to tell us.
+
+### Acceptance for P5 (to be written into the criteria when built)
+
+1. On the Regal cell, `target_bps` tracks within the headroom of
+   `pipe_belief.believed` instead of oscillating between the measurement and
+   the constant; no collapse larger than the headroom.
+2. Time-to-usable falls: the 4.5 minutes this session took to first reach its
+   ceiling is a ceiling-chasing artefact, and following the belief removes the
+   chase.
+3. A genuinely fast path is NOT capped at what an idle desktop happened to
+   deliver — the probe discovers growth within a bounded number of windows.
+4. The bpp bound still binds where it should: a decoder-limited viewer.
 
 ## Out of scope
 
