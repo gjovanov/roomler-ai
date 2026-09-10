@@ -84,19 +84,32 @@ is minutes not hours.
 
 ## Acceptance criteria
 
-- [ ] **AC1** a throwaway VM enrolls into the fleet org, appears on the mesh, and is fully removed
+- [x] **AC1** a throwaway VM enrolls into the fleet org, appears on the mesh, and is fully removed
       at teardown (device row gone, VM destroyed, fleet count back to baseline).
-- [ ] **AC2** every target's carrier is recorded with `why` evidence, and each is asserted against
+      *Both cells: `fleet-residue PASS — back to 21 devices (baseline 21), no ghost left`, plus
+      `teardown/org-baseline` on both orgs and no VM on zeus.*
+- [x] **AC2** every target's carrier is recorded with `why` evidence, and each is asserted against
       what that host can actually achieve — never a fixed expectation.
-- [ ] **AC3** latency is reported as a distribution (p50/p95/max/loss), not a single ping.
-- [ ] **AC4** bulk transfer completes in both directions with a verified sha256, and yields a
+      *`VMTEST-CARRIER` per target, `roomler why` captured to `/tmp/why-<t>.txt`, and the verdict
+      is reachability + stability, never which carrier won.*
+- [x] **AC3** latency is reported as a distribution (p50/p95/max/loss), not a single ping.
+      *40 samples × 5 targets × 2 arms; 0.0 % loss on every one.*
+- [x] **AC4** bulk transfer completes in both directions with a verified sha256, and yields a
       throughput number per arm.
-- [ ] **AC5** SSH session establishment is exercised repeatedly and reported as a success rate.
-- [ ] **AC6** carrier transitions are counted over the run — the stability claim gets a number.
-- [ ] **AC7** the relay arm is *forced*, not hoped for, and the direct arm proves the forcing knob
+      *32 MiB round trip, sha256 verified, on CORPLAP-1 and CORPLAP-2 in both arms
+      (0.36–0.41 MiB/s). CORPLAP-3 reports `target-has-no-sftp-server`; zeus and mars serve no
+      SSH at all — each named, none silent.*
+- [x] **AC5** SSH session establishment is exercised repeatedly and reported as a success rate.
+      *3/3 on all three corporate laptops in both arms — including CORPLAP-3, which had never
+      produced a successful session in this lane before #1565.*
+- [x] **AC6** carrier transitions are counted over the run — the stability claim gets a number.
+      *`carrier_transitions=0` on all ten (target × arm) pairs across ~3 ¼ hours.*
+- [x] **AC7** the relay arm is *forced*, not hoped for, and the direct arm proves the forcing knob
       changed something.
-- [ ] **AC8** the whole sweep runs from one command and is documented in a skill.
-
+      *mars: `carrier=direct` p50 0 ms in the direct arm → `carrier=relay:derp/tcp` p50 2 ms in the
+      relay arm. Same VM image, same target, one config key.*
+- [x] **AC8** the whole sweep runs from one command and is documented in a skill.
+      *`vmtest.sh run --lane stress --host zeus`; the `meshstress` skill carries eleven traps.*
 ## Out of scope
 
 Tuning anything. This measures; it does not fix. Also: no carrier pinning on any host but the
@@ -246,3 +259,47 @@ the platform's binary rather than embedding one, so that a transfer runs as the 
 instead of as the daemon — and on Windows that binary ships with the OpenSSH **Server** optional
 feature, which a corp-managed laptop need not have. `Test-Path` reads `False` there and `True` on
 both other laptops.
+
+#### Result — 24 PASS / 0 FAIL, run `20260909-204509`
+
+| target | arm | carrier | loss | p50 | p95 | max | SSH | 32 MiB round trip | transitions |
+|---|---|---|---|---|---|---|---|---|---|
+| CORPLAP-1 | direct | relay:derp | 0 % | 55 | 79 | 247 | 3/3 | ✅ 0.37 / 0.36 MiB/s · `scp_rc=1` | 0 |
+| CORPLAP-1 | relay | relay:derp | 0 % | 55 | 135 | 265 | 3/3 | ✅ 0.36 / 0.36 · `scp_rc=1` | 0 |
+| CORPLAP-2 | direct | relay:derp | 0 % | 57 | 105 | 199 | 3/3 | ✅ 0.41 / 0.34 · `scp_rc=0` | 0 |
+| CORPLAP-2 | relay | relay:derp | 0 % | 56 | 131 | 289 | 3/3 | ✅ 0.40 / 0.34 · `scp_rc=0` | 0 |
+| CORPLAP-3 | direct | relay:derp | 0 % | 46 | 82 | 95 | 3/3 | ⛔ no `sftp-server` | 0 |
+| CORPLAP-3 | relay | relay:derp | 0 % | 46 | **50** | 89 | 3/3 | ⛔ no `sftp-server` | 0 |
+| zeus | direct | relay:derp | 0 % | 2 | 8 | 27 | `ssh_enabled=false` | — | 0 |
+| zeus | relay | relay:derp | 0 % | 2 | 2 | 29 | `ssh_enabled=false` | — | 0 |
+| mars | **direct** | **direct** | 0 % | **0** | 0 | 0 | no host key published | — | 0 |
+| mars | **relay** | **relay:derp** | 0 % | 2 | 3 | 6 | no host key published | — | 0 |
+
+Zero loss on every target in both arms, and `carrier_transitions=0` on all ten pairs over ~3 ¼
+hours — the number that separates a mesh which connects once from one that holds.
+
+#### The matrix verified #1559 on its own, by accident and then on purpose
+
+`agent-v0.4.97` rolled **during** the run, so the fleet was mid-rollout and `scp_rc` — added to the
+metric as standing evidence rather than a one-off check — captured both sides:
+
+| CORPLAP-1, the SAME device | agent | `scp_rc` | bytes |
+|---|---|---|---|
+| direct arm | 0.4.96 | **1** | `up=yes sha_match=yes` |
+| relay arm | 0.4.96 | **1** | `up=yes sha_match=yes` |
+| targeted re-test after its update | **0.4.97** | **0** | `remote_size=2097152 sha_match=yes` |
+
+Three measurements on one laptop, one variable. The two 0.4.96 rows also rule out a timing race:
+a race would vary *within* a device across arms, and it does not.
+
+⚠️ The between-device comparison (CORPLAP-1 vs CORPLAP-2) came first and was the **weak** form —
+two laptops differ in more than their agent version. It is recorded because it is what prompted the
+within-device test, not because it settled anything.
+
+#### Residue, checked as the identity that could actually see it
+
+`cleanup=verified_gone` on CORPLAP-1/2 over SFTP; on CORPLAP-3 **neither identity reachable from
+inside the VM can look** (sftp cannot start, and a `roomler ssh` grant session is `console_user`,
+denied on `C:\Windows\Temp`), so it correctly reported `UNVERIFIED` and was checked from mars with
+`roomler exec`, which runs as the daemon: **0 files** matching `roomler-stress*`. zeus and mars: 0.
+Fleet org back to 21 devices, zero ghosts, no VM on zeus, k8s untouched.
