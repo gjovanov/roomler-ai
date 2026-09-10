@@ -55,11 +55,28 @@
           class="mt-4"
           hide-details
         />
-        <div class="text-caption text-medium-emphasis mb-4">
+        <v-alert
+          v-if="coercedFromConsoleUser"
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mt-2"
+        >
+          This device had been set to <strong>the signed-in user</strong>, which only exists
+          on Windows — the agent refuses it here, so every session was failing at connect
+          time. Pick an account and save to fix it.
+        </v-alert>
+        <div v-if="isWindows" class="text-caption text-medium-emphasis mb-4">
           <strong>The signed-in user</strong> is the least surprising choice on
           a workstation. <strong>The daemon account</strong> means
           <strong>SYSTEM</strong> on Windows and <strong>root</strong> under
           systemd — choosing it grants root on this device.
+        </div>
+        <div v-else class="text-caption text-medium-emphasis mb-4">
+          <strong>A named account</strong> is the least surprising choice here.
+          <strong>The daemon account</strong> means <strong>root</strong> under
+          systemd — choosing it grants root on this device. "The signed-in user"
+          is not offered: it needs a Windows console session token.
         </div>
 
         <v-text-field
@@ -173,23 +190,35 @@ const error = ref('')
 const agent = computed(() => props.agent)
 const orgDisabled = computed(() => agentStore.orgSshEnabled === false)
 
+/** `console_user` is a WINDOWS concept — it is `WTSQueryUserToken` +
+ *  `CreateProcessAsUserW`, and the agent refuses it outright on Unix
+ *  (`agents/roomlerd/src/exec.rs`, `pty/unix.rs`). Offering it on a Linux or
+ *  macOS device produces a policy no agent can ever honour, and the failure
+ *  surfaces at CONNECT time with "name a local account instead" — at a shell
+ *  prompt, about a field that lives in this dialog. */
+const isWindows = computed(() => agent.value?.os === 'windows')
+
 /** A closed default, so a dialog opened on a device with no policy row can
- *  only ever be saved MORE permissive by an explicit click. `console_user`
- *  rather than `daemon`: if someone turns SSH on without reading the account
- *  selector, the quiet outcome must not be a root shell. */
-function emptyPolicy(): SshPolicy {
+ *  only ever be saved MORE permissive by an explicit click. On Windows that is
+ *  `console_user` — if someone turns SSH on without reading the account
+ *  selector, the quiet outcome must not be a root shell. Off Windows the same
+ *  intent picks `named` with an EMPTY account, which is inert until someone
+ *  types one: still not a root shell, and still not a click away from one. */
+function emptyPolicy(windows: boolean): SshPolicy {
   return {
     mode: 'off',
     can_originate: false,
     allowed_user_ids: [],
     allowed_role_ids: [],
-    account_mode: 'console_user',
+    account_mode: windows ? 'console_user' : 'named',
     account: null,
     consent_mode: null,
   }
 }
 
-const draft = ref<SshPolicy>(emptyPolicy())
+const coercedFromConsoleUser = ref(false)
+/** Conservative until the dialog opens and the device OS is known. */
+const draft = ref<SshPolicy>(emptyPolicy(false))
 
 /** Bound separately from `draft.mode` so the switch is a plain boolean; the
  *  wire type is an enum because `off | on` will grow and a bool could not. */
@@ -210,11 +239,13 @@ const namedAccount = computed({
   },
 })
 
-const accountOptions = [
-  { title: 'The signed-in user at the device', value: 'console_user' },
+const accountOptions = computed(() => [
+  ...(isWindows.value
+    ? [{ title: 'The signed-in user at the device', value: 'console_user' }]
+    : []),
   { title: 'The daemon account (SYSTEM / root)', value: 'daemon' },
   { title: 'A named Unix account…', value: 'named' },
-]
+])
 
 const consentOptions = [
   { title: 'Prompt at the device (recommended)', value: null },
@@ -233,7 +264,15 @@ watch(
   (v) => {
     if (!v) return
     error.value = ''
-    draft.value = { ...emptyPolicy(), ...(agent.value?.ssh_policy ?? {}) }
+    coercedFromConsoleUser.value = false
+    draft.value = { ...emptyPolicy(isWindows.value), ...(agent.value?.ssh_policy ?? {}) }
+    // A policy stored before this gate existed can still say `console_user` on a Unix
+    // device. Show the corrected value with the reason rather than a select with no
+    // matching option — the dialog is where it gets fixed, so it should present the fix.
+    if (!isWindows.value && draft.value.account_mode === 'console_user') {
+      draft.value.account_mode = 'named'
+      coercedFromConsoleUser.value = true
+    }
     if (!agentStore.tenantMembers.length) {
       void agentStore.fetchTenantMembers(props.tenantId)
     }

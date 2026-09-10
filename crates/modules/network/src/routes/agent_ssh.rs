@@ -67,7 +67,7 @@ use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     models::{
-        Agent, ConsentMode, RpcCap, SshAccountMode, SshActivityEvent, SshActivityKind,
+        Agent, ConsentMode, OsKind, RpcCap, SshAccountMode, SshActivityEvent, SshActivityKind,
         SshAuditEvent, SshDenyReason, SshGates, SshGrantSpec, SshMode, SshPolicy, ssh_limits,
     },
     signaling::ServerMsg,
@@ -687,6 +687,22 @@ pub async fn set_policy(
         ));
     }
 
+    // Same rule again, applied to the ONE account mode that is platform-bound.
+    // `console_user` is `WTSQueryUserToken` + `CreateProcessAsUserW`: there is no
+    // console session token to assume off Windows, so the agent refuses it
+    // (`exec.rs`, `pty/unix.rs`) and EVERY session on that device fails at connect
+    // time — after the server has already told the caller where to dial. Gating it
+    // in the dialog alone is not enough: the API would still accept a policy no
+    // agent can ever honour, which is how the default reached Linux devices in the
+    // first place (#1557).
+    if console_user_unsupported(body.account_mode, agent.os) {
+        return Err(ApiError::BadRequest(format!(
+            "account_mode `console_user` needs a Windows console session token, and this \
+             device runs {:?}. Name a local account instead.",
+            agent.os
+        )));
+    }
+
     // Same rule, applied to consent: an agent older than P5d accepts a
     // `consent_mode` and ignores it. Storing one would hand the admin a policy
     // that reads as "a human must approve" while that device keeps letting
@@ -786,6 +802,22 @@ pub async fn set_org_settings(
 /// Would storing this `consent_mode` produce a policy the target device
 /// silently ignores?
 ///
+/// `console_user` is a Windows concept — `WTSQueryUserToken` +
+/// `CreateProcessAsUserW`. Off Windows there is no console session token to
+/// assume, so the agent refuses it (`exec.rs`, `pty/unix.rs`) and every session
+/// on that device dies at connect time, AFTER the server has already answered the
+/// caller with an address to dial.
+///
+/// ⚠️ The dialog gates this too, but a client-only gate is not the guarantee: the
+/// API would still accept a policy no agent can honour, and it was the dialog's
+/// own OS-blind default that put `console_user` on Linux devices to begin with
+/// (#1557). Same shape as the `named`-with-no-account and consent-would-be-ignored
+/// refusals above it — refuse the unsatisfiable policy at the write, not at the
+/// session.
+fn console_user_unsupported(mode: SshAccountMode, os: OsKind) -> bool {
+    mode == SshAccountMode::ConsoleUser && os != OsKind::Windows
+}
+
 /// Agents rc.419 and earlier advertise `ssh` while destructuring
 /// `SshPolicy.consent_mode` away, so persisting a non-auto value for one would
 /// show an admin a rule reading "a human must approve" while that device let
@@ -1234,6 +1266,31 @@ mod audit_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `console_user` is storable on Windows and nowhere else. The negative half
+    /// is the one that matters — before #1557 the dialog defaulted every device
+    /// to `console_user`, so a Linux or macOS device silently carried a policy
+    /// that failed every session at connect time.
+    #[test]
+    fn console_user_is_refused_off_windows_and_allowed_on_it() {
+        assert!(!console_user_unsupported(
+            SshAccountMode::ConsoleUser,
+            OsKind::Windows
+        ));
+        for os in [OsKind::Linux, OsKind::Macos] {
+            assert!(
+                console_user_unsupported(SshAccountMode::ConsoleUser, os),
+                "console_user must be refused on {os:?}"
+            );
+        }
+        // The other modes are platform-independent and must pass on every OS —
+        // a guard that refused those would break Windows policies too.
+        for os in [OsKind::Linux, OsKind::Macos, OsKind::Windows] {
+            for mode in [SshAccountMode::Daemon, SshAccountMode::Named] {
+                assert!(!console_user_unsupported(mode, os), "{mode:?} on {os:?}");
+            }
+        }
+    }
 
     /// A policy that promises operator approval may only be stored for a device
     /// that will actually ask. Otherwise the admin is handed a lie — the exact
