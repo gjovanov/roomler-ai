@@ -84,19 +84,32 @@ is minutes not hours.
 
 ## Acceptance criteria
 
-- [ ] **AC1** a throwaway VM enrolls into the fleet org, appears on the mesh, and is fully removed
+- [x] **AC1** a throwaway VM enrolls into the fleet org, appears on the mesh, and is fully removed
       at teardown (device row gone, VM destroyed, fleet count back to baseline).
-- [ ] **AC2** every target's carrier is recorded with `why` evidence, and each is asserted against
+      *Both cells: `fleet-residue PASS — back to 21 devices (baseline 21), no ghost left`, plus
+      `teardown/org-baseline` on both orgs and no VM on zeus.*
+- [x] **AC2** every target's carrier is recorded with `why` evidence, and each is asserted against
       what that host can actually achieve — never a fixed expectation.
-- [ ] **AC3** latency is reported as a distribution (p50/p95/max/loss), not a single ping.
-- [ ] **AC4** bulk transfer completes in both directions with a verified sha256, and yields a
+      *`VMTEST-CARRIER` per target, `roomler why` captured to `/tmp/why-<t>.txt`, and the verdict
+      is reachability + stability, never which carrier won.*
+- [x] **AC3** latency is reported as a distribution (p50/p95/max/loss), not a single ping.
+      *40 samples × 5 targets × 2 arms; 0.0 % loss on every one.*
+- [x] **AC4** bulk transfer completes in both directions with a verified sha256, and yields a
       throughput number per arm.
-- [ ] **AC5** SSH session establishment is exercised repeatedly and reported as a success rate.
-- [ ] **AC6** carrier transitions are counted over the run — the stability claim gets a number.
-- [ ] **AC7** the relay arm is *forced*, not hoped for, and the direct arm proves the forcing knob
+      *32 MiB round trip, sha256 verified, on CORPLAP-1 and CORPLAP-2 in both arms
+      (0.36–0.41 MiB/s). CORPLAP-3 reports `target-has-no-sftp-server`; zeus and mars serve no
+      SSH at all — each named, none silent.*
+- [x] **AC5** SSH session establishment is exercised repeatedly and reported as a success rate.
+      *3/3 on all three corporate laptops in both arms — including CORPLAP-3, which had never
+      produced a successful session in this lane before #1565.*
+- [x] **AC6** carrier transitions are counted over the run — the stability claim gets a number.
+      *`carrier_transitions=0` on all ten (target × arm) pairs across ~3 ¼ hours.*
+- [x] **AC7** the relay arm is *forced*, not hoped for, and the direct arm proves the forcing knob
       changed something.
-- [ ] **AC8** the whole sweep runs from one command and is documented in a skill.
-
+      *mars: `carrier=direct` p50 0 ms in the direct arm → `carrier=relay:derp/tcp` p50 2 ms in the
+      relay arm. Same VM image, same target, one config key.*
+- [x] **AC8** the whole sweep runs from one command and is documented in a skill.
+      *`vmtest.sh run --lane stress --host zeus`; the `meshstress` skill carries eleven traps.*
 ## Out of scope
 
 Tuning anything. This measures; it does not fix. Also: no carrier pinning on any host but the
@@ -141,3 +154,152 @@ client identity.
 5. The cleanup check grepped for the payload **path**, and PowerShell's not-found error quotes the
    path back — so a clean machine reported `LEFT_BEHIND`. It failed safe; the same shape inverted
    is how real leftovers get reported as gone. It now probes for a token.
+
+### 2026-09-09 — round two: the transfer arm, and two product bugs
+
+The operator enabled SSH on all three corp laptops and placed a client public key in each device's
+`ssh_authorized_keys` — precisely what round one's third finding asked for. Re-running against that
+turned the transfer arm from an accepted `NA` into a measurement, and found two defects in the
+product on the way.
+
+#### Round one's conclusion was only a third right
+
+Round one recorded *"a grant session cannot `scp`, because `roomler proxy` carries no client
+identity."* True as a mechanism — but it was **reasoning, not measurement**: the lane discarded
+scp's stderr, so the missing identity was an inference from the docs rather than something the run
+had seen. With the key in place and stderr kept, **four** independent things had to be right, and
+the identity was one of them.
+
+| # | wall | what it looked like |
+|---|---|---|
+| 1 | **`scp` dials 22; roomler SSH listens on 2222** | `Error: connecting to <ip>:22 … Connection timed out`. OpenSSH hands its port to the ProxyCommand as `%p`, so `roomler proxy` faithfully dialled `:22`. ⚠️ `roomler proxy --help`'s own example has this gap. |
+| 2 | **an identity** | with `-i` + `IdentitiesOnly`: `Authenticated to … (via proxy) using "publickey"`, and the device logs `sftp session started … run_as=daemon privileged=true`. |
+| 3 | **the verdict must be the file, not scp's status** | see the first product bug below |
+| 4 | **`/C:/…` on Windows** | a bare relative destination lands in the sftp default cwd, which is `C:\WINDOWS\system32`. |
+
+#### Product bug 1 — `scp` exits 1 on a transfer that fully succeeded (#1559, merged)
+
+`roomlerd`'s sftp subsystem was the only channel path that never sent an `exit-status`; the pty,
+exec and every refusal do. OpenSSH reads it as the verdict on the transfer, logs `Exit status -1`
+and exits 1:
+
+```
+scp rc=1
+### did it land? (asked over SFTP, SAME identity that wrote it)
+-rw-------    ? 0  0   2097152 Sep  9 21:30 /C:/Windows/Temp/rl-decide.bin
+### sftp GET it back and compare
+SHA MATCH — the upload was COMPLETE and CORRECT
+```
+
+`sftp` was unaffected — it never consults the channel status — which is exactly why this stayed
+invisible. Anything that branches on scp's status retries or aborts work that is already done.
+
+#### Product bug 2 — a corrupt host key wedges a device permanently (#1564 / #1565, merged)
+
+CORPLAP-3 refused every SSH attempt with *"has not published an SSH host key … needs an agent that
+has had SSH enabled at least once (rc.444+)"* — on a device running **0.4.96**, with
+`ssh_enabled = true` and a key present in its config. The stored PEM is corrupt; its boundary line
+against a working sibling:
+
+| device | len | content |
+|---|---|---|
+| CORPLAP-3 | 41 | `-----BEGIN OPENSSH PRIVATE KEY-----\r\r\` |
+| CORPLAP-1 | 35 | `-----BEGIN OPENSSH PRIVATE KEY-----` |
+
+The daemon detects it and fails closed — correct — but the mint was gated on `is_none()`, and
+`Some(garbage)` is not `None`, so it never replaced it. Two restarts (operator-approved) changed
+nothing. ⚠️ The one WARN that explains it sits past the ≤64 KiB tail `roomler logs --grep` reads;
+it took a whole-file `Select-String` to surface.
+
+#### 🔑🔑 The cleanup check has now been wrong in three ways, and all three printed green
+
+1. a path the checker was not looking in (sftp cwd ≠ shell cwd);
+2. a not-found error that **quoted the path back**, so grepping for the path counted the error as a
+   hit;
+3. **an account that could not see the directory at all** — the transfer authenticates from the key
+   list, so it runs as `ssh_account_mode = daemon` (SYSTEM) and writes `C:\Windows\Temp`, while a
+   `roomler ssh` verification is a *grant* session that policy resolves to `console_user`:
+
+```
+--- did it land? ---
+ABSENT
+Test-Path : Zugriff verweigert
+```
+
+Removal and proof now run over SFTP on the transfer's own identity, and an unreadable listing is a
+**third state** (`cleanup=UNVERIFIED`), never scored clean. That state then earned itself on the
+very next run: with no identity the listing could not be read, the check refused to say "gone", and
+a manual SFTP probe with the operator's key confirmed `not found` on both laptops — nothing left
+behind. Under the previous code that situation printed `verified_gone`.
+
+#### Two more harness defects, in this round's own code
+
+6. **`sftp -b` echoes each command**, so its output opens with `sftp> ls -l <path>` — a line whose
+   last field is *also* the path. Matching on the path alone matched the echo first, and `$(NF-4)`
+   on a four-field line is `$0`, so every successful upload would have read `up=no`. Caught by
+   unit-testing the awk against real sftp output before the run produced numbers.
+7. **A readability test asked as the wrong user.** The lane runs as unprivileged `vmtest` while
+   every consumer of the client key runs under `sudo`, and the key is staged 0600 root-only — so
+   `[ -r "$CLIENT_KEY" ]` was false about a key that works. Measured in the live VM:
+   `plain -r : FALSE` / `sudo -r : TRUE`. The same shape as defect 3 above, twenty lines away in
+   the same file: **a permission answer read as an existence answer**, found once and not carried
+   across. Both sites now call one `key_usable()` predicate.
+
+#### Rail change, with operator approval
+
+The standing *"nothing on a corp laptop is configured, restarted, or left behind"* was suspended
+once, explicitly, to restart CORPLAP-3's daemon. The skill now records that enabling SSH on a
+target, or restarting its daemon, is an **operator decision every time** — never inferred from the
+fact that the matrix would be greener.
+
+#### Known limit
+
+CORPLAP-3 cannot transfer files even once #1565 ships: it has no `sftp-server.exe`. roomler spawns
+the platform's binary rather than embedding one, so that a transfer runs as the session's account
+instead of as the daemon — and on Windows that binary ships with the OpenSSH **Server** optional
+feature, which a corp-managed laptop need not have. `Test-Path` reads `False` there and `True` on
+both other laptops.
+
+#### Result — 24 PASS / 0 FAIL, run `20260909-204509`
+
+| target | arm | carrier | loss | p50 | p95 | max | SSH | 32 MiB round trip | transitions |
+|---|---|---|---|---|---|---|---|---|---|
+| CORPLAP-1 | direct | relay:derp | 0 % | 55 | 79 | 247 | 3/3 | ✅ 0.37 / 0.36 MiB/s · `scp_rc=1` | 0 |
+| CORPLAP-1 | relay | relay:derp | 0 % | 55 | 135 | 265 | 3/3 | ✅ 0.36 / 0.36 · `scp_rc=1` | 0 |
+| CORPLAP-2 | direct | relay:derp | 0 % | 57 | 105 | 199 | 3/3 | ✅ 0.41 / 0.34 · `scp_rc=0` | 0 |
+| CORPLAP-2 | relay | relay:derp | 0 % | 56 | 131 | 289 | 3/3 | ✅ 0.40 / 0.34 · `scp_rc=0` | 0 |
+| CORPLAP-3 | direct | relay:derp | 0 % | 46 | 82 | 95 | 3/3 | ⛔ no `sftp-server` | 0 |
+| CORPLAP-3 | relay | relay:derp | 0 % | 46 | **50** | 89 | 3/3 | ⛔ no `sftp-server` | 0 |
+| zeus | direct | relay:derp | 0 % | 2 | 8 | 27 | `ssh_enabled=false` | — | 0 |
+| zeus | relay | relay:derp | 0 % | 2 | 2 | 29 | `ssh_enabled=false` | — | 0 |
+| mars | **direct** | **direct** | 0 % | **0** | 0 | 0 | no host key published | — | 0 |
+| mars | **relay** | **relay:derp** | 0 % | 2 | 3 | 6 | no host key published | — | 0 |
+
+Zero loss on every target in both arms, and `carrier_transitions=0` on all ten pairs over ~3 ¼
+hours — the number that separates a mesh which connects once from one that holds.
+
+#### The matrix verified #1559 on its own, by accident and then on purpose
+
+`agent-v0.4.97` rolled **during** the run, so the fleet was mid-rollout and `scp_rc` — added to the
+metric as standing evidence rather than a one-off check — captured both sides:
+
+| CORPLAP-1, the SAME device | agent | `scp_rc` | bytes |
+|---|---|---|---|
+| direct arm | 0.4.96 | **1** | `up=yes sha_match=yes` |
+| relay arm | 0.4.96 | **1** | `up=yes sha_match=yes` |
+| targeted re-test after its update | **0.4.97** | **0** | `remote_size=2097152 sha_match=yes` |
+
+Three measurements on one laptop, one variable. The two 0.4.96 rows also rule out a timing race:
+a race would vary *within* a device across arms, and it does not.
+
+⚠️ The between-device comparison (CORPLAP-1 vs CORPLAP-2) came first and was the **weak** form —
+two laptops differ in more than their agent version. It is recorded because it is what prompted the
+within-device test, not because it settled anything.
+
+#### Residue, checked as the identity that could actually see it
+
+`cleanup=verified_gone` on CORPLAP-1/2 over SFTP; on CORPLAP-3 **neither identity reachable from
+inside the VM can look** (sftp cannot start, and a `roomler ssh` grant session is `console_user`,
+denied on `C:\Windows\Temp`), so it correctly reported `UNVERIFIED` and was checked from mars with
+`roomler exec`, which runs as the daemon: **0 files** matching `roomler-stress*`. zeus and mars: 0.
+Fleet org back to 21 devices, zero ghosts, no VM on zeus, k8s untouched.

@@ -2859,6 +2859,68 @@ machine_name = "devbox"
         assert_eq!(back.tenant_id, cfg.tenant_id);
     }
 
+    /// A stored PEM must survive a save→load→save cycle, including one that
+    /// picked up CRLF somewhere along the way.
+    ///
+    /// ⚠️ **This test passes on unmodified code, and that is its result.** It
+    /// was written to reproduce the field defect in roomler-ai#1564 — a corp
+    /// laptop whose `ssh_host_key` held the literal text
+    /// `-----BEGIN OPENSSH PRIVATE KEY-----\r\r\`, so the PEM's boundary line
+    /// was not newline-terminated and every start logged `PEM error in
+    /// pre-encapsulation boundary`. The proposed mechanism was that a CRLF in
+    /// the value round-trips through `to_string_pretty` into `\r` escape text
+    /// and then into a bare CR.
+    ///
+    /// It does not. `toml` 0.9 round-trips a CRLF-bearing PEM twice with the
+    /// boundary line intact and no escape text in the value. So the save/load
+    /// path we ship is **not** how that device's key was mangled, and the origin
+    /// is still unknown — an older serializer, an editor writing the escapes
+    /// directly, or a writer nobody has thought of yet. Do not cite this test as
+    /// an explanation of #1564; it is a forward guard on the property, and it
+    /// goes red if the serializer or its escaping is ever swapped.
+    ///
+    /// Kept because it is cheap and the property is real, and because the next
+    /// person to chase that origin should not re-run the experiment that already
+    /// came back negative.
+    #[test]
+    fn a_stored_key_survives_a_round_trip_even_with_crlf_in_it() {
+        let pem_lf =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAABBBB\n-----END OPENSSH PRIVATE KEY-----\n";
+        let pem_crlf = pem_lf.replace('\n', "\r\n");
+
+        for (label, pem) in [("lf", pem_lf.to_string()), ("crlf", pem_crlf)] {
+            let mut cfg = fixture();
+            cfg.ssh_host_key = Some(pem.clone());
+
+            // Two full cycles: the field defect only appeared on a LATER save,
+            // so one round trip is not enough to reproduce the class.
+            let mut current = cfg;
+            for pass in 1..=2 {
+                let text = toml::to_string_pretty(&current).expect("serialise");
+                current = toml::from_str(&text).unwrap_or_else(|e| {
+                    panic!("{label}: pass {pass} failed to re-parse its own output: {e}")
+                });
+            }
+
+            let back = current.ssh_host_key.expect("the key must still be there");
+            // The property that actually matters: the boundary line is still a
+            // whole line. Comparing to the original would be too strict for the
+            // crlf case and too weak for what broke — a PEM whose BEGIN runs
+            // into the base64 is exactly what `from_openssh` refuses.
+            let first = back.lines().next().unwrap_or("");
+            assert_eq!(
+                first.trim_end_matches('\r'),
+                "-----BEGIN OPENSSH PRIVATE KEY-----",
+                "{label}: the boundary line did not survive: {first:?}"
+            );
+            assert!(
+                !back.contains("\\r"),
+                "{label}: the round trip left literal backslash-r escape text in the value, \
+                 which is the exact shape that wedged a device in the field: {back:?}"
+            );
+        }
+    }
+
     #[test]
     fn config_without_orgs_field_loads_and_serialises_without_it() {
         // Back-compat both ways: a legacy file has no `orgs` (defaults
