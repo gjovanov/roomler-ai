@@ -298,6 +298,11 @@ pub struct RateGovernor {
     /// FR-79 — windows the validity gate rejected, per reason. ONE field in
     /// place of the four T1b, T2 and T2b each added for their own rule.
     evidence: super::evidence::Rejections,
+    /// FR-79 V3b / FR-74 — the ONE belief about what the path carries, fed by
+    /// every window (a demonstrated floor) and by every push-back (a capacity
+    /// estimate). SHADOW for now: computed and reported, read by no consumer,
+    /// so the field can compare it against `pipe_bps` before anything acts.
+    belief: super::pipe::Pipe,
     /// FR-35 — a send blocked ≥ `HARD_STALL` since the last window boundary.
     /// The ×0.5 it earns is applied there, where the gate can say whether the
     /// block was the pipe (FR-79).
@@ -417,6 +422,7 @@ impl RateGovernor {
             pipe: super::pipe_state::PipeClassifier::new(),
             window_sender: None,
             evidence: super::evidence::Rejections::default(),
+            belief: super::pipe::Pipe::default(),
             window_hard_stall: false,
             slow_start: None,
             slow_start_logged: false,
@@ -456,6 +462,25 @@ impl RateGovernor {
     pub fn link_stats(&self) -> (u32, u32, i32) {
         let (drains, depth) = self.link_loop.drain_stats();
         (self.link_loop.congested_windows(), drains, depth)
+    }
+
+    /// FR-79 V3b — the ONE belief, in SHADOW: `(believed, floor, capacity)`.
+    ///
+    /// Read it against `pipe_bps` in the heartbeat. Where they agree the new
+    /// composition is safe to adopt; where `believed` has a number and
+    /// `pipe_bps` is `None`, that is a session the old rule was blind on —
+    /// which on the relay hosts is most of them.
+    pub fn belief_bps(&self, now: Instant) -> (Option<u32>, Option<u32>, Option<u32>) {
+        (
+            self.belief.believed_bps(now),
+            self.belief.floor_bps(now),
+            self.belief.capacity_bps(now),
+        )
+    }
+
+    /// FR-79 V3b — `(deliveries folded, capacities folded)`.
+    pub fn belief_counts(&self) -> (u32, u32) {
+        self.belief.counts()
     }
 
     /// FR-59 P6 — take the ceiling a measurement contradicted, if one was
@@ -954,6 +979,16 @@ impl RateGovernor {
         // FR-59 P3 — the viewer's own view of the link, taken here so the
         // verdict below can see whether the viewer said anything at all.
         let link = viewer_rate::unpack_link(take_link());
+        // FR-79 V3b — the viewer's arrival rate is a DEMONSTRATED delivery:
+        // those bytes reached the far end, whatever the queue was doing. It
+        // arrives every window on every carrier, and until now it was thrown
+        // away unless the link loop called the window congested — which is why
+        // a relay-TCP session could finish knowing nothing about its own path
+        // (CORPLAP-3, `goodput_samples=(0, 5)`). It is a FLOOR, never a
+        // capacity: an idle desktop delivers 300 kbps through a gigabit path.
+        if let Some((rx_bps, _)) = link {
+            self.belief.observe_delivered(rx_bps, now);
+        }
         // The window's blocked-send samples. Drained here rather than per
         // frame — the send task is a different task, and this is the existing
         // once-a-second rendezvous. Whether they are FOLDED is the gate's call,
@@ -1065,7 +1100,15 @@ impl RateGovernor {
         // blocked sends are DROPPED, not held. What they measured was the
         // stall, and the next valid window measures the pipe on its own merits.
         if valid {
-            self.goodput.observe_window(&samples, now);
+            // FR-79 V3b — a blocked send is the path RESISTING, so an accepted
+            // fold is a capacity estimate, not a delivery. Only fold it into
+            // the belief when the estimator actually accepted the window;
+            // `observe_window` rejects anything under `MIN_WINDOW_BLOCKED`.
+            if self.goodput.observe_window(&samples, now)
+                && let Some(bps) = self.goodput.estimate_bps(now)
+            {
+                self.belief.observe_capacity(bps, now);
+            }
         }
         // FR-35 — a send blocked ≥ `HARD_STALL` is a hard stall: ×0.5, bypassing
         // the ×0.85 ladder. It applies here rather than in `note_send_stall`
@@ -1174,7 +1217,13 @@ impl RateGovernor {
         }
         if link_acts {
             match (verdict.congested, link) {
-                (true, Some((rx_bps, _))) => self.link_rx_bps = Some((rx_bps, now)),
+                (true, Some((rx_bps, _))) => {
+                    // FR-79 V3b — an arrival rate measured while the viewer's
+                    // queue is GROWING is the path's limit, not merely a
+                    // delivery: the sender was offering more than arrived.
+                    self.belief.observe_capacity(rx_bps, now);
+                    self.link_rx_bps = Some((rx_bps, now));
+                }
                 // FR-59 — ONSET and HOLD read different sensors, because
                 // they ask different questions.
                 //

@@ -59,6 +59,10 @@ pub mod ceiling_learn;
 /// evidence about the PIPE? (pure; no clock, no I/O, and no kill switch —
 /// it replaced three).
 pub mod evidence;
+/// FR-79 V3b / FR-74 — ONE belief about what the path carries, split into a
+/// DEMONSTRATED floor (what arrived; available every window on every carrier)
+/// and a pushed-back CAPACITY estimate (only when the path resisted). Pure.
+pub mod pipe;
 /// FR-71 T1a — which plane is the limiter this window: sender, path or
 /// browser (pure). FR-79 made it load-bearing: the gate reads its verdict,
 /// so it runs on every constrained window.
