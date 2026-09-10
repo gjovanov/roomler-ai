@@ -109,21 +109,41 @@ function sectionBody(text, headingRe) {
 // is the fallback. Continuation lines (indented, or the trailing *( … )* evidence) are
 // folded into the item they belong to.
 const AC_ITEM = /^- \[([ xX])\]\s*(.*)$/;
-const AC_BOLD_ID = /^\*\*(AC\s*\d+[a-z]?)\*\*\s*(?:—|-|:)?\s*/i;
+// The whole bold span is the id, not just `ACn`. FR-70 splits criteria into halves —
+// `**AC5 (attribution half)**`, `**AC6 (rate half)**` — and a regex demanding the bold
+// END at the digit rejects those, dropping them to POSITIONAL ids that then collide with
+// the spec's own later `**AC7**`. That produced a phantom "two criteria labelled AC7"
+// warning against a spec that is perfectly correct: the duplicate was ours, not theirs.
+// ⚠️ A parser that invents ids will eventually accuse a document of its own bug.
+// Group 1 is the id (`AC5`); group 2 is anything else inside the bold span, which FR-70
+// uses to split a criterion into halves — `**AC5 (attribution half)**`. The qualifier is
+// kept in the TEXT, never folded into the id: the id has to stay stable and readable, and
+// the text is what preserves a `verify` judgement across a reword.
+const AC_BOLD_ID = /^\*\*(AC\s*\d+[a-z]?)([^*]*)\*\*\s*(?:—|-|:)?\s*/i;
 
 function parseAcs(text) {
   const body = sectionBody(text, /acceptance\s+criteri/i);
   if (!body) return [];
   const acs = [];
+  const used = new Set();
   for (const raw of body) {
     const m = AC_ITEM.exec(raw);
     if (m) {
       let rest = m[2].trim();
       let id = null;
       const b = AC_BOLD_ID.exec(rest);
-      if (b) { id = b[1].replace(/\s+/g, ''); rest = rest.slice(b[0].length); }
+      if (b) {
+        id = b[1].replace(/\s+/g, '');
+        const qualifier = (b[2] || '').trim();
+        rest = (qualifier ? qualifier + ' — ' : '') + rest.slice(b[0].length);
+      }
+      id = id || `AC${acs.length + 1}`;
+      // A spec may legitimately number two criteria the same (FR-70's halves). Disambiguate
+      // rather than warn: a collision here is the document's business, not a fault.
+      if (used.has(id)) { let n = 2; while (used.has(`${id}#${n}`)) n++; id = `${id}#${n}`; }
+      used.add(id);
       acs.push({
-        id: id || `AC${acs.length + 1}`,
+        id,
         text: rest,
         done: m[1].toLowerCase() === 'x',
         verify: 'unclassified', // agent | operator | unclassified — see Q10 in SKILL.md
@@ -256,6 +276,64 @@ function traceInFlight(card, fr, branches, worktrees) {
   return card.run.hands_off;
 }
 
+// ---------------------------------------------------------------- reaping worktrees
+
+// Remove a worktree once EVERY card that used it is closed — and nothing else, ever.
+//
+// Rail 6 says never delete a worktree this skill did not create, and 62 worktrees plus
+// 1043 branches predate it. So a candidate must clear three independent gates, and each
+// one alone would be too weak:
+//   1. its basename matches the `ap-` prefix this skill names its own worktrees with;
+//   2. at least one CARD records that path in `run.worktree` — proving we made it, rather
+//      than inferring it from a name someone else could pick;
+//   3. every issue referencing it (active cards AND archived ones) is closed — the user's
+//      rule is "all FRs closed", and one worktree can serve several.
+// Then `git worktree remove` runs WITHOUT `--force`, so git itself refuses on uncommitted
+// changes. A refusal is reported, never overridden: the whole point is that the operator's
+// work is not this skill's to discard.
+function reapWorktrees(openIssueNumbers) {
+  const archiveDir = join(DOCS, 'kanban', 'archive');
+  const cards = [...allCards()];
+  if (existsSync(archiveDir)) {
+    for (const f of readdirSync(archiveDir).filter((x) => x.endsWith('.json'))) {
+      cards.push(JSON.parse(readFileSync(join(archiveDir, f), 'utf8')));
+    }
+  }
+
+  // path -> the issues that used it
+  const byPath = new Map();
+  for (const c of cards) {
+    const p = c.run?.worktree;
+    if (!p) continue;
+    const key = p.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!byPath.has(key)) byPath.set(key, new Set());
+    byPath.get(key).add(c.issue);
+  }
+  if (!byPath.size) return;
+
+  const live = new Set(worktreeIndex().map((w) => w.path.replace(/\\/g, '/').replace(/\/+$/, '')));
+
+  for (const [path, issuesUsing] of byPath) {
+    if (!live.has(path)) continue;                       // already gone
+    if (!/^ap-/.test(path.split('/').pop() || '')) {
+      console.warn(`  ⚠️  ${path} is referenced by a card but is not an \`ap-\` worktree — left alone`);
+      continue;
+    }
+    const stillOpen = [...issuesUsing].filter((n) => openIssueNumbers.has(n));
+    if (stillOpen.length) continue;                      // the user's rule: ALL of them closed
+
+    const out = git(['worktree', 'remove', path]);       // no --force, deliberately
+    if (live.has(path) && git(['worktree', 'list']).includes(path)) {
+      console.warn(`  ⚠️  ${path}: every issue closed (${[...issuesUsing].map((n) => '#' + n).join(', ')}) but git refused to remove it`);
+      console.warn('      — almost certainly uncommitted changes. Left in place on purpose; look before forcing.');
+    } else {
+      console.log(`  🧹 ${path} removed — every issue that used it is closed (${[...issuesUsing].map((n) => '#' + n).join(', ')})`);
+    }
+    void out;
+  }
+  git(['worktree', 'prune']);
+}
+
 // ---------------------------------------------------------------- cards
 
 const cardPath = (id) => join(STATE, `${id}.json`);
@@ -375,13 +453,10 @@ function scan() {
     console.warn(`  ⚠️  FR-${u.fr} has no issue (${u.issueCell || 'empty'}) — ${u.specFile}`);
     console.warn('      A number claimed with nothing published behind it. Check master for a collision.');
   }
-  // A duplicate AC id is a typo in the SPEC, not in the card — surface it so someone fixes
-// the document; nothing here rewrites a spec.
-  for (const card of allCards()) {
-    const seen = new Set(), dup = new Set();
-    for (const a of card.acs) (seen.has(a.id) ? dup : seen).add(a.id);
-    if (dup.size) console.warn(`  ⚠️  ${card.id} labels two criteria ${[...dup].join(', ')} — fix ${card.spec}`);
-  }
+  // (There was a "two criteria share an id" warning here. It only ever fired on FR-70, and
+  // the duplicate was this parser's own positional fallback colliding with the spec's real
+  // AC7 — the document was correct throughout. Ids are now disambiguated at parse time, so
+  // the check had nothing left to catch and every firing of it had been a false accusation.)
   // A card whose issue has been CLOSED must leave the board. Skipping the ledger row is not
   // enough — the card file already exists, so the board would keep rendering a finished FR
   // for ever, and "44 cards" would quietly stop meaning "44 things to do". Archived rather
@@ -397,6 +472,9 @@ function scan() {
     rmSync(cardPath(card.id));
     console.log(`  ✓ ${card.id} (#${card.issue}) closed — card archived`);
   }
+
+  // AFTER archiving, so a card closed in this very pass counts as closed here too.
+  reapWorktrees(open);
 
   const carded = new Set(ledger.filter((r) => byNumber.has(r.issue)).map((r) => r.issue));
   for (const i of issues) {
