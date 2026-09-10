@@ -58,7 +58,10 @@ If you are running short on budget, **park the card and say so**. Never finish c
   collisions; the arbiter is a push race on one shared table.
 - **Never adopt a bare branch.** An open PR is adoptable; a branch you cannot see the
   reasoning behind is not.
-- **Never delete a worktree or branch you did not create.**
+- **Never delete a worktree or branch you did not create.** You never reap one either —
+  that is `scan`'s job, once every issue using it is closed. Your part is to **record the
+  path in `run.worktree`**, which is what proves the worktree was ours; a worktree you
+  create without recording it can never be cleaned up, because a name alone is not proof.
 - **Never push to master, promote a deploy, cut a release tag, or touch prod config.**
 - **Never mark an operator-only AC as done.** If the remaining criteria are all
   `verify: "operator"`, the card is `ready` — that is success, not failure.
