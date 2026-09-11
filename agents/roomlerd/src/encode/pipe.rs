@@ -50,9 +50,42 @@
 //! So: a floor is never allowed to lower the anchor, and the anchor is never
 //! `None` once anything has been delivered.
 //!
-//! ⚠️ The floor is a MAX over a recent window, not an average. An average of
-//! delivered rates measures the CONTENT (an idle desktop sends ~300 kbps
-//! through a gigabit path); only the peak says anything about the path.
+//! ⚠️ The floor is a MAX, not an average. An average of delivered rates
+//! measures the CONTENT (an idle desktop sends ~300 kbps through a gigabit
+//! path); only the peak says anything about the path.
+//!
+//! # ⚠️⚠️ What a quiet screen proves: nothing. The overnight shadow, 83 samples
+//!
+//! The first version expired the floor after 30 s, so that "a path which
+//! genuinely degraded is not pinned to its old peak". 300 sweeps across the
+//! fleet showed that reasoning is wrong, because it cannot tell a degraded path
+//! from a still screen. Direct sessions spanned **11 kbps to 24.7 Mbps**, median
+//! 270 kbps — and the extremes are the SAME HOSTS:
+//!
+//! ```text
+//! CORPLAP-3  19:46-20:02  s=6aa307be  belief = 4.8 - 8.4 Mbps    (content moving)
+//! CORPLAP-3  13:25-13:54  s=6aa3d669  belief = 12.8 kbps         (static screen)
+//!                                     tgt=34,560,000  n=(10696, 0)
+//! CORPLAP-2  19:39        s=6aa30771  belief = 24.7 Mbps
+//! CORPLAP-1  07:40-07:44  s=6aa3aff5  belief = 10.3 - 10.8 Mbps
+//! ```
+//!
+//! A host that demonstrated 8.4 Mbps read **13 kbps** hours later with nobody
+//! typing, and the floor kept expiring to `None` entirely between reports. Had
+//! FR-74 P5 anchored a ceiling on that, a still screen would have collapsed the
+//! ceiling to the legibility floor and STARVED the next burst — making the
+//! symptom this whole arc exists to fix strictly worse.
+//!
+//! So the rule is evidential, not temporal: **a delivery raises the floor and
+//! nothing but contrary evidence lowers it.** A capacity sample below the floor
+//! is that contrary evidence — the path got smaller, and the old demonstration
+//! stops being true. Time is not evidence. Quiet is not evidence.
+//!
+//! ⚠️ The cost, accepted knowingly: a path that silently degrades keeps an
+//! optimistic floor until something pushes back. That is the right trade,
+//! because the floor only ever feeds a CEILING — a bound saying "you may try" —
+//! and the capacity path cuts the moment trying fails. An optimistic bound
+//! costs one burst; a pessimistic one costs every burst.
 //!
 //! # ⚠️⚠️ The two questions are NOT interchangeable, and the API says so
 //!
@@ -86,12 +119,14 @@
 
 use std::time::{Duration, Instant};
 
-/// How long a demonstrated delivery stands as the floor. Long enough that a
-/// quiet stretch does not erase what a burst proved, short enough that a path
-/// which genuinely degraded is not pinned to its old peak. A carrier change
-/// re-keys the session's memory anyway (FR-79 V2), so this only has to survive
-/// content, not topology.
-pub const FLOOR_WINDOW: Duration = Duration::from_secs(30);
+/// ⚠️⚠️ There is deliberately NO time window on the floor. The first version of
+/// this type expired it after 30 s, and the overnight shadow showed why that is
+/// wrong — see the module header's "what a quiet screen proves" section. A
+/// demonstrated delivery is a FACT about the path; a quiet screen is not
+/// evidence against it. Only contrary evidence retires it.
+///
+/// Kept as the doc anchor for that decision; nothing reads it.
+pub const FLOOR_NEVER_EXPIRES: () = ();
 
 /// A capacity estimate expires on the same clock the goodput estimator uses,
 /// so "the path pushed back a minute ago" stops being an argument.
@@ -114,35 +149,54 @@ impl Pipe {
     /// and no blocked send, which is the whole point — it is the one
     /// observation a relay-TCP session reliably produces.
     ///
-    /// Keeps the max over [`FLOOR_WINDOW`]: a higher delivery always wins, and
-    /// a lower one only wins once the standing peak has aged out.
+    /// Keeps the MAX for the life of the session: a higher delivery always
+    /// wins, and only [`Self::observe_capacity`] with a smaller number takes it
+    /// back down.
     pub fn observe_delivered(&mut self, bps: u32, now: Instant) {
         if bps == 0 {
             return;
         }
         self.delivered_n = self.delivered_n.saturating_add(1);
         match self.floor {
-            Some((best, at)) if bps < best && now.duration_since(at) <= FLOOR_WINDOW => {}
+            Some((best, _)) if bps <= best => {}
             _ => self.floor = Some((bps, now)),
         }
     }
 
     /// Only when the path PUSHED BACK: a blocked-send goodput sample, or the
     /// viewer's arrival rate while its transit queue was growing.
+    ///
+    /// ⚠️ This is also the ONLY thing that moves a floor DOWN, and it moves it
+    /// by [`rate_memory::damp`] rather than snapping to it — the same
+    /// down-fast/up-slow asymmetry FR-79 V4 already uses for the pair memory,
+    /// not a second law.
+    ///
+    /// Snapping was wrong in both directions and the tests caught it:
+    /// a single blocked-send sample of 6.03 Mbps must NOT erase a 20 Mbps
+    /// delivery (that is the Regal sawtooth's collapse, rebuilt inside the
+    /// estimator), but a path that has genuinely shrunk must not keep an
+    /// optimistic floor forever either (that is the 38.88 Mbps constant, with
+    /// extra steps). Damping says: one sample barely moves it, sustained
+    /// evidence converges on it.
     pub fn observe_capacity(&mut self, bps: u32, now: Instant) {
         if bps == 0 {
             return;
         }
         self.capacity_n = self.capacity_n.saturating_add(1);
         self.capacity = Some((bps, now));
+        if let Some((floor, _)) = self.floor
+            && bps < floor
+        {
+            self.floor = Some((super::rate_memory::damp(floor, bps), now));
+        }
     }
 
-    /// The demonstrated lower bound: the path carried at least this much, and
-    /// recently enough to still mean something.
-    pub fn floor_bps(&self, now: Instant) -> Option<u32> {
-        self.floor
-            .filter(|(_, at)| now.duration_since(*at) <= FLOOR_WINDOW)
-            .map(|(bps, _)| bps)
+    /// The demonstrated lower bound: the most this path has EVER been shown to
+    /// carry this session, minus anything a later push-back contradicted.
+    ///
+    /// ⚠️ No staleness filter, deliberately. See [`FLOOR_NEVER_EXPIRES`].
+    pub fn floor_bps(&self, _now: Instant) -> Option<u32> {
+        self.floor.map(|(bps, _)| bps)
     }
 
     /// The pushed-back estimate, while it is still fresh.
@@ -216,15 +270,39 @@ mod tests {
     /// path that has just delivered 20 Mbps. The old `min` rule read 6 M and
     /// the target collapsed to it; the delivery is the harder fact.
     #[test]
-    fn a_capacity_sample_never_lowers_the_belief_below_a_real_delivery() {
+    fn one_capacity_sample_does_not_collapse_the_belief_onto_itself() {
         let now = t0();
         let mut p = Pipe::default();
         p.observe_delivered(20_000_000, now);
-        p.observe_capacity(6_028_814, now + Duration::from_secs(1));
-        assert_eq!(
-            p.ceiling_anchor_bps(now + Duration::from_secs(1)),
-            Some(20_000_000),
-            "the bytes arrived; the estimate is what is wrong"
+        let t = now + Duration::from_secs(1);
+        p.observe_capacity(6_028_814, t);
+        let anchor = p.ceiling_anchor_bps(t).expect("an anchor");
+        // ALPHA_DOWN halves the gap: 20 M -> ~13 M, not 6.03 M. Collapsing onto
+        // the sample IS the Regal sawtooth, rebuilt inside the estimator.
+        assert_eq!(anchor, 13_014_407);
+        assert!(
+            anchor > 6_028_814 * 2,
+            "a single blocked-send sample must not erase a 20 Mbps delivery"
+        );
+    }
+
+    /// ...but SUSTAINED push-back converges on it, so a path that really did
+    /// shrink is believed at its new size rather than its old peak. Without
+    /// this the floor would be the 38.88 Mbps constant with extra steps.
+    #[test]
+    fn sustained_push_back_converges_the_floor_onto_the_capacity() {
+        let now = t0();
+        let mut p = Pipe::default();
+        p.observe_delivered(20_000_000, now);
+        let mut t = now;
+        for _ in 0..8 {
+            t += Duration::from_secs(1);
+            p.observe_capacity(6_028_814, t);
+        }
+        let anchor = p.ceiling_anchor_bps(t).expect("an anchor");
+        assert!(
+            anchor < 6_500_000,
+            "eight consistent samples should converge on the measurement, got {anchor}"
         );
     }
 
@@ -255,17 +333,51 @@ mod tests {
         assert_eq!(p.floor_bps(now + Duration::from_secs(8)), Some(18_000_000));
     }
 
-    /// ...but it does not stand forever: past `FLOOR_WINDOW` a path that has
-    /// degraded is believed at its new rate rather than its old peak.
+    /// The overnight shadow, verbatim: CORPLAP-3 demonstrated 8.4 Mbps at
+    /// 20:02 and read 12,818 bps at 13:25 the next day with a static screen and
+    /// `n=(10696, 0)` — ten thousand deliveries, not one push-back.
+    ///
+    /// A still screen is NOT evidence the path shrank. The floor must survive
+    /// it, or FR-74 P5's ceiling would collapse on an idle desktop and starve
+    /// the next burst — the very symptom this arc exists to remove.
     #[test]
-    fn a_stale_peak_gives_way_to_what_the_path_carries_now() {
+    fn hours_of_a_still_screen_do_not_retire_what_the_path_demonstrated() {
+        let now = t0();
+        let mut p = Pipe::default();
+        p.observe_delivered(8_409_584, now);
+        // Seventeen hours of an idle desktop, one report a second.
+        let mut t = now;
+        for _ in 0..2_000 {
+            t += Duration::from_secs(1);
+            p.observe_delivered(12_818, t);
+        }
+        assert_eq!(
+            p.floor_bps(t),
+            Some(8_409_584),
+            "the demonstration stands; quiet is not contrary evidence"
+        );
+        assert_eq!(p.counts(), (2_001, 0));
+    }
+
+    /// A push-back is the ONLY thing that moves the floor down, and it damps
+    /// rather than snaps — see `one_capacity_sample_does_not_collapse_the_
+    /// belief_onto_itself` and `sustained_push_back_converges_the_floor_onto_
+    /// the_capacity` for the two halves of that law.
+    #[test]
+    fn nothing_but_a_push_back_moves_the_floor_down() {
         let now = t0();
         let mut p = Pipe::default();
         p.observe_delivered(18_000_000, now);
-        let later = now + FLOOR_WINDOW + Duration::from_secs(1);
-        assert_eq!(p.floor_bps(later), None, "the peak aged out");
-        p.observe_delivered(2_000_000, later);
-        assert_eq!(p.floor_bps(later), Some(2_000_000));
+        let mut t = now;
+        // Deliveries below the floor, however many, never lower it.
+        for _ in 0..50 {
+            t += Duration::from_secs(1);
+            p.observe_delivered(20_000, t);
+        }
+        assert_eq!(p.floor_bps(t), Some(18_000_000));
+        // One push-back does.
+        p.observe_capacity(2_000_000, t);
+        assert!(p.floor_bps(t).expect("a floor") < 18_000_000);
     }
 
     /// A capacity estimate expires on the goodput estimator's own clock, so a
