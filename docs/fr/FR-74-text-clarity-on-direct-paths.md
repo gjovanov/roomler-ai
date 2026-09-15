@@ -462,6 +462,58 @@ demonstrates more, so the belief never rises. The headroom IS the probe, and it
 must survive a quiet stretch — which is why the belief's floor is a max over a
 window rather than an average.
 
+### ⚠️⚠️ Refined 2026-09-15 — the first formulation had a regression mode
+
+`ceiling = clamp(anchor × HEADROOM, legibility_floor, bpp_bound)` is wrong, and
+the shadow's own data says why. Two failures, both worse than the constant:
+
+**1. An idle session starves its first burst.** A session that opens onto a
+still screen has a content-driven floor and no push-back at all — the shadow
+measured exactly this, CORPLAP-3 reading **12.8 kbps** with `n=(10696, 0)`
+against a 34,560,000 target. Anchoring on that clamps the ceiling to the
+legibility floor (~3.75 M for HEVC), and the first scroll is then starved on a
+path that carries 34 M. The symptom this FR exists to remove, caused by its own
+remedy.
+
+**2. The ratchet-down trap.** If the ceiling follows the anchor, the encoder
+never offers more than the ceiling, so the path never demonstrates more, so the
+anchor never rises. The ceiling can only fall. Forever.
+
+**The asymmetry is the whole design, and it maps onto FR-79 V3b-1's two
+accessors exactly:**
+
+| evidence | may it LOWER the ceiling? | may it RAISE it? |
+|---|---|---|
+| a push-back (`capacity`) — the path refused | **yes** | yes |
+| a delivery (`floor`) — the path carried | **never** | yes |
+
+A content-driven floor is evidence the path carried at least X. It is never
+evidence the path is *limited to* X, and no amount of idle delivery makes it so.
+Only a refusal limits.
+
+```rust
+// `cap_limit` exists only once something has actually pushed back.
+let cap_limit = capacity_trace.map(|c| c * HEADROOM / 100);
+let ceiling = match cap_limit {
+    // Never below what the path has demonstrably carried: the floor is the
+    // guard against one pessimistic blocked-send sample.
+    Some(limit) => bpp_bound.min(limit.max(floor)),
+    // Nothing ever refused us ⇒ today's behaviour, byte for byte.
+    None => bpp_bound,
+};
+```
+
+⚠️ **The probe is the capacity trace DECAYING UPWARD.** With the rule above and
+nothing else, a path that recovers is never rediscovered — the ceiling holds at
+the old limit and the encoder cannot prove otherwise. So the trace must relax
+toward `bpp_bound` while nothing pushes back: absence of refusal is weak
+evidence the path is fine, and weak evidence is exactly what a slow drift
+encodes. Sustained push-back holds it down; quiet lets it climb; a new push-back
+pulls it down again — a closed loop with no ratchet in either direction.
+
+⚠️ This is the same shape as FR-70 P1's prior, which already decays toward its
+band while nothing measures. Reuse that law rather than inventing a third.
+
 ### Sequencing — and why P5 is NOT built in the same breath
 
 FR-79 V3b ships the belief in **shadow** first: computed, reported in both pump
