@@ -184,10 +184,23 @@ impl Pipe {
         }
         self.capacity_n = self.capacity_n.saturating_add(1);
         self.capacity = Some((bps, now));
-        if let Some((floor, _)) = self.floor
-            && bps < floor
-        {
-            self.floor = Some((super::rate_memory::damp(floor, bps), now));
+        // ⚠️ A capacity sample is ALSO a delivery. A blocked-send goodput of X
+        // means X bits per second actually got through while the sender was
+        // blocked — those bytes arrived. So it feeds the floor by the same law
+        // as any other delivery: raise outright, lower damped.
+        //
+        // Missing this cost the anchor a real measurement. Field 2026-09-12,
+        // CORPLAP-3 session `6aa53186`: capacity measured 13,163,844 at 11:04,
+        // and four minutes later — one `CAPACITY_TTL` — the anchor had fallen
+        // back to a content-driven floor of 4,050,945 while the target ran to
+        // the 34,560,000 constant. A ceiling anchored there would cap a path
+        // just measured at 13 Mbps to about 5.
+        match self.floor {
+            Some((floor, _)) if bps < floor => {
+                self.floor = Some((super::rate_memory::damp(floor, bps), now));
+            }
+            Some((floor, _)) if bps <= floor => {}
+            _ => self.floor = Some((bps, now)),
         }
     }
 
@@ -378,6 +391,31 @@ mod tests {
         // One push-back does.
         p.observe_capacity(2_000_000, t);
         assert!(p.floor_bps(t).expect("a floor") < 18_000_000);
+    }
+
+    /// Field 2026-09-12, CORPLAP-3 session `6aa53186`, verbatim: a capacity of
+    /// 13,163,844 measured at 11:04 against a content-driven floor of
+    /// 4,050,945. One `CAPACITY_TTL` later the capacity had expired and the
+    /// anchor fell back to the floor, while the target ran to the 34,560,000
+    /// constant.
+    ///
+    /// A blocked-send goodput IS a delivery — those bytes got through at that
+    /// rate — so it must raise the floor, and the anchor must survive the
+    /// capacity expiring.
+    #[test]
+    fn a_capacity_sample_survives_its_own_expiry_by_raising_the_floor() {
+        let now = t0();
+        let mut p = Pipe::default();
+        p.observe_delivered(4_050_945, now);
+        p.observe_capacity(13_163_844, now + Duration::from_secs(1));
+        let after_ttl = now + Duration::from_secs(1) + CAPACITY_TTL + Duration::from_secs(1);
+        assert_eq!(p.capacity_bps(after_ttl), None, "the estimate aged out");
+        assert_eq!(
+            p.ceiling_anchor_bps(after_ttl),
+            Some(13_163_844),
+            "but the path demonstrably carried 13.16 Mbps, and that does not \
+             stop being true when the estimate expires"
+        );
     }
 
     /// A capacity estimate expires on the goodput estimator's own clock, so a
