@@ -19,7 +19,7 @@
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use tunnel_core::localapi::{
     self, ConnectionType, DaemonMode, FlowInfo, FlowKind, NodeStatus, PeerInfo, RouteInfo,
     RouteState,
@@ -1111,6 +1111,140 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
         println!("takes effect on the next daemon restart");
     }
     Ok(())
+}
+
+/// FR-52 gate 4 — `roomler rc password set`.
+///
+/// The password is read here, handed to the daemon over the local pipe, and
+/// registered THERE: this process never derives, stores or transmits anything
+/// derived from it, and the daemon persists only an OPAQUE record that is not
+/// password-equivalent. Nothing about it reaches the server — that is the whole
+/// property gate 4 provides, and the reason there is no dashboard equivalent.
+///
+/// ⚠️ `--stdin` reads exactly one line and strips only the terminator. Trimming
+/// surrounding whitespace would store a password the operator did not choose,
+/// and they would discover it at the worst possible moment: locked out of the
+/// machine they are trying to reach.
+fn read_new_password(from_stdin: bool) -> Result<String> {
+    if from_stdin {
+        use std::io::BufRead as _;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut line)
+            .context("reading the password from stdin")?;
+        // Only the terminator, and CRLF as well as LF — a password piped from a
+        // file written on Windows would otherwise carry a stray `\r` that
+        // nothing on screen shows.
+        let pw = line.strip_suffix('\n').unwrap_or(&line);
+        let pw = pw.strip_suffix('\r').unwrap_or(pw);
+        if pw.is_empty() {
+            bail!("no password on stdin");
+        }
+        return Ok(pw.to_string());
+    }
+    // Interactive: twice, never echoed. The confirmation is not politeness — a
+    // typo in an UNATTENDED password is undiscoverable until someone outside the
+    // org tries to use it and fails, by which time nobody suspects the typo.
+    let first = rpassword::prompt_password("New external-access password: ")
+        .context("reading the password")?;
+    let again = rpassword::prompt_password("Repeat it: ").context("reading the confirmation")?;
+    if first != again {
+        bail!("the two entries differ — nothing was changed");
+    }
+    Ok(first)
+}
+
+/// `roomler rc password set [--stdin]`.
+pub async fn rc_password_set(from_stdin: bool) -> Result<()> {
+    // Connect FIRST, before asking for a password: on a host with no daemon
+    // this fails in one clean line instead of making someone type a password
+    // twice and only then telling them there was nothing to send it to.
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let password = read_new_password(from_stdin)?;
+    let state = client
+        .external_password_set(&password)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("external-access password set for this device");
+    print_password_next_steps(&state);
+    Ok(())
+}
+
+/// `roomler rc password clear`.
+pub async fn rc_password_clear() -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let state = client
+        .external_password_clear()
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!("external-access password cleared — nobody outside this organization can connect");
+    if state.enabled {
+        println!(
+            "note: external_access_enabled is still true; it admits nobody without a password"
+        );
+    }
+    Ok(())
+}
+
+/// `roomler rc password status [--json]`.
+pub async fn rc_password_status(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let state = client
+        .external_password_status()
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+        return Ok(());
+    }
+    println!(
+        "build support     {}",
+        if state.supported {
+            "yes"
+        } else {
+            "NO — this build cannot hold a password"
+        }
+    );
+    println!(
+        "password          {}",
+        if state.password_set { "set" } else { "not set" }
+    );
+    println!(
+        "external access   {}",
+        if state.enabled { "on" } else { "off" }
+    );
+    if let Some(mode) = &state.consent_mode {
+        println!("consent mode      {mode}");
+    }
+    if let Some(perms) = &state.max_permissions {
+        println!("local ceiling     {perms}");
+    }
+    print_password_next_steps(&state);
+    Ok(())
+}
+
+/// Name the gate that is still shut, one line, most-blocking first.
+///
+/// ⚠️ This says nothing about the ORG side. Gates 1 and 2 — the organization's
+/// switch and its per-device approval — live on the server and this device
+/// cannot see them, so a device reporting every local gate open is still not a
+/// device an outsider can reach. Printing "ready" here would be a claim this
+/// process has no way to check.
+fn print_password_next_steps(state: &localapi::ExternalPasswordState) {
+    if !state.supported {
+        println!("  → install a build with external-access support to hold a password");
+        return;
+    }
+    if !state.password_set {
+        println!("  → `roomler rc password set` to set one");
+    }
+    if !state.enabled {
+        println!("  → `roomler config set external_access_enabled true` to open gate 3");
+    }
+    if state.password_set && state.enabled {
+        println!("  → this device is ready; an admin must also approve it for external access");
+    }
 }
 
 /// Map a LocalAPI connect/IO error to a user-facing one. A missing daemon is an

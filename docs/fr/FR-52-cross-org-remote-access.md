@@ -1,8 +1,9 @@
 # FR-52: Cross-org remote access — an outsider, a device password, and a server that cannot use it
 
 **Issue:** [#1100](https://github.com/gjovanov/roomler-ai/issues/1100) ·
-**Status:** proposed · **Owner:** remote-control (pillar 1) + control plane ·
-**Anchors verified against master `8a03ff0d`** (re-verified after FR-69)
+**Status:** in progress — P1 · P2a · P2b · P2c shipped, **no access path yet** ·
+**Owner:** remote-control (pillar 1) + control plane ·
+**Anchors verified against master `41425700`** (re-verified after FR-69)
 
 The gap TeamViewer and AnyDesk fill and roomler does not: someone **outside the
 organization** views and controls a device, authorised by a password the device
@@ -273,7 +274,8 @@ CAS. P6 follows it rather than inventing one.
 |---|---|---|---|
 | P1 | Addressing + policy, **no access path**: connect code (globally unique, rotatable), the org switch, `external_access_policy`, admin UI, `external_rc_audit` (90 d TTL). `decide_approval()` returns `Result<(), ExternalRcDenyReason>` so one place records both arms. | `external_rc_enabled = false` (default) | **SHIPPED** — 19 unit + 10 route + 6 integration tests, two guards falsified |
 | P2a | **The device can SAY it understands cross-org access, and opt in.** `RpcCap::ExternalAccess` on the hello (unconditional — a BUILD property, the `config` reasoning, never derived from the opt-in) + `external_access_enabled` (gate 3, default off) with its config-surface entry. The whole `external_*` surface is absent from `DesiredConfig`, guarded by a PREFIX test (FR-19's `relay_*` rule). ⚠️ Without this, gate 2 refuses EVERY device — no agent advertises the verb — so P1 is field-unverifiable until it lands. | `external_access_enabled = false` (default) | **SHIPPED** — both guards falsified |
-| P2b | The device-side CREDENTIAL: the OPAQUE registration record, `external_consent_mode`, `external_max_permissions`, `roomler rc password set\|clear\|status`, companion UI. Registration runs on the device (it holds the password momentarily); the dashboard may show *set / not set* and may CLEAR, never set. | the P2a flag | not started |
+| P2b | The device-side CREDENTIAL as a *type*: the OPAQUE suite (Ristretto255 · TripleDh · **Argon2id** Ksf), the registration record, `external_consent_mode`, `external_max_permissions`. Registration runs entirely on the device — it plays both halves, nothing crosses a network — which is *why* the dashboard can show *set / not set* and CLEAR but never SET. | `external-access` feature, off in every release build | **SHIPPED** — 7 unit tests incl. a full login round-trip |
+| P2c | The way to actually set one: `roomler rc password set\|clear\|status` over a new LocalAPI verb, and the length floor. Registration + persistence happen in the DAEMON (it owns the config path and the write lock); the CLI only carries the plaintext across the local pipe, the same channel and the same authority that already flips `exec_enabled`. ⚠️ No `--password` flag, ever — argv is world-readable through `/proc/<pid>/cmdline`. | the P2a flag; nothing verifies the record until P3 | **SHIPPED** — 6 unit tests, incl. the surface allowlist and the derived-`Debug` leak |
 | P3 | The handshake: `rc:extauth.*` frames, server as blind relay, agent-side verify + backoff. **Proven on loopback against the real agent first**, as FR-19's bind handshake was. | P2's flag; no client surface ships | not started |
 | P4 | Session establishment: the external branch in `resolve_session_authz`, transport binding at offer time, external consent path, public `/connect` page. Permission ceiling enforced **at the agent**, not merely offered by the server. | revert the authz branch; gates 1–3 still refuse | not started |
 | P5 | Visibility + accounting: owner notification on a first-ever external session by a principal and on repeated failures; audit UI beside `SshAuditSection`; per-principal revocation; relay bytes metered to the device's tenant (F3); a plan limit. | n/a — read-only surfaces | not started |

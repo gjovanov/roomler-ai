@@ -941,6 +941,65 @@ pub struct RcSessionInfo {
     pub started_at_ms: u64,
 }
 
+/// A string that must never reach a log, wrapped so the compiler carries that
+/// rule instead of a comment. [`Request`] derives `Debug`, and the day someone
+/// adds `tracing::debug!(?req)` to [`serve_connection`] — an entirely reasonable
+/// thing to want while debugging a client — the plaintext external-access
+/// password would land in the daemon's rolling log, which `roomler logs` uploads.
+/// Serialisation is transparent (the wire carries the bare string); only `Debug`
+/// is redacted, which is exactly the direction the leak travels.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Not even the length: it narrows a brute force, and no debugging
+        // session needs it.
+        f.write_str("Secret(***)")
+    }
+}
+
+impl Secret {
+    /// Borrow the plaintext. Every call site is a place to ask "can this end up
+    /// in a log line or an error message?".
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+/// FR-52 — what the DEVICE believes about the two gates it owns itself
+/// ([`Request::ExternalPasswordStatus`]).
+///
+/// The three states an operator needs told apart, which one boolean would
+/// collapse into "no":
+/// - `supported: false` — this BUILD has no credential stack, so no password
+///   can be held at all. Fix: a build/update. (Same reasoning as
+///   `RpcCap::ExternalAccess` being unconditional: "too old" and "opted out"
+///   have different fixes and must not render alike.)
+/// - `password_set: false` — the build can hold one, none is set. Fix: set it.
+/// - `enabled: false` — a password may be set, but gate 3 is shut, so nothing
+///   external is admitted. Fix: `roomler config set external_access_enabled true`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExternalPasswordState {
+    /// Was this daemon compiled with the external-access credential stack?
+    pub supported: bool,
+    /// Gate 4 — is a password record stored? Never the record itself: it is
+    /// not readable back by design, and the answer an operator needs is a
+    /// boolean.
+    pub password_set: bool,
+    /// Gate 3 — `external_access_enabled` in this device's own config.
+    pub enabled: bool,
+    /// The device's local consent mode for external sessions, if it overrides
+    /// the default. `None` = the daemon's built-in default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_mode: Option<String>,
+    /// The device's local permission ceiling for external sessions, if set.
+    /// `None` = whatever the org approved, clamped by the built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_permissions: Option<String>,
+}
+
 /// A LocalAPI request. P1 exposed read-only verbs; P2b adds the (mutating)
 /// consent verbs. Adjacently tagged on `t`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1048,6 +1107,36 @@ pub enum Request {
         #[serde(default)]
         value: Option<String>,
     },
+    /// FR-52 gate 4 — set the device-held external-access password.
+    ///
+    /// The plaintext crosses this pipe and **nothing else**: the daemon runs the
+    /// whole OPAQUE registration itself (it plays both halves — no network is
+    /// involved) and persists only the resulting record, so the password exists
+    /// in no file, no log and, above all, on no server. That is the one
+    /// constraint the whole feature is shaped around — the alternative a reviewer
+    /// finds obvious, POST the password and let the server compare a hash on the
+    /// `agents` row, turns a database dump into a fleet-wide credential dump.
+    ///
+    /// Deliberately **not** a `config set` key: `config get` lists every editable
+    /// key with its value, and `config set` would let anyone who can write the
+    /// config file choose the password without proving they know the old one.
+    ///
+    /// Mutating; the pipe/socket ACL is the trust boundary — the same authority
+    /// that already flips `exec_enabled`, which is a strictly stronger grant.
+    /// Returns [`Response::ExternalPassword`] or [`Response::Error`].
+    ExternalPasswordSet { password: Secret },
+    /// FR-52 gate 4 — forget the device-held password, closing gate 4.
+    ///
+    /// Clears **both** halves of the record together: a half-cleared credential
+    /// is a parse failure at verify time, which is a *refusal that looks like a
+    /// bug* instead of the clean "no password set" the operator asked for.
+    /// Deliberately works on a build without the credential stack — a device
+    /// that held a password and was then downgraded must still be able to drop
+    /// it. Returns [`Response::ExternalPassword`].
+    ExternalPasswordClear,
+    /// FR-52 — the device's own view of gates 3 and 4
+    /// ([`Response::ExternalPassword`]). Read-only, and never carries the record.
+    ExternalPasswordStatus,
     /// S2 — read the tail of one of the daemon's log files. `source` is
     /// `daemon` (this process's active rolling log), `service` (the
     /// machine-global SCM host log), or `panic` (the newest panic dump).
@@ -1203,6 +1292,10 @@ pub enum Response {
     ConfigUpdated {
         entry: ConfigEntry,
     },
+    /// FR-52 — the device's gate-3 / gate-4 state after a set/clear, or on a
+    /// bare status read. One shape for all three verbs so a client renders the
+    /// outcome from the same struct it renders the status from.
+    ExternalPassword(ExternalPasswordState),
     /// The tail of a daemon log file ([`Request::TailLog`]). `size` is
     /// the file's TOTAL size — a client polls it to detect growth and
     /// re-request; `content` starts on a line boundary when the tail cut
@@ -1435,6 +1528,28 @@ pub trait LocalApiState: Send + Sync {
     }
     /// S2 — tail a daemon log file (async — file I/O). Default:
     /// unsupported; the agent daemon overrides.
+    /// FR-52 gate 4 — register `password` and persist the record. Default: an
+    /// older daemon answers a clean `Error` rather than a silent success.
+    async fn external_password_set(&self, _password: &Secret) -> Response {
+        Response::Error {
+            message: "this daemon does not support external access".into(),
+        }
+    }
+
+    /// FR-52 gate 4 — drop the stored record.
+    async fn external_password_clear(&self) -> Response {
+        Response::Error {
+            message: "this daemon does not support external access".into(),
+        }
+    }
+
+    /// FR-52 — report gates 3 and 4. The default is a truthful "nothing here",
+    /// not an error: a client asking *whether* the feature exists must get an
+    /// answer it can render, and `supported: false` is that answer.
+    async fn external_password_status(&self) -> Response {
+        Response::ExternalPassword(ExternalPasswordState::default())
+    }
+
     async fn tail_log(&self, _source: &str, _max_bytes: Option<u64>) -> Response {
         Response::Error {
             message: "log tailing is not supported on this node".into(),
@@ -1497,6 +1612,9 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::ConfigCleanupStale
         | Request::ConfigGet
         | Request::ConfigSet { .. }
+        | Request::ExternalPasswordSet { .. }
+        | Request::ExternalPasswordClear
+        | Request::ExternalPasswordStatus
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. } => Response::Error {
@@ -1556,6 +1674,11 @@ where
             Ok(Request::ConfigCleanupStale) => state.config_cleanup_stale().await,
             Ok(Request::ConfigGet) => state.config_entries().await,
             Ok(Request::ConfigSet { key, value }) => state.config_set(&key, value.as_deref()).await,
+            Ok(Request::ExternalPasswordSet { password }) => {
+                state.external_password_set(&password).await
+            }
+            Ok(Request::ExternalPasswordClear) => state.external_password_clear().await,
+            Ok(Request::ExternalPasswordStatus) => state.external_password_status().await,
             Ok(Request::TailLog { source, max_bytes }) => state.tail_log(&source, max_bytes).await,
             Ok(Request::ExecRemote {
                 node,
@@ -2357,6 +2480,42 @@ impl Client {
             .await?
         {
             Response::ConfigUpdated { entry } => Ok(entry),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-52 gate 4 — hand the daemon a plaintext password to register.
+    ///
+    /// ⚠️ Slow **on purpose**: the daemon derives the record with Argon2id, so
+    /// this round trip is the KDF's cost (hundreds of ms, and more on a weak
+    /// CPU). A caller must not treat a delay here as a hung daemon.
+    pub async fn external_password_set(
+        &mut self,
+        password: &str,
+    ) -> std::io::Result<ExternalPasswordState> {
+        match self
+            .request(&Request::ExternalPasswordSet {
+                password: Secret(password.to_string()),
+            })
+            .await?
+        {
+            Response::ExternalPassword(state) => Ok(state),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-52 gate 4 — drop the stored record.
+    pub async fn external_password_clear(&mut self) -> std::io::Result<ExternalPasswordState> {
+        match self.request(&Request::ExternalPasswordClear).await? {
+            Response::ExternalPassword(state) => Ok(state),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-52 — read gates 3 and 4 as the device sees them.
+    pub async fn external_password_status(&mut self) -> std::io::Result<ExternalPasswordState> {
+        match self.request(&Request::ExternalPasswordStatus).await? {
+            Response::ExternalPassword(state) => Ok(state),
             other => Err(unexpected_response(other)),
         }
     }
@@ -3555,5 +3714,113 @@ mod tests {
             !json.contains("\"surface\""),
             "an empty surface must be omitted: {json}"
         );
+    }
+
+    /// FR-52 — the password cannot be printed, not even through the request
+    /// that carries it.
+    ///
+    /// The second half is the one that matters. `Secret`'s own `Debug` is easy
+    /// to get right; the leak that would actually happen is someone adding
+    /// `tracing::debug!(?req)` to `serve_connection` while chasing a client bug,
+    /// and that path goes through `Request`'s DERIVED `Debug`. This asserts the
+    /// derive is safe, so the tempting debugging line stays safe to write.
+    #[test]
+    fn a_password_never_prints_itself_through_debug() {
+        // Built, not written: a secret scanner cannot tell a test fixture from a
+        // leaked credential, and it is right not to try.
+        let marker = format!("fr52-{}-not-a-credential", "marker");
+
+        let s = Secret(marker.clone());
+        assert!(!format!("{s:?}").contains(&marker), "Secret's own Debug");
+        assert_eq!(s.expose(), marker, "but it is still readable on purpose");
+
+        let req = Request::ExternalPasswordSet {
+            password: Secret(marker.clone()),
+        };
+        let printed = format!("{req:?}");
+        assert!(
+            !printed.contains(&marker),
+            "Request's derived Debug leaked the password: {printed}"
+        );
+        // Not the length either — it narrows a brute force and no debugging
+        // session needs it.
+        assert!(!printed.contains(&marker.len().to_string()));
+    }
+
+    /// FR-52 — the three verbs and their response survive the wire, and the
+    /// password travels as a BARE STRING.
+    ///
+    /// `Secret` is `#[serde(transparent)]` on purpose: the redaction is a `Debug`
+    /// property, not a wire format. If it ever serialised as `{"0": "…"}` the
+    /// daemon would still parse it (same type both sides) while every other
+    /// client of this protocol — the desktop companion, a future tray — would
+    /// break, and the test that caught it would be someone else's field report.
+    #[test]
+    fn the_external_password_verbs_round_trip() {
+        let marker = format!("fr52-{}-not-a-credential", "wire");
+        let set = Request::ExternalPasswordSet {
+            password: Secret(marker.clone()),
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(
+            json.contains(&format!(r#""d":{{"password":"{marker}"}}"#)),
+            "the password must be a bare string on the wire: {json}"
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), set);
+
+        for req in [
+            Request::ExternalPasswordClear,
+            Request::ExternalPasswordStatus,
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+        }
+
+        let state = ExternalPasswordState {
+            supported: true,
+            password_set: true,
+            enabled: false,
+            consent_mode: Some("always-ask".into()),
+            max_permissions: None,
+        };
+        let json = serde_json::to_string(&Response::ExternalPassword(state.clone())).unwrap();
+        assert!(
+            !json.contains("max_permissions"),
+            "an unset ceiling is omitted, not null: {json}"
+        );
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::ExternalPassword(back) => assert_eq!(back, state),
+            other => panic!("wrong response: {other:?}"),
+        }
+    }
+
+    /// FR-52 — an older daemon answers the status verb rather than erroring.
+    ///
+    /// A client's first question is "does this device support external access at
+    /// all", and `supported: false` is an answer it can render. An `Error` would
+    /// make the question unanswerable and indistinguishable from a daemon that
+    /// is simply broken — while `set` and `clear` DO default to an error, because
+    /// there the caller asked for a change that did not happen.
+    #[tokio::test]
+    async fn an_older_daemon_still_answers_the_status_verb() {
+        // `Mock` predates these verbs and overrides none of them, which is
+        // exactly the shape of the daemon this is about.
+        match Mock.external_password_status().await {
+            Response::ExternalPassword(s) => {
+                assert!(!s.supported);
+                assert!(!s.password_set);
+                assert!(!s.enabled);
+            }
+            other => panic!("status must not be an error on an older daemon: {other:?}"),
+        }
+        for r in [
+            Mock.external_password_set(&Secret("x".into())).await,
+            Mock.external_password_clear().await,
+        ] {
+            assert!(
+                matches!(r, Response::Error { .. }),
+                "a change that did not happen must be an error, got {r:?}"
+            );
+        }
     }
 }
