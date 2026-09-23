@@ -290,7 +290,17 @@ CAS. P6 follows it rather than inventing one.
 - [ ] A server that is asked to start an external session **without** a client proof
       cannot: demonstrated by driving the mint path directly against a real agent.
 - [ ] The password never appears in any server-side log, request body, or collection.
-      Demonstrated by a capture of the full exchange.
+      Demonstrated by a capture of the full exchange. **The device-side half is
+      done (P2c)**: `an_external_password_persists_and_never_lands_in_the_config_file`
+      asserts it against the config file's RAW bytes, and
+      `a_password_never_prints_itself_through_debug` covers the daemon log by
+      making `Request`'s derived `Debug` safe. Both falsified. The *server*-side
+      half needs the P3 exchange to exist before it can be captured.
+- [x] A password cannot be SET from anywhere but the device. **P2c** — no server
+      route writes it, `config set` refuses both credential keys, and
+      `no_external_credential_key_is_editable_through_the_config_surface`
+      allowlists the editable `external_*` keys so the next one added has to be
+      defended rather than inherited. Falsified by registering the verifier.
 - [ ] An SDP offer whose DTLS fingerprint is not authenticated under `K` is refused
       by the agent (negative arm run explicitly — a pass with no failing arm proves
       nothing).
