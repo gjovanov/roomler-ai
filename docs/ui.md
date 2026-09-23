@@ -126,6 +126,31 @@ nodes) · `MagicDnsSection` · `TunnelPoliciesSection` · `MembersSection` ·
 - **API client**: `ui/src/api/client.ts` — token injection + refresh handling.
 - **Dev proxy**: Vite proxies `/api` + `/ws` to `http://localhost:5001`.
 
+## Conventions
+
+**Plugin order** (`main.ts`): i18n → vuetify → pinia → router.
+
+**Stores** use the Pinia setup pattern: `defineStore('name', () => { … })`.
+
+**Vuetify** runs light + dark themes with auto-import tree-shaking via
+`vite-plugin-vuetify`.
+
+### Responsive page padding
+
+| Surface | Class |
+|---|---|
+| Top-level view | `<v-container fluid class="pa-2 pa-md-4 pa-xl-6">` — 8 px mobile / 16 px tablet+ / 24 px ≥1920 px |
+| Empty-state block | `pa-4 pa-md-6 pa-lg-8` |
+| Heading | `text-h5 text-md-h4` — shrinks one step on phone |
+| Section CTA | `size="large"` — **not** `x-large`, which overflows narrow viewports |
+| Marketing / legal (`LandingView`, `Terms`, `Privacy`) | `py-6 py-md-12` / `py-8 py-md-16` in place of fixed `py-12` / `py-16` |
+
+Hide secondary toolbar items below `sm` with `d-none d-sm-inline-flex`, and
+surface a phone fallback alongside.
+
+⚠️ `ChatView` and `ConferenceView` own their own custom-flex layout and
+**intentionally do not use `<v-container>`** — do not "fix" them to match.
+
 ## Build & test
 
 ```bash
