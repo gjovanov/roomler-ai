@@ -148,6 +148,32 @@ jobs:
           packages: libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
           version: ci-gtk-v1
 
+      # ⚠️ VERIFY, don't trust the action's status — the #1438 lesson, which was
+      # applied to the libvpx steps below and never to this one. On 2026-09-23
+      # this lane went red on master with `Package glib-2.0 was not found in the
+      # pkg-config search path` while the cached-apt step above reported success:
+      # GitHub evicts a cache unused for 7 days, the last green run here was
+      # 09-15, and a restore of nothing is not a failure to that action. Two
+      # master commits merged into the red before anyone noticed, and every open
+      # PR inherited it.
+      #
+      # Probe `glib-2.0` only. It is the name the failure actually reports and
+      # the one this job's comment above names as required; the other four .pc
+      # files come from the same apt install, so glib present after a real
+      # install implies they are too. Guessing five pkg-config spellings here
+      # would risk a wrong name failing the re-verify on a lane that works.
+      - name: Verify the GTK/glib deps actually landed (cache-restore guard)
+        run: |
+          if ! pkg-config --exists glib-2.0; then
+            echo "::warning::cached apt restored no glib-2.0.pc — installing from the mirror"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              libglib2.0-dev libgtk-3-dev libsoup-3.0-dev \
+              libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
+          fi
+          pkg-config --exists glib-2.0 || { echo "::error::glib-2.0.pc still missing after the fallback install"; exit 1; }
+          echo "glib-2.0 $(pkg-config --modversion glib-2.0) present"
+
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
 
