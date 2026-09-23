@@ -146,7 +146,47 @@ jobs:
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
-          version: ci-gtk-v1
+          # v1 -> v2 on 2026-09-23 to ABANDON A POISONED CACHE ENTRY, not
+          # because the package list changed. See the guard below for what
+          # happened; the key is derived from this string plus the resolved
+          # package versions, so bumping it is the only way to stop restoring
+          # a bad entry.
+          version: ci-gtk-v2
+
+      # ⚠️ A RESTORED APT CACHE IS NOT AN INSTALLED PACKAGE SET, and the action
+      # reports success either way. Measured 2026-09-23 on master: the first
+      # run hit `E: Unable to fetch some archives`, the step went GREEN anyway
+      # and wrote its cache; every run after that logged
+      # `Cache restored successfully` and still had no glib. It surfaced ~40 s
+      # later, three steps away, as
+      # `failed to run custom build command for glib-sys` / `Package glib-2.0
+      # was not found in the pkg-config search path` — master red, and with it
+      # every open PR, for a reason that names neither apt nor the cache.
+      #
+      # This is the SAME defect #1438 fixed for libvpx twenty lines below, in
+      # the same file, with the same action. It was fixed there and not here,
+      # which is the whole lesson: a guard applies at every entry point, or it
+      # is a courtesy. If you add a third cached-apt step, it gets one too.
+      #
+      # `dpkg -s` takes the package names verbatim from the list above so a
+      # typo cannot make this assert vacuous; the `pkg-config` line is the
+      # check the build scripts themselves perform, because a package can be
+      # installed while its `.pc` file is still not on the search path.
+      - name: Verify the GTK dev packages really landed (fallback to apt-get)
+        run: |
+          pkgs="libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config"
+          missing=""
+          for p in $pkgs; do dpkg -s "$p" >/dev/null 2>&1 || missing="$missing $p"; done
+          if [ -n "$missing" ]; then
+            echo "::warning::cached apt set did not deliver:$missing — installing directly"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends $pkgs
+          fi
+          for p in $pkgs; do
+            dpkg -s "$p" >/dev/null 2>&1 || { echo "::error::$p still not installed after the fallback"; exit 1; }
+          done
+          pkg-config --exists glib-2.0 || { echo "::error::glib-2.0 still invisible to pkg-config after the fallback"; exit 1; }
+          echo "glib-2.0 $(pkg-config --modversion glib-2.0) — the build scripts can see it"
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
