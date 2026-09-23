@@ -85,6 +85,47 @@ Two force-multipliers:
 Feature negotiation is version-gated (`agent_supports_quic` / `…_overlay`), so
 mixed-version fleets degrade to the transports both ends speak.
 
+### ⚠️ A WebRTC peer MUST be `close()`d — dropping it frees NOTHING
+
+Fixed 2026-08-22. An `RTCPeerConnection`'s UDP sockets — one host candidate per
+local address, plus webrtc-ice's mDNS listener on `0.0.0.0:5353` — are owned by
+**tasks the ICE agent spawned**, not by the struct, so an `Arc` drop leaves every
+one of them live.
+
+`tunnel_core::transport::webrtc_dc::TunnelPeer` had no `close()` and no `Drop`,
+and `run_tunnel_session` has many `?` early returns, so **every failed tunnel
+session leaked its whole socket set**.
+
+Measured on devbox: `roomlerd` held **15,446 UDP sockets after 12 h** (10,367 on
+`:5353`) — the entire 16,384-port ephemeral range. Every socket allocation on the
+**host** then failed `WSAENOBUFS`/10055 and **the whole machine lost DNS**, while
+`ping 1.1.1.1` stayed at 3 ms.
+
+⚠️ **That signature — names unresolvable, IPs fine, `nslookup` "No response" even
+from a reachable server — is a socket-exhaustion tell, not a DNS-server problem.**
+Check this first:
+
+```bash
+netstat -ano -p UDP | awk '{print $NF}' | sort | uniq -c | sort -rn | head
+```
+
+⚠️ It also masquerades as flaky tests: the QUIC/relay-probe loopback tests fail
+with the same 10055 when the host is starved.
+
+The fix is an explicit `close()` plus a `Drop` net that spawns it, mirroring
+`AgentPeer`. mDNS is additionally `Disabled` in the tunnel `SettingEngine` — it is
+a browser privacy feature, both ends here are ours, and `MulticastDnsMode`
+defaults to `QueryOnly`, which still binds 5353.
+
+**The amplifier is fixed alongside**: the flow supervisor reset its retry ladder
+on *any* clean session end, so a flow that opened and died on arrival span hammered
+at the 1 s floor forever. A reset now requires `SESSION_RAN_THRESHOLD` (30 s) of
+actual uptime — the condition the code comment already assumed.
+
+> A *separate*, still-open leak on the relay node is tracked as
+> [FR-48](fr/FR-48-roomlerd-ice-socket-leak.md); this section is the prior art it
+> refers to.
+
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open

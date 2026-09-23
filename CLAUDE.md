@@ -48,41 +48,31 @@ answer is **the strongest model available, at maximum effort**.
 That is not a preference. It is the shape the bugs in this codebase actually have:
 
 1. **The cause sits three layers below the symptom.** "This host lost DNS" was a
-   leaked WebRTC UDP socket twelve hours earlier that had consumed the entire
-   ephemeral port range — while `ping 1.1.1.1` stayed at 3 ms. "Video works for
-   org A but not org B" was one cluster node missing its RTC-range iptables
-   rules: flawless signalling, zero media, for weeks, with nothing logged. "The
-   consent prompt never appeared" was a `loginctl` invocation that exits 1, whose
-   empty stdout shipped code read as "nobody is at the screen."
-
-2. **One change spans every layer at once** and is wrong in exactly one of them:
-   Rust async internals, kernel routing tables and netlink, Windows WFP filters
-   and ConPTY, an SFU's ICE candidate set, a browser's jitter buffer, MongoDB
-   indexes and BSON serialisation — inside a single feature.
-
+   leaked WebRTC UDP socket twelve hours earlier that had eaten the entire
+   ephemeral port range, while `ping 1.1.1.1` stayed at 3 ms.
+2. **One change spans every layer at once** and is wrong in exactly one of them —
+   Rust async internals, kernel routing and netlink, Windows WFP and ConPTY, an
+   SFU's ICE candidate set, a browser's jitter buffer, BSON serialisation, inside
+   a single feature.
 3. **The invariants are non-obvious, load-bearing, and each was paid for in the
    field.** `Some([])` means *deny* while `None` means *no policy compiled*.
    Pooling an overlay address before the tombstone locks the next joiner out
    permanently. `ssh` is a prefix of `ssh-consent` and the two mean different
-   things, so the match must stay equality. `from_slice` and `from_document`
-   disagree on `is_human_readable`, so a round-trip test passes on broken code.
-   Every one of those reads as a harmless simplification to a model that is
-   pattern-matching instead of reasoning — and every one of them was a live
-   production incident.
-
+   things, so the match must stay equality. Every one of those reads as a harmless
+   simplification to a model that is pattern-matching instead of reasoning — and
+   every one was a live production incident.
 4. **Most of this surface is unreachable by tests.** The corporate laptop, the
    full-tunnel VPN, the symmetric NAT, the locked screen, the headless cluster
    node — none of it is in CI. The reasoning done *before* the code ships is the
    verification budget.
-
 5. **The blast radius is a fleet.** The daemon runs as SYSTEM/root on every
-   enrolled machine and updates itself. A wrong answer here does not fail a test —
-   it takes an operator's remote access to their own box, freezes fleet updates
+   enrolled machine and updates itself. A wrong answer does not fail a test — it
+   takes an operator's remote access to their own box, freezes fleet updates
    fleet-wide, or opens a silent pivot into a corporate network.
 
 Cheaper is more expensive here. A plausible-but-wrong change costs a release
-cycle, a field-debug session across three time zones, and — measured repeatedly
-in this repository — weeks of latency before anyone notices it regressed.
+cycle, a field-debug session across three time zones, and — measured repeatedly in
+this repository — weeks of latency before anyone notices it regressed.
 
 > *This block states the requirement; it does not enforce it. The deterministic
 > levers are `/model` in-session, `"model"` in `.claude/settings.json`, and
@@ -92,80 +82,70 @@ in this repository — weeks of latency before anyone notices it regressed.
 
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
+
+> **This file is the always-loaded tier and is deliberately kept small.** It
+> carries the invariants that must hold *without* opening a doc, plus pointers.
+> Depth lives in **[`docs/README.md`](docs/README.md)** — the navigable index of
+> ~45 engineering docs — and in two skills that load themselves when the task
+> matches: **`encoder-cells`** (the capability probe, the cell matrix, per-backend
+> FFmpeg traps) and **`ship-it`** (release, signing, promote, deploy). Add depth
+> *there*, not here.
 
 ## Project Overview
-
-**Roomler AI** is three products on one daemon. `docs/README.md` has been
-organised this way since #490; this file now matches it, because the networking
-pillar owns `tunnel-core`, `derp-relay`, `localapi` and the large majority of
-recent commits while having had no top-level identity here at all.
 
 | # | Pillar | What it is | Start here |
 |---|---|---|---|
 | 1 | **Remote desktop** | TeamViewer-class remote control, in Rust | `docs/remote-control.md` |
-| 2 | **Networking** | a WireGuard overlay mesh (Tailscale-class) **+** userspace tunnels (ngrok-class), DERP relays, and roomler SSH | `docs/overlay-communication.md`, `docs/tunnels.md` |
-| 3 | **Collaboration** | chat · video conferencing · file sharing · rooms | this file's route/model sections |
+| 2 | **Networking** | a WireGuard overlay mesh (Tailscale-class) **+** userspace tunnels (ngrok-class), DERP relays, roomler SSH | `docs/overlay-communication.md`, `docs/tunnels.md` |
+| 3 | **Collaboration** | chat · video conferencing · file sharing · rooms | `docs/real-time.md`, `docs/ui.md` |
 
-Two invariants that were previously implicit and are load-bearing in both
-directions:
+Two invariants, load-bearing in both directions:
 
-- **One daemon per enrolled machine.** `roomlerd` *is* the remote-desktop
-  target, the tunnel exit, the tunnel client, the overlay node and the SSH
-  server — not four cooperating services. This is why a "just add another
-  install" answer is almost always wrong (fixed TUN name + GUID, a singleton
-  LocalAPI pipe, host-global exit/DNS/WFP state, one updater — `docs/multi-org.md`).
-- **The server coordinates but never carries plaintext.** Pixels, keystrokes,
-  SSH bytes and tunnel payloads travel P2P or over a relay that only ever sees
-  ciphertext. Any design that would make the control plane a data path is
-  wrong on those grounds alone, not merely on performance grounds.
+- **One daemon per enrolled machine.** `roomlerd` *is* the remote-desktop target,
+  the tunnel exit, the tunnel client, the overlay node and the SSH server — not
+  four cooperating services. This is why "just add another install" is almost
+  always wrong (fixed TUN name + GUID, a singleton LocalAPI pipe, host-global
+  exit/DNS/WFP state, one updater — `docs/multi-org.md`).
+- **The server coordinates but never carries plaintext.** Pixels, keystrokes, SSH
+  bytes and tunnel payloads travel P2P or over a relay that only ever sees
+  ciphertext. Any design that would make the control plane a data path is wrong on
+  those grounds alone, not merely on performance grounds.
 
-Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU)
-+ webrtc-rs (P2P remote-control) + WireGuard/smoltcp (overlay). The agent ships
-as a separate native binary (`roomlerd`) that runs
-on controlled hosts.
+Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU) +
+webrtc-rs (P2P remote-control) + WireGuard/smoltcp (overlay). The agent ships as a
+separate native binary (`roomlerd`) that runs on controlled hosts.
 
-### Pillar 2 design goal — read this before touching networking code
+### Pillar 2 design goal — read before touching networking code
 
-> **A resilient, secure private network that "just works" — at maximum
-> performance and lowest achievable latency — across varied and complex
-> real-world network infrastructures.**
+> **A resilient, secure private network that "just works" — at maximum performance
+> and lowest achievable latency — across varied and complex real-world network
+> infrastructures.**
 
-"Just works" is the acceptance bar, not a slogan. It has to hold on an
-unmanaged laptop *and* a GPO-locked corporate desktop (locked firewall,
-TLS-inspecting middlebox, EDR, no admin rights on the network stack); under a
-consumer VPN *and* an enterprise full-tunnel client that reroutes and reaps
-routes underneath us; on headless Linux, k8s nodes, containers and WSL with no
-desktop session; on Windows, Linux and macOS, where the mechanics differ
-(Wintun + WFP, netlink + rt tables, utun) but the *behaviour* must not.
+Six commitments follow. All are load-bearing in the code today; don't regress them
+(mechanics: `docs/overlay-nat-traversal.md`, `docs/overlay-communication.md`):
 
-Six commitments follow from it. All are load-bearing in the code today — don't
-regress them:
-
-1. **Best carrier that works, always measured, never assumed.** The cascade is
-   LAN → direct-public → srflx hole-punch → single-relay (TURN) → org relay
-   (FR-19: a tenant-owned node — a third relay KIND on the relay tier, only
-   when the org minted a session) → DERP over
-   WSS :443, chosen by a **server verdict over measured `CapVector`s**.
-   Heuristics may *detect*; they never *decide*. Never ratchet: a node that
+1. **Best carrier that works, always measured, never assumed.** LAN →
+   direct-public → srflx hole-punch → single-relay (TURN) → org relay (FR-19) →
+   DERP over WSS :443, chosen by a **server verdict over measured `CapVector`s**.
+   Heuristics may *detect*; they never *decide*. **Never ratchet** — a node that
    fell to relay keeps re-attempting direct (make-before-break, then relentless
    re-upgrade).
-2. **A floor that always connects.** With every UDP path blocked, DERP over
-   TLS :443 still carries the mesh (`derp_floor`). Connectivity is never
+2. **A floor that always connects.** With every UDP path blocked, DERP over TLS
+   :443 still carries the mesh (`derp_floor`). Connectivity is never
    all-or-nothing.
 3. **Never self-wedge.** Route/exit/firewall changes pin carrier + control-plane
-   exemptions FIRST and **withhold** the change if they can't. A mesh feature
-   must never cost the operator their own remote access to the box; route
-   guards re-assert and boot reconcilers heal stale state after a hard exit.
+   exemptions FIRST and **withhold** the change if they can't. A mesh feature must
+   never cost the operator their own remote access to the box; route guards
+   re-assert and boot reconcilers heal stale state after a hard exit.
 4. **No OS privileges required as a fallback.** Where a TUN or routing table is
    unavailable or owned by someone else, `overlay-netstack` gives the same mesh
    through a userspace stack + loopback SOCKS5 front, with zero routing changes.
 5. **Default-deny, tenant-scoped, end-to-end encrypted** — overlay ACLs, tunnel
    ACLs, and an agent-local gate that survives a compromised server. Every
    decision audited.
-6. **Field-validated, not CI-validated.** Networking changes are proven on the
-   real fleet across the topologies above via `roomler exec` after every roll.
-   **CI green ≠ done.**
+6. **Field-validated, not CI-validated.** Proven on the real fleet across the
+   topologies above via `roomler exec` after every roll. **CI green ≠ done.**
 
 ## Commands
 
@@ -176,545 +156,710 @@ cd ui && bun run dev                   # Vite dev server (port 5000, proxies to 
 cd ui && bun run build                 # Production UI build (includes vue-tsc --noEmit)
 
 # Remote-control agent (native binary — runs on the controlled host)
-cargo build -p roomlerd --release --features full      # full pipeline: capture + encode + input (SW encoder)
-cargo build -p roomlerd --release --features full-hw   # Windows + Media Foundation HW encoder scaffolding (opt-in)
+cargo build -p roomlerd --release --features full      # capture + encode + input (SW encoder)
+cargo build -p roomlerd --release --features full-hw   # + Media Foundation HW encoder scaffolding
 cargo build -p roomlerd --release                      # signalling-only (no media, no input)
 ./target/release/roomlerd enroll --server <url> --token <enrollment-jwt> --name <label>
-./target/release/roomlerd run
-./target/release/roomlerd run --encoder software       # force openh264 (default on Windows today)
-./target/release/roomlerd run --encoder hardware       # try MF-HW → MF-SW → openh264 (experimental)
-./target/release/roomlerd encoder-smoke --encoder hardware   # offline: feed 10 synthetic frames, diagnose MFT init
+./target/release/roomlerd run [--encoder software|hardware]
+./target/release/roomlerd encoder-smoke --encoder hardware   # offline MFT/FFmpeg init diagnosis
 ./scripts/dev-xvfb.sh                  # capture smoke test via a virtual framebuffer
 
 # Testing
-cargo test -p roomler-ai-tests           # All integration tests (163+ tests, requires MongoDB+Redis)
-cd ui && bun run test:unit             # Vitest unit tests (259 tests)
-cd ui && bun run test:unit:coverage    # Vitest with coverage
-cd ui && bun run e2e                   # Playwright E2E tests (24 spec files)
+cargo test -p roomler-ai-tests         # Integration tests (requires MongoDB + Redis)
+cd ui && bun run test:unit             # Vitest unit tests
+cd ui && bun run e2e                   # Playwright E2E tests
 
-# Static Analysis
-cargo fmt --all -- --check                  # Rust fmt (matches CI)
-cargo clippy --workspace -- -D warnings                                 # Rust lint — what CI runs across the workspace
-cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests --all-targets -- -D warnings   # + CI's audited-crate pass, where test-only lints fire
-cargo check --workspace                     # Rust compilation check
-cd ui && vue-tsc --noEmit                  # Vue TypeScript check
+# Static analysis — what CI runs
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests --all-targets -- -D warnings
+cd ui && vue-tsc --noEmit
 
-# Dependency Audit
-cargo audit                            # Rust CVE scan (requires cargo-audit)
-cargo outdated                         # Rust outdated deps (requires cargo-outdated)
-cd ui && bun audit                     # JS/TS vulnerability scan
-cd ui && bun outdated                  # JS/TS outdated deps
+# Dependency audit
+cargo audit / cargo outdated ;  cd ui && bun audit / bun outdated
 
 # Infrastructure
-docker compose up -d                   # Start MongoDB (27019), Redis (6379), MinIO (9000), coturn
+docker compose up -d                   # MongoDB (27019), Redis (6379), MinIO (9000), coturn
 ```
+
+⚠️ **`cargo clippy --workspace` compiles the feature UNION and can never see a
+profile or a feature-gated backend.** `--features full` is a *separate* CI clippy
+step — the only one that compiles the capture backend. Run
+`cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets`
+in WSL before pushing; a `#[cfg(windows)]` helper needs the same gate on its test.
+
+⚠️ `--workspace` clippy compiles only `pub mod fixtures` from `crates/tests` (every
+test module is `#[cfg(test)]`-gated), so `Checking roomler-ai-tests` in a build log
+is **not** evidence the tests build.
 
 ### Agent build requirements
 
-`--features full` (or the individual `scrap-capture` / `openh264-encoder` / `enigo-input` flags) pulls in system deps:
+`--features full` (or the individual `scrap-capture` / `openh264-encoder` /
+`enigo-input` flags) pulls in system deps:
 
 ```bash
-# Linux (for the scrap-capture feature)
-sudo apt install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
-
-# OpenH264 is compiled from C source on first build — slow but no runtime lib needed.
+sudo apt install -y libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev   # Linux, for scrap-capture
+# OpenH264 compiles from C source on first build — slow, but no runtime lib needed.
 ```
 
-Default build (no features) compiles on any rust:bookworm image and produces a signalling-only agent useful for CI / integration tests, but not usable in production (no capture, no input).
+The default build (no features) compiles on any `rust:bookworm` image and produces
+a signalling-only agent useful for CI, but **not usable in production** (no
+capture, no input).
 
-### Encoder selection (Windows)
+### Encoders — load the `encoder-cells` skill
 
-Preference resolution: **CLI `--encoder` > env `ROOMLERD_ENCODER` > `encoder_preference` in config TOML > `Auto` default**. Values: `auto` | `hardware` (`hw`/`mf`) | `software` (`sw`/`openh264`). `Auto` on Windows runs the MF H.264 probe-and-rollback cascade then falls back to openh264; everywhere else it's openh264 only. Escape hatch `ROOMLERD_HW_AUTO=0` reverts to openh264-first without a rebuild. Full cascade mechanics (DXGI adapter enumeration, async-unlock semantics, probe frame, Intel QSV async path) in `docs/remote-control.md`.
+Preference resolution: **CLI `--encoder` > env `ROOMLERD_ENCODER` >
+`encoder_preference` in config TOML > `Auto`**.
 
-### The caps probe runs in a CHILD PROCESS (rc.433)
+Everything else about the encoder surface — the child-process capability probe and
+its two phases, the cache, the `encoder_cells_deny` kill switch, the codec ×
+backend × chroma cell matrix, and the per-backend traps (NVENC / QSV / AMF /
+VAAPI / D3D12 / Vulkan / VideoToolbox) — lives in the **`encoder-cells` skill** and
+`docs/encoders.md`. Three that must not be re-learned the hard way:
 
-`encode::caps::detect()` spawns `roomlerd caps-probe` (hidden subcommand), reads one `ROOMLER_CAPS_JSON:{…}` line, and treats **any** failure — non-zero exit, killed by a signal, 60 s timeout, unspawnable, unparseable — as "every hardware codec is unavailable", falling back to `compute_caps(false)`: the caps that need no driver call. A capability probe is untrusted third-party code by definition (vendor drivers, GPU firmware) and does not belong in the daemon's address space. Before this, a fault inside a probe took `roomlerd` down and the service manager restarted it straight back into the same probe — a **crash-loop**, not a degraded agent (WSL sibling, 2026-08-20: WSL's `libcuda.so.1` stub dlopens fine, then `hevc_nvenc` SEGVs when `cuInit(0)` fails — the loaded-but-unusable state no presence check catches; hosts with no libcuda took the clean dlopen-failed branch, which is why it stayed latent). ⚠️ `ROOMLERD_HW_AUTO=0` / `ROOMLERD_ENCODER=software` do NOT skip the probe — those pick an encoder, while the probe enumerates what to ADVERTISE. ⚠️ The child sets `ROOMLERD_CAPS_CHILD=1`; `detect()` seeing it computes in-process (recursion guard). ⚠️ stdout is marker-parsed, not last-line-parsed, so anything else logging there can't be mistaken for the result; the child's stderr is INHERITED on purpose so its per-codec probe lines land in the daemon log next to the verdict.  ⚠️ **The child does NOT inherit the S2 config-fallback registry** (`tunnel_core::env::register_config_fallbacks` is process-local): since 0.4.20 `child::probe()` exports every registered knob as a real `ROOMLERD_*` env var (`config_fallbacks_for_child`, precedence preserved) and `detect()` recomputes `caps.rpc = rpc_caps()` in the PARENT — before that, a config-only `relay_server_enabled = true` started the relay server in-process while the hello never advertised `relay-server`, so the FR-19 mint could only ever answer `no_relay` (field, Asahi on 0.4.19: `sudo env ROOMLERD_RELAY_SERVER_ENABLED=1 ROOMLERD_CAPS_CHILD=1 roomlerd caps-probe` printed the verb, the bare probe did not). Any verb derived from CONFIG belongs in the parent, not the probe.
-
-### The probe advertises a CELL MATRIX (FR-77 P1)
-
-Since FR-77 the probe opens EVERY encoder (codec × backend) in cascade order — not the first that works — and the 4:4:4 form of the names the FFmpeg sources allow, and advertises `AgentCaps.video_cells` (`{codec, backend, chroma[], hw}`, wire strings from `models::{VideoCodec, VideoBackend, ChromaFormat}`, unknown names ignored) plus `probe_ms`. The legacy fields keep their exact pre-FR-77 meaning (first backend that opens) and `data-channel-vp9-444` stays on the wire forever. ⚠️ `hw` is VERIFIED: QSV counts as hardware only on the oneVPL build (`qsv_is_hardware_by_construction` — `av1_qsv` registers only under libvpl, and that dispatcher never enumerates the CPU runtime). ⚠️ The **denylist** is the kill switch: `ROOMLERD_ENCODER_CELLS_DENY` (`name:chroma`, comma-separated, empty = deny nothing) REPLACES the built-in `hevc_qsv:yuv444,hevc_vaapi:yuv444,vp9_qsv:yuv444,vp9_vaapi:yuv444,hevc_vulkan:yuv444`; a denied cell is never opened — by the probe AND by a session, both reading `cells::names_420` / `names_444` (the cascade minus the list). ⚠️ Until 0.4.90 only the probe and the 4:4:4 list read it: the 4:2:0 session cascades handed the static table to the dispatcher, and a HEVC session on jupiter opened a denied `hevc_vaapi` while the hello advertised only the Vulkan cells (FR-78 P3, 2026-09-08) — a kill switch a child process honours and the daemon ignores keeps nothing out of the daemon. ⚠️ `h264_nvenc` 4:4:4 needs `profile=high444p` — `rext` is HEVC-only and reads as "cannot". ⚠️ **A probe proves an OPEN; only a session proves a CELL** (FR-78 P3, 2026-09-08): `av1_vulkan` on the RTX 5090 opened, encoded and reported nothing wrong, and Chrome painted garbage (hardware AV1) or stalled (dav1d) — FFmpeg's `av1_vulkan` emits temporal units WITHOUT the temporal-delimiter OBU every other AV1 encoder starts with; `encoder-smoke --name <x> --dump <file>` + the FFmpeg CLI's dav1d attributed it in one run (the raw dump is refused, the same bytes with `12 00` before each unit decode 10/10). `FfmpegEncoder::drain_packets` now prepends the delimiter to any AV1 packet lacking one (`with_av1_temporal_delimiter`), for every AV1 backend — necessary, not sufficient: the repaired build's session shows correct keyframes and corrupt inter frames, and the FFmpeg CLI's own `av1_vulkan` on the same GPU emits frames dav1d cannot parse (`Error parsing frame header`, 29/29) — an FFmpeg 9.0.1 / NVIDIA driver defect with no roomler code in the loop, so `av1_vulkan:yuv420` is the built-in denylist's one 4:2:0 entry. Measured on the dev box: 8 cells in 3.5 s (the AMF cells on the Radeon 610M were invisible before, the cascade stopped at NVENC). The viewer derives cells for old agents in `ui/src/composables/videoCells.ts` — the ONE reading the picker and the admin chips share. Glossary: `CONTEXT.md`.
-
-### The probe is CACHED across restarts (FR-77 P3)
-
-Since P3 the child probe's answer is kept in `caps-cache.json` next to the daemon's logs (`encode/caps_cache.rs`) under a key of exactly what it depends on — the **build** (crate version + exe length/mtime), the **hardware fingerprint** (`encode/hwid.rs`: Windows = every display-class driver instance's `DriverDesc`/`DriverVersion`/`MatchingDeviceId` from the registry + OS build/UBR; Linux = sysfs DRM ids + kernel driver, the NVIDIA module version, kernel release, the userspace driver libraries' size+mtime; **macOS = no key ⇒ no cache**, its probe is ~120 ms) and a **SHA-256 of every `ROOMLERD_*` knob** (env + the S2 fallbacks the child receives). Any mismatch, a format bump, or **7 days** re-probes; `caps_cache = false` / `ROOMLERD_CAPS_CACHE=0` switches read and write off. ⚠️ **Only a result with a HARDWARE cell is cached** — a no-hardware answer is the cheap case AND the one a service that starts before the display driver produces; freezing it for a week would be a silent fleet regression. ⚠️ A hit takes ONLY the driver-derived fields (`hw_encoders`, `codecs`, `transports`, `hevc_chroma`, `vp9_chroma`, `video_cells`); permissions, the GUI-session state and every verb list are recomputed by the running process (`caps::merge_cached`) — they change without any driver changing. The hello then says `probe_cached: true` and `probe_ms` is the cached probe's duration. ⚠️ **Found on the way: the vp9_qsv runtime-IDR verdict never left the child.** rc.433 moved the probe out of process and the P4 verdict stayed in the child's `OnceLock`, so every vp9_qsv session since ran the GOP-60 containment the probe existed to lift; the child now prints a `ProbeReport` envelope (`{caps, vp9_qsv_idr}`, a bare-caps line still parses) and the parent installs it (`FfmpegEncoder::set_vp9_qsv_idr_verdict`). The denylist is a config key (`encoder_cells_deny`, validated `name:chroma` entries or `none`), bridged to the child like every knob, and **pushable through remote config with `MANAGE_AGENTS` alone** — it only ever removes cells; the device reports `needs_restart`. The ceiling table has a chroma column: `rate_factor_{h264,hevc,vp9}_444` (built-in 150 on top of the codec factor for a 4:4:4 cell). `encode/cells.rs` holds the shared vocabulary (`FFMPEG_444_CAPABLE`, the denylist, `names_444`) so the probe and the pump can never disagree.
-
-**P3b — the cells.** QSV and VAAPI take 4:4:4 as packed **VUYX** (`chroma444_pixel(name)`; FFmpeg n9's `vp9_qsv`/`hevc_qsv` list VUYX/XV30 and never planar 4:4:4 — the reason the P1 probe's `vp9_qsv` 4:4:4 open failed); the pump interleaves dcv's I444 planes (`pack_vuyx`: V, U, Y, 0xFF) into one packed plane, NVENC keeps planar `yuv444p`, and QSV's profile (`rext` / `profile1`) is set explicitly in the `base` option tier. Every constructor's 4:4:4 cascade is `cells::names_444(codec)` (the source matrix minus the denylist). ⚠️ **VP9 has NO 4:2:0 fallback on a rejected 4:4:4 open** (`new_vp9_adaptive` returns `Err`): the viewer configured its decoder for profile 1 and a VP9 profile mismatch is a blank canvas, so the session dispatch probes the exact cell first and runs libvpx (the software profile-1 path) when it cannot open; HEVC and H.264 fall back to 4:2:0 and report the truth. The pump is chroma-generic now (`cell_444`, `FfmpegDcCodec::pipeline_label` — a 4:4:4 session never shares a pipeline with a 4:2:0 one of the same codec). The H.264 data-channel session honours `chroma_pref` like HEVC's: both gates (the agent's `h264/nvenc yuv444` cell + the browser's `avc1.F4xxxx` High 4:4:4 Predictive probe, software decode) or the session runs 4:2:0. The viewer's auto-rank takes the hardware-encoded 4:4:4 cells (H.264 High 4:4:4, then VP9 profile 1 on vp9_qsv) only on an EXPLICIT 4:4:4, after the HEVC Rext pair and before libvpx; `h264-444` is a stored choice. HEVC 4:4:4 on QSV stays behind the denylist until its field test.
-
-**P3c — the probe runs in TWO children (0.4.85).** The 0.4.84 roll found the cost of one child: CORPLAP-3's Intel media runtime died with `0xc0000005` on the first `vp9_qsv` 4:4:4 open over VUYX and the daemon advertised **no hardware at all** (`av1_qsv`/`h264_qsv`/`vp9_qsv` 4:2:0 gone for a cell no session needed). Phase `base` (`ROOMLERD_CAPS_PHASE=base`) = every 4:2:0 open + the software cells + the IDR verdict; phase `444` = only the 4:4:4 forms of `candidates_444` (hardware NVENC/QSV/VAAPI cells on the source list minus the denylist), answered as `ROOMLER_CAPS_444:[…]` and folded in by `merge_444`. ⚠️ A dying/hanging 4:4:4 child costs only the 4:4:4 forms. ⚠️ **The child's stderr reaches no log on a service host** — it announces every open on stdout (`ROOMLER_CAPS_PROGRESS:<name>:yuv444`, line-buffered so it survives the crash) and the parent quotes the last one: that is the `encoder_cells_deny` entry. `vp9_qsv:yuv444` is on the built-in denylist since 2026-09-08. ⚠️ `roomler exec` on a host that restarts its own service answers "no answer within 45s" — the command ran. ⚠️ On a Windows SCM host the WORKER (console session) runs the probe and owns the cache file (`%LOCALAPPDATA%\roomler\roomler\data\logs\caps-cache.json`), not the supervisor's `service-logs`.
-
-**P4 — VAAPI on Linux x86_64.** The Linux vendor asset is `ffmpeg-9.0.1-linux64-lgpl-shared-minimal-vaapi.tar.xz` (`--enable-vaapi` + `h264/hevc/av1/vp9_vaapi`, 14 encoders verified; a NEW asset name because the tree's load-time needs changed — rollback = drop the `-vaapi` suffix in `release-agent.yml`). ⚠️ **libva + libdrm are BUNDLED** (built into the vendor tree, MIT; the `.deb` bundler carries them; NO `Depends`): `--enable-vaapi` makes `libva.so.2` a load-time need of the daemon binary, and a `Depends: libva2` holds only where apt reaches a mirror — the updater's offline `dpkg --install` replaces the binary BEFORE the dependency failure, i.e. a host that cannot start its daemon on its next restart. The VA DRIVER stays the host's (`Suggests`, never `Recommends`: Mesa's drags LLVM onto headless servers); libva's only coupling to a driver is the `__vaDriverInit_1_<minor>` lookup, which walks DOWN from the loader's minor, so the newest libva loads every older driver and a newer driver fails to load (no cells, not a crash). ⚠️ **WSL2 has no VAAPI for a daemon** — no `/dev/dri` (FR-45 recorded it on 2026-08-31), and libva refuses `/dev/dxg` (misc 10:125) with nothing but an `fstat`; it is the NEGATIVE cell. ⚠️ A `*_vaapi` encoder takes HARDWARE frames and ffmpeg-next wraps none of it: `encode/ffmpeg/vaapi.rs` holds the raw `ffmpeg_sys_next` calls — the device opens ONCE per process (`vaapi::device()`: pinned `vaapi_device` → `/dev/dri/renderD128..135` that exist), each encoder gets a frame pool (`vaapi::Frames`, NV12 or VUYX) whose ref goes onto `hw_frames_ctx` before `open`, and every software frame is uploaded (`get_buffer` + `transfer_data` + `copy_props`) before `send_frame`. `build_encoder` returns `(encoder, Option<Frames>)`; rebuilds carry the pool. Options: `rc_mode=VBR` on `b:v` = the cap, `profile=rext` for HEVC 4:4:4, `async_depth=1` tier-protected; a forced I picture IS an IDR in `vaapi_encode`. The names close every cascade (after the vendor names), `hw: true` by construction; `hevc_vaapi:yuv444` AND `vp9_vaapi:yuv444` are on the built-in denylist until a driver proves the packed open. arm64 stays without FFmpeg. ⚠️ **Never flush an FFmpeg encoder that never took a frame** (0.4.87): `FfmpegEncoder::drop` used to `send_eof` unconditionally, and a `hevc_vaapi` that had no picture issued SEGVs inside `avcodec_send_frame(NULL)` on radeonsi (jupiter, Mesa 25.2.8) — the probe child (open, then drop) died on every start and the host advertised no hardware, while `encoder-smoke` (ten frames, then drop) passed; the flush now runs only when `frame_count > 0` (reset per rebuild = frames sent to THIS inner encoder). In a session that drop runs in the daemon. ⚠️ The denylist gates BOTH chroma forms since 0.4.87 — before, `name:yuv420` in `encoder_cells_deny` still opened the cell. The positive cell is jupiter/zeus (AMD Raphael, VCN 3.1: H.264 + HEVC encode, no VP9/AV1 — `No usable encoding entrypoint` is the driver saying so, and the cascade falls through).
-
-**FR-78 — D3D12 and Vulkan video encode (P0 + P1).** The vendor-neutral rungs: `h264/hevc/av1_d3d12va` (Windows, the graphics driver's own encode DDI) and `h264/hevc/av1_vulkan` (Linux + Windows, whichever ICD the loader finds) close every cascade table after `_vaapi`. Both are **dlopen'd by FFmpeg itself** (`d3d12.dll`, `vulkan-1.dll`, `libvulkan.so.1`): the vendor jobs assert NO link directive / DT_NEEDED for them, so the P4 libva lesson (a load-time need of the daemon binary bricks offline hosts) cannot recur — a host without them loses cells, never the daemon. Assets: `…-minimal-d3d12-vulkan.zip` (Windows, sixteen encoders; the vcpkg port's own `vulkan` feature brings the headers) and `…-minimal-vaapi-vulkan.tar.xz` (Linux, seventeen; Vulkan-Headers 1.4.362 from Khronos into the prefix — 22.04's `libvulkan-dev` is 1.3.204 and `av1_vulkan` wants ≥ 1.4.317). ⚠️ `encode/ffmpeg/hwframes.rs` is the P4 `vaapi.rs` generalised: `HwKind::{Vaapi, D3d12, Vulkan}` by name suffix, the kind's candidate devices opened lazily and kept (D3D12: DXGI adapter INDEX strings `0`…`3`, pinned by `d3d12_adapter`; Vulkan: physical devices `0`…`3` or a name, `vulkan_device`; VAAPI as before), one `Frames` shape, the pixel format set RAW on the codec context (ffmpeg-next's `Pixel` has no D3D12 variant). ⚠️ **The OPEN decides the device** (`open_on_some_device`: preferred first, then the rest, winner remembered) — on the dev box Vulkan device 0 (the iGPU) has no `VK_KHR_video_encode_queue` and an RDNA2 iGPU has no AV1, so "first device that opens" would strand the RTX's cells; which device runs a codec is only known by the encoder's own open. ⚠️ FFmpeg's d3d12va encoders default to `bf=2` — the pump sets `bf=0` on both new backends; the d3d12va `rc_mode` constants are UPPERCASE (`VBR`), the Vulkan ones lowercase (`vbr`). D3D12 is 4:2:0 only (never on the 4:4:4 list); `hevc_vulkan:yuv444` (planar `yuv444p`) is on the built-in denylist until a driver proves it.
-
-### Linux config lives in `/etc/roomler` (rc.435)
-
-A root daemon on Linux resolves `/etc/roomler/config.toml` — the path the packaged `roomlerd.service` has always passed as `--config` — and `appdirs::migrate_system_config()` moves a legacy `/root/.config/roomler/config.toml` there once at startup (same rules as the tree migration: dest-absent only, `rename`, **never deletes**, notes logged at WARN after `logging::init`; the `.prev` sibling travels with it so no credential-bearing copy is stranded). `default_config_path()` resolves **`/etc` → profile → `/etc`**, so a host whose migration hasn't run (or couldn't) keeps its identity instead of losing it. Non-root Linux installs are untouched. ⚠️ This closes a real crash-loop class: hosts enrolled before the convention ran on an orphan `roomlerd run` using the profile path and died `no config found` the first time systemd started them — `Restart=always` then looped. Hit on buildhost, fleet-host-2 and the WSL sibling, the last from nothing but a `dpkg -i`. ⚠️ `systemctl is-active` reads **inactive while such a host is perfectly healthy** (the live daemon is an unmanaged orphan) — check `pgrep -x roomlerd` and `roomler peers`, and never "restart to fix" on that basis. The per-host `roomlerd.service.d/config-path.conf` drop-ins used as the stopgap are unnecessary from rc.435 and should be removed.
+- ⚠️ The probe runs in a **child process**, and *any* failure means "no hardware".
+  A capability probe is untrusted third-party code by definition (vendor drivers,
+  GPU firmware) and does not belong in the daemon's address space — before this, a
+  fault inside one took `roomlerd` down and the service manager restarted it
+  straight back into the same probe.
+- ⚠️ **A gate applies at every entry point, or it is a courtesy**: the cell
+  denylist was probe-only until 0.4.90, and a session happily opened a denied cell
+  the hello never advertised.
+- ⚠️ **A probe proves an OPEN; only a SESSION proves a CELL.**
 
 ## Architecture
 
 ```
 crates/
-  config/           → Settings (env vars via ROOMLER__ prefix, config crate)
-  db/               → MongoDB models (19 models) + indexes (18 collections) + native driver v3.2
-  services/         → Business logic: auth, DAOs, media (mediasoup), export, background tasks, OAuth, push, email, Stripe, Giphy, Claude AI
-  remote_control/   → TeamViewer-style remote-desktop subsystem: signalling, consent, audit, TURN creds (+ the canonical ACL rule shapes AND `dst_matches`/`host_matches`); the session Hub moved to `modules/fleet` in FR-69 P5a — this crate is wire-only for the server now
-  localapi/         → LocalAPI protocol LEAF crate (wire types, client, dispatch) — re-exported as `tunnel_core::localapi`; thin clients dep it directly (P3e lever E)
-  agent-core/       → package `roomler-node-core` (lib `roomler_node_core`; it was `roomler-core` from FR-21 until FR-69 — that name is now the SERVER core at `crates/core`): daemon-free agent building blocks: config, enrollment, machine-id, logging, sentinels, forward ACL — re-exported by `roomlerd` under the old `crate::` paths; the desktop companion deps THIS, never the full agent (P3e lever E)
-  core/             → package `roomler-core` (AGPL — SERVER side, never linked by an agent; the licensing lane's dependency-graph assertion enforces it): the FR-69 composition contract — the `Module` trait, hooks, jobs, capabilities, the module DAG — the composition snapshot (`composition.rs`) whose baseline in `crates/tests/fixtures/` gates every module move, and since P1 `Core` itself (`state.rs`: the 27 server-wide fields the host's `AppState` DEREFS to) with the primitives that hold its fields: the `/ws` registry, dispatcher and Redis fan-out (`ws/`), the cluster identity/directory/bus + counters (`cluster/`), storage, user analytics, the rate-limit primitive, the relay-load poller. The api crate re-exports all of them under their old `crate::` paths
-  modules/saas/     → package `roomler-ai-mod-saas` (AGPL): the FIRST module crate (FR-69 P2) — Stripe, the public updates list + newsletter, plan compliance. An ADD-ON feature on `crates/api` (`saas`, in `default`), never part of a profile: a self-host image built without it ships no Stripe webhook and no newsletter. The shape every later module copies: `SaasState` = `Core` + its own DAOs, DEREFS to `Core`, `impl FromRef<SaasState> for Core`, `impl Module` (routes / unlimited_routes / indexes / enabled)
-  modules/chat/     → package `roomler-ai-mod-chat` (AGPL): rooms + membership, messages, reactions, files (+ upload sniffing), search, xlsx export, Giphy, `/user/unread-summary`, and `typing:*` — the first module-owned WebSocket namespace (`Module::ws` → `Modules::ws_handler` in the host's socket dispatch). `conference` depends on THIS crate (rooms are the container calls run in): its room guards have `_with(tenants, rooms, …)` forms so both modules run ONE visibility rule
-  modules/conference/ → package `roomler-ai-mod-conference` (AGPL): the mediasoup SFU (room manager + worker pool, from `services/media`), the C-4 media claim-or-route, the per-pod media sampler, the call lifecycle + recordings, and `media:*` as a module namespace (FR-69 P4). **The ONLY crate that links `mediasoup`** — `services`, `roomler-core` and the api crate no longer compile the C++ worker. First user of the contract's stateful surfaces: `WsHandler::closed` (the disconnect path), `Module::jobs` (the stale-call reset, leader-gated under the host's startup lease), `Module::shutdown` (media claim release)
-  modules/fleet/    → package `roomler-ai-mod-fleet` (AGPL): device management (FR-69 P5a) — agents, enrollment tokens + keys, presence and its tokens, **the agent Hub** (moved here from `remote_control`, which is wire-only for the server now), crash + log ingest, releases + the installer proxies, owner consent + its consumer, remote config, fleet RPC (exec) + its audit, the ONE device-removal sequence (`removal.rs`). `remote` and `network` depend on THIS crate. Since P5c the agent SOCKET is this crate's too (`socket.rs`: hello, Hub registration, presence, the read loop, the teardown order) — the host keeps the `/ws` upgrade + role gate and dispatches `remote`/`network` messages through `Core::agent_socket` (`ws/agent_socket_host.rs` holds the host's transitional `network` half; `remote`'s registers itself). Since P7b the agent UPGRADE is this crate's too (`socket::ws_upgrade_agent`: token, `tid`, the row check, the Goodbye — the host keeps only the `/ws` role gate and calls `Modules::agent_upgrade`, 503 when unmounted), the owner-side `rc.agent_nudge` bus handler lives in `nudge.rs` and asks `core.hooks.agent_busy` for what it cannot see (network's tunnel maps), and `tenant_hooks.rs` revokes every device on a tenant archive. `AppState` keeps NO alias of this crate's handles: `fleet` is a feature like the rest, `[modules] fleet = false` unmounts it, and `remote`/`network` (whose `Deps` it is) are then not initialised
-  modules/remote/   → package `roomler-ai-mod-remote` (AGPL): remote desktop as what a CONTROLLER reaches (FR-69 P6) — the session routes (get / terminate / audit), `/turn/credentials`, `/relay/regions`, the controller's `rc:*` dispatch with its authz + consent-mode gate (`controller.rs`), the PR-2 cross-pod RC relay (`relay.rs`), the session-stats agent-socket half. Built ON `fleet`: **`Module::Deps` is born here** (`RemoteState.fleet: FleetState`, supplied by `compose.rs` in composition order, because the Hub is ONE live object). The session state machine stays in fleet's Hub. ⚠️ The controller path is a host → module CALL (`Modules::remote_controller_frame`, with the connection's Hub sender the host's socket minted), not a `Module::ws` namespace — a `WsCtx` cannot carry that sender
-  modules/network/  → package `roomler-ai-mod-network` (AGPL): pillar 2's server side (FR-69 P7a) — the overlay engine (`overlay.rs`: IPAM, netmaps, leases, the L3 ACL, relay grants), the org relay mint (`org_relay.rs`), the DERP ACL cache (`derp_acl.rs`) + the DERP registry TYPES (`derp_types.rs`), the seven route files (overlay block/node/ACL/key, tunnel clients + policies, peer relays, Roomler SSH) mounted at exactly the host's old paths, and the hooks (`NetworkHooks`: overlay release, MagicDNS rename). Built ON `fleet` (`Module::Deps = FleetState`). `Module::indexes_for(multi_block)` is born here: `overlay_blocks` has two schemas and the composition snapshot records both. Since P7b the SOCKETS are this crate's too: the tunnel-client upgrade + loop (`tunnel.rs`, reached through `Modules::tunnel_client_upgrade`, 503 when unmounted), `/derp` as the module's `UpgradeSpec` (`derp.rs`, the first user of `WsRegistration.upgrades`), the DERP cluster convergence + census + usage flush (`derp_cluster.rs`, init spawns), the ephemeral reaper (`ephemeral.rs`), the network half of the agent socket (`agent_socket.rs` + `agent_arms.rs`: SSH activity + request leg, key-rotation reports, DERP tickets, probe reports, the tunnel relay), `NetworkTenantHooks` (release every node + quarantine the block on a tenant archive) and the `agent_busy` answer. `network` is a feature; `[modules] network = false` unmounts it — no `/derp`, no tunnel-client socket, no overlay/tunnel routes, while the agent socket keeps serving fleet's and remote's arms
-  api/              → Axum HTTP/WS server: ~85 API routes + /ws + /health; `compose.rs` = the host composition (`EXTRACTED`, `Modules::{init, mount, mount_unlimited, index_sets, ws_handler}`)
-  tests/            → Integration tests (24 test modules, 163+ tests)
+  config/           → Settings (env vars via ROOMLER__ prefix)
+  db/               → MongoDB models + indexes (18 collections) + native driver v3.2
+  services/         → auth, DAOs, export, background tasks, OAuth, push, email, Giphy, Claude AI
+  remote_control/   → wire-only for the server: signalling, consent, audit, TURN creds,
+                      the canonical ACL rule shapes (`dst_matches` / `host_matches`).
+                      The `server` feature (default-ON) gates the Mongo audit DAO — the
+                      five agent-side consumers set `default-features = false`
+  localapi/         → LocalAPI protocol LEAF crate — re-exported as `tunnel_core::localapi`
+  agent-core/       → package `roomler-node-core`: daemon-free agent building blocks
+                      (config, enrollment, machine-id, logging, sentinels, forward ACL).
+                      The desktop companion deps THIS, never the full agent
+  core/             → package `roomler-core` (AGPL, SERVER side, never linked by an agent):
+                      the `Module` trait, hooks, jobs, the module DAG, the composition
+                      snapshot, and `Core` itself (`state.rs`) with the /ws registry,
+                      dispatcher, Redis fan-out, cluster identity, storage, rate limiting
+  modules/saas/       → Stripe, the public updates list + newsletter, plan compliance.
+                        An ADD-ON feature, never part of a profile
+  modules/chat/       → rooms + membership, messages, reactions, files, search, xlsx
+                        export, Giphy, `typing:*`
+  modules/conference/ → the mediasoup SFU, media claim-or-route, call lifecycle +
+                        recordings, `media:*`. The ONLY crate that links `mediasoup`
+  modules/fleet/      → device management: agents, enrollment, presence, the agent Hub,
+                        crash/log ingest, releases, owner consent, remote config, fleet
+                        RPC, the ONE device-removal sequence, the agent SOCKET + UPGRADE
+  modules/remote/     → remote desktop as what a CONTROLLER reaches: session routes,
+                        `/turn/credentials`, `/relay/regions`, the `rc:*` controller
+                        dispatch, the cross-pod RC relay. Built ON `fleet`
+  modules/network/    → pillar 2's server side: the overlay engine (IPAM, netmaps,
+                        leases, L3 ACL, relay grants), the org relay mint, the DERP ACL
+                        cache, seven route files, `/derp`, the tunnel-client socket.
+                        Built ON `fleet`
+  api/              → Axum HTTP/WS server: ~85 routes + /ws + /health; `compose.rs` is
+                      the host composition
+  tests/            → Integration tests (spawns real servers; drives the agent in-process)
 agents/
-  roomlerd/         → Native remote-control agent binary (CLI + lib): webrtc-rs peer, scrap capture, openh264 encode, enigo input injection
-  roomler-cli/      → Tunnel client. Bin `roomler` (tunnel-only hosts); the whole command surface lives in the LIB (`cli.rs`) so the daemon can host it too
-  roomler-cli-shim/ → Bin `roomler-shim`, installed BY THE MSI as `roomler.exe` on daemon hosts: re-execs `roomlerd cli` (P3e lever D)
-ui/
-  src/
-    api/            → HTTP client (client.ts)
-    components/     → Vue components (20+ files in 7 categories — includes admin/AgentsSection)
-    composables/    → 11 custom hooks (useAuth, useWebSocket, useMarkdown, useRemoteControl, etc.)
-    stores/         → 13 Pinia stores (setup store pattern — includes agents.ts)
-    views/          → 14 view modules (auth, chat, conference, dashboard, files, rooms, remote, etc.)
-    plugins/        → router, pinia, vuetify, i18n
-scripts/
-  dev-xvfb.sh       → Run the agent's capture path against a virtual X framebuffer (headless smoke test)
+  roomlerd/         → Native agent binary (CLI + lib): webrtc-rs peer, capture, encode,
+                      input injection, overlay, tunnels, SSH server
+  roomler-cli/      → Tunnel client. Bin `roomler`; the whole command surface lives in the
+                      LIB (`cli.rs`) so the daemon can host it too
+  roomler-cli-shim/ → Bin `roomler-shim`, installed BY THE MSI/.deb as `roomler`:
+                      re-execs `roomlerd cli`
+  roomler-setup/    → Tauri 2 unified install wizard (lib `wizard_app`)
+ui/src/             → api/ · components/ · composables/ · stores/ (Pinia setup pattern) ·
+                      views/ · plugins/  — map in `docs/ui.md`
+scripts/            → dev-xvfb.sh · e2e-*.sh · name-audit.sh · fr-registry-audit.sh · signing/
 ```
 
-### Modular monolith — the FR-69 program (P0–P9 shipped 2026-09-04; first prod roll field-verified 2026-09-05)
+**Crate dependency flow**: `config` ← `db` ← `remote_control` ← `services` ← `api`.
+`tests` depends on `api` + `config` + `db` + `roomlerd`.
 
-The server is decoupled into **`roomler-core` + six module crates** (`fleet`, `chat`, `conference`, `remote`, `network`, `saas`) behind ONE `Module` contract (`crates/core/src/module.rs`), statically composed under Cargo features into five profiles (`full` / `collab` / `remote` / `mesh` / `access`; `saas` is an add-on the self-host images never carry) and discovered at runtime via `GET /api/capabilities`. Spec with every decision's pros/cons: `docs/fr/FR-69-modular-monolith.md` (#1307). Rules while it is in flight:
+### Modular monolith (FR-69, shipped 2026-09-04) — the rules that still bind
 
-1. **The DAG is data**: `crates/core/src/graph.rs`. Any module → core; `conference → chat`, `remote → fleet`, `network → fleet`; core NEVER calls a module — the inverse flows (tenant archive, agent removal) are hooks core invokes in `hooks::HOOK_ORDER` (session holders → lease holders → the record owner).
-2. **A module PR is pure moves + signature changes.** `crates/tests/src/composition_tests.rs` asserts the composition (every route with its allowed methods, the index plan for both `multi_block` values, every wire name in `signaling.rs`) is byte-identical to `crates/tests/fixtures/composition.baseline.json`. Re-record ONLY with `COMPOSITION_UPDATE=1` and a commit message that says why — a reviewer diffs the JSON against the claim.
-3. **`ensure_indexes` is `index_plan(multi_block)` applied.** A new collection's indexes go into the plan (`crates/db/src/indexes.rs`), never as a side call — the baseline reads the plan, and a spec outside it is invisible to the gate.
-4. **The wire does not move.** `ClientMsg`/`ServerMsg` stay in `remote_control/src/signaling.rs`. Since P5b every client variant has an owner: `ClientMsg::namespace() -> Owner {Fleet, Remote, Network}` is an EXHAUSTIVE match (a new variant does not compile until it names one), `CLIENT_MSG_OWNERS` is the same map as a table — locked against the enum's own renames by a test that reads the file's source, and snapshotted by the composition baseline (`namespaces` section). ⚠️ The prefix is NOT the owner: `rc:consent*` is fleet's, `rc:relay.*` and `rc:agent.key_rotated` are network's. Adding a variant = a serde rename + a `wire_tag()` arm + a `namespace()` arm + a table row + a baseline re-record that says why.
-5. **Naming**: server crates `roomler-ai-*`; the core `roomler-core` (`crates/core`); modules `roomler-ai-mod-<name>` (`crates/modules/<name>`); the daemon's shared crate `roomler-node-core` (`crates/agent-core`, which held `roomler-core` from FR-21 until FR-69; its pre-FR-21 name is retired — never bring it back).
-7. **A module is a crate behind a feature, mounted by `crates/api/src/compose.rs`** (P2). `crates/modules/<name>` = `roomler-ai-mod-<name>`; its state = `Core` + the DAOs it owns, derefs to `Core`, `impl FromRef<ModuleState> for Core`; `impl Module` gives `routes` (full paths under `/api`, state applied, returned as `Router<()>` — the host joins it via `.with_state(())`), `unlimited_routes` (outside the governor), `indexes` (the module's sets go HERE, never in `crates/db/src/indexes.rs`), `enabled` (the `[modules]` switch — real only once the module is in `compose::EXTRACTED`). A module never depends on the api crate. ⚠️ A stacked branch compiles on CI in ~4 min via `gh workflow run integration-tests.yml --ref <branch> -f filter=composition_matches_baseline` — cheaper than any local server build on this box.
-8. **A stateful module has three more surfaces, and the host drives all of them** (P4). `WsHandler::closed(ctx)` — the host calls `Modules::ws_closed` for every handler of the socket's role after its own cleanup (registry removal, online mirror) and before it logs the disconnect; a module holding per-connection state (conference: transports + the call session) releases it there, never by watching the registry. `Module::jobs` — declared only; `Modules::run_startup_jobs(startup_leader)` runs the `AtStartup` ones in `main.rs` under the SAME Mongo lease that gates the host's own maintenance, logs a failure instead of refusing to boot, and warns on an `Every` cadence because nothing schedules those yet (a module's periodic work spawns its own task in `init` for now). `Module::shutdown` — `Modules::shutdown()` runs in REVERSE composition order at the top of `shutdown_cleanup`. ⚠️ Host → module reads (`Modules::media_gauges`, `Modules::close_orphaned_call_state`) are the allowed direction and return the empty value when the module is not mounted; a module never reaches the host. ⚠️ Cutting a block off the END of a file drags its `#[cfg(test)] mod tests` along — check whose functions those tests call before the lane does. ⚠️ A new workspace member needs `cargo update -w` before the lane builds it.
-9. **The inverse edges are hooks in a core registry** (P5a). `Core.hooks: HookRegistry` is shared through every `Core` clone; `Modules::register_hooks(&core)` registers each mounted module's `hooks()` under its id, and until a module is extracted the HOST registers its own implementation of that module's hooks under the same id (`crates/api/src/hooks.rs` = the transitional `network` hooks: overlay release, MagicDNS rename). A cascade's owner calls the registry (`core.hooks.agent_removed(…)`), which runs every registered `FleetLifecycle` in `hooks::HOOK_ORDER` (remote → network → fleet …) — the overlay lease releases BEFORE the row delete and BEFORE the kick, written once in `roomler_ai_mod_fleet::removal`. A failing holder STOPS the cascade. ⚠️ A hook is the ONLY way a module reaches "up" the DAG; a module that needs the host's state (the `rc.agent_nudge` busy check reads the tunnel session maps) leaves that piece in the host and records the query hook it will need. ⚠️ A file cut by line numbers gets `rustfmt --edition 2024 --check <file>` before the push — P5a's first push carried a mismatched brace from a range counted one line short.
-10. **The agent socket is fleet's; the other owners' arms reach it through `Core::agent_socket`** (P5c). `roomler_ai_mod_fleet::socket::handle_agent_socket` owns the hello, the Hub registration, presence, the read loop and the TEARDOWN ORDER; every message goes to ONE owner by `ClientMsg::namespace()` — fleet's arms in-crate, `remote`'s and `network`'s through the registered `AgentMsgHandler`, which hands back what it did not consume so the Hub's own dispatch sees what it always saw. Per-connection state a module needs (the tunnel originator, the probe throttle) lives behind its `AgentSocketLifecycle` (`hello` / `heartbeat` / `closing` / `closed(removal_was_ours)`), keyed by `AgentCtx.conn_id` — NEVER by agent id (a displacing connection must not tear down its successor). The order `closing → unregister (answers ours) → closed(ours) → Offline+presence (ours)` is the rc.53 / rc.307 B / Phase A-1 invariants written once — do not reorder. Until P6/P7 the host registers its halves in `ws/agent_socket_host.rs`. ⚠️ A host helper the module still needs must be `pub` in the module and reached through the host shim (`ws::remote_control::{pump_server_messages, prefs_from_rtt}`), never copied.
-11. **A module built on another declares it as `Module::Deps`** (P6). `init(core, settings, deps: Self::Deps)` — `()` for a module that stands on core alone, another module's STATE for one that needs a live object of it (`remote`'s is `FleetState`: the Hub is one registry, and a module that re-created it would dispatch into an empty one). `compose.rs` supplies the deps in composition order (`graph::MODULES`), so a dependency is initialised before its dependant by construction; a module never reaches for another module's state any other way. ⚠️ A stateless dependency (a DAO over `core.db`, a pure guard) is NOT a `Deps` — re-create it, as conference does with chat's room guards. ⚠️ When a cut leaves a helper that BOTH the moving module and the host's remaining code call (`spawn_agent_nudge`, `note_agent_offline_evidence`), it belongs to the module they both may depend on (fleet), not to either caller. ⚠️ After a line-range cut, grep the CUT file's identifiers against the REMAINING file, and count the braces at both ends of every range (P6's first fmt run found a function whose closing brace stayed behind).
-12. **When a host file keeps calling a moved engine, it gets ONE accessor, and every chain gets it** (P7a). `AppState::network()` (like `fleet()`) is the transitional seam; a moved field is reached as `state.network().x`. ⚠️ A line-oriented rename misses the `state\n.x` chains rustfmt produces — grep `^\s*\.<field>\s*$` for EVERY moved field (including the ones whose name is a prefix of another: `overlay_nodes` vs `overlay_nodes_by_id`) in the host AND in `crates/tests`, and prove the set empty with a "field line whose previous line is not the accessor" grep before pushing; a second insertion pass doubles the accessor. ⚠️ A moved crate's external deps come from its BODIES, not its `use` lines: census `\b[a-z][a-z0-9_]*::` tokens and diff against the Cargo.toml (`ipnet` was used by absolute path only). ⚠️ A `#[cfg(test)]` helper another crate's tests call is invisible there — `cfg(test)` does not cross crates; make it `#[doc(hidden)] pub` (or a `test-fixtures` feature).
-13. **Every pillar is a module; the host is `{ core, modules }` and a module that is not mounted answers 503, never a boot refusal** (P7b). `fleet` and `network` are features like the rest (`remote` and `network` require `fleet` in `Cargo.toml`, as in the graph); `[modules] fleet = false` unmounts — the agent socket and the tunnel-client socket are refused with 503 through `Modules::agent_upgrade` / `tunnel_client_upgrade`, `remote`/`network` are not initialised (their `Deps` is absent), and the gauges read zero (`fleet_gauges` / `network_gauges`). The host keeps ONLY the `/ws` role gate and the user socket; the agent upgrade (row check, Goodbye) is `roomler_ai_mod_fleet::socket::ws_upgrade_agent`, the tunnel client's is `roomler_ai_mod_network::tunnel::ws_upgrade_tunnel_client`, and `/derp` is network's `UpgradeSpec`, mounted by `Modules::mount_upgrades` before the host's `/ws`. The helpers both upgrades share live in `roomler_core::ws::upgrade`. ⚠️ A module that needs another module's ANSWER goes through a query hook, never a type: fleet's nudge asks `core.hooks.agent_busy(id)`, which network answers with a REASON (`Option<&'static str>`: `origin_busy` / `tunnel_busy`) — a bool would lose the reason the outcome names. A cascade that touches two modules is a `TenantLifecycle` run (`core.hooks.tenant_archived` sums `TenantArchived` in `HOOK_ORDER`; a failing holder stops it). A view that READS two modules where BOTH are required belongs to the one that depends on the other; a view where one of them is OPTIONAL is the HOST's (`routes/device.rs`: fleet's rows always, network's tunnel/overlay rows only when `modules.network` is `Some`) — P7b put the device listing in `network` on the strength of the graph edge and every `remote` profile (fleet + remote, no network) 404'd its own devices page, which the `/health`-only boot smoke could not see; the publish smoke now asserts the route answers 401 (mounted) wherever fleet is. ⚠️ `AppState::fleet()` / `network()` exist for the integration tests, which build every module; host code that may run without a module reads `modules.fleet` / `modules.network` and handles `None`. ⚠️ The un-accessor rename (`state.network().x` → `state.x`) EATS the receiver wherever the chain starts a statement or an argument (`= .ssh_activity`, `&.derp_registry`, a line that is just `.derp_cancels.insert(…)`): grep `[=(&,]\s*\.[a-z_]+` and `^\s*\.[a-z_]+\.` whose previous line ends in `;`/`{`/`}` — `cargo fmt` finds them as parse errors, `grep` for the field names does not.
-14. **A profile is a feature aggregate, and what it leaves OUT is the claim** (P8). `crates/api/Cargo.toml` has `profile-full` / `profile-collab` / `profile-remote` / `profile-mesh` / `profile-access`; `default = ["profile-full", "saas"]` is the HOSTED build (deliberately not D9's bare `profile-full`: the prod image is a manual `docker build` with no feature argument and the suite builds with `default`, so a default without `saas` would drop billing from the next deploy silently). The Dockerfile takes `ARG PROFILE=full` + `ARG SAAS=1` and builds `-p roomler-ai-api -p derp-relay --no-default-features --features roomler-ai-api/profile-$PROFILE[,roomler-ai-api/saas]` — package-qualified because one build line serves two packages. The self-host publish workflow passes `SAAS=0` and its boot smoke asserts `/health .modules` equals the profile's set and never contains `saas`; `latest` is refused for a non-full profile. ⚠️ `/health` and `/api/capabilities` report the MOUNTED set (`Modules::mounted()`) plus `compiled` (`compose::EXTRACTED`) — never `graph::MODULES`, which is the DAG every build knows and would make a `mesh` image answer all six. ⚠️ `cargo clippy --workspace` compiles the feature UNION and can never see a profile: the `profiles` CI job checks each reduced profile per package with `--no-default-features`, and asserts the absences (`remote`/`mesh`/`access` link no `mediasoup`, `collab` no `roomler-ai-tunnel-core`) against a `cargo tree` that must list ≥100 crates AND a positive control on the full graph — an absence assertion that cannot fail proves nothing.
-15. **The SPA gates on `/api/capabilities`, with ONE predicate for navigation and routes** (P9). `ui/src/stores/capabilities.ts` asks the server once per page load (kicked off in `main.ts`, awaited by the router guard) and answers `has(module)` = the bundle carries it (`VITE_MODULES`, `ui/src/modules/registry.ts`; unset = all six) AND the server mounts it. **Fail-OPEN until the server has answered** — the same rule `canSeeFleetNav` follows for permissions: the server enforces every action anyway, so the worst case of failing open is a link whose page 404s, while failing closed would blank the product behind one round-trip. Every pillar route carries `meta.module` (children inherit through `to.matched`), a second `router.beforeEach` lands a refused route on the org dashboard, and `AppLayout.vue` / `TenantDashboard.vue` read `caps.has(...)` for their nav groups and tiles. ⚠️ Unknown module names from a newer server are IGNORED, never an error (the additive-list rule the agent capability verbs follow). ⚠️ A bundle built with `VITE_MODULES` is an OPTIMISATION, not the gate: the published image ships one bundle for every profile, and the runtime answer is what hides a pillar.
-6. **`State<Core>` is the handler seam** (P1). `AppState` DEREFS to `roomler_core::Core`, so `state.settings` / `state.users` / `state.db` read the same from either; a handler or helper that needs only core fields takes `State<Core>` / `&Core` (a `&AppState` argument coerces), and `impl FromRef<AppState> for Core` lives in `crates/api/src/core_state.rs` — the ONE place the orphan rules allow it; `roomler-core` must never learn `AppState` exists. ⚠️ `[modules]` switches (`ROOMLER__MODULES__<ID>=false`) are recorded and reported (`/api/capabilities` → `switched_off`) but unmount NOTHING until that module's own PR lands.
+Full treatment: **`docs/modular-monolith.md`**. What constrains new work:
 
-### Crate dependency flow
-`config` <- `db` <- `remote_control` <- `services` <- `api`
-`tests` depends on `api` + `config` + `db` + `roomlerd` (spawns real servers with random ports and test databases; drives the agent library in-process for end-to-end signalling tests)
+1. **The DAG is data** (`crates/core/src/graph.rs`). Any module → core;
+   `conference → chat`, `remote → fleet`, `network → fleet`. **Core never calls a
+   module** — the inverse flows are hooks core invokes in `hooks::HOOK_ORDER`
+   (session holders → lease holders → the record owner), and a failing holder
+   STOPS the cascade. A hook is the *only* way a module reaches "up".
+2. **The composition is gated by a byte-identical baseline.**
+   `crates/tests/src/composition_tests.rs` asserts every route with its allowed
+   methods, the index plan for both `multi_block` values, and every wire name
+   against `crates/tests/fixtures/composition.baseline.json`. Re-record **only**
+   with `COMPOSITION_UPDATE=1` and a commit message that says why — a reviewer
+   diffs the JSON against the claim.
+3. **`ensure_indexes` is `index_plan(multi_block)` applied.** A module's index sets
+   go in the module, never in `crates/db/src/indexes.rs`; a spec outside the plan
+   is invisible to the gate.
+4. **The wire does not move.** `ClientMsg`/`ServerMsg` stay in
+   `remote_control/src/signaling.rs`, and every variant names an owner via an
+   exhaustive `namespace()`. ⚠️ **The prefix is NOT the owner**: `rc:consent*` is
+   fleet's; `rc:relay.*` and `rc:agent.key_rotated` are network's.
+   ⚠️ A **defensive `_ =>` arm added before the variants that would make it
+   reachable** fails `clippy -D warnings` with `unreachable_patterns`; annotate it
+   `#[allow(unreachable_patterns)]` with a comment, and remove the allow when the
+   variants land (`docs/modular-monolith.md` §6).
+5. **A module built on another declares it as `Module::Deps`** — `remote`'s is
+   `FleetState`, because the Hub is ONE live object and a module that re-created it
+   would dispatch into an empty one. ⚠️ A *stateless* dependency (a DAO over
+   `core.db`, a pure guard) is **not** a `Deps` — re-create it.
+6. **An unmounted module answers 503, never a boot refusal.** `[modules] x = false`
+   unmounts; the gauges read zero. ⚠️ A view that reads two modules where **both**
+   are required belongs to the one that depends on the other; a view where one is
+   **optional** is the HOST's — putting the device listing in `network` on the
+   strength of a graph edge made every `remote` profile 404 its own devices page,
+   which a `/health`-only boot smoke could not see.
+7. **A profile is a feature aggregate, and what it leaves OUT is the claim.**
+   `/health` and `/api/capabilities` report the **mounted** set plus `compiled` —
+   never `graph::MODULES`, which every build knows and would make a `mesh` image
+   answer all six. ⚠️ An absence assertion that cannot fail proves nothing: the
+   `profiles` CI job checks each reduced profile with `--no-default-features` **and**
+   a positive control on the full graph.
+8. **The SPA gates on `/api/capabilities`, failing OPEN until the server answers**
+   — the server enforces every action anyway, so the worst case of failing open is
+   a link whose page 404s, while failing closed blanks the product behind one
+   round-trip. ⚠️ Unknown module names from a newer server are IGNORED, never an
+   error.
+
+⚠️ **`State<Core>` is the handler seam.** `AppState` derefs to `roomler_core::Core`,
+so a handler or helper that needs only core fields takes `State<Core>` / `&Core`.
+`impl FromRef<AppState> for Core` lives in `crates/api/src/core_state.rs` — the ONE
+place the orphan rules allow it. `roomler-core` must never learn `AppState` exists.
+
+**Naming**: server crates `roomler-ai-*`; the core `roomler-core` (`crates/core`);
+modules `roomler-ai-mod-<name>` (`crates/modules/<name>`); the daemon's shared crate
+`roomler-node-core` (`crates/agent-core`, which held the name `roomler-core` from
+FR-21 until FR-69 — its pre-FR-21 name is retired, never bring it back).
 
 ## Multi-Tenancy
 
-All data is scoped by `tenant_id`. Routes are nested: `/api/tenant/{tenant_id}/room/{room_id}/message/...`. The `tenant_members` collection tracks user-tenant membership. Room membership is tracked via `room_members`.
+All data is scoped by `tenant_id`. Routes nest:
+`/api/tenant/{tenant_id}/room/{room_id}/message/...`. `tenant_members` tracks
+user-tenant membership; `room_members` tracks room membership.
+
+⚠️ **`is_member(tid)` is not an authorization check for anything keyed by id** —
+see Security Baseline below.
 
 ## Auth Pattern
 
-JWT-based auth (jsonwebtoken 9 crate) with Argon2 password hashing:
-- Access token: configurable TTL (default 604800s = 7 days)
-- Refresh token: configurable TTL (default 2592000s = 30 days)
-- Auth middleware extracts user from `Authorization: Bearer` header
-- OAuth: Google, Facebook, GitHub, LinkedIn, Microsoft
+JWT (jsonwebtoken 9) + Argon2. Access token 7 d, refresh 30 d, both configurable
+via `ROOMLER__JWT__*` (secret `ROOMLER__JWT__SECRET`, issuer `ROOMLER__JWT__ISSUER`).
+Middleware extracts the user from `Authorization: Bearer`; OAuth via Google,
+Facebook, GitHub, LinkedIn, Microsoft.
 
-Four `TokenType` variants, all signed with the same JWT secret:
-- `Access` / `Refresh` — standard user flow
-- `Enrollment` — single-use, 10 min, issued by an admin to bootstrap a new agent
-- `Agent` — long-lived (1 y), carried by an enrolled agent on its WS connection
+Four `TokenType` variants, all signed with the same secret: `Access` / `Refresh`
+(user flow), `Enrollment` (single-use, 10 min, issued by an admin to bootstrap a
+new agent), `Agent` (long-lived, carried on the agent WS).
+⚠️ Audience checks are load-bearing — `verify_agent_token` rejects a user JWT and
+vice-versa, locked by tests in `crates/services/src/auth/mod.rs::tests`.
 
-Audience checks: `verify_agent_token` rejects a user JWT and vice-versa. Tests in `crates/services/src/auth/mod.rs::tests` lock this.
-
-JWT settings in `crates/config/src/settings.rs`:
-- Secret: `ROOMLER__JWT__SECRET` (default: "change-me-in-production")
-- Issuer: `ROOMLER__JWT__ISSUER` (default: "roomler-ai")
+**WebSocket role multiplexing**: `/ws?token=<jwt>&role=agent` uses the agent JWT
+audience; no `role` param (or `role=user`) uses the user flow — same endpoint, same
+handshake, different claim validator. `/ws` and `/derp` also accept an optional
+`tid=<tenant-hex>` the front LB hashes on; agent/tunnel tokens must match their
+`tenant_id` claim, user tokens are checked against `tenant_members` (403 on a
+non-member claim), and an absent `tid` is a legacy client, accepted.
 
 ## Route Pattern
 
 ```rust
-// Axum nested routers under /api/tenant/{tenant_id}/...
 let room_routes = Router::new()
     .route("/", get(routes::room::list))
     .route("/", post(routes::room::create))
-    .route("/{room_id}", get(routes::room::get))
-    .route("/{room_id}", put(routes::room::update))
-    .route("/{room_id}", delete(routes::room::delete));
+    .route("/{room_id}", get(routes::room::get));
 
-// Composed in build_router():
 Router::new()
     .nest("/api/tenant/{tenant_id}/room", room_routes)
     .with_state(state)
 ```
 
-Route groups: auth (7), user (2), oauth (2), stripe (4), invite (2+4), giphy (2), push (3), notification (5), tenant (3), member (2), role (6), room (16), message (11), recording (3), file (7), task (3), export (2), search (1), health (1), ws (1), agent (4 tenant-scoped + 1 public enroll), session (3), turn (1), peer-relay (3 + 1 per-device policy).
+Full route inventory: **`docs/api.md`**.
 
 ## DB Model Pattern
 
-MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` except the three remote-control entities, which live in `crates/remote_control/src/models.rs` to keep the subsystem self-contained:
-- 18 collections: tenants, users, tenant_members, roles, rooms, room_members, messages, reactions, recordings, files, invites, background_tasks, audit_logs, notifications, custom_emojis, activation_codes, **agents, remote_sessions, remote_audit**
-- Indexes defined in `crates/db/src/indexes.rs` (unique, TTL, text indexes on email, username, slug, code, content, etc.)
-- Text indexes on messages (content), rooms (name, purpose, tags), users (display_name, username) for full-text search
-- TTL indexes on audit_logs (90 days), activation_codes, background_tasks, **remote_audit (90 days)**, **exec_audit (90 days)**, **ssh_audit (90 days)**, **ssh_activity (90 days)**, **peer_relay_audit (90 days)**
-- Unique composite index on `agents.{tenant_id, machine_id}` so re-enrolling a known machine reuses its row
-- All queries use BSON documents, no ORM
+MongoDB native driver (not Mongoose), BSON documents, no ORM. Models live in
+`crates/db/src/models/` except the three remote-control entities, which live in
+`crates/remote_control/src/models.rs` to keep the subsystem self-contained. Every
+collection, index, TTL and ER diagram: **`docs/data-model.md`**.
+
+⚠️ Unique composite index on `agents.{tenant_id, machine_id}` so re-enrolling a
+known machine reuses its row.
+⚠️ Tombstoned rows use `index_unique_partial(..., {deleted_at: {$type: "null"}})` —
+`$type`, **not** `{deleted_at: null}`, which also matches *absent*.
 
 ## Frontend Conventions
 
-- **Plugin order**: i18n -> vuetify -> pinia -> router (in main.ts)
-- **Vuetify**: Light + dark themes, auto-import tree-shaking via `vite-plugin-vuetify`
-- **Stores**: Pinia with setup store pattern (`defineStore('name', () => { ... })`)
-- **Rich text**: TipTap v3 with markdown support, mentions, emoji
-- **WebRTC**: Mediasoup client for video conferencing
-- **API client**: `ui/src/api/client.ts` with auth token injection
-- **Vite proxy**: `/api` and `/ws` proxied to `http://localhost:5001`
-- **Responsive page padding**: top-level views use `<v-container fluid class="pa-2 pa-md-4 pa-xl-6">` (8px mobile / 16px tablet+ / 24px ≥1920px). Empty-state blocks use `pa-4 pa-md-6 pa-lg-8`. Headings use `text-h5 text-md-h4` so they shrink one step on phone. Section CTAs use `size="large"` (not `x-large`) — the wider button overflows narrow viewports. Marketing/legal sections (`LandingView`, `Terms`, `Privacy`) replace fixed `py-12`/`py-16` with `py-6 py-md-12` / `py-8 py-md-16`. Custom-flex views (`ChatView`, `ConferenceView`) own their own layout and intentionally don't use `<v-container>`. Hide secondary toolbar items on `<sm` with `d-none d-sm-inline-flex`; surface a phone fallback alongside.
+Plugin order i18n → vuetify → pinia → router; Pinia setup stores; TipTap v3 for
+rich text; mediasoup-client for WebRTC; `ui/src/api/client.ts` with auth token
+injection; Vite proxies `/api` + `/ws` to `:5001`. Layout, store map and the
+responsive-padding conventions: **`docs/ui.md`**.
 
 ## Test Setup
 
-**Integration tests** (`crates/tests/`):
-- Each test gets a unique UUID-named database, dropped on teardown. ⚠️ **That teardown did not run at all until #646** — `Drop for TestApp` used a detached `tokio::spawn`, and every test is a plain `#[tokio::test]`, so the current-thread runtime was dropped with the cleanup task queued and never polled. Measured: 29 tests ⇒ 29 databases left, ~246 WiredTiger files each, which crossed mongod's 64 000-descriptor ceiling around the 260th database and aborted it *mid-suite* (fatal assertion 50853) — surfacing as dozens of unrelated-looking `Connection refused` failures. It is now a blocking `std::thread` + its own runtime + its own client; ⚠️ reusing the test's client deadlocks, because `join()` stops the runtime that drives its IO
-- Tests spawn real Axum servers on random ports. ⚠️ The binary is a DEBUG build and `peer_relay_mint_tests::every_refusal_is_audited_with_its_reason` builds SEVEN of them in one body: on the harness's default 2 MiB test thread it overflowed its stack twice during FR-69 (P4: the server-construction future grew — the fixture now `Box::pin`s `AppState::new`; P5a: one more Core-sized module state per server re-tipped a ~25 KB margin). The lane runs with `RUST_MIN_STACK=8388608`; set it locally too, or a `SIGABRT` with `has overflowed its stack` is what a perfectly green suite looks like
-- Requires MongoDB on `localhost:27019` and Redis on `localhost:6379`
-- **~294 tests across 34 modules** (2026-08-24). ⚠️ Treat the count as approximate and the module count as the real one: the old "291 across 25" undercounted modules by nine because it listed the names it knew instead of counting `mod *_tests;`, and the total moves whenever master does — two green runs of the same commit reported 292 and 290 passing purely because `pull_request` checks out the branch **merged with master** while a dispatch checks out the branch alone. The lane therefore asserts a FLOOR, never an exact count. Notables: auth, tenant, room, message, reaction, recording, file, invite, role, notification, push, giphy, oauth, call, pagination, rate_limit, cors, billing, multi_tenancy, channel_crud, pdf_export, conference_message, stats, cluster, **remote_control, agent** (full rc:* round-trip drives the agent library in-process against a TestApp), plus **harness** — a test of the FIXTURE rather than the product, asserting `TestApp`'s teardown really drops its database. Its precondition assert is load-bearing: without it a database that never existed would satisfy the post-condition and the test would pass proving nothing.
-- **CI RUNS THIS LANE — `.github/workflows/integration-tests.yml`** (#646), on master pushes touching `crates/**` or `agents/roomlerd/**`, on PRs touching `crates/tests/**`, and on dispatch (with an optional `filter`). **0 failures, 2 skipped**, verified twice (292 and 290 passing — see the count caveat above); the suite is ~440–510 s, the job ~20 min with the build. Deliberately NOT on every PR — a job that long on every push trains people to ignore it.
-  - The two skips were **measured on the runner**, not inherited from the build host: `conference_tests::call_leave_cleans_up_participant_media` (no mediasoup worker there) and `rate_limit_tests::rate_limit_returns_429_after_burst` (timing-sensitive against tower_governor's refill). ⚠️ A third skip should feel expensive — if the list grows, the lane is drifting back to the unfalsifiable state it replaced.
-  - `agent_presence_tests::rehome_race_keeps_newest_claim`, long recorded here as a load-dependent flake, **passes in this lane**.
-- ⚠️ The lane asserts a **minimum test count** and a **leaked-database ceiling**, because a job that silently runs nothing is indistinguishable from a passing one — which is exactly how this crate rotted. `cargo test` reports success for a filter matching no test.
-- ⚠️ Since #603 `ci.yml` also `cargo check`s the crate (`--all-targets`), which catches the "a DAO grew a field and 8 test callers didn't" breakage cheaply on every PR. That is still not a run.
-- ⚠️ `--workspace` clippy compiles only `pub mod fixtures` from this crate (every test module is `#[cfg(test)]`-gated), so `Checking roomler-ai-tests` in a build log is **not** evidence the tests build.
-- ⚠️ `RUST_LOG` did nothing here until #615 — the harness installed no subscriber, so every `info!`/`warn!` explaining a refusal was discarded (a `/derp` registration refusal in particular looks like an unexplained missing record). Set `RUST_LOG` and use `--nocapture`.
+Suites, harnesses and the nightly lane: **`docs/testing.md`**.
 
-**E2E tests** (`ui/e2e/`):
-- Playwright 1.58 with Chromium (fake media stream devices for WebRTC)
-- 24 spec files: auth, channels, chat, chat-multi, chat-pagination, chat-reactions, chat-threads, conference (4 specs), connection-status, dashboard, files, invite, mention, notifications, oauth, profile, room-fixes, room-management, websocket, 404
-- Fixtures in `ui/e2e/fixtures/test-helpers.ts`
-- Base URL: `http://localhost:5000` (or E2E_BASE_URL env var); the fixtures ALSO call the API directly — set `E2E_API_URL` (defaults to the dev port `http://localhost:5001`) or every API-driven spec fails with ECONNREFUSED. Mailpit-driven specs need `E2E_MAILPIT_URL`.
-- **Nightly lane** (rebuilt 2026-08-30, FR-37): `scripts/e2e-nightly.sh` runs the whole suite from the build host via cron (03:30 UTC) — pins the standing `roomler-ai-e2e` stack to the current prod tag, runs, diffs failures against `scripts/e2e-expected-failures.txt`, writes `~/e2e-nightly/LATEST`, and files a GitHub issue on regressions. `scripts/e2e-run.sh [tag] [specs…]` is the on-demand form; pass a tag to pin ANY historical image, which is how an A/B is done (the e2e namespace is deliberately not ArgoCD-managed). Current: **165 passed / 2 failed / 6.5 min**; the two are `rc-vp9-444`, which needs an agent on the feature lane. 🔑 **The browser runs as the `pwrunner` SIDECAR inside the app pod** (deploy repo `k8s/overlays/e2e`), not on the build host. Three reasons, each measured: this host has **no route to the pod network** (`ip route get <podIP>` leaves via the default route), so a port-forward carries one TCP port and **no RTP ever arrives**; a Service URL is **not a secure context**, so `navigator.mediaDevices` is simply undefined; and in the pod the app is `http://127.0.0.1`, which is a secure context AND the address mediasoup announces. ⚠️ `ROOMLER__APP__FRONTEND_URL` must equal the browser's origin (`http://127.0.0.1` — **a port is part of an Origin**), or the cookie-authenticated `/ws` upgrade is refused with 403 and every realtime spec fails for that one reason. ⚠️ A Job cannot replace the sidecar: it cannot share the app's network namespace, which is the whole mechanism. ⚠️ The retired recipe said the conference specs failed because "mediasoup RTC ports aren't forwarded". That was wrong, and it hid a product bug for months: a blank `turn.url` advertised an ICE server with an empty URL, so **no browser could join a call at all** on such a stack (#940). An entry in `e2e-expected-failures.txt` is a claim that you understand the failure — re-test it or delete it.
-
-**Unit tests** (`ui/src/`):
-- Vitest with jsdom environment, 259 tests across 16 files
-- Stores: auth, messages, rooms, ws (incl. rc:* channel), notifications, conference, tenants, files, agents
-- Composables: useValidation, useSnackbar, useMarkdown, useRemoteControl (HID + button mapping locks)
-- API client: token injection, error handling
-- Plugins: vuetify theme config
-
-**Rust unit tests** (in-crate `#[cfg(test)] mod tests`):
-- `remote_control` crate: 20 tests (consent, session state machine, signalling, serde wire-format locks, permissions, TURN creds)
-- `roomlerd` lib (default features): 5 tests; plus 4 openh264, 3 enigo, 1 scrap under the matching feature flags
-- `services::auth`: 5 tests (token roundtrip + cross-audience rejection)
-
-**Capture smoke test** (no desktop required):
-- `./scripts/dev-xvfb.sh` spins up Xvfb, paints an xterm on it, runs the scrap-capture smoke test against that virtual display. See docs in the script header for subcommands (`run`, `shell`, arbitrary pass-through).
+- **Integration** (`crates/tests/`, ~294 tests across 34 modules): a unique
+  UUID-named database per test, real Axum servers on random ports. Needs MongoDB
+  `:27019` + Redis `:6379`. Run with `RUST_MIN_STACK=8388608` — several tests build
+  seven servers in one body and overflow the harness's default 2 MiB thread
+  otherwise, and a `SIGABRT` with `has overflowed its stack` is what a perfectly
+  green suite looks like. Set `RUST_LOG` and `--nocapture`; without a subscriber
+  every `info!`/`warn!` explaining a refusal is discarded.
+- **CI runs this lane** — `.github/workflows/integration-tests.yml`, on master
+  pushes touching `crates/**` or `agents/roomlerd/**`, on PRs touching
+  `crates/tests/**`, and on dispatch (optional `filter`). Deliberately **not** on
+  every PR: a ~20 min job on every push trains people to ignore it.
+  ⚠️ The lane asserts a **minimum test count** and a **leaked-database ceiling**,
+  because a job that silently runs nothing is indistinguishable from a passing one
+  — `cargo test` reports success for a filter matching no test. Treat the count as
+  approximate: `pull_request` checks out the branch *merged with master* while a
+  dispatch checks out the branch alone, so two green runs of one commit differ.
+  ⚠️ The two skips were **measured on the runner**, not inherited from the build
+  host: `conference_tests::call_leave_cleans_up_participant_media` (no mediasoup
+  worker there) and `rate_limit_tests::rate_limit_returns_429_after_burst`
+  (timing-sensitive). A third skip should feel expensive.
+- **E2E** (`ui/e2e/`, Playwright, 24 specs). Set `E2E_API_URL` (defaults to the dev
+  port `:5001`) or every API-driven spec fails ECONNREFUSED; Mailpit specs need
+  `E2E_MAILPIT_URL`. 🔑 **The browser runs as the `pwrunner` sidecar inside the app
+  pod** — this host has no route to the pod network (a port-forward carries one TCP
+  port and no RTP ever arrives), a Service URL is not a secure context so
+  `navigator.mediaDevices` is undefined, and in the pod the app is
+  `http://127.0.0.1`, which is both a secure context and the address mediasoup
+  announces. A Job cannot replace the sidecar — it cannot share the app's network
+  namespace, which is the whole mechanism. ⚠️ `ROOMLER__APP__FRONTEND_URL` must
+  equal the browser's origin (**a port is part of an Origin**) or the
+  cookie-authenticated `/ws` upgrade is refused 403 and every realtime spec fails
+  for that one reason. ⚠️ An entry in `e2e-expected-failures.txt` is a claim that
+  you understand the failure — re-test it or delete it.
+- **Unit**: Vitest (`ui/src/`), plus in-crate `#[cfg(test)]` tests in
+  `remote_control`, `roomlerd` and `services::auth`.
+  ⚠️ `roomlerd`'s `main.rs` tests **never run** — CI is `--lib`.
 
 ## Environment
 
-- `.env` — development (not committed, in .gitignore)
-- Config via `ROOMLER__` prefixed env vars (double underscore separator)
-- Docker: `docker-compose.yml` runs MongoDB 7 (auth credentials defined in `docker-compose.yml`; local dev only), Redis 7, MinIO, coturn
-- Default DB URL: `mongodb://localhost:27019` (tests use no auth)
+`.env` for development (gitignored). Config via `ROOMLER__`-prefixed env vars
+(double-underscore separator). `docker-compose.yml` runs MongoDB 7, Redis 7, MinIO
+and coturn locally; default DB URL `mongodb://localhost:27019` (tests use no auth).
 
 ## Deployment
 
-- **Production URL**: `https://roomler.ai/` — the live deployment. Use this as the `--server` argument when enrolling agents and as the origin the browser controller loads.
-- **Docker**: Multi-stage build (rust:1.88-bookworm -> oven/bun:1 -> debian:trixie-slim + nginx)
-- **Deploy repo**: `<deploy-repo>` on the build host. Kustomize manifests live under `k8s/base/` + `k8s/overlays/prod/`. Ansible playbooks retained for host-level tasks only (HAProxy, WireGuard, iptables).
-- **GitOps**: ArgoCD (at `<argocd-host>`) reconciles the `roomler-ai` Application from the deploy repo's `master` branch, path `k8s/overlays/prod`. Sync policy is **Automated + selfHeal + prune** with a GitHub webhook on the deploy repo: `git push` to master rolls out within ~5 s. 60 s polling fallback via `argocd-cm.timeout.reconciliation: 60s`. Sibling Application CRDs (bauleiter / lgr / oxmux / purestat / regal / roomler-ai / roomler-old / tickytack) are gitops-managed under a parent app-of-apps. Verify the live targetRevision with `argocd app get roomler-ai --grpc-web | grep -E "Target|Sync Status"`.
-- **Image registry**: `<internal-registry>` (self-hosted Docker Registry v2 on the build host, basic auth, cert auto-renewed via acme.sh). Pull secret `regcred` lives in the `roomler-ai` namespace.
-- **K8s cluster**: 3 control-plane + 3 worker nodes (Ubuntu 22.04, containerd 1.7.29, v1.31.14). Three zones via `topology.kubernetes.io/zone` (one master + one worker VM per bare-metal host).
-- **Tier policy** (added 2026-05-01): cluster nodes are labelled `tier=high-performance` (the two high-perf worker hosts) and `tier=utility` (the build/utility worker host). roomler-ai schedules on `tier=high-performance` only — never on the utility worker. Enforced via a Kustomize patch in `<deploy-repo>/k8s/overlays/prod/kustomization.yaml` (commit `dab3cfa`) that adds a required `nodeAffinity` to every Deployment + StatefulSet. Hostname pin in `base/` (`kubernetes.io/hostname: <storage-pinned-worker>`) is intentionally retained — the StatefulSet PVCs use node-local storage, so the data lives on that specific node; the tier requirement is an *additional* constraint, both must match. **Utility worker hosts**: monitoring (kube-prometheus), `<internal-registry>`, image builds (direct on the host), `bauleiter`, `regal`. **High-perf workers**: roomler (old), roomler-ai, oxmux, clawui (when migrated to K8s), lgr, purestat, tickytack.
-- **Pod placement** (S6, 2026-07-28): the API runs **2 replicas**, one per high-performance worker, forced apart by a `podAntiAffinity` overlay patch (hostNetwork ports collide on a shared node). The API Deployment's hostname pin was dropped; the Mongo/MinIO StatefulSets keep theirs (node-local storage). Namespace `roomler-ai`, deployment `roomler2` (note: name is `roomler2` not `roomler-ai`), **RollingUpdate maxSurge 0 / maxUnavailable 1** (zero-downtime deploys; surge 0 because hostNetwork can't double-bind), hostNetwork, `imagePullPolicy: IfNotPresent`. Each pod resolves its own public mediasoup announced IP from `ROOMLER__MEDIASOUP__ANNOUNCED_IP_MAP` (`<node_ip>=<public_ip>,...`) keyed by the Downward-API `ROOMLER__POD_HOST_IP` (status.hostIP); the static `announced_ip` is the fallback.
-- **Mediasoup RTC-range host forwarding (2026-08-26 incident)**: browsers send RTP straight at each pod's announced public IP on UDP/TCP 40000–49999, and the worker VMs sit behind libvirt NAT — so EVERY mediasoup-serving cluster host needs the RTC-range DNAT/SNAT/TTL rules in its `COTURN_*` iptables chains. S6 provisioned them on **jupiter only**; zeus never had them, so every conference whose tenant hashed onto the zeus pod had flawless signalling (join/transports/producers/consumers all green — `connect_transport` only records the client's DTLS params, it proves nothing about packets) and ZERO media, for weeks, with nothing logged. ⚠️ Because of the tenant-affinity hash this breaks a *consistent subset of tenants* while others work — "video works for org A but not org B" is a per-NODE media-path suspect, not an app bug. Ownership chain: **provisioning** lives in `~/k8s-cluster-multi` on the build host (`coturn_dnat_rules[*].port_ranges` must include `"40000:49999"` for every roomler-ai-hosting node + `host_firewall_mediasoup_rtc: true` in its host_vars; applied by playbook `11-host-networking`, which **flushes and rebuilds** the COTURN chains — never hand-fix a host without also fixing the vars, or the next playbook run reverts it; a boot service re-runs the rendered script). **Drift guard**: `<deploy-repo>/scripts/mediasoup-rtc-forwarding.sh` (`check`/`apply` on the host) + a weekly audit cron on the build host (`mediasoup-rtc-forwarding-audit.sh`, Mon 04:15 UTC) that pushes it over the overlay mesh and files a GitHub issue on drift. App-side tell: WARN `media transport has no DTLS 15s after connect_transport` in the pod log (watchdog in `room_manager.rs`), and the `media:join ... ICE diagnostics` line logs the pod's RESOLVED announced IP. The RTC range must change in lockstep with `ROOMLER__MEDIASOUP__RTC_MIN/MAX_PORT` in the prod configmap.
-- **Tenant-affinity LB** (S6, LIVE 2-pod since 2026-08-02): the front reverse proxy (docker-nginx on the build host) routes to the pods through a `hash <tenant-key> consistent` upstream — key = path tenant (`/api/tenant/{tid}/...`) → `?tid=` query param → client IP. This co-locates a tenant's users, agents, tunnel clients, DERP sockets and mediasoup rooms on ONE pod (the rc-hub / tunnel-hub / DERP relay / room registry are pod-local). **Strict pinning for long-lived sockets**: the upstream runs `max_fails=0` (the balancer must never mark a peer unavailable — with consistent hashing that walks the ring to the survivor, and a WS that reconnects during a deploy roll PARKS on the wrong pod after recovery, splitting controllers from agents), `location = /ws` + `location = /derp` add `proxy_next_upstream off` (a rolling pod ⇒ fail fast, client backoff re-homes correctly), and plain HTTP keeps per-request failover via `proxy_next_upstream error timeout` + a 5 s connect timeout. To park a pod (fall back to single-pod): add ` down` to its server line + `nginx -t && nginx -s reload`; **after ANY flip either way, also `kubectl rollout restart deploy/roomler2`** so long-lived WSs re-hash. Cross-pod chat/notifications/presence ride the Redis fan-out; a Redis online-registry (`roomler:online:<uid>`, 90 s TTL + 30 s heartbeat) backs the offline push/email dedupe; startup maintenance (stale-call reset, migrations) is leader-gated behind a 120 s Mongo lease (`locks` collection). ⚠️ Lesson (2026-07-29 + 2026-08-02 incidents): the listing's `is_online` is heartbeat-based (HTTP) while rc/tunnel need the pod-local hub — an agent whose control WS is half-open (a TLS-inspecting corp middlebox keeps ACKing its keepalive pings after a pod roll killed the upstream leg) shows GREEN but is `agent_offline`; agents ≥rc.293 detect this via a receive-liveness deadline (no inbound frames for 80 s ⇒ reconnect) and self-heal in ≤~2 min.
-- **Health probes**: startup/readiness/liveness all on `/health` (port 80 via nginx -> :3000 backend)
-- **nginx**: Pod-internal reverse proxy (`files/nginx-pod.conf`) — SPA fallback + API proxy + WS proxy
-- **Agent binary**: built separately (`cargo build -p roomlerd --release --features full`) and distributed to controlled hosts via GitHub Releases (MSI / .pkg / .deb auto-built by `.github/workflows/release-agent.yml` on `agent-v*` tag push). Not part of the API Docker image.
+**Production**: `https://roomler.ai/` — the `--server` for enrollments and the
+origin the browser controller loads. Topology, k8s layout, tenant-affinity LB and
+the media-path rules: **`docs/deployment.md`** + `docs/multi-pod-scale-out.md`.
+Release, signing and promotion mechanics: the **`ship-it` skill**.
 
-### Deploy pipeline (FR-73, since 2026-09-05): Actions builds, GHCR serves, a dispatch promotes
-
-The hosted image is **built by GitHub Actions on every merge to `master`** that can change it
-(`.github/workflows/hosted-image.yml`: `crates/**`, `ui/**`, `files/**`, `config/**`, the two
-installer scripts, the Dockerfile, `Cargo.*`), smoke-booted with Mongo + Redis (`/health` must
-mount all six modules including `saas`, the device route must answer 401, `/` must serve the
-SPA), attested, and pushed to the public package as
-**`ghcr.io/gjovanov/roomler-ai:hosted-<YYYYMMDD>-<sha7>`** plus the moving `hosted` pointer. The
-job summary carries the measured build time (first cold run: 13 min 37 s build, 15 min merge →
-tag). ⚠️ The lane never writes `latest` — that is the self-host `full` image (no `saas`), owned by
-`publish-selfhost-image.yml`. ⚠️ Build ≠ deploy: nothing rolls until someone promotes.
-
-```bash
-# 1. find the image a merge produced (or read the run summary)
-gh run list --workflow hosted-image.yml --limit 3
-# 2. promote it — bumps newTag in the deploy repo; ArgoCD rolls within seconds
-gh workflow run promote.yml -f tag=hosted-20260905-5ef0030   # empty tag = whatever `hosted` points at
-# 3. field-verify from the fleet, as after EVERY roll (pods on the new image, online-agent
-#    count, an RC session, an overlay pair, a tunnel forward) — the workflow only proves
-#    the public /health kept answering
-```
-
-`promote` runs in the **`release` environment**, whose secret `DEPLOY_REPO_TOKEN` (a fine-grained
-PAT, Contents read/write on the private deploy repo — in place since 2026-09-06) it uses after
-proving write access with a dry-run push; ⚠️ an environment secret is invisible to a job that
-does not declare the environment, and the symptom is the job's "not set" branch, not an error.
-Without the secret the job prints the exact manual bump
-(`sed -i 's|newTag:.*|newTag: <tag>|' k8s/overlays/prod/kustomization.yaml` in the deploy repo,
-commit, push). It refuses anything that is not an existing `hosted-*` tag, and refuses while the
-deploy repo's `newName` is not `ghcr.io/gjovanov/roomler-ai`. The cluster pulls from GHCR with
-**no pull secret** (the package is public; `regcred` on the Deployment is vestigial) — measured
-3 s per node for the whole 81 MB image on the first roll, 20 s from the deploy-repo push to both
-pods. Retention: `ghcr-retention.yml` (Mondays) deletes untagged versions and keeps the newest
-20 `hosted-*` tags, never touching any other tag family.
-
-⚠️ The e2e lane (`scripts/e2e-nightly.sh`, `scripts/e2e-run.sh`) reads the registry from the
-deploy repo's `newName` — a bare tag given to `e2e-run.sh` is resolved against it; a full
-reference containing `/` pins anything.
-
-#### Break-glass: the build-host path (a GitHub outage, or a fix that must not wait for a runner)
-
-The recipe below still works unchanged — build, push to the build host's registry, then set
-BOTH `newName: registry.roomler.ai/roomler-ai` and `newTag` in the deploy repo (`promote` will
-refuse until `newName` is switched back to GHCR). Fill in the env vars at the top once per shell
-session:
-
-```bash
-# Operator-filled (set once per shell):
-: "${BUILD_HOST:=ssh-target}"            # e.g. your build host alias
-: "${REGISTRY:=registry.example.com}"    # your <internal-registry>
-: "${REPO:=$HOME/roomler-ai}"            # local clone of this repo on the build host
-: "${DEPLOY_REPO:=$HOME/roomler-ai-deploy}"
-
-ssh "$BUILD_HOST"
-cd "$REPO" && git pull
-docker build -t "$REGISTRY/roomler-ai:build-$$" \
-  --build-arg VERSION="$(git describe --tags --always)" \
-  --build-arg GIT_SHA="$(git rev-parse HEAD)" .        # ~5–15 min (cache warm)
-TAG="v$(date +%Y%m%d)-$(docker images -q "$REGISTRY/roomler-ai:build-$$" | head -c 12)"
-docker tag "$REGISTRY/roomler-ai:build-$$" "$REGISTRY/roomler-ai:$TAG"
-docker tag "$REGISTRY/roomler-ai:build-$$" "$REGISTRY/roomler-ai:latest"
-docker push "$REGISTRY/roomler-ai:$TAG"
-docker push "$REGISTRY/roomler-ai:latest"
-
-# ── ALWAYS run after every deploy: reclaim the build's disk footprint. ──
-# The image is safely in the registry now, so the local copies are just build
-# leftovers. Every deploy bakes a fresh multi-stage image (+ intermediate layers
-# + build cache); without pruning they pile up until the build host's root FS
-# fills. (2026-07-12: `/` hit 100% from ~13 GB of stale build images mid-deploy.)
-# `-a` drops images not backed by a RUNNING container, so the mongo + registry
-# containers (and their images) are untouched; NO `--volumes`, so mongo DATA is
-# safe. Reclaims the per-deploy delta every time.
-docker system prune -af
-docker builder prune -f
-df -h / | awk 'NR==2{print "build-host / : "$4" free ("$5")"}'   # sanity
-
-cd "$DEPLOY_REPO"
-git checkout master && git pull
-sed -i "s|newTag:.*|newTag: $TAG|" k8s/overlays/prod/kustomization.yaml
-git commit -am "chore(k8s): bump roomler-ai to $TAG"
-git push
-
-argocd app sync roomler-ai --grpc-web     # or Sync via the ArgoCD UI
-curl -sI https://roomler.ai/health        # HTTP/2 200
-```
-
-Registry retention: `registry-retention.sh 1` (weekly cron at Sun 04:00) keeps at most 2 tags per repo (latest + most-recent-versioned) and GC's the registry storage. **Run it manually if `/gjovanov/registry` is fat** — the blob store isn't touched by `docker system prune` (it's the registry's own storage, not docker's), and heavy repos (e.g. `lgr` at ~7.5 GB/image) accrete fast between weekly GCs.
-
-**Periodic build-host maintenance (NOT per-deploy):** the fattest reclaimables are the local Rust `target/` dirs of the *other* projects cloned on the build host (`~/{harvex,oxmux,purestat,parakeet-rs}/target` were ~44 GB combined on 2026-07-12) — `cargo clean` or `rm -rf <proj>/target` when idle; they just recompile on next build. **Never touch `/var/lib/libvirt`** (the running k8s master+worker VM disks, ~87 GB) or the active container data volumes.
+- **Pipeline (FR-73)**: Actions builds
+  `ghcr.io/gjovanov/roomler-ai:hosted-<YYYYMMDD>-<sha7>` on every merge to master
+  that can change the image; **`gh workflow run promote.yml -f tag=…`** bumps the
+  deploy repo and ArgoCD (Automated + selfHeal + prune, webhook) rolls it within
+  ~5 s. ⚠️ **Build ≠ deploy — nothing rolls until someone promotes.** ⚠️ The lane
+  never writes `latest`; that is the self-host `full` image (no `saas`).
+- **Pods**: namespace `roomler-ai`, deployment **`roomler2`** (not `roomler-ai`), 2
+  replicas forced apart by `podAntiAffinity`, hostNetwork, RollingUpdate
+  maxSurge 0 / maxUnavailable 1 (surge 0 because hostNetwork can't double-bind).
+  Scheduling is pinned to `tier=high-performance` nodes; the Mongo/MinIO
+  StatefulSets keep their hostname pins (node-local storage).
+- ⚠️ **Every mediasoup-serving cluster host needs the RTC-range (40000–49999)
+  DNAT/SNAT/TTL rules** in its `COTURN_*` iptables chains. One node missing them
+  gave flawless signalling and **zero media, for weeks, with nothing logged**
+  (`connect_transport` only records the client's DTLS params — it proves nothing
+  about packets). Because of the tenant-affinity hash this breaks a *consistent
+  subset of tenants*: **"video works for org A but not org B" is a per-NODE
+  media-path suspect, not an app bug.** Provisioning lives in the Ansible host vars
+  and the playbook **flushes and rebuilds** those chains — never hand-fix a host
+  without also fixing the vars. App-side tell: `media transport has no DTLS 15s
+  after connect_transport` in the pod log.
+- ⚠️ **Tenant affinity pins long-lived sockets.** The front proxy hashes on the
+  tenant key so a tenant's users, agents, tunnel clients, DERP sockets and
+  mediasoup rooms land on ONE pod (the rc-hub / tunnel-hub / DERP relay / room
+  registry are pod-local). After any upstream flip, **also
+  `kubectl rollout restart deploy/roomler2`** so long-lived WSs re-hash.
+  ⚠️ A listing's `is_online` is heartbeat-based (HTTP) while rc/tunnel need the
+  pod-local hub — an agent whose control WS is half-open (a TLS-inspecting corp
+  middlebox keeps ACKing keepalives after a pod roll killed the upstream leg) shows
+  GREEN but is `agent_offline`; agents ≥rc.293 self-heal in ≤~2 min via a
+  receive-liveness deadline.
+- **After every roll, field-verify from the fleet** — pods on the new image,
+  online-agent count, an RC session, an overlay pair, a tunnel forward. The
+  workflow only proves the public `/health` kept answering. ⚠️ An exec sweep is a
+  **biased sample** (it reaches only what is online) — query the server for the
+  denominator.
 
 ## Functional Requirements (FR) workflow — STANDING RULE (operator, 2026-08-27)
 
-Every substantial feature or multi-step program (a new capability, a performance arc, a
-protocol/scheme change — anything bigger than a one-PR fix) gets a **Functional
-Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`.
+Every substantial feature or multi-step program — a new capability, a performance
+arc, a protocol change, anything bigger than a one-PR fix — gets a **Functional
+Requirement** tracked in GitHub. **Creating the FR is a step of the PLAN**, not a
+write-up filed afterwards. Registry and full protocol: **`docs/fr/README.md`**.
 
-**Creating the FR is a step of the PLAN**, alongside the implementation steps — not a
-write-up produced afterwards. Plan it, open it, then build against it:
-
-0. **Open the issue BEFORE you implement.** The FR is part of the plan, not paperwork
-   filed after the fact, and it is the only collision guard that actually works: on
-   2026-08-26 two sessions independently built the same feature from the same recorded
-   decision in a memory file (#724 vs a branch that was discarded). A memory file is
-   invisible to the other session; an open issue is not. Re-fetch master and list open FR
-   issues before starting.
-1. **Spec doc**: `docs/fr/FR-N-<slug>.md` — on master up front where the design is known,
-   with the implementation PR where it is not (#770); the issue body says which. Goal, root-cause/field
-   evidence, key design with `file:line` anchors verified against master, a phase/status
-   table with each phase's kill switch, acceptance criteria as checkboxes, open decisions,
-   out-of-scope, and a field-verification log. **Claim the number by adding your row to
-   `docs/fr/README.md` in the same commit as the spec** — unpadded `FR-N`, never reused.
-   ⚠️ Do NOT allocate by scanning `docs/fr/` or the issue list, with or without a
-   post-create re-check: two sessions both read `max = N`, both write `FR-N+1`, and git
-   merges them without a murmur because they touched *different* files. Measured three
-   times on day one — #767/#768, then #773/#774 seven seconds apart, then **three**
-   sessions on FR-5 within minutes *while the scan-and-re-verify rule was already in
-   force*. Editing one shared table makes git the arbiter instead: the loser's push is
-   rejected as non-fast-forward and the rebase shows the number is taken before anything
-   is published — the overlay block allocator's shape, where a unique index arbitrates
-   concurrent claims rather than a lock.
-   ⚠️ **If one still slips through, repair it deterministically: the LOWER issue number
-   keeps `FR-N`, the HIGHER renumbers** — title, spec filename, ledger row and in-body
-   references together. Not "the younger one, ambiguous ⇒ the retrospective one": both
-   sessions in the FR-3 collision applied exactly that and renumbered PAST each other,
-   leaving #773 and #774 both titled `FR-5` with two `docs/fr/FR-5-*.md` specs on master,
-   and it took a third commit (`7ad2ca0b`) to settle. `FR-7` then repeated it (#778 vs
-   #780). Creation timestamps seconds apart are not a usable ordering and "the
-   retrospective one" was true of both at different moments; issue ids are server-assigned
-   and monotonic, so two sessions that never talk compute the same winner. Renumber to the
-   next free N — never into a vacated one — and **numbers already settled STAY settled**;
-   this decides the next collision, not the ones behind us.
-2. **GitHub issue** `FR-N: <title>` in `gjovanov/roomler-ai/issues` (labels:
-   `enhancement` + whatever fits, e.g. `performance`): body links the spec doc and carries
-   Goal / Key design / Acceptance criteria / Open decisions / Out of scope / Related.
-3. **Comment as you ship — every step, not just the finish.** Two shapes, both already in
-   use on #768:
-   - a **`## Step log`** table (`# | step | PR | outcome`) appended to as each PR merges,
-     so the arc is readable without archaeology through `git log`;
-   - a **`## Result — field-verified on <version>`** comment carrying the actual
-     measurement (before/after table, the operator's own read, heartbeat numbers) with the
-     acceptance criteria ticked off.
-   ⚠️ **CI green is not a result.** A field test must be shown to FAIL on the current
-   deploy first, or its pass proves nothing — record both runs. Record the wrong turns
-   too; a dead end documented is often the most valuable line in the log. Update the
-   spec's status table and check off acceptance criteria in the same breath.
-4. **Close** the issue only when the acceptance criteria are field-verified; a regression
+0. **Open the issue BEFORE you implement.** It is the only collision guard that
+   actually works: a memory file is invisible to a parallel session, an open issue
+   is not. Re-fetch master and list open FR issues before starting.
+1. **Spec doc** `docs/fr/FR-N-<slug>.md`: goal, root-cause/field evidence, key
+   design with `file:line` anchors verified against master, a phase/status table
+   with each phase's kill switch, acceptance criteria as checkboxes, open
+   decisions, out-of-scope, and a field-verification log.
+   ⚠️ **Claim the number by adding your row to `docs/fr/README.md` in the same
+   commit as the spec** — never by scanning the directory. Two sessions both read
+   `max = N`, both write `FR-N+1`, and git merges them without a murmur because
+   they touched *different* files (measured three times in one day, twice while a
+   scan-and-re-verify rule was already in force). Editing one shared table makes
+   git the arbiter instead: the loser's push is rejected as non-fast-forward.
+   Enforced by `scripts/fr-registry-audit.sh` + CI.
+   ⚠️ If one still slips through: **the LOWER issue number keeps `FR-N`, the HIGHER
+   renumbers** — title, spec filename, ledger row and in-body references together,
+   to the next free N, never into a vacated one. Issue ids are server-assigned and
+   monotonic, so two sessions that never talk compute the same winner. Numbers
+   already settled STAY settled.
+2. **GitHub issue** `FR-N: <title>` with the spec link, and Goal / Key design /
+   Acceptance criteria / Open decisions / Out of scope / Related.
+3. **Comment as you ship** — a `## Step log` table appended as each PR merges, and
+   a `## Result — field-verified on <version>` carrying the actual measurement.
+   ⚠️ **CI green is not a result.** A field test must be shown to FAIL on the
+   current deploy first, or its pass proves nothing — record both runs. Record the
+   wrong turns too; a dead end documented is often the most valuable line in the log.
+4. **Close** only when the acceptance criteria are field-verified; a regression
    reopens it with the evidence.
-5. **Docs before close — STANDING RULE (operator, 2026-09-05).** Closing an FR requires the
-   docs that describe what it built to be **updated, or created**, in the house style of the
-   other `docs/*.md`: **mermaid diagrams** (a DAG as a `flowchart`/`graph`, a lifecycle as a
-   `sequenceDiagram` — `docs/overlay-communication.md` is the reference), tables, callouts,
-   `file:line` anchors, and a row in `docs/README.md`'s index (map + table). The spec is the
-   record of decisions and evidence; the doc is how the next person understands the system
-   without reading the spec. It is a **phase row and an acceptance criterion in every FR spec**
-   ("docs updated/created with diagrams, linked from `docs/README.md`"), ticked before the close
-   — not a write-up filed afterwards. FR-69 was the first case, owed after the fact
-   (`docs/modular-monolith.md`); FR-73's is the pipeline section of `docs/deployment.md`.
-
-`docs/fr/README.md` is the registry — every FR, its issue and its status, plus the claim
-protocol. Retroactive FRs for already-shipped arcs are welcome when a program resurfaces.
+5. **Docs before close** (operator, 2026-09-05): closing requires the docs that
+   describe what it built to be updated or created, in the house style of the other
+   `docs/*.md` — **mermaid diagrams**, tables, callouts, `file:line` anchors, and a
+   row in `docs/README.md`'s index. It is a phase row *and* an acceptance criterion
+   in every spec, ticked before the close.
 
 ## Post-Implementation Testing
 
-After every feature or fix, verify your changes:
+Run the **most specific** command first; if a backend change also affects the
+frontend, run both.
 
-| Change type | Command | What it checks |
-|-------------|---------|----------------|
-| Backend (models, services, routes) | `cargo test -p roomler-ai-tests` | Integration tests (real MongoDB) |
-| Remote-control crate (Hub, signalling, wire format) | `cargo test -p roomler-ai-remote-control --lib` | Unit tests (no MongoDB required) |
-| Agent library | `cargo test -p roomlerd --lib` | Default-feature unit tests |
-| Agent with media / input backends | `cargo test -p roomlerd --lib --features full` | Needs libxcb*-dev on Linux |
-| Agent capture against a headless display | `./scripts/dev-xvfb.sh` | Xvfb + xterm + capture smoke test |
-| Frontend (views, stores, composables) | `cd ui && bun run build` | TypeScript + Vite build |
-| Frontend unit tests | `cd ui && bun run test:unit` | Vitest (259 tests) |
-| Full-flow (auth, routes, UI+API) | `cd ui && bun run e2e` | Playwright E2E tests |
+| Change type | Command |
+|---|---|
+| Backend (models, services, routes) | `cargo test -p roomler-ai-tests` |
+| Remote-control crate (signalling, wire format) | `cargo test -p roomler-ai-remote-control --lib` |
+| Agent library | `cargo test -p roomlerd --lib` |
+| Agent with media / input backends | `cargo test -p roomlerd --lib --features full` |
+| Agent capture, headless | `./scripts/dev-xvfb.sh` |
+| Frontend | `cd ui && bun run build` |
+| Frontend unit | `cd ui && bun run test:unit` |
+| Full flow | `cd ui && bun run e2e` |
 
-Run the **most specific** command first. If a backend change also affects the frontend, run both.
+⚠️ The agent builds and unit-tests **natively on Windows**
+(`cargo test -p roomlerd --lib`) — the WSL lane is not the only option.
 
-### Defensive enum catch-alls
+## The three pillars — invariants, and where the detail lives
 
-`ClientMsg` / `ServerMsg` in `crates/remote_control/src/signaling.rs` are matched exhaustively from multiple consumer crates (agent, api/ws, hub). When you preemptively add a `_ =>` / `other =>` catch-all arm in a consumer match **without** adding the new variants that would make it reachable in the same commit, `cargo clippy --workspace -- -D warnings` fails with `unreachable_patterns` (the existing arms already cover every known variant). CI run [25972574628](https://github.com/gjovanov/roomler-ai/actions/runs/25972574628) hit this — defensive catch-all landed in `ec61f03` before the corresponding T2 wire variants did. The rule:
+`docs/README.md` is the navigable index. This section holds only what must be true
+without opening any of them.
 
-- If the new variants are landing in **the same commit**: no allow needed, the catch-all is immediately reachable.
-- If the new variants are landing in **a later commit** (defensive future-proofing): annotate the catch-all with `#[allow(unreachable_patterns)]` and reference this rule in a comment so the next reviewer doesn't strip the allow. Remove the allow when the variants land.
-- `#[non_exhaustive]` on the enum upstream is the structural alternative but forces a catch-all in every consumer everywhere — too invasive for the existing `signaling::*` matches.
+### Remote desktop
 
-## Remote Control Subsystem
+Design: `docs/remote-control.md` · encoders: `docs/encoders.md` + the
+`encoder-cells` skill · rate control: `docs/rate-control.md`.
 
-TeamViewer-style remote desktop. One native agent per controlled host, Roomler API as signalling-only relay, browser as controller. All media + input flows over direct WebRTC P2P (TURN-relayed if needed) — the server never sees raw pixels or keystrokes.
+One native agent per controlled host, the API as a **signalling-only** relay, the
+browser as controller. All media + input flow over direct WebRTC P2P (TURN-relayed
+if needed) — the server never sees raw pixels or keystrokes.
 
-**Design + architecture**: `docs/README.md` is the navigable index of all docs (three-pillar split: collaboration / remote desktop / overlay+tunnels; new umbrella docs `encoders.md`, `tunnels.md`, `installation.md`). Deep-dive: `docs/remote-control.md` (19 sections; §17-19 are historical appendices — current encoder reference is `docs/encoders.md`). Overlay-mesh sub-topics: `docs/agent-tunnel-architecture.md`, `docs/overlay-wfp.md` (Windows firewall override), **`docs/overlay-exit-nodes.md`** (Tailscale-style exit nodes), **`docs/overlay-nat-traversal.md`** (carrier-selection mechanics: LAN→direct-public→srflx hole-punch→single-relay→DERP), **`docs/overlay-communication.md`** (the end-to-end picture with mermaid diagrams: control plane vs data plane, every tier as a sequence diagram, and which carrier wins inside vs outside a corporate VPN — start here), **`docs/multi-org.md`** (one device in N orgs, N users on one host, cross-org events — the whole P1–P6 program plus the block-renumber runbook and the failure matrix).
+**Wire**: `rc:*` JSON over the existing `/ws`. `ClientMsg`/`ServerMsg` in
+`crates/remote_control/src/signaling.rs`. ObjectIds are raw hex strings and
+`Permissions` serialises pipe-separated (bitflags 2.x convention) — both locked by
+tests.
 
-**Multi-org** (`docs/multi-org.md`): ONE multi-tenant daemon, never N side-by-side installs (fixed TUN name+GUID, LocalAPI pipe singleton, host-global exit/DNS/WFP, per-machine updater). The config's scalar identity stays the PRIMARY enrollment (rollback-safe); secondaries live in `[[orgs]]` with their OWN freshly-minted WG key (never a copy — cross-org pubkey correlation), one supervised WS loop each, per-org `DOWN_SINCE`, and `rc:agent.update` honored ONLY from the primary. Overlay addressing: every legacy tenant shares `100.64.0.0/10` seeded at `.1`, so tenant A's and tenant B's `100.64.0.7` are the SAME address — **P2b** carves disjoint blocks from a GLOBAL `overlay_blocks` registry (aligned `/22` slots, monotonic from slot 64 = `100.65.0.0`; the whole `100.64.0.0/16` below is the legacy reserve). Non-overlap is structural: `slot` is uniquely indexed and starts are buddy-aligned, so concurrent allocations either collide on one slot (index arbitrates) or are disjoint — no lock. Freed blocks are **quarantined, never re-issued** (a device that missed the migration still believes it holds an address there). Carving is behind `ROOMLER__OVERLAY__BLOCKS_ENABLED` (default OFF ⇒ zero registry reads, pre-P2b behaviour) and only ever touches VIRGIN networks; an existing tenant moves via `POST …/overlay-block/renumber`, **dry-run by default**, which preserves ordinals where they fit, gates on `ROOMLER__OVERLAY__BLOCK_VERSION_FLOOR` (rc.301 = the P2a forward-compat set; below it a daemon purges its own on-link route at boot ⇒ host-wide blackhole) and then CYCLES every agent WS — `self_ip` binds once at establish, so nothing else makes a live fleet re-bind. ⚠️ The cycle is disruptive: a corp-VPN host can come back relay-locked. ⚠️ Tunnel-client nodes have no server-side cycle primitive — they're reported as `reconnect_required`. **P2c (agent-side shared TUN)**: `tunnel_core::overlay::tun_mux` — ONE `roomler` adapter, per-org `MuxPort` facades, dst-based longest-prefix demux whose table is built from the runtime's own route installs (`add_peer_route` /32s + `add_cidr_route` subnet/exit routes + the org's block from registration) so OS and demux tables can't drift; derived-ULA v6 unmaps to embedded v4. Behind the agent config key `overlay_multi_org` (default OFF ⇒ P1 behaviour byte-for-byte); the `for_org` gate additionally requires `overlay_mode="tun"` + the PRIMARY's `server_url` + the org's own WG key. One legacy `/10` org coexists with carved blocks (longest prefix); a SECOND un-migrated `/10` is refused at registration (`AddrInUse`) — renumber one. Exit roles + netstack stay primary-only/overridden; macOS has no multi-address TUN (`SystemTun::add_address_sync` refuses). **Mux NAT (rc.328, `docs/multi-org.md` §4b)**: the OS can pick the WRONG org's source for a shared-adapter destination (nested blocks defeat source selection — field 2026-08-09, 100 % loss toward single-org peers); `overlay/mux_nat.rs` + `tun_mux` hooks normalize cross-org egress sources and restore reply destinations (kill switch `overlay_mux_nat`, default on), Linux routes additionally carry `src` hints, and receivers split the signature into `rx_denied_noroute` (`peers --json`). **Multi-org v2 (rc.333-339, `docs/multi-org.md` §4a)**: `overlay_shared_carrier` (ONE process-wide direct-socket set, receiver-index demux) + `overlay_tun_per_org` (per-org adapters; primary keeps `roomler`/`roomler0`) are **default ON since rc.339** after the 4-host soak — explicit `false` per key is the kill switch; the mux/NAT/SkipAsSource stack above is the flag-OFF fallback until its evidence-gated deletion (counters in `peers --json` must stay fleet-zero).
+**Agent capability verbs** (`AgentCaps.rpc`): the wire stays `Vec<String>` because
+fleet agents span many releases and a typed wire format would strand them, but both
+sides go through **`models::RpcCap`**. Adding a verb: variant → `wire()` arm (the
+match is exhaustive, so the compiler makes you) → `ALL` entry (a test makes you).
+⚠️ Unrecognised verbs are **IGNORED, never an error** — a newer agent may advertise
+something this server has never heard of, and an additive list is only additive if
+old readers skip what they don't know.
+⚠️ **`ssh` is a PREFIX of `ssh-consent`** ("runs a server" vs "honours
+`consent_mode`"), and `config` is a prefix of `config-report`. Matching must stay
+**equality** — `starts_with`/`contains` would silently mark every ssh-capable agent
+consent-capable, fleet-wide. Locked by `ssh_does_not_imply_ssh_consent`.
+⚠️ The wire spellings are a compatibility surface: renaming one doesn't fail
+loudly, it makes every deployed device look like it lacks the feature.
 
-**Overlay exit nodes** (`overlay-l3`, default-OFF): a client routes its whole internet egress (`0.0.0.0/0` + `::/0`) through a chosen mesh peer. Config keys: exit offers with `overlay_exit_node_enabled=true`; an admin approves via `PUT …/overlay-node/{id}/exit-node` (writes `is_exit_node` + adds `/0` to `approved_routes` — the data-plane signal, NOT `is_exit_node` alone); a client opts in with `overlay_exit_node="<name|hex>"`. Core invariant = **never self-wedge**: pin `/32`/`/128` carrier+control exemptions first, then install the split-default (`0.0.0.0/1`+`128.0.0.0/1`; v6 `::/1`+`8000::/1`), else WITHHOLD; route-guard re-asserts every 2 s; boot-reconciler + `purge_exit_routes()` heal a stale `/1` after a hard exit. DNS steered to the exit's vantage (no leak). ⚠️ An exit reroutes the host's own *inbound*-reply traffic → it breaks un-exempted SSH; and NEVER run the exit field-test on a prod cluster node (see `docs/overlay-exit-nodes.md` caveats). Full detail in `docs/overlay-exit-nodes.md`.
+### Networking
 
-**Overlay address leases — allocation + RELEASE**: `overlay_networks` holds a monotonic `next_host` cursor **and** `free_hosts`, a pool of recycled host numbers. `allocate_host` pops the pool head (FIFO) before bumping the cursor; both branches are single atomic `find_one_and_update`s so concurrent joiners can't collide. v6 is DERIVED from the v4 (`derive_overlay_v6`) — one allocator, freeing v4 frees both. All three removal paths (`DELETE …/agent/{id}` cascade, `DELETE …/overlay-node/{id}` admin evict, `DELETE …/tunnel-client/{id}`) funnel through `ws::overlay::release_overlay_node`, whose **order is load-bearing**: read peers while live → **CAS-tombstone** (winning the CAS is the release *token*, so two concurrent removals can't pool one host twice) → pool the host → fan `netmap_delta{removes}` to peers *and* to the released node. Pooling BEFORE the tombstone would hand the address out while the old row still held it and the unique index would lock that joiner out permanently; this order only ever leaks a host. Rows are **tombstoned, not deleted** (address/name/pubkey kept as the record of who held them) and the three unique indexes on `overlay_nodes` are `index_unique_partial(..., {deleted_at: {$type: "null"}})` so a tombstone holds neither address nor MagicDNS name — `$type` not `{deleted_at: null}`, which also matches *absent*. `find_live_by_tenant_and_machine` is live-scoped ⇒ **removal is final**: a re-enrolled machine gets a fresh lease, never the revived tombstone. Evict = "force a new lease", NOT a ban (a still-enrolled device rejoins with a different address; there is no per-machine denylist). Client-side consequences: routing teardown is keyed by **pubkey** (`Router::remove_by_pubkey`; the IP-keyed variant is gone), an OS `/32` is dropped only when no surviving peer claims it, `install_peers` reinstalls on a pubkey rotation, and an `overlay_exit_node` **name** is pinned to the node it first resolved to. Those fire on the delta `removes` arm and `sweep_carrier_health`'s lazy reap — the two paths that can reap a stale peer *after* its address was recycled. ⚠️ The full-netmap arm also diff-and-prunes, but that is **defensive only and unreachable today** (field-checked 2026-08-02): `run()` joins once and eats the first netmap before the loop, the server only sends a full netmap in reply to a join, and the runtime is scoped to ONE WS session — a disconnect drops `by_node`/WgDevice/TUN and the reconnect rebuilds from empty, so there is no "stale peer survives a disconnect" leak to fix. Don't cite that arm as a live protection. ⚠️ **Pre-release gaps are ACCEPTED, not a bug**: devices removed before 2026-07-29 burned their host number with nothing to return it, so a long-lived tenant's `next_host` sits above its live count with holes below (fleet tenant: cursor 33, 14 live, 16 orphans `.3 .5 .8–.13 .16–.23`). They belong to NO document, so eviction can't reach them, and reclaiming means writing `free_hosts` directly — bypassing every `release_host` guard for a 4.19 M-address `/10`. Leave them; if it ever matters, build an admin reconcile that routes gaps back through `release_host`. Detail in `docs/overlay-communication.md` §1.
+Start at `docs/overlay-communication.md`. Sub-topics: `overlay-nat-traversal.md`,
+`overlay-exit-nodes.md`, `overlay-wfp.md`, `multi-org.md`, `magicdns.md`,
+`tunnels.md`, `tunnel-install.md`, `roomler-ssh.md`, `fleet-rpc.md`,
+`remote-config.md`, `ephemeral-nodes.md`, `device-naming.md`,
+`fr/FR-19-peer-relays.md`.
 
-**Resumption note after a session break**: see `git log` and `docs/remote-control.md` — per-release handover files were retired 2026-05-23 as part of a privacy/security cleanup.
+**Overlay address leases** (`docs/overlay-communication.md` §1) — the release order
+is load-bearing: read peers while live → **CAS-tombstone** (winning the CAS is the
+release *token*, so two concurrent removals can't pool one host twice) → pool the
+host → fan `netmap_delta{removes}`.
+⚠️ **Pooling before the tombstone** would hand the address out while the old row
+still held it, and the unique index would lock that joiner out **permanently**.
+This order only ever *leaks* a host.
+⚠️ Rows are **tombstoned, not deleted**, and lookups are live-scoped ⇒ **removal is
+final**: a re-enrolled machine gets a fresh lease, never the revived tombstone.
+Evict = "force a new lease", **not** a ban.
+⚠️ Client-side teardown is keyed by **pubkey**, never by IP.
 
-**Wire protocol**: `rc:*` JSON messages over the existing `/ws` endpoint. `ClientMsg` / `ServerMsg` in `crates/remote_control/src/signaling.rs`. ObjectIds are raw hex strings (locked by tests); `Permissions` serialises as pipe-separated names (bitflags 2.x convention, also locked).
+**Overlay exit nodes** (`docs/overlay-exit-nodes.md`, default-OFF) — an admin
+approval writes `is_exit_node` **and** adds `/0` to `approved_routes`; the route
+list is the data-plane signal, not the flag alone. Core invariant = **never
+self-wedge**: pin `/32`/`/128` carrier + control exemptions first, then install the
+split-default, else WITHHOLD.
+⚠️ An exit reroutes the host's own *inbound*-reply traffic, so it breaks
+un-exempted SSH — and never run the exit field-test on a prod cluster node.
 
-**Agent capability verbs** (`AgentCaps.rpc`, rc.437): the wire stays `Vec<String>` — agents in the field span many releases and a typed wire format would strand them — but both sides now go through **`models::RpcCap`** (`Exec` | `Originate` | `Ssh` | `SshConsent`). The agent names variants and maps via `RpcCap::wire()`; the server asks `caps.has_rpc(RpcCap::X)`. Adding a verb: variant → `wire()` arm (the match is exhaustive, so the compiler makes you) → `ALL` entry (a test makes you); consumers then can't misspell it. ⚠️ Unrecognised verbs are IGNORED, never an error — a NEWER agent may advertise something this server has never heard of, and an additive list is only additive if old readers skip what they don't know. ⚠️ `ssh` is a PREFIX of `ssh-consent` and the two mean different things ("runs a server" vs "honours `consent_mode`"), so matching MUST stay equality — `starts_with`/`contains` would silently mark every ssh-capable agent consent-capable and re-create the exact P5d lie fleet-wide. Locked by `ssh_does_not_imply_ssh_consent`. ⚠️ The wire spellings are a compatibility surface: renaming one doesn't fail loudly, it makes every deployed device look like it lacks the feature (`rpc_cap_wire_strings_are_locked`).
+**Multi-org** (`docs/multi-org.md`) — ONE multi-tenant daemon, never N side-by-side
+installs. The config's scalar identity stays the PRIMARY enrollment (rollback-safe);
+secondaries live in `[[orgs]]` with their **own freshly-minted WG key** (never a
+copy — cross-org pubkey correlation), and `rc:agent.update` is honoured only from
+the primary.
+⚠️ Every legacy tenant shares `100.64.0.0/10`, so tenant A's and tenant B's
+`100.64.0.7` are the **same address**. Carved blocks are disjoint by construction
+(uniquely-indexed `slot`, buddy-aligned starts — the index arbitrates concurrent
+claims, no lock). Freed blocks are **quarantined, never re-issued**: a device that
+missed the migration still believes it holds an address there.
+⚠️ Joining a **secondary** org does not start its WS loop — the daemon must be
+restarted. Signature: `last_seen_at == created_at` forever.
 
-**WebSocket role multiplexing**: `/ws?token=<jwt>&role=agent` uses the agent JWT audience; no `role` param (or `role=user`) uses the existing user flow. Same WS endpoint, same handshake, different claim validator. **Tenant affinity (S6)**: `/ws` (all roles) and `/derp` also accept an optional `tid=<tenant-hex>` the front LB hashes on — agent/tunnel tokens must match their `tenant_id` claim; user tokens are checked against `tenant_members` (403 on a non-member claim); absent `tid` = legacy client, accepted.
+**Peer relays** (FR-19) — a tenant-owned `roomlerd` forwards **ciphertext** between
+two nodes of the same tenant over UDP **3478** (the one port the symmetric-NAT corp
+population was measured to reach; 41641 and the coturn band are dead for it). Four
+default-deny gates, each owned by a different party, every decision audited in
+`peer_relay_audit`.
+⚠️ It is a third `RelayKind` behind the existing `RelayConn` seam, **not** a new
+tier — `is_direct()` reads any new tier variant as DIRECT, silently.
+⚠️ Serving **and** use are **primary-org only** — a UDP listener is host-global and
+a secondary org's admin must not mint onto the device owner's listener.
+⚠️ `static_endpoints` are public `ip:port` literals only, checked at the route
+**and** at mint time — a server-pushed probe target is a port scanner run by every
+device in the tenant as SYSTEM/root.
+⚠️ Org relay engages on a **ladder climb, not the mode flip**: a pair on a healthy
+DERP floor won't re-request until it churns.
 
-**Unified installer (P4, 2026-07-17)** — ONE wizard for the whole node stack:
-- **`agents/roomler-setup/`** (Tauri 2 single-window app, lib `wizard_app`) + **`crates/roomler-setup-core/`** (event-shape-free mechanics, lib `wizard_shared`). Role picker on Welcome: three daemon flavours on Windows (perMachine-SCM service / perUser task / perMachine attended — mapping to the MSI flavours) + tunnel-client on any OS. Steps: Welcome/role → Server → Token → Install → Done, with cancel/force-kill, progress replay, cross-flavour ack gate, and wizard-state persistence (**token NEVER persisted**). Daemon roles also place the `roomler-desktop` companion EXE (GAP-A). Released by `release-setup.yml` on `setup-v*` tags (Linux/macOS tarballs + SIGNED Windows EXE in `.zip`); first field-proven at setup-v0.3.0-rc.197.
-- **Backend proxies** in `crates/api`: `/api/setup/{latest-release,{platform}/health,{platform}}` serves the wizard itself (routes/setup_release.rs) + `/api/setup/install.{sh,ps1}` serve the terminal (no-GUI) installers embedded at compile time from `scripts/`. `/api/agent/installer/{flavour}` + `/health` (routes/agent_release.rs) streams MSI bytes through `roomler.ai` (NOT `github.com`) so corporate ESET / Defender allow-lists trust the download; `/api/tunnel/installer/{platform}` serves the CLI tarball.
-- **UAC lib-naming rule** — Windows UAC's "installer detection" heuristic auto-elevates any EXE whose filename contains "install" / "setup" / "update" / "patch"; cargo derives test-binary names from the LIB crate, so wizard lib targets must dodge those substrings (`wizard_app`, `wizard_shared`; historically `wizard_core` / `tunnel_wizard_core`). The user-facing bin EXE keeps the marketing name; `[[bin]] test = false` keeps `cargo test -p roomler-setup` off the UAC prompt.
+**Roomler SSH** (`docs/roomler-ssh.md`) — SSH into any node by overlay address with
+**no `sshd`, no bound port, no firewall rule**; packets are intercepted below the OS
+by `SplitTun`. That is not an elegance choice: binding `overlay:22` fails
+EADDRINUSE wherever sshd covers `0.0.0.0:22`, and a corp-managed laptop cannot have
+sshd at all. Interception also leaves nothing for an EDR agent to terminate. Four
+default-deny gates; `ssh_enabled` alone grants nothing (empty `ssh_authorized_keys`
+= nobody).
+⚠️ `-R` is **deliberately not implemented** — it would make the device bind a
+listening socket, the one thing this design exists to avoid.
+⚠️ `direct-tcpip` reads `forward_acl` **default-DENY, the opposite sense to the
+tunnel path that shares the struct**: a tunnel flow was already authorized by the
+server, but an SSH channel has no server in the path at all, so empty must mean
+*nowhere* or every session is a silent open pivot.
+⚠️ A key-list session with an unset `ssh_account_mode` authenticates and then runs
+**nothing**, rather than quietly taking SYSTEM/root. An unparseable mode is a
+refusal, never a fallback.
+⚠️ **Session CONTENT is never recorded** — recording a terminal means shipping
+whatever the operator typed (passwords into `sudo`, `mysql -p`) off the host, which
+is the exact property this pillar exists to provide.
+⚠️ `ssh_audit` is the server's own **decision** (authoritative); `ssh_activity` is a
+**claim by a host that may be compromised**. Two collections on purpose; join on
+`grant_id`. **An empty activity result is not evidence of inactivity** — the
+device-owned `ssh_activity_log` defaults to off.
+
+**Fleet RPC** (`docs/fleet-rpc.md`) — `roomler exec` over the agent's **existing
+control WS**, deliberately not the overlay: the diagnostics this exists for are most
+needed when the mesh is broken. Four independent default-deny gates, the last of
+which (`exec_enabled` on the device) is the only refusal that survives a compromised
+server.
+⚠️ Commands inherit the daemon's identity — **SYSTEM on Windows, root under
+systemd**.
+⚠️ A caller **awaits** this frame, so unlike `Goodbye`/`UpdateNow` it must gate on
+`AgentCaps.rpc` containing `exec` (412 otherwise) — pushing to a pre-feature agent
+would hang the caller until its deadline.
+⚠️ `roomler exec` **re-splits argv**: Windows targets need ONE quoted argument, and
+`;` never `&&`. On a host that restarts its own service it answers "no answer within
+45 s" — the command ran.
+
+**Remote configuration** (`docs/remote-config.md`) — the design constraint is **make
+the device remotely configurable without making it server-configurable**.
+Resolution: a device-owned `remote_config_enabled`, default OFF, **structurally
+absent from `DesiredConfig`** (a test asserts it never appears in a serialised
+request). Delivery is **reconcile-on-connect only**, so an offline device converges
+by the same code path as an online one.
+⚠️ **The device REPORTS BACK** — without it, *applied / applied-pending-restart /
+refused-not-opted-in / refused-secondary-org / never-arrived* are ONE state on
+screen, and each has a different fix. **Compare revisions, not just outcomes.**
+⚠️ **Local edits are live too** (`adopt_local`) — making a server push live while
+the owner's own edit waited for a restart inverts the very property gate 4 exists
+for.
+⚠️ There is deliberately **no self-restart**: nothing can tell whether the daemon is
+supervised, and exiting an orphan `roomlerd run` host takes it permanently offline.
+
+**Linux root daemons resolve `/etc/roomler/config.toml`** (rc.435,
+`docs/installation.md`). ⚠️ `systemctl is-active` reads **inactive while such a host
+is perfectly healthy** (the live daemon is an unmanaged orphan) — check
+`pgrep -x roomlerd` and `roomler peers`, and never "restart to fix" on that basis.
+
+**Declared tunnel routes** — `roomlerd` supervises forwards/SOCKS5 listeners
+declared as `[[tunnel_routes]]` in its config, reconciled into hub flows on every
+start (`docs/tunnel-install.md` §6).
+
+⚠️ **A WebRTC peer MUST be `close()`d — dropping it frees NOTHING.** Its UDP sockets
+are owned by tasks the ICE agent spawned, not by the struct, so an `Arc` drop leaves
+every one of them live. This once consumed the entire ephemeral port range and
+**took host DNS down** while `ping 1.1.1.1` stayed at 3 ms. That signature — names
+unresolvable, IPs fine — is socket exhaustion, **not** a DNS-server problem. Full
+note, with the diagnostic one-liner: `docs/tunnels.md`.
+
+### Collaboration
+
+`docs/real-time.md` (the WebSocket surfaces: user events, presence, mediasoup
+signalling, DERP) · `docs/ui.md` (frontend map).
+
+### Installation and packaging
+
+`docs/installation.md` · `docs/code-signing.md` · the **`ship-it` skill**.
+
+ONE unified wizard (`agents/roomler-setup`, Tauri 2) covers every role; backend
+proxies under `/api/setup/*` and `/api/agent/installer/*` stream installer bytes
+through `roomler.ai` (**not** `github.com`) so corporate ESET/Defender allow-lists
+trust the download.
+
+⚠️ **UAC lib-naming rule** — Windows UAC's "installer detection" heuristic
+auto-elevates any EXE whose filename contains "install"/"setup"/"update"/"patch",
+and cargo derives test-binary names from the **lib** crate, so wizard lib targets
+must dodge those substrings (`wizard_app`, `wizard_shared`). The user-facing bin
+keeps the marketing name; `[[bin]] test = false` keeps `cargo test -p roomler-setup`
+off the UAC prompt.
 <!-- RETIRED-NAME-ANCHOR(2): these two directories were DELETED under their
      retired names. A history line has to name what actually existed; an
      earlier path sweep rewrote one of them into agents/roomler-cli-installer,
      a directory git has never heard of. FR-21 D6. -->
-- **Legacy wizards RETIRED in P4c-2** — `agents/roomler-installer` (rc.28 agent wizard) and `agents/roomler-tunnel-installer` (rc.59 tunnel wizard) were reduced to shims over `wizard_shared` in P4a and deleted after the unified wizard's field-proof, along with `release-tunnel-wizard.yml`, the installer-EXE half of release-agent.yml's companions job, and the legacy `/api/tunnel-wizard/*` route family. The tunnel CLI's `self-update` is KEPT — it's the sole updater for tunnel-only hosts ("one updater" is per-role; daemon hosts get `roomler.exe` refreshed by the MSI).
-
-**Install-size trim (P3e, 2026-08-15)** — the per-Machine install was 102.6 MiB on disk (`roomlerd.exe` 61.7 + `roomler.exe` 22.1 + `roomler-desktop.exe` 16.5 + 1.9 CRT + wintun), MSI 31.97 MiB. Two levers landed:
-- **Lever D — `roomler.exe` is a shim.** The command surface moved from `roomler-cli`'s `main.rs` into its LIB (`roomler_cli::cli`, entry `run_from(argv, Origin)`); `roomlerd cli <args>` dispatches into it from the FIRST statement of `main()` (raw-argv check, deliberately ahead of DPI awareness / the 1 ms timer / the legacy-tree migration / `logging::init` — a CLI call must not run daemon-startup side effects), and both MSIs now install the ~150 KB `roomler-cli-shim` under the unchanged name `roomler.exe`. Rationale: `cargo bloat` put only 1.16 MiB of that 22.1 MiB binary in CLI-specific code — the rest duplicated std/webrtc/tunnel_core/tokio/rustls/reqwest/quinn/clap that `roomlerd.exe` already links — and the MSI job spent a serial 143 s rebuilding it under a different feature set. `self-update` REFUSES under `Origin::EmbeddedInDaemon` (the MSI owns the whole node stack; without the guard a daemon host would swap its own shim for a 22 MiB CLI). Tunnel-only hosts are untouched: `release-tunnel.yml` still ships the real standalone binary. ⚠️ The Linux .deb still ships the full `roomler` CLI — same duplication, same fix, but the shim needs SIGINT ignoring on Unix first or Ctrl-C orphans the child.
-- **Lever H — CRT trim.** The `VcRedistCrt` component shipped all nine Microsoft.VC14x.CRT DLLs; the import tables want three (`msvcp140`, `vcruntime140`, `vcruntime140_1` — and msvcp140 itself imports only the two vcruntimes). The other six are satellites a binary imports DIRECTLY when it uses the matching STL feature; none of ours does. Re-check with `dumpbin -dependents <exe> | findstr /i 140` before adding a C++ dependency, and extend the wxs components AND both workflows' staging lists together.
-- **Lever E — the desktop companion stopped linking the daemon.** Two leaf crates: `crates/localapi` (the LocalAPI protocol, re-exported as `tunnel_core::localapi` so every call site is unchanged) and `crates/agent-core` (config/config_surface/enrollment/machine/logging/logs_upload/crash_recorder/notify-primitives/acl/apps-config, re-exported by `roomlerd` under the old `crate::` paths). `dst_matches`/`host_matches` moved to `remote_control::models` next to their canonical shapes (tunnel-core `policy` re-exports). The tray's graph went **470 → 368 crates with ZERO transport crates** (webrtc family, quinn, turn, tokio-tungstenite, openh264, scrap, enigo, async_zip all gone). Seams to know: the rc.53 worker-aware notify trio stays in `roomlerd/src/notify.rs` (probes SystemContext); `apps` re-exports the moved config shapes; `appdirs::service_log_dir()` is the canonical SCM-log path (win_service delegates); `config::test_fixture` is behind the `test-fixtures` feature for downstream test builds (cfg(test) doesn't cross crates); agent-core's `overlay-l3`/`overlay-netstack` passthrough features exist ONLY for enrollment's WG-mint — thin clients must never enable them. Known residual: `remote_control` drags mongodb into every agent-side binary (5 `mongodb::` refs in audit/error/hub) — a `server` feature there is the follow-up.
-
-**P3e Phase 2 (rc.368)** — three more levers on the rc.365 base:
-- **Lever A — ffmpeg-next trimmed to `codec + format`.** `ffmpeg_next::init()` with default features calls `avdevice_register_all()` + filter registration, dragging avfilter (3.48 MiB) + avformat's demuxer table + avdevice + swscale into `roomlerd` — 23.07 MiB linked where the 10 HW encoders' true closure is 0.29 (measured with MSVC link stubs against the vendored static tree; −6.8 MiB from the trim). rc.71's breakage was codec-ALONE (`format` satisfies interrupt.rs/packet.rs); nothing in `src/encode/ffmpeg/` uses filter/device/scaling APIs (`format::Pixel` is the avutil enum). Verified live: `encoder-smoke --codec hevc` opened `hevc_nvenc` on an RTX 5090 and PASSED. Local feature-on checks need vcvars (bindgen wants MSVC's `stdint.h`) + `PKG_CONFIG_PATH` at a vendored FFmpeg tree.
-- **`codegen-units = 1` as WORKFLOW env** (`CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"` in release-agent.yml + release-tunnel.yml), deliberately NOT `[profile.release]` in Cargo.toml so the API docker build is untouched. Measured: roomlerd −18.4%, CLI −27.1% — and fat/thin LTO both LOSE to it on size AND build time for these binaries (thin is +5% size); don't "upgrade" to LTO without re-measuring.
-- **The .deb ships the shim too** (`target/release/roomler-shim` installed as `usr/bin/roomler`, mirroring the MSI). The shim gained real Unix signal semantics: parent ignores SIGINT/SIGQUIT (foreground-group convention), child resets to SIG_DFL via `pre_exec`, kill-by-signal exits 128+n. This also structurally retires the 2026-08-06 CLI/daemon version-skew class — the command surface lives inside `roomlerd`, and a stale shim is a version-agnostic re-exec. Tunnel-only hosts keep the standalone binary from release-tunnel.yml.
-
-**P3e Phase 3 + lever B (rc.371/374/377) — program complete.** Final field-verified state: Windows install 118 MB → 51.1 MiB on disk (`roomlerd.exe` 35, MSI **13.13 MB**), x86_64 `.deb` 64.2 → **10.44 MiB**, agent-host FFmpeg dir 150 → **5.7 MB**.
-- **`remote_control` `server` feature** (default-ON): the Mongo audit DAO and `Error::Mongo` are server-only (the session `Hub` moved to the fleet module in FR-69 P5a); the five agent-side consumers set `default-features = false` — the mongodb driver is GONE from roomlerd/roomler/roomler-desktop/derp-relay graphs (tray 470 → 321 crates over the program). api/services/tests are unchanged.
-- **Minimal vendored FFmpeg, BOTH platforms** (`vendor-ffmpeg-windows.yml`, jobs `build` + `build-linux-minimal`): `--disable-everything` + exactly the ten encoders `encode/ffmpeg/encoder.rs` dispatches (`*_nvenc`/`*_qsv`/`*_amf` × h264/hevc/av1 + `vp9_qsv`; the name lists are locked by unit tests). Windows = overlay port over the pinned vcpkg baseline (avcodec.lib 139.3 → 12.1 MB; ALWAYS re-bootstrap vcpkg.exe after the baseline reset); Linux = from-source n9.0.1 on ubuntu-22.04 (FR-77 P0; was n8.1.2) (whole lib dir 2.5 MB). Configure gotchas are pinned in the workflow comments — the big three: `--disable-autodetect` suppresses the ffnvcodec/cuda auto-enable (the die message misleadingly blames "ffnvcodec"), qsv encoders need `--enable-parser=h264,hevc,av1` for their SEI/PS helper objects (else the shared lib carries an undefined `ff_hevc_decode_nal_sei`), and verification MUST be a runtime `find_encoder_by_name` probe (version scripts hide `ff_*` from `nm`; the build host's `/usr/local` hides missing DT_NEEDEDs — the staged-tree ldd assert closes that class).
-- **`.deb` bundles only ldd-referenced libs** (fixpoint over DT_NEEDED): keep-set = `libavcodec libavutil libvpl libvpx` — `--as-needed` drops avformat and even swresample against the minimal tree, so the bundle guard floor is 2, and correctness is owned by the stock-24.04 load check.
-- Runtime proof on real silicon: `hevc_nvenc` on two Blackwell-class GPUs, `hevc_qsv` on Iris Xe (winhost-a), `mf-h264` cascade intact; `roomler … | head` no longer panics (SIGPIPE reset at `cli::run_from`). **amf remains CI-symbol-asserted only** (no AMD host in the fleet; the cascade falls through cleanly). **macOS note (rc.453)**: the macOS build no longer carries FFmpeg AT ALL. The size program had already measured it as dead weight — no `*_videotoolbox` names exist in the cascade, so every name the dispatch tables try is nvenc/qsv/amf and Apple Silicon falls to SW — but it was worse than inert: the six dylibs were built on a runner with Homebrew, so configure autodetected X11 and baked `/opt/homebrew/opt/libx11/…` (plus four `libxcb*` in libavdevice) into them, and **dyld killed the agent at launch on every end-user Mac**. `ffmpeg-encoder` is therefore off in the macOS lane; libvpx (the one real dynamic dep, for VP9-4:4:4) is bundled into `Contents/Frameworks` by a dependency WALK, and a gate fails the build if any Mach-O in the `.app` still references `/opt` or `/usr/local`. ⚠️ Wiring VideoToolbox needs BOTH halves: the `*_videotoolbox` names in the tables AND a re-run of `vendor-ffmpeg-macos.yml` (now `--disable-xlib --disable-libxcb`) — restoring the feature alone re-ships the crash.
-
-**⚠️ A WebRTC peer MUST be `close()`d — dropping it frees NOTHING** (fixed 2026-08-22). An `RTCPeerConnection`'s UDP sockets — one host candidate per local address, plus webrtc-ice's mDNS listener on `0.0.0.0:5353` — are owned by tasks the ICE agent spawned, not by the struct, so an `Arc` drop leaves every one of them live. `tunnel_core::transport::webrtc_dc::TunnelPeer` had no `close()` and no `Drop`, and `run_tunnel_session` has many `?` early returns, so every failed tunnel session leaked its whole socket set. Measured on devbox: `roomlerd` held **15,446 UDP sockets after 12 h** (10,367 on `:5353`), i.e. the entire 16,384-port ephemeral range — every socket allocation on the HOST then failed `WSAENOBUFS`/10055 and **the whole machine lost DNS** while `ping 1.1.1.1` stayed at 3 ms. ⚠️ That signature (names unresolvable, IPs fine, `nslookup` "No response" even from a reachable server) is a socket-exhaustion tell, NOT a DNS-server problem — check `netstat -ano -p UDP | awk '{print $NF}' | sort | uniq -c | sort -rn | head` first. ⚠️ It also masquerades as flaky tests: the QUIC/relay-probe loopback tests fail with the same 10055 when the host is starved. Fix = explicit `close()` + a `Drop` net that spawns it, mirroring `AgentPeer`; mDNS is additionally `Disabled` in the tunnel `SettingEngine` (it is a browser privacy feature — both ends here are ours — and `MulticastDnsMode` defaults to `QueryOnly`, which still binds 5353). The amplifier is fixed alongside: the flow supervisor reset its retry ladder on ANY clean session end, so a flow that opened and died on arrival span at the 1 s floor forever — a reset now requires `SESSION_RAN_THRESHOLD` (30 s) of actual uptime, the condition the code comment already assumed.
-
-**Declared tunnel routes (P6)** — `roomlerd` supervises forwards/SOCKS5 listeners declared in its config (`[[tunnel_routes]]`, `tunnel_core::localapi::RouteDescriptor` = one type for wire + disk): `agents/roomlerd/src/tunnel/route_reconciler.rs` reconciles them into hub flows on every start (create-retry backoff; terminal `failed` on revoked/cross-tenant so a dead route never hammers the server), `roomler route add/rm/ls/enable/disable` + the desktop Tunnels section manage them over the LocalAPI `Route*` verbs, and the daemon persists through an atomic `config::save` + a daemon-wide write lock. See `docs/tunnel-install.md` §6 "Declared routes".
-
-**Peer relays (FR-19, `docs/fr/FR-19-peer-relays.md`, #805)** — a tenant-owned `roomlerd` forwards **ciphertext** between two other nodes of the same tenant over UDP (default **3478** — the one port the symmetric-NAT corp population was MEASURED to reach; 41641 and the coturn band are dead for it), so a relayed pair no longer crosses the API pod (`relay:derp/tcp` = the control plane as a data path). It is a third `RelayKind` behind the existing `RelayConn` seam, **not** a new tier (`is_direct()` reads any new tier variant as DIRECT, silently). Four gates, each owned by a different party, every decision audited in `peer_relay_audit` (90 d): org `peer_relay_mode` (`off` default ⇒ zero mints, zero rows; `warn` decides and audits, pushes nothing) → an overlay-ACL rule that makes the relay node visible to EACH member, evaluated **regardless of `acl_mode`** through the fail-closed `try_load_acl` (an unreadable policy set is `policy_unreadable`, never a grant — `load_acl` fails OPEN by design and would have GRANTED on a Mongo blip) → per-device approval `PUT …/agent/{id}/peer-relay-policy` needing `MANAGE_AGENTS` **+ `EXEC_DEVICE`** (there is no free permission bit: the UI mask is a signed int32 with bit 30 as the ceiling, #888; clearing needs only `MANAGE_AGENTS` — revocation is not a grant) → the device's own `relay_server_enabled` (never server-pushable, structurally absent from `DesiredConfig`). The server MINTS (`crates/api/src/ws/org_relay.rs`): `rc:overlay.relay_serve` to the relay with both members' secrets, `rc:overlay.relay_session` to each member with its own, then steps out of the way — the bind at the relay is a 3-way authenticated handshake (`tunnel_core::overlay::orgrelay`; ⚠️ `tag₁` covers NO address, because a NAT client cannot know its own mapping on its first packet — the cookie binds it at the challenge; the first implementation got this wrong and only the loopback test showed it). ⚠️ VNIs are 24-bit and unique **per relay node**, never per tenant (the Geneve header has no tenant field); 0 and the STUN cookie `0x2112A4` are never minted. ⚠️ Revocation is a **push** (`rc:overlay.relay_revoke`) from four triggers — mode off, an ACL edit, approval cleared, a party removed or leaving — because the idle deadline never fires under a WireGuard keepalive; `MAX_LIFETIME_SECS` (1 h) bounds a session the server has forgotten (pod restart). ⚠️ Serving AND use are **primary-org only** (`org_primary` on the join; absent = fail closed): a UDP listener is host-global and a secondary org's admin must not mint onto the device owner's listener. ⚠️ `static_endpoints` on an approval are public `ip:port` literals only, checked by the route AND at mint time — a server-pushed probe target is a port scanner run by every device in the tenant as SYSTEM/root. ⚠️ Sessions / VNI cursors / probe reports are **pod-local** on purpose (tenant affinity puts all three parties on one pod; the relay's own table is the truth after a restart). ⚠️ mars cannot host a relay on 3478 — its `COTURN_DNAT` consumes the port on BOTH public IPs while `ss -ulnp` shows it free; the field relay is `scw-m2-asahi`. State: P1 responder field-verified (CORPLAP-3 PASS against the real daemon), P2 forwarding proven on loopback, P3 server-side mint integration-tested over real agent WebSockets; **P4a/P4b** the client — the bind handshake + `OrgRelayConn` (loopback-proven against the real relay), `RelayKind::Org` + the `relay_strategy` branch (a LIVE session decides, ahead of the netmap stamp), the agent installing `relay_serve` into its relay server and dropping relay frames on a secondary org’s WS, the `relay_probe` report — shipped in **0.4.19** behind **`overlay_org_relay` (default OFF)**: every join still advertises `supports_org_relay: false`, so the fleet is unchanged until a host opts in. **P4c field-verified on 0.4.20** (the caps-probe fix #915 unblocked it — see §the caps-probe paragraph): CORPLAP-3↔mars carried real traffic on `relay:org/udp` ~84 ms via the scw-m2-asahi relay (`forwarded=128`), the DERP floor (CORPLAP-2 + all non-opted peers) untouched, then a `serve:false` revoke tore the live session down back to DERP. ⚠️ Org relay engages on a **ladder climb, not the mode flip** — vni 4–5 minted but idle-reaped before both members bound (make-before-break working); a pair on a healthy DERP floor won't re-request until it churns, so restart a member to provoke the flip.
-
-**Fleet RPC (remote command execution)** — run a command on a trusted device from `roomler exec` or the web device console, over the agent's **existing control WS** (deliberately NOT the overlay: the diagnostics this exists for are most needed when the mesh is broken). Wire = `rc:rpc.exec` / `rc:rpc.cancel` / `rc:rpc.result` / `rc:rpc.request` / `rc:rpc.response`; the hub parks the caller on a oneshot keyed by request id (`Hub::exec_on_agent`), the policy decision point is `crates/api/src/routes/agent_exec.rs::authorize`, execution is `agents/roomlerd/src/exec.rs`. **Four independent default-deny gates**, each owned by a different party: org `TenantSettings.remote_exec_enabled` → caller's `permissions::EXEC_DEVICE` (1<<27, deliberately NOT in `DEFAULT_ADMIN`; `VIEW_EXEC_AUDIT` 1<<28 IS) → the device's `Agent.exec_policy` → the agent-local `exec_enabled` config key (the only refusal that survives a compromised server). ⚠️ Commands inherit the daemon's identity — **SYSTEM on Windows, root under systemd**. ⚠️ A caller AWAITS this frame, so unlike `Goodbye`/`UpdateNow` it must gate on `AgentCaps.rpc` containing `exec` (412 otherwise) — pushing to a pre-feature agent would hang the caller until its deadline. Every attempt including refusals lands in `exec_audit` (90 d TTL); output is redacted (agent token / `Bearer` / JWT-shaped) before it leaves the host. Diagnostic bundles (`roomler diag host|pair`) live in the CLI, not the agent, so a new probe is a CLI release rather than a fleet rollout. Full design in `docs/fleet-rpc.md`.
-
-**Roomler SSH (P1–P5 + P4a, 2026-08-20, field-proven on corplap)** — SSH into any enrolled node by its overlay address with **no `sshd`, no bound port, no firewall rule**; the roomler answer to Tailscale SSH, and unlike theirs it can serve Windows. The packets are **intercepted below the OS**: `tunnel_core::overlay::split_tun::SplitTun` is a `TunIo` spliced between the WG bridge and the real device that diverts TCP for `<self overlay ip>:<ssh_port>` into the in-process smoltcp netstack and passes everything else through. That is not an elegance choice — field-measured 2026-08-19, binding `overlay:22` FAILS with EADDRINUSE on buildhost/fleet-host-2/fleet-host-1 (sshd on `0.0.0.0:22` covers every local address, in BOTH orgs) and on devbox (sshd bound to the overlay IP itself), while corplap-3 cannot have sshd at all (capability `NotPresent`, corp-managed, WSL holds loopback `:22`, all 3 firewall profiles on). Interception also leaves nothing for an EDR agent to terminate — the failure that parked `regal` outbound-only when Kaspersky killed `sshd.exe` as a service — and makes "unreachable off-mesh" a property of the topology rather than a policy. Server = russh 0.62 (`default-features=false, features=["ring"]` — **defaults would pull aws-lc-rs**, a C/NASM build that breaks tunnel-core's ring-only invariant; `rsa` deliberately off), behind the `ssh-server` cargo feature: **+1.86 MiB measured in roomlerd (29.94→31.80, +6.2%; ~+0.7 MiB on the MSI), ~99 crates, a second RustCrypto generation** (russh is on aes-gcm 0.11 / curve25519-dalek 5 / p256 0.14 vs our 0.10/4/0.13, so nothing is shared) — opt-in per build, and **in all four release feature sets since rc.417**, so every device carries the code with all gates default-closed. Config: `ssh_enabled` (default off), `ssh_port` (default **2222**, not 22, so an existing sshd keeps serving the overlay address during migration — the daemon warns when it shadows one), `ssh_authorized_keys` (empty = nobody, so `ssh_enabled` alone grants nothing), `ssh_host_key` (ed25519, minted on first SSH-enabled start, stored in config.toml so it inherits the atomic+fsync+`.prev`+0600/ACL treatment; **if it cannot be persisted SSH stays OFF** rather than serving a per-boot identity). `exec` runs through the existing `crate::exec` engine, inheriting its timeout / output ceiling / concurrency cap / redaction / process-tree kill; **Interactive shells (P4a, UNIX only)** — `ssh <node>` gets a real pty via `agents/roomlerd/src/pty.rs`: login shell, bidirectional streaming, SIGWINCH-on-resize, SIGHUP to the whole process group on teardown. A pty session deliberately does NOT use the exec engine (its buffering-to-a-ceiling is the opposite of interactive), so it has **no output cap and no timeout** — it keeps the identity model (same `exec::apply_run_as`, so no second privilege story) and the consent gate. The terminal is allocated when the SHELL starts, not at `pty_request`, so a session about to be refused never gets a pty. ⚠️ `openpty` not `posix_openpt` (no `ptsname_r` on macOS); ⚠️ the PARENT must close the slave or reads never EOF; ⚠️ Linux gives **EIO not EOF** on a master whose slave closed — treating it as an error would make every normal shell exit look like a transport failure. **Interactive shells on WINDOWS (P4b, rc.429)** — ConPTY, and `ssh.rs` keeps ONE code path: `pty/{mod,unix,windows}.rs` share a surface, so the `#[cfg(unix)]` gates are gone rather than duplicated. `console_user` works too (the same attribute list on `CreateProcessAsUserW` + the `WTSQueryUserToken` token + the user's own `EnvBlock`), which is the point on corplap — a corp laptop that cannot host `sshd`; it needs the daemon to be SYSTEM and says so otherwise, and `named:<account>` stays refused exactly as `exec` refuses it. Teardown is a **job object** (`KILL_ON_JOB_CLOSE`) since Windows has no process group. ⚠️ Three traps, all commented in `pty/windows.rs`: (1) the pseudoconsole attribute gives the child a CONSOLE but does NOT redirect its std handles — set `STARTF_USESTDHANDLES` with **three NULLs** so ConDrv assigns real console handles; pointing them at the pseudoconsole's own pipe ends "fixes" stdout and silently breaks stdin (two readers race for keystrokes ⇒ an interactive shell hangs), and omitting the flag loses all program output whenever the parent's stdout is a pipe. Diagnose in one line inside the session: `echo a & echo b > CON`. (2) `USESTDHANDLES` needs `bInheritHandles=TRUE`, which alone leaks EVERY inheritable handle into the child — other sessions' pipes then never EOF (an 8 s suite became 41 min); bound it with a second `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. (3) the HPCON is passed BY VALUE — wrong ⇒ `CreateProcess` succeeds and the child dies `0xC0000142`. `ClosePseudoConsole` is ORDERED (blocks until flushed), so no drain loop is needed. **File transfer (P7a, rc.450)** — the `sftp` subsystem, so `sftp` and `scp` work. It **spawns the platform's `sftp-server` AS THE SESSION'S ACCOUNT** rather than embedding `russh-sftp`: an in-process implementation would do file I/O as the daemon, so a `console_user` session would silently read and write as SYSTEM/root — exec and pty both drop privilege via a child, and this keeps ONE privilege story (same `apply_run_as`, same consent gate). ⚠️ Windows non-daemon accounts REFUSE (no piped `CreateProcessAsUserW` yet — only the pty's pseudoconsole form exists), so corplap has no scp. ⚠️ `sftp-server`'s stderr goes to the daemon log, NEVER the channel — SFTP is binary and injected text corrupts a transfer. ⚠️ `ROOMLER_SFTP_SERVER` overrides the binary probe. **Port forwarding (P7b)** — `-L`, `-J` and `-W` all arrive as `direct-tcpip` and share one handler, gated on the device's `forward_acl` **read DEFAULT-DENY, the opposite sense to the tunnel path that shares the struct**: a tunnel flow was already authorized by the server, so an empty allowlist sensibly means "no extra local restriction", but a `direct-tcpip` channel has no server in the path at all — empty must mean *nowhere*, or every SSH session is a silent open pivot into whatever the device can reach. Refusals carry a cause the client can act on (`AdministrativelyProhibited` for policy vs `ConnectFailed` for an unreachable destination — connect happens BEFORE accept so a dead target isn't an accepted channel that mysteriously hangs up), while the reason string stays in the daemon log because it names internal topology. ⚠️ No consent prompt on a forward, deliberately: the channel isn't open yet so there's no stderr to announce a wait on, and the allowlist entry IS the operator's consent — given in advance, naming the destination. ⚠️ `-J` needs the JUMP host to allowlist the final target, not the client. ⚠️ `-D` (dynamic SOCKS) works and each connection is checked individually, which is why forwards are capped at **64 concurrent process-wide, refusing rather than queueing** (`ResourceShortage`) — a browser opens one channel per connection. ⚠️ **`-R` is deliberately not implemented** — it would make the device bind a listening socket, the one thing this design exists to avoid, and it's redundant with the tunnel subsystem since the client is itself a mesh node; russh's default refuses it cleanly. **Privilege (P5, rc.417/418)** — a session runs as what was actually asked for, never more: `RunAs::{Daemon, ConsoleUser, Named}`, Unix drop = `setgroups`→`setgid`→`setuid` then *verified* with `getuid`/`geteuid` (uid 0 is refused via the `named` path); Windows `ConsoleUser` = `WTSQueryUserToken` + `CreateProcessAsUserW` with piped output. A grant carries its mode from the device `SshPolicy`; a key-list session has no policy behind it, so it reads the device-owned `ssh_account_mode` and — **unset, the default** — authenticates and then runs NOTHING rather than quietly taking SYSTEM/root. An unparseable mode is a refusal, never a fallback. **All four gates are live** (P3a+P3b): carrier identity → org `remote_ssh_enabled` (a SEPARATE switch from `remote_exec_enabled`) → `SSH_DEVICE` (1<<29, a SEPARATE bit from `EXEC_DEVICE`, NOT in `DEFAULT_ADMIN`) → per-device `SshPolicy` → the device-owned config keys (`ssh_enabled` + `ssh_authorized_keys` for access, `ssh_account_mode` for what a key-list session may run). Decision point `crates/api/src/routes/agent_ssh.rs`; both the HTTP route and the `rc:ssh.request` device leg go through ONE `dispatch`. The server mints a single-use grant (ephemeral pubkey + principal + account mode + 60 s expiry), pushes it to the target and answers the caller with where to dial — its role ENDS there, because the session rides a path it never observes, which is also why every refusal reason is enumerated and answered synchronously. Agent re-clamps the grant against its OWN clock (server timestamps can only shorten), single-use, table capped at 16. **Operator consent (P5d)** — `SshPolicy.consent_mode` is honoured: `auto` is the ONLY value that skips the prompt, and an absent directive means ask (the Fleet-RPC fail-safe). The prompt fires at REDEMPTION, not grant arrival — by grant time the server has already told the caller where to dial, so a refusal there would be a connection that rejects them for no stated reason; at exec time the refusal explains itself on stderr, and the caller is warned *before* the wait (`waiting up to 30s for approval at the device…`) so a policy of `prompt` isn't indistinguishable from a hang. ⚠️ Key-list sessions are deliberately EXEMPT — they're the break-glass path for when the control plane is the broken thing. **Phase A hardening (rc.426)**: session entitlements resolve in ONE place — `sshd::ResolvedSessionPolicy` (agent, at auth) and `SshPolicy::split()` (server, at dispatch) both destructure their inputs exhaustively, so a field added to the grant or the policy fails to compile until someone decides what a session does with it (the rc.419/P5d silently-dropped-field class, closed structurally); `session_secs` is now ENFORCED (grant sessions disconnect at their bound, 0 = the 12 h ceiling; key-list sessions stay unbounded by design); and the consent broker rides `ssh::SessionServices` through `overlay::maybe_start` instead of the deleted `consent::set_shared` global — "no broker ⇒ deny" is unrepresentable now. A denied/timed-out consent BURNS the grant (auth consumed it) — request a new one, don't re-dial. **P3c (audit + admin UI)**: every request through `dispatch` lands in **`ssh_audit`** (90 d TTL; tenant / device / user indexes), read by `GET …/ssh-audit` behind **`VIEW_SSH_AUDIT` (1<<30)** — in `DEFAULT_ADMIN`, while `SSH_DEVICE` deliberately is not, because reviewing who held a session is a different job from opening one. The refusals are the load-bearing rows, so it is not per-call-site: `decide` returns `Result<Granted, SshDenyReason>` and `dispatch` records BOTH arms in one place, making "a new refusal that forgets to audit itself" unrepresentable. ⚠️ A row is the **DECISION, not the session** — the server hands back an address and steps out of the way, so there is no duration/exit/output and never will be; `account_mode` is the field worth reading. UI = an org switch in Settings (separate card from exec), `SshPolicyDialog` per device (empty policy defaults to `console_user`, never `daemon`, so an unread selector can't yield a root shell; a rejected save keeps the dialog OPEN because the server refuses a prompt policy an old agent would ignore), `SshAuditSection`, and (P8b) **`SshActivitySection`** directly beneath it — the activity card leads with the two properties a reader would otherwise get wrong (empty ≠ inactive; these are the device's own account of itself) and renders a device-refused row in error red, since a declined forward is what an operator is usually hunting for. ⚠️ `VIEW_SSH_AUDIT` is a new bit — EXISTING admin roles don't carry it until their mask is rewritten (Owner is fine via the `ADMINISTRATOR` bypass). **P8a (session activity)**: `ssh_audit` records the server's DECISION; **`ssh_activity`** records what the DEVICE says it did — `rc:ssh.activity` over the control WS → a separate collection (90 d TTL), read at `GET …/ssh-activity` behind the same `VIEW_SSH_AUDIT` bit. Six kinds: `session_open`/`session_close`/`exec` (command + exit code)/`shell`/`sftp`/`forward` (host:port + allowed). ⚠️ **Session CONTENT is deliberately never recorded** — no pty byte stream, no command output; recording a terminal means shipping whatever the operator typed (passwords into `sudo`, `mysql -p`) off the host, which is the exact property §1 exists to provide. ⚠️ **Two collections on purpose**: an audit row is the server's own decision and is authoritative, an activity row is a claim by a host that may be compromised — folded together a reader couldn't tell which is which; join on `grant_id`. ⚠️ **An empty activity result is NOT evidence of inactivity**: `ssh_activity_log` is a DEVICE config key defaulting to off (same last-word rule as `ssh_enabled`/`exec_enabled` — a server can't force a host to self-report honestly), so a non-reporting device looks exactly like an idle one; `ssh_audit` is what survives a device that lies. ⚠️ `tenant_id`/`agent_id` come from the authenticated WS, never the frame, so a device can only write rows about itself. Commands are redacted with `exec`'s registered-secret redactor and capped at 512 chars ON THE DEVICE, then re-clamped server-side (a bound that exists only on the reporting side is not a bound); reports are `try_send` fire-and-forget, and `session_close` fires from the handler's `Drop` so it survives every way a session can end. Full design + roadmap in `docs/roomler-ssh.md`.
-
-**Remote configuration (2026-08-24, `docs/remote-config.md`)** — flip `exec_enabled` / `ssh_*` on a fleet device from the dashboard, instead of editing `config.toml` on each host by hand (the reason both features are still off nearly everywhere: the last gate is the one nobody can reach). The tension it resolves: gate 4 is *"the only refusal that survives a compromised server"* for exactly ONE reason — the server cannot write it — so the design constraint is **make the device remotely configurable without making it server-configurable**. Resolution = a device-owned `remote_config_enabled`, default OFF, **structurally absent from `DesiredConfig`** (a test asserts it never appears in a serialised request); a host that sets it has knowingly delegated gate 4 to its control plane. Delivery is **reconcile-on-connect only** — an offline device converges by the same code as an online one, so the offline case runs on every connect rather than only when nobody is watching. Authz falls out of #600/#605: enabling exec needs `MANAGE_AGENTS` **and** `EXEC_DEVICE`, any `ssh_*` key needs `SSH_DEVICE` (opening a door you cannot walk through is the same escalation). Push is **primary-only** — the keys are host-global while the server models policy per-org, mirroring `rc:agent.update`. ⚠️ **The device REPORTS BACK** (`rc:agent.config_status` → `agents.config_report` → one server-resolved `RemoteConfigState`): without it, *applied / applied-pending-restart / refused-not-opted-in / refused-secondary-org / never-arrived* are ONE state on screen, and each has a different fix. ⚠️ `config-report` is a **separate capability verb** from `config` — the `ssh`/`ssh-consent` split recurring exactly as that doc predicted, because rc.457/rc.458 shipped `config` and report nothing; `config` is a PREFIX of `config-report`, so matching stays equality. ⚠️ A report is a **claim by the device** (`ssh_activity` sense), while `config_audit` is the server's own authoritative decision — never fold them. ⚠️ **Compare revisions, not just outcomes**: a report about revision 3 says nothing about revision 4. ⚠️ `exec_enabled` is LIVE (one read site → `AtomicBool`); `ssh_*` are persisted and honestly reported `needs_restart` (the SSH server splices into the packet path at overlay build, and `RuntimeFingerprint` has no SSH field). ⚠️ **Local edits are live too** (`adopt_local`, called from the LocalAPI `ConfigSet`) — making a SERVER push live while the owner's own edit waited for a restart inverted the property gate 4 exists for. There is deliberately **no self-restart**: nothing can tell whether the daemon is supervised, orphan `roomlerd run` hosts exist, and exiting them would take them permanently offline (§7b).
-
-**Code signing (2026-08-22, LIVE)** — tracked as **FR-7** (`docs/fr/FR-7-signed-releases.md` + issue #778, which carries the implementation/results log); full runbook in `docs/code-signing.md`; operator scripts in `scripts/signing/`. Publisher = **G ROX LTD** (BG, UIC 205174895); Azure identity validation COMPLETED (valid to 2028-11-21), account `roomlersigning`/`roomler-public-trust` in **polandcentral**, field-proven signature `CN=G ROX LTD, O=G ROX LTD, L=Pazardzhik, C=BG`. Key rules: Windows signs via **Azure Artifact Signing over GitHub OIDC** through `.github/actions/sign-windows` (modes `auto|azure|local|off`, verify-after-sign, `require` gate fails release tags that would ship unsigned; seven `AZURE_*` repo **variables**, zero key material in GitHub); every azure-signing job MUST carry **`environment: release`** — the tenant rejects wildcard tag-subject federated credentials, so the FIC is bound to that GitHub environment; MSI **payload** (`roomlerd.exe` + `roomler-shim.exe`) is signed before `cargo wix` harvests, third-party DLLs (wintun, VC-CRT) are staged AFTER signing and must keep their original signers (CI asserts); nothing after payload signing may `cargo build` (relink strips sigs); the `-unsigned` filename suffix is retired (consumers verified suffix-agnostic); `roomlerd.exe`/`roomler.exe`/`roomler-shim.exe` embed VERSIONINFO via `build.rs` + `embed_resource::compile_for` (NEVER winres/winresource — its link-lib leaks a second RT_VERSION into the Tauri EXEs); macOS is all-or-nothing on six `APPLE_*` secrets (agent .pkg staple-verified via `spctl`; wizard ships a stapled `.app` in the unchanged tarball name; bare tunnel CLI = notarised, unstapleable); publish jobs add GPG `.asc` + `actions/attest-build-provenance`. Rehearse with `signing_mode=local` dispatches (cert from `50-selfsigned-dev-cert.ps1`), never with throwaway `agent-v*` tags. **GPG is LIVE** (re-checked 2026-08-24; this line said "pending" and was stale): rc.458 ships 9 `.asc` sidecars + `roomler-release-pubkey.asc` — ed25519 primary `[C]` certify-only `D654B016…25973A7F` + ed25519 `[S]` subkey `5DB8221F…E6FA485A`, both to 2028-08-22, signatures verify and a flipped byte gives `BAD signature`. **Pinned-key verify is LIVE** (#724/#727, was stale here): the updater verifies `.asc` against the key pinned IN THE BINARY, field-proven ×2 (rc.481/482 logged `installer .asc verified against the pinned release signing key`). Apple: D-U-N-S obtained (524365169, D&B name "G ROX EOOD"), org enrolment 5XS5WN8R99 under Apple identity review — the last gate before `60-apple-setup.sh` and real `pkgutil --check-signature` in the updater; interim macOS releases use the stable self-signed identity (#729/#737/#740).
-
-**Older releases (0.1.x → 0.3.0-rc.26)**: CLAUDE.md no longer mirrors per-release notes — `git log` and `docs/remote-control.md` are authoritative for the historical arc. Key milestones, all shipped: live-verified WebRTC P2P (0.1.36), MF H.264 HW cascade with REMB-driven bitrate (0.1.26), codec negotiation H.264/HEVC/AV1 with probe-at-startup filter (0.1.28-0.1.30), clipboard + file-transfer data channels (0.1.32-0.1.33), WebCodecs canvas render bypass (0.1.36, Tier B7), agent lifecycle service hooks + auto-update (0.1.36), failure-resilience cycle with watchdog + crash rollback + SHA256 verification (0.1.50-0.1.54), heartbeat telemetry + pre-flight checks + opt-in Windows Service mode (0.1.55-0.1.58), M5 verification + clean-exit fixes + install-storm cooldown (0.1.61-0.1.63), M3 Z-path lock-screen overlay + browser auto-reconnect + perMachine MSI (0.2.0-0.2.5; A1 WGC NO-GO empirically confirmed), auto-update asset-picker flavour-aware (0.2.6), input regression fix (0.2.7), M3 A1 SystemContext-from-cold-start (rc.1-rc.7), UAC self-update + cross-flavour MSI cleanup + Tauri tray companion (rc.18), resumable file-DC transfers (rc.19-rc.20), ESET-evasive PROGRAMDATA staging (rc.21-rc.22), SystemContext Winlogon + elevated apps gating via `ROOMLERD_ENABLE_SYSTEM_SWAP` (rc.26).
+⚠️ The legacy wizards `agents/roomler-installer` (rc.28) and
+`agents/roomler-tunnel-installer` (rc.59) were retired in P4c-2. The tunnel CLI's
+`self-update` is **kept** — it is the sole updater for tunnel-only hosts ("one
+updater" is per-role; daemon hosts get `roomler.exe` refreshed by the MSI).
 
 ## Known Issues (OPEN only)
 
-Fixed-and-shipped issues live in `git log`. Currently open:
+Fixed-and-shipped issues live in `git log` and the docs. Currently open:
 
-- [LOW] [2026-08-03] Overlay ACL is feature-complete but **not yet field-proven under `enforce`**. `overlay_policies` + `OverlayNetwork.acl_mode` (`off`|`warn`|`enforce`, default `off`) shape the netmap per recipient, gate BOTH relay tiers (TURN relay-grant + `ws::derp_acl`'s precomputed per-network allow table), and compile **per-source ingress rules** onto `NetmapPeer.ingress_rules`. `overlay_rpf` (default `warn`) enforces all three node-side tiers: a peer can neither forge a SOURCE it doesn't own, nor address a DESTINATION outside the subnets this node advertises, nor reach a cidr/port/proto the tenant's policies didn't grant it. ⚠️ `ingress_rules` is `Option`: `None` = no ACL compiled (fall back to the coarse scope), `Some([])` = **deny** — never collapse them. Rules ship ONLY under `enforce`, so `warn` can never cause a node to drop. Remaining work is operational, not structural: nothing has run under `enforce` in the field, so flip a tenant to `warn` first and read `rx_denied` + the `overlay: inbound packet the sending peer is not entitled to send` lines before cutting over.
-<!-- RETIRED-NAME-ANCHOR(3): ROOMLER_AGENT_VIRTUAL_DESKTOP is the spelling the
-- [MEDIUM] [2026-04-17, rewritten 2026-08-29 by **FR-27** (#854)] Host consent is now correct on the wire, has ONE prompt payload for all three subsystems, and has a **`PromptSurface` chain** rather than a single hard-coded surface: **native** (`win` · `mac` · `x11`) → **companion** (`roomler-desktop` over LocalAPI, started on demand by `companion::ensure_running()`) → **cli** (`roomlerd consent`) → **none**, which reports `no_prompt_surface` instead of a silent deny. The chosen surface is logged per prompt, which is the whole point — before it, "the prompt didn't appear" was unattributable. ⚠️ Two backends are compiled but **not in every release feature set**: `viewer-indicator-x11` IS on in both Linux release lines, `viewer-indicator-macos` is CI-compiled only, because it moves tokio off the main thread (i.e. changes how every Mac agent STARTS) and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. ⚠️ GNOME/KDE **Wayland** expose no `wlr-layer-shell` to arbitrary clients, so those sessions have no native path at all and fall through to the companion by design, not by omission. Five things the old entry got wrong or missed, all closed: (1) the picker never applied to a device's OWNER — `resolve_session_authz` returned `Auto` before the policy was read, so on a single-owner fleet `consent_mode` had *no observable effect*; `AccessPolicy.prompt_owner` (default off = unchanged) opts back in and the grid labels it. (2) An agent-side prompt timeout came back as a bare `granted:false` and was terminated as `UserDenied` — "nobody was at the machine" reached the controller as "a human refused you"; `rc:consent.reason` now splits `UserDenied` / `ConsentTimeout` / `NoPromptSurface` — ⚠️ and the hub waits `CONSENT_VERDICT_GRACE` (5 s) LONGER than the window it announces, because with equal timers its own fallback fired ~130 ms before the agent's reasoned verdict on every non-answer (measured on mars on 0.4.16 AND 0.4.18) and the reason was thrown away. (3) `write_pending` had ONE production call site, so `exec` and SSH prompts reached no UI and were answerable only by grepping the daemon log inside 30 s; all three now write a marker carrying `kind` + a redacted `detail`. (4) The server's directive OVERRODE a device's `auto_grant_session=false` — inverting the gate-4 property exec/SSH are built on; `consent::strictest_of` makes the local setting a floor. (5) `prompt_then_email` ran a 300 s modal on the host and its timeout killed the emailed link; the host half is now the 30 s attended window and going unanswered HANDS OVER to the owner. **Field-verified on 0.4.16, 2026-08-29** (#854): a human Approved on the native Windows panel and the session started; Deny, timeout and the 30 s `prompt_then_email` handover are each distinct at the controller; the companion dropped from TWO tray icons to one; and an in-session `exclusive` no longer outlives its session. ⚠️ **Publishing the Linux companion `.deb` INTO the agent release froze every pre-0.4.16 Linux agent** — their picker takes the FIRST `.deb` matching their arch and `/api/agent/latest-release` forwards GitHub's order, which put the companion first: mars and jupiter apt-installed it AS their daemon update, logged "package installed", never moved version, and jupiter pulled 34 packages of webkit/GTK onto a headless cluster node. Fixed SERVER-side (`agent_release::order_assets_daemon_first`) because a frozen agent cannot receive an agent-side fix; 0.4.16+ also refuses by name. ⚠️ **A `ROOMLER_AGENT_VIRTUAL_DESKTOP=1` host is NOT a consent surface** even though its X display connects: the only viewer of that Xvfb is a remote controller, so an unattended host reports `timeout` where the truth is `no_prompt_surface`, and an attended one lets viewer A approve viewer B. ⚠️ Still unverified: `prompt_owner` (needs the owner account — every fleet device is owned by a different user), `no_prompt_surface` (no virtual-desktop-free Linux host left to test on), two concurrent viewers, `email`/`push`, and the macOS/X11 panels.
-- [~~LOW~~ → **FIXED 2026-08-25**] File upload stored the client-supplied `content-type` verbatim. `crate::media_type::resolve` now sniffs the bytes (`infer`) and stores what they ACTUALLY are; the claim is passed in only to be ignored, so the call sites read as "we had a claim and did not use it". Both upload handlers go through it. ⚠️ The fallback for signature-less content is a **narrow extension map that structurally cannot produce `image/*` or `text/html`** — those are exactly the types worth lying about, so they must be proven by magic bytes; a `.png` name alone gets `application/octet-stream`. A table-level test enforces that, because adding `("svg", "image/svg+xml")` later would look reasonable in review and would reintroduce the whole defect. ⚠️ NOT a whitelist of what a client may claim — a whitelist still trusts the claim. ⚠️ **Correction to the 2026-08-23 re-rating**, which partly rested on "the UI only ever renders `<a href=…>` (no iframe, no `<img>`)": that is **false**. `MessageBubble.vue` renders `<v-img :src="att.url">` for any attachment whose type starts with `image/`, i.e. an inline render driven by the stored value. It still was not an XSS (an SVG in `<img>` cannot run script, and `openAttachment` is `window.open` → a top-level navigation, which honours `Content-Disposition: attachment`) — but the reasoning was wrong, and the render decision is now made on a sniffed type instead of a claimed one. `integration.rs` also steers a recognition backend with this string.
-- [~~LOW~~ → CLOSED, measured 2026-08-24] Agent `config.toml` holds the `agent_token` (and, since P1, the SSH host private key). Unix saves `0600`; the MACHINE-GLOBAL Windows path is hardened by `harden_machine_global_dir` (W4c) because ProgramData's default ACL really is `BUILTIN\Users`-readable. The open half of this entry — "the per-user path relies on a loose default ACL" — **does not reproduce**: `icacls` on `%APPDATA%\roomler` reports exactly `SYSTEM:(F)`, `BUILTIN\Administrators:(F)` and the owning user `:(F)`, all inherited, with no `Users` or `Everyone` ACE. SYSTEM and Administrators can read any file on the box regardless, so they are not a boundary this could defend. Adding an explicit ACL there would spend an `icacls` subprocess per save to re-state what the profile already enforces. ⚠️ Re-open only with a measurement showing a profile whose inherited ACEs are wider — the file moved to `crates/agent-core/src/config.rs` (P3e lever E), so the old pointer no longer resolves either.
-- [LOW] [2026-08-26] **`roomler self-update` verifies only the same-channel SHA-256, and fails OPEN when the manifest carries no digest** (`agents/roomler-cli/src/update.rs`: `None => println!("(no digest in manifest — skipping hash check)")`). Same hole the agent updater closed — whoever serves the manifest serves the digest with it — for the binary that is the SOLE updater on tunnel-only hosts. Rated LOW rather than MEDIUM after measuring the exposure instead of assuming it: `self_update` has exactly ONE caller, the manual `self-update` subcommand — no timer, no daemon-driven invocation, unlike the agent's automatic root-identity updater; and Windows is the only platform with a real self-update path there. ⚠️ The fix is not a copy-paste: `code_signature.rs` lives in `roomlerd`, which depends ON `roomler-cli`, so the tunnel crate cannot reach it. The shared home both already dep is **`crates/tunnel-core`** (agent-core would drag config/enrollment/logging into the standalone CLI, which P3e would not want) — but tunnel-core is on `windows-sys` **0.61** while the agent is on **0.59**, so the WinTrust/Cryptography bindings must be re-checked on the move, not assumed. The module itself is portable: 375 lines, `std` + `windows-sys` only, zero `crate::` references.
-- [LOW] [2026-03-10] No git hooks configured (no pre-commit, no lint-staged). Also no secret scanner (gitleaks/trufflehog) in CI.
-- [MEDIUM] [2026-08-23, publisher trust CLOSED on all three platforms 2026-08-26] **The agent auto-updater verifies the publisher everywhere now; what remains unattested is the MANIFEST, and the TUNNEL CLI is not covered.** The updater runs what it downloads as the daemon identity (**SYSTEM on Windows, root under systemd**), and its SHA256 is not a tamper anchor: the digest arrives in the SAME manifest, from the SAME origin, as the `browser_download_url`, so anyone able to serve one serves both. `code_signature::verify_publisher` closes that on Windows — `WinVerifyTrust` **plus** an assert that the signer contains `G ROX LTD` — and `download_asset` refuses, discards the file and keeps the current version when it fails. ⚠️ **Both halves are load-bearing**: `WinVerifyTrust` alone proves only that *someone Windows trusts* signed it, and every commercial code-signing cert chains to a trusted root, so the name check is what makes the signature mean "ours". ⚠️ Making the same-channel SHA256 merely *mandatory* is NOT a fix. ⚠️ **A signature alone does not stop a ROLLBACK, and that half is now closed separately.** `is_newer` compared the MANIFEST's tag while `verify_publisher` verified the ARTIFACT, and nothing connected them: a tampered manifest advertising `agent-v0.3.0-rc.999` while pointing `browser_download_url` at a genuinely-signed OLDER build passed both checks and downgraded the fleet into a known-exploitable version. `artifact_version::verify_artifact_version` binds the two — the MSI's own `ProductVersion` (inside the signed envelope, so editing it breaks the signature) must equal what the manifest claimed. ⚠️ `msi_product_version_for` is the SECOND copy of the `MAJOR.MINOR.RC` mapping in `release-agent.yml`'s "Derive the MSI ProductVersion" step; **they must change together or every agent refuses every update** — a silent fleet-wide freeze, not an error. Re-check with `cargo test -p roomlerd --lib -- --ignored real_published_msi`. ⚠️ The binding is deliberately `Unsupported` (not a refusal) for `.deb`/`.pkg`: with no signature to anchor it, a version check there compares a claim against a claim while reading like a control. **Linux/macOS publisher trust CLOSED 2026-08-26 (rc.476, `pgp_verify.rs`)**: the release signing subkey's ed25519 point (fpr `5DB8221F…E6FA485A`) is PINNED in the binary, and `download_asset` on non-Windows fetches `<asset-url>.asc` and refuses fail-closed — the sidecar is REQUIRED, so a release whose GPG job skipped would freeze Linux/macOS updates. ⚠️ That compositional hazard is closed at the SOURCE by #727: `release-agent.yml` used to skip signing with `exit 0` when `GPG_PRIVATE_KEY` was absent, which after rc.476 meant a tag published without it silently froze every Linux/macOS agent. It is now a hard failure on a tag (graceful skip still on a branch dispatch) plus a post-signing assertion that every `.deb`/`.pkg`/`.msi` actually got a sidecar. ⚠️ The publish job is `if: is_release` so it CANNOT be rehearsed on a branch — the gate was verified by replaying it against rc.476's real asset list (accepts; rejects when one real sidecar is removed). Deliberately not an OpenPGP implementation: ~150 lines of RFC 4880 framing for exactly the shape CI emits (one v4 packet, class 0x00, EdDSA, SHA-256/512), ring doing the ed25519 (already in the graph). Key rotation requires a release; the module docs carry the overlap recipe, and `pinned_key_matches_committed_pubkey` re-derives the constant from `scripts/signing/gpg/roomler-release-pubkey.asc` on every test run so pin and file cannot drift. Proven against the REAL published rc.475 `.pkg` + its `.asc` (verify OK; one flipped byte mid-file refused) — re-check with `cargo test -p roomlerd --lib -- --ignored real_published_asc`. Remaining: the manifest itself is still unsigned (version+url+hash not attested as a unit), and the tunnel CLI's separate `self-update` does not share `download_asset`, so it is not yet pinned. Verified against real release artifacts: `agent-v0.3.0-rc.453`'s perMachine MSI reports `signer: G ROX LTD`, an unsigned file is refused, and flipping four bytes in the middle of that MSI yields `TRUST_E_BAD_DIGEST`; `agent-v0.3.0-rc.458`'s perMachine MSI carries `ProductVersion=0.3.458` (confirmed independently via the `WindowsInstaller.Installer` COM object), verifies against its own tag, and is REFUSED when offered as `agent-v0.3.0-rc.65000`. ⚠️ The agent builds and unit-tests NATIVELY on Windows (`cargo test -p roomlerd --lib`) — the WSL lane is not the only option, and this whole path was developed that way.
-- [~~MEDIUM~~ → CLOSED 2026-08-25, re-verified in code 2026-08-26] Browser sessions used to hand JS **both** tokens — access (7 d) + refresh (30 d) in `localStorage` — and shipped the access token in URL **query strings** (`/oauth/callback?token=`, `/ws?token=`) that nginx logged in plaintext. Any XSS stole 30 days of re-mintable access that survived logout. **Closed by the cookie-only session work (#680/#682/#690/#691).** Re-verified against the current tree rather than from memory: the only `localStorage` use left is a boolean `SIGNED_IN` hint documented as *not* a credential (`ui/src/api/session.ts`) plus a one-shot purge of the legacy token keys; `ui/src/stores/ws.ts` no longer puts `token=` on the WS dial; and `oauth_callback` returns the token in the **URL FRAGMENT**, which browsers never send to a server, so it cannot reach an access log or a `Referer`. ⚠️ Two transitional shims are still in the tree and can be dropped now both halves have rolled: the server still appends `#token=` for cached older bundles, and `OAuthCallbackView.vue`'s comments still describe accepting a query-string form the code no longer reads (it ignores the value entirely and relies on the cookie — it only strips the fragment so it does not linger in history).
-- [MEDIUM] [2026-08-23, agent half CLOSED + re-verified in code 2026-08-30] **USER** sessions are stateless and **irrevocable**: `logout` only clears the cookie, there is no password-change flow at all (no route exists), and nothing checks a `token_epoch` (the identifier appears nowhere in the tree), so a stolen access token stays valid for its full 7 days and disabling/deleting a user does not end their live sessions. Refresh tokens are not rotated, so reuse is undetectable. Fix = a `token_epoch` in the claims checked on verify. ⚠️ **The AGENT half of this entry is FIXED and the old wording is now false** — it claimed a deleted/quarantined agent's 1-year token still authenticates the log/crash ingest routes because `agent_log.rs`/`agent_crash.rs` "never load the agent row". They no longer parse the bearer themselves: both go through `crates/api/src/extractors/agent.rs::AuthAgent`, which loads the row (`find_in_tenant`) and refuses via `refusal_reason` — i.e. exactly the "centralized agent-token extractor that always status-checks the row" this entry prescribed. ⚠️ **A lookup FAILURE is deliberately 500, not 401**: a Mongo blip must not tell a healthy fleet its credentials were revoked, which would turn a database wobble into an enrollment storm. ⚠️ **Deletion wins over status** — the cascade tombstones the row without necessarily rewriting `status`, so an Online-looking tombstone still refuses; verified in the field 2026-08-30 when a throwaway device's agent JWT was surfaced in a daemon log line and the device had already been deleted.
-- [LOW] [2026-04-20] Remote-control: NVIDIA NVENC `ActivateObject` returns 0x8000FFFF on RTX 5090 Blackwell for H.264 / HEVC / AV1 MFTs regardless of adapter binding. Cascade routes around it (H.264+HEVC land on alternative MFTs; AV1 has no alternative and is filtered from advertised caps by the probe-at-startup check). Worth re-testing on newer drivers / `CODECAPI_AVEncAdapterLUID` experiments.
-- [MEDIUM] [2026-04-22] Browser viewer: Chrome's `<video>` enforces a ~80 ms jitter-buffer floor regardless of `jitterBufferTarget=0` / `playoutDelayHint=0`. Partial workaround shipped (opt-in WebCodecs canvas render path, Chrome-only) — flip on by default once field hours accumulate.
+- **[MEDIUM]** [2026-04-22] Chrome's `<video>` enforces a ~80 ms jitter-buffer floor
+  regardless of `jitterBufferTarget=0` / `playoutDelayHint=0`. The opt-in WebCodecs
+  canvas render path (Chrome-only) is the partial workaround — flip it on by
+  default once field hours accumulate.
+- **[MEDIUM]** [2026-08-23] **User sessions are irrevocable** — no `token_epoch`
+  check, no password-change route, no refresh rotation. `docs/security-baseline.md` §1.
+- **[MEDIUM]** [2026-08-23] **The updater's manifest is unsigned** — version + url +
+  hash are not attested as a unit — and the tunnel CLI's separate `self-update` does
+  not share `download_asset`, so it is not key-pinned. Publisher trust on the
+  artifact itself is closed on all three platforms (`ship-it` skill §3).
+- **[MEDIUM]** [2026-04-17, rewritten 2026-08-29 by **FR-27**, #854] Host consent now
+  has a **`PromptSurface` chain** — native (`win`·`mac`·`x11`) → companion
+  (`roomler-desktop` over LocalAPI) → cli (`roomlerd consent`) → none, which reports
+  `no_prompt_surface` instead of a silent deny, and the chosen surface is logged per
+  prompt (before it, "the prompt didn't appear" was unattributable). ⚠️ GNOME/KDE
+  **Wayland** expose no `wlr-layer-shell` to arbitrary clients, so those sessions
+  have no native path at all and fall through to the companion **by design, not by
+  omission**. ⚠️ An agent-side prompt **timeout** must not come back as a bare
+  `granted:false` — "nobody was at the machine" reaching the controller as "a human
+  refused you"; the hub waits 5 s **longer** than the window it announces, because
+  with equal timers its own fallback fired ~130 ms before the agent's reasoned
+  verdict. ⚠️ A server directive must never override a device's
+  `auto_grant_session=false` — `consent::strictest_of` makes the local setting a
+  floor.
+<!-- RETIRED-NAME-ANCHOR: the env-var spelling on the line below carries a
+     retired product name deliberately — it is what the daemon actually reads,
+     so renaming it would silently disable every virtual-desktop host. FR-27. -->
+  ⚠️ A `ROOMLER_AGENT_VIRTUAL_DESKTOP=1` host is **not** a consent surface even
+  though its X display connects: the only viewer of that Xvfb is a remote
+  controller, so an unattended host reports `timeout` where the truth is
+  `no_prompt_surface`, and an attended one lets viewer A approve viewer B.
+  Still unverified: `prompt_owner`, `no_prompt_surface`, two concurrent viewers,
+  `email`/`push`, and the macOS/X11 panels. Detail: `docs/fr/FR-27-*.md`.
+- **[LOW]** [2026-08-03] Overlay ACL is feature-complete but **not field-proven
+  under `enforce`**. ⚠️ `ingress_rules` is `Option`: `None` = no ACL compiled (fall
+  back to the coarse scope), `Some([])` = **deny** — never collapse them. Rules ship
+  ONLY under `enforce`, so `warn` can never cause a node to drop. Flip a tenant to
+  `warn` first and read `rx_denied` before cutting over.
+- **[LOW]** [2026-08-26] **`roomler self-update` verifies only the same-channel
+  SHA-256 and fails OPEN when the manifest carries no digest** — the same hole the
+  agent updater closed, in the binary that is the sole updater on tunnel-only hosts.
+  Rated LOW after measuring the exposure: it has exactly one caller, the manual
+  subcommand — no timer, no daemon-driven invocation. ⚠️ The fix is not a
+  copy-paste: `code_signature.rs` lives in `roomlerd`, which depends **on**
+  `roomler-cli`. The shared home is `crates/tunnel-core`, but it is on `windows-sys`
+  **0.61** while the agent is on **0.59**, so the WinTrust bindings must be
+  re-checked on the move, not assumed.
+- **[LOW]** [2026-04-20] NVENC `ActivateObject` returns 0x8000FFFF on RTX 5090
+  Blackwell for H.264/HEVC/AV1 MFTs regardless of adapter binding. The cascade routes
+  around it; AV1 has no alternative and is filtered from advertised caps by the
+  probe. Worth re-testing on newer drivers.
+- **[LOW]** [2026-03-10] No git hooks for linting and no secret scanner
+  (gitleaks/trufflehog) in CI.
 
 ## Security Baseline
 
-- JWT expiry: access=604800s (7 days), refresh=2592000s (30 days) (configurable via ROOMLER__JWT__*).
-- Rate limiting: tower_governor 60 req/min per IP (2026-03-21).
-- CORS (tightened 2026-07-28): unset `cors_origins` now allows ONLY the frontend's own origin (was: `Any`); explicit `"*"` keeps permissive mode with a startup warning; the restrictive branch enumerates methods/headers because `allow_credentials(true)` + wildcard is rejected by tower-http at request time (the old known-failing cors_tests pair).
-- JWT default secret (2026-07-28): with `app.environment=production` (set in the prod configmap) the server REFUSES to boot on the built-in default secret; development keeps the loud warning.
-- **Email ownership (2026-08-23, closes the nOAuth class)** — the invariant in `find_or_create_by_oauth` is that **`users.email` holds an address only if that account PROVED it**. It is a UNIQUE index, so it is a *reservation*, not a contact field, and it is what account-linking keys off. Three rules implement it, all load-bearing: (1) an unverified provider assertion takes a `.invalid` placeholder (RFC 2606) with the claim recorded in the non-indexed `unverified_email` — so a hostile Entra tenant cannot even RESERVE an address it doesn't own, let alone link into one; (2) linking checks the **target** account is verified too — otherwise an attacker registers `victim@corp` with a password, never activates, and collects the victim's later Google sign-in, after which the activation mail *that lands in the victim's own inbox* hands over a password login; (3) a proven identity **evicts** an unproven claim instead of inheriting it, which is safe only because an unverified account cannot have been signed into (password login refuses it; any verified provider identity would have made it verified). On top of those three, **step 2c** refuses an *unverified* identity whose asserted address already belongs to someone (#610) — that one is a **UX policy, not a security control**: it arrived as a mechanical necessity (the create used to collide on EMAIL and blame the username) and the placeholder removed the collision, so it could now mint a parallel account and simply chooses not to, because that account would be invisible to whoever owns the address. Deleting 2c costs UX; deleting any of the three above costs security. ⚠️ Do not "simplify" this back to a one-sided `email_verified` check — that was the state between #360 and this fix, and it left both the reservation and the unactivated-signup paths open. Locked by 4 unit tests on the placeholders + 4 integration tests in `oauth_tests`. ⚠️ #610 and #613 fixed the same defect with different designs, in parallel sessions, and git auto-merged them cleanly — verify the result on the buildhost lane, because CI does not run this crate. ⚠️ Microsoft is the only provider that is *always* unverified (its Graph `mail`/UPN are tenant-settable); its `id` (the `oid`) stays trusted and is the provider-identity key.
-- **A 403 is an answer, not an expired credential; and a managed role is reconciled, not frozen (FR-82, 2026-09-08, `docs/permissions.md`)** — two class defects behind one field report: a member opened `/tenant/{id}/devices` and was **signed out of the product**. (1) `ui/src/api/client.ts` read ANY `403` on a `GET` as a dead session (clear the sign-in hint, push `/login`), so every permission-gated read anywhere was a logout waiting for the first caller without the bit; the trigger was FR-51 P4's `EnrollKeysSection`, mounted unconditionally on the Devices page and fetching `ephemeral-key-settings`, which needs `MANAGE_TENANT`. ⚠️ **The OWNER is the only member of any org this did not hit** — `MANAGE_TENANT` is deliberately absent from `DEFAULT_ADMIN`, so an org's own admins were logged out by opening their own Devices page, and only the `ADMINISTRATOR` bypass hid it. ⚠️ The store's `catch` that carefully left the switch `null` was correct and **never ran on the branch that mattered**: the logout fired one layer below it, inside `request()`, before the throw — a handler cannot defend against a side effect its own transport performs first. ⚠️ Nothing caught it because a unit test asserted the logout as CORRECT, and three fail-closed predicates in `ui/src/utils/permissions.ts` exist only to route around the rule, each written after the same bug in a different corner (analytics, invites, enrollment keys). Now: a 403 NEVER ends a session, on any method; the only 403 with a navigation is `not_a_member` (`ApiError::NotAMember` ⇒ `error: "not_a_member"`, a server-sent code — never a message-string sniff, because `chat`'s `Forbidden("Not a member of this room")` is the same shape and must not evict anyone from their org) and it leaves the TENANT. ⚠️⚠️ **The default direction is the guarantee**: an unclassified 403 does nothing but throw, so a newly-added gated route is inert on the client by construction. (2) A system-managed role's mask was written once at tenant creation and never again, so adding a permission bit reached only orgs created afterwards — measured on prod, **63 of 72 orgs** carried `admin = 0x7ffff7` (no `MANAGE_AGENTS`, no `REMOTE_CONTROL`, neither audit view), and each distinct `owner` mask is a snapshot of `permissions::ALL` on that org's creation day. There were TWO divergent definition copies, one dead (`RoleDao::seed_defaults`: Titlecased, no `guest`, a `Moderator` with `MANAGE_MEETINGS` and no `REMOTE_CONTROL` — the reverse of the live one); now ONE `role::MANAGED_ROLES` table, seeded from and reconciled to by `TenantDao::reconcile_managed_roles` under the existing `startup_maintenance` lease. ⚠️⚠️ **Additive (`stored | definition`), never a replace** — a managed mask IS editable (`PUT …/role/{id}`; only deletion is refused), so overwriting would silently revoke an org's own grant; the cost is that a bit REMOVED from a definition does not propagate and needs its own migration. ⚠️⚠️ **`EXEC_DEVICE`/`SSH_DEVICE` are in no row below the ADMINISTRATOR bypass and `no_managed_role_below_administrator_seeds_a_root_shell` enforces it**: the reconcile grants what the table says to EVERY existing org, so `DEFAULT_ADMIN |= EXEC_DEVICE` — a one-token edit that reads as tidying — would open exec-as-SYSTEM deployment-wide at the next boot, with no migration to review and no admin action to audit.
-- nginx security headers: X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy (2026-03-21); HSTS + CSP added 2026-07-28 (`files/nginx-pod.conf`). **CSP allowlist (corrected 2026-07-29, #252):** `script-src 'self' https://purestat.ai` (the site's own analytics, loaded in index.html); `connect-src 'self' wss: https: http://127.0.0.1:* http://localhost:*` — the loopback origins are REQUIRED: the remote-control viewer probes the local agent's loopback-TURN relay (`http://127.0.0.1:4798x/rc-local-turn`) and clipboard bridge (`rc-clipboard`, port bases 41989 + 47989). ⚠️ The initial CSP (#242) omitted both and broke analytics + the RC loopback-relay path in prod — the CSP validation had only exercised dashboard/auth/websocket, never the RC viewer. **When touching CSP, re-scan `ui/` for external + loopback endpoints (`grep -rhoE "https?://…"`) and exercise the remote-control page, not just the main SPA.**
-- **Object-level tenant scoping on the collaboration data plane (2026-08-23, closes a CRITICAL cross-tenant break)** — `is_member(tid)` is NOT an authorization check for anything keyed by id. Any user can create a tenant for free (`routes/tenant::create` is gated only by `AuthUser`), so a caller can always satisfy `is_member` for a tenant THEY own and then pass ANOTHER tenant's `room_id`/`message_id`; the older collaboration handlers did exactly that and the DAO reads (`find_in_room`, `find_pinned`, `find_thread_replies`, `find_by_room`, `list_members`, `list_participants`) filter by the bare id with **no `tenant_id`**. That exposed every org's chat history, bulk xlsx export, room rosters, recordings and live call state to any authenticated account, and allowed injecting `@everyone` messages into another org's channel. The invariant now: **resolve the object WITHIN the tenant before touching it** — `helpers::require_room_in_tenant` / `require_message_in_tenant` (they check membership AND `find_by_id_in_tenant`, so a foreign id 404s and leaks neither content nor existence). ⚠️ A handler keyed by `message_id` MUST use the message guard, not the room one — the two ids are decoupled, so a caller can pass their own room with a foreign message (this is why `reaction::add/remove` now fan out to `message.room_id`, not the path room). ⚠️ Never re-fetch with a bare `find_by_id` after a tenant-scoped write: `message::update` did, and returned another tenant's content in the response even though the write itself was correctly scoped. ⚠️ `room::join` additionally requires `is_open` — it previously had NO checks at all, so anyone could join any private room in any org and receive its WS fan-out. `room::update`/`delete` now require `MANAGE_CHANNELS` (they were member-only, so any guest could archive or cascade-delete a channel).
-- **OAuth CSRF (2026-08-23)** — `oauth_redirect` binds its random `state` to the browser in a short-lived `HttpOnly` `oauth_state` cookie and `oauth_callback` REQUIRES the query `state` to equal it (double-submit), clearing it one-shot. Before this the state was minted and thrown away with the callback validating nothing, so an attacker could feed a victim a pre-obtained `code` and silently sign them into the ATTACKER's account (login CSRF): everything the victim then wrote landed in the attacker's account. ⚠️ Any test driving `/api/oauth/callback/*` directly must now send the cookie.
-- **Session cookies carry `Secure` in production** (`app.environment == "production"`; plain http in dev so the localhost flow still works). The cookie is a full API credential — the auth extractor accepts it — so it must never travel in cleartext.
-- **Per-(caller, device) ceilings on exec/SSH are ENFORCED** (`crates/api/src/rate_limit.rs`, wired into `agent_exec::authorize` and `agent_ssh::decide`). `exec_limits`/`ssh_limits::RATE_LIMIT_PER_MINUTE` and the `RateLimited` deny reasons existed but had **no production readers** — the constants were dead and the variant was built only in tests. The HTTP `tower_governor` is per-IP and never saw the device-originated `rc:rpc.request` / `rc:ssh.request` WS legs, so those had no ceiling at all. ⚠️ Enforcement sits AFTER the identity gates on purpose: a refusal is then attributable and lands in `exec_audit`/`ssh_audit` like any other. ⚠️ It also protects the TARGET — the device's pending-grant table holds 16 and evicts the OLDEST, so an unthrottled caller could burst a legitimate caller's un-redeemed grant out of existence.
-- **Web Push endpoints are SSRF-validated at subscribe time** (`routes/push.rs::validate_push_endpoint`): https only, and every resolved address must be globally routable (loopback / RFC1918 / `169.254` metadata / CGNAT-and-overlay `100.64/10` / ULA / link-local v6 / v4-mapped forms all refused, unresolvable hosts refused). The endpoint is browser-supplied and the SERVER POSTs to it from inside the cluster on every notification fan-out, so without this any user had a blind SSRF + internal port-scan primitive. ⚠️ This is subscribe-time only — DNS can still rebind before send.
-- **A WG public key cannot be claimed by two live nodes in a network** (`overlay_nodes::wg_key_taken_by_other`, checked in `ws::overlay` join, fail-CLOSED). The key is client-supplied but used as an ADDRESSING key (DERP authorizes registration against it; WireGuard keys peers by it) and nothing proves possession of the private half, so a second enrolled device could advertise a peer's key and black-hole its DERP traffic (registration is last-writer-wins). Live-scoped so tombstones don't block a joiner, and `machine_id`-scoped so a device rotating its OWN key is unaffected.
-- **The SSH request route requires tenant membership before the device lookup** (`agent_ssh::member_tenant`, mirroring `agent_exec`). Without it a non-member could distinguish "agent exists" (200 + refusal) from "no such agent" (404) across tenants, write attacker-timed rows into another org's `ssh_audit`, and read whether that org had `remote_ssh_enabled`.
-- Message HTML: the sanitizer allowlist (`ui/src/composables/useMarkdown.ts`) deliberately **excludes `style`** — author-controlled inline CSS let one chat message paint a full-viewport `position:fixed` overlay inside the trusted origin (credential phishing that no framing header stops) and fire a `background:url()` beacon at every viewer. The mention preprocessor HTML-escapes its label/id, so that string-concatenation step is not relying on DOMPurify's allowlist to stay exactly as it is. ⚠️ Treat `ALLOWED_TAGS`/`ALLOWED_ATTR` as a security control: it is the ONLY XSS boundary for message content, and tokens live in `localStorage`.
-- **Publishing identity — an ALLOWLIST at four layers (2026-09-05)**. This repo is PUBLIC, and two surfaces leak *who* rather than *what*, both invisible to the machine-name guards: a commit's **author/committer email** (metadata — in no blob, no message, so `check_shapes.py` walks straight past it) and a **GitHub account login** on an issue, comment, review or release (never touches git at all). Found by audit: a second GitHub account — a corp one, whose *login alone* named an employer — had authored one issue and three comments here across three days spanning eleven, plus 520 commits in this history carrying a corp mailbox as their author address. Nothing failed, nothing warned. Layers, each blind to the others' surface: `.githooks/pre-commit` (`--pending`, pure bash+git so it still runs where python does not) → `.githooks/pre-push` (the only one that survives `--no-verify` and a clone that never set `core.hooksPath`) → CI job **No foreign commit identity** → the `PreToolUse` hook `.claude/hooks/gh-account-guard.sh`, which gates GitHub **writes** on the active `gh` account (reads always pass — auditing the wrong account is legitimate, and is what found this). ⚠️ **Allowlist, never a denylist**: a denylist would have to write the unwanted addresses into a public file, publishing exactly what it removes, and only finds mistakes someone already thought of — `.githooks/allowed-identities.txt` names only already-public identities, and the selftest fails on a wildcard or a bare-domain entry. ⚠️ **`gh auth switch` is GLOBAL** — it re-identifies every concurrent session from a shared config, and `gh issue comment` prints a URL, not an identity, so the mistake is invisible from inside the session making it; the hook refuses it outright and `scripts/gh-scoped-config.sh` builds a config the other account is not *in*. ⚠️ **`--require-commits` in CI is load-bearing**: an empty range otherwise answers "all known" over zero commits — the same shape as a `cargo test` filter matching no test. ⚠️ **Neither leak is recoverable downstream**: a commit identity can only be *rewritten* (renumbering every SHA above it, and the old objects stay reachable through `refs/pull/*`), and an issue/comment author cannot be changed at all — only delete-and-recreate, which dangles every reference to its number, including one already baked into a merged commit subject. ⚠️ **The one hole no local layer closes**: a merge made through the GitHub web UI is committed *on GitHub* from the email set on the **account**, after every hook and PR check has passed. ⚠️ **A ruleset cannot close it here** — the whole metadata-rule family (`commit_author_email_pattern`, `committer_email_pattern`, `commit_message_pattern`, `branch_name_pattern`) is organisation-and-paid-plan only and is refused with HTTP 422 on this user-owned repo, in `active` enforcement as well (`evaluate` is separately Enterprise-only); measured 2026-09-06, so don't plan around it. What covers it is the CI job's **push-to-master** run (`github.event.before..github.sha`), which turns master red within a minute — detection, not prevention. ⚠️ Its fallback is load-bearing and was exercised on day one: after a force-push `event.before` names a commit that no longer exists, so it falls back to `<sha>~1..<sha>` instead of erroring or silently scanning nothing. The actual fix for the account is GitHub Settings → Emails.
-- TURN `static-auth-secret` rotated out of the repo on 2026-05-23 — the committed `turnserver.conf` carries a `CHANGE-ME` placeholder; the live value lives in the operator's `ROOMLER__TURN__SHARED_SECRET` env.
-- `Content-Disposition` filenames sanitized + RFC 5987 encoded on the file-download route (2026-05-23).
-- Dependency-uplift pass (2026-07-29): **Rust** — cleared 4 advisories via precise semver-compatible lockfile bumps (crossbeam-epoch 0.9.18→0.9.20 RUSTSEC-2026-0204, memmap2 0.9.10→0.9.11 RUSTSEC-2024-0429, quinn-proto 0.11.14→0.11.16 RUSTSEC-2026-0185, spin 0.9.8→0.9.9 yanked). Deferred (need BREAKING direct-dep bumps + are not reachable in our usage): **rsa 0.7.2** Marvin timing ← web-push/jwt-simple — VAPID uses EC (ES256), not RSA-decrypt, so the timing oracle isn't reachable; **lopdf 0.26.0** stack-overflow ← genpdf (which is at its latest 0.2.0, upstream-blocked) — genpdf only GENERATES PDFs, never parses untrusted input, so the vulnerable parse path is unreached; **idna 0.5.0** punycode ← validator 0.18 (latest 0.21, 3 breaking minors); **quick-xml 0.38.4** ← transitive `^0.38` pin. Each remaining fix = its own breaking-bump PR with a full buildhost build+test cycle; tracked for a later pass. **JS** — the only runtime-reachable high is markdown-it→linkify-it (client-side ReDoS on crafted message links), but the fix is only in linkify-it 6.x which markdown-it 14 can't import (`default` export removed → build break), so it's ecosystem-blocked until markdown-it adopts 6.x. All other JS highs (jsdom→undici, @vue/test-utils→js-cookie/minimatch, vue-router→rollup) are dev/build tooling, never shipped in the prod bundle. Re-run: `bun audit` (ui) + `cargo audit` (buildhost, `~/.cargo/bin`).
+Full treatment, with the reasoning behind every control:
+**[`docs/security-baseline.md`](docs/security-baseline.md)**. Permission bits and
+the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
+
+- **`is_member(tid)` is NOT an authorization check for anything keyed by id.**
+  Anyone can create a tenant for free, so a caller can always satisfy `is_member`
+  for a tenant they own and then pass **another** tenant's `room_id`/`message_id`.
+  Resolve the object **within** the tenant: `helpers::require_room_in_tenant` /
+  `require_message_in_tenant`, so a foreign id 404s and leaks neither content nor
+  existence. ⚠️ A handler keyed by `message_id` must use the **message** guard — the
+  two ids are decoupled. ⚠️ Never re-fetch with a bare `find_by_id` after a
+  tenant-scoped write.
+- **A 403 is an answer, not an expired credential.** It never ends a session, on any
+  method. The only 403 with a navigation is `not_a_member`, matched on a
+  **server-sent code**, never a message-string sniff — chat's
+  `Forbidden("Not a member of this room")` is the same shape and must not evict
+  anyone from their org. ⚠️⚠️ An unclassified 403 does nothing but throw, so a
+  newly-gated route is inert on the client by construction.
+- **A system-managed role is reconciled, not frozen at its birthday** — one
+  `role::MANAGED_ROLES` table, reconciled at boot under the startup lease.
+  ⚠️⚠️ **Additive (`stored | definition`), never a replace** — a managed mask *is*
+  editable, so overwriting would silently revoke an org's own grant.
+  ⚠️⚠️ `EXEC_DEVICE`/`SSH_DEVICE` are in no row below the `ADMINISTRATOR` bypass:
+  `DEFAULT_ADMIN |= EXEC_DEVICE` — a one-token edit that reads as tidying — would
+  open exec-as-SYSTEM deployment-wide at the next boot, with no migration to review
+  and no admin action to audit.
+- **`users.email` holds an address only if that account PROVED it.** It is a UNIQUE
+  index, so it is a *reservation*, not a contact field, and it is what
+  account-linking keys off. An unverified provider assertion takes a `.invalid`
+  placeholder; linking checks the **target** account is verified too; a proven
+  identity **evicts** an unproven claim. ⚠️ Do not "simplify" this back to a
+  one-sided `email_verified` check — that state left both the reservation and the
+  unactivated-signup paths open. ⚠️ Microsoft is the only provider that is *always*
+  unverified.
+- **Agent tokens are status-checked on every use** via
+  `crates/api/src/extractors/agent.rs::AuthAgent`. ⚠️ A lookup **failure is 500, not
+  401** — a Mongo blip must not tell a healthy fleet its credentials were revoked,
+  turning a database wobble into an enrollment storm. ⚠️ **Deletion wins over
+  status**: an Online-looking tombstone still refuses.
+- **A WG public key cannot be claimed by two live nodes in a network**
+  (`wg_key_taken_by_other`, fail-CLOSED). Nothing proves possession of the private
+  half, and the key is an *addressing* key — DERP authorizes registration against
+  it, WireGuard keys peers by it.
+- **Push endpoints are SSRF-validated at subscribe time** — the server POSTs to a
+  browser-supplied URL from inside the cluster on every fan-out.
+- **Uploads are sniffed, never trusted** (`crate::media_type::resolve`); the
+  extension fallback structurally cannot produce `image/*` or `text/html`, which are
+  exactly the types worth lying about.
+- **The message-HTML allowlist is a security control** —
+  `ui/src/composables/useMarkdown.ts` deliberately excludes `style`, and it is the
+  ONLY XSS boundary for message content.
+- **The CSP allowlist contains loopback origins on purpose** (`http://127.0.0.1:*`)
+  — the RC viewer probes the local agent's loopback-TURN relay and clipboard bridge.
+  ⚠️ When touching CSP, exercise the remote-control page, not just the main SPA.
+- **Publishing identity is an allowlist at four layers.** This repo is **public**,
+  and a commit's author email and a GitHub account login leak *who* rather than
+  *what* — both invisible to the machine-name guards. ⚠️ `gh auth switch` is
+  **global**; use `scripts/gh-scoped-config.sh`. ⚠️ Neither leak is recoverable
+  downstream.
+- **Prod refuses to boot on the default JWT secret**; session cookies carry `Secure`
+  in production; CORS defaults to the frontend's own origin only; `tower_governor`
+  caps 60 req/min per IP, and exec/SSH additionally have per-(caller, device)
+  ceilings enforced **after** the identity gates so a refusal is attributable.
