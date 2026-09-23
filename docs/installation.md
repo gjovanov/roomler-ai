@@ -93,6 +93,34 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   display, so "Connect" drops you into a live console.
 - Design notes for the tarball/self-update path: [linux-self-update.md](linux-self-update.md).
 
+### Where a root daemon's config lives (rc.435)
+
+A **root** daemon on Linux resolves `/etc/roomler/config.toml` — the path the
+packaged `roomlerd.service` has always passed as `--config`. Non-root Linux
+installs are untouched.
+
+`appdirs::migrate_system_config()` moves a legacy
+`/root/.config/roomler/config.toml` there once at startup, under the same rules
+as the tree migration: **dest-absent only**, `rename`, **never deletes**, notes
+logged at WARN after `logging::init`. The `.prev` sibling travels with it so no
+credential-bearing copy is stranded.
+
+`default_config_path()` resolves **`/etc` → profile → `/etc`**, so a host whose
+migration has not run (or could not) keeps its identity instead of losing it.
+
+⚠️ **This closes a real crash-loop class.** Hosts enrolled before the convention
+ran on an orphan `roomlerd run` using the profile path, and died `no config
+found` the first time systemd started them — `Restart=always` then looped. Hit on
+buildhost, fleet-host-2 and the WSL sibling, the last from nothing but a
+`dpkg -i`.
+
+⚠️ **`systemctl is-active` reads `inactive` while such a host is perfectly
+healthy** — the live daemon is an unmanaged orphan. Check `pgrep -x roomlerd` and
+`roomler peers`, and never "restart to fix" on that basis.
+
+⚠️ The per-host `roomlerd.service.d/config-path.conf` drop-ins used as the stopgap
+are unnecessary from rc.435 and should be removed.
+
 ## macOS
 
 Same `install.sh` one-liner, but macOS is the one platform that needs **two

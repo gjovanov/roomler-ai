@@ -296,6 +296,32 @@ the probe throttle) lives behind its `AgentSocketLifecycle`, keyed by `conn_id` 
 connection must not tear down its successor. The teardown order above is the rc.53 / rc.307 B /
 Phase A-1 invariants written once; do not reorder.
 
+### Adding a variant
+
+A serde rename → a `wire_tag()` arm → a `namespace()` arm → a `CLIENT_MSG_OWNERS`
+row → a baseline re-record whose commit message says why. The compiler and the
+tests make you do all five.
+
+### Defensive catch-alls need an `#[allow]` until the variants land
+
+`ClientMsg` / `ServerMsg` are matched **exhaustively** from several consumer
+crates (agent, api/ws, hub). Adding a preemptive `_ =>` / `other =>` arm to a
+consumer match **without** the new variants that would make it reachable makes
+`cargo clippy --workspace -- -D warnings` fail with `unreachable_patterns` — the
+existing arms already cover every known variant. CI run
+[25972574628](https://github.com/gjovanov/roomler-ai/actions/runs/25972574628) hit
+this: the defensive catch-all landed in `ec61f03` before the corresponding T2 wire
+variants did.
+
+| Situation | What to do |
+|---|---|
+| New variants land in **the same commit** | No allow needed — the catch-all is immediately reachable |
+| New variants land in **a later commit** | Annotate with `#[allow(unreachable_patterns)]` **and reference this section in a comment**, so the next reviewer does not strip it. Remove the allow when the variants land |
+
+⚠️ `#[non_exhaustive]` on the enum upstream is the structural alternative, but it
+forces a catch-all in every consumer everywhere — too invasive for the existing
+`signaling::*` matches.
+
 ---
 
 ## 7. Inverse edges — hooks in a core registry

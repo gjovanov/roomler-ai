@@ -37,6 +37,12 @@ ui/e2e/video/output/
 .claude/skills/*
 !.claude/skills/sanitize-hostnames/
 .claude/skills/sanitize-hostnames/__pycache__/
+# encoder-cells and ship-it carry the invariants that used to sit in CLAUDE.md,
+# loaded on demand instead of on every prompt. They name no host and no IP, so
+# unlike the four fleet skills they belong in the public repo -- and a rule a
+# contributor's agent never loads is not a rule.
+!.claude/skills/encoder-cells/
+!.claude/skills/ship-it/
 # Same reasoning one directory over: .claude/hooks/ holds the GitHub-write
 # identity guard and its selftest, which CI RUNS. Ignored, they would not be in
 # the repo at all -- the CI job would fail on a missing file, and the guard
