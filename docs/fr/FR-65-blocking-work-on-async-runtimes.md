@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** proposed · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 shipped and field-read on 0.4.60** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), and the verdict as a pure tested type (#1304). **1 of 7 criteria ticked**: the rest are measurement criteria and none of them has its measurement yet, which is the point of an FR whose first rule is *measure first*. · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -223,7 +223,27 @@ of each is to produce a number.
 - [ ] **AC1** — the stall watch ships and its overhead is **measured** at < 1 % of
       the frame budget by an A/B with it disabled, on real hardware. An instrument
       that costs what it measures is worthless.
-- [ ] **AC2** — a synthetic stall is caught and attributed to the correct phase.
+      ⚠️ **Half of this is done and the half that is left is the whole point.**
+      The watch ships. What is owed is the A/B, and it must not be closed on the
+      analytical figure (*"an `Instant::now()` is ~20–40 ns, and there are N of
+      them"*): that is an argument, not a measurement, and this FR's first rule is
+      that inference does not count. Arithmetic over a constant nobody timed on
+      the hardware in question is exactly what AC7 refuses.
+- [x] **AC2** — a synthetic stall is caught and attributed to the correct phase.
+      *#1304 (merged 2026-09-04) made the verdict a pure type,
+      `encode::stall::PassTiming`, and the tests assert **attribution**, not just
+      detection — `an_encoder_open_is_a_stall_and_is_attributed_to_open`,
+      `a_gate_skip_is_attributed_to_gate_not_to_other`,
+      `an_untimed_phase_surfaces_as_other_and_blames_nobody`. Re-run locally
+      2026-09-23: `cargo test -p roomlerd --lib` → **11 `encode::stall` tests, all
+      ok**.*
+      ⚠️ The reason this needed a PR at all is the FR's own subject: the rule
+      lived inline behind `ffmpeg-encoder`, **not a default feature**, so
+      `cargo test -p roomlerd --lib` compiled none of it — the instrument this FR
+      exists to turn on was unreachable in the lane everyone runs. `pub mod stall`
+      is now declared unconditionally; verified on master, not assumed, because a
+      checked-out test file that no module registers runs nothing and still
+      reports green.
 - [ ] **AC3** — no pump iteration exceeds 250 ms across a downscale-tier change on
       a constrained QSV session; recorded **before and after** P1.
 - [ ] **AC4** — the encode-scheduling question is answered with canary data; if
