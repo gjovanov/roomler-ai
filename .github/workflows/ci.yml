@@ -130,8 +130,25 @@ jobs:
 
       # Belt for the cold path of the cached-apt steps below: apt retries
       # transient mirror failures instead of stalling into the job timeout.
-      - name: Configure apt retries
-        run: echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+      #
+      # The `apt-get update` is what keeps the cached-apt steps from poisoning
+      # their own cache keys, and it is why it must run BEFORE them. The runner
+      # image ships a stale apt index; cache-apt-pkgs-action resolves pinned
+      # versions from it, the mirror has already superseded them, every fetch
+      # 404s — and the action then logs `Caching 0 installed packages`,
+      # **saves the empty set under the key** and exits `success`. Every later
+      # run is a cache HIT on nothing. That is how `ci-gtk-v1` died, and then
+      # `ci-gtk-v2` was poisoned AT BIRTH by the same mechanism minutes later,
+      # so the key bump alone did not take.
+      #
+      # ⚠️ A fresh key is NOT a fix by itself — only an index the action can
+      # resolve against is. The guards below are the safety net and the metric,
+      # not the cure: their `did not deliver` warning must be ABSENT on a
+      # healthy cache, and it had been firing on every green run for 17 days.
+      - name: Configure apt retries and refresh the index
+        run: |
+          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          sudo apt-get update -qq
 
       # rc.18 added a Tauri-tray companion (agents/roomler-tray) that
       # pulls in glib-sys / gobject-sys on Linux. Workspace clippy walks
@@ -150,7 +167,16 @@ jobs:
           # below saved an EMPTY set under the v1 key, so every later run got a
           # cache *hit* on nothing and failed without even the 404s to explain
           # it. A cache key is the only way to disown a bad entry.
-          version: ci-gtk-v2
+          #
+          # v2 -> v3 the same evening, because v2 was poisoned AT BIRTH: its
+          # very first run missed the fresh key, 404'd on 11 packages against
+          # the image's stale index, and saved EMPTY again. The bump only works
+          # now that the step above refreshes the index first — that ordering,
+          # not the number, is what makes v3 able to hold a real set.
+          # Verification: the first run must log `Caching N installed packages`
+          # with N > 0 and NO `did not deliver` warning; the next must hit with
+          # no warning either.
+          version: ci-gtk-v3
 
       # 2026-09-23: this lane broke on master and every PR, and the shape is the
       # one this file already documents twice below — the action installs
@@ -182,48 +208,6 @@ jobs:
           for m in glib-2.0 gtk+-3.0 webkit2gtk-4.1; do
             pkg-config --exists "$m" || { echo "::error::$m still not found by pkg-config after the fallback install"; exit 1; }
           done
-
-      # 2026-09-23: the silent-empty-restore that cost the libvpx lane on
-      # 2026-09-04 hit THIS step too, and nothing here was watching for it.
-      # `cargo clippy --workspace` died with "The system library `glib-2.0`
-      # required by crate `glib-sys` was not found" while the cache step above
-      # reported SUCCESS — so master went red at c21f1bb7c and stayed red,
-      # for a reason no code change could explain and no docs-only PR could
-      # dodge. The action's silence is the hazard, so check the consumer's own
-      # view and install directly when the set is not actually there.
-      #
-      # ⚠️ Checked with pkg-config, NOT `ldconfig -p` like the libvpx lane:
-      # these are -dev packages, and what the build scripts resolve is the
-      # `.pc` file. A runtime-loader check cannot see a missing header or
-      # pkg-config file, so it would pass while the build still fails.
-      #
-      # ⚠️ The trailing re-check is the load-bearing half. Without it a failed
-      # apt-get would hand the job back to clippy, which reports a missing
-      # system library as a BUILD failure — the shape that reads as "someone
-      # broke the code" and sent this one to the wrong suspect for hours.
-      - name: Verify the GTK/glib set really landed (fallback to apt-get)
-        run: |
-          GTK_PC="glib-2.0 gtk+-3.0 libsoup-3.0 javascriptcoregtk-4.1 webkit2gtk-4.1"
-          missing=""
-          if ! command -v pkg-config >/dev/null 2>&1; then
-            missing=" pkg-config(binary)"
-          else
-            for pc in $GTK_PC; do
-              pkg-config --exists "$pc" 2>/dev/null || missing="$missing $pc"
-            done
-          fi
-          if [ -n "$missing" ]; then
-            echo "::warning::cached apt set did not deliver:$missing — installing directly"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends \
-              libglib2.0-dev libgtk-3-dev libsoup-3.0-dev \
-              libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
-          fi
-          for pc in $GTK_PC; do
-            pkg-config --exists "$pc" \
-              || { echo "::error::$pc still missing after apt-get — clippy would fail as a build error"; exit 1; }
-          done
-          echo "GTK/glib set present: $GTK_PC"
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
@@ -670,6 +654,18 @@ jobs:
         with:
           shared-key: ci-ffmpeg-encoder
           cache-on-failure: true
+      # Same ordering requirement as the rust job: the index must be fresh
+      # BEFORE the cached-apt step, or a cache miss resolves superseded
+      # versions, 404s, and saves an EMPTY set under the key — poisoning it for
+      # every later run. This job had no refresh at all before its cache step
+      # (its apt-retries step sits ~400 lines further down, long after this),
+      # so `ci-ffmpeg-*` was one superseded libvpx version away from the same
+      # outage the GTK set just caused.
+      - name: Configure apt retries and refresh the index
+        run: |
+          echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+          sudo apt-get update -qq
+
       - name: Install build deps (cached apt)
         # libclang is bindgen's runtime requirement (ffmpeg-sys-next and
         # env-libvpx-sys both generate FFI at build time); pkg-config is how the
