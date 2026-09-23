@@ -103,6 +103,10 @@ pub enum Error {
     /// The password was empty. Refused rather than registered, because an
     /// empty password that "works" is a device with no gate 4 at all.
     EmptyPassword,
+    /// Shorter than [`MIN_PASSWORD_CHARS`]. Separate from `EmptyPassword`
+    /// because the two need different words on screen: one is a mistake, the
+    /// other is a choice the operator has to revise.
+    TooShort,
     /// The OPAQUE protocol refused. The cause is not surfaced on purpose.
     Protocol,
     /// A stored value is not valid base64, or not a value this suite wrote.
@@ -113,6 +117,14 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::EmptyPassword => "the external-access password must not be empty",
+            // The number is inlined rather than formatted because `Display` on
+            // an error with no arguments is `write_str`-able, and a `format!`
+            // here would allocate on every refusal path.
+            Self::TooShort => {
+                "the external-access password must be at least 12 characters — it is the whole \
+                 authorization for controlling this machine, and the connect code in front of it \
+                 is dictated aloud, not secret"
+            }
             Self::Protocol => "could not derive the external-access credential",
             Self::Corrupt => {
                 "the stored external-access credential is unreadable — set the password again"
@@ -135,22 +147,96 @@ fn b64() -> base64::engine::general_purpose::GeneralPurpose {
 /// password the first time a device is re-enrolled and gets a new one.
 const IDENTITY: &[u8] = b"roomler-external-access";
 
-/// Turn a password into the pair this device will store.
+/// First-time registration with a freshly minted setup — **a test shorthand**,
+/// private on purpose.
 ///
-/// Runs both halves of OPAQUE registration locally. The password is used and
-/// dropped here; nothing derived from it that could stand in for it is
-/// returned.
-pub fn register(password: &str) -> Result<Credential, Error> {
-    if password.is_empty() {
-        return Err(Error::EmptyPassword);
+/// [`set_password`] is the single production entry point, because it is where
+/// [`MIN_PASSWORD_CHARS`] is enforced. A second public way to mint a credential
+/// would make that floor a courtesy instead of a gate — precisely the shape the
+/// encoder cell denylist had before 0.4.90, where the check lived on the probe
+/// and a session cheerfully opened a cell the probe had denied. This shorthand
+/// delegates, so every test goes through the real gate too.
+#[cfg(test)]
+fn register(password: &str) -> Result<Credential, Error> {
+    set_password(None, password).map(|(cred, _)| cred)
+}
+
+/// The shortest password this device will accept.
+///
+/// Not a style preference. After the three gates in front of it, this password
+/// is the *entire* authorization for remote control of the machine — and unlike
+/// every other credential in the product there is no username to guess first:
+/// the connect code that names the device is dictated over the phone and is not
+/// a secret. OPAQUE makes an attacker pay a round trip to the device for every
+/// guess, but "pay a round trip" is only a defence if the guess space is large,
+/// so the floor is where the entropy has to come from.
+///
+/// ⚠️ Raising this later cannot retroactively strengthen a password already
+/// set in the field — that needs a forced re-set — so the number is easier to
+/// get right now than to correct.
+pub const MIN_PASSWORD_CHARS: usize = 12;
+
+/// Where the `ServerSetup` behind a newly stored credential came from. The
+/// caller logs it: `Replaced` means this set REPAIRED a device whose stored
+/// record could not be read, which is worth a line in the log because the
+/// failure it fixes is otherwise invisible until someone tries to connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupOrigin {
+    /// A password *change* — the device's existing OPAQUE identity was kept.
+    Reused,
+    /// First password on this device.
+    Minted,
+    /// A setup was stored but did not parse; a fresh one replaced it.
+    Replaced,
+}
+
+/// Set — or change — the device's password, keeping the device's OPAQUE
+/// identity stable across a change.
+///
+/// `stored_setup` is the base64 `external_access_setup` already in this
+/// device's config, if any. When it is present and parses, the new record is
+/// registered against it, so changing a password does **not** rotate the
+/// device's long-term OPAQUE keypair. That keypair is per-DEVICE
+/// infrastructure, not per-password: a stable one is what a client can pin,
+/// and rotating it on every change would mean a password change and a device
+/// re-identification were indistinguishable to anyone watching.
+///
+/// ⚠️ A stored setup that does **not** parse falls back to minting a fresh one
+/// rather than failing. `rc password set` is precisely the command an operator
+/// reaches for when the stored record is broken, and refusing it there would
+/// leave the device with no route back except hand-editing the config as
+/// SYSTEM — the state this returns `Replaced` for.
+pub fn set_password(
+    stored_setup: Option<&str>,
+    password: &str,
+) -> Result<(Credential, SetupOrigin), Error> {
+    if password.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(if password.is_empty() {
+            Error::EmptyPassword
+        } else {
+            Error::TooShort
+        });
     }
     let mut rng = OsRng;
-    let setup = ServerSetup::<Suite>::new(&mut rng);
+    let (setup, origin) = match stored_setup {
+        None => (ServerSetup::<Suite>::new(&mut rng), SetupOrigin::Minted),
+        Some(encoded) => match b64()
+            .decode(encoded)
+            .ok()
+            .and_then(|bytes| ServerSetup::<Suite>::deserialize(&bytes).ok())
+        {
+            Some(existing) => (existing, SetupOrigin::Reused),
+            None => (ServerSetup::<Suite>::new(&mut rng), SetupOrigin::Replaced),
+        },
+    };
     let verifier = register_with(&setup, password, &mut rng)?;
-    Ok(Credential {
-        setup: b64().encode(setup.serialize()),
-        verifier: b64().encode(verifier.serialize()),
-    })
+    Ok((
+        Credential {
+            setup: b64().encode(setup.serialize()),
+            verifier: b64().encode(verifier.serialize()),
+        },
+        origin,
+    ))
 }
 
 /// Re-register a password against an EXISTING `ServerSetup`.
@@ -293,30 +379,6 @@ mod tests {
         );
     }
 
-    /// A password change keeps the setup — see [`register_with`]. Losing the
-    /// setup on every change is a silent way for the two stored halves to
-    /// drift apart.
-    #[test]
-    fn changing_the_password_keeps_the_setup_and_invalidates_the_old_one() {
-        let first = register(&pw("first")).unwrap();
-        let setup_bytes = b64().decode(&first.setup).unwrap();
-        let setup = ServerSetup::<Suite>::deserialize(&setup_bytes).unwrap();
-        let mut rng = OsRng;
-        let changed = Credential {
-            setup: first.setup.clone(),
-            verifier: b64().encode(
-                register_with(&setup, &pw("second"), &mut rng)
-                    .unwrap()
-                    .serialize(),
-            ),
-        };
-        login(&changed, &pw("second")).expect("the new password authenticates");
-        assert!(
-            login(&changed, &pw("first")).is_err(),
-            "the old password still works after a change"
-        );
-    }
-
     /// An empty password is REFUSED, not registered. A device whose password
     /// is "" has no gate 4 while looking exactly like one that does.
     #[test]
@@ -358,5 +420,111 @@ mod tests {
         let e = parse(&bad).unwrap_err();
         assert!(!format!("{e}").contains(marker));
         assert!(!format!("{e:?}").contains(marker));
+    }
+
+    /// A password CHANGE keeps the device's OPAQUE identity and retires the old
+    /// password.
+    ///
+    /// Both halves matter. Keeping the setup is what makes the device's
+    /// long-term keypair per-device rather than per-password; retiring the old
+    /// password is what makes it a change rather than an addition. A bug that
+    /// reused the whole *credential* instead of just the setup would leave the
+    /// old password working, which is the failure an operator would least
+    /// expect and least likely notice.
+    ///
+    /// ⚠️ This REPLACED a P2b test that asserted the same property by calling
+    /// `register_with` directly and assembling the changed `Credential` by hand.
+    /// That test exercised the mechanism and never the caller, so it stayed
+    /// green no matter what `set_password` did — including minting a fresh setup
+    /// on every change, the exact bug it was named for. The property has to be
+    /// asserted through the entry point that ships.
+    #[test]
+    fn a_password_change_keeps_the_identity_and_retires_the_old_password() {
+        let (first, origin) = set_password(None, &pw("before")).unwrap();
+        assert_eq!(origin, SetupOrigin::Minted);
+
+        let (second, origin) = set_password(Some(&first.setup), &pw("after")).unwrap();
+        assert_eq!(origin, SetupOrigin::Reused);
+        assert_eq!(
+            first.setup, second.setup,
+            "a password change must not rotate the device's OPAQUE keypair"
+        );
+        assert_ne!(
+            first.verifier, second.verifier,
+            "the record must change with the password"
+        );
+
+        assert!(
+            login(&second, &pw("after")).is_ok(),
+            "the new password works"
+        );
+        assert!(
+            login(&second, &pw("before")).is_err(),
+            "the OLD password must stop working"
+        );
+    }
+
+    /// A stored setup that cannot be read is REPLACED, not a refusal.
+    ///
+    /// `rc password set` is the command an operator reaches for when the record
+    /// is broken. Failing here would leave them with no route back except
+    /// hand-editing the config as SYSTEM, and the resulting credential must be
+    /// fully usable — a `Replaced` that produced an unloggable-into record
+    /// would turn one broken state into another.
+    #[test]
+    fn a_corrupt_stored_setup_is_replaced_rather_than_refused() {
+        let (cred, origin) = set_password(Some("!!! not base64 !!!"), &pw("repair")).unwrap();
+        assert_eq!(origin, SetupOrigin::Replaced);
+        assert!(login(&cred, &pw("repair")).is_ok());
+
+        // Valid base64 that is not a ServerSetup this suite wrote takes the same
+        // path — the decode succeeding is not the same as the value being ours.
+        let (cred, origin) = set_password(Some(&b64().encode([7u8; 8])), &pw("repair2")).unwrap();
+        assert_eq!(origin, SetupOrigin::Replaced);
+        assert!(login(&cred, &pw("repair2")).is_ok());
+    }
+
+    /// The length floor holds at its exact boundary, and counts CHARACTERS.
+    ///
+    /// ⚠️ The chars-vs-bytes half is the one worth a test: with `len()` the
+    /// 6-character accented password below is 12 BYTES and would sail through,
+    /// giving an operator who chose a non-ASCII password half the floor everyone
+    /// else gets — and silently, since nothing on screen distinguishes them.
+    #[test]
+    fn the_password_floor_is_exact_and_counts_characters() {
+        assert_eq!(MIN_PASSWORD_CHARS, 12, "the boundary cases below assume 12");
+
+        let short = "a".repeat(MIN_PASSWORD_CHARS - 1);
+        assert!(matches!(set_password(None, &short), Err(Error::TooShort)));
+
+        let exact = "a".repeat(MIN_PASSWORD_CHARS);
+        assert!(set_password(None, &exact).is_ok(), "the floor is inclusive");
+
+        // 6 chars, 12 bytes.
+        let multibyte = "é".repeat(6);
+        assert_eq!(multibyte.len(), 12, "the byte length matches the floor");
+        assert_eq!(multibyte.chars().count(), 6);
+        assert!(
+            matches!(set_password(None, &multibyte), Err(Error::TooShort)),
+            "the floor must count characters, not bytes"
+        );
+
+        // Empty stays its own answer — a mistake, not a choice to revise.
+        assert!(matches!(set_password(None, ""), Err(Error::EmptyPassword)));
+    }
+
+    /// The refusal names the real minimum.
+    ///
+    /// The number is inlined in `Display` (an argument-free `Display` is
+    /// `write_str`-able), so this test is what keeps the two from drifting —
+    /// the failure mode being an operator told "at least 12" by a build that
+    /// wants 16.
+    #[test]
+    fn the_too_short_message_states_the_actual_minimum() {
+        let msg = format!("{}", Error::TooShort);
+        assert!(
+            msg.contains(&MIN_PASSWORD_CHARS.to_string()),
+            "the refusal must name MIN_PASSWORD_CHARS ({MIN_PASSWORD_CHARS}), got: {msg}"
+        );
     }
 }
