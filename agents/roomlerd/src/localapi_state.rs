@@ -1833,6 +1833,110 @@ mod tests {
         assert_eq!(p2[0].connection, ConnectionType::Blocked);
     }
 
+    /// FR-52 P2c — set → persist → reload → clear, against a real config file,
+    /// and **the password is never on disk**.
+    ///
+    /// The last assertion is the one worth the test. Everything else here would
+    /// still pass if `set_password` stored the plaintext beside the record, or
+    /// if a future "cache the password to avoid re-deriving" optimisation landed
+    /// — and a config file is exactly what gets copied into a support ticket,
+    /// a backup, or a crash bundle. The gate's entire claim is that the password
+    /// exists nowhere the server or a file copy can reach, so it is asserted
+    /// here rather than trusted. (Falsified: leaking the plaintext into any
+    /// other config field turns this red.)
+    ///
+    /// Only compiled with the credential stack: without it `set` is a refusal,
+    /// which the wire test already covers.
+    #[cfg(feature = "external-access")]
+    #[tokio::test]
+    async fn an_external_password_persists_and_never_lands_in_the_config_file() {
+        // Built, not written — a scanner cannot tell a KDF input in a test from
+        // a leaked credential, and it is right to stop the ones it sees.
+        let password = format!("fr52-{}-not-a-credential-p2c", "roundtrip");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "dev".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("extpw"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        )
+        .with_config_persist(path.clone(), Arc::new(tokio::sync::Mutex::new(())));
+
+        // Nothing set yet.
+        match st.external_password_status().await {
+            Response::ExternalPassword(s) => {
+                assert!(s.supported);
+                assert!(!s.password_set);
+                assert!(!s.enabled, "gate 3 is off by default");
+            }
+            other => panic!("expected ExternalPassword, got {other:?}"),
+        }
+
+        // A refused password must not touch the file — the same discipline
+        // `set_device_name` has, and the reason the floor lives in the daemon.
+        assert!(matches!(
+            st.external_password_set(&Secret("short".into())).await,
+            Response::Error { .. }
+        ));
+        assert!(
+            crate::config::load(&path)
+                .unwrap()
+                .external_access_setup
+                .is_none()
+        );
+
+        // Set it.
+        match st.external_password_set(&Secret(password.clone())).await {
+            Response::ExternalPassword(s) => assert!(s.password_set),
+            other => panic!("expected ExternalPassword, got {other:?}"),
+        }
+
+        // It survives a reload — the daemon reads this file, not a snapshot.
+        let stored = crate::config::load(&path).unwrap();
+        let cred = crate::external_access::Credential {
+            setup: stored.external_access_setup.clone().expect("setup"),
+            verifier: stored.external_access_verifier.clone().expect("verifier"),
+        };
+        crate::external_access::parse(&cred).expect("the stored record must be readable back");
+        assert!(
+            !stored.external_access_enabled,
+            "setting a password must not open gate 3"
+        );
+
+        // ⚠️ The plaintext is nowhere in the file. Checked against the RAW bytes,
+        // not the parsed struct: a leak would most plausibly arrive as a new
+        // field nobody thought to look at.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains(&password),
+            "the password reached the config file on disk"
+        );
+
+        // Clear drops BOTH halves.
+        match st.external_password_clear().await {
+            Response::ExternalPassword(s) => assert!(!s.password_set),
+            other => panic!("expected ExternalPassword, got {other:?}"),
+        }
+        let cleared = crate::config::load(&path).unwrap();
+        assert!(cleared.external_access_setup.is_none(), "setup cleared");
+        assert!(
+            cleared.external_access_verifier.is_none(),
+            "a surviving setup would be silently reused by the next set, reviving the OPAQUE \
+             identity of a credential the operator believed destroyed"
+        );
+    }
+
     /// FR-52 — a half-written record reports NOT set, and gate 4 never reports
     /// gate 3.
     ///
