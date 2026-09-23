@@ -13,7 +13,7 @@ Eliminate a slow UDP-socket accumulation in `roomlerd` — measured at **~+6.5 s
 Hourly `ss -H -uanp | grep -c roomlerd`, 24 samples over 22 h:
 - From a reconnect-reset baseline of **16** the count climbed **monotonically ~+3/hour to 64 over 15 h** (no downward fluctuation), reset on a control-WS reconnect, then climbed again.
 - Session-1 on **0.4.23** had OSCILLATED (16↔62↔10↔15↔0), no monotonic climb → the leak correlates with **0.4.23→0.4.33**.
-- All sockets are ephemeral `0.0.0.0:<random-high-port>` **UNCONN** (only 1 is mDNS `:5353`) = the WebRTC-ICE host-candidate signature (CLAUDE.md socket-leak note).
+- All sockets are ephemeral `0.0.0.0:<random-high-port>` **UNCONN** (only 1 is mDNS `:5353`) = the WebRTC-ICE host-candidate signature ([tunnels.md — a WebRTC peer must be `close()`d](../tunnels.md#%EF%B8%8F-a-webrtc-peer-must-be-closed--dropping-it-frees-nothing)).
 - **NOT org-relay-specific** — it climbed while the org relay was OFF and the operator idle. General `roomlerd`, not FR-19.
 - Bounded by the ~15 h reconnect reset (does not exhaust between reconnects) — but a real leak: the 2026-08-22 incident showed this class can exhaust the ephemeral range and take host DNS down.
 

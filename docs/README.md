@@ -133,6 +133,7 @@ same accounts and server.*
 | [newsletter.md](newsletter.md) | The subscriber list and the sending program (FR-39/FR-58): public subscribe/confirm/unsubscribe + RFC-8058 one-click, the platform-admin issue pipeline (claim-first ledger, preview = the sent bytes), and the ops prerequisites for a real campaign |
 | [api.md](api.md) | Every HTTP route (method + path + purpose) and the auth model |
 | [permissions.md](permissions.md) | The `u64` bit catalogue and the `ADMINISTRATOR` bypass; the five system-managed roles, seeded from ONE table and **reconciled** to it at boot so a permission bit reaches orgs that already exist (FR-82 — 63 of 72 prod orgs were frozen at their creation-day masks); the splits that are deliberately not implied (`MANAGE_AGENTS` ⇏ `EXEC_DEVICE` ⇏ `SSH_DEVICE`); and what a `403` means — **a permission refusal is not a logout**, only `not_a_member` navigates, and an unclassified 403 does nothing |
+| [security-baseline.md](security-baseline.md) | The server and web security controls and **why each is shaped the way it is**: identity and session handling, the email-ownership invariant that closes the nOAuth class, object-level tenant scoping (`is_member` is not an authorization check), the device plane, SSRF/CORS/CSP and the loopback origins the remote-desktop viewer needs, content sniffing and the message-HTML allowlist, the four-layer publishing-identity allowlist, and the open gaps |
 | [data-model.md](data-model.md) | Every MongoDB collection with ER diagrams, indexes, TTLs |
 
 ## 📐 Design records
