@@ -237,6 +237,18 @@ of each is to produce a number.
       `an_untimed_phase_surfaces_as_other_and_blames_nobody`. Re-run locally
       2026-09-23: `cargo test -p roomlerd --lib` → **11 `encode::stall` tests, all
       ok**.*
+      *The **negative controls** are what make that set mean anything, and they
+      are named here so nobody has to rediscover which ones they are:
+      `an_idle_capture_wait_is_not_a_stall` and
+      `a_cadence_sleep_is_idle_and_does_not_warn`. A suite that only ever asserts
+      "a stall was flagged" passes just as happily on a rule that flags
+      everything — a cell that would pass with the change reverted proves
+      nothing, which FR-79 hit four separate times.*
+      *And the word **"synthetic"** in this criterion is what makes a pure-type
+      test the right instrument rather than a field run: AC2 asks for a
+      fabricated stall attributed correctly, which is exactly what a table of
+      hand-written `PassTiming` values is. AC1 and AC3–AC7 ask for measurements
+      and none of them can be closed this way.*
       ⚠️ The reason this needed a PR at all is the FR's own subject: the rule
       lived inline behind `ffmpeg-encoder`, **not a default feature**, so
       `cargo test -p roomlerd --lib` compiled none of it — the instrument this FR
