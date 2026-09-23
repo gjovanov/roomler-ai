@@ -1165,7 +1165,7 @@ pub async fn rc_password_set(from_stdin: bool) -> Result<()> {
     let state = client
         .external_password_set(&password)
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(external_verb_err)?;
     println!("external-access password set for this device");
     print_password_next_steps(&state);
     Ok(())
@@ -1177,7 +1177,7 @@ pub async fn rc_password_clear() -> Result<()> {
     let state = client
         .external_password_clear()
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(external_verb_err)?;
     println!("external-access password cleared — nobody outside this organization can connect");
     if state.enabled {
         println!(
@@ -1193,7 +1193,7 @@ pub async fn rc_password_status(json: bool) -> Result<()> {
     let state = client
         .external_password_status()
         .await
-        .map_err(|e| anyhow!("{e}"))?;
+        .map_err(external_verb_err)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&state)?);
         return Ok(());
@@ -1222,6 +1222,32 @@ pub async fn rc_password_status(json: bool) -> Result<()> {
     }
     print_password_next_steps(&state);
     Ok(())
+}
+
+/// Turn a LocalAPI refusal on an FR-52 verb into something an operator can act on.
+///
+/// ⚠️ Measured against the live 0.4.99 service, which predates these verbs: a
+/// daemon that does not know them cannot *refuse* them, it cannot **parse** the
+/// request at all, so what comes back is serde's
+/// `unknown variant \`external_password_status\`, expected one of` followed by
+/// all twenty-two verb names it does know. That is what the operator sees, and it
+/// says nothing about the one thing they can do. Version skew is normal here: on
+/// tunnel-only hosts the CLI self-updates independently of any daemon, and a
+/// locally built `roomler` against an installed service is exactly this case.
+///
+/// ⚠️ The hint is **additive and the raw error is kept**. Matching a foreign
+/// library's message text is brittle — the same reason a Windows error string is
+/// never branched on — so if serde rewords this, the outcome must degrade to
+/// "slightly noisier", never to "a real failure is hidden behind a wrong guess".
+fn external_verb_err(e: std::io::Error) -> anyhow::Error {
+    let raw = e.to_string();
+    if raw.contains("unknown variant") {
+        return anyhow!(
+            "this daemon does not know the external-access verbs, so it is older than this \
+             CLI — update the daemon (`roomler status` shows its version).\n  raw: {raw}"
+        );
+    }
+    anyhow!("{raw}")
 }
 
 /// Name the gate that is still shut, one line, most-blocking first.
@@ -1943,6 +1969,39 @@ fn route_state_word(s: &RouteState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-52 — an older daemon gets a line it can act on, and the raw error
+    /// survives underneath it.
+    ///
+    /// The second assertion is the one that matters. The hint is triggered by
+    /// matching serde's message text, which is a foreign library's wording, so
+    /// the failure mode to design against is not "the hint stops appearing" —
+    /// it is "a real error was swallowed by a confident wrong guess". Keeping
+    /// the raw string and passing everything else through untouched is what
+    /// makes a serde rewording cost noise instead of a misdiagnosis.
+    #[test]
+    fn an_older_daemon_gets_an_actionable_hint_and_keeps_the_raw_error() {
+        // The real message, measured against the live 0.4.99 SYSTEM service.
+        let raw = "localapi error: bad request: unknown variant \
+                   `external_password_status`, expected one of `status`, `peers`";
+        let mapped = external_verb_err(io::Error::other(raw)).to_string();
+        assert!(
+            mapped.contains("older than this CLI"),
+            "no actionable line: {mapped}"
+        );
+        assert!(
+            mapped.contains(raw),
+            "the raw error must survive — the hint is additive: {mapped}"
+        );
+
+        // Anything else passes through UNCHANGED.
+        let other = "loading config: permission denied";
+        assert_eq!(
+            external_verb_err(io::Error::other(other)).to_string(),
+            other,
+            "an unrelated failure must not be relabelled as a version problem"
+        );
+    }
 
     fn peer(name: &str, org: &str) -> PeerInfo {
         PeerInfo {
