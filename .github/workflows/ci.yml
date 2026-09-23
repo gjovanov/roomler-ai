@@ -279,7 +279,16 @@ jobs:
           # the lane dies before linting anything. Bump `version:` whenever
           # this list changes, or the action serves the previously cached set.
           packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
-          version: ci-vpx-v2
+          # v2 -> v3 on 2026-09-23: the v2 entry is the EMPTY set the 09-04
+          # incident saved (same mechanism as the GTK key above — a stale
+          # runner apt index, 404s, then "Caching 0 installed packages" saved
+          # as a hit). Every run since has logged `Cache hit for:
+          # cache-apt-pkgs_12b1…` and then the guard below's `##[warning]
+          # cached apt set did not deliver libvpx` + a full apt install —
+          # green, ~1 min/run, and never self-correcting, because only a new
+          # key can disown a poisoned entry. Healthy = that warning line is
+          # ABSENT from the job log.
+          version: ci-vpx-v3
       # 2026-09-04: the cache action restored NOTHING (its own manifest was
       # missing: `cat: …/cache-apt-pkgs/manifest_all.log: No such file`) and
       # did not fail the job — the vp9-444 test binary then died at LOAD with
@@ -627,7 +636,11 @@ jobs:
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: pkg-config libclang-dev libvpx-dev
-          version: ci-ffmpeg-v2
+          # v2 -> v3 on 2026-09-23: poisoned exactly like `ci-vpx-v2` (see the
+          # vp9-444 lane) — `Cache hit for: cache-apt-pkgs_134e…` followed by
+          # the guard's `did not deliver libvpx` warning and a full apt install
+          # on every run since 09-06. A new key is the only way to disown it.
+          version: ci-ffmpeg-v3
       # Same self-heal as the vp9-444 lane (2026-09-04: a silent empty cache
       # restore left `libvpx.so.9` missing at test-binary load, exit 127).
       - name: Verify libvpx really landed (fallback to apt-get)
