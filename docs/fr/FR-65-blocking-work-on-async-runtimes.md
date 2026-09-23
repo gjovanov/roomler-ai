@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** proposed · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **in progress — 1/7 (AC2 closed by #1304)**; AC1, the overhead A/B, is the next one and needs a measurement, not a test · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -223,7 +223,16 @@ of each is to produce a number.
 - [ ] **AC1** — the stall watch ships and its overhead is **measured** at < 1 % of
       the frame budget by an A/B with it disabled, on real hardware. An instrument
       that costs what it measures is worthless.
-- [ ] **AC2** — a synthetic stall is caught and attributed to the correct phase.
+- [x] **AC2** — a synthetic stall is caught and attributed to the correct phase.
+      *Closed by #1304: the verdict is `encode::stall::PassTiming`, a pure type on
+      the default feature set. The discriminating tests are
+      `a_gate_skip_is_attributed_to_gate_not_to_other` and
+      `an_untimed_phase_surfaces_as_other_and_blames_nobody` — attribution to the
+      **correct** phase rather than merely "something was flagged" — with
+      `an_idle_capture_wait_is_not_a_stall` and
+      `a_cadence_sleep_is_idle_and_does_not_warn` as the negative controls.
+      "Synthetic" is what makes a pure-type test the right instrument here; AC1
+      and AC3–AC7 need measurement and are untouched.*
 - [ ] **AC3** — no pump iteration exceeds 250 ms across a downscale-tier change on
       a constrained QSV session; recorded **before and after** P1.
 - [ ] **AC4** — the encode-scheduling question is answered with canary data; if
