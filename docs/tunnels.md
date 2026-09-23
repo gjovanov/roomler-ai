@@ -122,9 +122,55 @@ on *any* clean session end, so a flow that opened and died on arrival span hamme
 at the 1 s floor forever. A reset now requires `SESSION_RAN_THRESHOLD` (30 s) of
 actual uptime — the condition the code comment already assumed.
 
-> A *separate*, still-open leak on the relay node is tracked as
-> [FR-48](fr/FR-48-roomlerd-ice-socket-leak.md); this section is the prior art it
-> refers to.
+> The same ownership trap on a different object — a **TURN client** — was the
+> root cause of [FR-48](fr/FR-48-roomlerd-ice-socket-leak.md); it is the next
+> section.
+
+### ⚠️ A TURN client MUST be `close()`d too — FR-48
+
+Found 2026-09-23, fixed in #1556: **the same trap as the WebRTC peer above, on a
+different object.** The sockets are owned by a task the library spawned, not by
+the value you are holding, so a drop releases nothing.
+
+```mermaid
+flowchart LR
+    A["your value<br/>TunnelPeer / TurnRelayConn"] -->|"Arc::clone"| B["spawned task<br/>ICE agent / TURN read loop"]
+    B --> S["UDP socket"]
+    A -.->|"drop(): frees the Arc,<br/>NOT the socket"| X["socket stays bound"]
+    B -->|"close() cancels<br/>the task's notify"| F["socket closed"]
+```
+
+| | WebRTC peer (2026-08-22, above) | TURN client (FR-48, #1086) |
+|---|---|---|
+| Owner of the socket | tasks the ICE agent spawned | the read loop `Client::listen()` spawned |
+| What a drop frees | nothing | nothing — `turn` has **no `Drop` impl at all** |
+| What closes it | `RTCPeerConnection::close()` | `Client::close()` → `close_notify.cancel()` |
+| Measured cost | **15 446 UDP sockets in 12 h** — the whole ephemeral range | ~**+8 sockets/h** on every overlay node, never reclaimed |
+
+On Linux the check is the pid-scoped count — ⚠️ scope it to the pid, because
+`grep roomlerd` also matches any other process of that name:
+
+```bash
+ss -H -uanp | grep "pid=$(pgrep -x roomlerd | head -1)," | wc -l
+```
+
+⚠️ **The dominant leak path is CANCELLATION, not an error return.** Every caller
+wraps `allocate_turn_relay_*` in `tokio::time::timeout`, so on a node that cannot
+reach coturn the whole future is *dropped* mid-`allocate()` — a fix that closed
+only on the `?` paths would pass a happy-path test and leak exactly the case that
+actually happens. Hence `ClientCloseGuard`, armed *before* `listen()` and closing
+on any exit including a discarded future, plus a `Drop` on `TurnRelayConn` for the
+live conn (`crates/tunnel-core/src/transport/relay.rs`).
+
+⚠️ **A comment is not a guarantee.** `TurnRelayConn._client` carried
+*"dropping it closes the allocation on coturn"* for months. It was false, and it
+is what every later reader reasoned from.
+
+🔑 **Regression tests for this class must count file descriptors, not mock a
+close** — `a_cancelled_turn_allocate_does_not_strand_its_underlay_socket` reads
+`/proc/self/fd` across six cancelled allocates, and reports `13 -> 19` with the
+guard reverted: one stranded descriptor per attempt. A test that cannot go red
+proves nothing.
 
 ## Policy — two independent gates
 
