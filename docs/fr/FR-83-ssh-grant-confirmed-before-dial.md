@@ -24,7 +24,10 @@ The same mechanism hides a second class of failure: every refusal the **device**
 a grant — gate 4 (`ssh_enabled` off), a grant that arrived already expired (clock skew) —
 exists only in the device's own log. `agent_ssh.rs` says so in as many words: *"Gate 4
 cannot be reported back here at all"*. With an acknowledgement it can, and the caller gets
-a reason instead of a publickey error.
+a reason instead of an error that names none: `Permission denied (publickey)` for a grant
+the running server refused, or — for gate 4, where `ssh_enabled` off means nothing
+intercepts the port at all (`ssh::maybe_intercept` is a no-op) — `Connection refused` on
+an address the server had just told it to dial.
 
 ## The field evidence
 
@@ -216,7 +219,9 @@ one small frame per grant.
       `session opening` for every grant-issued session — with the pre-roll run recorded as
       the baseline.
 - [ ] **AC8** — Field: `roomler ssh` to a device with `ssh_enabled = false` names gate 4 —
-      shown answering `Permission denied (publickey)` on the current deploy first.
+      shown on the current deploy first to hand the caller an address that then refuses the
+      connection (nothing intercepts the port when SSH is off), with the only reason in the
+      device's own log.
 - [ ] **AC9** — Docs: `docs/roomler-ssh.md` shows the ack in the grant sequence and corrects
       "gate 4 cannot be reported back"; `agent_ssh.rs`'s module doc and `record_grant`'s doc
       say what is now true.
