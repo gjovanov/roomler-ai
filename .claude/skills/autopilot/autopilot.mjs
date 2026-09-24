@@ -251,9 +251,40 @@ function worktreeIndex() {
 // Tracked files only: an untracked scratch file is not evidence that someone is mid-change.
 const isDirty = (path) => git(['status', '--porcelain', '--untracked-files=no'], path).trim().length > 0;
 
+// A branch whose PR MERGED is finished work that nobody deleted, not work in flight.
+//
+// Found on FR-43 (2026-09-24): its card sat hands-off on
+// `fr43-p2d-installer-stops-reverting-delegation`, "touched 14d ago" — but that branch's
+// PR (#1553) had merged on 2026-09-09. Age alone cannot tell "being worked on" from
+// "done and left behind", and this box keeps branches for ever, so the age rule held
+// back cards with no live work behind them at all.
+//
+// ⚠️ This repo SQUASH-merges, so `git merge-base --is-ancestor <branch> origin/master`
+// would call every merged branch UNMERGED — its commits never reach master verbatim.
+// GitHub's record of which PR merged, keyed by head branch, is the only authority.
+// ⚠️ An UNCOMMITTED worktree still wins over a merged PR: someone may have reused a
+// merged branch's checkout for new work, and that is exactly what must not be raced.
+let MERGED_BRANCHES = null;
+function mergedBranches() {
+  if (MERGED_BRANCHES) return MERGED_BRANCHES;
+  try {
+    const raw = gh([
+      'pr', 'list', '--repo', 'gjovanov/roomler-ai',
+      '--state', 'merged', '--limit', '1000', '--json', 'headRefName',
+    ]);
+    MERGED_BRANCHES = new Set(JSON.parse(raw).map((p) => p.headRefName));
+  } catch {
+    // Fail CLOSED toward safety: with no merged-set, fall back to the age rule rather
+    // than treat every branch as finished and let a worker race a human.
+    MERGED_BRANCHES = new Set();
+  }
+  return MERGED_BRANCHES;
+}
+
 function traceInFlight(card, fr, branches, worktrees) {
   const re = new RegExp(`^fr-?0*${fr}(?![0-9])`, 'i');
   const now = Date.now() / 1000;
+  const merged = mergedBranches();
   const found = [];
   for (const b of branches.filter((b) => re.test(b.name))) {
     const wt = worktrees.find((w) => w.branch === b.name);
@@ -263,16 +294,20 @@ function traceInFlight(card, fr, branches, worktrees) {
       age_days: ageDays,
       worktree: wt ? wt.path : null,
       uncommitted: wt ? isDirty(wt.path) : false,
+      merged: merged.has(b.name),
     });
   }
   card.run.in_flight = found;
 
-  const live = found.some((f) => f.uncommitted || f.age_days <= FRESH_DAYS);
+  const live = found.some((f) => f.uncommitted || (!f.merged && f.age_days <= FRESH_DAYS));
   card.run.hands_off = Boolean(card.run.adopted_pr || live);
   card.run.hands_off_reason = !card.run.hands_off ? null
     : card.run.adopted_pr ? `open PR #${card.run.adopted_pr}`
     : found.find((f) => f.uncommitted) ? `uncommitted changes in ${found.find((f) => f.uncommitted).worktree}`
-    : `branch ${found.find((f) => f.age_days <= FRESH_DAYS).branch} touched ${found.find((f) => f.age_days <= FRESH_DAYS).age_days}d ago`;
+    : (() => {
+        const f = found.find((x) => !x.merged && x.age_days <= FRESH_DAYS);
+        return `branch ${f.branch} touched ${f.age_days}d ago (no merged PR)`;
+      })();
   return card.run.hands_off;
 }
 
@@ -421,11 +456,33 @@ function scan() {
     // Adoption (Q8): an OPEN PR whose branch names this FR is adoptable — its diff is
     // reviewable and its intent is stated. A bare branch is NEVER adopted; that is the
     // #1144 shape (a merged, field-verified fix silently reverted, green CI, no conflict).
+    //
+    // ⚠️ An adoption is re-checked on EVERY scan. It used to be set once and never
+    // cleared, so a PR that merged kept holding its card for ever — measured
+    // 2026-09-24: three of seven "held by an open PR" cards cited MERGED PRs (#1556,
+    // #1542, #1543). A merged PR is the end of that work, not a claim on the card.
+    // Only the adoption-derived columns are unwound; a column a worker set on
+    // purpose (`field`, say) is left where it is.
     const slug = `fr${row.fr}`;
-    const match = prs.find((p) => {
+    // The slug must not run on into ANOTHER digit: `fr6` must never claim
+    // `fr65-ac2-tick`. This tested `/^fr\d/` against the remainder, which is never true
+    // for a remainder like `5ac2tick` — so FR-6 adopted FR-65's PR (#1587).
+    const ours = (p) => {
       const b = p.headRefName.toLowerCase().replace(/[^a-z0-9]/g, '');
-      return b.startsWith(slug) && !/^fr\d/.test(b.slice(slug.length));
-    });
+      return b.startsWith(slug) && !/^\d/.test(b.slice(slug.length));
+    };
+    // Re-checked against BOTH conditions: still open, AND still this FR's. A stale
+    // adoption can fail either one — #1556 merged (not open); #1587 is open but was
+    // never FR-6's, so an openness-only check kept that false hold alive.
+    const adopted = card.run.adopted_pr && prs.find((p) => p.number === card.run.adopted_pr);
+    if (card.run.adopted_pr && (!adopted || !ours(adopted))) {
+      card.run.notes.push(
+        `PR #${card.run.adopted_pr} ${adopted ? 'belongs to another FR' : 'is no longer open'} — adoption cleared`,
+      );
+      card.run.adopted_pr = null;
+      if (card.column === 'pr_open' || card.column === 'judgement') card.column = 'admitted';
+    }
+    const match = prs.find(ours);
     if (match && !card.run.adopted_pr) {
       card.run.adopted_pr = match.number;
       card.run.branch = match.headRefName;
