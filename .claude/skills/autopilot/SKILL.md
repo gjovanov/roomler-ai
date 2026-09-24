@@ -88,11 +88,13 @@ never edits a spec, never touches an issue.
    intent stated). A branch is not. This is the #1144 shape: a merged, field-verified fix
    silently reverted, green CI, no conflict.
 5. **Work already in flight is TRACED, never picked up.** `scan` marks a card `hands_off`
-   when its FR has an open PR, a branch whose last commit is inside `--fresh-days`
-   (default 14), or a worktree with uncommitted changes — and records which. `next` and
-   the column derivation skip those cards entirely. ⚠️ The reason is on the board *with
-   the branch's age*, because the judgement "that branch is dead, work it" is the
-   operator's: 1043 local branches exist, and staleness is not something this can infer.
+   when its FR has an open PR, an open PR under **any** branch name that edits its spec,
+   an unmerged branch whose last commit is inside `--fresh-days` (default 14), or a
+   worktree with uncommitted changes, and records which. `next` and the column derivation
+   skip those cards entirely. ⚠️ The reason is on the board *with the branch's age*,
+   because the judgement "that branch is dead, work it" is the operator's: 1043 local
+   branches exist, and staleness is not something this can infer. When the work ends, the
+   card leaves In progress again. It used to be a one-way door that held 24 idle cards.
 6. **Never delete a worktree or branch it did not create.** 62 worktrees and 1043 local
    branches predate this skill. Report them; prune nothing.
    **The one exception is reaping its own**, and it is narrow by construction: `scan`

@@ -245,9 +245,19 @@ function openPrs() {
   const raw = gh([
     'pr', 'list', '--repo', 'gjovanov/roomler-ai',
     '--state', 'open', '--limit', '100',
-    '--json', 'number,title,headRefName,isDraft,updatedAt',
+    '--json', 'number,title,headRefName,isDraft,updatedAt,files',
   ]);
   return JSON.parse(raw);
+}
+
+// Open PRs that EDIT this FR's spec, whatever their branch is called. Branch names miss a
+// PR that works on several FRs at once. On 2026-09-24, #1598 (`fr-verification-debt`)
+// was adding a criterion to FR-74's and FR-81's specs while the board showed both as
+// Ready to close: an operator closing FR-81 then would have closed it one criterion short.
+// ⚠️ gh returns at most 100 files per PR, so a PR larger than that can hide a spec edit.
+function specEditors(prs, fr) {
+  const re = new RegExp(`^docs/fr/FR-0*${fr}-`);
+  return prs.filter((p) => (p.files || []).some((f) => re.test(f.path))).map((p) => p.number);
 }
 
 // ---------------------------------------------------------------- work in flight
@@ -319,7 +329,7 @@ function mergedBranches() {
   return MERGED_BRANCHES;
 }
 
-function traceInFlight(card, fr, branches, worktrees) {
+function traceInFlight(card, fr, branches, worktrees, editors = []) {
   const re = new RegExp(`^fr-?0*${fr}(?![0-9])`, 'i');
   const now = Date.now() / 1000;
   const merged = mergedBranches();
@@ -338,14 +348,15 @@ function traceInFlight(card, fr, branches, worktrees) {
   card.run.in_flight = found;
 
   const live = found.some((f) => f.uncommitted || (!f.merged && f.age_days <= FRESH_DAYS));
-  card.run.hands_off = Boolean(card.run.adopted_pr || live);
+  const fresh = found.find((x) => !x.merged && x.age_days <= FRESH_DAYS);
+  const dirty = found.find((f) => f.uncommitted);
+  const editing = editors.filter((n) => n !== card.run.adopted_pr);
+  card.run.hands_off = Boolean(card.run.adopted_pr || live || editing.length);
   card.run.hands_off_reason = !card.run.hands_off ? null
     : card.run.adopted_pr ? `open PR #${card.run.adopted_pr}`
-    : found.find((f) => f.uncommitted) ? `uncommitted changes in ${found.find((f) => f.uncommitted).worktree}`
-    : (() => {
-        const f = found.find((x) => !x.merged && x.age_days <= FRESH_DAYS);
-        return `branch ${f.branch} touched ${f.age_days}d ago (no merged PR)`;
-      })();
+    : dirty ? `uncommitted changes in ${dirty.worktree}`
+    : fresh ? `branch ${fresh.branch} touched ${fresh.age_days}d ago (no merged PR)`
+    : `open PR ${editing.map((n) => '#' + n).join(', ')} edits this spec`;
   return card.run.hands_off;
 }
 
@@ -555,8 +566,17 @@ function scan() {
     }
 
     // Trace, never take over. A card with work in flight is reported and left alone.
-    if (traceInFlight(card, row.fr, branches, worktrees) && card.column === 'admitted') {
+    // ⚠️ Both directions. This only ever moved a card IN, so "In progress" was a one-way
+    // door: when the traced work ended (its PR merged, its branch went stale), the card
+    // stayed. On 2026-09-24, 24 of 39 cards sat there with no live work and no worker of
+    // ours behind them, which is 24 cards an operator reading the board takes to be busy.
+    // A card a worker of ours STARTED (`started_at`) is left alone: its column is that
+    // worker's to set when it parks.
+    const live = traceInFlight(card, row.fr, branches, worktrees, specEditors(prs, row.fr));
+    if (live && card.column === 'admitted') {
       card.column = 'in_progress';
+    } else if (!live && card.column === 'in_progress' && !card.run.started_at) {
+      card.column = 'admitted';
     }
 
     saveCard(card);
