@@ -107,8 +107,10 @@ stays out of scope (operator's standing rule).
       restart (117 that day before it). **Both halves field-verified 2026-09-24 from the
       three laptops' own logs (0.4.9x, two VPN vendors — see the field log):** 0 LAN probes
       toward neo16 in 16 known-captured intervals of up to 629 min each, and after a
-      clear the first LAN probe or direct promotion lands at +0 s to +10 s (7 of 9 clears).
-      The two slow cases had neo16 penalised or off the LAN
+      clear the first LAN probe or direct promotion lands at +0 s to +10 s in 5 of the 7
+      clears that needed a resume. The other two took +311 s (neo16 on the LAN, cause
+      unexplained) and 18 h (neo16 elsewhere). Of the 9 clears seen, two needed none: the
+      LAN carrier survived a 36 s blip, and one had no data before a process restart
 - [x] the RC pill on a same-LAN pair whose agent host is captured (`neo16 → CORPLAP-3` at
       home, or `→ CORPLAP-2`) reads `… · relay · VPN captures the host's LAN` — **0.4.61,
       2026-09-04, from Chrome** (raw `rc:video-info` carries `transport_reason: lan-captured`);
