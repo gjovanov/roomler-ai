@@ -175,12 +175,26 @@ fi
 #      Each criterion is joined with its indented continuation lines first.
 #   ⚠️ Many FEATURE criteria mention a doc — "docs/self-hosting.md states it"
 #      (FR-42), "no longer say amd64-only" (FR-57). Those are about the feature,
-#      not about documenting it; a matcher on the word "docs" counts them. The
-#      rule names what its own criterion contains — "a row in docs/README.md's
-#      index" — so that is the signal: a criterion committing to that index
-#      row, or one naming the rule outright (FR-23's deliverable IS user-facing
-#      documentation, and its criterion says how that satisfies it).
-#   `docs/fr/README.md` — the ledger — does not match: there "docs/" is
+#      not about documenting it; a matcher on the word "docs" ANYWHERE counts
+#      them.
+#   ⚠️ …but the index row is not a complete signal either, and that was found
+#      the day this shipped. FR-83's criterion — "Docs: `docs/roomler-ssh.md`
+#      shows the ack in the grant sequence" — updates a doc that is ALREADY
+#      indexed, so it has no reason to mention docs/README.md; nor does it name
+#      the rule. The guard failed CI naming FR-83 as a breach of the rule it had
+#      followed. A matcher calibrated on 81 specs met a legitimate 82nd phrasing.
+#
+#   So a criterion is the docs criterion when ANY of three holds:
+#     1. its SUBJECT is the docs step — the first line, with the checkbox, the
+#        bold/italic markers and an `ACn`/`Pn` id stripped, opens with the WORD
+#        "docs" ("Docs updated…", "**Docs** —", "AC9 — Docs:"). A feature
+#        criterion opens with something else, or with a `docs/` PATH whose
+#        content it asserts — excluded by "docs" not followed by "/";
+#     2. it commits to the docs/README.md index row (the rule's own words);
+#     3. it names the rule outright (FR-23: its deliverable IS documentation).
+#   Measured on the 82 specs: (1) adds exactly FR-83 to what (2)+(3) found, and
+#   matches none of the feature criteria above.
+#   `docs/fr/README.md` — the ledger — does not match (2): there "docs/" is
 #   followed by "fr/".
 #
 # Prints "<ticked> <unticked> <has_docs_criterion 0|1>".
@@ -189,12 +203,18 @@ ac_scan() {
         function chk(t) {
             if (tolower(t) ~ /docs\/readme\.md|docs[- ]before[- ]close|close[- ]requires[- ]docs/) docs = 1
         }
+        function subject(l) {
+            sub(/^[[:space:]]*-[[:space:]]*\[[ xX]\][[:space:]]*/, "", l)
+            gsub(/\*/, "", l)
+            sub(/^(AC|P)[0-9]+[a-z]?[^A-Za-z`]*/, "", l)
+            if (tolower(l) ~ /^docs?([^a-z\/]|$)/) docs = 1
+        }
         /^## .*[Aa]cceptance [Cc]riteria/ { in_ac = 1; next }
         /^## /  { if (cur != "") chk(cur); cur = ""; in_ac = 0 }
         !in_ac  { next }
         /^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]/         { ticked++ }
         /^[[:space:]]*-[[:space:]]*\[[[:space:]]\][[:space:]]/ { untick++ }
-        /^[[:space:]]*-[[:space:]]*\[[ xX]\]/ { if (cur != "") chk(cur); cur = $0; next }
+        /^[[:space:]]*-[[:space:]]*\[[ xX]\]/ { if (cur != "") chk(cur); cur = $0; subject($0); next }
         /^[[:space:]]+[^[:space:]]/ && cur != "" { cur = cur " " $0; next }
         { if (cur != "") chk(cur); cur = "" }
         END { if (cur != "") chk(cur); printf "%d %d %d\n", ticked + 0, untick + 0, docs + 0 }
