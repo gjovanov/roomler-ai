@@ -2681,6 +2681,48 @@ impl ExternalRcAuditEvent {
     pub const COLLECTION: &'static str = "external_rc_audit";
 }
 
+/// FR-52 P3 — why an external-access login step was refused.
+///
+/// Carried device → server in `rc:extauth.outcome`, and server → controller in
+/// the same shape. The server maps its OWN refusals onto the same values, so a
+/// controller cannot tell which party said no — see [`Self::Unavailable`].
+///
+/// ⚠️ Decoded LENIENTLY off the agent (`extauth_refusal_lenient` in
+/// `signaling`), for FR-83's reason: an unknown spelling from a newer agent
+/// lands on [`Self::Other`] — still a refusal. A strict decode would fail the
+/// whole frame, the server would drop it at `debug!`, and a clear refusal would
+/// become "no answer" after the full wait. It must never land on "verified".
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtauthRefusal {
+    /// The ONE answer for everything a would-be controller must not be able to
+    /// tell apart: no such connect code, the org's switch off (gate 1), the
+    /// device not approved or the approval expired (gate 2), the device
+    /// offline or too old, the device's own opt-in off (gate 3), no password
+    /// set or an unreadable record (gate 4). Distinguishing them would turn the
+    /// connect code into a probe of the device's configuration — and would let
+    /// the holder of an old, rotated code learn that it once worked.
+    Unavailable,
+    /// The device has answered too many guesses recently. The one refusal that
+    /// carries a `retry_after_secs`, because telling a legitimate outsider when
+    /// to try again costs nothing — an attacker is throttled either way.
+    Throttled,
+    /// The server's own per-caller / per-code ceiling, a second limit behind
+    /// the device's (§4b of the FR-52 spec).
+    RateLimited,
+    /// Too many logins in flight on the device.
+    Busy,
+    /// A login message that is not an OPAQUE message.
+    Malformed,
+    /// KE3 did not verify.
+    Rejected,
+    /// KE3 for an attempt the device does not have in flight — never started,
+    /// expired, or already finished.
+    UnknownAttempt,
+    /// A reason this build does not know. Still a refusal.
+    Other,
+}
+
 #[cfg(test)]
 mod external_access_tests {
     use super::*;
