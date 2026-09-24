@@ -327,7 +327,7 @@ CAS. P6 follows it rather than inventing one.
 | P2b | The device-side CREDENTIAL as a *type*: the OPAQUE suite (Ristretto255 · TripleDh · **Argon2id** Ksf), the registration record, `external_consent_mode`, `external_max_permissions`. Registration runs entirely on the device — it plays both halves, nothing crosses a network — which is *why* the dashboard can show *set / not set* and CLEAR but never SET. | `external-access` feature, off in every release build | **SHIPPED** — 7 unit tests incl. a full login round-trip |
 | P2c | The way to actually set one: `roomler rc password set\|clear\|status` over a new LocalAPI verb, and the length floor. Registration + persistence happen in the DAEMON (it owns the config path and the write lock); the CLI only carries the plaintext across the local pipe, the same channel and the same authority that already flips `exec_enabled`. ⚠️ No `--password` flag, ever — argv is world-readable through `/proc/<pid>/cmdline`. | the P2a flag; nothing verifies the record until P3 | **SHIPPED** — 6 unit tests, incl. the surface allowlist and the derived-`Debug` leak |
 | P3a | **The compatibility surface, fixed before any wire exists.** Pinned KSF (`PinnedArgon2`, §4-0), the device's login half (`login_start` KE1→KE2, `login_finish` KE3→session key), and a cross-implementation harness (`examples/extauth_interop.rs`). **Proven against the real browser library**: RED with the old crate-default KSF (the correct password refused), GREEN after pinning with both sides deriving the same session key, and a wrong password decided at KE2 with no KE3 ever sent — the measurement §4b's counting rule rests on. Corrected the spec's browser library (`@cloudflare/opaque-ts` is draft-07 + scrypt; cannot interoperate). | `external-access` feature, in no release build | **SHIPPED** |
-| P3b | The device's login **state machine**: guesses debited when KE1 is answered (§4b), a bounded pending-login table with a TTL, capped exponential backoff, and a verified login retained **single-use** for P4 as an application key derived from the session key and the principal (the browser library binds no OPAQUE `context`, so the principal is bound after the login). | same | not started |
+| P3b | The device's login **state machine** (`external_logins.rs`): guesses debited when a KE2 leaves the device (§4b), check-and-debit in ONE critical section (a concurrent burst cannot outrun it), a success refunds only its own guess, 5 free then 30 s doubling to a 1 h cap over a 24 h window, bounded pending/verified tables with TTLs, and a verified login retained **single-use** as `AppKey = HKDF-SHA512(session key, label ‖ attempt ‖ principal)` — the principal is bound after the login because the browser library binds no OPAQUE `context`. Known-answer test against an independent HKDF. Open decisions 6 + 7. | same | **SHIPPED** |
 | P3c | The wire: `rc:extauth.*` frames, the server as a blind relay (connect-code resolution that is not an existence oracle, gates 1 + 2, audit), gate 3 on the agent. **Proven on loopback against the real agent first**, as FR-19's bind handshake was. | P2's flag; no client surface ships | not started |
 | P4 | Session establishment: the external branch in `resolve_session_authz`, transport binding at offer time, external consent path, public `/connect` page. Permission ceiling enforced **at the agent**, not merely offered by the server. | revert the authz branch; gates 1–3 still refuse | not started |
 | P5 | Visibility + accounting: owner notification on a first-ever external session by a principal and on repeated failures; audit UI beside `SshAuditSection`; per-principal revocation; relay bytes metered to the device's tenant (F3); a plan limit. | n/a — read-only surfaces | not started |
@@ -405,6 +405,19 @@ CAS. P6 follows it rather than inventing one.
    approver — a fleet admin holding no root-command grant — to buy a hurdle nothing
    depends on. A dedicated bit waits on the BigInt migration. Locked by
    `the_compound_gate_does_not_restrict_a_default_admin`, so the claim cannot rot.
+6. **The guess window is in memory (P3b), so a daemon restart forgives it.**
+   Persisting it would put a disk write on an attacker-driven path and a second
+   writer beside the config's lock; not persisting it costs at most one day's
+   budget per restart. An attacker cannot restart the daemon without local access or
+   a crash bug — and a crash bug that doubled as a budget reset is the case worth
+   watching for. Shipped in memory; revisit if the crash recorder ever shows a
+   restart loop correlated with external-login traffic.
+7. **There is no hard lockout (P3b), only a capped backoff.** A lockout that needs
+   the owner to re-arm it turns anyone who knows the connect code — which is dictated
+   aloud and is not a secret — into someone who can switch external access off at
+   will. The cap (≈34 answered guesses a day against a ≥12-character password) is
+   the trade. P5's owner notification on repeated failures is the complement: a
+   human learns of a sustained attack, and rotating the connect code ends it.
 
 ## 10. Out of scope
 

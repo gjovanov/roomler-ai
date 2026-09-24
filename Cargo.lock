@@ -9484,6 +9484,7 @@ dependencies = [
  "ffmpeg-next",
  "futures",
  "hex",
+ "hkdf 0.12.4",
  "http-body-util",
  "hyper",
  "hyper-util",
