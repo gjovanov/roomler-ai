@@ -122,9 +122,92 @@ on *any* clean session end, so a flow that opened and died on arrival span hamme
 at the 1 s floor forever. A reset now requires `SESSION_RAN_THRESHOLD` (30 s) of
 actual uptime — the condition the code comment already assumed.
 
-> A *separate*, still-open leak on the relay node is tracked as
-> [FR-48](fr/FR-48-roomlerd-ice-socket-leak.md); this section is the prior art it
-> refers to.
+### ⚠️ The same trap, a second time: the TURN client (FR-48)
+
+Fixed in `agent-v0.4.100` ([#1556](https://github.com/gjovanov/roomler-ai/pull/1556),
+[FR-48](fr/FR-48-roomlerd-ice-socket-leak.md)). Every overlay node leaked **~9 UDP
+sockets an hour**, never reclaimed within a daemon's life, and it was the rule above
+in a different crate.
+
+`turn::Client` has **no `Drop` anywhere**. `listen()` spawns a read loop that owns a
+clone of the underlay socket's `Arc`, and that loop exits only when `close_notify` is
+cancelled — which only `Client::close()` does. So dropping the client, or the
+`TurnRelayConn` wrapping it, freed nothing; the comment on that field claimed
+*"dropping it closes the allocation on coturn"*, and the claim was the leak.
+
+⚠️ **The dominant path was cancellation, not an error return.** Every caller wraps an
+allocation in `tokio::time::timeout`, so on a node that cannot reach coturn the usual
+outcome is not an `Err` a `?` could catch — it is the whole future being **dropped**
+mid-`allocate()`. A fix that closed only on the error paths would pass a happy-path
+test and leak exactly the case that happens in the field.
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant A as allocate_turn_relay_from
+    participant T as listen() read-loop task
+    participant S as underlay UDP socket
+
+    C->>A: timeout(UDP_ALLOC_TIMEOUT, …)
+    A->>S: bind (Arc #1)
+    A->>T: listen() spawns — takes Arc #2
+    Note over A: guard armed HERE, before listen()
+    C--xA: timeout fires → the future is DROPPED
+    alt before #1556
+        Note over T,S: task still holds Arc #2 → socket bound forever
+    else after #1556
+        A->>T: ClientCloseGuard::drop spawns close()
+        T-->>S: close_notify cancelled → task exits → Arc #2 dropped → socket freed
+    end
+```
+
+The fix is `ClientCloseGuard`, armed **before** `listen()` — the call that spawns the
+task holding the `Arc` — so cancellation, `?` and panic all close; `disarm()` hands the
+client to `TurnRelayConn`, whose own `Drop` spawns the close when a live connection
+goes away. Both allocators are covered: UDP, and TURNS/TCP, where the stranded
+resource is a TLS connection and its task, invisible to `ss -uanp` — the same bug.
+
+**Measured after the fix** — an hourly census over 24 h on four fleet hosts, counting only
+the daemon's own pid. The "after" column is the longest single daemon lifetime:
+
+| host | before (`0.4.99`) | after (`0.4.100`, 20.0 h) |
+|---|---|---|
+| jupiter | 134 sockets @ 14.5 h ≈ **9.2/h** | 5 → 5, **0.000/h** |
+| zeus | 300 @ 38 h | 5 → 5, **0.000/h** |
+| mars | 1269 @ 288 h | 6 → 6, **0.000/h** |
+| asahi | 849 @ 292 h | 5 → 5, **0.000/h** |
+
+At the old rate, 20 hours would have added ~180 sockets per host; no host exceeded 7 at any
+sample in the full 24 h. The lifetime is 20 h rather than 24 because an unrelated release
+auto-updated the fleet mid-window and restarted every daemon — it carried the fix too, and
+stayed flat.
+
+#### What made it hard to find — each worth keeping
+
+- ⚠️ **It was eliminated early by counting the wrong event.** "TURN re-allocation"
+  was ruled out at 4 events/day against ~11 sockets per 2 h — but that counted
+  *successful* re-allocations. The leak came from *cancelled* attempts, which never
+  register as one.
+- ⚠️ **A snapshot of a long-uptime host is worthless.** The count resets on every
+  control-WS reconnect, so a daemon up for 175 h can show 58 sockets while leaking at
+  the full rate. Only growth measured **within one daemon lifetime** means anything —
+  and one host's uptime ran 175 → 200 h *without* restarting while its count reset
+  twice, which is how that was proven.
+- ⚠️ **The leak had a period.** Sockets arrived in pairs ~60 s apart every ~20 minutes.
+  A 14-minute uprobe window cannot observe a 20-minute period, and one suspect was
+  "eliminated" by exactly that. Measure the period before trusting an elimination.
+- ⚠️ **`bpftrace` on `comm == "roomlerd"` sees almost nothing.** The daemon runs ~19
+  threads named `tokio-rt-worker` and one named `roomlerd`; `comm` is per-thread and
+  every socket call happens on a worker. Filter on `pid`.
+- 🔑 **`ustack` cannot unwind this binary** (no frame pointers — the frame above
+  `__GI_socket` resolves into `[heap]`), **but at function entry the return address is
+  at `[rsp]`**, so a uprobe plus one dereference names the caller with no unwinding at
+  all. Chaining that walked the stack one reliable level per probe:
+  `socket() ← mio::UdpSocket::bind ← tokio::UdpSocket::bind_addr ←
+  tunnel_core::transport::relay::allocate_turn_relay_from`.
+- ⚠️ **A socket census must count only the daemon's own pid.** A host can run a second
+  `roomlerd` inside a container; `pgrep -x roomlerd | head -1` returns whichever comes
+  first, and a bare `grep -c roomlerd` sums both. Ask systemd for `MainPID`.
 
 ## Policy — two independent gates
 
