@@ -275,7 +275,8 @@ agents/
   roomler-setup/    → Tauri 2 unified install wizard (lib `wizard_app`)
 ui/src/             → api/ · components/ · composables/ · stores/ (Pinia setup pattern) ·
                       views/ · plugins/  — map in `docs/ui.md`
-scripts/            → dev-xvfb.sh · e2e-*.sh · name-audit.sh · fr-registry-audit.sh · signing/
+scripts/            → dev-xvfb.sh · e2e-*.sh · name-audit.sh · fr-registry-audit.sh ·
+                      fr-verification-debt.sh · signing/
 ```
 
 **Crate dependency flow**: `config` ← `db` ← `remote_control` ← `services` ← `api`.
@@ -528,6 +529,15 @@ write-up filed afterwards. Registry and full protocol: **`docs/fr/README.md`**.
    wrong turns too; a dead end documented is often the most valuable line in the log.
 4. **Close** only when the acceptance criteria are field-verified; a regression
    reopens it with the evidence.
+   ⚠️ **Tick the boxes in the same breath as the close** — the ticks *are* the
+   record that the verification happened, and an unticked criterion on a closed
+   issue cannot afterwards be told apart from one that was never verified.
+   Measured: 8 closed FRs carrying 28 unticked criteria on 2026-09-01, **19
+   carrying 74** three weeks later, entirely unobserved. Enforced by
+   `scripts/fr-verification-debt.sh` + a daily lane — scheduled, not just
+   push-triggered, because closing an issue leaves no trace in the repo at all.
+   Pre-existing debt is pinned per-FR in `scripts/fr-ac-debt-baseline.txt`, each
+   line saying *why* that FR closed without them.
 5. **Docs before close** (operator, 2026-09-05): closing requires the docs that
    describe what it built to be updated or created, in the house style of the other
    `docs/*.md` — **mermaid diagrams**, tables, callouts, `file:line` anchors, and a
