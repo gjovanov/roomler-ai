@@ -5,6 +5,11 @@ name: FR verification debt
 # places. This lane is the one check that reads those two facts together: the
 # GitHub issue's state, and whether its spec's criteria are actually ticked.
 #
+# A SECOND CHECK rides in the same script: an FR bound by the docs-before-close
+# rule (opened, or closed, after PR #1401 put it on master) must carry the docs
+# criterion at all. The first check counts boxes, so it cannot see a criterion
+# nobody wrote — FR-81 had all 8 ticked and nothing public documenting it.
+#
 # WHY IT IS NOT A JOB IN ci.yml, where its sibling `fr-registry` lives
 #
 #   ci.yml keys the Rust cache on `hashFiles('.github/workflows/ci.yml')`, and

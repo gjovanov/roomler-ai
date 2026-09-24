@@ -63,6 +63,33 @@
 #   records a criterion its own spec declares "NOT met — and not addressable
 #   by P1" — honest, deliberate, and now written down where a guard can see it.
 #
+# A SECOND CHECK: THE DOCS CRITERION ITSELF
+#
+#   The operator's rule (PR #1401, 2026-09-05): closing an FR requires its docs,
+#   and the docs step is "a phase row AND an acceptance criterion in every
+#   spec". The check above can only enforce a criterion that EXISTS — it counts
+#   boxes, so a spec that never wrote the docs criterion looks exactly like one
+#   whose docs are done. FR-81 was the live case: all 8 criteria ticked, a clean
+#   Result, reported as a close candidate — and no docs page, no docs/README.md
+#   row, no docs criterion. Its AC8 says "documented in a skill", and that skill
+#   is gitignored, so nothing public documents it at all.
+#
+#   Measured when this was written: 11 of 81 specs carry the criterion, and 37
+#   of 41 open FRs lack it. But a rule binds from when it was made, so an FR is
+#   BOUND by it if its issue OPENED, or it CLOSED, after the rule reached
+#   master. Bound and lacking the criterion: exactly four — FR-74 and FR-81
+#   (written after the rule), FR-7 and FR-66 (closed after it). Of the 9 specs
+#   written since the rule, 7 carry it.
+#
+#   The 35 open FRs written BEFORE the rule are reported, not failed: each
+#   becomes bound the day it closes, and a close without the criterion fails
+#   then. Together the two checks make docs-before-close enforceable at all —
+#   this one makes the docs criterion exist, the first makes it ticked.
+#
+#   ⚠️ Phase rows are NOT checked, although the rule names them. `autopilot`
+#      measured 15+ distinct phase-table shapes and prose in place of a table,
+#      and records that nothing may depend on parsing them.
+#
 # USAGE
 #   bash scripts/fr-verification-debt.sh                   # CI guard; non-zero on drift
 #   bash scripts/fr-verification-debt.sh --summary         # report only, always exit 0
@@ -95,6 +122,18 @@ FR_DIR="docs/fr"
 README="$FR_DIR/README.md"
 BASELINE="scripts/fr-ac-debt-baseline.txt"
 
+# The moment the docs-before-close rule reached master: PR #1401's mergedAt.
+# ⚠️ NOT the calendar date "2026-09-05", and the difference is not pedantry.
+#    FR-69 — the modular monolith — closed at 11:53Z that same day with no
+#    reader-facing docs. That close is WHY the operator made the rule, and the
+#    PR that stated it (#1401, 20:49Z) also delivered FR-69's owed docs. Keyed
+#    on the date, this guard would have named as a breach the one FR the rule
+#    was written about, whose docs landed in the very commit that introduced
+#    it. A rule binds from when anyone could have read it.
+# ISO-8601 UTC with a `Z`, the shape gh returns, so a plain string comparison
+# orders these correctly.
+RULE_AT="2026-09-05T20:49:42Z"
+
 MODE=check
 case "${1:-}" in
     --summary)         MODE=summary ;;
@@ -108,7 +147,11 @@ esac
 # ── refuse to scan nothing ───────────────────────────────────────────────────
 # `name-audit.sh` carries this guard for a measured reason: a scan that finds
 # no files reports a clean tree in exactly the same words as a healthy one.
-specs=$(ls -1 "$FR_DIR" 2>/dev/null | grep -E '^FR-[0-9]+-[a-z0-9-]+\.md$' | sort -u || true)
+# Numeric on the FR number, so every list below reads FR-6 … FR-66 … FR-7 as
+# 6, 7, 66. ⚠️ No `-u` here: with a key, `sort -u` dedupes on the KEY, and two
+# specs sharing a number would silently collapse into one — hiding exactly the
+# collision `fr-registry-audit.sh` exists to report. Filenames are already unique.
+specs=$(ls -1 "$FR_DIR" 2>/dev/null | grep -E '^FR-[0-9]+-[a-z0-9-]+\.md$' | sort -t- -k2,2n || true)
 n_specs=$(printf '%s\n' "$specs" | grep -c . || true)
 if [ "$n_specs" -eq 0 ]; then
     echo "FAIL  no FR specs found under $FR_DIR — refusing to report a clean tree." >&2
@@ -123,13 +166,38 @@ fi
 # "## Acceptance criteria (all field-verified)", …), and it runs to the next
 # `##`. `###` sub-headings do NOT end it — several specs group criteria under
 # them, and treating those as the end would silently undercount.
-ac_counts() {
+#
+# The same pass answers the second question: does the section contain THE docs
+# criterion? Two traps, both measured on these 81 specs:
+#
+#   ⚠️ Criteria are MULTI-LINE. FR-72's and FR-75's index-row commitment sits
+#      on a continuation line, so reading only the checkbox line misses them.
+#      Each criterion is joined with its indented continuation lines first.
+#   ⚠️ Many FEATURE criteria mention a doc — "docs/self-hosting.md states it"
+#      (FR-42), "no longer say amd64-only" (FR-57). Those are about the feature,
+#      not about documenting it; a matcher on the word "docs" counts them. The
+#      rule names what its own criterion contains — "a row in docs/README.md's
+#      index" — so that is the signal: a criterion committing to that index
+#      row, or one naming the rule outright (FR-23's deliverable IS user-facing
+#      documentation, and its criterion says how that satisfies it).
+#   `docs/fr/README.md` — the ledger — does not match: there "docs/" is
+#   followed by "fr/".
+#
+# Prints "<ticked> <unticked> <has_docs_criterion 0|1>".
+ac_scan() {
     awk '
+        function chk(t) {
+            if (tolower(t) ~ /docs\/readme\.md|docs[- ]before[- ]close|close[- ]requires[- ]docs/) docs = 1
+        }
         /^## .*[Aa]cceptance [Cc]riteria/ { in_ac = 1; next }
-        /^## /                            { in_ac = 0 }
-        in_ac && /^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]/  { ticked++ }
-        in_ac && /^[[:space:]]*-[[:space:]]*\[[[:space:]]\][[:space:]]/ { untick++ }
-        END { printf "%d %d\n", ticked + 0, untick + 0 }
+        /^## /  { if (cur != "") chk(cur); cur = ""; in_ac = 0 }
+        !in_ac  { next }
+        /^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]/         { ticked++ }
+        /^[[:space:]]*-[[:space:]]*\[[[:space:]]\][[:space:]]/ { untick++ }
+        /^[[:space:]]*-[[:space:]]*\[[ xX]\]/ { if (cur != "") chk(cur); cur = $0; next }
+        /^[[:space:]]+[^[:space:]]/ && cur != "" { cur = cur " " $0; next }
+        { if (cur != "") chk(cur); cur = "" }
+        END { if (cur != "") chk(cur); printf "%d %d %d\n", ticked + 0, untick + 0, docs + 0 }
     ' "$1"
 }
 
@@ -165,19 +233,29 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 issue_states=$(gh issue list --state all --limit 500 --search "FR- in:title" \
-                  --json number,state --jq '.[] | "\(.number) \(.state)"' 2>/dev/null || true)
+                  --json number,state,createdAt,closedAt \
+                  --jq '.[] | "\(.number) \(.state) \(.createdAt) \(.closedAt // "-")"' 2>/dev/null || true)
 if [ -z "$issue_states" ]; then
     echo "FAIL  gh returned no FR issues — refusing to report a clean tree." >&2
     echo "      Check authentication (GH_TOKEN) and network." >&2
     exit 2
 fi
 
-state_of() { printf '%s\n' "$issue_states" | awk -v n="$1" '$1 == n { print $2; exit }'; }
+# "<number> <state> <createdAt> <closedAt|->" for one issue.
+issue_row() { printf '%s\n' "$issue_states" | awk -v n="$1" '$1 == n { print; exit }'; }
 
 # ── the baseline ─────────────────────────────────────────────────────────────
 pinned_for() {
     [ -f "$BASELINE" ] || return 0
     sed -nE 's/^FR-([0-9]+)=([0-9]+).*/\1 \2/p' "$BASELINE" | awk -v n="$1" '$1 == n { print $2; exit }'
+}
+
+# A bound FR with no docs criterion is pinned as `nodocs FR-<n>  # reason`.
+# A different line shape from the debt pins on purpose, so neither parser can
+# read the other's lines — and `FR-7` must not match `nodocs FR-74`.
+nodocs_pinned() {
+    [ -f "$BASELINE" ] || return 1
+    grep -qE "^nodocs[[:space:]]+FR-$1([^0-9]|\$)" "$BASELINE"
 }
 
 faults=0
@@ -189,15 +267,19 @@ fault() { faults_out="$faults_out
 
 # ── walk every spec once, classifying as we go ───────────────────────────────
 debt_lines=""     # FR-n=count for --update-baseline
-ready=""          # open, every criterion ticked
+ready=""          # open, every criterion ticked, docs criterion present
+ready_nodocs=""   # open, every criterion ticked — but there is no docs criterion
+nodocs_lines=""   # bound by the docs rule, no docs criterion
+predocs=""        # open, written before the rule, no docs criterion yet
 unknown=""        # spec with no resolvable issue
 n_debt=0
 n_debt_criteria=0
+n_nodocs=0
 
 for f in $specs; do
     n=$(printf '%s\n' "$f" | sed -E 's/^FR-([0-9]+)-.*/\1/')
-    read -r ticked untick <<EOF
-$(ac_counts "$FR_DIR/$f")
+    read -r ticked untick has_docs <<EOF
+$(ac_scan "$FR_DIR/$f")
 EOF
 
     iss=$(issue_for "$n")
@@ -205,11 +287,14 @@ EOF
         unknown="$unknown FR-$n"
         continue
     fi
-    st=$(state_of "$iss")
-    if [ -z "$st" ]; then
+    row=$(issue_row "$iss")
+    if [ -z "$row" ]; then
         unknown="$unknown FR-$n(#$iss)"
         continue
     fi
+    read -r _ st created closed <<EOF
+$row
+EOF
 
     if [ "$st" = "CLOSED" ] && [ "$untick" -gt 0 ]; then
         n_debt=$((n_debt + 1))
@@ -226,8 +311,38 @@ FR-$n=$untick"
         fi
     fi
 
+    # Bound by the docs rule? Opened after it (the author could have read it),
+    # or closed after it (the close was made under it).
+    bound=0
+    if [[ "$created" > "$RULE_AT" ]]; then bound=1; fi
+    if [ "$st" = "CLOSED" ] && [[ "$closed" > "$RULE_AT" ]]; then bound=1; fi
+
+    if [ "$has_docs" -eq 0 ]; then
+        if [ "$bound" -eq 1 ]; then
+            n_nodocs=$((n_nodocs + 1))
+            nodocs_lines="$nodocs_lines FR-$n"
+            if ! nodocs_pinned "$n"; then
+                if [ "$st" = "CLOSED" ]; then
+                    fault "FR-$n (#$iss) CLOSED after the docs-before-close rule ($RULE_AT) and its spec has NO docs criterion — the rule makes one mandatory in every spec. Add it and document what the FR built, or pin 'nodocs FR-$n' with a reason."
+                else
+                    fault "FR-$n (#$iss) was opened after the docs-before-close rule ($RULE_AT) and its spec has NO docs criterion. Add one — \"Docs updated/created with diagrams, linked from docs/README.md\" — so that closing without docs is visible here."
+                fi
+            fi
+        elif [ "$st" = "OPEN" ]; then
+            predocs="$predocs FR-$n"
+        fi
+    fi
+
+    # ⚠️ "Every box ticked" is NOT "closable" when no docs box exists: that was
+    #    FR-81, reported here as a close candidate with nothing public to show
+    #    for it. Only an FR that has the docs criterion — and has ticked it —
+    #    is a candidate.
     if [ "$st" = "OPEN" ] && [ "$untick" -eq 0 ] && [ "$ticked" -gt 0 ]; then
-        ready="$ready FR-$n(#$iss,$ticked)"
+        if [ "$has_docs" -eq 1 ]; then
+            ready="$ready FR-$n(#$iss,$ticked)"
+        else
+            ready_nodocs="$ready_nodocs FR-$n(#$iss,$ticked)"
+        fi
     fi
 done
 
@@ -245,6 +360,16 @@ if [ -f "$BASELINE" ]; then
     done <<EOF
 $(sed -nE 's/^FR-([0-9]+)=([0-9]+).*/\1 \2/p' "$BASELINE")
 EOF
+
+    # Same for the docs pins: one that no longer describes the tree is a floor
+    # that has stopped tracking it. The spaces around both sides are what keep
+    # `FR-7` from matching inside ` FR-74 `.
+    for pn in $(sed -nE 's/^nodocs[[:space:]]+FR-([0-9]+).*/\1/p' "$BASELINE"); do
+        case " $nodocs_lines " in
+            *" FR-$pn "*) ;;
+            *) fault "$BASELINE pins 'nodocs FR-$pn', but FR-$pn now carries a docs criterion (or is no longer bound by the rule) — remove the entry (--update-baseline)." ;;
+        esac
+    done
 fi
 
 # ── --update-baseline ────────────────────────────────────────────────────────
@@ -281,11 +406,23 @@ if [ "$MODE" = update ]; then
     #    entry whose count is unchanged is emitted byte-for-byte, so the diff
     #    shows only what really moved.
     tmp="$BASELINE.tmp.$$"
-    awk -v debt="$debt_kv" '
+    awk -v debt="$debt_kv" -v nodocs="$nodocs_lines" '
         BEGIN {
             n = split(debt, arr, "\n")
             for (i = 1; i <= n; i++)
                 if (arr[i] != "") { split(arr[i], kv, "="); cur[kv[1]] = kv[2] }
+            m = split(nodocs, nd, " ")
+            for (i = 1; i <= m; i++) if (nd[i] != "") want[nd[i]] = 1
+        }
+        /^nodocs[[:space:]]+FR-[0-9]+/ {
+            match($0, /FR-[0-9]+/); key = substr($0, RSTART, RLENGTH)
+            if (!(key in want)) {
+                printf "  - dropped nodocs %s (docs criterion present, or no longer bound)\n", key > "/dev/stderr"
+                next
+            }
+            nseen[key] = 1
+            print                                      # a boolean pin: never rewritten
+            next
         }
         /^FR-[0-9]+=/ {
             key = $0; sub(/=.*/, "", key)
@@ -308,10 +445,15 @@ if [ "$MODE" = update ]; then
                     printf "%s=%s  # TODO: say why this FR closed with criteria unticked\n", k, cur[k]
                     printf "  - ADDED %s=%s — needs a reason before commit\n", k, cur[k] > "/dev/stderr"
                 }
+            for (k in want)
+                if (!(k in nseen)) {
+                    printf "nodocs %s  # TODO: say why this FR is bound by the docs rule and has no docs criterion\n", k
+                    printf "  - ADDED nodocs %s — needs a reason before commit\n", k > "/dev/stderr"
+                }
         }
     ' "$BASELINE" > "$tmp" && mv "$tmp" "$BASELINE"
 
-    echo "$BASELINE updated in place — $n_debt FRs, $n_debt_criteria criteria pinned."
+    echo "$BASELINE updated in place — $n_debt FRs / $n_debt_criteria criteria, $n_nodocs nodocs pinned."
     echo "⚠️  Any line marked TODO records a count and nothing else. Say what it is."
     exit 0
 fi
@@ -325,13 +467,32 @@ else
 fi
 
 echo
-echo "== open FRs with every acceptance criterion ticked =="
-if [ -z "$ready" ]; then
+echo "== FRs bound by the docs-before-close rule, with no docs criterion =="
+if [ -z "$nodocs_lines" ]; then
     echo "  none"
 else
-    # Not a fault. Closing also needs docs and, for many criteria, the
-    # operator's own eyes — `autopilot` parks exactly here for that reason.
+    for x in $nodocs_lines; do echo "  $x"; done
+fi
+
+echo
+echo "== open FRs with every acceptance criterion ticked =="
+if [ -z "$ready" ] && [ -z "$ready_nodocs" ]; then
+    echo "  none"
+else
+    # Not a fault. Closing also needs, for many criteria, the operator's own
+    # eyes — `autopilot` parks exactly here for that reason.
     for r in $ready; do echo "  · $r — candidate to close"; done
+    for r in $ready_nodocs; do
+        echo "  · $r — every box ticked, but NO docs criterion: not closable under the docs-before-close rule"
+    done
+fi
+
+n_predocs=$(printf '%s\n' $predocs | grep -c . || true)
+if [ "$n_predocs" -gt 0 ]; then
+    echo
+    echo "== open FRs written before the rule, with no docs criterion yet ($n_predocs) =="
+    echo "  Not a fault. Each becomes one if it closes without adding the criterion:"
+    echo $predocs | fold -s -w 74 | sed 's/^/    /'
 fi
 
 if [ -n "$unknown" ]; then
@@ -347,13 +508,14 @@ if [ "$faults" -ne 0 ]; then
 fi
 
 echo
-echo "specs: $n_specs   debt: $n_debt FRs / $n_debt_criteria criteria   faults: $faults"
+echo "specs: $n_specs   debt: $n_debt FRs / $n_debt_criteria criteria   nodocs: $n_nodocs bound, $n_predocs pre-rule   faults: $faults"
 
 if [ "$faults" -ne 0 ] && [ "$MODE" = check ]; then
     echo
     echo "An FR closes when its acceptance criteria are FIELD-VERIFIED and its docs"
-    echo "exist — not when its PR merges. Tick the criteria with linked evidence, or"
-    echo "pin them in $BASELINE with a line saying why that FR closed without them."
+    echo "exist — not when its PR merges. Tick the criteria with linked evidence, add"
+    echo "the docs criterion the rule requires, or pin the gap in $BASELINE"
+    echo "with a line saying why."
     exit 1
 fi
 exit 0
