@@ -97,6 +97,8 @@ mod role_tests;
 #[cfg(test)]
 mod room_visibility_tests;
 #[cfg(test)]
+mod ssh_grant_ack_tests;
+#[cfg(test)]
 mod stats_tests;
 #[cfg(test)]
 mod subscribe_tests;

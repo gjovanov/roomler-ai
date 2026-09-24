@@ -3529,6 +3529,10 @@ async fn handle_server_msg(
         // Gate 4 is re-checked locally: a device with `ssh_enabled` off must
         // not accumulate grants it would never honour, and refusing loudly
         // beats a caller timing out against a port that answers nothing.
+        //
+        // FR-83 — and every outcome is ANSWERED (`rc:ssh.grant_ack`). The
+        // server holds the caller until it arrives, so the refusals above now
+        // reach the person who asked instead of only this log.
         ServerMsg::SshGrant {
             grant_id,
             public_key,
@@ -3541,24 +3545,41 @@ async fn handle_server_msg(
         } => {
             #[cfg(feature = "ssh-server")]
             {
-                if !agent_cfg.ssh_enabled {
+                use roomler_ai_remote_control::models::SshGrantRefusal;
+                let refused = if !agent_cfg.ssh_enabled {
                     warn!(
                         %grant_id, %caller,
                         "rc:ssh.grant refused — ssh_enabled is off on this device"
                     );
-                } else if let Err(e) = crate::ssh::record_grant(
-                    grant_id.clone(),
-                    public_key,
-                    caller.clone(),
-                    account_mode,
-                    account,
-                    consent_mode,
-                    expires_at_ms,
-                    session_secs,
-                ) {
-                    warn!(%grant_id, %caller, %e, "rc:ssh.grant rejected");
-                }
+                    Some(SshGrantRefusal::SshDisabled)
+                } else {
+                    match crate::ssh::record_grant(
+                        grant_id.clone(),
+                        public_key,
+                        caller.clone(),
+                        account_mode,
+                        account,
+                        consent_mode,
+                        expires_at_ms,
+                        session_secs,
+                    ) {
+                        Ok(()) => None,
+                        Err(e) => {
+                            warn!(%grant_id, %caller, %e, "rc:ssh.grant rejected");
+                            Some(e.refusal())
+                        }
+                    }
+                };
+                // Only NOW: on `None` the grant is already in the table the
+                // auth path reads, so "acknowledged" means "redeemable". Sent
+                // unconditionally — an older server cannot parse the frame and
+                // drops it at `debug!`, which costs one small frame per grant.
+                let _ = outbound_tx
+                    .send(ClientMsg::SshGrantAck { grant_id, refused })
+                    .await;
             }
+            // No ack from this build: it advertises neither `ssh` nor
+            // `ssh-grant-ack`, so no server pushes it a grant or waits on one.
             #[cfg(not(feature = "ssh-server"))]
             {
                 let _ = (

@@ -116,6 +116,10 @@ const DENY_LABEL: Record<string, string> = {
   no_overlay_address: 'not on the mesh',
   rate_limited: 'rate limited',
   bad_public_key: 'bad public key',
+  agent_disabled: 'SSH off on the device',
+  grant_expired_on_arrival: 'grant expired (clock skew?)',
+  grant_refused: 'device refused grant',
+  grant_unconfirmed: 'device did not confirm',
 }
 
 const ACCOUNT_LABEL: Record<string, string> = {

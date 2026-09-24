@@ -299,7 +299,7 @@ compromise is sufficient.
 
 | Route | Permission | What |
 |---|---|---|
-| `POST …/agent/{id}/ssh` | `SSH_DEVICE` (gate 2) | Ask for a session. 200 with where to dial, or with which gate refused |
+| `POST …/agent/{id}/ssh` | `SSH_DEVICE` (gate 2) | Ask for a session. 200 with where to dial — once the device has confirmed the grant (FR-83, ≤ 10 s) — or with which gate refused |
 | `PUT …/agent/{id}/ssh-policy` | `MANAGE_AGENTS` | Gate 3. Deciding a device *may* be SSHed into is a management act, distinct from being allowed to do it |
 | `GET`/`PUT …/ssh-settings` | `MANAGE_AGENTS` / `MANAGE_TENANT` | Gate 1. Writing needs the higher bar — one switch governs the org |
 
@@ -307,9 +307,10 @@ The device-originated leg (`rc:ssh.request`, for `roomler ssh` from a laptop's
 LocalAPI) goes through the **same** `dispatch`, so there is exactly one place
 the gates are evaluated regardless of how a request arrived.
 
-A refusal is the server's last word — the session runs over a path it is not
-on, so there is no equivalent of exec's device-reported error. Every failure is
-therefore enumerated and answered synchronously, each naming which gate said
+The server's last word is the grant's **confirmation**, not the session: the
+session runs over a path the server is not on. Every failure up to that point —
+the server's gates, and since FR-83 the device's own answer to the grant — is
+enumerated and answered before the caller dials, each naming which gate said
 no; "denied" without a reason turns a five-second config fix into a support
 ticket.
 
@@ -318,7 +319,76 @@ ticket.
 The caller mints an **ephemeral keypair per session** and sends only the public
 half in `rc:ssh.request`. If the server authorizes, it pushes
 `rc:ssh.grant` — that key, the principal's name, the account mode, an expiry —
-to the **target**, and answers the caller with where to dial.
+to the **target**, waits for the target to confirm it holds it
+(`rc:ssh.grant_ack`), and only then answers the caller with where to dial.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as caller
+    participant S as server
+    participant D as target device
+    C->>S: rc:ssh.request / POST …/ssh (session public key)
+    S->>S: gates 1–3, rate limit, mint grant, park a waiter
+    S-)D: rc:ssh.grant
+    D->>D: gate 4 · record_grant → the key is in the table auth reads
+    D-)S: rc:ssh.grant_ack { grant_id, refused? }
+    alt recorded
+        S->>C: address + port + host key
+        C->>D: SSH over the overlay — authenticated by the grant
+    else refused (gate 4, expired on arrival, invalid)
+        S->>C: which one, by name
+    else no ack within 10 s
+        S->>C: grant_unconfirmed — never an address
+    end
+```
+
+### The grant is confirmed before the caller dials (FR-83 — shipped)
+
+Until FR-83 the server answered the caller as soon as the grant was **queued**
+for the target, and queued is not recorded. On 2026-09-23 the FR-81 stress lane
+caught a corp laptop — on DERP, behind a TLS-inspecting middlebox — recording a
+grant **4.4 s after** it had refused the session that grant was for: the caller
+(a VM on a fleet host, fast to the server) dialled first, the device correctly
+found no grant for the key, and the user saw `Permission denied (publickey)`
+about keys and policies that were all correct (#1597). It is path-dependent —
+the same device passed 3/3 from a caller whose route to the server was no
+faster than its own — which is the hardest shape to diagnose from a report.
+
+Now an agent advertising **`ssh-grant-ack`** answers every grant, and does so
+only after `record_grant` has put the key in the table its auth path reads — so
+"acknowledged" means "a connection with this key succeeds from now". The server
+holds the caller for that answer, bounded at
+`ssh_limits::GRANT_ACK_TIMEOUT_SECS` (10 s: twice the worst lag measured,
+inside the originating device's own 30 s wait, leaving most of the 60 s grant
+life to dial in), and logs `confirmed_after_ms` on every confirmed grant.
+
+| the device's answer | what the caller hears (`SshDenyReason`) |
+|---|---|
+| recorded | where to dial |
+| `ssh_disabled` — gate 4 | `agent_disabled` |
+| `expired` — arrived past its deadline (clock skew) | `grant_expired_on_arrival` |
+| `invalid`, or a reason newer than the server | `grant_refused` |
+| nothing within 10 s | `grant_unconfirmed` — **never an address**: the one thing known is that the device has not confirmed |
+
+⚠️ `ssh-grant-ack` is **equality-matched** — `ssh` is its prefix exactly as it is
+of `ssh-consent`, and every agent before FR-83 advertises `ssh` and never acks,
+so a prefix match would make every grant to those devices wait out the bound
+and then be refused. Such an agent is answered exactly as before, without
+waiting.
+
+⚠️ The capability is read from the **live connection** (the Hub entry), never
+the stored agent row — after a rollback the row still promises an ack the
+running agent never sends.
+
+⚠️ An ack confirms only if it arrives on the socket of the agent the grant was
+pushed to; one from any other socket confirms nothing and leaves the slot for
+the real answer. Grant ids are ObjectIds — structured, not secret.
+
+⚠️ `refused` is decoded **leniently**: an unknown spelling from a newer agent
+lands on a refusal, never on "recorded" (which would send a caller to dial a
+device that has just said no) and never on a parse error (which would drop the
+frame and turn a clear refusal into `grant_unconfirmed` after the full wait).
 
 The agent does not verify a signature on the grant, and does not need to: the
 frame arrived over the control WebSocket it is already authenticated on, the
@@ -343,7 +413,10 @@ reason to accept an unbounded table or an eternal key:
   — deliberately, because the break-glass session must not die under whoever
   is fixing the control plane.
 - **Gate 4 again.** A device with `ssh_enabled` off refuses to record grants at
-  all rather than accumulating credentials it would never honour.
+  all rather than accumulating credentials it would never honour — and since
+  FR-83 says so in its acknowledgement, so the caller is told it was gate 4.
+  Before, the server sent the caller to dial a port that nothing intercepts
+  when SSH is off, and the answer was a bare `Connection refused`.
 
 Grants are tried before `ssh_authorized_keys` and take precedence; sessions
 authenticated by a grant carry the roomler principal into the log and the audit
@@ -742,6 +815,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
 | P8a | Session **activity** log — commands + exit codes, shell/SFTP/forward events, device-reported into `ssh_activity`. Deliberately NOT session content | **shipped** |
 | P8b | Admin UI for the activity feed — `SshActivitySection`, under the audit log in org Settings | **shipped** |
+| FR-83 | `rc:ssh.grant_ack` + `ssh-grant-ack`: the caller is answered only once the target confirms the grant (≤ 10 s), and the device's refusals — gate 4, expired on arrival — reach the caller by name | **shipped**, field verification pending |
 | M5 | `ssh_max_privilege` — the device refuses a server grant that asks for the daemon identity. The one gate that survives a compromised control plane | **shipped**, default unset (permissive) |
 
 ## 6. Build
