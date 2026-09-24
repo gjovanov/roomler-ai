@@ -108,7 +108,16 @@ function sectionBody(text, headingRe) {
 // but only 13 use the bold `**ACn**` form — so the id is OPTIONAL and positional numbering
 // is the fallback. Continuation lines (indented, or the trailing *( … )* evidence) are
 // folded into the item they belong to.
-const AC_ITEM = /^- \[([ xX])\]\s*(.*)$/;
+//
+// The mark is ANY one character, not just ` ` / `x`. The specs also use `- [~]` for "half
+// met" — 11 criteria across 7 specs (2026-09-24) — and a pattern that knew only two marks
+// skipped that line. That did two things at once. The criterion vanished from its card.
+// And the lines under it, which are indented, were added to the criterion ABOVE it. So
+// FR-79's docs criterion (AC7) carried half of AC8's field evidence, and its card read 6/8
+// when the spec says 6 of 9.
+// ⚠️ Only `x` means done. `~` is kept as `mark` and counted as open. A mark this parser
+// has never seen is also open: a parser must never tick a box it cannot read.
+const AC_ITEM = /^- \[(.)\]\s*(.*)$/;
 // The whole bold span is the id, not just `ACn`. FR-70 splits criteria into halves —
 // `**AC5 (attribution half)**`, `**AC6 (rate half)**` — and a regex demanding the bold
 // END at the digit rejects those, dropping them to POSITIONAL ids that then collide with
@@ -121,11 +130,20 @@ const AC_ITEM = /^- \[([ xX])\]\s*(.*)$/;
 // the text is what preserves a `verify` judgement across a reword.
 const AC_BOLD_ID = /^\*\*(AC\s*\d+[a-z]?)([^*]*)\*\*\s*(?:—|-|:)?\s*/i;
 
+// The criteria whose id the SPEC wrote (`**AC7**`), as opposed to a positional count. Kept
+// out of the card JSON on purpose (a WeakSet, not a field): it matters only while a rescan
+// carries judgements over, and persisting it would rewrite every card for no reader.
+const NAMED = new WeakSet();
+
 function parseAcs(text) {
   const body = sectionBody(text, /acceptance\s+criteri/i);
   if (!body) return [];
   const acs = [];
   const used = new Set();
+  // Whether indented lines still belong to the last item. A non-indented line that is not
+  // an item ends the item above it: continuation text that follows such a line is the
+  // START of something the parser could not read, never the END of the previous criterion.
+  let open = false;
   for (const raw of body) {
     const m = AC_ITEM.exec(raw);
     if (m) {
@@ -142,14 +160,22 @@ function parseAcs(text) {
       // rather than warn: a collision here is the document's business, not a fault.
       if (used.has(id)) { let n = 2; while (used.has(`${id}#${n}`)) n++; id = `${id}#${n}`; }
       used.add(id);
-      acs.push({
+      const ac = {
         id,
         text: rest,
         done: m[1].toLowerCase() === 'x',
         verify: 'unclassified', // agent | operator | unclassified — see Q10 in SKILL.md
-      });
-    } else if (acs.length && /^\s+\S/.test(raw)) {
+      };
+      // Only for a mark that is neither ` ` nor `x`, so the 600-odd ordinary criteria keep
+      // their exact shape and a rescan does not rewrite every card on the board.
+      if (!/[ xX]/.test(m[1])) ac.mark = m[1];
+      if (b) NAMED.add(ac);
+      acs.push(ac);
+      open = true;
+    } else if (open && /^\s+\S/.test(raw)) {
       acs[acs.length - 1].text += ' ' + raw.trim();
+    } else if (/^\S/.test(raw)) {
+      open = false;
     }
   }
   // Evidence parentheticals bloat the text; keep the claim, drop the log.
@@ -169,9 +195,17 @@ function parsePhases(text) {
   if (rows.length < 3) return [];
   const cells = (l) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
   const head = cells(rows[0]).map((h) => h.toLowerCase().replace(/[*`]/g, '').trim());
-  const idx = (names) => head.findIndex((h) => names.some((n) => h === n || h.startsWith(n)));
-  const iId = idx(['phase', 'p', '#']);
-  const iWhat = idx(['what', 'scope', 'content', 'delivers', 'deliverable']);
+  // A short name matches EXACTLY. `startsWith('p')` read FR-6's `PR(s)` column as its
+  // phase ids; only a word as long as `phase` is safe to match as a prefix.
+  const idx = (names, not = -1) => head.findIndex((h, i) => i !== not
+    && names.some((n) => h === n || (n.length > 3 && h.startsWith(n))));
+  const iId = idx(['phase', 'p', '#', 'wave']);
+  // `| # | Phase | Kill switch |` puts the description under `Phase`, and FR-68 and
+  // FR-76 showed "P0 — " with nothing after it. So `phase` is a description column too,
+  // but only as a FALLBACK, and never when it is already the id column. A table that
+  // has a real `What` column keeps it: FR-59 has both.
+  const iWhatNamed = idx(['what', 'scope', 'content', 'delivers', 'deliverable', 'change']);
+  const iWhat = iWhatNamed >= 0 ? iWhatNamed : idx(['phase'], iId);
   const iStatus = idx(['status', 'outcome', 'state']);
   if (iId < 0) return [];
   const out = [];
@@ -182,7 +216,11 @@ function parsePhases(text) {
     out.push({
       id: clean(c[iId]),
       what: clean(c[iWhat]).slice(0, 200),
-      status: clean(c[iStatus]).slice(0, 300),
+      // `null` = the table has NO status column, so the state is unknown. That is not
+      // the same as an empty cell, which does mean "not started". Seven specs' tables have
+      // no status column. Reading their `''` as "not started" put "P0 — This spec + ledger
+      // row + issue" on the board as FR-61's next step, on a card at 9/11.
+      status: iStatus < 0 ? null : clean(c[iStatus]).slice(0, 300),
     });
   }
   return out;
@@ -207,9 +245,19 @@ function openPrs() {
   const raw = gh([
     'pr', 'list', '--repo', 'gjovanov/roomler-ai',
     '--state', 'open', '--limit', '100',
-    '--json', 'number,title,headRefName,isDraft,updatedAt',
+    '--json', 'number,title,headRefName,isDraft,updatedAt,files',
   ]);
   return JSON.parse(raw);
+}
+
+// Open PRs that EDIT this FR's spec, whatever their branch is called. Branch names miss a
+// PR that works on several FRs at once. On 2026-09-24, #1598 (`fr-verification-debt`)
+// was adding a criterion to FR-74's and FR-81's specs while the board showed both as
+// Ready to close: an operator closing FR-81 then would have closed it one criterion short.
+// ⚠️ gh returns at most 100 files per PR, so a PR larger than that can hide a spec edit.
+function specEditors(prs, fr) {
+  const re = new RegExp(`^docs/fr/FR-0*${fr}-`);
+  return prs.filter((p) => (p.files || []).some((f) => re.test(f.path))).map((p) => p.number);
 }
 
 // ---------------------------------------------------------------- work in flight
@@ -281,7 +329,7 @@ function mergedBranches() {
   return MERGED_BRANCHES;
 }
 
-function traceInFlight(card, fr, branches, worktrees) {
+function traceInFlight(card, fr, branches, worktrees, editors = []) {
   const re = new RegExp(`^fr-?0*${fr}(?![0-9])`, 'i');
   const now = Date.now() / 1000;
   const merged = mergedBranches();
@@ -300,14 +348,15 @@ function traceInFlight(card, fr, branches, worktrees) {
   card.run.in_flight = found;
 
   const live = found.some((f) => f.uncommitted || (!f.merged && f.age_days <= FRESH_DAYS));
-  card.run.hands_off = Boolean(card.run.adopted_pr || live);
+  const fresh = found.find((x) => !x.merged && x.age_days <= FRESH_DAYS);
+  const dirty = found.find((f) => f.uncommitted);
+  const editing = editors.filter((n) => n !== card.run.adopted_pr);
+  card.run.hands_off = Boolean(card.run.adopted_pr || live || editing.length);
   card.run.hands_off_reason = !card.run.hands_off ? null
     : card.run.adopted_pr ? `open PR #${card.run.adopted_pr}`
-    : found.find((f) => f.uncommitted) ? `uncommitted changes in ${found.find((f) => f.uncommitted).worktree}`
-    : (() => {
-        const f = found.find((x) => !x.merged && x.age_days <= FRESH_DAYS);
-        return `branch ${f.branch} touched ${f.age_days}d ago (no merged PR)`;
-      })();
+    : dirty ? `uncommitted changes in ${dirty.worktree}`
+    : fresh ? `branch ${fresh.branch} touched ${fresh.age_days}d ago (no merged PR)`
+    : `open PR ${editing.map((n) => '#' + n).join(', ')} edits this spec`;
   return card.run.hands_off;
 }
 
@@ -424,14 +473,38 @@ function scan() {
     const prev = loadCard(id);
     // A rescan must never silently un-classify an AC a human or a worker judged, and must
     // never resurrect a tick the spec has since cleared: the SPEC owns `done`, the CARD
-    // owns `verify`. Match on id first, then on text, so a reworded AC keeps its judgement
-    // only when its id is stable.
+    // owns `verify`.
+    //
+    // Match on TEXT first, and on the id only when the spec NAMED it. A positional id is a
+    // count, and a count moves under every criterion added above it. This used to match
+    // on id first, which is only right when ids are stable. On 2026-09-24 the parser
+    // stopped dropping FR-56's `[~]` criterion, every positional id below it moved down
+    // one, and an id-first match gave each judgement to the neighbour: an `operator`
+    // verdict landed on a box already ticked, and the open box it was written about came
+    // back `unclassified`.
+    // ⚠️ The honest failure is `unclassified`, which the board counts and warns about. A
+    // judgement on the WRONG criterion sends work to the wrong party and nothing shows it.
+    // A positional id is still trustworthy when the COUNT did not change, and only then.
+    // In that case nothing was inserted, so a criterion whose text grew (a note appended,
+    // evidence added on the tick) keeps its verdict. The one exception is a previous
+    // occupant that a text match has already claimed, because that criterion MOVED.
     if (prev) {
       const prevById = new Map(prev.acs.map((a) => [a.id, a]));
       const prevByText = new Map(prev.acs.map((a) => [a.text, a]));
+      const stable = acs.length === prev.acs.length;
+      const claimed = new Set();
+      const matched = new Map();
       for (const ac of acs) {
-        const old = prevById.get(ac.id) || prevByText.get(ac.text);
-        if (old && old.verify !== 'unclassified') ac.verify = old.verify;
+        const old = prevByText.get(ac.text);
+        if (old) { matched.set(ac, old); claimed.add(old); }
+      }
+      for (const ac of acs) {
+        if (matched.has(ac) || !(NAMED.has(ac) || stable)) continue;
+        const old = prevById.get(ac.id);
+        if (old && !claimed.has(old)) { matched.set(ac, old); claimed.add(old); }
+      }
+      for (const [ac, old] of matched) {
+        if (old.verify !== 'unclassified') ac.verify = old.verify;
       }
     }
 
@@ -493,8 +566,17 @@ function scan() {
     }
 
     // Trace, never take over. A card with work in flight is reported and left alone.
-    if (traceInFlight(card, row.fr, branches, worktrees) && card.column === 'admitted') {
+    // ⚠️ Both directions. This only ever moved a card IN, so "In progress" was a one-way
+    // door: when the traced work ended (its PR merged, its branch went stale), the card
+    // stayed. On 2026-09-24, 24 of 39 cards sat there with no live work and no worker of
+    // ours behind them, which is 24 cards an operator reading the board takes to be busy.
+    // A card a worker of ours STARTED (`started_at`) is left alone: its column is that
+    // worker's to set when it parks.
+    const live = traceInFlight(card, row.fr, branches, worktrees, specEditors(prs, row.fr));
+    if (live && card.column === 'admitted') {
       card.column = 'in_progress';
+    } else if (!live && card.column === 'in_progress' && !card.run.started_at) {
+      card.column = 'admitted';
     }
 
     saveCard(card);
@@ -623,9 +705,11 @@ function board() {
     L.push('|---|---|---|---|---|');
     for (const c of col) {
       const done = c.acs.filter((a) => a.done).length;
+      const half = c.acs.filter((a) => !a.done && a.mark === '~').length;
       const op = operatorOnly(c).length;
       const title = `**[${c.id}](https://github.com/gjovanov/roomler-ai/issues/${c.issue})** ${trunc(c.title, 60)}`;
-      const acCell = `${done}/${c.acs.length}${op ? ` (${op} 👤)` : ''}`;
+      const marks = [half ? `${half} ◐` : '', op ? `${op} 👤` : ''].filter(Boolean);
+      const acCell = `${done}/${c.acs.length}${marks.length ? ` (${marks.join(', ')})` : ''}`;
       const next = c.run.hands_off ? `🔒 ${c.run.hands_off_reason}`
         : (c.run.last_action || nextPhase(c) || '—');
       L.push(`| ${title} | ${acCell} | \`${bar(fraction(c))}\` | ${trunc(next, 70)} | ${c.blocked ? '🚧 ' + trunc(c.blocked, 60) : ''} |`);
@@ -635,7 +719,8 @@ function board() {
 
   L.push('---');
   L.push('');
-  L.push('**Legend** — `👤` an open criterion only the operator can settle · `🚧` blocked ·');
+  L.push('**Legend** — `👤` an open criterion only the operator can settle · `◐` one the spec');
+  L.push('marks half met (`- [~]`), counted as open until it reads `[x]` · `🚧` blocked ·');
   L.push('`🔒` work already in flight — **traced, never picked up**. A branch counts as live for');
   L.push(`${FRESH_DAYS} days after its last commit (\`--fresh-days\`); clear a card by hand if its`);
   L.push('branch is actually dead. ·');
@@ -651,8 +736,20 @@ function board() {
   console.log(`board: ${cards.length} cards -> ${join(DOCS, 'kanban', 'BOARD.md')}`);
 }
 
+// A phase with nothing left to BUILD, whether it shipped or was dropped. The acceptance
+// criteria still carry the field work, so "implemented — field pending" is settled here.
+// A P0 whose status is "this doc" / "this spec" is the spec itself, so it is settled too.
+const SETTLED = /\b(?:shipped|closed|done|built|verified|completed?|implemented|merged|proven|resolved|retired|superseded)\b|\bnot planned\b|✅|^this\b/i;
+// A NEGATED keyword says the opposite. FR-74's P5 reads "decided 2026-09-10, not built",
+// and the bare keyword test settled it, hiding the one phase on that card still to build.
+// Strip the negated phrase before testing. "not planned" is not in this list, so it
+// still settles the phase: nothing left to build.
+const NEGATED = /\b(?:not|never)\s+(?:yet\s+)?(?:shipped|closed|done|built|verified|completed?|implemented|merged|proven|resolved)\b/gi;
+const settled = (status) => SETTLED.test((status || '').replace(NEGATED, ''));
+
 function nextPhase(c) {
-  const open = c.phases.find((p) => !/shipped|closed|done|built|verified|complete/i.test(p.status || ''));
+  // An unknown status (no status column) is never offered as the next step.
+  const open = c.phases.find((p) => p.status !== null && !settled(p.status));
   return open ? `${open.id} — ${open.what}` : null;
 }
 const trunc = (s, n) => {
@@ -662,8 +759,12 @@ const trunc = (s, n) => {
 
 function next() {
   const n = Number(flag('n', '3'));
-  // hands_off cards are somebody else's work in flight — traced, never dispatched.
-  const pool = allCards().filter((c) => !c.run.hands_off && ['admitted', 'field'].includes(c.column));
+  // hands_off cards are somebody else's work in flight — traced, never dispatched. A BLOCKED
+  // card, or one whose open criteria are all operator-only, gives an agent nothing to do. This
+  // used to offer both anyway: FR-6, blocked on the operator's `cgu=1` decision, was the
+  // second card `next` named on 2026-09-24.
+  const pool = allCards().filter((c) => !c.run.hands_off && !c.blocked && agentLeft(c).length > 0
+    && ['admitted', 'field'].includes(c.column));
   for (const c of rank(pool).slice(0, n)) {
     const left = agentLeft(c);
     console.log(`${c.id}  #${c.issue}  ${c.acs.filter(a=>a.done).length}/${c.acs.length} ACs  [${c.column}]  ${c.title}`);
