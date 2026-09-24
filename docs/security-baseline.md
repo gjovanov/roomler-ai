@@ -8,7 +8,7 @@ over-complication to someone who did not see the failure.
 > **Scope.** This is the *server and web* baseline. The device-side gates —
 > exec, SSH, remote config, peer relays — are default-deny ladders documented
 > with their features: [fleet-rpc.md](fleet-rpc.md), [roomler-ssh.md](roomler-ssh.md),
-> [remote-config.md](remote-config.md), [fr/FR-19-peer-relays.md](fr/FR-19-peer-relays.md).
+> [remote-config.md](remote-config.md), [peer-relays.md](peer-relays.md).
 > The permission bit catalogue is [permissions.md](permissions.md).
 
 ```mermaid

@@ -592,7 +592,7 @@ Start at `docs/overlay-communication.md`. Sub-topics: `overlay-nat-traversal.md`
 `overlay-exit-nodes.md`, `overlay-wfp.md`, `multi-org.md`, `magicdns.md`,
 `tunnels.md`, `tunnel-install.md`, `roomler-ssh.md`, `fleet-rpc.md`,
 `remote-config.md`, `ephemeral-nodes.md`, `device-naming.md`,
-`fr/FR-19-peer-relays.md`.
+`peer-relays.md`.
 
 **Overlay address leases** (`docs/overlay-communication.md` §1) — the release order
 is load-bearing: read peers while live → **CAS-tombstone** (winning the CAS is the
