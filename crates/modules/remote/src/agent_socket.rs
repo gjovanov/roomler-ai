@@ -65,6 +65,39 @@ impl AgentMsgHandler for RemoteAgentSocket {
                 }
                 None
             }
+            // FR-52 P3c — the device's answers to a relayed login. Delivered
+            // only to a waiter registered for THIS agent (`ctx.agent_id` is the
+            // authenticated socket's, never the frame's); anything else lands
+            // nowhere. Consumed either way — never handed to the Hub.
+            ClientMsg::ExtauthKe2 { attempt_id, ke2 } => {
+                let answer = crate::extauth::DeviceAnswer::Ke2(ke2);
+                if !self
+                    .state
+                    .extauth
+                    .deliver(&attempt_id, ctx.agent_id, answer)
+                {
+                    debug!(agent = %ctx.agent_id, %attempt_id, "extauth: KE2 for no waiting step");
+                }
+                None
+            }
+            ClientMsg::ExtauthOutcome {
+                attempt_id,
+                refused,
+                retry_after_secs,
+            } => {
+                let answer = crate::extauth::DeviceAnswer::Outcome {
+                    refused,
+                    retry_after_secs,
+                };
+                if !self
+                    .state
+                    .extauth
+                    .deliver(&attempt_id, ctx.agent_id, answer)
+                {
+                    debug!(agent = %ctx.agent_id, %attempt_id, "extauth: outcome for no waiting step");
+                }
+                None
+            }
             other => Some(other),
         }
     }

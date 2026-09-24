@@ -2637,6 +2637,11 @@ pub enum ExternalRcAuditAction {
     /// rotation is the revocation story for a leaked code, so "when did this
     /// code start being valid?" has to be answerable.
     RotateCode,
+    /// FR-52 P3 — an external-access LOGIN ended, verified or refused. One row
+    /// per attempt, written when it ends, once the connect code has resolved to
+    /// a device (an unresolvable code has no device and no tenant to attach a
+    /// row to). `user_id` is the would-be controller, not an admin.
+    Login,
 }
 
 /// One external-access decision, granted or refused. TTL-expired after 90 days
@@ -2675,6 +2680,21 @@ pub struct ExternalRcAuditEvent {
     /// Refusal reason; `None` = the decision went through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied: Option<ExternalRcDenyReason>,
+    /// `login` — the attempt this row closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    /// `login` — why it was refused; `None` on a `login` row = VERIFIED.
+    ///
+    /// ⚠️ This is the one place the refusal reasons are told apart. The
+    /// would-be controller only ever sees `unavailable` for every configuration
+    /// refusal; the org's own audit log is where "gate 2 had expired" and "the
+    /// device is offline" must be distinguishable, or no admin could act on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_refused: Option<ExtauthRefusal>,
+    /// `login` — what the SERVER knows about a refusal the controller saw as
+    /// `unavailable`: which gate, or offline. `None` when the device refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_detail: Option<String>,
 }
 
 impl ExternalRcAuditEvent {
@@ -2920,6 +2940,9 @@ mod external_access_tests {
             expires_at: None,
             at: DateTime::now(),
             denied: Some(ExternalRcDenyReason::NotDeviceAdmin),
+            attempt_id: None,
+            login_refused: None,
+            login_detail: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("approved").is_none());

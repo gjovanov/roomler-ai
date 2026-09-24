@@ -22,7 +22,12 @@ roomler-core = { path = "../core" }
 roomler-ai-mod-conference = { path = "../modules/conference" }
 roomler-ai-mod-fleet = { path = "../modules/fleet" }
 roomler-ai-mod-network = { path = "../modules/network" }
-roomlerd = { path = "../../agents/roomlerd" }
+# `external-access` so the FR-52 loopback proof runs the REAL device-side login
+# (the OPAQUE record, the guess budget, the live config read) rather than a
+# stand-in — the spec's bar for P3 is "proven on loopback against the real
+# agent". Everything else in this crate is unaffected: the feature only adds
+# the credential modules.
+roomlerd = { path = "../../agents/roomlerd", features = ["external-access"] }
 webrtc.workspace = true
 tokio.workspace = true
 mongodb.workspace = true
@@ -47,3 +52,9 @@ tempfile = { workspace = true }
 tokio-test = "0.4"
 tokio-tungstenite = "0.26"
 futures.workspace = true
+# FR-52 — the OUTSIDER's half of the login in `extauth_tests`, standing in for
+# the browser (P4). Same version and features as roomlerd's, so cargo unifies
+# them into one crate; `rand_opaque` is the rand 0.8 alias opaque-ke needs
+# (see roomlerd's Cargo.toml for why it cannot be the workspace rand).
+opaque-ke = { version = "4", default-features = false, features = ["ristretto255", "serde", "argon2", "std"] }
+rand_opaque = { package = "rand", version = "0.8" }
