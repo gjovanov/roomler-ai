@@ -414,8 +414,9 @@ reason to accept an unbounded table or an eternal key:
   is fixing the control plane.
 - **Gate 4 again.** A device with `ssh_enabled` off refuses to record grants at
   all rather than accumulating credentials it would never honour — and since
-  FR-83 says so in its acknowledgement, so the caller is told it was gate 4
-  instead of meeting a key refusal.
+  FR-83 says so in its acknowledgement, so the caller is told it was gate 4.
+  Before, the server sent the caller to dial a port that nothing intercepts
+  when SSH is off, and the answer was a bare `Connection refused`.
 
 Grants are tried before `ssh_authorized_keys` and take precedence; sessions
 authenticated by a grant carry the roomler principal into the log and the audit

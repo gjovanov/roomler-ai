@@ -262,8 +262,9 @@ async fn the_caller_is_answered_only_after_the_device_confirms() {
 }
 
 /// AC2 — gate 4 reaches the caller. Before FR-83 the device's refusal lived
-/// only in its own log and the caller got an address, then
-/// `Permission denied (publickey)`: the deterministic negative control.
+/// only in its own log and the caller got an address — then a bare
+/// `Connection refused`, since nothing intercepts the port when SSH is off:
+/// the deterministic negative control.
 #[tokio::test]
 async fn a_device_with_ssh_switched_off_answers_the_caller_as_gate_4() {
     let app = TestApp::spawn().await;

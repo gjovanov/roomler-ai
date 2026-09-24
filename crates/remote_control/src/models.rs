@@ -2599,8 +2599,9 @@ pub enum SshDenyReason {
     BadPublicKey,
     /// FR-83 — gate 4: the device's own `ssh_enabled` is off. Reported BY the
     /// device (in `rc:ssh.grant_ack`), the twin of
-    /// [`ExecDenyReason::AgentDisabled`]; before the ack existed this refusal
-    /// lived only in the device's log and the caller saw a key error.
+    /// [`ExecDenyReason::AgentDisabled`]. Before the ack existed this refusal
+    /// lived only in the device's log, and the caller was told to dial a port
+    /// that nothing intercepts when SSH is off — a bare `Connection refused`.
     AgentDisabled,
     /// FR-83 — the grant had already expired when the device received it:
     /// the device's clock is ahead of the server's, or its control connection
