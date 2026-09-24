@@ -2064,10 +2064,54 @@ static GRANTS: std::sync::LazyLock<std::sync::Mutex<Vec<Grant>>> =
 #[cfg(feature = "ssh-server")]
 const MAX_PENDING_GRANTS: usize = 16;
 
-/// Record an `rc:ssh.grant`. Returns an error string to log when the grant is
-/// unusable; the caller does not answer the server, because the caller of the
-/// SSH session (a different device) is the one waiting, and it learns the
-/// outcome by its connection succeeding or not.
+/// Why [`record_grant`] would not hold a grant.
+///
+/// A type rather than the string it used to be because the caller now
+/// ANSWERS with it (FR-83): the variant crosses the wire in
+/// `rc:ssh.grant_ack`, and the person who asked for the session is told which
+/// one it was instead of meeting `Permission denied (publickey)`. The text a
+/// log line prints is unchanged.
+#[cfg(feature = "ssh-server")]
+#[derive(Debug)]
+pub enum GrantRejected {
+    /// The key the server validated does not parse here.
+    UnparseableKey(String),
+    /// Nothing is left of the window between arrival and the server's
+    /// deadline: this clock is ahead of the server's, or the grant spent its
+    /// whole life in transit.
+    ExpiredOnArrival,
+}
+
+#[cfg(feature = "ssh-server")]
+impl GrantRejected {
+    /// The refusal as the server — and through it the caller — hears it.
+    pub fn refusal(&self) -> roomler_ai_remote_control::models::SshGrantRefusal {
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+        match self {
+            Self::UnparseableKey(_) => SshGrantRefusal::Invalid,
+            Self::ExpiredOnArrival => SshGrantRefusal::Expired,
+        }
+    }
+}
+
+#[cfg(feature = "ssh-server")]
+impl std::fmt::Display for GrantRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnparseableKey(e) => write!(f, "grant carries an unparseable public key: {e}"),
+            Self::ExpiredOnArrival => {
+                f.write_str("grant is already expired on arrival (clock skew?)")
+            }
+        }
+    }
+}
+
+/// Record an `rc:ssh.grant`.
+///
+/// On `Ok` the grant is in `GRANTS` — the table the auth path reads — so a
+/// connection authenticating with its key succeeds from this moment. That is
+/// what the caller's `rc:ssh.grant_ack` promises the server (FR-83), which is
+/// why the ack is sent only after this returns.
 #[cfg(feature = "ssh-server")]
 #[allow(clippy::too_many_arguments)]
 pub fn record_grant(
@@ -2079,7 +2123,7 @@ pub fn record_grant(
     consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     expires_at_ms: u64,
     session_secs: u64,
-) -> Result<(), String> {
+) -> Result<(), GrantRejected> {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use roomler_ai_remote_control::models::ssh_limits;
@@ -2087,7 +2131,7 @@ pub fn record_grant(
     // Parse now, not at authentication time: a malformed key should be a
     // start-up-shaped error in the log, not a mysterious auth failure later.
     russh::keys::ssh_key::PublicKey::from_openssh(&public_key)
-        .map_err(|e| format!("grant carries an unparseable public key: {e}"))?;
+        .map_err(|e| GrantRejected::UnparseableKey(e.to_string()))?;
 
     // Re-clamp the lifetime against our own clock. The server's timestamp can
     // only make the window SMALLER than the local ceiling, never larger.
@@ -2099,7 +2143,7 @@ pub fn record_grant(
     let server_window = Duration::from_millis(expires_at_ms.saturating_sub(now_ms));
     let window = server_window.min(ceiling);
     if window.is_zero() {
-        return Err("grant is already expired on arrival (clock skew?)".into());
+        return Err(GrantRejected::ExpiredOnArrival);
     }
 
     let grant = Grant {
@@ -2736,6 +2780,7 @@ mod tests {
             0,
         )
         .map(|()| grant_id)
+        .map_err(|e| e.to_string())
     }
 
     /// A grant admits its key, and admits it exactly once. Without single-use,
@@ -2798,6 +2843,44 @@ mod tests {
         // Arrives already past its expiry — rejected outright rather than
         // stored as a live credential.
         assert!(grant_for(&line, 0).is_err());
+        assert_eq!(super::pending_grants(), 0);
+
+        // FR-83 — and the refusal that reaches the caller says WHICH: expiry
+        // means "the clocks disagree", which someone can fix, where an
+        // unusable key means "report a bug". Both paths reject before
+        // anything is stored, so this needs no table state of its own.
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+        let (_, other_line) = client_key(12);
+        let expired = super::record_grant(
+            "g-expired".into(),
+            other_line,
+            "alice@example.com".into(),
+            "daemon".into(),
+            None,
+            None,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(expired, super::GrantRejected::ExpiredOnArrival));
+        assert_eq!(expired.refusal(), SshGrantRefusal::Expired);
+        assert_eq!(
+            expired.to_string(),
+            "grant is already expired on arrival (clock skew?)",
+            "the device's log line must not change with the type"
+        );
+        let garbage = super::record_grant(
+            "g-garbage".into(),
+            "not a key".into(),
+            "alice@example.com".into(),
+            "daemon".into(),
+            None,
+            None,
+            now_ms() + 30_000,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(garbage.refusal(), SshGrantRefusal::Invalid);
         assert_eq!(super::pending_grants(), 0);
 
         let config = Arc::new(russh::client::Config::default());

@@ -131,6 +131,10 @@ pub async fn handle_agent_socket(
     // without the `ssh-server` feature is recorded by nobody, and the caller
     // then dials a port that authenticates them against an empty table.
     let supports_ssh = caps.has_rpc(RpcCap::Ssh);
+    // FR-83 — this connection answers grants, so the server may hold the
+    // caller for the answer. Equality-matched through `has_rpc`: `ssh` is a
+    // prefix of it, and every pre-FR-83 agent advertises `ssh`.
+    let acks_ssh_grants = caps.has_rpc(RpcCap::SshGrantAck);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -141,6 +145,9 @@ pub async fn handle_agent_socket(
         supports_exec,
     );
     state.rc_hub.set_agent_ssh_support(agent_id, supports_ssh);
+    state
+        .rc_hub
+        .set_agent_ssh_grant_ack(agent_id, acks_ssh_grants);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 

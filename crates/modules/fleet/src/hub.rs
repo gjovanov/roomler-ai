@@ -115,6 +115,13 @@ pub struct ConnectedAgent {
     /// grant to a build that drops it would leave the caller dialling a port
     /// that authenticates nobody, with nothing anywhere saying why.
     pub supports_ssh: bool,
+    /// FR-83 — the agent advertises `ssh-grant-ack`: it answers every grant
+    /// with `rc:ssh.grant_ack` once the grant is redeemable, so the server may
+    /// hold the caller for it. Kept per CONNECTION, never read from the stored
+    /// row: after a rollback the row still promises an ack the running agent
+    /// never sends, and every grant to it would wait out the bound and then
+    /// be refused.
+    pub supports_ssh_grant_ack: bool,
 }
 
 pub struct ConnectedController {
@@ -313,6 +320,9 @@ impl Hub {
             // `false` is the safe starting point: an agent whose capability is
             // never recorded is treated as unable to serve SSH.
             supports_ssh: false,
+            // Same setter, same reasoning: `false` = answered without waiting,
+            // exactly as before FR-83.
+            supports_ssh_grant_ack: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1357,21 +1367,28 @@ impl Hub {
         self.inner.agents.get(&agent_id).map(|a| a.supports_exec)
     }
 
-    /// Push an authorization to a device and return immediately.
+    /// Push an authorization to a device and return as soon as it is QUEUED.
     ///
-    /// Unlike [`Self::exec_on_agent`] there is nothing to wait for: the target
-    /// records the grant, and the *caller* learns whether it worked by dialling
-    /// the overlay address and authenticating — over a path the server is not
-    /// on and cannot observe. So the only failures this can report are the ones
-    /// visible from here: not connected, wrong tenant, or a build that would
-    /// drop the frame.
+    /// Queued is not recorded (#1597): the frame still has to cross the
+    /// device's control connection, which on a corp laptop behind a
+    /// TLS-inspecting middlebox was measured seconds slower than the caller's.
+    /// So `Ok(true)` says this connection ANSWERS grants (`ssh-grant-ack`,
+    /// FR-83) and the caller must not be told where to dial until
+    /// `rc:ssh.grant_ack` arrives; `Ok(false)` is a pre-FR-83 agent, which
+    /// never will, and is answered as before. Read here, in the lookup that
+    /// validates the push, rather than in a separate query a reconnect could
+    /// fall between.
+    ///
+    /// The SESSION itself still runs over a path the server is not on. The
+    /// failures reported here are the ones visible from here: not connected,
+    /// wrong tenant, or a build that would drop the frame.
     pub fn push_ssh_grant(
         &self,
         agent_id: ObjectId,
         tenant_id: ObjectId,
         msg: ServerMsg,
-    ) -> Result<()> {
-        {
+    ) -> Result<bool> {
+        let acks = {
             let entry = self
                 .inner
                 .agents
@@ -1386,8 +1403,10 @@ impl Hub {
             if !entry.supports_ssh {
                 return Err(Error::ExecUnsupported(agent_id.to_hex()));
             }
-        }
-        self.send_to_agent(agent_id, msg)
+            entry.supports_ssh_grant_ack
+        };
+        self.send_to_agent(agent_id, msg)?;
+        Ok(acks)
     }
 
     /// Whether a connected agent advertises the `ssh` RPC capability.
@@ -1403,6 +1422,18 @@ impl Hub {
     pub fn set_agent_ssh_support(&self, agent_id: ObjectId, supports: bool) {
         if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
             entry.supports_ssh = supports;
+        }
+    }
+
+    /// FR-83 — record whether this connection acknowledges grants
+    /// (`ssh-grant-ack`), alongside [`Self::set_agent_ssh_support`] and for
+    /// the same reasons. A separate setter rather than a second positional
+    /// bool on that one: two adjacent bools are exactly the call a transposed
+    /// argument turns into "waits on every grant to an agent that never
+    /// answers".
+    pub fn set_agent_ssh_grant_ack(&self, agent_id: ObjectId, acks: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_ssh_grant_ack = acks;
         }
     }
 

@@ -133,6 +133,24 @@ impl AgentMsgHandler for NetworkAgentSocket {
                 });
                 None
             }
+            // FR-83 — the target's answer to a grant. The agent id is the
+            // authenticated socket's, never the frame's: an ack confirms only
+            // the grant that was pushed to THIS device.
+            ClientMsg::SshGrantAck { grant_id, refused } => {
+                if !state
+                    .ssh_grant_acks
+                    .deliver(&grant_id, ctx.agent_id, refused)
+                {
+                    // The caller gave up (past the bound) or never waited.
+                    // Worth a line: a stream of these from one device says its
+                    // control connection is slower than the bound.
+                    debug!(
+                        agent_id = %ctx.agent_id, %grant_id, ?refused,
+                        "ssh: grant ack with no waiter — late, or not this device's grant"
+                    );
+                }
+                None
+            }
             ClientMsg::SshActivity {
                 grant_id,
                 caller,
