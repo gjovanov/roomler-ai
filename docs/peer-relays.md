@@ -25,13 +25,13 @@ flowchart LR
     S["roomler server<br/>(mints, audits)"]
     D["DERP floor<br/>(API pods, TLS :443)"]
 
-    S -. "rc:overlay.relay_session" .-> A
-    S -. "rc:overlay.relay_serve" .-> R
-    S -. "rc:overlay.relay_session" .-> B
-    A <== "WireGuard ciphertext" ==> R
-    R <== "WireGuard ciphertext" ==> B
-    A -. "always registered, never torn down" .- D
-    B -. "always registered, never torn down" .- D
+    S -.->|"rc:overlay.relay_session"| A
+    S -.->|"rc:overlay.relay_serve"| R
+    S -.->|"rc:overlay.relay_session"| B
+    A ==>|"WireGuard ciphertext, both ways"| R
+    R ==>|"forwarded verbatim"| B
+    A -.-|"always registered, never torn down"| D
+    B -.-|"always registered, never torn down"| D
 ```
 
 ## Where it sits in the carrier ladder
