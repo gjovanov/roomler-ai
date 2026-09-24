@@ -427,6 +427,8 @@ peers`. Revocation is a **push** (org off, an ACL edit, approval cleared, a
 party gone), because the idle deadline never fires under a WireGuard keepalive.
 Sessions are 24-bit VNIs unique **per relay node**, capped at 64 per relay, 1 h
 absolute lifetime. The floor is untouched: a node with no UDP stays on DERP.
+Full treatment, including what the relay operator can still see:
+[peer-relays.md](peer-relays.md).
 
 ---
 

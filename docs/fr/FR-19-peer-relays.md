@@ -1,6 +1,6 @@
 # FR-19: Peer relays — tenant-owned UDP relay nodes between direct and DERP
 
-Status: **P0–P4c field-verified** — shipped through **0.4.20** (`agent-v0.4.20`); the whole path is proven on the primary tenant: **CORPLAP-3↔mars carried real traffic on `relay:org/udp` (~84 ms) via the scw-m2-asahi relay** (`forwarded=128`), then torn down on revoke back to the DERP floor. Capability + gates + mint + forward + revoke all field-verified 2026-08-29; live behind `overlay_org_relay` + `peer_relay_mode`, default off. Proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
+Status: **P0–P4c field-verified** — shipped through **0.4.20** (`agent-v0.4.20`); the whole path is proven on the primary tenant: **CORPLAP-3↔mars carried real traffic on `relay:org/udp` (~84 ms) via the scw-m2-asahi relay** (`forwarded=128`), then torn down on revoke back to the DERP floor. Capability + gates + mint + forward + revoke all field-verified 2026-08-29; live behind `overlay_org_relay` + `peer_relay_mode`, default off. **27 of 29 criteria as of 2026-09-24**: the relay socket census ticked once FR-48 fixed the TURN client's leak, and the docs criterion was added retroactively and met by [`docs/peer-relays.md`](../peer-relays.md). The two still open are **decisions for the operator, not measurements**: the pre-FR-19 forward-compatibility box (#811's `unknown_relay_strategy_tag_keeps_the_whole_netmap_parseable` already asserts the parser tolerance its note calls unasserted) and the `peer_relay_mode=off` before/after diff (no pre-FR-19 build is left in the fleet to diff against). Proposed 2026-08-28. Tracking issue: [`FR-19` (#805)](https://github.com/gjovanov/roomler-ai/issues/805).
 Reference design: [Tailscale peer relays](https://tailscale.com/docs/features/peer-relay).
 Sibling of FR-18 (#801) and FR-17 (#799) — both are about the *cost* of the relay path;
 this FR is about **replacing that path with a better one** rather than tuning it.
@@ -760,6 +760,7 @@ appears in **two** places), and the customer-facing install docs (§12).
 | **P4** | `RelayKind::Org` live in the verdict + `relay_strategy` branch + promote/demote. Split: **P4a** the client in `tunnel-core` (`orgrelay/client.rs`: bind handshake + `OrgRelayConn`, proven over loopback against the real P2 relay) · **P4b** runtime + agent wiring — `RelayKind::Org`, the `relay_strategy` branch, `OverlayEvent::OrgRelay{Session,Revoke}`, relay-side `relay_serve` install, the probe report, the join flags — behind the config key · **P4c** the first field mint (`warn`, then `on`) — **field-verified 0.4.20** (CORPLAP-3↔mars on `relay:org/udp` via asahi; caps-probe fix #915 unblocked it) | `overlay_org_relay=false` |
 | **P5** | jupiter/zeus provisioning in `~/k8s-cluster-multi` + weekly drift-audit cron | revert host_vars |
 | **P6** | Admin UI: relay approval, org switch, audit section | UI-only |
+| **Docs** | [`docs/peer-relays.md`](../peer-relays.md): what shipped, in the house style. ✅ Written 2026-09-24, **added retroactively** because this spec predates the docs-before-close rule | docs only |
 
 ⚠️ **P1 is NOT "inert by construction", and the first draft claimed it was.** The
 reachability question cannot be answered by generalising the existing probe (§5) — coturn is
@@ -897,6 +898,10 @@ kill switch. That is what makes E2E-3 executable before P2.
 - [x] The port rule is **scoped**, not merely present. *(`scripts/peer-relay-port-audit.sh`, field 0.4.20: Asahi’s explicit `3478/udp` → scoped/exit 0; a blanket allow-all → exit 2; mars’s DNAT-consumed `3478` → exit 4.)*
 - [x] A relay at `relay_max_sessions` refuses with a distinct reason; the pair falls back.
 - [x] Relay-node UDP socket census flat over 24 h (F6). *(2026-09-24, closed by [FR-48](FR-48-roomlerd-ice-socket-leak.md) — this criterion is the consumer of that fix. The leak was never FR-19's: `turn::Client` has no `Drop`, so a **cancelled** TURN allocate stranded its underlay socket on every overlay node, relay or not; fixed in `agent-v0.4.100` (#1556). Hourly census over 24 h including the relay node `scw-m2-asahi`: no host ever exceeded 7 sockets, and the longest single lifetime — 20.0 h on 0.4.100 — ran **0.000/h** on all four, where 0.4.99 ran ~9/h. Full series and method in FR-48's field log.)*
+
+**Documentation**
+
+- [x] **Docs updated/created with diagrams, linked from `docs/README.md`** — [`docs/peer-relays.md`](../peer-relays.md): where the org relay sits in the ladder and why it is a `RelayKind` rather than a tier, the five gates and their owners, the mint and its audit vocabulary, the two-key bind, what the relay forwards and refuses, revocation, the floor, **what the relay operator can see** (§12a's table, published outside the spec as §12a asked), the measured results, the operating checklist and a code map. Three `mermaid` diagrams, `file:line` anchors verified against master; indexed in `docs/README.md`, and linked from `overlay-communication.md` UC-7 and `security-baseline.md`. ⚠️ **Added retroactively (2026-09-24)**: FR-19 opened on 2026-08-28, before the docs-before-close rule (#1401, 2026-09-05), and a close after that date binds it. Marked rather than backdated, so the spec does not claim it always complied.
 
 ---
 
