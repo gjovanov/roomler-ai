@@ -1269,6 +1269,70 @@ pub enum ClientMsg {
     /// through the ACL-checked `rc:overlay.relay_request` at pairing time.
     #[serde(rename = "rc:overlay.warm_relay_request")]
     OverlayWarmRelayRequest {},
+
+    // ── FR-52 P3 — external access (`rc:extauth.*`) ──────────────────────
+    //
+    // An OPAQUE login between someone OUTSIDE the device's organization and
+    // the device, relayed by a server that learns nothing it can use: no
+    // password, nothing to attack offline, no proof it could replay. Every
+    // login blob is base64url WITHOUT padding — `@serenity-kit/opaque`'s
+    // encoding, so the browser's output crosses unmodified.
+    //
+    // Both CONTROLLER frames carry the connect code, not an agent id: an
+    // outsider never learns the device's internal id, and the pod the browser
+    // landed on re-resolves the code on every frame to route it to the pod
+    // that holds the device — the outsider has no tenant, so tenant affinity
+    // cannot put them on that pod to begin with.
+    /// FR-52 P3 — controller → server: begin an external-access login.
+    #[serde(rename = "rc:extauth.start")]
+    ExtauthStart {
+        /// As typed: grouping dashes and Crockford confusables are normalised
+        /// server-side.
+        connect_code: String,
+        /// OPAQUE KE1.
+        ke1: String,
+    },
+    /// FR-52 P3 — controller → server: finish the login the server's
+    /// `rc:extauth.challenge` answered.
+    ///
+    /// ⚠️ Only the principal who STARTED `attempt_id` may finish it; the server
+    /// checks, and the device checks again against the principal it was given
+    /// at KE1.
+    #[serde(rename = "rc:extauth.finish")]
+    ExtauthFinish {
+        connect_code: String,
+        attempt_id: String,
+        /// OPAQUE KE3.
+        ke3: String,
+    },
+    /// FR-52 P3 — device → server: the device answered KE1. One guess spent.
+    ///
+    /// ⚠️ `agent_id` comes from the authenticated socket, never from this
+    /// frame, and the server honours it only from the agent the KE1 was sent
+    /// to — attempt ids are relayed to both parties and are not secret.
+    #[serde(rename = "rc:extauth.ke2")]
+    ExtauthKe2 {
+        attempt_id: String,
+        /// OPAQUE KE2.
+        ke2: String,
+    },
+    /// FR-52 P3 — device → server: a login step is over. `refused` absent
+    /// after KE3 = VERIFIED; present at either step = refused, and why.
+    #[serde(rename = "rc:extauth.outcome")]
+    ExtauthOutcome {
+        attempt_id: String,
+        /// Decoded leniently: an unknown refusal is still a refusal
+        /// ([`crate::models::ExtauthRefusal::Other`]), never "verified".
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "extauth_refusal_lenient"
+        )]
+        refused: Option<crate::models::ExtauthRefusal>,
+        /// Only with [`crate::models::ExtauthRefusal::Throttled`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_secs: Option<u32>,
+    },
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1361,6 +1425,10 @@ impl ClientMsg {
             ClientMsg::OverlayRelayProbe { .. } => "rc:overlay.relay_probe",
             ClientMsg::OverlayRelayRequest { .. } => "rc:overlay.relay_request",
             ClientMsg::OverlayWarmRelayRequest { .. } => "rc:overlay.warm_relay_request",
+            ClientMsg::ExtauthStart { .. } => "rc:extauth.start",
+            ClientMsg::ExtauthFinish { .. } => "rc:extauth.finish",
+            ClientMsg::ExtauthKe2 { .. } => "rc:extauth.ke2",
+            ClientMsg::ExtauthOutcome { .. } => "rc:extauth.outcome",
         }
     }
 
@@ -1382,7 +1450,13 @@ impl ClientMsg {
             | ClientMsg::SdpAnswer { .. }
             | ClientMsg::Ice { .. }
             | ClientMsg::Terminate { .. }
-            | ClientMsg::SessionStats { .. } => Owner::Remote,
+            | ClientMsg::SessionStats { .. }
+            // FR-52 — what a controller reaches (§2d of the spec), including
+            // the device's answers, which exist only to be relayed back to it.
+            | ClientMsg::ExtauthStart { .. }
+            | ClientMsg::ExtauthFinish { .. }
+            | ClientMsg::ExtauthKe2 { .. }
+            | ClientMsg::ExtauthOutcome { .. } => Owner::Remote,
             ClientMsg::RelayProbeReport { .. }
             | ClientMsg::DerpTicketRequest { .. }
             | ClientMsg::SshRequest { .. }
@@ -1469,6 +1543,10 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:overlay.relay_probe", Owner::Network),
     ("rc:overlay.relay_request", Owner::Network),
     ("rc:overlay.warm_relay_request", Owner::Network),
+    ("rc:extauth.start", Owner::Remote),
+    ("rc:extauth.finish", Owner::Remote),
+    ("rc:extauth.ke2", Owner::Remote),
+    ("rc:extauth.outcome", Owner::Remote),
 ];
 
 #[cfg(test)]
@@ -1479,7 +1557,14 @@ mod namespace_tests {
     /// source — so the table below is checked against what serde actually
     /// emits, not against a second hand-written list.
     fn client_renames() -> Vec<String> {
-        let src = include_str!("signaling.rs");
+        // Line endings normalised first. A Windows checkout (core.autocrlf)
+        // stores this file with CRLF, so the `"\n}\n"` search below never
+        // matched and the test panicked with "the enum closes" BEFORE checking
+        // a single tag — on those machines the owner table was unverifiable,
+        // and the failure read as one of "the stale tests on master". ⚠️ No CI
+        // lane runs this crate's unit tests at all (2026-09-24), so a local run
+        // is the only place this gate has ever executed.
+        let src = include_str!("signaling.rs").replace("\r\n", "\n");
         let start = src
             .find("pub enum ClientMsg {")
             .expect("the enum is in this file");
@@ -1556,6 +1641,24 @@ mod namespace_tests {
             ClientMsg::SshGrantAck {
                 grant_id: "g1".into(),
                 refused: None,
+            },
+            ClientMsg::ExtauthStart {
+                connect_code: "ABCD-EFGH-JKMN".into(),
+                ke1: "a2Ux".into(),
+            },
+            ClientMsg::ExtauthFinish {
+                connect_code: "ABCD-EFGH-JKMN".into(),
+                attempt_id: "a1".into(),
+                ke3: "a2Uz".into(),
+            },
+            ClientMsg::ExtauthKe2 {
+                attempt_id: "a1".into(),
+                ke2: "a2Uy".into(),
+            },
+            ClientMsg::ExtauthOutcome {
+                attempt_id: "a1".into(),
+                refused: None,
+                retry_after_secs: None,
             },
         ];
         for m in &samples {
@@ -2469,6 +2572,52 @@ pub enum ServerMsg {
     /// the agent re-requests at ~90 % of the TTL.
     #[serde(rename = "rc:relay.derp_ticket")]
     DerpTicket { ticket: String, exp: u64 },
+
+    // ── FR-52 P3 — external access (`rc:extauth.*`) ──────────────────────
+    /// FR-52 P3 — server → device: an outsider's KE1, relayed.
+    ///
+    /// `principal` is the controller's user id, as the SERVER knows it. The
+    /// device binds it into the key a verified login leaves behind, so a server
+    /// that names the wrong principal produces a key the real controller does
+    /// not share, and the session that key must authenticate fails closed.
+    ///
+    /// ⚠️ Honoured only on the PRIMARY org's socket: the password is the
+    /// device owner's, and a secondary org must not be able to point outsiders
+    /// at it (FR-19's rule for host-global resources).
+    #[serde(rename = "rc:extauth.ke1")]
+    ExtauthKe1 {
+        attempt_id: String,
+        principal: String,
+        ke1: String,
+    },
+    /// FR-52 P3 — server → device: the controller's KE3 for `attempt_id`.
+    #[serde(rename = "rc:extauth.ke3")]
+    ExtauthKe3 {
+        attempt_id: String,
+        principal: String,
+        ke3: String,
+    },
+    /// FR-52 P3 — server → controller: the device's KE2, relayed. The browser
+    /// opens it; a wrong password is detected THERE, and a well-behaved client
+    /// then simply stops.
+    #[serde(rename = "rc:extauth.challenge")]
+    ExtauthChallenge { attempt_id: String, ke2: String },
+    /// FR-52 P3 — server → controller: the end of a login. `refused` absent =
+    /// the device verified the login. `attempt_id` is absent when the refusal
+    /// came before one was allocated (an unresolvable connect code, a server
+    /// rate limit).
+    ///
+    /// A distinct tag from the device's `rc:extauth.outcome`, so a log line or
+    /// a frame dump is never ambiguous about which hop it came from.
+    #[serde(rename = "rc:extauth.result")]
+    ExtauthResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<crate::models::ExtauthRefusal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_secs: Option<u32>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2774,6 +2923,35 @@ where
             serde::de::value::StrDeserializer::<serde::de::value::Error>::new(tag.as_str()),
         )
         .unwrap_or(SshGrantRefusal::Other),
+    ))
+}
+
+/// FR-52 P3 — lenient decoder for [`ClientMsg::ExtauthOutcome::refused`], the
+/// same shape as [`grant_refusal_lenient`] and for the same reason.
+///
+/// ⚠️ The direction of the fallback is the security property here, not a
+/// convenience: an unrecognised or malformed refusal is still a REFUSAL
+/// ([`ExtauthRefusal::Other`]); only an absent or `null` field means
+/// "verified". Falling back to `None` would turn any refusal this server has
+/// not heard of into a verified login for an outsider.
+///
+/// [`ExtauthRefusal::Other`]: crate::models::ExtauthRefusal::Other
+fn extauth_refusal_lenient<'de, D>(de: D) -> Result<Option<crate::models::ExtauthRefusal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::models::ExtauthRefusal;
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(tag) = raw else {
+        return Ok(Some(ExtauthRefusal::Other));
+    };
+    Ok(Some(
+        ExtauthRefusal::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(tag.as_str()),
+        )
+        .unwrap_or(ExtauthRefusal::Other),
     ))
 }
 
@@ -3188,6 +3366,120 @@ mod tests {
             absent,
             ClientMsg::SshGrantAck { refused: None, .. }
         ));
+    }
+
+    /// FR-52 P3 — a device's outcome can only mean "verified" by the ABSENCE
+    /// of a refusal. Anything present, whatever its shape, is a refusal.
+    ///
+    /// This is FR-83's rule with higher stakes: there a wrong fallback sent a
+    /// caller to dial a device that said no; here it would hand an OUTSIDER a
+    /// verified login the device refused.
+    #[test]
+    fn an_extauth_outcome_is_verified_only_when_no_refusal_is_present() {
+        use crate::models::ExtauthRefusal;
+
+        let parse = |refused: serde_json::Value| {
+            let mut v = serde_json::json!({"t": "rc:extauth.outcome", "attempt_id": "a1"});
+            v["refused"] = refused;
+            match serde_json::from_value::<ClientMsg>(v).expect("the frame must still parse") {
+                ClientMsg::ExtauthOutcome { refused, .. } => refused,
+                other => panic!("wrong variant: {other:?}"),
+            }
+        };
+        assert_eq!(
+            parse(serde_json::json!("a_reason_from_2027")),
+            Some(ExtauthRefusal::Other)
+        );
+        assert_eq!(
+            parse(serde_json::json!({"quota": 3})),
+            Some(ExtauthRefusal::Other)
+        );
+        assert_eq!(parse(serde_json::json!(false)), Some(ExtauthRefusal::Other));
+        assert_eq!(
+            parse(serde_json::json!("throttled")),
+            Some(ExtauthRefusal::Throttled)
+        );
+        assert_eq!(parse(serde_json::Value::Null), None);
+        let absent: ClientMsg =
+            serde_json::from_str(r#"{"t":"rc:extauth.outcome","attempt_id":"a1"}"#).unwrap();
+        assert!(matches!(
+            absent,
+            ClientMsg::ExtauthOutcome { refused: None, .. }
+        ));
+    }
+
+    /// FR-52 P3 — the refusal spellings are a compatibility surface (the
+    /// browser renders them, older agents send them), and every `rc:extauth.*`
+    /// frame survives the wire in both directions.
+    #[test]
+    fn extauth_wire_shapes_are_locked() {
+        use crate::models::ExtauthRefusal;
+
+        for (r, want) in [
+            (ExtauthRefusal::Unavailable, "unavailable"),
+            (ExtauthRefusal::Throttled, "throttled"),
+            (ExtauthRefusal::RateLimited, "rate_limited"),
+            (ExtauthRefusal::Busy, "busy"),
+            (ExtauthRefusal::Malformed, "malformed"),
+            (ExtauthRefusal::Rejected, "rejected"),
+            (ExtauthRefusal::UnknownAttempt, "unknown_attempt"),
+            (ExtauthRefusal::Other, "other"),
+        ] {
+            let m = ClientMsg::ExtauthOutcome {
+                attempt_id: "a1".into(),
+                refused: Some(r),
+                retry_after_secs: None,
+            };
+            let v = serde_json::to_value(&m).unwrap();
+            assert_eq!(v["refused"], want, "refusal wire spelling changed");
+        }
+
+        // A verified outcome is the smallest frame on the wire.
+        let verified = ClientMsg::ExtauthOutcome {
+            attempt_id: "a1".into(),
+            refused: None,
+            retry_after_secs: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&verified).unwrap(),
+            serde_json::json!({"t": "rc:extauth.outcome", "attempt_id": "a1"})
+        );
+
+        let server_frames = [
+            ServerMsg::ExtauthKe1 {
+                attempt_id: "a1".into(),
+                principal: "665f1c2a9b3e4d5f6a7b8c9d".into(),
+                ke1: "a2Ux".into(),
+            },
+            ServerMsg::ExtauthKe3 {
+                attempt_id: "a1".into(),
+                principal: "665f1c2a9b3e4d5f6a7b8c9d".into(),
+                ke3: "a2Uz".into(),
+            },
+            ServerMsg::ExtauthChallenge {
+                attempt_id: "a1".into(),
+                ke2: "a2Uy".into(),
+            },
+            ServerMsg::ExtauthResult {
+                attempt_id: None,
+                refused: Some(ExtauthRefusal::Unavailable),
+                retry_after_secs: None,
+            },
+            ServerMsg::ExtauthResult {
+                attempt_id: Some("a1".into()),
+                refused: Some(ExtauthRefusal::Throttled),
+                retry_after_secs: Some(30),
+            },
+        ];
+        for m in server_frames {
+            let json = serde_json::to_string(&m).unwrap();
+            let back: ServerMsg = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                serde_json::to_string(&back).unwrap(),
+                json,
+                "{json} did not survive the wire"
+            );
+        }
     }
 
     /// The optional fields must all be omissible: a `session_open` carries no

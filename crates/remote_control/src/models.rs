@@ -2637,6 +2637,11 @@ pub enum ExternalRcAuditAction {
     /// rotation is the revocation story for a leaked code, so "when did this
     /// code start being valid?" has to be answerable.
     RotateCode,
+    /// FR-52 P3 — an external-access LOGIN ended, verified or refused. One row
+    /// per attempt, written when it ends, once the connect code has resolved to
+    /// a device (an unresolvable code has no device and no tenant to attach a
+    /// row to). `user_id` is the would-be controller, not an admin.
+    Login,
 }
 
 /// One external-access decision, granted or refused. TTL-expired after 90 days
@@ -2675,10 +2680,67 @@ pub struct ExternalRcAuditEvent {
     /// Refusal reason; `None` = the decision went through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied: Option<ExternalRcDenyReason>,
+    /// `login` — the attempt this row closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    /// `login` — why it was refused; `None` on a `login` row = VERIFIED.
+    ///
+    /// ⚠️ This is the one place the refusal reasons are told apart. The
+    /// would-be controller only ever sees `unavailable` for every configuration
+    /// refusal; the org's own audit log is where "gate 2 had expired" and "the
+    /// device is offline" must be distinguishable, or no admin could act on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_refused: Option<ExtauthRefusal>,
+    /// `login` — what the SERVER knows about a refusal the controller saw as
+    /// `unavailable`: which gate, or offline. `None` when the device refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_detail: Option<String>,
 }
 
 impl ExternalRcAuditEvent {
     pub const COLLECTION: &'static str = "external_rc_audit";
+}
+
+/// FR-52 P3 — why an external-access login step was refused.
+///
+/// Carried device → server in `rc:extauth.outcome`, and server → controller in
+/// the same shape. The server maps its OWN refusals onto the same values, so a
+/// controller cannot tell which party said no — see [`Self::Unavailable`].
+///
+/// ⚠️ Decoded LENIENTLY off the agent (`extauth_refusal_lenient` in
+/// `signaling`), for FR-83's reason: an unknown spelling from a newer agent
+/// lands on [`Self::Other`] — still a refusal. A strict decode would fail the
+/// whole frame, the server would drop it at `debug!`, and a clear refusal would
+/// become "no answer" after the full wait. It must never land on "verified".
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtauthRefusal {
+    /// The ONE answer for everything a would-be controller must not be able to
+    /// tell apart: no such connect code, the org's switch off (gate 1), the
+    /// device not approved or the approval expired (gate 2), the device
+    /// offline or too old, the device's own opt-in off (gate 3), no password
+    /// set or an unreadable record (gate 4). Distinguishing them would turn the
+    /// connect code into a probe of the device's configuration — and would let
+    /// the holder of an old, rotated code learn that it once worked.
+    Unavailable,
+    /// The device has answered too many guesses recently. The one refusal that
+    /// carries a `retry_after_secs`, because telling a legitimate outsider when
+    /// to try again costs nothing — an attacker is throttled either way.
+    Throttled,
+    /// The server's own per-caller / per-code ceiling, a second limit behind
+    /// the device's (§4b of the FR-52 spec).
+    RateLimited,
+    /// Too many logins in flight on the device.
+    Busy,
+    /// A login message that is not an OPAQUE message.
+    Malformed,
+    /// KE3 did not verify.
+    Rejected,
+    /// KE3 for an attempt the device does not have in flight — never started,
+    /// expired, or already finished.
+    UnknownAttempt,
+    /// A reason this build does not know. Still a refusal.
+    Other,
 }
 
 #[cfg(test)]
@@ -2878,6 +2940,9 @@ mod external_access_tests {
             expires_at: None,
             at: DateTime::now(),
             denied: Some(ExternalRcDenyReason::NotDeviceAdmin),
+            attempt_id: None,
+            login_refused: None,
+            login_detail: None,
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert!(json.get("approved").is_none());

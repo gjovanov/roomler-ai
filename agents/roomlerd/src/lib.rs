@@ -40,6 +40,19 @@ pub mod displays;
 pub mod dpi;
 pub mod encode;
 pub mod exec;
+/// FR-52 P3c — the device's answer to `rc:extauth.*`. Ungated: every build
+/// advertises `external-access`, so every build must answer, if only with
+/// `unavailable`.
+pub mod extauth;
+/// FR-52 gate 4 — the device-held external-access password. Feature-gated
+/// (`external-access`): the OPAQUE stack is +7 crates, and only a build that
+/// serves cross-org access needs it.
+#[cfg(feature = "external-access")]
+pub mod external_access;
+/// FR-52 P3b — gate 4's policy: the guess budget, in-flight logins, and the
+/// single-use key a verified login leaves for the session offer.
+#[cfg(feature = "external-access")]
+pub mod external_logins;
 pub mod files;
 pub mod fp16;
 pub mod gpu_clock;

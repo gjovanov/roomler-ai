@@ -85,6 +85,14 @@ ssh-key = { workspace = true }
 # dep (vendored webrtc-data pulls it in), so adding it as a direct
 # dep is zero extra build cost.
 socket2 = "0.5"
+# FR-52 — hidden terminal input for `rc password set`. +2 crates (rpassword,
+# rtoolbox); libc / windows-sys are already here.
+#
+# Hand-rolling the ~60 lines (termios `ECHO` off on Unix, `SetConsoleMode` on
+# Windows) would mean owning the RESTORE path, and getting that wrong leaves the
+# operator's shell with echo permanently off after a Ctrl-C — a worse bug than
+# the one it saves a dependency on. This crate restores on drop.
+rpassword = "7.5.4"
 
 # SIGPIPE reset at the CLI entry (cli::run_from) so `roomler … | head` dies
 # quietly on EPIPE instead of panicking — Rust starts with SIGPIPE ignored.

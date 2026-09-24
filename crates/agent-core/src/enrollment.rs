@@ -105,6 +105,10 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // that would let enrollment itself hand the server the local veto.
         remote_config_enabled: false,
         external_access_enabled: false,
+        external_access_setup: None,
+        external_access_verifier: None,
+        external_consent_mode: None,
+        external_max_permissions: None,
         // Same rule for SSH, which grants strictly more than a bounded command.
         // `preserve_operator_config` keeps all three across a RE-enrollment
         // (they sit in the `..existing` tail), so a device that opted in stays

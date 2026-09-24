@@ -66,6 +66,18 @@ pub struct RemoteConfigServices {
     /// assertions took effect immediately — would be a strange kind of last
     /// word. The server can never write this; only [`Self::adopt_local`] can.
     remote_config_enabled: Arc<AtomicBool>,
+    /// FR-52 P3 — the device's external-login state: guess budget, in-flight
+    /// logins, verified grants.
+    ///
+    /// Here because this struct is built ONCE per daemon (`main.rs`) and cloned
+    /// into every org's control loop and the LocalAPI: the budget has to be the
+    /// DEVICE's, and one per loop would hand an attacker a separate budget for
+    /// every org the device belongs to. It is NOT a process-wide static — that
+    /// would be device-global too, but the integration tests run many agents in
+    /// one process, and a shared static would make one test's wrong passwords
+    /// throttle another's.
+    #[cfg(feature = "external-access")]
+    external_logins: Arc<crate::external_logins::ExternalLogins>,
 }
 
 impl RemoteConfigServices {
@@ -80,7 +92,15 @@ impl RemoteConfigServices {
             lock,
             exec_enabled: Arc::new(AtomicBool::new(exec_enabled)),
             remote_config_enabled: Arc::new(AtomicBool::new(remote_config_enabled)),
+            #[cfg(feature = "external-access")]
+            external_logins: Arc::new(crate::external_logins::ExternalLogins::new()),
         }
+    }
+
+    /// FR-52 P3 — the device's one external-login state (see the field).
+    #[cfg(feature = "external-access")]
+    pub fn external_logins(&self) -> &crate::external_logins::ExternalLogins {
+        &self.external_logins
     }
 
     /// Gate 4 for Fleet RPC, read per request.
@@ -91,6 +111,38 @@ impl RemoteConfigServices {
     /// Does this device accept pushed config at all? Read per push.
     pub fn remote_config_enabled(&self) -> bool {
         self.remote_config_enabled.load(Ordering::Relaxed)
+    }
+
+    /// FR-52 P3 — gate 3 and the gate-4 record, read from the config FILE at
+    /// the moment an outsider knocks.
+    ///
+    /// Live for the reason `exec_enabled` is live: `roomler rc password clear`
+    /// and `config set external_access_enabled false` are how the person at the
+    /// machine REVOKES cross-org access. A revocation that took effect only at
+    /// the next restart would leave an outsider able to log in after the owner
+    /// believed they had shut them out — the one direction in which "stale"
+    /// cannot be allowed.
+    ///
+    /// `None` = gate 3 is shut, or no complete record is stored: the device is
+    /// not accepting external logins. An unreadable file is the same answer —
+    /// failing closed is the only safe reading of "cannot tell".
+    #[cfg(feature = "external-access")]
+    pub async fn external_access_live(&self) -> Option<crate::external_access::Credential> {
+        let _guard = self.lock.lock().await;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let cfg = crate::config::load(&path).ok()?;
+            if !cfg.external_access_enabled {
+                return None;
+            }
+            Some(crate::external_access::Credential {
+                setup: cfg.external_access_setup?,
+                verifier: cfg.external_access_verifier?,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Re-seed the live flags from a config the LOCAL owner just wrote.

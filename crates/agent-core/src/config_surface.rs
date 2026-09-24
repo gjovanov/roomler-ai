@@ -113,6 +113,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Let someone OUTSIDE this device's organization control it (FR-52 gate 3). NEVER settable by the server — the whole `external_*` surface is absent from remote config, because a server able to set this could admit a stranger to a machine whose owner never agreed. Opens nothing on its own: an org admin must also approve this device, the outsider must prove the password held HERE, and whoever is at the machine is still asked. Default: OFF.",
     ),
     (
+        "external_consent_mode",
+        "prompt|auto",
+        "How consent is obtained when the controller is from OUTSIDE this organization (FR-52 gate 5). Deliberately separate from the org's consent setting: its answer for a colleague is not automatically its answer for a stranger. `auto` is the unattended case the password exists for, and has to be chosen HERE, on this device. Default: prompt.",
+    ),
+    (
+        "external_max_permissions",
+        "VIEW | INPUT | CLIPBOARD | FILES",
+        "This device's OWN ceiling on what an external session may do. Unset defers to the org's ceiling; where both are set a session gets the INTERSECTION, so a device can narrow what its org allows but never widen it. NOTE: the external-access PASSWORD is not settable here - use `roomler rc password set`, which never writes it anywhere readable.",
+    ),
+    (
         "ssh_enabled",
         "bool",
         "Serve SSH in-process on this node's overlay address (intercepted before the OS; sessions inherit the daemon's SYSTEM/root identity). Default: OFF.",
@@ -868,6 +878,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         }),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
         "external_access_enabled" => Some(fmt_bool(cfg.external_access_enabled)),
+        "external_consent_mode" => cfg.external_consent_mode.clone(),
+        "external_max_permissions" => cfg.external_max_permissions.clone(),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
@@ -1067,6 +1079,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // be one push away from meaningless. See `docs/remote-config.md`.
         "remote_config_enabled" => cfg.remote_config_enabled = parse_bool_or(value, false)?,
         "external_access_enabled" => cfg.external_access_enabled = parse_bool_or(value, false)?,
+        "external_consent_mode" => cfg.external_consent_mode = value.map(str::to_string),
+        "external_max_permissions" => cfg.external_max_permissions = value.map(str::to_string),
         // Same fail-safe direction as `exec_enabled`: clearing the key means
         // OFF. An SSH session is strictly more than a bounded command.
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
@@ -2721,5 +2735,72 @@ mod netstack_port_surface_tests {
 
         apply(&mut cfg, "ssh_max_privilege", None).unwrap();
         assert_eq!(cfg.ssh_max_privilege, None, "clearing returns to no limit");
+    }
+}
+
+#[cfg(test)]
+mod external_access_surface_tests {
+    use super::{KEYS, apply};
+
+    /// FR-52 — the credential half of the `external_*` surface is not editable
+    /// here, and a NEW `external_*` key has to be defended deliberately.
+    ///
+    /// Both directions of this surface are the problem, and each is worse than
+    /// it first looks:
+    /// - `config get` lists every key **with its value**, so a registered
+    ///   `external_access_verifier` is a credential printed on a terminal.
+    /// - `config set` would let anyone who can reach the LocalAPI store a record
+    ///   they generated themselves — and the pipe admits the **interactive
+    ///   user**, not just an admin. That is gate 4 replaced by a stranger's
+    ///   password without knowing the old one, which is the one thing the gate
+    ///   exists to make impossible.
+    ///
+    /// ⚠️ The allowlist, not a pair of `assert!(absent)` lines, is the point. The
+    /// two keys that exist today are excluded by **omission** — nothing stops the
+    /// next `external_*` field from being registered for symmetry, and the key
+    /// that matters is always the one added after the test was written. This is
+    /// the same shape as the `DesiredConfig` prefix guard for the same reason.
+    #[test]
+    fn no_external_credential_key_is_editable_through_the_config_surface() {
+        /// `external_*` keys an operator MAY edit on their own device. A new
+        /// `external_*` key fails this test until it is added here, which is the
+        /// moment to ask whether it is a setting or a secret.
+        const EDITABLE_EXTERNAL_KEYS: &[&str] = &[
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
+        ];
+
+        let registered: Vec<&str> = KEYS
+            .iter()
+            .map(|(k, _, _)| *k)
+            .filter(|k| k.starts_with("external"))
+            .collect();
+        for key in &registered {
+            assert!(
+                EDITABLE_EXTERNAL_KEYS.contains(key),
+                "`{key}` is on the editable config surface. If it is a SETTING, add it to \
+                 EDITABLE_EXTERNAL_KEYS. If it is any part of the password record, it must not be \
+                 here at all — `config get` would print it and `config set` would let the \
+                 interactive user choose the password. Set it with `roomler rc password set`."
+            );
+        }
+
+        // And the two that exist today, named explicitly, so the failure message
+        // points straight at them if someone registers them.
+        for key in ["external_access_setup", "external_access_verifier"] {
+            assert!(
+                !registered.contains(&key),
+                "`{key}` is part of the OPAQUE record and must never be on this surface"
+            );
+            // `apply` is the write half — belt and braces, because a key could
+            // be handled there without appearing in `KEYS`, and then it would be
+            // settable while staying invisible to `config ls`.
+            let mut cfg = crate::config::test_fixture();
+            assert!(
+                apply(&mut cfg, key, Some("anything")).is_err(),
+                "`{key}` must be unsettable through `apply`, listed or not"
+            );
+        }
     }
 }

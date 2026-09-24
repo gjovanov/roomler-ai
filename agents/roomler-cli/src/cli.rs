@@ -263,6 +263,12 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Remote-control settings for THIS device — the gates whose last word
+    /// belongs to whoever is at the machine, not to the organization.
+    Rc {
+        #[command(subcommand)]
+        action: RcAction,
+    },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
@@ -426,6 +432,52 @@ enum ConfigAction {
     Clear {
         /// Config key (as shown by `config ls`).
         key: String,
+    },
+}
+
+/// `roomler rc …` — this device's own remote-control settings.
+#[derive(Debug, Subcommand)]
+enum RcAction {
+    /// The external-access password (FR-52 gate 4) — what lets someone
+    /// OUTSIDE this device's organization control it, the way TeamViewer's
+    /// unattended password does.
+    Password {
+        #[command(subcommand)]
+        action: RcPasswordAction,
+    },
+}
+
+/// `roomler rc password …` — set, clear or inspect the device-held password.
+///
+/// The password is registered by the daemon as an OPAQUE record and is not
+/// readable back, by anyone, including this CLI and including the server. There
+/// is deliberately no way to set it from the dashboard: a password typed into a
+/// web form has already crossed the server, which is the one thing gate 4
+/// exists to prevent.
+#[derive(Debug, Subcommand)]
+enum RcPasswordAction {
+    /// Set (or change) it. Prompted twice and never echoed.
+    ///
+    /// ⚠️ There is deliberately **no** `--password <value>` flag. A process's
+    /// argv is readable by other local users through `/proc/<pid>/cmdline` on
+    /// Linux, and it lands in shell history; a flag would make the documented
+    /// way to use this command the insecure one. Unattended setup pipes the
+    /// password on stdin instead.
+    Set {
+        /// Read the password from stdin (one line) instead of prompting, for
+        /// unattended setup: `printf '%s' "$PW" | roomler rc password set --stdin`.
+        /// Only the line terminator is stripped.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Forget it — closes gate 4 on this device. Nothing outside the
+    /// organization can connect afterwards, whatever the org has approved.
+    Clear,
+    /// What this device believes about the gates it owns: is a password set, is
+    /// external access switched on, and can this build hold one at all.
+    Status {
+        #[command(flatten)]
+        fmt: OutputFmt,
     },
 }
 
@@ -647,6 +699,13 @@ where
             ConfigAction::Ls { fmt } => localclient::config_ls(fmt.json).await,
             ConfigAction::Set { key, value } => localclient::config_set(&key, Some(&value)).await,
             ConfigAction::Clear { key } => localclient::config_set(&key, None).await,
+        },
+        Command::Rc { action } => match action {
+            RcAction::Password { action } => match action {
+                RcPasswordAction::Set { stdin } => localclient::rc_password_set(stdin).await,
+                RcPasswordAction::Clear => localclient::rc_password_clear().await,
+                RcPasswordAction::Status { fmt } => localclient::rc_password_status(fmt.json).await,
+            },
         },
         Command::Ping {
             target,

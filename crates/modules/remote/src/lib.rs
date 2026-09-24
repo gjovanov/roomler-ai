@@ -38,6 +38,7 @@ use roomler_core::{AgentSocketHooks, Capabilities, Core, Module, TenantCtx};
 
 pub mod agent_socket;
 pub mod controller;
+pub mod extauth;
 pub mod relay;
 pub mod routes;
 
@@ -57,6 +58,10 @@ pub struct RemoteState {
     /// proxied rc sessions (a WS close forwards `rc.conn_closed` there;
     /// mirrors conference's `remote_media_conns`).
     pub remote_rc_conns: Arc<relay::RemoteRcConns>,
+    /// FR-52 P3c — the external-access login relay: attempts in flight and
+    /// the waiters for the device's answers. Pod-local, like the Hub it
+    /// relays through. See [`extauth`].
+    pub extauth: Arc<extauth::ExtauthRelay>,
 }
 
 impl std::ops::Deref for RemoteState {
@@ -86,6 +91,7 @@ impl Module for RemoteState {
             remote_audit: Arc::new(RemoteAuditDao::new(db)),
             rc_proxy_controllers: Arc::new(relay::ProxyControllers::new()),
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
+            extauth: Arc::new(extauth::ExtauthRelay::new()),
             fleet,
             core,
         };

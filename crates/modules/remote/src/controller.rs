@@ -44,6 +44,12 @@ pub struct ControllerFrame<'a> {
 /// (the socket then runs its other arms); a denial is answered on the
 /// controller's sender and counts as handled.
 pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame<'_>) -> bool {
+    // FR-52 P3c — an external-access login is not a session: it has its own
+    // gates and never reaches the Hub. Before the authz gate below, which
+    // would judge an outsider by a membership they do not have.
+    if let Some(handled) = crate::extauth::intercept(state, &frame) {
+        return handled;
+    }
     // Authorization + consent-mode gate for `rc:session.request`
     // (self-control / admin / REMOTE_CONTROL + per-device allowlist +
     // quarantine). A non-request rc:* message resolves to `Ok(Prompt)` and

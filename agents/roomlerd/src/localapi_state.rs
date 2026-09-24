@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::watch;
 use tunnel_core::localapi::{
-    ConnectionType, ConsentRequest, DaemonMode, FlowInfo, LocalApiState, NodeStatus, OverlayView,
-    PeerInfo, Response,
+    ConnectionType, ConsentRequest, DaemonMode, ExternalPasswordState, FlowInfo, LocalApiState,
+    NodeStatus, OverlayView, PeerInfo, Response, Secret,
 };
 
 /// How often the RTT prober ICMP-pings each carrier-reachable peer (P3b-3).
@@ -900,6 +900,160 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// FR-52 gate 4 — register a password and persist the record.
+    ///
+    /// Same write discipline as [`config_set`](Self::config_set): the daemon-wide
+    /// lock is held across load → derive → save, so a concurrent writer cannot
+    /// have its field dropped by our full-struct save, and a failure anywhere
+    /// leaves the file untouched (`config::save` is temp + fsync + rename).
+    ///
+    /// ⚠️ **What is logged here is the whole point of the method's shape**: the
+    /// outcome and nothing else. Not the password, not its length, not the
+    /// record. The neighbouring `config_set` logs `value = ?entry.value` — which
+    /// is right for it and would be a credential in the daemon's rolling log
+    /// here, a log `roomler logs` uploads to the server this gate exists to keep
+    /// out.
+    ///
+    /// ⚠️ Deliberately does **not** touch `external_access_enabled`. Setting a
+    /// password and opening gate 3 are two decisions; doing the second one on
+    /// the operator's behalf would admit outsiders at the moment they were
+    /// preparing to.
+    ///
+    /// Scope of the plaintext, stated because "never leaves the device" invites
+    /// a stronger reading than is true: the password exists in the calling CLI's
+    /// memory, in this process's memory for the duration of the call (the
+    /// request line buffer, serde's scratch, and the argument below), and
+    /// nowhere else — no file, no log, no server. It is not zeroized; doing so
+    /// for this argument alone while the line buffer in `serve_connection`
+    /// holds the same bytes would claim a property the code does not have.
+    async fn external_password_set(&self, password: &Secret) -> Response {
+        let Some((path, lock)) = self.config_persist.as_ref() else {
+            return Response::Error {
+                message: "config editing is not available on this daemon".into(),
+            };
+        };
+        #[cfg(not(feature = "external-access"))]
+        {
+            let _ = (path, lock, password);
+            // Distinct from "no password is set" on purpose — the fix is a
+            // different one (a build/update, not a command), and the two
+            // rendering alike is the failure `RpcCap::ExternalAccess` is
+            // unconditional to avoid.
+            Response::Error {
+                message: "this daemon was built without external-access support, so it cannot \
+                          hold a password"
+                    .into(),
+            }
+        }
+        #[cfg(feature = "external-access")]
+        {
+            let _guard = lock.lock().await;
+            let path = path.clone();
+            let password = password.expose().to_string();
+            // Argon2id by design — hundreds of ms, and this is a blocking KDF,
+            // so it must not run on a reactor thread. `spawn_blocking` also
+            // keeps the (already blocking) config load/save with it.
+            let saved = tokio::task::spawn_blocking(move || {
+                let mut cfg =
+                    crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
+                let (cred, origin) = crate::external_access::set_password(
+                    cfg.external_access_setup.as_deref(),
+                    &password,
+                )
+                .map_err(|e| e.to_string())?;
+                cfg.external_access_setup = Some(cred.setup);
+                cfg.external_access_verifier = Some(cred.verifier);
+                crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+                Ok((origin, external_password_state(&cfg)))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("external password task join: {e}")));
+            match saved {
+                Ok((origin, state)) => {
+                    tracing::info!(
+                        ?origin,
+                        gate3_enabled = state.enabled,
+                        "localapi: external-access password set"
+                    );
+                    Response::ExternalPassword(state)
+                }
+                Err(message) => Response::Error { message },
+            }
+        }
+    }
+
+    /// FR-52 gate 4 — drop the stored record, closing gate 4.
+    ///
+    /// Ungated by the feature: a device that held a password and was later
+    /// downgraded to a build without the credential stack must still be able to
+    /// forget it. Clearing is two `None`s and a save — no crypto is involved, so
+    /// there is nothing for the feature to gate.
+    ///
+    /// Both halves go together. A clear that dropped only the verifier would
+    /// leave a device that reports "no password set" (correct) next to a stored
+    /// setup that a later set would silently reuse — reviving the OPAQUE
+    /// identity of a credential the operator believed they had destroyed.
+    async fn external_password_clear(&self) -> Response {
+        let Some((path, lock)) = self.config_persist.as_ref() else {
+            return Response::Error {
+                message: "config editing is not available on this daemon".into(),
+            };
+        };
+        let _guard = lock.lock().await;
+        let path = path.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            let mut cfg =
+                crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
+            let had = cfg.external_access_setup.is_some() || cfg.external_access_verifier.is_some();
+            cfg.external_access_setup = None;
+            cfg.external_access_verifier = None;
+            // Saved even when nothing was stored: a half-written pair also
+            // reaches here, and an unconditional write is how a clear stays
+            // idempotent rather than depending on what it found.
+            crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+            Ok((had, external_password_state(&cfg)))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("external password task join: {e}")));
+        match saved {
+            Ok((had, state)) => {
+                tracing::info!(had, "localapi: external-access password cleared");
+                Response::ExternalPassword(state)
+            }
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    /// FR-52 — report gates 3 and 4 as this device sees them.
+    ///
+    /// Reads the config FILE rather than a boot-time snapshot, for the same
+    /// reason [`config_entries`](Self::config_entries) does: an edit made since
+    /// startup is exactly what the operator is checking for, and a snapshot
+    /// would answer with the state they are trying to change.
+    async fn external_password_status(&self) -> Response {
+        let Some((path, lock)) = self.config_persist.as_ref() else {
+            // No config path: report the build's capability truthfully and the
+            // rest as unknown-but-closed. An `Error` here would make "is this
+            // supported?" unanswerable, which is the one thing the caller came
+            // to ask.
+            return Response::ExternalPassword(ExternalPasswordState {
+                supported: cfg!(feature = "external-access"),
+                ..Default::default()
+            });
+        };
+        let _guard = lock.lock().await;
+        let path = path.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("config load task join: {e}")));
+        match loaded {
+            Ok(cfg) => Response::ExternalPassword(external_password_state(&cfg)),
+            Err(message) => Response::Error { message },
+        }
+    }
+
     /// S2 — bounded log tail for the desktop's log viewer. The daemon
     /// resolves the source from ITS OWN perspective (role-correct dirs,
     /// SYSTEM-profile paths the desktop can't even read), caps the
@@ -1270,6 +1424,27 @@ pub type RttSampleHook = Arc<dyn Fn(&str, u32) + Send + Sync>;
 /// A 24-char hex ObjectId — the only shape a session id may take before it's
 /// used as a sentinel filename. Guards [`DaemonState::consent_decide`] against a
 /// caller smuggling path separators / traversal into the filename.
+/// FR-52 — build the device's gate-3 / gate-4 view from its config.
+///
+/// ⚠️ `password_set` requires **both** halves. A config holding one without the
+/// other authenticates nobody, so reporting it as "set" would tell an operator
+/// their device is ready when the next connection attempt will fail to parse the
+/// record — and the fix for both states is the same command, so there is nothing
+/// lost by calling the broken one "not set".
+///
+/// ⚠️ `supported` is `cfg!`, not a runtime probe: it answers "was this binary
+/// built with the credential stack", which is the question whose fix is a
+/// different build rather than a different command.
+fn external_password_state(cfg: &crate::config::AgentConfig) -> ExternalPasswordState {
+    ExternalPasswordState {
+        supported: cfg!(feature = "external-access"),
+        password_set: cfg.external_access_setup.is_some() && cfg.external_access_verifier.is_some(),
+        enabled: cfg.external_access_enabled,
+        consent_mode: cfg.external_consent_mode.clone(),
+        max_permissions: cfg.external_max_permissions.clone(),
+    }
+}
+
 fn is_hex_object_id(s: &str) -> bool {
     s.len() == 24 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1656,5 +1831,148 @@ mod tests {
         let mut p2 = vec![peer(Some("aid-1"), ConnectionType::Blocked)];
         apply_tunnel_override(&mut p2, &HashSet::new());
         assert_eq!(p2[0].connection, ConnectionType::Blocked);
+    }
+
+    /// FR-52 P2c — set → persist → reload → clear, against a real config file,
+    /// and **the password is never on disk**.
+    ///
+    /// The last assertion is the one worth the test. Everything else here would
+    /// still pass if `set_password` stored the plaintext beside the record, or
+    /// if a future "cache the password to avoid re-deriving" optimisation landed
+    /// — and a config file is exactly what gets copied into a support ticket,
+    /// a backup, or a crash bundle. The gate's entire claim is that the password
+    /// exists nowhere the server or a file copy can reach, so it is asserted
+    /// here rather than trusted. (Falsified: leaking the plaintext into any
+    /// other config field turns this red.)
+    ///
+    /// Only compiled with the credential stack: without it `set` is a refusal,
+    /// which the wire test already covers.
+    #[cfg(feature = "external-access")]
+    #[tokio::test]
+    async fn an_external_password_persists_and_never_lands_in_the_config_file() {
+        // Built, not written — a scanner cannot tell a KDF input in a test from
+        // a leaked credential, and it is right to stop the ones it sees.
+        let password = format!("fr52-{}-not-a-credential-p2c", "roundtrip");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "dev".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("extpw"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        )
+        .with_config_persist(path.clone(), Arc::new(tokio::sync::Mutex::new(())));
+
+        // Nothing set yet.
+        match st.external_password_status().await {
+            Response::ExternalPassword(s) => {
+                assert!(s.supported);
+                assert!(!s.password_set);
+                assert!(!s.enabled, "gate 3 is off by default");
+            }
+            other => panic!("expected ExternalPassword, got {other:?}"),
+        }
+
+        // A refused password must not touch the file — the same discipline
+        // `set_device_name` has, and the reason the floor lives in the daemon.
+        assert!(matches!(
+            st.external_password_set(&Secret("short".into())).await,
+            Response::Error { .. }
+        ));
+        assert!(
+            crate::config::load(&path)
+                .unwrap()
+                .external_access_setup
+                .is_none()
+        );
+
+        // Set it.
+        match st.external_password_set(&Secret(password.clone())).await {
+            Response::ExternalPassword(s) => assert!(s.password_set),
+            other => panic!("expected ExternalPassword, got {other:?}"),
+        }
+
+        // It survives a reload — the daemon reads this file, not a snapshot.
+        let stored = crate::config::load(&path).unwrap();
+        let cred = crate::external_access::Credential {
+            setup: stored.external_access_setup.clone().expect("setup"),
+            verifier: stored.external_access_verifier.clone().expect("verifier"),
+        };
+        crate::external_access::parse(&cred).expect("the stored record must be readable back");
+        assert!(
+            !stored.external_access_enabled,
+            "setting a password must not open gate 3"
+        );
+
+        // ⚠️ The plaintext is nowhere in the file. Checked against the RAW bytes,
+        // not the parsed struct: a leak would most plausibly arrive as a new
+        // field nobody thought to look at.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains(&password),
+            "the password reached the config file on disk"
+        );
+
+        // Clear drops BOTH halves.
+        match st.external_password_clear().await {
+            Response::ExternalPassword(s) => assert!(!s.password_set),
+            other => panic!("expected ExternalPassword, got {other:?}"),
+        }
+        let cleared = crate::config::load(&path).unwrap();
+        assert!(cleared.external_access_setup.is_none(), "setup cleared");
+        assert!(
+            cleared.external_access_verifier.is_none(),
+            "a surviving setup would be silently reused by the next set, reviving the OPAQUE \
+             identity of a credential the operator believed destroyed"
+        );
+    }
+
+    /// FR-52 — a half-written record reports NOT set, and gate 4 never reports
+    /// gate 3.
+    ///
+    /// The half-written case is not hypothetical bookkeeping: it is what a
+    /// hand-edited config, a partial merge or a future writer that forgets one
+    /// field produces. Reporting it as "set" would tell an operator the device
+    /// is ready, and the failure would surface as an unexplained refusal at the
+    /// moment someone outside the org is waiting on the phone.
+    ///
+    /// The last assertion is the one that would catch a "helpful" change: a set
+    /// that also flipped `external_access_enabled` would admit outsiders at the
+    /// instant the owner was still preparing to.
+    #[test]
+    fn a_half_written_password_record_reports_not_set() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!external_password_state(&cfg).password_set, "neither half");
+
+        cfg.external_access_setup = Some("setup".into());
+        assert!(
+            !external_password_state(&cfg).password_set,
+            "a setup without a verifier authenticates nobody"
+        );
+
+        cfg.external_access_setup = None;
+        cfg.external_access_verifier = Some("verifier".into());
+        assert!(
+            !external_password_state(&cfg).password_set,
+            "a verifier without its setup cannot be read back"
+        );
+
+        cfg.external_access_setup = Some("setup".into());
+        let state = external_password_state(&cfg);
+        assert!(state.password_set, "both halves");
+        assert!(
+            !state.enabled,
+            "gate 4 must not report gate 3 — a stored password opens nothing on its own"
+        );
     }
 }
