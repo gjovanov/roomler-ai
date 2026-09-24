@@ -405,6 +405,19 @@ if [ "$MODE" = update ]; then
     #    So: comments, blank lines, grouping and ordering are NEVER touched. An
     #    entry whose count is unchanged is emitted byte-for-byte, so the diff
     #    shows only what really moved.
+    #
+    # ⚠️ …and "byte-for-byte" includes the LINE ENDINGS, which the first version
+    #    got wrong on this repo's own dev box. Git for Windows checks this file
+    #    out CRLF (`core.autocrlf=true`), and MSYS awk STRIPS the CR on read and
+    #    writes a bare LF — measured: `ab\r\n` reads as length 2, prints `ab\n`.
+    #    So a no-op update rewrote all 76 lines. `git diff` normalises and showed
+    #    nothing, which is exactly why the byte-identity test passed in the main
+    #    clone (whose copy had never been re-checked-out) and why nobody would
+    #    have seen it — until a raw `diff` in a fresh worktree flagged every line.
+    #    Detected with `od`, not `grep $'\r'`: through a pipe on this box that
+    #    reported a CR on every line of a file that had none.
+    crlf=0
+    if od -An -tx1 -v "$BASELINE" | tr ' ' '\n' | grep -q '^0d$'; then crlf=1; fi
     tmp="$BASELINE.tmp.$$"
     awk -v debt="$debt_kv" -v nodocs="$nodocs_lines" '
         BEGIN {
@@ -451,7 +464,17 @@ if [ "$MODE" = update ]; then
                     printf "  - ADDED nodocs %s — needs a reason before commit\n", k > "/dev/stderr"
                 }
         }
-    ' "$BASELINE" > "$tmp" && mv "$tmp" "$BASELINE"
+    ' "$BASELINE" > "$tmp"
+
+    # Put the file's own line endings back. Every line, whether it came from a
+    # `print` or from one of the `printf`s above: those emit a bare LF whatever
+    # ORS says. `sub(/\r$/, "")` first, because gawk on Linux does NOT strip the
+    # CR on read, and a line that kept one would otherwise end up CR CR LF.
+    if [ "$crlf" -eq 1 ]; then
+        awk 'BEGIN { ORS = "\r\n" } { sub(/\r$/, ""); print }' "$tmp" > "$tmp.eol"
+        mv "$tmp.eol" "$tmp"
+    fi
+    mv "$tmp" "$BASELINE"
 
     echo "$BASELINE updated in place — $n_debt FRs / $n_debt_criteria criteria, $n_nodocs nodocs pinned."
     echo "⚠️  Any line marked TODO records a count and nothing else. Say what it is."
