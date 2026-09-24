@@ -78,9 +78,83 @@ pub struct Suite;
 impl opaque_ke::CipherSuite for Suite {
     type OprfCs = Ristretto255;
     type KeyExchange = TripleDh<Ristretto255, sha2::Sha512>;
-    /// ⚠️ NOT `ksf::Identity`. See the module docs — this is what stands
-    /// between a stolen config file and the password in it.
-    type Ksf = argon2::Argon2<'static>;
+    /// ⚠️ NOT `ksf::Identity` (see the module docs — this is what stands
+    /// between a stolen config file and the password in it), and NOT a bare
+    /// `argon2::Argon2` either: see [`PinnedArgon2`].
+    type Ksf = PinnedArgon2;
+}
+
+/// Argon2id memory cost, in KiB — 2^16, i.e. 64 MiB.
+pub const KSF_MEMORY_KIB: u32 = 1 << 16;
+/// Argon2id passes.
+pub const KSF_ITERATIONS: u32 = 3;
+/// Argon2id lanes.
+pub const KSF_PARALLELISM: u32 = 4;
+
+/// The key-stretching function, with its parameters PINNED rather than taken
+/// from a crate default.
+///
+/// In OPAQUE the KSF runs on the **client** — at registration (where this
+/// device plays the client) and at every login (where the outsider's browser
+/// does). Both must use byte-identical parameters or the login cannot verify:
+/// the browser derives a different key, the envelope does not open, and the
+/// right password is refused. So the parameters are a wire-compatibility
+/// surface, and changing them after a record is stored is a forced password
+/// reset on that device.
+///
+/// ⚠️ **What this replaced, and why it had to go.** `type Ksf =
+/// argon2::Argon2<'static>` used `Argon2::default()` — 19 MiB, 2 passes,
+/// 1 lane — because opaque-ke falls back to `CS::Ksf::default()` whenever a
+/// caller passes no KSF. The browser library (`@serenity-kit/opaque`, which is
+/// opaque-ke itself compiled to WASM) defaults to 64 MiB, 3 passes, 4 lanes.
+/// Measured before this change: the real browser client, typing the CORRECT
+/// password, could not log into a device this crate had registered ("KE2 did
+/// not verify"). Every browser login would have failed, and the first place
+/// anyone would have seen it was P4's connect page.
+///
+/// Making the TYPE's `Default` the pinned instance, rather than passing pinned
+/// parameters at call sites, is the point: opaque-ke reaches for `Default`
+/// whenever a caller omits the KSF, so a call site that forgot could not fall
+/// back to anything else.
+///
+/// The values are the browser library's DEFAULT ("memory-constrained", RFC
+/// 9106 §4's recommendation for memory-constrained environments), so the
+/// connect page can call it with no key-stretching option at all — one fewer
+/// place for the two sides to drift. ~1 s on a laptop's browser per login.
+pub struct PinnedArgon2(opaque_ke::argon2::Argon2<'static>);
+
+impl Default for PinnedArgon2 {
+    fn default() -> Self {
+        use opaque_ke::argon2::{Algorithm, Argon2, Params, Version};
+        // Valid by construction; `the_pinned_ksf_matches_an_independent_argon2id`
+        // builds this first and would fail before any record could be written.
+        let params = Params::new(KSF_MEMORY_KIB, KSF_ITERATIONS, KSF_PARALLELISM, None)
+            .expect("the pinned Argon2id parameters are valid");
+        Self(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+    }
+}
+
+impl opaque_ke::ksf::Ksf for PinnedArgon2 {
+    /// Byte-for-byte opaque-ke's own `impl Ksf for Argon2` — and
+    /// `@serenity-kit/opaque`'s `CustomKsf` — so the only thing this type
+    /// changes is WHICH instance runs: a zero salt of `RECOMMENDED_SALT_LEN`
+    /// (OPAQUE salts through the OPRF, not here) and an output as long as the
+    /// input.
+    fn hash<L: opaque_ke::generic_array::ArrayLength<u8>>(
+        &self,
+        input: opaque_ke::generic_array::GenericArray<u8, L>,
+    ) -> Result<opaque_ke::generic_array::GenericArray<u8, L>, opaque_ke::errors::InternalError>
+    {
+        let mut output = opaque_ke::generic_array::GenericArray::default();
+        self.0
+            .hash_password_into(
+                &input,
+                &[0; opaque_ke::argon2::RECOMMENDED_SALT_LEN],
+                &mut output,
+            )
+            .map_err(|_| opaque_ke::errors::InternalError::KsfError)?;
+        Ok(output)
+    }
 }
 
 /// What `rc password set` persists. Both halves or neither: a config carrying
@@ -111,6 +185,12 @@ pub enum Error {
     Protocol,
     /// A stored value is not valid base64, or not a value this suite wrote.
     Corrupt,
+    /// A login message from the other side did not deserialize. Distinct from
+    /// `LoginRejected`: this is a broken or hostile client, not a wrong
+    /// password, and the two want different lines in an audit log.
+    Malformed,
+    /// KE3 did not verify — the client did not prove it knows the password.
+    LoginRejected,
 }
 
 impl std::fmt::Display for Error {
@@ -129,6 +209,8 @@ impl std::fmt::Display for Error {
             Self::Corrupt => {
                 "the stored external-access credential is unreadable — set the password again"
             }
+            Self::Malformed => "a login message could not be read",
+            Self::LoginRejected => "the login did not verify",
         })
     }
 }
@@ -280,10 +362,96 @@ pub fn parse(cred: &Credential) -> Result<(ServerSetup<Suite>, ServerRegistratio
     Ok((setup, verifier))
 }
 
+// ---------------------------------------------------------------------------
+// FR-52 P3 — the device's half of an OPAQUE LOGIN.
+//
+// Two pure steps, no state tables and no gates: KE1 → KE2, then KE3 → a
+// session key. Who may start a login, how often, and what a verified login is
+// good for are the caller's business; these functions only speak the
+// protocol, so they can be proven against a real browser client in isolation.
+// ---------------------------------------------------------------------------
+
+/// The device's state between answering KE1 and receiving KE3.
+///
+/// Deliberately opaque and not `Clone`: a pending login is consumed by
+/// [`login_finish`], so the type makes "finish the same login twice"
+/// unrepresentable rather than merely unlikely.
+pub struct PendingLogin(opaque_ke::ServerLogin<Suite>);
+
+/// The 64-byte key both sides hold after a verified login.
+///
+/// ⚠️ `Debug` is redacted, for the reason `localapi::Secret` is: this is the
+/// value everything after the login is authenticated under, and the most likely
+/// way it leaves the process is a well-meant `tracing::debug!(?grant)`.
+pub struct SessionKey(Vec<u8>);
+
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionKey(***)")
+    }
+}
+
+impl SessionKey {
+    /// Borrow the key. Every call site is a place to ask where it can end up.
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// KE1 → KE2: answer a client's login request against this device's record.
+///
+/// ⚠️ **The caller must count this call as a guess, not wait for KE3.** In
+/// OPAQUE the *client* learns whether its password is right when it opens KE2 —
+/// before it ever sends KE3. A caller that throttled only failed KE3s would give
+/// an attacker unlimited free guesses: send KE1, check KE2 locally, never send
+/// KE3, and the device never sees a failure at all.
+///
+/// Cheap on this side by design: the key stretching (Argon2id) runs on the
+/// CLIENT at login. The device does one OPRF evaluation and the 3DH, so a flood
+/// of KE1s costs the attacker a round trip each and the device almost nothing.
+pub fn login_start(cred: &Credential, ke1: &[u8]) -> Result<(Vec<u8>, PendingLogin), Error> {
+    let (setup, record) = parse(cred)?;
+    let request =
+        opaque_ke::CredentialRequest::<Suite>::deserialize(ke1).map_err(|_| Error::Malformed)?;
+    let mut rng = OsRng;
+    let started = opaque_ke::ServerLogin::<Suite>::start(
+        &mut rng,
+        &setup,
+        Some(record),
+        request,
+        IDENTITY,
+        // No context and default identifiers, matching the browser client
+        // (`@serenity-kit/opaque` passes `None` for both). The principal is
+        // bound AFTER the login, by deriving the application key from the
+        // session key — see the P3 section of the FR-52 spec.
+        opaque_ke::ServerLoginParameters::default(),
+    )
+    .map_err(|_| Error::Protocol)?;
+    Ok((
+        started.message.serialize().to_vec(),
+        PendingLogin(started.state),
+    ))
+}
+
+/// KE3 → the session key, or a refusal.
+///
+/// A wrong password surfaces HERE as [`Error::LoginRejected`] — but only for a
+/// client honest enough to send its KE3. See [`login_start`] for why that is
+/// not where guesses may be counted.
+pub fn login_finish(pending: PendingLogin, ke3: &[u8]) -> Result<SessionKey, Error> {
+    let finalization = opaque_ke::CredentialFinalization::<Suite>::deserialize(ke3)
+        .map_err(|_| Error::Malformed)?;
+    let finished = pending
+        .0
+        .finish(finalization, opaque_ke::ServerLoginParameters::default())
+        .map_err(|_| Error::LoginRejected)?;
+    Ok(SessionKey(finished.session_key.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opaque_ke::{ClientLogin, ClientLoginFinishParameters, ServerLogin, ServerLoginParameters};
+    use opaque_ke::{ClientLogin, ClientLoginFinishParameters};
 
     /// Test passwords are BUILT, never written as literals.
     ///
@@ -303,38 +471,32 @@ mod tests {
     /// pair is actually usable, and proves it now rather than after a protocol
     /// change has quietly made every fielded password unreadable.
     fn login(cred: &Credential, password: &str) -> Result<(), ()> {
-        let (setup, verifier) = parse(cred).map_err(|_| ())?;
+        // The DEVICE half goes through `login_start` / `login_finish` — the
+        // functions that ship — not through opaque-ke directly. A helper that
+        // drove the protocol itself would keep every test below green no
+        // matter what the shipping path did (P2c deleted a test for exactly
+        // that). The CLIENT half is raw opaque-ke, standing in for the browser.
         let mut rng = OsRng;
         let c1 = ClientLogin::<Suite>::start(&mut rng, password.as_bytes()).map_err(|_| ())?;
-        let s1 = ServerLogin::<Suite>::start(
-            &mut rng,
-            &setup,
-            Some(verifier),
-            c1.message,
-            IDENTITY,
-            ServerLoginParameters::default(),
-        )
-        .map_err(|_| ())?;
+        let (ke2, pending) = login_start(cred, &c1.message.serialize()).map_err(|_| ())?;
         let c2 = c1
             .state
             .finish(
                 &mut rng,
                 password.as_bytes(),
-                s1.message,
+                opaque_ke::CredentialResponse::<Suite>::deserialize(&ke2).map_err(|_| ())?,
                 ClientLoginFinishParameters::default(),
             )
             .map_err(|_| ())?;
-        let s2 = s1
-            .state
-            .finish(c2.message, ServerLoginParameters::default())
-            .map_err(|_| ())?;
+        let key = login_finish(pending, &c2.message.serialize()).map_err(|_| ())?;
         // Both sides derived a session key, and they AGREE. That agreement is
-        // the thing P3 binds the DTLS fingerprint to; without it a "verified"
+        // the thing P4 binds the DTLS fingerprint to; without it a "verified"
         // password would still leave the server free to substitute its own
         // peer, and the whole aPAKE would buy less than it looks like.
         assert_eq!(
-            c2.session_key, s2.session_key,
-            "client and server derived different session keys"
+            c2.session_key.as_slice(),
+            key.expose(),
+            "client and device derived different session keys"
         );
         Ok(())
     }
@@ -525,6 +687,106 @@ mod tests {
         assert!(
             msg.contains(&MIN_PASSWORD_CHARS.to_string()),
             "the refusal must name MIN_PASSWORD_CHARS ({MIN_PASSWORD_CHARS}), got: {msg}"
+        );
+    }
+
+    /// FR-52 P3a — the KSF reproduces a vector from an INDEPENDENT Argon2id.
+    ///
+    /// The expected bytes were computed by OpenSSL's Argon2 (Node 24,
+    /// `crypto.argon2Sync("argon2id", { message: 00..3f, nonce: 16 × 00,
+    /// memory: 65536, passes: 3, parallelism: 4, tagLength: 64 })`), not by
+    /// this crate. One assertion therefore pins the algorithm, the version, all
+    /// three costs, the salt convention and the output length — every value the
+    /// browser client must share with this device for a login to verify.
+    ///
+    /// ⚠️ A golden value computed by the code under test would only prove the
+    /// code agrees with itself; this one would fail if the argon2 crate, the
+    /// pinned constants, or opaque-ke's salt convention moved.
+    #[test]
+    fn the_pinned_ksf_matches_an_independent_argon2id() {
+        use opaque_ke::generic_array::{GenericArray, typenum::U64};
+        use opaque_ke::ksf::Ksf as _;
+
+        let input: GenericArray<u8, U64> = GenericArray::from_exact_iter(0u8..64).unwrap();
+        let out = PinnedArgon2::default().hash(input).expect("the KSF runs");
+        let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "763c05e205e6d06f9d49921578c5fc314590d8016bd8ccc98049f3da265fad5d\
+             4a27e85aaac6ac1de7cf2aeda7b8c767de0ff4e5db3ff8421d9bb3e8effb279b",
+            "the KSF no longer matches the browser client's Argon2id — every \
+             stored record and every login in the field depends on these bytes"
+        );
+    }
+
+    /// FR-52 P3 — a wrong password is decided at KE2, so the DEVICE never sees
+    /// a failure.
+    ///
+    /// This is the property the device's throttling is built on, asserted here
+    /// so it cannot be forgotten by whoever writes that throttle: the device
+    /// answers KE1 (one guess served), and the client learns it was wrong while
+    /// opening KE2 — before a KE3 exists to send. A guessing client simply
+    /// stops there. Measured with the real browser library too (FR-52 field
+    /// log, 2026-09-24): wrong password ⇒ "KE2 did not verify", and the device
+    /// saw only an abandoned login.
+    ///
+    /// ⚠️ Consequence: guesses must be counted when KE1 is ANSWERED. A throttle
+    /// that counted failed KE3s would count nothing.
+    #[test]
+    fn a_wrong_password_is_decided_at_ke2_so_the_device_never_sees_a_failure() {
+        let cred = register(&pw("right")).unwrap();
+        let mut rng = OsRng;
+        let c1 = ClientLogin::<Suite>::start(&mut rng, pw("wrong").as_bytes()).unwrap();
+
+        // The device answers — it cannot know the guess is wrong yet.
+        let (ke2, _pending) =
+            login_start(&cred, &c1.message.serialize()).expect("the device answers KE1");
+
+        // ...and the client learns the answer from KE2 alone.
+        let opened = c1.state.finish(
+            &mut rng,
+            pw("wrong").as_bytes(),
+            opaque_ke::CredentialResponse::<Suite>::deserialize(&ke2).unwrap(),
+            ClientLoginFinishParameters::default(),
+        );
+        assert!(
+            opened.is_err(),
+            "a wrong password must fail CLIENT-side at KE2 — if this ever passes, the \
+             throttling rationale in `login_start` no longer holds and must be revisited"
+        );
+        // `_pending` is dropped unfinished: the device has no failure to count.
+    }
+
+    /// A message that is not an OPAQUE message is `Malformed`, at either step —
+    /// never `LoginRejected`, which would record a broken client as a wrong
+    /// password in the audit log.
+    #[test]
+    fn garbage_is_malformed_not_a_wrong_password() {
+        let cred = register(&pw("malformed")).unwrap();
+        assert!(matches!(
+            login_start(&cred, b"not a KE1"),
+            Err(Error::Malformed)
+        ));
+
+        let mut rng = OsRng;
+        let c1 = ClientLogin::<Suite>::start(&mut rng, pw("malformed").as_bytes()).unwrap();
+        let (_, pending) = login_start(&cred, &c1.message.serialize()).unwrap();
+        assert!(matches!(
+            login_finish(pending, b"not a KE3"),
+            Err(Error::Malformed)
+        ));
+    }
+
+    /// The session key does not print itself — the same guard `Secret` has, for
+    /// the value everything after a login is authenticated under.
+    #[test]
+    fn a_session_key_never_prints_itself() {
+        let key = SessionKey(vec![0xAB; 64]);
+        let printed = format!("{key:?}");
+        assert!(!printed.to_lowercase().contains("ab"), "{printed}");
+        assert!(
+            !printed.contains("171"),
+            "not even as decimal bytes: {printed}"
         );
     }
 }

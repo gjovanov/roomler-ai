@@ -24,6 +24,12 @@ path = "src/lib.rs"
 name = "roomlerd"
 path = "src/main.rs"
 
+[[example]]
+# FR-52 — the device half of a cross-implementation OPAQUE login, for proving a
+# browser client can log into a device. See the file's module docs.
+name = "extauth_interop"
+required-features = ["external-access"]
+
 [dependencies]
 # Shared protocol types (ClientMsg, ServerMsg, etc.)
 # default-features = false drops the `server` half (Mongo audit DAO + Hub) —
@@ -193,9 +199,13 @@ opaque-ke = { version = "4", default-features = false, features = [
     "std",
 ], optional = true }
 
-# The KSF behind opaque-ke's `argon2` feature, named directly because
-# `Suite::Ksf = argon2::Argon2<'static>` needs the type in scope.
-argon2 = { workspace = true, optional = true }
+# ⚠️ NO direct `argon2` dependency, on purpose (FR-52 P3a). The KSF uses
+# `opaque_ke::argon2` — the crate opaque-ke's own hashing was written against —
+# because the KSF's output IS every device's stored record: a workspace bump of
+# a SHARED crate (the server hashes user passwords with it) must not be able to
+# change what an external-access password derives to. The parameters are pinned
+# in `external_access::PinnedArgon2` and locked by a known-answer test against an
+# independent implementation, so an opaque-ke bump that moved argon2 fails there.
 
 # ⚠️ opaque-ke is on `rand 0.8` (rand_core 0.6) while the workspace is on
 # `rand 0.9`, and the two `RngCore` traits are DIFFERENT types — passing the
@@ -690,7 +700,7 @@ ssh-server = ["dep:russh", "overlay-netstack"]
 # password one. Gating the verb here would make a build without the feature
 # un-approvable AND indistinguishable from an agent too old to have it: two
 # different fixes behind one symptom, which is the split P2a exists to keep.
-external-access = ["dep:opaque-ke", "dep:argon2", "dep:rand_opaque"]
+external-access = ["dep:opaque-ke", "dep:rand_opaque"]
 
 # build.rs embeds a Windows VERSIONINFO resource into roomlerd.exe.
 # `[target.'cfg(windows)'.build-dependencies]` resolves against the HOST
