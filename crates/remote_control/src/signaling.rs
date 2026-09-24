@@ -1479,7 +1479,14 @@ mod namespace_tests {
     /// source — so the table below is checked against what serde actually
     /// emits, not against a second hand-written list.
     fn client_renames() -> Vec<String> {
-        let src = include_str!("signaling.rs");
+        // Line endings normalised first. A Windows checkout (core.autocrlf)
+        // stores this file with CRLF, so the `"\n}\n"` search below never
+        // matched and the test panicked with "the enum closes" BEFORE checking
+        // a single tag — on those machines the owner table was unverifiable,
+        // and the failure read as one of "the stale tests on master". ⚠️ No CI
+        // lane runs this crate's unit tests at all (2026-09-24), so a local run
+        // is the only place this gate has ever executed.
+        let src = include_str!("signaling.rs").replace("\r\n", "\n");
         let start = src
             .find("pub enum ClientMsg {")
             .expect("the enum is in this file");
