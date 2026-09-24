@@ -45,6 +45,10 @@ pub mod exec;
 /// serves cross-org access needs it.
 #[cfg(feature = "external-access")]
 pub mod external_access;
+/// FR-52 P3b — gate 4's policy: the guess budget, in-flight logins, and the
+/// single-use key a verified login leaves for the session offer.
+#[cfg(feature = "external-access")]
+pub mod external_logins;
 pub mod files;
 pub mod fp16;
 pub mod gpu_clock;

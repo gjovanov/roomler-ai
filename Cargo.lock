@@ -8571,6 +8571,7 @@ dependencies = [
  "ffmpeg-next",
  "futures",
  "hex",
+ "hkdf 0.12.4",
  "if-addrs",
  "ipnet",
  "libc",

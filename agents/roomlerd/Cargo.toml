@@ -199,6 +199,13 @@ opaque-ke = { version = "4", default-features = false, features = [
     "std",
 ], optional = true }
 
+# FR-52 P3b — derives the single-use application key a verified login leaves
+# behind (session key + attempt + principal). Already in the graph through the
+# RustCrypto stack, so +0 crates; named here because the derivation is a wire
+# surface the browser must reproduce byte-for-byte, and it gets a known-answer
+# test against an independent HKDF.
+hkdf = { version = "0.12", optional = true }
+
 # ⚠️ NO direct `argon2` dependency, on purpose (FR-52 P3a). The KSF uses
 # `opaque_ke::argon2` — the crate opaque-ke's own hashing was written against —
 # because the KSF's output IS every device's stored record: a workspace bump of
@@ -700,7 +707,7 @@ ssh-server = ["dep:russh", "overlay-netstack"]
 # password one. Gating the verb here would make a build without the feature
 # un-approvable AND indistinguishable from an agent too old to have it: two
 # different fixes behind one symptom, which is the split P2a exists to keep.
-external-access = ["dep:opaque-ke", "dep:rand_opaque"]
+external-access = ["dep:opaque-ke", "dep:rand_opaque", "dep:hkdf"]
 
 # build.rs embeds a Windows VERSIONINFO resource into roomlerd.exe.
 # `[target.'cfg(windows)'.build-dependencies]` resolves against the HOST
