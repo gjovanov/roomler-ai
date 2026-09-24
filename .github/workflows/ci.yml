@@ -144,7 +144,13 @@ jobs:
       # ⚠️ A fresh key is NOT a fix by itself — only an index the action can
       # resolve against is. The guards below are the safety net and the metric,
       # not the cure: their `did not deliver` warning must be ABSENT on a
-      # healthy cache, and it had been firing on every green run for 17 days.
+      # healthy cache.
+      #
+      # ⚠️ But a guard's alarm is a metric only once it has stayed SILENT on a
+      # known-good input. The libvpx guard fired on every green run from 09-06
+      # to 09-24 against caches that were full the whole time, because
+      # `ldconfig -p` reads /etc/ld.so.cache rather than the disk (#1604) — 17
+      # days of warnings that described the detector, not the cache.
       - name: Configure apt retries and refresh the index
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
