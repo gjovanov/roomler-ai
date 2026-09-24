@@ -179,11 +179,23 @@ The FFmpeg builds already publish to a **permanent GitHub Release**
 artifact expires in 90 days and cannot carry a three-year offer, which is why
 the release, not the artifact, is the anchor.
 
-`lgpl-source-offer.yml` publishes the **corresponding source** — pristine
-upstream tarball archived by us (an upstream tag can move) plus the complete
-build recipe — to that same release, and then asserts the asset actually
-resolves. ⚠️ A written offer pointing at a missing asset claims compliance we do
-not have, so the verification step is part of the job, not a nicety.
+`lgpl-source-offer.yml` publishes the **corresponding source** — the upstream
+tarball archived by us (an upstream tag can move), every change our builds make
+to it, and the complete build recipe — to that same release, and then asserts
+the asset actually resolves. ⚠️ A written offer pointing at a missing asset claims
+compliance we do not have, so the verification step is part of the job, not a
+nicety.
+
+⚠️ **"Resolves" was not "complete", and for four weeks nothing noticed** (P4c).
+The bundle shipped the upstream tarball and the recipe only. The recipe
+*referenced* `.github/ffmpeg-patches/` (our FR-62 patch, since 2026-09-02) and
+the vcpkg port's own 14 patches without carrying either. Meanwhile this page, the
+bundle's README and `THIRD-PARTY-NOTICES.md` all said "we apply no patches", and
+`docs/lgpl-relink.md` said the recipe applied them. The asset check was green
+throughout, because it asked "is there a file" and never "is it the source we
+built from". The fix answers that at both ends. The bundle ships both patch sets
+and publishes what it was built from as `…inputs.txt`, and `release-agent.yml`
+refuses to tag while that file disagrees with the release's own checkout.
 
 ## Phases
 
@@ -194,6 +206,7 @@ not have, so the verification step is part of the job, not a nicety.
 | **P3** | `CONTRIBUTING.md`, `SECURITY.md`, `security.txt`, `docs/CLA.md` (Apache-ICLA-derived), disabled `cla.yml` | ✅ shipped; ⚠️ CLA still needs legal review before the bot is enabled |
 | **P4a** | `THIRD-PARTY-NOTICES.md` + written offer + `lgpl-source-offer.yml` | ✅ shipped; workflow needs its first dispatch (blocked until this merges — `workflow_dispatch` only resolves on the default branch) |
 | **P4b** | Close the §6 relink gap | ✅ **resolved by publication** — see below; `docs/lgpl-relink.md` |
+| **P4c** | The offer carries every change the builds make: our patches + the vcpkg port at the recipe's baseline, an `inputs.txt` asset, and a `release-agent.yml` gate against the checkout | ✅ republished complete 2026-09-24 (run 36062315391) and verified on the served asset; the release gate fails before and passes after |
 | **P5** | *(optional)* `server` feature on `tunnel-core` so AGPL reaches further | not planned |
 | **P6** | OCI image labels on the runtime stage + build-args in the deploy recipe | ✅ shipped |
 
@@ -235,7 +248,7 @@ a win and needs measuring on its own merits, not as a legal necessity.
 - [x] FFmpeg build flags documented; openh264 grant gap and HEVC exposure recorded
 - [x] `cargo check` green on both lanes; `ui` build + 858 unit tests green
 - [x] `cargo deny check licenses` passes in CI — three real findings triaged (WTFPL `tun`, MIT-0 `dcv-color-primitives`, and our own AGPL members, fixed with `publish = false` + `private.ignore` rather than allowlisting AGPL)
-- [ ] `lgpl-source-offer.yml` dispatched; corresponding-source asset live *(blocked: `workflow_dispatch` resolves only on the default branch, so it runs the moment this merges)*
+- [x] `lgpl-source-offer.yml` dispatched; corresponding-source asset live *(2026-09-24, run 36062315391: the **complete** bundle, with upstream + `patches/` + `vcpkg-port-ffmpeg/` at the recipe's baseline + the recipe, verified on the served asset; the release gate failed against the live release before this dispatch and passes after it. ⚠️ The 2026-08-29 and 2026-09-07 dispatches were live but incomplete: see P4c and the field log.)*
 - [x] CLA rewritten on the Apache ICLA 2.0 skeleton; `cla.yml` present but `if: false`
 - [ ] CLA reviewed by a lawyer and the bot enabled *(the only thing still gating P3)*
 - [x] OCI `licenses` label set on the runtime stage, landing WITH this FR — plus title/description/url/source/documentation/vendor, and `VERSION`/`GIT_SHA` build-args wired into the deploy recipe
@@ -297,3 +310,11 @@ CI run and this landing is not. The fix is the same one command.
 | 2026-08-29 | Merged master (FR-21 renames + FR-25/26/28/29) into the branch | `agents/roomler-agent`→`roomlerd`, `roomler-tunnel`→`roomler-cli`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→`roomler-core`; classification and crate lists repointed |
 | 2026-08-29 | **The rename exposed a hole in the sweep** | an unclassified path was a silent `continue`, so a renamed directory would have dropped the whole daemon out of the sweep while `--check` still reported OK. Unclassified is now a hard failure; it immediately caught 10 real files (`ui/*.ts`, `ui/index.html`, `ui/public/*`) that `ui/src` never covered ⇒ SERVER_PATHS broadened to `ui` |
 | 2026-08-29 | Post-merge re-verification | SPDX 647/647 · manifest audit exit 0 · graph check `none` × 5 · fmt clean · agent crates check · ui build + **898/898** vitest |
+| 2026-08-29 | First dispatch of `lgpl-source-offer.yml`, from master (run 33255539777) | asset live and the assert step green. ⚠️ It already lacked the vcpkg port's patches, which the Windows build applied from the start (found 2026-09-24) |
+| 2026-09-07 | Re-dispatched for FFmpeg 9.0.1 (FR-77 P0, run 34141875484) | asset live and green. ⚠️ It now also lacked #1249's patch, which both the Windows and the Linux builds had applied since 2026-09-02 |
+| 2026-09-24 | `tar t` of the **served** bundle | **zero patch files.** Upstream tarball + two workflow files + a README that said "we apply no patches", as did `THIRD-PARTY-NOTICES.md` and this spec. `docs/lgpl-relink.md` said the recipe applied them; it only referenced them |
+| 2026-09-24 | The new `release-agent.yml` gate, run from its own YAML text against a stub | matching offer passes · tampered offer **fails** · missing asset **fails** |
+| 2026-09-24 | The same gate against the **live** release, before republishing | **fails**: no `inputs.txt`. The fail-first half |
+| 2026-09-24 | Offer workflow run from its YAML in WSL, with one patch and with none | both pass. The no-patch run caught two bugs before they shipped: `sha256sum` with no arguments hashing STDIN into the manifest, and an `ls` pipeline killing the step under `pipefail` |
+| 2026-09-24 | Republished from the PR branch (run 36062315391); the served asset re-downloaded | `sha256sum -c` OK · `patches/` = the patch + manifest · `vcpkg-port-ffmpeg/` = 21 files at `2e6b9238` · `inputs.txt` = patch + baseline |
+| 2026-09-24 | The same gate against the live release, after | **passes**: `FR-24 gate OK: the LGPL offer carries 1 patch(es) + vcpkg baseline 2e6b9238` |
