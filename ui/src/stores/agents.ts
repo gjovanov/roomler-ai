@@ -523,6 +523,12 @@ export type SshDenyReason =
   | 'no_overlay_address'
   | 'rate_limited'
   | 'bad_public_key'
+  // FR-83 — reported BY the device in its grant acknowledgement, or its
+  // absence within the bound.
+  | 'agent_disabled'
+  | 'grant_expired_on_arrival'
+  | 'grant_refused'
+  | 'grant_unconfirmed'
 
 /** One SSH grant DECISION.
  *

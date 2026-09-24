@@ -1417,6 +1417,11 @@ fn rpc_caps() -> Vec<String> {
         // honour it, rather than hand an admin a rule that reads as enforced
         // and isn't.
         caps.push(RpcCap::SshConsent);
+        // FR-83. This build answers every `rc:ssh.grant` with
+        // `rc:ssh.grant_ack` once the grant is redeemable, so the server may
+        // hold the caller for it. A property of the BUILD, like `ssh`: the
+        // ack is sent even when the device refuses — that is the point.
+        caps.push(RpcCap::SshGrantAck);
     }
     // FR-19 — advertise the org-relay SERVER only when this device has opted
     // in (`relay_server_enabled`, gate 4). The server never installs a session
@@ -1619,6 +1624,15 @@ mod tests {
             advertised.iter().any(|v| v == RpcCap::Ssh.wire()),
             cfg!(feature = "ssh-server"),
             "the ssh verbs must track the ssh-server feature, not the version"
+        );
+        // FR-83 — and the ack travels with them. A build advertising
+        // `ssh-grant-ack` without an SSH server would have the server wait on
+        // grants nothing records; one serving SSH without it would put every
+        // caller back in the #1597 race.
+        assert_eq!(
+            advertised.iter().any(|v| v == RpcCap::SshGrantAck.wire()),
+            cfg!(feature = "ssh-server"),
+            "ssh-grant-ack must be advertised exactly when the SSH server is built"
         );
     }
 

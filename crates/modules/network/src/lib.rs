@@ -58,6 +58,7 @@ pub mod ephemeral;
 pub mod hooks;
 pub mod org_relay;
 pub mod overlay;
+pub mod ssh_grant_acks;
 pub mod tunnel;
 pub mod routes {
     pub mod agent_ssh;
@@ -146,6 +147,10 @@ pub struct NetworkState {
     /// HTTP route and the device-originated WS leg — both funnel through the
     /// same `dispatch`, so neither transport is unlimited.
     pub ssh_rate_limiter: Arc<RateLimiter>,
+    /// FR-83 — grants whose caller is held until the target acknowledges
+    /// them. Pod-local like the Hub's exec waiters: the push only succeeds
+    /// when the target's socket is here, and its ack arrives on that socket.
+    pub ssh_grant_acks: Arc<ssh_grant_acks::SshGrantAcks>,
     /// FR-19 — per-(requesting node, relay node) mint ceiling
     /// (`peer_relay_limits::MINT_RATE_LIMIT_PER_MINUTE`), checked by the mint
     /// in [`overlay`] AFTER the identity gates so a refusal is attributable.
@@ -288,6 +293,7 @@ impl Module for NetworkState {
             key_rotation_audit: Arc::new(KeyRotationAuditDao::new(db)),
             peer_relay_audit: Arc::new(PeerRelayAuditDao::new(db)),
             ssh_rate_limiter: Arc::new(RateLimiter::new()),
+            ssh_grant_acks: Arc::new(ssh_grant_acks::SshGrantAcks::new()),
             relay_rate_limiter: Arc::new(RateLimiter::new()),
             key_rotation_rate_limiter: Arc::new(RateLimiter::new()),
             fleet,

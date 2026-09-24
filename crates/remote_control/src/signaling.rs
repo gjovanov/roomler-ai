@@ -516,6 +516,38 @@ pub enum ClientMsg {
         allowed: bool,
     },
 
+    /// FR-83 — the target's answer to a [`ServerMsg::SshGrant`]: whether the
+    /// grant can now be redeemed.
+    ///
+    /// Sent only AFTER the grant is in the table the device's auth path reads,
+    /// so "acknowledged" means "a connection authenticating with this key now
+    /// succeeds". The server holds the caller until this arrives
+    /// ([`crate::models::ssh_limits::GRANT_ACK_TIMEOUT_SECS`]): before it,
+    /// "queued for the device" was read as "the device has it", and a caller
+    /// whose control path was faster than the target's dialled first and got
+    /// `Permission denied (publickey)` (#1597).
+    ///
+    /// Only an agent advertising [`crate::models::RpcCap::SshGrantAck`] is
+    /// waited for. An older server cannot parse the frame and drops it at
+    /// `debug!`, which is harmless.
+    ///
+    /// ⚠️ `tenant_id` / `agent_id` come from the authenticated WS, NOT from
+    /// this frame, and the server honours an ack only from the agent the grant
+    /// was pushed to — grant ids are ObjectIds, structured, not secret.
+    #[serde(rename = "rc:ssh.grant_ack")]
+    SshGrantAck {
+        /// Echo of the `grant_id` in the `rc:ssh.grant` being answered.
+        grant_id: String,
+        /// Absent = recorded. Present = refused, and why — decoded leniently,
+        /// see [`crate::models::SshGrantRefusal`].
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "grant_refusal_lenient"
+        )]
+        refused: Option<crate::models::SshGrantRefusal>,
+    },
+
     /// The agent's answer to a [`ServerMsg::ConfigPush`] — what it actually
     /// did (`docs/remote-config.md`).
     ///
@@ -1293,6 +1325,7 @@ impl ClientMsg {
             ClientMsg::RpcExecRequest { .. } => "rc:rpc.request",
             ClientMsg::SshRequest { .. } => "rc:ssh.request",
             ClientMsg::SshActivity { .. } => "rc:ssh.activity",
+            ClientMsg::SshGrantAck { .. } => "rc:ssh.grant_ack",
             ClientMsg::ConfigStatus { .. } => "rc:agent.config_status",
             ClientMsg::KeyRotated { .. } => "rc:agent.key_rotated",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
@@ -1354,6 +1387,7 @@ impl ClientMsg {
             | ClientMsg::DerpTicketRequest { .. }
             | ClientMsg::SshRequest { .. }
             | ClientMsg::SshActivity { .. }
+            | ClientMsg::SshGrantAck { .. }
             | ClientMsg::KeyRotated { .. }
             | ClientMsg::TunnelHello { .. }
             | ClientMsg::TunnelOpen { .. }
@@ -1399,6 +1433,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:rpc.request", Owner::Fleet),
     ("rc:ssh.request", Owner::Network),
     ("rc:ssh.activity", Owner::Network),
+    ("rc:ssh.grant_ack", Owner::Network),
     ("rc:agent.config_status", Owner::Fleet),
     ("rc:agent.key_rotated", Owner::Network),
     ("rc:sdp.answer", Owner::Remote),
@@ -1517,6 +1552,10 @@ mod namespace_tests {
             ClientMsg::TunnelTerminate {
                 session_id: ObjectId::new(),
                 reason: CloseReason::ClientShutdown,
+            },
+            ClientMsg::SshGrantAck {
+                grant_id: "g1".into(),
+                refused: None,
             },
         ];
         for m in &samples {
@@ -2705,6 +2744,39 @@ where
     .ok())
 }
 
+/// FR-83 — lenient decoder for [`ClientMsg::SshGrantAck::refused`], the same
+/// shape and for the same reason as [`relay_strategy_lenient`]: the refusal
+/// enum is externally tagged with unit variants, so an unknown spelling from
+/// a NEWER agent would be a hard error failing the whole frame — dropped at
+/// `debug!`, leaving the caller to wait out the full bound and then be told
+/// the grant was *unconfirmed* when the device had clearly refused it.
+///
+/// ⚠️ The direction of the fallback is the point. An unrecognised or
+/// malformed refusal is still a REFUSAL ([`SshGrantRefusal::Other`]); only an
+/// absent or `null` field means "recorded". Falling back to `None` would tell
+/// a caller to dial a device that has just said no.
+///
+/// [`SshGrantRefusal::Other`]: crate::models::SshGrantRefusal::Other
+fn grant_refusal_lenient<'de, D>(de: D) -> Result<Option<crate::models::SshGrantRefusal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::models::SshGrantRefusal;
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(tag) = raw else {
+        return Ok(Some(SshGrantRefusal::Other));
+    };
+    // Re-parse through the derive so the spellings live in exactly one place.
+    Ok(Some(
+        SshGrantRefusal::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(tag.as_str()),
+        )
+        .unwrap_or(SshGrantRefusal::Other),
+    ))
+}
+
 /// One peer in a netmap. `node_id` is the peer's `overlay_nodes._id`
 /// (the stable handle the control plane uses for fan-out + ACL). The
 /// node installs this peer as a WireGuard `Tunn` keyed by
@@ -3036,6 +3108,86 @@ mod tests {
                 "activity kind wire spelling changed"
             );
         }
+    }
+
+    /// FR-83 — the ack's wire shape. "Recorded" is the ABSENCE of `refused`,
+    /// so the commonest ack on the wire is the smallest one, and the
+    /// spellings of the refusals are a compatibility surface like the RpcCap
+    /// verbs.
+    #[test]
+    fn ssh_grant_ack_wire_shape_is_locked() {
+        use crate::models::SshGrantRefusal;
+
+        let recorded = ClientMsg::SshGrantAck {
+            grant_id: "g1".into(),
+            refused: None,
+        };
+        let v = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"t": "rc:ssh.grant_ack", "grant_id": "g1"})
+        );
+
+        for (r, want) in [
+            (SshGrantRefusal::SshDisabled, "ssh_disabled"),
+            (SshGrantRefusal::Expired, "expired"),
+            (SshGrantRefusal::Invalid, "invalid"),
+            (SshGrantRefusal::Other, "other"),
+        ] {
+            let m = ClientMsg::SshGrantAck {
+                grant_id: "g1".into(),
+                refused: Some(r),
+            };
+            let v = serde_json::to_value(&m).unwrap();
+            assert_eq!(v["refused"], want, "refusal wire spelling changed");
+            match serde_json::from_value::<ClientMsg>(v).unwrap() {
+                ClientMsg::SshGrantAck { refused, .. } => assert_eq!(refused, Some(r)),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+    }
+
+    /// FR-83 — the lenient decode, in both directions that matter.
+    ///
+    /// A refusal this build does not know must stay a REFUSAL (a strict
+    /// decode would fail the frame, and the caller would wait out the bound
+    /// only to be told "unconfirmed"), and must never collapse into
+    /// "recorded" (which would send a caller to dial a device that said no).
+    #[test]
+    fn an_unknown_refusal_is_still_a_refusal_and_never_a_confirmation() {
+        use crate::models::SshGrantRefusal;
+
+        // Always PRESENT here, explicit `null` included; absence is checked
+        // separately below.
+        let parse = |refused: serde_json::Value| {
+            let mut v = serde_json::json!({"t": "rc:ssh.grant_ack", "grant_id": "g1"});
+            v["refused"] = refused;
+            match serde_json::from_value::<ClientMsg>(v).expect("the frame must still parse") {
+                ClientMsg::SshGrantAck { refused, .. } => refused,
+                other => panic!("wrong variant: {other:?}"),
+            }
+        };
+        assert_eq!(
+            parse(serde_json::json!("a_reason_from_2027")),
+            Some(SshGrantRefusal::Other)
+        );
+        assert_eq!(
+            parse(serde_json::json!({"quota": 3})),
+            Some(SshGrantRefusal::Other),
+            "a reason that grew a payload is still a refusal"
+        );
+        assert_eq!(
+            parse(serde_json::json!("ssh_disabled")),
+            Some(SshGrantRefusal::SshDisabled)
+        );
+        // Only absent / null means recorded.
+        assert_eq!(parse(serde_json::Value::Null), None);
+        let absent: ClientMsg =
+            serde_json::from_str(r#"{"t":"rc:ssh.grant_ack","grant_id":"g1"}"#).unwrap();
+        assert!(matches!(
+            absent,
+            ClientMsg::SshGrantAck { refused: None, .. }
+        ));
     }
 
     /// The optional fields must all be omissible: a `session_open` carries no

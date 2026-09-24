@@ -20,9 +20,9 @@
 //!    device-originated leg) `can_originate` on the ORIGINATING device.
 //! 4. The agent's own `ssh_enabled` config key, enforced agent-side.
 //!
-//! Gates 1-3 are evaluated by [`authorize`]. Gate 4 cannot be reported back
-//! here at all, which is the structural difference from exec: the session runs
-//! over a path the server is not on.
+//! Gates 1-3 are evaluated by [`authorize`]. Gate 4 is the device's, and it
+//! reaches the caller through the grant acknowledgement (FR-83): an
+//! ack-capable agent answers every grant, naming its refusal if it has one.
 //!
 //! ## Why this hands out a key instead of a command
 //!
@@ -30,14 +30,22 @@
 //! everything. SSH cannot work that way and should not: the whole point is a
 //! session the server never observes. So the server's role ends at
 //! authorization. It mints a **grant** — the caller's ephemeral public key,
-//! the principal's name, the account, an expiry — pushes it to the target, and
-//! tells the caller where to dial. What passes over that connection is between
-//! the two devices.
+//! the principal's name, the account, an expiry — pushes it to the target,
+//! waits for the target to confirm it holds it, and tells the caller where to
+//! dial. What passes over that connection is between the two devices.
 //!
-//! That also means a refusal here is the LAST word the server gets. There is
-//! no equivalent of exec's `error` coming back from the device, so every
-//! reason a request can fail is enumerated in [`SshDenyReason`] and answered
-//! synchronously.
+//! ⚠️ The wait is the difference between "queued for the device" and "the
+//! device has it" (#1597). Without it, a caller whose control path to the
+//! server was faster than the target's dialled first and was refused
+//! `Permission denied (publickey)` by a device behaving correctly. It is
+//! bounded ([`ssh_limits::GRANT_ACK_TIMEOUT_SECS`]) and applies only to an
+//! agent advertising `ssh-grant-ack`; an older one is answered as before.
+//!
+//! So the server's last word is the grant's CONFIRMATION, not the session:
+//! whether a connection then succeeds is still decided on a path the server
+//! is not on. Every reason a request can fail — the server's gates and the
+//! device's answer — is enumerated in [`SshDenyReason`] and answered before
+//! the caller dials.
 //!
 //! ## Privilege
 //!
@@ -80,6 +88,7 @@ use roomler_core::guards::require_permission;
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
 use crate::NetworkState;
+use crate::ssh_grant_acks::AckOutcome;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Wire shapes
@@ -264,6 +273,10 @@ struct Granted {
     expires_at_ms: u64,
     account_mode: SshAccountMode,
     session_secs: u64,
+    /// FR-83 — how long the target took to confirm the grant, from the push.
+    /// `None` = a pre-FR-83 agent, answered without waiting. Logged, so the
+    /// ack bound can be tuned against what the field actually measures.
+    confirmed_after_ms: Option<u64>,
 }
 
 /// Gate, mint, push, answer. The ONE path a session request takes, whether it
@@ -292,6 +305,7 @@ pub async fn dispatch(
             info!(
                 agent = %agent_id, caller = %caller.display, grant_id = %g.grant_id,
                 account_mode = ?g.account_mode, session_secs = g.session_secs,
+                confirmed_after_ms = ?g.confirmed_after_ms,
                 "ssh: grant issued"
             );
             SshResponseBody {
@@ -392,17 +406,52 @@ async fn decide(
         consent_mode: Some(effective_wire_consent(consent_mode)),
     };
 
-    if let Err(e) = state.fleet.rc_hub.push_ssh_grant(agent_id, tenant_id, msg) {
+    // FR-83 — park on the target's answer BEFORE the push: an ack that beats
+    // this function back here must find somewhere to land. Dropping the guard
+    // (any early return below) deregisters it.
+    let pending_ack = state.ssh_grant_acks.expect(&grant_id, agent_id);
+    let pushed_at = std::time::Instant::now();
+    let acks = match state.fleet.rc_hub.push_ssh_grant(agent_id, tenant_id, msg) {
+        Ok(acks) => acks,
         // The hub distinguishes "not connected" from "connected but cannot
         // honour it", and the caller needs that difference: one is wait and
         // retry, the other is upgrade the agent.
-        return Err(match e {
-            roomler_ai_remote_control::error::Error::ExecUnsupported(_) => {
-                SshDenyReason::Unsupported
+        Err(e) => {
+            return Err(match e {
+                roomler_ai_remote_control::error::Error::ExecUnsupported(_) => {
+                    SshDenyReason::Unsupported
+                }
+                _ => SshDenyReason::Offline,
+            });
+        }
+    };
+
+    // Queued is not recorded (#1597). The caller is told where to dial only
+    // once the target says the grant is in the table its auth path reads —
+    // otherwise a caller whose control path is faster than the target's
+    // dials first and is refused `Permission denied (publickey)` by a device
+    // that is behaving correctly. A pre-FR-83 agent never answers, and is
+    // answered exactly as before rather than made to wait out the bound.
+    let confirmed_after_ms = if acks {
+        let bound = std::time::Duration::from_secs(ssh_limits::GRANT_ACK_TIMEOUT_SECS);
+        match pending_ack.wait(bound).await {
+            AckOutcome::Recorded => Some(pushed_at.elapsed().as_millis() as u64),
+            AckOutcome::Refused(refusal) => {
+                warn!(
+                    agent = %agent_id, caller = %caller.display, %grant_id, ?refusal,
+                    "ssh: the device refused the grant"
+                );
+                return Err(refusal.deny_reason());
             }
-            _ => SshDenyReason::Offline,
-        });
-    }
+            // Refused, never answered with an address: the one thing known
+            // now is that the device has NOT confirmed. The grant may still
+            // land; it then expires unused within its TTL.
+            AckOutcome::Unconfirmed => return Err(SshDenyReason::GrantUnconfirmed),
+        }
+    } else {
+        drop(pending_ack);
+        None
+    };
 
     Ok(Granted {
         grant_id,
@@ -416,6 +465,7 @@ async fn decide(
         expires_at_ms,
         account_mode,
         session_secs,
+        confirmed_after_ms,
     })
 }
 
@@ -1109,6 +1159,7 @@ mod audit_tests {
             expires_at_ms: 1,
             account_mode: SshAccountMode::ConsoleUser,
             session_secs: 900,
+            confirmed_after_ms: Some(42),
         }
     }
 
@@ -1195,6 +1246,10 @@ mod audit_tests {
             SshDenyReason::NoOverlayAddress,
             SshDenyReason::RateLimited,
             SshDenyReason::BadPublicKey,
+            SshDenyReason::AgentDisabled,
+            SshDenyReason::GrantExpiredOnArrival,
+            SshDenyReason::GrantRefused,
+            SshDenyReason::GrantUnconfirmed,
         ] {
             let e = audit_event(
                 ObjectId::new(),
@@ -1431,6 +1486,10 @@ mod tests {
             SshDenyReason::NoOverlayAddress,
             SshDenyReason::RateLimited,
             SshDenyReason::BadPublicKey,
+            SshDenyReason::AgentDisabled,
+            SshDenyReason::GrantExpiredOnArrival,
+            SshDenyReason::GrantRefused,
+            SshDenyReason::GrantUnconfirmed,
         ] {
             let m = r.message();
             assert!(!m.is_empty(), "{r:?} has no message");
