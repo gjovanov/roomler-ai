@@ -211,10 +211,22 @@ impl Inner {
     }
 }
 
-/// The device's external-login state. One per daemon.
+/// The device's external-login state. One per daemon — see [`global`].
 #[derive(Default)]
 pub struct ExternalLogins {
     inner: Mutex<Inner>,
+}
+
+/// The daemon's ONE login state.
+///
+/// Process-wide on purpose, not per connection: the guess budget has to be the
+/// DEVICE's, and a multi-org daemon runs one control loop per org. An instance
+/// per loop would hand an attacker a separate budget for every org the device
+/// is enrolled in. (Logins are also refused on every socket but the primary
+/// org's; this is the second reason, not the first.)
+pub fn global() -> &'static ExternalLogins {
+    static LOGINS: std::sync::OnceLock<ExternalLogins> = std::sync::OnceLock::new();
+    LOGINS.get_or_init(ExternalLogins::new)
 }
 
 impl ExternalLogins {

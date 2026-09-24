@@ -53,6 +53,10 @@ pub mod exec;
 /// the worker and the SYSTEM service, and the service's runner. Compiled
 /// everywhere; off Windows it advertises nothing and refuses every ring.
 pub mod exec_service;
+/// FR-52 P3c — the device's answer to `rc:extauth.*`. Ungated: every build
+/// advertises `external-access`, so every build must answer, if only with
+/// `unavailable`.
+pub mod extauth;
 /// FR-52 gate 4 — the device-held external-access password. Feature-gated
 /// (`external-access`): the OPAQUE stack is +7 crates, and only a build that
 /// serves cross-org access needs it.
