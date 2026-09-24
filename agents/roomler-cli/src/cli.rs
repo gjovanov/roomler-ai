@@ -336,15 +336,25 @@ enum Command {
     ///   # ~/.ssh/config
     ///   Host *.roomler
     ///     ProxyCommand roomler proxy %h %p
+    ///     Port 2222
     ///
     ///   scp report.pdf corplap-3.roomler:/tmp/
+    ///
+    /// A device is matched by its bare name, as <name>.roomler, or by its
+    /// MagicDNS name. 2222 is roomler SSH's default port; drop the `Port`
+    /// line to reach a device's own sshd on 22 instead.
+    ///
+    /// ⚠️ OpenSSH applies a `HostName` line BEFORE substituting %h, so a host
+    /// that also has a `HostName` entry hands this its public address, not
+    /// its name — a connect error naming no device (`scp -v` shows it).
     ///
     /// Transport and name resolution only: `ProxyCommand` cannot supply an
     /// identity or a host key, so this uses keys YOU manage. For a
     /// grant-issued session with the account resolved by policy and the host
     /// key verified for you, use `roomler ssh` instead.
     Proxy {
-        /// Device name or overlay address (OpenSSH passes `%h`).
+        /// Device name (bare, <name>.roomler, or MagicDNS) or overlay address
+        /// (OpenSSH passes `%h`).
         host: String,
         /// Port (OpenSSH passes `%p`).
         port: u16,

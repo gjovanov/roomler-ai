@@ -546,13 +546,75 @@ async fn run_remote(node: &str, shell: &str, command: &str, timeout_ms: u64) -> 
 /// device names are display strings and nobody types `CORPLAP-3`.
 /// `Ok(None)` = no such peer — the caller must report that rather than dial
 /// something arbitrary.
+///
+/// The name may also arrive QUALIFIED, in the two spellings a user is steered
+/// toward (#1573): `corplap-3.roomler`, which the `Host *.roomler` recipe in
+/// `roomler proxy --help` hands over as `%h` — until this, the documented
+/// setup failed for every host — and the MagicDNS name,
+/// `corplap-3.<magic domain>`. [`mesh_label`] says why no other suffix is
+/// stripped.
 pub async fn resolve_overlay_ip(name: &str) -> Result<Option<String>> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
     let peers = client.peers().await.map_err(daemon_err)?;
-    Ok(peers
+    let find = |label: &str| {
+        peers
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(label))
+            .map(|p| p.overlay_ip.clone())
+    };
+    // The name as given first, so everything that resolved before still
+    // resolves to the same peer.
+    if let Some(ip) = find(name) {
+        return Ok(ip);
+    }
+    if !name.contains('.') {
+        return Ok(None);
+    }
+    // Only a qualified name pays for the second round-trip. A daemon that
+    // cannot say (MagicDNS off for the tenant, or older than the field) still
+    // gets `.roomler`.
+    let magic = client
+        .status()
+        .await
+        .ok()
+        .and_then(|s| s.dns)
+        .map(|d| d.magic_domain);
+    Ok(mesh_label(name, magic.as_deref()).and_then(find).flatten())
+}
+
+/// The device label inside a qualified mesh name, or `None` when `name`
+/// carries no suffix this resolver owns.
+///
+/// Owned: the tenant's MagicDNS domain (when the daemon reports one) and
+/// `.roomler`, both case-insensitive, with an absolute name's trailing dot
+/// ignored.
+///
+/// ⚠️ Deliberately NOT "everything after the first dot". A `ProxyCommand`
+/// scoped wider than `Host *.roomler` would then turn `github.com` into a
+/// lookup for a device named `github` and hand the user's `git` to it. A mesh
+/// lookup must fail on a name it does not own, never find a different
+/// destination — the same rule that keeps the OS resolver away from mesh
+/// names.
+fn mesh_label<'a>(name: &'a str, magic_domain: Option<&str>) -> Option<&'a str> {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    let magic = magic_domain
+        .map(|d| d.trim_matches('.'))
+        .filter(|d| !d.is_empty());
+    magic
         .into_iter()
-        .find(|p| p.name.eq_ignore_ascii_case(name))
-        .and_then(|p| p.overlay_ip))
+        .chain(["roomler"])
+        .find_map(|domain| strip_domain(name, domain))
+}
+
+/// `name` minus a trailing `.<domain>`, compared case-insensitively. `None`
+/// when it does not end that way, or when nothing would be left.
+fn strip_domain<'a>(name: &'a str, domain: &str) -> Option<&'a str> {
+    let cut = name.len().checked_sub(domain.len() + 1)?;
+    // `get`, not indexing: in a non-ASCII name the byte offset can fall
+    // inside a character, and that is a non-match, not a panic.
+    let (label, tail) = (name.get(..cut)?, name.get(cut..)?);
+    let rest = tail.strip_prefix('.')?;
+    (!label.is_empty() && rest.eq_ignore_ascii_case(domain)).then_some(label)
 }
 
 /// What the server answered about an SSH session request.
@@ -2216,5 +2278,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_recipe_suffix_and_the_magicdns_name_both_yield_the_label() {
+        // #1573: `Host *.roomler` guarantees `%h` arrives WITH the suffix, so
+        // a proxy that looked the name up verbatim failed for every host.
+        let magic = Some("grox.roomler.ai");
+        assert_eq!(mesh_label("zeus.roomler", magic), Some("zeus"));
+        assert_eq!(mesh_label("zeus.roomler", None), Some("zeus"));
+        assert_eq!(mesh_label("zeus.grox.roomler.ai", magic), Some("zeus"));
+        // Absolute form, and any casing a user or a config file produces.
+        assert_eq!(mesh_label("zeus.grox.roomler.ai.", magic), Some("zeus"));
+        assert_eq!(mesh_label("CORPLAP-3.ROOMLER", None), Some("CORPLAP-3"));
+        assert_eq!(mesh_label("zeus.Grox.Roomler.AI", magic), Some("zeus"));
+        // A domain reported with dots around it is the same domain.
+        assert_eq!(
+            mesh_label("zeus.grox.roomler.ai", Some(".grox.roomler.ai.")),
+            Some("zeus")
+        );
+    }
+
+    #[test]
+    fn a_suffix_the_mesh_does_not_own_is_never_stripped() {
+        // The failure this prevents: a ProxyCommand scoped wider than
+        // `*.roomler` turning `github.com` into a lookup for a device named
+        // `github` and handing the user's git to it.
+        let magic = Some("grox.roomler.ai");
+        assert_eq!(mesh_label("github.com", magic), None);
+        assert_eq!(mesh_label("zeus.example.roomler.ai", magic), None);
+        // Without the daemon's word for it, a MagicDNS name is not guessed at.
+        assert_eq!(mesh_label("zeus.grox.roomler.ai", None), None);
+        // A suffix that merely ENDS the same way is not the suffix.
+        assert_eq!(mesh_label("zeusroomler", None), None);
+        assert_eq!(mesh_label("zeus.xroomler", None), None);
+    }
+
+    #[test]
+    fn nothing_left_after_the_suffix_is_no_label() {
+        assert_eq!(mesh_label(".roomler", None), None);
+        assert_eq!(mesh_label("roomler", None), None);
+        assert_eq!(mesh_label("grox.roomler.ai", Some("grox.roomler.ai")), None);
+        assert_eq!(mesh_label("", None), None);
+        // An empty domain must not turn every dotted name into a match.
+        assert_eq!(mesh_label("zeus.local", Some("")), None);
+        assert_eq!(mesh_label("zeus.local", Some(".")), None);
+    }
+
+    #[test]
+    fn a_non_ascii_name_is_a_non_match_not_a_panic() {
+        // The cut is a BYTE offset; in the last two it lands inside a
+        // character (`ž` is two bytes, `€` three).
+        assert_eq!(mesh_label("ž.roomler", None), Some("ž"));
+        assert_eq!(mesh_label("a.žroomler", None), None);
+        assert_eq!(mesh_label("€€€€", None), None);
     }
 }
