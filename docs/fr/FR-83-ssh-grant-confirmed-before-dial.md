@@ -1,6 +1,6 @@
 # FR-83: An SSH grant is confirmed before the caller is told to dial
 
-**Issue:** [#1601](https://github.com/gjovanov/roomler-ai/issues/1601) · **Status:** proposed 2026-09-24 ·
+**Issue:** [#1601](https://github.com/gjovanov/roomler-ai/issues/1601) · **Status:** **closed 2026-09-24 — shipped + field-verified** (`agent-v0.4.101`, `hosted-20260924-531fde8`), all 9 criteria met ·
 **Field report:** [#1597](https://github.com/gjovanov/roomler-ai/issues/1597), found by the
 FR-81 stress lane ([#1546](https://github.com/gjovanov/roomler-ai/issues/1546))
 
@@ -118,11 +118,15 @@ grant will never be honoured:
 | `ssh_disabled` | gate 4 — the device's own `ssh_enabled` is off | `agent_disabled` |
 | `expired` | arrived past its deadline — clock skew or a control WS slower than the TTL | `grant_expired_on_arrival` |
 | `invalid` | the device cannot parse what the server validated | `grant_refused` |
-| *anything newer* | `#[serde(other)] other` | `grant_refused` |
+| *anything newer* | lands on `other` | `grant_refused` |
 
-⚠️ `#[serde(other)]` is load-bearing: without it a newer agent's new reason makes the whole
-frame unparseable on an older server, which drops it at `debug!` and waits out the bound —
-turning a clear refusal into `grant_unconfirmed`.
+⚠️ The lenient decode is load-bearing: strictly decoded, a newer agent's new reason makes the
+whole frame unparseable on an older server, which drops it at `debug!` and waits out the
+bound — turning a clear refusal into `grant_unconfirmed`. *As built:* serde's
+`#[serde(other)]` is not available for an externally tagged enum (the codebase's own note at
+`relay_strategy_lenient` says so), so the field goes through `grant_refusal_lenient` in
+`signaling.rs`, the same shape as that shim — an unknown or malformed value is still a
+REFUSAL (`other`), and only an absent or `null` field means recorded.
 
 ### 2. The capability — `ssh-grant-ack`, read from the LIVE connection
 
@@ -199,32 +203,46 @@ one small frame per grant.
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | spec + ledger row + issue | — | this PR |
-| P1 | wire, capability, server wait, agent ack, tests, docs | promote the previous server image (`promote.yml`) — an old server never waits, and the ack is dropped at `debug!` | planned |
-| P2 | agent release + server image promoted; field verification (AC7, AC8) | as P1 | planned |
+| P0 | spec + ledger row + issue | — | **merged** #1602 `a227fe62a` |
+| P1 | wire, capability, server wait, agent ack, tests, docs | promote the previous server image (`promote.yml`) — an old server never waits, and the ack is dropped at `debug!` | **merged** #1607 `1699b4310` |
+| P2 | agent release + server image promoted; field verification (AC7, AC8) | as P1 — `hosted-20260910-4114dc7` was live before | **shipped** `agent-v0.4.101` (#1609 `531fde8d3`) + `hosted-20260924-531fde8`; field-verified — see the log |
 
 ## Acceptance criteria
 
-- [ ] **AC1** — For an ack-capable agent the server answers only after the device
+- [x] **AC1** — For an ack-capable agent the server answers only after the device
       confirmed: an integration test whose agent delays its ack gets no answer before it.
-- [ ] **AC2** — `ssh_enabled` off on the device reaches the caller as gate 4
+      *`the_caller_is_answered_only_after_the_device_confirms` — on master's server: "answered
+      1.500232382s BEFORE the device confirmed the grant" (run 35999677732); green on #1607.*
+- [x] **AC2** — `ssh_enabled` off on the device reaches the caller as gate 4
       (`agent_disabled`), not an address. **Deterministic negative control**: the same test
-      on master receives an address.
-- [ ] **AC3** — No ack within the bound ⇒ `grant_unconfirmed`, never an address.
-- [ ] **AC4** — An agent without `ssh-grant-ack` is answered as before, without waiting.
-- [ ] **AC5** — An ack arriving on another agent's socket confirms nothing.
-- [ ] **AC6** — `ssh` does not imply `ssh-grant-ack` (equality, locked by test).
-- [ ] **AC7** — Field: after the roll, the stress lane's SSH column is 3/3 on every corp
+      on master receives an address. *Received an address on master (35999677732); green, and
+      audited `agent_disabled`, on #1607.*
+- [x] **AC3** — No ack within the bound ⇒ `grant_unconfirmed`, never an address.
+      *`silence_from_the_target_is_unconfirmed_even_when_another_device_acks` + unit
+      `silence_is_unconfirmed_and_the_slot_is_released`.*
+- [x] **AC4** — An agent without `ssh-grant-ack` is answered as before, without waiting.
+      *`an_agent_without_the_verb_is_answered_at_once` (passes on master too — the behaviour
+      kept); in the field, `roomler ssh zeus` through the new server while zeus was 0.4.100:
+      rc 0 in 1.1 s.*
+- [x] **AC5** — An ack arriving on another agent's socket confirms nothing.
+      *The same integration test (a second device acks the target's grant id) + unit
+      `an_ack_from_another_agent_confirms_nothing_and_leaves_the_slot`.*
+- [x] **AC6** — `ssh` does not imply `ssh-grant-ack` (equality, locked by test).
+      *`ssh_does_not_imply_ssh_grant_ack`; the pair is in the prefix-lock's `KNOWN` list.*
+- [x] **AC7** — Field: after the roll, the stress lane's SSH column is 3/3 on every corp
       laptop in both arms, and each target's log shows `grant recorded` before
       `session opening` for every grant-issued session — with the pre-roll run recorded as
-      the baseline.
-- [ ] **AC8** — Field: `roomler ssh` to a device with `ssh_enabled = false` names gate 4 —
+      the baseline. *Run `20260924-155559`: SSH 30/30 (every target, both arms); the five
+      targets' own logs: 40/40 grant-issued sessions recorded before they opened, 0
+      `rejected` in the run window. Baseline: 2026-09-23, CORPLAP-2 direct 0/3.*
+- [x] **AC8** — Field: `roomler ssh` to a device with `ssh_enabled = false` names gate 4 —
       shown on the current deploy first to hand the caller an address that then refuses the
       connection (nothing intercepts the port when SSH is off), with the only reason in the
-      device's own log.
-- [ ] **AC9** — Docs: `docs/roomler-ssh.md` shows the ack in the grant sequence and corrects
+      device's own log. *Before: an address, then `Connection refused` (13:23 UTC). After:
+      no address, gate 4 by name, audited `agent_disabled` (16:11 UTC). See the log.*
+- [x] **AC9** — Docs: `docs/roomler-ssh.md` shows the ack in the grant sequence and corrects
       "gate 4 cannot be reported back"; `agent_ssh.rs`'s module doc and `record_grant`'s doc
-      say what is now true.
+      say what is now true. *Landed in #1607.*
 
 ## Open decisions
 
@@ -247,3 +265,8 @@ one small frame per grant.
 | date | build | observation |
 |---|---|---|
 | 2026-09-23 | agent 0.4.97, server as deployed that day | **Baseline, failing** (#1597): CORPLAP-2 direct arm 0/3 — device log shows `rejected — no live grant` 3.3–4.4 s before `grant recorded`; relay arm 3/3 |
+| 2026-09-24 | CI, master's server | **Negative control** — #1607's integration tests against the pre-FR-83 server, three runs (35998108123, 35998593627, 35999677732; the last on the exact merged file): "the caller was answered 1.500232382s BEFORE the device confirmed the grant"; a gate-4 device and a silent one were each still offered an address; the pre-ack test passed |
+| 2026-09-24 | agent 0.4.100, `hosted-20260910-4114dc7` | **AC8 baseline** (13:23 UTC): a stress VM with SSH off — server answered `100.65.4.23:2222` in 51 ms with no error; the dial got `Connection refused`; the only reason was the device's own `rc:ssh.grant refused — ssh_enabled is off`. (The same probe's first version replaced the VM's whole policy and revoked the lane's `can_originate` — that run's relay-arm SSH read 0/15 because of it; FR-81's skill now carries the trap.) |
+| 2026-09-24 | `agent-v0.4.101`, `hosted-20260924-531fde8` | Roll: `/health` 0.4.101 (6/6 samples); `roomler ssh zeus -- hostname` → `zeus`, rc 0, 1.1 s while zeus was still 0.4.100 — the pre-ack path unchanged (AC4). All five stress targets auto-updated to 0.4.101 within ~1.5 h |
+| 2026-09-24 | `agent-v0.4.101`, `hosted-20260924-531fde8` | **AC8 after** (16:11 UTC): a 0.4.101 VM with SSH off — **no address**, *"roomler SSH is switched off on the device itself"* in 57 ms; device log `rc:ssh.grant refused — ssh_enabled is off`; prod audit `agent_disabled` |
+| 2026-09-24 | `agent-v0.4.101` on all five targets, `hosted-20260924-531fde8` | **AC7** — FR-81 stress run `20260924-155559` (PASS 26/0, launched automatically once every target reported 0.4.101): **SSH 3/3 on every target in both arms (30/30)**, incl. CORPLAP-2's direct arm, 0/3 in the baseline. From the targets' OWN logs (full-file grep, 16:00–18:59 UTC): **40/40 grant-issued sessions had `grant recorded` before `session opening`** — leads 92–173 ms on the three corp laptops, 7–28 ms on zeus and mars — and **0 `rejected`** on any target; 48 key-list (scp/sftp) sessions alongside. Carrier/latency/loss/stability unchanged: 0 % loss everywhere, 0 transitions/189 samples on every pair |
