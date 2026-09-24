@@ -174,6 +174,16 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     }
                 };
 
+                // FR-52 P3d — an external-access login the origin pod forwarded
+                // because the device is homed HERE. Handled by the extauth relay,
+                // not the Hub, and answered through this proxy sender — whose
+                // pump already routes every reply back to the browser's socket.
+                if let Some(handled) =
+                    crate::extauth::on_relayed(&state, user_id, &controller_name, &tx, &frame)
+                {
+                    return Ok(serde_json::json!({ "dispatched": handled }));
+                }
+
                 let ctx = DispatchCtx {
                     role: Role::Controller,
                     user_id: Some(user_id),

@@ -21,13 +21,16 @@
 //!    function gets back from `send_to_agent`; the waiter is registered first,
 //!    so an early answer finds somewhere to land (FR-83's rule).
 //!
-//! # What is not here yet
+//! # Across pods (P3d)
 //!
-//! The cross-pod path. An outsider has no tenant, so tenant affinity cannot put
-//! their socket on the pod that holds the device, and roughly half of them will
-//! land elsewhere. Until the PR-2 relay carries these frames (P3c-4), such a
-//! device answers `unavailable` with `login_detail` saying why. Nothing sends
-//! `rc:extauth.start` in production before P4's connect page exists.
+//! An outsider has no tenant, so tenant affinity cannot put their socket on the
+//! pod that holds the device, and roughly half of them land elsewhere. Both
+//! controller frames carry the connect code rather than an agent id so the pod
+//! they land on can re-resolve it and, when the device is not here, forward the
+//! raw frame ONCE over the PR-2 rc relay ([`Hop`]). The owner pod handles it
+//! with the relay's proxy sender, whose replies route back to the browser's own
+//! connection. `finish` resolves the code BEFORE the attempt table for the same
+//! reason: an attempt started cross-pod lives on the other pod.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -172,6 +175,77 @@ impl Drop for PendingAnswer {
     }
 }
 
+/// Where a frame came from — which decides whether it may be forwarded.
+///
+/// An outsider has no tenant, so tenant affinity cannot put their socket on the
+/// pod that holds the device, and `/ws` refuses a `tid` they are not a member
+/// of: with two replicas, roughly half of them land on a pod that cannot reach
+/// it. So a frame that arrives on the wrong pod is forwarded ONCE, over the
+/// PR-2 rc relay, to the pod that holds the device, and handled there with a
+/// proxy sender whose replies route back to the browser's own connection.
+pub enum Hop {
+    /// Straight off this pod's user socket: may be forwarded, once.
+    Origin {
+        connection_id: String,
+        frame: serde_json::Value,
+    },
+    /// Already forwarded by another pod: handled here or refused, NEVER
+    /// forwarded again — or a device moving between pods mid-login would turn
+    /// one login into a loop between them.
+    Relayed,
+}
+
+/// Forward a frame to the pod that holds `agent_id`. `true` = the owner pod
+/// took it, and its replies will reach the browser without us.
+async fn forward(
+    state: &RemoteState,
+    hop: &Hop,
+    agent_id: ObjectId,
+    principal: ObjectId,
+    actor: &str,
+) -> bool {
+    let Hop::Origin {
+        connection_id,
+        frame,
+    } = hop
+    else {
+        return false;
+    };
+    let Some(redis) = &state.redis_pubsub else {
+        return false;
+    };
+    // The same presence probe, with the same 250 ms budget, the session path
+    // uses before it relays.
+    let Ok(Ok(Some(owner))) = tokio::time::timeout(
+        Duration::from_millis(250),
+        redis.agent_presence_foreign(&agent_id.to_hex()),
+    )
+    .await
+    else {
+        return false;
+    };
+    let Some(pod) = roomler_core::cluster::directory::OwnerRecord::parse(&owner).map(|r| r.pod_id)
+    else {
+        return false;
+    };
+    matches!(
+        crate::relay::relay_rc_frame(
+            state,
+            &pod,
+            connection_id,
+            principal,
+            actor,
+            Default::default(),
+            &None,
+            None,
+            &None,
+            frame,
+        )
+        .await,
+        Ok(None)
+    )
+}
+
 fn result(
     attempt_id: Option<String>,
     refused: Option<ExtauthRefusal>,
@@ -282,6 +356,7 @@ fn audit(
 }
 
 /// `rc:extauth.start` — resolve, gate, relay KE1, relay the device's answer.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_start(
     state: &RemoteState,
     principal: ObjectId,
@@ -289,6 +364,7 @@ pub async fn handle_start(
     tx: &ClientTx,
     connect_code: &str,
     ke1: String,
+    hop: Hop,
 ) {
     let relay = &state.extauth;
     let now = Instant::now();
@@ -321,7 +397,15 @@ pub async fn handle_start(
         return;
     }
     if !state.fleet.rc_hub.is_agent_online(agent_id) {
-        let detail = "the device is not connected to this pod (offline, or homed on another pod — the cross-pod path is P3c-4)";
+        // Not here. If another pod holds the device, hand the frame over once;
+        // its replies reach the browser over the conn-addressed lane.
+        if forward(state, &hop, agent_id, principal, actor).await {
+            return;
+        }
+        let detail = match hop {
+            Hop::Origin { .. } => "the device is offline (no pod holds it)",
+            Hop::Relayed => "forwarded here, but the device is no longer on this pod",
+        };
         let _ = tx.try_send(unavailable(None));
         audit(
             state,
@@ -416,6 +500,7 @@ pub async fn handle_start(
 }
 
 /// `rc:extauth.finish` — relay KE3, relay the verdict.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_finish(
     state: &RemoteState,
     principal: ObjectId,
@@ -424,9 +509,30 @@ pub async fn handle_finish(
     connect_code: &str,
     attempt_id: String,
     ke3: String,
+    hop: Hop,
 ) {
     let relay = &state.extauth;
     relay.prune(Instant::now());
+    let unknown =
+        |attempt_id: String| result(Some(attempt_id), Some(ExtauthRefusal::UnknownAttempt), None);
+    // The code FIRST, before the attempt table: on the pod the browser landed
+    // on, an attempt that was started cross-pod lives on the OTHER pod, and a
+    // local lookup would wrongly answer "no such attempt".
+    let Some(agent) = resolve(state, connect_code).await else {
+        let _ = tx.try_send(unknown(attempt_id));
+        return;
+    };
+    let Some(device) = agent.id else {
+        let _ = tx.try_send(unknown(attempt_id));
+        return;
+    };
+    if !state.fleet.rc_hub.is_agent_online(device) {
+        if forward(state, &hop, device, principal, actor).await {
+            return;
+        }
+        let _ = tx.try_send(unavailable(Some(attempt_id)));
+        return;
+    }
     // Taken, not read: whatever happens next, this attempt ends here. Only its
     // own principal can take it — anyone else leaves it in place and is told
     // it does not exist.
@@ -434,26 +540,15 @@ pub async fn handle_finish(
         .attempts
         .remove_if(&attempt_id, |_, a| a.principal == principal)
     else {
-        let _ = tx.try_send(result(
-            Some(attempt_id),
-            Some(ExtauthRefusal::UnknownAttempt),
-            None,
-        ));
+        let _ = tx.try_send(unknown(attempt_id));
         return;
     };
     // The code must still name the attempt's device, and the gates must still
     // be open: an admin who revokes mid-login must not see it complete.
-    let agent = match resolve(state, connect_code).await {
-        Some(a) if a.id == Some(attempt.agent_id) => a,
-        _ => {
-            let _ = tx.try_send(result(
-                Some(attempt_id),
-                Some(ExtauthRefusal::UnknownAttempt),
-                None,
-            ));
-            return;
-        }
-    };
+    if attempt.agent_id != device {
+        let _ = tx.try_send(unknown(attempt_id));
+        return;
+    }
     let agent_id = attempt.agent_id;
     if let Err(detail) = gates(state, &agent).await {
         let _ = tx.try_send(unavailable(Some(attempt_id.clone())));
@@ -565,17 +660,60 @@ pub fn intercept(
     }
     let msg =
         serde_json::from_str::<roomler_ai_remote_control::signaling::ClientMsg>(frame.text).ok()?;
-    use roomler_ai_remote_control::signaling::ClientMsg;
-    let (state, principal, actor, tx) = (
-        state.clone(),
+    // The raw frame too: if the device is on another pod, THIS is what the PR-2
+    // relay forwards.
+    let raw = serde_json::from_str::<serde_json::Value>(frame.text).ok()?;
+    let hop = Hop::Origin {
+        connection_id: frame.connection_id.to_string(),
+        frame: raw,
+    };
+    dispatch(
+        state,
         frame.user_id,
-        frame.controller_name.to_string(),
-        frame.controller_tx.clone(),
-    );
+        frame.controller_name,
+        frame.controller_tx,
+        msg,
+        hop,
+    )
+}
+
+/// The OWNER pod's entry: a frame another pod forwarded over the PR-2 relay,
+/// answered through `tx`, the relay's proxy sender (its replies route back to
+/// the browser's connection on the origin pod). `None` = not an extauth frame.
+pub fn on_relayed(
+    state: &RemoteState,
+    principal: ObjectId,
+    actor: &str,
+    tx: &ClientTx,
+    msg: &roomler_ai_remote_control::signaling::ClientMsg,
+) -> Option<bool> {
+    use roomler_ai_remote_control::signaling::ClientMsg;
+    if !matches!(
+        msg,
+        ClientMsg::ExtauthStart { .. }
+            | ClientMsg::ExtauthFinish { .. }
+            | ClientMsg::ExtauthKe2 { .. }
+            | ClientMsg::ExtauthOutcome { .. }
+    ) {
+        return None;
+    }
+    dispatch(state, principal, actor, tx, msg.clone(), Hop::Relayed)
+}
+
+fn dispatch(
+    state: &RemoteState,
+    principal: ObjectId,
+    actor: &str,
+    tx: &ClientTx,
+    msg: roomler_ai_remote_control::signaling::ClientMsg,
+    hop: Hop,
+) -> Option<bool> {
+    use roomler_ai_remote_control::signaling::ClientMsg;
+    let (state, actor, tx) = (state.clone(), actor.to_string(), tx.clone());
     match msg {
         ClientMsg::ExtauthStart { connect_code, ke1 } => {
             tokio::spawn(async move {
-                handle_start(&state, principal, &actor, &tx, &connect_code, ke1).await;
+                handle_start(&state, principal, &actor, &tx, &connect_code, ke1, hop).await;
             });
             Some(true)
         }
@@ -593,15 +731,17 @@ pub fn intercept(
                     &connect_code,
                     attempt_id,
                     ke3,
+                    hop,
                 )
                 .await;
             });
             Some(true)
         }
-        // A DEVICE's frames arriving on a USER socket: a browser trying to
-        // speak for a device. Swallowed — never delivered, never dispatched.
+        // A DEVICE's frames arriving from a USER — on a socket or through the
+        // relay: a browser trying to speak for a device. Swallowed — never
+        // delivered, never dispatched.
         ClientMsg::ExtauthKe2 { .. } | ClientMsg::ExtauthOutcome { .. } => {
-            warn!(%principal, "extauth: a device frame arrived on a user socket — dropped");
+            warn!(%principal, "extauth: a device frame arrived from a user — dropped");
             Some(true)
         }
         _ => None,

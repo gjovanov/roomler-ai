@@ -489,3 +489,69 @@ async fn only_the_starter_can_finish_an_attempt() {
     );
     let _ = dev.stop.send(true);
 }
+
+/// P3d — the outsider lands on the OTHER pod, and still logs in.
+///
+/// An outsider has no tenant, so tenant affinity cannot put their socket on the
+/// pod that holds the device, and `/ws` refuses a `tid` they are not a member
+/// of. Before P3d this login answered `unavailable`. Now both frames are
+/// forwarded over the PR-2 relay to the device's pod, handled there, and
+/// answered back to THIS socket — including `finish`, whose attempt lives only
+/// on the other pod.
+///
+/// ⚠️ Needs a cluster bus (Redis). Without one it cannot run and says so
+/// loudly rather than passing on nothing.
+#[tokio::test]
+async fn an_outsider_on_the_other_pod_still_logs_in() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_bus.is_none() {
+        eprintln!(
+            "SKIPPED an_outsider_on_the_other_pod_still_logs_in: no Redis — P3d unproven here"
+        );
+        return;
+    }
+    for _ in 0..40 {
+        let (a, b) = (
+            app1.state.cluster_bus.as_ref().unwrap(),
+            app2.state.cluster_bus.as_ref().unwrap(),
+        );
+        if a.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+            && b.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let seeded = app1.seed_tenant("extauth-xpod").await;
+    // The device is homed on pod 1…
+    let dev = device(&app1, &seeded, "mach-extauth-xpod", &pw("device")).await;
+    // …and the outsider lands on pod 2.
+    let (_id, mut ws) = outsider(&app2, "extxpod").await;
+
+    let (state, ke1) = client_ke1(&pw("device"));
+    send(
+        &mut ws,
+        json!({"t": "rc:extauth.start", "connect_code": dev.code, "ke1": ke1}),
+    )
+    .await;
+    let challenge = next_of(&mut ws, &["rc:extauth.challenge", "rc:extauth.result"]).await;
+    assert_eq!(
+        challenge["t"], "rc:extauth.challenge",
+        "the device on the OTHER pod answered KE1: {challenge}"
+    );
+    let attempt_id = challenge["attempt_id"].as_str().unwrap().to_string();
+    let ke3 = client_ke3(state, &pw("device"), challenge["ke2"].as_str().unwrap())
+        .expect("the right password opens the device's KE2");
+    send(
+        &mut ws,
+        json!({"t": "rc:extauth.finish", "connect_code": dev.code, "attempt_id": attempt_id, "ke3": ke3}),
+    )
+    .await;
+    let result = next_of(&mut ws, &["rc:extauth.result"]).await;
+    assert!(
+        result.get("refused").is_none(),
+        "verified across pods — the attempt lives on pod 1, the socket on pod 2: {result}"
+    );
+    let _ = dev.stop.send(true);
+}
