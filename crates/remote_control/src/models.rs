@@ -564,6 +564,19 @@ pub enum RpcCap {
     /// Only advertised by builds with an overlay surface (`overlay-l3` /
     /// `overlay-netstack`): a build with no key has nothing to rotate.
     KeyRotate,
+    /// FR-83 — the agent answers every `rc:ssh.grant` with
+    /// `rc:ssh.grant_ack`, sent only once the grant is in the table its auth
+    /// path reads (or naming why it refused it). The server then answers the
+    /// CALLER only after that ack — before it, "queued for the device" was
+    /// read as "the device has it", and a caller with a faster control path
+    /// than the target dialled first and got `Permission denied (publickey)`
+    /// (#1597).
+    ///
+    /// ⚠️ Third verb with `ssh` as its prefix, after `ssh-consent`: an agent
+    /// advertising `ssh` alone never acks, so a server that read an ack out of
+    /// `ssh` would wait out its whole bound on every grant to such a device.
+    /// Equality-matched, locked by test.
+    SshGrantAck,
 }
 
 impl RpcCap {
@@ -583,11 +596,12 @@ impl RpcCap {
             Self::ConfigReport => "config-report",
             Self::RelayServer => "relay-server",
             Self::KeyRotate => "key-rotate",
+            Self::SshGrantAck => "ssh-grant-ack",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 8] = [
+    pub const ALL: [RpcCap; 9] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -596,6 +610,7 @@ impl RpcCap {
         Self::ConfigReport,
         Self::RelayServer,
         Self::KeyRotate,
+        Self::SshGrantAck,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -1212,6 +1227,18 @@ pub mod ssh_limits {
     /// signalling latency plus a slow WireGuard handshake. A grant that
     /// lingered would be a standing key to the device.
     pub const GRANT_TTL_SECS: u64 = 60;
+    /// FR-83 — how long the server holds the CALLER while it waits for the
+    /// target to confirm a grant (`rc:ssh.grant_ack`). No confirmation in
+    /// time ⇒ the request is refused as unconfirmed, never answered with an
+    /// address the device may not honour.
+    ///
+    /// Sized from the field, not guessed: the slowest grant delivery measured
+    /// (#1597, a corp laptop on DERP behind a TLS-inspecting middlebox) was
+    /// 4.4 s, so this is twice that. It must also stay well inside the
+    /// originating device's own 30 s wait for `rc:ssh.response`, so the caller
+    /// hears the server's reason rather than its own timeout, and leave most
+    /// of [`GRANT_TTL_SECS`] to dial in once confirmed.
+    pub const GRANT_ACK_TIMEOUT_SECS: u64 = 10;
     /// Hard ceiling on a session's lifetime, after which the agent closes it.
     /// Twelve hours is long enough for a working day and short enough that a
     /// forgotten terminal does not stay open for a week.
@@ -2570,6 +2597,24 @@ pub enum SshDenyReason {
     RateLimited,
     /// The caller offered something other than a usable ed25519 public key.
     BadPublicKey,
+    /// FR-83 — gate 4: the device's own `ssh_enabled` is off. Reported BY the
+    /// device (in `rc:ssh.grant_ack`), the twin of
+    /// [`ExecDenyReason::AgentDisabled`]; before the ack existed this refusal
+    /// lived only in the device's log and the caller saw a key error.
+    AgentDisabled,
+    /// FR-83 — the grant had already expired when the device received it:
+    /// the device's clock is ahead of the server's, or its control connection
+    /// is slower than the grant's whole life.
+    GrantExpiredOnArrival,
+    /// FR-83 — the device refused the grant for a reason with no dedicated
+    /// variant (an unusable key, or a reason newer than this server).
+    GrantRefused,
+    /// FR-83 — the device did not confirm the grant within
+    /// [`ssh_limits::GRANT_ACK_TIMEOUT_SECS`]. The caller is refused rather
+    /// than told to dial: the one thing known at that moment is that the
+    /// device has NOT confirmed, and "dial here" is the answer that produced
+    /// `Permission denied (publickey)` in #1597.
+    GrantUnconfirmed,
 }
 
 impl SshDenyReason {
@@ -2597,6 +2642,60 @@ impl SshDenyReason {
             }
             Self::RateLimited => "too many SSH requests for this device; try again shortly",
             Self::BadPublicKey => "the session public key is missing or not a usable ed25519 key",
+            Self::AgentDisabled => {
+                "roomler SSH is switched off on the device itself (its own ssh_enabled \
+                 setting) — only someone with access to that device can turn it on"
+            }
+            Self::GrantExpiredOnArrival => {
+                "the grant had already expired when the device received it — the \
+                 device's clock is probably ahead of the server's by a minute or more"
+            }
+            Self::GrantRefused => {
+                "the device refused the session grant — its own log (`roomler logs \
+                 --grep ssh:` on that device) says why"
+            }
+            Self::GrantUnconfirmed => {
+                "the device did not confirm the grant within 10 s — its connection to \
+                 the server may be slow or stale; try again, or check it with \
+                 `roomler exec`"
+            }
+        }
+    }
+}
+
+/// FR-83 — why a device refused an `rc:ssh.grant`, carried back to the server
+/// in `rc:ssh.grant_ack` (see [`crate::signaling::ClientMsg::SshGrantAck`]).
+///
+/// Absent from the ack = RECORDED: the grant is in the table the device's
+/// auth path reads, and the caller may dial. Present = the grant will never
+/// be honoured, and [`Self::deny_reason`] is what the caller is told.
+///
+/// ⚠️ Decoded LENIENTLY on the ack (`grant_refusal_lenient` in `signaling`):
+/// an unknown spelling from a newer agent lands on [`Self::Other`] — still a
+/// refusal. Strict decoding would fail the whole frame, the server would drop
+/// it at `debug!`, and a clear refusal would turn into `grant_unconfirmed`
+/// after the full wait. It must never land on "recorded" either: that would
+/// tell a caller to dial a device that has just said no.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SshGrantRefusal {
+    /// Gate 4 — the device's own `ssh_enabled` is off.
+    SshDisabled,
+    /// The grant arrived past its deadline.
+    Expired,
+    /// The device could not use what the server had validated.
+    Invalid,
+    /// A reason this build does not know.
+    Other,
+}
+
+impl SshGrantRefusal {
+    /// The refusal the CALLER is answered with.
+    pub fn deny_reason(self) -> SshDenyReason {
+        match self {
+            Self::SshDisabled => SshDenyReason::AgentDisabled,
+            Self::Expired => SshDenyReason::GrantExpiredOnArrival,
+            Self::Invalid | Self::Other => SshDenyReason::GrantRefused,
         }
     }
 }
@@ -3880,6 +3979,7 @@ mod tests {
         assert_eq!(RpcCap::Config.wire(), "config");
         assert_eq!(RpcCap::ConfigReport.wire(), "config-report");
         assert_eq!(RpcCap::KeyRotate.wire(), "key-rotate");
+        assert_eq!(RpcCap::SshGrantAck.wire(), "ssh-grant-ack");
     }
 
     /// Every prefix relationship between verbs is a KNOWN one.
@@ -3897,9 +3997,13 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 2] = [
+        const KNOWN: [(RpcCap, RpcCap); 3] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
+            // FR-83 — the third, and the same idea again: "runs an SSH
+            // server" is not "confirms a grant". Locked by
+            // `ssh_does_not_imply_ssh_grant_ack`.
+            (RpcCap::Ssh, RpcCap::SshGrantAck),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -3980,6 +4084,30 @@ mod tests {
             ..Default::default()
         };
         assert!(both.has_rpc(RpcCap::Ssh) && both.has_rpc(RpcCap::SshConsent));
+    }
+
+    /// FR-83 — every agent before the ack advertises `ssh` (and most
+    /// `ssh-consent`) and never answers a grant. A prefix matcher would make
+    /// the server wait out its full bound on every grant to every one of them
+    /// and then refuse the session as unconfirmed — turning an intermittent
+    /// race into a fleet-wide outage of roomler SSH.
+    #[test]
+    fn ssh_does_not_imply_ssh_grant_ack() {
+        let pre_ack = AgentCaps {
+            rpc: vec!["exec".into(), "ssh".into(), "ssh-consent".into()],
+            ..Default::default()
+        };
+        assert!(pre_ack.has_rpc(RpcCap::Ssh));
+        assert!(
+            !pre_ack.has_rpc(RpcCap::SshGrantAck),
+            "an agent that never acks must NOT read as ack-capable"
+        );
+
+        let acking = AgentCaps {
+            rpc: vec!["ssh".into(), "ssh-consent".into(), "ssh-grant-ack".into()],
+            ..Default::default()
+        };
+        assert!(acking.has_rpc(RpcCap::SshGrantAck));
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has
