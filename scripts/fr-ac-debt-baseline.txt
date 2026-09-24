@@ -62,9 +62,17 @@ FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — an
 #
 # The rule (PR #1401, merged 2026-09-05T20:49:42Z) makes a docs criterion
 # mandatory in every spec. An FR is bound by it if its issue opened, or it
-# closed, after that moment. These four are bound and carry no such criterion,
-# so the debt pins above cannot see their docs at all — there is no box to be
+# closed, after that moment. These are bound and carry no such criterion, so
+# the debt pins above cannot see their docs at all — there is no box to be
 # unticked. Each line is removed the day its spec gains the criterion.
+#
+# Four were found when the check was written. FR-74 and FR-81, both still
+# OPEN, were given the criterion in the same PR (#1598), so the debt pins can
+# now see their docs. The two below are CLOSED, and they cannot be fixed the
+# same way: an unticked criterion on a closed FR only moves it from this list
+# to the debt list above, and a ticked one without the docs would be a false
+# record. The honest fix for each is to write the docs, then add the criterion
+# ticked, with a link to them.
 #
 # ⚠️ FR-69 is deliberately ABSENT. It closed at 11:53Z on 2026-09-05 with no
 #    reader-facing docs — the close the operator made the rule ABOUT — and its
@@ -72,5 +80,3 @@ FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — an
 #    timestamp and not a date.
 nodocs FR-7    # closed 2026-09-08, three days after the rule. docs/code-signing.md exists and has a docs/README.md row, but carries NO mermaid diagram (the rule requires them) and the spec never recorded a docs criterion.
 nodocs FR-66   # closed 2026-09-06, the day after the rule. A severity fix (a missing machine-global config logged ERROR). No doc mentions the change; whether it warranted docs was never written down.
-nodocs FR-74   # opened 2026-09-06, the day after the rule, and written without the criterion. Still open — add it before this closes, and the debt pins will then see the docs.
-nodocs FR-81   # opened 2026-09-08. All 8 criteria ticked, clean Result (24 PASS / 0 FAIL) — and AC8 says "documented in a skill", which is gitignored: nothing public documents it. Not closable until it has a docs/*.md page, a docs/README.md row, and the criterion.

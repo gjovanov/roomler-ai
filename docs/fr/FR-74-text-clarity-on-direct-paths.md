@@ -336,6 +336,7 @@ now nothing on screen said whether the frame that came back actually matched the
 | P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07, released in 0.4.80** — offline: every notch frame at q 64 instead of 255, refine to lossless kept; field gate: **instrument PASS 13:25 UTC** (`max_qp` 64 in every scroll window, was 255; settles to q 0; 0 skips) and **operator PASS** ("scrolling large texts seems much better") ⇒ **field-verified 2026-09-07**; thin direct path measured 20:08 UTC — sharp but laggy below the cap's ~10 Mbps floor (§P3), an open decision |
 | P4 | viewer display-scale pill + 1:1 guidance: screen pixels per remote pixel, `1:1 pixels` or `shown at 1.05×`, the way to 1:1 in the tooltip and the Display tab (§P4) | — (UI; the pill has its own metrics checkbox) | **built 2026-09-08 (#1497), field-verified the same morning** on `hosted-20260908-a6257b8`: `shown at 1.05×` in Adaptive = the FSR canvas exactly (2018 ÷ 1920), `1:1 pixels` at Custom zoom 100/dpr % with FSR disengaging on its own; docs `docs/remote-control.md` §18.6.1 |
 | P5 | **the direct ceiling FOLLOWS the measured path** — `clamp(believed × HEADROOM, legibility_floor, bpp_bound)`; the bpp product stops being the operating point and becomes a cap (§"P5 — the ceiling follows the path") | — (the belief itself is the way back: with no belief the bound still applies, which is today's behaviour byte for byte) | **decided 2026-09-10, not built.** Gated on FR-79 V3b's belief reading sane in the field first — the shadow ships before the law |
+| P6 | **docs, in the house style** (the docs-before-close rule, #1401): a design section in `docs/rate-control.md` for P1's direct ceiling and P1b's measured-send-wait gate — today only three changelog rows there, and no mermaid diagram of how the ceiling and the gate compose — joined by P5's path-following ceiling when it is built; linked from `docs/README.md`. P3 (`docs/encoders.md`) and P4 (`docs/remote-control.md` §18.6.1) are documented already | — (docs) | **open** — AC5 |
 
 ## Acceptance criteria
 
@@ -363,6 +364,13 @@ now nothing on screen said whether the frame that came back actually matched the
 - [ ] **AC4** — every phase carries a before/after from the same instrument (the
       heartbeat's `target_bps`, `frames_skipped`, `swaps`, keyframes) plus the
       operator's read of the same scroll.
+- [ ] **AC5** — docs in the house style, linked from `docs/README.md` (the
+      docs-before-close rule, #1401) — P6. Owed, measured 2026-09-24: P1's direct
+      ceiling and P1b's measured-send-wait gate appear in `docs/rate-control.md`
+      only as three changelog rows, with no design section and no mermaid diagram
+      of how the ceiling and the gate compose; P5 joins them when it is built.
+      P3 (`docs/encoders.md`) and P4 (`docs/remote-control.md` §18.6.1) are
+      documented already.
 
 ## Open decisions
 
