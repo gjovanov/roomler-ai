@@ -393,11 +393,24 @@ counterpart despite the identical failure mode under PackageKit. Pinned
 - [ ] P2c: a device with no worker (every non-macOS agent, and a macOS one with
       the switch off) sends no `caps` on its heartbeats at all — measured on the
       wire, not inferred from behaviour.
-- [ ] P2d: a supervised Mac takes a package **update** and delegation is still
+- [x] P2d: a supervised Mac takes a package **update** and delegation is still
       armed afterwards — `gui/<uid>/com.roomler.agent` is not loaded, the plist
       is gone from `~/Library/LaunchAgents`, and a session started after the
       update streams real pixels. This is the criterion the old build fails, so
       measure it on the CURRENT release first.
+      *(2026-09-24, `agent-v0.4.100` — the first package update to reach a
+      supervised Mac since P2d landed; the Mac took it unattended. After it:
+      `launchctl print gui/501/com.roomler.agent` → **`Could not find service`**;
+      `~/Library/LaunchAgents` holds only `com.roomler.desktop.plist` — **no
+      `com.roomler.agent.plist`**; a session started afterwards on the daemon row
+      rendered **3024×1968** (native Retina), luma variance **3957** (a black frame
+      reads ~0), **H.265** at **8 fps** with the bitrate counter live. Preconditions
+      on the device: `macos_supervise_gui_worker = true`. ⚠️ **The fail half is the
+      RECORDED pre-P2d observation**, not a fresh re-measurement: the P2d section
+      above documents `postinstall` re-bootstrapping the label on every update and
+      the black-screen-with-working-input result, which is why P2d exists.
+      Re-creating it today would mean downgrading the operator's Mac to a pre-P2d
+      build.)*
 - [ ] P2d: a Mac with the daemon opted in but the supervise key **absent** takes
       the same update and keeps its LaunchAgent — the five unchanged states are
       what makes this safe to ship to every Mac, not just the supervised one.
@@ -625,3 +638,29 @@ level the field runs at.
 
 **P2b is complete.** P2c is next: the daemon's row still advertises `no-gui-session`, so
 the UI presents it as "not a capture target" even though it now is one.
+
+### 2026-09-24 — `agent-v0.4.100`: P2d holds through a real update (AC9)
+
+P2d (#1553) had been CI-green for fifteen days and never met the event it exists for.
+`agent-v0.4.100` was the first package update to reach this supervised Mac since, and it
+arrived the way updates do — **unattended**. The daemon row went offline at 11:29Z,
+the separately-enrolled `MacBook-1` row followed at 11:36Z, and the daemon
+came back on 0.4.100.
+
+| check, after the update | result |
+|---|---|
+| `launchctl print gui/501/com.roomler.agent` | **`Could not find service`** — not loaded |
+| `~/Library/LaunchAgents/` | only `com.roomler.desktop.plist` (touched by this update) — **no `com.roomler.agent.plist`** |
+| a session started afterwards, on the daemon row | canvas **3024 × 1968**, luma variance **3957**, **H.265**, **8 fps**, bitrate counter live (95 → 93 kbps between reads) |
+| `macos_supervise_gui_worker` | `true` — this is the supervised case AC9 names |
+
+The second row going dark and **staying** dark is the other half of the same result: that
+row *was* the LaunchAgent. Under the pre-P2d installer the update would have
+re-bootstrapped it, the row would have come back, and the supervisor would have stood down
+to `LaunchdOwns`. What remains is one row serving the session — the shape this FR exists for.
+
+⚠️ **Watch-only, on purpose.** The session drove no input on the operator's machine, so
+AC4's input half (`has_input_permission`, no TCC re-prompt) is **not** claimed here.
+⚠️ **AC10 needs a second Mac** — one with the daemon opted in but the supervise key
+*absent*, which must keep its LaunchAgent through the same update. This Mac cannot be
+both halves.
