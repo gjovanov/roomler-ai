@@ -44,6 +44,8 @@ If you are running short on budget, **park the card and say so**. Never finish c
    ⚠️ A field test must be shown to **fail on the current deploy first**, or its pass
    proves nothing. Record both runs.
 6. **Tick honestly.** An AC gets ticked only with a link to evidence that supports it.
+   Evidence for part of a criterion is `- [~]`, with the met half and the missing half
+   both named in the text. It never becomes `[x]`, and the board counts it as open.
    Record the wrong turns too — a documented dead end is often the most valuable line in
    an FR's log.
 7. **Park.** Update the card, append a `## Step log` row to the issue, set `column`,
