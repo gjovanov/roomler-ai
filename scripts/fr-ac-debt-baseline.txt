@@ -57,3 +57,20 @@ FR-53=5   # C.10 #1123 Result present; 0 of 5 ticked (rollback sentinel lifecycl
 FR-54=4   # C.11 #1130 Result present; 0 of 4 ticked (orphaned-network reporting).
 FR-57=6   # C.12 #1161 Result present; 0 of 6 ticked (multi-arch manifest).
 FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — and "docs before close" is a standing operator rule (2026-09-05). The only breach of it in the tree, and nothing could see it.
+
+# ── nodocs: bound by the docs-before-close rule, and no docs criterion ───────
+#
+# The rule (PR #1401, merged 2026-09-05T20:49:42Z) makes a docs criterion
+# mandatory in every spec. An FR is bound by it if its issue opened, or it
+# closed, after that moment. These four are bound and carry no such criterion,
+# so the debt pins above cannot see their docs at all — there is no box to be
+# unticked. Each line is removed the day its spec gains the criterion.
+#
+# ⚠️ FR-69 is deliberately ABSENT. It closed at 11:53Z on 2026-09-05 with no
+#    reader-facing docs — the close the operator made the rule ABOUT — and its
+#    owed docs landed in #1401 itself. It is the reason the boundary is a
+#    timestamp and not a date.
+nodocs FR-7    # closed 2026-09-08, three days after the rule. docs/code-signing.md exists and has a docs/README.md row, but carries NO mermaid diagram (the rule requires them) and the spec never recorded a docs criterion.
+nodocs FR-66   # closed 2026-09-06, the day after the rule. A severity fix (a missing machine-global config logged ERROR). No doc mentions the change; whether it warranted docs was never written down.
+nodocs FR-74   # opened 2026-09-06, the day after the rule, and written without the criterion. Still open — add it before this closes, and the debt pins will then see the docs.
+nodocs FR-81   # opened 2026-09-08. All 8 criteria ticked, clean Result (24 PASS / 0 FAIL) — and AC8 says "documented in a skill", which is gitignored: nothing public documents it. Not closable until it has a docs/*.md page, a docs/README.md row, and the criterion.

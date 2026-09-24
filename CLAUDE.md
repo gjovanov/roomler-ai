@@ -543,6 +543,11 @@ write-up filed afterwards. Registry and full protocol: **`docs/fr/README.md`**.
    `docs/*.md` — **mermaid diagrams**, tables, callouts, `file:line` anchors, and a
    row in `docs/README.md`'s index. It is a phase row *and* an acceptance criterion
    in every spec, ticked before the close.
+   ⚠️ Enforced by the same `scripts/fr-verification-debt.sh`: a spec **bound** by
+   this rule — its issue opened, or it closed, after the rule reached master
+   (#1401, 2026-09-05T20:49Z) — must carry the docs criterion, recognised by its
+   `docs/README.md` index-row commitment. Without it the ticked-box check cannot
+   see the docs at all: FR-81 had every box ticked and nothing public documenting it.
 
 ## Post-Implementation Testing
 
