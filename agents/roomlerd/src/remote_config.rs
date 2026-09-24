@@ -66,6 +66,18 @@ pub struct RemoteConfigServices {
     /// assertions took effect immediately — would be a strange kind of last
     /// word. The server can never write this; only [`Self::adopt_local`] can.
     remote_config_enabled: Arc<AtomicBool>,
+    /// FR-52 P3 — the device's external-login state: guess budget, in-flight
+    /// logins, verified grants.
+    ///
+    /// Here because this struct is built ONCE per daemon (`main.rs`) and cloned
+    /// into every org's control loop and the LocalAPI: the budget has to be the
+    /// DEVICE's, and one per loop would hand an attacker a separate budget for
+    /// every org the device belongs to. It is NOT a process-wide static — that
+    /// would be device-global too, but the integration tests run many agents in
+    /// one process, and a shared static would make one test's wrong passwords
+    /// throttle another's.
+    #[cfg(feature = "external-access")]
+    external_logins: Arc<crate::external_logins::ExternalLogins>,
 }
 
 impl RemoteConfigServices {
@@ -80,6 +92,8 @@ impl RemoteConfigServices {
             lock,
             exec_enabled: Arc::new(AtomicBool::new(exec_enabled)),
             remote_config_enabled: Arc::new(AtomicBool::new(remote_config_enabled)),
+            #[cfg(feature = "external-access")]
+            external_logins: Arc::new(crate::external_logins::ExternalLogins::new()),
         }
     }
 
@@ -87,6 +101,12 @@ impl RemoteConfigServices {
     /// names the restart that fits its install.
     pub fn config_path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// FR-52 P3 — the device's one external-login state (see the field).
+    #[cfg(feature = "external-access")]
+    pub fn external_logins(&self) -> &crate::external_logins::ExternalLogins {
+        &self.external_logins
     }
 
     /// Gate 4 for Fleet RPC, read per request.

@@ -39,7 +39,7 @@ pub async fn on_ke1(
     #[cfg(feature = "external-access")]
     {
         imp::on_ke1(
-            crate::external_logins::global(),
+            remote_cfg.external_logins(),
             is_primary,
             remote_cfg,
             attempt_id,
@@ -68,7 +68,7 @@ pub async fn on_ke3(
     #[cfg(feature = "external-access")]
     {
         imp::on_ke3(
-            crate::external_logins::global(),
+            remote_cfg.external_logins(),
             is_primary,
             remote_cfg,
             attempt_id,
