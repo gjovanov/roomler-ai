@@ -3856,6 +3856,42 @@ async fn handle_server_msg(
             });
         }
 
+        // FR-52 P3c — an outsider's login, relayed by the server. Answered in
+        // a task, not inline: the live config read waits on the config lock,
+        // which `rc password set` holds across an Argon2 derivation, and the
+        // control loop must not stall behind it. Answered in EVERY build —
+        // this one included when it has no credential stack — because every
+        // build advertises `external-access` and a silent device would make
+        // the server wait out its bound.
+        ServerMsg::ExtauthKe1 {
+            attempt_id,
+            principal,
+            ke1,
+        } => {
+            let (is_primary, remote_cfg, tx) =
+                (ctx.is_primary, remote_cfg.clone(), outbound_tx.clone());
+            tokio::spawn(async move {
+                let reply =
+                    crate::extauth::on_ke1(is_primary, &remote_cfg, attempt_id, principal, &ke1)
+                        .await;
+                let _ = tx.send(reply).await;
+            });
+        }
+        ServerMsg::ExtauthKe3 {
+            attempt_id,
+            principal,
+            ke3,
+        } => {
+            let (is_primary, remote_cfg, tx) =
+                (ctx.is_primary, remote_cfg.clone(), outbound_tx.clone());
+            tokio::spawn(async move {
+                let reply =
+                    crate::extauth::on_ke3(is_primary, &remote_cfg, attempt_id, principal, &ke3)
+                        .await;
+                let _ = tx.send(reply).await;
+            });
+        }
+
         // Remaining tunnel-flow `ServerMsg` variants
         // (TunnelOpened / TcpForwardAccept / TcpForwardReject /
         // TcpHalfClose / TcpClosed / TunnelRevoked) target the

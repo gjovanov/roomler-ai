@@ -93,6 +93,38 @@ impl RemoteConfigServices {
         self.remote_config_enabled.load(Ordering::Relaxed)
     }
 
+    /// FR-52 P3 — gate 3 and the gate-4 record, read from the config FILE at
+    /// the moment an outsider knocks.
+    ///
+    /// Live for the reason `exec_enabled` is live: `roomler rc password clear`
+    /// and `config set external_access_enabled false` are how the person at the
+    /// machine REVOKES cross-org access. A revocation that took effect only at
+    /// the next restart would leave an outsider able to log in after the owner
+    /// believed they had shut them out — the one direction in which "stale"
+    /// cannot be allowed.
+    ///
+    /// `None` = gate 3 is shut, or no complete record is stored: the device is
+    /// not accepting external logins. An unreadable file is the same answer —
+    /// failing closed is the only safe reading of "cannot tell".
+    #[cfg(feature = "external-access")]
+    pub async fn external_access_live(&self) -> Option<crate::external_access::Credential> {
+        let _guard = self.lock.lock().await;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let cfg = crate::config::load(&path).ok()?;
+            if !cfg.external_access_enabled {
+                return None;
+            }
+            Some(crate::external_access::Credential {
+                setup: cfg.external_access_setup?,
+                verifier: cfg.external_access_verifier?,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Re-seed the live flags from a config the LOCAL owner just wrote.
     ///
     /// Called by the LocalAPI's `ConfigSet` (the desktop companion, `roomler
