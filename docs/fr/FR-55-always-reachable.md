@@ -1,7 +1,12 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # FR-55: A device stays reachable instead of quietly sleeping
 
-**Status:** proposed (2026-09-01). Tracking issue: [#1154](https://github.com/gjovanov/roomler-ai/issues/1154). Anchors verified against
+**Status:** P0 measured, P1 + P2 shipped (`agent-v0.4.45` / `0.4.46`), P3 deferred on
+evidence, P4 + P5 open — and ⚠️ **P2's AC-power arm FAILS in the field**: a Mac that
+falls asleep on battery and is then plugged in stays asleep all night with our
+assertion held (2026-09-24, field log). This line read "proposed" until then, with the
+field log empty, while P0–P2 had shipped and been measured — the record below restores
+that history. Tracking issue: [#1154](https://github.com/gjovanov/roomler-ai/issues/1154). Anchors verified against
 master `40da643d`.
 
 ## Goal
@@ -140,6 +145,16 @@ reported normally while a feature was dark.
   `docs/remote-config.md` resolves with `remote_config_enabled`.
 - Is `NetworkClientActive` or `PreventUserIdleSystemSleep` the right macOS type? The
   former is semantically exact and may behave better with Power Nap; needs measuring.
+  **Half-answered by measurement, 2026-09-24: `PreventUserIdleSystemSleep` is NOT
+  sufficient.** It governs the idle timer during a *full*, user-driven wake and nothing
+  else. It has no power over a system in a transient (dark / notification / maintenance)
+  wake returning to sleep — and a Mac that dozed off on battery lives in exactly those
+  wakes after it is plugged in. macOS logged ~59 such returns to sleep on AC in one night
+  with our assertion held and confirmed present (field log). The replacement is still
+  open and still has to be MEASURED, in the one scenario that failed:
+  `NetworkClientActive`, or `PreventSystemSleep` (honoured only on AC, which is
+  exactly `on-ac`'s semantics). ⚠️ Do not pick one from documentation — this module
+  already chose once on "well understood" and it was wrong in the most ordinary case.
 - Should an **exec** run hold an assertion? A 40-minute build kicked off by `roomler exec`
   has the same problem as a session, and the same answer is not obvious.
 
@@ -151,4 +166,91 @@ reported normally while a feature was dark.
 
 ## Field-verification log
 
-_(empty — P0 has not run)_
+⚠️ This section read *"empty — P0 has not run"* until 2026-09-24, while P0 had been
+measured and P1/P2 shipped and field-verified on 2026-09-01. The first two entries are
+restored from #1154's comments, where that evidence had lived alone for three weeks.
+
+### 2026-09-01 — P1 + P2 shipped in `agent-v0.4.45`, field-verified on the MacBook
+
+Precondition asserted first: `git merge-base --is-ancestor c0287753 agent-v0.4.45`.
+
+| # | arm | assertion | result |
+|---|---|---|---|
+| 1 | **control** — default policy | we hold nothing | ✅ 0 assertions |
+| 2 | typo at set time | refused, not coerced | ✅ `power_policy must be one of never \| on-ac \| always (got "alwyas")` |
+| 3 | `on-ac` on mains | held, by **policy** | ✅ `session_active=false` |
+| 4 | flip to `never` | released | ✅ back to 0 |
+| 5 | back to `on-ac` | held again | ✅ |
+
+⚠️ **Every arm ran with the Mac already awake.** Row 3 proved we *take* the assertion
+on AC; nothing proved the assertion *keeps the Mac awake* — see 2026-09-24.
+
+### 2026-09-01 — P0 measured: the Linux fleet does not sleep, so P3 is deferred
+
+`/sys/power/state` offers `freeze mem disk` on mars, jupiter and zeus, but `IdleAction`
+is unset on all three, and uptimes were 6 weeks, 6 weeks and **25 weeks** — a host up
+25 weeks has not been idle-suspending. P3 (logind `Inhibit()` over D-Bus) would put a
+D-Bus stack into every Linux agent for no measured benefit. Deferred, not cancelled: the
+case it exists for is a Linux *desktop*, which the fleet does not have.
+
+Left open that day, needing a human: the **battery** arm, and a **session overriding
+`never`**.
+
+### 2026-09-24 — the battery arm passes; the AC arm FAILS
+
+Found while field-verifying FR-43 P2c: the daemon row re-announced its capabilities
+every 30–60 minutes overnight, each time right after WireGuard reported
+`CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)` — nine silent minutes, i.e. the machine had
+been asleep. The daemon's own log said it was holding the Mac awake the whole time.
+macOS's power log (`pmset -g log`) is the surface that settles which is true.
+
+**Battery arm — passes**, and needed no human after all: it happened on its own.
+
+| evidence | source |
+|---|---|
+| 09-23 00:33:36 (+0300) `Entering Sleep state due to 'Idle Sleep' … Using Batt (Charge:76%)`, keeper **not** holding | `pmset -g log` |
+| 09-24 18:28:30Z `power: released the device to sleep normally policy="on-ac"` | daemon log |
+| afterwards: `Now drawing from 'Battery Power'`, `PreventSystemSleep 0`, **no** roomlerd assertion listed | `pmset -g batt` + `-g assertions` |
+
+**AC arm — fails.** One night, second by second (`pmset` times are the Mac's `+0300`):
+
+| time | event |
+|---|---|
+| 00:33:36 | `Idle Sleep`, **on battery** — correct under `on-ac` |
+| 00:34:30 | `DarkWake to FullWake … due to Notification Using AC` — the charger goes in |
+| 00:34:34 | keeper: `holding the device awake policy="on-ac" on_ac=Some(true) session_active=false`; macOS: `PID 72979(roomlerd) … PreventUserIdleSystemSleep "roomler: keeping this device reachable"` |
+| 00:34:41 | `Notification Wake Back to Sleep` — **seven seconds later, assertion held** |
+| 02:18:05 | the **same** assertion (`id 0x10000954c`) still present, age `01:43:30` |
+| to 11:35 | no FullWake ever again; the Mac surfaces only in DarkWakes |
+
+Inside the window the keeper logged as holding (00:34:34 → 11:41:30), macOS returned to
+sleep **47 times — all 47 on AC**: 27 `Maintenance Sleep`, 18 `Sleep Service Back to
+Sleep`, 2 `Notification Wake Back to Sleep`. **Zero** were `Idle Sleep`, and zero were
+`Clamshell Sleep` — so this is **not** the documented lid limitation.
+
+🔑 **Why it fails.** `PreventUserIdleSystemSleep` stops the *idle timer* during a full,
+user-driven wake. It has no say over a system in a transient wake going back to sleep —
+and a Mac that dozed off on battery is in exactly those wakes after it is plugged in.
+So the assertion is real, present, and irrelevant, and the keeper's log line *"holding the
+device awake"* is a claim about the device that the device contradicts.
+
+The following day and night corroborate it from the daemon's side, more weakly: the
+keeper logged one continuous hold from 09-23 08:52:50Z to 09-24 11:50:36Z, and inside it
+the daemon re-announced its capabilities **49 times** — each one a fresh control
+connection. The overnight ones I inspected follow the same sleep tell. `pmset` was not
+pulled for that window, so it supports the finding rather than proving it a second time.
+
+🔑🔑 **Why 2026-09-01 did not catch it.** Every arm began with the Mac awake, so it tested
+whether we take the assertion, never whether the assertion keeps anyone reachable. The
+scenario that matters most — lid open, battery flat by evening, plugged in at night — is
+the one path the test could not enter. *A hold is not a wake.*
+
+⚠️ **P1 (a session holds the machine) is not refuted by this**, and the reason is *when*
+the assertion is taken, not how. A session can only begin while the Mac is reachable,
+i.e. in a full wake — the one state where `PreventUserIdleSystemSleep` does its job. The
+standing policy acquires on an AC *transition*, and plugging in a dozing laptop delivers
+that transition during a transient wake, where the same assertion is inert. So the
+failure is specific to P2 — the case with nobody connected, which is the case FR-55
+exists for. (Not claimed: that a session is otherwise protected. Input injection tickles
+`IOHIDSystem` only while someone is typing; a view-only session or an SSH session gets
+nothing from it — see `power.rs`'s module doc.)
