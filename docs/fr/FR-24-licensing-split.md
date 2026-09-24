@@ -179,11 +179,23 @@ The FFmpeg builds already publish to a **permanent GitHub Release**
 artifact expires in 90 days and cannot carry a three-year offer, which is why
 the release, not the artifact, is the anchor.
 
-`lgpl-source-offer.yml` publishes the **corresponding source** — pristine
-upstream tarball archived by us (an upstream tag can move) plus the complete
-build recipe — to that same release, and then asserts the asset actually
-resolves. ⚠️ A written offer pointing at a missing asset claims compliance we do
-not have, so the verification step is part of the job, not a nicety.
+`lgpl-source-offer.yml` publishes the **corresponding source** — the upstream
+tarball archived by us (an upstream tag can move), every change our builds make
+to it, and the complete build recipe — to that same release, and then asserts
+the asset actually resolves. ⚠️ A written offer pointing at a missing asset claims
+compliance we do not have, so the verification step is part of the job, not a
+nicety.
+
+⚠️ **"Resolves" was not "complete", and for four weeks nothing noticed** (P4c).
+The bundle shipped the upstream tarball and the recipe only. The recipe
+*referenced* `.github/ffmpeg-patches/` (our FR-62 patch, since 2026-09-02) and
+the vcpkg port's own 14 patches without carrying either. Meanwhile this page, the
+bundle's README and `THIRD-PARTY-NOTICES.md` all said "we apply no patches", and
+`docs/lgpl-relink.md` said the recipe applied them. The asset check was green
+throughout, because it asked "is there a file" and never "is it the source we
+built from". The fix answers that at both ends. The bundle ships both patch sets
+and publishes what it was built from as `…inputs.txt`, and `release-agent.yml`
+refuses to tag while that file disagrees with the release's own checkout.
 
 ## Phases
 
@@ -194,6 +206,7 @@ not have, so the verification step is part of the job, not a nicety.
 | **P3** | `CONTRIBUTING.md`, `SECURITY.md`, `security.txt`, `docs/CLA.md` (Apache-ICLA-derived), disabled `cla.yml` | ✅ shipped; ⚠️ CLA still needs legal review before the bot is enabled |
 | **P4a** | `THIRD-PARTY-NOTICES.md` + written offer + `lgpl-source-offer.yml` | ✅ shipped; workflow needs its first dispatch (blocked until this merges — `workflow_dispatch` only resolves on the default branch) |
 | **P4b** | Close the §6 relink gap | ✅ **resolved by publication** — see below; `docs/lgpl-relink.md` |
+| **P4c** | The offer carries every change the builds make: our patches + the vcpkg port at the recipe's baseline, an `inputs.txt` asset, and a `release-agent.yml` gate against the checkout | 🔄 in PR — to be republished from the PR branch and verified on the served asset |
 | **P5** | *(optional)* `server` feature on `tunnel-core` so AGPL reaches further | not planned |
 | **P6** | OCI image labels on the runtime stage + build-args in the deploy recipe | ✅ shipped |
 

@@ -27,20 +27,31 @@ Both halves are satisfied by publication, not by request:
 
 | §6(a) requires | Where it is |
 |---|---|
-| Complete source of **the Library** | [`vendored-ffmpeg-9.0.1`](https://github.com/gjovanov/roomler-ai/releases/tag/vendored-ffmpeg-9.0.1) → `ffmpeg-<version>-corresponding-source.tar.xz` (pristine upstream + the full build recipe) |
+| Complete source of **the Library** | [`vendored-ffmpeg-9.0.1`](https://github.com/gjovanov/roomler-ai/releases/tag/vendored-ffmpeg-9.0.1) → `ffmpeg-<version>-corresponding-source.tar.xz` (upstream + every patch our builds apply + the full build recipe) |
 | The **"work that uses the Library"**, as **source code** | This repository. The agent is MPL-2.0; `agents/roomlerd` and every crate it depends on are public. |
 | Terms permitting modification and debugging | MPL-2.0 for our code; upstream licences for vendored crates |
 
 The written offer in [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md) stands
 in addition to this, not instead of it.
 
-Our customisation is the configure flag set, which selects components, plus the
-source patches in [`.github/ffmpeg-patches/`](../.github/ffmpeg-patches/) (since
-FR-62: one NVENC patch so a bitrate change does not force an IDR). Every shipped
-tree carries a `ROOMLER-PATCHES.txt` manifest (sha256 per patch) that the
-release lane checks against the committed patches, and the corresponding-source
-tarball's `recipe/` applies them the same way — so "the Library as used in that
-binary" is reproducible from what is published.
+Our customisation is the configure flag set, which selects components, plus two
+sets of source patches:
+
+| patches | applied by | in the tarball |
+|---|---|---|
+| ours, [`.github/ffmpeg-patches/`](../.github/ffmpeg-patches/) (since FR-62: one NVENC patch so a bitrate change does not force an IDR) | the Windows and Linux builds | `patches/`, with a SHA-256 manifest |
+| the vcpkg `ffmpeg` port's own (14: build-system fixes, plus one API addition) | the Windows build | `vcpkg-port-ffmpeg/`, at the baseline the recipe pins |
+
+So "the Library as used in that binary" is reproducible from what is published.
+Two checks keep it that way. Every shipped tree carries a `ROOMLER-PATCHES.txt`
+manifest that the release lane compares with the committed patches. And the
+release lane refuses to tag while the published tarball was built from a
+different patch set or vcpkg baseline than the release's own checkout.
+
+⚠️ Until 2026-09-24 the tarball carried neither set, although this page said its
+`recipe/` applied them. The recipe *referenced* the patch directory without
+shipping it, which was invisible to anyone who read the recipe instead of the
+tarball.
 
 ---
 
@@ -55,8 +66,18 @@ sha256sum -c ffmpeg-n9.0.1-corresponding-source.tar.xz.sha256
 tar xf ffmpeg-n9.0.1-corresponding-source.tar.xz
 ```
 
-You now have the pristine upstream tarball and `recipe/`, which contains the
-exact workflow that produced our binaries.
+You now have the upstream tarball, `patches/` (ours), `vcpkg-port-ffmpeg/` (the
+port the Windows build starts from) and `recipe/`, which contains the exact
+workflows that produced our binaries. To start from exactly the library we
+shipped on Linux, apply `patches/` first:
+
+```bash
+tar xf ffmpeg-n9.0.1.tar.gz && cd FFmpeg-n9.0.1
+for p in ../patches/*.patch; do patch -p1 < "$p"; done
+```
+
+The Windows build applies the same patches through the vcpkg port's `PATCHES`
+list, ahead of the port's own; `recipe/vendor-ffmpeg-windows.yml` shows how.
 
 ### 2. Modify and build FFmpeg
 
