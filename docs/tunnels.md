@@ -167,14 +167,20 @@ client to `TurnRelayConn`, whose own `Drop` spawns the close when a live connect
 goes away. Both allocators are covered: UDP, and TURNS/TCP, where the stranded
 resource is a TLS connection and its task, invisible to `ss -uanp` — the same bug.
 
-**Measured after the fix**, one continuous daemon lifetime on each of four fleet hosts:
+**Measured after the fix** — an hourly census over 24 h on four fleet hosts, counting only
+the daemon's own pid. The "after" column is the longest single daemon lifetime:
 
-| host | before (`0.4.99`) | after (`0.4.100`) |
+| host | before (`0.4.99`) | after (`0.4.100`, 20.0 h) |
 |---|---|---|
 | jupiter | 134 sockets @ 14.5 h ≈ **9.2/h** | 5 → 5, **0.000/h** |
 | zeus | 300 @ 38 h | 5 → 5, **0.000/h** |
 | mars | 1269 @ 288 h | 6 → 6, **0.000/h** |
 | asahi | 849 @ 292 h | 5 → 5, **0.000/h** |
+
+At the old rate, 20 hours would have added ~180 sockets per host; no host exceeded 7 at any
+sample in the full 24 h. The lifetime is 20 h rather than 24 because an unrelated release
+auto-updated the fleet mid-window and restarted every daemon — it carried the fix too, and
+stayed flat.
 
 #### What made it hard to find — each worth keeping
 
