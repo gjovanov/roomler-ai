@@ -305,15 +305,13 @@ jobs:
           # the lane dies before linting anything. Bump `version:` whenever
           # this list changes, or the action serves the previously cached set.
           packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
-          # v2 -> v3 on 2026-09-23: the v2 entry is the EMPTY set the 09-04
-          # incident saved (same mechanism as the GTK key above — a stale
-          # runner apt index, 404s, then "Caching 0 installed packages" saved
-          # as a hit). Every run since has logged `Cache hit for:
-          # cache-apt-pkgs_12b1…` and then the guard below's `##[warning]
-          # cached apt set did not deliver libvpx` + a full apt install —
-          # green, ~1 min/run, and never self-correcting, because only a new
-          # key can disown a poisoned entry. Healthy = that warning line is
-          # ABSENT from the job log.
+          # v2 -> v3 on 2026-09-23 (#1593) on a premise that turned out WRONG
+          # (corrected 2026-09-24): the v2 entry was never empty — its restores
+          # delivered libvpx (`Restoring 18 packages from cache… libvpx9=…tar
+          # restoring…`). The `did not deliver libvpx` warning that fired on
+          # every run was the guard below misreading a stale /etc/ld.so.cache
+          # (see its comment). The bump was harmless and not needed; only the
+          # 09-04 entry was truly empty (manifest missing ⇒ exit 127 at load).
           version: ci-vpx-v3
       # 2026-09-04: the cache action restored NOTHING (its own manifest was
       # missing: `cat: …/cache-apt-pkgs/manifest_all.log: No such file`) and
@@ -323,8 +321,17 @@ jobs:
       # the lane verifies the runtime lib is really there and installs the
       # set directly when it is not. The check is the loader's own view
       # (`ldconfig -p`), not the action's status.
+      #
+      # ⚠️ `ldconfig -p` prints /etc/ld.so.cache, NOT the filesystem, and the
+      # cache action restores a package by untarring its files — it never runs
+      # the postinst that refreshes that cache. So on every cache HIT, from
+      # 09-06 to 09-24, this check saw no libvpx right after `libvpx9=…tar
+      # restoring…` and "fell back" to a full apt install, warning that the
+      # cache "did not deliver" when it had. `sudo ldconfig` first makes the
+      # cache match the disk, so the warning now means what it says.
       - name: Verify libvpx really landed (fallback to apt-get)
         run: |
+          sudo ldconfig
           if ! ldconfig -p | grep -q 'libvpx\.so'; then
             echo "::warning::cached apt set did not deliver libvpx — installing directly"
             sudo apt-get update -qq
@@ -674,15 +681,18 @@ jobs:
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: pkg-config libclang-dev libvpx-dev
-          # v2 -> v3 on 2026-09-23: poisoned exactly like `ci-vpx-v2` (see the
-          # vp9-444 lane) — `Cache hit for: cache-apt-pkgs_134e…` followed by
-          # the guard's `did not deliver libvpx` warning and a full apt install
-          # on every run since 09-06. A new key is the only way to disown it.
+          # v2 -> v3 on 2026-09-23 (#1593) on the same wrong premise as
+          # `ci-vpx` (see the vp9-444 lane): the entry was full, and the
+          # warning was the guard's stale-ld.so.cache false positive.
+          # Harmless, not needed.
           version: ci-ffmpeg-v3
       # Same self-heal as the vp9-444 lane (2026-09-04: a silent empty cache
-      # restore left `libvpx.so.9` missing at test-binary load, exit 127).
+      # restore left `libvpx.so.9` missing at test-binary load, exit 127),
+      # including its `sudo ldconfig` — without it this check misreads every
+      # cache HIT as "not delivered" (see the vp9-444 lane's comment).
       - name: Verify libvpx really landed (fallback to apt-get)
         run: |
+          sudo ldconfig
           if ! ldconfig -p | grep -q 'libvpx\.so'; then
             echo "::warning::cached apt set did not deliver libvpx — installing directly"
             sudo apt-get update -qq
