@@ -638,12 +638,35 @@ is the row an operator is usually hunting for.
 # ~/.ssh/config
 Host *.roomler
   ProxyCommand roomler proxy %h %p
+  Port 2222
 
 scp report.pdf corplap-3.roomler:/tmp/
 ```
 
 Resolves a device **name** to its overlay address and pipes stdio. A literal
-IP short-circuits the lookup, so `%h` works either way.
+IP short-circuits the lookup, so `%h` works either way. `Port 2222` is roomler
+SSH's default intercept port; without it `%p` is 22, which reaches only a
+device's own `sshd`.
+
+| `%h` as it arrives | looked up as | why it is accepted |
+|---|---|---|
+| `corplap-3` | `corplap-3` | the bare label — tried first, exactly as before |
+| `corplap-3.roomler` | `corplap-3` | what the `Host *.roomler` pattern above always produces |
+| `corplap-3.<magic domain>` | `corplap-3` | the MagicDNS name, when the daemon reports a magic domain |
+| anything else | verbatim — and fails | see below |
+
+⚠️ Until #1573 the lookup was verbatim, so the recipe this section had always
+shown failed for **every** host (`no device named "zeus.roomler"`). The fix
+strips only suffixes the mesh owns: stripping "everything after the first dot"
+would let a `ProxyCommand` scoped wider than `*.roomler` turn `github.com`
+into a lookup for a device named `github` (`localclient::mesh_label`).
+
+⚠️ **OpenSSH applies `HostName` before it substitutes `%h`.** A host that
+also has a `Host zeus / HostName <public ip>` block hands the ProxyCommand its
+*public* address, and the failure is a bare `actively refused` / `timed out`
+that names no device and reads exactly like a broken overlay. `scp -v` shows
+it (`Executing proxy command: exec roomler proxy <public ip> 2222`), and the
+proxy now says so itself when a connect to a non-overlay literal fails.
 
 ⚠️ **Transport and resolution only, and the two commands are not
 interchangeable.** `ProxyCommand` hands the client a byte pipe; it cannot
