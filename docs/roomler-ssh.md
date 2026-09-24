@@ -815,7 +815,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
 | P8a | Session **activity** log — commands + exit codes, shell/SFTP/forward events, device-reported into `ssh_activity`. Deliberately NOT session content | **shipped** |
 | P8b | Admin UI for the activity feed — `SshActivitySection`, under the audit log in org Settings | **shipped** |
-| FR-83 | `rc:ssh.grant_ack` + `ssh-grant-ack`: the caller is answered only once the target confirms the grant (≤ 10 s), and the device's refusals — gate 4, expired on arrival — reach the caller by name | **shipped**, field verification pending |
+| FR-83 | `rc:ssh.grant_ack` + `ssh-grant-ack`: the caller is answered only once the target confirms the grant (≤ 10 s), and the device's refusals — gate 4, expired on arrival — reach the caller by name | **shipped** 0.4.101, field-verified — 40/40 grant-issued sessions recorded before they opened across the FR-81 matrix |
 | M5 | `ssh_max_privilege` — the device refuses a server grant that asks for the daemon identity. The one gate that survives a compromised control plane | **shipped**, default unset (permissive) |
 
 ## 6. Build
