@@ -133,7 +133,13 @@ pub async fn run(device: &str, session_secs: u64, args: &[String]) -> Result<i32
 /// ```text
 /// Host *.roomler
 ///   ProxyCommand roomler proxy %h %p
+///   Port 2222
 /// ```
+///
+/// `%h` arrives as `corplap-3.roomler`; the lookup strips that suffix, and a
+/// MagicDNS name's, before matching (#1573 — before it did, this very recipe
+/// failed for every host). `Port 2222` is roomler SSH's default intercept
+/// port; without it `%p` is 22, which reaches only a device's own `sshd`.
 ///
 /// This is TRANSPORT AND NAME RESOLUTION ONLY, and the distinction matters.
 /// `ProxyCommand` hands the client a byte pipe; it cannot supply an identity
@@ -156,26 +162,63 @@ pub async fn proxy(host: &str, port: u16) -> Result<()> {
 
     // An address is already an answer. Only a NAME needs the daemon, so a
     // proxy to a literal address keeps working when the daemon is busy.
-    let addr = if host.parse::<std::net::IpAddr>().is_ok() {
+    let literal = host.parse::<std::net::IpAddr>().ok();
+    let addr = if literal.is_some() {
         host.to_string()
     } else {
         match localclient::resolve_overlay_ip(host).await? {
             Some(ip) => ip,
             None => bail!(
                 "no device named {host:?} on this mesh (or it has no overlay address). \
-                 `roomler peers` lists what is reachable."
+                 A device is matched by its bare name, as <name>.roomler, or by its \
+                 MagicDNS name; `roomler peers` lists what is reachable."
             ),
         }
     };
 
     let sock = TcpStream::connect((addr.as_str(), port))
         .await
-        .with_context(|| format!("connecting to {addr}:{port}"))?;
+        .with_context(|| {
+            let hint = match literal {
+                Some(ip) if !is_overlay_address(ip) => HOSTNAME_BEFORE_PERCENT_H,
+                _ => "",
+            };
+            format!("connecting to {addr}:{port}{hint}")
+        })?;
     // Nagle would add up to 40 ms to every keystroke of an interactive
     // session riding this pipe.
     let _ = sock.set_nodelay(true);
 
     pump(sock, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Appended to a failed connect when `%h` was an address the mesh does not
+/// own. The trap it names cost a field session several minutes (#1573):
+/// OpenSSH applies a `HostName` line BEFORE substituting `%h`, so an existing
+/// `Host zeus / HostName <public ip>` block hands the ProxyCommand the PUBLIC
+/// address. What surfaces is a bare `actively refused` / `timed out` that
+/// names no host and reads exactly like a broken overlay.
+const HOSTNAME_BEFORE_PERCENT_H: &str = " (not a mesh overlay address — if you \
+     meant a device by name, check ssh_config for a `HostName` line: OpenSSH \
+     substitutes it into %h before running the ProxyCommand, so the name \
+     never reached roomler)";
+
+/// Whether `ip` lies in the overlay's own space: IPv4 `100.64.0.0/10`, which
+/// every tenant's block is carved from, or the derived IPv6
+/// `fd72:6f6f:6d6c::/48`. Only ever used to decide whether a failed connect
+/// deserves [`HOSTNAME_BEFORE_PERCENT_H`] — never to refuse an address, since
+/// a literal outside the overlay can be legitimate (an advertised subnet).
+fn is_overlay_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0xc0) == 64
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd72 && s[1] == 0x6f6f && s[2] == 0x6d6c
+        }
+    }
 }
 
 /// Splice `input`→socket→`output` until the PEER closes.
@@ -374,6 +417,46 @@ mod tests {
             msg.contains("connecting to 127.0.0.1:9"),
             "a literal address must go straight to connect, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_to_a_non_mesh_literal_names_the_hostname_trap() {
+        // #1573: `Host zeus / HostName <public ip>` hands the ProxyCommand the
+        // PUBLIC address, and the bare connect error named no host at all —
+        // it read as a broken overlay for several minutes in the field.
+        let err = proxy("127.0.0.1", 9)
+            .await
+            .expect_err("nothing listens on :9");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("`HostName` line"),
+            "a non-mesh literal must point at the HostName trap, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn overlay_space_is_the_cgnat_slash_ten_and_the_derived_ula() {
+        let yes = [
+            "100.64.0.1",
+            "100.65.4.2", // a carved tenant block
+            "100.127.255.254",
+            "fd72:6f6f:6d6c::6441:402",
+        ];
+        let no = [
+            "100.63.255.255",
+            "100.128.0.1",
+            "203.0.113.7",
+            "127.0.0.1",
+            "192.168.1.10",
+            "fd72:6f6f:6d6d::1",
+            "::1",
+        ];
+        for a in yes {
+            assert!(is_overlay_address(a.parse().unwrap()), "{a} is overlay");
+        }
+        for a in no {
+            assert!(!is_overlay_address(a.parse().unwrap()), "{a} is not");
+        }
     }
 
     #[test]
