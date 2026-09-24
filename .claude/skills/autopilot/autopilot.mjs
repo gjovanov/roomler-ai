@@ -739,8 +739,12 @@ const trunc = (s, n) => {
 
 function next() {
   const n = Number(flag('n', '3'));
-  // hands_off cards are somebody else's work in flight — traced, never dispatched.
-  const pool = allCards().filter((c) => !c.run.hands_off && ['admitted', 'field'].includes(c.column));
+  // hands_off cards are somebody else's work in flight — traced, never dispatched. A BLOCKED
+  // card, or one whose open criteria are all operator-only, gives an agent nothing to do. This
+  // used to offer both anyway: FR-6, blocked on the operator's `cgu=1` decision, was the
+  // second card `next` named on 2026-09-24.
+  const pool = allCards().filter((c) => !c.run.hands_off && !c.blocked && agentLeft(c).length > 0
+    && ['admitted', 'field'].includes(c.column));
   for (const c of rank(pool).slice(0, n)) {
     const left = agentLeft(c);
     console.log(`${c.id}  #${c.issue}  ${c.acs.filter(a=>a.done).length}/${c.acs.length} ACs  [${c.column}]  ${c.title}`);
