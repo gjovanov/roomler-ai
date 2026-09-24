@@ -385,8 +385,11 @@ counterpart despite the identical failure mode under PackageKit. Pinned
 - [ ] A remote-desktop session started while logged in streams real pixels and accepts
       input, with `caps` reporting `has_input_permission: true` and **no TCC re-prompt**.
 - [ ] `codesign -d -r-` on the bundle is byte-identical before and after the migration.
-- [ ] P2c: with a worker attached, the daemon's row reports `screen-capture` +
+- [x] P2c: with a worker attached, the daemon's row reports `screen-capture` +
       `input` and the dashboard stops calling it "not a capture target".
+      *Field-verified 2026-09-24 end to end — the daemon's send AND the row the dashboard
+      renders from (field log). The daemon's own hello reports `no-gui-session`, so the
+      row can only say otherwise through the P2c heartbeat path.*
 - [ ] P2c: when the worker DETACHES, the row goes back to `no-gui-session`
       within one heartbeat — a stale "capture target" is worse than an honest
       "not one", because the next session gets a black screen.
@@ -664,3 +667,42 @@ AC4's input half (`has_input_permission`, no TCC re-prompt) is **not** claimed h
 ⚠️ **AC10 needs a second Mac** — one with the daemon opted in but the supervise key
 *absent*, which must keep its LaunchAgent through the same update. This Mac cannot be
 both halves.
+
+### 2026-09-24 — P2c: the daemon's row reports the worker's permissions (end to end)
+
+P2c shipped in `agent-v0.4.78` (#1458) and waited seventeen days for this. Two halves,
+because each alone can lie:
+
+| half | evidence |
+|---|---|
+| the daemon **sends** | its log, every connection: `announcing changed capabilities on the heartbeat (FR-43 P2c) permissions=Some(["screen-capture", "input"])` |
+| the row **reports** | the dashboard's own data for MacBook-1-Daemon (`os: macos`, online): `permissions: ["screen-capture", "input"]`, `has_input_permission: true` |
+
+🔑 **Why the second half is the one that counts.** The agent log proves only the send; a
+broken `update_capabilities` on the server would leave that log identical while the row
+kept saying `no-gui-session`. And the row value is self-discriminating: the daemon runs in
+session 0, so its own **hello** reports `no-gui-session` on every connect — which is
+exactly what this row showed before P2c (#971's step log after P2b shipped: *"the daemon's
+row still advertises `no-gui-session`, so the UI presents it as 'not a capture target'
+even though it now is one"*). The only path by which it can
+read `screen-capture` + `input` is the P2c heartbeat → `update_capabilities` → the
+dashboard. `permissionWarnings()` therefore renders no "No screen access" / "No input
+access" chips, and the `no-gui-session` early return (the "not a capture target" branch)
+does not fire.
+
+⚠️ **The re-announcements are frequent, and that is correct.** The daemon announced these
+same permissions 49 times across one 27-hour window — `last_announced_permissions` is
+scoped to a *connection*, because a new connection's hello resets the row to
+`no-gui-session` and P2c must restore it. Each one follows a fresh control connection, and
+overnight those were the Mac surfacing from sleep: WireGuard's
+`CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)` precedes them. That sleep is FR-55's, not this
+FR's — and it turned out to be a real FR-55 defect (#1612).
+
+⚠️ **Not claimed.** P2c's *revert* (row back to `no-gui-session` when the worker
+detaches) needs a detach longer than one heartbeat: the two observed today
+(`delegation channel closed` → `attached` at 11:50:35 and 17:50:43) lasted ~2 s, so no
+heartbeat fell inside either, and a row that never needed to revert says nothing about
+whether it can. The no-worker criterion asks for a **wire** measurement, and the absence
+of a log line on another device is inference from behaviour, which it rules out. And
+`has_input_permission: true` in the caps is only AC4's reporting half — that criterion
+also needs real input accepted with no TCC re-prompt.
