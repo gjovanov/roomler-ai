@@ -209,6 +209,8 @@ refuses to tag while that file disagrees with the release's own checkout.
 | **P4c** | The offer carries every change the builds make: our patches + the vcpkg port at the recipe's baseline, an `inputs.txt` asset, and a `release-agent.yml` gate against the checkout | ✅ republished complete 2026-09-24 (run 36062315391) and verified on the served asset; the release gate fails before and passes after |
 | **P5** | *(optional)* `server` feature on `tunnel-core` so AGPL reaches further | not planned |
 | **P6** | OCI image labels on the runtime stage + build-args in the deploy recipe | ✅ shipped |
+| **P7** | The split's own guard covers FR-69's modules: the manifest check walks the workspace `members` (it globbed one level deep and saw 18 of 24), and the server crate list gains `roomler-ai-mod-remote`/`-network` (the AGPL-in-agent graph check could not see them) | ✅ 2026-09-25, proven fail-first (field log) |
+| **Docs** | [`docs/licensing.md`](../licensing.md) plus index rows for it and `lgpl-relink.md`. ✅ 2026-09-25, **added retroactively**: this FR opened before docs-before-close, and closing it binds it | ✅ |
 
 ### P4b — the relink gap was smaller than it looked
 
@@ -253,6 +255,7 @@ a win and needs measuring on its own merits, not as a legal necessity.
 - [ ] CLA reviewed by a lawyer and the bot enabled *(the only thing still gating P3)*
 - [x] OCI `licenses` label set on the runtime stage, landing WITH this FR — plus title/description/url/source/documentation/vendor, and `VERSION`/`GIT_SHA` build-args wired into the deploy recipe
 - [x] LGPL §6 relink right is **exercisable and documented** (`docs/lgpl-relink.md`), not merely offered by mail
+- [x] **Docs updated/created with diagrams, linked from `docs/README.md`**: [`docs/licensing.md`](../licensing.md) (the classification, the four CI checks and how each is shaped, the FFmpeg LGPL obligations with the corresponding-source release gate), plus a new Licensing section in `docs/README.md` indexing it and `lgpl-relink.md`. ⚠️ **Added retroactively (2026-09-25)**: FR-24 opened before the docs-before-close rule (#1401), and closing it binds it. The autopilot board had parked this card as Ready to close with no docs criterion, and the close would have failed the verification-debt guard, as FR-22's did that same day.
 
 ### Known friction, accepted deliberately
 
