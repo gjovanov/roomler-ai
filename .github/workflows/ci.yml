@@ -282,6 +282,25 @@ jobs:
       - name: Run fleet module unit tests
         run: cargo test -p roomler-ai-mod-fleet --lib
 
+      # Every other crate that carries `#[cfg(test)]` bodies — and until
+      # 2026-09-25 ran them in NO lane, for the reason the api step above
+      # gives: `--workspace` clippy never compiles a test body, and the test
+      # steps name crates explicitly. Found when two of `remote_control`'s
+      # wire-format tests had been failing on master since FR-78 taught the
+      # codec vocabulary `vulkan` and `d3d12va`, and a `setup-core` fixture
+      # since a retired-name anchor was inserted INSIDE its JSON string.
+      # `remote_control` holds the `rc:*` wire locks CLAUDE.md calls
+      # load-bearing, `mod-network` the SSH gates and the grant-ack table,
+      # `agent-core` the config round-trips. One invocation, one build graph.
+      - name: Run the remaining crates' unit tests
+        run: >-
+          cargo test --lib
+          -p roomler-ai-remote-control -p roomler-ai-mod-network
+          -p roomler-node-core -p roomler-cli -p roomler-localapi
+          -p roomler-ai-services -p roomler-ai-db -p roomler-ai-config
+          -p roomler-ai-mod-chat -p roomler-ai-mod-saas
+          -p tcp-turn-conn -p roomler-setup-core
+
       # The integration crate cannot RUN here (it needs MongoDB + Redis), but
       # it can still be compiled — and compiling it is what was missing. It sat
       # broken for an unknown stretch because `OverlayNodeDao::create` grew

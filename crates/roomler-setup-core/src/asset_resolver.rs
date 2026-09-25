@@ -414,12 +414,16 @@ mod tests {
     #[test]
     fn artifact_health_deserialises_flavour_alias() {
         // Agent endpoint shape (agent_release.rs): `flavour`.
+        //
+        // ⚠️ The anchor below once sat INSIDE the raw JSON string, where the
+        // name audit reads it as a comment but serde reads it as JSON — the
+        // fixture stopped parsing and this test failed for as long as no CI
+        // lane ran this crate. Anchors go in Rust comments, never in a literal.
+        // RETIRED-NAME-ANCHOR(5): names a PUBLISHED release asset. Filenames are
+        // fixed by what is already on GitHub Releases (FR-21 D6); this fixture
+        // is a copy of a real GitHub asset list.
         let h: ArtifactHealth = serde_json::from_str(
             r#"{"tag":"agent-v0.3.0-rc.28","flavour":"permachine",
-                // RETIRED-NAME-ANCHOR(20): names a PUBLISHED release asset. Filenames
-                // are fixed by what is already on GitHub Releases (FR-21 D6); these
-                // fixtures are
-                // copies of real GitHub asset lists.
                 "filename":"roomler-agent-0.3.0-rc.28-perMachine-x86_64-pc-windows-msvc.msi",
                 "size":123,"digest":null,
                 "uri":"/api/agent/installer/permachine?version=latest"}"#,
@@ -431,6 +435,7 @@ mod tests {
     #[test]
     fn artifact_health_deserialises_platform_alias() {
         // Tunnel endpoint shape (tunnel_release.rs): `platform`.
+        // RETIRED-NAME-ANCHOR(3): the same — a real published asset's name.
         let h: ArtifactHealth = serde_json::from_str(
             r#"{"tag":"tunnel-v0.3.0-rc.46","platform":"windows-x86_64",
                 "filename":"roomler-tunnel-0.3.0-rc.46-x86_64-pc-windows-msvc.zip",

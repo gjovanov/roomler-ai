@@ -404,17 +404,30 @@ mod tests {
         assert_eq!(&out, b"ack", "and its answer must reach the output");
     }
 
+    /// A loopback port nothing listens on: bound to learn a free number, then
+    /// released, so a connect to it is REFUSED at once.
+    ///
+    /// ⚠️ Not a fixed "surely closed" port. These tests used `:9` (discard),
+    /// and under WSL a connect to `127.0.0.1:9` is not refused — it hangs
+    /// until the SYN-retry budget runs out, ~134 s per test, while a
+    /// just-freed ephemeral port is refused in single-digit ms (measured).
+    async fn refusing_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
     #[tokio::test]
     async fn proxy_takes_a_literal_address_without_asking_the_daemon() {
-        // Port 9 (discard) on localhost is almost certainly closed, so this
-        // fails at CONNECT — which is the point: it got past resolution
-        // without a daemon, proving an address short-circuits the lookup.
-        let err = proxy("127.0.0.1", 9)
+        // Nothing listens on the port, so this fails at CONNECT — which is
+        // the point: it got past resolution without a daemon, proving an
+        // address short-circuits the lookup.
+        let port = refusing_port().await;
+        let err = proxy("127.0.0.1", port)
             .await
-            .expect_err("nothing listens on :9");
+            .expect_err("nothing listens on the freed port");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("connecting to 127.0.0.1:9"),
+            msg.contains(&format!("connecting to 127.0.0.1:{port}")),
             "a literal address must go straight to connect, got: {msg}"
         );
     }
@@ -424,9 +437,9 @@ mod tests {
         // #1573: `Host zeus / HostName <public ip>` hands the ProxyCommand the
         // PUBLIC address, and the bare connect error named no host at all —
         // it read as a broken overlay for several minutes in the field.
-        let err = proxy("127.0.0.1", 9)
+        let err = proxy("127.0.0.1", refusing_port().await)
             .await
-            .expect_err("nothing listens on :9");
+            .expect_err("nothing listens on the freed port");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("`HostName` line"),
