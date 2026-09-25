@@ -368,7 +368,7 @@ now nothing on screen said whether the frame that came back actually matched the
 - [ ] **AC4** — every phase carries a before/after from the same instrument (the
       heartbeat's `target_bps`, `frames_skipped`, `swaps`, keyframes) plus the
       operator's read of the same scroll.
-- [ ] **AC5** — docs in the house style, linked from `docs/README.md` (the
+- [x] **AC5** — docs in the house style, linked from `docs/README.md` (the
       docs-before-close rule, #1401) — P6. Owed, measured 2026-09-24: P1's direct
       ceiling and P1b's measured-send-wait gate appear in `docs/rate-control.md`
       only as three changelog rows, with no design section and no mermaid diagram
@@ -380,7 +380,10 @@ now nothing on screen said whether the frame that came back actually matched the
       they compose, the field reads, P5's status and its gate read), the
       `direct_queue_ms` / `direct_hrd_pct` / `FFMPEG_MAXRATE_KBPS` /
       `VP9_DIRECT_MAX_Q` config rows, and the `docs/README.md` row — ticked on
-      merge, not before.*
+      merge, not before.* **Merged 2026-09-25 as `719206df8` (#1661)** and
+      checked on master: the section is at `docs/rate-control.md:270`, the file
+      carries 3 mermaid diagrams, and the `docs/README.md` rate-control row names
+      it. P5's own docs join the section when P5 is built.
 
 ## Open decisions
 

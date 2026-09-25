@@ -197,7 +197,7 @@ leaves a warning with no ending.
       browser row with no `session_id`). Fail-first on the current deploy: **0** such rows.
       The pass read — a stall with its phase named, and the agent's log for the same session —
       is owed after the deploy, from real foreground use.
-- [ ] **Docs updated/created with diagrams, linked from `docs/README.md`** —
+- [x] **Docs updated/created with diagrams, linked from `docs/README.md`** —
       [`docs/remote-control.md`](../remote-control.md) §12.1 *Time-to-first-frame — the connect
       timeline*: the eleven marks and who can see each (flowchart), the phase-aware signalling
       bound, the `agent_offline` fast-fail (sequence diagram), the operator's verdict rules, the
@@ -207,7 +207,9 @@ leaves a warning with no ending.
       ⚠️ **Added retroactively (2026-09-25)**: FR-22 opened on 2026-08-28, before the
       docs-before-close rule (#1401, 2026-09-05), and a close after that date binds it. Marked
       rather than backdated, so the spec does not claim it always complied. Ticked when the PR
-      carrying the docs has merged, not before.
+      carrying the docs has merged, not before. **Merged 2026-09-25 as `dff8fce52` (#1658)** and
+      checked on master: §12.1 is at `docs/remote-control.md:748` with 2 mermaid diagrams, and
+      the `docs/README.md` remote-control row names it.
 
 ## Open decisions
 
