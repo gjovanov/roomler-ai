@@ -52,6 +52,15 @@ pub struct RecordArgs {
     /// FR-85 P1c — record the microphone. Local only: no remote path ever
     /// sets it.
     pub microphone: bool,
+    /// FR-85 P1e — only say which folder a recording would go to, and why
+    /// (`{"ev":"where"}`), then exit. The daemon asks the recorder rather
+    /// than deciding itself, because the answer depends on who asks: a
+    /// SYSTEM daemon's Videos folder is not the person's, and its write probe
+    /// passes where theirs would not.
+    pub where_only: bool,
+    /// FR-85 P1e — only report the identity this process runs as
+    /// (`{"ev":"whoami"}`), then exit.
+    pub whoami: bool,
 }
 
 /// Open the audio sources the recording was asked for. Each failure is
@@ -290,6 +299,12 @@ fn encoder_factory(pref: &str, fps: u32, gop_seconds: u32) -> Result<(EncoderFac
 
 /// Body of `roomlerd record`. Returns once the file is final.
 pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> {
+    if args.whoami {
+        let mut ev = super::launch::describe_self();
+        ev["ev"] = "whoami".into();
+        emit(&ev);
+        return Ok(());
+    }
     if let Ok(cfg) = roomler_node_core::config::load(&config_path.to_path_buf()) {
         register_encoder_fallbacks(&cfg);
     }
@@ -306,6 +321,10 @@ pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> 
         }
         None => folder::resolve(None),
     };
+    if args.where_only {
+        emit(&serde_json::json!({"ev": "where", "dir": choice.dir, "reason": choice.reason}));
+        return Ok(());
+    }
     if let Some(reason) = &choice.reason {
         tracing::info!(folder = %choice.dir.display(), %reason, "recording: folder fallback");
         emit(&serde_json::json!({"ev": "folder", "path": choice.dir, "reason": reason}));

@@ -9,17 +9,18 @@
 //! that goes away closes the child's stdin, which the child reads as
 //! `parent_gone` and finalizes — a recording never outlives its launcher.
 //!
-//! ⚠️ Not yet here (FR-85 P1e): launching the recorder AS the console user.
-//! The child inherits the daemon's identity, so a SYSTEM/root daemon refuses
-//! a local recording ([`super::identity`]), and a Windows worker running the
-//! elevated linked token of a UAC-split admin records elevated rather than
-//! at medium integrity.
+//! FR-85 P1e — the recorder runs as the person signed in at the device, at
+//! normal integrity ([`super::launch`]): an elevated worker hands it a
+//! restricted medium copy of its token, a SYSTEM one the console user's. The
+//! daemon's own work in the recordings folder (listing, deleting, serving a
+//! download) runs as that same identity ([`RecordingManager::as_user`]), and
+//! the folder is decided by the recorder, as the recorder (`record --where`).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, watch};
@@ -29,6 +30,7 @@ use tunnel_core::localapi::{
 
 use super::child::parse_event_line;
 use super::folder;
+use super::launch::{self, Identity, Refusal};
 use super::sidecar::{Initiator, SIDECAR_SUFFIX, Sidecar};
 
 /// How long `start` waits for the child to report `started` or `refused`
@@ -39,11 +41,14 @@ const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// recording copies every byte once.
 const STOP_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Why a SYSTEM/root daemon cannot record locally (until P1e): said on a
-/// refused start, and ahead of time in the state's `unavailable_reason`.
-const SERVICE_IDENTITY_REFUSAL: &str = "this device service runs as SYSTEM/root, so a recording \
-    would be saved in the service account's profile, not yours; local recording from a service \
-    arrives with FR-85 P1e — until then run `roomlerd record` in your own session";
+/// How long a folder the recorder resolved (`record --where`) is reused. The
+/// list is refreshed every few seconds while roomler-desktop's view is open,
+/// and a process launch per refresh would be waste; a recording's own
+/// `started` refreshes it early.
+const WHERE_TTL: Duration = Duration::from_secs(60);
+/// How long `record --where` may take: a folder probe on a slow or scanned
+/// disk, never a capture.
+const WHERE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Recorders of this process that reported `started` and have not ended —
 /// for the updater's defer gate. A count, not a flag: each recorder's reader
@@ -57,11 +62,20 @@ pub fn is_recording() -> bool {
 }
 
 struct Active {
-    stdin: Option<tokio::process::ChildStdin>,
-    child: tokio::process::Child,
+    stdin: Option<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>,
+    child: launch::Child,
     /// Flips to `true` when the child reported `stopped`/`refused`/`error`, or
     /// its stdout closed.
     ended: watch::Receiver<bool>,
+}
+
+/// A folder the recorder decided, for the identity and `record_dir` it was
+/// decided under.
+struct WhereCache {
+    identity: Identity,
+    configured: Option<PathBuf>,
+    choice: folder::FolderChoice,
+    at: Instant,
 }
 
 /// FR-85 P3 — who a REMOTE recording is for: the session that asked (the
@@ -79,7 +93,8 @@ pub struct RemoteInitiator {
 /// a closed set rather than a sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartError {
-    /// This daemon cannot record here (SYSTEM/root, until P1e).
+    /// No recorder can be launched here now: SYSTEM with nobody signed in,
+    /// or root (P1e's [`Refusal`]).
     Unavailable(String),
     /// A recording is already running (one at a time).
     Busy,
@@ -104,9 +119,10 @@ pub struct RecordingManager {
     config_path: PathBuf,
     state: Arc<StdMutex<RecordingState>>,
     active: Mutex<Option<Active>>,
-    /// This daemon runs as SYSTEM/root, where a local recording would land in
-    /// the service account's profile — refused until P1e.
-    service_identity: bool,
+    /// Set by a test; `None` = decide from this process ([`launch::decide`]).
+    identity_override: Option<Result<Identity, Refusal>>,
+    /// The folder the recorder last decided (`record --where`).
+    where_cache: StdMutex<Option<WhereCache>>,
     /// Extra environment for the child, on top of the config fallbacks.
     child_env: Vec<(String, String)>,
     /// [`START_TIMEOUT`], unless a test shortens it.
@@ -123,17 +139,25 @@ impl RecordingManager {
             config_path,
             state: Arc::new(StdMutex::new(RecordingState::default())),
             active: Mutex::new(None),
-            service_identity: super::identity::daemon_is_service_account(),
+            identity_override: None,
+            where_cache: StdMutex::new(None),
             child_env: Vec::new(),
             start_timeout: START_TIMEOUT,
             remote: StdMutex::new(None),
         }
     }
 
+    /// Who a recorder launched now would run as, or why none can be (P1e).
+    /// Read afresh each time: a person signs in and out.
+    pub fn identity(&self) -> Result<Identity, Refusal> {
+        self.identity_override.unwrap_or_else(launch::decide)
+    }
+
     /// Can this daemon record at all (FR-85 P3 advertises remote recording
-    /// only where it can)? `false` for a SYSTEM/root service until P1e.
+    /// only where it can)? `false` for SYSTEM with nobody signed in, and for
+    /// root.
     pub fn available(&self) -> bool {
-        !self.service_identity
+        self.identity().is_ok()
     }
 
     /// FR-85 P3 — the session a REMOTE recording in progress belongs to.
@@ -153,9 +177,25 @@ impl RecordingManager {
     }
 
     /// Override the identity probe — for tests, which may run as root in a
-    /// container and still need to drive the whole path.
-    pub fn with_service_identity(mut self, service_identity: bool) -> Self {
-        self.service_identity = service_identity;
+    /// container and still need to drive the whole path. `true` = this
+    /// platform's service refusal; `false` = record as this process.
+    pub fn with_service_identity(self, service_identity: bool) -> Self {
+        let refusal = if cfg!(windows) {
+            Refusal::NoConsoleUser
+        } else {
+            Refusal::RootDaemon
+        };
+        self.with_identity(if service_identity {
+            Err(refusal)
+        } else {
+            Ok(Identity::Inherit)
+        })
+    }
+
+    /// Override the identity decision outright (a test that must exercise a
+    /// particular launch).
+    pub fn with_identity(mut self, identity: Result<Identity, Refusal>) -> Self {
+        self.identity_override = Some(identity);
         self
     }
 
@@ -173,11 +213,20 @@ impl RecordingManager {
 
     fn snapshot(&self) -> RecordingState {
         let mut s = self.state.lock().map(|s| s.clone()).unwrap_or_default();
-        s.available = !self.service_identity;
-        s.unavailable_reason = self
-            .service_identity
-            .then(|| SERVICE_IDENTITY_REFUSAL.to_string());
+        let identity = self.identity();
+        s.available = identity.is_ok();
+        s.unavailable_reason = identity.err().map(|r| r.message().to_string());
         s
+    }
+
+    /// The environment every recorder gets on top of its own. The
+    /// config-backed knobs (the encoder denylist, pinned devices) are
+    /// process-local here, so they are handed over as real env, exactly as
+    /// the capability probe does, or the gate would be a courtesy.
+    fn child_env(&self) -> Vec<(String, String)> {
+        let mut env = tunnel_core::env::config_fallbacks_for_child();
+        env.extend(self.child_env.iter().cloned());
+        env
     }
 
     /// The configured folder, if any (read fresh — `record_dir` is live).
@@ -224,9 +273,9 @@ impl RecordingManager {
         opts: RecordStartOpts,
         remote: Option<RemoteInitiator>,
     ) -> Result<RecordingState, StartError> {
-        if self.service_identity {
-            return Err(StartError::Unavailable(SERVICE_IDENTITY_REFUSAL.into()));
-        }
+        let identity = self
+            .identity()
+            .map_err(|r| StartError::Unavailable(r.message().into()))?;
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.as_ref()
             && !*a.ended.borrow()
@@ -241,63 +290,49 @@ impl RecordingManager {
             let _ = tokio::time::timeout(Duration::from_secs(2), old.child.wait()).await;
         }
 
-        let mut cmd = tokio::process::Command::new(&self.exe);
-        cmd.arg("record")
-            .arg("--fps")
-            .arg(opts.fps.unwrap_or(30).clamp(1, 60).to_string())
-            .arg("--encoder")
-            .arg(opts.encoder.as_deref().unwrap_or("auto"))
-            .arg("--max-minutes")
-            .arg(opts.max_minutes.unwrap_or(240).max(1).to_string())
-            .arg("--config")
-            .arg(&self.config_path);
-        if let Some(dir) = self.configured_dir() {
-            cmd.arg("--out").arg(dir);
+        let mut args: Vec<OsString> = vec![
+            "record".into(),
+            "--fps".into(),
+            opts.fps.unwrap_or(30).clamp(1, 60).to_string().into(),
+            "--encoder".into(),
+            opts.encoder.as_deref().unwrap_or("auto").into(),
+            "--max-minutes".into(),
+            opts.max_minutes.unwrap_or(240).max(1).to_string().into(),
+            "--config".into(),
+            self.config_path.clone().into(),
+        ];
+        let configured = self.configured_dir();
+        if let Some(dir) = &configured {
+            args.extend(["--out".into(), dir.into()]);
         }
         // FR-85 P1c — both default OFF. The child refuses, by name, a source
         // it cannot open (or a build without audio) rather than recording
         // without the audio the person asked for.
         if opts.system_audio {
-            cmd.arg("--system-audio");
+            args.push("--system-audio".into());
         }
         if opts.microphone {
-            cmd.arg("--microphone");
+            args.push("--microphone".into());
         }
         // FR-85 P3 — the `=` form, so a display name that starts with `-`
         // is a value, never a flag.
         if let Some(r) = &remote {
-            cmd.arg(format!(
-                "--remote-user-id={}",
-                r.controller_user_id.to_hex()
-            ))
-            .arg(format!("--remote-user-name={}", r.controller_name));
+            args.push(format!("--remote-user-id={}", r.controller_user_id.to_hex()).into());
+            args.push(format!("--remote-user-name={}", r.controller_name).into());
         }
-        // The config-backed knobs (the encoder denylist, pinned devices) are
-        // process-local here; hand them to the child as real env, exactly as
-        // the capability probe does, or the gate would be a courtesy.
-        cmd.envs(tunnel_core::env::config_fallbacks_for_child())
-            .envs(self.child_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(false);
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        let launched = match launch::spawn(identity, &self.exe, &args, &self.child_env()) {
+            Ok(l) => l,
             Err(e) => {
                 return Err(StartError::Failed(format!(
                     "could not launch the recorder: {e}"
                 )));
             }
         };
-        let stdin = child.stdin.take();
-        let Some(stdout) = child.stdout.take() else {
-            return Err(StartError::Failed("the recorder has no stdout".into()));
-        };
+        let launch::Launched {
+            stdin,
+            stdout,
+            child,
+        } = launched;
 
         // A fresh state for this recording; the last one's ending stays.
         if let Ok(mut s) = self.state.lock() {
@@ -384,7 +419,21 @@ impl RecordingManager {
         .await;
         let snap = self.snapshot();
         match outcome {
-            Ok(()) if snap.active => Ok(snap),
+            Ok(()) if snap.active => {
+                // The recorder just decided its folder, as itself: the
+                // freshest answer a listing could have.
+                if let Some(dir) = snap.path.as_deref().and_then(|p| Path::new(p).parent()) {
+                    self.remember_folder(
+                        identity,
+                        configured,
+                        folder::FolderChoice {
+                            dir: dir.to_path_buf(),
+                            reason: snap.folder_reason.clone(),
+                        },
+                    );
+                }
+                Ok(snap)
+            }
             Ok(()) => Err(StartError::Failed(
                 snap.last
                     .as_ref()
@@ -407,7 +456,7 @@ impl RecordingManager {
                 let mut guard = self.active.lock().await;
                 if let Some(a) = guard.as_mut() {
                     a.stdin.take();
-                    let _ = a.child.start_kill();
+                    a.child.start_kill();
                     let mut ended = a.ended.clone();
                     let _ =
                         tokio::time::timeout(Duration::from_secs(5), ended.wait_for(|e| *e)).await;
@@ -490,23 +539,149 @@ impl RecordingManager {
     /// `None` when it cannot be resolved: never a fallback directory, which
     /// would be a folder of files this device did not decide to serve.
     pub async fn folder(&self) -> Option<PathBuf> {
+        self.folder_choice().await.ok().map(|c| c.dir)
+    }
+
+    /// The folder the NEXT recording would go to, decided the way the
+    /// recorder decides it — by the recorder, as the recorder (P1e): a SYSTEM
+    /// daemon's own answer would be SYSTEM's Videos folder, and its write
+    /// probe would pass where the person's would not.
+    async fn folder_choice(&self) -> Result<folder::FolderChoice, String> {
+        let identity = self.identity().map_err(|r| r.message().to_string())?;
         let configured = self.configured_dir();
-        tokio::task::spawn_blocking(move || folder::resolve(configured.as_deref()).dir)
-            .await
-            .ok()
+        if identity == Identity::Inherit {
+            return tokio::task::spawn_blocking(move || folder::resolve(configured.as_deref()))
+                .await
+                .map_err(|e| format!("folder resolution: {e}"));
+        }
+        if let Ok(cache) = self.where_cache.lock()
+            && let Some(c) = cache.as_ref()
+            && c.identity == identity
+            && c.configured == configured
+            && c.at.elapsed() < WHERE_TTL
+        {
+            return Ok(c.choice.clone());
+        }
+        let choice = self
+            .where_via_recorder(identity, configured.as_deref())
+            .await?;
+        self.remember_folder(identity, configured, choice.clone());
+        Ok(choice)
+    }
+
+    fn remember_folder(
+        &self,
+        identity: Identity,
+        configured: Option<PathBuf>,
+        choice: folder::FolderChoice,
+    ) {
+        if let Ok(mut cache) = self.where_cache.lock() {
+            *cache = Some(WhereCache {
+                identity,
+                configured,
+                choice,
+                at: Instant::now(),
+            });
+        }
+    }
+
+    /// `roomlerd record --where`, launched as `identity`: the folder and why
+    /// it is that one.
+    async fn where_via_recorder(
+        &self,
+        identity: Identity,
+        configured: Option<&Path>,
+    ) -> Result<folder::FolderChoice, String> {
+        let mut args: Vec<OsString> = vec![
+            "record".into(),
+            "--where".into(),
+            "--config".into(),
+            self.config_path.clone().into(),
+        ];
+        if let Some(dir) = configured {
+            args.extend(["--out".into(), dir.into()]);
+        }
+        let launched = launch::spawn(identity, &self.exe, &args, &self.child_env())
+            .map_err(|e| format!("could not ask the recorder for its folder: {e}"))?;
+        let launch::Launched {
+            stdin,
+            stdout,
+            mut child,
+        } = launched;
+        // Nothing to say to it; closing stdin is also its "the parent is gone".
+        drop(stdin);
+        let answer = tokio::time::timeout(WHERE_TIMEOUT, async {
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Some(ev) = parse_event_line(&line) else {
+                    continue;
+                };
+                match ev["ev"].as_str() {
+                    Some("where") => {
+                        return ev["dir"].as_str().map(|d| folder::FolderChoice {
+                            dir: PathBuf::from(d),
+                            reason: ev["reason"].as_str().map(str::to_string),
+                        });
+                    }
+                    Some("refused") | Some("error") => return None,
+                    _ => {}
+                }
+            }
+            None
+        })
+        .await;
+        match answer {
+            Ok(Some(choice)) => {
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                Ok(choice)
+            }
+            other => {
+                child.start_kill();
+                Err(if other.is_err() {
+                    "the recorder did not say where its folder is in time".into()
+                } else {
+                    "the recorder could not resolve a folder".into()
+                })
+            }
+        }
+    }
+
+    /// Run blocking work in the recordings folder AS the recorder's identity
+    /// (P1e). The folder is the person's to rearrange: a junction or a hard
+    /// link in it is followed with THEIR rights, never this daemon's — an
+    /// elevated or SYSTEM reader, lister or deleter in a user-writable folder
+    /// is the primitive the identity rule exists to avoid. `None` when no
+    /// recorder can run here, or the identity could not be taken on.
+    pub async fn as_user<R: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> R + Send + 'static,
+    ) -> Option<R> {
+        let identity = self.identity().ok()?;
+        match tokio::task::spawn_blocking(move || launch::as_identity(identity, f)).await {
+            Ok(Ok(r)) => Some(r),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "recording: could not act as the recorder's identity");
+                None
+            }
+            Err(_) => None,
+        }
     }
 
     /// The folder recordings go to, and the finished recordings in it.
     pub async fn list(&self) -> Response {
-        let configured = self.configured_dir();
-        let choice = tokio::task::spawn_blocking(move || folder::resolve(configured.as_deref()))
-            .await
-            .unwrap_or_else(|_| folder::FolderChoice {
-                dir: std::env::temp_dir(),
-                reason: Some("folder resolution failed".into()),
-            });
+        let choice = match self.folder_choice().await {
+            Ok(c) => c,
+            Err(reason) => {
+                return Response::Recordings(RecordingsListing {
+                    dir: String::new(),
+                    folder_reason: Some(reason),
+                    items: Vec::new(),
+                });
+            }
+        };
         let dir = choice.dir.clone();
-        let items = tokio::task::spawn_blocking(move || list_recordings(&dir))
+        let items = self
+            .as_user(move || list_recordings(&dir))
             .await
             .unwrap_or_default();
         Response::Recordings(RecordingsListing {
@@ -524,12 +699,12 @@ impl RecordingManager {
                 message: Some(message),
             };
         }
-        let dir = match self.list().await {
-            Response::Recordings(l) => PathBuf::from(l.dir),
-            _ => {
+        let dir = match self.folder_choice().await {
+            Ok(c) => c.dir,
+            Err(reason) => {
                 return Response::RecordingDeleted {
                     ok: false,
-                    message: Some("the recordings folder could not be resolved".into()),
+                    message: Some(reason),
                 };
             }
         };
@@ -542,9 +717,10 @@ impl RecordingManager {
                 message: Some("that recording is still being written".into()),
             };
         }
-        let result = tokio::task::spawn_blocking(move || delete_recording(&path))
+        let result = self
+            .as_user(move || delete_recording(&path))
             .await
-            .unwrap_or_else(|e| Err(format!("delete task: {e}")));
+            .unwrap_or_else(|| Err("could not act as the recorder's identity".into()));
         match result {
             Ok(()) => Response::RecordingDeleted {
                 ok: true,

@@ -347,6 +347,14 @@ enum Command {
         /// Also record the microphone.
         #[arg(long)]
         microphone: bool,
+        /// (internal, P1e) print the folder a recording would go to, and
+        /// why, then exit.
+        #[arg(long = "where", hide = true)]
+        where_only: bool,
+        /// (internal, P1e) print the identity this recorder runs as, then
+        /// exit.
+        #[arg(long, hide = true)]
+        whoami: bool,
     },
     CaptureSmoke {
         /// How many frames to pull before reporting.
@@ -1359,6 +1367,8 @@ async fn daemon_main() -> Result<()> {
             remote_user_name,
             system_audio,
             microphone,
+            where_only,
+            whoami,
         } => {
             roomlerd::recording::child::run(
                 roomlerd::recording::child::RecordArgs {
@@ -1370,6 +1380,8 @@ async fn daemon_main() -> Result<()> {
                     remote_user_name,
                     system_audio,
                     microphone,
+                    where_only,
+                    whoami,
                 },
                 &config_path,
             )
