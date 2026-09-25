@@ -393,6 +393,129 @@ async fn no_frame_refuses_the_start() {
     );
 }
 
+// ── audio (FR-85 P1c) ────────────────────────────────────────────────────────
+
+/// Decode a recording's audio track back to 48 kHz stereo PCM.
+#[cfg(feature = "audio")]
+fn decode_audio(path: &Path) -> Vec<i16> {
+    use audiopus::coder::Decoder;
+    use audiopus::packet::Packet;
+    use audiopus::{Channels, MutSignals, SampleRate};
+    use roomlerd::recording::mp4::AUDIO_TRACK_ID;
+    let pf = ProgressiveFile::open(path).expect("open the recording");
+    let samples = pf.samples(AUDIO_TRACK_ID).expect("an audio track");
+    let mut f = std::fs::File::open(path).unwrap();
+    let mut dec = Decoder::new(SampleRate::Hz48000, Channels::Stereo).unwrap();
+    let mut pcm = Vec::new();
+    let mut out = vec![0i16; 960 * 2];
+    for s in &samples {
+        let pkt = pf.read_sample(&mut f, s).unwrap();
+        let n = dec
+            .decode(
+                Some(Packet::try_from(&pkt[..]).unwrap()),
+                MutSignals::try_from(&mut out[..]).unwrap(),
+                false,
+            )
+            .unwrap();
+        pcm.extend_from_slice(&out[..n * 2]);
+    }
+    pcm
+}
+
+/// Zero crossings per second of the left channel over `pcm[from..to)`
+/// (48 kHz frames).
+#[cfg(feature = "audio")]
+fn crossings_per_second(pcm: &[i16], from: usize, to: usize) -> f64 {
+    let left: Vec<i16> = pcm[from * 2..to * 2].iter().step_by(2).copied().collect();
+    let n = left.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count();
+    n as f64 * 48_000.0 / (to - from) as f64
+}
+
+/// FR-85 P1c — audio on the RECORDER's clock. A 440 Hz tone arriving at
+/// 44.1 kHz mono (a real device's shape) comes out as an Opus track as long
+/// as the video, still at 440 Hz; and a source that delivers NOTHING (the
+/// microphone here, a quiet WASAPI loopback in the field) leaves no hole.
+#[cfg(feature = "audio")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recording_with_audio_is_in_step_with_its_video() {
+    use roomlerd::recording::audio::SineCapture;
+    use roomlerd::recording::mp4::AUDIO_TRACK_ID;
+    use roomlerd::recording::recorder::AudioSources;
+
+    let dir = scratch();
+    let opts = options(dir.path());
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+    let audio = AudioSources {
+        system: Some(Box::new(SineCapture::new(440.0, 44_100, 1, 8_000.0))),
+        microphone: Some(Box::new(roomlerd::audio::NoopAudioCapture)),
+    };
+    let fps = opts.fps;
+    let handle = tokio::spawn(recorder::run_with_audio(
+        opts,
+        Box::new(CounterCapture::new(fps)),
+        openh264_factory(fps),
+        audio,
+        stop_rx,
+        ev_tx,
+    ));
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let _ = stop_tx.send(Some(StopReason::Requested));
+    let summary = handle.await.unwrap().expect("the recording");
+    let path = summary.path.expect("a file");
+
+    let pf = ProgressiveFile::open(&path).unwrap();
+    let video = pf.samples(VIDEO_TRACK_ID).unwrap().len() as u64;
+    let audio = pf.samples(AUDIO_TRACK_ID).unwrap().len() as u64;
+    let video_ms = video * 1000 / u64::from(fps);
+    let audio_ms = audio * 20;
+    assert!(audio > 100, "{audio} audio frames");
+    assert!(
+        audio_ms.abs_diff(video_ms) <= 80,
+        "audio {audio_ms} ms vs video {video_ms} ms"
+    );
+
+    let pcm = decode_audio(&path);
+    // Past the start-up (the pre-skip, the mix lag, the first deliveries).
+    let (from, to) = (48_000 / 2, 48_000 * 2);
+    let rate = crossings_per_second(&pcm, from, to);
+    assert!(
+        (836.0..=924.0).contains(&rate),
+        "440 Hz = 880 crossings/s, got {rate:.0}"
+    );
+    let rms = (pcm[from * 2..to * 2]
+        .iter()
+        .map(|&s| f64::from(s).powi(2))
+        .sum::<f64>()
+        / ((to - from) * 2) as f64)
+        .sqrt();
+    // An 8000-peak sine is ~5657 RMS; Opus keeps it within a few percent.
+    assert!((4_500.0..=6_800.0).contains(&rms), "rms {rms:.0}");
+
+    let sc = summary.sidecar.expect("sidecar");
+    assert!(sc.audio.system && sc.audio.microphone, "{:?}", sc.audio);
+    assert_eq!(sc.audio.codec.as_deref(), Some("opus"));
+}
+
+/// The negative control for the test above: the same recording WITHOUT audio
+/// has no audio track at all — so the assertions there are about audio that
+/// was recorded, not about a track that is always present.
+#[cfg(feature = "audio")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recording_without_audio_has_no_audio_track() {
+    use roomlerd::recording::mp4::AUDIO_TRACK_ID;
+    let dir = scratch();
+    let (res, _) = record_for(
+        options(dir.path()),
+        CounterCapture::new(30),
+        Duration::from_millis(1500),
+    )
+    .await;
+    let path = res.unwrap().path.unwrap();
+    let pf = ProgressiveFile::open(&path).unwrap();
+    assert!(pf.samples(AUDIO_TRACK_ID).is_err() || pf.samples(AUDIO_TRACK_ID).unwrap().is_empty());
+}
+
 // ── the real `roomlerd record` process ──────────────────────────────────────
 
 #[cfg(feature = "synthetic-frame-source")]
@@ -411,9 +534,15 @@ mod process {
     }
 
     fn spawn(out: &Path) -> Rec {
+        spawn_with(out, &[], &[])
+    }
+
+    fn spawn_with(out: &Path, extra_args: &[&str], extra_env: &[(&str, &str)]) -> Rec {
         let mut child = Command::new(env!("CARGO_BIN_EXE_roomlerd"))
             .args(["record", "--encoder", "software", "--fps", "30", "--out"])
             .arg(out)
+            .args(extra_args)
+            .envs(extra_env.iter().copied())
             .env("ROOMLERD_SYNTHETIC_FRAMES", "1")
             // No config on the runner; point it at a path that does not exist
             // so the test never reads a developer's real config.
@@ -456,6 +585,25 @@ mod process {
                 };
                 assert_ne!(v["ev"], "refused", "the recorder refused to start: {v}");
                 if v["ev"] == ev {
+                    return v;
+                }
+            }
+        }
+
+        /// The first `started` or `refused` — for the tests about which.
+        #[cfg_attr(feature = "audio", allow(dead_code))]
+        fn outcome(&self, within: Duration) -> serde_json::Value {
+            let deadline = Instant::now() + within;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let line = self
+                    .lines
+                    .recv_timeout(left)
+                    .unwrap_or_else(|_| panic!("no outcome within {within:?}"));
+                let Some(v) = roomlerd::recording::child::parse_event_line(&line) else {
+                    continue;
+                };
+                if v["ev"] == "started" || v["ev"] == "refused" {
                     return v;
                 }
             }
@@ -744,6 +892,59 @@ mod process {
             })
             .unwrap_or(0);
         assert_eq!(written, 0, "no recording was written");
+    }
+
+    /// FR-85 P1c — `--system-audio` through the real process, the synthetic
+    /// tone standing in for the device: `started` says so, and the finished
+    /// file carries an audio track.
+    #[cfg(feature = "audio")]
+    #[test]
+    fn the_process_records_computer_audio_when_asked() {
+        let dir = scratch();
+        let mut r = spawn_with(
+            dir.path(),
+            &["--system-audio"],
+            &[("ROOMLERD_SYNTHETIC_AUDIO", "1")],
+        );
+        let started = r.wait_for("started", Duration::from_secs(30));
+        assert_eq!(started["system_audio"], true);
+        assert_eq!(
+            started["microphone"], false,
+            "the microphone was not asked for"
+        );
+        std::thread::sleep(Duration::from_millis(2000));
+        writeln!(r.stdin.as_mut().unwrap(), r#"{{"cmd":"stop"}}"#).unwrap();
+        r.wait_for("stopped", Duration::from_secs(30));
+        assert!(r.wait_exit(Duration::from_secs(30)).success());
+        let p = r.only_recording();
+        let n = ProgressiveFile::open(&p)
+            .unwrap()
+            .samples(roomlerd::recording::mp4::AUDIO_TRACK_ID)
+            .unwrap()
+            .len();
+        assert!(n > 50, "{n} audio frames");
+        let sc = sidecar_of(&p);
+        assert!(sc.audio.system && !sc.audio.microphone, "{:?}", sc.audio);
+    }
+
+    /// A build WITHOUT audio refuses an audio request by name — never a
+    /// recording that silently lacks the audio the person asked for.
+    #[cfg(not(feature = "audio"))]
+    #[test]
+    fn a_build_without_audio_refuses_an_audio_request_by_name() {
+        let dir = scratch();
+        let mut r = spawn_with(dir.path(), &["--microphone"], &[]);
+        let ev = r.outcome(Duration::from_secs(30));
+        assert_eq!(ev["ev"], "refused", "{ev}");
+        assert_eq!(ev["code"], "audio_unavailable", "{ev}");
+        let _ = r.wait_exit(Duration::from_secs(30));
+        let wrote_one = std::fs::read_dir(dir.path())
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.path().extension().is_some_and(|x| x == "mp4"))
+            })
+            .unwrap_or(false);
+        assert!(!wrote_one, "nothing was recorded");
     }
 
     /// A SYSTEM/root daemon refuses a local recording (until P1e launches
