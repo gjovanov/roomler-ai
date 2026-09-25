@@ -2176,9 +2176,109 @@ describe('parseAppsListReply', () => {
     expect(reply.error).toBe('wmctrl not installed')
     expect(reply.windows[0].focused).toBe(false)
   })
+
+  // FR-56 AC10. P5 (#1179) added `missing_tools` to the agent, the interface
+  // and the template — and not to this parser, so the field the agent sent
+  // was dropped between the wire and the screen. This test is RED on that
+  // parser (asserted by reverting the parse and running it).
+  it('carries missing_tools — the P5 field this parser used to drop (FR-56 AC10)', () => {
+    const reply = parseAppsListReply({
+      ok: true,
+      supported: true,
+      windows: [],
+      launchable: [],
+      coverage: {
+        sources: ['x11'],
+        missing_tools: [
+          { tool: 'tmux', blocks: 'persistent shell sessions', install: 'apt install tmux' },
+        ],
+      },
+    })
+    expect(reply.coverage?.missing_tools).toEqual([
+      { tool: 'tmux', blocks: 'persistent shell sessions', install: 'apt install tmux' },
+    ])
+  })
+
+  it('drops a malformed missing_tools entry and keeps the rest; absent stays absent', () => {
+    const reply = parseAppsListReply({
+      ok: true,
+      supported: true,
+      coverage: {
+        sources: ['x11'],
+        missing_tools: [
+          { tool: 'tmux', blocks: 'shell sessions', install: 'apt install tmux' },
+          { tool: 'xterm' }, // no blocks / install — unactionable, dropped
+          { tool: '', blocks: 'x', install: 'y' }, // nameless, dropped
+          'xterm',
+          null,
+        ],
+      },
+    })
+    expect(reply.coverage?.missing_tools).toEqual([
+      { tool: 'tmux', blocks: 'shell sessions', install: 'apt install tmux' },
+    ])
+    // An agent between P2 and P5 sends coverage with no missing_tools at all.
+    // Absent must stay absent — an empty array would claim "checked, none".
+    const older = parseAppsListReply({ ok: true, supported: true, coverage: { sources: ['x11'] } })
+    expect(older.coverage?.missing_tools).toBeUndefined()
+  })
+
+  it('carries the refusal reason beside supported:false (FR-56 AC10)', () => {
+    const reply = parseAppsListReply({
+      ok: true,
+      supported: false,
+      windows: [],
+      launchable: [],
+      unavailable: {
+        code: 'no_session',
+        reason: 'No active graphical login session on this host — nobody is at its screen.',
+      },
+    })
+    expect(reply.supported).toBe(false)
+    expect(reply.unavailable).toEqual({
+      code: 'no_session',
+      reason: 'No active graphical login session on this host — nobody is at its screen.',
+    })
+  })
+
+  it('a malformed unavailable costs itself, never the reply — and an absent one stays absent', () => {
+    for (const bad of [
+      { code: 'no_session' }, // no sentence to show
+      { reason: 'words' }, // no code to key off
+      { code: '', reason: 'words' },
+      { code: 'x', reason: '' },
+      'no_session',
+      42,
+      null,
+    ]) {
+      const reply = parseAppsListReply({ ok: true, supported: false, unavailable: bad })
+      expect(reply.ok).toBe(true)
+      expect(reply.supported).toBe(false)
+      expect(reply.unavailable, JSON.stringify(bad)).toBeUndefined()
+    }
+    // Pre-AC10 agents: `supported: false` and nothing beside it.
+    expect(parseAppsListReply({ ok: true, supported: false }).unavailable).toBeUndefined()
+  })
 })
 
 describe('parseAppsActionReply', () => {
+  it('carries the refusal reason on a focus/launch refused for want of a backend (FR-56 AC10)', () => {
+    expect(
+      parseAppsActionReply({
+        ok: false,
+        error: 'apps not available on this host: Remote apps are disabled on this device',
+        unavailable: { code: 'disabled', reason: 'Remote apps are disabled on this device' },
+      }),
+    ).toEqual({
+      ok: false,
+      error: 'apps not available on this host: Remote apps are disabled on this device',
+      unavailable: { code: 'disabled', reason: 'Remote apps are disabled on this device' },
+    })
+    expect(parseAppsActionReply({ ok: false, unavailable: { code: 'disabled' } })).toEqual({
+      ok: false,
+    })
+  })
+
   it('parses focus/launch ok replies with optional window_id', () => {
     expect(parseAppsActionReply({ ok: true })).toEqual({ ok: true })
     expect(parseAppsActionReply({ ok: true, window_id: '0xNEW' })).toEqual({
