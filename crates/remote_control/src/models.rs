@@ -184,11 +184,21 @@ pub struct AgentCaps {
     /// caps builder only when the `audio` Cargo feature is compiled in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audio: Vec<String>,
-    /// Remote app selection & launch on virtual-desktop hosts. Present +
-    /// non-empty only when the agent can manage a desktop (Linux
-    /// virtual-desktop mode) AND `virtual_desktop_apps.enabled`. Known
-    /// values: `"list"`, `"focus"`, `"launch"`. Empty / unset (older
-    /// agents, non-VD hosts) → the browser hides the Apps menu.
+    /// Remote app selection & launch (FR-56). Known values, matched by
+    /// EQUALITY:
+    ///
+    /// * `"list"`, `"focus"`, `"launch"` — the agent could manage a desktop
+    ///   when it announced itself (a Linux virtual desktop or a logged-in
+    ///   X11/Xwayland session, or Windows) AND `virtual_desktop_apps.enabled`.
+    /// * `"status"` (FR-56 AC10) — this build has a Remote Apps backend and
+    ///   answers `rc:apps.list` honestly: with the list, or with
+    ///   `unavailable: {code, reason}` when there is no desktop to manage.
+    ///   Advertised whenever the platform has a backend, so the viewer can
+    ///   show WHY rather than hide the button. ⚠️ The hello is a boot-time
+    ///   snapshot: `status` without `list` can simply mean nobody had logged
+    ///   in yet when the daemon started; only the live reply can say.
+    ///
+    /// Empty / unset (older agents, macOS) → the browser hides the Apps menu.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<String>,
     /// Fleet-RPC capabilities. Recognised values:

@@ -852,6 +852,16 @@ export interface RcAppsCoverage {
    *  which is exactly the lie this field exists to remove. */
   missing_tools?: RcAppsMissingTool[]
 }
+/** FR-56 AC10 — why remote apps are unavailable on this host, from the agent.
+ *  `code` is a closed set on the agent side (`disabled`, `no_session`,
+ *  `no_x_display`, `cannot_run_as`, `tool_missing`, `platform`); the sentence
+ *  is composed there, because only the agent knows which arm it took. Rides
+ *  every `supported: false` list reply and every focus/launch refusal that had
+ *  no backend. Absent from agents older than AC10. */
+export interface RcAppsUnavailable {
+  code: string
+  reason: string
+}
 export interface RcAppsListReply {
   ok: boolean
   supported: boolean
@@ -861,6 +871,8 @@ export interface RcAppsListReply {
    *  as "the listing is complete". */
   coverage?: RcAppsCoverage
   error?: string
+  /** Set beside `supported: false` by agents that carry FR-56 AC10. */
+  unavailable?: RcAppsUnavailable
 }
 /** focus + launch share this shape. `window_id` is the new window on a
  *  successful launch (best-effort Ã¢ÂÂ may be absent). */
@@ -868,7 +880,16 @@ export interface RcAppsActionReply {
   ok: boolean
   window_id?: string
   error?: string
+  /** FR-56 AC10 — set when the refusal was "no backend", with the reason. */
+  unavailable?: RcAppsUnavailable
 }
+
+/** FR-56 AC10 — what the dialog says when an agent answers `supported: false`
+ *  without a reason (every agent before AC10). Exported so the wording is one
+ *  string and the arm that uses it can be tested. */
+export const APPS_UNAVAILABLE_NO_REASON =
+  'Remote apps are not available on this host. This agent did not say why (agents ' +
+  'older than FR-56 AC10 carry no reason) — run `roomlerd apps-probe` on the host.'
 
 export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
@@ -1120,10 +1141,49 @@ export function parseAppsListReply(obj: Record<string, unknown>): RcAppsListRepl
       : []
     const parsed: RcAppsCoverage = { sources }
     if (typeof c.unlisted === 'string' && c.unlisted !== '') parsed.unlisted = c.unlisted
+    // FR-56 P5 — the helpers the host lacks, named BEFORE the click.
+    // ⚠️ This parse was missing from P5's own PR (#1179): the agent sent the
+    // field, the template rendered it, and this function dropped it in
+    // between — so the warning was field-verified on the host with
+    // `roomlerd apps-probe` and never once reached a screen (found by the
+    // FR-56 AC10 audit). An entry needs all three strings or it is dropped:
+    // the template prints all three, and a blank `install` beside a broken
+    // button is not actionable. Absent stays absent (an older agent).
+    if (Array.isArray(c.missing_tools)) {
+      parsed.missing_tools = c.missing_tools
+        .filter((t): t is Record<string, unknown> => typeof t === 'object' && t !== null)
+        .filter(
+          (t) =>
+            typeof t.tool === 'string' &&
+            t.tool !== '' &&
+            typeof t.blocks === 'string' &&
+            typeof t.install === 'string',
+        )
+        .map((t) => ({
+          tool: t.tool as string,
+          blocks: t.blocks as string,
+          install: t.install as string,
+        }))
+    }
     reply.coverage = parsed
   }
   if (typeof obj.error === 'string') reply.error = obj.error
+  const unavailable = parseAppsUnavailable(obj.unavailable)
+  if (unavailable) reply.unavailable = unavailable
   return reply
+}
+
+/** FR-56 AC10 — the agent's `unavailable` object. Both halves are required:
+ *  the code is what a viewer keys copy off, the reason is what this one shows.
+ *  An object missing either is malformed and costs itself, never the reply —
+ *  and `undefined` here means "no reason given", which the arm renders as such
+ *  rather than inventing one. */
+function parseAppsUnavailable(v: unknown): RcAppsUnavailable | undefined {
+  if (typeof v !== 'object' || v === null) return undefined
+  const u = v as Record<string, unknown>
+  if (typeof u.code !== 'string' || u.code === '') return undefined
+  if (typeof u.reason !== 'string' || u.reason === '') return undefined
+  return { code: u.code, reason: u.reason }
 }
 
 /** Parse an `rc:apps.focus.reply` / `rc:apps.launch.reply` body. Exported for tests. */
@@ -1131,6 +1191,8 @@ export function parseAppsActionReply(obj: Record<string, unknown>): RcAppsAction
   const reply: RcAppsActionReply = { ok: obj.ok === true }
   if (typeof obj.window_id === 'string') reply.window_id = obj.window_id
   if (typeof obj.error === 'string') reply.error = obj.error
+  const unavailable = parseAppsUnavailable(obj.unavailable)
+  if (unavailable) reply.unavailable = unavailable
   return reply
 }
 
@@ -8460,7 +8522,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         if (parsed.reply.ok) {
           remoteWindows.value = parsed.reply.windows
           launchableApps.value = parsed.reply.launchable
-          appsError.value = null
+          // FR-56 AC10 — `supported: false` is a REFUSAL, not a quiet desktop.
+          // Until this the arm cleared the error here and the dialog read
+          // "No windows reported" — the calm reading — for every host with no
+          // desktop to manage. The agent now says why; an agent that does not
+          // is named as such rather than papered over.
+          appsError.value = parsed.reply.supported
+            ? null
+            : (parsed.reply.unavailable?.reason ?? APPS_UNAVAILABLE_NO_REASON)
         } else {
           appsError.value = parsed.reply.error ?? 'apps list failed'
         }
