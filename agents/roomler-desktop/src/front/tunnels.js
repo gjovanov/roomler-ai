@@ -39,7 +39,8 @@
   let lastFlows = [];
   let seq = 0;                 // refresh requests issued
   let applied = 0;             // the newest response applied to the page
-  let inFlight = false;        // a poll is awaiting the daemon
+  let inFlight = 0;            // refreshes awaiting the daemon (a count: a
+                               // forced refresh can overlap a stalled poll)
   let failures = 0;            // consecutive failed refreshes
   let unavailableSince = null; // Date of the first failure of the streak
   let editing = null;          // the RouteDescriptor the form is editing, or null
@@ -58,9 +59,9 @@
   async function refresh(opts) {
     if (!visible()) return;
     const force = !!(opts && opts.force);
-    if (inFlight && !force) return;
+    if (inFlight > 0 && !force) return;
     const mine = ++seq;
-    inFlight = true;
+    inFlight += 1;
     let view;
     try {
       view = await invoke('cmd_tunnels_view');
@@ -69,7 +70,9 @@
       // that is a failure like any other — shown, never painted as data.
       view = { available: false, reason: 'cmd_tunnels_view rejected: ' + String(err) };
     } finally {
-      inFlight = false;
+      // A count, not a flag: a forced refresh that finishes while a stalled
+      // poll is still waiting must not re-open the gate for the next tick.
+      inFlight -= 1;
     }
     // Sequence guard: a response older than the newest already applied is
     // dropped, not painted.
@@ -430,6 +433,9 @@
   function endEdit(form) {
     editing = null;
     form.reset();
+    // An error from a rejected Save belongs to the edit being left; it must
+    // not stay under a form that now says "Add route".
+    hide($('tn-form-error'));
     $('tn-custom-node').hidden = true;
     setFormMode();
   }
