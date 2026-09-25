@@ -36,6 +36,7 @@
 
 mod commands;
 mod desktop_log;
+mod first_run;
 mod panels;
 mod tray;
 

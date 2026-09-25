@@ -3918,3 +3918,58 @@ mod localapi_pipe_pool_surface_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod companion_autostart_surface_tests {
+    use super::{apply, current_value, entry_for};
+
+    /// FR-84 D6 — `companion_autostart` is the kill switch for the whole of
+    /// D6's launch behaviour, so it has to be a real surface key: default ON,
+    /// echoed as a plain bool, a restart-bound Device key (the Run value is
+    /// synced and the post-install launch decided at service start), and
+    /// clearing it returns to ON rather than OFF. Written against the surface
+    /// API only, so on a tree that does not register the key it compiles and
+    /// fails with "unknown or non-editable config key".
+    #[test]
+    fn companion_autostart_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        let entry = entry_for(&cfg, "companion_autostart").expect("a registered surface key");
+        assert_eq!(entry.kind, "bool");
+        assert_eq!(entry.group, "device");
+        assert_eq!(entry.tier, "standard");
+        assert!(
+            entry.restart_required,
+            "read at service start: the Run-value sync and the launch-once"
+        );
+        assert_eq!(entry.default.as_deref(), Some("true"), "on by default");
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("true")
+        );
+
+        apply(&mut cfg, "companion_autostart", Some("false")).unwrap();
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "companion_autostart", Some(" ON ")).unwrap();
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("true")
+        );
+
+        apply(&mut cfg, "companion_autostart", Some("off")).unwrap();
+        assert!(apply(&mut cfg, "companion_autostart", Some("sometimes")).is_err());
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("false"),
+            "a rejected set is a no-op"
+        );
+        apply(&mut cfg, "companion_autostart", None).unwrap();
+        assert_eq!(
+            current_value(&cfg, "companion_autostart").as_deref(),
+            Some("true"),
+            "cleared = the built-in default, which is ON"
+        );
+    }
+}
