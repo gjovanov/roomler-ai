@@ -16,6 +16,14 @@ declare module 'vue-router' {
      *  core route; children inherit it through `to.matched`, so a `network`
      *  section needs no meta of its own. */
     module?: ModuleId
+    /** #1631 — the param whose change must REMOUNT the routed view (see
+     *  `plugins/routeViewKey.ts` + `components/layout/KeyedRouterView.vue`).
+     *  Vue Router reuses the mounted component when only params change, so
+     *  a view that resolves its subject once in `onMounted` (the remote
+     *  viewer, the profile page) kept showing the previous subject under the
+     *  new URL. Absent = today's reuse, which the views that rewrite
+     *  `route.query` in place depend on — do not key by fullPath. */
+    remountOn?: string
   }
 }
 
@@ -134,6 +142,9 @@ const routes: RouteRecordRaw[] = [
         path: 'profile/:userId',
         name: 'profile',
         component: () => import('@/views/profile/ProfileView.vue'),
+        // #1631 — loads its user once in onMounted; a profile→profile hop
+        // must be a fresh view, not the previous user under the new URL.
+        meta: { remountOn: 'userId' },
       },
       {
         path: 'tenant/:tenantId',
@@ -279,7 +290,12 @@ const routes: RouteRecordRaw[] = [
             path: 'agent/:agentId/remote',
             name: 'agent-remote',
             component: () => import('@/views/remote/RemoteControl.vue'),
-            meta: { module: 'remote' },
+            // #1631 — the viewer resolves its device in onMounted and owns a
+            // live session; picking another device in the nav must tear that
+            // view down and mount a fresh one for the new agentId, never
+            // re-point the mounted one (its Connect kept dialling the old
+            // device). Locked by KeyedRouterView.spec.ts on this record.
+            meta: { module: 'remote', remountOn: 'agentId' },
           },
         ],
       },

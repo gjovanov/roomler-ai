@@ -742,6 +742,28 @@ export const useAgentStore = defineStore('agents', () => {
     }
   }
 
+  /** #1631 — resolve ONE device whether or not the cached page holds it.
+   *  `fetchAgents` stops at the server's 100-row page, so a device beyond
+   *  it — or a deep link opened before any listing ran — was invisible to
+   *  the remote view, and its 5-min status poll then NULLED the device it
+   *  was showing. `GET /tenant/{tid}/agent/{id}` is the same
+   *  `AgentResponse` shape as a list row (`crates/modules/fleet/src/agent.rs`
+   *  `get_agent` / `list_agents` share `to_agent_response`). The row is
+   *  upserted into `agents` so `applyPresence` patches it like any other,
+   *  and the STORE's row is returned so the caller holds the reactive one.
+   *  Throws on any error (transport, 404, not-a-member) — the caller decides
+   *  whether to keep the snapshot it already has. */
+  async function fetchAgent(tenantId: string, agentId: string): Promise<Agent> {
+    const fetched = await api.get<Agent>(`/tenant/${tenantId}/agent/${agentId}`)
+    const idx = agents.value.findIndex((a) => a.id === fetched.id)
+    if (idx === -1) {
+      agents.value.push(fetched)
+      return agents.value[agents.value.length - 1]!
+    }
+    agents.value[idx] = { ...agents.value[idx]!, ...fetched }
+    return agents.value[idx]!
+  }
+
   async function issueEnrollmentToken(tenantId: string): Promise<EnrollmentToken> {
     return api.post<EnrollmentToken>(`/tenant/${tenantId}/agent/enroll-token`)
   }
@@ -1229,6 +1251,7 @@ export const useAgentStore = defineStore('agents', () => {
     loading,
     error,
     fetchAgents,
+    fetchAgent,
     applyPresence,
     issueEnrollmentToken,
     rename,
