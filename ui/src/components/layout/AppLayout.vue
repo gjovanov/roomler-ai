@@ -530,7 +530,9 @@
     </v-alert>
 
     <v-main class="app-main-no-scroll">
-      <router-view />
+      <!-- #1631 — keyed by `meta.remountOn` so the remote viewer follows the
+           device in the URL; every other route keeps the plain reuse. -->
+      <keyed-router-view />
     </v-main>
 
     <!-- FR-12 P2 — one mount point for spotlight tours. It lives here rather
@@ -609,6 +611,7 @@ import { useWsStore } from '@/stores/ws'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
+import KeyedRouterView from '@/components/layout/KeyedRouterView.vue'
 import MiniConference from '@/components/conference/MiniConference.vue'
 import SearchDialog from '@/components/layout/SearchDialog.vue'
 import { useSnackbar } from '@/composables/useSnackbar'
