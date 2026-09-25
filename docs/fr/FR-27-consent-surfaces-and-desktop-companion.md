@@ -194,14 +194,14 @@ is why it is sequenced last, behind its own feature and the probe.
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
 | 0 | FR + issue + ledger | n/a | **done** — the FR-24 collision was already repaired on master by #850 |
-| 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomlerd consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | **implemented** — field pending |
+| 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomlerd consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | **implemented** — timeout≠deny and `prompt_then_email` field-verified on 0.4.16, `.pending` for exec+ssh on 0.4.18, **the local floor on 2026-09-25** (AC4, WSL node, 0.4.102); `prompt_owner` still needs an owner-account run |
 | 2 | Desktop companion — one tray with an icon, daemon-path resolution, update-output surfacing, version honesty, `ensure_running()` | each item independent; no wire change | **implemented** (version honesty deferred to a follow-up) — field pending |
 | 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac |
 | 4 | Linux packaging — a **separate** `roomler-desktop` .deb | absent package = today's behaviour | **implemented** — field pending |
 | 5 | Input arbitration — mode re-seed, visible floor requests, single-viewer rail, deterministic handover | none needed (bug fixes) | **implemented** — field pending |
 | 6 | Field test on the GROX fleet | n/a | **partly done, 2026-08-29 on 0.4.16** — the Windows native panel is verified end to end and the field log below lists exactly what is not. The test itself found 3 defects (#877), one of which froze the whole pre-0.4.16 Linux fleet |
-| 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **implemented in #877** — needs an API deploy + 0.4.17 to field-verify |
-| 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the field-result half lands with phase 6 |
+| 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **deployed** (#877; API `v20260829-0d5078f44e42`, agents ≥ 0.4.18) — the guard and the ordering were field-verified 2026-08-29; `companion_version` read on the live grid 2026-09-25: on the wire for all 21 devices, rendered only on a skew, and the fleet has none (AC10 half; see the log) |
+| 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the resolution diagram + the floor's field line added to §11.2 on 2026-09-25; the docs criterion is in the list below |
 
 ## Acceptance criteria
 
@@ -216,7 +216,16 @@ Ticked only where a run is recorded in the field log below.
       controller is told nobody could be asked, and the audit row says so —
       **mars, 0.4.18 + API `v20260829-507d7b33990a`** (it took both halves: the
       agent's virtual-desktop guard AND the hub's verdict grace; see the log).
-- [ ] `auto_grant_session=false` on a device defeats a server `Auto` directive.
+- [x] `auto_grant_session=false` on a device defeats a server `Auto` directive —
+      **NEO16-WSL (the WSL node), agent 0.4.102, API 0.4.101, 2026-09-25.** The
+      control first: same account (the owner), same device, same server policy
+      (`consent_mode = auto`), local setting at its as-found `true` →
+      auto-granted in **1.5 ms** (`effective_mode=AutoGrant`). With the floor
+      set, the identical request ran as a prompt over the server's **300 s**
+      window, found no surface (virtual desktop, no companion) and ended
+      `reason="no_prompt_surface"` → hub `NoPromptSurface` 41 ms later; the
+      controller was told nobody could be asked. Both settings restored and
+      re-proven (auto-granted again, 0.3 ms). See the 2026-09-25 log.
 - [ ] All five modes exercised end-to-end on the fleet, each recorded with the
       surface that served it. `auto`, `prompt` and the host half of
       `prompt_then_email` are done; `email` / `push` resolve at the **owner**,
@@ -231,8 +240,20 @@ Ticked only where a run is recorded in the field log below.
 - [x] `roomler-desktop` shows exactly one tray icon, with a menu — **Windows**,
       measured 2 → 1 against the 0.4.15 build. macOS/Linux untested.
 - [ ] macOS "Check for updates" and "Apply update" both work from the companion.
-- [ ] The Devices grid shows the companion version alongside the agent version.
-      (Implemented in #877; needs the server deploy + 0.4.17.)
+- [~] The Devices grid shows the companion version alongside the agent version.
+      (Implemented in #877; deployed since API `v20260829-0d5078f44e42` + 0.4.18.)
+      **Half met, 2026-09-25 on the live grid (API 0.4.101, 21 devices):** the
+      value is on the wire for every row — 10 companion hosts (Windows, macOS)
+      report a version equal to the daemon's, 11 report *absent* (Linux hosts
+      without a companion, and pre-FR-27 agents) — and the deployed bundle
+      renders `· desktop v<x>` in warning colour with its tooltip the moment a
+      row's companion version differs (shown by injecting a skew into the client
+      store on the live page). **Missing:** the grid renders the companion
+      version ONLY when it disagrees with the daemon's (by design,
+      `AgentsSection.vue:354`), no device in the fleet carried a skew today, so
+      the caption has not been seen on a real row — and per #1617 the value is
+      the *installed* version, so the one skew that actually happened (a 0.4.92
+      companion still RUNNING under a 0.4.101 daemon) was invisible to it.
 - [ ] `free` ↔ `exclusive` verified with two concurrent viewers; the device policy
       re-applies after every session ends. **Second half done** (re-seed proven on
       one daemon process, no restart); the two-viewer half is blocked by a
@@ -240,6 +261,12 @@ Ticked only where a run is recorded in the field log below.
 - [x] The `roomlerd` .deb's `Depends` still contains no GTK/webkit entry —
       `libasound2, libc6, libxcb-randr0, libxcb-shm0, libxcb1`, and the guard that
       asserts it actually runs now (#871).
+- [x] **Docs** — `docs/remote-control.md` §11.2 documents the consent model in
+      the house style (the five modes and their windows, the owner shortcut, the
+      device's floor, the surface chain, the verdict grace) with a mermaid
+      diagram of how one session's consent is resolved, and is linked from
+      `docs/README.md` (the docs-before-close rule). The field-result half of
+      phase 6 lives in this spec's log.
 
 ## Deviations (accepted, recorded up front)
 
@@ -351,3 +378,116 @@ Also on 0.4.18: `companion_version` is live end to end — NEO16 reports `0.4.18
 companion, and correctly not an empty string). The release-time picker guard
 ran for the first time on a real tag and printed the daemon `.deb` for both
 arches.
+
+### 2026-09-25 — AC4 on the WSL node: the local floor holds against a server `auto`
+
+Device **NEO16-WSL** (display name; Linux, the root `roomlerd.service` unit,
+virtual desktop, no companion), API `0.4.101`. The controller is the device's
+**owner**, so `resolve_session_authz`
+(`crates/modules/remote/src/controller.rs:436`) resolves `auto` by the owner
+shortcut; the device's server policy was additionally set to `consent_mode =
+auto` for the run (as found: unset) so the directive did not rest on the
+shortcut alone. Nothing in the consent code differs between the two agent
+builds below (`git log agent-v0.4.101..agent-v0.4.102` touches no consent
+file), and the hub sends `consent_timeout_secs = host_prompt_timeout_secs =
+300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:888`,
+`crates/remote_control/src/consent.rs:115`).
+
+| | control (as found) | with the floor | restored |
+|---|---|---|---|
+| agent build | 0.4.101 | 0.4.102 | 0.4.102 |
+| `auto_grant_session` (device) | `true` | **`false`** | `true` |
+| server directive | `auto` | `auto` (unchanged) | `auto` |
+| broker at daemon start | `mode=AutoGrant` | `mode=Prompt { timeout: 30s }` | `mode=AutoGrant` |
+| verdict | `Granted`, **1.5 ms** | `Timeout` after **300.1 s**, `reason="no_prompt_surface"` | `Granted`, 0.3 ms |
+| hub end reason | — (session ran) | `NoPromptSurface`, **41 ms after** the verdict | — (session ran) |
+| controller | connected | `awaiting_consent` for 5 min, then *"That device could not show a prompt to anyone…"* | connected |
+
+The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
+
+```
+13:04:20.785  incoming session request — running consent broker … consent_timeout_secs=300 … consent_mode=Prompt { timeout: 30s } org=Some("Grox")
+13:04:20.785  no desktop companion on this host — an on-screen prompt is not possible; answer with `roomlerd consent --list` / `--approve`, or set this device to email/push consent
+13:04:20.785  consent prompt surface session=6ab6714c… native=false have_surface=false
+13:04:20.785  operator consent required — answer it with `roomlerd consent --session 6ab6714c… --approve|--deny` … timeout_secs=300
+13:09:20.923  operator consent decision session="6ab6714c…" outcome=Timeout
+13:09:20.923  consent decision → sending rc:consent session=6ab6714c… decision=Timeout effective_mode=Prompt { timeout: 300s } granted=false reason="no_prompt_surface"
+13:09:20.964  session terminated by server session_id=6ab6714c… reason=NoPromptSurface
+```
+
+The attribution is in the two windows. The device's own mode is `Prompt {
+timeout: 30s }` (line 1 prints `consent_broker.mode()`,
+`agents/roomlerd/src/signaling.rs:2302`), yet the prompt stood for **300 s** —
+the server's window — which is exactly the shape `strictest_of`
+(`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
+directive: `Prompt { timeout: host_window }` (`signaling.rs:2352`). The control
+run pins the other half: same account, device and policy, only the local
+setting differs, and it auto-granted (`decision=Granted effective_mode=AutoGrant`,
+1.5 ms after the request). Meanwhile `roomlerd consent --list` on the device
+listed the outstanding `[rc]` request from the controller with its approve
+command — the CLI surface (chain step 3) was live for the whole five minutes;
+nobody used it, which is the point of the test.
+
+Controller, at t+5:00: *"That device could not show a prompt to anyone - nobody
+is signed in at its screen, or the Roomler desktop app is not running there.
+Start it on the device, or set this device to email/push consent."*
+
+⚠️ **Two things the run found on the way.**
+
+- **Restarting the daemon for the floor let its auto-updater pull
+  `agent-v0.4.102`** (`new release available — spawning installer and exiting`,
+  then a systemd restart 1 min 40 s later). The first floor attempt landed in
+  that gap and the controller was told *"This device is offline"* —
+  `agent_offline`, not a consent outcome; the run above is the retry. The
+  device stays on 0.4.102: a self-update is the fleet's normal behaviour, not a
+  change to roll back.
+- **`GET /api/tenant/{tid}/session/{sid}/audit` answers 500 on API 0.4.101** —
+  for every session tried, including ones a parallel session had run on the
+  same device earlier that day:
+  `{"error":"internal","message":"Kind: numeric permissions are not accepted here …"}`.
+  The audit rows' `permissions` are written as a number
+  (`crates/remote_control/src/audit.rs:129,169`, via `bson::to_bson`) and read
+  back through a path that expects the pipe-separated string — the
+  `is_human_readable` split. So the server's own `ConsentPrompted` /
+  `NoPromptSurface` record for these sessions exists but is unreadable through
+  the API; the attribution above is from the agent's log and the controller,
+  not the audit row. A separate defect that needs its own fix. (The session
+  GET, `/session/{sid}`, works, and carries no `consent_mode`.)
+
+Restoration, verified: `/etc/roomler/config.toml` back to
+`auto_grant_session = true` (the only other diff against the as-found copy is
+the daemon's own `last_known_good_version`, `0.4.101 → 0.4.102`), broker
+`mode=AutoGrant` on the restart; the server policy PUT back to its as-found
+object (`consent_mode: null`, `prompt_owner: null`, empty allowlists) and read
+back equal; one more session auto-granted in 0.3 ms and was hung up.
+
+### 2026-09-25 — AC10 on the live grid: on the wire everywhere, rendered only on a skew
+
+The Devices page, API `0.4.101`, 21 devices. Each row's caption reads
+`id: … · <machine_id> · v<agent_version>`
+(`ui/src/components/admin/AgentsSection.vue:345`); the companion half,
+`· desktop v<companion_version>`, renders **only when the companion disagrees
+with the daemon** (`companionSkew`, `AgentsSection.vue:354-358,1671`), and the
+card view's chip follows the same rule (`:697`).
+
+| device (display name) | daemon | `companion_version` on the wire | caption shows |
+|---|---|---|---|
+| NEO16 (Windows, companion) | 0.4.101 | `0.4.101` | `· v0.4.101` — no `desktop` half (equal) |
+| MacBook-1 (macOS, companion) | 0.4.102 | `0.4.102` | `· v0.4.102` — no `desktop` half (equal) |
+| NEO16-WSL (Linux, no companion) | 0.4.101 | *absent* | `· v0.4.101` |
+| mars (Linux, no companion) | 0.4.101 | *absent* | `· v0.4.101` |
+| fleet-wide | — | 10 equal · 11 absent · **0 skewed** | no row shows a `desktop` half today |
+
+With a skew injected into the client store on the live page (NEO16-WSL's row
+given `companion_version = "0.4.99"`; no server call), the same row rendered
+`id: … · v0.4.101 · desktop v0.4.99` in warning colour (`rgb(255,193,7)`) with
+the tooltip *"roomler-desktop is on v0.4.99 while the daemon is on v0.4.101 —
+the companion updates separately …"*; reverting the store removed it. So the
+deployed rendering path works; what has not been seen is a real skew, and the
+fleet has none today.
+
+⚠️ **The value is the installed version, not the running one** (#1617, the same
+day): a Mac ran a 0.4.92 companion under a 0.4.101 daemon for 17 days while this
+field read `0.4.101` throughout. The grid can only ever surface a skew the
+companion's *files* have; a stale *process* needs the companion to report
+itself (over LocalAPI) — a follow-up, not this FR's phase 2d.
