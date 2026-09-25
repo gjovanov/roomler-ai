@@ -1258,11 +1258,23 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         audio.push("opus".into());
     }
 
-    // Remote app selection & launch (virtual-desktop hosts). Advertised
-    // only when this process can actually manage a desktop (Linux VD
-    // mode) AND the operator hasn't disabled it; the browser gates its
-    // Apps menu on this list. Older agents omit the field → menu hidden.
+    // Remote app selection & launch. `list`/`focus`/`launch` are advertised
+    // only when this process can actually manage a desktop (a Linux virtual
+    // desktop or a logged-in X11/Xwayland session, or Windows) AND the
+    // operator hasn't disabled it; the browser gates its Apps menu on this
+    // list. Older agents omit the field → menu hidden.
+    //
+    // FR-56 AC10 — `status` says "this build has a Remote Apps backend and
+    // answers `rc:apps.list` honestly": with the list when there is a desktop,
+    // with `unavailable: {code, reason}` when there is not. It is what lets the
+    // viewer show WHY instead of hiding the button — and it matters because
+    // this whole struct is a boot-time snapshot (`detect()` memoizes it), so
+    // `list` being absent here can simply mean nobody had logged in yet when
+    // the daemon started. The reply is live; the hello is not.
     let mut apps: Vec<String> = Vec::new();
+    if crate::apps::has_backend() {
+        apps.push("status".into());
+    }
     if crate::apps::apps_supported() {
         apps.push("list".into());
         apps.push("focus".into());
