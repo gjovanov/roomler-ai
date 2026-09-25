@@ -19,11 +19,13 @@
 //! dedicated LocalAPI verbs, not surface keys), and the crash-bookkeeping
 //! fields.
 //!
-//! Every key but three is read once at daemon startup, so `restart_required`
+//! Every key but four is read once at daemon startup, so `restart_required`
 //! holds across the surface — except `exec_enabled` and
 //! `remote_config_enabled`, which `RemoteConfigServices::adopt_local` puts
 //! into force the moment `ConfigSet` saves them (docs/remote-config.md §7b),
-//! and `record_dir` (FR-85), read when a recording starts.
+//! `record_dir` (FR-85), read when a recording starts, and
+//! `local_restart_enabled` (FR-84 D3), read by the restart verb on every
+//! request.
 //! FR-84 D2 made that per-key truth part of the registry ([`KeyMeta::live`])
 //! instead of a list each client kept by hand, and gave every key a
 //! [`Group`] and a [`Tier`] so the Settings page can be more than 150 rows.
@@ -176,8 +178,9 @@ impl Tier {
 /// a wrong one is a lie to the person at the machine — `live` above all:
 /// `true` means the daemon applies a change WITHOUT a restart, which today
 /// holds for exactly the two gate-4 flags `RemoteConfigServices::adopt_local`
-/// re-seeds after a `ConfigSet`, and `record_dir`, read when a recording
-/// starts. Everything else is read once at startup. Locked by
+/// re-seeds after a `ConfigSet`, `record_dir`, read when a recording starts,
+/// and `local_restart_enabled`, read by the restart verb per request.
+/// Everything else is read once at startup. Locked by
 /// `live_keys_are_exactly_the_adopt_local_set`.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyMeta {
@@ -312,6 +315,17 @@ const KEYS: &[KeyMeta] = &[
         live: true,
         kind: "bool",
         description: "Accept configuration pushed by the control plane. NEVER settable by the server — it is what keeps exec_enabled/ssh_enabled refusable by a compromised one. Turning it ON delegates that last refusal. Default: OFF.",
+    },
+    KeyMeta {
+        key: "local_restart_enabled",
+        group: Group::Access,
+        tier: Tier::Standard,
+        // LIVE: the restart verb reads it from the file on every request
+        // (localapi_state.rs, `restart_daemon`), so an owner's OFF is in force
+        // for the very next "Apply now".
+        live: true,
+        kind: "bool",
+        description: "FR-84 - let a person at this device restart the service from the companion (Apply now) or `roomler restart`. The daemon restarts itself only under a service manager it can prove (a Windows service or scheduled task, systemd, launchd), and at most once every 30 s; a hand-started `roomlerd run` always refuses. Off = every such request is refused. Never settable by the server, which cannot restart a daemon at all. Default: on.",
     },
     KeyMeta {
         key: "ssh_enabled",
@@ -1534,6 +1548,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
             cfg.power_policy.clone()
         }),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
+        "local_restart_enabled" => Some(fmt_bool(cfg.local_restart_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
@@ -1734,6 +1749,10 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // explicitly; if the server could set it, every other gate here would
         // be one push away from meaningless. See `docs/remote-config.md`.
         "remote_config_enabled" => cfg.remote_config_enabled = parse_bool_or(value, false)?,
+        // FR-84 D3 — clearing restores the built-in ON: unlike the gates
+        // above, this grants nothing, so OFF is an owner's choice rather than
+        // the fail-safe direction. Settable only from here (never pushed).
+        "local_restart_enabled" => cfg.local_restart_enabled = parse_bool_or(value, true)?,
         // Same fail-safe direction as `exec_enabled`: clearing the key means
         // OFF. An SSH session is strictly more than a bounded command.
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
@@ -2347,9 +2366,11 @@ mod tests {
     /// FR-84 D2 — `restart_required` is the truth PER KEY, not a blanket.
     /// The keys the daemon applies without a restart are the two gate-4
     /// flags `RemoteConfigServices::adopt_local` re-seeds after a
-    /// `ConfigSet` (agents/roomlerd/src/localapi_state.rs), and `record_dir`
+    /// `ConfigSet` (agents/roomlerd/src/localapi_state.rs), `record_dir`
     /// (FR-85), which the recorder's supervisor reads fresh when a recording
-    /// starts (`recording/manager.rs`, `configured_dir`). A key wrongly
+    /// starts (`recording/manager.rs`, `configured_dir`), and
+    /// `local_restart_enabled` (FR-84 D3), which the restart verb reads fresh
+    /// on every request (`localapi_state.rs`, `restart_daemon`). A key wrongly
     /// claiming `live` tells a person their change is in force while the
     /// daemon still runs the old value; a live key claiming `restart` has
     /// them bounce a healthy service — or believe a refusal they just made
@@ -2364,11 +2385,15 @@ mod tests {
             .filter(|e| !e.restart_required)
             .map(|e| e.key)
             .collect();
-        let expected: std::collections::BTreeSet<String> =
-            ["exec_enabled", "remote_config_enabled", "record_dir"]
-                .into_iter()
-                .map(String::from)
-                .collect();
+        let expected: std::collections::BTreeSet<String> = [
+            "exec_enabled",
+            "remote_config_enabled",
+            "record_dir",
+            "local_restart_enabled",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
         assert_eq!(
             live, expected,
             "the live set is exactly what adopt_local re-seeds, plus the keys read at use"
@@ -3350,6 +3375,46 @@ mod tests {
         apply(&mut cfg, "exec_enabled", None).unwrap();
         assert!(!cfg.exec_enabled, "clearing must fail SAFE, not open");
         assert!(apply(&mut cfg, "exec_enabled", Some("perhaps")).is_err());
+    }
+
+    /// FR-84 D3 — the switch that keeps "Apply now" off a shared machine.
+    /// Default ON (a personal device wants it); clearing returns to ON, the
+    /// built-in default — unlike the root-granting gates, OFF is not the
+    /// fail-safe direction here, it only removes a convenience. LIVE: the
+    /// restart verb re-reads the file on every request, so an administrator's
+    /// edit is in force at once and the desktop must not ask for a restart to
+    /// apply it. Written against strings so it compiles on the pre-D3 tree,
+    /// where it is RED: the key was unknown to the surface.
+    #[test]
+    fn local_restart_enabled_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(
+            current_value(&cfg, "local_restart_enabled").as_deref(),
+            Some("true"),
+            "a fresh device lets the person at it restart the service"
+        );
+        apply(&mut cfg, "local_restart_enabled", Some("false")).unwrap();
+        assert_eq!(
+            entry_for(&cfg, "local_restart_enabled")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "local_restart_enabled", None).unwrap();
+        assert_eq!(
+            current_value(&cfg, "local_restart_enabled").as_deref(),
+            Some("true"),
+            "clearing restores the built-in default"
+        );
+        assert!(apply(&mut cfg, "local_restart_enabled", Some("perhaps")).is_err());
+        let e = entry_for(&cfg, "local_restart_enabled").unwrap();
+        assert_eq!(e.group, "access");
+        assert_eq!(e.tier, "standard");
+        assert!(
+            !e.restart_required,
+            "the restart verb reads the file per request — the key is live"
+        );
     }
 
     /// The opt-in that keeps `exec_enabled` / `ssh_enabled` refusable by a

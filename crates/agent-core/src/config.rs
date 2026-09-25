@@ -180,6 +180,24 @@ pub struct AgentConfig {
     #[serde(default)]
     pub remote_config_enabled: bool,
 
+    /// FR-84 D3 — whether a LOCAL client (the companion's "Apply now",
+    /// `roomler restart`) may ask the daemon to restart itself through its
+    /// supervisor (`Request::RestartDaemon`).
+    ///
+    /// Default **`true`**, unlike the gate-4 keys above: this grants nothing —
+    /// it only spares a person a trip to the service manager — so OFF is not
+    /// the fail-safe direction, it is the choice of an owner who wants no
+    /// restarts offered on this machine (a kiosk, a shared host). LIVE: the
+    /// verb re-reads the file on every request.
+    ///
+    /// ⚠️ Not a security boundary against the person at the machine: the
+    /// LocalAPI admits the interactive user, who can `config set` it back on,
+    /// as for every key on that surface. And it has no remote half — the
+    /// server can neither set it nor restart a daemon (docs/remote-config.md
+    /// §7b).
+    #[serde(default = "default_true")]
+    pub local_restart_enabled: bool,
+
     /// Serve SSH on this node's overlay address, in-process.
     ///
     /// Default **`false`**, for the same reason as [`Self::exec_enabled`] and
@@ -2031,6 +2049,7 @@ pub fn test_fixture() -> AgentConfig {
         macos_supervise_gui_worker: false,
         power_policy: String::new(),
         remote_config_enabled: false,
+        local_restart_enabled: true,
         ssh_enabled: false,
         ssh_port: None,
         ssh_authorized_keys: Vec::new(),

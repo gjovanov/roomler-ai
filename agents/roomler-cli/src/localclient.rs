@@ -1303,11 +1303,111 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
     // either restart a healthy daemon for nothing or assume they are still
     // exposed.
     if entry.restart_required {
-        println!("takes effect on the next daemon restart");
+        println!("takes effect on the next daemon restart (apply it now: `roomler restart`)");
     } else {
         println!("in effect now — no restart needed");
     }
     Ok(())
+}
+
+/// How long `roomler restart` waits for the relaunched daemon to answer.
+const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `roomler restart` — FR-84 D3. Ask the daemon to restart itself through its
+/// supervisor; the daemon decides, and a refusal exits non-zero with its
+/// reason. Then wait for the NEW daemon (a different pid) to answer, running
+/// `roomlerd service start` along the way when the answer says the relaunch
+/// is ours (`restart_by: caller` — the Windows Scheduled Task).
+///
+/// ⚠️ Through Fleet RPC (`roomler exec <host> -- roomler restart`) the daemon
+/// relaying the command is the one restarting, so the caller sees "no answer"
+/// even though it ran; `roomler exec <host> -- roomler status` afterwards
+/// shows the new pid and version.
+pub async fn restart(
+    reason: &str,
+    no_wait: bool,
+    daemon_exe: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let reason = if reason.trim().is_empty() {
+        "roomler restart"
+    } else {
+        reason
+    };
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let answer = client.restart_daemon(reason).await.map_err(daemon_err)?;
+    drop(client);
+    let (supervisor, restart_by, exit_code, leaving) = match answer {
+        localapi::RestartAnswer::Accepted {
+            supervisor,
+            restart_by,
+            exit_code,
+            leaving,
+        } => (supervisor, restart_by, exit_code, leaving),
+        localapi::RestartAnswer::Refused(why) => bail!("the daemon refused to restart: {why}"),
+        localapi::RestartAnswer::Unsupported(_) => bail!(
+            "this daemon predates `roomler restart` — restart it through its service manager \
+             (Windows: the Roomler service or scheduled task; Linux: systemctl; macOS: launchctl)"
+        ),
+    };
+    let caller_starts = restart_by == "caller";
+    println!(
+        "restarting: pid {} exits with code {exit_code}; {}",
+        leaving
+            .pid
+            .map_or_else(|| "?".to_string(), |p| p.to_string()),
+        if caller_starts {
+            format!("this command starts it again ({supervisor})")
+        } else {
+            format!("{supervisor} relaunches it")
+        }
+    );
+    if no_wait {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let start = || {
+        let exe = daemon_exe.clone();
+        async move { start_daemon_service(exe).await }
+    };
+    match localapi::wait_for_restart(leaving, caller_starts, start, RESTART_WAIT).await {
+        Ok(pid) => {
+            println!(
+                "back: pid {} after {:.1} s",
+                pid.map_or_else(|| "?".to_string(), |p| p.to_string()),
+                started.elapsed().as_secs_f64()
+            );
+            Ok(())
+        }
+        Err(why) => bail!("{why} — check the service manager"),
+    }
+}
+
+/// `roomlerd service start`, the caller half of a restart under the Windows
+/// Scheduled Task. The daemon it starts is spawned by the scheduler, never as
+/// a child of this process.
+async fn start_daemon_service(exe: Option<std::path::PathBuf>) -> Result<(), String> {
+    let exe = exe.ok_or_else(|| "roomlerd was not found next to this command".to_string())?;
+    let run = tokio::process::Command::new(&exe)
+        .args(["service", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(std::time::Duration::from_secs(20), run).await {
+        Ok(Ok(out)) if out.status.success() => Ok(()),
+        Ok(Ok(out)) => Err(format!(
+            "`{} service start` failed ({}): {}",
+            exe.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Ok(Err(e)) => Err(format!("running `{} service start`: {e}", exe.display())),
+        Err(_) => Err(format!(
+            "`{} service start` did not finish within 20 s",
+            exe.display()
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
