@@ -1,9 +1,11 @@
 # FR-61: Throwaway-OS install & verify matrix ("vmtest") — every method, every type, every OS, on demand
 
 **Issue**: [#1199](https://github.com/gjovanov/roomler-ai/issues/1199)
-**Status**: proposed
-**Repos**: `roomler-ai` (this spec, one Playwright spec), `roomler-ai-deploy` (orchestrator +
-lanes), `k8s-cluster-multi` (host capability)
+**Status**: built and field-verified — all five lanes green on every release since 0.4.48
+(P0–P8, 2026-09-02..06); the regression-issue lifecycle made real and field-verified
+2026-09-25 (P9); docs landed (P10). Open for the operator's call on AC10 and the close.
+**Repos**: `roomler-ai` (this spec, one Playwright spec, [`docs/vmtest.md`](../vmtest.md)),
+`roomler-ai-deploy` (orchestrator + lanes), `k8s-cluster-multi` (host capability)
 
 ## Goal
 
@@ -153,6 +155,8 @@ COW-clone golden image → boot → SSH in
 | P6 | macOS lane (tart on the MacBook, opt-in): 2 types × 2 methods | `tart delete`; lane auto-skips when host absent |
 | P7 | **Run and tweak** — every supported cell to green on the live fleet; fail-first evidence per cell class; Result comment with the matrix | — |
 | P8 | Repeatable skill (`vmtest`) — written after P7 proves the flow | — |
+| P9 | **Regression-issue lifecycle** (`roomler-ai-deploy` #12, 2026-09-25) — the isolated re-run the README had described since P2 but nothing performed; ONE issue per condition (`lane/method/type#check`, any host), a comment on repeat, closed by the first green run (the legacy per-run issues drain the same way); unreached checks record `NA`, not `FAIL`; `vmtest.sh triage --run-dir` re-evaluates a finished run without VMs | `VMTEST_RERUN=0` skips the re-run; `VMTEST_FILE_ISSUES=0` makes the lifecycle a logged dry run |
+| P10 | **Docs** — [`docs/vmtest.md`](../vmtest.md) in the house style + a `docs/README.md` row + a `testing.md` pointer | — |
 
 ## Acceptance criteria
 
@@ -180,12 +184,33 @@ COW-clone golden image → boot → SSH in
 - [x] AC8 — teardown leaves the org at baseline (graceful self-unenroll + reaper backstop
   observed; `count ≤ baseline` accepts the reaper cleaning older leftovers); k8s untouched
   (`kubectl get nodes` + prod `/health` green across every run).
-- [ ] AC9 — the regression-issue mechanism (isolated re-run + `gh issue create`) is coded; not
-  yet observed firing (no green-then-red regression occurred).
-- [~] AC10 — fail-first evidence recorded for Linux `.deb` install, perMachine SystemContext,
-  Wayland RD, ARM install (ALSA runtime-lib symbol), wizard — all shown failing before their fix/expectation.
+- [x] AC9 — the regression-issue mechanism files **one issue per condition**
+  (`lane/method/type#check`), only after an **isolated re-run** confirms the failure; a repeat
+  comments on the open issue; the first green run closes it — and drains the legacy per-run
+  issues once every condition they list is green. Field-verified 2026-09-25 on
+  `ubuntu/script/system@zeus` with an induced enroll refusal, fail-first: master filed #1618
+  and, eight minutes later, its duplicate #1620 (one per run, no re-run, nothing closing
+  either); the fix (`roomler-ai-deploy` #12) filed **#1623** once (run A, after the re-run),
+  commented on it (run B), and the green run C retired #1623, #1620 and #1618 with a comment
+  naming the run. Runs and rows in the field log.
+- [~] AC10 — fail-first evidence per cell class (P7), each shown failing before its fix or
+  expectation, with the run id and the issue the mechanism filed (the table in the field log,
+  2026-09-25). **Met** for perMachine SystemContext (`win11/script/system` — three PowerShell
+  defects, #1215/#1216), Wayland RD (`ubuntu/*#rd` — cookie auth + the DataChannel transport,
+  #1210/#1212; the RTP-shaped oracle blind to that transport, #1295/#1298/#1300), ARM install
+  (`libasound2` left uninstalled by the aarch64 `.deb` ⇒ `roomlerd` rc=127, #1220; the
+  dpkg-lock race, #1403) and the wizard (no `setup-v*` release, then CDP selectors + clock skew,
+  #1224–#1227). **Not met as worded** for the x86 Linux `.deb` install:
+  `ubuntu/installer/*#install` PASSED on its first recorded run (`20260902-012127`) and never
+  needed a fix, so there is no "before" to show; the `.deb` cells' first red was the per-user
+  overlay (netstack, #1214), and the only `.deb` *install-check* fail-firsts on record are the
+  ARM ones. Producing an x86 `.deb` install failure would mean shipping a broken `.deb` —
+  whether the class-level evidence satisfies this criterion is the operator's call.
 - [x] AC11 — invocable as one command from the dev box via mars (`vmtest.sh run --lane/--method/
   --type`, `--keep`); the `vmtest` skill documents it.
+- [x] AC12 — docs: [`docs/vmtest.md`](../vmtest.md) in the house style (mermaid, tables,
+  callouts, `file:line` anchors), a row in `docs/README.md`'s index, and `testing.md` pointing
+  at it. Landed with the 2026-09-25 spec PR, #1648.
 
 ## Open decisions
 
@@ -265,3 +290,61 @@ a DataChannel → a canvas, not `<video>`** (transport-agnostic frame oracle); o
 Also fixed here, and worth carrying: **`curl … | bash` reports BASH's status**, so a failed fetch
 (no DNS) still read as `install PASS` having installed nothing — the standing "never branch on a
 piped exit status" rule, recurring in a new place.
+
+**2026-09-04 → 2026-09-24 — re-runs on 0.4.61, 0.4.67, 0.4.69, 0.4.75, 0.4.82 (issue step log):
+17/17 green each time; no product regression across seven releases.** What broke was the harness
+(the RTP-shaped RD oracle, guest DNS/dpkg races, Playwright drift, a stale clone) and each is a
+trap in [`docs/vmtest.md`](../vmtest.md). The FR-51 lifecycle joined as a standing cell
+(`ephem/lifecycle/both`, `roomler-ai-deploy` #7).
+
+**2026-09-25 — AC9: the regression-issue lifecycle, made real and field-verified
+(`roomler-ai-deploy` #12).** Two findings first, both visible only by reading what the mechanism
+had actually done rather than what its comments said:
+
+1. **The isolated re-run never existed.** `vmtest.sh`'s header, `README.md` and
+   `vmtest.env.example` all described "one isolated re-run, then a GitHub issue" from P2 on;
+   `finish_run` diffed against `expected-failures.txt` and called `gh issue create`
+   unconditionally. The re-runs in the 09-04/09-05/09-06 step-log entries were done by hand
+   (`fr61-rerun*` driver dirs on the orchestrator). The mechanism *did* fire — 31 issues,
+   09-02..09-10 — but **one per RUN**: #1224–#1227 are the same `win11/wizard/user#install` four
+   times inside an hour, and none was ever de-duplicated or closed by anything but the 09-24 bulk
+   sweep. AC9's old text ("not yet observed firing") was stale; the real gap was "fires once per
+   condition and closes itself".
+2. **Unreached checks were recorded as FAIL.** A refused enroll produced `enroll FAIL`,
+   `overlay FAIL "no verdict"`, `wayland FAIL "no verdict"` **and** a bare-cell
+   `FAIL "cell script rc=1"` — one root cause, four FAIL rows; the bare row landed on *every*
+   failing cell because its guard grepped `<cell><TAB>`, which never matches a `<cell>#check`
+   row. Under per-condition keying that is four issues. Now the lift stops at the first FAIL or
+   the first missing verdict (`lib.sh lift_verdicts`) and later checks record `NA "not
+   reached"`; the bare row lands only when the cell has no FAIL row of its own.
+
+**The fail-first**, on `ubuntu/script/system@zeus` with an induced, harmless failure — a
+deliberately invalid ephemeral key, so `roomlerd enroll` is refused by the server and no device
+row ever exists (org at baseline 1 throughout). The current-master code ran from a separate
+clone, the fix from the PR branch, each with its own `VMTEST_HOME`; nothing touched the shared
+orchestrator checkout:
+
+| run | code | result | what the mechanism did |
+|---|---|---|---|
+| `20260925-110253` | master (`623fe58`) | `FAIL pass=4 fail=5 na=1` — enroll rc=1, overlay + wayland "no verdict", bare cell | **#1618** created at once, no re-run |
+| `20260925-111117` | master | same | **#1620** created — a duplicate of #1618 eight minutes later; one issue per run, nothing closes either |
+| `20260925-111956` (A) | PR #12 (`e5b744d`) | main `FAIL pass=4 fail=2 na=3`: enroll rc=1, overlay + wayland **NA "not reached"**, no bare row; isolated re-run (11:28→11:36) identical ⇒ `unexpected='…#enroll' flaky=''` | **#1623** `vmtest: unexpected failure in ubuntu/script/system#enroll` created — ONE issue for one root cause; #1618/#1620 left open ("RED in this run") |
+| `20260925-113642` (B) | PR #12 | identical to A (main + isolated re-run) | a **comment** on #1623, no new issue; open vmtest issues still exactly three (#1618, #1620, #1623) |
+| `20260925-115327` (C) | PR #12, valid key | `PASS pass=8 fail=0 na=0` — enroll, overlay (`self=100.65.20.1`, anchor 2 ms), wayland, **RD** (frames decoded, advancing), desktop (5 views); org back at baseline 1; no VM left on zeus | close-on-green retired **#1623**, then **#1620 and #1618** (every condition each lists went green), each with a comment naming the run; zero open `vmtest:` issues afterwards |
+
+Dry `triage` runs before the field test (copied run dirs, `VMTEST_FILE_ISSUES=0`): the
+2026-09-02 ARM failure run → six "would create" (its archived rows still carry the cascade
+FAILs) and "#1618 stays open: UNSEEN"; the last green sweep (`20260924-202800`) → "would close
+#1618 (green: all four conditions)"; the before-run itself → "#1618 stays open: RED".
+
+**AC10 — the fail-first per cell class, reconstructed from the run archive and the issues the
+mechanism filed** (run ids are directories on the orchestrator; every FAIL row quoted is in that
+run's `results.tsv`):
+
+| class | first red | fix | first green |
+|---|---|---|---|
+| perMachine **SystemContext** (`win11/script/system`: `install.ps1 -Role daemon-system` ⇒ `ENABLE_SYSTEM_CONTEXT=1`) | `20260902-021940` `#enroll FAIL` with an **empty** detail (`$ErrorActionPreference='Stop'` turned roomlerd's stderr into a terminating error) + `#overlay` no verdict → #1215; `20260902-023040` `#install FAIL no verdict` (non-ASCII broke the `.ps1` parse; the `true` SSH probe) → #1216 | the three PowerShell fixes (03:01 step-log entry) | `20260902-024606` — all PASS, `self=100.65.20.3`. The MSI SystemContext cell (`win11/installer/system`) passed on its first run |
+| **Wayland RD** (`ubuntu/*#rd`) | `20260902-002533` `#rd FAIL` → #1210; `20260902-004405` → #1212 (cookie-only sessions #1211; the DataChannel→canvas transport #1213). Again `20260904-000906` on all four Ubuntu cells → #1295/#1298/#1300 (the RTP-shaped oracle blind to that transport, #1297; the static-desktop keepalive, #1301) | as cited | `20260902-010001`; `20260904-010310` / `014606` / `015150` |
+| **ARM install** | `20260902-034419` `arm/{script,installer}/system#enroll FAIL roomlerd enroll --ephemeral rc=127` — guest.log: `roomlerd depends on libasound2; however: Package libasound2 is not installed` (the aarch64 `.deb` left unconfigured; rc=127 is the loader failing on `libasound.so.2`) → #1220. `20260905-202405` `arm/installer/system#install FAIL dpkg/apt install failed` (the `unattended-upgrades` lock race) → #1403 | the ALSA runtime dependency in the guest driver; apt timers stopped + masked, `DPkg::Lock::Timeout=300` | `20260902-041405`; `20260905-205517` |
+| **wizard** (`win11/wizard/user`) | `20260902-030033` `#install FAIL wizard fetch/launch failed` (no `setup-v*` release — `/api/setup/windows` 404), recorded as an expected failure; after `setup-v0.4.48`: `20260902-083823` `#install FAIL wizard CDP walk failed` + `#enroll FAIL no device row` → #1224, then `084120` → #1225, `084413` → #1226, → #1227 (guessed selectors; a guest clock ~3 h ahead of UTC rejecting a fresh token) | #1222 (`skip_macos`), the wizard's own stable ids, a `w32time` resync | `20260902-084901` `wizard walked Welcome→Done over CDP` |
+| Linux **`.deb`** install (`ubuntu/installer/*`) | **no install-check red exists**: `#install PASS .deb installed (x86_64)` on the first recorded run, `20260902-012127`, for both types. The cells' first red was `ubuntu/installer/user#overlay FAIL no overlay self address within 90s` (a per-user daemon cannot create a TUN — the netstack finding) in that same run → #1214 | `ROOMLERD_OVERLAY_NETSTACK_SOCKS` for the per-user role | `20260902-015346` |

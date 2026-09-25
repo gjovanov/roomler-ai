@@ -10,7 +10,7 @@ flowchart TB
     E2E["Playwright E2E (32 specs)<br/>real browser × real server"]
     INT["Rust integration (33 modules)<br/>real Axum servers × real MongoDB/Redis<br/>+ the agent library in-process"]
     UNIT["Unit: Vitest (30 files) ·<br/>in-crate #[cfg(test)] (signalling wire locks,<br/>consent, permissions, encoders, overlay)"]
-    HARNESS["Harnesses: Xvfb capture smoke ·<br/>encoder-smoke · installer-smoke CI ·<br/>k8s e2e lane · nightly lane"]
+    HARNESS["Harnesses: Xvfb capture smoke ·<br/>encoder-smoke · installer-smoke CI ·<br/>k8s e2e lane · nightly lane ·<br/>vmtest (throwaway-OS install matrix)"]
 
     UNIT --> INT --> E2E
     HARNESS -.-> INT & E2E
@@ -73,7 +73,7 @@ ACLs, and overlay internals under their feature flags.
 | `installer-smoke.yml` | Installs and uninstalls the freshly-built per-user MSI on a Windows runner |
 | k8s e2e (`scripts/e2e-k8s.sh`, `Dockerfile.agent-e2e`) | The suite against a standing cluster namespace — validates the real multi-pod topology |
 | Nightly (`scripts/e2e-nightly.sh`) | Full E2E against the current prod tag, diffed against an expected-failures list; regressions file an issue |
-| vmtest install matrix (FR-61, private `roomler-ai-deploy/vmtest`) | Throwaway VMs on the fleet hosts install from the real served scripts and installers, enrol into a test org, and check overlay + remote desktop + the desktop app per OS × method × type; an unexpected failure files a `vmtest:` issue |
+| vmtest (`roomler-ai-deploy/vmtest/vmtest.sh`, on demand) | Installs the product the way users do on throwaway Win11 / Ubuntu-Wayland / ARM / macOS VMs, enrols against prod, proves remote desktop + overlay + `roomler-desktop`, destroys the VM; one issue per failing condition, closed on green — [vmtest.md](vmtest.md) |
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
 
 Known environmental failures (conference specs without forwarded RTC ports,
