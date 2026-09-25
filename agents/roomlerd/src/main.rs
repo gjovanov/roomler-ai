@@ -1291,7 +1291,7 @@ async fn daemon_main() -> Result<()> {
                 encoder_smoke_cmd(&encoder, &codec, name.as_deref(), dump.as_deref()).await
             }
         }
-        Command::AppsProbe => apps_probe_cmd(),
+        Command::AppsProbe => apps_probe_cmd(&config_path),
         #[cfg(feature = "recording")]
         Command::Record {
             out,
@@ -4693,24 +4693,53 @@ async fn encoder_reconfigure_sweep_cmd(
 /// the image catches it, which is how FR-36's 10-bit scanout was found.
 /// FR-56 P1 — answer "can Remote Apps manage a desktop here, and what does it
 /// see", on the host, with no session.
-fn apps_probe_cmd() -> anyhow::Result<()> {
+fn apps_probe_cmd(config_path: &std::path::Path) -> anyhow::Result<()> {
     use roomlerd::apps;
 
-    let supported = apps::apps_supported();
-    println!("apps supported: {supported}");
-    if !supported {
-        println!(
-            "  no manageable desktop found. Either apps are disabled in the config, or there \
-             is no X display: a virtual-desktop host sets one, and on a real session the \
-             compositor's Xwayland provides it. ⚠️ A Wayland compositor with NO Xwayland \
-             cannot be managed by this backend at all."
-        );
-        return Ok(());
+    // FR-56 AC10 — answer as the DAEMON would: install the device's own
+    // `[virtual_desktop_apps]` first. Until this the probe ran on the built-in
+    // default (apps enabled) and could print `supported: true` on a device
+    // whose owner had turned them off — a gap of exactly the kind the probe
+    // exists to remove.
+    match config::load(&config_path.to_path_buf()) {
+        Ok(cfg) => {
+            println!(
+                "config: {} ([virtual_desktop_apps] enabled = {}, {} allowlisted)",
+                config_path.display(),
+                cfg.virtual_desktop_apps.enabled,
+                cfg.virtual_desktop_apps.allowlist.len()
+            );
+            apps::set_apps_config(cfg.virtual_desktop_apps.clone());
+        }
+        Err(e) => println!(
+            "config: {} not loaded ({e:#}) — probing with the built-in default (apps enabled)",
+            config_path.display()
+        ),
     }
 
-    let Some(be) = apps::backend() else {
-        println!("  supported, but no backend could be constructed (a race, or a config change)");
-        return Ok(());
+    match apps::availability() {
+        Ok(()) => println!("apps supported: true"),
+        Err(why) => {
+            println!("apps supported: false");
+            println!("  reason [{}]: {}", why.code(), why.reason());
+            println!(
+                "  (the same code + reason ride `rc:apps.list.reply` as `unavailable`, so the \
+                 viewer shows this instead of hiding the button)"
+            );
+            return Ok(());
+        }
+    }
+
+    let be = match apps::backend() {
+        Ok(be) => be,
+        Err(why) => {
+            println!(
+                "  supported a moment ago, but no backend now [{}]: {}",
+                why.code(),
+                why.reason()
+            );
+            return Ok(());
+        }
     };
     // FR-56 P2 — what this listing covers, and what it structurally cannot.
     let cov = be.coverage();

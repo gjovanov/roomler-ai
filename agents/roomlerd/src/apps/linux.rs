@@ -28,11 +28,11 @@ use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use super::MissingTool;
 use super::{
     Coverage, LaunchOutcome, ResolvedApp, WindowInfo, WindowManager, classify_title,
     next_tmux_session_name, parse_tmux_sessions, parse_wmctrl_list,
 };
+use super::{MissingTool, Unavailable};
 
 /// Synthetic window-id prefix for a detached tmux session (no live X
 /// window). `focus()` treats it as "attach", not "raise".
@@ -472,14 +472,29 @@ fn is_safe_session(s: &str) -> bool {
 /// not report a `Display=` for every Wayland session, so a guess of `:0` is
 /// unavoidable — but an unverified guess would surface later as a confusing
 /// "no windows" instead of an honest "no desktop".
-pub fn discover() -> Option<Target> {
+///
+/// FR-56 AC10: the `Err` is the REASON, and it rides the wire. This used to
+/// return `Option`, which threw away three different answers — no session, no
+/// X display, cannot run as the owner — on the way to one silent `None`.
+pub fn discover() -> Result<Target, Unavailable> {
     if let Some(display) = std::env::var_os("DISPLAY").and_then(|d| d.into_string().ok()) {
         // Virtual-desktop mode. Unchanged, including running as the daemon:
         // the daemon started that Xvfb and owns it.
-        return Some(Target::Daemon { display });
+        return Ok(Target::Daemon { display });
     }
 
-    let sess = crate::companion::graphical_session().ok()?;
+    let sess = match crate::companion::graphical_session() {
+        Ok(s) => s,
+        // This used to be `.ok()?`, which discarded the sentence
+        // `graphical_session` composes ("no active graphical session — nobody
+        // is at this machine's screen") and left the hello silent with nothing
+        // anywhere saying why.
+        Err(e) => {
+            return refused(Unavailable::NoSession {
+                detail: format!("{e:#}"),
+            });
+        }
+    };
     let xauthority = find_xauthority(sess.uid);
     // loginctl reports `Display=` for X11 sessions and often not for Wayland
     // ones; `:0` is what a compositor-started Xwayland almost always takes.
@@ -493,7 +508,7 @@ pub fn discover() -> Option<Target> {
         }
     }
 
-    for candidate in candidates {
+    for candidate in &candidates {
         let target = Target::Session {
             display: candidate.clone(),
             wayland: sess.wayland_display.is_some(),
@@ -513,22 +528,50 @@ pub fn discover() -> Option<Target> {
                     xauthority = ?xauthority,
                     "apps: found a usable desktop in the user's session"
                 );
-                return Some(target);
+                return Ok(target);
             }
-            // wmctrl missing is not "no desktop" — it is a dependency the
-            // existing error message already names actionably ("apt install
-            // wmctrl"). Returning the target lets that message reach the
-            // operator instead of a silent `supported:false`.
-            Probe::ToolMissing => return Some(target),
+            // Until AC10 this returned the target anyway, so the "install
+            // wmctrl" message could reach the operator through the list
+            // error — which also advertised `list` on a host that cannot
+            // list. The reason now has its own lane, so the hello stays
+            // honest and the message still arrives.
+            Probe::ToolMissing => {
+                return refused(Unavailable::ToolMissing {
+                    tool: "wmctrl",
+                    install: "apt install wmctrl",
+                });
+            }
+            // Until AC10 this was folded into `NoDisplay`: a failed privilege
+            // drop (an account `getpwnam` cannot resolve, a `setuid` refused)
+            // was retried against the next display and then reported as "no
+            // Xwayland" — a wrong answer that sent the operator to look at the
+            // compositor. Nothing about the next display changes it, so stop.
+            Probe::CannotRun(detail) => {
+                return refused(Unavailable::CannotRunAs {
+                    user: sess.name.clone(),
+                    detail,
+                });
+            }
             Probe::NoDisplay => continue,
         }
     }
+    refused(Unavailable::NoXDisplay {
+        user: sess.name,
+        tried: candidates,
+    })
+}
+
+/// One log line per refusal, at `debug!` because on a headless server this
+/// is the normal state and runs on every boot (the hello asks). The reason
+/// reaches the operator through the reply and `roomlerd apps-probe` — the
+/// point of AC10 is that the log is no longer the only place it lives.
+fn refused(why: Unavailable) -> Result<Target, Unavailable> {
     tracing::debug!(
-        user = %sess.name,
-        "apps: a graphical session exists but no X display answered — a Wayland \
-         compositor with no Xwayland cannot be managed by the X11 backend"
+        code = why.code(),
+        reason = %why.reason(),
+        "apps: not available on this host"
     );
-    None
+    Err(why)
 }
 
 /// Outcome of poking a candidate desktop.
@@ -537,6 +580,11 @@ enum Probe {
     Answered,
     /// `wmctrl` is not installed. Says nothing about the display.
     ToolMissing,
+    /// The command could not be RUN — the privilege drop could not be
+    /// installed, or the spawn failed for a reason other than "not found".
+    /// Says nothing about the display either, and trying the next one cannot
+    /// help.
+    CannotRun(String),
     /// `wmctrl` ran and could not open that display.
     NoDisplay,
 }
@@ -560,8 +608,9 @@ fn probe(target: &Target) -> Probe {
             user: user.clone(),
         },
     });
-    let Ok(mut cmd) = wm.cmd("wmctrl") else {
-        return Probe::NoDisplay;
+    let mut cmd = match wm.cmd("wmctrl") {
+        Ok(c) => c,
+        Err(e) => return Probe::CannotRun(format!("{e:#}")),
     };
     match cmd
         .arg("-m")
@@ -573,7 +622,7 @@ fn probe(target: &Target) -> Probe {
         Ok(st) if st.success() => Probe::Answered,
         Ok(_) => Probe::NoDisplay,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::ToolMissing,
-        Err(_) => Probe::NoDisplay,
+        Err(e) => Probe::CannotRun(format!("spawning wmctrl: {e}")),
     }
 }
 
