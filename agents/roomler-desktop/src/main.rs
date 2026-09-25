@@ -122,6 +122,9 @@ fn main() {
             commands::cmd_recording_delete,
             commands::cmd_recording_open,
             commands::cmd_pick_record_dir,
+            // FR-84 D5c — the Devices page's grid and mesh.
+            commands::cmd_devices,
+            commands::cmd_mesh,
         ])
         .on_window_event(|window, event| {
             // Close-to-hide: the MAIN window is a view over a resident tray
