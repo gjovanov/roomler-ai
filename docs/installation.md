@@ -111,6 +111,15 @@ Details worth knowing:
 
 - **Two MSI flavours** exist (`peruser`, `permachine`) — the wizard maps roles
   onto them and flips SystemContext separately (`roomlerd enable-system-context`).
+- **The private network is on by default for the two machine roles** (FR-84 S2):
+  the Advanced **overlay** box follows the role — checked for *Daemon — system* and
+  *Daemon — machine*, unchecked for *Daemon — per user* (the WireGuard adapter
+  needs a service install; a per-user host can still join through the userspace
+  netstack) — until you touch it, after which your choice sticks across role
+  changes. The served `install.ps1` / `install.sh` keep their own defaults.
+- **The wizard ships with every agent release** (FR-84 S1): `agent-v<V>` also
+  publishes `setup-v<V>` at the same commit, so `/api/setup/*` serves a wizard as
+  new as the daemon it installs.
 - Daemon installs also place **`roomler-desktop`** (tray companion: status,
   tunnels pane, consent prompts) and **`roomler.exe`** — a small shim that
   re-execs `roomlerd cli`, so CLI and daemon can never version-skew.
