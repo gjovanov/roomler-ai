@@ -22,6 +22,17 @@
   --border: #e4e7ec;
   --code: #f1f3f5;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+  /* FR-84 D5c — carrier colours, the web dashboard's theme exactly
+   * (ui/src/plugins/vuetify.ts: success / warning / info / secondary /
+   * error), so a pair is the same colour in the browser and here. */
+  --mesh-direct: #69f0ae;
+  --mesh-relay: #ffc107;
+  --mesh-derp: #4db6ac;
+  --mesh-tunnel: #ef5350;
+  --mesh-blocked: #dd2c00;
+  --mesh-other: rgba(107, 114, 128, 0.45);
+  /* The relay amber, dark enough to read as TEXT on a light background. */
+  --relay-text: #8a6100;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", sans-serif;
   font-size: 14px;
@@ -38,6 +49,7 @@
     --code: #22242a;
     --primary-tint: rgba(64, 145, 224, 0.16);
     --shadow: none;
+    --relay-text: #ffc107;
   }
 }
 
@@ -271,9 +283,11 @@ body {
   border: 1px solid transparent;
 }
 
-/* One colour per connection type — mirrors ConnectionType (snake_case). */
+/* One colour per connection type — mirrors ConnectionType (snake_case).
+ * Relay is the web's amber (FR-84 D5c), not the primary blue it used to be:
+ * one carrier, one colour, in every Roomler surface. */
 .badge-direct  { color: var(--ok);      background: rgba(21, 128, 61, 0.12);   border-color: var(--ok); }
-.badge-relay   { color: var(--primary); background: var(--primary-tint);        border-color: var(--primary); }
+.badge-relay   { color: var(--relay-text); background: rgba(255, 193, 7, 0.16); border-color: var(--mesh-relay); }
 .badge-tunnel  { color: var(--warn);    background: rgba(180, 83, 9, 0.12);     border-color: var(--warn); }
 .badge-blocked { color: var(--error);   background: rgba(185, 28, 28, 0.12);    border-color: var(--error); }
 .badge-offline { color: var(--muted);   background: rgba(107, 114, 128, 0.12);  border-color: var(--muted); }
@@ -400,6 +414,7 @@ label {
 }
 
 input[type="text"],
+input[type="search"],
 input[type="number"],
 select,
 textarea {
@@ -439,24 +454,173 @@ textarea {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-/* ── Devices view bits ─────────────────────────────────────────────── */
+/* ── Devices view bits (FR-84 D5c) ─────────────────────────────────── */
 
-/* Fixed layout so the flagship table ALWAYS fits the pane — auto layout
- * lets long mono IPs blow the columns past the window edge. Cells wrap
- * (overflow-wrap) instead of overflowing. */
-#dv-peers-table {
-  table-layout: fixed;
+.dv-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
 }
-#dv-peers-table th:nth-child(1) { width: 28%; }
-#dv-peers-table th:nth-child(2) { width: 34%; }
-#dv-peers-table th:nth-child(3) { width: 22%; }
-#dv-peers-table th:nth-child(4) { width: 16%; }
-#dv-peers-table td { overflow-wrap: anywhere; }
+.dv-toolbar #dv-search { flex: 1 1 220px; width: auto; min-width: 160px; }
+.dv-toolbar select { width: auto; }
+.dv-size { display: inline-flex; align-items: center; gap: 6px; }
+.dv-note { margin: 0 0 8px; }
+#dv-cols-btn.is-custom { border-color: var(--primary); color: var(--primary); }
 
-.ping-cell { white-space: normal; }
+/* The grid keeps its natural widths and scrolls sideways in a narrow window;
+ * Actions + Name come first, so what matters never scrolls away. */
+.dv-grid th.sortable { cursor: pointer; user-select: none; }
+.dv-grid th.sortable:hover { color: var(--fg); }
+.dv-grid th.sorted { color: var(--primary); }
+.sort-ind { margin-left: 4px; font-size: 9px; }
+.dv-grid td { white-space: nowrap; }
+.dv-grid td.dv-col-name { white-space: normal; min-width: 150px; }
+.dv-grid.is-loading tbody { opacity: 0.55; }
+.dv-name-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dv-name-title { font-weight: 500; }
+.dv-sub { margin: 1px 0 0 14px; }
+.dv-chips .chip { font-size: 10px; padding: 0 7px; }
+.chip-self { color: var(--primary); background: var(--primary-tint); border-color: var(--primary); }
+.tag-chip {
+  display: inline-block;
+  padding: 0 7px;
+  margin: 1px 3px 1px 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+}
+.dv-col-actions button.is-error { border-color: var(--error); color: var(--error); }
+.dv-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ping-cell { white-space: nowrap; }
 .ping-result { font-size: 0.9em; }
 .ping-result.ok  { color: var(--ok); }
 .ping-result.err { color: var(--error); cursor: help; }
+
+/* The column chooser. */
+.cols-dialog {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elev);
+  color: var(--fg);
+  padding: 16px 18px;
+  width: min(420px, calc(100vw - 32px));
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+.cols-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+.cols-dialog h3 { margin: 0; font-size: 15px; }
+.cols-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  max-height: 55vh;
+  overflow-y: auto;
+}
+.cols-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+.cols-item:hover { background: var(--bg-inset); }
+.cols-item label {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--fg);
+  font-size: 13px;
+}
+.cols-item.dragging { opacity: 0.5; }
+.cols-item.drag-over { border-color: var(--primary); }
+.drag-handle { cursor: grab; color: var(--muted); letter-spacing: -2px; user-select: none; }
+.cols-moves { display: inline-flex; gap: 4px; }
+.cols-move { padding: 0 7px; }
+
+/* The mesh graph (mesh.js). Colours come from the --mesh-* variables. */
+.mesh-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  margin-bottom: 4px;
+}
+.mesh-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+}
+.mesh-filter-offline { margin-left: auto; }
+.mesh-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+.mesh-dot.c-direct  { background: var(--mesh-direct); }
+.mesh-dot.c-relay   { background: var(--mesh-relay); }
+.mesh-dot.c-derp    { background: var(--mesh-derp); }
+.mesh-dot.c-tunnel  { background: var(--mesh-tunnel); }
+.mesh-dot.c-blocked { background: var(--mesh-blocked); }
+.mesh-wrap { position: relative; width: 100%; display: flex; justify-content: center; }
+.mesh-svg { overflow: visible; max-width: 100%; }
+.mesh-ring { fill: none; stroke: var(--border); stroke-dasharray: 2 4; }
+.mesh-spoke { stroke: var(--muted); stroke-opacity: 0.35; stroke-width: 1; }
+.mesh-spoke--off { stroke-dasharray: 2 4; stroke-opacity: 0.2; }
+.mesh-center { fill: var(--primary); }
+.mesh-center-label,
+.mesh-node-label { fill: var(--muted); font-size: 11px; }
+.mesh-node-label.is-self { fill: var(--fg); font-weight: 700; }
+.mesh-node-dot.is-online  { fill: var(--mesh-direct); }
+.mesh-node-dot.is-offline { fill: var(--muted); fill-opacity: 0.45; }
+.mesh-node-ring { fill: none; stroke: var(--primary); stroke-width: 2.5; }
+.mesh-edge { stroke-width: 1.6; opacity: 0.65; }
+.mesh-edge.is-hover { stroke-width: 3; opacity: 1; }
+.mesh-edge.c-direct  { stroke: var(--mesh-direct); }
+.mesh-edge.c-relay   { stroke: var(--mesh-relay); }
+.mesh-edge.c-derp    { stroke: var(--mesh-derp); }
+.mesh-edge.c-tunnel  { stroke: var(--mesh-tunnel); }
+.mesh-edge.c-blocked { stroke: var(--mesh-blocked); }
+.mesh-edge.c-other   { stroke: var(--mesh-other); }
+.mesh-stop.c-direct  { stop-color: var(--mesh-direct); }
+.mesh-stop.c-relay   { stop-color: var(--mesh-relay); }
+.mesh-stop.c-derp    { stop-color: var(--mesh-derp); }
+.mesh-stop.c-tunnel  { stop-color: var(--mesh-tunnel); }
+.mesh-stop.c-blocked { stop-color: var(--mesh-blocked); }
+.mesh-stop.c-other   { stop-color: var(--mesh-other); }
+.mesh-tooltip {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  pointer-events: none;
+  /* One line per direction — an asymmetric edge reads as two claims. */
+  white-space: pre-line;
+  z-index: 2;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+.mesh-legend { margin-top: 4px; text-align: center; }
+.mesh-asym-swatch {
+  display: inline-block;
+  width: 22px;
+  height: 6px;
+  border-radius: 3px;
+  vertical-align: middle;
+  background: linear-gradient(to right, var(--mesh-direct) 42%, var(--mesh-relay) 58%);
+}
 
 /* ── Tunnels view bits ─────────────────────────────────────────────── */
 
