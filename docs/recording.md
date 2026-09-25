@@ -4,14 +4,15 @@
 > [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core,
 > and its audio on Windows and Linux), P2a (the local verbs), P2b
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
-> remote recording) and P3b (the device's half of it, §10).** It sits behind
-> the `recording` cargo feature and is in no release build yet. It is driven by
-> `roomlerd record`, by the daemon for the LocalAPI recording verbs and
-> `roomler record` (§6), by roomler-desktop (§7), and by a remote controller
-> over the session's `record` channel (§10). Still to come: the microphone on
-> macOS, delivery out of the recorder's data folder (P2c), downloading a remote
-> recording and re-attaching after a drop (P3b-2), the viewer's Record button
-> (P3c), and the editor (cut, speed up, background music) in P5.
+> remote recording), P3b (the device's half of it) and P3b-2 (downloading it,
+> §10).** It sits behind the `recording` cargo feature and is in no release
+> build yet. It is driven by `roomlerd record`, by the daemon for the LocalAPI
+> recording verbs and `roomler record` (§6), by roomler-desktop (§7), and by a
+> remote controller over the session's `record` channel (§10). Still to come:
+> the microphone on macOS, delivery out of the recorder's data folder (P2c),
+> re-attaching after a dropped session (P3b-3), the viewer's Record and
+> Download buttons (P3c), and the editor (cut, speed up, background music) in
+> P5.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -518,9 +519,45 @@ unknown prompt kind as a remote-control request. So a record prompt carries the
 whole question in its detail line, the one field every companion shows as it
 is.
 
-Not in P3b yet: the download (`rc:record.list` / `rc:record.get`, resumable)
-and the 60 s re-attach after a dropped session (P3b-2), and the viewer's Record
-button (P3c).
+### Downloading a remote recording (P3b-2)
+
+The recording stays on the device. A controller fetches it over the same
+`record` channel, so the bytes go peer to peer (or through a relay that sees
+only ciphertext), never through the server.
+
+```mermaid
+sequenceDiagram
+    participant V as viewer
+    participant D as device (record DC)
+
+    V->>D: rc:record.list {id}
+    D-->>V: rc:record.list {items: this controller's recordings}
+    V->>D: rc:record.get {id, name, offset}
+    D->>D: a bare *.mp4 name · the sidecar names THIS user · no link · offset ≤ size
+    D-->>V: rc:record.file {id, name, offset, size}
+    D-->>V: the bytes from offset, 64 KiB binary messages
+    D-->>V: rc:record.done {id, name, bytes, size, sha256 of the WHOLE file}
+    Note over V,D: a flap mid-transfer: ask again from the bytes already held
+```
+
+| Rule | Why |
+|---|---|
+| **Ownership is by USER**: the sidecar's `Initiator::Remote.controller_user_id` must be this session's controller | the reconnect ladder mints new session ids, and a controller whose connection flapped must still reach their file |
+| **Someone else's recording reads as `not_found`**, exactly like no recording | a controller learns nothing about files that are not theirs, including that they exist |
+| **A bare `*.mp4` name** (no separator, no `..`), opened **without following a link**, and a regular file once open | the name comes from another machine; a link at that name must not serve a file outside the folder |
+| **Resumable by offset, with no size cap** | a relay flap must not restart a 3 GB transfer from zero |
+| **`sha256` is of the whole file** | a resumed transfer is checked end to end like any other; the prefix the controller already had is hashed from disk, not sent |
+| **One transfer at a time per session**; `rc:record.cancel` abandons it, and so does the session ending | |
+| **The files channel's pacing**: 64 KiB chunks, paused while more than 4 MiB is queued on the channel | a multi-GB file must not become a multi-GB queue |
+
+Each finished transfer is reported as `rc:recording.activity` `downloaded`, with
+its bytes. The refusals are `bad_name`, `not_found`, `bad_offset`,
+`transfer_in_progress`, `unavailable`, `read_failed`, `send_failed`,
+`cancelled` and `session_ended`, each on `rc:record.error {id, reason, detail}`.
+
+Not yet: the 60 s re-attach after a dropped session, which needs something on
+screen for a recording with no session to show it (P3b-3), and the viewer's
+Record and Download buttons (P3c).
 
 ### Decision and claim, like SSH
 
@@ -554,6 +591,8 @@ audit. The device is resolved within the tenant, so a foreign id gets a 404.
 | `recording::remote` unit tests (P3b) | nothing advertised unless the owner opted in AND a recorder can run, `remote-audio` only on top with an audio build; the prechecks refuse in order and by name; the wire parses (audio off unless asked; a `microphone` field is ignored) and speaks the documented state shape; the controller is told a file name, never a path; `adopt` signals only a change | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `tests/control_dc_record.rs` (P3b) | A loopback PeerConnection pair, the PRODUCTION `record` handler and the real recorder child. The owner's switch and the audio gate refuse by name, leave no file and no banner, and are reported to the server; a grant without RECORD gets a refusing channel. No indicator surface means no recording and no running recorder. An auto-granted session records: the banner is up before the file, a second start is `busy`, Stop ends it `requested`, and the sidecar names the controller with no microphone. A host-consented session asks again with a FRESH prompt id (never the session's), the detail line carries the question, a deny holds for a minute (`rate_limited`), and an approval records. The owner's OFF ends it `gate_revoked`, the host's Stop `host_stopped`, the controller going away `session_ended` | same step, `--test control_dc_record` |
 | `rc_sessions` (P3b) | the banner's `recording` follows the session, survives a re-announce, and cannot be set on a session the banner does not show | the default `--lib` step |
+| `recording::remote` unit tests (P3b-2) | a recording is a controller's only when its sidecar says THAT user started it remotely (not a local one, not another controller's, not one with no or a broken sidecar); the list holds exactly those; a directory, and a link at a recording's name, are never opened (the link case where the OS lets a test make one). ⚠️ The link cell stays green with EITHER layer removed, the `symlink_metadata` pre-check or the no-follow open, because each refuses a link on its own; it is red only with both gone. A green run after deleting one is not evidence that the other is redundant: the pre-check also keeps a FIFO from blocking the handler in `open`, and the no-follow open closes the swap between the check and the open | "Test the recorder (FR-85)" |
+| `tests/control_dc_record.rs`, download (P3b-2) | the controller lists its recording, downloads it whole (bytes equal to the file, `sha256` equal to the file's) and resumed from the middle (only the rest sent, the same whole-file `sha256`); `bad_name`, `bad_offset` and `not_found` said by name; both transfers reported `downloaded` with their bytes; a second controller of the same device lists nothing and gets `not_found` for the name | same step, `--test control_dc_record` |
 | `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config`; `remote_recording_does_not_imply_remote_audio` (equality, an old agent's hello advertises nothing, a newer word is ignored, the wire words are pinned); `rc:recording.activity` owned by `remote` | same |
 | `crates/db` (P3a) | `RECORD_REMOTE_SCREEN` is named, inside `ALL`, in no managed row below `ADMINISTRATOR`, and outside `DEFAULT_ADMIN` | same |
 | `crates/modules/fleet` (P3a) | `record_grant`'s table: kept only when the controller may AND the device serves it, each refusal with its reason, a grant without RECORD untouched; the hub strips RECORD from the effective grant and names why in `SessionCreated`; a coalesced duplicate repeats the reason | "Run fleet module unit tests" |
