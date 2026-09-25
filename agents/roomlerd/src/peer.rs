@@ -236,6 +236,11 @@ pub struct AgentPeer {
     /// telemetry can report the fps the USER actually saw rather than
     /// what we hoped to send.
     viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
+    /// FR-85 P3b — what this session's `record` DataChannel needs from the
+    /// signalling loop. Set once by [`Self::set_record_ctx`] before the offer
+    /// is answered, so it is in place before any channel can open.
+    #[cfg(feature = "recording")]
+    record_ctx: Arc<std::sync::OnceLock<crate::recording::remote::SessionCtx>>,
 }
 
 /// One `rc:session.stats` sample: what this session actually did.
@@ -962,6 +967,11 @@ impl AgentPeer {
         let control_dc_for_callback = control_dc.clone();
         let cursor_dc_for_callback = cursor_dc_stash.clone();
         let lock_state_rx_for_dc = lock_state_rx.clone();
+        #[cfg(feature = "recording")]
+        let record_ctx: Arc<std::sync::OnceLock<crate::recording::remote::SessionCtx>> =
+            Arc::new(std::sync::OnceLock::new());
+        #[cfg(feature = "recording")]
+        let record_ctx_for_callback = record_ctx.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
             info!(session = %session_id, %label, "data channel opened");
@@ -976,6 +986,8 @@ impl AgentPeer {
             let control_stash = control_dc_for_callback.clone();
             let cursor_stash = cursor_dc_for_callback.clone();
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
+            #[cfg(feature = "recording")]
+            let record_ctx = record_ctx_for_callback.clone();
             Box::pin(async move {
                 use roomler_ai_remote_control::permissions::Permissions;
                 match label.as_str() {
@@ -1042,6 +1054,21 @@ impl AgentPeer {
                         attach_files_denied(dc, session_id)
                     }
                     "files" => attach_files_handler(dc, session_id),
+                    // FR-85 P3b — the same attach-time gate for RECORD: the
+                    // hub strips it unless the controller may record AND this
+                    // device's owner opted in, and a grant without it gets a
+                    // channel that refuses, never one that records.
+                    #[cfg(feature = "recording")]
+                    "record" if !permissions.contains(Permissions::RECORD) => {
+                        crate::recording::remote::attach_refusing(dc, session_id, "not_granted")
+                    }
+                    #[cfg(feature = "recording")]
+                    "record" => match record_ctx.get() {
+                        Some(ctx) => crate::recording::remote::attach(dc, ctx.clone()),
+                        None => {
+                            crate::recording::remote::attach_refusing(dc, session_id, "unavailable")
+                        }
+                    },
                     "video-bytes" => {
                         // Phase Y.3 stash. The media pump (when caps
                         // negotiated this transport) consults this
@@ -1183,7 +1210,17 @@ impl AgentPeer {
             audio_pump: audio_pump_handle,
             rtcp_reader: Some(rtcp_reader),
             viewer_report: viewer_report.clone(),
+            #[cfg(feature = "recording")]
+            record_ctx,
         })
+    }
+
+    /// FR-85 P3b — give this session's `record` channel what it needs. Call
+    /// before [`Self::handle_offer`]; a channel that opens without it refuses
+    /// every request as `unavailable`.
+    #[cfg(feature = "recording")]
+    pub fn set_record_ctx(&self, ctx: crate::recording::remote::SessionCtx) {
+        let _ = self.record_ctx.set(ctx);
     }
 
     /// Wave 2 — a telemetry sample for `rc:session.stats`.

@@ -127,7 +127,11 @@
         );
       }
       if (st.width && st.height) parts.push(st.width + '×' + st.height + ' @ ' + st.fps + ' fps');
-      setText('rec-status', 'Recording — ' + parts.join(', '));
+      // FR-85 P3b — a remote controller's recording says whose it is.
+      const lead = st.remote_controller
+        ? 'Recording for ' + st.remote_controller + ' (remote)'
+        : 'Recording';
+      setText('rec-status', lead + ' — ' + parts.join(', '));
     } else {
       hide($('rec-live'));
       setText('rec-status', 'Not recording.');
@@ -177,6 +181,45 @@
       show(reason);
     } else {
       hide(reason);
+    }
+  }
+
+  /* ── FR-85 P3b — the remote-recording gates ─────────────────────── */
+
+  let remoteBusy = false;
+
+  function renderRemote(view) {
+    const card = $('rec-remote');
+    const g = view.remote;
+    if (!g) {
+      hide(card);
+      return;
+    }
+    show(card);
+    const en = $('rec-remote-enabled');
+    const au = $('rec-remote-audio');
+    // Never repaint a box while its change is in flight.
+    if (!remoteBusy) {
+      en.checked = !!g.enabled;
+      au.checked = !!g.audio;
+    }
+    en.disabled = remoteBusy;
+    // Computer audio means nothing until remote recording is allowed.
+    au.disabled = remoteBusy || !g.enabled;
+  }
+
+  async function setRemote(key, on) {
+    remoteBusy = true;
+    hide($('rec-remote-error'));
+    try {
+      await invoke('cmd_config_set', { key, value: on ? 'true' : 'false' });
+    } catch (e) {
+      const el = $('rec-remote-error');
+      el.textContent = errorText(e);
+      show(el);
+    } finally {
+      remoteBusy = false;
+      await refresh({ force: true });
     }
   }
 
@@ -278,6 +321,7 @@
     lastGood = view;
     renderControl(view);
     renderFolder(view);
+    renderRemote(view);
     renderList(view);
   }
 
@@ -415,6 +459,12 @@
     $('rec-folder-change').addEventListener('click', () => void changeFolder());
     $('rec-folder-default').addEventListener('click', () => void useDefaultFolder());
     $('rec-folder-open').addEventListener('click', () => void openFolder());
+    $('rec-remote-enabled').addEventListener('change', (ev) => {
+      void setRemote('record_remote_enabled', ev.target.checked);
+    });
+    $('rec-remote-audio').addEventListener('change', (ev) => {
+      void setRemote('record_remote_audio', ev.target.checked);
+    });
     document.addEventListener('roomler:view', (ev) => {
       if (ev.detail === 'recordings') void refresh({ force: true });
     });

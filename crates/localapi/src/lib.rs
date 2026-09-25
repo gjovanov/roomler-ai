@@ -968,6 +968,12 @@ pub struct RcSessionInfo {
     /// `0` = unknown.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub started_at_ms: u64,
+    /// FR-85 P3 — this controller is RECORDING the screen. The banner must
+    /// say so, with a way to stop it, before the first frame is written.
+    /// Additive: an older companion ignores it (and an older daemon never
+    /// records remotely).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recording: bool,
 }
 
 /// A LocalAPI request. P1 exposed read-only verbs; P2b adds the (mutating)
@@ -1593,6 +1599,11 @@ pub struct RecordingState {
     pub system_audio: bool,
     #[serde(default)]
     pub microphone: bool,
+    /// FR-85 P3 — the active recording was started by a REMOTE controller
+    /// (this is their display name); `None` for a local one. What the host
+    /// sees in the tray and the Recordings view: "recording for Alice".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_controller: Option<String>,
     /// Why the default or configured folder was not used, when it was not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder_reason: Option<String>,

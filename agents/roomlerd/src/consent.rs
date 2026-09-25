@@ -175,6 +175,15 @@ pub enum PromptKind {
     RemoteControl,
     Exec,
     Ssh,
+    /// FR-85 P3 — a controller already in a session asks to RECORD the
+    /// screen. Its own question, on its own prompt id, because "may they see
+    /// my screen" and "may they keep a copy of it" are different answers.
+    ///
+    /// ⚠️ A companion older than P3 renders a kind it does not know as `rc`
+    /// ("is requesting to control this device"), so a record prompt always
+    /// carries the whole question in its `detail` line too — the one field
+    /// every companion shows as it is.
+    Record,
 }
 
 impl PromptKind {
@@ -183,6 +192,7 @@ impl PromptKind {
             PromptKind::RemoteControl => "rc",
             PromptKind::Exec => "exec",
             PromptKind::Ssh => "ssh",
+            PromptKind::Record => "record",
         }
     }
 }
