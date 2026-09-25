@@ -74,6 +74,12 @@ const MAX_TRANSFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// initialization race in practice because file-DC handlers can't
 /// fire until a session opens, which is well after main has
 /// settled.
+///
+/// ⚠️ The default is what a process that never loads the config sees —
+/// the `caps-probe` child, above all. That is why the hello's `files`
+/// list is assigned by `encode::caps::detect()` in the DAEMON (its second
+/// reader, at the first hello, after `run_cmd` has stored the flag) and
+/// never computed inside the child's `compute_caps` (#1672).
 static REMOTE_BROWSE_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
