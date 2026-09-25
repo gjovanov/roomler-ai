@@ -264,6 +264,14 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Record this device's screen to an HQ MP4 in the recordings folder
+    /// (FR-85). Change the folder with `roomler config set record_dir <path>`.
+    /// The daemon runs the recorder; only the person at the console may
+    /// start, stop or delete a recording.
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
@@ -429,6 +437,47 @@ enum ConfigAction {
     Clear {
         /// Config key (as shown by `config ls`).
         key: String,
+    },
+}
+
+/// `roomler record …` — FR-85 local screen recording. Every verb talks to the
+/// LOCAL daemon; `start`, `stop` and `rm` are refused unless the caller is the
+/// console user (an RDP guest must not record the console user's desktop).
+#[derive(Debug, Subcommand)]
+enum RecordAction {
+    /// Start recording the screen. Answers once the recorder is encoding.
+    Start {
+        /// Frames per second (1–60). Default: 30.
+        #[arg(long)]
+        fps: Option<u32>,
+        /// `auto` (hardware, then software) | `hardware` | `software`.
+        #[arg(long)]
+        encoder: Option<String>,
+        /// Stop by itself after this many minutes. Default: 240.
+        #[arg(long)]
+        max_minutes: Option<u32>,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Stop the recording. Answers once the file is final.
+    Stop {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Whether a recording is running, and how the last one ended.
+    Status {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// The recordings folder and the recordings in it, newest first.
+    Ls {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Delete a recording (and its sidecar) by file name.
+    Rm {
+        /// File name, as `record ls` shows it.
+        name: String,
     },
 }
 
@@ -690,6 +739,18 @@ where
             ConfigAction::Ls { fmt } => localclient::config_ls(fmt.json).await,
             ConfigAction::Set { key, value } => localclient::config_set(&key, Some(&value)).await,
             ConfigAction::Clear { key } => localclient::config_set(&key, None).await,
+        },
+        Command::Record { action } => match action {
+            RecordAction::Start {
+                fps,
+                encoder,
+                max_minutes,
+                fmt,
+            } => localclient::record_start(fps, encoder, max_minutes, fmt.json).await,
+            RecordAction::Stop { fmt } => localclient::record_stop(fmt.json).await,
+            RecordAction::Status { fmt } => localclient::record_status(fmt.json).await,
+            RecordAction::Ls { fmt } => localclient::recordings_ls(fmt.json).await,
+            RecordAction::Rm { name } => localclient::recording_rm(&name).await,
         },
         Command::Ping {
             target,
@@ -1035,6 +1096,51 @@ mod tests {
                 (v, other) => panic!("verb {v} parsed as {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn parses_record_verbs() {
+        let cli = Cli::try_parse_from([
+            "roomler",
+            "record",
+            "start",
+            "--fps",
+            "60",
+            "--encoder",
+            "software",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Record {
+                action:
+                    RecordAction::Start {
+                        fps,
+                        encoder,
+                        max_minutes,
+                        fmt,
+                    },
+            } => {
+                assert_eq!(fps, Some(60));
+                assert_eq!(encoder.as_deref(), Some("software"));
+                assert_eq!(max_minutes, None, "absent = the daemon's default");
+                assert!(fmt.json);
+            }
+            other => panic!("expected record start, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["roomler", "record", "rm", "a.mp4"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Record {
+                action: RecordAction::Rm { ref name }
+            } if name == "a.mp4"
+        ));
+        for verb in ["stop", "status", "ls"] {
+            let cli = Cli::try_parse_from(["roomler", "record", verb]).unwrap();
+            assert!(matches!(cli.command, Command::Record { .. }), "{verb}");
+        }
+        // There is no microphone flag until audio lands (P1c).
+        assert!(Cli::try_parse_from(["roomler", "record", "start", "--microphone"]).is_err());
     }
 
     #[test]

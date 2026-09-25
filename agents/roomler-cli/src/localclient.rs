@@ -1216,6 +1216,174 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// FR-85 — screen recording
+// ---------------------------------------------------------------------------
+
+/// A recording's length: `m:ss`, or `h:mm:ss` past the hour.
+fn fmt_duration_ms(ms: u64) -> String {
+    let s = ms / 1000;
+    let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// How the last recording ended, in one line (`None` = nothing has ended).
+fn fmt_recording_end(last: &localapi::RecordingEnded) -> String {
+    let what = match &last.path {
+        Some(p) => format!(
+            "saved {p} — {}, {}",
+            fmt_duration_ms(last.duration_ms),
+            human_bytes(last.bytes)
+        ),
+        None => "no file was written".to_string(),
+    };
+    let mut line = if last.reason == "requested" {
+        what
+    } else {
+        format!("{what} (ended: {})", last.reason)
+    };
+    if let Some(d) = &last.detail {
+        line.push_str(&format!("\n  {d}"));
+    }
+    line
+}
+
+/// `roomler record start` — record this device's screen until `record stop`.
+/// Answers once the recorder is encoding, naming the file and the encoder.
+pub async fn record_start(
+    fps: Option<u32>,
+    encoder: Option<String>,
+    max_minutes: Option<u32>,
+    json: bool,
+) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let st = client
+        .record_start(localapi::RecordStartOpts {
+            fps,
+            encoder,
+            max_minutes,
+            ..Default::default()
+        })
+        .await
+        .map_err(daemon_err)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&st)?);
+        return Ok(());
+    }
+    println!("recording to {}", st.path.as_deref().unwrap_or(DASH));
+    println!(
+        "  {}x{} @ {} fps, {}",
+        st.width,
+        st.height,
+        st.fps,
+        st.encoder.as_deref().unwrap_or(DASH)
+    );
+    if let Some(reason) = &st.folder_reason {
+        println!("  folder: {reason}");
+    }
+    println!("stop with `roomler record stop`");
+    Ok(())
+}
+
+/// `roomler record stop` — answers once the file is final.
+pub async fn record_stop(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let st = client.record_stop().await.map_err(daemon_err)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&st)?);
+        return Ok(());
+    }
+    match (&st.last, st.active) {
+        (_, true) => println!("still finalizing — check `roomler record status`"),
+        (Some(last), false) => println!("{}", fmt_recording_end(last)),
+        (None, false) => println!("nothing was recording"),
+    }
+    Ok(())
+}
+
+/// `roomler record status` — is a recording running, and how the last ended.
+pub async fn record_status(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let st = client.record_status().await.map_err(daemon_err)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&st)?);
+        return Ok(());
+    }
+    if st.active {
+        println!(
+            "recording — {}, {}, {} frames, {}",
+            fmt_duration_ms(st.duration_ms),
+            human_bytes(st.bytes),
+            st.frames,
+            st.encoder.as_deref().unwrap_or(DASH)
+        );
+        println!("  {}", st.path.as_deref().unwrap_or(DASH));
+    } else {
+        println!("not recording");
+    }
+    if let Some(last) = &st.last {
+        println!("last: {}", fmt_recording_end(last));
+    }
+    Ok(())
+}
+
+/// `roomler record ls` — the recordings folder, why it is that one, and what
+/// is in it (newest first).
+pub async fn recordings_ls(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let l = client.recordings_list().await.map_err(daemon_err)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&l)?);
+        return Ok(());
+    }
+    println!("folder: {}", l.dir);
+    if let Some(reason) = &l.folder_reason {
+        println!("  ({reason})");
+    }
+    if l.items.is_empty() {
+        println!("no recordings yet");
+        return Ok(());
+    }
+    let name_w = l
+        .items
+        .iter()
+        .map(|i| i.name.chars().count())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    println!(
+        "{:name_w$}  {:>8}  {:>10}  {:8}  ENDED",
+        "NAME", "LENGTH", "SIZE", "ORIGIN"
+    );
+    for i in &l.items {
+        let origin = match &i.controller {
+            Some(c) => format!("{} ({c})", i.origin),
+            None => i.origin.clone(),
+        };
+        println!(
+            "{:name_w$}  {:>8}  {:>10}  {:8}  {}",
+            i.name,
+            fmt_duration_ms(i.duration_ms),
+            human_bytes(i.bytes),
+            origin,
+            i.stop_reason.as_deref().unwrap_or(DASH)
+        );
+    }
+    Ok(())
+}
+
+/// `roomler record rm <name>` — delete one recording and its sidecar.
+pub async fn recording_rm(name: &str) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    client.recording_delete(name).await.map_err(daemon_err)?;
+    println!("deleted {name}");
+    Ok(())
+}
+
 /// Map a LocalAPI connect/IO error to a user-facing one. A missing daemon is an
 /// *expected* state, so `NotFound` collapses to a single clean line with **no**
 /// `.source()` chain (the raw "The system cannot find the file specified" /
@@ -2104,6 +2272,33 @@ mod tests {
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn recording_lengths_and_endings_read_plainly() {
+        assert_eq!(fmt_duration_ms(0), "0:00");
+        assert_eq!(fmt_duration_ms(61_999), "1:01");
+        assert_eq!(fmt_duration_ms(3_600_000 + 62_000), "1:01:02");
+        let mut last = localapi::RecordingEnded {
+            reason: "requested".into(),
+            path: Some("C:\\r.mp4".into()),
+            bytes: 1024 * 1024,
+            duration_ms: 90_000,
+            detail: None,
+        };
+        assert_eq!(fmt_recording_end(&last), "saved C:\\r.mp4 — 1:30, 1.0 MiB");
+        // Anything but a plain stop says why it ended.
+        last.reason = "disk_low".into();
+        assert!(fmt_recording_end(&last).ends_with("(ended: disk_low)"));
+        let never = localapi::RecordingEnded {
+            reason: "encoder_unavailable".into(),
+            detail: Some("no GPU".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            fmt_recording_end(&never),
+            "no file was written (ended: encoder_unavailable)\n  no GPU"
+        );
     }
 
     #[test]

@@ -4150,6 +4150,43 @@ mod tests {
         );
     }
 
+    /// FR-85 — the `record_*` twin of the test above. `record_dir` picks where
+    /// the recorder writes and (P3) `record_remote_enabled` is the device's
+    /// consent to being recorded from afar; a server that could push either
+    /// would choose a write path on every device in the tenant, or turn remote
+    /// recording on behind the owner's back. Both stay device-owned, so no
+    /// `record_*` key may exist here. Spelled out in full, for the same reason
+    /// as the relay test: a new field must make this stop compiling.
+    #[test]
+    fn no_record_key_is_server_pushable_via_desired_config() {
+        let full = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
+            ssh_account_mode: Some("console_user".into()),
+            ssh_port: Some(2222),
+            encoder_cells_deny: Some("none".into()),
+            revision: 7,
+            updated_by: None,
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(
+            !json.contains("record_"),
+            "a record_* key reached DesiredConfig -- a server-pushable recording \
+             path or remote-recording opt-in: {json}"
+        );
+        let back: DesiredConfig = serde_json::from_str(
+            r#"{"exec_enabled":true,"record_dir":"C:\\pwned","record_remote_enabled":true,"revision":1}"#,
+        )
+        .expect("unknown keys must be ignored, not fail the frame");
+        assert_eq!(back.exec_enabled, Some(true));
+        assert!(
+            !serde_json::to_string(&back).unwrap().contains("record_"),
+            "a record_* key survived a decode/encode round trip"
+        );
+    }
+
     /// WIRE LOCK. These exact strings are what every deployed agent already
     /// sends and what the server gates on; changing one does not fail loudly,
     /// it silently makes every existing device look like it lacks the feature.

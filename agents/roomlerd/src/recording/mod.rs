@@ -20,6 +20,8 @@
 pub mod annexb;
 pub mod child;
 pub mod folder;
+pub mod identity;
+pub mod manager;
 pub mod mp4;
 pub mod pacer;
 pub mod recorder;
