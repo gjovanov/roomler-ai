@@ -4,7 +4,11 @@
 P1 (0.4.77) + P1b (0.4.79) + P3 (0.4.80) released and **field-verified 2026-09-07 on all four
 codecs** by the operator's read and the heartbeat; P2 retired by measurement (0 rate swaps);
 AC3 ticked; the thin-direct-path read of the q-cap done 2026-09-07 (sharp but laggy below the
-cap's ~10 Mbps floor — an open decision, §P3); AC1 ticked (pixel half: faithful on 4:4:4, not on 4:2:0 — measured); P4 built and field-verified 2026-09-08 ·
+cap's ~10 Mbps floor — an open decision, §P3); AC1 ticked (pixel half: faithful on 4:4:4, not on 4:2:0 — measured); P4 built and field-verified 2026-09-08;
+**P5's gate read 2026-09-25** on the FR-79 V3b shadow (agents 0.4.99–0.4.102, four hosts, 104,698
+heartbeats in 37 sessions): the relay half holds and V3b-2 is confirmed in the field, the direct half
+is content-bound before the first burst and the refined law's floor guard erodes on every push-back —
+**P5 stays unbuilt** (§"The gate, read 2026-09-25"); P6 docs written the same day ·
 **Parent:** the RC quality program (FR-17/16/14); rides on FR-59's measured pipe and FR-70's
 pump instrumentation.
 
@@ -335,8 +339,8 @@ now nothing on screen said whether the frame that came back actually matched the
 | P2 | ladder hysteresis on QSV | — (pure policy, measured by `swaps`) | **retired by measurement 2026-09-07** — after P1 the rate ladder no longer fires on direct paths: 0 rate swaps in all 17 sessions on the three hosts today (QSV direct on CORPLAP-1/-3, nvenc relay on CORPLAP-2; the 2026-09-06 baseline had 37 in 11 min). Reopen only if a relay-path QSV session shows swaps |
 | P3 | the libvpx pump: `rc_max_quantizer` 16 on DIRECT transports (63 on relay) — libvpx's scene-change reset to the worst quality on every wheel notch was the 4:4:4 blur, measured offline in four rounds (§P3) | `ROOMLERD_VP9_DIRECT_MAX_Q` (63 = pre-P3) | **built 2026-09-07, released in 0.4.80** — offline: every notch frame at q 64 instead of 255, refine to lossless kept; field gate: **instrument PASS 13:25 UTC** (`max_qp` 64 in every scroll window, was 255; settles to q 0; 0 skips) and **operator PASS** ("scrolling large texts seems much better") ⇒ **field-verified 2026-09-07**; thin direct path measured 20:08 UTC — sharp but laggy below the cap's ~10 Mbps floor (§P3), an open decision |
 | P4 | viewer display-scale pill + 1:1 guidance: screen pixels per remote pixel, `1:1 pixels` or `shown at 1.05×`, the way to 1:1 in the tooltip and the Display tab (§P4) | — (UI; the pill has its own metrics checkbox) | **built 2026-09-08 (#1497), field-verified the same morning** on `hosted-20260908-a6257b8`: `shown at 1.05×` in Adaptive = the FSR canvas exactly (2018 ÷ 1920), `1:1 pixels` at Custom zoom 100/dpr % with FSR disengaging on its own; docs `docs/remote-control.md` §18.6.1 |
-| P5 | **the direct ceiling FOLLOWS the measured path** — `clamp(believed × HEADROOM, legibility_floor, bpp_bound)`; the bpp product stops being the operating point and becomes a cap (§"P5 — the ceiling follows the path") | — (the belief itself is the way back: with no belief the bound still applies, which is today's behaviour byte for byte) | **decided 2026-09-10, not built.** Gated on FR-79 V3b's belief reading sane in the field first — the shadow ships before the law |
-| P6 | **docs, in the house style** (the docs-before-close rule, #1401): a design section in `docs/rate-control.md` for P1's direct ceiling and P1b's measured-send-wait gate — today only three changelog rows there, and no mermaid diagram of how the ceiling and the gate compose — joined by P5's path-following ceiling when it is built; linked from `docs/README.md`. P3 (`docs/encoders.md`) and P4 (`docs/remote-control.md` §18.6.1) are documented already | — (docs) | **open** — AC5 |
+| P5 | **the direct ceiling FOLLOWS the measured path** — `clamp(believed × HEADROOM, legibility_floor, bpp_bound)`; the bpp product stops being the operating point and becomes a cap (§"P5 — the ceiling follows the path") | — (the belief itself is the way back: with no belief the bound still applies, which is today's behaviour byte for byte) | **decided 2026-09-10, not built.** Gated on FR-79 V3b's belief reading sane in the field first — the shadow ships before the law. **Gate read 2026-09-25** (§"The gate, read 2026-09-25"; 104,698 heartbeats, 37 sessions, four hosts, 0.4.99–0.4.102): the relay half holds; V3b-2 confirmed (19 of 19 push-back-free direct sessions kept their floor); the direct half is content-bound before the first burst by construction; and the refined law's floor guard **erodes** — V3b-2 halves the floor on every push-back regardless of spacing (28.84 → 7.76 M on three, 38.90 → 8.57 M on five) ⇒ **stays unbuilt** until the guard is decided (an undamped demonstrated max beside the damped floor, or time-aware damping — FR-79's `Pipe`), `HEADROOM` and the decay rate are fixed, and a sim replay of the Regal 09-25 arc is read |
+| P6 | **docs, in the house style** (the docs-before-close rule, #1401): a design section in `docs/rate-control.md` for P1's direct ceiling and P1b's measured-send-wait gate — today only three changelog rows there, and no mermaid diagram of how the ceiling and the gate compose — joined by P5's path-following ceiling when it is built; linked from `docs/README.md`. P3 (`docs/encoders.md`) and P4 (`docs/remote-control.md` §18.6.1) are documented already | — (docs) | **written 2026-09-25** in the PR carrying this row: `docs/rate-control.md` §"The direct path (FR-74)" — the ceiling chain (P1), the measured-wait gate (P1b), one mermaid of how they compose, the field reads, and P5's status with the gate read; two config rows; the `docs/README.md` row. AC5 ticks on merge |
 
 ## Acceptance criteria
 
@@ -371,6 +375,12 @@ now nothing on screen said whether the frame that came back actually matched the
       of how the ceiling and the gate compose; P5 joins them when it is built.
       P3 (`docs/encoders.md`) and P4 (`docs/remote-control.md` §18.6.1) are
       documented already.
+      *Written 2026-09-25 in the PR carrying this line: `docs/rate-control.md`
+      §"The direct path (FR-74)" (the ceiling chain, the gate, a mermaid of how
+      they compose, the field reads, P5's status and its gate read), the
+      `direct_queue_ms` / `direct_hrd_pct` / `FFMPEG_MAXRATE_KBPS` /
+      `VP9_DIRECT_MAX_Q` config rows, and the `docs/README.md` row — ticked on
+      merge, not before.*
 
 ## Open decisions
 
@@ -451,6 +461,11 @@ ceiling = clamp(believed × HEADROOM,          // follow
 - `believed` is `encode::pipe::Pipe::believed_bps()` (FR-79 V3b) — the
   demonstrated floor when nothing has pushed back, the pushed-back capacity
   when something has, and never `None` once bytes have arrived.
+  *(V3b-1, #1578, `0.4.99`, split that accessor the day after this was
+  written: `capacity_bps` answers "am I over?", `ceiling_anchor_bps` =
+  `max(capacity, floor)` answers "what may the ceiling be?", and the heartbeat
+  prints `pipe_belief=(anchor, floor, capacity)`. The refinement below reads
+  the two halves separately, which is why it survives the split.)*
 - `HEADROOM` is the probe: enough above the belief to discover growth, not
   enough to flood. The sawtooth's amplitude becomes the headroom (tens of
   percent) instead of 650 %.
@@ -534,6 +549,123 @@ Shipping a new ceiling law on an unvalidated estimate would be the same mistake
 twice in two days: FR-79 V5 shipped a rule whose input (`blocked_send_bps`) was
 silent on the hosts that needed it, and the fleet had to tell us.
 
+### The gate, read 2026-09-25 — P5 stays unbuilt
+
+**Method.** The hosts' own daemon log files (`service-logs\roomlerd.log.<date>`,
+`KEEP_DAYS = 14`) read over Fleet RPC — not `roomler logs`, whose 64 KiB tail
+a finished session ages out of. Every heartbeat carrying `pipe_belief=` was
+parsed on the host (one regex per pump) and aggregated per session there, so
+the wire carried summaries and the windows with a live capacity, never the
+logs. The population is the exec-enabled hosts only — the three corp laptops
+and the Regal cell — and nobody else's sessions are in it.
+
+| host | files | heartbeats | sessions | agent |
+|---|---|---|---|---|
+| CORPLAP-3 | 7 (09-11 → 09-25) | 9,765 | 9, all direct (`av1_qsv` 1920×1200) | 0.4.98 on 09-11/09-12 (the pre-V3b-2 control), 0.4.99 → 0.4.101 after |
+| CORPLAP-1 | 4 (09-22 → 09-25) | 26 | 3 short direct (`hevc_qsv`) | 0.4.99 → 0.4.102 |
+| CORPLAP-2 | 5 (09-11 → 09-25) | 5,274 | 5: 3 short direct (`av1_nvenc`), **2 relay** (5,240 constrained windows) | 0.4.99 → 0.4.102 |
+| the Regal cell | 3 (09-23 → 09-25) | 89,633 | 20, all direct (`hevc_qsv` 1920×1080), nine of them 2–8 h long | 0.4.99 → 0.4.102 |
+
+**What the shadow said, against the two conditions above.**
+
+1. **Relay hosts — the anchor is not `None`: holds.** Both relay sessions
+   carried a floor within their first five windows (1.7–1.9 M at 10 s) and an
+   anchor of 3.5–5.2 M for the rest — `pipe_belief_n` 9,912 / 1 over three
+   hours and 155 / 0 over three minutes. One host produced every relay
+   session on file (CORPLAP-1 and CORPLAP-3 ran direct in all of theirs).
+2. **Direct — "tracks the path, not the content" splits three ways.**
+   - *A quiet screen must not read as a thin pipe:* **holds since 0.4.99.**
+     On the current law the floor never fell without a push-back: **19 of 19
+     push-back-free direct sessions ended at their maximum floor**, and each
+     of the 7 sessions whose floor ended below its maximum carried at least
+     one push-back. CORPLAP-3 (09-25, `6ab64e41`) held 34.27 M through 3.5 min
+     of idle after one scroll (249 deliveries). The 0.4.98 control on the same
+     host (09-11, `6aa3d669`): 16.4 M → **13.5 kbps** over 4.3 h with zero
+     push-backs — the defect V3b-2 fixed, still visible in the older file.
+   - *Before the first burst the anchor is the content's weight — by
+     construction.* The Regal sessions open at 0.07–2.4 M and take 2–3,960
+     windows (4 s to 2.2 h) to reach half their eventual floor; a 4.6-min
+     CORPLAP-3 session (09-24) never rose above 3.5 M on a path that carries
+     34 M, because its content peaked at 6 Mbps. Nothing measures capacity on
+     an uncongested direct path, so this half of the condition is not
+     meetable as written. The 2026-09-15 refinement already makes it
+     harmless (a delivery never lowers the ceiling), which turns the gate's
+     direct condition into the two rows below.
+   - *Are the push-backs real refusals?* On the LAN-class hosts the only
+     capacities are the encoder's burst drain **at the cap**: 34.3 M against a
+     34.56 M ceiling (CORPLAP-3), 45.6–59.7 M against 43.2 M (CORPLAP-1),
+     27.5 M against 34.56 M (CORPLAP-2). Not refusals; under the refined law
+     `limit ≥ bound` and the ceiling is untouched. On the Regal cell — the
+     case that decided P5 — **14 accepted push-backs in ~51 h of sessions,
+     0.85–19.9 M**, with send waits up to 1.36 s in the windows around them
+     (two ≥ 1 s hard stalls), and at every one the AIMD target had already
+     collapsed from the 38.88 M constant to **1.5–17.0 M (median 3.9 M)**.
+     That is today's sawtooth, at one accepted fold per ~3.6 h rather than the
+     2–3 min period of 09-10 (collapses without an accepted fold are not
+     counted here — the pass that would count them did not run: the host went
+     offline for the night between the two sweeps).
+
+   | session (UTC) | when | target at the fold | capacity | floor before → after | anchor then |
+   |---|---|---|---|---|---|
+   | `6ab3a699` 09-23 | 11:00:04 | 6.24 M | 7.34 M | 28.84 → 18.09 M | 18.09 M |
+   | | 12:51:38 | 4.72 M | 5.56 M | 18.09 → 11.82 M | 11.82 M |
+   | | 16:32:26 | 3.14 M | 3.69 M | 11.82 → 7.76 M | 7.76 M |
+   | `6ab41f5b` 09-23 | 19:17:27 | 16.96 M | 19.95 M | 22.34 → 21.14 M | 21.14 M |
+   | | 20:50:45 | 8.63 M | 10.16 M | 30.25 → 20.21 M | 20.21 M |
+   | | 20:50:47 | 8.63 M | 11.14 M | 20.21 → 15.67 M | 15.67 M |
+   | `6ab447ac` 09-23 | 23:55:53 | 1.50 M | 0.85 M | 23.03 → 11.94 M | 11.94 M |
+   | `6ab4d959` 09-24 | 10:24:53 | 14.32 M | 16.85 M | 38.35 → 27.60 M | 27.60 M |
+   | `6ab60a69` 09-25 | 05:50:13 | 1.50 M | 1.53 M | 11.74 → 6.64 M | 6.64 M |
+   | `6ab62dcb` 09-25 | 11:47:32 | 4.77 M | 5.61 M | 38.90 → 22.26 M | 22.26 M |
+   | | 13:03:26 | 2.52 M | 2.96 M | 25.12 → 14.04 M | 14.04 M |
+   | | 13:03:28 | 2.52 M | 3.09 M | 14.04 → 8.57 M | 8.57 M |
+   | | 13:06:14 | 2.68 M | 3.16 M | 16.40 → 9.78 M | 9.78 M |
+   | | 13:21:51 | 2.97 M | 3.50 M | 24.90 → 14.21 M | 14.21 M |
+
+   - *Does the floor guard hold?* **It erodes.** V3b-2 damps the floor by
+     half the gap on *every* push-back below it, whatever the spacing: three
+     push-backs 5.5 h apart took a 28.84 M demonstration to 7.76 M; five in
+     1.6 h took 38.90 M to 8.57 M, the demonstration re-arming to 16–25 M
+     between them and being halved again at each. The refinement's "never
+     below what the path has demonstrably carried" assumed an undamped
+     demonstration. With the damped floor, P5's ceiling on this cell would
+     have sat at 8–18 M for hours of sessions whose path also carried
+     24–39 M, and — because an encoder under an 8 M ceiling cannot
+     demonstrate 25 M — recovery would rest on the upward decay alone, whose
+     rate the design leaves open.
+
+**Verdict.** One condition met, one confirmed in the field for the specific
+defect it targeted, and the load-bearing one — the guard the refined law
+stands on — refuted by the shadow's own arithmetic. **P5 is not built.**
+Whether a ceiling at 8–18 M beats the constant with its ~90 % collapses cannot
+be read from the belief alone; it needs the viewer's outcome under both laws,
+and the 09-23 daytime viewer on the Regal cell reported no paint age at all
+(`viewer_age_ms=None` for 6.7 h; the 09-25 sessions do report it, p50 15 ms).
+
+**What unblocks P5, in order.**
+
+1. A decision on the guard: an *undamped* demonstrated maximum kept beside the
+   damped floor (a second field on `Pipe`), or a time-aware damping — a
+   `Pipe` change, which is FR-79's to make.
+2. The two numbers the design leaves open: `HEADROOM`, and the upward-decay
+   rate (FR-70 P1's law, reused).
+3. A replay of the Regal 09-25 arc (`6ab62dcb`: five refusals, the floors
+   above, the 38.88 M constant) in `encode::sim` under both laws — the
+   collapse amplitude, the time back to the offered rate — before any release.
+4. The release, and an A/B on that cell with a viewer that reports age. The
+   cell is exec-reachable, so the same sweep reads the after.
+
+⚠️ **A side finding from the same sweep, not P5's.** CORPLAP-3, 09-25
+10:35:58: the *ceiling itself* dropped to 13,824,000 (0.4 ×) at 4 ms of viewer
+age and 0 bytes in flight, and was back at 27.8 M eleven seconds later. The
+pump's own lines name the cause: `av1_qsv` passes of 120–170 ms (`FFmpeg DC
+pump STALL`), the cadence paced 60 → 20 fps, i.e. the **encode-pressure
+factor** multiplying the plan's ceiling — a host-side cause with no path in
+it. A path-following ceiling must compose with that factor, which is why the
+P6 diagram draws the whole chain; and a heartbeat's `target_bps` dropping is
+not evidence about the path until `ceiling_bps` on the `set_bitrate` line has
+been read.
+
 ### Acceptance for P5 (to be written into the criteria when built)
 
 1. On the Regal cell, `target_bps` tracks within the headroom of
@@ -575,3 +707,4 @@ program FR-17 / 16 / 14.
 | 2026-09-07 21:34 UTC | 0.4.83 | CORPLAP-3, AV1 4:2:0 (av1_qsv, ICQ 22), sole viewer, settled text | **AC1 pixel comparison, HW path.** Host truth = a DPI-aware `CopyFromScreen` PNG from a one-shot task in the interactive session; viewer side = the decoded frame read from the viewer's canvas with the scale mode at `original` (1:1, 1920×1200 — in `adaptive` the canvas is the FSR-upscaled 2018×1261); a 260×160 text block at (100,400), the two captures 6 s apart on a static screen, compared in-page, alignment best at dx=dy=0: **mean \|Δ\| 12.6, 54 % of pixels within ±2, 73 % within ±8, 82 % within ±16, 13.6 % more than 32 off, max 123.** The settled 4:2:0 picture is not pixel-faithful on ClearType text — finding 4, quantified. |
 | 2026-09-07 21:42 UTC | 0.4.83 | CORPLAP-3, VP9 4:4:4 (libvpx, settled at q 0), sole viewer, same text block | **AC1 pixel comparison, 4:4:4.** Same method and block: **mean \|Δ\| 1.37, 85 % within ±2, 96.8 % within ±8, 100 % within ±16, max 15, none more than 32 off.** Pixel-faithful up to the BGRA↔YUV 4:4:4 rounding. The two host shots taken 8 min apart differed by mean 5.3 (a caret-line highlight toggling with window focus), so a comparison is only valid when both captures are seconds apart. |
 | 2026-09-08 08:27–08:31 UTC | server `hosted-20260908-a6257b8` (0.4.86), agent 0.4.85 | CORPLAP-3, AV1 4:2:0 (av1_qsv), direct, view-only from an automation tab (hidden, display scaling 1.125×, stage 1926×1121 CSS) | **P4 field gate — PASS.** Adaptive: pill `shown at 1.05×`, tooltip "Each remote pixel is spread over 1.05 screen pixels … For 1:1 use Display → Custom zoom 88.9 %, or Match remote display so the host renders at your window's 2167×1261 (your display scaling is 1.125×, so Original is 1.13× on screen)"; the FSR canvas backing was 2018×1261 = 1920 × 1.051, i.e. the pill and the sharpening pass computed the same factor. The Display tab's hint under *Fit in my window* carried the same text. Custom zoom 88.9 % (stored preference, reload, reconnect): pill `1:1 pixels`, tooltip "Pixel-exact", the canvas backing 1920×1200 at 1706.88 CSS px (= 1920 ÷ 1.125) and **FSR disengaged on its own** (the codec pill lost its `· FSR`), which is the sizing policy's own 1:1 verdict agreeing with the pill's. The stored metrics set predated the pill (`{codec,bitrate,fps,resolution,age,paint}`) and the pill still showed — the per-key fallback in the field. |
+| 2026-09-25 (logs of 09-11 → 09-25) | agents 0.4.99 → 0.4.102 (V3b shadow; 0.4.98 on CORPLAP-3's 09-11/09-12 files as the control) | CORPLAP-1 / -2 / -3 and the Regal cell — every `pipe_belief=` heartbeat in their daemon log files over Fleet RPC, parsed and aggregated on the host | **P5's gate read — P5 stays unbuilt** (§"The gate, read 2026-09-25"). 104,698 heartbeats in 37 sessions (35 direct, 2 relay). Relay: the anchor is non-`None` from the first 10 s (`pipe_belief_n` 9,912 / 1 over 3 h) — holds. Direct: V3b-2 confirmed — 19 of 19 push-back-free sessions kept their maximum floor, every floor loss coincides with a push-back, CORPLAP-3 held 34.27 M through 3.5 min of idle, while the 0.4.98 control shows 16.4 M → 13.5 kbps over 4.3 h; before the first burst the anchor is the content's weight by construction (openings at 0.07–2.4 M, 4 s to 2.2 h to half the eventual floor); the LAN hosts' only capacities are the burst drain at the cap (34.3 / 45.6–59.7 / 27.5 M against 34.56 / 43.2 / 34.56 M ceilings); the Regal cell's 14 accepted push-backs (0.85–19.9 M, send waits to 1.36 s) each found the target already collapsed to 1.5–17.0 M (median 3.9 M) from 38.88 M; and the refined law's floor guard erodes under V3b-2's per-sample damping (28.84 → 7.76 M on three push-backs 5.5 h apart; 38.90 → 8.57 M on five in 1.6 h). Side finding: CORPLAP-3 10:35:58 the ceiling itself fell to 13.82 M (0.4 ×) under the encode-pressure factor (120–170 ms `av1_qsv` passes, cadence 60 → 20 fps) at 4 ms of viewer age — host-side, recovered in 11 s. Bias: exec-enabled hosts only; the Regal cell went offline before the collapse-count pass, so collapses without an accepted fold are uncounted there. |
