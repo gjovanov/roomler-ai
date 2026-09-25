@@ -8462,6 +8462,7 @@ name = "roomler-localapi"
 version = "0.4.102"
 dependencies = [
  "async-trait",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

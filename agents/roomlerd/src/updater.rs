@@ -126,6 +126,21 @@ pub fn decide_defer(active: usize, net_transition: bool, consecutive_defers: u32
     }
 }
 
+/// Work an installer would cut short: file transfers in flight, plus an
+/// active screen recording (FR-85). An update restarts the daemon, and the
+/// Windows installer's Restart Manager kills the recorder child outright
+/// (it holds the image being replaced) — the partial survives and is
+/// finalized `interrupted` later, but it is not the recording the person
+/// was making. Same defer budget as a transfer: ≤ MAX_CONSECUTIVE_DEFERS.
+fn active_work() -> usize {
+    let transfers = crate::files::active_transfer_count();
+    #[cfg(feature = "recording")]
+    let recording = usize::from(crate::recording::manager::is_recording());
+    #[cfg(not(feature = "recording"))]
+    let recording = 0;
+    transfers + recording
+}
+
 /// R5b — did a material MAJOR network change land inside
 /// [`NET_TRANSITION_WINDOW`]? Feature-shaped: no-overlay builds have no
 /// netstate and never defer on this input.
@@ -2209,11 +2224,11 @@ pub async fn run_periodic(
                 );
                 continue;
             }
-            let active = crate::files::active_transfer_count();
+            let active = active_work();
             if active > 0 {
                 tracing::warn!(
                     active,
-                    "forced update proceeding despite in-flight file transfers"
+                    "forced update proceeding despite in-flight file transfers or a recording"
                 );
             }
             let outcome = match pin {
@@ -2233,7 +2248,7 @@ pub async fn run_periodic(
         // when active > 0 unless we've deferred MAX_CONSECUTIVE_DEFERS
         // times in a row (security-vs-uptime trade-off documented in
         // the rc.19 plan M3 fix).
-        let active = crate::files::active_transfer_count();
+        let active = active_work();
         let net_transition = net_transition_recent();
         match decide_defer(active, net_transition, consecutive_defers) {
             DeferDecision::DeferOnce => {
@@ -2251,7 +2266,7 @@ pub async fn run_periodic(
                     net_transition,
                     consecutive_defers,
                     next_check_secs = recheck.as_secs(),
-                    "auto-updater: deferring — transfers in flight or the network just moved"
+                    "auto-updater: deferring — transfers or a recording in flight, or the network just moved"
                 );
                 continue;
             }

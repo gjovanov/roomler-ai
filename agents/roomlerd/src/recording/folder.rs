@@ -21,9 +21,13 @@
 //! stages in its own data dir instead, and roomler-desktop — the same user —
 //! moves the file into place.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+/// The `record_dir` rules are shared with the config surface and
+/// roomler-desktop, so they live in `roomler-node-core`.
+pub use roomler_node_core::recording_dir::{link_component, validate_record_dir};
 
 /// The folder recordings go to, and why it is that one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,62 +185,6 @@ pub fn ensure_writable(dir: &Path) -> Result<()> {
     result.with_context(|| format!("test write in {}", dir.display()))
 }
 
-/// Why a `record_dir` value is refused. The strings are the config surface's
-/// error text, so they name the fix.
-pub fn validate_record_dir(raw: &str) -> std::result::Result<PathBuf, String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Err("record_dir: empty — unset the key to use the default folder".into());
-    }
-    if raw.starts_with('~') {
-        return Err("record_dir: `~` is not expanded — give the full path".into());
-    }
-    if raw.starts_with(r"\\?\") || raw.starts_with(r"\\.\") || raw.starts_with("//?/") {
-        return Err(
-            "record_dir: device and verbatim paths (\\\\?\\, \\\\.\\) are not accepted".into(),
-        );
-    }
-    if raw.starts_with(r"\\") || raw.starts_with("//") {
-        return Err("record_dir: network shares are not accepted — a dropped link would cut a recording mid-write".into());
-    }
-    let path = PathBuf::from(raw);
-    if !path.is_absolute() {
-        return Err("record_dir: must be an absolute path".into());
-    }
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err("record_dir: `..` is not accepted".into());
-    }
-    if let Some(link) = link_component(&path) {
-        return Err(format!(
-            "record_dir: {} is a symbolic link or junction — choose the folder it points to",
-            link.display()
-        ));
-    }
-    Ok(path)
-}
-
-/// The first existing component of `path` that is a symlink or a junction,
-/// below the filesystem root. On Windows, `FileType::is_symlink` is true for
-/// name-surrogate reparse points (symlinks AND junctions) and false for cloud
-/// placeholders, which is exactly the distinction wanted: a placeholder does
-/// not redirect a path, a junction does.
-pub fn link_component(path: &Path) -> Option<PathBuf> {
-    let mut cur = PathBuf::new();
-    for (i, c) in path.components().enumerate() {
-        cur.push(c.as_os_str());
-        // Skip the prefix and root (`C:`, `\`, `/`).
-        if i == 0 || matches!(c, Component::RootDir | Component::Prefix(_)) {
-            continue;
-        }
-        match std::fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_symlink() => return Some(cur),
-            Ok(_) => {}
-            Err(_) => break, // the rest does not exist yet
-        }
-    }
-    None
-}
-
 /// The file name for a recording started at `now` (local time), made unique
 /// in `dir` by appending ` (2)`, ` (3)`, … — a recording never replaces
 /// another one.
@@ -316,39 +264,8 @@ mod tests {
         assert!(d.is_dir());
     }
 
-    #[test]
-    fn record_dir_refuses_what_it_should() {
-        assert!(validate_record_dir("").is_err());
-        assert!(validate_record_dir("~/Videos").is_err());
-        assert!(validate_record_dir("relative/dir").is_err());
-        assert!(validate_record_dir(r"\\server\share\rec").is_err());
-        assert!(validate_record_dir(r"\\?\C:\rec").is_err());
-        assert!(validate_record_dir(r"\\.\PhysicalDrive0").is_err());
-        let d = scratch("valid");
-        let bad = d.join("..").join("x");
-        assert!(validate_record_dir(&bad.to_string_lossy()).is_err());
-    }
-
-    #[test]
-    fn record_dir_accepts_an_absolute_local_path_even_if_missing() {
-        let d = scratch("ok").join("not-yet");
-        let p = validate_record_dir(&d.to_string_lossy()).unwrap();
-        assert_eq!(p, d);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn record_dir_refuses_a_symlink_component() {
-        let d = scratch("link");
-        let target = d.join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        let link = d.join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let err = validate_record_dir(&link.join("rec").to_string_lossy()).unwrap_err();
-        assert!(err.contains("symbolic link"), "{err}");
-        // Positive control: the real folder is fine.
-        assert!(validate_record_dir(&target.join("rec").to_string_lossy()).is_ok());
-    }
+    // The `record_dir` validator's own tests live with it, in
+    // `roomler_node_core::recording_dir`.
 
     #[test]
     fn names_never_collide() {

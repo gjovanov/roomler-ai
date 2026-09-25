@@ -19,10 +19,11 @@
 //! dedicated LocalAPI verbs, not surface keys), and the crash-bookkeeping
 //! fields.
 //!
-//! Every key but two is read once at daemon startup, so `restart_required`
+//! Every key but three is read once at daemon startup, so `restart_required`
 //! holds across the surface — except `exec_enabled` and
 //! `remote_config_enabled`, which `RemoteConfigServices::adopt_local` puts
-//! into force the moment `ConfigSet` saves them (docs/remote-config.md §7b).
+//! into force the moment `ConfigSet` saves them (docs/remote-config.md §7b),
+//! and `record_dir` (FR-85), read when a recording starts.
 //! FR-84 D2 made that per-key truth part of the registry ([`KeyMeta::live`])
 //! instead of a list each client kept by hand, and gave every key a
 //! [`Group`] and a [`Tier`] so the Settings page can be more than 150 rows.
@@ -175,8 +176,9 @@ impl Tier {
 /// a wrong one is a lie to the person at the machine — `live` above all:
 /// `true` means the daemon applies a change WITHOUT a restart, which today
 /// holds for exactly the two gate-4 flags `RemoteConfigServices::adopt_local`
-/// re-seeds after a `ConfigSet`. Everything else is read once at startup.
-/// Locked by `live_keys_are_exactly_the_adopt_local_set`.
+/// re-seeds after a `ConfigSet`, and `record_dir`, read when a recording
+/// starts. Everything else is read once at startup. Locked by
+/// `live_keys_are_exactly_the_adopt_local_set`.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyMeta {
     pub key: &'static str,
@@ -1423,6 +1425,16 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-78 P1 - pin the Vulkan physical device by index or name (e.g. 1, or NVIDIA GeForce RTX 5090). Empty = the loader's default device. Env: ROOMLERD_VULKAN_DEVICE. Restart required.",
     },
     KeyMeta {
+        key: "record_dir",
+        group: Group::Files,
+        tier: Tier::Standard,
+        // LIVE: the recorder's supervisor reads it when a recording starts
+        // (FR-85), and nothing caches it.
+        live: true,
+        kind: "string",
+        description: "FR-85 - the folder screen recordings are saved to: an absolute local path (no ~, no network share, no symlink or junction). Empty = Videos\\Roomler on Windows when it is local and writable (else %USERPROFILE%\\Roomler Recordings), ~/Movies/Roomler on macOS, the XDG videos folder + Roomler on Linux. Read when a recording starts. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "forward_acl",
         group: Group::Tunnels,
         tier: Tier::Standard,
@@ -1671,6 +1683,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "vaapi_device" => cfg.vaapi_device.clone(),
         "d3d12_adapter" => cfg.d3d12_adapter.clone(),
         "vulkan_device" => cfg.vulkan_device.clone(),
+        "record_dir" => cfg.record_dir.clone(),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -2137,6 +2150,16 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         }
+        "record_dir" => {
+            cfg.record_dir = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => Some(
+                    crate::recording_dir::validate_record_dir(v)?
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            }
+        }
         "encoder_cells_deny" => {
             cfg.encoder_cells_deny = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
@@ -2322,9 +2345,11 @@ mod tests {
     }
 
     /// FR-84 D2 — `restart_required` is the truth PER KEY, not a blanket.
-    /// The only keys the daemon applies without a restart are the two
-    /// gate-4 flags `RemoteConfigServices::adopt_local` re-seeds after a
-    /// `ConfigSet` (agents/roomlerd/src/localapi_state.rs). A key wrongly
+    /// The keys the daemon applies without a restart are the two gate-4
+    /// flags `RemoteConfigServices::adopt_local` re-seeds after a
+    /// `ConfigSet` (agents/roomlerd/src/localapi_state.rs), and `record_dir`
+    /// (FR-85), which the recorder's supervisor reads fresh when a recording
+    /// starts (`recording/manager.rs`, `configured_dir`). A key wrongly
     /// claiming `live` tells a person their change is in force while the
     /// daemon still runs the old value; a live key claiming `restart` has
     /// them bounce a healthy service — or believe a refusal they just made
@@ -2340,13 +2365,13 @@ mod tests {
             .map(|e| e.key)
             .collect();
         let expected: std::collections::BTreeSet<String> =
-            ["exec_enabled", "remote_config_enabled"]
+            ["exec_enabled", "remote_config_enabled", "record_dir"]
                 .into_iter()
                 .map(String::from)
                 .collect();
         assert_eq!(
             live, expected,
-            "the live set is exactly what adopt_local re-seeds"
+            "the live set is exactly what adopt_local re-seeds, plus the keys read at use"
         );
         // The post-apply echo says the same thing as the listing.
         for key in &expected {
@@ -2452,6 +2477,42 @@ mod tests {
     /// FR-84 D2 — the wire ids and labels are a compatibility surface: a
     /// renamed id lands every key of that group in "unknown" on an older
     /// desktop, a renamed label is a silent UI change. Spell them out.
+    /// FR-85 — the surface's first path-valued key: set, echo, validate,
+    /// clear. A refused path leaves the previous value in place.
+    #[test]
+    fn record_dir_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "record_dir"), None);
+        let dir = std::env::temp_dir()
+            .join("roomler-fr85-surface")
+            .join("Recordings");
+        let raw = format!("  {}  ", dir.display());
+        apply(&mut cfg, "record_dir", Some(&raw)).unwrap();
+        assert_eq!(
+            cfg.record_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            entry_for(&cfg, "record_dir").unwrap().value.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
+        for bad in [
+            "relative/rec",
+            "~/Videos",
+            r"\\nas\share\rec",
+            r"\\?\C:\rec",
+        ] {
+            let err = apply(&mut cfg, "record_dir", Some(bad)).unwrap_err();
+            assert!(err.starts_with("record_dir:"), "{bad}: {err}");
+        }
+        assert_eq!(
+            cfg.record_dir.as_deref(),
+            Some(dir.to_string_lossy().as_ref())
+        );
+        apply(&mut cfg, "record_dir", Some("   ")).unwrap();
+        assert_eq!(cfg.record_dir, None, "blank clears to the default folder");
+    }
+
     #[test]
     fn group_wire_ids_are_stable() {
         let ids: Vec<&str> = Group::ALL.iter().map(|g| g.wire()).collect();
