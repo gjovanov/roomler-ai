@@ -429,7 +429,9 @@ pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> 
 /// [`cmd_set_device_name`]; the direct-file fallback runs the SAME
 /// per-key validator (`config_surface::apply`), so a validation error
 /// reads identically on both paths and nothing skips validation.
-/// Changes take effect on the next daemon restart.
+/// The echoed entry's `restart_required` says whether the change is live
+/// or waits for the next daemon restart (FR-84 D2) — the front renders
+/// that, never a list of its own.
 #[tauri::command]
 pub async fn cmd_config_set(
     key: String,

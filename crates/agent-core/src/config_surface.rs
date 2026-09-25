@@ -17,11 +17,19 @@
 //! per-org secrets managed by `roomlerd enroll` / the `org` CLI
 //! verbs, same policy as `tunnel_routes`; a future desktop org pane gets
 //! dedicated LocalAPI verbs, not surface keys), and the crash-bookkeeping
-//! fields. Every key is read at daemon startup, so the whole surface is
-//! `restart_required = true`.
+//! fields.
+//!
+//! Every key but two is read once at daemon startup, so `restart_required`
+//! holds across the surface — except `exec_enabled` and
+//! `remote_config_enabled`, which `RemoteConfigServices::adopt_local` puts
+//! into force the moment `ConfigSet` saves them (docs/remote-config.md §7b).
+//! FR-84 D2 made that per-key truth part of the registry ([`KeyMeta::live`])
+//! instead of a list each client kept by hand, and gave every key a
+//! [`Group`] and a [`Tier`] so the Settings page can be more than 150 rows.
 
 use crate::config::{AgentConfig, EncoderPreferenceChoice};
 use roomler_localapi::ConfigEntry;
+use std::sync::OnceLock;
 
 /// Mirror of `tunnel_core::overlay::direct::MAX_DIRECT_PORT_BASE`
 /// (`u16::MAX - PUBLIC_DIAL_PORT_OFFSET - DIRECT_PORT_BAND`): the largest
@@ -31,816 +39,1460 @@ use roomler_localapi::ConfigEntry;
 /// feature combination. Source of truth is `direct.rs`; keep in sync.
 const MAX_OVERLAY_DIRECT_PORT_BASE: u32 = 64_759;
 
-/// `(key, kind, description)` for the whole surface, in display order.
-/// `kind` is the client-side editor hint contract — see [`ConfigEntry`].
+/// Where a key lives on the Settings page (FR-84 D2).
+///
+/// The variant order is the DISPLAY order: [`entries`] emits the surface
+/// grouped this way, so a client (the desktop companion, `roomler config
+/// ls`) renders sections in the order they arrive and never needs an order
+/// table of its own. [`Group::wire`] ids are a compatibility surface — a
+/// renamed id makes every key of that group land in "unknown" on an older
+/// client — and are locked, with the labels, by `group_wire_ids_are_stable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Group {
+    /// Who may connect, run commands, or push configuration.
+    Access,
+    /// The overlay mesh: joining it, what this node routes for others.
+    Network,
+    /// How a carrier is chosen and kept: relays, probes, the netcheck.
+    NetworkCarriers,
+    /// The OS route table and the TUN adapter (the Windows route wars).
+    NetworkRouting,
+    /// Userspace tunnels and the SOCKS5 mesh.
+    Tunnels,
+    /// The in-process SSH server on the overlay address.
+    Ssh,
+    /// Remote-control sessions and their media ICE.
+    RemoteDesktop,
+    /// Screen-capture backends and input injection.
+    CaptureInput,
+    /// Encoder selection, the encoder cells, the pipeline's threads.
+    VideoEncoding,
+    /// Rate control, queues, and latency levers.
+    VideoRate,
+    /// File transfer and remote browsing.
+    Files,
+    /// The daemon itself: updates, power, logs, supervision.
+    Device,
+}
+
+impl Group {
+    /// Every group, in display order.
+    pub const ALL: [Group; 12] = [
+        Group::Access,
+        Group::Network,
+        Group::NetworkCarriers,
+        Group::NetworkRouting,
+        Group::Tunnels,
+        Group::Ssh,
+        Group::RemoteDesktop,
+        Group::CaptureInput,
+        Group::VideoEncoding,
+        Group::VideoRate,
+        Group::Files,
+        Group::Device,
+    ];
+
+    /// The stable wire id (`ConfigEntry::group`).
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Group::Access => "access",
+            Group::Network => "network",
+            Group::NetworkCarriers => "network_carriers",
+            Group::NetworkRouting => "network_routing",
+            Group::Tunnels => "tunnels",
+            Group::Ssh => "ssh",
+            Group::RemoteDesktop => "remote_desktop",
+            Group::CaptureInput => "capture_input",
+            Group::VideoEncoding => "video_encoding",
+            Group::VideoRate => "video_rate",
+            Group::Files => "files",
+            Group::Device => "device",
+        }
+    }
+
+    /// The human label (`ConfigEntry::group_label`).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Group::Access => "Access & consent",
+            Group::Network => "Private network",
+            Group::NetworkCarriers => "Network carriers & relays",
+            Group::NetworkRouting => "Routing & adapter (Windows)",
+            Group::Tunnels => "Tunnels & SOCKS",
+            Group::Ssh => "Roomler SSH",
+            Group::RemoteDesktop => "Remote desktop",
+            Group::CaptureInput => "Capture & input",
+            Group::VideoEncoding => "Video encoding",
+            Group::VideoRate => "Video rate & latency",
+            Group::Files => "Files",
+            Group::Device => "Device & service",
+        }
+    }
+
+    /// Position in [`Group::ALL`] — the sort key [`entries`] groups by.
+    const fn order(self) -> usize {
+        match self {
+            Group::Access => 0,
+            Group::Network => 1,
+            Group::NetworkCarriers => 2,
+            Group::NetworkRouting => 3,
+            Group::Tunnels => 4,
+            Group::Ssh => 5,
+            Group::RemoteDesktop => 6,
+            Group::CaptureInput => 7,
+            Group::VideoEncoding => 8,
+            Group::VideoRate => 9,
+            Group::Files => 10,
+            Group::Device => 11,
+        }
+    }
+}
+
+/// How much a key expects to be touched (FR-84 D2).
+///
+/// `Essential` keys are the handful a person is expected to decide on —
+/// the Settings page shows them open, first. `Standard` keys sit in their
+/// group. `Advanced` keys are field levers: every one documented, none a
+/// healthy device needs a hand on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tier {
+    Essential,
+    Standard,
+    Advanced,
+}
+
+impl Tier {
+    /// The stable wire id (`ConfigEntry::tier`).
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Tier::Essential => "essential",
+            Tier::Standard => "standard",
+            Tier::Advanced => "advanced",
+        }
+    }
+}
+
+/// One registry row. Every field is a claim the desktop puts on screen, so
+/// a wrong one is a lie to the person at the machine — `live` above all:
+/// `true` means the daemon applies a change WITHOUT a restart, which today
+/// holds for exactly the two gate-4 flags `RemoteConfigServices::adopt_local`
+/// re-seeds after a `ConfigSet`. Everything else is read once at startup.
+/// Locked by `live_keys_are_exactly_the_adopt_local_set`.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyMeta {
+    pub key: &'static str,
+    /// The client-side editor hint contract — see [`ConfigEntry::kind`].
+    pub kind: &'static str,
+    pub group: Group,
+    pub tier: Tier,
+    /// The daemon puts a change into force without a restart.
+    pub live: bool,
+    pub description: &'static str,
+}
+
+/// The whole surface, in registry order (grouped for display by
+/// [`entries`]). `kind` is the client-side editor hint contract — see
+/// [`ConfigEntry`].
 /// CONTRACT (rc.280): a key whose daemon read goes through
 /// `tunnel_core::env::node_env` must ALSO appear in
 /// [`crate::config::env_bridge_bools`] / `env_bridge_numerics`, else
 /// `roomler config set <key>` writes TOML the daemon ignores. The parity
 /// test `env_bridge_pairs_have_surface_parity` locks the mapping (and
 /// covers set/echo for every bridged key, replacing per-key boilerplate).
-const KEYS: &[(&str, &str, &str)] = &[
-    (
-        "overlay_enabled",
-        "bool",
-        "Join the L3 overlay mesh (WireGuard-style private network). Default: off.",
-    ),
-    (
-        "overlay_multi_org",
-        "bool",
-        "Multi-org: let secondary [[orgs]] entries with overlay_mode=\"tun\" join \
+const KEYS: &[KeyMeta] = &[
+    KeyMeta {
+        key: "overlay_enabled",
+        group: Group::Network,
+        tier: Tier::Essential,
+        live: false,
+        kind: "bool",
+        description: "Join the L3 overlay mesh (WireGuard-style private network). Default: off.",
+    },
+    KeyMeta {
+        key: "overlay_multi_org",
+        group: Group::Network,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "Multi-org: let secondary [[orgs]] entries with overlay_mode=\"tun\" join \
          their own tenant's mesh over the ONE shared TUN (same server_url as the \
          primary required). Default: off.",
-    ),
-    (
-        "overlay_advertised_routes",
-        "list",
-        "CIDRs this node offers to route for overlay peers (subnet router); admin approval required. Comma-separated.",
-    ),
-    (
-        "overlay_exit_node_enabled",
-        "bool",
-        "Offer this node as an overlay exit node (advertises 0.0.0.0/0; admin approval required). Default: off.",
-    ),
-    (
-        "overlay_exit_node",
-        "string",
-        "Route ALL of this node's internet egress through the named mesh peer (name or node-id hex). Empty = normal routing.",
-    ),
-    (
-        "advertise_routes",
-        "list",
-        "CIDRs this host advertises for the tunnel/SOCKS mesh; admin approval required. Comma-separated.",
-    ),
-    (
-        "advertise_local_subnets",
-        "bool",
-        "Auto-detect and advertise directly-connected IPv4 subnets (untrusted until admin-approved). Default: on.",
-    ),
-    (
-        "auto_grant_session",
-        "bool",
-        "Auto-approve incoming remote-control session requests without an operator prompt. Default: on.",
-    ),
-    (
-        "enable_remote_browse",
-        "bool",
-        "Answer remote filesystem-browse requests from the controller. Default: on.",
-    ),
-    (
-        "exec_enabled",
-        "bool",
-        "Run Fleet-RPC commands sent by the server (commands inherit the daemon's SYSTEM/root identity). Default: OFF.",
-    ),
-    (
-        "macos_supervise_gui_worker",
-        "bool",
-        "macOS only. Let the root daemon spawn and babysit the GUI-session worker (FR-43 P1). Stands down whenever the LaunchAgent is loaded, so one enrollment is never served twice. Default: OFF.",
-    ),
-    (
-        "power_policy",
-        "never|on-ac|always",
-        "Ask the OS to stay awake so this device stays reachable (FR-55). `on-ac` is the setting a laptop usually wants. A live remote-control or SSH session ALWAYS holds the machine awake regardless of this. ⚠️ macOS clamshell sleep (lid closed, no external display) ignores it — an OS limit, not a setting. Default: never.",
-    ),
-    (
-        "remote_config_enabled",
-        "bool",
-        "Accept configuration pushed by the control plane. NEVER settable by the server — it is what keeps exec_enabled/ssh_enabled refusable by a compromised one. Turning it ON delegates that last refusal. Default: OFF.",
-    ),
-    (
-        "ssh_enabled",
-        "bool",
-        "Serve SSH in-process on this node's overlay address (intercepted before the OS; sessions inherit the daemon's SYSTEM/root identity). Default: OFF.",
-    ),
-    (
-        "ssh_activity_log",
-        "bool",
-        "Report SSH session activity to the org: commands and their exit codes, and that a shell / SFTP / forward happened. NEVER session content — no pty stream, no command output. Default: OFF.",
-    ),
-    (
-        "ssh_port",
-        "string",
-        "TCP port intercepted on the overlay address when ssh_enabled is on (1-65535). Empty = built-in default (2222).",
-    ),
-    (
-        "ssh_authorized_keys",
-        "list",
-        "Comma-separated OpenSSH public keys allowed to open an SSH session. Empty = nobody (ssh_enabled alone grants no access). Set ssh_account_mode too, or these keys authenticate and run nothing.",
-    ),
-    (
-        "ssh_account_mode",
-        "string",
-        "What an ssh_authorized_keys session runs as: daemon | console_user | named:<account>. Empty = sessions authenticate but run nothing (listing a key must not silently hand out SYSTEM/root).",
-    ),
-    (
-        "ssh_max_privilege",
-        "string",
-        "Ceiling on what a SERVER-GRANTED ssh session may run as: daemon (or empty) = no device-side limit; console_user = a grant asking for the daemon identity is refused. The device's answer to 'what do I still refuse when the server asking is the compromised thing'.",
-    ),
+    },
+    KeyMeta {
+        key: "overlay_advertised_routes",
+        group: Group::Network,
+        tier: Tier::Standard,
+        live: false,
+        kind: "list",
+        description: "CIDRs this node offers to route for overlay peers (subnet router); admin approval required. Comma-separated.",
+    },
+    KeyMeta {
+        key: "overlay_exit_node_enabled",
+        group: Group::Network,
+        tier: Tier::Standard,
+        live: false,
+        kind: "bool",
+        description: "Offer this node as an overlay exit node (advertises 0.0.0.0/0; admin approval required). Default: off.",
+    },
+    KeyMeta {
+        key: "overlay_exit_node",
+        group: Group::Network,
+        tier: Tier::Standard,
+        live: false,
+        kind: "string",
+        description: "Route ALL of this node's internet egress through the named mesh peer (name or node-id hex). Empty = normal routing.",
+    },
+    KeyMeta {
+        key: "advertise_routes",
+        group: Group::Tunnels,
+        tier: Tier::Standard,
+        live: false,
+        kind: "list",
+        description: "CIDRs this host advertises for the tunnel/SOCKS mesh; admin approval required. Comma-separated.",
+    },
+    KeyMeta {
+        key: "advertise_local_subnets",
+        group: Group::Tunnels,
+        tier: Tier::Standard,
+        live: false,
+        kind: "bool",
+        description: "Auto-detect and advertise directly-connected IPv4 subnets (untrusted until admin-approved). Default: on.",
+    },
+    KeyMeta {
+        key: "auto_grant_session",
+        group: Group::Access,
+        tier: Tier::Essential,
+        live: false,
+        kind: "bool",
+        description: "Auto-approve incoming remote-control session requests without an operator prompt. Default: on.",
+    },
+    KeyMeta {
+        key: "enable_remote_browse",
+        group: Group::Files,
+        tier: Tier::Standard,
+        live: false,
+        kind: "bool",
+        description: "Answer remote filesystem-browse requests from the controller. Default: on.",
+    },
+    KeyMeta {
+        key: "exec_enabled",
+        group: Group::Access,
+        tier: Tier::Essential,
+        // LIVE: `RemoteConfigServices::adopt_local` re-seeds the gate-4
+        // flag from the file `ConfigSet` just wrote (localapi_state.rs).
+        live: true,
+        kind: "bool",
+        description: "Run Fleet-RPC commands sent by the server (commands inherit the daemon's SYSTEM/root identity). Default: OFF.",
+    },
+    KeyMeta {
+        key: "macos_supervise_gui_worker",
+        group: Group::Device,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "macOS only. Let the root daemon spawn and babysit the GUI-session worker (FR-43 P1). Stands down whenever the LaunchAgent is loaded, so one enrollment is never served twice. Default: OFF.",
+    },
+    KeyMeta {
+        key: "power_policy",
+        group: Group::Device,
+        tier: Tier::Essential,
+        live: false,
+        // `enum:` so the desktop renders a select — it was a bare
+        // `never|on-ac|always`, which the editor contract reads as free text.
+        kind: "enum:never|on-ac|always",
+        description: "Ask the OS to stay awake so this device stays reachable (FR-55). `on-ac` is the setting a laptop usually wants. A live remote-control or SSH session ALWAYS holds the machine awake regardless of this. ⚠️ macOS clamshell sleep (lid closed, no external display) ignores it — an OS limit, not a setting. Default: never.",
+    },
+    KeyMeta {
+        key: "remote_config_enabled",
+        group: Group::Access,
+        tier: Tier::Essential,
+        // LIVE: the owner's revocation of the delegation must never be the
+        // slower of the two paths (docs/remote-config.md §7b).
+        live: true,
+        kind: "bool",
+        description: "Accept configuration pushed by the control plane. NEVER settable by the server — it is what keeps exec_enabled/ssh_enabled refusable by a compromised one. Turning it ON delegates that last refusal. Default: OFF.",
+    },
+    KeyMeta {
+        key: "ssh_enabled",
+        group: Group::Ssh,
+        tier: Tier::Essential,
+        live: false,
+        kind: "bool",
+        description: "Serve SSH in-process on this node's overlay address (intercepted before the OS; sessions inherit the daemon's SYSTEM/root identity). Default: OFF.",
+    },
+    KeyMeta {
+        key: "ssh_activity_log",
+        group: Group::Ssh,
+        tier: Tier::Standard,
+        live: false,
+        kind: "bool",
+        description: "Report SSH session activity to the org: commands and their exit codes, and that a shell / SFTP / forward happened. NEVER session content — no pty stream, no command output. Default: OFF.",
+    },
+    KeyMeta {
+        key: "ssh_port",
+        group: Group::Ssh,
+        tier: Tier::Standard,
+        live: false,
+        kind: "string",
+        description: "TCP port intercepted on the overlay address when ssh_enabled is on (1-65535). Empty = built-in default (2222).",
+    },
+    KeyMeta {
+        key: "ssh_authorized_keys",
+        group: Group::Ssh,
+        tier: Tier::Standard,
+        live: false,
+        kind: "list",
+        description: "Comma-separated OpenSSH public keys allowed to open an SSH session. Empty = nobody (ssh_enabled alone grants no access). Set ssh_account_mode too, or these keys authenticate and run nothing.",
+    },
+    KeyMeta {
+        key: "ssh_account_mode",
+        group: Group::Ssh,
+        tier: Tier::Standard,
+        live: false,
+        kind: "string",
+        description: "What an ssh_authorized_keys session runs as: daemon | console_user | named:<account>. Empty = sessions authenticate but run nothing (listing a key must not silently hand out SYSTEM/root).",
+    },
+    KeyMeta {
+        key: "ssh_max_privilege",
+        group: Group::Ssh,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "Ceiling on what a SERVER-GRANTED ssh session may run as: daemon (or empty) = no device-side limit; console_user = a grant asking for the daemon identity is refused. The device's answer to 'what do I still refuse when the server asking is the compromised thing'.",
+    },
     // `ssh_host_key` is deliberately ABSENT from this surface: it is private
     // key material, and everything here is readable over the LocalAPI.
-    (
-        "encoder_preference",
-        "enum:auto|hardware|software",
-        "Video encoder selection: auto (HW probe then fallback), hardware, or software.",
-    ),
-    (
-        "update_check_interval_h",
-        "string",
-        "Hours between self-update checks (1-8760). Empty = built-in default (24 h).",
-    ),
-    (
-        "overlay_quic",
-        "tribool",
-        "QUIC-over-TURN overlay carrier. Built-in default: off.",
-    ),
-    (
-        "overlay_direct",
-        "tribool",
-        "Direct (LAN / hole-punched) overlay carriers. Built-in default: on.",
-    ),
-    (
-        "overlay_derp",
-        "tribool",
-        "DERP (WebSocket-relay) overlay fallback tier. Built-in default: on.",
-    ),
-    (
-        "overlay_server_relay_strategy",
-        "tribool",
-        "U2 — accept the server's computed relay-tier verdict instead of the local derivation. Built-in default: off.",
-    ),
-    (
-        "overlay_derp_floor",
-        "tribool",
-        "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session, advertise the capability, and floor fresh pairs at birth. Built-in default: on since rc.400.",
-    ),
-    (
-        "overlay_org_relay",
-        "tribool",
-        "FR-19 P4b - ride a tenant-owned ORG RELAY when the server mints a session for a \
+    KeyMeta {
+        key: "encoder_preference",
+        group: Group::VideoEncoding,
+        tier: Tier::Essential,
+        live: false,
+        kind: "enum:auto|hardware|software",
+        description: "Video encoder selection: auto (HW probe then fallback), hardware, or software.",
+    },
+    KeyMeta {
+        key: "update_check_interval_h",
+        group: Group::Device,
+        tier: Tier::Standard,
+        live: false,
+        kind: "string",
+        description: "Hours between self-update checks (1-8760). Empty = built-in default (24 h).",
+    },
+    KeyMeta {
+        key: "overlay_quic",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "QUIC-over-TURN overlay carrier. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "overlay_direct",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Direct (LAN / hole-punched) overlay carriers. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_derp",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "DERP (WebSocket-relay) overlay fallback tier. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_server_relay_strategy",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "U2 — accept the server's computed relay-tier verdict instead of the local derivation. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "overlay_derp_floor",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session, advertise the capability, and floor fresh pairs at birth. Built-in default: on since rc.400.",
+    },
+    KeyMeta {
+        key: "overlay_org_relay",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-19 P4b - ride a tenant-owned ORG RELAY when the server mints a session for a \
          pair (org switch on, an ACL rule granting each member the relay node, an approved \
          and serving relay). Advertised on the join as supports_org_relay; the serving half \
          is relay_server_enabled. Built-in default: OFF.",
-    ),
-    (
-        "relay_server_enabled",
-        "tribool",
-        "FR-19 - offer this node as an ORG RELAY: bind relay_server_port and answer \
+    },
+    KeyMeta {
+        key: "relay_server_enabled",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-19 - offer this node as an ORG RELAY: bind relay_server_port and answer \
          reachability probes (it forwards nothing until the relay data path ships). \
          Device-local by design and never server-pushable: this is the refusal that \
          survives a compromised server. Built-in default: OFF.",
-    ),
-    (
-        "relay_server_port",
-        "number",
-        "FR-19 - UDP port for the org-relay listener (1-65535). Built-in default: 3478, \
+    },
+    KeyMeta {
+        key: "relay_server_port",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "FR-19 - UDP port for the org-relay listener (1-65535). Built-in default: 3478, \
          measured rather than guessed - the corp-managed target host reaches 3478 on an \
          arbitrary public IP and no other port. A successful bind does NOT prove \
          reachability: a coturn DNAT can consume the port in PREROUTING while ss shows it \
          free.",
-    ),
-    (
-        "overlay_netcheck",
-        "tribool",
-        "Overlay v3 Phase B — netcheck: measure egress capabilities (relay-band probe over the dialer path, STUN/NAT, /derp health) every ~20 min and publish the capability vector. Built-in default: on.",
-    ),
-    (
-        "tunnel_derp_fallback",
-        "tribool",
-        "R4 — tunnel quic-derp-v1 fallback: after repeated quick tunnel session deaths (a corp capture window killing fresh TURN/TLS legs), lead the next attempt with QUIC over the ESTABLISHED /derp WS. Client-side only. Built-in default: off.",
-    ),
-    (
-        "tunnel_peers_survive_reattach",
-        "tribool",
-        "R3 — keep established tunnel QUIC peers alive across a control-WS reattach instead of tearing them down on every transient WS drop, so a QUIC/derp data plane survives a corp-VPN control-WS blip. Needs the server-side grace. Agent (target) side. Built-in default: off.",
-    ),
-    (
-        "overlay_mbb",
-        "tribool",
-        "Make-before-break overlay carrier upgrades. Built-in default: on.",
-    ),
-    (
-        "overlay_lan_iface_filter",
-        "tribool",
-        "LAN-gather virtual-interface filter (skip WSL/Hyper-V/other-VPN adapters). Built-in default: on.",
-    ),
-    (
-        "overlay_wsl_mirrored_guard",
-        "tribool",
-        "WSL2 mirrored-networking guard: a mirrored guest shares the Windows host's adapters, so skip its LAN gather (binding the host's address starves the host agent). Built-in default: on.",
-    ),
-    (
-        "overlay_init_auth_first",
-        "tribool",
-        "Auth-first handshake routing on a multi-org carrier plane: route an inbound WG initiation by trial-authentication instead of the source shortcut (fixes the dual-org direct lockout). Built-in default: on.",
-    ),
-    (
-        "overlay_srflx_seek",
-        "tribool",
-        "srflx SEEKING mode: when the STUN gather finds no public candidate, keep re-gathering with backoff + on interface events instead of staying NONE for the daemon lifetime. Built-in default: on.",
-    ),
-    (
-        "ws_replaced_exit",
-        "tribool",
-        "LEGACY ReplacedByNewer escalation: exit the process after 3 displacements in the window instead of backing off in-process. Built-in default: off (W4d — zombie-WS storms must not tear down the overlay).",
-    ),
-    (
-        "overlay_warm_relay",
-        "tribool",
-        "C4 stage 1: keep one standing warm TURN/UDP allocation (established while UDP works) alive across VPN transitions — measurement-only, nothing routes over it yet. Built-in default: off.",
-    ),
-    (
-        "overlay_quic_async",
-        "tribool",
-        "Raw-first QUIC-over-TURN upgrade: commit the raw relay immediately, rendezvous in the background (90s window), swap in on success. Off restores the blocking 8s pre-install window. Built-in default: on.",
-    ),
-    (
-        "overlay_vpn_vantage",
-        "tribool",
-        "R2: srflx gather falls back to the wildcard public-dial socket when every LAN-bound vantage is dead (full-tunnel VPN rescue — on AnyConnect-class clients the tunnel is the only path that passes UDP). Built-in default: on.",
-    ),
-    (
-        "overlay_netd",
-        "tribool",
-        "Track A stage 1 (SCAFFOLD): spawn the session-independent network daemon (roomlerd netd) as a second supervisor child. netd hosts nothing yet; flag read at service start. Built-in default: off.",
-    ),
-    (
-        "overlay_pathmon",
-        "string",
-        "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLERD_OVERLAY_PATHMON.",
-    ),
-    (
-        "overlay_demote",
-        "string",
-        "B2 - score-driven demotion of degraded-but-live direct carriers: shadow (count only - built-in default) | on | off. Env: ROOMLERD_OVERLAY_DEMOTE.",
-    ),
-    (
-        "overlay_rpf",
-        "string",
-        "P4 - ingress filtering of inbound overlay packets: drops a SOURCE address the sending peer does not own, and a DESTINATION outside the subnets this node advertises. warn (count + log, still deliver - built-in default) | enforce | off. Env: ROOMLERD_OVERLAY_RPF.",
-    ),
-    (
-        "overlay_route_events",
-        "tribool",
-        "Event-driven route guard (OS route-table change subscription; the blind tick backstops it). Built-in default: on.",
-    ),
-    (
-        "overlay_route_tick_secs",
-        "number",
-        "Route-guard blind-tick seconds while the route-event subscription is live (2-300; 2 = pre-demotion war cadence). Built-in default: 30. Always 2 s without a live subscription.",
-    ),
-    (
-        "overlay_netmon",
-        "tribool",
-        "netstate - the process-wide network monitor: ONE OS change subscription, typed \
+    },
+    KeyMeta {
+        key: "overlay_netcheck",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Overlay v3 Phase B — netcheck: measure egress capabilities (relay-band probe over the dialer path, STUN/NAT, /derp health) every ~20 min and publish the capability vector. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "tunnel_derp_fallback",
+        group: Group::Tunnels,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "R4 — tunnel quic-derp-v1 fallback: after repeated quick tunnel session deaths (a corp capture window killing fresh TURN/TLS legs), lead the next attempt with QUIC over the ESTABLISHED /derp WS. Client-side only. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "tunnel_peers_survive_reattach",
+        group: Group::Tunnels,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "R3 — keep established tunnel QUIC peers alive across a control-WS reattach instead of tearing them down on every transient WS drop, so a QUIC/derp data plane survives a corp-VPN control-WS blip. Needs the server-side grace. Agent (target) side. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "overlay_mbb",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Make-before-break overlay carrier upgrades. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_lan_iface_filter",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "LAN-gather virtual-interface filter (skip WSL/Hyper-V/other-VPN adapters). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_wsl_mirrored_guard",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "WSL2 mirrored-networking guard: a mirrored guest shares the Windows host's adapters, so skip its LAN gather (binding the host's address starves the host agent). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_init_auth_first",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Auth-first handshake routing on a multi-org carrier plane: route an inbound WG initiation by trial-authentication instead of the source shortcut (fixes the dual-org direct lockout). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_srflx_seek",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "srflx SEEKING mode: when the STUN gather finds no public candidate, keep re-gathering with backoff + on interface events instead of staying NONE for the daemon lifetime. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "ws_replaced_exit",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "LEGACY ReplacedByNewer escalation: exit the process after 3 displacements in the window instead of backing off in-process. Built-in default: off (W4d — zombie-WS storms must not tear down the overlay).",
+    },
+    KeyMeta {
+        key: "overlay_warm_relay",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "C4 stage 1: keep one standing warm TURN/UDP allocation (established while UDP works) alive across VPN transitions — measurement-only, nothing routes over it yet. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "overlay_quic_async",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Raw-first QUIC-over-TURN upgrade: commit the raw relay immediately, rendezvous in the background (90s window), swap in on success. Off restores the blocking 8s pre-install window. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_vpn_vantage",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "R2: srflx gather falls back to the wildcard public-dial socket when every LAN-bound vantage is dead (full-tunnel VPN rescue — on AnyConnect-class clients the tunnel is the only path that passes UDP). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_netd",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Track A stage 1 (SCAFFOLD): spawn the session-independent network daemon (roomlerd netd) as a second supervisor child. netd hosts nothing yet; flag read at service start. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "overlay_pathmon",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLERD_OVERLAY_PATHMON.",
+    },
+    KeyMeta {
+        key: "overlay_demote",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "B2 - score-driven demotion of degraded-but-live direct carriers: shadow (count only - built-in default) | on | off. Env: ROOMLERD_OVERLAY_DEMOTE.",
+    },
+    KeyMeta {
+        key: "overlay_rpf",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "P4 - ingress filtering of inbound overlay packets: drops a SOURCE address the sending peer does not own, and a DESTINATION outside the subnets this node advertises. warn (count + log, still deliver - built-in default) | enforce | off. Env: ROOMLERD_OVERLAY_RPF.",
+    },
+    KeyMeta {
+        key: "overlay_route_events",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Event-driven route guard (OS route-table change subscription; the blind tick backstops it). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_route_tick_secs",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Route-guard blind-tick seconds while the route-event subscription is live (2-300; 2 = pre-demotion war cadence). Built-in default: 30. Always 2 s without a live subscription.",
+    },
+    KeyMeta {
+        key: "overlay_netmon",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "netstate - the process-wide network monitor: ONE OS change subscription, typed \
          snapshots/deltas, non-blocking fan-out (the route-event feed and the PR-2 \
          reaction fast lanes ride it). Built-in default: on.",
-    ),
-    (
-        "overlay_netmon_debounce_ms",
-        "number",
-        "netstate - debounce window in ms coalescing OS signal bursts (a VPN connect \
+    },
+    KeyMeta {
+        key: "overlay_netmon_debounce_ms",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "netstate - debounce window in ms coalescing OS signal bursts (a VPN connect \
          injects dozens of routes) into one delta (100-5000). Built-in default: 750.",
-    ),
-    (
-        "netstack_socks_port",
-        "number",
-        "Multi-org: the loopback SOCKS5 port serving THIS org's userspace netstack \
+    },
+    KeyMeta {
+        key: "netstack_socks_port",
+        group: Group::Network,
+        tier: Tier::Standard,
+        live: false,
+        kind: "number",
+        description: "Multi-org: the loopback SOCKS5 port serving THIS org's userspace netstack \
          (overlay_mode=\"netstack\"). One TCP listener per org — two orgs configured onto \
          one port means the second joins no mesh. The primary reads \
          ROOMLERD_OVERLAY_NETSTACK_SOCKS instead; set this on an [[orgs]] entry. \
          Built-in default: unset (OS-TUN mode).",
-    ),
-    (
-        "rc_max_sessions",
-        "number",
-        "Concurrent remote-control sessions this agent accepts (1-8). Same-profile DC viewers share one capture+encoder (see shared_encoder); distinct profiles run their own — weak-GPU hosts may prefer 1. Built-in default: 2.",
-    ),
-    (
-        "overlay_direct_port",
-        "number",
-        "Stable UDP base port for the overlay direct sockets (per-interface LAN; the public/srflx dialer takes base+256). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. A swallowed base walks an 8-port band, then the same walk at base+512 (Hyper-V/WSL reserve invisible pools that move between boots). 0 = ephemeral ports. Built-in default: DERIVED per machine (43648 + machine-id-hash slot, 43648..43896) so siblings behind one NAT never collide; set 43648 explicitly to pin the old fleet-wide constant. Env: ROOMLERD_OVERLAY_DIRECT_PORT.",
-    ),
-    (
-        "overlay_iface_metric",
-        "number",
-        "The overlay NIC's IPv4 interface metric (Windows). Windows ranks a route by route metric + INTERFACE metric; corp endpoint managers (Check Point, AnyConnect) mirror overlay prefixes at route metric 1 on an interface also pinned to 1, producing an exact tie that Windows breaks by lower ifIndex — the VPN's — and the per-destination pick is sticky, so peers stay captured across restarts. Unlike metric-0 routes (which those products delete), an interface metric has no route-monitor hook, so 0 wins outright. Raise only to make the overlay deliberately lose against another interface. Built-in default: 0. Env: ROOMLERD_OVERLAY_IFACE_METRIC.",
-    ),
-    (
-        "shared_encoder",
-        "tribool",
-        "P5 shared-floor encoder: concurrent same-profile DC viewers share one capture+encoder with floor-merged rate/dials. off = one pipeline per session (rc.302 behaviour). Built-in default: on.",
-    ),
-    (
-        "overlay_relay_tls",
-        "tribool",
-        "Force overlay coturn allocations onto the TURNS/TCP (TLS) tier — corp-VPN probe. Built-in default: off.",
-    ),
-    (
-        "overlay_shared_carrier",
-        "tribool",
-        "Multi-org v2 shared carrier plane: every org's engine shares ONE process-wide direct-socket set (receiver-index demux) instead of racing the per-org port band. Built-in default: off.",
-    ),
-    (
-        "overlay_roam",
-        "tribool",
-        "WG-style endpoint roaming: adopt a peer's observed source after an authenticated inbound from it (repoints the carrier in place). Completes a punch from a symmetric-NAT peer and heals a mid-session NAT rebind. off = strict no-roam demux. Built-in default: on.",
-    ),
-    (
-        "overlay_plane_watchdog",
-        "tribool",
-        "Carrier-plane socket-liveness watchdog: force a debounced plane rebuild when the shared punch-socket keepalive fails N consecutive cycles (reader-less/wedged socket). off = warn-only. Built-in default: on.",
-    ),
-    (
-        "overlay_session_trace",
-        "tribool",
-        "Diagnostic: per-session plane-demux + carrier-health INFO traces (inbound src vs expected, poke/proof/rx state). Verbose; enable briefly on an affected host to diagnose a specific peer's carrier. Built-in default: off.",
-    ),
-    (
-        "overlay_disco_respond",
-        "tribool",
-        "Answer out-of-tunnel disco echoes on the carrier socket (path liveness, answered by the daemon itself — no OS, firewall or tunnel session involved). Answering only; this node does not probe. Built-in default: on.",
-    ),
-    (
-        "overlay_disco_probe",
-        "tribool",
-        "Probe peers with out-of-tunnel disco echoes and record per-path loss + RTT. Measurement only — nothing acts on the table (scoring is a later stage). Built-in default: off; enable only where every peer already answers.",
-    ),
-    (
-        "overlay_answer_while_followed",
-        "tribool",
-        "Answer a peer's direct handshake even while that tier is suppressed, when accepting cannot cost the relay (it becomes a shadow probe). The demote-follow hold-down otherwise stops this node ANSWERING for up to 15 min, so two followed ends go mutually deaf and a good LAN pair sits on relay. Built-in default: ON since 0.4.2 (set false as the kill switch).",
-    ),
-    (
-        "overlay_tun_stable_guid",
-        "tribool",
-        "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
-    ),
-    (
-        "overlay_route_evict",
-        "tribool",
-        "Route-war eviction of competing VPN-installed routes for overlay prefixes (Windows). Built-in default: on.",
-    ),
-    (
-        "overlay_route_reclaim",
-        "tribool",
-        "Route-war stolen-path reclaim (targeted evict + cache pin for tie-captured destinations) and evict-on-change debounce (Windows). Built-in default: on.",
-    ),
-    (
-        "overlay_tun_persist",
-        "tribool",
-        "Keep the overlay TUN device alive across signaling reconnects (process-lifetime cache). Built-in default: on.",
-    ),
-    (
-        "overlay_route_metric0",
-        "tribool",
-        "Install defended peer /32s (and the ULA /96 + connected /10) at route metric 0 so they outrank a corp VPN's metric-1 mirror routes (Windows). Built-in default: off — an opt-in experiment that auto-yields to metric 1 where a VPN route monitor deletes routes that would win.",
-    ),
-    (
-        "overlay_route_win",
-        "tribool",
-        "Win the contested prefixes outright instead of evicting a competitor off them forever (Windows). Built-in default: off. Two halves: it pins the overlay adapter's IPv6 interface metric, the lever IPv4 has had since rc.410 and IPv6 never got; and it asserts the derived-ULA /96 AND the connected v4 prefix (the carved block or legacy /10) at the defended route metric 1 instead of the stock connected-route 256. Measured against a corp VPN, v6 was 261 for us vs 26 for the VPN — lost outright, which is why the route guard evicts the VPN's mirrored /96 about 20 times a minute forever on a host whose IPv4 is quiet; the v4 half closes the same gap on the carved block, where the VPN holds it at effective 2 against our 256. Not the metric-0 variant a VPN route monitor deletes outright — it uses the same metric 1 IPv4 runs fleet-wide.",
-    ),
-    (
-        "local_turn",
-        "tribool",
-        "Loopback-TURN relay for controllers on the same corporate network. Built-in default: on.",
-    ),
-    (
-        "dns_aaaa",
-        "tribool",
-        "MagicDNS AAAA (IPv6) answers for overlay names. Built-in default: on.",
-    ),
-    (
-        "magicdns_hosts",
-        "tribool",
-        "MagicDNS hosts-file fallback: when the OS DNS path is MEASURED not to \
+    },
+    KeyMeta {
+        key: "rc_max_sessions",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        live: false,
+        kind: "number",
+        description: "Concurrent remote-control sessions this agent accepts (1-8). Same-profile DC viewers share one capture+encoder (see shared_encoder); distinct profiles run their own — weak-GPU hosts may prefer 1. Built-in default: 2.",
+    },
+    KeyMeta {
+        key: "overlay_direct_port",
+        group: Group::Network,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Stable UDP base port for the overlay direct sockets (per-interface LAN; the public/srflx dialer takes base+256). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. A swallowed base walks an 8-port band, then the same walk at base+512 (Hyper-V/WSL reserve invisible pools that move between boots). 0 = ephemeral ports. Built-in default: DERIVED per machine (43648 + machine-id-hash slot, 43648..43896) so siblings behind one NAT never collide; set 43648 explicitly to pin the old fleet-wide constant. Env: ROOMLERD_OVERLAY_DIRECT_PORT.",
+    },
+    KeyMeta {
+        key: "overlay_iface_metric",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "The overlay NIC's IPv4 interface metric (Windows). Windows ranks a route by route metric + INTERFACE metric; corp endpoint managers (Check Point, AnyConnect) mirror overlay prefixes at route metric 1 on an interface also pinned to 1, producing an exact tie that Windows breaks by lower ifIndex — the VPN's — and the per-destination pick is sticky, so peers stay captured across restarts. Unlike metric-0 routes (which those products delete), an interface metric has no route-monitor hook, so 0 wins outright. Raise only to make the overlay deliberately lose against another interface. Built-in default: 0. Env: ROOMLERD_OVERLAY_IFACE_METRIC.",
+    },
+    KeyMeta {
+        key: "shared_encoder",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "P5 shared-floor encoder: concurrent same-profile DC viewers share one capture+encoder with floor-merged rate/dials. off = one pipeline per session (rc.302 behaviour). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_relay_tls",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Force overlay coturn allocations onto the TURNS/TCP (TLS) tier — corp-VPN probe. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "overlay_shared_carrier",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Multi-org v2 shared carrier plane: every org's engine shares ONE process-wide direct-socket set (receiver-index demux) instead of racing the per-org port band. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "overlay_roam",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "WG-style endpoint roaming: adopt a peer's observed source after an authenticated inbound from it (repoints the carrier in place). Completes a punch from a symmetric-NAT peer and heals a mid-session NAT rebind. off = strict no-roam demux. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_plane_watchdog",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Carrier-plane socket-liveness watchdog: force a debounced plane rebuild when the shared punch-socket keepalive fails N consecutive cycles (reader-less/wedged socket). off = warn-only. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_session_trace",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Diagnostic: per-session plane-demux + carrier-health INFO traces (inbound src vs expected, poke/proof/rx state). Verbose; enable briefly on an affected host to diagnose a specific peer's carrier. Built-in default: off.",
+    },
+    KeyMeta {
+        key: "overlay_disco_respond",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Answer out-of-tunnel disco echoes on the carrier socket (path liveness, answered by the daemon itself — no OS, firewall or tunnel session involved). Answering only; this node does not probe. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_disco_probe",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Probe peers with out-of-tunnel disco echoes and record per-path loss + RTT. Measurement only — nothing acts on the table (scoring is a later stage). Built-in default: off; enable only where every peer already answers.",
+    },
+    KeyMeta {
+        key: "overlay_answer_while_followed",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Answer a peer's direct handshake even while that tier is suppressed, when accepting cannot cost the relay (it becomes a shadow probe). The demote-follow hold-down otherwise stops this node ANSWERING for up to 15 min, so two followed ends go mutually deaf and a good LAN pair sits on relay. Built-in default: ON since 0.4.2 (set false as the kill switch).",
+    },
+    KeyMeta {
+        key: "overlay_tun_stable_guid",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_route_evict",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Route-war eviction of competing VPN-installed routes for overlay prefixes (Windows). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_route_reclaim",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Route-war stolen-path reclaim (targeted evict + cache pin for tie-captured destinations) and evict-on-change debounce (Windows). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_tun_persist",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Keep the overlay TUN device alive across signaling reconnects (process-lifetime cache). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "overlay_route_metric0",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Install defended peer /32s (and the ULA /96 + connected /10) at route metric 0 so they outrank a corp VPN's metric-1 mirror routes (Windows). Built-in default: off — an opt-in experiment that auto-yields to metric 1 where a VPN route monitor deletes routes that would win.",
+    },
+    KeyMeta {
+        key: "overlay_route_win",
+        group: Group::NetworkRouting,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Win the contested prefixes outright instead of evicting a competitor off them forever (Windows). Built-in default: off. Two halves: it pins the overlay adapter's IPv6 interface metric, the lever IPv4 has had since rc.410 and IPv6 never got; and it asserts the derived-ULA /96 AND the connected v4 prefix (the carved block or legacy /10) at the defended route metric 1 instead of the stock connected-route 256. Measured against a corp VPN, v6 was 261 for us vs 26 for the VPN — lost outright, which is why the route guard evicts the VPN's mirrored /96 about 20 times a minute forever on a host whose IPv4 is quiet; the v4 half closes the same gap on the carved block, where the VPN holds it at effective 2 against our 256. Not the metric-0 variant a VPN route monitor deletes outright — it uses the same metric 1 IPv4 runs fleet-wide.",
+    },
+    KeyMeta {
+        key: "local_turn",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Loopback-TURN relay for controllers on the same corporate network. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "dns_aaaa",
+        group: Group::Network,
+        tier: Tier::Standard,
+        live: false,
+        kind: "tribool",
+        description: "MagicDNS AAAA (IPv6) answers for overlay names. Built-in default: on.",
+    },
+    KeyMeta {
+        key: "magicdns_hosts",
+        group: Group::Network,
+        tier: Tier::Standard,
+        live: false,
+        kind: "tribool",
+        description: "MagicDNS hosts-file fallback: when the OS DNS path is MEASURED not to \
          reach the local resolver (a corporate DNS-enforcement layer refusing \
          the host's own queries), write overlay names into the hosts file \
          instead, and remove them again as soon as DNS works. Built-in default: \
          off.",
-    ),
-    (
-        "auto_update",
-        "tribool",
-        "Periodic self-update checks (also gates web-pushed updates). Built-in default: on.",
-    ),
-    (
-        "logs_upload_disabled",
-        "tribool",
-        "Disable centralized diagnostic-log upload. Built-in default: uploads on.",
-    ),
-    (
-        "rate_factor_h264",
-        "string",
-        "H.264 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_H264. Empty = built-in 150. Restart required.",
-    ),
-    (
-        "rate_factor_hevc",
-        "string",
-        "HEVC maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_HEVC. Empty = built-in 125. Restart required.",
-    ),
-    (
-        "rate_factor_vp9",
-        "string",
-        "VP9 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_VP9. Empty = built-in 125. Restart required.",
-    ),
-    (
-        "rate_factor_av1",
-        "string",
-        "AV1 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_AV1. Empty = built-in 100. Restart required.",
-    ),
-    (
-        "rate_factor_h264_444",
-        "string",
-        "FR-77 P3 - the chroma column: H.264 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_h264. Env: ROOMLERD_RATE_FACTOR_H264_444. Empty = built-in 150. Restart required.",
-    ),
-    (
-        "rate_factor_hevc_444",
-        "string",
-        "FR-77 P3 - the chroma column: HEVC 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_hevc. Env: ROOMLERD_RATE_FACTOR_HEVC_444. Empty = built-in 150. Restart required.",
-    ),
-    (
-        "rate_factor_vp9_444",
-        "string",
-        "FR-77 P3 - the chroma column: VP9 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_vp9. Env: ROOMLERD_RATE_FACTOR_VP9_444. Empty = built-in 150. Restart required.",
-    ),
-    (
-        "lanczos_min_pct",
-        "string",
-        "P7 - minimum linear downscale (percent, 0-100) at which the Lanczos-3 text-sharp filter engages; shallower shrinks use box. Empty = built-in 34 (covers the Smoother rungs; 56 restores the pre-P7 gate; 0 = always). Env: ROOMLERD_LANCZOS_MIN_PCT. Restart required.",
-    ),
-    (
-        "nvenc_spatial_aq",
-        "tribool",
-        "P7 - NVENC spatial AQ. Built-in default: OFF (AQ steals bits from desktop text); true restores it for camera-heavy hosts. Env: ROOMLERD_NVENC_SPATIAL_AQ. Restart required.",
-    ),
-    (
-        "scale_cq_boost",
-        "string",
-        "P7 - CQ sharpening steps granted at deep resolution rungs (0-12; spends the maxrate-floor headroom on text). Empty = built-in 4; 0 disables. Env: ROOMLERD_SCALE_CQ_BOOST. Restart required.",
-    ),
-    (
-        "idle_refine",
-        "tribool",
-        "P7 - idle native-rung refinement: lift the resolution cap when the scene settles so text is crisp at rest; motion restores it in ~300 ms. Built-in default: on (Smoother scope). Env: ROOMLERD_IDLE_REFINE. Restart required.",
-    ),
-    (
-        "idle_refine_balanced",
-        "tribool",
-        "P7 - idle refinement on Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: on since P7c (field-proven on the winhost-b relay); off restores the un-refined Balanced rung. Env: ROOMLERD_IDLE_REFINE_BALANCED. Restart required.",
-    ),
-    (
-        "gpu_scale",
-        "tribool",
-        "HW-downscale Phase B - GPU scale-before-readback (D3D11 VideoProcessor) on DXGI-direct capture: the Smoother rung is scaled on the GPU and the readback shrinks with it. Built-in default: on; off reverts to the Phase-A CPU resample. Env: ROOMLERD_GPU_SCALE. Restart required.",
-    ),
-    (
-        "overlay_lan_capture_probe",
-        "tribool",
-        "FR-33 - probe each LAN prefix for a corp-VPN split-prefix capture (own address on interface A, traffic to the prefix leaves via interface B) and surface it in status / why / the RC pill. Built-in default: on (a read-only route lookup per LAN address per netstate snapshot). Env: ROOMLERD_OVERLAY_LAN_CAPTURE_PROBE. Restart required.",
-    ),
-    (
-        "relay_ceiling_learn",
-        "tribool",
-        "FR-35 - let the constrained (relay) ceiling grow above the nominal 3 Mbps on delivery evidence (AIMD pinned at the ceiling, the window carried >=70% of it, no decrease/stall for 10 s, viewer age within 1.5x floor) and remember the pair's stable rate so the next session opens there. Built-in default: on. Env: ROOMLERD_RELAY_CEILING_LEARN. Restart required.",
-    ),
-    (
-        "drm_capture",
-        "tribool",
-        "FR-36 - capture the scanout framebuffer via DRM/KMS, BELOW the compositor. The only backend that can see a Wayland desktop, a locked screen or the login greeter (the xdg portal refuses all three). Built-in default: OFF - it carries no damage information, so enabling it where X11 works costs the FR-29 idle-CPU win. Env: ROOMLERD_DRM_CAPTURE. Restart required.",
-    ),
-    (
-        "uinput",
-        "tribool",
-        "FR-36 - inject input through /dev/uinput, below the compositor. Pair with drm_capture on a Wayland host: XTest reaches Xwayland clients ONLY, so without this a captured Wayland session is read-only. Built-in default: OFF - a uinput device is host-global and injects into whatever has focus, including the greeter and lock screen. Env: ROOMLERD_UINPUT. Restart required.",
-    ),
-    (
-        "portal_capture",
-        "tribool",
-        "FR-45 - capture a Wayland desktop through xdg-desktop-portal ScreenCast + PipeWire. The ATTENDED path: needs a logged-in user session, and the first use shows that user a consent dialog (later ones restore the grant without asking). Serves hosts DRM cannot reach - no scanout, nested compositors. Built-in default: OFF - an unattended host would wait forever on a dialog nobody answers. Tried after DRM, before X11. Env: ROOMLERD_PORTAL_CAPTURE. Restart required.",
-    ),
-    (
-        "portal_input",
-        "tribool",
-        "FR-45 P4 - inject input through the portal RemoteDesktop interface, riding the SAME portal session (one consent dialog covers see+touch). Built-in default: OFF - a WithInput session needs its own see+touch consent + restore token, so enabling it makes every portal capture prompt afresh (and block or fall through if unanswered), regressing capture where capture-only works; it has also not yet been field-proven to land input. On = the portal session can be controlled; inert unless portal_capture is on. NOTE (measured on GNOME): this key alone is not enough - the portal's consent dialog carries a SEPARATE 'Allow Remote Interaction' switch that defaults OFF, so a human who only clicks Share grants capture and the session runs view-only. Env: ROOMLERD_PORTAL_INPUT. Restart required.",
-    ),
-    (
-        "mutter_capture",
-        "tribool",
-        "FR-45 P5 - take screencast frames from org.gnome.Mutter.ScreenCast DIRECTLY instead of the desktop portal. For hosts where no portal backend can run at all (measured on WSL2: xdg-desktop-portal-gnome exits without a GNOME session, while mutter itself works). GNOME-only. Built-in default: OFF. ** UNATTENDED - this shows NO consent dialog; its peer is drm_capture, not portal_capture.** Env: ROOMLERD_MUTTER_CAPTURE. Restart required.",
-    ),
-    (
-        "window_capture",
-        "tribool",
-        "FR-56 P4 - capture ONE application window instead of the whole monitor (the RAIL-shaped half of Remote Apps: the viewer sees one app, not the desktop). Built-in default: OFF. ** ATTENDED BY CONSTRUCTION - the portal answers this by showing the person at the screen a WINDOW PICKER, and nothing agent-side can name a window (GNOME refuses Introspect.GetWindows), so on an unattended host the capture never starts.** Env: ROOMLERD_WINDOW_CAPTURE. Restart required.",
-    ),
-    (
-        "x11_damage",
-        "tribool",
-        "FR-29 - skip the XShm readback when XDAMAGE proves the screen is unchanged. Built-in default: on; took a Linux host's idle capture from 45.8% of a core to 2.8%. Env: ROOMLERD_X11_DAMAGE. Restart required.",
-    ),
-    (
-        "overlay_key_rotation",
-        "tribool",
-        "FR-40 - honour rc:agent.key_rotate: an admin retiring this device's overlay (WireGuard) key from the dashboard. The device mints the new key locally, persists it and re-joins the mesh under it; the server never sees a private key. Built-in default: on (a kill switch, not a gate - the order leaks nothing). Env: ROOMLERD_OVERLAY_KEY_ROTATION. Restart required.",
-    ),
-    (
-        "relay_max_hi_kbps",
-        "string",
-        "FR-35 - upper bound (kbps, 0-100000) for the learned relay ceiling. Empty = built-in 8000 (one pair measured: sustained 6-9 Mbps, choked at 12.8); 0 = learning off. Env: ROOMLERD_RELAY_MAX_HI_KBPS. Restart required.",
-    ),
-    (
-        "idle_refine_max_edge",
-        "string",
-        "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLERD_IDLE_REFINE_MAX_EDGE. Restart required.",
-    ),
-    (
-        "idle_refine_min_frame_kb",
-        "string",
-        "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Defined at the 1024x640 reference rung and scaled by the live encode area (P7c-2 - a fixed floor oscillated across rungs). Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLERD_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
-    ),
-    (
-        "idle_refine_major_area_permille",
-        "string",
-        "P8a-2 - MAJOR-motion area floor (permille of the frame, 0-1000) on capture-tracked backends (DXGI-direct/WGC): only damage at/above it restores the resolution cap; smaller damage (typing, popups, windowed terminal scrolls, PiP video) stays at native so text is sharp all the time. Empty = built-in 400 (40%); 0 = any non-empty tracked damage counts (pre-P8a-2 posture). Env: ROOMLERD_IDLE_REFINE_MAJOR_AREA_PERMILLE. Restart required.",
-    ),
-    (
-        "idle_refine_settle_ms",
-        "string",
-        "P8a-2 - up-flip settle (ms, 100-5000) on capture-tracked backends: the cap lifts this long after the last major-damage frame (damage truth needs no 1s window drain). Empty = built-in 500. Env: ROOMLERD_IDLE_REFINE_SETTLE_MS. Restart required.",
-    ),
-    (
-        "idle_refine_settle_constrained_ms",
-        "string",
-        "Phase B - tracked settle (ms, 100-10000) on CONSTRAINED transports: the cap lifts only after this long without major damage, because the refined IDR itself costs link time and a 500 ms settle fired on ordinary drag pauses (field: freezing/lag). Empty = built-in 1200 (2000 before the constrained HRD trim bounded the IDR). Env: ROOMLERD_IDLE_REFINE_SETTLE_CONSTRAINED_MS. Restart required.",
-    ),
-    (
-        "constrained_cq_relief",
-        "string",
-        "Constrained-motion CQ relief (softening steps, 0-12) applied at the resolution rung of a RELAY session; the rung exists for motion fluidity and softer frames arrive steadily instead of in lumps (field 2026-08-21: the sharpening bias at the rung was the 9 fps equilibrium). At-rest native quality is untouched; an explicit resolution pick is exempt. Empty = built-in 4; 0 = no relief. Env: ROOMLERD_CONSTRAINED_CQ_RELIEF. Restart required.",
-    ),
-    (
-        "constrained_queue_ms",
-        "string",
-        "Constrained send-queue byte budget (ms of the relay ceiling, 0-2000): frame production skips while more than this much link time is queued, converting viewer lag into a small fps reduction (field 2026-08-21: the drag-start freeze was ~0.5-1 MB of native motion frames queued on a ~2 Mbps relay). Empty = built-in 450; 0 = unbounded (pre-rc.442). Env: ROOMLERD_CONSTRAINED_QUEUE_MS. Restart required.",
-    ),
-    (
-        "constrained_hrd_pct",
-        "string",
-        "HRD/VBV window for CONSTRAINED sessions (percent of maxrate, 25-200). Empty = built-in 200 (the rc.234 2x window; rc.442 defaulted 75 to bound IDR transit and rc.443 reverted it - av1_qsv errors and hangs on a forced IDR that exceeds a sub-1x reservoir). Sub-100 values are per-host experiments only. Env: ROOMLERD_CONSTRAINED_HRD_PCT. Restart required.",
-    ),
-    (
-        "direct_queue_ms",
-        "string",
-        "DIRECT-path send-queue byte budget (ms of the path's rate ceiling, 0-2000, and since FR-74 P1b also the lag bound: bytes over the budget gate only once the MEASURED send wait has crossed this many ms, while bytes alone gate at the encoder's HRD reservoir; it was ms of the AIMD's live target until FR-74 P1 measured that as a self-reinforcing trap): frame production skips while more than this much link time is queued, bounding the standing lag a drag burst can build on a direct session (field 2026-08-26: 100-345 KB queued = the sluggish, rubber-band drag). Empty = built-in 150; 0 = unbounded (pre-P1 posture). Env: ROOMLERD_DIRECT_QUEUE_MS. Restart required.",
-    ),
-    (
-        "direct_hrd_pct",
-        "string",
-        "HRD/VBV window for DIRECT sessions (percent of maxrate, 25-200). Empty = built-in 100 - half the rc.234 2x window, which legalised drag-start bursts of seconds' worth of bits (the standing-queue lag). av1_* encoders are floored at 200 regardless (rc.443: Intel AV1 VDENC errors on an over-reservoir IDR instead of QP-clamping). Env: ROOMLERD_DIRECT_HRD_PCT. Restart required.",
-    ),
-    (
-        "bg_rebuild",
-        "tribool",
-        "Background encoder rebuild (2026-08-27, drag-latency P3). Default ON: on encoders with no in-place bitrate reconfigure (QSV/AMF), a bitrate change opens the replacement on a blocking thread while the current encoder keeps producing, then swaps between frames - no mid-drag stall, and rate drops land DURING motion as smaller frames instead of production skips. false = the rc.445 motion-defer (applies held until 1.2s of quiet, then a blocking re-open). Env: ROOMLERD_BG_REBUILD. Restart required.",
-    ),
-    (
-        "par_convert",
-        "tribool",
-        "Parallel colour conversion (2026-08-27, drag-latency P5). Default ON: big frames run the BGRA->NV12/I444 convert in row bands across threads - byte-identical output, roughly halves the convert share of encode time at 2880x1800+. false = single-threaded convert. Env: ROOMLERD_PAR_CONVERT. Restart required.",
-    ),
-    (
-        "fps_pace",
-        "tribool",
-        "fps-first cadence pacing on HW encoders (2026-08-27, drag-latency P5). Default ON: when the encoder cannot hold target fps, frames are consumed on an EVEN grid at the sustainable rate (5 fps steps, floor 15) instead of dropping ~33% at random phases - even cadence beats a jittery higher rate. While engaged the encode-pressure bitrate factor is masked at 1.0 (pixels-bound HW encode time does not respond to bitrate); the resolution tier stays the second lever. false = unpaced pre-P5 behaviour. Env: ROOMLERD_FPS_PACE. Restart required.",
-    ),
-    (
-        "relay_idr_thrift",
-        "tribool",
-        "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CORPLAP-3 bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLERD_RELAY_IDR_THRIFT. Restart required.",
-    ),
-    (
-        "send_stall_ms",
-        "number",
-        "Blocked-send congestion threshold in ms (2026-08-28, FR-15 P2 follow-up). Default 250; 0 disables. A frame that sat longer than this inside the DataChannel send call is unambiguous congestion - the pipe refused to drain - and the pump feeds the AIMD a congestion sample. This is the one congestion signal that needs NO clock sync and NO viewer and works on both transports, which matters on a relay where the measured-rate clamp is direct-only and the age loop rides a probe the congestion itself biases. Acted on for CONSTRAINED sessions only; direct keeps the measured ceiling. Env: ROOMLER_NODE_SEND_STALL_MS. Restart required.",
-    ),
-    (
-        "relay_age_feedback",
-        "tribool",
-        "Relay age feedback (2026-08-27, FR-15). Default ON: the viewer reports the true paint AGE of the frames it showed (the FR-1 P7 clock probe) on its rc:decodestat window; the agent learns the session's age FLOOR and treats sustained excess (>=70ms over floor for 2 consecutive windows) on a CONSTRAINED transport as over-rate - capping send-fps and feeding the AIMD a congestion sample, so the decrease lands through the normal (FR-10-deferred) apply path. It exists because a relay backlog sits BELOW every agent counter: the field measured 1000ms of viewer age against a 26KB agent queue. false = open-loop 0.4.7 relay posture. Direct sessions unaffected. Env: ROOMLERD_RELAY_AGE_FEEDBACK. Restart required.",
-    ),
-    (
-        "measured_ceiling",
-        "tribool",
-        "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLERD_MEASURED_CEILING. Restart required.",
-    ),
-    (
-        "encoder_inplace_rate",
-        "tribool",
-        "In-place encoder rate changes (2026-09-02, FR-62 A1). Default OFF: a QSV rate move REBUILDS the encoder (a 0.65-0.87 s blocking open on Iris-Xe-class, the reason the defer/swap machinery exists), and the NVENC in-place move writes a 1x HRD buffer. ON: QSV writes bit_rate + rc_max_rate + rc_buffer_size on the AVCodecContext (qsvenc's per-frame update_bitrate resets the BRC, no rebuild) and NVENC sizes the buffer to the window the session opened with. Ships OFF and inert until A0 clears the QSV MFXVideoENCODE_Reset on real Iris-Xe silicon; OFF is byte-for-byte the pre-A1 behaviour. Env: ROOMLERD_ENCODER_INPLACE_RATE. Restart required.",
-    ),
-    (
-        "ice_relay_tcp",
-        "tribool",
-        "Pin remote-control's ICE to a TURN relay (diagnostic). Default OFF: the session takes whatever pair ICE nominates, and `constrained` is MEASURED from that pair (a public relay candidate = constrained; the loopback-TURN does not count). ON forces the relay path, which is bandwidth- and head-of-line-limited, so the encoder runs its constrained posture. ⚠️ This DEGRADES a session that would otherwise be direct - it is a test pin, not a tuning knob, and a device left with it set will be slow for no visible reason. It exists as a key because the constrained posture is otherwise only reproducible when a corporate VPN happens to be up, which makes every constrained-path acceptance test hostage to one laptop's network state; virtual-desktop mode sets the same flag for the same reason. Clear it (empty = default) when the measurement is done. WARNING: on a VIRTUAL-DESKTOP host with a hostile NAT the vd startup auto-pins this to 1, and its check for an explicit operator override reads the OS env var ONLY - so setting this key to false there does not defeat the auto-pin; use a real ROOMLERD_ICE_RELAY_TCP=0 for that one case. Env: ROOMLERD_ICE_RELAY_TCP. Restart required.",
-    ),
-    (
-        "relay_max_kbps",
-        "number",
-        "Bitrate ceiling for a CONSTRAINED (relay) remote-control transport, kbps. Built-in default: 3000; clamped 100-100000. A single TURN relay carries roughly 1-4 Mbps and head-of-line blocks on TCP, so a ceiling sized for a direct pair (a 1920x1200 pair resolves ~12 Mbps) collapses it. LOWER it on a relay population that is thinner than the default assumes. RAISE it only to build a deliberate over-drive for a rate-control measurement: field 2026-09-03, a forced-relay cell on CORPLAP-1 opened at the 2.55 Mbps plan rate into a coturn carrying ~3 Mbps, which is NOT an over-drive - the AIMD simply climbed to the cap and viewer age stayed at 30-49 ms, so the FR-63 A/B had nothing to measure. At 12000 the same real pipe and real encoder give a genuine 4x over-drive on demand, instead of waiting for a corporate VPN to produce one. Pairs with ice_relay_tcp. Env: ROOMLERD_RELAY_MAX_KBPS. Restart required.",
-    ),
-    (
-        "rate_slow_start",
-        "tribool",
-        "Slow-start the session opener (2026-09-03, FR-63). Default OFF. A session commits to a bitrate before it has any evidence about the pipe, and the same host over-drove from BOTH directions on one day: opened at a REMEMBERED 6134627 -> 6287ms of viewer paint age; opened at the NOMINAL relay cap 2550000 into a path measured at ~213000 -> 444ms of queue, 1550ms paint, and six windows collapsing back down. No constant is safe, because a constant is an assumption about a band. ON: open at 300000 (lifted by any PROVEN floor, e.g. the FR-59 P8 remembered-slow-pair open) and DOUBLE per clean window until the ceiling; the first congestion evidence ends the ramp and hands control back to the normal controller. A fast pair reaches a 6.1 Mbps ceiling in 5 windows. Only ever LOWERS the opening commitment - it can never raise a rate above what the controller already allows. Env: ROOMLERD_RATE_SLOW_START. Restart required.",
-    ),
-    (
-        "media_thread",
-        "tribool",
-        "The encoder runs on its own OS thread per session (2026-09-05, FR-70 M1). Default ON since 0.4.70 - M1c met its gate on all three CORPLAP hosts on 0.4.69 (encode and capture averages unchanged, the loop's worst pass per window down on every host, the >50 ms windows fewer). ON: the FFmpeg encoder lives on a dedicated thread named rc-enc-<session> behind a command channel - the pump sends each frame and awaits the packets, and every rate move, keyframe request and background-rebuild adoption is a message applied in order - instead of encoding under block_in_place on whichever async worker happens to poll the pump. Nothing the pump decides changes: same frame, same decision, same packet, one thread hop later. What changes is that the async runtime is never held for the 5-30 ms of an encode (the send task, the control channel and the heartbeats stop sharing a worker with it) and hardware encoders that are thread-affine (Media Foundation per-thread COM, QSV sessions) are driven from one thread for the whole session. A thread that cannot be spawned falls back to the inline path with a warning; a thread that dies surfaces as the next encode's error, which the existing error ladder turns into a rebuild. Gate for flipping the default: FR-65's iter_ms_max / pump_stalls / apply_ms_max on the three CORPLAP hosts, unchanged or better. false = the inline encode, the pre-0.4.70 path. Env: ROOMLERD_MEDIA_THREAD. Restart required.",
-    ),
-    (
-        "pump_stall_watch",
-        "tribool",
-        "Pump stall watch (2026-09-03, FR-65 P0). Default ON: a send-pump iteration slower than pump_stall_warn_ms is logged once with its phase breakdown (capture/scale/encode/apply/send), and the per-heartbeat apply_us / apply_us_max / iter_us_max / pump_stalls counters are published. Costs two Instant::now() per iteration (~20-40ns against a 16.7ms budget at 60fps) and logs nothing until an iteration actually overruns. It exists because a 2s blocking encoder open hid for months: the pump measured capture/scale/encode/send and the stall appeared in NONE of them - the apply/rebuild phase was untimed, and a per-heartbeat AVERAGE cannot represent a single outlier even where it is counted. false = no timing, no counters. Env: ROOMLERD_PUMP_STALL_WATCH. Restart required.",
-    ),
-    (
-        "pump_stall_warn_ms",
-        "number",
-        "Pump stall threshold in ms (2026-09-03, FR-65 P0). Built-in default: 100; clamped 10-5000. Lowered from the 250 this shipped with, because the first field data said 250 was blind to the class that actually hurts: a corp-VPN host reported iter_ms_max=107.6 - real 100ms+ passes, matching the operator's own '>100ms' and '>148ms' age reports - while pump_stalls stayed 0. Deliberately a FLAT wall-clock threshold, NOT a multiple of the frame budget: the pump lowers target_fps BECAUSE it is already struggling, so a budget-relative bar RISES as the session degrades and stops reporting precisely when the trouble starts. Env: ROOMLERD_PUMP_STALL_WARN_MS. Restart required.",
-    ),
-    (
-        "bg_rebuild_constrained",
-        "tribool",
-        "Off-thread encoder rebuild on CONSTRAINED transports too (2026-09-03, FR-65). Default ON: a rebuild-mode encoder open is 0.65-0.87s of BLOCKING work on Iris-Xe-class silicon, and running it on the send pump stalls capture, encode and send together - measured as a ~2s hole. The open now runs on spawn_blocking for constrained paths as it already did for direct ones. Changes only WHERE the open runs, never WHEN the change lands: adoption stays gated on the same quiet window the defer policy uses, so the swap's IDR still arrives on a static scene - adopting mid-motion on a thin pipe is the 2026-08-27 relay regression that put the !constrained guard there originally. false = rebuild inline on constrained paths (pre-FR-65). Env: ROOMLERD_BG_REBUILD_CONSTRAINED. Restart required.",
-    ),
-    (
-        "slow_link_floor",
-        "tribool",
-        "Slow-link floor relief (2026-09-01, FR-59 P1). Default ON: on a CONSTRAINED transport the AIMD legibility floor descends toward the session MEASURED drain rate instead of pinning at the flat 1.5 Mbps MIN_BITRATE_BPS. That flat floor is calibrated for the 2-9 Mbps band every measured relay sat in; on a slower link it is not a floor but a PIN, because it is also where the multiplicative decrease bottoms out - field 2026-09-01 measured a 395 kbps pipe met by a 1.5 Mbps floor, 3.8x over, with the excess landing as 2.3-7.1 s of viewer paint age. Evidence-gated: with no held goodput estimate the nominal floor stands, so a session that never measures is byte-for-byte unchanged. Never descends below slow_link_min_bitrate. false = flat floor (pre-FR-59). Env: ROOMLERD_SLOW_LINK_FLOOR. Restart required.",
-    ),
-    (
-        "slow_link_min_bitrate",
-        "number",
-        "Absolute stop for the FR-59 P1 floor relief, bps (50000-1500000). Empty = built-in 200000. Below roughly this a full-resolution frame is illegible at any QP, so the honest lever is fewer PIXELS rather than fewer bits; the relief exists to let the AIMD converge onto a slow pipe, not to chase it to zero. A value at or above the nominal 1.5 Mbps floor is inert by construction. Env: ROOMLERD_SLOW_LINK_MIN_BITRATE. Restart required.",
-    ),
-    (
-        "constrained_queue_measured",
-        "tribool",
-        "Constrained queue budget denominated in the MEASURED rate (2026-09-01, FR-59 P2). Default ON: the constrained send-queue byte budget is re-derived each iteration from the session measured drain rate instead of being resolved once against the nominal relay ceiling. A budget expressed in MILLISECONDS is a lie unless the bits-per-second it divides by is the pipe: constrained_queue_ms 450 against a nominal 3 Mbps is 168750 bytes, which on a measured 395 kbps link is 3.4 SECONDS of standing queue - and the gate never fired while the viewer sat seconds behind. A held measurement may only ever LOWER the reference. Note this consumes the same lumpy TURN-TCP estimate measured_ceiling deliberately refuses for the CEILING; the asymmetry is the point, since an under-estimate here shrinks the budget (more shedding, LOWER latency) where an under-estimated ceiling collapses quality. false = pre-FR-59. Env: ROOMLERD_CONSTRAINED_QUEUE_MEASURED. Restart required.",
-    ),
-    (
-        "seed_contradiction",
-        "tribool",
-        "Abandon a contradicted rate-memory seed (2026-09-01, FR-59 P6). Default ON: a held goodput measurement more than 2x below the FR-35 learned or seeded ceiling abandons it back to the nominal band. The rate memory keys on the nominated ICE pair remote address, which on a RELAYED session is the relay address rather than the viewer - so one fast day writes a number every later session through that relay inherits for the memory 7-day TTL, whatever network the client is on today (field 2026-09-01: a 5069353 bps seed opened a session on a hotspot measured at 395122 bps, 12.8x under it). Applies to an in-session learned ceiling too, since a measurement is evidence either way and re-climbing is something the learner already does. false = keep the seed until the AIMD walks it down. Env: ROOMLERD_SEED_CONTRADICTION. Restart required.",
-    ),
-    (
-        "viewer_rate_clamp",
-        "tribool",
-        "Viewer-reported link clamp (2026-09-01, FR-59 P3). Default ON: the VIEWER reports the bytes/s it actually received and how much its transit queue GREW this window, and on a constrained transport a sustained growing queue caps send-fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90% of the measured arrival rate. It exists because the agent structurally cannot see this: on a relayed path its own send channel reads empty (field 2026-09-01: bytes_inflight 1-4 KB, send_wait_max_ms 0.1 ms) while seconds of video sit in the relay and the carrier. Unlike the FR-15 age report it needs NO clock probe - a byte count is local and the queue drift is a difference of two intervals, so the unknown offset cancels - which matters because on exactly these links the age is absent or rejected in most windows. The arrival rate may bound the ceiling ONLY while the queue is growing, since otherwise it is merely whatever the agent happened to send. false = observe-and-report only. Env: ROOMLERD_VIEWER_RATE_CLAMP. Restart required.",
-    ),
-    (
-        "queue_drain",
-        "tribool",
-        "Queue drain (2026-09-01, FR-59 P4). Default ON: when the viewer reports a transit queue deeper than a rate cut can clear in reasonable time, the pump STOPS producing for a bounded sub-second pause so the queue drains. A rate cut alone drains at capacity minus inflow, which is the slowest possible way - converging to 90% of a 400 kbps pipe clears a 2 s backlog at 40 kbps, i.e. over ~20 s, which is why a field session stayed seconds behind even after it stopped growing. Pausing sets inflow to zero so the same backlog clears in the ~2 s it represents. Deliberately no forced keyframe on resume: a pause loses no frames so the delta chain survives, and an IDR at these rates is itself seconds of transit. Skipping production rather than discarding the agent queue is the only lever that reaches a queue living in the relay and the carrier - those bytes are already sent and cannot be recalled. false = rate control only. Env: ROOMLERD_QUEUE_DRAIN. Restart required.",
-    ),
-    (
-        "slow_link_profile",
-        "tribool",
-        "Slow-link opening profile (2026-09-01, FR-59 P5). Default ON: a CONSTRAINED session whose pair the rate memory remembers at or below slow_link_profile_bps opens with a 1280 long-edge cap and 15 fps instead of native. The bitrate levers (FR-59 P1-P4) can make the encoder TRACK a 400 kbps pipe but cannot make 1920x1200 at 30 fps legible through it - that is about 1.7 KB per frame; halving the long edge quarters the pixels and halving the rate doubles the per-frame budget, together about 8x the bits per pixel. Resolved ONCE at pump start and never as a mid-session rung, because every rung flip pays a BLOCKING encoder open (0.65-0.87 s measured on Iris Xe) plus a fresh IDR - which is why priority_res_cap is off by default. A pair with NO memory never engages it: an unknown link is not a slow one, and guessing soft would degrade the first session on every healthy relay. false = open at the normal size. Env: ROOMLERD_SLOW_LINK_PROFILE. Restart required.",
-    ),
-    (
-        "slow_link_profile_bps",
-        "number",
-        "Remembered rate at or below which the FR-59 P5 slow-link profile engages, bps. Empty = built-in 1000000; 0 = never engage. Env: ROOMLERD_SLOW_LINK_PROFILE_BPS. Restart required.",
-    ),
-    (
-        "area_min_bitrate",
-        "tribool",
-        "Area-scaled AIMD bitrate floor (2026-08-26). Default ON: the flat 1.5 Mbps floor was a 1080p legibility tuning and is unreadable mush at 5+ MPix; the scaled floor is ~3.1 Mbps at 2880x1800, capped 4 Mbps, unconstrained sessions only (a relay's 3 Mbps clamp keeps the flat floor so the MD keeps room). false = flat 1.5 Mbps floor. Env: ROOMLERD_AREA_MIN_BITRATE. Restart required.",
-    ),
-    (
-        "priority_res_cap",
-        "tribool",
-        "rc.445 - restore the pre-rc.445 Priority-dial resolution caps (Smoother 1024 everywhere / Balanced 1280 on relay). Default OFF: every mid-motion rung flip costs a blocking encoder open (0.65-0.87s measured on Iris Xe) and the field verdict was that never flipping beats the rung; the dial's bit-shedding moved to the ceiling factors. Env: ROOMLERD_PRIORITY_RES_CAP. Restart required.",
-    ),
-    (
-        "smoother_rate_pct",
-        "string",
-        "rc.445 - Smoother's bitrate-ceiling factor (percent, 30-100): a lower ceiling makes the HRD raise QP during motion continuously (smaller frames, steadier fps) with ZERO encoder rebuilds; at-rest quality untouched. Empty = built-in 70. Env: ROOMLERD_SMOOTHER_RATE_PCT. Restart required.",
-    ),
-    (
-        "balanced_rate_pct",
-        "string",
-        "rc.445 - Balanced's bitrate-ceiling factor (percent, 30-100). Empty = built-in 85. Env: ROOMLERD_BALANCED_RATE_PCT. Restart required.",
-    ),
-    (
-        "scale_threads",
-        "string",
-        "HW-downscale Phase A - worker threads (1-8) for the CPU resampler's row-banded passes; a lever for weak hosts where the Smoother rung's downscale eats the frame budget. Empty = built-in 1 (inline, no threads). Env: ROOMLERD_SCALE_THREADS. Restart required.",
-    ),
-    (
-        "ice_follow_renomination",
-        "enum:auto|always|never",
-        "Media-ICE nomination-follow policy. auto (empty) = upward-only + stale-failover (recommended); always = legacy follow-everything (thrash-prone, diagnostics only); never = pin to first nomination. Env: ROOMLER_ICE_FOLLOW_RENOMINATION.",
-    ),
-    (
-        "ice_warm_standby",
-        "tribool",
-        "Keepalive pings on validated-but-unselected media ICE pairs (keeps the real-path fallback's NAT mapping alive). Built-in default: on. Env: ROOMLER_ICE_WARM_STANDBY.",
-    ),
-    (
-        "ice_overlay_host_deprioritize",
-        "tribool",
-        "Rank overlay-TUN host candidates below srflx in media ICE (media prefers the real path). Built-in default: on. Env: ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE.",
-    ),
-    (
-        "overlay_tier_detect",
-        "tribool",
-        "Clamp media bitrate when the overlay carrier under a nominated pair is relay-tier. Built-in default: on. Env: ROOMLERD_OVERLAY_TIER_DETECT.",
-    ),
-    (
-        "overlay_rtt_q",
-        "tribool",
-        "B1 - feed the 15 s overlay RTT probes into the PathMonitor quality plane (Q-only, never eligibility). Built-in default: on. Env: ROOMLERD_OVERLAY_RTT_Q.",
-    ),
-    (
-        "overlay_upward_probe",
-        "tribool",
-        "B3 - probe an eligible higher tier from a healthy srflx/public incumbent every >=120 s (MBB; incumbent held until latch). Built-in default: on. Env: ROOMLERD_OVERLAY_UPWARD_PROBE.",
-    ),
-    (
-        "relay_probe",
-        "tribool",
-        "Multi-region relay PoPs - probe the server-pushed region list (timed STUN per PoP) and report RTTs; the server derives this node's relay_home from them. Built-in default: on. Env: ROOMLERD_RELAY_PROBE.",
-    ),
-    (
-        "text_mod_neutralize",
-        "tribool",
-        "KeyText typing: temporarily release physically-held Shift/Ctrl/Alt the remote layout does not want around each character tap (fixes wrong/dead symbols on non-US layouts). Built-in default: on. Env: ROOMLERD_TEXT_MOD_NEUTRALIZE. Restart required.",
-    ),
-    (
-        "caps_cache",
-        "tribool",
-        "FR-77 P3 - cache the hardware encoder probe across daemon restarts, keyed by GPU + driver + OS build + roomlerd build; re-probed on any change or after 7 days. Built-in default: on. Env: ROOMLERD_CAPS_CACHE.",
-    ),
-    (
-        "encoder_cells_deny",
-        "string",
-        "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444); `none` = deny nothing. Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
-    ),
-    (
-        "vaapi_device",
-        "string",
-        "FR-77 P4 - pin the VAAPI render node the Linux daemon opens (e.g. /dev/dri/renderD129). Empty = the first node libva accepts, /dev/dri/renderD128..135 in order. Env: ROOMLERD_VAAPI_DEVICE. Restart required.",
-    ),
-    (
-        "d3d12_adapter",
-        "string",
-        "FR-78 P1 - pin the DXGI adapter index the D3D12 video-encode device opens on (Windows; e.g. 1). Empty = adapters 0..3 in order, the first FFmpeg accepts. Env: ROOMLERD_D3D12_ADAPTER. Restart required.",
-    ),
-    (
-        "vulkan_device",
-        "string",
-        "FR-78 P1 - pin the Vulkan physical device by index or name (e.g. 1, or NVIDIA GeForce RTX 5090). Empty = the loader's default device. Env: ROOMLERD_VULKAN_DEVICE. Restart required.",
-    ),
-    (
-        "forward_acl",
-        "json",
-        "Agent-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
-    ),
-    (
-        "virtual_desktop_apps",
-        "json",
-        "Remote app launcher config for virtual-desktop hosts (JSON; browser only ever sends an allowlist key).",
-    ),
+    },
+    KeyMeta {
+        key: "auto_update",
+        group: Group::Device,
+        tier: Tier::Essential,
+        live: false,
+        kind: "tribool",
+        description: "Periodic self-update checks (also gates web-pushed updates). Built-in default: on.",
+    },
+    KeyMeta {
+        key: "logs_upload_disabled",
+        group: Group::Device,
+        tier: Tier::Standard,
+        live: false,
+        kind: "tribool",
+        description: "Disable centralized diagnostic-log upload. Built-in default: uploads on.",
+    },
+    KeyMeta {
+        key: "rate_factor_h264",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "H.264 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_H264. Empty = built-in 150. Restart required.",
+    },
+    KeyMeta {
+        key: "rate_factor_hevc",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "HEVC maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_HEVC. Empty = built-in 125. Restart required.",
+    },
+    KeyMeta {
+        key: "rate_factor_vp9",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "VP9 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_VP9. Empty = built-in 125. Restart required.",
+    },
+    KeyMeta {
+        key: "rate_factor_av1",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "AV1 maxrate ceiling factor, % (50-400). Env: ROOMLERD_RATE_FACTOR_AV1. Empty = built-in 100. Restart required.",
+    },
+    KeyMeta {
+        key: "rate_factor_h264_444",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-77 P3 - the chroma column: H.264 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_h264. Env: ROOMLERD_RATE_FACTOR_H264_444. Empty = built-in 150. Restart required.",
+    },
+    KeyMeta {
+        key: "rate_factor_hevc_444",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-77 P3 - the chroma column: HEVC 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_hevc. Env: ROOMLERD_RATE_FACTOR_HEVC_444. Empty = built-in 150. Restart required.",
+    },
+    KeyMeta {
+        key: "rate_factor_vp9_444",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-77 P3 - the chroma column: VP9 4:4:4 cells' extra maxrate factor, % (50-400), applied on top of rate_factor_vp9. Env: ROOMLERD_RATE_FACTOR_VP9_444. Empty = built-in 150. Restart required.",
+    },
+    KeyMeta {
+        key: "lanczos_min_pct",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "P7 - minimum linear downscale (percent, 0-100) at which the Lanczos-3 text-sharp filter engages; shallower shrinks use box. Empty = built-in 34 (covers the Smoother rungs; 56 restores the pre-P7 gate; 0 = always). Env: ROOMLERD_LANCZOS_MIN_PCT. Restart required.",
+    },
+    KeyMeta {
+        key: "nvenc_spatial_aq",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "P7 - NVENC spatial AQ. Built-in default: OFF (AQ steals bits from desktop text); true restores it for camera-heavy hosts. Env: ROOMLERD_NVENC_SPATIAL_AQ. Restart required.",
+    },
+    KeyMeta {
+        key: "scale_cq_boost",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "P7 - CQ sharpening steps granted at deep resolution rungs (0-12; spends the maxrate-floor headroom on text). Empty = built-in 4; 0 disables. Env: ROOMLERD_SCALE_CQ_BOOST. Restart required.",
+    },
+    KeyMeta {
+        key: "idle_refine",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "P7 - idle native-rung refinement: lift the resolution cap when the scene settles so text is crisp at rest; motion restores it in ~300 ms. Built-in default: on (Smoother scope). Env: ROOMLERD_IDLE_REFINE. Restart required.",
+    },
+    KeyMeta {
+        key: "idle_refine_balanced",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "P7 - idle refinement on Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: on since P7c (field-proven on the winhost-b relay); off restores the un-refined Balanced rung. Env: ROOMLERD_IDLE_REFINE_BALANCED. Restart required.",
+    },
+    KeyMeta {
+        key: "gpu_scale",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "HW-downscale Phase B - GPU scale-before-readback (D3D11 VideoProcessor) on DXGI-direct capture: the Smoother rung is scaled on the GPU and the readback shrinks with it. Built-in default: on; off reverts to the Phase-A CPU resample. Env: ROOMLERD_GPU_SCALE. Restart required.",
+    },
+    KeyMeta {
+        key: "overlay_lan_capture_probe",
+        group: Group::Network,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-33 - probe each LAN prefix for a corp-VPN split-prefix capture (own address on interface A, traffic to the prefix leaves via interface B) and surface it in status / why / the RC pill. Built-in default: on (a read-only route lookup per LAN address per netstate snapshot). Env: ROOMLERD_OVERLAY_LAN_CAPTURE_PROBE. Restart required.",
+    },
+    KeyMeta {
+        key: "relay_ceiling_learn",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-35 - let the constrained (relay) ceiling grow above the nominal 3 Mbps on delivery evidence (AIMD pinned at the ceiling, the window carried >=70% of it, no decrease/stall for 10 s, viewer age within 1.5x floor) and remember the pair's stable rate so the next session opens there. Built-in default: on. Env: ROOMLERD_RELAY_CEILING_LEARN. Restart required.",
+    },
+    KeyMeta {
+        key: "drm_capture",
+        group: Group::CaptureInput,
+        tier: Tier::Standard,
+        live: false,
+        kind: "tribool",
+        description: "FR-36 - capture the scanout framebuffer via DRM/KMS, BELOW the compositor. The only backend that can see a Wayland desktop, a locked screen or the login greeter (the xdg portal refuses all three). Built-in default: OFF - it carries no damage information, so enabling it where X11 works costs the FR-29 idle-CPU win. Env: ROOMLERD_DRM_CAPTURE. Restart required.",
+    },
+    KeyMeta {
+        key: "uinput",
+        group: Group::CaptureInput,
+        tier: Tier::Standard,
+        live: false,
+        kind: "tribool",
+        description: "FR-36 - inject input through /dev/uinput, below the compositor. Pair with drm_capture on a Wayland host: XTest reaches Xwayland clients ONLY, so without this a captured Wayland session is read-only. Built-in default: OFF - a uinput device is host-global and injects into whatever has focus, including the greeter and lock screen. Env: ROOMLERD_UINPUT. Restart required.",
+    },
+    KeyMeta {
+        key: "portal_capture",
+        group: Group::CaptureInput,
+        tier: Tier::Standard,
+        live: false,
+        kind: "tribool",
+        description: "FR-45 - capture a Wayland desktop through xdg-desktop-portal ScreenCast + PipeWire. The ATTENDED path: needs a logged-in user session, and the first use shows that user a consent dialog (later ones restore the grant without asking). Serves hosts DRM cannot reach - no scanout, nested compositors. Built-in default: OFF - an unattended host would wait forever on a dialog nobody answers. Tried after DRM, before X11. Env: ROOMLERD_PORTAL_CAPTURE. Restart required.",
+    },
+    KeyMeta {
+        key: "portal_input",
+        group: Group::CaptureInput,
+        tier: Tier::Standard,
+        live: false,
+        kind: "tribool",
+        description: "FR-45 P4 - inject input through the portal RemoteDesktop interface, riding the SAME portal session (one consent dialog covers see+touch). Built-in default: OFF - a WithInput session needs its own see+touch consent + restore token, so enabling it makes every portal capture prompt afresh (and block or fall through if unanswered), regressing capture where capture-only works; it has also not yet been field-proven to land input. On = the portal session can be controlled; inert unless portal_capture is on. NOTE (measured on GNOME): this key alone is not enough - the portal's consent dialog carries a SEPARATE 'Allow Remote Interaction' switch that defaults OFF, so a human who only clicks Share grants capture and the session runs view-only. Env: ROOMLERD_PORTAL_INPUT. Restart required.",
+    },
+    KeyMeta {
+        key: "mutter_capture",
+        group: Group::CaptureInput,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-45 P5 - take screencast frames from org.gnome.Mutter.ScreenCast DIRECTLY instead of the desktop portal. For hosts where no portal backend can run at all (measured on WSL2: xdg-desktop-portal-gnome exits without a GNOME session, while mutter itself works). GNOME-only. Built-in default: OFF. ** UNATTENDED - this shows NO consent dialog; its peer is drm_capture, not portal_capture.** Env: ROOMLERD_MUTTER_CAPTURE. Restart required.",
+    },
+    KeyMeta {
+        key: "window_capture",
+        group: Group::CaptureInput,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-56 P4 - capture ONE application window instead of the whole monitor (the RAIL-shaped half of Remote Apps: the viewer sees one app, not the desktop). Built-in default: OFF. ** ATTENDED BY CONSTRUCTION - the portal answers this by showing the person at the screen a WINDOW PICKER, and nothing agent-side can name a window (GNOME refuses Introspect.GetWindows), so on an unattended host the capture never starts.** Env: ROOMLERD_WINDOW_CAPTURE. Restart required.",
+    },
+    KeyMeta {
+        key: "x11_damage",
+        group: Group::CaptureInput,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-29 - skip the XShm readback when XDAMAGE proves the screen is unchanged. Built-in default: on; took a Linux host's idle capture from 45.8% of a core to 2.8%. Env: ROOMLERD_X11_DAMAGE. Restart required.",
+    },
+    KeyMeta {
+        key: "overlay_key_rotation",
+        group: Group::Network,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-40 - honour rc:agent.key_rotate: an admin retiring this device's overlay (WireGuard) key from the dashboard. The device mints the new key locally, persists it and re-joins the mesh under it; the server never sees a private key. Built-in default: on (a kill switch, not a gate - the order leaks nothing). Env: ROOMLERD_OVERLAY_KEY_ROTATION. Restart required.",
+    },
+    KeyMeta {
+        key: "relay_max_hi_kbps",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-35 - upper bound (kbps, 0-100000) for the learned relay ceiling. Empty = built-in 8000 (one pair measured: sustained 6-9 Mbps, choked at 12.8); 0 = learning off. Env: ROOMLERD_RELAY_MAX_HI_KBPS. Restart required.",
+    },
+    KeyMeta {
+        key: "idle_refine_max_edge",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLERD_IDLE_REFINE_MAX_EDGE. Restart required.",
+    },
+    KeyMeta {
+        key: "idle_refine_min_frame_kb",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Defined at the 1024x640 reference rung and scaled by the live encode area (P7c-2 - a fixed floor oscillated across rungs). Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLERD_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
+    },
+    KeyMeta {
+        key: "idle_refine_major_area_permille",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "P8a-2 - MAJOR-motion area floor (permille of the frame, 0-1000) on capture-tracked backends (DXGI-direct/WGC): only damage at/above it restores the resolution cap; smaller damage (typing, popups, windowed terminal scrolls, PiP video) stays at native so text is sharp all the time. Empty = built-in 400 (40%); 0 = any non-empty tracked damage counts (pre-P8a-2 posture). Env: ROOMLERD_IDLE_REFINE_MAJOR_AREA_PERMILLE. Restart required.",
+    },
+    KeyMeta {
+        key: "idle_refine_settle_ms",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "P8a-2 - up-flip settle (ms, 100-5000) on capture-tracked backends: the cap lifts this long after the last major-damage frame (damage truth needs no 1s window drain). Empty = built-in 500. Env: ROOMLERD_IDLE_REFINE_SETTLE_MS. Restart required.",
+    },
+    KeyMeta {
+        key: "idle_refine_settle_constrained_ms",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "Phase B - tracked settle (ms, 100-10000) on CONSTRAINED transports: the cap lifts only after this long without major damage, because the refined IDR itself costs link time and a 500 ms settle fired on ordinary drag pauses (field: freezing/lag). Empty = built-in 1200 (2000 before the constrained HRD trim bounded the IDR). Env: ROOMLERD_IDLE_REFINE_SETTLE_CONSTRAINED_MS. Restart required.",
+    },
+    KeyMeta {
+        key: "constrained_cq_relief",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "Constrained-motion CQ relief (softening steps, 0-12) applied at the resolution rung of a RELAY session; the rung exists for motion fluidity and softer frames arrive steadily instead of in lumps (field 2026-08-21: the sharpening bias at the rung was the 9 fps equilibrium). At-rest native quality is untouched; an explicit resolution pick is exempt. Empty = built-in 4; 0 = no relief. Env: ROOMLERD_CONSTRAINED_CQ_RELIEF. Restart required.",
+    },
+    KeyMeta {
+        key: "constrained_queue_ms",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "Constrained send-queue byte budget (ms of the relay ceiling, 0-2000): frame production skips while more than this much link time is queued, converting viewer lag into a small fps reduction (field 2026-08-21: the drag-start freeze was ~0.5-1 MB of native motion frames queued on a ~2 Mbps relay). Empty = built-in 450; 0 = unbounded (pre-rc.442). Env: ROOMLERD_CONSTRAINED_QUEUE_MS. Restart required.",
+    },
+    KeyMeta {
+        key: "constrained_hrd_pct",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "HRD/VBV window for CONSTRAINED sessions (percent of maxrate, 25-200). Empty = built-in 200 (the rc.234 2x window; rc.442 defaulted 75 to bound IDR transit and rc.443 reverted it - av1_qsv errors and hangs on a forced IDR that exceeds a sub-1x reservoir). Sub-100 values are per-host experiments only. Env: ROOMLERD_CONSTRAINED_HRD_PCT. Restart required.",
+    },
+    KeyMeta {
+        key: "direct_queue_ms",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "DIRECT-path send-queue byte budget (ms of the path's rate ceiling, 0-2000, and since FR-74 P1b also the lag bound: bytes over the budget gate only once the MEASURED send wait has crossed this many ms, while bytes alone gate at the encoder's HRD reservoir; it was ms of the AIMD's live target until FR-74 P1 measured that as a self-reinforcing trap): frame production skips while more than this much link time is queued, bounding the standing lag a drag burst can build on a direct session (field 2026-08-26: 100-345 KB queued = the sluggish, rubber-band drag). Empty = built-in 150; 0 = unbounded (pre-P1 posture). Env: ROOMLERD_DIRECT_QUEUE_MS. Restart required.",
+    },
+    KeyMeta {
+        key: "direct_hrd_pct",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "HRD/VBV window for DIRECT sessions (percent of maxrate, 25-200). Empty = built-in 100 - half the rc.234 2x window, which legalised drag-start bursts of seconds' worth of bits (the standing-queue lag). av1_* encoders are floored at 200 regardless (rc.443: Intel AV1 VDENC errors on an over-reservoir IDR instead of QP-clamping). Env: ROOMLERD_DIRECT_HRD_PCT. Restart required.",
+    },
+    KeyMeta {
+        key: "bg_rebuild",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Background encoder rebuild (2026-08-27, drag-latency P3). Default ON: on encoders with no in-place bitrate reconfigure (QSV/AMF), a bitrate change opens the replacement on a blocking thread while the current encoder keeps producing, then swaps between frames - no mid-drag stall, and rate drops land DURING motion as smaller frames instead of production skips. false = the rc.445 motion-defer (applies held until 1.2s of quiet, then a blocking re-open). Env: ROOMLERD_BG_REBUILD. Restart required.",
+    },
+    KeyMeta {
+        key: "par_convert",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Parallel colour conversion (2026-08-27, drag-latency P5). Default ON: big frames run the BGRA->NV12/I444 convert in row bands across threads - byte-identical output, roughly halves the convert share of encode time at 2880x1800+. false = single-threaded convert. Env: ROOMLERD_PAR_CONVERT. Restart required.",
+    },
+    KeyMeta {
+        key: "fps_pace",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "fps-first cadence pacing on HW encoders (2026-08-27, drag-latency P5). Default ON: when the encoder cannot hold target fps, frames are consumed on an EVEN grid at the sustainable rate (5 fps steps, floor 15) instead of dropping ~33% at random phases - even cadence beats a jittery higher rate. While engaged the encode-pressure bitrate factor is masked at 1.0 (pixels-bound HW encode time does not respond to bitrate); the resolution tier stays the second lever. false = unpaced pre-P5 behaviour. Env: ROOMLERD_FPS_PACE. Restart required.",
+    },
+    KeyMeta {
+        key: "relay_idr_thrift",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CORPLAP-3 bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLERD_RELAY_IDR_THRIFT. Restart required.",
+    },
+    KeyMeta {
+        key: "send_stall_ms",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Blocked-send congestion threshold in ms (2026-08-28, FR-15 P2 follow-up). Default 250; 0 disables. A frame that sat longer than this inside the DataChannel send call is unambiguous congestion - the pipe refused to drain - and the pump feeds the AIMD a congestion sample. This is the one congestion signal that needs NO clock sync and NO viewer and works on both transports, which matters on a relay where the measured-rate clamp is direct-only and the age loop rides a probe the congestion itself biases. Acted on for CONSTRAINED sessions only; direct keeps the measured ceiling. Env: ROOMLER_NODE_SEND_STALL_MS. Restart required.",
+    },
+    KeyMeta {
+        key: "relay_age_feedback",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Relay age feedback (2026-08-27, FR-15). Default ON: the viewer reports the true paint AGE of the frames it showed (the FR-1 P7 clock probe) on its rc:decodestat window; the agent learns the session's age FLOOR and treats sustained excess (>=70ms over floor for 2 consecutive windows) on a CONSTRAINED transport as over-rate - capping send-fps and feeding the AIMD a congestion sample, so the decrease lands through the normal (FR-10-deferred) apply path. It exists because a relay backlog sits BELOW every agent counter: the field measured 1000ms of viewer age against a 26KB agent queue. false = open-loop 0.4.7 relay posture. Direct sessions unaffected. Env: ROOMLERD_RELAY_AGE_FEEDBACK. Restart required.",
+    },
+    KeyMeta {
+        key: "measured_ceiling",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLERD_MEASURED_CEILING. Restart required.",
+    },
+    KeyMeta {
+        key: "encoder_inplace_rate",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "In-place encoder rate changes (2026-09-02, FR-62 A1). Default OFF: a QSV rate move REBUILDS the encoder (a 0.65-0.87 s blocking open on Iris-Xe-class, the reason the defer/swap machinery exists), and the NVENC in-place move writes a 1x HRD buffer. ON: QSV writes bit_rate + rc_max_rate + rc_buffer_size on the AVCodecContext (qsvenc's per-frame update_bitrate resets the BRC, no rebuild) and NVENC sizes the buffer to the window the session opened with. Ships OFF and inert until A0 clears the QSV MFXVideoENCODE_Reset on real Iris-Xe silicon; OFF is byte-for-byte the pre-A1 behaviour. Env: ROOMLERD_ENCODER_INPLACE_RATE. Restart required.",
+    },
+    KeyMeta {
+        key: "ice_relay_tcp",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Pin remote-control's ICE to a TURN relay (diagnostic). Default OFF: the session takes whatever pair ICE nominates, and `constrained` is MEASURED from that pair (a public relay candidate = constrained; the loopback-TURN does not count). ON forces the relay path, which is bandwidth- and head-of-line-limited, so the encoder runs its constrained posture. ⚠️ This DEGRADES a session that would otherwise be direct - it is a test pin, not a tuning knob, and a device left with it set will be slow for no visible reason. It exists as a key because the constrained posture is otherwise only reproducible when a corporate VPN happens to be up, which makes every constrained-path acceptance test hostage to one laptop's network state; virtual-desktop mode sets the same flag for the same reason. Clear it (empty = default) when the measurement is done. WARNING: on a VIRTUAL-DESKTOP host with a hostile NAT the vd startup auto-pins this to 1, and its check for an explicit operator override reads the OS env var ONLY - so setting this key to false there does not defeat the auto-pin; use a real ROOMLERD_ICE_RELAY_TCP=0 for that one case. Env: ROOMLERD_ICE_RELAY_TCP. Restart required.",
+    },
+    KeyMeta {
+        key: "relay_max_kbps",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Bitrate ceiling for a CONSTRAINED (relay) remote-control transport, kbps. Built-in default: 3000; clamped 100-100000. A single TURN relay carries roughly 1-4 Mbps and head-of-line blocks on TCP, so a ceiling sized for a direct pair (a 1920x1200 pair resolves ~12 Mbps) collapses it. LOWER it on a relay population that is thinner than the default assumes. RAISE it only to build a deliberate over-drive for a rate-control measurement: field 2026-09-03, a forced-relay cell on CORPLAP-1 opened at the 2.55 Mbps plan rate into a coturn carrying ~3 Mbps, which is NOT an over-drive - the AIMD simply climbed to the cap and viewer age stayed at 30-49 ms, so the FR-63 A/B had nothing to measure. At 12000 the same real pipe and real encoder give a genuine 4x over-drive on demand, instead of waiting for a corporate VPN to produce one. Pairs with ice_relay_tcp. Env: ROOMLERD_RELAY_MAX_KBPS. Restart required.",
+    },
+    KeyMeta {
+        key: "rate_slow_start",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Slow-start the session opener (2026-09-03, FR-63). Default OFF. A session commits to a bitrate before it has any evidence about the pipe, and the same host over-drove from BOTH directions on one day: opened at a REMEMBERED 6134627 -> 6287ms of viewer paint age; opened at the NOMINAL relay cap 2550000 into a path measured at ~213000 -> 444ms of queue, 1550ms paint, and six windows collapsing back down. No constant is safe, because a constant is an assumption about a band. ON: open at 300000 (lifted by any PROVEN floor, e.g. the FR-59 P8 remembered-slow-pair open) and DOUBLE per clean window until the ceiling; the first congestion evidence ends the ramp and hands control back to the normal controller. A fast pair reaches a 6.1 Mbps ceiling in 5 windows. Only ever LOWERS the opening commitment - it can never raise a rate above what the controller already allows. Env: ROOMLERD_RATE_SLOW_START. Restart required.",
+    },
+    KeyMeta {
+        key: "media_thread",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "The encoder runs on its own OS thread per session (2026-09-05, FR-70 M1). Default ON since 0.4.70 - M1c met its gate on all three CORPLAP hosts on 0.4.69 (encode and capture averages unchanged, the loop's worst pass per window down on every host, the >50 ms windows fewer). ON: the FFmpeg encoder lives on a dedicated thread named rc-enc-<session> behind a command channel - the pump sends each frame and awaits the packets, and every rate move, keyframe request and background-rebuild adoption is a message applied in order - instead of encoding under block_in_place on whichever async worker happens to poll the pump. Nothing the pump decides changes: same frame, same decision, same packet, one thread hop later. What changes is that the async runtime is never held for the 5-30 ms of an encode (the send task, the control channel and the heartbeats stop sharing a worker with it) and hardware encoders that are thread-affine (Media Foundation per-thread COM, QSV sessions) are driven from one thread for the whole session. A thread that cannot be spawned falls back to the inline path with a warning; a thread that dies surfaces as the next encode's error, which the existing error ladder turns into a rebuild. Gate for flipping the default: FR-65's iter_ms_max / pump_stalls / apply_ms_max on the three CORPLAP hosts, unchanged or better. false = the inline encode, the pre-0.4.70 path. Env: ROOMLERD_MEDIA_THREAD. Restart required.",
+    },
+    KeyMeta {
+        key: "pump_stall_watch",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Pump stall watch (2026-09-03, FR-65 P0). Default ON: a send-pump iteration slower than pump_stall_warn_ms is logged once with its phase breakdown (capture/scale/encode/apply/send), and the per-heartbeat apply_us / apply_us_max / iter_us_max / pump_stalls counters are published. Costs two Instant::now() per iteration (~20-40ns against a 16.7ms budget at 60fps) and logs nothing until an iteration actually overruns. It exists because a 2s blocking encoder open hid for months: the pump measured capture/scale/encode/send and the stall appeared in NONE of them - the apply/rebuild phase was untimed, and a per-heartbeat AVERAGE cannot represent a single outlier even where it is counted. false = no timing, no counters. Env: ROOMLERD_PUMP_STALL_WATCH. Restart required.",
+    },
+    KeyMeta {
+        key: "pump_stall_warn_ms",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Pump stall threshold in ms (2026-09-03, FR-65 P0). Built-in default: 100; clamped 10-5000. Lowered from the 250 this shipped with, because the first field data said 250 was blind to the class that actually hurts: a corp-VPN host reported iter_ms_max=107.6 - real 100ms+ passes, matching the operator's own '>100ms' and '>148ms' age reports - while pump_stalls stayed 0. Deliberately a FLAT wall-clock threshold, NOT a multiple of the frame budget: the pump lowers target_fps BECAUSE it is already struggling, so a budget-relative bar RISES as the session degrades and stops reporting precisely when the trouble starts. Env: ROOMLERD_PUMP_STALL_WARN_MS. Restart required.",
+    },
+    KeyMeta {
+        key: "bg_rebuild_constrained",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Off-thread encoder rebuild on CONSTRAINED transports too (2026-09-03, FR-65). Default ON: a rebuild-mode encoder open is 0.65-0.87s of BLOCKING work on Iris-Xe-class silicon, and running it on the send pump stalls capture, encode and send together - measured as a ~2s hole. The open now runs on spawn_blocking for constrained paths as it already did for direct ones. Changes only WHERE the open runs, never WHEN the change lands: adoption stays gated on the same quiet window the defer policy uses, so the swap's IDR still arrives on a static scene - adopting mid-motion on a thin pipe is the 2026-08-27 relay regression that put the !constrained guard there originally. false = rebuild inline on constrained paths (pre-FR-65). Env: ROOMLERD_BG_REBUILD_CONSTRAINED. Restart required.",
+    },
+    KeyMeta {
+        key: "slow_link_floor",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Slow-link floor relief (2026-09-01, FR-59 P1). Default ON: on a CONSTRAINED transport the AIMD legibility floor descends toward the session MEASURED drain rate instead of pinning at the flat 1.5 Mbps MIN_BITRATE_BPS. That flat floor is calibrated for the 2-9 Mbps band every measured relay sat in; on a slower link it is not a floor but a PIN, because it is also where the multiplicative decrease bottoms out - field 2026-09-01 measured a 395 kbps pipe met by a 1.5 Mbps floor, 3.8x over, with the excess landing as 2.3-7.1 s of viewer paint age. Evidence-gated: with no held goodput estimate the nominal floor stands, so a session that never measures is byte-for-byte unchanged. Never descends below slow_link_min_bitrate. false = flat floor (pre-FR-59). Env: ROOMLERD_SLOW_LINK_FLOOR. Restart required.",
+    },
+    KeyMeta {
+        key: "slow_link_min_bitrate",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Absolute stop for the FR-59 P1 floor relief, bps (50000-1500000). Empty = built-in 200000. Below roughly this a full-resolution frame is illegible at any QP, so the honest lever is fewer PIXELS rather than fewer bits; the relief exists to let the AIMD converge onto a slow pipe, not to chase it to zero. A value at or above the nominal 1.5 Mbps floor is inert by construction. Env: ROOMLERD_SLOW_LINK_MIN_BITRATE. Restart required.",
+    },
+    KeyMeta {
+        key: "constrained_queue_measured",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Constrained queue budget denominated in the MEASURED rate (2026-09-01, FR-59 P2). Default ON: the constrained send-queue byte budget is re-derived each iteration from the session measured drain rate instead of being resolved once against the nominal relay ceiling. A budget expressed in MILLISECONDS is a lie unless the bits-per-second it divides by is the pipe: constrained_queue_ms 450 against a nominal 3 Mbps is 168750 bytes, which on a measured 395 kbps link is 3.4 SECONDS of standing queue - and the gate never fired while the viewer sat seconds behind. A held measurement may only ever LOWER the reference. Note this consumes the same lumpy TURN-TCP estimate measured_ceiling deliberately refuses for the CEILING; the asymmetry is the point, since an under-estimate here shrinks the budget (more shedding, LOWER latency) where an under-estimated ceiling collapses quality. false = pre-FR-59. Env: ROOMLERD_CONSTRAINED_QUEUE_MEASURED. Restart required.",
+    },
+    KeyMeta {
+        key: "seed_contradiction",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Abandon a contradicted rate-memory seed (2026-09-01, FR-59 P6). Default ON: a held goodput measurement more than 2x below the FR-35 learned or seeded ceiling abandons it back to the nominal band. The rate memory keys on the nominated ICE pair remote address, which on a RELAYED session is the relay address rather than the viewer - so one fast day writes a number every later session through that relay inherits for the memory 7-day TTL, whatever network the client is on today (field 2026-09-01: a 5069353 bps seed opened a session on a hotspot measured at 395122 bps, 12.8x under it). Applies to an in-session learned ceiling too, since a measurement is evidence either way and re-climbing is something the learner already does. false = keep the seed until the AIMD walks it down. Env: ROOMLERD_SEED_CONTRADICTION. Restart required.",
+    },
+    KeyMeta {
+        key: "viewer_rate_clamp",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Viewer-reported link clamp (2026-09-01, FR-59 P3). Default ON: the VIEWER reports the bytes/s it actually received and how much its transit queue GREW this window, and on a constrained transport a sustained growing queue caps send-fps, feeds the AIMD a congestion sample, and bounds the ceiling at 90% of the measured arrival rate. It exists because the agent structurally cannot see this: on a relayed path its own send channel reads empty (field 2026-09-01: bytes_inflight 1-4 KB, send_wait_max_ms 0.1 ms) while seconds of video sit in the relay and the carrier. Unlike the FR-15 age report it needs NO clock probe - a byte count is local and the queue drift is a difference of two intervals, so the unknown offset cancels - which matters because on exactly these links the age is absent or rejected in most windows. The arrival rate may bound the ceiling ONLY while the queue is growing, since otherwise it is merely whatever the agent happened to send. false = observe-and-report only. Env: ROOMLERD_VIEWER_RATE_CLAMP. Restart required.",
+    },
+    KeyMeta {
+        key: "queue_drain",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Queue drain (2026-09-01, FR-59 P4). Default ON: when the viewer reports a transit queue deeper than a rate cut can clear in reasonable time, the pump STOPS producing for a bounded sub-second pause so the queue drains. A rate cut alone drains at capacity minus inflow, which is the slowest possible way - converging to 90% of a 400 kbps pipe clears a 2 s backlog at 40 kbps, i.e. over ~20 s, which is why a field session stayed seconds behind even after it stopped growing. Pausing sets inflow to zero so the same backlog clears in the ~2 s it represents. Deliberately no forced keyframe on resume: a pause loses no frames so the delta chain survives, and an IDR at these rates is itself seconds of transit. Skipping production rather than discarding the agent queue is the only lever that reaches a queue living in the relay and the carrier - those bytes are already sent and cannot be recalled. false = rate control only. Env: ROOMLERD_QUEUE_DRAIN. Restart required.",
+    },
+    KeyMeta {
+        key: "slow_link_profile",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Slow-link opening profile (2026-09-01, FR-59 P5). Default ON: a CONSTRAINED session whose pair the rate memory remembers at or below slow_link_profile_bps opens with a 1280 long-edge cap and 15 fps instead of native. The bitrate levers (FR-59 P1-P4) can make the encoder TRACK a 400 kbps pipe but cannot make 1920x1200 at 30 fps legible through it - that is about 1.7 KB per frame; halving the long edge quarters the pixels and halving the rate doubles the per-frame budget, together about 8x the bits per pixel. Resolved ONCE at pump start and never as a mid-session rung, because every rung flip pays a BLOCKING encoder open (0.65-0.87 s measured on Iris Xe) plus a fresh IDR - which is why priority_res_cap is off by default. A pair with NO memory never engages it: an unknown link is not a slow one, and guessing soft would degrade the first session on every healthy relay. false = open at the normal size. Env: ROOMLERD_SLOW_LINK_PROFILE. Restart required.",
+    },
+    KeyMeta {
+        key: "slow_link_profile_bps",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Remembered rate at or below which the FR-59 P5 slow-link profile engages, bps. Empty = built-in 1000000; 0 = never engage. Env: ROOMLERD_SLOW_LINK_PROFILE_BPS. Restart required.",
+    },
+    KeyMeta {
+        key: "area_min_bitrate",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Area-scaled AIMD bitrate floor (2026-08-26). Default ON: the flat 1.5 Mbps floor was a 1080p legibility tuning and is unreadable mush at 5+ MPix; the scaled floor is ~3.1 Mbps at 2880x1800, capped 4 Mbps, unconstrained sessions only (a relay's 3 Mbps clamp keeps the flat floor so the MD keeps room). false = flat 1.5 Mbps floor. Env: ROOMLERD_AREA_MIN_BITRATE. Restart required.",
+    },
+    KeyMeta {
+        key: "priority_res_cap",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "rc.445 - restore the pre-rc.445 Priority-dial resolution caps (Smoother 1024 everywhere / Balanced 1280 on relay). Default OFF: every mid-motion rung flip costs a blocking encoder open (0.65-0.87s measured on Iris Xe) and the field verdict was that never flipping beats the rung; the dial's bit-shedding moved to the ceiling factors. Env: ROOMLERD_PRIORITY_RES_CAP. Restart required.",
+    },
+    KeyMeta {
+        key: "smoother_rate_pct",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "rc.445 - Smoother's bitrate-ceiling factor (percent, 30-100): a lower ceiling makes the HRD raise QP during motion continuously (smaller frames, steadier fps) with ZERO encoder rebuilds; at-rest quality untouched. Empty = built-in 70. Env: ROOMLERD_SMOOTHER_RATE_PCT. Restart required.",
+    },
+    KeyMeta {
+        key: "balanced_rate_pct",
+        group: Group::VideoRate,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "rc.445 - Balanced's bitrate-ceiling factor (percent, 30-100). Empty = built-in 85. Env: ROOMLERD_BALANCED_RATE_PCT. Restart required.",
+    },
+    KeyMeta {
+        key: "scale_threads",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "HW-downscale Phase A - worker threads (1-8) for the CPU resampler's row-banded passes; a lever for weak hosts where the Smoother rung's downscale eats the frame budget. Empty = built-in 1 (inline, no threads). Env: ROOMLERD_SCALE_THREADS. Restart required.",
+    },
+    KeyMeta {
+        key: "ice_follow_renomination",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "enum:auto|always|never",
+        description: "Media-ICE nomination-follow policy. auto (empty) = upward-only + stale-failover (recommended); always = legacy follow-everything (thrash-prone, diagnostics only); never = pin to first nomination. Env: ROOMLER_ICE_FOLLOW_RENOMINATION.",
+    },
+    KeyMeta {
+        key: "ice_warm_standby",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Keepalive pings on validated-but-unselected media ICE pairs (keeps the real-path fallback's NAT mapping alive). Built-in default: on. Env: ROOMLER_ICE_WARM_STANDBY.",
+    },
+    KeyMeta {
+        key: "ice_overlay_host_deprioritize",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Rank overlay-TUN host candidates below srflx in media ICE (media prefers the real path). Built-in default: on. Env: ROOMLER_ICE_OVERLAY_HOST_DEPRIORITIZE.",
+    },
+    KeyMeta {
+        key: "overlay_tier_detect",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Clamp media bitrate when the overlay carrier under a nominated pair is relay-tier. Built-in default: on. Env: ROOMLERD_OVERLAY_TIER_DETECT.",
+    },
+    KeyMeta {
+        key: "overlay_rtt_q",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "B1 - feed the 15 s overlay RTT probes into the PathMonitor quality plane (Q-only, never eligibility). Built-in default: on. Env: ROOMLERD_OVERLAY_RTT_Q.",
+    },
+    KeyMeta {
+        key: "overlay_upward_probe",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "B3 - probe an eligible higher tier from a healthy srflx/public incumbent every >=120 s (MBB; incumbent held until latch). Built-in default: on. Env: ROOMLERD_OVERLAY_UPWARD_PROBE.",
+    },
+    KeyMeta {
+        key: "relay_probe",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "Multi-region relay PoPs - probe the server-pushed region list (timed STUN per PoP) and report RTTs; the server derives this node's relay_home from them. Built-in default: on. Env: ROOMLERD_RELAY_PROBE.",
+    },
+    KeyMeta {
+        key: "text_mod_neutralize",
+        group: Group::CaptureInput,
+        tier: Tier::Standard,
+        live: false,
+        kind: "tribool",
+        description: "KeyText typing: temporarily release physically-held Shift/Ctrl/Alt the remote layout does not want around each character tap (fixes wrong/dead symbols on non-US layouts). Built-in default: on. Env: ROOMLERD_TEXT_MOD_NEUTRALIZE. Restart required.",
+    },
+    KeyMeta {
+        key: "caps_cache",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-77 P3 - cache the hardware encoder probe across daemon restarts, keyed by GPU + driver + OS build + roomlerd build; re-probed on any change or after 7 days. Built-in default: on. Env: ROOMLERD_CAPS_CACHE.",
+    },
+    KeyMeta {
+        key: "encoder_cells_deny",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444); `none` = deny nothing. Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
+    },
+    KeyMeta {
+        key: "vaapi_device",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-77 P4 - pin the VAAPI render node the Linux daemon opens (e.g. /dev/dri/renderD129). Empty = the first node libva accepts, /dev/dri/renderD128..135 in order. Env: ROOMLERD_VAAPI_DEVICE. Restart required.",
+    },
+    KeyMeta {
+        key: "d3d12_adapter",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-78 P1 - pin the DXGI adapter index the D3D12 video-encode device opens on (Windows; e.g. 1). Empty = adapters 0..3 in order, the first FFmpeg accepts. Env: ROOMLERD_D3D12_ADAPTER. Restart required.",
+    },
+    KeyMeta {
+        key: "vulkan_device",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-78 P1 - pin the Vulkan physical device by index or name (e.g. 1, or NVIDIA GeForce RTX 5090). Empty = the loader's default device. Env: ROOMLERD_VULKAN_DEVICE. Restart required.",
+    },
+    KeyMeta {
+        key: "forward_acl",
+        group: Group::Tunnels,
+        tier: Tier::Standard,
+        live: false,
+        kind: "json",
+        description: "Agent-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
+    },
+    KeyMeta {
+        key: "virtual_desktop_apps",
+        group: Group::RemoteDesktop,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "json",
+        description: "Remote app launcher config for virtual-desktop hosts (JSON; browser only ever sends an allowlist key).",
+    },
 ];
 
-/// The full editable surface with current values from `cfg`.
+/// The full editable surface with current values from `cfg`, in DISPLAY
+/// order: grouped by [`Group::ALL`], registry order within a group. A
+/// client renders sections in the order they arrive.
 pub fn entries(cfg: &AgentConfig) -> Vec<ConfigEntry> {
-    KEYS.iter()
-        .map(|(key, kind, description)| ConfigEntry {
-            key: (*key).to_string(),
-            value: current_value(cfg, key),
-            kind: (*kind).to_string(),
-            restart_required: true,
-            description: (*description).to_string(),
-        })
-        .collect()
+    let mut ordered: Vec<&KeyMeta> = KEYS.iter().collect();
+    // Stable, so registry order survives inside each group.
+    ordered.sort_by_key(|m| m.group.order());
+    ordered.into_iter().map(|m| to_entry(cfg, m)).collect()
 }
 
 /// One entry by key (post-apply echo). `None` = unknown key.
 pub fn entry_for(cfg: &AgentConfig, key: &str) -> Option<ConfigEntry> {
-    KEYS.iter()
-        .find(|(k, _, _)| *k == key)
-        .map(|(k, kind, description)| ConfigEntry {
-            key: (*k).to_string(),
-            value: current_value(cfg, k),
-            kind: (*kind).to_string(),
-            restart_required: true,
-            description: (*description).to_string(),
+    KEYS.iter().find(|m| m.key == key).map(|m| to_entry(cfg, m))
+}
+
+fn to_entry(cfg: &AgentConfig, m: &KeyMeta) -> ConfigEntry {
+    ConfigEntry {
+        key: m.key.to_string(),
+        value: current_value(cfg, m.key),
+        kind: m.kind.to_string(),
+        restart_required: !m.live,
+        description: m.description.to_string(),
+        group: m.group.wire().to_string(),
+        group_label: m.group.label().to_string(),
+        tier: m.tier.wire().to_string(),
+        default: builtin_default(m.key),
+    }
+}
+
+/// The built-in default for `key`, rendered exactly as [`current_value`]
+/// renders a set value — what the wire reports as `ConfigEntry::default`
+/// so a client can say "modified" truthfully. `None` = unset by default
+/// (the tribool and optional-number keys).
+///
+/// Derived from a config in which NO surface key is present, through the
+/// SAME serde defaults `config::load` applies to an absent key — so it
+/// cannot drift from what clearing a key produces. Locked per key by
+/// `wire_default_is_what_clearing_yields`.
+fn builtin_default(key: &str) -> Option<String> {
+    static DEFAULTS: OnceLock<Option<AgentConfig>> = OnceLock::new();
+    DEFAULTS
+        .get_or_init(|| {
+            // Only the six identity fields have no serde default; every
+            // surface key does (that is what "absent = built-in" means for
+            // the file on disk).
+            match toml::from_str::<AgentConfig>(
+                "server_url = \"\"\nagent_token = \"\"\nagent_id = \"\"\n\
+                 tenant_id = \"\"\nmachine_id = \"\"\nmachine_name = \"\"\n",
+            ) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    // Never fatal: the surface still serves, the desktop
+                    // just loses its "modified" chips. The unit test is the
+                    // real guard — this cannot fail there without failing CI.
+                    tracing::warn!(error = %e, "config surface: built-in defaults unavailable");
+                    None
+                }
+            }
         })
+        .as_ref()
+        .and_then(|cfg| current_value(cfg, key))
 }
 
 fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
@@ -1644,13 +2296,224 @@ mod tests {
         assert_eq!(all.len(), KEYS.len());
         // Every listed key roundtrips through entry_for + a no-op apply
         // of its own current value (or a clear for unset optionals).
+        // (`restart_required` per key is `live_keys_are_exactly_the_adopt_local_set`.)
         for e in &all {
-            assert!(e.restart_required);
             assert!(!e.description.is_empty());
             apply(&mut cfg, &e.key, e.value.as_deref()).expect("self-value apply");
             let echoed = entry_for(&cfg, &e.key).expect("known key");
             assert_eq!(echoed.value, e.value, "roundtrip for {}", e.key);
         }
+    }
+
+    /// FR-84 D2 — `restart_required` is the truth PER KEY, not a blanket.
+    /// The only keys the daemon applies without a restart are the two
+    /// gate-4 flags `RemoteConfigServices::adopt_local` re-seeds after a
+    /// `ConfigSet` (agents/roomlerd/src/localapi_state.rs). A key wrongly
+    /// claiming `live` tells a person their change is in force while the
+    /// daemon still runs the old value; a live key claiming `restart` has
+    /// them bounce a healthy service — or believe a refusal they just made
+    /// is not yet in force. Red on the pre-D2 surface, which reported
+    /// `restart_required = true` for every key and left the desktop and
+    /// the CLI each keeping the live list by hand.
+    #[test]
+    fn live_keys_are_exactly_the_adopt_local_set() {
+        let cfg = crate::config::test_fixture();
+        let live: std::collections::BTreeSet<String> = entries(&cfg)
+            .into_iter()
+            .filter(|e| !e.restart_required)
+            .map(|e| e.key)
+            .collect();
+        let expected: std::collections::BTreeSet<String> =
+            ["exec_enabled", "remote_config_enabled"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(
+            live, expected,
+            "the live set is exactly what adopt_local re-seeds"
+        );
+        // The post-apply echo says the same thing as the listing.
+        for key in &expected {
+            assert!(
+                !entry_for(&cfg, key).expect("known key").restart_required,
+                "{key} must echo live"
+            );
+        }
+        assert!(entry_for(&cfg, "overlay_enabled").unwrap().restart_required);
+        assert!(entry_for(&cfg, "ssh_enabled").unwrap().restart_required);
+    }
+
+    /// FR-84 D2 — the compiler already forces a `Group` and a `Tier` on
+    /// every row; this locks the CONTENT of the classification that the
+    /// Settings page shows open by default, and that the wire carries
+    /// exactly what the table says.
+    #[test]
+    fn every_key_is_classified_and_essentials_are_the_named_set() {
+        use std::collections::BTreeSet;
+        let mut seen = BTreeSet::new();
+        for m in KEYS {
+            assert!(seen.insert(m.key), "duplicate registry key {}", m.key);
+        }
+        for g in Group::ALL {
+            assert!(
+                KEYS.iter().any(|m| m.group == g),
+                "group {g:?} has no key — an empty section on screen"
+            );
+        }
+        let essentials: BTreeSet<&str> = KEYS
+            .iter()
+            .filter(|m| m.tier == Tier::Essential)
+            .map(|m| m.key)
+            .collect();
+        let named: BTreeSet<&str> = [
+            "overlay_enabled",
+            "auto_grant_session",
+            "exec_enabled",
+            "remote_config_enabled",
+            "ssh_enabled",
+            "encoder_preference",
+            "power_policy",
+            "auto_update",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(essentials, named);
+
+        // The wire carries the table, for every key.
+        let cfg = crate::config::test_fixture();
+        for m in KEYS {
+            let e = entry_for(&cfg, m.key).expect("known key");
+            assert_eq!(e.group, m.group.wire(), "{}", m.key);
+            assert_eq!(e.group_label, m.group.label(), "{}", m.key);
+            assert_eq!(e.tier, m.tier.wire(), "{}", m.key);
+            assert_eq!(e.restart_required, !m.live, "{}", m.key);
+            assert!(!e.group.is_empty() && !e.tier.is_empty(), "{}", m.key);
+        }
+
+        // `entries()` is display order: grouped by `Group::ALL`, registry
+        // order inside a group — so a client needs no order table.
+        let all = entries(&cfg);
+        assert_eq!(all.len(), KEYS.len());
+        let order = |e: &ConfigEntry| {
+            Group::ALL
+                .iter()
+                .position(|g| g.wire() == e.group)
+                .unwrap_or_else(|| panic!("unknown group id {:?}", e.group))
+        };
+        for w in all.windows(2) {
+            assert!(
+                order(&w[0]) <= order(&w[1]),
+                "{} ({}) listed after {} ({})",
+                w[1].key,
+                w[1].group,
+                w[0].key,
+                w[0].group
+            );
+            if w[0].group == w[1].group {
+                let pos = |k: &str| KEYS.iter().position(|m| m.key == k).unwrap();
+                assert!(
+                    pos(&w[0].key) < pos(&w[1].key),
+                    "registry order within a group"
+                );
+            }
+        }
+        // And every editor kind still meets the `ConfigEntry::kind` contract
+        // (the desktop switches on these; `power_policy` used to be a bare
+        // `a|b|c` that rendered as free text).
+        for m in KEYS {
+            assert!(
+                matches!(
+                    m.kind,
+                    "bool" | "tribool" | "string" | "list" | "json" | "number"
+                ) || m.kind.starts_with("enum:"),
+                "{} has an unknown editor kind {:?}",
+                m.key,
+                m.kind
+            );
+        }
+    }
+
+    /// FR-84 D2 — the wire ids and labels are a compatibility surface: a
+    /// renamed id lands every key of that group in "unknown" on an older
+    /// desktop, a renamed label is a silent UI change. Spell them out.
+    #[test]
+    fn group_wire_ids_are_stable() {
+        let ids: Vec<&str> = Group::ALL.iter().map(|g| g.wire()).collect();
+        assert_eq!(
+            ids,
+            [
+                "access",
+                "network",
+                "network_carriers",
+                "network_routing",
+                "tunnels",
+                "ssh",
+                "remote_desktop",
+                "capture_input",
+                "video_encoding",
+                "video_rate",
+                "files",
+                "device",
+            ]
+        );
+        let labels: Vec<&str> = Group::ALL.iter().map(|g| g.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Access & consent",
+                "Private network",
+                "Network carriers & relays",
+                "Routing & adapter (Windows)",
+                "Tunnels & SOCKS",
+                "Roomler SSH",
+                "Remote desktop",
+                "Capture & input",
+                "Video encoding",
+                "Video rate & latency",
+                "Files",
+                "Device & service",
+            ]
+        );
+        // ALL is the order() ranking, one-to-one.
+        for (i, g) in Group::ALL.iter().enumerate() {
+            assert_eq!(g.order(), i, "{g:?}");
+        }
+        assert_eq!(
+            [
+                Tier::Essential.wire(),
+                Tier::Standard.wire(),
+                Tier::Advanced.wire()
+            ],
+            ["essential", "standard", "advanced"]
+        );
+    }
+
+    /// FR-84 D2 — `ConfigEntry::default` is what the desktop compares a
+    /// value against to say "modified", so it has to be what CLEARING the
+    /// key yields — for every key, including the ones whose clear is not
+    /// the serde default's obvious spelling (`power_policy` renders `never`
+    /// for an empty string, the JSON keys render their struct default).
+    #[test]
+    fn wire_default_is_what_clearing_yields() {
+        let mut cfg = crate::config::test_fixture();
+        for m in KEYS {
+            apply(&mut cfg, m.key, None).unwrap_or_else(|e| panic!("clear {}: {e}", m.key));
+            let e = entry_for(&cfg, m.key).expect("known key");
+            assert_eq!(
+                e.default, e.value,
+                "{}: the wire default must equal a cleared value",
+                m.key
+            );
+        }
+        // A set value is NOT the default (the chip has something to say).
+        apply(&mut cfg, "overlay_enabled", Some("true")).unwrap();
+        let e = entry_for(&cfg, "overlay_enabled").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.value.as_deref(), Some("true"));
+        // Tribools are unset by default: no `default` on the wire, and the
+        // value alone says "modified".
+        let e = entry_for(&cfg, "overlay_quic").unwrap();
+        assert_eq!(e.default, None);
     }
 
     #[test]

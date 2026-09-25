@@ -258,7 +258,8 @@ enum Command {
     /// daemon (S2 config surface): overlay knobs, subnet routes, update
     /// policy, encoder preference. The daemon validates per key and
     /// persists to its OWN config (profile-correct even under a SYSTEM
-    /// service). Changes take effect on the next daemon restart.
+    /// service). Most changes take effect on the next daemon restart; `ls`
+    /// shows which apply at once.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -405,10 +406,12 @@ struct OutputFmt {
 
 /// `roomler config …` — the S2 editable config surface. All verbs talk
 /// to the LOCAL daemon over the LocalAPI; secrets are excluded by
-/// construction and every change is restart-to-apply.
+/// construction, and the daemon says per key whether a change applies at
+/// once or on the next restart.
 #[derive(Debug, Subcommand)]
 enum ConfigAction {
-    /// List every editable key with its current value and type.
+    /// List every editable key with its current value, type and whether a
+    /// change applies live or on restart, grouped the way Settings shows them.
     Ls {
         #[command(flatten)]
         fmt: OutputFmt,

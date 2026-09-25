@@ -557,3 +557,74 @@ textarea {
   margin: 12px 0 0;
   min-height: 1em;
 }
+
+/* ── Settings: grouped configuration (FR-84 D2) ────────────────────── */
+
+.cfg-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 10px;
+}
+
+.cfg-search input { flex: 1; }
+
+.cfg-group {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 12px;
+  margin: 8px 0 0;
+}
+
+.cfg-group > summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  font-size: 13px;
+  font-weight: 600;
+  list-style: none;
+  user-select: none;
+}
+
+.cfg-group > summary::-webkit-details-marker { display: none; }
+
+.cfg-group > summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 11px;
+  width: 10px;
+  flex: 0 0 10px;
+}
+
+.cfg-group[open] > summary::before { content: "▾"; }
+
+.cfg-group-name { flex: 1; }
+
+.cfg-group-count { font-weight: 400; }
+
+.cfg-group-body { padding: 0 0 10px; }
+
+/* A key whose value differs from its built-in default, and a section's
+ * count of them. */
+.cfg-chip-mod {
+  color: var(--primary);
+  background: var(--primary-tint);
+  border-color: var(--primary);
+  margin-left: 6px;
+}
+
+/* Sticks under the top edge of the scrolling content pane while the long
+ * configuration card scrolls beneath it. */
+.cfg-restart-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  justify-content: space-between;
+}
+
+.cfg-restart-actions {
+  display: inline-flex;
+  gap: 8px;
+}
