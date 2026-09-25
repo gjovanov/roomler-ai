@@ -7,7 +7,7 @@
  * the first one. Self-contained: no app shell, no router, no shared store —
  * this window has to work when the main window has never been opened.
  *
- * The three KINDS are not the same question. "Approve" over a screen share and
+ * The KINDS are not the same question. "Approve" over a screen share and
  * "Approve" over a command running as SYSTEM/root deserve different words, and
  * before FR-27 exec and SSH prompts reached no UI at all, so there was nothing
  * to get wrong. An ABSENT kind means a pre-FR-27 daemon, which only ever wrote
@@ -28,6 +28,12 @@
     ssh: {
       title: 'SSH session request',
       verb: 'wants to open an SSH session on this device',
+    },
+    // FR-85 P3b — a controller already in a session asks to keep a COPY of the
+    // screen. Its own question: seeing and recording are different answers.
+    record: {
+      title: 'Screen recording request',
+      verb: 'wants to record this screen',
     },
   }
 
