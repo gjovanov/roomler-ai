@@ -865,6 +865,214 @@ pub fn cmd_service_status(as_service: bool) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// FR-84 D3 — what the daemon said to "Apply now".
+#[derive(Debug, Serialize)]
+pub struct RestartReport {
+    /// Accepted: the daemon is on its way out.
+    pub started: bool,
+    /// `scm` | `task` | `systemd` | `launchd` | `macos-supervisor`.
+    pub supervisor: String,
+    /// `supervisor` | `caller` — see [`cmd_restart_wait`].
+    pub restart_by: String,
+    pub exit_code: i32,
+    /// The process that is leaving (pid + start time, `0` = not reported);
+    /// [`cmd_restart_wait`] waits for another.
+    pub pid: u32,
+    pub started_at_ms: u64,
+    /// Refused: the daemon's own reason, shown verbatim.
+    pub refusal: Option<String>,
+    /// The daemon predates the verb.
+    pub predates: bool,
+}
+
+/// FR-84 D3 — ask the daemon to restart itself through its supervisor. The
+/// daemon decides: a refusal (no supervisor it can prove, the device's
+/// `local_restart_enabled` off, a recording running, a restart moments ago)
+/// comes back as `refusal`, never as an error; `Err` means the service could
+/// not be asked at all.
+#[tauri::command]
+pub async fn cmd_restart_daemon(reason: String) -> Result<RestartReport, String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let answer = client
+        .restart_daemon(&reason)
+        .await
+        .map_err(|e| format!("asking the device service to restart: {e}"))?;
+    let mut report = RestartReport {
+        started: false,
+        supervisor: String::new(),
+        restart_by: String::new(),
+        exit_code: 0,
+        pid: 0,
+        started_at_ms: 0,
+        refusal: None,
+        predates: false,
+    };
+    match answer {
+        localapi::RestartAnswer::Accepted {
+            supervisor,
+            restart_by,
+            exit_code,
+            leaving,
+        } => {
+            tracing::info!(%supervisor, %restart_by, exit_code, pid = ?leaving.pid, %reason,
+                "restart accepted by the device service");
+            report.started = true;
+            report.supervisor = supervisor;
+            report.restart_by = restart_by;
+            report.exit_code = exit_code;
+            report.pid = leaving.pid.unwrap_or(0);
+            report.started_at_ms = leaving.started_at_ms.unwrap_or(0);
+        }
+        localapi::RestartAnswer::Refused(why) => {
+            tracing::info!(refusal = %why, "restart refused by the device service");
+            report.refusal = Some(why);
+        }
+        localapi::RestartAnswer::Unsupported(_) => report.predates = true,
+    }
+    Ok(report)
+}
+
+/// FR-84 D3 — wait (≤ 60 s) until a daemon process other than the one that
+/// accepted (`old_pid` + `old_started_at_ms`, from [`RestartReport`]) answers,
+/// returning its pid. When the relaunch is ours (`restart_by = "caller"`, the
+/// Windows Scheduled Task), run `roomlerd service start` whenever nothing
+/// answers, again every few seconds until something does — the task's
+/// `IgnoreNew` drops a start that lands while the old instance is still
+/// exiting (`localapi::wait_for_restart`).
+#[tauri::command]
+pub async fn cmd_restart_wait(
+    old_pid: u32,
+    old_started_at_ms: u64,
+    restart_by: String,
+) -> Result<Option<u32>, String> {
+    let start = || async {
+        tokio::task::spawn_blocking(run_service_start)
+            .await
+            .map_err(|e| format!("service start task: {e}"))?
+    };
+    localapi::wait_for_restart(
+        localapi::DaemonInstance::leaving(old_pid, old_started_at_ms),
+        restart_by == "caller",
+        start,
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .inspect_err(|why| tracing::warn!(%why, "restart: the device service did not come back"))
+}
+
+/// `roomlerd service start`, the caller half of a restart under the Scheduled
+/// Task. Blocking; bounded at 20 s.
+fn run_service_start() -> Result<(), String> {
+    let exe = agent_exe_path()?;
+    #[cfg(windows)]
+    {
+        match spawn_no_inherit_and_wait(&exe, "service start", std::time::Duration::from_secs(20))?
+        {
+            0 => Ok(()),
+            code => Err(format!("`roomlerd service start` exited {code}")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let out = no_window_command(&exe)
+            .args(["service", "start"])
+            .output()
+            .map_err(|e| format!("Spawning service start ({}): {e}", exe.display()))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+}
+
+/// Run `exe args` with NO handle inheritance and no console window, and wait
+/// for it (killing it past `timeout`). Returns its exit code.
+///
+/// `std::process::Command` on Windows always passes `bInheritHandles = TRUE`,
+/// so a child gets every inheritable handle this process holds — the class of
+/// leak #1035 found (a companion holding a daemon's route ports). The child
+/// here is short-lived and the daemon it starts is the Task Scheduler's child,
+/// not ours; this makes "nothing of ours travels" true by construction rather
+/// than by that argument.
+#[cfg(windows)]
+fn spawn_no_inherit_and_wait(
+    exe: &std::path::Path,
+    args: &str,
+    timeout: std::time::Duration,
+) -> Result<u32, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW,
+        TerminateProcess, WaitForSingleObject,
+    };
+    let app: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    // CreateProcessW may write into the command-line buffer, so it is ours
+    // and mutable. The executable is quoted (a path with spaces), the
+    // arguments are fixed words.
+    let mut cmdline: Vec<u16> = format!("\"{}\" {args}", exe.display())
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: plain-old-data structs, all-zero is their documented initial
+    // state (with `cb` set below).
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // SAFETY: as above.
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: every pointer is valid for the call — `app` and `cmdline` are
+    // NUL-terminated UTF-16 buffers that outlive it, the optional ones are
+    // null, and `si` / `pi` are live locals.
+    let ok = unsafe {
+        CreateProcessW(
+            app.as_ptr(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0, // bInheritHandles = FALSE
+            CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "starting {}: {}",
+            exe.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: `pi` holds live handles CreateProcessW just returned; each is
+    // closed exactly once below.
+    unsafe {
+        CloseHandle(pi.hThread);
+        let result = if WaitForSingleObject(pi.hProcess, millis) == WAIT_OBJECT_0 {
+            let mut code = 0u32;
+            if GetExitCodeProcess(pi.hProcess, &mut code) != 0 {
+                Ok(code)
+            } else {
+                Err(format!(
+                    "reading the exit code: {}",
+                    std::io::Error::last_os_error()
+                ))
+            }
+        } else {
+            TerminateProcess(pi.hProcess, 1);
+            Err(format!(
+                "`{} {args}` did not finish within {} s",
+                exe.display(),
+                timeout.as_secs()
+            ))
+        };
+        CloseHandle(pi.hProcess);
+        result
+    }
+}
+
 /// The host permissions the agent needs, and whether the OS has granted them.
 ///
 /// Only macOS gates these, and it does so SILENTLY: without Screen Recording

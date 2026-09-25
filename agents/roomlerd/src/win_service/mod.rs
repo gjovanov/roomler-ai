@@ -377,7 +377,7 @@ fn service_main_inner() -> Result<()> {
     // a `run` subcommand to drive the existing user-mode signaling /
     // capture pipeline in the active session's context.
     let worker_exe = std::env::current_exe().context("resolving current_exe for worker spawn")?;
-    let worker_args = vec!["run".to_string()];
+    let worker_args = worker_args();
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -407,6 +407,22 @@ fn service_main_inner() -> Result<()> {
         .set_service_status(stopped_status())
         .context("set_service_status(Stopped)")?;
     Ok(())
+}
+
+/// The argv the supervisor spawns every worker with — the user-session worker
+/// and the SystemContext one alike (both spawn sites take the same borrow).
+///
+/// FR-84 D3: `--supervisor scm` is how the worker learns that the exit it is
+/// about to make for `RestartDaemon` will be answered by
+/// `supervisor::decide_exit_reaction` — a bare `run` reads as an orphan in
+/// `supervision::detect` and refuses to restart, which is the right answer
+/// for a hand-started `roomlerd run` and the wrong one for ours.
+pub fn worker_args() -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--supervisor".to_string(),
+        "scm".to_string(),
+    ]
 }
 
 fn running_status() -> ServiceStatus {
@@ -449,6 +465,20 @@ mod tests {
         assert_eq!(NEW_SERVICE_NAME, "Roomler");
         assert_eq!(LEGACY_SERVICE_NAME, "RoomlerAgentService");
         assert_eq!(RUN_SUBCOMMAND, "service-run");
+    }
+
+    /// FR-84 D3 — the worker must be told it is ours. `supervision::detect`
+    /// reads the flag; without it every SCM worker refuses "Apply now" as
+    /// an orphan.
+    #[test]
+    fn worker_args_mark_the_worker_as_scm_supervised() {
+        let args = worker_args();
+        assert_eq!(args[0], "run", "the worker subcommand comes first");
+        assert_eq!(&args[1..], ["--supervisor", "scm"]);
+        assert_eq!(
+            crate::supervision::detect(Some("scm"), false, &|_| None, None),
+            crate::supervision::Supervision::WindowsScm
+        );
     }
 
     #[test]

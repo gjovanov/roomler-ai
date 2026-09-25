@@ -203,6 +203,100 @@ pub struct DaemonState {
     /// unit tests / states built without one → the trait default
     /// (`Upstream { code: "unsupported" }`).
     self_view: Option<Arc<crate::self_view::SelfView>>,
+    /// FR-84 D3 — the `RestartDaemon` verb's handle into `run_cmd`. `None` in
+    /// unit tests and daemon shapes built without one → the verb answers
+    /// "not available", which is also what an older daemon's clients expect.
+    restart: Option<RestartHandle>,
+    /// FR-84 D3 — when this daemon process started (unix ms), reported with
+    /// its pid so a client can tell the relaunched daemon from the one that
+    /// left even when Windows hands the new process the old PID.
+    started_at_ms: u64,
+}
+
+/// FR-84 D3 — what the `RestartDaemon` verb needs from `run_cmd`: who
+/// supervises this process, the internal-shutdown sender the auto-updater
+/// already uses, when the process started, and where the last accepted
+/// restart is recorded. `run_cmd` keeps a clone and reads
+/// [`Self::accepted_exit_code`] back once the graceful shutdown is done.
+///
+/// The verb ARMS a restart (records it, answers `DaemonRestarting`); only
+/// [`Self::commit`] — called by the LocalAPI connection loop once that
+/// answer has been written — starts the shutdown, so a caller never loses its
+/// connection before it knows the restart was accepted.
+#[derive(Clone)]
+pub struct RestartHandle {
+    inner: Arc<RestartInner>,
+}
+
+struct RestartInner {
+    supervision: crate::supervision::Supervision,
+    shutdown: watch::Sender<bool>,
+    started: Instant,
+    record_path: std::path::PathBuf,
+    /// One decision at a time: two requests racing must not both pass the
+    /// rate limit before either has recorded itself.
+    decide: tokio::sync::Mutex<()>,
+    /// The accepted restart's exit code — set once, when a restart is armed.
+    accepted: std::sync::OnceLock<i32>,
+    /// The shutdown has been started (idempotence for [`RestartHandle::commit`]).
+    committed: AtomicBool,
+}
+
+/// If the connection loop never gets to [`RestartHandle::commit`] (its task
+/// was torn down between the answer and the write), an accepted restart
+/// still happens this long after it was armed. The answer is ~100 bytes into
+/// a pipe buffer, so on the normal path the commit comes first by orders of
+/// magnitude; this only makes "accepted ⇒ restarted" unconditional.
+const RESTART_COMMIT_FALLBACK: Duration = Duration::from_secs(5);
+
+impl RestartHandle {
+    pub fn new(
+        supervision: crate::supervision::Supervision,
+        shutdown: watch::Sender<bool>,
+        started: Instant,
+        record_path: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RestartInner {
+                supervision,
+                shutdown,
+                started,
+                record_path,
+                decide: tokio::sync::Mutex::new(()),
+                accepted: std::sync::OnceLock::new(),
+                committed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// The exit code of the restart this process accepted, if it accepted
+    /// one. `run_cmd` leaves with it after the graceful shutdown.
+    pub fn accepted_exit_code(&self) -> Option<i32> {
+        self.inner.accepted.get().copied()
+    }
+
+    /// Start the graceful shutdown of an ACCEPTED restart. Idempotent, and a
+    /// no-op when nothing was accepted.
+    pub fn commit(&self) {
+        if self.inner.accepted.get().is_none() || self.inner.committed.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        tracing::info!(
+            supervisor = self.inner.supervision.wire(),
+            "restart: the answer is out — starting the graceful shutdown"
+        );
+        let _ = self.inner.shutdown.send(true);
+    }
+}
+
+/// Wall-clock ms since the epoch — the restart record is compared across
+/// process lifetimes, so it cannot be a monotonic clock.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Multi-org P1 — one enrollment's live handles, seeded by `run_cmd` and
@@ -279,7 +373,18 @@ impl DaemonState {
             ephemeral: false,
             #[cfg(feature = "recording")]
             recorder: None,
+            restart: None,
+            // Built once, in `run_cmd`, seconds into the process's life.
+            started_at_ms: unix_now_ms(),
         }
+    }
+
+    /// FR-84 D3 — attach the restart verb's handle (see [`RestartHandle`]).
+    /// The verb reads `local_restart_enabled` through [`Self::with_config_persist`]'s
+    /// path, so both must be attached for it to accept anything.
+    pub fn with_restart(mut self, restart: RestartHandle) -> Self {
+        self.restart = Some(restart);
+        self
     }
 
     /// FR-85 — attach the recorder's supervisor so the recording verbs are
@@ -580,6 +685,10 @@ impl LocalApiState for DaemonState {
             // question indistinguishable from an unanswerable one.
             legacy_env_uses: Some(tunnel_core::env::legacy_env_uses()),
             retired_env_present: Some(tunnel_core::env::retired_env_present()),
+            // FR-84 D3 — which process answered, so a client waiting out a
+            // restart knows the relaunched daemon from the one that is leaving.
+            pid: Some(std::process::id()),
+            started_at_ms: Some(self.started_at_ms),
         }
     }
 
@@ -1033,6 +1142,140 @@ impl LocalApiState for DaemonState {
         match &self.recorder {
             Some(r) => r.delete(name).await,
             None => recording_unavailable(),
+        }
+    }
+
+    /// FR-84 D3 — "Apply now": restart this daemon through its supervisor.
+    ///
+    /// LocalAPI-only by construction: no server message reaches this, and
+    /// remote configuration never restarts a daemon (docs/remote-config.md
+    /// §7b). Refused unless a supervisor was PROVEN at startup, the device
+    /// allows it (`local_restart_enabled`, read from the file for this
+    /// request), nothing would be lost (a recording), and the last accepted
+    /// restart — recorded on disk, so it binds the relaunched process too —
+    /// is at least `RESTART_MIN_INTERVAL` old. Under systemd the unit's
+    /// effective policy is read back before anything is promised.
+    ///
+    /// Accepting records the request durably FIRST (a restart that could not
+    /// be recorded must not happen — the record is the loop bound), then arms
+    /// the exit code and answers. The shutdown itself starts in
+    /// [`Self::restart_commit`], after the answer is written.
+    async fn restart_daemon(&self, reason: &str) -> Response {
+        use crate::supervision as sup;
+        let refuse = |message: String| Response::Error { message };
+        let Some(restart) = self.restart.as_ref() else {
+            return refuse("restarting is not available on this daemon".into());
+        };
+        let Some((config_path, lock)) = self.config_persist.as_ref() else {
+            return refuse("restarting is not available on this daemon (no config)".into());
+        };
+        let reason = sup::sanitize_reason(reason);
+        let inner = &restart.inner;
+        let _one_at_a_time = inner.decide.lock().await;
+
+        // The kill switch, from the FILE — the key is live, so an owner's
+        // edit is in force for the very next request.
+        let enabled = {
+            let _guard = lock.lock().await;
+            let path = config_path.clone();
+            match tokio::task::spawn_blocking(move || crate::config::load(&path)).await {
+                Ok(Ok(cfg)) => cfg.local_restart_enabled,
+                Ok(Err(e)) => {
+                    return refuse(format!(
+                        "could not read local_restart_enabled from {}: {e:#}",
+                        config_path.display()
+                    ));
+                }
+                Err(e) => return refuse(format!("config read task: {e}")),
+            }
+        };
+        let record_path = inner.record_path.clone();
+        let last =
+            match tokio::task::spawn_blocking(move || sup::read_last_request(&record_path)).await {
+                Ok(Ok(last)) => last,
+                Ok(Err(e)) => {
+                    return refuse(format!(
+                        "could not read the last restart's record ({e}) — refusing, because that \
+                     record is what keeps a restart loop impossible"
+                    ));
+                }
+                Err(e) => return refuse(format!("restart record task: {e}")),
+            };
+        #[cfg(feature = "recording")]
+        let recording = crate::recording::manager::is_recording();
+        #[cfg(not(feature = "recording"))]
+        let recording = false;
+        let now_ms = unix_now_ms();
+        let inputs = sup::RestartInputs {
+            supervision: inner.supervision,
+            enabled,
+            last_request_ms: last,
+            now_ms,
+            uptime: inner.started.elapsed(),
+            recording,
+            already_accepted: inner.accepted.get().is_some(),
+        };
+        let supervisor = inner.supervision.wire();
+        let refused = |why: String| {
+            tracing::info!(%reason, supervisor, refusal = %why, "restart requested through the LocalAPI: refused");
+            refuse(why)
+        };
+        let plan = match sup::decide_restart(&inputs) {
+            Ok(plan) => plan,
+            Err(why) => return refused(why),
+        };
+        if let sup::Supervision::Systemd(unit) = inner.supervision
+            && let Err(why) = sup::confirm_systemd(unit, plan.exit_code).await
+        {
+            return refused(why);
+        }
+        let record = sup::RestartRecord {
+            at_ms: now_ms,
+            pid: std::process::id(),
+            supervisor: plan.supervisor.to_string(),
+            reason: reason.clone(),
+        };
+        let record_path = inner.record_path.clone();
+        match tokio::task::spawn_blocking(move || sup::write_record(&record_path, &record)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return refused(format!(
+                    "could not record this restart ({e}) — refusing, because that record is \
+                     what keeps a restart loop impossible"
+                ));
+            }
+            Err(e) => return refused(format!("restart record task: {e}")),
+        }
+        // Armed. From here the process WILL restart: `restart_commit` starts
+        // the shutdown once this answer is written, and the fallback below
+        // covers a connection that never gets that far.
+        let _ = inner.accepted.set(plan.exit_code);
+        tracing::info!(
+            %reason,
+            supervisor,
+            restart_by = plan.restart_by,
+            exit_code = plan.exit_code,
+            "restart requested through the LocalAPI: accepted — leaving once the answer is written"
+        );
+        let fallback = restart.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(RESTART_COMMIT_FALLBACK).await;
+            fallback.commit();
+        });
+        Response::DaemonRestarting {
+            supervisor: plan.supervisor.to_string(),
+            restart_by: plan.restart_by.to_string(),
+            exit_code: plan.exit_code,
+            pid: std::process::id(),
+            started_at_ms: self.started_at_ms,
+        }
+    }
+
+    /// FR-84 D3 — the `DaemonRestarting` answer is written: start the
+    /// graceful shutdown (no-op unless a restart was accepted).
+    fn restart_commit(&self) {
+        if let Some(restart) = self.restart.as_ref() {
+            restart.commit();
         }
     }
 
@@ -1833,5 +2076,223 @@ mod tests {
         let mut p2 = vec![peer(Some("aid-1"), ConnectionType::Blocked)];
         apply_tunnel_override(&mut p2, &HashSet::new());
         assert_eq!(p2[0].connection, ConnectionType::Blocked);
+    }
+
+    // ── FR-84 D3: the restart verb, end to end on the daemon side ──────────
+
+    use crate::supervision::{RESTART_RECORD_FILE, Supervision, SystemdUnit};
+
+    /// A fresh config directory holding a real `config.toml` (the verb reads
+    /// `local_restart_enabled` from the FILE), unique per test.
+    fn restart_dir(tag: &str, enabled: bool) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("roomler-las-restart-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::test_fixture();
+        cfg.local_restart_enabled = enabled;
+        crate::config::save(&dir.join("config.toml"), &cfg).unwrap();
+        dir
+    }
+
+    /// A `DaemonState` wired the way `run_cmd` wires it for the verb — as a
+    /// freshly started process would be (its own handle, its own shutdown
+    /// channel), over the config in `dir`.
+    fn restart_state(
+        dir: &std::path::Path,
+        supervision: Supervision,
+    ) -> (DaemonState, RestartHandle, watch::Receiver<bool>) {
+        let (_ov_tx, ov_rx) = watch::channel(view());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let config = dir.join("config.toml");
+        let restart = RestartHandle::new(
+            supervision,
+            shutdown_tx,
+            // Just started — which only FR-43's worker minds, and it has its
+            // own test (`a_young_macos_worker_waits_out_the_fr43_threshold`).
+            // Not `now - 1h`: that panics on a runner booted under an hour ago.
+            Instant::now(),
+            crate::supervision::restart_record_path(&config),
+        );
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            ov_rx,
+            consent_broker("restart"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        )
+        .with_config_persist(config, Arc::new(tokio::sync::Mutex::new(())))
+        .with_restart(restart.clone());
+        (st, restart, shutdown_rx)
+    }
+
+    fn refusal(resp: Response) -> String {
+        match resp {
+            Response::Error { message } => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The orphan `roomlerd run`: refused, nothing recorded, and even an
+    /// explicit commit starts no shutdown — nothing was accepted.
+    #[tokio::test]
+    async fn restart_refused_when_unsupervised() {
+        let dir = restart_dir("orphan", true);
+        let (st, restart, shutdown) = restart_state(&dir, Supervision::None);
+        let why = refusal(st.restart_daemon("apply").await);
+        assert!(why.contains("not running under a service manager"), "{why}");
+        assert!(
+            !dir.join(RESTART_RECORD_FILE).exists(),
+            "a refusal records nothing"
+        );
+        st.restart_commit();
+        assert!(
+            !*shutdown.borrow(),
+            "a refused restart never shuts the daemon down"
+        );
+        assert_eq!(restart.accepted_exit_code(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `local_restart_enabled = false` in the file refuses — and the key is
+    /// LIVE: turning it back on in the file is in force for the next request,
+    /// no restart needed (which would be circular).
+    #[tokio::test]
+    async fn restart_refused_when_disabled_and_the_switch_is_live() {
+        let dir = restart_dir("disabled", false);
+        let (st, _restart, shutdown) = restart_state(&dir, Supervision::WindowsScm);
+        let why = refusal(st.restart_daemon("apply").await);
+        assert!(why.contains("local_restart_enabled = false"), "{why}");
+        assert!(!*shutdown.borrow());
+        // Same process, the file flipped back on through the LocalAPI.
+        assert!(matches!(
+            st.config_set("local_restart_enabled", Some("true")).await,
+            Response::ConfigUpdated { .. }
+        ));
+        assert!(matches!(
+            st.restart_daemon("apply").await,
+            Response::DaemonRestarting { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Accepted: the answer names the supervisor's own exit code, the request
+    /// is on disk BEFORE the answer, and the shutdown starts only at the
+    /// commit — the LocalAPI loop's cue that the answer is out. A second ask
+    /// in the same process is refused.
+    #[tokio::test]
+    async fn restart_accepted_records_first_and_shuts_down_only_on_commit() {
+        let dir = restart_dir("accept", true);
+        let (st, restart, shutdown) = restart_state(&dir, Supervision::WindowsScm);
+        match st.restart_daemon("settings: overlay_enabled").await {
+            Response::DaemonRestarting {
+                supervisor,
+                restart_by,
+                exit_code,
+                pid,
+                started_at_ms,
+            } => {
+                assert_eq!(supervisor, "scm");
+                assert_eq!(restart_by, "supervisor");
+                assert_eq!(exit_code, 0, "decide_exit_reaction(0) is Respawn");
+                // The same process identity `status` reports, so a waiting
+                // caller can recognise the one that is leaving.
+                let status = st.status();
+                assert_eq!(Some(pid), status.pid);
+                assert_eq!(Some(started_at_ms), status.started_at_ms);
+            }
+            other => panic!("expected DaemonRestarting, got {other:?}"),
+        }
+        let record = std::fs::read_to_string(dir.join(RESTART_RECORD_FILE)).unwrap();
+        assert!(record.contains("settings: overlay_enabled"), "{record}");
+        assert!(!*shutdown.borrow(), "armed, not yet committed");
+        assert_eq!(restart.accepted_exit_code(), Some(0));
+        st.restart_commit();
+        assert!(
+            *shutdown.borrow(),
+            "the commit starts the internal shutdown"
+        );
+        let why = refusal(st.restart_daemon("again").await);
+        assert!(why.contains("already under way"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The loop bound survives the restart it bounds: the relaunched process
+    /// (a new handle, nothing in memory) reads the record and refuses a
+    /// second restart inside the window.
+    #[tokio::test]
+    async fn restart_rate_limit_binds_the_relaunched_process() {
+        let dir = restart_dir("ratelimit", true);
+        let (st, _restart, _shutdown) = restart_state(&dir, Supervision::WindowsTask);
+        match st.restart_daemon("first").await {
+            Response::DaemonRestarting {
+                restart_by,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(restart_by, "caller", "the task's restart is the caller's");
+                assert_eq!(exit_code, crate::watchdog::RESTART_REQUESTED_EXIT_CODE);
+            }
+            other => panic!("expected DaemonRestarting, got {other:?}"),
+        }
+        drop(st);
+        let (next, next_restart, next_shutdown) = restart_state(&dir, Supervision::WindowsTask);
+        let why = refusal(next.restart_daemon("second").await);
+        assert!(
+            why.contains("s ago") && why.contains("try again in"),
+            "{why}"
+        );
+        assert!(!*next_shutdown.borrow());
+        assert_eq!(next_restart.accepted_exit_code(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under systemd nothing is promised until systemd itself confirms it
+    /// will restart THIS process. A test process is never a unit's main
+    /// process (and on a host without systemd there is nobody to ask), so
+    /// the answer here is always a refusal — the fail-closed direction.
+    #[tokio::test]
+    async fn systemd_restart_is_refused_unless_systemd_confirms() {
+        let dir = restart_dir("systemd", true);
+        let unit = SystemdUnit {
+            name: "roomlerd.service",
+            user: false,
+        };
+        let (st, restart, shutdown) = restart_state(&dir, Supervision::Systemd(unit));
+        let why = refusal(st.restart_daemon("apply").await);
+        assert!(why.contains("roomlerd.service"), "{why}");
+        assert!(!dir.join(RESTART_RECORD_FILE).exists());
+        assert!(!*shutdown.borrow());
+        assert_eq!(restart.accepted_exit_code(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon built without the handle (older shapes, other tests) says it
+    /// cannot restart, and `status` names the answering process.
+    #[tokio::test]
+    async fn restart_without_a_handle_is_unavailable_and_status_names_the_pid() {
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("nohandle"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+        assert!(refusal(st.restart_daemon("x").await).contains("not available"));
+        st.restart_commit(); // no handle: a no-op, not a panic
+        let status = st.status();
+        assert_eq!(status.pid, Some(std::process::id()));
+        assert!(status.started_at_ms.is_some_and(|t| t > 0));
     }
 }
