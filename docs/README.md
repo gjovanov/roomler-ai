@@ -129,6 +129,7 @@ same accounts and server.*
 | Doc | What it covers |
 |---|---|
 | [installation.md](installation.md) | Every install path: wizard, MSI flavours, `.deb`/`.pkg`, terminal installers, enrollment, service modes, self-update |
+| [desktop-companion.md](desktop-companion.md) | The companion app (`roomler-desktop`, FR-84): its pages and what each reads from the LocalAPI, why the Routes page used to blink (a single listening pipe instance) and the listener pool that fixed it, the polling rules, grouped Settings, **what a device may learn about other devices** (the netmap boundary), Apply now and the supervisor it must prove, the encoder card, where dropped files land and the rules that confine a SYSTEM writer, and the post-install launch + Welcome |
 | [code-signing.md](code-signing.md) | How every published artifact is signed: Azure Artifact Signing over GitHub OIDC, macOS notarisation, GPG + build provenance, and the operator scripts that (re)establish the credentials |
 | [linux-self-update.md](linux-self-update.md) | Design of the Linux self-update path (tarball as the universal artifact) |
 | [deployment.md](deployment.md) | Deploying the server: Docker image and its profiles, the hosted-image pipeline (built on Actions, served from GHCR, promoted by a dispatch — FR-73), dev compose stack, environment, health, release pipelines |
