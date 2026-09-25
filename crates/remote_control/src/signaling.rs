@@ -374,6 +374,17 @@ pub enum ClientMsg {
         /// exactly the skew the operator hit on macOS.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         companion_version: Option<String>,
+        /// FR-27 phase 9 — whether the companion that RUNS is the installed
+        /// one, as a [`crate::models::CompanionRunning::wire`] spelling.
+        /// `None` = not measured. Additive agent→server like
+        /// `companion_version`, so no capability flag.
+        ///
+        /// ⚠️ A `String`, not the enum, on purpose: an unknown spelling from a
+        /// newer agent must cost this one display field, not the heartbeat
+        /// parse that keeps the device online. The server filters it through
+        /// `CompanionRunning::from_wire`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        companion_running: Option<String>,
     },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
@@ -3542,6 +3553,7 @@ mod tests {
             srflx_count: Some(2),
             warm_relay: Some("5.9.157.221:12586".into()),
             companion_version: Some("0.4.16".into()),
+            companion_running: Some("stale".into()),
             // FR-43 P2c — absent means "no news", which is the steady state.
             caps: None,
         };
@@ -3564,6 +3576,7 @@ mod tests {
                 srflx_count,
                 warm_relay,
                 companion_version,
+                companion_running,
                 caps,
             } => {
                 // FR-43 P2c — the steady state is ABSENT, and that is the
@@ -3577,10 +3590,12 @@ mod tests {
                 assert_eq!(srflx_count, Some(2));
                 assert_eq!(warm_relay.as_deref(), Some("5.9.157.221:12586"));
                 assert_eq!(companion_version.as_deref(), Some("0.4.16"));
+                assert_eq!(companion_running.as_deref(), Some("stale"));
             }
             other => panic!("wrong variant: {other:?}"),
         }
         assert!(s.contains(r#""companion_version":"0.4.16""#));
+        assert!(s.contains(r#""companion_running":"stale""#));
         // A stage-1 agent omits the field — decodes as None, and a
         // warm-less stage-2 agent's None must not serialize at all.
         let stage1 = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":1}"#;
@@ -3601,6 +3616,26 @@ mod tests {
                 companion_version: None,
                 ..
             }
+        ));
+        // FR-27 phase 9 — likewise "not measured", never a state.
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(stage1).unwrap(),
+            ClientMsg::AgentHeartbeat {
+                companion_running: None,
+                ..
+            }
+        ));
+        // ⚠️ The reason the field is a String: a state this build has never
+        // heard of must still leave the heartbeat parseable. Were it the enum,
+        // this line would be an `Err` and the device would stop refreshing its
+        // `last_seen_at` over a display-only field.
+        let newer = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":0,"companion_running":"some-future-state"}"#;
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(newer).unwrap(),
+            ClientMsg::AgentHeartbeat {
+                companion_running: Some(ref v),
+                ..
+            } if v == "some-future-state"
         ));
     }
 
@@ -3667,6 +3702,7 @@ mod tests {
             // server reading it cannot tell it apart from an old agent (both
             // mean "nothing to show").
             companion_version: None,
+            companion_running: None,
             caps: None,
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -5992,6 +6028,7 @@ mod tests {
             srflx_count: None,
             warm_relay: None,
             companion_version: None,
+            companion_running: None,
             caps: None,
         };
         let s = serde_json::to_string(&quiet).unwrap();
@@ -6009,6 +6046,7 @@ mod tests {
             srflx_count: None,
             warm_relay: None,
             companion_version: None,
+            companion_running: None,
             caps: Some(Box::new(AgentCaps {
                 permissions: Some(vec!["screen-capture".into(), "input".into()]),
                 has_input_permission: true,

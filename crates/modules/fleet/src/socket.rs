@@ -21,7 +21,7 @@ use axum::extract::ws::{Message, WebSocket};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
-    models::{ConsentMode, RpcCap},
+    models::{CompanionRunning, ConsentMode, RpcCap},
     signaling::{AgentSysStats, ClientMsg, Owner, RelayRegionRtt, Role, ServerMsg},
     turn_creds::relay_regions_wire,
 };
@@ -507,6 +507,7 @@ pub async fn handle_agent_socket(
                                 srflx_count,
                                 warm_relay,
                                 companion_version,
+                                companion_running,
                                 caps,
                                 ..
                             } = &parsed
@@ -517,6 +518,13 @@ pub async fn handle_agent_socket(
                                     *srflx_count,
                                     warm_relay.clone(),
                                     companion_version.clone(),
+                                    // FR-27 phase 9 — filtered HERE, at the edge:
+                                    // a spelling this server cannot interpret is
+                                    // stored as absent, never passed through to
+                                    // the grid.
+                                    companion_running
+                                        .as_deref()
+                                        .and_then(CompanionRunning::from_wire),
                                     caps.clone(),
                                 ))
                             } else {
@@ -531,6 +539,7 @@ pub async fn handle_agent_socket(
                                 srflx_count,
                                 warm_relay,
                                 companion_version,
+                                companion_running,
                                 caps,
                             )) = heartbeat_sessions
                             {
@@ -555,6 +564,7 @@ pub async fn handle_agent_socket(
                                         agent_id,
                                         warm_relay.as_deref(),
                                         companion_version.as_deref(),
+                                        companion_running,
                                     )
                                     .await
                                 {

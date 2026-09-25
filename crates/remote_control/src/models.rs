@@ -912,6 +912,53 @@ impl ExecPolicy {
     }
 }
 
+/// FR-27 phase 9 — whether the `roomler-desktop` that RUNS on a device is the
+/// one INSTALLED there, as the device measured it.
+///
+/// [`Agent::companion_version`] reads the disk, so it cannot see a companion
+/// that kept running through an update: on 2026-09-25 a Mac's row read
+/// `0.4.101` for 17 days while a person-opened `0.4.92` ran (#1617). The daemon
+/// therefore compares each running companion's executable (device, inode) with
+/// the installed file, and reports one of these.
+///
+/// ⚠️ It travels as a plain string (`AgentHeartbeat::companion_running`), not
+/// as this enum. A newer agent may report a state this server has never heard
+/// of, and an enum on the wire would fail the WHOLE heartbeat's parse — the
+/// message that keeps the device online — over a field that is only ever
+/// displayed. [`Self::from_wire`] is where unknown spellings are dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompanionRunning {
+    /// No companion process is running.
+    None,
+    /// Every running companion is the installed file.
+    Current,
+    /// At least one running companion is NOT the installed file — it was
+    /// updated underneath a running copy, which keeps the old code until it
+    /// restarts.
+    Stale,
+}
+
+impl CompanionRunning {
+    /// Exactly what crosses the wire. Locked by test, like [`RpcCap::wire`].
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Current => "current",
+            Self::Stale => "stale",
+        }
+    }
+
+    /// Every state THIS build knows about.
+    pub const ALL: [CompanionRunning; 3] = [Self::None, Self::Current, Self::Stale];
+
+    /// Parse a reported state. `None` for anything unrecognised, which the
+    /// server then stores as ABSENT: a value it cannot interpret must not
+    /// reach the grid, and the device is not wrong to know more than we do.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.wire() == s)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Agent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -980,11 +1027,22 @@ pub struct Agent {
     /// mechanisms on every platform — Windows: the daemon side-loads the EXE
     /// (`companion::refresh_if_stale`), macOS: the `.pkg` carries
     /// `/Applications/Roomler.app`, Linux: a separate `roomler-desktop` .deb
-    /// that apt owns — so "Update all" moving the daemon says nothing about the
-    /// companion, and until now nothing on screen could tell you it had been
-    /// left behind. That was the operator's report, not a hypothetical.
+    /// that `install.sh` installs once and nothing upgrades (FR-27 phase 10) —
+    /// so "Update all" moving the daemon says nothing about the companion, and
+    /// until now nothing on screen could tell you it had been left behind.
+    /// That was the operator's report, not a hypothetical.
+    ///
+    /// ⚠️ It is the version ON DISK. A companion that kept running through an
+    /// update is invisible here — that is [`Self::companion_running`]'s job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub companion_version: Option<String>,
+    /// FR-27 phase 9 — whether the companion that RUNS is the installed one:
+    /// a [`CompanionRunning::wire`] spelling, stored only after
+    /// [`CompanionRunning::from_wire`] accepted it. Absent = not measured (a
+    /// pre-phase-9 agent, a Windows host, no companion installed, or a probe
+    /// that could not read every running copy) — never "current".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_running: Option<String>,
     /// P6 — OpenSSH public half of the device's SSH host key, as reported on
     /// its last hello. Published so a caller can verify what it dialled
     /// instead of trusting it on first use.
@@ -4060,6 +4118,38 @@ mod tests {
         }
         assert_eq!(seen.len(), RpcCap::ALL.len());
         assert_eq!(RpcCap::from_wire("no-such-verb"), None);
+    }
+
+    /// FR-27 phase 9 — the three spellings are what the grid keys its warning
+    /// on and what every deployed agent sends, so they are locked here; and
+    /// anything else, including a state a NEWER agent knows, must come back
+    /// `None` so the server stores nothing rather than an uninterpretable
+    /// string.
+    #[test]
+    fn companion_running_spellings_are_locked_and_unknowns_dropped() {
+        assert_eq!(CompanionRunning::None.wire(), "none");
+        assert_eq!(CompanionRunning::Current.wire(), "current");
+        assert_eq!(CompanionRunning::Stale.wire(), "stale");
+        let mut seen = std::collections::HashSet::new();
+        for v in CompanionRunning::ALL {
+            assert!(seen.insert(v.wire()), "duplicate wire string {v:?}");
+            assert_eq!(CompanionRunning::from_wire(v.wire()), Some(v));
+        }
+        for junk in [
+            "",
+            "STALE",
+            "Stale",
+            " stale",
+            "stale ",
+            "restarting",
+            "0.4.92",
+        ] {
+            assert_eq!(
+                CompanionRunning::from_wire(junk),
+                None,
+                "{junk:?} must not be accepted as a state"
+            );
+        }
     }
 
     /// ⚠️ `ssh` is a PREFIX of `ssh-consent`, and the difference between them
