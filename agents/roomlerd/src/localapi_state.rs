@@ -198,6 +198,11 @@ pub struct DaemonState {
     /// applied before any of them reaches this state.)
     #[cfg(feature = "recording")]
     recorder: Option<Arc<crate::recording::manager::RecordingManager>>,
+    /// FR-84 D5b — the org device list + mesh proxy behind the `Devices` /
+    /// `Mesh` verbs (per-org server + agent token, a short cache). `None` in
+    /// unit tests / states built without one → the trait default
+    /// (`Upstream { code: "unsupported" }`).
+    self_view: Option<Arc<crate::self_view::SelfView>>,
 }
 
 /// Multi-org P1 — one enrollment's live handles, seeded by `run_cmd` and
@@ -270,6 +275,7 @@ impl DaemonState {
             orgs: None,
             org_views: None,
             remote_config: None,
+            self_view: None,
             ephemeral: false,
             #[cfg(feature = "recording")]
             recorder: None,
@@ -284,6 +290,15 @@ impl DaemonState {
         recorder: Arc<crate::recording::manager::RecordingManager>,
     ) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// FR-84 D5b — attach the per-org HTTP registry (server URL + agent
+    /// token per enrollment, seeded next to the `OrgRuntime` rows) so the
+    /// `Devices` / `Mesh` verbs can ask the org's server. Builder style like
+    /// the rest, so `new()`'s call sites stay put.
+    pub fn with_org_http(mut self, registry: crate::self_view::OrgHttpRegistry) -> Self {
+        self.self_view = Some(Arc::new(crate::self_view::SelfView::new(registry)));
         self
     }
 
@@ -1169,6 +1184,32 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// FR-84 D5b — the devices this device may see, asked of the org's
+    /// server with the org's agent token (`self_view.rs`). Read-only; the
+    /// token never crosses the pipe.
+    async fn devices(&self, org: &str, query: &tunnel_core::localapi::DevicesQuery) -> Response {
+        match &self.self_view {
+            Some(view) => view.devices(org, query).await,
+            None => Response::Upstream {
+                code: "unsupported".into(),
+                message: "this daemon was started without a server identity to ask".into(),
+                status: None,
+            },
+        }
+    }
+
+    /// FR-84 D5b — the mesh graph for the same set.
+    async fn mesh(&self, org: &str) -> Response {
+        match &self.self_view {
+            Some(view) => view.mesh(org).await,
+            None => Response::Upstream {
+                code: "unsupported".into(),
+                message: "this daemon was started without a server identity to ask".into(),
+                status: None,
+            },
+        }
+    }
+
     /// S1b — archive the STALE config copy on a split-config host (the
     /// desktop's "Two configurations found" banner finally gets a button).
     /// The daemon is the only safe actor: it knows which copy it LOADED and
@@ -1596,6 +1637,55 @@ mod tests {
         assert!(matches!(
             bare.set_device_name("x").await,
             Response::Error { .. }
+        ));
+    }
+
+    /// FR-84 D5b — the verbs reach the self-view only when a registry was
+    /// attached; without one the answer is the named `unsupported`, never a
+    /// bare error a client could mistake for "no devices".
+    #[tokio::test]
+    async fn devices_and_mesh_route_through_the_attached_registry() {
+        fn state(tag: &str) -> DaemonState {
+            let (_tx, rx) = watch::channel(view());
+            DaemonState::new(
+                "aid".into(),
+                "host".into(),
+                DaemonMode::Service,
+                None,
+                Arc::new(AtomicBool::new(true)),
+                rx,
+                consent_broker(tag),
+                None,
+                crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                empty_rtt_cache(),
+            )
+        }
+        let q = tunnel_core::localapi::DevicesQuery::default();
+
+        let bare = state("dv-bare");
+        assert!(matches!(
+            bare.devices("", &q).await,
+            Response::Upstream { ref code, .. } if code == "unsupported"
+        ));
+        assert!(matches!(
+            bare.mesh("").await,
+            Response::Upstream { ref code, .. } if code == "unsupported"
+        ));
+
+        // With a registry, the org is resolved BEFORE any request: an unknown
+        // label is named as such (no server is contacted — none exists here).
+        let registry: crate::self_view::OrgHttpRegistry =
+            Arc::new(Mutex::new(vec![crate::self_view::OrgHttp {
+                label: "primary".into(),
+                server_url: "https://example.invalid".into(),
+                agent_token: "tok".into(),
+                primary: true,
+                enabled: true,
+            }]));
+        let wired = state("dv-wired").with_org_http(registry);
+        assert!(matches!(
+            wired.devices("ghost", &q).await,
+            Response::Upstream { ref code, .. } if code == "unknown_org"
         ));
     }
 
