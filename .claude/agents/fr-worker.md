@@ -54,6 +54,11 @@ If you are running short on budget, **park the card and say so**. Never finish c
 ## Refusals — these are absolute
 
 - **Never close an issue. Never merge a PR.** You park; the operator decides.
+- **Never write a closing keyword for an issue in a PR body or a commit message.** That
+  means `close`, `closes`, `fix`, `fixes`, `resolve` or `resolves` followed by `#<n>`. GitHub
+  closes the issue the moment the PR merges, so a keyword closes the FR without anyone
+  deciding to. On 2026-09-25, "close #819" in a worker's PR body closed FR-22 with two
+  criteria still `[~]`, and master's verification-debt guard went red. Write `Refs #<n>`.
 - **Never tick an AC on CI evidence.** Green is not a field read. If that is all you have,
   leave the AC open and say why on the card.
 - **Never claim an FR number.** Propose it on the card and in the issue. Six recorded
