@@ -643,6 +643,7 @@ mod process {
             other => panic!("start: {other:?}"),
         };
         assert!(st.active, "{st:?}");
+        assert!(st.available && st.unavailable_reason.is_none(), "{st:?}");
         assert_eq!(st.encoder.as_deref(), Some("openh264"));
         assert!(
             st.path
@@ -758,6 +759,20 @@ mod process {
             dir.path().join("config.toml"),
         )
         .with_service_identity(true);
+        // Said AHEAD of time, so a client greys its Start out (P2b)…
+        match m.status() {
+            Response::Recording(st) => {
+                assert!(!st.available, "{st:?}");
+                assert!(
+                    st.unavailable_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("SYSTEM/root")),
+                    "{st:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // …and again if a start is attempted anyway.
         match m.start(RecordStartOpts::default()).await {
             Response::Error { message } => assert!(message.contains("SYSTEM/root"), "{message}"),
             other => panic!("{other:?}"),

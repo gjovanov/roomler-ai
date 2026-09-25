@@ -628,3 +628,16 @@ textarea {
   display: inline-flex;
   gap: 8px;
 }
+
+/* FR-85 — the Recordings view's REC chip: a red dot that blinks, unless the
+ * person asked the OS for less motion. */
+.rec-dot {
+  background: var(--error);
+  animation: rec-blink 1.2s steps(2, start) infinite;
+}
+@keyframes rec-blink {
+  to { visibility: hidden; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot { animation: none; }
+}

@@ -338,6 +338,18 @@ jobs:
           -p roomler-ai-mod-chat -p roomler-ai-mod-saas
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
 
+      # FR-85 P2b — the desktop companion's unit tests ran in NO lane: the
+      # macOS job only `cargo check`s it, and the step above is `--lib`, which
+      # a bin-only crate cannot join. Its tests include the Recordings view's
+      # Rust half (the tray's wording and when its item is enabled; only a bare
+      # `*.mp4` name is ever opened; a refusal the daemon ANSWERED for a
+      # `record_*` key is final), alongside the FR-84 D1 refresh ledger and
+      # the config-path split, which were already here and already unrun.
+      # The GTK/WebKit dev packages it links are installed above for the
+      # workspace clippy.
+      - name: Test the desktop companion (roomler-desktop)
+        run: cargo test -p roomler-desktop --bins
+
       # The integration crate cannot RUN here (it needs MongoDB + Redis), but
       # it can still be compiled — and compiling it is what was missing. It sat
       # broken for an unknown stretch because `OverlayNodeDao::create` grew

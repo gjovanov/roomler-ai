@@ -39,6 +39,12 @@ const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// recording copies every byte once.
 const STOP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Why a SYSTEM/root daemon cannot record locally (until P1e): said on a
+/// refused start, and ahead of time in the state's `unavailable_reason`.
+const SERVICE_IDENTITY_REFUSAL: &str = "this device service runs as SYSTEM/root, so a recording \
+    would be saved in the service account's profile, not yours; local recording from a service \
+    arrives with FR-85 P1e — until then run `roomlerd record` in your own session";
+
 /// Recorders of this process that reported `started` and have not ended —
 /// for the updater's defer gate. A count, not a flag: each recorder's reader
 /// task adds itself once and removes itself once, so no path can clear the
@@ -115,7 +121,12 @@ impl RecordingManager {
     }
 
     fn snapshot(&self) -> RecordingState {
-        self.state.lock().map(|s| s.clone()).unwrap_or_default()
+        let mut s = self.state.lock().map(|s| s.clone()).unwrap_or_default();
+        s.available = !self.service_identity;
+        s.unavailable_reason = self
+            .service_identity
+            .then(|| SERVICE_IDENTITY_REFUSAL.to_string());
+        s
     }
 
     /// The configured folder, if any (read fresh — `record_dir` is live).
@@ -131,11 +142,7 @@ impl RecordingManager {
     pub async fn start(&self, opts: RecordStartOpts) -> Response {
         if self.service_identity {
             return Response::Error {
-                message: "this daemon runs as SYSTEM/root, so a recording would be saved in the \
-                          service account's profile, not yours; local recording from a service \
-                          daemon arrives with FR-85 P1e — until then use `roomlerd record` in \
-                          your own session"
-                    .into(),
+                message: SERVICE_IDENTITY_REFUSAL.into(),
             };
         }
         if opts.system_audio || opts.microphone {
