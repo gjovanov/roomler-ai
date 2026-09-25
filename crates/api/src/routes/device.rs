@@ -142,43 +142,8 @@ pub async fn list_devices(
         ));
     };
 
-    // FR-11: NO sort param = the compound default — online first, then
-    // name (the sidebar's exact order). An explicit `sort=name` stays a
-    // pure name sort; the two are distinguishable only by keeping the
-    // Option here instead of the old `unwrap_or("name")`.
-    let sort_key = params.sort.as_deref();
-    const SORT_KEYS: &[&str] = &[
-        "name",
-        "kind",
-        "os",
-        "status",
-        "version",
-        "overlay_ip",
-        "magic_dns",
-        "last_seen_at",
-        "created_at",
-    ];
-    if let Some(k) = sort_key
-        && !SORT_KEYS.contains(&k)
-    {
-        return Err(ApiError::BadRequest(format!("Unknown sort key: {k}")));
-    }
-    let desc = match params.dir.as_deref() {
-        None | Some("asc") => false,
-        Some("desc") => true,
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!("Unknown dir: {other}")));
-        }
-    };
-    let kind_filter = match params.kind.as_deref() {
-        None => None,
-        Some(k @ ("agent" | "tunnel_client")) => Some(k.to_string()),
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!("Unknown kind: {other}")));
-        }
-    };
-    let per_page = params.per_page.clamp(1, MAX_PER_PAGE);
-    let page = params.page.max(1);
+    let query = parse_query(&params)?;
+    let kind_filter = query.kind.clone();
 
     // ── Fetch + join ────────────────────────────────────────────
     // Fleet's agents always; the network module's tunnel clients and overlay
@@ -267,16 +232,114 @@ pub async fn list_devices(
         rows.push(client_row(c, node, dns_domain.as_deref()));
     }
 
+    let page = apply_query(rows, &query);
+
+    Ok(Json(serde_json::json!({
+        "items": page.items,
+        "total": page.total,
+        "page": page.page,
+        "per_page": page.per_page,
+        "total_pages": page.total_pages,
+    })))
+}
+
+/// The sort keys a listing accepts. Anything else is a 400, never a silent
+/// fallback to some other order.
+pub const SORT_KEYS: &[&str] = &[
+    "name",
+    "kind",
+    "os",
+    "status",
+    "version",
+    "overlay_ip",
+    "magic_dns",
+    "last_seen_at",
+    "created_at",
+];
+
+/// A [`DeviceListQuery`] validated and normalised — the grid's contract,
+/// shared by the admin listing and the device's own listing
+/// (`routes/agent_self.rs`, FR-84 D5a) so the two cannot drift.
+#[derive(Debug, Clone)]
+pub struct DeviceQuery {
+    /// The explicit sort key, one of [`SORT_KEYS`]. `None` = the FR-11
+    /// compound default (online → stale → offline, name within each bucket).
+    pub sort: Option<String>,
+    pub desc: bool,
+    /// `agent` | `tunnel_client`.
+    pub kind: Option<String>,
+    /// The lowercased, trimmed search needle; `None` when absent or blank.
+    pub needle: Option<String>,
+    pub page: u64,
+    pub per_page: u64,
+}
+
+/// One page of rows plus the envelope every device listing serialises.
+#[derive(Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+/// Validate the query parameters. Unknown `sort` / `dir` / `kind` values are
+/// a 400; `page` and `per_page` are clamped.
+pub fn parse_query(params: &DeviceListQuery) -> Result<DeviceQuery, ApiError> {
+    // FR-11: NO sort param = the compound default — online first, then
+    // name (the sidebar's exact order). An explicit `sort=name` stays a
+    // pure name sort; the two are distinguishable only by keeping the
+    // Option here instead of the old `unwrap_or("name")`.
+    if let Some(k) = params.sort.as_deref()
+        && !SORT_KEYS.contains(&k)
+    {
+        return Err(ApiError::BadRequest(format!("Unknown sort key: {k}")));
+    }
+    let desc = match params.dir.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!("Unknown dir: {other}")));
+        }
+    };
+    let kind = match params.kind.as_deref() {
+        None => None,
+        Some(k @ ("agent" | "tunnel_client")) => Some(k.to_string()),
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!("Unknown kind: {other}")));
+        }
+    };
+    Ok(DeviceQuery {
+        sort: params.sort.clone(),
+        desc,
+        kind,
+        needle: params
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_lowercase),
+        page: params.page.max(1),
+        per_page: params.per_page.clamp(1, MAX_PER_PAGE),
+    })
+}
+
+/// Filter, sort and page the rows — in memory, deliberately (see the module
+/// docs). The caller owns what is IN `rows`: a listing that must not expose
+/// a field blanks it before calling this, so the needle cannot probe it.
+pub fn apply_query(mut rows: Vec<DeviceRow>, query: &DeviceQuery) -> Page<DeviceRow> {
     // ── Filter ──────────────────────────────────────────────────
-    if let Some(kind) = &kind_filter {
+    if let Some(kind) = &query.kind {
         rows.retain(|r| r.kind == kind);
     }
-    if let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
-        let needle = q.to_lowercase();
-        rows.retain(|r| row_matches(r, &needle));
+    if let Some(needle) = &query.needle {
+        rows.retain(|r| row_matches(r, needle));
     }
 
     // ── Sort (stable; id tiebreak keeps pages disjoint) ─────────
+    let sort_key = query.sort.as_deref();
+    let desc = query.desc;
     rows.sort_by(|a, b| {
         let ord = match sort_key {
             // FR-11 default: online → stale → offline, name within each
@@ -294,6 +357,7 @@ pub async fn list_devices(
     });
 
     // ── Slice + envelope ────────────────────────────────────────
+    let (page, per_page) = (query.page, query.per_page);
     let total = rows.len() as u64;
     let total_pages = total.div_ceil(per_page).max(1);
     let start = ((page - 1) * per_page) as usize;
@@ -305,17 +369,16 @@ pub async fn list_devices(
             .take(per_page as usize)
             .collect()
     };
-
-    Ok(Json(serde_json::json!({
-        "items": items,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-        "total_pages": total_pages,
-    })))
+    Page {
+        items,
+        total,
+        page,
+        per_page,
+        total_pages,
+    }
 }
 
-fn agent_row(
+pub(crate) fn agent_row(
     a: Agent,
     presence: AgentPresence,
     is_online: bool,
@@ -348,7 +411,7 @@ fn agent_row(
     }
 }
 
-fn client_row(
+pub(crate) fn client_row(
     c: TunnelClient,
     node: Option<&roomler_ai_remote_control::models::OverlayNode>,
     dns_domain: Option<&str>,

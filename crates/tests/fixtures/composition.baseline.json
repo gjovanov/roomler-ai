@@ -93,6 +93,14 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/agent/self/devices",
+      "methods": "GET,HEAD"
+    },
+    {
+      "path": "/api/agent/self/mesh",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/agent/self/unenroll",
       "methods": "POST"
     },

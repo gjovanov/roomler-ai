@@ -723,11 +723,109 @@ pub async fn tenant_mesh(
     if !state.settings.stats.enabled {
         return Ok(disabled_payload());
     }
+    // FR-84 D5a — the same graph a device gets of ITS visible set through
+    // `/api/agent/self/mesh`; unfiltered here, and byte-identical to what
+    // this route answered before the split (`web_mesh_payload_is_unchanged`).
+    Ok(Json(to_payload(build_mesh(&state, tid).await?, None, None)))
+}
 
+/// The org's mesh, built and merged but not yet shaped for a consumer: the
+/// three lists [`tenant_mesh`] has always answered with.
+#[derive(Debug, Default)]
+pub(crate) struct BuiltMesh {
+    /// One per live overlay node: `id`, `agent_id_hex`, `name`, `overlay_ip`,
+    /// `relay_home`, `status`, `last_seen_at`.
+    pub nodes: Vec<serde_json::Value>,
+    /// One per live agent: `id`, `name`, `display_name`, `last_presence`,
+    /// `agent_version`, `relay_home`, `os`.
+    pub agents: Vec<serde_json::Value>,
+    /// Undirected peer edges, `from`/`to` in NODE id space, the two ends'
+    /// snapshots merged pessimistically.
+    pub edges: Vec<serde_json::Value>,
+}
+
+/// The mesh payload for a consumer.
+///
+/// `filter = None` is the web dashboard's unshaped org view — exactly the
+/// pre-FR-84 payload. `filter = Some(visible)` (the device's own view, keyed
+/// by overlay node id) keeps only the visible nodes, the agents that back
+/// them and the edges whose BOTH ends are visible — an edge to a withheld
+/// node would name it — and adds a server-computed `label` per node
+/// (display_name > agent name > node name > overlay ip > id tail, the web
+/// dashboard's rule) because the companion has no agent list to join
+/// against. `self_node_id` is added when given.
+pub(crate) fn to_payload(
+    built: BuiltMesh,
+    filter: Option<&std::collections::HashSet<String>>,
+    self_node_id: Option<&str>,
+) -> serde_json::Value {
+    let BuiltMesh {
+        mut nodes,
+        mut agents,
+        mut edges,
+    } = built;
+    if let Some(visible) = filter {
+        let id_of = |v: &serde_json::Value, key: &str| -> Option<String> {
+            v.get(key).and_then(|s| s.as_str()).map(str::to_string)
+        };
+        nodes.retain(|n| id_of(n, "id").is_some_and(|id| visible.contains(&id)));
+        let backing: std::collections::HashSet<String> = nodes
+            .iter()
+            .filter_map(|n| id_of(n, "agent_id_hex"))
+            .collect();
+        agents.retain(|a| id_of(a, "id").is_some_and(|id| backing.contains(&id)));
+        edges.retain(|e| {
+            id_of(e, "from").is_some_and(|f| visible.contains(&f))
+                && id_of(e, "to").is_some_and(|t| visible.contains(&t))
+        });
+        let agent_by_id: HashMap<String, &serde_json::Value> = agents
+            .iter()
+            .filter_map(|a| Some((id_of(a, "id")?, a)))
+            .collect();
+        let non_empty = |v: Option<&serde_json::Value>| -> Option<String> {
+            v.and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let labels: Vec<String> = nodes
+            .iter()
+            .map(|n| {
+                let agent = id_of(n, "agent_id_hex").and_then(|a| agent_by_id.get(&a).copied());
+                non_empty(agent.and_then(|a| a.get("display_name")))
+                    .or_else(|| non_empty(agent.and_then(|a| a.get("name"))))
+                    .or_else(|| non_empty(n.get("name")))
+                    .or_else(|| non_empty(n.get("overlay_ip")))
+                    .or_else(|| {
+                        id_of(n, "id").map(|id| id[id.len().saturating_sub(6)..].to_string())
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        for (n, label) in nodes.iter_mut().zip(labels) {
+            n["label"] = serde_json::Value::String(label);
+        }
+    }
+    let mut out = serde_json::json!({
+        "enabled": true,
+        "center": { "id": "control-plane", "name": "roomler.ai" },
+        "nodes": nodes,
+        "agents": agents,
+        "edges": edges,
+    });
+    if let Some(id) = self_node_id {
+        out["self_node_id"] = serde_json::Value::String(id.to_string());
+    }
+    out
+}
+
+/// The org's overlay topology, merged: every live node, every live agent,
+/// and one undirected edge per reported pair (the worse carrier, the lower
+/// RTT, both ends' own views).
+pub(crate) async fn build_mesh(state: &Core, tid: ObjectId) -> Result<BuiltMesh, ApiError> {
     // Nodes: every live device, with the overlay identity the mesh
     // edges are keyed by.
     let nodes = agg(
-        &state,
+        state,
         "overlay_nodes",
         vec![
             doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
@@ -757,7 +855,7 @@ pub async fn tenant_mesh(
     // Agents carry presence + version; joined client-side by hex id so
     // the graph can grey out a device that is enrolled but offline.
     let agents = agg(
-        &state,
+        state,
         "agents",
         vec![
             doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
@@ -783,7 +881,7 @@ pub async fn tenant_mesh(
     // routing asymmetry. Six missed heartbeats = no vote.
     let fresh_floor = DateTime::from_millis(DateTime::now().timestamp_millis() - 180 * 1000);
     let snapshots = agg(
-        &state,
+        state,
         roomler_ai_services::dao::stats::STATS_MESH,
         vec![
             doc! { "$match": { "tenant_id": tid, "ts": { "$gte": fresh_floor } } },
@@ -891,13 +989,11 @@ pub async fn tenant_mesh(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({
-        "enabled": true,
-        "center": { "id": "control-plane", "name": "roomler.ai" },
-        "nodes": nodes,
-        "agents": agents,
-        "edges": peer_edges,
-    })))
+    Ok(BuiltMesh {
+        nodes,
+        agents,
+        edges: peer_edges,
+    })
 }
 
 /// GET /api/tenant/{tid}/stats/calls?range= — MANAGE_AGENTS.
@@ -1424,4 +1520,145 @@ pub async fn admin_calls(
         None => None,
     };
     calls_payload(&state, tid, q.range.as_deref()).await
+}
+
+#[cfg(test)]
+mod mesh_payload_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Three nodes (A, B, C backed by agents a, b, c) and the three edges
+    /// between them, in the shape `build_mesh` produces.
+    fn built() -> BuiltMesh {
+        let node = |id: &str, agent: &str, name: &str, ip: &str| {
+            json!({
+                "id": id, "agent_id_hex": agent, "name": name, "overlay_ip": ip,
+                "relay_home": null, "status": "online", "last_seen_at": null,
+            })
+        };
+        let agent = |id: &str, name: &str, display: Option<&str>| {
+            json!({
+                "id": id, "name": name, "display_name": display, "last_presence": "online",
+                "agent_version": "0.4.103", "relay_home": null, "os": "linux",
+            })
+        };
+        let edge = |from: &str, to: &str| {
+            json!({
+                "kind": "peer", "from": from, "to": to, "carrier": "direct",
+                "rtt_ms": 5, "stalled": false, "reports": 2, "ends": [],
+            })
+        };
+        BuiltMesh {
+            nodes: vec![
+                node("nodeA", "agentA", "alpha", "100.64.0.1"),
+                node("nodeB", "agentB", "bravo", "100.64.0.2"),
+                node("nodeC", "agentC", "charlie", "100.64.0.3"),
+            ],
+            agents: vec![
+                agent("agentA", "alpha-box", None),
+                agent("agentB", "bravo-box", Some("Kilo")),
+                agent("agentC", "charlie-box", Some("")),
+            ],
+            edges: vec![
+                edge("nodeA", "nodeB"),
+                edge("nodeA", "nodeC"),
+                edge("nodeB", "nodeC"),
+            ],
+        }
+    }
+
+    /// The web route's payload is exactly what `tenant_mesh` built inline
+    /// before FR-84 split it: the same five keys, the lists untouched, no
+    /// `label`, no `self_node_id`.
+    #[test]
+    fn web_mesh_payload_is_unchanged() {
+        let b = built();
+        let expected = json!({
+            "enabled": true,
+            "center": { "id": "control-plane", "name": "roomler.ai" },
+            "nodes": b.nodes.clone(),
+            "agents": b.agents.clone(),
+            "edges": b.edges.clone(),
+        });
+        let actual = to_payload(b, None, None);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            serde_json::to_string(&actual).unwrap(),
+            serde_json::to_string(&expected).unwrap(),
+            "byte-identical, not merely equal"
+        );
+        assert!(actual.get("self_node_id").is_none());
+        assert!(
+            actual["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|n| n.get("label").is_none())
+        );
+    }
+
+    /// The device view: nodes ∈ visible, agents whose node is visible, edges
+    /// only when BOTH ends are visible, labels by the dashboard's rule, and
+    /// the caller named.
+    #[test]
+    fn device_mesh_payload_is_restricted_to_the_visible_set() {
+        let visible: std::collections::HashSet<String> =
+            ["nodeA", "nodeB"].iter().map(|s| s.to_string()).collect();
+        let out = to_payload(built(), Some(&visible), Some("nodeA"));
+        assert_eq!(out["enabled"], json!(true));
+        assert_eq!(out["self_node_id"], json!("nodeA"));
+
+        let node_ids: Vec<&str> = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(node_ids, vec!["nodeA", "nodeB"]);
+        let agent_ids: Vec<&str> = out["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(agent_ids, vec!["agentA", "agentB"]);
+        let edges = out["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 1, "only the A–B edge survives: {edges:?}");
+        assert_eq!(edges[0]["from"], json!("nodeA"));
+        assert_eq!(edges[0]["to"], json!("nodeB"));
+
+        // display_name > agent name > node name > overlay ip > id tail.
+        let labels: Vec<&str> = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, vec!["alpha-box", "Kilo"]);
+    }
+
+    /// Every rung of the label ladder, including the empty-string skips.
+    #[test]
+    fn label_falls_through_empty_values() {
+        let visible: std::collections::HashSet<String> =
+            ["n1", "n2", "n3"].iter().map(|s| s.to_string()).collect();
+        let b = BuiltMesh {
+            nodes: vec![
+                json!({ "id": "n1", "agent_id_hex": "a1", "name": "", "overlay_ip": "100.64.0.9" }),
+                json!({ "id": "n2", "agent_id_hex": null, "name": "tunnel-laptop", "overlay_ip": "100.64.0.10" }),
+                json!({ "id": "n3", "agent_id_hex": null, "name": "", "overlay_ip": "" }),
+            ],
+            agents: vec![json!({ "id": "a1", "name": "", "display_name": null })],
+            edges: vec![],
+        };
+        let out = to_payload(b, Some(&visible), None);
+        let labels: Vec<&str> = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, vec!["100.64.0.9", "tunnel-laptop", "n3"]);
+        assert!(out.get("self_node_id").is_none());
+    }
 }
