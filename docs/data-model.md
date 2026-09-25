@@ -63,6 +63,7 @@ erDiagram
     tenants ||--o{ agents : enrolls
     agents ||--o{ remote_sessions : serves
     remote_sessions ||--o{ remote_audit : logs
+    remote_sessions ||--o{ recording_activity : "device claims (FR-85)"
     agents ||--o{ agent_crashes : reports
     agents ||--o{ agent_logs : uploads
     agents ||--o{ exec_audit : "exec attempts"
@@ -83,6 +84,7 @@ erDiagram
 | `agents` | One row per enrolled machine: name, os, version, caps (codecs/transports/rpc), exec policy, status. **Unique `(tenant_id, machine_id)`** — re-enrollment reuses the row |
 | `remote_sessions` | Remote-desktop sessions: agent, controller user, state machine, stats. 90 d TTL |
 | `remote_audit` | Per-session audit events (connect, consent, input, terminate). 90 d TTL |
+| `recording_activity` | FR-85: what a device **claims** about remote recordings (prompt outcome, started, stopped, refused, downloaded), with name, bytes, duration and reason, never content. Kept only for a session of that device whose grant held `RECORD`; the decision itself is in `remote_audit`. `(tenant_id, agent_id, at desc)`, `(session_id, at)`. 90 d TTL |
 | `consent_requests` | Pending owner-consent decisions (capability token = the auth) |
 | `agent_crashes` | Crash-report ingest. 90 d TTL on `reported_at` |
 | `agent_logs` | Centralized log batches (agent + browser ingest). **7 d TTL**, text index on `lines.msg` |
@@ -114,7 +116,7 @@ Raw event streams with short TTLs, rolled up hourly/daily by an in-server task
 |---|---|
 | Unique identity | `users.email`, `users.username`, `tenants.slug`, `(tenant_id, user_id)` membership, `(tenant_id, machine_id)` on `agents` **and** `overlay_nodes`, `(tenant_id, network_id, overlay_ip)`, partial-unique live `overlay_nodes.name`, `overlay_blocks.slot`, sparse-unique `rooms.meeting_code` |
 | Full-text search | `messages.content` · `rooms.{name,purpose,tags}` · `users.{display_name,username}` · `agent_logs.lines.msg` |
-| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `tunnel_audit`, `exec_audit`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` |
+| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `recording_activity`, `tunnel_audit`, `exec_audit`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` |
 
 Two patterns worth knowing when touching this layer:
 
