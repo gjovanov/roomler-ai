@@ -206,7 +206,7 @@ pub type EncoderFactory = Box<dyn FnOnce(u32, u32) -> Result<Box<dyn VideoEncode
 
 /// Openh264 returns a keyframe as one packet per layer; every other backend
 /// returns one packet per frame. Group accordingly.
-fn group_access_units(
+pub(crate) fn group_access_units(
     encoder: &str,
     packets: Vec<crate::encode::EncodedPacket>,
 ) -> Vec<(Vec<u8>, bool)> {
