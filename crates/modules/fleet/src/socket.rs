@@ -21,7 +21,7 @@ use axum::extract::ws::{Message, WebSocket};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
-    models::{ConsentMode, RpcCap},
+    models::{ConsentMode, RecordCap, RpcCap},
     signaling::{AgentSysStats, ClientMsg, Owner, RelayRegionRtt, Role, ServerMsg},
     turn_creds::relay_regions_wire,
 };
@@ -135,6 +135,10 @@ pub async fn handle_agent_socket(
     // caller for the answer. Equality-matched through `has_rpc`: `ssh` is a
     // prefix of it, and every pre-FR-83 agent advertises `ssh`.
     let acks_ssh_grants = caps.has_rpc(RpcCap::SshGrantAck);
+    // FR-85 P3 — the agent serves remote recording AND its owner opted in
+    // (it advertises `remote` only while that gate is on). Equality-matched:
+    // `remote` is a prefix of `remote-audio`.
+    let records = caps.has_record(RecordCap::Remote);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -148,6 +152,7 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_ssh_grant_ack(agent_id, acks_ssh_grants);
+    state.rc_hub.set_agent_record_support(agent_id, records);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 
@@ -320,6 +325,7 @@ pub async fn handle_agent_socket(
         override_reason: None,
         input_mode: None,
         tenant_name: None,
+        may_record: false,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's
@@ -548,6 +554,20 @@ pub async fn handle_agent_socket(
                                         state.agents.update_capabilities(agent_id, caps).await
                                 {
                                     warn!(%agent_id, %e, "agent update_capabilities failed");
+                                }
+                                // FR-85 P3 — the device's owner switches remote
+                                // recording on or off while connected, and the
+                                // agent re-announces its caps here. Without this
+                                // the hub would keep the hello's answer until the
+                                // next reconnect: an owner's OFF would still let
+                                // controllers ask for RECORD (the device refuses
+                                // them, but the grant should not say yes), and an
+                                // ON would do nothing. Same `None` rule as above.
+                                if let Some(caps) = caps.as_ref() {
+                                    state.rc_hub.set_agent_record_support(
+                                        agent_id,
+                                        caps.has_record(RecordCap::Remote),
+                                    );
                                 }
                                 if let Err(e) = state
                                     .agents
