@@ -36,6 +36,7 @@
 
 mod commands;
 mod desktop_log;
+mod first_run;
 mod panels;
 mod tray;
 
@@ -60,20 +61,51 @@ fn main() {
         ),
     }
 
+    // FR-84 D6 — the FIRST process reads its own argv too (before D6 only
+    // the single-instance callback below did), and the per-user state says
+    // whether this person has been through the Welcome tour. A login start
+    // for someone who switched it off ends here, before any window or tray.
+    let argv: Vec<String> = std::env::args().collect();
+    let launch = first_run::parse_launch_args(&argv);
+    let state = roomler_node_core::desktop_state::load();
+    let action = first_run::decide_startup(&launch, state.first_run_done, state.autostart_opt_out);
+    tracing::info!(
+        ?launch,
+        ?action,
+        first_run_done = state.first_run_done,
+        "startup"
+    );
+    if action == first_run::StartupAction::Exit {
+        return;
+    }
+    let show_view = match &action {
+        first_run::StartupAction::Show(view) => Some(view.clone()),
+        _ => None,
+    };
+    first_run::set_launch_view(show_view.clone());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second invocation: focus the existing window instead
             // of starting a new tray. Prevents "10 trays running"
             // when an operator double-clicks the launcher.
+            //
+            // FR-84 D6 — what the forwarded launch asked for decides: a
+            // login start (`--autostart`) never pops the window of a
+            // companion that is already up; `--first-run` opens the tour (or
+            // the Overview once it is done); `--view=<name>` routes there.
+            let launch = first_run::parse_launch_args(&args);
+            let done = roomler_node_core::desktop_state::load().first_run_done;
+            let view = match first_run::decide_second_instance(&launch, done) {
+                first_run::SecondLaunch::Ignore => return,
+                first_run::SecondLaunch::Show => None,
+                first_run::SecondLaunch::ShowView(view) => Some(view),
+            };
             if let Some(window) = app.get_webview_window("main") {
-                // Deep-link: `roomler-desktop --view=<name>` routes the SPA
-                // to that view (shortcuts / scripts / smoke tests). The name
-                // is whitelisted to ascii-alphanumeric before it goes near
-                // eval; the router maps anything unknown to Overview.
-                if let Some(view) = args.iter().find_map(|a| a.strip_prefix("--view="))
-                    && !view.is_empty()
-                    && view.chars().all(|c| c.is_ascii_alphanumeric())
-                {
+                // The name is whitelisted to ascii-alphanumeric by the parser
+                // before it goes near eval; the router maps anything unknown
+                // to Overview.
+                if let Some(view) = view {
                     let _ = window.eval(format!("window.location.hash = '#/{view}'"));
                 }
                 let _ = window.show();
@@ -133,6 +165,13 @@ fn main() {
             // FR-84 D5c — the Devices page's grid and mesh.
             commands::cmd_devices,
             commands::cmd_mesh,
+            // FR-84 D6 — the Welcome tour and the login start.
+            first_run::cmd_launch_intent,
+            first_run::cmd_desktop_state,
+            first_run::cmd_first_run_done,
+            first_run::cmd_autostart_get,
+            first_run::cmd_autostart_set,
+            first_run::cmd_free_port,
         ])
         .on_window_event(|window, event| {
             // Close-to-hide: the MAIN window is a view over a resident tray
@@ -151,11 +190,27 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             // Install the tray icon + menu. The main window starts
             // hidden (visible:false in tauri.conf.json); operator
             // opens it from the tray menu.
             tray::install(app.handle())?;
+            // FR-84 D6 — a launch that asked for a view (the Welcome on a
+            // first run, `--first-run`, `--view=`) shows the window at once;
+            // the page routes itself from `cmd_launch_intent` when it loads.
+            if show_view.is_some()
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            if launch.autostart || !state.first_run_done {
+                tauri::async_runtime::spawn(first_run::startup_checks(
+                    app.handle().clone(),
+                    launch.autostart,
+                    state.first_run_done,
+                ));
+            }
             // Phase 3 — watch the shared consent dir; when the agent drops a new
             // `.pending` marker (a remote session awaiting approval), surface the
             // window so the operator sees the Approve/Deny modal the SPA renders

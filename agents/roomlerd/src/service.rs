@@ -183,6 +183,17 @@ mod windows {
     use std::path::PathBuf;
     use std::process::Command;
 
+    /// Every `schtasks` spawn, without a console window: FR-84 D6's wizard
+    /// calls [`start`] in-process, and a GUI process has no console for a
+    /// child to share — each spawn would flash one.
+    fn schtasks() -> Command {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = Command::new("schtasks");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    }
+
     /// Canonical scheduled-task name after the P3D rename.
     pub const NEW_TASK_NAME: &str = "Roomler";
     /// Pre-rename scheduled-task name, retired best-effort by `install()`
@@ -199,7 +210,7 @@ mod windows {
         let xml = render_task_xml(&exe_str, &user);
         let xml_path = write_temp_xml(&xml).context("writing temp XML")?;
 
-        let result = Command::new("schtasks")
+        let result = schtasks()
             .args([
                 "/Create",
                 "/TN",
@@ -226,7 +237,7 @@ mod windows {
         let _ = std::fs::remove_file(&xml_path);
         // New task is registered — retire the pre-rename task best-effort.
         // Idempotent: a fresh install (no legacy task) just no-ops here.
-        let _ = Command::new("schtasks")
+        let _ = schtasks()
             .args(["/Delete", "/TN", LEGACY_TASK_NAME, "/F"])
             .output();
         Ok(())
@@ -258,7 +269,7 @@ mod windows {
                  or start the service from an elevated prompt)"
             );
         };
-        let output = Command::new("schtasks")
+        let output = schtasks()
             .args(["/Run", "/TN", name])
             .output()
             .context("running schtasks /Run")?;
@@ -274,7 +285,7 @@ mod windows {
     }
 
     fn delete_task(name: &str) -> Result<()> {
-        let output = Command::new("schtasks")
+        let output = schtasks()
             .args(["/Delete", "/TN", name, "/F"])
             .output()
             .context("running schtasks /Delete")?;
@@ -313,10 +324,7 @@ mod windows {
     /// caller treating absence as success can never be fooled by a broken
     /// probe into skipping real work.
     fn task_exists(name: &str) -> bool {
-        let Ok(out) = Command::new("schtasks")
-            .args(["/Query", "/TN", name])
-            .output()
-        else {
+        let Ok(out) = schtasks().args(["/Query", "/TN", name]).output() else {
             return true;
         };
         if !out.status.success() {
@@ -336,10 +344,7 @@ mod windows {
     /// fails, so an unavailable or access-denied schtasks yields `Unknown`
     /// rather than a confident `NotInstalled`.
     fn task_absent_from_listing(name: &str) -> bool {
-        let Ok(out) = Command::new("schtasks")
-            .args(["/Query", "/FO", "CSV", "/NH"])
-            .output()
-        else {
+        let Ok(out) = schtasks().args(["/Query", "/FO", "CSV", "/NH"]).output() else {
             return false;
         };
         if !out.status.success() {
@@ -358,7 +363,7 @@ mod windows {
     }
 
     fn query_task(name: &str) -> Result<AutostartStatus> {
-        let output = Command::new("schtasks")
+        let output = schtasks()
             .args(["/Query", "/TN", name])
             .output()
             .context("running schtasks /Query")?;

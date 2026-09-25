@@ -518,6 +518,18 @@ async fn run_install_inner(
     // install; the operator can always grab it later.
     let desktop_installed = place_desktop_companion(wfx, on_event).await;
 
+    // --- Step 7c: start a per-user daemon now (FR-84 D6) -----------------
+    // The perUser MSI registers the Scheduled Task for the NEXT logon only,
+    // so until now a wizard install ran nothing — and nothing could open the
+    // companion — until the person signed out and back in. `install.ps1`
+    // has always kicked the task here; the wizard now does the same. The
+    // daemon then opens the companion once (the Welcome tour). A perMachine
+    // install needs nothing: its service is already running, and its host
+    // opens the companion as soon as the enrollment and the EXE are in place.
+    if matches!(wfx, WindowsInstallFlavour::PerUser) {
+        start_user_task();
+    }
+
     // --- Step 8: done ----------------------------------------------------
     emit(on_event, ProgressEvent::Done);
 
@@ -612,14 +624,53 @@ async fn place_desktop_companion(
         }
     }
     let target = dir.join("roomler-desktop.exe");
+    // FR-84 D6 — the companion may already be RUNNING from `target`: the
+    // service's own refresh can place it during the MSI, and its post-install
+    // launch opens it as soon as the enrollment above lands. Windows refuses
+    // to overwrite a running EXE but lets it be renamed, so move it aside
+    // first — the rename-swap the daemon's companion refresh uses. The open
+    // window keeps running from the renamed file; every later start uses the
+    // new one.
+    let old = dir.join("roomler-desktop.exe.old");
+    let _ = std::fs::remove_file(&old);
+    if target.exists()
+        && let Err(e) = std::fs::rename(&target, &old)
+    {
+        tracing::warn!(error = %e, path = %target.display(), "could not move the old roomler-desktop aside");
+    }
     match std::fs::copy(&staged, &target) {
-        Ok(_) => Some(true),
+        Ok(_) => {
+            // Best-effort: still locked while the window it backs is open.
+            let _ = std::fs::remove_file(&old);
+            Some(true)
+        }
         Err(e) => {
+            // Never leave the host with NO companion.
+            if !target.exists() && old.exists() {
+                let _ = std::fs::rename(&old, &target);
+            }
             tracing::warn!(error = %e, path = %target.display(), "placing roomler-desktop failed");
             Some(false)
         }
     }
 }
+
+/// FR-84 D6 — start the per-user daemon now instead of at the next logon,
+/// best-effort, through the same `roomlerd service start` FR-84 D3's Apply
+/// now uses (the Scheduled Task, legacy name included).
+#[cfg(target_os = "windows")]
+fn start_user_task() {
+    match roomlerd::service::start() {
+        Ok(()) => tracing::info!("started the per-user Roomler task"),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "could not start the per-user Roomler task; it starts at the next logon"
+        ),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_user_task() {}
 
 /// Non-Windows: daemon roles don't run a real install here, and the
 /// desktop companion is Windows-only.

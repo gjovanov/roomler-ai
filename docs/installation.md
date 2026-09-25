@@ -306,6 +306,74 @@ sudo tccutil reset Accessibility com.roomler.agent
 Remove the device row(s) in the admin UI too — deletion there releases the
 overlay lease.
 
+## After install: the companion opens, and starts at login (FR-84 D6)
+
+Every install path ends with the daemon starting, so the **daemon** opens the
+companion — once — with the **Welcome tour**: this device, the private network
+(what it is, what it changes, an **Enable** button), who may view this screen,
+where received files land, start at login. The tour shows at every start until
+the person finishes or skips it (per-user state), and is reachable again from
+the tray (**Welcome tour…**) and Settings.
+
+| Install path | Who opens it after install | Login start |
+|---|---|---|
+| Windows perMachine — wizard, `install.ps1`, MSI | the **SCM service host** (LocalSystem), into the console session with the console user's own **non-elevated** token (`WTSQueryUserToken` + `CreateProcessAsUserW`, no inherited handles) | `HKLM\Software\Microsoft\Windows\CurrentVersion\Run\Roomler Desktop` = `"<install dir>\roomler-desktop.exe" --autostart` — written by the elevated `service install --as-service` (MSI custom action), self-healed at every service start, removed by `service uninstall --as-service` |
+| Windows perUser — wizard, `install.ps1 -Role daemon-user` | the **worker** (the Scheduled Task, as the user) — `CreateProcessW` with `bInheritHandles = FALSE` | `HKCU\…\Run\Roomler Desktop` — written by the per-user `service install`, the worker at each start and the companion's first run; removed by `service uninstall` |
+| Ubuntu / Debian — `install.sh` (user or `--system`) | the **daemon**, via `systemd-run` as its own transient unit (never in the daemon's cgroup) into the active `Class=user` graphical session — it waits for the companion `.deb`, which `install.sh` installs after the daemon's | the package's `/etc/xdg/autostart/roomler-desktop.desktop` (`--autostart`) |
+| macOS — `.pkg` | the package's postinstall (the `com.roomler.desktop` LaunchAgent) — unchanged | the same LaunchAgent (`RunAtLoad`) |
+
+```mermaid
+flowchart TD
+  S[daemon starts] --> M{marker exists?}
+  M -- yes --> X[done: never again for this install]
+  M -- no --> O{companion_autostart on?}
+  O -- no --> N[nothing, no marker]
+  O -- yes --> E{enrolled?}
+  E -- no --> W[wait: re-check every 3 s for 10 min]
+  E -- yes --> F{fresh install?<br/>last_known_good_version unset}
+  F -- "no (an upgrade)" --> A[marker: adopted, launch nothing]
+  F -- yes --> C{companion installed<br/>and a user signed in?}
+  C -- no --> W
+  C -- yes --> R{already running?}
+  R -- yes --> K[marker: already_running]
+  R -- no --> L[write marker FIRST, then launch --first-run]
+```
+
+The rules that matter (`agents/roomlerd/src/companion/launch_once.rs`, `decide`):
+
+- ⚠️ **One launch per install, never a resurrection.** The marker
+  (`companion-first-launch.json`: `%PROGRAMDATA%\roomler\roomler\` for the SCM
+  host, else next to the daemon's `config.toml`) is written with `create_new`
+  BEFORE the spawn; a failed write launches nothing. A companion the person quit
+  stays quit across daemon restarts.
+- ⚠️ **An upgrade is not an install.** `last_known_good_version` is unset until a
+  daemon has run healthily for five minutes, so a host upgrading into D6 is
+  *adopted* (marker written, nothing opened by the launcher). Its people meet the
+  tour the next time their companion starts — at login, or straight after the
+  update where the service's version refresh restarts a running companion.
+- **Nobody signed in** (an RMM install, a headless box): no marker; the login start
+  covers the first person to sign in.
+- **Pre-enrollment starts wait**: the wizard's MSI starts the service before it
+  enrolls and places the companion, so the launcher re-checks for ten minutes.
+  The wizard also starts a **per-user** daemon right away now (its Scheduled
+  Task used to wait for the next logon), as `install.ps1` always has.
+- The marker records what happened (`launched`, `adopted`, `already_running`),
+  and the daemon log says it: `companion launch-once …`. The companion logs its
+  own `startup … action=Show("welcome")` in its `desktop.log`.
+
+**Opting out.** A person: the companion's **Start at login** toggle (Settings, or
+the tour) — per-user Windows deletes the `HKCU` value; per-machine Windows records
+the choice and an `--autostart` launch exits at once; Linux writes
+`~/.config/autostart/roomler-desktop.desktop` with `Hidden=true`; macOS points at
+**System Settings → General → Login Items**. The whole device:
+**`companion_autostart = false`** (Settings → Device configuration, or `roomler
+config set companion_autostart false`) — no post-install launch, the Windows Run
+value removed at the next service start, and any `--autostart` launch leaves.
+⚠️ The machine-wide Run value starts a companion in **every** interactive session,
+RDP ones included: on a multi-user server, this switch is the one to turn off.
+The consent prompt does not depend on it — a prompt still starts the companion
+when one is needed (FR-27).
+
 ## Keeping it updated
 
 | Component | Mechanism |

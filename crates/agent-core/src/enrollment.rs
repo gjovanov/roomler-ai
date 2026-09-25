@@ -101,6 +101,10 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // enrollment like every other posture switch.
         macos_supervise_gui_worker: false,
         power_policy: String::new(),
+        // FR-84 D6 — the companion opens after install and starts at login by
+        // default; a RE-enrollment keeps whatever the device had (the
+        // `..existing` tail of `preserve_operator_config`).
+        companion_autostart: true,
         // Same rule, one level up: accepting PUSHED config is the opt-in that
         // makes the two flags above refusable by a compromised control plane
         // (`docs/remote-config.md`). Joining an org must never turn it on —

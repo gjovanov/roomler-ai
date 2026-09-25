@@ -580,7 +580,11 @@ install_desktop_linux() {
     # `apt-get -f install` pulls webkit2gtk / GTK / appindicator when dpkg
     # reports them missing, which on a fresh desktop it usually will.
     if sudo dpkg -i "$desktop_pkg" || sudo apt-get -f install -y; then
-        say "desktop companion installed — starts at your next login, or now: roomler-desktop &"
+        # FR-84 D6 — the daemon (started above) watches for the companion and
+        # opens it once, with the Welcome tour, in the logged-in graphical
+        # session; the package's XDG entry starts it at every later login.
+        say "desktop companion installed — the Roomler service opens it on this screen within a few"
+        say "  seconds (the Welcome tour), or at the next login if nobody is signed in graphically."
     else
         warn "the desktop companion did not install; the daemon is unaffected."
         warn "  Without it this device has no on-screen consent prompt — use"
