@@ -197,10 +197,14 @@ projects. Nothing on the host is torn down by this FR.
       `70a279d` built on the build host in 9 min 38 s (warm), pushed to the build host's registry in
       9 s (digest acknowledged in the push log), tag `bg-20260905-70a279d`, not deployed; the local
       tag removed. `CLAUDE.md` keeps the recipe under "Break-glass" with the `newName` rule.
-- [ ] **AC9** Docs updated or created with diagrams, linked from `docs/README.md` (the rule of
+- [x] **AC9** Docs updated or created with diagrams, linked from `docs/README.md` (the rule of
       `CLAUDE.md` § FR workflow step 5). — the pipeline section of `docs/deployment.md` (flowchart:
       merge → build/smoke/push → GHCR → promote → deploy repo → ArgoCD → cluster → fleet
-      verification), the image section's three-layer build, `docs/README.md`'s row.
+      verification), the image section's three-layer build, `docs/README.md`'s row. — Met since
+      2026-09-05: `docs/deployment.md` § "The hosted image pipeline (FR-73)" carries that flowchart
+      node for node, § "The server image" the `chef` / `planner` / `builder` layers, and
+      `docs/README.md` its row — all landed in #1401. *Ticked 2026-09-25: the docs existed, the box
+      was simply never ticked.*
 
 ## Open decisions
 

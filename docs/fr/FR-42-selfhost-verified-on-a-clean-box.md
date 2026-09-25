@@ -85,7 +85,10 @@ is what counts as a pass:
       appears online — **enrolment proven, "online" not** (see the log: this host
       already runs a daemon, and one machine serves one)
 - [x] every deviation between the document and reality is either fixed or written down
-- [ ] `docker compose down -v` leaves the machine clean
+- [x] `docker compose down -v` leaves the machine clean
+      *0 containers, 0 volumes, 0 networks, port released — run twice
+      ([#967 — Result, 2026-09-01](https://github.com/gjovanov/roomler-ai/issues/967#issuecomment-5493250899)).
+      Ticked 2026-09-25: verified then, never ticked here.*
 
 ## Open decisions
 

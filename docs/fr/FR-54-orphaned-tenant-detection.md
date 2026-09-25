@@ -90,12 +90,26 @@ as much as that they are there.
 
 ## 5. Acceptance criteria
 
-- [ ] A network whose tenant row is gone is reported, with node and agent counts
-- [ ] A network whose tenant EXISTS is never reported, archived or not — an
+- [x] A network whose tenant row is gone is reported, with node and agent counts
+- [x] A network whose tenant EXISTS is never reported, archived or not — an
       archived org is retired, not orphaned, and the two must not be conflated
-- [ ] Applying releases nodes through `release_overlay_node`, so addresses
+- [x] Applying releases nodes through `release_overlay_node`, so addresses
       return to the pool and peers are told
 - [ ] Dry-run writes nothing, and a second run after an apply reports nothing
+      *Open on its wording, not its behaviour: dry-run writes nothing (tested), but
+      by design the network ROW is left alone — removing it "would be the
+      unsupervised surgery this exists to detect" (#1130, P1) — so a second run
+      still lists the network, holding no nodes. The Result paraphrased this as
+      "reports no remaining nodes"; the criterion was never amended to say so.*
+
+The three ticked are locked by
+`the_orphan_detector_finds_a_vanished_tenant_and_spares_an_archived_one` (seeds a
+vanished tenant beside an archived one; the archived org's node is untouched at
+every step, apply included) and field-verified on prod `v20260901-f52fed233390`:
+0 orphans across all four networks, the archived FR-47 org correctly not flagged
+([#1130](https://github.com/gjovanov/roomler-ai/issues/1130#issuecomment-5493129384)).
+The apply path calls `crate::overlay::release_overlay_node`
+(`routes/overlay_block.rs`). *Ticked 2026-09-25.*
 
 ## 6. Out of scope
 
