@@ -33,6 +33,7 @@ flowchart TB
     subgraph rd["🖥️ 1 · Remote desktop"]
         RC["remote-control.md"]
         ENC["encoders.md"]
+        LCAP["linux-capture.md"]
         REC["recording.md"]
     end
 
@@ -86,6 +87,7 @@ side, consent-gated, end-to-end encrypted.*
 | [remote-control.md](remote-control.md) | Full design: topology, agent internals, `rc:*` signalling, consent/security model, latency budget; **§12.1 the connect timeline (FR-22)** — the eleven time-to-first-frame marks and who can see each, the phase-aware signalling bound (`requesting` 4 s vs ICE's 15 s), the `agent_offline` fast-fail, the operator's verdict, and the per-attempt records persisted to `agent_logs` (collection, filter, 7 d retention, the `hidden` validity flag, how to mine them) |
 | [recording.md](recording.md) | FR-85 screen recording: the recorder's own pipeline (capture → constant-rate pacer → recording encoder → fragmented MP4, remuxed moov-first on stop), crash recovery (the partial lock), where files go (the default-folder probe, `record_dir` rules, staging), the `roomlerd record` protocol and stop reasons, the daemon's local verbs (LocalAPI + the console-user gate, `roomler record`), the sidecar |
 | [encoders.md](encoders.md) | The cell matrix a host advertises (codec × backend × chroma) and how the viewer resolves it into a session; the probe lifecycle (child processes, the cache, the denylist); the hardware-encoder cascade per platform (NVENC · QSV · AMF · VideoToolbox · VAAPI · D3D12 · Vulkan, with libva bundled on Linux); rate control, capture backends, viewer decode paths |
+| [linux-capture.md](linux-capture.md) | How a Linux desktop is captured by a root daemon that sits in no session: the four arms of the cascade and why each is opt-in — X11 XShm + XDamage and the daemon's own Xvfb, DRM/KMS below the compositor (FR-36), the desktop portal through a privilege-dropped helper that `dlopen`s PipeWire (FR-45, with RemoteDesktop input on the same session), and mutter's own ScreenCast API where no portal backend can run (FR-45 P5); the **attended-only rule** (no greeter, no locked screen) and where the product says it; the logind session gate that keeps the mutter arm off WSL2 and headless hosts (open decision P5b); the knobs, and why flipping any of them forces a fresh capability probe that must run on an unloaded host |
 | [rate-control.md](rate-control.md) | How a session spends its bits: the FR-79 **validity gate** every estimator reads first (one verdict per window, V5's one exception, the pair memory's write-back and seed, the V3b belief still in shadow), the Priority dial, the per-session control loops, the FR-74 **direct path** (a ceiling that is a bound, a gate that measures lag, and P5's gate read against the shadow), why resolution never flips mid-motion (rc.445), crisp-at-rest, config reference |
 
 ## 🔐 2 · Your own secure private network
