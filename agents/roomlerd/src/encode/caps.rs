@@ -36,6 +36,82 @@ use super::cells::{cell_denied, denied_cells, ffmpeg_444_capable};
 
 static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 
+/// FR-84 D4 — the probe's result if it has run in this process, else `None`.
+///
+/// Reads the `OnceLock` and nothing else — deliberately NOT `detect()`. The
+/// LocalAPI serves this on every Overview poll, and the first `detect()` in a
+/// process spawns the probe children (vendor driver code, the reason the
+/// probe is out-of-process at all); a control-surface read must never be what
+/// launches that. The probe runs at the first `rc:agent.hello`, so before a
+/// daemon has reached its server this is `None`, and the Overview says
+/// "not probed yet" and asks again later.
+pub fn cached() -> Option<AgentCaps> {
+    CACHED_CAPS.get().cloned()
+}
+
+/// Whether this build carries ANY video encoder. A signalling-only build
+/// (`cargo build -p roomlerd` with no media feature) has nothing to probe and
+/// nothing to advertise, so the Overview says `unsupported` instead of
+/// waiting for a probe that will never produce a cell.
+pub const ENCODERS_COMPILED: bool = cfg!(any(
+    feature = "openh264-encoder",
+    feature = "mf-encoder",
+    feature = "ffmpeg-encoder",
+    feature = "vp9-444"
+));
+
+/// FR-84 D4 — the Overview's view of a caps value: the cell matrix, the
+/// legacy labels, the probe timing, the denylist and the resolved preference.
+/// Pure — `caps` is whatever the caller holds (the cache, a fixture).
+pub fn summarize(
+    caps: Option<&AgentCaps>,
+    denied: Vec<String>,
+    preference: Option<&str>,
+) -> tunnel_core::localapi::EncoderCapsSummary {
+    use tunnel_core::localapi::{EncoderCapsSummary, EncoderCell};
+    let state = if !ENCODERS_COMPILED {
+        "unsupported"
+    } else if caps.is_some() {
+        "ready"
+    } else {
+        "not_probed"
+    };
+    let mut out = EncoderCapsSummary {
+        state: state.to_string(),
+        denied,
+        encoder_preference: preference.map(str::to_string),
+        ..Default::default()
+    };
+    if let Some(c) = caps {
+        out.cells = c
+            .video_cells
+            .iter()
+            .map(|cell| EncoderCell {
+                codec: cell.codec.clone(),
+                backend: cell.backend.clone(),
+                chroma: cell.chroma.clone(),
+                hardware: cell.hw,
+            })
+            .collect();
+        out.hw_encoders = c.hw_encoders.clone();
+        out.codecs = c.codecs.clone();
+        out.probe_ms = c.probe_ms;
+        out.probe_cached = c.probe_cached;
+    }
+    out
+}
+
+/// FR-84 D4 — what the LocalAPI `EncoderCaps` verb answers: the CACHED
+/// probe (never a fresh one), the denylist in force (env > config > built-in)
+/// and the preference `run` resolved.
+pub fn summarize_cached() -> tunnel_core::localapi::EncoderCapsSummary {
+    summarize(
+        cached().as_ref(),
+        denied_cells(),
+        super::resolved_preference().map(|p| p.wire()),
+    )
+}
+
 /// Running the hardware probes in a CHILD PROCESS.
 ///
 /// A capability probe is untrusted third-party code by definition — it calls
@@ -1592,6 +1668,104 @@ pub fn pick_best_codec(browser_caps: &[String], agent_caps: &[String]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-84 D4 — the LocalAPI's read of the encoder matrix must never be
+    /// what launches the probe. `summarize_cached` reads the `OnceLock` and
+    /// reports `not_probed` while it is empty; a version that reached for
+    /// `detect()` to have something to show would spawn the probe children
+    /// from a control-surface poll on every host that has not connected yet
+    /// — vendor driver code, run because someone opened the Overview.
+    ///
+    /// The lock is read DIRECTLY, not through `cached()`: a `cached()` that
+    /// called `detect()` would fill the lock before `before` was taken and
+    /// pass. (Negative control, run for the PR: `cached()` returning
+    /// `Some(detect())` turns this red.) No other lib test fills the lock.
+    #[test]
+    fn not_probed_never_triggers_a_probe() {
+        let before = CACHED_CAPS.get().is_some();
+        let summary = summarize_cached();
+        let after = CACHED_CAPS.get().is_some();
+        assert_eq!(
+            before, after,
+            "reading the summary must not populate the probe cache"
+        );
+        match (ENCODERS_COMPILED, before) {
+            (false, _) => assert_eq!(summary.state, "unsupported"),
+            (true, false) => {
+                assert_eq!(summary.state, "not_probed");
+                assert!(summary.cells.is_empty());
+                assert!(summary.hw_encoders.is_empty());
+                assert_eq!(summary.probe_ms, None);
+                assert!(!summary.probe_cached);
+            }
+            (true, true) => assert_eq!(summary.state, "ready"),
+        }
+        // The denylist and the preference are facts about the process, not
+        // about the probe: reported whatever the state.
+        assert_eq!(summary.denied, denied_cells());
+        assert_eq!(
+            summary.encoder_preference.as_deref(),
+            super::super::resolved_preference().map(|p| p.wire())
+        );
+    }
+
+    /// FR-84 D4 — a populated caps value maps cell for cell onto the wire
+    /// summary: codec / backend / chroma / hardware, the legacy labels, the
+    /// probe timing, plus the denylist and preference the caller supplies.
+    #[test]
+    fn summary_of_a_populated_caps_carries_every_cell() {
+        let caps = AgentCaps {
+            hw_encoders: vec!["ffmpeg-hevc_nvenc".into(), "openh264-sw".into()],
+            codecs: vec!["h264".into(), "h265".into()],
+            video_cells: vec![
+                VideoCell::new(
+                    VideoCodec::Hevc,
+                    VideoBackend::Nvenc,
+                    &[ChromaFormat::Yuv420, ChromaFormat::Yuv444],
+                    true,
+                ),
+                VideoCell::new(
+                    VideoCodec::H264,
+                    VideoBackend::Openh264,
+                    &[ChromaFormat::Yuv420],
+                    false,
+                ),
+            ],
+            probe_ms: Some(812),
+            probe_cached: true,
+            ..Default::default()
+        };
+        let s = summarize(
+            Some(&caps),
+            vec!["hevc_qsv:yuv444".into()],
+            Some("hardware"),
+        );
+        assert_eq!(
+            s.state,
+            if ENCODERS_COMPILED {
+                "ready"
+            } else {
+                "unsupported"
+            }
+        );
+        assert_eq!(s.cells.len(), 2);
+        assert_eq!(s.cells[0].codec, "hevc");
+        assert_eq!(s.cells[0].backend, "nvenc");
+        assert_eq!(s.cells[0].chroma, vec!["yuv420", "yuv444"]);
+        assert!(s.cells[0].hardware);
+        assert_eq!(s.cells[1].backend, "openh264");
+        assert!(!s.cells[1].hardware);
+        assert_eq!(s.hw_encoders, caps.hw_encoders);
+        assert_eq!(s.codecs, caps.codecs);
+        assert_eq!(s.probe_ms, Some(812));
+        assert!(s.probe_cached);
+        assert_eq!(s.denied, vec!["hevc_qsv:yuv444"]);
+        assert_eq!(s.encoder_preference.as_deref(), Some("hardware"));
+        // No caps at all: the process facts still travel, nothing invented.
+        let none = summarize(None, Vec::new(), None);
+        assert!(none.cells.is_empty() && none.probe_ms.is_none());
+        assert_eq!(none.encoder_preference, None);
+    }
 
     /// Closes the loop the `RpcCap` enum exists to close: every verb this
     /// agent PUTS ON THE WIRE must be one the server can parse back. A typo
