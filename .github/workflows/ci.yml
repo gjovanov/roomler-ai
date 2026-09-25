@@ -389,7 +389,9 @@ jobs:
       # tree — a large cost to silence findings that are not defects. Every
       # other class still bites.
       - name: Clippy agent --features full (the capture + encode + input path)
-        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server --all-targets -- -D warnings -A dead_code
+        # `recording` (FR-85) rides here too: it is not in `full` until its
+        # local surfaces land, so without naming it no lane would lint it.
+        run: cargo clippy -p roomlerd --features full,vp9-444,vp9-444-bindgen,clipboard,ssh-server,recording --all-targets -- -D warnings -A dead_code
 
       - name: Check agent --features vp9-444
         run: cargo check -p roomlerd --features vp9-444,vp9-444-bindgen
@@ -423,6 +425,19 @@ jobs:
         #     under test on a real Linux host, which a Windows dev box cannot
         #     exercise at all. russh is pure Rust; the cost is compile time.
         run: cargo test -p roomlerd --features vp9-444,vp9-444-bindgen,clipboard,ssh-server --lib
+
+      - name: Test the recorder (FR-85) — unit tests + the recorder integration binary
+        # ⚠️ Named explicitly, twice, on purpose. Every other roomlerd test
+        # step is `--lib`, so `agents/roomlerd/tests/*.rs` runs only when a
+        # step NAMES it — `tests/file_dc.rs` has never run in CI for exactly
+        # that reason. And `recording` is not in any other feature set here,
+        # so its unit tests would not run under the `--lib` step above either.
+        # `synthetic-frame-source` lets the `roomlerd record` process tests
+        # capture on a runner with no display; openh264 is both the encoder and
+        # the decoder the oracle reads frames back through.
+        run: |
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
 
       # Overlay L3 (Phase 3) feature gate. `overlay-l3` pulls the `tun`
       # crate (Wintun on Windows / /dev/net/tun on Linux) + the TUN↔WG
