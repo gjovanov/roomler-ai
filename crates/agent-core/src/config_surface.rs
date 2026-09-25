@@ -1653,6 +1653,44 @@ mod tests {
         }
     }
 
+    /// FR-84 D2 — `restart_required` is the truth PER KEY, not a blanket.
+    /// The only keys the daemon applies without a restart are the two
+    /// gate-4 flags `RemoteConfigServices::adopt_local` re-seeds after a
+    /// `ConfigSet` (agents/roomlerd/src/localapi_state.rs). A key wrongly
+    /// claiming `live` tells a person their change is in force while the
+    /// daemon still runs the old value; a live key claiming `restart` has
+    /// them bounce a healthy service — or believe a refusal they just made
+    /// is not yet in force. Red on the pre-D2 surface, which reported
+    /// `restart_required = true` for every key and left the desktop and
+    /// the CLI each keeping the live list by hand.
+    #[test]
+    fn live_keys_are_exactly_the_adopt_local_set() {
+        let cfg = crate::config::test_fixture();
+        let live: std::collections::BTreeSet<String> = entries(&cfg)
+            .into_iter()
+            .filter(|e| !e.restart_required)
+            .map(|e| e.key)
+            .collect();
+        let expected: std::collections::BTreeSet<String> =
+            ["exec_enabled", "remote_config_enabled"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        assert_eq!(
+            live, expected,
+            "the live set is exactly what adopt_local re-seeds"
+        );
+        // The post-apply echo says the same thing as the listing.
+        for key in &expected {
+            assert!(
+                !entry_for(&cfg, key).expect("known key").restart_required,
+                "{key} must echo live"
+            );
+        }
+        assert!(entry_for(&cfg, "overlay_enabled").unwrap().restart_required);
+        assert!(entry_for(&cfg, "ssh_enabled").unwrap().restart_required);
+    }
+
     #[test]
     fn tribool_set_and_clear() {
         let mut cfg = crate::config::test_fixture();
