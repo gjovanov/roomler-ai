@@ -28,38 +28,160 @@
 
 #![cfg(target_os = "windows")]
 
-use anyhow::Result;
-use std::path::Path;
+use anyhow::{Result, bail};
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, FALSE, GetLastError, HANDLE,
+};
+use windows_sys::Win32::System::Threading::{
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS,
+    PROCESS_INFORMATION, STARTUPINFOW,
+};
 
 /// Quote one argument so `CommandLineToArgvW` (and the MSVC CRT) read it
-/// back unchanged.
+/// back unchanged: bare when it has no whitespace or quote, else wrapped in
+/// quotes with each embedded quote escaped and every run of backslashes
+/// before a quote — including the closing one — doubled.
 pub fn quote_arg(arg: &str) -> String {
-    // STUB (RED stage).
-    arg.to_string()
+    let needs_quotes = arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '"'));
+    if !needs_quotes {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                // n backslashes before a quote → 2n, then an escaped quote.
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    // Backslashes before the CLOSING quote are doubled too.
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
 }
 
 /// The full command line: the quoted EXE, then each argument quoted as
-/// needed.
+/// needed. (A Windows path cannot contain `"`, so the EXE needs no escaping.)
 pub fn command_line(exe: &Path, args: &[&str]) -> String {
-    // STUB (RED stage): the naive join `spawn_in_session` does.
     let mut s = format!("\"{}\"", exe.display());
     for a in args {
         s.push(' ');
-        s.push_str(a);
+        s.push_str(&quote_arg(a));
     }
     s
 }
 
-/// Start `exe args…` detached, inheriting NO handle. Returns the child's pid.
+fn wide(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Start `exe args…` detached, inheriting NO handle. Returns the child's pid;
+/// the process and thread handles are closed at once (nobody waits on it).
 pub fn spawn_detached_no_inherit(exe: &Path, args: &[&str]) -> Result<u32> {
-    // STUB (RED stage): exactly what the user-session respawn does today.
-    let child = std::process::Command::new(exe)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(child.id())
+    let exe_w = wide(exe.as_os_str());
+    let line = command_line(exe, args);
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    let mut last_err = 0u32;
+    for flags in [base | CREATE_BREAKAWAY_FROM_JOB, base] {
+        // CreateProcessW may write into the command-line buffer, so each
+        // attempt gets a fresh one.
+        let mut line_w = wide(OsStr::new(&line));
+        // SAFETY: zero-initialised Win32 structs are valid "no options".
+        let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: every buffer outlives the call; out-params are valid.
+        // `bInheritHandles = FALSE` and no STARTF_USESTDHANDLES: the child
+        // receives none of this process's handles.
+        let ok = unsafe {
+            CreateProcessW(
+                exe_w.as_ptr(),
+                line_w.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                FALSE,
+                flags,
+                std::ptr::null(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            )
+        };
+        if ok != 0 {
+            // SAFETY: both handles were just returned to us.
+            unsafe {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            return Ok(pi.dwProcessId);
+        }
+        // SAFETY: thread-local read.
+        last_err = unsafe { GetLastError() };
+        // A job that forbids breakaway refuses the first attempt with
+        // ERROR_ACCESS_DENIED; anything else is a real failure.
+        if !(last_err == ERROR_ACCESS_DENIED && flags & CREATE_BREAKAWAY_FROM_JOB != 0) {
+            break;
+        }
+    }
+    bail!("CreateProcessW({}) failed (err {last_err})", exe.display())
+}
+
+/// This process's Terminal Services session. `0` is services' session: no
+/// desktop anyone can see.
+pub fn own_session_id() -> Option<u32> {
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    let mut sid = 0u32;
+    // SAFETY: plain out-param call on our own pid.
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut sid) };
+    (ok != 0).then_some(sid)
+}
+
+/// The user's Roaming AppData for `token` (a logged-on user's token from
+/// `WTSQueryUserToken`). `SHGetKnownFolderPath` with a token resolves the
+/// user's REAL folder — folder redirection included — where `C:\Users\<name>`
+/// would only guess. `None` on any failure.
+///
+/// # Safety
+/// `token` must be a live user token opened with at least `TOKEN_QUERY |
+/// TOKEN_IMPERSONATE` (a `WTSQueryUserToken` token qualifies).
+pub unsafe fn roaming_app_data_for_token(token: HANDLE) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_RoamingAppData, SHGetKnownFolderPath};
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: valid GUID pointer, flags 0, caller-guaranteed token, out-param.
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_RoamingAppData, 0, token, &mut raw) };
+    let path = if hr >= 0 && !raw.is_null() {
+        // SAFETY: on success `raw` is a NUL-terminated wide string.
+        let len = (0..).take_while(|&i| unsafe { *raw.add(i) } != 0).count();
+        let slice = unsafe { std::slice::from_raw_parts(raw, len) };
+        Some(PathBuf::from(std::ffi::OsString::from_wide(slice)))
+    } else {
+        None
+    };
+    // SAFETY: the API allocates with CoTaskMemAlloc even on failure paths;
+    // freeing null is a no-op.
+    unsafe { CoTaskMemFree(raw as *const core::ffi::c_void) };
+    path
 }
 
 #[cfg(test)]
@@ -120,14 +242,14 @@ mod tests {
             OpenProcess, PROCESS_TERMINATE, TerminateProcess,
         };
 
-        let mut sa = SECURITY_ATTRIBUTES {
+        let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
             bInheritHandle: TRUE,
         };
         let (mut read, mut write): (HANDLE, HANDLE) = (std::ptr::null_mut(), std::ptr::null_mut());
         // SAFETY: out-pointers are valid; `sa` outlives the call.
-        assert_ne!(unsafe { CreatePipe(&mut read, &mut write, &mut sa, 0) }, 0);
+        assert_ne!(unsafe { CreatePipe(&mut read, &mut write, &sa, 0) }, 0);
 
         // A child that lives ~3 s and never touches the pipe.
         let ping = std::path::PathBuf::from(

@@ -36,6 +36,114 @@ use anyhow::{Context, Result};
 /// marker that makes it one-shot.
 mod launch_once;
 
+pub use launch_once::LaunchOwner;
+
+/// FR-84 D6 — open the companion ONCE after a fresh install, from whichever
+/// process owns that on this host: the SCM host on a perMachine Windows
+/// install, the worker everywhere else (per-user Scheduled Task, systemd
+/// unit). Spawn-and-forget; waits up to ten minutes for what a fresh install
+/// is still missing (the enrollment, the companion, a logged-on user), and
+/// never launches twice — or at all on an install that ran before. See
+/// `companion/launch_once.rs`.
+pub async fn launch_once_after_install(owner: LaunchOwner) {
+    launch_once::run(owner).await
+}
+
+/// FR-84 D6 — what the SCM service host does for the companion at every
+/// start, after the version refresh: bring the machine-wide Run value in line
+/// with the device switch and the installed EXE (the self-heal), then run the
+/// post-install launcher.
+#[cfg(target_os = "windows")]
+pub async fn scm_host_startup() {
+    sync_machine_autostart_logged(scm_companion_autostart());
+    launch_once_after_install(LaunchOwner::ScmHost).await;
+}
+
+/// The device's `companion_autostart` as the SCM host can see it: from the
+/// config the worker uses (machine-global, else the console user's); ON when
+/// none is readable yet (a fresh install before enrollment).
+#[cfg(target_os = "windows")]
+pub fn scm_companion_autostart() -> bool {
+    use crate::win_service::supervisor;
+    let token = supervisor::active_console_session_id()
+        .and_then(|sid| supervisor::query_user_token(sid).ok().flatten());
+    launch_once::scm_worker_config(token.as_ref()).is_none_or(|c| c.companion_autostart)
+}
+
+/// FR-84 D6 — `HKLM\…\Run\Roomler Desktop`: present iff the device switch is
+/// on and the companion sits beside this daemon. Elevated callers only (the
+/// SCM host, `service install --as-service`). Logs a change, not a no-op.
+#[cfg(target_os = "windows")]
+pub fn sync_machine_autostart_logged(companion_autostart: bool) {
+    use roomler_node_core::companion_autostart::{
+        RunKeyAction, WINDOWS_RUN_SUBKEY, WINDOWS_RUN_VALUE_NAME, desired_run_value,
+        registry::{Hive, sync_value},
+    };
+    let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(DESKTOP_EXE)))
+    else {
+        return;
+    };
+    let desired = desired_run_value(companion_autostart, &exe, exe.exists(), false);
+    match sync_value(
+        Hive::LocalMachine,
+        WINDOWS_RUN_SUBKEY,
+        WINDOWS_RUN_VALUE_NAME,
+        desired.as_deref(),
+    ) {
+        Ok(RunKeyAction::Keep) => {}
+        Ok(action) => tracing::info!(?action, "companion login start (HKLM Run) updated"),
+        Err(e) => tracing::warn!(error = %e, "companion login start (HKLM Run): could not update"),
+    }
+}
+
+/// FR-84 D6 — `HKCU\…\Run\Roomler Desktop` for a per-user install: present
+/// iff the device switch is on, the companion is installed, and THIS person
+/// has not switched "Start at login" off (the companion's own state).
+#[cfg(target_os = "windows")]
+pub fn sync_user_autostart_logged(companion_autostart: bool) {
+    use roomler_node_core::companion_autostart::{
+        RunKeyAction, WINDOWS_RUN_SUBKEY, WINDOWS_RUN_VALUE_NAME, desired_run_value,
+        registry::{Hive, sync_value},
+    };
+    let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(DESKTOP_EXE)))
+    else {
+        return;
+    };
+    let opted_out = roomler_node_core::desktop_state::load().autostart_opt_out;
+    let desired = desired_run_value(companion_autostart, &exe, exe.exists(), opted_out);
+    match sync_value(
+        Hive::CurrentUser,
+        WINDOWS_RUN_SUBKEY,
+        WINDOWS_RUN_VALUE_NAME,
+        desired.as_deref(),
+    ) {
+        Ok(RunKeyAction::Keep) => {}
+        Ok(action) => tracing::info!(?action, "companion login start (HKCU Run) updated"),
+        Err(e) => tracing::warn!(error = %e, "companion login start (HKCU Run): could not update"),
+    }
+}
+
+/// FR-84 D6 — remove the Run value an uninstall leaves behind (`Ok(true)` =
+/// there was one).
+#[cfg(target_os = "windows")]
+pub fn remove_login_autostart(machine: bool) -> Result<bool> {
+    use roomler_node_core::companion_autostart::{
+        WINDOWS_RUN_SUBKEY, WINDOWS_RUN_VALUE_NAME,
+        registry::{Hive, delete_value},
+    };
+    let hive = if machine {
+        Hive::LocalMachine
+    } else {
+        Hive::CurrentUser
+    };
+    delete_value(hive, WINDOWS_RUN_SUBKEY, WINDOWS_RUN_VALUE_NAME)
+        .with_context(|| format!("removing the {hive:?} Run value"))
+}
+
 /// Who is calling the refresh — decides how a running desktop gets
 /// respawned after the swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,11 +470,7 @@ fn console_user_uid() -> Result<u32> {
 async fn ensure_running_inner() -> Result<EnsureOutcome> {
     const BIN: &str = "roomler-desktop";
 
-    let Some(path) = ["/usr/bin", "/usr/local/bin"]
-        .iter()
-        .map(|d| std::path::Path::new(d).join(BIN))
-        .find(|p| p.exists())
-    else {
+    let Some(path) = linux_companion_path() else {
         // Until FR-27's packaging phase there is no Linux companion at all,
         // and after it there still won't be on a headless server — which is
         // the correct state for a machine with no screen, not a fault.
@@ -379,13 +483,60 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
     // A root systemd daemon has no display of its own. Find the graphical
     // session's owner and its bus/display, then spawn as that user.
     let sess = graphical_session().context("finding a graphical login session")?;
+    let out = systemd_run_command(&sess, &path, &[], false)
+        .output()
+        .context("spawning systemd-run")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "systemd-run failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(EnsureOutcome::Started)
+}
+
+/// Where the Linux companion lives: `/usr/bin` from its .deb, `/usr/local/bin`
+/// for a hand install. One list, so every caller agrees on which file is
+/// "the" companion.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn linux_companion_path() -> Option<std::path::PathBuf> {
+    ["/usr/bin", "/usr/local/bin"]
+        .iter()
+        .map(|d| std::path::Path::new(d).join("roomler-desktop"))
+        .find(|p| p.exists())
+}
+
+/// `systemd-run` for the companion in `sess`, as its own transient unit — so
+/// it is NOT a child in the daemon's cgroup, which systemd kills with the
+/// daemon on every restart or update.
+///
+/// * `user_manager = false` — a ROOT daemon: a system transient unit running
+///   as the session's uid (`--uid=`), the shape FR-27's consent path has used
+///   since it shipped.
+/// * `user_manager = true` — a per-user daemon: the user's own manager
+///   (`--user`); the system manager would ask polkit for a password nobody is
+///   there to type.
+///
+/// Either way the session's bus and display go along as `--setenv`: a
+/// transient unit starts with an empty environment.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn systemd_run_command(
+    sess: &GraphicalSession,
+    exe: &std::path::Path,
+    args: &[&str],
+    user_manager: bool,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new("systemd-run");
+    if user_manager {
+        cmd.arg("--user");
+    }
+    cmd.args(["--quiet", "--collect"]);
+    if !user_manager {
+        cmd.arg(format!("--uid={}", sess.uid));
+    }
     cmd.args([
-        "--quiet",
-        "--collect",
-        &format!("--uid={}", sess.uid),
-        &format!("--setenv=XDG_RUNTIME_DIR=/run/user/{}", sess.uid),
-        &format!(
+        format!("--setenv=XDG_RUNTIME_DIR=/run/user/{}", sess.uid),
+        format!(
             "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{}/bus",
             sess.uid
         ),
@@ -396,15 +547,20 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
     if let Some(wayland) = &sess.wayland_display {
         cmd.arg(format!("--setenv=WAYLAND_DISPLAY={wayland}"));
     }
-    cmd.arg(path.as_os_str());
-    let out = cmd.output().context("spawning systemd-run")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "systemd-run failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(EnsureOutcome::Started)
+    cmd.arg(exe.as_os_str());
+    cmd.args(args);
+    cmd
+}
+
+/// Is a `roomler-desktop` of THIS user running? `pgrep -u` so another user's
+/// companion on a shared machine does not count as this person's.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn companion_running_for_uid(uid: u32) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", "-u", &uid.to_string(), "roomler-desktop"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
 }
 
 /// ⚠️ `pub(crate)` because FR-45's portal helper needs the same answer: the
@@ -459,6 +615,19 @@ fn session_ids(list_output: &str) -> Vec<&str> {
 /// box — again, the correct answer, not a failure.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn graphical_session() -> Result<GraphicalSession> {
+    graphical_session_matching(None, false)
+}
+
+/// [`graphical_session`], optionally restricted to one user's sessions — a
+/// per-user daemon may only open something in its OWN user's session — and
+/// optionally to `Class=user`: a display manager's greeter (GDM runs one as
+/// uid `gdm` at the login screen) IS an active graphical session, which the
+/// consent path wants and the post-install launch must never open into.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn graphical_session_matching(
+    want_uid: Option<u32>,
+    users_only: bool,
+) -> Result<GraphicalSession> {
     // ⚠️ NOT `-o value -p Id`. Those are `show-*` options; `list-sessions`
     // rejects them with `Unknown output 'value'` and exits 1, which this
     // function then read as an empty session list — i.e. "nobody is at the
@@ -490,9 +659,15 @@ pub(crate) fn graphical_session() -> Result<GraphicalSession> {
         if field("Active").as_deref() != Some("yes") {
             continue;
         }
+        if users_only && field("Class").as_deref() != Some("user") {
+            continue;
+        }
         let Some(uid) = field("User").and_then(|u| u.parse::<u32>().ok()) else {
             continue;
         };
+        if want_uid.is_some_and(|w| w != uid) {
+            continue;
+        }
         // A session with no `Name` is not usable by the privilege drop, so
         // skip it rather than return one that will fail later — the next
         // session in the list may well be serviceable.
@@ -687,13 +862,39 @@ fn kill_desktop() {
         .output();
 }
 
+/// Is `roomler-desktop.exe` running in Terminal Services session `session`?
+/// The launcher's question is "does THIS user already have it open", which a
+/// machine-wide listing cannot answer on a host with more than one session.
+#[cfg(target_os = "windows")]
+pub(crate) fn desktop_running_in_session(session: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("tasklist")
+        .args([
+            "/FI",
+            &format!("IMAGENAME eq {DESKTOP_EXE}"),
+            "/FI",
+            &format!("SESSION eq {session}"),
+            "/NH",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains(DESKTOP_EXE))
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "windows")]
 fn respawn_desktop(respawn: RespawnContext, dest: &std::path::Path) {
     match respawn {
-        RespawnContext::UserSession => match std::process::Command::new(dest).spawn() {
-            Ok(_) => tracing::info!("desktop companion respawned (user session)"),
-            Err(e) => tracing::warn!(error = %e, "desktop companion respawn failed"),
-        },
+        // FR-84 D6 / #1035 — NOT `std::process::Command`: that passes
+        // `bInheritHandles = TRUE`, and a companion lives for months holding
+        // whatever this daemon had marked inheritable at the spawn instant.
+        RespawnContext::UserSession => {
+            match crate::win_service::companion_spawn::spawn_detached_no_inherit(dest, &[]) {
+                Ok(pid) => tracing::info!(pid, "desktop companion respawned (user session)"),
+                Err(e) => tracing::warn!(error = %e, "desktop companion respawn failed"),
+            }
+        }
         RespawnContext::SystemService => {
             use crate::win_service::supervisor;
             let Some(session_id) = supervisor::active_console_session_id() else {
@@ -728,6 +929,53 @@ fn respawn_desktop(respawn: RespawnContext, dest: &std::path::Path) {
 #[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
     use super::session_ids;
+
+    /// FR-84 D6 — the companion runs as its OWN transient unit, never in the
+    /// daemon's cgroup; a root daemon targets the session's uid, a per-user
+    /// daemon its own manager (no polkit prompt nobody can answer), and the
+    /// session's bus + display travel along.
+    #[test]
+    fn systemd_run_command_for_root_and_for_a_user_daemon() {
+        let sess = super::GraphicalSession {
+            uid: 1000,
+            name: "ana".into(),
+            display: Some(":0".into()),
+            wayland_display: Some("wayland-0".into()),
+        };
+        let argv = |user: bool| -> Vec<String> {
+            let cmd = super::systemd_run_command(
+                &sess,
+                std::path::Path::new("/usr/bin/roomler-desktop"),
+                &["--first-run"],
+                user,
+            );
+            assert_eq!(cmd.get_program(), "systemd-run");
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let root = argv(false);
+        assert!(root.contains(&"--uid=1000".to_string()), "{root:?}");
+        assert!(!root.contains(&"--user".to_string()), "{root:?}");
+        for want in [
+            "--collect",
+            "--setenv=XDG_RUNTIME_DIR=/run/user/1000",
+            "--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+            "--setenv=DISPLAY=:0",
+            "--setenv=WAYLAND_DISPLAY=wayland-0",
+        ] {
+            assert!(root.contains(&want.to_string()), "{want} missing: {root:?}");
+        }
+        assert_eq!(
+            &root[root.len() - 2..],
+            ["/usr/bin/roomler-desktop", "--first-run"],
+            "the program, then its own arguments, last"
+        );
+        let user = argv(true);
+        assert_eq!(user[0], "--user");
+        assert!(!user.iter().any(|a| a.starts_with("--uid=")), "{user:?}");
+        assert!(user.contains(&"--setenv=DISPLAY=:0".to_string()));
+    }
 
     /// Both samples are REAL `loginctl list-sessions --no-legend --no-pager`
     /// output, captured from fleet hosts on 2026-08-31. They are here because

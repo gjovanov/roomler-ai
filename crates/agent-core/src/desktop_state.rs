@@ -43,18 +43,40 @@ pub fn default_path() -> Option<PathBuf> {
 
 /// Read the state. Missing, unreadable or corrupt ⇒ the default, which is a
 /// first run.
-pub fn load_from(_path: &Path) -> DesktopState {
-    // STUB (RED stage): the wrong answer on purpose.
-    DesktopState {
-        first_run_done: true,
-        ..DesktopState::default()
+pub fn load_from(path: &Path) -> DesktopState {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return DesktopState::default();
+    };
+    match serde_json::from_str::<DesktopState>(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "desktop state unreadable — treating this as a first run"
+            );
+            DesktopState::default()
+        }
     }
 }
 
 /// Write the state atomically (temp file + rename), creating the directory.
-pub fn save_to(_path: &Path, _state: &DesktopState) -> std::io::Result<()> {
-    // STUB (RED stage).
-    Ok(())
+/// A crash mid-write leaves either the old file or the new one, never half
+/// of either — and a half file would read as a first run anyway.
+pub fn save_to(path: &Path, state: &DesktopState) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, body)?;
+    // `rename` replaces an existing target on every platform we ship to
+    // (`MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows).
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// [`load_from`] at [`default_path`]; the default when there is no path.
