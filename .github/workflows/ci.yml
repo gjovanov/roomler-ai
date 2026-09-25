@@ -770,7 +770,11 @@ jobs:
         run: cargo clippy -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --tests -- -D warnings
       - name: The identity rule — unit tests (the table, argv, env, impersonation)
         run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- recording::launch --nocapture
+      # Runs even when the unit step failed: the two prove different halves
+      # (the child's integrity, the daemon's impersonation), and one red must
+      # not hide the other's evidence.
       - name: The identity rule — the recorder launched as the person, end to end
+        if: ${{ !cancelled() }}
         run: cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder -- process::an_elevated process::the_manager_records_as_the_person --nocapture
 
   ffmpeg-encoder-check:

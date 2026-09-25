@@ -1142,6 +1142,72 @@ pub(crate) mod win {
             )
         }
 
+        /// Make `dir` a folder ONLY Administrators may touch: owned by them,
+        /// one ACE, nothing inherited.
+        ///
+        /// ⚠️ Built with the Win32 security APIs, not `icacls /inheritance:r
+        /// /grant:r`. On GitHub's Windows runner (the built-in Administrator,
+        /// UAC off) a new folder under a parent with nothing inheritable
+        /// takes the creating token's default DACL as EXPLICIT ACEs — SYSTEM,
+        /// Administrators AND the user — so `/inheritance:r` removed nothing,
+        /// the user kept Full Control, and the recorder's identity (the same
+        /// user) was rightly allowed in. The cell went red for a folder that
+        /// was never Administrators-only; this sets the whole descriptor.
+        fn lock_to_administrators(dir: &Path) {
+            use windows_sys::Win32::Security::{
+                AddAccessAllowedAceEx, DACL_SECURITY_INFORMATION, InitializeSecurityDescriptor,
+                OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+                SECURITY_DESCRIPTOR, SetFileSecurityW, SetSecurityDescriptorDacl,
+                SetSecurityDescriptorOwner,
+            };
+            const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+            const OBJECT_AND_CONTAINER_INHERIT: u32 = 0x1 | 0x2;
+            let mut admins = well_known_sid(WinBuiltinAdministratorsSid).unwrap();
+            let sid: PSID = admins.as_mut_ptr().cast();
+            // SAFETY: `admins` holds a valid SID; the buffers below are sized
+            // for exactly one ACE and outlive every call that points at them.
+            unsafe {
+                let size = std::mem::size_of::<ACL>() as u32
+                    + std::mem::size_of::<ACCESS_ALLOWED_ACE>() as u32
+                    - 4
+                    + GetLengthSid(sid);
+                let mut acl_buf = vec![0u64; (size as usize).div_ceil(8)];
+                let acl = acl_buf.as_mut_ptr() as *mut ACL;
+                assert_ne!(InitializeAcl(acl, size, ACL_REVISION), 0);
+                assert_ne!(
+                    AddAccessAllowedAceEx(
+                        acl,
+                        ACL_REVISION,
+                        OBJECT_AND_CONTAINER_INHERIT,
+                        GENERIC_ALL,
+                        sid
+                    ),
+                    0
+                );
+                let mut sd: SECURITY_DESCRIPTOR = std::mem::zeroed();
+                let psd = (&mut sd as *mut SECURITY_DESCRIPTOR).cast();
+                assert_ne!(
+                    InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION),
+                    0
+                );
+                assert_ne!(SetSecurityDescriptorDacl(psd, 1, acl, 0), 0);
+                assert_ne!(SetSecurityDescriptorOwner(psd, sid, 0), 0);
+                let path: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+                assert_ne!(
+                    SetFileSecurityW(
+                        path.as_ptr(),
+                        OWNER_SECURITY_INFORMATION
+                            | DACL_SECURITY_INFORMATION
+                            | PROTECTED_DACL_SECURITY_INFORMATION,
+                        psd,
+                    ),
+                    0,
+                    "{}",
+                    last_error("SetFileSecurityW")
+                );
+            }
+        }
+
         /// The daemon's work in the person's folder gets only the person's
         /// rights: on an elevated run, a folder only Administrators may write
         /// to takes this process's write and refuses the same write made
@@ -1163,12 +1229,7 @@ pub(crate) mod win {
             let dir = tempfile::tempdir().unwrap();
             let locked = dir.path().join("administrators-only");
             std::fs::create_dir(&locked).unwrap();
-            let granted = std::process::Command::new("icacls")
-                .arg(&locked)
-                .args(["/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F"])
-                .output()
-                .unwrap();
-            assert!(granted.status.success(), "{granted:?}");
+            lock_to_administrators(&locked);
 
             let acl = std::process::Command::new("icacls")
                 .arg(&locked)
