@@ -2,10 +2,26 @@
 // Copyright (C) 2026 G ROX EOOD
 /*
  * Tunnels view: declared, daemon-supervised routes (P6) + the live-forwards
- * table (`cmd_flows` — per-forward transport, connection count and byte
- * counters). Routes and flows poll ONLY while this view is visible; the
- * route list is also broadcast (`roomler:routes`) so the Overview can show
- * an active-count without polling again.
+ * table (per-forward transport, connection count and byte counters). Both
+ * come from ONE `cmd_tunnels_view` call — one LocalAPI connection per
+ * refresh (FR-84 D1) — polled only while this view is visible; the route
+ * list is also broadcast (`roomler:routes`) so the Overview can show an
+ * active-count without polling again.
+ *
+ * FR-84 D1 — the page holds still:
+ *   - an error is never painted as data. A failed refresh keeps the last
+ *     good routes/flows on screen and shows ONE status line ("live data
+ *     unavailable since HH:MM:SS · N failures · reason"); it clears on the
+ *     next success. Before this, any error became `[]`, and `[]` hid the
+ *     table and showed "no routes yet" every few seconds.
+ *   - a sequence guard drops a response that is older than the newest one
+ *     already applied (a slow pipe answering after a faster later call).
+ *   - rows are keyed by route id / flow id and patched in place — cells via
+ *     textContent, a row added or removed only when the SET changes — so a
+ *     button never moves under the cursor.
+ *   - a declared route can be EDITED: the action pre-fills the add form,
+ *     which then saves through `cmd_route_update` (an atomic replace in the
+ *     daemon; an invalid edit leaves the old route running).
  *
  * The add-route form offers a picker of known agent peers (from the central
  * device view — PeerInfo.agent_id is the join key) with a free-text escape
@@ -18,29 +34,83 @@
   'use strict';
   const { $, invoke, show, hide, fmtBytes, on, get, currentView } = window.Roomler;
 
-  let busy = false; // one mutation in flight at a time
-  let lastRoutes = [];
+  let busy = false;            // one mutation in flight at a time
+  let lastRoutes = [];         // last GOOD data — what the tables show
   let lastFlows = [];
+  let seq = 0;                 // refresh requests issued
+  let applied = 0;             // the newest response applied to the page
+  let inFlight = 0;            // refreshes awaiting the daemon (a count: a
+                               // forced refresh can overlap a stalled poll)
+  let failures = 0;            // consecutive failed refreshes
+  let unavailableSince = null; // Date of the first failure of the streak
+  let editing = null;          // the RouteDescriptor the form is editing, or null
+
+  const routeRows = new Map(); // route id → row handle
+  const flowRows = new Map();  // flow id → row handle
 
   const CUSTOM = '__custom__';
 
   function visible() { return currentView() === 'tunnels'; }
 
-  async function refresh() {
+  /* ── refresh ────────────────────────────────────────────────────── */
+
+  // `force` — a mutation or a view entry always runs; a poll tick never
+  // stacks behind a stalled pipe (each stacked call is one more open).
+  async function refresh(opts) {
     if (!visible()) return;
+    const force = !!(opts && opts.force);
+    if (inFlight > 0 && !force) return;
+    const mine = ++seq;
+    inFlight += 1;
+    let view;
     try {
-      [lastRoutes, lastFlows] = await Promise.all([
-        invoke('cmd_route_list'),
-        invoke('cmd_flows'),
-      ]);
+      view = await invoke('cmd_tunnels_view');
     } catch (err) {
-      // Both commands are never-fail by contract.
-      console.error('tunnels refresh failed', err);
+      // The command never rejects by contract; if the bridge itself does,
+      // that is a failure like any other — shown, never painted as data.
+      view = { available: false, reason: 'cmd_tunnels_view rejected: ' + String(err) };
+    } finally {
+      // A count, not a flag: a forced refresh that finishes while a stalled
+      // poll is still waiting must not re-open the gate for the next tick.
+      inFlight -= 1;
+    }
+    // Sequence guard: a response older than the newest already applied is
+    // dropped, not painted.
+    if (mine < applied) return;
+    applied = mine;
+
+    if (!view || !view.available) {
+      noteUnavailable(view && view.reason ? view.reason : 'no response');
       return;
     }
+    noteAvailable();
+    lastRoutes = Array.isArray(view.routes) ? view.routes : [];
+    lastFlows = Array.isArray(view.flows) ? view.flows : [];
     paintRoutes(lastRoutes);
     paintFlows(lastFlows);
     document.dispatchEvent(new CustomEvent('roomler:routes', { detail: lastRoutes }));
+  }
+
+  function fmtClock(d) {
+    return d.toLocaleTimeString([], { hour12: false });
+  }
+
+  function noteUnavailable(reason) {
+    failures += 1;
+    if (!unavailableSince) unavailableSince = new Date();
+    const line = $('tn-stale');
+    if (!line) return;
+    line.textContent =
+      'live data unavailable since ' + fmtClock(unavailableSince) +
+      ' · ' + failures + (failures === 1 ? ' failure' : ' failures') +
+      ' · ' + reason;
+    show(line);
+  }
+
+  function noteAvailable() {
+    failures = 0;
+    unavailableSince = null;
+    hide($('tn-stale'));
   }
 
   /* ── peer lookups ───────────────────────────────────────────────── */
@@ -64,27 +134,27 @@
     return agentId.length > 10 ? agentId.slice(0, 8) + '…' : agentId;
   }
 
-  /* ── declared routes ────────────────────────────────────────────── */
-
-  // Compact human word for a RouteState (adjacently tagged on `state`).
-  function stateLabel(s) {
-    switch (s.state) {
-      case 'disabled': return { text: 'disabled', cls: 'muted' };
-      case 'pending': return { text: 'pending', cls: 'muted' };
-      case 'active': return { text: 'active', cls: 'ok' };
-      case 'backoff':
-        return { text: 'retrying in ' + s.next_retry_secs + 's: ' + s.last_error, cls: 'warn' };
-      case 'failed':
-        return { text: 'FAILED: ' + s.reason, cls: 'err' };
-      default: return { text: s.state || '—', cls: 'muted' };
-    }
-  }
+  /* ── row plumbing ───────────────────────────────────────────────── */
 
   function td(text, cls) {
     const el = document.createElement('td');
     el.textContent = text;
     if (cls) el.className = cls;
     return el;
+  }
+
+  // Patch helpers: touch the DOM only when the value changed, so a steady
+  // page does zero mutations per tick.
+  function setText(el, text) { if (el.textContent !== text) el.textContent = text; }
+  function setClass(el, cls) { if (el.className !== cls) el.className = cls; }
+
+  // Sync `body`'s children to `order` (an array of <tr>), moving a row only
+  // when its position changed and never touching a row already in place.
+  function syncOrder(body, order) {
+    order.forEach((tr, idx) => {
+      const at = body.children[idx];
+      if (at !== tr) body.insertBefore(tr, at || null);
+    });
   }
 
   function actionBtn(label, danger, onClick) {
@@ -105,16 +175,87 @@
         if (slot) { slot.textContent = String(err); show(slot); }
       } finally {
         busy = false;
-        await refresh();
+        b.disabled = false;
+        await refresh({ force: true });
       }
     });
     return b;
+  }
+
+  /* ── declared routes ────────────────────────────────────────────── */
+
+  // Compact human word for a RouteState (adjacently tagged on `state`).
+  function stateLabel(s) {
+    switch (s.state) {
+      case 'disabled': return { text: 'disabled', cls: 'muted' };
+      case 'pending': return { text: 'pending', cls: 'muted' };
+      case 'active': return { text: 'active', cls: 'ok' };
+      case 'backoff':
+        return { text: 'retrying in ' + s.next_retry_secs + 's: ' + s.last_error, cls: 'warn' };
+      case 'failed':
+        return { text: 'FAILED: ' + s.reason, cls: 'err' };
+      default: return { text: s.state || '—', cls: 'muted' };
+    }
   }
 
   // The flow backing an active route, for its live Traffic column.
   function flowForRoute(state) {
     if (!state || state.state !== 'active' || !state.flow_id) return null;
     return lastFlows.find((f) => f.id === state.flow_id) || null;
+  }
+
+  function buildRouteRow(id) {
+    const tr = document.createElement('tr');
+    const cells = {
+      id: td(id, 'mono'),
+      kind: td(''),
+      local: td('', 'mono'),
+      remote: td('', 'mono'),
+      device: td(''),
+      state: td(''),
+    };
+    // The state cell holds a text node + the live-traffic span, so the text
+    // can be patched without dropping the span.
+    const stateText = document.createTextNode('');
+    const traffic = document.createElement('span');
+    traffic.className = 'muted small';
+    traffic.hidden = true;
+    cells.state.append(stateText, traffic);
+    tr.append(cells.id, cells.kind, cells.local, cells.remote, cells.device, cells.state);
+
+    const row = { tr, cells, stateText, traffic, route: null };
+    const actions = document.createElement('td');
+    // The handlers read `row.route` at click time, so the buttons are
+    // created once and never re-created by a repaint.
+    row.toggle = actionBtn('Disable', false, () =>
+      invoke('cmd_route_set_enabled', { id, enabled: !(row.route && row.route.enabled) }));
+    row.edit = actionBtn('Edit', false, () => beginEdit(row.route));
+    row.remove = actionBtn('Remove', true, () => invoke('cmd_route_remove', { id }));
+    actions.append(row.toggle, row.edit, row.remove);
+    tr.appendChild(actions);
+    return row;
+  }
+
+  function updateRouteRow(row, r) {
+    const d = r.route;
+    row.route = d;
+    setText(row.cells.kind, d.kind);
+    setText(row.cells.local, '127.0.0.1:' + d.local);
+    setText(row.cells.remote, d.remote || '—');
+    setText(row.cells.device, deviceLabel(d.node));
+    const st = stateLabel(r.state);
+    if (row.stateText.data !== st.text) row.stateText.data = st.text;
+    setClass(row.cells.state, st.cls || '');
+    // Live traffic rides in the state cell ("active · ↓ 2 MiB ↑ 1 MiB") —
+    // one column fewer keeps the table inside a narrow window.
+    const flow = flowForRoute(r.state);
+    if (flow) {
+      setText(row.traffic, ' · ↓ ' + fmtBytes(flow.bytes_in) + ' ↑ ' + fmtBytes(flow.bytes_out));
+      row.traffic.hidden = false;
+    } else {
+      row.traffic.hidden = true;
+    }
+    setText(row.toggle, d.enabled ? 'Disable' : 'Enable');
   }
 
   function paintRoutes(routes) {
@@ -124,74 +265,92 @@
     if (!body) return;
 
     if (!routes.length) {
+      // Real data saying "no routes" — never reached from an error path.
       show(empty); hide(table);
+      body.replaceChildren();
+      routeRows.clear();
       return;
     }
     hide(empty); show(table);
 
-    const rows = routes.map((r) => {
-      const d = r.route;
-      const tr = document.createElement('tr');
-      tr.appendChild(td(d.id, 'mono'));
-      tr.appendChild(td(d.kind));
-      tr.appendChild(td('127.0.0.1:' + d.local, 'mono'));
-      tr.appendChild(td(d.remote || '—', 'mono'));
-      tr.appendChild(td(deviceLabel(d.node)));
-      const st = stateLabel(r.state);
-      const stateTd = td(st.text, st.cls);
-      // Live traffic rides in the state cell ("active · ↓ 2 MiB ↑ 1 MiB") —
-      // one column fewer keeps the table inside a narrow window.
-      const flow = flowForRoute(r.state);
-      if (flow) {
-        const traffic = document.createElement('span');
-        traffic.className = 'muted small';
-        traffic.textContent =
-          ' · ↓ ' + fmtBytes(flow.bytes_in) + ' ↑ ' + fmtBytes(flow.bytes_out);
-        stateTd.appendChild(traffic);
+    const seen = new Set();
+    const order = [];
+    for (const r of routes) {
+      const id = r.route.id;
+      seen.add(id);
+      let row = routeRows.get(id);
+      if (!row) {
+        row = buildRouteRow(id);
+        routeRows.set(id, row);
       }
-      tr.appendChild(stateTd);
-
-      const actions = document.createElement('td');
-      if (d.enabled) {
-        actions.appendChild(actionBtn('Disable', false, () =>
-          invoke('cmd_route_set_enabled', { id: d.id, enabled: false })));
-      } else {
-        actions.appendChild(actionBtn('Enable', false, () =>
-          invoke('cmd_route_set_enabled', { id: d.id, enabled: true })));
-      }
-      actions.appendChild(actionBtn('Remove', true, () =>
-        invoke('cmd_route_remove', { id: d.id })));
-      tr.appendChild(actions);
-      return tr;
-    });
-    body.replaceChildren(...rows);
+      updateRouteRow(row, r);
+      order.push(row.tr);
+    }
+    for (const [id, row] of routeRows) {
+      if (!seen.has(id)) { row.tr.remove(); routeRows.delete(id); }
+    }
+    syncOrder(body, order);
   }
 
   /* ── live flows ─────────────────────────────────────────────────── */
+
+  function buildFlowRow() {
+    const tr = document.createElement('tr');
+    const cells = {
+      kind: td(''),
+      local: td('', 'mono'),
+      target: td('', 'mono'),
+      device: td(''),
+      transport: td(''),
+      conns: td(''),
+      traffic: td('', 'small'),
+    };
+    tr.append(cells.kind, cells.local, cells.target, cells.device,
+      cells.transport, cells.conns, cells.traffic);
+    return { tr, cells };
+  }
+
+  function updateFlowRow(row, f) {
+    setText(row.cells.kind, f.kind);
+    setText(row.cells.local, f.local_addr);
+    setText(row.cells.target, f.target || '—');
+    setText(row.cells.device, deviceLabel(f.node));
+    setText(row.cells.transport, f.transport);
+    setText(row.cells.conns, String(f.active_flows));
+    setText(row.cells.traffic, '↓ ' + fmtBytes(f.bytes_in) + ' ↑ ' + fmtBytes(f.bytes_out));
+  }
 
   function paintFlows(flows) {
     const card = $('tn-flows-card');
     const body = $('tn-flows-body');
     if (!body) return;
     if (!flows.length) {
+      // Real data: no live forwards right now.
       hide(card);
+      body.replaceChildren();
+      flowRows.clear();
       return;
     }
     show(card);
-    body.replaceChildren(...flows.map((f) => {
-      const tr = document.createElement('tr');
-      tr.appendChild(td(f.kind));
-      tr.appendChild(td(f.local_addr, 'mono'));
-      tr.appendChild(td(f.target || '—', 'mono'));
-      tr.appendChild(td(deviceLabel(f.node)));
-      tr.appendChild(td(f.transport));
-      tr.appendChild(td(String(f.active_flows)));
-      tr.appendChild(td('↓ ' + fmtBytes(f.bytes_in) + ' ↑ ' + fmtBytes(f.bytes_out), 'small'));
-      return tr;
-    }));
+    const seen = new Set();
+    const order = [];
+    for (const f of flows) {
+      seen.add(f.id);
+      let row = flowRows.get(f.id);
+      if (!row) {
+        row = buildFlowRow();
+        flowRows.set(f.id, row);
+      }
+      updateFlowRow(row, f);
+      order.push(row.tr);
+    }
+    for (const [id, row] of flowRows) {
+      if (!seen.has(id)) { row.tr.remove(); flowRows.delete(id); }
+    }
+    syncOrder(body, order);
   }
 
-  /* ── add-route form ─────────────────────────────────────────────── */
+  /* ── add / edit form ────────────────────────────────────────────── */
 
   function paintNodeOptions() {
     const sel = $('tn-node');
@@ -224,6 +383,63 @@
     return sel.value;
   }
 
+  // Add mode vs edit mode: the same form, different title, submit label,
+  // a Cancel button, and a read-only id (the id is what the update is
+  // keyed by — renaming is remove + add).
+  function setFormMode() {
+    const title = $('tn-form-title');
+    const submit = $('tn-submit');
+    const cancel = $('tn-cancel');
+    const idInput = $('tn-id');
+    if (editing) {
+      if (title) title.textContent = 'Edit route ' + editing.id;
+      if (submit) submit.textContent = 'Save changes';
+      show(cancel);
+      if (idInput) idInput.readOnly = true;
+    } else {
+      if (title) title.textContent = 'Add route…';
+      if (submit) submit.textContent = 'Add route';
+      hide(cancel);
+      if (idInput) idInput.readOnly = false;
+    }
+  }
+
+  function beginEdit(d) {
+    if (!d) return;
+    editing = d;
+    const sel = $('tn-node');
+    const custom = $('tn-custom-node');
+    paintNodeOptions();
+    if ([...sel.options].some((o) => o.value === d.node)) {
+      sel.value = d.node;
+      custom.value = '';
+      custom.hidden = true;
+    } else {
+      sel.value = CUSTOM;
+      custom.value = d.node;
+      custom.hidden = false;
+    }
+    $('tn-local').value = d.local;
+    $('tn-remote').value = d.remote || '';
+    $('tn-transport').value = d.transport === 'auto' ? '' : (d.transport || '');
+    $('tn-id').value = d.id;
+    hide($('tn-form-error'));
+    setFormMode();
+    const details = $('tn-add');
+    if (details) details.open = true;
+    $('tn-local').focus();
+  }
+
+  function endEdit(form) {
+    editing = null;
+    form.reset();
+    // An error from a rejected Save belongs to the edit being left; it must
+    // not stay under a form that now says "Add route".
+    hide($('tn-form-error'));
+    $('tn-custom-node').hidden = true;
+    setFormMode();
+  }
+
   function wireForm() {
     const form = $('tn-form');
     if (!form) return;
@@ -231,6 +447,9 @@
     $('tn-node').addEventListener('change', () => {
       $('tn-custom-node').hidden = $('tn-node').value !== CUSTOM;
     });
+
+    const cancel = $('tn-cancel');
+    if (cancel) cancel.addEventListener('click', () => endEdit(form));
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -247,7 +466,7 @@
       const local = parseInt($('tn-local').value, 10);
       const remoteRaw = $('tn-remote').value.trim();
       const transport = $('tn-transport').value;
-      const id = $('tn-id').value.trim();
+      const id = editing ? editing.id : $('tn-id').value.trim();
 
       const route = {
         id: id,
@@ -255,33 +474,41 @@
         node: node,
         local: local,
         transport: transport,
-        enabled: true,
+        // An edit keeps the route's enabled state and org; an add is live.
+        enabled: editing ? !!editing.enabled : true,
       };
       if (remoteRaw) route.remote = remoteRaw;
+      if (editing && editing.org) route.org = editing.org;
 
       busy = true;
       try {
-        await invoke('cmd_route_add', { route });
-        form.reset();
-        $('tn-custom-node').hidden = true;
+        if (editing) {
+          await invoke('cmd_route_update', { route });
+          endEdit(form);
+        } else {
+          await invoke('cmd_route_add', { route });
+          form.reset();
+          $('tn-custom-node').hidden = true;
+        }
       } catch (err) {
         errSlot.textContent = String(err);
         show(errSlot);
       } finally {
         busy = false;
-        await refresh();
+        await refresh({ force: true });
       }
     });
   }
 
   document.addEventListener('DOMContentLoaded', () => {
     wireForm();
+    setFormMode();
     on('deviceView', paintNodeOptions);
     // Refresh immediately when the view is entered; poll only while visible.
     document.addEventListener('roomler:view', (ev) => {
-      if (ev.detail === 'tunnels') void refresh();
+      if (ev.detail === 'tunnels') void refresh({ force: true });
     });
-    void refresh();
-    setInterval(refresh, 2000);
+    void refresh({ force: true });
+    setInterval(() => void refresh(), 2000);
   });
 })();

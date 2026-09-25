@@ -482,6 +482,28 @@ enum RouteAction {
         /// Route id (from `route ls`).
         id: String,
     },
+    /// Edit a declared route in place (FR-84). The daemon replaces it in
+    /// ONE step: an invalid edit is refused and the old route keeps
+    /// running; a valid one restarts the route with the new settings.
+    Edit {
+        /// Route id (from `route ls`).
+        id: String,
+        /// New target agent id (24-hex).
+        #[arg(long)]
+        agent: Option<String>,
+        /// New local loopback port.
+        #[arg(long)]
+        local: Option<u16>,
+        /// New forward target `host:port` (turns a SOCKS5 route into a forward).
+        #[arg(long, conflicts_with = "socks5")]
+        remote: Option<String>,
+        /// Make it a SOCKS5 route (drops the forward target).
+        #[arg(long)]
+        socks5: bool,
+        /// New transport preference: auto | quic | webrtc.
+        #[arg(long, value_enum)]
+        transport: Option<CliTransport>,
+    },
 }
 
 /// Which binary is hosting this command surface.
@@ -603,6 +625,24 @@ where
             RouteAction::Ls { fmt } => localclient::route_ls(fmt.json).await,
             RouteAction::Enable { id } => localclient::route_set_enabled(&id, true).await,
             RouteAction::Disable { id } => localclient::route_set_enabled(&id, false).await,
+            RouteAction::Edit {
+                id,
+                agent,
+                local,
+                remote,
+                socks5,
+                transport,
+            } => {
+                localclient::route_edit(localclient::RouteEdit {
+                    id,
+                    agent,
+                    local,
+                    remote,
+                    socks5,
+                    transport: transport.map(CliTransport::as_word),
+                })
+                .await
+            }
         },
         Command::Run {} => bail!(
             "`run` was superseded by daemon-supervised declared routes — use `route add` \

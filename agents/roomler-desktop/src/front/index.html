@@ -225,6 +225,10 @@
           on every restart until removed.
         </p>
 
+        <!-- FR-84 D1: a failed refresh keeps the tables below as they were and
+             says so here (since when, how often, why); cleared on recovery. -->
+        <p id="tn-stale" class="banner banner-warn small" hidden></p>
+
         <div class="card">
           <h3>Declared routes</h3>
           <p id="tn-empty" class="muted small" style="margin: 0" hidden>
@@ -248,7 +252,7 @@
           </div>
 
           <details id="tn-add">
-            <summary>Add route…</summary>
+            <summary id="tn-form-title">Add route…</summary>
             <form id="tn-form" class="form-narrow" autocomplete="off">
               <label>Target device
                 <select id="tn-node"></select>
@@ -277,7 +281,8 @@
                 <input id="tn-id" type="text" placeholder="generated when empty" spellcheck="false" />
               </label>
               <div class="actions">
-                <button type="submit" class="primary">Add route</button>
+                <button type="submit" id="tn-submit" class="primary">Add route</button>
+                <button type="button" id="tn-cancel" hidden>Cancel</button>
               </div>
               <p id="tn-form-error" class="error small" hidden></p>
             </form>
