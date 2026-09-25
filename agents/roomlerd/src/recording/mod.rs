@@ -24,7 +24,9 @@ pub mod annexb;
 pub mod audio;
 pub mod child;
 pub mod folder;
-pub mod identity;
+/// FR-85 P1e — who the recorder runs as (the person signed in at the
+/// device, at normal integrity), and launching it as that.
+pub mod launch;
 pub mod manager;
 pub mod mp4;
 pub mod pacer;
