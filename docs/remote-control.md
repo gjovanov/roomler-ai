@@ -776,10 +776,10 @@ flowchart LR
     sc -->|"awaiting_consent · server-owned, never armed"| rdy[ready]
     rdy --> off[offer_sent]
     off -->|"negotiating · 15 s bound"| ans[answer]
-    ans --> pc
     subgraph carrier["carrier — browser only, dominates a relayed connect"]
         pc[pc_connected] --> dc[dc_open] --> ff["first_frame = TTFF"]
     end
+    ans --> pc
     classDef srv fill:#dbeafe,stroke:#2563eb,color:#1e3a8a;
     class sc,rdy,ans srv;
 ```
@@ -859,14 +859,16 @@ sequenceDiagram
             O-->>V: rc:session.created, via the relay
         else nobody holds it
             P-->>V: rc:error agent_offline (error_code, controller.rs:508)
-            Note over V: isRetryableRcErrorCode → the ladder advances;<br/>no client timer was involved
+            Note over V: a first connect fails fast with the reason;<br/>a mid-ladder attempt rides on (isRetryableRcErrorCode).<br/>No client timer was involved either way
         end
     end
 ```
 
-The viewer surfaces the code (`rcErrorMessage`) and advances the ladder on it
-(`isRetryableRcErrorCode`, `useRemoteControl.ts:264`), so the undeliverable case
-never waits for any timer. ⚠️ **What the server genuinely cannot see** is the case
+The viewer surfaces the code (`rcErrorMessage`) — a first connect fails fast
+with an attributable reason, and an attempt already inside the ladder advances
+on it instead (`isRetryableRcErrorCode`, `useRemoteControl.ts:264`) — so the
+undeliverable case never waits for any timer. ⚠️ **What the server genuinely
+cannot see** is the case
 actually observed in the field: a session that *reached* the agent, gathered
 candidates at +160 ms, and then went silent. A live agent that stops answering is
 not detectable by another server-side check — only the browser's marks can name
@@ -927,7 +929,7 @@ posts **one record**: the console line, persisted.
       "v": 1,
       "outcome": "first_frame",             // first_frame | abandoned | closed | retried
       "attempt": 1, "after_drop": false,
-      "hidden": false,                      // the tab was hidden at some point during the attempt
+      "hidden": false,                      // true when the tab was hidden at any point during the attempt
       "stalled_at": null,                   // the first mark never reached, e.g. "answer"
       "ttff_ms": 2736,
       "agent_id": "<device hex>",
@@ -979,7 +981,7 @@ route by `browser_connect_timing_record_parses` (`agent_log.rs:445`), because a
 **Mining it** (`roomler2`, in the `mongodb-0` pod — credentials from the
 `mongodb-secret`, never on a transcript). Retention is the collection's **7 d
 TTL** (`lib.rs:475`, `crates/db/src/models/agent_log.rs:115`) — the same window
-as the agent's own logs and the pod log is shorter still, so a stall must be
+as the agent's own logs, and the pod log is shorter still — so a stall must be
 mined within the week; `remote_audit` keeps its three marks for 90 d.
 
 ```js
