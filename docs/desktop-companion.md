@@ -54,7 +54,8 @@ Hash routes in `src/front/app.js`; one `<section id="view-*">` per page. The ins
 | Page | Route | What it shows | Data (LocalAPI) | Refresh |
 |---|---|---|---|---|
 | Overview | `#/overview` | this device (name, overlay IPs, server, service, versions), exit node, updates | `Status` (via the shared device view) | on the 2 s device-view tick |
-| Devices | `#/devices` | the devices this machine can see — see §6 and §9 | `Status` + `Peers` today; `Devices` / `Mesh` with FR-84 D5 | 2 s (local peers) |
+| Devices | `#/devices` | the devices this machine's mesh can see: a server-side grid (search, sort, paging, column chooser) and the mesh graph — see §6 | `Devices` / `Mesh` (daemon-proxied), live connection cells from `Peers` | list 30 s and mesh 60 s while visible; peers 2 s |
+| Recordings | `#/recordings` | local and remote screen recordings (FR-85) | FR-85's verbs | on entry |
 | Routes | `#/tunnels` | declared routes (`[[tunnel_routes]]`) and live forwards, with add / edit / enable / disable / remove | `RouteList` + `Flows` on **one** connection; `RouteAdd` / `RouteUpdate` / `RouteSetEnabled` / `RouteRemove` | 2 s while visible |
 | Settings | `#/settings` | the config surface, grouped (§5); device name; service; the log | `ConfigGet` / `ConfigSet`, `SetDeviceName`, `TailLog` | on entry |
 | Onboarding | `#/onboarding` | enrol (server, name, token) or re-enrol | in-process enrolment | — |
@@ -203,6 +204,43 @@ flowchart TD
 - Proven by a negative control: with visibility taken from every live node instead of the
   shaped netmap, the enforce test leaks a withheld peer and fails
   (`crates/tests/src/agent_self_tests.rs`).
+
+### The companion's side
+
+```mermaid
+sequenceDiagram
+    participant G as Devices page (grid.js, mesh.js)
+    participant L as LocalAPI
+    participant V as roomlerd self_view
+    participant S as /api/agent/self/*
+    G->>L: Devices {org, page, per_page, q, sort, dir}
+    L->>V: cache hit (≤ 10 s)? answer it
+    V->>S: GET with THAT org's agent token (10 s timeout)
+    S-->>V: VisibleDevicesPage
+    V-->>G: DevicesPage — or Upstream {code, message}
+    Note over G: live connection / RTT cells come from the local<br/>Peers poll (2 s), joined on the overlay node id
+```
+
+- **The daemon proxies, per org.** `agents/roomlerd/src/self_view.rs` keeps each org's server
+  URL and agent token (the token is redacted from `Debug` and never logged) and asks with
+  the right one. Answers are cached — 10 s for a page, 20 s for the mesh, 32 entries, one
+  request in flight per key — so the companion, the CLI and re-renders share a fetch.
+- **A failure has a name, never an empty list.** `Response::Upstream { code }`:
+  `server_unreachable` (connect, TLS, timeout), `unauthorized` (401), `unsupported_server`
+  (404 — a server older than the route), `module_unmounted` (the server's own 503),
+  `rate_limited` (429), `server_error`, `unknown_org`, `org_disabled`.
+- **The page.** `front/grid.js` is the web grid's model ported to plain JS: server sort keys,
+  debounced search, pager, and a column chooser (show / hide, drag, ▲/▼) remembered per org
+  in `localStorage`. `front/mesh.js` draws the web dashboard's ring graph in plain SVG; its
+  pure helpers `front/mesh-util.js` are **generated** from `ui/src/utils/mesh.ts`, and a
+  Vitest check fails when the copy is stale. The list refreshes every 30 s only while the
+  view is visible (60 → 120 s back-off after an error, the last page kept on screen).
+- **Older sides still work.** A daemon that predates the verbs, or a server without the
+  routes, gets the pre-FR-84 peers table with a one-line note to update. `overlay:
+  "no_node"` shows this device and the "private network is off" hint; ACL `enforce` with no
+  visible peers says so.
+- **From a terminal:** `roomler devices [--org L] [-q TEXT] [--sort KEY] [--desc]
+  [--page N] [--per-page N] [--json]`.
 
 ## 7. Apply now — restarting the service from the companion
 
