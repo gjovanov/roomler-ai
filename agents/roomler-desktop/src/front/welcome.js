@@ -174,7 +174,7 @@
         platform.macosPrivilegedHalf
           ? "The private network runs in Roomler's system service, which has its own " +
               'enrollment (it appears among your devices with "-daemon" after its name). ' +
-              'Nothing to turn on here; Settings of that device controls it.'
+              'There is nothing to turn on here.'
           : "On a Mac the private network runs in Roomler's system service, which the " +
               'installer adds when given a second enrollment token (install.sh --daemon-token). ' +
               'Screen sharing works without it.',
