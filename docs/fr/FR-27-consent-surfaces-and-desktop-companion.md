@@ -111,6 +111,25 @@ Every line below was read on `origin/master` at `861d4557`.
     although it already *compiles* there — `cargo clippy --workspace` installs
     webkit2gtk and walks the crate. This is packaging, not porting.
     — `.github/workflows/ci.yml:128`
+11. **(2026-09-25) The version the grid shows is the one on DISK, so a stale
+    RUNNING companion is invisible.** `companion::installed_version` reads the
+    Windows sidecar marker, the macOS bundle's `Info.plist`, or `dpkg-query`.
+    On MacBook-1 a companion that a person had opened ran **0.4.92 through nine
+    updates**, while the row read `companion_version = 0.4.101` for 17 days:
+    the running image was inode `1454160`, the file on disk `1809418`. It ran
+    under LaunchServices' own launchd job, which the `.pkg` postinstall's
+    `bootout com.roomler.desktop` never reaches. The cause is fixed by #1617
+    (field-verified on 0.4.102, see the log). Phase 9 fixes the grid's
+    blindness to it. — `agents/roomlerd/src/companion.rs:140`
+12. **(2026-09-25) Nothing upgrades the Linux companion after install.**
+    `scripts/install.sh` runs `dpkg -i` on the `roomler-desktop` .deb once.
+    The daemon's updater refuses that package by design
+    (`pick_linux_asset_never_takes_the_desktop_companion`), and there is no apt
+    source to upgrade it from. The `refresh_if_stale` comment saying "apt
+    upgrades" it was false; this PR corrects it. No fleet host is affected
+    today: every Linux row reports no companion (servers, WSL, Fedora). The
+    grid already shows the gap when it happens, because dpkg reports the old
+    version. Phase 10, an open decision.
 
 ### The on-screen panel
 
@@ -202,6 +221,8 @@ is why it is sequenced last, behind its own feature and the probe.
 | 6 | Field test on the GROX fleet | n/a | **partly done, 2026-08-29 on 0.4.16** — the Windows native panel is verified end to end and the field log below lists exactly what is not. The test itself found 3 defects (#877), one of which froze the whole pre-0.4.16 Linux fleet |
 | 8 | Field fixes — release-asset ordering, the virtual-desktop guard, the CLI name, and phase 2d's `companion_version` | the ordering fix is server-only and additive; the x11 guard only ever DECLINES | **implemented in #877** — needs an API deploy + 0.4.17 to field-verify |
 | 7 | Docs — `docs/remote-control.md` §11.2, `CLAUDE.md` known-issues | n/a | **done** — §11.2 rewritten (76bd6ef6) and the 2026-04-17 known-issue replaced rather than deleted; the field-result half lands with phase 6 |
+| 9 | Version honesty, part 2 (finding 11) — the grid says whether the companion that RUNS is the one INSTALLED. The daemon compares each running `roomler-desktop`'s executable identity (device + inode) with the installed file — `lsof -FDin` on macOS, a `stat` of `/proc/<pid>/exe` on Linux, not measured on Windows — and reports `companion_running` = `none` \| `current` \| `stale` on the heartbeat. The server stores only those three spellings, and the grid warns on `stale` | additive heartbeat field: absent = today's grid. `ROOMLERD_COMPANION_RUNNING_PROBE=0` stops the probe | **implemented** — field pending on the next release |
+| 10 | Linux — the companion `.deb` moves with the daemon (finding 12) | n/a | **not built — open decision** (see Open decisions); no fleet host runs a Linux companion today |
 
 ## Acceptance criteria
 
@@ -240,6 +261,16 @@ Ticked only where a run is recorded in the field log below.
 - [x] The `roomlerd` .deb's `Depends` still contains no GTK/webkit entry —
       `libasound2, libc6, libxcb-randr0, libxcb-shm0, libxcb1`, and the guard that
       asserts it actually runs now (#871).
+- [x] **(finding 11's cause)** A companion a person opened on macOS is
+      replaced by an update, not left running — MacBook-1, 0.4.102 (#1617). The
+      armed pid was GONE after the organic self-update, and the one companion
+      left runs the file on disk. See the 2026-09-25 log entry.
+- [ ] **(phase 9)** The grid tells a stale RUNNING companion apart from a
+      current one wherever that can be measured. Replacing the executable under
+      a running companion turns the row's `companion_running` to `stale` and
+      shows the warning within 3 min. Restarting the companion turns it back to
+      `current` and clears the warning. **macOS** and **Linux**; a Windows row
+      reports nothing new.
 
 ## Deviations (accepted, recorded up front)
 
@@ -259,6 +290,21 @@ Ticked only where a run is recorded in the field log below.
 - Whether the Windows session banner should eventually move to the companion for
   a single implementation, accepting the loss of `WDA_EXCLUDEFROMCAPTURE`.
   Current answer: no.
+- **Phase 10 — how a Linux companion gets updated.** Two options:
+  - The daemon installs the matching `roomler-desktop` .deb from its own
+    release at startup when dpkg says one is installed. This would be the Linux
+    arm of `refresh_if_stale`, and it goes *through* dpkg rather than around
+    it. The cost: a root daemon runs `dpkg -i`, and for a new dependency
+    `apt-get -f install`, on a person's desktop, unprompted.
+  - The companion joins an apt repository. That is infrastructure the project
+    does not have.
+
+  Undecided. No fleet host needs it yet, and the grid already shows the gap
+  when it happens.
+- **Phase 9 on Windows.** Not measured, because the daemon's own refresh kills
+  and respawns the companion it swaps. An identity check there would need the
+  mapped section's current name, since the image path is fixed at process
+  creation. Revisit only if a stale Windows companion is ever seen.
 
 ## Out of scope
 
@@ -351,3 +397,40 @@ Also on 0.4.18: `companion_version` is live end to end — NEO16 reports `0.4.18
 companion, and correctly not an empty string). The release-time picker guard
 ran for the first time on a real tag and printed the daemon `.deb` for both
 arches.
+
+### 2026-09-25 — 0.4.102: a companion a person opened survived nine updates (#1617)
+
+MacBook-1's companion showed `0.4.92` in its own window while the row read
+`companion_version = 0.4.101`. Measured read-only:
+
+| what | value |
+|---|---|
+| companion start | 2026-09-08 22:10, the same pid alive through 9 updates |
+| running image vs the file on disk | inode `1454160` vs `1809418` |
+| launchd job that owned it | LaunchServices' `application.ai.roomler.agent-tray.<n>.<n>` — not `com.roomler.desktop` |
+| `com.roomler.desktop` | `runs = 1`, `last exit code = 0`, not running |
+| install.log, after every update | "Roomler menu-bar app started" |
+
+**Mechanism.** `tauri-plugin-single-instance` made each freshly bootstrapped
+companion hand its arguments to the stale one and exit 0. The postinstall's
+`bootout com.roomler.desktop` only ever reached launchd's own instance. #1617
+now stops every console-user companion, however it was started. It then
+requires the same `launchctl print` pid on two looks 2 s apart before it prints
+"started".
+
+**Field test, criteria set in advance.** A person-opened 0.4.101 companion was
+set up *before* the release existed, the exact state the old postinstall leaves
+running. The Mac then self-updated to 0.4.102 at 12:29:05Z, on its own and 3 s
+before a manual "Update now", so the normal self-update path is what was
+tested. Every criterion passed:
+
+- the receipt and the on-disk `roomlerd`, `roomler` and `Roomler.app` all read
+  0.4.102;
+- the daemon and the GUI worker restarted, and both run the file on disk;
+- **the armed pid was GONE**;
+- exactly one companion remained, owned by launchd, running the file on disk
+  (image inode = disk inode), never exited;
+- the install.log line was true this time;
+- the row read 0.4.102 for both `agent_version` and `companion_version`.
+
+What let this run for 17 days unseen is finding 11, fixed by phase 9.

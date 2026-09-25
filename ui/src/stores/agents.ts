@@ -213,8 +213,18 @@ export interface Agent {
    *  flatten them: a pre-FR-27 agent, no companion installed, or a probe that
    *  could not read one. The daemon and the companion update by different
    *  mechanisms on every platform, so `agent_version` moving says nothing
-   *  about this one. */
+   *  about this one. ⚠️ It is the version ON DISK — a companion that kept
+   *  running through an update is invisible here (`companion_running`). */
   companion_version?: string
+  /** FR-27 phase 9 — whether the companion that RUNS is the installed one, as
+   *  the device measured it (device + inode of each running copy's executable
+   *  against the installed file): `none` | `current` | `stale`. Absent means
+   *  NOT MEASURED — Windows, a pre-phase-9 agent, no companion installed, or a
+   *  probe that could not read every running copy — never "current". Only
+   *  `stale` is worth a word on screen: a copy updated underneath it keeps
+   *  running the old code until it restarts (a Mac ran 0.4.92 for 17 days
+   *  while this row read 0.4.101). */
+  companion_running?: string
   /** FR-51 — enrolled as temporary: the server reaps it after silence, and a
    *  clean stop removes it immediately. Removal is FINAL (hard delete) — a
    *  later enrollment is a NEW device. The grid badges it so nobody is
