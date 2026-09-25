@@ -524,30 +524,14 @@ async fn handle_overlay_join(
     // Overlay ACL — the joiner's view is shaped for the JOINER. This half is
     // naturally per-recipient because the full netmap is built for exactly one
     // node; the delta fan-out below is the half that had to be un-broadcast.
-    let acl = load_acl(state, tenant_id).await;
-    let joiner_src = overlay_source_of(state, &self_node).await;
-    let mut peers: Vec<NetmapPeer> = Vec::new();
-    for n in all.iter().filter(|n| n.id != self_node.id) {
-        // P4 — resolving the peer's own identity costs up to 2 reads, so do it
-        // ONLY when the tenant is enforcing and the rules will actually ship.
-        // An `off`/`warn` tenant's join path is unchanged.
-        let peer_src = if acl.enforcing() {
-            Some(overlay_source_of(state, n).await)
-        } else {
-            None
-        };
-        if let Some(mut p) = shape_peer(
-            &acl,
-            &joiner_src,
-            n,
-            peer_src.as_ref(),
-            is_reachable(&reach, n),
-        ) {
-            // U2 — the joiner's full-netmap edge is `self_node → n`.
-            p.relay_strategy = server_relay_verdict(state, &self_node, n);
-            peers.push(p);
-        }
-    }
+    // FR-84 D5a — the shaping is `shape_full_netmap`, shared with the
+    // device's own `/api/agent/self/devices` listing so that list can never
+    // show a peer the netmap withholds.
+    let ShapedNetmap {
+        acl,
+        self_src: joiner_src,
+        peers,
+    } = shape_full_netmap(state, &self_node, &all, &reach).await;
 
     // FR-40 — stamp what this device PRESENTED, as verified above, onto its
     // agent row: the server's own record of the device's current overlay
@@ -1976,7 +1960,7 @@ const NODE_STALE_AFTER_MS: i64 = 120_000;
 /// crash can leave one Online-but-gone until its next clean leave; a
 /// periodic stale-sweep is the v2). FAIL-OPEN: a freshness-query error reads
 /// as "everything reachable" — a DB blip must not mark the fleet offline.
-async fn reachability(state: &NetworkState, nodes: &[OverlayNode]) -> HashMap<ObjectId, bool> {
+pub async fn reachability(state: &NetworkState, nodes: &[OverlayNode]) -> HashMap<ObjectId, bool> {
     let agent_ids: Vec<ObjectId> = nodes
         .iter()
         .filter_map(|n| match &n.node_ref {
@@ -2373,6 +2357,71 @@ fn relay_verdict_core(
         return RelayStrategyWire::Derp;
     }
     RelayStrategyWire::BothAllocate
+}
+
+/// What [`shape_full_netmap`] produced for one node: the peers its full
+/// netmap carries, plus the ACL posture and the node's own identity the
+/// shaping was made under — the join path keeps using both after the full
+/// netmap (the delta fan-out compiles the joiner's ingress rules from
+/// `self_src`; the DERP allow-table refresh keys on `acl.gating()`).
+pub struct ShapedNetmap {
+    pub acl: AclCtx,
+    pub self_src: OverlaySource,
+    pub peers: Vec<NetmapPeer>,
+}
+
+/// The full netmap ONE node receives: every live peer in `all` (self
+/// excluded), shaped for that node under the tenant's ACL posture, with the
+/// presence verdict from `reach` and the server's relay-tier verdict per edge.
+///
+/// This is the join path's shaping, verbatim (`handle_overlay_join` calls it),
+/// extracted in FR-84 D5a because the device's own listing
+/// (`GET /api/agent/self/devices`) must show exactly what the netmap carries
+/// — a second implementation of "who may this node see" would drift from the
+/// first, and the direction it drifts in is the one that lists a peer the
+/// netmap withholds. The semantics therefore fall out of [`shape_peer`]:
+/// `off` and `warn` return every live peer, `enforce` only the visible set.
+///
+/// ⚠️ `load_acl` goes through `get_or_create`, which can ALLOCATE a network
+/// row (and, with blocks on, carve a block) for a tenant that has none. A
+/// read-only caller must find the tenant's network and this node's live row
+/// first — both of which the join path has by construction — and call this
+/// only then. `self_node` must be a LIVE row of `all`'s network.
+pub async fn shape_full_netmap(
+    state: &NetworkState,
+    self_node: &OverlayNode,
+    all: &[OverlayNode],
+    reach: &HashMap<ObjectId, bool>,
+) -> ShapedNetmap {
+    let acl = load_acl(state, self_node.tenant_id).await;
+    let self_src = overlay_source_of(state, self_node).await;
+    let mut peers: Vec<NetmapPeer> = Vec::new();
+    for n in all.iter().filter(|n| n.id != self_node.id) {
+        // P4 — resolving the peer's own identity costs up to 2 reads, so do it
+        // ONLY when the tenant is enforcing and the rules will actually ship.
+        // An `off`/`warn` tenant's join path is unchanged.
+        let peer_src = if acl.enforcing() {
+            Some(overlay_source_of(state, n).await)
+        } else {
+            None
+        };
+        if let Some(mut p) = shape_peer(
+            &acl,
+            &self_src,
+            n,
+            peer_src.as_ref(),
+            is_reachable(reach, n),
+        ) {
+            // U2 — the recipient's full-netmap edge is `self_node → n`.
+            p.relay_strategy = server_relay_verdict(state, self_node, n);
+            peers.push(p);
+        }
+    }
+    ShapedNetmap {
+        acl,
+        self_src,
+        peers,
+    }
 }
 
 fn shape_peer(

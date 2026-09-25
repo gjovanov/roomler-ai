@@ -16,6 +16,11 @@ pub mod cost;
 // module and still has a devices page.
 #[cfg(feature = "fleet")]
 pub mod device;
+// FR-84 D5a — a device's OWN view of its org (`/api/agent/self/*`), the same
+// composition over fleet (required) + network (optional), agent-token
+// authenticated. Host-owned for the same reason as `device`.
+#[cfg(feature = "fleet")]
+pub mod agent_self;
 pub mod integration;
 pub mod invite;
 pub mod notification;
