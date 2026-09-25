@@ -18,6 +18,10 @@
 //! Design and gates: `docs/fr/FR-85-hq-screen-recording.md`.
 
 pub mod annexb;
+/// FR-85 P1c — computer audio and the microphone, mixed on the recorder's
+/// clock (the `audio` feature: cpal + audiopus).
+#[cfg(feature = "audio")]
+pub mod audio;
 pub mod child;
 pub mod folder;
 pub mod identity;
