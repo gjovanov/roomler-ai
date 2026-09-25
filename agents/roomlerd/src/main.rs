@@ -3327,37 +3327,49 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>, supervised: b
     #[cfg(not(unix))]
     let delegation_role = roomlerd::delegate::Delegation::Off;
 
+    let daemon_state = localapi_state::DaemonState::new(
+        cfg.agent_id.clone(),
+        cfg.machine_name.clone(),
+        tunnel_core::localapi::DaemonMode::Service,
+        (!cfg.tenant_id.is_empty()).then(|| cfg.tenant_id.clone()),
+        localapi_connected.clone(),
+        overlay_view_rx,
+        consent_broker.clone(),
+        Some(pinger.clone()),
+        tunnel_hub.clone(),
+        rtt_cache.clone(),
+    )
+    .with_routes(route_reconciler)
+    // The rename verb persists through the daemon's own resolved
+    // config path + the P6 write lock (profile-correct under SYSTEM).
+    .with_config_persist(config_path.clone(), cfg_write_lock.clone())
+    // …and the live gate-4 flags, so a `config set` here is in force
+    // as fast as a pushed one (docs/remote-config.md).
+    .with_remote_config(remote_cfg.clone())
+    // Multi-org P1 — live per-enrollment rows for `roomler status`.
+    // FR-27 — live remote-control sessions, so the desktop app can
+    // render "Being viewed by ..." and offer a Disconnect. Written by
+    // every signalling loop through its ViewerIndicator.
+    .with_rc_sessions(rc_sessions.clone())
+    .with_orgs(org_registry.clone())
+    .with_org_views(org_views.clone())
+    // FR-51 P4 — surface the enrollment's nature in `roomler status`.
+    .with_ephemeral(cfg.ephemeral);
+    // FR-85 — the local recording verbs: this daemon launches `roomlerd
+    // record` (its own image, resolved now, before any package upgrade can
+    // leave `/proc/self/exe` pointing at a deleted inode).
+    #[cfg(feature = "recording")]
+    let daemon_state = match std::env::current_exe() {
+        Ok(exe) => daemon_state.with_recorder(std::sync::Arc::new(
+            roomlerd::recording::manager::RecordingManager::new(exe, config_path.clone()),
+        )),
+        Err(e) => {
+            tracing::warn!(%e, "recording: cannot resolve our own path — the recording verbs are off");
+            daemon_state
+        }
+    };
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
-        std::sync::Arc::new(
-            localapi_state::DaemonState::new(
-                cfg.agent_id.clone(),
-                cfg.machine_name.clone(),
-                tunnel_core::localapi::DaemonMode::Service,
-                (!cfg.tenant_id.is_empty()).then(|| cfg.tenant_id.clone()),
-                localapi_connected.clone(),
-                overlay_view_rx,
-                consent_broker.clone(),
-                Some(pinger.clone()),
-                tunnel_hub.clone(),
-                rtt_cache.clone(),
-            )
-            .with_routes(route_reconciler)
-            // The rename verb persists through the daemon's own resolved
-            // config path + the P6 write lock (profile-correct under SYSTEM).
-            .with_config_persist(config_path.clone(), cfg_write_lock.clone())
-            // …and the live gate-4 flags, so a `config set` here is in force
-            // as fast as a pushed one (docs/remote-config.md).
-            .with_remote_config(remote_cfg.clone())
-            // Multi-org P1 — live per-enrollment rows for `roomler status`.
-            // FR-27 — live remote-control sessions, so the desktop app can
-            // render "Being viewed by ..." and offer a Disconnect. Written by
-            // every signalling loop through its ViewerIndicator.
-            .with_rc_sessions(rc_sessions.clone())
-            .with_orgs(org_registry.clone())
-            .with_org_views(org_views.clone())
-            // FR-51 P4 — surface the enrollment's nature in `roomler status`.
-            .with_ephemeral(cfg.ephemeral),
-        );
+        std::sync::Arc::new(daemon_state);
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every
     // RTT_PROBE_INTERVAL into rtt_cache; exits on shutdown. A fresh
     // `overlay_view_tx.subscribe()` receiver (the original moved into

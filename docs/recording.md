@@ -1,11 +1,12 @@
 # Screen recording
 
 > **FR-85** ([#1634](https://github.com/gjovanov/roomler-ai/issues/1634),
-> [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1, the recorder core.**
-> It sits behind the `recording` cargo feature, is in no release build yet, and
-> is driven from `roomlerd record`. The local surfaces come in P2 (roomler-desktop's
-> Recordings view, the tray, `roomler record`), remote recording in P3, and the
-> editor (cut, speed up, background music) in P5.
+> [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core) and
+> P2a (the local verbs).** It sits behind the `recording` cargo feature and is in
+> no release build yet. It is driven by `roomlerd record`, and by the daemon for
+> the LocalAPI recording verbs and `roomler record` (§6). Still to come:
+> roomler-desktop's Recordings view and the tray in P2b, remote recording in P3,
+> and the editor (cut, speed up, background music) in P5.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -127,16 +128,25 @@ but the recorder skipped would only be a courtesy.
 - ⚠️ **The probe is a real write.** Defender's Controlled Folder Access lets
   `metadata()` succeed and then blocks the write. OneDrive's Known Folder Move
   would upload gigabytes of screen recordings by default.
-- **Override** (`--out`, `record_dir` from P2): absolute, local, no `~`, no UNC
-  or `\\?\` device path, no `..`, no symlink or junction component
-  (`folder::validate_record_dir`). On Windows `is_symlink` is true for
-  junctions and false for cloud placeholders. That is the distinction wanted:
-  a placeholder doesn't redirect a path, a junction does.
+- **Override** (`--out`, or the config key `record_dir`): absolute, local, no
+  `~`, no UNC or `\\?\` device path, no `..`, no symlink or junction component.
+  ONE validator, `roomler_node_core::recording_dir::validate_record_dir`
+  (`crates/agent-core/src/recording_dir.rs`), shared by the config surface and
+  the child. On Windows `is_symlink` is true for junctions and false for cloud
+  placeholders. That is the distinction wanted: a placeholder doesn't redirect
+  a path, a junction does.
+- **`record_dir` is live.** The daemon reads it when a recording starts, so the
+  surface marks it `restart_required = false`. It is **device-only**: a
+  `DesiredConfig` cannot carry it, because the struct has no `record_*` field
+  at all. `no_record_key_is_server_pushable_via_desired_config` locks that.
+  Where screen recordings are kept is the owner's choice. A server that could
+  move the folder could move them into a synced or shared one.
 - **Names never collide:** `Roomler Recording 2026-09-25 14-30-12.mp4`, then
   ` (2)`, ` (3)`, … A partial with the name counts as taken.
 - **Staging:** `<folder>/.roomler-partial/<name>.partial`, renamed into place on
   finish. The file is created with `create_new`: a recording never replaces
-  anything.
+  anything. Beside it sits `<name>.partial.lock`, an OS file lock the recorder
+  holds until the file is final (see §5, crash recovery).
 
 ## 5. `roomlerd record`
 
@@ -156,6 +166,7 @@ the first log line. Use `recording::child::parse_event_line`.
 | `progress` | every second | `duration_ms`, `bytes`, `frames`, `late_ticks` |
 | `stopped` | the file is final | `reason`, `path`, `bytes`, `duration_ms`, `frames`, `fragmented` |
 | `refused` | it never started | `code`: `no_frame` · `disk_low` · `encoder_unavailable` · `folder_unwritable` |
+| `recovered` | a dead recorder's partial in this folder was finalized | `path` |
 
 **stdin:** `{"cmd":"stop"}`, optionally with a `"reason"`. **End of stdin
 stops the recording** (`parent_gone`), and so does Ctrl+C. Every stop
@@ -170,7 +181,99 @@ Guards: the recorder refuses to start with under 2 GiB free, stops cleanly
 under 1 GiB, and stops at the maximum length. A display that changes size ends
 the file cleanly (`display_changed`) instead of scaling mid-recording.
 
-## 6. The sidecar
+**Crash recovery.** A recorder that died (a crash, `kill -9`, the Windows
+installer's Restart Manager during an update) leaves its partial in the staging
+dir. Every `roomlerd record` runs `recorder::reconcile_partials` over its own
+staging dir as it starts. That runs beside the new recording, never before it,
+because a multi-GB remux must not hold up `started`. Each complete fragment is
+remuxed into place, and the file is marked `interrupted` in its sidecar.
+
+⚠️ **A partial is finalized only if its `.partial.lock` can be taken**
+(`recorder::PartialLock`). The recorder takes that OS file lock before it
+creates the partial, holds it until the file is final, and the kernel releases
+it however the process dies. Without it the reconciler could not tell a dead
+recorder's partial from a live one's. A second recorder in the same folder (a
+manual `roomlerd record` beside the daemon's) would remux a file under its
+writer, or, before the writer's first fragment, **delete it as
+unrecoverable**. `a_live_partial_is_left_alone_by_the_reconciler` is red with
+the lock disabled.
+
+## 6. Recording through the daemon — the local verbs (P2a)
+
+The person at the device records through the running daemon: from
+roomler-desktop (P2b) or from `roomler record`. The daemon never records in its
+own address space. It launches `roomlerd record` and follows its events
+(`recording/manager.rs`, `RecordingManager`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as roomler record / roomler-desktop
+    participant L as LocalAPI listener
+    participant M as RecordingManager (daemon)
+    participant R as roomlerd record (child)
+    C->>L: RecordStart {fps, encoder, max_minutes}
+    L->>L: peer is the console user?<br/>(else: refused, never reaches M)
+    L->>M: record_start(opts)
+    M->>M: SYSTEM/root daemon? refuse (P1e)<br/>one already running? refuse
+    M->>R: spawn: record --config … [--out record_dir]<br/>env: config fallbacks (the encoder denylist)
+    R-->>M: ROOMLER_REC_JSON:{"ev":"started",…}
+    M-->>C: Recording {active, path, encoder, w×h@fps}
+    loop every second
+        R-->>M: progress {duration_ms, bytes, frames}
+    end
+    C->>L: RecordStop
+    L->>M: record_stop()
+    M->>R: stdin {"cmd":"stop"}
+    R-->>M: stopped {reason, path, bytes, …} (file final)
+    M-->>C: Recording {active: false, last}
+```
+
+| Verb | Caller | Answers |
+|---|---|---|
+| `RecordStart {opts}` | console user | `Recording` once the child reports `started` (≤ 20 s), or an error naming why it did not start |
+| `RecordStop` | console user | `Recording` once the file is final (the remux copies every byte once; ≤ 5 min) |
+| `RecordStatus` | any LocalAPI client | `Recording`: active, file, length, size, frames, encoder, and how the last one ended |
+| `RecordingsList` | any LocalAPI client | `Recordings`: the folder, why it is that one, and each file with its sidecar facts, newest first |
+| `RecordingDelete {name}` | console user | `RecordingDeleted`; a bare `*.mp4` name only, a regular file only (never a link), refused while it is being written |
+
+- ⚠️ **The console-user gate is the listener's, not the handler's**
+  (`serve_connection_as`, `crates/localapi/src/lib.rs`). The pipe ACL admits
+  every Interactive User, RDP sessions included, which is right for reading
+  status and wrong for recording: a guest in an RDP session must not be able
+  to record the console user's desktop. Windows: the client's session
+  (`GetNamedPipeClientProcessId` → `ProcessIdToSessionId`) must be the active
+  console session. Unix: the peer's uid must be the daemon's, or root. An
+  unidentified peer fails the check. The same gate covers `ConfigSet` of any
+  `record_*` key.
+- ⚠️ **A SYSTEM/root daemon refuses a local recording, and says why**
+  (`recording/identity.rs`). The child inherits the daemon's identity, so from
+  the Windows SystemContext worker or a Linux/macOS root daemon the recording
+  would land in the service account's own profile
+  (`…\systemprofile\Videos`, `/root/Videos`), where the person who pressed
+  Record cannot see it. P1e launches the recorder as the console user. Until
+  then, `roomlerd record` run in your own session still works.
+- **One recording at a time.** A second start answers an error. A child that
+  exits without saying how it ended (a crash, bad arguments, a binary built
+  without the recorder) ends as `recorder_exited` with a sentence, never as a
+  silent "did not start".
+- ⚠️ **A recorder that misses the start deadline is killed, never left
+  running** (`start_timeout`). Its caller was told it did not start. Stuck in an
+  encoder open, it could otherwise begin recording a minute later, unseen. A
+  stop command would not reach it, because the recorder reads its stop only once
+  it is recording. `a_recorder_that_misses_the_start_deadline_is_stopped_not_left_recording`
+  is red without the kill: the child reported `started` after its caller had
+  been told no.
+- **Updates wait for a recording** (`updater.rs`, `active_work`). An active
+  recording counts as in-flight work, like a file transfer, with the same defer
+  budget. An operator-forced update proceeds anyway and says so. The mark
+  (`manager::is_recording`) is a count each recorder's reader task adds to once
+  and removes once, so no code path can clear a recording it does not own.
+- **`roomler record start|stop|status|ls|rm`**
+  (`agents/roomler-cli/src/cli.rs`) wraps these verbs one to one. `--json`
+  prints the wire shape.
+
+## 7. The sidecar
 
 `<recording>.roomler.json`, beside the file: who started it (`local`, or
 `remote` with the controller's **user id**, because remote downloads are
@@ -179,12 +282,16 @@ codec and the backend that encoded it, colour, audio sources, frames,
 late ticks, events, the stop reason, and bytes. ⚠️ **Never content**: no
 window titles, and nothing typed.
 
-## 7. Tests
+## 8. Tests
 
 | Where | What | CI |
 |---|---|---|
-| `recording::*` unit tests | Annex-B split and parameter sets; the fragmented writer (keyframe cuts, refusals, never overwriting); remux sample order with `moov` first; truncated recovery; audio interleave; the pacer's tick math and FIFO; folder probe, validation, names, OneDrive/UNC; sidecar round trip | `ci.yml` "Test the recorder (FR-85)" (`--lib recording::`) |
-| `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; and the real `roomlerd record` process: the stop command, stdin EOF, and `kill -9` followed by `reconcile_partials` | same step, `--test recorder` |
+| `recording::*` unit tests | Annex-B split and parameter sets; the fragmented writer (keyframe cuts, refusals, never overwriting); remux sample order with `moov` first; truncated recovery; audio interleave; the pacer's tick math and FIFO; folder probe, validation, names, OneDrive/UNC; sidecar round trip; the manager's event folding, delete-name rules and listing; the identity probe | `ci.yml` "Test the recorder (FR-85)" (`--lib recording::`) |
+| `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the SYSTEM/root refusal | same step, `--test recorder` |
+| `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |
+| `crates/agent-core` | `record_dir` set/echo/validate/clear; the live set is exactly `exec_enabled`, `remote_config_enabled`, `record_dir`; `recording_dir` validation incl. a real Windows junction | same |
+| `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config` | same |
+| `agents/roomler-cli` | `record` verbs parse; lengths and endings read plainly | same |
 
 ⚠️ `agents/roomlerd/tests/*.rs` runs only when a step **names** it. Every other
 roomlerd test step is `--lib`, which is why `tests/file_dc.rs` has never run in

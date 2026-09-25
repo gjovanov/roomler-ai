@@ -81,7 +81,7 @@ impl RecordOptions {
         }
     }
 
-    fn staging(&self) -> PathBuf {
+    pub fn staging(&self) -> PathBuf {
         self.staging_dir
             .clone()
             .unwrap_or_else(|| self.dest_dir.join(PARTIAL_DIR))
@@ -272,6 +272,23 @@ pub async fn run(
 
     let partial = staging.join(format!("{}{PARTIAL_SUFFIX}", opts.file_name));
     let dest = opts.dest_dir.join(&opts.file_name);
+    // Held until the file is final: the reconciler leaves a partial alone
+    // for exactly as long as this lock is held.
+    let partial_lock = match PartialLock::try_take(&partial) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return Err(refuse(
+                StartRefusal::FolderUnwritable,
+                format!("another recorder holds {}", partial.display()),
+            ));
+        }
+        Err(e) => {
+            return Err(refuse(
+                StartRefusal::FolderUnwritable,
+                format!("{}: {e}", PartialLock::path_for(&partial).display()),
+            ));
+        }
+    };
     let cadence = Cadence::new(opts.fps);
     let video = VideoTrack {
         width,
@@ -504,6 +521,8 @@ pub async fn run(
             }
         }
     };
+    // The partial is gone, or left for the reconciler to retry.
+    drop(partial_lock);
 
     let sidecar = path.as_ref().map(|p| Sidecar {
         version: SIDECAR_VERSION,
@@ -548,6 +567,52 @@ pub async fn run(
     })
 }
 
+/// The liveness lock beside a partial, `<name>.partial.lock`: an OS file lock
+/// held for as long as a recorder owns the partial, and released by the
+/// kernel however that recorder dies.
+///
+/// ⚠️ Without it the reconciler cannot tell a dead recorder's partial from a
+/// live one's — a second recorder in the same folder (a manual `roomlerd
+/// record` beside the daemon's) would remux a file under its writer, or,
+/// finding no complete fragment yet, DELETE it as unrecoverable.
+pub struct PartialLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl PartialLock {
+    pub fn path_for(partial: &Path) -> PathBuf {
+        let mut name = partial
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".lock");
+        partial.with_file_name(name)
+    }
+
+    /// Take the lock without waiting: `Ok(None)` = a live recorder holds it.
+    pub fn try_take(partial: &Path) -> std::io::Result<Option<PartialLock>> {
+        let path = Self::path_for(partial);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(PartialLock { file, path })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+}
+
+impl Drop for PartialLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Remux `partial` to `dest` and remove the partial on success.
 fn finalize_into_place(partial: &Path, dest: &Path) -> Result<mp4::FinalizeSummary> {
     if dest.exists() {
@@ -560,7 +625,8 @@ fn finalize_into_place(partial: &Path, dest: &Path) -> Result<mp4::FinalizeSumma
 
 /// Finalize every partial a dead recorder left in `staging` (the boot
 /// reconciler): remux what is complete, mark it `interrupted`. Returns the
-/// finished paths. A partial with nothing recoverable is removed.
+/// finished paths. A partial with nothing recoverable is removed; one whose
+/// [`PartialLock`] is held belongs to a live recorder and is left alone.
 pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(staging) else {
         return Vec::new();
@@ -575,6 +641,19 @@ pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
             .map(str::to_string)
         else {
             continue;
+        };
+        // A partial whose lock is held is being written right now — not
+        // interrupted. The guard lives to the end of this iteration.
+        let _lock = match PartialLock::try_take(&p) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                tracing::debug!(partial = %p.display(), "recording: a partial another recorder is writing — left alone");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(%e, partial = %p.display(), "recording: cannot take a partial's lock — left alone");
+                continue;
+            }
         };
         let dest = dest_dir.join(&name);
         if dest.exists() {

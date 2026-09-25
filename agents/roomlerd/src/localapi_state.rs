@@ -118,6 +118,14 @@ pub(crate) fn parse_ping_ms(s: &str) -> Option<u64> {
     None
 }
 
+/// FR-85 — the answer when this daemon has no recorder attached.
+#[cfg(feature = "recording")]
+fn recording_unavailable() -> Response {
+    Response::Error {
+        message: "screen recording is not available on this daemon".into(),
+    }
+}
+
 /// Live daemon state behind the LocalAPI. Built once in `run_cmd`, wrapped in an
 /// `Arc<dyn LocalApiState>` for the listener; reads are cheap clones off a
 /// `watch` borrow + an atomic load.
@@ -184,6 +192,12 @@ pub struct DaemonState {
     /// `None` in unit tests → the save still lands, only the live re-seed is
     /// skipped.
     remote_config: Option<crate::remote_config::RemoteConfigServices>,
+    /// FR-85 — the recorder's supervisor behind the recording verbs. `None`
+    /// in unit tests and daemon shapes built without one → the verbs answer
+    /// "not available". (The console-user gate is the LocalAPI listener's,
+    /// applied before any of them reaches this state.)
+    #[cfg(feature = "recording")]
+    recorder: Option<Arc<crate::recording::manager::RecordingManager>>,
 }
 
 /// Multi-org P1 — one enrollment's live handles, seeded by `run_cmd` and
@@ -257,7 +271,20 @@ impl DaemonState {
             org_views: None,
             remote_config: None,
             ephemeral: false,
+            #[cfg(feature = "recording")]
+            recorder: None,
         }
+    }
+
+    /// FR-85 — attach the recorder's supervisor so the recording verbs are
+    /// live.
+    #[cfg(feature = "recording")]
+    pub fn with_recorder(
+        mut self,
+        recorder: Arc<crate::recording::manager::RecordingManager>,
+    ) -> Self {
+        self.recorder = Some(recorder);
+        self
     }
 
     /// FR-51 P4 — stamp the primary enrollment's ephemeral nature (builder
@@ -950,6 +977,46 @@ impl LocalApiState for DaemonState {
         .unwrap_or_else(|e| Response::Error {
             message: format!("log tail task join: {e}"),
         })
+    }
+
+    #[cfg(feature = "recording")]
+    async fn record_start(&self, opts: tunnel_core::localapi::RecordStartOpts) -> Response {
+        match &self.recorder {
+            Some(r) => r.start(opts).await,
+            None => recording_unavailable(),
+        }
+    }
+
+    #[cfg(feature = "recording")]
+    async fn record_stop(&self) -> Response {
+        match &self.recorder {
+            Some(r) => r.stop().await,
+            None => recording_unavailable(),
+        }
+    }
+
+    #[cfg(feature = "recording")]
+    async fn record_status(&self) -> Response {
+        match &self.recorder {
+            Some(r) => r.status(),
+            None => Response::Recording(Default::default()),
+        }
+    }
+
+    #[cfg(feature = "recording")]
+    async fn recordings_list(&self) -> Response {
+        match &self.recorder {
+            Some(r) => r.list().await,
+            None => recording_unavailable(),
+        }
+    }
+
+    #[cfg(feature = "recording")]
+    async fn recording_delete(&self, name: &str) -> Response {
+        match &self.recorder {
+            Some(r) => r.delete(name).await,
+            None => recording_unavailable(),
+        }
     }
 
     /// Fleet RPC — relay an exec to another device over this daemon's own
