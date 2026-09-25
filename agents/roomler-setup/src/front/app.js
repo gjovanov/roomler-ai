@@ -31,6 +31,10 @@ const { listen } = window.__TAURI__.event;
 
 const STEPS = ["welcome", "server", "token", "install", "done"];
 const ROLES = ["daemon-system", "daemon-machine", "daemon-user", "tunnel-client"];
+// The roles whose MSI is perMachine (Role::msi_flavour → "permachine*"): the
+// daemon runs as a service that can create the overlay's TUN adapter, so the
+// private network is on by default for them (FR-84 S2).
+const PER_MACHINE_ROLES = ["daemon-system", "daemon-machine"];
 
 const state = {
   step: "welcome",
@@ -49,6 +53,11 @@ const state = {
   installInFlight: false,
   msiSpawned: false,   // relabels Cancel → Force-kill installer
   totalBytes: 0,       // download denominator
+  overlayChoice: null, // FR-84 S2: the overlay box once the operator touched
+                       // it (true/false); null = follow the role. Memory
+                       // only — deliberately NOT in the persisted
+                       // WizardState, so a relaunch re-derives it from the
+                       // role instead of replaying a stale click.
 };
 
 // Checklist rows keyed by event type — replay + live events render
@@ -209,6 +218,18 @@ function flavourLabel(flavour) {
   return flavour;
 }
 
+function isPerMachine(role) {
+  return PER_MACHINE_ROLES.includes(role);
+}
+
+// FR-84 S2 — what the overlay box shows: the operator's explicit choice if
+// they made one, else the role's default. Mirrors
+// `AdvancedOptions::with_flavour_defaults` on the Rust side, which applies
+// the same rule when the option never reaches it.
+function overlayChecked(role, choice) {
+  return choice ?? isPerMachine(role);
+}
+
 // ─── Step 1: Welcome ────────────────────────────────────────────────────────
 
 function wireWelcome() {
@@ -337,6 +358,13 @@ function wireServer() {
     renderServer();
   });
   document.getElementById("device-name").addEventListener("blur", persistState);
+  // FR-84 S2: a click on the overlay box is an explicit choice — it sticks
+  // across Back → another role → Continue, where an untouched box would
+  // follow the new role instead.
+  document.getElementById("adv-overlay").addEventListener("change", (e) => {
+    state.overlayChoice = e.target.checked;
+    renderServer();
+  });
 }
 
 function renderServer() {
@@ -347,11 +375,20 @@ function renderServer() {
   // S2: the advanced section holds daemon config keys — meaningless for
   // the tunnel-client role.
   document.getElementById("advanced-wrap").hidden = state.role === "tunnel-client";
+  // FR-84 S2: the overlay box follows the role until touched — on for the
+  // perMachine roles (the service can create the TUN adapter), off for a
+  // per-user install (its worker runs with a filtered token and cannot;
+  // the hint says so). The box stays enabled: the choice is the
+  // operator's, the default is only the likely one.
+  document.getElementById("adv-overlay").checked = overlayChecked(state.role, state.overlayChoice);
+  document.getElementById("adv-overlay-hint").hidden = state.role !== "daemon-user";
 }
 
 // S2 — gather the advanced daemon options for cmd_install. `null` for
 // the tunnel-client role (the section is hidden there; the Rust side
-// ignores it anyway).
+// ignores it anyway). The overlay box is sent as the operator SAW it
+// (renderServer already resolved the role default into it), so what lands
+// in config.toml is what the screen showed.
 function gatherAdvanced() {
   if (state.role === "tunnel-client") return null;
   return {
