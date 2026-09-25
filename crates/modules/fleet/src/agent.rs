@@ -431,6 +431,12 @@ pub struct AgentResponse {
     /// different situations into one string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub companion_version: Option<String>,
+    /// FR-27 phase 9 — `none` | `current` | `stale`: whether the companion that
+    /// RUNS is the one installed. Omitted when not measured, which is NOT
+    /// "current" — Windows, a pre-phase-9 agent, no companion installed, or a
+    /// probe that could not read every running copy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub companion_running: Option<String>,
     pub status: AgentStatus,
     /// FR-51 — this device enrolled as temporary: the reaper removes it after
     /// its inactivity TTL, and removal is final (hard delete, no tombstone).
@@ -1447,6 +1453,7 @@ fn to_agent_response(
         os: a.os,
         agent_version: a.agent_version,
         companion_version: a.companion_version,
+        companion_running: a.companion_running,
         status: a.status,
         ephemeral: a.ephemeral,
         ephemeral_ttl_secs: a.ephemeral_ttl_secs,

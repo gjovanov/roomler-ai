@@ -475,3 +475,93 @@ async fn stale_when_heartbeat_fresh_but_no_socket() {
     assert_eq!(row["presence"], "stale", "row: {row}");
     assert_eq!(row["is_online"], false, "stale must not read green: {row}");
 }
+
+/// Poll the listing row until `want` holds (or ~5 s pass), and return the last
+/// row read — so a failed assertion prints what the row actually said.
+async fn row_when(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    agent_id: &str,
+    want: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let row = fetch_agent_row(app, seeded, agent_id).await;
+        if want(&row) || tokio::time::Instant::now() >= deadline {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// (f) FR-27 phase 9 — the heartbeat's `companion_running` reaches the device
+/// row through a REAL agent socket (the filter lives in the socket handler, so
+/// a pure test could not see it), and only as a spelling the grid knows:
+///
+/// - `stale` is stored and served;
+/// - a state this server has never heard of — a newer agent's — is stored as
+///   ABSENT rather than passed through to the grid, and clears the `stale`;
+/// - a beat that omits the field (a pre-phase-9 agent, or "not measured")
+///   clears it too: a warning that stays up after the companion was restarted
+///   would be a lie on the screen.
+///
+/// Lives here for this file's enroll / connect / fetch helpers.
+#[tokio::test]
+async fn heartbeat_companion_running_is_stored_filtered_and_cleared() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("comprun").await;
+    let (agent_id, agent_token) = enroll(&app, &seeded, "mach-comprun-a").await;
+    let mut ws = connect_agent(&app, &agent_token).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let beat = |running: Option<&str>| {
+        let mut hb = json!({
+            "t": "rc:agent.heartbeat",
+            "rss_mb": 0,
+            "cpu_pct": 0.0,
+            "active_sessions": 0,
+            "companion_version": "0.4.103",
+        });
+        if let Some(r) = running {
+            hb["companion_running"] = json!(r);
+        }
+        Message::Text(hb.to_string().into())
+    };
+
+    ws.send(beat(Some("stale"))).await.unwrap();
+    let row = row_when(&app, &seeded, &agent_id, |r| {
+        r["companion_running"] == "stale"
+    })
+    .await;
+    assert_eq!(row["companion_running"], "stale", "row: {row}");
+    assert_eq!(row["companion_version"], "0.4.103", "row: {row}");
+
+    ws.send(beat(Some("some-future-state"))).await.unwrap();
+    let row = row_when(&app, &seeded, &agent_id, |r| {
+        r.get("companion_running").is_none()
+    })
+    .await;
+    assert!(
+        row.get("companion_running").is_none(),
+        "a state this server cannot interpret must not be stored: {row}"
+    );
+
+    ws.send(beat(Some("current"))).await.unwrap();
+    let row = row_when(&app, &seeded, &agent_id, |r| {
+        r["companion_running"] == "current"
+    })
+    .await;
+    assert_eq!(row["companion_running"], "current", "row: {row}");
+
+    ws.send(beat(None)).await.unwrap();
+    let row = row_when(&app, &seeded, &agent_id, |r| {
+        r.get("companion_running").is_none()
+    })
+    .await;
+    assert!(
+        row.get("companion_running").is_none(),
+        "a beat without the field must clear it: {row}"
+    );
+
+    let _ = ws.close(None).await;
+}

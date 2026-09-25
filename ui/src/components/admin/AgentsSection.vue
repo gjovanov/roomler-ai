@@ -357,6 +357,17 @@
               >
                 · desktop v{{ companionSkew(item) }}
               </span>
+              <!-- FR-27 phase 9 — the companion that RUNS is not the one on
+                   disk. Separate from the version skew above, which reads the
+                   disk and so cannot see this: the case it exists for had
+                   installed == daemon == 0.4.101 while 0.4.92 ran. -->
+              <span
+                v-if="companionStale(item)"
+                class="companion-skew ml-1"
+                :title="COMPANION_STALE_HINT"
+              >
+                · desktop app needs a restart
+              </span>
             </div>
           </template>
           <template #item.kind="{ item }">
@@ -701,6 +712,17 @@
                 :title="`roomler-desktop is on v${a.companion_version} while the daemon is on v${a.agent_version} — the companion updates separately`"
               >
                 desktop v{{ a.companion_version }}
+              </v-chip>
+              <!-- FR-27 phase 9 — see the grid caption: the running copy is
+                   not the installed file, whatever the versions above say. -->
+              <v-chip
+                v-if="a.companion_running === 'stale'"
+                size="x-small"
+                color="warning"
+                variant="tonal"
+                :title="COMPANION_STALE_HINT"
+              >
+                desktop app needs a restart
               </v-chip>
               <v-chip
                 v-for="codec in codecChips(a)"
@@ -1672,6 +1694,18 @@ function companionSkew(row: DeviceRow): string {
   const cv = agentFor(row)?.companion_version
   return cv && cv !== row.version ? cv : ''
 }
+
+/** FR-27 phase 9 — the device measured a running companion that is NOT the
+ *  installed file. Only `stale` says anything: `current` and `none` are the
+ *  expected states, and an absent field means "not measured", which must not
+ *  be rendered as either. */
+function companionStale(row: DeviceRow): boolean {
+  return agentFor(row)?.companion_running === 'stale'
+}
+const COMPANION_STALE_HINT =
+  'The Roomler desktop app running on this device is not the build installed on it: it was ' +
+  'updated underneath a running copy, which keeps the old code until it restarts. Quit it ' +
+  'from the menu bar and open it again, or sign out and back in.'
 const clientById = computed(() => {
   const m = new Map<string, TunnelClient>()
   for (const c of tunnelClientStore.clients) m.set(c.id, c)

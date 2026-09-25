@@ -31,6 +31,7 @@
 // FR-27: unconditional now — `ensure_running` has a real body on every
 // platform, where before this module was Windows-only.
 use anyhow::{Context, Result};
+use roomler_ai_remote_control::models::CompanionRunning;
 
 /// Who is calling the refresh — decides how a running desktop gets
 /// respawned after the swap.
@@ -245,6 +246,439 @@ mod version_tests {
     }
 }
 
+/// FR-27 phase 9 — whether the companion that RUNS is the one INSTALLED, for
+/// the heartbeat.
+///
+/// [`installed_version`] reads the disk, and on 2026-09-25 that was the whole
+/// problem: a Mac's row read `0.4.101` for 17 days while a companion a person
+/// had opened kept running `0.4.92` through nine updates (#1617). Nothing asked
+/// the process, so nothing on screen could say.
+///
+/// This asks the process. For each running `roomler-desktop` it compares the
+/// executable the process was loaded from — device and inode — with the
+/// installed file. An update replaces that file, which gives it a new inode,
+/// while a process keeps the image it started from until it exits: the two
+/// differ exactly when the running copy predates the file on disk. Measured on
+/// both platforms it runs on by replacing a running binary — macOS `lsof` kept
+/// reporting the old inode (under the original path, even after a delete), and
+/// Linux `/proc/<pid>/exe` still stat'ed to it.
+///
+/// `None` means NOT MEASURED, never "current":
+/// - Windows — the daemon's own refresh kills and respawns the companion it
+///   swaps, and an identity check there would need the mapped section's name
+///   (the image path is fixed at process creation) for a failure nobody has
+///   seen;
+/// - no companion installed — nothing to compare with, and no reason for a
+///   server to scan its process table every minute;
+/// - a probe that could not read every running copy and found none stale;
+/// - the kill switch, `ROOMLERD_COMPANION_RUNNING_PROBE=0`;
+/// - the first beat after start, before the first probe has finished.
+///
+/// ⚠️ Never waits for a measurement. The caller is the heartbeat that keeps
+/// the device online, so this returns the last answer and, when one is due,
+/// starts the next in the background — `pgrep`/`lsof` as `tokio::process`
+/// children under [`PROBE_TIMEOUT`] with `kill_on_drop`. A wedged `lsof` costs
+/// a measurement, never a beat.
+pub fn running_state() -> Option<CompanionRunning> {
+    #[cfg(unix)]
+    {
+        use std::sync::Mutex;
+        use std::time::Instant;
+        // (when the last probe STARTED, what the last one to finish found).
+        // Marking the start rather than the finish is what stops two
+        // concurrent heartbeats — one per enrolled org — from both probing.
+        static STATE: Mutex<(Option<Instant>, Option<CompanionRunning>)> = Mutex::new((None, None));
+
+        if !running_probe_enabled() {
+            return None;
+        }
+        let mut state = STATE.lock().unwrap();
+        if state.0.is_none_or(|at| at.elapsed() >= RUNNING_TTL) {
+            state.0 = Some(Instant::now());
+            tokio::spawn(async {
+                let found = running_state_inner().await;
+                STATE.lock().unwrap().1 = found;
+            });
+        }
+        state.1
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+/// One probe per this interval. The answer changes when a package manager runs
+/// or someone restarts the companion, and a minute is fast enough for the grid
+/// to follow either; on a Mac it costs two short-lived processes.
+#[cfg(unix)]
+const RUNNING_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Ceiling on each probe process. `lsof` is the one with a reputation for
+/// hanging, and it answers in milliseconds when it is healthy.
+#[cfg(unix)]
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The companion's process name. `pgrep -x` matches it exactly, and on Linux it
+/// is exactly `comm`'s 15-character limit, so nothing is truncated away.
+#[cfg(unix)]
+const COMPANION_PROCESS: &str = "roomler-desktop";
+
+/// Phase 9 kill switch: `ROOMLERD_COMPANION_RUNNING_PROBE=0` stops the probe,
+/// and the heartbeat goes back to carrying no `companion_running` at all.
+#[cfg(unix)]
+fn running_probe_enabled() -> bool {
+    !matches!(
+        std::env::var("ROOMLERD_COMPANION_RUNNING_PROBE").as_deref(),
+        Ok("0") | Ok("false") | Ok("no")
+    )
+}
+
+#[cfg(unix)]
+async fn running_state_inner() -> Option<CompanionRunning> {
+    // Nothing installed ⇒ not measured; see `running_state`.
+    let installed = installed_companion_exe()?;
+    let installed = FileId::of(&std::fs::metadata(installed).ok()?);
+    let pids = pgrep_pids(COMPANION_PROCESS).await?;
+    let running = running_images(&pids).await;
+    running_verdict(installed, &running)
+}
+
+/// Which file an executable image is: device + inode. A replaced file always
+/// gets a new inode, so "same `FileId`" is exactly "same file" — no version
+/// parsing, and no timestamps, which a `.pkg` sets to the BUILD's.
+#[cfg(any(unix, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl FileId {
+    fn of(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: m.dev(),
+            ino: m.ino(),
+        }
+    }
+}
+
+/// The verdict over every running copy. Pure, so the three-way rule is tested
+/// on every platform.
+#[cfg(any(unix, test))]
+fn running_verdict(installed: FileId, running: &[Option<FileId>]) -> Option<CompanionRunning> {
+    if running.is_empty() {
+        return Some(CompanionRunning::None);
+    }
+    // One readable copy that is not the installed file is a finding on its
+    // own, whatever could not be read about the others.
+    if running.iter().flatten().any(|id| *id != installed) {
+        return Some(CompanionRunning::Stale);
+    }
+    // "current" is a claim about EVERY running copy, so it needs all of them.
+    running
+        .iter()
+        .all(Option::is_some)
+        .then_some(CompanionRunning::Current)
+}
+
+/// The installed companion's executable, when there is one.
+#[cfg(target_os = "macos")]
+fn installed_companion_exe() -> Option<std::path::PathBuf> {
+    let exe = std::path::Path::new(MACOS_COMPANION_EXE);
+    exe.exists().then(|| exe.to_path_buf())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn installed_companion_exe() -> Option<std::path::PathBuf> {
+    linux_companion_path()
+}
+
+/// The executable inside the bundle the `.pkg` installs.
+#[cfg(target_os = "macos")]
+const MACOS_COMPANION_EXE: &str = "/Applications/Roomler.app/Contents/MacOS/roomler-desktop";
+
+/// Where the Linux companion lives: `/usr/bin` from its .deb, `/usr/local/bin`
+/// for a hand install. One list, so the probe and [`ensure_running`] cannot
+/// disagree about which file is "the" companion.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_companion_path() -> Option<std::path::PathBuf> {
+    ["/usr/bin", "/usr/local/bin"]
+        .iter()
+        .map(|d| std::path::Path::new(d).join("roomler-desktop"))
+        .find(|p| p.exists())
+}
+
+/// PIDs of every process with exactly this name. `None` when `pgrep` itself did
+/// not answer — which must stay distinct from "none running" (its exit 1), or a
+/// host without `pgrep` would report the companion as not running.
+#[cfg(unix)]
+async fn pgrep_pids(name: &str) -> Option<Vec<u32>> {
+    let mut cmd = tokio::process::Command::new("pgrep");
+    cmd.args(["-x", name]);
+    let out = bounded_output(cmd).await?;
+    match out.status.code() {
+        Some(0) => Some(parse_pids(&String::from_utf8_lossy(&out.stdout))),
+        Some(1) => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+#[cfg(any(unix, test))]
+fn parse_pids(text: &str) -> Vec<u32> {
+    text.lines().filter_map(|l| l.trim().parse().ok()).collect()
+}
+
+/// Run a probe process to completion within [`PROBE_TIMEOUT`]. On timeout the
+/// output future is dropped, and `kill_on_drop` takes the child with it — a
+/// hung probe must not outlive its measurement.
+#[cfg(unix)]
+async fn bounded_output(mut cmd: tokio::process::Command) -> Option<std::process::Output> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => Some(out),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "companion probe: could not run {:?}", cmd.as_std().get_program());
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                "companion probe: {:?} timed out — `companion_running` not measured this round",
+                cmd.as_std().get_program()
+            );
+            None
+        }
+    }
+}
+
+/// macOS: the executable each process was loaded from, via `lsof`.
+///
+/// The daemon is root, so it can read every user's companion (the legacy
+/// per-user daemon reads its own user's). `/usr/sbin/lsof` by absolute path:
+/// `sbin` is on launchd's default `PATH` but not on every user's.
+#[cfg(target_os = "macos")]
+async fn running_images(pids: &[u32]) -> Vec<Option<FileId>> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut cmd = tokio::process::Command::new("/usr/sbin/lsof");
+    // No DNS or port lookups, no warnings; only the text (program) entries of
+    // these pids; machine-readable device, inode and name fields.
+    cmd.args(["-n", "-P", "-w", "-p", &list, "-a", "-d", "txt", "-FDin"]);
+    // ⚠️ Deliberately not gated on the exit status: `lsof` exits 1 when ANY of
+    // the pids has gone, while still printing the rest.
+    let found = bounded_output(cmd)
+        .await
+        .map(|o| parse_lsof_images(&String::from_utf8_lossy(&o.stdout), COMPANION_PROCESS))
+        .unwrap_or_default();
+    pids.iter().map(|p| found.get(p).copied()).collect()
+}
+
+/// Linux: `/proc/<pid>/exe` stats to the image the process was loaded from,
+/// even after the file was replaced or deleted. A pid that has gone, or that
+/// is not ours to read (a per-user daemon looking at another user's companion),
+/// is unknown — not current.
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn running_images(pids: &[u32]) -> Vec<Option<FileId>> {
+    pids.iter()
+        .map(|pid| {
+            std::fs::metadata(format!("/proc/{pid}/exe"))
+                .ok()
+                .map(|m| FileId::of(&m))
+        })
+        .collect()
+}
+
+/// The executable image of each process in `lsof -FDin` output: under each `p`
+/// line, the first `txt` entry named `…/<exe_name>`.
+///
+/// Picked by NAME, not by position. The executable does come first today (then
+/// `dyld`, then the shared cache), but comparing `dyld`'s inode with the
+/// companion's would call every Mac stale; and the name survives exactly the
+/// case this exists for — after the file is replaced, or even deleted, `lsof`
+/// still prints the ORIGINAL path, with the OLD inode (measured 2026-09-25).
+#[cfg(any(target_os = "macos", test))]
+fn parse_lsof_images(text: &str, exe_name: &str) -> std::collections::HashMap<u32, FileId> {
+    let suffix = format!("/{exe_name}");
+    let mut found = std::collections::HashMap::new();
+    let mut pid: Option<u32> = None;
+    // The file entry being read: is it a `txt` entry, and its device + inode.
+    let (mut txt, mut dev, mut ino) = (false, None, None);
+    for line in text.lines() {
+        let mut chars = line.chars();
+        let Some(tag) = chars.next() else { continue };
+        let rest = chars.as_str();
+        match tag {
+            'p' => {
+                pid = rest.parse().ok();
+                (txt, dev, ino) = (false, None, None);
+            }
+            'f' => (txt, dev, ino) = (rest == "txt", None, None),
+            'D' => {
+                dev = rest
+                    .strip_prefix("0x")
+                    .and_then(|h| u64::from_str_radix(h, 16).ok())
+            }
+            'i' => ino = rest.parse().ok(),
+            // `n` is the last field of an entry, so the entry is complete here.
+            'n' => {
+                if let (Some(p), true, Some(dev), Some(ino)) = (pid, txt, dev, ino)
+                    && rest.ends_with(&suffix)
+                {
+                    found.entry(p).or_insert(FileId { dev, ino });
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod running_tests {
+    use super::{CompanionRunning, FileId, parse_lsof_images, parse_pids, running_verdict};
+
+    const DISK: FileId = FileId {
+        dev: 16_777_234,
+        ino: 1_828_148,
+    };
+    const OLD: FileId = FileId {
+        dev: 16_777_234,
+        ino: 1_454_160,
+    };
+
+    #[test]
+    fn verdict_covers_none_current_stale_and_unmeasured() {
+        assert_eq!(running_verdict(DISK, &[]), Some(CompanionRunning::None));
+        assert_eq!(
+            running_verdict(DISK, &[Some(DISK)]),
+            Some(CompanionRunning::Current)
+        );
+        // The 2026-09-25 shape: one companion, loaded from a file since replaced.
+        assert_eq!(
+            running_verdict(DISK, &[Some(OLD)]),
+            Some(CompanionRunning::Stale)
+        );
+        // Two sessions, one of them behind: the stale one is what matters.
+        assert_eq!(
+            running_verdict(DISK, &[Some(DISK), Some(OLD)]),
+            Some(CompanionRunning::Stale)
+        );
+    }
+
+    /// "current" is a claim about every running copy; one we could not read
+    /// makes it unmeasured — but never hides a stale one we COULD read.
+    #[test]
+    fn an_unreadable_copy_blocks_current_but_not_stale() {
+        assert_eq!(running_verdict(DISK, &[Some(DISK), None]), None);
+        assert_eq!(running_verdict(DISK, &[None]), None);
+        assert_eq!(
+            running_verdict(DISK, &[None, Some(OLD)]),
+            Some(CompanionRunning::Stale)
+        );
+    }
+
+    /// Same inode on another device is another file.
+    #[test]
+    fn device_is_part_of_identity() {
+        let elsewhere = FileId {
+            dev: 1,
+            ino: DISK.ino,
+        };
+        assert_eq!(
+            running_verdict(DISK, &[Some(elsewhere)]),
+            Some(CompanionRunning::Stale)
+        );
+    }
+
+    /// REAL `lsof -nP -p <pid> -a -d txt -FDin` output, captured on the Mac on
+    /// 2026-09-25 from the launchd-owned 0.4.102 companion. `stat -f '%d %i'` on
+    /// the installed executable gave `16777234 1828148` — `0x1000012` is
+    /// 16777234, so this pins the hex parse as well as the entry choice.
+    #[test]
+    fn parses_the_captured_macos_output_and_matches_stat() {
+        let out = "p56489\nftxt\nD0x1000012\ni1828148\n\
+                   n/Applications/Roomler.app/Contents/MacOS/roomler-desktop\n\
+                   ftxt\nD0x1000012\ni1152921500312573255\nn/usr/lib/dyld\n\
+                   ftxt\nD0x1000012\ni1053436\n\
+                   n/Library/Preferences/Logging/.plist-cache.Y6Z2Hbgt\n";
+        let found = parse_lsof_images(out, "roomler-desktop");
+        assert_eq!(found.get(&56489), Some(&DISK));
+        assert_eq!(
+            running_verdict(DISK, &[found.get(&56489).copied()]),
+            Some(CompanionRunning::Current)
+        );
+    }
+
+    /// REAL output from the same Mac, for a binary replaced while it ran
+    /// (`cp -p` + `mv -f` over it): `lsof` kept the ORIGINAL path and the OLD
+    /// inode `1829698`, while `stat` on the file now said `1829699`. This is the
+    /// measurement the whole phase rests on.
+    #[test]
+    fn a_binary_replaced_under_a_running_process_reads_stale() {
+        let after_replace = "p45232\nftxt\nD0x1000012\ni1829698\nn/private/tmp/rtest-bin\n";
+        let running = parse_lsof_images(after_replace, "rtest-bin")
+            .get(&45232)
+            .copied();
+        let disk_now = FileId {
+            dev: 16_777_234,
+            ino: 1_829_699,
+        };
+        assert_eq!(
+            running,
+            Some(FileId {
+                dev: 16_777_234,
+                ino: 1_829_698
+            })
+        );
+        assert_eq!(
+            running_verdict(disk_now, &[running]),
+            Some(CompanionRunning::Stale)
+        );
+    }
+
+    /// Picked by name, not position: were `dyld` listed first, reading the first
+    /// `txt` entry would compare the wrong file and call every Mac stale.
+    #[test]
+    fn the_executable_is_chosen_by_name_not_position() {
+        let out = "p7\nftxt\nD0x1000012\ni99\nn/usr/lib/dyld\n\
+                   ftxt\nD0x1000012\ni1828148\n\
+                   n/Applications/Roomler.app/Contents/MacOS/roomler-desktop\n";
+        assert_eq!(
+            parse_lsof_images(out, "roomler-desktop").get(&7),
+            Some(&DISK)
+        );
+    }
+
+    /// One `lsof` call serves every pid; an entry that is not `txt`, or that
+    /// carries no device, is no evidence; and nothing is invented from noise.
+    #[test]
+    fn several_pids_non_txt_entries_and_junk() {
+        let out = "p1\nftxt\nD0x1000012\ni1828148\n\
+                   n/Applications/Roomler.app/Contents/MacOS/roomler-desktop\n\
+                   p2\nfcwd\nD0x1000012\ni5\nn/Applications/Roomler.app/Contents/MacOS/roomler-desktop\n\
+                   p3\nftxt\ni1828148\nn/Applications/Roomler.app/Contents/MacOS/roomler-desktop\n";
+        let found = parse_lsof_images(out, "roomler-desktop");
+        assert_eq!(found.get(&1), Some(&DISK));
+        assert_eq!(found.get(&2), None, "a cwd entry is not the executable");
+        assert_eq!(found.get(&3), None, "no device, no identity");
+        assert!(parse_lsof_images("", "roomler-desktop").is_empty());
+        assert!(parse_lsof_images("lsof: WARNING\n\n\u{e9}\n", "roomler-desktop").is_empty());
+    }
+
+    #[test]
+    fn pgrep_output_parses_to_pids() {
+        assert_eq!(parse_pids("56489\n"), vec![56489]);
+        assert_eq!(parse_pids("12\n34\n"), vec![12, 34]);
+        assert!(parse_pids("").is_empty());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnsureOutcome {
     AlreadyRunning,
@@ -358,11 +792,7 @@ fn console_user_uid() -> Result<u32> {
 async fn ensure_running_inner() -> Result<EnsureOutcome> {
     const BIN: &str = "roomler-desktop";
 
-    let Some(path) = ["/usr/bin", "/usr/local/bin"]
-        .iter()
-        .map(|d| std::path::Path::new(d).join(BIN))
-        .find(|p| p.exists())
-    else {
+    let Some(path) = linux_companion_path() else {
         // Until FR-27's packaging phase there is no Linux companion at all,
         // and after it there still won't be on a headless server — which is
         // the correct state for a machine with no screen, not a fault.
@@ -541,12 +971,17 @@ pub async fn refresh_if_stale(respawn: RespawnContext) {
         //
         // This function exists because the Windows companion is a standalone
         // EXE placed BESIDE the daemon by the wizard / install.ps1, in neither
-        // MSI, so nothing else would ever move it forward. Everywhere else the
-        // packaging owns it: the macOS .pkg carries `/Applications/Roomler.app`
-        // and its postinstall re-bootstraps the LaunchAgent, and on Linux the
-        // companion is its own `roomler-desktop` .deb that apt upgrades. A
-        // daemon reaching in to swap those would be fighting the package
-        // manager for a file it does not own.
+        // MSI, so nothing else would ever move it forward. On macOS the
+        // packaging owns it: the .pkg carries `/Applications/Roomler.app`, and
+        // its postinstall stops every running copy — however it was started —
+        // before re-bootstrapping the LaunchAgent (#1617).
+        //
+        // ⚠️ Linux is NOT covered, whatever this comment used to say. The
+        // companion is its own `roomler-desktop` .deb, which `install.sh`
+        // installs once; the updater refuses it by design, and there is no apt
+        // source for apt to upgrade it from — so nothing moves it forward
+        // (FR-27 phase 10, an open decision). The grid does show it: dpkg
+        // reports the old version, so the row reads `desktop v<old>`.
         let _ = respawn;
     }
 }

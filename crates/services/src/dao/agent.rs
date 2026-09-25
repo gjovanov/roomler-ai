@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy, OsKind,
-    PeerRelayPolicy, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, CompanionRunning, DesiredConfig, DisplayInfo,
+    ExecPolicy, OsKind, PeerRelayPolicy, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -113,6 +113,7 @@ impl AgentDao {
             // FR-27 — unknown until the device's first heartbeat, for the same
             // reason as the host key below: enrolment never reaches the machine.
             companion_version: None,
+            companion_running: None,
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
@@ -335,6 +336,7 @@ impl AgentDao {
         agent_id: ObjectId,
         warm_relay: Option<&str>,
         companion_version: Option<&str>,
+        companion_running: Option<CompanionRunning>,
     ) -> DaoResult<bool> {
         // C4 stage 2 — the standing warm allocation's relayed address rides
         // the same per-heartbeat write: stored pair-less so a peer can be
@@ -369,6 +371,18 @@ impl AgentDao {
             }
             None => {
                 unset.insert("companion_version", "");
+            }
+        }
+        // FR-27 phase 9 — same present/absent rule, and it matters more here:
+        // a `stale` left behind after the companion was restarted would keep a
+        // warning on the grid that is no longer true. Typed, so only a spelling
+        // `CompanionRunning::from_wire` accepted can ever be stored.
+        match companion_running {
+            Some(v) => {
+                set.insert("companion_running", v.wire());
+            }
+            None => {
+                unset.insert("companion_running", "");
             }
         }
         let update = if unset.is_empty() {
