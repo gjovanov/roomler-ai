@@ -4,15 +4,15 @@
 > [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core,
 > and its audio on Windows and Linux), P2a (the local verbs), P2b
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
-> remote recording), P3b (the device's half of it) and P3b-2 (downloading it,
-> §10).** It sits behind the `recording` cargo feature and is in no release
-> build yet. It is driven by `roomlerd record`, by the daemon for the LocalAPI
-> recording verbs and `roomler record` (§6), by roomler-desktop (§7), and by a
-> remote controller over the session's `record` channel (§10). Still to come:
-> the microphone on macOS, delivery out of the recorder's data folder (P2c),
-> re-attaching after a dropped session (P3b-3), the viewer's Record and
-> Download buttons (P3c), and the editor (cut, speed up, background music) in
-> P5.
+> remote recording), P3b (the device's half of it), P3b-2 (downloading it) and
+> P3c (the viewer's Record and Download, §10).** It sits behind the `recording`
+> cargo feature and is in no release build yet. It is driven by
+> `roomlerd record`, by the daemon for the LocalAPI recording verbs and
+> `roomler record` (§6), by roomler-desktop (§7), and by a remote controller
+> from the viewer's toolbar, over the session's `record` channel (§10). Still
+> to come: the microphone on macOS, delivery out of the recorder's data folder
+> (P2c), re-attaching after a dropped session (P3b-3), and the editor (cut,
+> speed up, background music) in P5.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -386,8 +386,9 @@ bundle. Both are refused by name until then.
 ## 10. Remote recording (P3)
 
 A controller in the browser records the screen it controls. P3a built the
-server's gates, P3b the device side, and P3c builds the viewer. The file stays **on the device**, and
-the controller downloads it on demand over the session's own P2P channel. The
+server's gates, P3b the device side, P3b-2 the download and P3c the viewer.
+The file stays **on the device**, and the controller downloads it on demand
+over the session's own P2P channel. The
 server never holds a byte of it (`RemoteSession.recording_url` stays `None`). It
 decides who may ask, and it keeps the device's account of what happened.
 
@@ -555,9 +556,51 @@ its bytes. The refusals are `bad_name`, `not_found`, `bad_offset`,
 `transfer_in_progress`, `unavailable`, `read_failed`, `send_failed`,
 `cancelled` and `session_ended`, each on `rc:record.error {id, reason, detail}`.
 
+### The viewer (P3c)
+
+The viewer always asks for `RECORD` (`useRemoteControl.ts`, the default
+request). The server strips it, with a reason, unless this controller may
+record and the device's owner opted in. So asking costs nothing, and the answer
+is what the toolbar shows:
+
+| The grant | The toolbar |
+|---|---|
+| holds `RECORD` | a **Record** button, and the `record` channel opened |
+| stripped, `record_refused` set | a disabled Record control whose tooltip says why, never a button that can only fail |
+| a server older than P3a (no grant sent) | nothing: absent means no, never assumed |
+
+⚠️ **The `record` channel is opened when the grant arrives, never beside
+`files`** (`openRecordChannel`, called from `rc:session.created`). The other
+channels are made in `connect()` before the session request goes out, when no
+grant has been seen: a gate there is always closed, and the Record button
+would show over a channel that never existed. That was P3c's first cut, caught
+before merge. The offer is built on `rc:ready`, which follows the create, so a
+channel opened then is still in it.
+
+`useRemoteRecording.ts` speaks the channel. It is channel-agnostic, and its
+save sink can be injected, so its unit tests drive the real protocol code
+without a PeerConnection or a save dialog.
+
+- **Record**: start, with "Include what the computer plays" as a separate,
+  unticked box. The microphone is not offered: the device never takes it
+  remotely. While the host is asked, it reads "Waiting for the person at the
+  device to allow it". While recording, a red **REC m:ss** chip stays on the
+  toolbar with **Stop**. Every refusal and every ending is one sentence
+  (`RECORD_REASONS`); a code from a newer device reads as itself.
+- **Your recordings on this device**: the device's list (`rc:record.list`),
+  refreshed when the menu opens and after each recording.
+- **Download**: into a file the person picks (`showSaveFilePicker`, Chromium)
+  or, elsewhere, into memory up to 2 GiB. Chunks are written in order, and a
+  file that arrives short is an error, never a quiet success. The in-memory
+  path hashes the file and keeps it only when the SHA-256 matches the
+  device's. The streamed path cannot hash (WebCrypto has no incremental
+  digest), so it shows the device's SHA-256 for the person to compare.
+- **Resume**: when the session drops mid-transfer, the download pauses. When
+  the reconnect ladder's next session opens its `record` channel, it asks for
+  the rest from the bytes already held.
+
 Not yet: the 60 s re-attach after a dropped session, which needs something on
-screen for a recording with no session to show it (P3b-3), and the viewer's
-Record and Download buttons (P3c).
+screen for a recording with no session to show it (P3b-3).
 
 ### Decision and claim, like SSH
 
@@ -602,6 +645,9 @@ audit. The device is resolved within the tenant, so a foreign id gets a 404.
 | `ui/src/__tests__/companion/recordings.spec.ts` | roomler-desktop's REAL `index.html` section and `recordings.js`, in jsdom against a mocked `invoke`: Start greyed out with the reason, the running state, start options, a refusal said, delete only on the second click (red when a single click deletes), the arm expiring, the folder picker saving through `cmd_config_set` and a cancel saving nothing, keyed rows kept in place (red when rows are rebuilt), the last good data kept on a failed refresh, a service with no recorder | "Frontend checks" (`bun run test:unit`) |
 | `ui/src/__tests__/companion/recordings.spec.ts` (P3b) | the remote-recording card: absent against a service that predates the gates; computer audio offered only once remote recording is allowed; each toggle saved through `cmd_config_set`; a refused toggle said and not faked; a remote recording's status names who it is for | "Frontend checks" |
 | `ui/src/__tests__/companion/viewing.spec.ts` (P3b) | the REAL banner (`panel-viewing.html` / `.js`): who is watching; a RECORDING controller leads, even when another viewer came first (red when the lookup is removed); Stop recording stops the recording and not the session; the notice comes down when the recording ends | "Frontend checks" |
+| `ui/src/__tests__/composables/useRemoteRecording.spec.ts` (P3c) | the viewer's half of the `record` channel, against a scripted channel and an injected save sink: the status and the list asked for as the channel opens; a recording followed from the prompt to its end, a refusal said in words; a channel that closes mid-recording reads as ended with its session; a download written in order, with the device's SHA-256 shown; a transfer the session cut, resumed from the bytes already held (red when it restarts from 0); in memory, a file kept only when its SHA-256 matches (red when any file is kept); a short file is an error (red without the length check); a refusal ends a transfer by name and a cancel tells the device; one transfer at a time | "Frontend checks" (`bun run test:unit`) |
+| `ui/src/__tests__/composables/useRemoteControl.spec.ts`, the record channel (P3c) | RECORD read out of the effective grant by equality (a newer `RECORDING` is not it; red with a prefix match) and never assumed when a server sends no grant; the channel opened from the grant, once per PeerConnection (red without the already-open guard), and never without a PeerConnection | "Frontend checks" |
+| `ui/e2e/remote-recording-refused.spec.ts`, `remote-recording-smoke.spec.ts` (P3c) | against the `agent-e2e` harness: a device that never opted in shows a disabled Record control whose tooltip says why, and no Record button; on a device that advertises `record`, Record ends in the REC chip or in a refusal said in words (a headless harness agent has no indicator surface, so there the answer is `no_indicator_surface`) | the k8s agent lane (`scripts/e2e-k8s.sh`); each skips without a seeded tenant or a fitting device |
 | `agents/roomler-desktop` | the tray's wording and when its item is enabled; only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys (incl. both remote gates) are the daemon's to accept; the remote gates come from the listing and are absent on an older service | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |
 
 ⚠️ `agents/roomlerd/tests/*.rs` runs only when a step **names** it. Every other
