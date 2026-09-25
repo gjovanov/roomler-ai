@@ -28,11 +28,11 @@ use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use super::MissingTool;
 use super::{
     Coverage, LaunchOutcome, ResolvedApp, WindowInfo, WindowManager, classify_title,
     next_tmux_session_name, parse_tmux_sessions, parse_wmctrl_list,
 };
+use super::{MissingTool, Unavailable};
 
 /// Synthetic window-id prefix for a detached tmux session (no live X
 /// window). `focus()` treats it as "attach", not "raise".
@@ -52,6 +52,7 @@ const LAUNCH_SETTLE: std::time::Duration = std::time::Duration::from_millis(250)
 /// encoded a second assumption: that the DAEMON owns the X server. That is
 /// true in virtual-desktop mode and false everywhere else, and it is why
 /// Remote Apps never engaged on a Wayland host — see [`discover`].
+#[derive(Debug)]
 pub enum Target {
     /// Virtual-desktop mode: the daemon started Xvfb and owns it, so commands
     /// run as the daemon with nothing but `DISPLAY`. Byte-for-byte the
@@ -472,14 +473,39 @@ fn is_safe_session(s: &str) -> bool {
 /// not report a `Display=` for every Wayland session, so a guess of `:0` is
 /// unavoidable — but an unverified guess would surface later as a confusing
 /// "no windows" instead of an honest "no desktop".
-pub fn discover() -> Option<Target> {
+///
+/// FR-56 AC10: the `Err` is the REASON, and it rides the wire. This used to
+/// return `Option`, which threw away three different answers — no session, no
+/// X display, cannot run as the owner — on the way to one silent `None`.
+pub fn discover() -> Result<Target, Unavailable> {
     if let Some(display) = std::env::var_os("DISPLAY").and_then(|d| d.into_string().ok()) {
         // Virtual-desktop mode. Unchanged, including running as the daemon:
         // the daemon started that Xvfb and owns it.
-        return Some(Target::Daemon { display });
+        return Ok(Target::Daemon { display });
     }
+    discover_with(
+        crate::companion::graphical_session().map_err(|e| format!("{e:#}")),
+        probe,
+    )
+}
 
-    let sess = crate::companion::graphical_session().ok()?;
+/// The session arm of [`discover`] with its two inputs injected — what
+/// `loginctl` said (or why it said nothing), and what `wmctrl -m` answers per
+/// candidate. The unit-test seam: the refusal arms below are decisions, and a
+/// decision that can only be exercised on a host with a real login session is
+/// one nobody re-checks.
+fn discover_with(
+    sess: Result<crate::companion::GraphicalSession, String>,
+    probe: impl Fn(&Target) -> Probe,
+) -> Result<Target, Unavailable> {
+    let sess = match sess {
+        Ok(s) => s,
+        // This used to be `.ok()?`, which discarded the sentence
+        // `graphical_session` composes ("no active graphical session — nobody
+        // is at this machine's screen") and left the hello silent with nothing
+        // anywhere saying why.
+        Err(detail) => return refused(Unavailable::NoSession { detail }),
+    };
     let xauthority = find_xauthority(sess.uid);
     // loginctl reports `Display=` for X11 sessions and often not for Wayland
     // ones; `:0` is what a compositor-started Xwayland almost always takes.
@@ -493,7 +519,7 @@ pub fn discover() -> Option<Target> {
         }
     }
 
-    for candidate in candidates {
+    for candidate in &candidates {
         let target = Target::Session {
             display: candidate.clone(),
             wayland: sess.wayland_display.is_some(),
@@ -513,22 +539,50 @@ pub fn discover() -> Option<Target> {
                     xauthority = ?xauthority,
                     "apps: found a usable desktop in the user's session"
                 );
-                return Some(target);
+                return Ok(target);
             }
-            // wmctrl missing is not "no desktop" — it is a dependency the
-            // existing error message already names actionably ("apt install
-            // wmctrl"). Returning the target lets that message reach the
-            // operator instead of a silent `supported:false`.
-            Probe::ToolMissing => return Some(target),
+            // Until AC10 this returned the target anyway, so the "install
+            // wmctrl" message could reach the operator through the list
+            // error — which also advertised `list` on a host that cannot
+            // list. The reason now has its own lane, so the hello stays
+            // honest and the message still arrives.
+            Probe::ToolMissing => {
+                return refused(Unavailable::ToolMissing {
+                    tool: "wmctrl",
+                    install: "apt install wmctrl",
+                });
+            }
+            // Until AC10 this was folded into `NoDisplay`: a failed privilege
+            // drop (an account `getpwnam` cannot resolve, a `setuid` refused)
+            // was retried against the next display and then reported as "no
+            // Xwayland" — a wrong answer that sent the operator to look at the
+            // compositor. Nothing about the next display changes it, so stop.
+            Probe::CannotRun(detail) => {
+                return refused(Unavailable::CannotRunAs {
+                    user: sess.name.clone(),
+                    detail,
+                });
+            }
             Probe::NoDisplay => continue,
         }
     }
+    refused(Unavailable::NoXDisplay {
+        user: sess.name,
+        tried: candidates,
+    })
+}
+
+/// One log line per refusal, at `debug!` because on a headless server this
+/// is the normal state and runs on every boot (the hello asks). The reason
+/// reaches the operator through the reply and `roomlerd apps-probe` — the
+/// point of AC10 is that the log is no longer the only place it lives.
+fn refused(why: Unavailable) -> Result<Target, Unavailable> {
     tracing::debug!(
-        user = %sess.name,
-        "apps: a graphical session exists but no X display answered — a Wayland \
-         compositor with no Xwayland cannot be managed by the X11 backend"
+        code = why.code(),
+        reason = %why.reason(),
+        "apps: not available on this host"
     );
-    None
+    Err(why)
 }
 
 /// Outcome of poking a candidate desktop.
@@ -537,6 +591,11 @@ enum Probe {
     Answered,
     /// `wmctrl` is not installed. Says nothing about the display.
     ToolMissing,
+    /// The command could not be RUN — the privilege drop could not be
+    /// installed, or the spawn failed for a reason other than "not found".
+    /// Says nothing about the display either, and trying the next one cannot
+    /// help.
+    CannotRun(String),
     /// `wmctrl` ran and could not open that display.
     NoDisplay,
 }
@@ -560,8 +619,9 @@ fn probe(target: &Target) -> Probe {
             user: user.clone(),
         },
     });
-    let Ok(mut cmd) = wm.cmd("wmctrl") else {
-        return Probe::NoDisplay;
+    let mut cmd = match wm.cmd("wmctrl") {
+        Ok(c) => c,
+        Err(e) => return Probe::CannotRun(format!("{e:#}")),
     };
     match cmd
         .arg("-m")
@@ -573,7 +633,7 @@ fn probe(target: &Target) -> Probe {
         Ok(st) if st.success() => Probe::Answered,
         Ok(_) => Probe::NoDisplay,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probe::ToolMissing,
-        Err(_) => Probe::NoDisplay,
+        Err(e) => Probe::CannotRun(format!("spawning wmctrl: {e}")),
     }
 }
 
@@ -772,5 +832,145 @@ mod tests {
         assert!(!is_safe_session("a b"));
         assert!(!is_safe_session("a;rm -rf"));
         assert!(!is_safe_session(&"x".repeat(65)));
+    }
+
+    // ── FR-56 AC10 (review of #1667) — the refusal arms of `discover`, driven
+    // through the `discover_with` seam with a scripted `wmctrl -m`. Each test
+    // is red with its arm reverted to the pre-P6 behaviour (recorded in the
+    // PR): ToolMissing → `Ok(target)`, CannotRun → `continue`, NoSession →
+    // an empty detail.
+
+    use std::cell::RefCell;
+
+    /// A login session as `loginctl` would report it. The uid is one no host
+    /// has, so `find_xauthority` finds no runtime dir and carries no cookie.
+    fn session(display: Option<&str>, wayland: bool) -> crate::companion::GraphicalSession {
+        crate::companion::GraphicalSession {
+            uid: u32::MAX - 7,
+            name: "someone".to_string(),
+            display: display.map(str::to_string),
+            wayland_display: wayland.then(|| "wayland-0".to_string()),
+        }
+    }
+
+    fn display_of(t: &Target) -> String {
+        match t {
+            Target::Daemon { display } | Target::Session { display, .. } => display.clone(),
+        }
+    }
+
+    #[test]
+    fn no_session_keeps_the_sentence_and_never_probes() {
+        let probes = RefCell::new(0u32);
+        let sentence = "no active graphical session — nobody is at this machine's screen";
+        let out = discover_with(Err(sentence.to_string()), |_| {
+            *probes.borrow_mut() += 1;
+            Probe::Answered
+        });
+        match out {
+            Err(Unavailable::NoSession { detail }) => {
+                assert!(
+                    detail.contains("nobody is at this machine's screen"),
+                    "{detail}"
+                );
+                assert!(
+                    Unavailable::NoSession { detail }
+                        .reason()
+                        .contains("nobody is at"),
+                    "the sentence must survive into the wire reason"
+                );
+            }
+            other => panic!("expected NoSession, got {other:?}"),
+        }
+        assert_eq!(*probes.borrow(), 0, "nothing to probe without a session");
+    }
+
+    #[test]
+    fn wmctrl_missing_on_the_first_candidate_refuses_at_once() {
+        let probes = RefCell::new(0u32);
+        let out = discover_with(Ok(session(Some(":5"), true)), |_| {
+            *probes.borrow_mut() += 1;
+            Probe::ToolMissing
+        });
+        match out {
+            Err(Unavailable::ToolMissing { tool, install }) => {
+                assert_eq!(tool, "wmctrl");
+                assert!(install.contains("install"), "{install}");
+            }
+            other => panic!("expected ToolMissing, got {other:?}"),
+        }
+        // A missing binary says nothing about a display, and the next display
+        // cannot install it: one probe, then the refusal.
+        assert_eq!(*probes.borrow(), 1);
+    }
+
+    #[test]
+    fn a_failed_privilege_drop_stops_at_the_first_candidate() {
+        let tried: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let out = discover_with(Ok(session(None, false)), |t| {
+            tried.borrow_mut().push(display_of(t));
+            Probe::CannotRun("setuid refused".to_string())
+        });
+        match out {
+            Err(Unavailable::CannotRunAs { user, detail }) => {
+                assert_eq!(user, "someone");
+                assert_eq!(detail, "setuid refused");
+            }
+            other => panic!("expected CannotRunAs, got {other:?}"),
+        }
+        // Pre-P6 this was folded into NoDisplay: `:1` was tried next and the
+        // answer came back as "no Xwayland". The account has not changed
+        // between displays, so the walk must stop here.
+        assert_eq!(*tried.borrow(), vec![":0".to_string()]);
+    }
+
+    #[test]
+    fn no_x_display_walks_every_candidate_then_names_them() {
+        let tried: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let out = discover_with(Ok(session(Some(":7"), true)), |t| {
+            tried.borrow_mut().push(display_of(t));
+            Probe::NoDisplay
+        });
+        let want = vec![":7".to_string(), ":0".to_string(), ":1".to_string()];
+        assert_eq!(
+            *tried.borrow(),
+            want,
+            "loginctl's Display= first, then the guesses"
+        );
+        match out {
+            Err(Unavailable::NoXDisplay { user, tried }) => {
+                assert_eq!(user, "someone");
+                assert_eq!(tried, want, "the reply names what was tried");
+            }
+            other => panic!("expected NoXDisplay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_first_answering_candidate_wins_as_the_session_owner() {
+        let out = discover_with(Ok(session(None, true)), |t| {
+            if display_of(t) == ":1" {
+                Probe::Answered
+            } else {
+                Probe::NoDisplay
+            }
+        });
+        match out {
+            Ok(Target::Session {
+                display,
+                wayland,
+                user,
+                xauthority,
+            }) => {
+                assert_eq!(display, ":1");
+                assert!(wayland, "a Wayland session is reported as one (P2)");
+                assert_eq!(
+                    user, "someone",
+                    "commands run as the session's owner, never root"
+                );
+                assert!(xauthority.is_none(), "no runtime dir for a uid nobody has");
+            }
+            other => panic!("expected a Session target on :1, got {other:?}"),
+        }
     }
 }

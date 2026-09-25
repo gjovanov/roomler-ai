@@ -17,10 +17,15 @@
 //! mirroring the `rc:logs-fetch` request/response precedent:
 //!
 //! ```text
-//! rc:apps.list   {id}                    → rc:apps.list.reply   {id, ok, supported, windows, launchable}
-//! rc:apps.focus  {id, window_id}         → rc:apps.focus.reply  {id, ok, error?}
-//! rc:apps.launch {id, app_key}           → rc:apps.launch.reply {id, ok, window_id?, session?, error?}
+//! rc:apps.list   {id}                    → rc:apps.list.reply   {id, ok, supported, windows, launchable, coverage?, unavailable?}
+//! rc:apps.focus  {id, window_id}         → rc:apps.focus.reply  {id, ok, error?, unavailable?}
+//! rc:apps.launch {id, app_key}           → rc:apps.launch.reply {id, ok, window_id?, session?, error?, unavailable?}
 //! ```
+//!
+//! Two additive objects carry the honesty (FR-56): `coverage` says what a
+//! listing could and could not see on a host where the feature works
+//! ([`Coverage`]), and `unavailable` says WHY on a host where it does not
+//! ([`Unavailable`]) — the reason rides the reply, not only the daemon log.
 //!
 //! `window_id` is an **opaque string** the browser only round-trips
 //! (X11 hex on Linux, HWND decimal on Windows). Launch takes an
@@ -152,6 +157,105 @@ pub struct MissingTool {
     pub install: &'static str,
 }
 
+/// FR-56 AC10 — why Remote Apps is **not** available on this host, when the
+/// answer is knowable.
+///
+/// Rides the wire as `unavailable: {code, reason}` beside every
+/// `supported: false`, and on a focus/launch refusal that had no backend to
+/// hand the request to. Before it, every one of these collapsed into one bare
+/// `supported: false`, and the reason lived in the daemon log at `debug!` — or
+/// nowhere: a failed privilege drop was swallowed inside the display probe, and
+/// the log line that followed blamed Xwayland for it.
+///
+/// ⚠️ A CLOSED set, and `code` is a compatibility surface like every other
+/// `rc:*` string (FR-80's rule): renaming one does not fail loudly, it changes
+/// what an operator reads on a screen that exists to explain a refusal. The
+/// sentence is composed HERE, not in the viewer, because only the agent knows
+/// which arm it took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unavailable {
+    /// `[virtual_desktop_apps] enabled = false` on this device — the owner's
+    /// choice, reported as such rather than as a missing desktop.
+    Disabled,
+    /// No active graphical login session: nobody is at the screen. The normal
+    /// state of a headless server, and of a desktop parked at the greeter.
+    NoSession { detail: String },
+    /// A session exists but no X display on it answered — a Wayland
+    /// compositor running without Xwayland, which this X11 backend cannot
+    /// manage (native Wayland windows can only be enumerated where the
+    /// compositor exposes a foreign-toplevel protocol, which GNOME does not;
+    /// the FR-56 spec's P3 has the measurements).
+    NoXDisplay { user: String, tried: Vec<String> },
+    /// The session's owner was found but commands cannot be run as them — the
+    /// privilege drop failed. Running them as root instead is never the
+    /// answer: that would put a root shell on somebody's own desktop.
+    CannotRunAs { user: String, detail: String },
+    /// `wmctrl`, the binary `list` and `focus` ARE, is not installed on the
+    /// host. ⚠️ Deliberately NOT a [`MissingTool`] in [`Coverage`]: without it
+    /// there is no backend at all, so it must not read as a footnote on a
+    /// reply that otherwise looks like success.
+    ToolMissing {
+        tool: &'static str,
+        install: &'static str,
+    },
+    /// This platform has no Remote Apps backend (macOS, the BSDs).
+    Platform,
+}
+
+impl Unavailable {
+    /// The wire spelling. Locked by a test that every code is distinct and
+    /// that no code is a prefix of another — the `ssh` / `ssh-consent` lesson,
+    /// so an equality match can never be "simplified" into `starts_with`.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NoSession { .. } => "no_session",
+            Self::NoXDisplay { .. } => "no_x_display",
+            Self::CannotRunAs { .. } => "cannot_run_as",
+            Self::ToolMissing { .. } => "tool_missing",
+            Self::Platform => "platform",
+        }
+    }
+
+    /// The operator-facing sentence: what is true, and what would change it.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Disabled => "Remote apps are disabled on this device \
+                               (`[virtual_desktop_apps] enabled = false` in its config). \
+                               Enable them there and restart the daemon."
+                .to_string(),
+            Self::NoSession { detail } => format!(
+                "No active graphical login session on this host — nobody is at its screen — \
+                 so there is no desktop to list windows on or launch into. Remote shell and \
+                 file transfer still work. ({detail})"
+            ),
+            Self::NoXDisplay { user, tried } => format!(
+                "{user} has a graphical session but no X display on it answered (tried {}): \
+                 a Wayland compositor without Xwayland. This backend lists and focuses X11 \
+                 windows only; native Wayland windows can be managed only where the \
+                 compositor exposes a foreign-toplevel protocol, which GNOME does not.",
+                tried.join(", ")
+            ),
+            Self::CannotRunAs { user, detail } => format!(
+                "A desktop was found, but commands cannot be run as its owner {user} \
+                 ({detail}). They are never run as root on a user's session instead."
+            ),
+            Self::ToolMissing { tool, install } => format!(
+                "`{tool}` is not installed on the agent host ({install}); this backend \
+                 needs it to find and manage the desktop."
+            ),
+            Self::Platform => "Remote apps have no backend on this platform — they exist for \
+                               Linux desktops (X11, or Wayland through Xwayland) and Windows."
+                .to_string(),
+        }
+    }
+
+    /// The `unavailable` wire object.
+    pub fn to_json(&self) -> Value {
+        json!({ "code": self.code(), "reason": self.reason() })
+    }
+}
+
 pub trait WindowManager: Send + Sync {
     /// Enumerate the desktop's windows (already classified against the
     /// title convention / allowlist).
@@ -193,15 +297,30 @@ pub fn apps_config() -> VirtualDesktopAppsConfig {
     APPS_CONFIG.get().cloned().unwrap_or_default()
 }
 
-/// True when this process can actually manage a desktop AND apps are
-/// enabled — the signal the caps builder advertises to the browser.
+/// Can this process manage a desktop right now — and if not, why not.
+///
 /// Linux: virtual-desktop mode, **or** a logged-in user's session whose X
 /// display answers (FR-56 P1 — including a Wayland session, because its
 /// compositor runs Xwayland). Windows: the agent always drives the active
 /// user's desktop.
-pub fn apps_supported() -> bool {
-    if !apps_config().enabled {
-        return false;
+///
+/// The hello advertises `list`/`focus`/`launch` on `Ok` (`encode::caps::detect`
+/// assigns them from [`availability_for`] with the installed config, in the
+/// daemon — never in the caps-probe child, which loads no config); the
+/// `rc:apps.list` reply carries the `Err` as `unavailable`. Both go through
+/// [`availability_for`], so the two can disagree only by TIME — the hello is
+/// a boot-time snapshot (`detect` memoizes it), the reply is live — never by
+/// logic, and never by which process asked.
+pub fn availability() -> Result<(), Unavailable> {
+    availability_for(&apps_config())
+}
+
+/// [`availability`] against an explicit config — the seam the hello builder
+/// uses (so its answer is testable without installing a process-global
+/// config) and the one the reply path shares.
+pub fn availability_for(cfg: &VirtualDesktopAppsConfig) -> Result<(), Unavailable> {
+    if !cfg.enabled {
+        return Err(Unavailable::Disabled);
     }
     #[cfg(target_os = "linux")]
     {
@@ -211,37 +330,52 @@ pub fn apps_supported() -> bool {
         // `supported:false` and the feature never engaged. `discover()` keeps
         // that path first and unchanged, then looks for whoever is at the
         // screen.
-        linux::discover().is_some()
+        linux::discover().map(|_| ())
     }
     #[cfg(target_os = "windows")]
     {
         // Windows: the agent always drives the active user's desktop.
-        true
+        Ok(())
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        false
+        Err(Unavailable::Platform)
     }
 }
 
-/// Construct the platform backend, or `None` when apps can't be managed on
-/// this host/build.
+/// True when this process can actually manage a desktop AND apps are
+/// enabled — the signal the caps builder advertises to the browser.
+pub fn apps_supported() -> bool {
+    availability().is_ok()
+}
+
+/// FR-56 AC10 — whether this BUILD has a Remote Apps backend at all, whatever
+/// the host is doing right now. The hello advertises `status` on it: "ask me,
+/// and I will say whether Remote Apps work here — and if not, why". A platform
+/// with no backend stays silent, exactly as before: there is nothing a reason
+/// could change there, and a permanently disabled button is noise.
+pub const fn has_backend() -> bool {
+    cfg!(any(target_os = "linux", target_os = "windows"))
+}
+
+/// Construct the platform backend, or say why apps can't be managed on this
+/// host/build.
 ///
 /// FR-56 P1: the Linux arm now takes a discovered [`linux::Target`] rather
 /// than a display string, because "which display" and "as whom" are two
 /// answers and only the first was being carried.
-pub fn backend() -> Option<Box<dyn WindowManager>> {
+pub fn backend() -> Result<Box<dyn WindowManager>, Unavailable> {
     #[cfg(target_os = "linux")]
     {
         linux::discover().map(|t| Box::new(linux::LinuxWm::new(t)) as Box<dyn WindowManager>)
     }
     #[cfg(target_os = "windows")]
     {
-        Some(Box::new(windows::WindowsWm) as Box<dyn WindowManager>)
+        Ok(Box::new(windows::WindowsWm) as Box<dyn WindowManager>)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        None
+        Err(Unavailable::Platform)
     }
 }
 
@@ -258,17 +392,25 @@ pub fn handle_control_message(val: &Value) -> Value {
     // FR-56 P1: the backend discovers its own target — the daemon's `DISPLAY`
     // (virtual-desktop mode, unchanged and still first) or the display of
     // whoever is at the screen. When apps are disabled we build no backend →
-    // replies say `supported:false`.
-    let be = if cfg.enabled { backend() } else { None };
-    dispatch(val, &cfg, be.as_deref())
+    // replies say `supported:false`, and (AC10) why.
+    let be = if cfg.enabled {
+        backend()
+    } else {
+        Err(Unavailable::Disabled)
+    };
+    match &be {
+        Ok(b) => dispatch(val, &cfg, Ok(b.as_ref())),
+        Err(why) => dispatch(val, &cfg, Err(why)),
+    }
 }
 
 /// Pure dispatch over a supplied (possibly fake) backend — the unit-test
-/// seam.
+/// seam. `Err` is "no backend, and this is why"; every reply built from it
+/// carries the reason.
 fn dispatch(
     val: &Value,
     cfg: &VirtualDesktopAppsConfig,
-    backend: Option<&dyn WindowManager>,
+    backend: Result<&dyn WindowManager, &Unavailable>,
 ) -> Value {
     let id = msg_id(val);
     match val.get("t").and_then(|v| v.as_str()).unwrap_or("") {
@@ -291,13 +433,21 @@ fn msg_id(val: &Value) -> Option<String> {
 fn build_list_reply(
     id: Option<String>,
     cfg: &VirtualDesktopAppsConfig,
-    backend: Option<&dyn WindowManager>,
+    backend: Result<&dyn WindowManager, &Unavailable>,
 ) -> Value {
-    let Some(backend) = backend else {
-        return json!({
-            "t": "rc:apps.list.reply", "id": id, "ok": true, "supported": false,
-            "windows": [], "launchable": [],
-        });
+    let backend = match backend {
+        Ok(b) => b,
+        Err(why) => {
+            return json!({
+                "t": "rc:apps.list.reply", "id": id, "ok": true, "supported": false,
+                "windows": [], "launchable": [],
+                // FR-56 AC10 — the reason rides the reply. Before this the
+                // panel received a bare `supported: false`, cleared its error
+                // and showed "No windows reported": a calm desktop, where the
+                // truth was a refusal with a cause the operator could act on.
+                "unavailable": why.to_json(),
+            });
+        }
     };
     match backend.list() {
         Ok(mut windows) => {
@@ -320,11 +470,12 @@ fn build_list_reply(
 
 fn build_focus_reply(
     id: Option<String>,
-    backend: Option<&dyn WindowManager>,
+    backend: Result<&dyn WindowManager, &Unavailable>,
     val: &Value,
 ) -> Value {
-    let Some(backend) = backend else {
-        return action_error("rc:apps.focus.reply", id, "apps not supported on this host");
+    let backend = match backend {
+        Ok(b) => b,
+        Err(why) => return unavailable_reply("rc:apps.focus.reply", id, why),
     };
     let Some(window_id) = val.get("window_id").and_then(|v| v.as_str()) else {
         return action_error("rc:apps.focus.reply", id, "missing window_id");
@@ -338,15 +489,12 @@ fn build_focus_reply(
 fn build_launch_reply(
     id: Option<String>,
     cfg: &VirtualDesktopAppsConfig,
-    backend: Option<&dyn WindowManager>,
+    backend: Result<&dyn WindowManager, &Unavailable>,
     val: &Value,
 ) -> Value {
-    let Some(backend) = backend else {
-        return action_error(
-            "rc:apps.launch.reply",
-            id,
-            "apps not supported on this host",
-        );
+    let backend = match backend {
+        Ok(b) => b,
+        Err(why) => return unavailable_reply("rc:apps.launch.reply", id, why),
     };
     let Some(app_key) = val.get("app_key").and_then(|v| v.as_str()) else {
         return action_error("rc:apps.launch.reply", id, "missing app_key");
@@ -365,6 +513,17 @@ fn build_launch_reply(
 
 fn action_error(t: &str, id: Option<String>, error: &str) -> Value {
     json!({ "t": t, "id": id, "ok": false, "error": error })
+}
+
+/// FR-56 AC10 — a focus/launch refused because there is no backend. The
+/// `error` string keeps the pre-AC10 shape for viewers that only read that
+/// field; `unavailable` carries the code for the ones that key off it.
+fn unavailable_reply(t: &str, id: Option<String>, why: &Unavailable) -> Value {
+    json!({
+        "t": t, "id": id, "ok": false,
+        "error": format!("apps not available on this host: {}", why.reason()),
+        "unavailable": why.to_json(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -695,12 +854,117 @@ mod tests {
     #[test]
     fn dispatch_list_unsupported_when_no_backend() {
         let cfg = VirtualDesktopAppsConfig::default();
-        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a1"}), &cfg, None);
+        let why = Unavailable::NoSession {
+            detail: "no active graphical session".to_string(),
+        };
+        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a1"}), &cfg, Err(&why));
         assert_eq!(reply["t"], "rc:apps.list.reply");
         assert_eq!(reply["id"], "a1");
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["supported"], false);
         assert_eq!(reply["windows"].as_array().unwrap().len(), 0);
+        // FR-56 AC10 — `supported: false` carries WHY. Without this the panel
+        // rendered a calm "No windows reported" for every host with no
+        // desktop, and the cause lived only in the daemon log.
+        assert_eq!(reply["unavailable"]["code"], "no_session");
+        let reason = reply["unavailable"]["reason"].as_str().unwrap();
+        assert!(reason.contains("no active graphical session"), "{reason}");
+    }
+
+    /// FR-56 AC10 — every refusal arm names its reason on every verb, so a
+    /// viewer never has to guess which of six situations produced a bare
+    /// `supported: false` (or a bare "not supported" on focus/launch).
+    #[test]
+    fn every_refusal_names_its_reason_on_the_wire() {
+        let cfg = cfg_with(&[("bash", true)]);
+        for why in unavailable_examples() {
+            let list = dispatch(&json!({"t": "rc:apps.list", "id": "l"}), &cfg, Err(&why));
+            assert_eq!(
+                list["ok"], true,
+                "{why:?}: a refusal is a well-formed reply"
+            );
+            assert_eq!(list["supported"], false, "{why:?}");
+            assert_eq!(list["unavailable"]["code"], why.code(), "{why:?}");
+            assert_eq!(list["unavailable"]["reason"], why.reason(), "{why:?}");
+
+            let actions = [
+                json!({"t": "rc:apps.focus", "id": "x", "window_id": "0x1"}),
+                json!({"t": "rc:apps.launch", "id": "x", "app_key": "bash"}),
+            ];
+            for msg in actions {
+                let reply = dispatch(&msg, &cfg, Err(&why));
+                let t = msg["t"].as_str().unwrap();
+                assert_eq!(reply["t"], format!("{t}.reply"));
+                assert_eq!(reply["ok"], false, "{t} {why:?}");
+                assert_eq!(reply["unavailable"]["code"], why.code(), "{t} {why:?}");
+                let err = reply["error"].as_str().unwrap();
+                assert!(
+                    err.contains(&why.reason()),
+                    "{t}: the legacy `error` string must carry the reason too, for viewers \
+                     that read nothing else: {err}"
+                );
+            }
+        }
+    }
+
+    /// The code set is a compatibility surface: distinct, snake_case, and no
+    /// code a prefix of another — so an equality match can never be
+    /// "simplified" into `starts_with` (the `ssh` / `ssh-consent` lesson).
+    /// And a reason is a sentence, never the code restated.
+    #[test]
+    fn unavailable_codes_are_distinct_and_never_a_prefix_of_another() {
+        let all = unavailable_examples();
+        let codes: Vec<&str> = all.iter().map(|u| u.code()).collect();
+        for (i, a) in codes.iter().enumerate() {
+            assert!(!a.is_empty());
+            assert!(
+                a.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{a}: wire codes are snake_case"
+            );
+            for (j, b) in codes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "duplicate code");
+                    assert!(!b.starts_with(a), "{a} is a prefix of {b}");
+                }
+            }
+        }
+        for u in &all {
+            let r = u.reason();
+            assert!(
+                r.len() > 40,
+                "{}: a reason is a sentence the operator can act on, not a code: {r}",
+                u.code()
+            );
+            assert_ne!(r, u.code());
+            let j = u.to_json();
+            assert_eq!(j["code"], u.code());
+            assert_eq!(j["reason"], r);
+        }
+    }
+
+    /// One of every variant. ⚠️ A variant added to `Unavailable` without a row
+    /// here still compiles — `code()`'s match is exhaustive, this list is not —
+    /// so keep the two together.
+    fn unavailable_examples() -> Vec<Unavailable> {
+        vec![
+            Unavailable::Disabled,
+            Unavailable::NoSession {
+                detail: "loginctl: no active graphical session".into(),
+            },
+            Unavailable::NoXDisplay {
+                user: "someone".into(),
+                tried: vec![":0".into(), ":1".into()],
+            },
+            Unavailable::CannotRunAs {
+                user: "someone".into(),
+                detail: "looking up local account failed".into(),
+            },
+            Unavailable::ToolMissing {
+                tool: "wmctrl",
+                install: "apt install wmctrl",
+            },
+            Unavailable::Platform,
+        ]
     }
 
     #[test]
@@ -716,7 +980,7 @@ mod tests {
             }],
             fail: false,
         };
-        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a2"}), &cfg, Some(&wm));
+        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a2"}), &cfg, Ok(&wm));
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["supported"], true);
         assert_eq!(reply["windows"][0]["window_id"], "0x1");
@@ -731,7 +995,7 @@ mod tests {
             windows: vec![],
             fail: true,
         };
-        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a3"}), &cfg, Some(&wm));
+        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a3"}), &cfg, Ok(&wm));
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["supported"], true);
         assert!(reply["error"].as_str().unwrap().contains("no display"));
@@ -755,7 +1019,7 @@ mod tests {
             windows: vec![],
             fail: false,
         };
-        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a4"}), &cfg, Some(&wm));
+        let reply = dispatch(&json!({"t": "rc:apps.list", "id": "a4"}), &cfg, Ok(&wm));
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["windows"].as_array().unwrap().len(), 0);
         assert_eq!(reply["coverage"]["sources"][0], "x11");
@@ -775,7 +1039,7 @@ mod tests {
         let ok = dispatch(
             &json!({"t": "rc:apps.focus", "id": "f1", "window_id": "0x5"}),
             &cfg,
-            Some(&wm),
+            Ok(&wm),
         );
         assert_eq!(ok["t"], "rc:apps.focus.reply");
         assert_eq!(ok["ok"], true);
@@ -783,12 +1047,12 @@ mod tests {
         let bad = dispatch(
             &json!({"t": "rc:apps.focus", "id": "f2", "window_id": "0xBAD"}),
             &cfg,
-            Some(&wm),
+            Ok(&wm),
         );
         assert_eq!(bad["ok"], false);
         assert!(bad["error"].as_str().unwrap().contains("no such window"));
 
-        let missing = dispatch(&json!({"t": "rc:apps.focus", "id": "f3"}), &cfg, Some(&wm));
+        let missing = dispatch(&json!({"t": "rc:apps.focus", "id": "f3"}), &cfg, Ok(&wm));
         assert_eq!(missing["ok"], false);
         assert!(missing["error"].as_str().unwrap().contains("window_id"));
     }
@@ -803,7 +1067,7 @@ mod tests {
         let ok = dispatch(
             &json!({"t": "rc:apps.launch", "id": "l1", "app_key": "bash"}),
             &cfg,
-            Some(&wm),
+            Ok(&wm),
         );
         assert_eq!(ok["t"], "rc:apps.launch.reply");
         assert_eq!(ok["ok"], true);
@@ -813,7 +1077,7 @@ mod tests {
         let denied = dispatch(
             &json!({"t": "rc:apps.launch", "id": "l2", "app_key": "evil"}),
             &cfg,
-            Some(&wm),
+            Ok(&wm),
         );
         assert_eq!(denied["ok"], false);
         assert!(denied["error"].as_str().unwrap().contains("allowlist"));
@@ -825,16 +1089,21 @@ mod tests {
         let reply = dispatch(
             &json!({"t": "rc:apps.focus", "id": "x", "window_id": "0x1"}),
             &cfg,
-            None,
+            Err(&Unavailable::Disabled),
         );
         assert_eq!(reply["ok"], false);
-        assert!(reply["error"].as_str().unwrap().contains("not supported"));
+        assert!(reply["error"].as_str().unwrap().contains("disabled"));
+        assert_eq!(reply["unavailable"]["code"], "disabled");
     }
 
     #[test]
     fn dispatch_null_id_tolerated() {
         let cfg = cfg_with(&[]);
-        let reply = dispatch(&json!({"t": "rc:apps.list"}), &cfg, None);
+        let reply = dispatch(
+            &json!({"t": "rc:apps.list"}),
+            &cfg,
+            Err(&Unavailable::Platform),
+        );
         assert!(reply["id"].is_null());
         assert_eq!(reply["ok"], true);
     }

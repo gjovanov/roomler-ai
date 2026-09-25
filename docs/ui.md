@@ -95,7 +95,8 @@ flowchart TB
   bridge for full-fidelity RTF.
 - **File transfer**: chunked uploads/downloads, folder download (streamed zip),
   resumable, cancellable.
-- **Remote apps**: list / focus / launch on the controlled host.
+- **Remote apps**: list / focus / launch on the controlled host — and, on a
+  host that cannot, the reason ([`remote-apps.md`](remote-apps.md)).
 - **Diagnostics**: stats polling, jank detector, long-task observer, inbound-RTP
   diagnostics, agent-log fetch — surfaced in an opt-in HUD.
 - **Resilience**: reconnect with backoff, decode-pressure shedding.
