@@ -1,7 +1,7 @@
 # FR-22: Time-to-first-frame — connecting sometimes takes 10–15 s
 
 Status: **parts 1 + 3 + 3b shipped; field-verified 2026-09-25 (prod `0.4.101`) — the healthy
-signalling band is unchanged across #821 (AC4 `[~]`) and the stall is localized to the
+signalling band shows no slowdown attributable to #821 (AC4 `[~]`) and the stall is localized to the
 negotiating phase on flap-prone control-WS hosts (AC5 `[~]`); both criteria stay open pending
 a persisted-marks trace, so the FR does not close.** Tracking issue: `FR-22` (#819).
 UX rather than picture quality — but it is the first thing every session is judged on,
@@ -149,10 +149,13 @@ leaves a warning with no ending.
 - [~] The healthy path is not slowed: p50 TTFF unchanged within noise. **Signalling half
       met; paint-inclusive half unproven.** Field-verified 2026-09-25 on prod `0.4.101`
       (§ Field-verification): the server-observed signalling band — consent EXCLUDED,
-      `consent_prompted`→`session_started`, mined from `remote_audit` (90 d) — is unchanged
-      across the #821 boundary: p50 **116 ms → 143 ms**, p90 216 → 293 (n 6503 before /
-      1809 after), and #821 only arms a *client-side* timeout that never fires on a healthy
-      connect, so it has no mechanism to slow one. ⚠️ MISSING: a **paint-inclusive** TTFF
+      `consent_prompted`→`session_started`, mined from `remote_audit` (90 d) — shows **no
+      slowdown attributable to #821**. The numbers are not "unchanged": p50 **116 ms → 143 ms**,
+      p90 216 → 293 (n 6503 before / 1809 after), a shift that sample sizes this large do not
+      put down to chance. But the aggregate is confounded by fleet composition (corporate and
+      WSL hosts carry the later tail), the last 7 d read p50 118 (n 49), and #821 only arms a
+      *client-side* timeout that never fires on a healthy connect, so it has no mechanism to
+      slow one. A per-host before/after would settle it. ⚠️ MISSING: a **paint-inclusive** TTFF
       (through `first_frame`) p50 baseline. TTFF is browser-only and **not persisted** —
       `agent_logs` holds **zero** browser rows because the `/api/log/browser` route was
       never wired — so no pre-#821 TTFF distribution exists and none can be reconstructed;
@@ -188,7 +191,7 @@ leaves a warning with no ending.
 | 2026-08-28 | — | Parts 1 + 3 merged (#821): phase-aware bound (`requesting` 4 s) and eight-mark connect timing. Part 2 measured against the tree and found ALREADY PRESENT — recorded rather than rebuilt. **No field reading yet**; the p50 and the root cause both need a deployed build, so nothing here is a result. |
 | 2026-08-28 | `v20260828-afeb977584f0` | Parts 1 + 3 DEPLOYED. Verified in the SERVED bundle, not just the rollout: `/assets/RemoteControl-*.js` carries the markers. Awaiting a field connect. |
 | 2026-08-28 | — | 3b merged (#822): the verdict reaches the operator through the snackbar. Console-only reporting could not produce a root cause, because the console is closed during the sessions that stall. |
-| 2026-09-25 | prod `0.4.101` | **AC4 field read.** Server-observed signalling band (consent excluded) unchanged across #821: p50 116 → 143 ms, p90 216 → 293 (n 6503/1809). Last 30 d p50 142, last 7 d p50 118 / p99 204 / max 252 (n 49) — no stalls in the recent window at all. AC4 → `[~]`: signalling half met; paint-inclusive TTFF has no recorded baseline (browser marks unpersisted) and could not be self-measured (hidden automation tab). |
+| 2026-09-25 | prod `0.4.101` | **AC4 field read.** Server-observed signalling band (consent excluded) shows no slowdown attributable to #821, though the aggregate moved: p50 116 → 143 ms, p90 216 → 293 (n 6503/1809). Last 30 d p50 142, last 7 d p50 118 / p99 204 / max 252 (n 49) — no stalls in the recent window at all. AC4 → `[~]`: signalling half met; paint-inclusive TTFF has no recorded baseline (browser marks unpersisted) and could not be self-measured (hidden automation tab). |
 | 2026-09-25 | prod `0.4.101` | **AC5 field read.** The server-visible stall is the **negotiating** band; 34/8312 started sessions ≥ 3 s (0.41 %), ~17 ≥ 8 s, clustered on flap-prone control-WS hosts, consent excluded. Leading mechanism: a half-open agent control WS delaying offer delivery — not the carrier, not consent. AC5 → `[~]`: phase + mechanism localized; single-attempt end-to-end trace and requesting-phase quantification still owed (explanatory logs aged out; marks unpersisted). |
 
 ## Field-verification — 2026-09-25 (prod `0.4.101`)
@@ -234,7 +237,7 @@ is **browser-only and unpersisted**:
   relayed pair: `answer` +214 ms but `pc_connected` +1.2 s, `dc_open` +0.3–0.8 s,
   `first_frame` +0.4 s of a 2.7 s TTFF). The server is blind to all of it.
 
-### AC4 — the healthy signalling band is unchanged across #821
+### AC4 — no slowdown attributable to #821 in the healthy signalling band
 
 Negotiate band = consent EXCLUDED (`consent_granted`→`session_started`), the only part of
 the wait #821 shares a code path with. Consent (`consent_prompted`→`consent_granted`) is
@@ -249,8 +252,11 @@ reported separately and excluded, exactly as the snackbar excludes it.
 | consent band, before | 6503 | 43 ms | 84 | 12 846 | 29 276 |
 | consent band, after | 1809 | 46 ms | 215 | 25 232 | 202 386 |
 
-p50/p90 are flat across the boundary (116 → 143 / 216 → 293 — within week-to-week noise).
-The p99 rose (439 → 2 777) but that is the negotiating stalls #821 deliberately did **not**
+p50/p90 are **not** flat across the boundary: 116 → 143 / 216 → 293, and with n 6503 and 1809
+that shift is real, not chance. What it is not is evidence against #821. The last 7 d (n 49)
+read 118 / 177, back at the "before" level, so the aggregate moves with which hosts happened
+to connect in a window. A per-host before/after, not this aggregate, is what would show a
+change in the healthy path. The p99 rose (439 → 2 777) but that is the negotiating stalls #821 deliberately did **not**
 touch (AC3's caveat) plus sample composition, not a slowdown of the healthy path — and #821
 only arms a client-side `setTimeout` that never fires on a healthy connect. The consent band's
 huge p99/max (up to 202 s) is a human taking their time on a Prompt-mode device — correctly
