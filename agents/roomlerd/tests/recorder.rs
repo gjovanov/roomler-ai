@@ -947,9 +947,9 @@ mod process {
         assert!(!wrote_one, "nothing was recorded");
     }
 
-    /// A SYSTEM/root daemon refuses a local recording (until P1e launches
-    /// the recorder as the console user) — and says why, before spawning
-    /// anything.
+    /// A service with nobody to record as (SYSTEM with nobody signed in;
+    /// root, until the unix drop exists) refuses a local recording — and
+    /// says why, before spawning anything.
     #[tokio::test]
     async fn a_service_identity_daemon_refuses_a_local_recording() {
         use roomlerd::recording::manager::RecordingManager;
@@ -967,7 +967,7 @@ mod process {
                 assert!(
                     st.unavailable_reason
                         .as_deref()
-                        .is_some_and(|r| r.contains("SYSTEM/root")),
+                        .is_some_and(|r| r.contains("this device service runs as")),
                     "{st:?}"
                 );
             }
@@ -975,8 +975,157 @@ mod process {
         }
         // …and again if a start is attempted anyway.
         match m.start(RecordStartOpts::default()).await {
-            Response::Error { message } => assert!(message.contains("SYSTEM/root"), "{message}"),
+            Response::Error { message } => {
+                assert!(message.contains("this device service runs as"), "{message}")
+            }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// FR-85 P1e — the recorder a daemon launches runs at normal integrity
+    /// whatever the daemon runs at: an elevated worker (a UAC-split
+    /// administrator's, the service default) hands it a restricted copy of
+    /// its token — the same user, the admin group deny-only, medium
+    /// integrity. `record --whoami` reports what the child actually got.
+    ///
+    /// On an elevated test run the parent is High and the child must not be;
+    /// on a medium one both are medium and the case still holds.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_elevated_daemon_launches_the_recorder_at_medium_integrity() {
+        use roomlerd::recording::launch::{self, Identity};
+        use tokio::io::AsyncBufReadExt;
+        let parent = launch::describe_self();
+        let expected = launch::decide().expect("a test run is never refused");
+        let whoami = |identity: Identity| async move {
+            let l = launch::spawn(
+                identity,
+                Path::new(env!("CARGO_BIN_EXE_roomlerd")),
+                &["record".into(), "--whoami".into()],
+                &[],
+            )
+            .expect("launch");
+            drop(l.stdin);
+            let mut lines = tokio::io::BufReader::new(l.stdout).lines();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while let Some(line) = lines.next_line().await.expect("read") {
+                    if let Some(ev) = roomlerd::recording::child::parse_event_line(&line) {
+                        return ev;
+                    }
+                }
+                panic!("the recorder said nothing")
+            })
+            .await
+            .expect("the recorder answers")
+        };
+        let child = whoami(expected).await;
+        println!("the daemon: {parent}\nits recorder, as {expected:?}: {child}");
+        // The CI lane runs elevated ON PURPOSE and says so: there, a medium
+        // run would prove nothing and must not pass as if it had.
+        if std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_some() {
+            assert!(
+                parent["integrity_rid"]
+                    .as_u64()
+                    .is_some_and(|rid| rid > 0x2000),
+                "this lane must run elevated for the drop to be proven: {parent}"
+            );
+        }
+        assert_eq!(child["ev"], "whoami", "{child}");
+        assert_eq!(
+            child["user"], parent["user"],
+            "the same person: {child} vs {parent}"
+        );
+        assert_eq!(child["system"], false, "{child}");
+        assert!(
+            child["integrity_rid"]
+                .as_u64()
+                .is_some_and(|rid| rid <= 0x2000),
+            "the recorder ran above medium integrity: {child} (the daemon: {parent})"
+        );
+        assert_eq!(
+            child["admin_enabled"], false,
+            "{child} (the daemon: {parent})"
+        );
+        if parent["integrity_rid"]
+            .as_u64()
+            .is_some_and(|rid| rid > 0x2000)
+        {
+            assert_eq!(expected, Identity::RestrictedCopy);
+            // The positive control: launched as the daemon itself, the child
+            // IS elevated — so the assertions above can fail.
+            let same = whoami(Identity::Inherit).await;
+            assert_eq!(same["integrity_rid"], parent["integrity_rid"], "{same}");
+        }
+    }
+
+    /// FR-85 P1e — a whole recording through the identity rule. On an
+    /// elevated run the recorder is the restricted, medium copy: the folder
+    /// is asked of it (`record --where`), it captures, encodes and writes the
+    /// file as the person, and the daemon's list and delete run impersonating
+    /// it. On a medium run the same flow is the plain launch.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_manager_records_as_the_person_at_normal_integrity() {
+        use roomlerd::recording::launch;
+        use roomlerd::recording::manager::RecordingManager;
+        use tunnel_core::localapi::{RecordStartOpts, Response};
+
+        let _serial = MANAGER_TESTS.lock().await;
+        let identity = launch::decide().expect("a test run is never refused");
+        let dir = scratch();
+        let out = dir.path().join("Recordings");
+        let cfg_path = dir.path().join("config.toml");
+        let mut cfg = roomler_node_core::config::test_fixture();
+        cfg.record_dir = Some(out.to_string_lossy().into_owned());
+        roomler_node_core::config::save(&cfg_path, &cfg).unwrap();
+        let exe = PathBuf::from(env!("CARGO_BIN_EXE_roomlerd"));
+        let manager = || {
+            RecordingManager::new(exe.clone(), cfg_path.clone())
+                .with_identity(Ok(identity))
+                .with_child_env([("ROOMLERD_SYNTHETIC_FRAMES", "1")])
+        };
+
+        // A fresh manager has no answer cached: this one comes from the
+        // recorder, launched as `identity`.
+        assert_eq!(
+            manager().folder().await.as_deref(),
+            Some(out.as_path()),
+            "as {identity:?}"
+        );
+
+        let m = manager();
+        let started = m
+            .start(RecordStartOpts {
+                encoder: Some("software".into()),
+                ..Default::default()
+            })
+            .await;
+        let st = match started {
+            Response::Recording(s) => s,
+            other => panic!("start as {identity:?}: {other:?}"),
+        };
+        assert!(st.active, "{st:?}");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let st = match m.stop().await {
+            Response::Recording(s) => s,
+            other => panic!("stop: {other:?}"),
+        };
+        let file = PathBuf::from(st.last.and_then(|l| l.path).expect("the finished file"));
+        assert!(
+            file.starts_with(&out) && file.is_file(),
+            "{}",
+            file.display()
+        );
+
+        let listing = match m.list().await {
+            Response::Recordings(l) => l,
+            other => panic!("list: {other:?}"),
+        };
+        assert_eq!(listing.items.len(), 1, "{listing:?}");
+        assert!(matches!(
+            m.delete(&listing.items[0].name).await,
+            Response::RecordingDeleted { ok: true, .. }
+        ));
+        assert!(!file.exists(), "deleted as {identity:?}");
     }
 }
