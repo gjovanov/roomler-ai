@@ -121,6 +121,9 @@ pub struct RecordingManager {
     active: Mutex<Option<Active>>,
     /// Set by a test; `None` = decide from this process ([`launch::decide`]).
     identity_override: Option<Result<Identity, Refusal>>,
+    /// `ROOMLERD_RECORDING=0`, read once at start like every `ROOMLERD_*`
+    /// kill switch: the whole recording surface answers "switched off".
+    switched_off: bool,
     /// The folder the recorder last decided (`record --where`).
     where_cache: StdMutex<Option<WhereCache>>,
     /// Extra environment for the child, on top of the config fallbacks.
@@ -140,6 +143,7 @@ impl RecordingManager {
             state: Arc::new(StdMutex::new(RecordingState::default())),
             active: Mutex::new(None),
             identity_override: None,
+            switched_off: launch::switched_off(tunnel_core::env::node_env("RECORDING").as_deref()),
             where_cache: StdMutex::new(None),
             child_env: Vec::new(),
             start_timeout: START_TIMEOUT,
@@ -148,9 +152,21 @@ impl RecordingManager {
     }
 
     /// Who a recorder launched now would run as, or why none can be (P1e).
-    /// Read afresh each time: a person signs in and out.
+    /// Read afresh each time: a person signs in and out. The kill switch
+    /// comes first, so it answers every path — a local start, a remote one,
+    /// what the device advertises, and the listing.
     pub fn identity(&self) -> Result<Identity, Refusal> {
+        if self.switched_off {
+            return Err(Refusal::SwitchedOff);
+        }
         self.identity_override.unwrap_or_else(launch::decide)
+    }
+
+    /// Set the kill switch the way `ROOMLERD_RECORDING=0` would — for the
+    /// test that proves it closes every path.
+    pub fn with_switched_off(mut self, switched_off: bool) -> Self {
+        self.switched_off = switched_off;
+        self
     }
 
     /// Can this daemon record at all (FR-85 P3 advertises remote recording
