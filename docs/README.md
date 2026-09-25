@@ -84,7 +84,7 @@ side, consent-gated, end-to-end encrypted.*
 |---|---|
 | [remote-control.md](remote-control.md) | Full design: topology, agent internals, `rc:*` signalling, consent/security model, latency budget |
 | [encoders.md](encoders.md) | The cell matrix a host advertises (codec × backend × chroma) and how the viewer resolves it into a session; the probe lifecycle (child processes, the cache, the denylist); the hardware-encoder cascade per platform (NVENC · QSV · AMF · VideoToolbox · VAAPI · D3D12 · Vulkan, with libva bundled on Linux); rate control, capture backends, viewer decode paths |
-| [rate-control.md](rate-control.md) | How a session spends its bits: the Priority dial, the per-session control loops, why resolution never flips mid-motion (rc.445), crisp-at-rest, config reference |
+| [rate-control.md](rate-control.md) | How a session spends its bits: the FR-79 **validity gate** every estimator reads first (one verdict per window, V5's one exception, the pair memory's write-back and seed, the V3b belief still in shadow), the Priority dial, the per-session control loops, why resolution never flips mid-motion (rc.445), crisp-at-rest, config reference |
 
 ## 🔐 2 · Your own secure private network
 
