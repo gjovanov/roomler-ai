@@ -302,6 +302,36 @@ enum Command {
     /// asymmetry inspectable on a host instead of inferred.
     #[command(name = "apps-probe")]
     AppsProbe,
+    /// FR-85 — record this machine's screen to an HQ MP4 until stopped
+    /// (Ctrl+C, `{"cmd":"stop"}` on stdin, or stdin closing). Prints JSON
+    /// events (`started`, `progress`, `stopped`, `refused`) on stdout.
+    ///
+    /// Hidden while the recorder is P1 (no local surface yet): the daemon and
+    /// roomler-desktop are its callers from P2 on.
+    #[cfg(feature = "recording")]
+    #[command(hide = true, name = "record")]
+    Record {
+        /// Destination folder. Default: the configured one, else Videos\Roomler
+        /// (Windows, when local and writable), ~/Movies/Roomler (macOS), the
+        /// XDG videos dir + Roomler (Linux).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Frames per second (1–60).
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        /// `auto` | `hardware` | `software`.
+        #[arg(long, default_value = "auto")]
+        encoder: String,
+        /// Stop cleanly after this many minutes.
+        #[arg(long, default_value_t = 240)]
+        max_minutes: u32,
+        /// (internal, P3) a remote recording's controller user id.
+        #[arg(long, hide = true)]
+        remote_user_id: Option<String>,
+        /// (internal, P3) the controller's display name.
+        #[arg(long, hide = true)]
+        remote_user_name: Option<String>,
+    },
     CaptureSmoke {
         /// How many frames to pull before reporting.
         #[arg(long, default_value_t = 10)]
@@ -1256,6 +1286,28 @@ async fn daemon_main() -> Result<()> {
             }
         }
         Command::AppsProbe => apps_probe_cmd(),
+        #[cfg(feature = "recording")]
+        Command::Record {
+            out,
+            fps,
+            encoder,
+            max_minutes,
+            remote_user_id,
+            remote_user_name,
+        } => {
+            roomlerd::recording::child::run(
+                roomlerd::recording::child::RecordArgs {
+                    out,
+                    fps,
+                    encoder,
+                    max_minutes,
+                    remote_user_id,
+                    remote_user_name,
+                },
+                &config_path,
+            )
+            .await
+        }
         Command::CaptureSmoke {
             frames,
             dump,

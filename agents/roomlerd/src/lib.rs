@@ -84,6 +84,8 @@ pub mod preflight;
 pub mod pty;
 pub mod rc_local_turn;
 pub mod rc_sessions;
+#[cfg(feature = "recording")]
+pub mod recording;
 pub mod relay_probe;
 /// FR-19 P1d — the org-relay reachability responder (process-wide, opt-in).
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]

@@ -1,0 +1,565 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
+//! FR-85 P1 — the recorder, end to end: frames in, a playable MP4 out, and
+//! the frames that come back out of a decoder are the ones that went in.
+//!
+//! ⚠️ This binary runs only when CI NAMES it (`--test recorder`) — every
+//! `cargo test -p roomlerd` lane is `--lib`, so an integration test nobody
+//! names is decoration.
+//!
+//! The oracle: a test capturer paints its frame counter as 16 blocks of
+//! 16×16 px, black or white, into the luma a decoder hands back. A block that
+//! size survives H.264 at any sane QP; a 1-px counter strip (the synthetic
+//! backend's) does not. The oracle is proven to discriminate before it is
+//! trusted (`the_oracle_reads_what_was_painted_and_nothing_else`).
+
+#![cfg(all(feature = "recording", feature = "openh264-encoder"))]
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use roomlerd::capture::{Damage, Frame, PixelFormat, ScreenCapture};
+use roomlerd::encode::VideoEncoder;
+use roomlerd::encode::openh264_backend::Openh264Encoder;
+use roomlerd::recording::annexb::length_prefixed_to_annexb;
+use roomlerd::recording::folder::{PARTIAL_DIR, PARTIAL_SUFFIX};
+use roomlerd::recording::mp4::{ProgressiveFile, VIDEO_TRACK_ID};
+use roomlerd::recording::recorder::{
+    self, EncoderFactory, RecordOptions, RecorderEvent, StartError, StartRefusal,
+};
+use roomlerd::recording::sidecar::{Initiator, Sidecar, StopReason};
+use tokio::sync::{mpsc, watch};
+
+const W: u32 = 320;
+const H: u32 = 240;
+const BLOCK: u32 = 16;
+const BITS: u32 = 16;
+
+/// Paint `counter` as 16 luma blocks along the top of a mid-grey frame.
+fn render(counter: u16, w: u32, h: u32) -> Vec<u8> {
+    let mut data = vec![0x80u8; (w * h * 4) as usize];
+    for bit in 0..BITS {
+        let on = (counter >> (BITS - 1 - bit)) & 1 == 1;
+        let v = if on { 0xFF } else { 0x00 };
+        for y in 0..BLOCK {
+            for x in bit * BLOCK..(bit + 1) * BLOCK {
+                let i = ((y * w + x) * 4) as usize;
+                data[i] = v;
+                data[i + 1] = v;
+                data[i + 2] = v;
+                data[i + 3] = 0xFF;
+            }
+        }
+    }
+    data
+}
+
+/// Read the counter back from a luma plane: the centre 8×8 of each block,
+/// thresholded at mid-grey.
+fn read_counter(y_plane: &[u8], stride: usize) -> u16 {
+    let mut v = 0u16;
+    for bit in 0..BITS as usize {
+        let mut sum = 0u32;
+        for dy in 4..12usize {
+            for dx in 4..12usize {
+                sum += u32::from(y_plane[dy * stride + bit * BLOCK as usize + dx]);
+            }
+        }
+        let on = sum / 64 > 128;
+        v = (v << 1) | u16::from(on);
+    }
+    v
+}
+
+/// BT.601 limited-range luma of a BGRA frame, for the oracle's self-test.
+fn luma_of(bgra: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let mut y = vec![0u8; (w * h) as usize];
+    for (i, px) in bgra.chunks_exact(4).enumerate() {
+        let (b, g, r) = (i32::from(px[0]), i32::from(px[1]), i32::from(px[2]));
+        y[i] = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
+    }
+    y
+}
+
+/// A capturer that paints its frame counter and paces itself at `fps`.
+/// After `resize_after` frames (if set) it changes size.
+///
+/// ⚠️ The counter is the frame index of ELAPSED TIME, like a real screen that
+/// shows the present — not a count of calls. A call-counting capturer bursts
+/// through its backlog after a slow encoder open, and the first frame the
+/// recorder encodes is then a late one; measured on a loaded run, where the
+/// first test version read `counters[0] == 15` and failed for a reason no
+/// real backend has.
+struct CounterCapture {
+    start: Instant,
+    interval: Duration,
+    n: u64,
+    resize_after: Option<u64>,
+    fail: bool,
+}
+
+impl CounterCapture {
+    fn new(fps: u32) -> Self {
+        Self {
+            start: Instant::now(),
+            interval: Duration::from_micros(1_000_000 / u64::from(fps)),
+            n: 0,
+            resize_after: None,
+            fail: false,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ScreenCapture for CounterCapture {
+    async fn next_frame(&mut self) -> Result<Option<Frame>> {
+        if self.fail {
+            anyhow::bail!("no display");
+        }
+        // Sleep to the next frame boundary, then show the frame of NOW.
+        let due = self.start + self.interval * (self.n as u32);
+        let now = Instant::now();
+        if due > now {
+            tokio::time::sleep(due - now).await;
+        }
+        self.n = (self.start.elapsed().as_nanos() / self.interval.as_nanos()) as u64;
+        let (w, h) = match self.resize_after {
+            Some(k) if self.n >= k => (W + 64, H),
+            _ => (W, H),
+        };
+        let f = Frame {
+            width: w,
+            height: h,
+            stride: w * 4,
+            pixel_format: PixelFormat::Bgra,
+            data: render(self.n as u16, w, h),
+            monotonic_us: self.start.elapsed().as_micros() as u64,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        };
+        self.n += 1;
+        Ok(Some(f))
+    }
+
+    fn monitor_count(&self) -> u8 {
+        1
+    }
+}
+
+fn openh264_factory(fps: u32) -> EncoderFactory {
+    Box::new(move |w, h| {
+        let e = Openh264Encoder::new_recording(w, h, fps, fps * 2)?;
+        Ok(Box::new(e) as Box<dyn VideoEncoder>)
+    })
+}
+
+fn options(dir: &Path) -> RecordOptions {
+    let mut o = RecordOptions::new(
+        dir.to_path_buf(),
+        "test.mp4".into(),
+        Initiator::Local {
+            user: Some("tester".into()),
+        },
+    );
+    o.encoder_keeps_gop = true;
+    // CI runners have far less than the production 2 GiB floor free, and this
+    // test is not about disk space.
+    o.min_free_to_start = 0;
+    o.min_free_to_continue = 0;
+    o
+}
+
+/// Record for `for_how_long`, then stop with `Requested`.
+async fn record_for(
+    opts: RecordOptions,
+    cap: CounterCapture,
+    for_how_long: Duration,
+) -> (Result<recorder::RecordingSummary>, Vec<RecorderEvent>) {
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    let fps = opts.fps;
+    let handle = tokio::spawn(recorder::run(
+        opts,
+        Box::new(cap),
+        openh264_factory(fps),
+        stop_rx,
+        ev_tx,
+    ));
+    tokio::time::sleep(for_how_long).await;
+    let _ = stop_tx.send(Some(StopReason::Requested));
+    let result = handle.await.expect("the recorder task panicked");
+    let mut events = Vec::new();
+    while let Ok(e) = ev_rx.try_recv() {
+        events.push(e);
+    }
+    (result, events)
+}
+
+struct Decoded {
+    counters: Vec<u16>,
+    samples: usize,
+    dts: Vec<u64>,
+}
+
+/// Decode every video sample of a progressive recording with openh264 and
+/// read the counter back out of each picture.
+fn decode_counters(path: &Path) -> Decoded {
+    use openh264::formats::YUVSource;
+    let pf = ProgressiveFile::open(path).expect("open the recording");
+    assert!(pf.moov_offset < pf.mdat_offset, "moov must precede mdat");
+    let samples = pf.samples(VIDEO_TRACK_ID).expect("sample table");
+    let ps = pf.avc_parameter_sets_annexb().expect("avcC");
+    let mut dec = openh264::decoder::Decoder::new().expect("openh264 decoder");
+    let mut f = std::fs::File::open(path).unwrap();
+    let mut counters = Vec::new();
+    for (i, s) in samples.iter().enumerate() {
+        let bytes = pf.read_sample(&mut f, s).unwrap();
+        let mut annexb = length_prefixed_to_annexb(&bytes).expect("a well-formed sample");
+        if i == 0 {
+            assert!(s.sync, "the first sample must be a keyframe");
+            annexb = [ps.clone(), annexb].concat();
+        }
+        if let Some(yuv) = dec.decode(&annexb).expect("decode") {
+            let (ys, _, _) = yuv.strides();
+            counters.push(read_counter(yuv.y(), ys));
+        }
+    }
+    Decoded {
+        counters,
+        samples: samples.len(),
+        dts: samples.iter().map(|s| s.dts).collect(),
+    }
+}
+
+fn scratch() -> tempfile::TempDir {
+    tempfile::tempdir().expect("tempdir")
+}
+
+// ── the oracle, proven before it is trusted ────────────────────────────────
+
+#[test]
+fn the_oracle_reads_what_was_painted_and_nothing_else() {
+    for c in [0u16, 1, 0x8001, 0x5A5A, 0xFFFF, 1234] {
+        let y = luma_of(&render(c, W, H), W, H);
+        assert_eq!(read_counter(&y, W as usize), c);
+    }
+    // Negative control: a flipped block reads as a DIFFERENT counter, so a
+    // pipeline that returned the wrong frame could not pass by accident.
+    let mut bgra = render(0x00F0, W, H);
+    for y in 0..BLOCK {
+        for x in 0..BLOCK {
+            let i = ((y * W + x) * 4) as usize;
+            bgra[i..i + 3].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
+        }
+    }
+    assert_eq!(read_counter(&luma_of(&bgra, W, H), W as usize), 0x80F0);
+}
+
+// ── in-process: the pipeline ────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recording_plays_back_the_frames_that_went_in() {
+    let dir = scratch();
+    let opts = options(dir.path());
+    let (result, events) = record_for(opts, CounterCapture::new(30), Duration::from_secs(3)).await;
+    let summary = result.expect("the recording finalizes");
+    assert_eq!(summary.reason, StopReason::Requested);
+    let path = summary.path.expect("a finished file");
+    assert_eq!(path, dir.path().join("test.mp4"));
+    assert!(
+        !dir.path()
+            .join(PARTIAL_DIR)
+            .join(format!("test.mp4{PARTIAL_SUFFIX}"))
+            .exists(),
+        "the partial is removed once the file is final"
+    );
+
+    let d = decode_counters(&path);
+    // ~3 s at 30 fps. Generous bounds: CI runners are noisy, and the
+    // assertion that matters is the next one.
+    assert!(
+        (75..=100).contains(&d.samples),
+        "expected ~90 frames in 3 s, got {}",
+        d.samples
+    );
+    assert_eq!(
+        d.counters.len(),
+        d.samples,
+        "every sample decoded to a picture"
+    );
+    // Frames come out in the order they went in; a still screen may repeat a
+    // frame, nothing may go backwards.
+    assert!(
+        d.counters.windows(2).all(|p| p[0] <= p[1]),
+        "counters went backwards: {:?}",
+        d.counters
+    );
+    assert!(
+        d.counters[0] <= 3,
+        "the recording starts at the start: {:?}",
+        &d.counters[..5]
+    );
+    let unique = {
+        let mut u = d.counters.clone();
+        u.dedup();
+        u.len()
+    };
+    assert!(
+        unique * 10 >= d.samples * 8,
+        "at least 80% distinct frames at matched rates ({unique} of {})",
+        d.samples
+    );
+    // Constant frame rate on the recorder's own clock: 3000 ticks of 90 kHz
+    // per frame, except where the encoder fell behind (a longer gap, never a
+    // shorter one).
+    assert!(
+        d.dts
+            .windows(2)
+            .all(|p| p[1] - p[0] >= 3000 && (p[1] - p[0]) % 3000 == 0)
+    );
+
+    // The sidecar says what happened.
+    let sc: Sidecar =
+        serde_json::from_str(&std::fs::read_to_string(Sidecar::path_for(&path)).unwrap()).unwrap();
+    assert_eq!(sc.stop_reason, Some(StopReason::Requested));
+    assert_eq!((sc.width, sc.height, sc.fps), (W, H, 30));
+    assert_eq!(sc.encoder, "openh264");
+    assert_eq!(sc.frames as usize, d.samples);
+    assert!(matches!(sc.initiator, Initiator::Local { .. }));
+
+    // And the event stream said it too.
+    assert!(matches!(
+        events.first(),
+        Some(RecorderEvent::Started {
+            width: 320,
+            height: 240,
+            ..
+        })
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(RecorderEvent::Stopped {
+            reason: StopReason::Requested,
+            fragmented: false,
+            ..
+        })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_display_that_changes_size_ends_the_file_cleanly() {
+    let dir = scratch();
+    let mut cap = CounterCapture::new(30);
+    cap.resize_after = Some(30);
+    let (result, _) = record_for(options(dir.path()), cap, Duration::from_secs(4)).await;
+    let s = result.unwrap();
+    assert_eq!(s.reason, StopReason::DisplayChanged);
+    let d = decode_counters(&s.path.unwrap());
+    assert!(
+        d.samples >= 20 && d.samples <= 40,
+        "{} frames before the resize",
+        d.samples
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn not_enough_disk_refuses_the_start_and_writes_nothing() {
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    opts.min_free_to_start = u64::MAX;
+    let (result, events) =
+        record_for(opts, CounterCapture::new(30), Duration::from_millis(50)).await;
+    let err = result.unwrap_err();
+    let se = err.downcast_ref::<StartError>().expect("a StartError");
+    assert_eq!(se.refusal, StartRefusal::DiskLow);
+    assert!(events.is_empty(), "a refused start emits no events");
+    assert!(!dir.path().join("test.mp4").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_frame_refuses_the_start() {
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    opts.first_frame_timeout = Duration::from_millis(300);
+    let mut cap = CounterCapture::new(30);
+    cap.fail = true;
+    let (result, _) = record_for(opts, cap, Duration::from_millis(50)).await;
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<StartError>().unwrap().refusal,
+        StartRefusal::NoFrame
+    );
+}
+
+// ── the real `roomlerd record` process ──────────────────────────────────────
+
+#[cfg(feature = "synthetic-frame-source")]
+mod process {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::PathBuf;
+    use std::process::{Child, ChildStdin, Command, Stdio};
+
+    struct Rec {
+        child: Child,
+        stdin: Option<ChildStdin>,
+        lines: std::sync::mpsc::Receiver<String>,
+        out: PathBuf,
+    }
+
+    fn spawn(out: &Path) -> Rec {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_roomlerd"))
+            .args(["record", "--encoder", "software", "--fps", "30", "--out"])
+            .arg(out)
+            .env("ROOMLERD_SYNTHETIC_FRAMES", "1")
+            // No config on the runner; point it at a path that does not exist
+            // so the test never reads a developer's real config.
+            .arg("--config")
+            .arg(out.join("no-such-config.toml"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn roomlerd record");
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        let stdin = child.stdin.take();
+        Rec {
+            child,
+            stdin,
+            lines: rx,
+            out: out.to_path_buf(),
+        }
+    }
+
+    impl Rec {
+        /// Wait for the first stdout event of kind `ev`.
+        fn wait_for(&self, ev: &str, within: Duration) -> serde_json::Value {
+            let deadline = Instant::now() + within;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let line = self
+                    .lines
+                    .recv_timeout(left)
+                    .unwrap_or_else(|_| panic!("no `{ev}` event within {within:?}"));
+                // Log lines share stdout; only prefixed lines are protocol.
+                let Some(v) = roomlerd::recording::child::parse_event_line(&line) else {
+                    continue;
+                };
+                assert_ne!(v["ev"], "refused", "the recorder refused to start: {v}");
+                if v["ev"] == ev {
+                    return v;
+                }
+            }
+        }
+
+        fn wait_exit(&mut self, within: Duration) -> std::process::ExitStatus {
+            let deadline = Instant::now() + within;
+            loop {
+                if let Some(st) = self.child.try_wait().unwrap() {
+                    return st;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the recorder did not exit within {within:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn only_recording(&self) -> PathBuf {
+            let mut mp4s: Vec<PathBuf> = std::fs::read_dir(&self.out)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "mp4"))
+                .collect();
+            assert_eq!(mp4s.len(), 1, "exactly one recording: {mp4s:?}");
+            mp4s.pop().unwrap()
+        }
+    }
+
+    fn sidecar_of(p: &Path) -> Sidecar {
+        serde_json::from_str(&std::fs::read_to_string(Sidecar::path_for(p)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_stop_command_finalizes_and_reports_the_file() {
+        let dir = scratch();
+        let mut r = spawn(dir.path());
+        r.wait_for("started", Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(2500));
+        writeln!(r.stdin.as_mut().unwrap(), r#"{{"cmd":"stop"}}"#).unwrap();
+        let stopped = r.wait_for("stopped", Duration::from_secs(30));
+        assert_eq!(stopped["reason"], "requested");
+        assert_eq!(stopped["fragmented"], false);
+        assert!(r.wait_exit(Duration::from_secs(30)).success());
+        let p = r.only_recording();
+        assert_eq!(stopped["path"].as_str().map(PathBuf::from), Some(p.clone()));
+        assert_eq!(sidecar_of(&p).stop_reason, Some(StopReason::Requested));
+        assert!(
+            ProgressiveFile::open(&p)
+                .unwrap()
+                .samples(VIDEO_TRACK_ID)
+                .unwrap()
+                .len()
+                >= 45
+        );
+    }
+
+    #[test]
+    fn closing_stdin_finalizes_as_parent_gone() {
+        let dir = scratch();
+        let mut r = spawn(dir.path());
+        r.wait_for("started", Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(r.stdin.take());
+        let stopped = r.wait_for("stopped", Duration::from_secs(30));
+        assert_eq!(stopped["reason"], "parent_gone");
+        assert!(r.wait_exit(Duration::from_secs(30)).success());
+        assert_eq!(
+            sidecar_of(&r.only_recording()).stop_reason,
+            Some(StopReason::ParentGone)
+        );
+    }
+
+    #[test]
+    fn a_killed_recorder_leaves_a_partial_the_reconciler_finalizes() {
+        let dir = scratch();
+        let mut r = spawn(dir.path());
+        r.wait_for("started", Duration::from_secs(30));
+        // Past the first 2 s fragment, so at least one GOP is on disk.
+        std::thread::sleep(Duration::from_millis(3500));
+        r.child.kill().unwrap(); // SIGKILL / TerminateProcess: no finalize ran
+        let _ = r.child.wait();
+        let staging = dir.path().join(PARTIAL_DIR);
+        let partials: Vec<_> = std::fs::read_dir(&staging).unwrap().flatten().collect();
+        assert_eq!(partials.len(), 1, "the dead recorder left its partial");
+
+        let done = recorder::reconcile_partials(&staging, dir.path());
+        assert_eq!(done.len(), 1);
+        let p = &done[0];
+        assert_eq!(sidecar_of(p).stop_reason, Some(StopReason::Interrupted));
+        let n = ProgressiveFile::open(p)
+            .unwrap()
+            .samples(VIDEO_TRACK_ID)
+            .unwrap()
+            .len();
+        assert!(
+            n >= 60,
+            "at least the first complete 2 s fragment survives ({n} frames)"
+        );
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            0,
+            "the partial is gone"
+        );
+    }
+}

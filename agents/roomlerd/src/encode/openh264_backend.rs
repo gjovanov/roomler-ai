@@ -27,7 +27,10 @@
 //! [OpenH264]: https://www.openh264.org/
 
 use anyhow::{Context, Result, anyhow};
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod};
+use openh264::encoder::{
+    BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, QpRange,
+    RateControlMode, UsageType, VuiConfig,
+};
 use openh264::formats::YUVBuffer;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
@@ -45,6 +48,15 @@ use crate::capture::{Frame, PixelFormat};
 use super::initial_bitrate_for;
 
 const TARGET_FPS: u32 = 30;
+
+/// FR-85 — the recording profile's rate target: ~0.2 bits per pixel per
+/// frame, floored at 4 Mbps and capped at 40 Mbps. Quality mode treats it as
+/// a budget to aim at, not a wall; the QP window is what guards quality.
+/// 1080p30 → ~12.4 Mbps; screen content (mostly static) averages far less.
+pub fn recording_bitrate_for(width: u32, height: u32, fps: u32) -> u32 {
+    let bps = u64::from(width) * u64::from(height) * u64::from(fps.max(1)) / 5;
+    bps.clamp(4_000_000, 40_000_000) as u32
+}
 
 pub struct Openh264Encoder {
     /// Worker thread; commands go in, packets come out.
@@ -66,28 +78,77 @@ impl Openh264Encoder {
     /// the width/height at construction time; if the capture source resizes
     /// (dock/undock) the caller must rebuild this encoder.
     pub fn new(width: u32, height: u32) -> Result<Self> {
+        let bitrate_bps = initial_bitrate_for(width, height);
+        Self::spawn(width, height, "roomlerd-encoder", move || {
+            tracing::info!(bitrate_bps, width, height, "openh264 encoder init");
+            EncoderConfig::new()
+                .bitrate(BitRate::from_bps(bitrate_bps))
+                .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32))
+                // Force an IDR every 60 frames (≈2 s @ 30 fps).
+                // Without a bounded IDR interval, openh264 can go
+                // 300+ frames between keyframes on a static
+                // desktop; a single lost packet then freezes the
+                // decoder for ~10 s. 60 gives <2 s recovery floor
+                // even if the RTCP-PLI round-trip drops.
+                .intra_frame_period(IntraFramePeriod::from_num_frames(60))
+        })
+    }
+
+    /// FR-85 — the RECORDING profile. What differs from the live one, and why:
+    ///
+    /// - quality-mode rate control with a QP window, not a bitrate the network
+    ///   sets — a file has no link to fit, so the target is generous and the
+    ///   QP ceiling (30) is what bounds the worst frame;
+    /// - `skip_frames(false)`: a skipped frame is a hole in a constant-rate file;
+    /// - a fixed GOP (`gop_frames`), so every fragment starts on a keyframe and
+    ///   a cut in the editor needs at most one GOP of decoding;
+    /// - screen-content tuning;
+    /// - BT.601 limited range signalled in the SPS VUI — what
+    ///   [`bgra_to_yuv_buffer`] actually produces, and what the MP4's `colr`
+    ///   says, so an HD player does not assume BT.709 and shift every colour.
+    pub fn new_recording(width: u32, height: u32, fps: u32, gop_frames: u32) -> Result<Self> {
+        let fps = fps.clamp(1, 60);
+        let bitrate_bps = recording_bitrate_for(width, height, fps);
+        let gop = gop_frames.max(1);
+        Self::spawn(width, height, "roomlerd-rec-encoder", move || {
+            tracing::info!(
+                bitrate_bps,
+                width,
+                height,
+                fps,
+                gop,
+                "openh264 recording encoder init"
+            );
+            EncoderConfig::new()
+                .rate_control_mode(RateControlMode::Quality)
+                .bitrate(BitRate::from_bps(bitrate_bps))
+                .qp(QpRange::new(10, 30))
+                .max_frame_rate(FrameRate::from_hz(fps as f32))
+                .intra_frame_period(IntraFramePeriod::from_num_frames(gop))
+                .skip_frames(false)
+                .usage_type(UsageType::ScreenContentRealTime)
+                .num_threads(0)
+                .vui(VuiConfig::bt601())
+        })
+    }
+
+    fn spawn(
+        width: u32,
+        height: u32,
+        thread_name: &str,
+        make_config: impl FnOnce() -> EncoderConfig + Send + 'static,
+    ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
 
         thread::Builder::new()
-            .name("roomlerd-encoder".into())
+            .name(thread_name.into())
             .spawn(move || {
-                let bitrate_bps = initial_bitrate_for(width, height);
                 let init = || -> Result<Encoder> {
                     let api = openh264::OpenH264API::from_source();
-                    let cfg = EncoderConfig::new()
-                        .bitrate(BitRate::from_bps(bitrate_bps))
-                        .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32))
-                        // Force an IDR every 60 frames (≈2 s @ 30 fps).
-                        // Without a bounded IDR interval, openh264 can go
-                        // 300+ frames between keyframes on a static
-                        // desktop; a single lost packet then freezes the
-                        // decoder for ~10 s. 60 gives <2 s recovery floor
-                        // even if the RTCP-PLI round-trip drops.
-                        .intra_frame_period(IntraFramePeriod::from_num_frames(60));
+                    let cfg = make_config();
                     Encoder::with_api_config(api, cfg).map_err(|e| anyhow!("encoder init: {e}"))
                 };
-                tracing::info!(bitrate_bps, width, height, "openh264 encoder init");
 
                 let mut enc = match init() {
                     Ok(e) => {
