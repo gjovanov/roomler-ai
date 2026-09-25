@@ -610,6 +610,22 @@
           </div>
         </div>
 
+        <!-- FR-84 D6: this person's own "Start Roomler at login" (per-user;
+             the device-wide switch is `companion_autostart` below), and the
+             way back into the Welcome tour. Wired by welcome.js. -->
+        <div class="card" id="st-autostart-card">
+          <h3>Start at login</h3>
+          <label class="wl-check" id="st-autostart-label">
+            <input type="checkbox" id="st-autostart-toggle" />
+            Start Roomler when I sign in
+          </label>
+          <p id="st-autostart-note" class="muted small"></p>
+          <p id="st-autostart-result" class="small" hidden></p>
+          <div class="actions">
+            <button type="button" id="btn-welcome-tour">Open the Welcome tour</button>
+          </div>
+        </div>
+
         <div class="card">
           <h3>Background service</h3>
           <dl class="kv">
@@ -756,6 +772,188 @@
           <div id="enroll-result" class="banner" hidden></div>
         </div>
       </section>
+
+      <!-- FR-84 D6: the Welcome tour. Not in the nav — it opens on a first
+           run however the app was started (after install, at login, from the
+           menu), and again from the tray's "Welcome tour" or Settings. All
+           dynamic text is set by welcome.js via textContent. -->
+      <section id="view-welcome" class="view" hidden>
+        <div class="view-head"><h2>Welcome to Roomler</h2></div>
+        <p class="view-sub">
+          A few choices, one at a time. You can change every one of them later
+          in Settings.
+        </p>
+
+        <ol id="wl-progress" class="wl-progress" aria-label="Welcome steps">
+          <li data-step="device">This device</li>
+          <li data-step="network">Private network</li>
+          <li data-step="consent">Screen access</li>
+          <li data-step="files">Received files</li>
+          <li data-step="login">Start at login</li>
+          <li data-step="done">Done</li>
+        </ol>
+
+        <div class="card wl-card">
+          <!-- 1. This device -->
+          <div class="wl-step" data-step="device" hidden>
+            <h3>This device</h3>
+            <div id="wl-dev-enrolled" hidden>
+              <p>
+                This computer is enrolled as <strong id="wl-dev-name">—</strong>
+                on <span id="wl-dev-server" class="mono">—</span>.
+              </p>
+            </div>
+            <div id="wl-dev-unenrolled" class="banner banner-warn" hidden>
+              <div>
+                <strong>Not enrolled yet</strong>
+                <p class="muted small" style="margin: 4px 0 8px">
+                  To join your organisation, this computer needs an enrollment
+                  token from an admin (Admin → Devices → Generate enrollment
+                  token). You can also do this later.
+                </p>
+                <button type="button" class="primary" id="wl-btn-enroll">Enroll this device…</button>
+              </div>
+            </div>
+            <p>
+              Roomler runs in the background as a service. This app is how that
+              service talks to you: it shows what the device is doing, and it is
+              where a request to view your screen appears.
+            </p>
+            <p id="wl-dev-offline" class="banner banner-warn small" hidden>
+              The Roomler service is not running on this computer right now, so
+              the choices below are saved but cannot take effect until it starts.
+            </p>
+          </div>
+
+          <!-- 2. Private network -->
+          <div class="wl-step" data-step="network" hidden>
+            <h3>Your private network</h3>
+            <p>
+              Roomler can join this computer to a private network with your
+              other devices. It is a WireGuard mesh: devices talk to each other
+              directly, encrypted end to end. The Roomler server introduces the
+              devices to each other but never sees what they send.
+            </p>
+            <ul class="wl-points">
+              <li>
+                <strong>What you get.</strong> Reach your devices by name. Remote
+                desktop, SSH and tunnels use this network.
+              </li>
+              <li>
+                <strong>What changes on this computer.</strong> Roomler adds a
+                virtual network adapter and routes for the network's own
+                addresses (100.64.0.0/10) only. Nothing else on this computer is
+                rerouted.
+              </li>
+              <li>
+                <strong>Who can reach this computer.</strong> Only devices in your
+                organisation, and only as far as your organisation's access rules
+                allow. When your admins enforce rules, anything they have not
+                allowed is blocked.
+              </li>
+              <li>
+                <strong>Turning it off.</strong> Settings → Private network, at
+                any time.
+              </li>
+            </ul>
+            <dl class="kv wl-state">
+              <dt>Status</dt>
+              <dd id="wl-net-state">—</dd>
+            </dl>
+            <div id="wl-net-user" class="banner banner-warn" hidden>
+              <div>
+                <strong>Per-user installation</strong>
+                <p class="small" style="margin: 4px 0 0" id="wl-net-user-text"></p>
+              </div>
+            </div>
+            <div class="actions" id="wl-net-actions">
+              <button type="button" class="primary" id="wl-btn-net-enable">Turn on the private network</button>
+            </div>
+            <p id="wl-net-result" class="small" hidden></p>
+          </div>
+
+          <!-- 3. Who may view this screen -->
+          <div class="wl-step" data-step="consent" hidden>
+            <h3>Who may view this screen</h3>
+            <p>
+              When someone in your organisation asks to view or control this
+              computer, Roomler can let them in straight away, or ask you first.
+            </p>
+            <label class="wl-check">
+              <input type="checkbox" id="wl-consent-ask" />
+              Ask me before someone connects
+            </label>
+            <p class="muted small">
+              Leave this off on a computer nobody sits at: a request that nobody
+              answers is refused.
+            </p>
+            <p id="wl-consent-result" class="small" hidden></p>
+          </div>
+
+          <!-- 4. Files you receive -->
+          <div class="wl-step" data-step="files" hidden>
+            <h3>Files you receive</h3>
+            <p>
+              Files someone sends to this computer during a remote session are
+              saved to:
+            </p>
+            <p id="wl-files-path" class="mono small">your Downloads folder</p>
+            <div class="actions" id="wl-files-actions" hidden>
+              <button type="button" id="wl-btn-files-open">Open folder</button>
+              <button type="button" id="wl-btn-files-change">Change…</button>
+            </div>
+            <p id="wl-files-note" class="muted small">
+              You can pick a different folder later in Settings.
+            </p>
+            <p id="wl-files-result" class="small" hidden></p>
+          </div>
+
+          <!-- 5. Start at login -->
+          <div class="wl-step" data-step="login" hidden>
+            <h3>Start at login</h3>
+            <p>
+              Roomler lives in the notification area (the menu bar on a Mac).
+              That is where a request to view this screen appears, so keeping it
+              running is recommended.
+            </p>
+            <label class="wl-check" id="wl-login-label">
+              <input type="checkbox" id="wl-login-toggle" />
+              Start Roomler when I sign in
+            </label>
+            <p id="wl-login-note" class="muted small"></p>
+            <p id="wl-login-result" class="small" hidden></p>
+          </div>
+
+          <!-- 6. Done -->
+          <div class="wl-step" data-step="done" hidden>
+            <h3>You're set</h3>
+            <dl class="kv" id="wl-summary">
+              <dt>Private network</dt>
+              <dd id="wl-sum-network">—</dd>
+              <dt>Screen access</dt>
+              <dd id="wl-sum-consent">—</dd>
+              <dt>Start at login</dt>
+              <dd id="wl-sum-login">—</dd>
+            </dl>
+            <div id="wl-pending" class="banner banner-warn" hidden>
+              <div>
+                <span id="wl-pending-text"></span>
+                <div class="actions" style="margin-top: 6px">
+                  <button type="button" class="primary" id="wl-btn-apply">Restart the service now</button>
+                </div>
+                <p id="wl-pending-result" class="small" hidden></p>
+              </div>
+            </div>
+          </div>
+
+          <div class="wl-nav">
+            <button type="button" id="wl-btn-back">Back</button>
+            <button type="button" id="wl-btn-skip" class="wl-skip">Skip the tour</button>
+            <span class="wl-nav-spacer"></span>
+            <button type="button" class="primary" id="wl-btn-next">Next</button>
+          </div>
+        </div>
+      </section>
     </main>
 
     <script src="app.js"></script>
@@ -770,6 +968,7 @@
     <script src="recordings.js"></script>
     <script src="settings.js"></script>
     <script src="onboarding.js"></script>
+    <script src="welcome.js"></script>
     <script src="consent.js"></script>
   </body>
 </html>

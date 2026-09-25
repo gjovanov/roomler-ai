@@ -10,6 +10,7 @@
 //!                           service; the label and the tray tooltip follow
 //!                           the recorder (a light poll, every 3 s)
 //!   - Onboarding…        — show the main window on the Onboarding view
+//!   - Welcome tour…      — FR-84 D6: the first-run tour, again
 //!   - Check for Updates  — invoke `cmd_check_update` and surface
 //!                           the result in the Overview's update panel
 //!   - Open Logs Folder   — invoke `cmd_open_log_dir`
@@ -32,6 +33,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // FR-85 — disabled until the service says it has a recorder.
     let record = MenuItem::with_id(app, RECORD_ITEM_ID, "Start recording", false, None::<&str>)?;
     let onboarding = MenuItem::with_id(app, "onboarding", "Onboarding…", true, None::<&str>)?;
+    let welcome = MenuItem::with_id(app, "welcome", "Welcome tour…", true, None::<&str>)?;
     let check_updates_item = MenuItem::with_id(
         app,
         "check_updates",
@@ -48,6 +50,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             &open_web,
             &record,
             &onboarding,
+            &welcome,
             &check_updates_item,
             &open_logs,
             &quit,
@@ -59,6 +62,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         "open_web" => open_roomler_web(app),
         RECORD_ITEM_ID => toggle_recording(app),
         "onboarding" => show_window(app, "/onboarding"),
+        "welcome" => show_window(app, "/welcome"),
         "check_updates" => check_updates(app),
         "open_logs" => {
             // The resolve probes the service flavour (CLI spawns) — keep

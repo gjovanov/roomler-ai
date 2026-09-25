@@ -114,9 +114,11 @@ assets = [
     # Autostart, because the companion is the device's consent PROMPT surface:
     # a device set to "Prompt on host" whose companion is not running has no
     # way to ask anyone, and the operator finds out by a session mysteriously
-    # timing out. `Hidden=true` in the file is the documented per-user opt-out.
+    # timing out. `Hidden=true` in a same-named per-user file is the opt-out.
+    # FR-84 D6: its own source file, so the login start carries `--autostart`
+    # (stay in the tray) while the launcher entry above opens the window.
     [
-        "packaging/linux/roomler-desktop.desktop",
+        "packaging/linux/roomler-desktop-autostart.desktop",
         "etc/xdg/autostart/roomler-desktop.desktop",
         "644",
     ],

@@ -360,6 +360,14 @@ fn service_main_inner() -> Result<()> {
     // even for the plain-SCM flavour whose worker runs user-context (and
     // therefore skips the swap itself). Detached thread + its own small
     // runtime: service_main is sync and must not block on a download.
+    //
+    // FR-84 D6 — then, in the same thread and AFTER the refresh (so a launch
+    // never races a swap of the file it launches): self-heal the machine's
+    // login start (`HKLM\…\Run\Roomler Desktop`) and run the post-install
+    // launcher. The SCM host owns both on a perMachine install: it is the one
+    // process that can write HKLM and can start the companion with the
+    // console user's own NON-elevated token — the worker may be running with
+    // that user's elevated one.
     {
         let _ = thread::Builder::new()
             .name("roomler-svc-companion".into())
@@ -368,9 +376,13 @@ fn service_main_inner() -> Result<()> {
                     .enable_all()
                     .build()
                 {
-                    rt.block_on(crate::companion::refresh_if_stale(
-                        crate::companion::RespawnContext::SystemService,
-                    ));
+                    rt.block_on(async {
+                        crate::companion::refresh_if_stale(
+                            crate::companion::RespawnContext::SystemService,
+                        )
+                        .await;
+                        crate::companion::scm_host_startup().await;
+                    });
                 }
             });
     }
