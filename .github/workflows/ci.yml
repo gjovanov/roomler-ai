@@ -734,6 +734,45 @@ jobs:
       - name: Clippy roomlerd (overlay-l3 + ssh-server, incl. tests)
         run: cargo clippy -p roomlerd --features overlay-l3,ssh-server --tests -- -D warnings
 
+  windows-recorder:
+    # FR-85 P1e — the recorder's identity rule is Windows code that no other
+    # lane compiles: every recorder test step above runs on Linux, and the
+    # Windows job lints overlay + ssh-server only. It is the code that keeps
+    # a recording from ever being made elevated (a restricted, medium copy of
+    # an elevated worker's token) and keeps the daemon's reads and deletes in
+    # the person's folder to the person's own rights (impersonation).
+    #
+    # ⚠️ GitHub's Windows runner is ELEVATED, which is what makes this lane
+    # worth having: the elevated branch of each cell runs for real.
+    # `ROOMLERD_TEST_REQUIRE_ELEVATED` turns a runner that is not elevated
+    # into a failure instead of a quiet skip that proves nothing.
+    #
+    # A job of its own (not a step of the one above) so the recorder's
+    # openh264 build does not spend that job's timeout, and without `audio`:
+    # audiopus pulls cmake, which is why the Windows lanes avoid it.
+    name: Windows recorder identity (FR-85)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      ROOMLERD_TEST_REQUIRE_ELEVATED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+        with:
+          shared-key: ci-windows-recorder
+          cache-on-failure: true
+      - name: Clippy roomlerd (recording, incl. tests)
+        run: cargo clippy -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --tests -- -D warnings
+      - name: The identity rule — unit tests (the table, argv, env, impersonation)
+        run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- recording::launch --nocapture
+      - name: The identity rule — the recorder launched as the person, end to end
+        run: cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder -- process::an_elevated process::the_manager_records_as_the_person --nocapture
+
   ffmpeg-encoder-check:
     # `ffmpeg-encoder` compiled in NO pull-request lane. It needs a vendored
     # FFmpeg 9.0.1 (Ubuntu apt ships 6.1 and `ffmpeg-next = 9.0` needs 9.x),
