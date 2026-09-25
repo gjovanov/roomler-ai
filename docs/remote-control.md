@@ -1386,6 +1386,14 @@ to-activate, so the browser never sees a bait-and-switch.
   per the active user; a SYSTEM/root writer is confined to the active user's
   profile), shown and changed from the companion's Overview —
   [desktop-companion.md](desktop-companion.md) §9 has the rules.
+  Gated by `AgentCaps.files` — `upload · download ·
+  download-folder · resume` always, `browse` only while
+  `enable_remote_browse` is on. ⚠️ The list is assigned by the daemon in
+  `encode::caps::detect()` (`files_caps`), never by the caps-probe child:
+  the child loads no config, so a `browse` computed there rode the flag's
+  default and a device with browse disabled advertised it on every
+  cache-miss boot (#1672 — the same hole [`remote-apps.md`](remote-apps.md)
+  §4.3 closed for `apps`).
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in

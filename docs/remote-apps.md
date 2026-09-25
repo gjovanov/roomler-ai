@@ -262,7 +262,9 @@ restart changes it. That is why P6 added a fourth value:
   and the child's struct carries none (`apps_caps`, `caps.rs:1408`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
-  contain untrusted driver code.
+  contain untrusted driver code. `files` followed in #1672 — its `browse`
+  entry rode the same default the same way — and is assigned on the next
+  line of `detect()` (`files_caps`).
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
   The viewer names that as such (*"this agent did not say why"*,
   `useRemoteControl.ts:890`) rather than papering over it — inventing a reason
