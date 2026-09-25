@@ -148,10 +148,18 @@ export interface AgentCapabilities {
    *  console tells the operator to update the agent rather than letting
    *  them send a frame it would silently drop. */
   rpc?: string[]
-  /** rc.NEXT — remote app selection & launch on virtual-desktop hosts.
-   *  Known values: 'list', 'focus', 'launch'. Empty / unset on older
-   *  agents or non-VD hosts — the browser hides the Apps menu. Mirrors
-   *  `AgentCaps.apps` in `crates/remote_control/src/models.rs`. */
+  /** Remote app selection & launch (FR-56). Known values, matched by
+   *  equality: 'list', 'focus', 'launch' — the agent could manage a desktop
+   *  when it announced itself (a Linux virtual desktop or a logged-in
+   *  X11/Xwayland session, or Windows) and the feature is enabled there;
+   *  'status' (AC10) — this build has a Remote Apps backend and answers
+   *  rc:apps.list honestly, with the list or with `unavailable: {code,
+   *  reason}`. The viewer shows the Apps entry for 'list' OR 'status' and
+   *  lets the live reply say what is true now — the hello is a boot-time
+   *  snapshot, so 'status' without 'list' can just mean nobody had logged in
+   *  yet when the daemon started. Empty / unset on older agents and macOS —
+   *  the browser hides the Apps menu. Mirrors `AgentCaps.apps` in
+   *  `crates/remote_control/src/models.rs`. */
   apps?: string[]
   /** Clipboard-DC protocol v2. Known values: 'ack' (write-ack replies
    *  gate the deferred Ctrl+V), 'events' (agent pushes host clipboard
