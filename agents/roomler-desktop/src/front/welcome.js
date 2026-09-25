@@ -36,6 +36,9 @@
   let entries = new Map();
   // What the tour did, for the summary.
   const outcome = { network: null, consent: null, login: null };
+  // From cmd_desktop_state: the platform, and on a Mac whether the privileged
+  // half (which owns the mesh there) is installed.
+  const platform = { name: null, macosPrivilegedHalf: false };
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -140,6 +143,11 @@
   }
 
   function networkState() {
+    if (platform.name === 'macos') {
+      return platform.macosPrivilegedHalf
+        ? "Run by Roomler's system service on this Mac"
+        : 'Not installed on this Mac';
+    }
     const dv = get('deviceView');
     const on = entryValue('overlay_enabled') === 'true';
     if (!dv || !dv.available) {
@@ -153,13 +161,34 @@
   }
 
   function paintNetwork() {
+    const btn = el('wl-btn-net-enable');
+    const userBox = el('wl-net-user');
+    // A Mac is two enrollments: this app talks to the per-user (capture)
+    // half, and the mesh belongs to the privileged half. Offering to put THIS
+    // half on the mesh as well would make the Mac two nodes.
+    if (platform.name === 'macos') {
+      setText('wl-net-state', networkState());
+      setText('wl-net-user-title', 'On a Mac');
+      setText(
+        'wl-net-user-text',
+        platform.macosPrivilegedHalf
+          ? "The private network runs in Roomler's system service, which has its own " +
+              'enrollment (it appears among your devices with "-daemon" after its name). ' +
+              'Nothing to turn on here; Settings of that device controls it.'
+          : "On a Mac the private network runs in Roomler's system service, which the " +
+              'installer adds when given a second enrollment token (install.sh --daemon-token). ' +
+              'Screen sharing works without it.',
+      );
+      userBox.hidden = false;
+      btn.hidden = true;
+      return;
+    }
     setText('wl-net-state', networkState());
+    setText('wl-net-user-title', 'Per-user installation');
     const scope = installScope();
     const dv = get('deviceView');
     const hasIp = !!(dv && dv.available && dv.status && dv.status.overlay_ip);
     const multiOrg = entryValue('overlay_multi_org') === 'true';
-    const userBox = el('wl-net-user');
-    const btn = el('wl-btn-net-enable');
     userBox.hidden = scope !== 'user';
     if (scope === 'user') {
       if (multiOrg) {
@@ -469,6 +498,8 @@
     try {
       const st = await invoke('cmd_desktop_state');
       window.Roomler.welcomePending = !st.first_run_done;
+      platform.name = st.platform || null;
+      platform.macosPrivilegedHalf = !!st.macos_privileged_half;
     } catch (e) {
       window.Roomler.welcomePending = false;
     }
