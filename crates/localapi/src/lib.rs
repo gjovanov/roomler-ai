@@ -1363,6 +1363,14 @@ pub struct RecordStartOpts {
 /// FR-85 — what the recorder is doing now, and how the last recording ended.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecordingState {
+    /// A local recording can be started here at all. `false` on a service
+    /// built without the recorder, and on a SYSTEM/root service until the
+    /// recorder can run as the console user — the reason says which. A
+    /// client greys its Start out instead of offering one that can only fail.
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     pub active: bool,
     /// The file being written (its final path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1390,6 +1398,20 @@ pub struct RecordingState {
     /// How the previous recording ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<RecordingEnded>,
+}
+
+/// FR-85 — why a service without the recorder cannot record.
+pub const NO_RECORDER: &str = "this device service was built without the screen recorder";
+
+impl RecordingState {
+    /// Idle, and unable to record here, for `reason`.
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            available: false,
+            unavailable_reason: Some(reason.to_string()),
+            ..Default::default()
+        }
+    }
 }
 
 /// FR-85 — how a recording ended.
@@ -1762,7 +1784,7 @@ pub trait LocalApiState: Send + Sync {
     }
     /// FR-85 — the recorder's state.
     async fn record_status(&self) -> Response {
-        Response::Recording(RecordingState::default())
+        Response::Recording(RecordingState::unavailable(NO_RECORDER))
     }
     /// FR-85 — the recordings folder and its recordings.
     async fn recordings_list(&self) -> Response {
@@ -4082,6 +4104,27 @@ mod tests {
         )
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
+    }
+
+    /// FR-85 P2b — a state without a recorder says so AHEAD of a start, so a
+    /// client greys its Start out instead of offering one that can only fail.
+    /// A state from a service that predates `available` parses, and reads as
+    /// unable to record — the fail-closed direction (no release carried the
+    /// recording verbs before the field existed).
+    #[tokio::test]
+    async fn a_service_without_a_recorder_says_so_before_any_start() {
+        match ask(ClientPeer::UNKNOWN, r#"{"t":"record_status"}"#).await {
+            Response::Recording(st) => {
+                assert!(!st.available && !st.active, "{st:?}");
+                assert_eq!(st.unavailable_reason.as_deref(), Some(NO_RECORDER));
+            }
+            other => panic!("{other:?}"),
+        }
+        let older: RecordingState = serde_json::from_str(r#"{"active":false}"#).unwrap();
+        assert!(
+            !older.available,
+            "absent = cannot record, never the reverse"
+        );
     }
 
     #[tokio::test]

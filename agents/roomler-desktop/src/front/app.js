@@ -8,8 +8,9 @@
  * exposed because tauri.conf.json has `withGlobalTauri: true`.
  *
  * Views are sections of index.html (`#view-<name>`), one visible at a
- * time. Routes are `#/overview`, `#/devices`, `#/tunnels`, `#/settings`,
- * `#/onboarding`; tray.rs navigates by evaluating `location.hash`.
+ * time. Routes are `#/overview`, `#/devices`, `#/tunnels`, `#/recordings`,
+ * `#/settings`, `#/onboarding`; tray.rs navigates by evaluating
+ * `location.hash`.
  *
  * Central pollers (one LocalAPI/status source instead of one per view):
  *   - `cmd_status` every 10 s      → store key `status`
@@ -87,7 +88,7 @@ window.Roomler = (function () {
 
   /* ── router ─────────────────────────────────────────────────────── */
 
-  const VIEWS = ['overview', 'devices', 'tunnels', 'settings', 'onboarding'];
+  const VIEWS = ['overview', 'devices', 'tunnels', 'recordings', 'settings', 'onboarding'];
   // The pre-overhaul front was one page per file and tray.rs navigated by
   // filename hash; map those so any stale caller still lands somewhere sane.
   const LEGACY = {

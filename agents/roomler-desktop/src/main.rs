@@ -115,6 +115,13 @@ fn main() {
             commands::cmd_tail_log,
             commands::cmd_open_remote,
             commands::cmd_open_roomler,
+            // FR-85 — the Recordings view.
+            commands::cmd_recordings_view,
+            commands::cmd_record_start,
+            commands::cmd_record_stop,
+            commands::cmd_recording_delete,
+            commands::cmd_recording_open,
+            commands::cmd_pick_record_dir,
         ])
         .on_window_event(|window, event| {
             // Close-to-hide: the MAIN window is a view over a resident tray
