@@ -86,6 +86,8 @@ The authoritative statement for any given file is its own
 | Business logic, DAOs | `crates/services` | `AGPL-3.0-only` |
 | Database models and indexes | `crates/db` | `AGPL-3.0-only` |
 | Server configuration | `crates/config` | `AGPL-3.0-only` |
+| Server composition core (the `Module` contract, hooks, jobs) | `crates/core` | `AGPL-3.0-only` |
+| Feature modules: SaaS, chat, conference, fleet, remote, network | `crates/modules/*` | `AGPL-3.0-only` |
 | Regional DERP relay | `crates/derp-relay` | `AGPL-3.0-only` |
 | Integration tests | `crates/tests` | `AGPL-3.0-only` |
 | Web UI | `ui/` | `AGPL-3.0-only` |
