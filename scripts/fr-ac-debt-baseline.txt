@@ -40,22 +40,20 @@ FR-37=1   # A.5 #928 no Result comment. One nightly run settles it: does the nig
 # ── B. deliberately not met, and the spec says so ────────────────────────────
 FR-29=1   # B.1 #864 the spec DECLARES this criterion "NOT met — and not addressable by P1" (fps under sustained motion). Honest and intentional. Owed: a child FR or an in-spec waiver, so a later reader does not have to infer it.
 
-# ── C. closed WITH field evidence on the issue; the record lagged ────────────
-# Each of these has a Result / field-verified comment. The likeliest reading is
-# that the work was verified and nobody walked back to the checkboxes — but see
-# the warning above: the comment does not attest to THESE boxes.
-FR-12=5   # C.2  #788 P1 and P2 spotlight tours both shipped (#797, #1117); no criterion was ticked for either.
-FR-32=7   # C.3  #898 14 comments and a field-verified Result; 0 of 7 ticked.
-FR-34=3   # C.4  #917 Result present; 3 of 6 remain, incl. "the controller is TOLD the host is locked".
-FR-39=2   # C.5  #951 Result present; the self-host compose criterion overlaps FR-42's.
-FR-41=7   # C.6  #965 the 90-second demo. Result present; 0 of 7 ticked.
-FR-42=1   # C.7  #967 Result present; the remaining one is `docker compose down -v` leaving the machine clean.
-FR-49=8   # C.8  #1084 Result present; 0 of 8 ticked (per-org overlay mode across `org ls` / `status` / `peers`).
-FR-50=6   # C.9  #1083 Result present; 0 of 6 ticked (the served installer naming its own server).
-FR-53=5   # C.10 #1123 Result present; 0 of 5 ticked (rollback sentinel lifecycle).
-FR-54=4   # C.11 #1130 Result present; 0 of 4 ticked (orphaned-network reporting).
-FR-57=6   # C.12 #1161 Result present; 0 of 6 ticked (multi-arch manifest).
-FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — and "docs before close" is a standing operator rule (2026-09-05). The only breach of it in the tree, and nothing could see it.
+# ── C. closed WITH field evidence on the issue — what the evidence did NOT reach ─
+# 2026-09-25: every one of this group's 55 criteria was matched against its own
+# evidence, one at a time — the issue's Result comments, the spec's field log,
+# the code, and live reads of prod, the registry and this box. 42 were ticked,
+# each with a link. What remains is the 13 the evidence did not reach, and each
+# spec now says why beside the box. Six FRs cleared entirely (FR-34, FR-42,
+# FR-49, FR-50, FR-53, FR-73). ⚠️ FR-73 was never the docs-rule breach this file
+# first called it: its docs had existed since #1401; only the tick was missing.
+FR-12=4   # C.2  #788 the four P1 behaviours P1 LIVE handed to a human and nobody recorded: first-login auto-open once, the `?`/menu entry points, empty states, deep-link click-through. One browser session with a fresh account.
+FR-32=4   # C.3  #898 the thread ticked all seven; four do not survive the code. ⚠️ The compile-time classification of PlanLimits fields NEVER existed (the match covers Limit's variants, not the struct's fields; two fields unclassified since the start) — a false claim in `quota.rs` too. Also: one deliberate hand-rolled read, members' Warn/Off not route-proven, no per-limit tests.
+FR-39=1   # C.5  #951 the demo criterion names enroll -> ssh -> forward; the embedded demo shows desktop + mesh ping. Same substitution as FR-41; resolves with it.
+FR-41=2   # C.6  #965 the embedded 09-01 re-shoot swapped on-camera enrolment and ssh + forward for a mesh ping; the operator accepted the take's cosmetics, not the substitution, and the spec never recorded it. Re-shoot or amend with the operator.
+FR-54=1   # C.11 #1130 wording, not behaviour: by design the network ROW survives an apply, so a second run lists it with no nodes rather than "reports nothing". Amend the criterion to match the design and tick.
+FR-57=1   # C.12 #1161 the image RAN on a native aarch64 runner but no arm64 host ever PULLED it; the Result declined to claim it. One `docker pull` on an arm64 host.
 
 # ── nodocs: bound by the docs-before-close rule, and no docs criterion ───────
 #
@@ -74,10 +72,11 @@ FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — an
 # added ticked in the same PR. Writing FR-7's also paid its one debt pin: the
 # Apple criterion had been field-verified on 2026-09-08 and never ticked.
 #
-# So this section is empty on purpose. A line appearing here means an FR bound
-# by the rule was written, or closed, without the criterion.
+# A line appearing here means an FR bound by the rule was written, or closed,
+# without the criterion — which is what happened next:
 #
 # ⚠️ FR-69 is deliberately ABSENT. It closed at 11:53Z on 2026-09-05 with no
 #    reader-facing docs — the close the operator made the rule ABOUT — and its
 #    owed docs landed in #1401 itself. It is the reason the boundary is a
 #    timestamp and not a date.
+nodocs FR-22  # opened before the rule, CLOSED 2026-09-25T13:20Z — so bound on close — by the merge of the autopilot's ap-819 work (d5db02c0f touched only the spec). No docs criterion, no reader-facing doc of TTFF anywhere; the guard failed on master 2 s later and stayed red. Pinned so master is green again; the docs are owed (the phase-aware `requesting` bound, #821, and where the stall was localized). The FR-81 shape again: a card looks done when the docs box was never written.
