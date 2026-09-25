@@ -379,27 +379,7 @@ impl RouteReconciler {
     /// descriptor (id generated when empty). `Err` is a user-facing
     /// message for the LocalAPI.
     pub async fn add(&self, mut route: RouteDescriptor) -> Result<RouteDescriptor, String> {
-        // Validation mirrors what the hub will enforce at create time, so
-        // a bad route fails HERE (once, with a clear message) instead of
-        // silently backing off forever.
-        super::client_mgr::parse_node(&route.node)?;
-        match route.kind {
-            FlowKind::Forward => {
-                let remote = route
-                    .remote
-                    .as_deref()
-                    .ok_or_else(|| "a forward route requires `remote` (host:port)".to_string())?;
-                super::client_mgr::parse_host_port(remote).map_err(|e| e.to_string())?;
-            }
-            FlowKind::Socks5 => {
-                if route.remote.is_some() {
-                    return Err("a socks5 route must not set `remote`".to_string());
-                }
-            }
-        }
-        if route.local == 0 {
-            return Err("`local` must be a non-zero port".to_string());
-        }
+        validate_shape(&route)?;
 
         let effective = {
             let mut routes = self.inner.routes.lock().unwrap();
@@ -438,6 +418,76 @@ impl RouteReconciler {
             return Err(e);
         }
         self.inner.kick.notify_one();
+        Ok(route)
+    }
+
+    /// FR-84 D1 — replace a declared route IN ONE STEP, keyed by `route.id`
+    /// (the `RouteUpdate` verb).
+    ///
+    /// Validated exactly like [`Self::add`], with the route being replaced
+    /// excepted from the local-port clash check. An invalid descriptor is
+    /// refused before anything changes, so the OLD route keeps running and
+    /// stays persisted. A valid one is written to config in ONE save, then
+    /// its old flow is stopped and the new descriptor is reconciled. The
+    /// obvious alternative — `remove` then `add` — loses the route entirely
+    /// when the add fails: the removal is already on disk by then.
+    ///
+    /// `Ok` carries the effective descriptor. A replacement identical to what
+    /// is declared is a no-op (nothing is restarted).
+    pub async fn replace(&self, route: RouteDescriptor) -> Result<RouteDescriptor, String> {
+        if route.id.trim().is_empty() {
+            return Err("a route update needs the id of the route to replace".to_string());
+        }
+        validate_shape(&route)?;
+
+        // Swap the descriptor in memory (remembering the old one), then
+        // persist; on a failed save put the old one back so memory matches
+        // disk — the same rollback discipline as `add`.
+        let (previous, snapshot) = {
+            let mut routes = self.inner.routes.lock().unwrap();
+            let Some(idx) = routes.iter().position(|r| r.id == route.id) else {
+                return Err(format!("no declared route with id '{}'", route.id));
+            };
+            if routes[idx] == route {
+                return Ok(route);
+            }
+            if route.enabled
+                && routes
+                    .iter()
+                    .enumerate()
+                    .any(|(i, r)| i != idx && r.enabled && r.local == route.local)
+            {
+                return Err(format!(
+                    "local port {} is already used by another enabled route",
+                    route.local
+                ));
+            }
+            let previous = std::mem::replace(&mut routes[idx], route.clone());
+            (previous, routes.clone())
+        };
+        if let Err(e) = self.persist(&snapshot).await {
+            let mut routes = self.inner.routes.lock().unwrap();
+            if let Some(slot) = routes.iter_mut().find(|r| r.id == route.id) {
+                *slot = previous;
+            }
+            return Err(e);
+        }
+
+        // Persisted. Retire the old flow and let the next pass build the new
+        // one — both under the runtime lock, so a concurrent pass cannot
+        // create the replacement while the old listener still holds the
+        // port. A disabled replacement simply has no runtime.
+        {
+            let mut runtime = self.inner.runtime.lock().unwrap();
+            if let Some(RouteRuntime::Live { flow_id }) = runtime.remove(&route.id) {
+                self.inner.hub.kill_flow(&flow_id);
+            }
+            if route.enabled {
+                runtime.insert(route.id.clone(), RouteRuntime::fresh());
+            }
+        }
+        self.inner.kick.notify_one();
+        info!(route = %route.id, local = route.local, enabled = route.enabled, "route replaced");
         Ok(route)
     }
 
@@ -513,6 +563,31 @@ impl RouteReconciler {
             .map_err(|e| format!("could not persist routes: {e:#}"))?;
         Ok(())
     }
+}
+
+/// The shape checks shared by `add` and `replace`. They mirror what the hub
+/// enforces at create time, so a bad route fails HERE (once, with a clear
+/// message) instead of silently backing off forever.
+fn validate_shape(route: &RouteDescriptor) -> Result<(), String> {
+    super::client_mgr::parse_node(&route.node)?;
+    match route.kind {
+        FlowKind::Forward => {
+            let remote = route
+                .remote
+                .as_deref()
+                .ok_or_else(|| "a forward route requires `remote` (host:port)".to_string())?;
+            super::client_mgr::parse_host_port(remote).map_err(|e| e.to_string())?;
+        }
+        FlowKind::Socks5 => {
+            if route.remote.is_some() {
+                return Err("a socks5 route must not set `remote`".to_string());
+            }
+        }
+    }
+    if route.local == 0 {
+        return Err("`local` must be a non-zero port".to_string());
+    }
+    Ok(())
 }
 
 /// Exponential create-retry backoff: 1 s, 2 s, 4 s, … capped at 30 s.
@@ -661,6 +736,168 @@ mod tests {
                 .is_empty()
         );
         assert!(!r.remove("a").await.unwrap());
+    }
+
+    /// `N` distinct free loopback ports, for routes that must really bind.
+    /// The listeners are held together and dropped together, so no two
+    /// answers can be the same port.
+    fn free_ports<const N: usize>() -> [u16; N] {
+        let held: Vec<std::net::TcpListener> = (0..N)
+            .map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap())
+            .collect();
+        let ports: Vec<u16> = held
+            .iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect();
+        ports.try_into().unwrap()
+    }
+
+    /// The flow id behind an `Active` route, or a panic naming its state.
+    fn active_flow(r: &RouteReconciler, id: &str) -> String {
+        let rows = r.list();
+        let row = rows.iter().find(|i| i.route.id == id).unwrap();
+        match &row.state {
+            RouteState::Active { flow_id } => flow_id.clone(),
+            other => panic!("route {id} is not active: {other:?}"),
+        }
+    }
+
+    /// FR-84 D1 — editing a live route's port: the old flow is gone the
+    /// moment the replacement is persisted, the replacement is ONE config
+    /// write, and the next pass brings the route back `active` on the new
+    /// port with exactly one flow in the hub.
+    #[tokio::test]
+    async fn replace_while_live_moves_the_flow_to_the_new_port() {
+        let [p1, p2] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p1, true)]);
+        r.reconcile_pass().await;
+        let f1 = active_flow(&r, "a");
+        assert!(r.inner.hub.has_flow(&f1));
+        assert_eq!(
+            r.inner.hub.flows_snapshot()[0].local_addr,
+            format!("127.0.0.1:{p1}")
+        );
+
+        let eff = r.replace(desc("a", p2, true)).await.unwrap();
+        assert_eq!(eff.local, p2);
+        assert!(
+            !r.inner.hub.has_flow(&f1),
+            "the old flow is retired the moment the replacement is persisted"
+        );
+        let on_disk = crate::config::load(&r.inner.config_path)
+            .unwrap()
+            .tunnel_routes;
+        assert_eq!(
+            on_disk.len(),
+            1,
+            "a replace is not a remove+add: {on_disk:?}"
+        );
+        assert_eq!(
+            on_disk[0].local, p2,
+            "the replacement is what got persisted"
+        );
+        assert_eq!(r.list()[0].state, RouteState::Pending);
+
+        r.reconcile_pass().await;
+        let f2 = active_flow(&r, "a");
+        assert_ne!(f1, f2, "a new flow, not the old one revived");
+        let flows = r.inner.hub.flows_snapshot();
+        assert_eq!(
+            flows.len(),
+            1,
+            "exactly one flow — the old listener did not survive: {flows:?}"
+        );
+        assert_eq!(flows[0].local_addr, format!("127.0.0.1:{p2}"));
+    }
+
+    /// FR-84 D1 — every way a replacement can be invalid leaves the OLD
+    /// route running on its old flow and persisted on its old port. This is
+    /// the property that rules out implementing the edit as remove+add.
+    #[tokio::test]
+    async fn replace_with_invalid_keeps_the_old_route_running_and_persisted() {
+        let [p1, p2, p3] = free_ports();
+        let (r, _dir) = reconciler(vec![desc("a", p1, true), desc("b", p2, true)]);
+        r.reconcile_pass().await;
+        let f1 = active_flow(&r, "a");
+
+        let mut bad_node = desc("a", p3, true);
+        bad_node.node = "nope".into();
+        let mut no_remote = desc("a", p3, true);
+        no_remote.remote = None;
+        let mut socks_with_remote = desc("a", p3, true);
+        socks_with_remote.kind = FlowKind::Socks5;
+        let clash = desc("a", p2, true); // b's port
+        let zero = desc("a", 0, true);
+        let cases = [
+            ("bad node", bad_node),
+            ("forward without remote", no_remote),
+            ("socks5 with remote", socks_with_remote),
+            ("port clash with another enabled route", clash),
+            ("port 0", zero),
+        ];
+        for (what, bad) in cases {
+            let err = r.replace(bad).await.expect_err(what);
+            assert!(!err.is_empty(), "{what}: the refusal names a reason");
+            assert_eq!(
+                active_flow(&r, "a"),
+                f1,
+                "{what}: the old flow must keep running"
+            );
+            assert!(
+                r.inner.hub.has_flow(&f1),
+                "{what}: old flow still in the hub"
+            );
+            let on_disk = crate::config::load(&r.inner.config_path)
+                .unwrap()
+                .tunnel_routes;
+            assert_eq!(on_disk.len(), 2, "{what}: nothing removed from disk");
+            assert_eq!(
+                on_disk.iter().find(|x| x.id == "a").unwrap().local,
+                p1,
+                "{what}: still persisted on the old port"
+            );
+        }
+
+        // A route's OWN port is not a clash with itself: changing only the
+        // remote is a valid edit.
+        let mut same_port = desc("a", p1, true);
+        same_port.remote = Some("db:6543".into());
+        let eff = r.replace(same_port).await.unwrap();
+        assert_eq!(eff.remote.as_deref(), Some("db:6543"));
+        assert_eq!(
+            crate::config::load(&r.inner.config_path)
+                .unwrap()
+                .tunnel_routes
+                .iter()
+                .find(|x| x.id == "a")
+                .unwrap()
+                .remote
+                .as_deref(),
+            Some("db:6543")
+        );
+    }
+
+    /// FR-84 D1 — an unknown (or empty) id is an error, and the declared set
+    /// is untouched on disk and in memory.
+    #[tokio::test]
+    async fn replace_unknown_id_errors_and_changes_nothing() {
+        let (r, _dir) = reconciler(vec![desc("a", 1001, true)]);
+        let err = r.replace(desc("ghost", 1002, true)).await.unwrap_err();
+        assert!(err.contains("ghost"), "the refusal names the id: {err}");
+        let err = r.replace(desc("", 1002, true)).await.unwrap_err();
+        assert!(
+            err.contains("id"),
+            "an empty id cannot address a route: {err}"
+        );
+        let on_disk = crate::config::load(&r.inner.config_path)
+            .unwrap()
+            .tunnel_routes;
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].id, "a");
+        assert_eq!(on_disk[0].local, 1001);
+        let rows = r.list();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].route.local, 1001);
     }
 
     #[tokio::test]

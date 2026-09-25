@@ -832,6 +832,20 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// FR-84 D1 — the atomic route edit; the reconciler's `replace` owns the
+    /// validation and the one-write persistence.
+    async fn route_update(&self, route: tunnel_core::localapi::RouteDescriptor) -> Response {
+        let Some(routes) = self.routes.as_ref() else {
+            return Response::Error {
+                message: "declared routes are not available on this daemon".into(),
+            };
+        };
+        match routes.replace(route).await {
+            Ok(route) => Response::RouteReplaced { route },
+            Err(message) => Response::Error { message },
+        }
+    }
+
     /// S2 — the editable config surface. Values come from a FRESH load of
     /// the daemon's own config file, so pending not-yet-restarted edits
     /// show (the boot-time snapshot would lie after a `ConfigSet`).
