@@ -703,8 +703,18 @@ pub enum ExitReaction {
     /// Worker exited cleanly (code=0). Respawn immediately and reset
     /// the consecutive-failure counter. Sources of clean exits we
     /// honour: auto-update self-shutdown (M5 #6), instance-lock race
-    /// after an SCM restart (M5 #8). Differentiating by exit code
-    /// keeps real crashes (non-zero) on the existing backoff ladder.
+    /// after an SCM restart (M5 #8), and FR-84 D3's requested restart
+    /// ("Apply now": an SCM worker exits 0 for it; the
+    /// `RESTART_REQUESTED_EXIT_CODE` sentinel is honoured the same way).
+    /// Differentiating by exit code keeps real crashes (non-zero) on the
+    /// existing backoff ladder.
+    ///
+    /// ⚠️ No backoff is exactly what ONE deliberate restart wants, and it
+    /// is a hot loop the moment anything could trigger the exit on every
+    /// start. The requested restart cannot: the verb refuses a second
+    /// request within 30 s of the last accepted one, and that record is
+    /// persisted, so it binds the relaunched worker too
+    /// (`supervision::RESTART_MIN_INTERVAL`).
     Respawn,
     /// Worker exited with a non-zero code. Increment the counter and
     /// wait `Duration` before respawning (exponential backoff).
@@ -819,7 +829,11 @@ pub const SESSION_TEARDOWN_EXIT_CODE: u32 = 0x4001_0004;
 /// Decide how to react to a worker exit. Returns the reaction plus
 /// the new value for `consecutive_failures`.
 pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReaction, u32) {
-    if code == 0 {
+    if code == 0 || code == crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32 {
+        // FR-84 D3: a requested restart (`RestartDaemon`) is the second kind
+        // of clean exit. An SCM worker actually exits 0 for it — the
+        // sentinel arm is for a worker that emits the code anyway, so the
+        // restart it was asked for never lands on the crash ladder.
         (ExitReaction::Respawn, 0)
     } else if code == crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32 {
         // The worker is redundant, not broken. Checked BEFORE the generic
@@ -859,11 +873,14 @@ pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReacti
 ///     guard working, not a crash; banking it would mean a host with two
 ///     daemon flavours installed reporting a crash on every supervisor
 ///     cycle forever.
+///   * `RESTART_REQUESTED_EXIT_CODE` (FR-84 D3) — a person asked for the
+///     restart; the worker went through its graceful shutdown first.
 pub fn should_record_supervisor_crash(code: u32) -> bool {
     code != 0
         && code != crate::watchdog::STALL_EXIT_CODE as u32
         && code != crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
         && code != crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32
+        && code != crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32
         && code != SESSION_TEARDOWN_EXIT_CODE
 }
 
@@ -1214,9 +1231,17 @@ pub fn run(
                     consecutive_failures = next_failures;
                     match reaction {
                         ExitReaction::Respawn => {
+                            // 0 = a clean exit (an auto-update's, or FR-84
+                            // D3's "Apply now" under this supervisor); 9 = a
+                            // requested restart from a worker that emits the
+                            // sentinel. Neither failed, so no backoff. A loop
+                            // is impossible because the only thing that asks
+                            // for a restart refuses a second within 30 s
+                            // (`supervision::RESTART_MIN_INTERVAL`, persisted).
                             tracing::info!(
                                 pid = w.process.pid,
-                                "supervisor: worker exited cleanly (code=0); respawning without backoff"
+                                code,
+                                "supervisor: worker exited cleanly; respawning without backoff"
                             );
                             respawn_at = None;
                         }
@@ -2114,6 +2139,29 @@ mod tests {
         assert!(should_record_supervisor_crash(1));
     }
 
+    /// FR-84 D3 — a worker that exits because a person asked it to restart
+    /// ("Apply now") must come straight back, like an auto-update's exit 0,
+    /// and must not bank a crash. Under the SCM the worker exits 0 for
+    /// exactly that reason; the sentinel (9, `RESTART_REQUESTED_EXIT_CODE`)
+    /// is mapped as well so a worker that emits it — a build that moves the
+    /// SCM flavour onto the sentinel, or a task-flavour binary re-spawned
+    /// under the service — is never put on the crash ladder for a restart it
+    /// was asked for. Written against the literal so it compiles on the
+    /// pre-D3 tree, where it is RED: 9 was an ordinary non-zero exit →
+    /// `Backoff(2 s)` plus a `SupervisorDetected` sidecar.
+    #[test]
+    fn restart_requested_exit_respawns_without_backoff() {
+        assert_eq!(decide_exit_reaction(9, 0), (ExitReaction::Respawn, 0));
+        assert_eq!(
+            decide_exit_reaction(9, 4),
+            (ExitReaction::Respawn, 0),
+            "a requested restart resets the ladder — nothing failed"
+        );
+        assert!(!should_record_supervisor_crash(9));
+        // Guard the guard, as above.
+        assert!(should_record_supervisor_crash(1));
+    }
+
     /// The sentinel is shared with the Linux units, which list it in
     /// `RestartPreventExitStatus` (asserted in `watchdog`'s tests). Nothing
     /// couples the three sites, so pin the value here as well — renumbering
@@ -2121,11 +2169,18 @@ mod tests {
     #[test]
     fn the_already_running_sentinel_is_pinned() {
         assert_eq!(crate::watchdog::ALREADY_RUNNING_EXIT_CODE, 8);
+        // FR-84 D3: the restart sentinel is the literal the regression test
+        // above uses, and the Stop arm must never absorb it.
+        assert_eq!(crate::watchdog::RESTART_REQUESTED_EXIT_CODE, 9);
         // It must not collide with any other code the supervisor special-cases,
         // or one meaning would shadow the other.
         for (other, name) in [
             (crate::watchdog::STALL_EXIT_CODE, "STALL"),
             (crate::watchdog::AGENT_DELETED_EXIT_CODE, "AGENT_DELETED"),
+            (
+                crate::watchdog::RESTART_REQUESTED_EXIT_CODE,
+                "RESTART_REQUESTED",
+            ),
         ] {
             assert_ne!(
                 crate::watchdog::ALREADY_RUNNING_EXIT_CODE,

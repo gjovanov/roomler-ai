@@ -95,6 +95,9 @@ fn main() {
             commands::cmd_service_install,
             commands::cmd_service_uninstall,
             commands::cmd_service_status,
+            // FR-84 D3 — Apply now.
+            commands::cmd_restart_daemon,
+            commands::cmd_restart_wait,
             commands::cmd_permissions,
             commands::cmd_request_permission,
             commands::cmd_open_log_dir,

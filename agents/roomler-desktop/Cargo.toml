@@ -67,6 +67,12 @@ gethostname = "0.5"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # FR-84 D3 — `roomlerd service start` spawned with `CreateProcessW`
+    # (bInheritHandles = FALSE, CREATE_NO_WINDOW): std's `Command` always
+    # inherits every inheritable handle (#1035). `Win32_Security` only because
+    # `CreateProcessW`'s signature names `SECURITY_ATTRIBUTES`.
+    "Win32_Security",
+    "Win32_System_Threading",
 ] }
 
 [build-dependencies]
