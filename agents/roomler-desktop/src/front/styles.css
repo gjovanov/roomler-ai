@@ -805,3 +805,37 @@ textarea {
 @media (prefers-reduced-motion: reduce) {
   .rec-dot { animation: none; }
 }
+
+/* ── Overview: encoder matrix + incoming files (FR-84 D4) ───────────── */
+
+/* One row per codec, one column per backend the probe opened something on.
+ * Each cell holds a chip per chroma form: filled = hardware, outlined =
+ * software, struck through = denied by encoder_cells_deny (never opened). */
+.enc-matrix td { white-space: nowrap; }
+
+.enc-cell {
+  display: inline-block;
+  padding: 1px 7px;
+  margin: 1px 4px 1px 0;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.enc-hw     { color: var(--ok);    background: rgba(21, 128, 61, 0.12);  border-color: var(--ok); }
+.enc-sw     { color: var(--muted); background: transparent;              border-color: var(--muted); }
+.enc-denied {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--muted);
+  border-style: dashed;
+  text-decoration: line-through;
+  text-decoration-thickness: 1.5px;
+}
+
+.enc-legend { margin: 8px 0 0; }
+.enc-legend .enc-cell { margin-left: 6px; }
+.enc-legend .enc-cell:first-child { margin-left: 0; }
+
+#ov-enc-raw summary { cursor: pointer; margin-top: 6px; }

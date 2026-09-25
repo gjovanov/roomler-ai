@@ -19,13 +19,14 @@
 //! dedicated LocalAPI verbs, not surface keys), and the crash-bookkeeping
 //! fields.
 //!
-//! Every key but four is read once at daemon startup, so `restart_required`
+//! Every key but five is read once at daemon startup, so `restart_required`
 //! holds across the surface — except `exec_enabled` and
 //! `remote_config_enabled`, which `RemoteConfigServices::adopt_local` puts
 //! into force the moment `ConfigSet` saves them (docs/remote-config.md §7b),
-//! `record_dir` (FR-85), read when a recording starts, and
+//! `record_dir` (FR-85), read when a recording starts,
 //! `local_restart_enabled` (FR-84 D3), read by the restart verb on every
-//! request.
+//! request, and `files_dir`, which `files::set_files_dir` re-seeds on the
+//! same path and every drop re-reads (FR-84 D4).
 //! FR-84 D2 made that per-key truth part of the registry ([`KeyMeta::live`])
 //! instead of a list each client kept by hand, and gave every key a
 //! [`Group`] and a [`Tier`] so the Settings page can be more than 150 rows.
@@ -179,8 +180,10 @@ impl Tier {
 /// `true` means the daemon applies a change WITHOUT a restart, which today
 /// holds for exactly the two gate-4 flags `RemoteConfigServices::adopt_local`
 /// re-seeds after a `ConfigSet`, `record_dir`, read when a recording starts,
-/// and `local_restart_enabled`, read by the restart verb per request.
-/// Everything else is read once at startup. Locked by
+/// `local_restart_enabled`, read by the restart verb per request, and
+/// `files_dir`, which the same `ConfigSet` path hands to
+/// `files::set_files_dir` and every drop re-reads. Everything else is read
+/// once at startup. Locked by
 /// `live_keys_are_exactly_the_adopt_local_set`.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyMeta {
@@ -277,6 +280,17 @@ const KEYS: &[KeyMeta] = &[
         live: false,
         kind: "bool",
         description: "Answer remote filesystem-browse requests from the controller. Default: on.",
+    },
+    KeyMeta {
+        key: "files_dir",
+        group: Group::Files,
+        tier: Tier::Essential,
+        // LIVE: the daemon's `ConfigSet` hands the saved value to
+        // `files::set_files_dir`, and every drop re-validates it
+        // (agents/roomlerd/src/files.rs) — nothing is read at startup only.
+        live: true,
+        kind: "string",
+        description: "FR-84 - where files dropped onto a remote-control session land. An absolute folder, or `~/...` for the active user's profile (expanded per user, at the time of the drop). Must be outside system folders and, when the service runs as SYSTEM/root, inside the active user's profile; created if missing. Empty = the default: the active user's Downloads folder (Windows falls back to %PROGRAMDATA%\\roomler\\...\\uploads when that is unreachable). Only the person at the device's console can change it. Applies at once.",
     },
     KeyMeta {
         key: "exec_enabled",
@@ -1540,6 +1554,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "advertise_local_subnets" => Some(fmt_bool(cfg.advertise_local_subnets)),
         "auto_grant_session" => Some(fmt_bool(cfg.auto_grant_session)),
         "enable_remote_browse" => Some(fmt_bool(cfg.enable_remote_browse)),
+        "files_dir" => cfg.files_dir.clone(),
         "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
         "macos_supervise_gui_worker" => Some(fmt_bool(cfg.macos_supervise_gui_worker)),
         "power_policy" => Some(if cfg.power_policy.is_empty() {
@@ -1725,6 +1740,21 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "advertise_local_subnets" => cfg.advertise_local_subnets = parse_bool_or(value, true)?,
         "auto_grant_session" => cfg.auto_grant_session = parse_bool_or(value, true)?,
         "enable_remote_browse" => cfg.enable_remote_browse = parse_bool_or(value, true)?,
+        "files_dir" => {
+            cfg.files_dir = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    // SHAPE only. Placement (the SYSTEM/root-inside-the-
+                    // profile rule) and writability need the daemon's own
+                    // identity and its disk; the daemon runs them in its
+                    // `ConfigSet` before this apply, and again on every
+                    // drop — this surface also serves the desktop's
+                    // direct-file fallback, which has neither.
+                    crate::files_dir::check_shape(v, &crate::files_dir::Rules::from_env())?;
+                    Some(v.to_string())
+                }
+            }
+        }
         // Clearing the key (`value: None`) resets to OFF, not ON — the
         // fail-safe direction for a gate that grants root.
         "exec_enabled" => cfg.exec_enabled = parse_bool_or(value, false)?,
@@ -2368,9 +2398,11 @@ mod tests {
     /// flags `RemoteConfigServices::adopt_local` re-seeds after a
     /// `ConfigSet` (agents/roomlerd/src/localapi_state.rs), `record_dir`
     /// (FR-85), which the recorder's supervisor reads fresh when a recording
-    /// starts (`recording/manager.rs`, `configured_dir`), and
+    /// starts (`recording/manager.rs`, `configured_dir`),
     /// `local_restart_enabled` (FR-84 D3), which the restart verb reads fresh
-    /// on every request (`localapi_state.rs`, `restart_daemon`). A key wrongly
+    /// on every request (`localapi_state.rs`, `restart_daemon`), and
+    /// `files_dir` (FR-84 D4), which the same `ConfigSet` hands to
+    /// `files::set_files_dir` and every drop re-reads. A key wrongly
     /// claiming `live` tells a person their change is in force while the
     /// daemon still runs the old value; a live key claiming `restart` has
     /// them bounce a healthy service — or believe a refusal they just made
@@ -2390,6 +2422,7 @@ mod tests {
             "remote_config_enabled",
             "record_dir",
             "local_restart_enabled",
+            "files_dir",
         ]
         .into_iter()
         .map(String::from)
@@ -2407,6 +2440,80 @@ mod tests {
         }
         assert!(entry_for(&cfg, "overlay_enabled").unwrap().restart_required);
         assert!(entry_for(&cfg, "ssh_enabled").unwrap().restart_required);
+    }
+
+    /// FR-84 D4 — `files_dir` is LIVE: the daemon's `ConfigSet` re-seeds the
+    /// drop folder and every drop re-validates it, so a restart prompt
+    /// would send a person bouncing a healthy service for nothing. Red
+    /// with `live: false` on the row.
+    #[test]
+    fn files_dir_is_live() {
+        let cfg = crate::config::test_fixture();
+        let e = entry_for(&cfg, "files_dir").expect("files_dir is on the surface");
+        assert!(!e.restart_required, "files_dir applies at once");
+        assert_eq!(e.group, Group::Files.wire());
+        assert_eq!(e.tier, Tier::Essential.wire());
+        assert_eq!(e.kind, "string");
+        assert_eq!(e.value, None, "unset by default — the Downloads ladder");
+        assert_eq!(e.default, None);
+    }
+
+    /// FR-84 D4 — the surface checks the SHAPE of `files_dir` (absolute or
+    /// `~/…`, no device paths, no `..`, no system roots) and nothing more:
+    /// placement against the writer's identity and writability are the
+    /// daemon's, which has the identity and the disk. A clear goes back to
+    /// the built-in ladder.
+    #[test]
+    fn files_dir_set_echo_clear_and_shape_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "files_dir"), None);
+        let good = if cfg!(windows) {
+            r"D:\Drops\in"
+        } else {
+            "/srv/drops"
+        };
+        apply(&mut cfg, "files_dir", Some(&format!("  {good}  "))).unwrap();
+        assert_eq!(
+            cfg.files_dir.as_deref(),
+            Some(good),
+            "trimmed, stored as spelled"
+        );
+        assert_eq!(
+            entry_for(&cfg, "files_dir").unwrap().value.as_deref(),
+            Some(good)
+        );
+        // `~/…` is a shape the surface accepts without knowing whose home —
+        // the daemon expands it per user at the time of the drop.
+        apply(&mut cfg, "files_dir", Some("~/Drops")).unwrap();
+        assert_eq!(cfg.files_dir.as_deref(), Some("~/Drops"));
+        // Clearing, by null or by blank.
+        apply(&mut cfg, "files_dir", None).unwrap();
+        assert_eq!(cfg.files_dir, None);
+        apply(&mut cfg, "files_dir", Some("~/Drops")).unwrap();
+        apply(&mut cfg, "files_dir", Some("   ")).unwrap();
+        assert_eq!(cfg.files_dir, None, "blank clears to the built-in ladder");
+        // Refusals leave the stored value untouched.
+        apply(&mut cfg, "files_dir", Some("~/Drops")).unwrap();
+        let system_dir = if cfg!(windows) {
+            r"C:\Windows\Temp"
+        } else {
+            "/etc/roomler"
+        };
+        for bad in [
+            "drops",
+            "~/../x",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\x",
+            "~user/x",
+            system_dir,
+        ] {
+            let err = apply(&mut cfg, "files_dir", Some(bad)).unwrap_err();
+            assert!(err.contains("files_dir"), "{bad:?}: {err}");
+            assert_eq!(
+                cfg.files_dir.as_deref(),
+                Some("~/Drops"),
+                "{bad:?} must not land"
+            );
+        }
     }
 
     /// FR-84 D2 — the compiler already forces a `Group` and a `Tier` on
@@ -2438,6 +2545,7 @@ mod tests {
             "remote_config_enabled",
             "ssh_enabled",
             "encoder_preference",
+            "files_dir",
             "power_policy",
             "auto_update",
         ]

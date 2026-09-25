@@ -1154,6 +1154,36 @@ impl std::str::FromStr for EncoderPreference {
     }
 }
 
+impl EncoderPreference {
+    /// The canonical spelling — what the LocalAPI reports and the config
+    /// key accepts (`auto` | `hardware` | `software`), never an alias.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Hardware => "hardware",
+            Self::Software => "software",
+        }
+    }
+}
+
+/// FR-84 D4 — the encoder preference `run` RESOLVED (CLI > env > config >
+/// `Auto`), published once so the LocalAPI reports what is actually in force
+/// rather than re-deriving it from a config that a CLI flag or an env var may
+/// have overridden. Unset in a process that never resolved one (`roomlerd
+/// caps`, tests) — reported as absent, never guessed.
+static RESOLVED_PREFERENCE: std::sync::OnceLock<EncoderPreference> = std::sync::OnceLock::new();
+
+/// Record the preference `run` resolved. First writer wins; later calls are
+/// ignored, like every other once-per-process fact here.
+pub fn set_resolved_preference(p: EncoderPreference) {
+    let _ = RESOLVED_PREFERENCE.set(p);
+}
+
+/// The preference `run` resolved, if this process resolved one.
+pub fn resolved_preference() -> Option<EncoderPreference> {
+    RESOLVED_PREFERENCE.get().copied()
+}
+
 /// Open the best-available encoder for the given input size.
 ///
 /// Selection cascade:
