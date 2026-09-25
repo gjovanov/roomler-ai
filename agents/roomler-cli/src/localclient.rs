@@ -19,7 +19,7 @@
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use tunnel_core::localapi::{
     self, ConnectionType, DaemonMode, FlowInfo, FlowKind, NodeStatus, PeerInfo, RouteInfo,
     RouteState,
@@ -1036,6 +1036,91 @@ pub async fn route_ls(json: bool) -> Result<()> {
     } else {
         print_routes(&routes);
     }
+    Ok(())
+}
+
+/// What `roomler route edit` may change. Every field is optional; the
+/// route's other settings (enabled state, org) are carried over unchanged.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RouteEdit {
+    pub id: String,
+    pub agent: Option<String>,
+    pub local: Option<u16>,
+    pub remote: Option<String>,
+    pub socks5: bool,
+    pub transport: Option<&'static str>,
+}
+
+/// Apply an edit to the descriptor `route ls` returned. Pure, so the
+/// field-by-field carry-over is testable without a daemon.
+pub fn apply_route_edit(
+    mut route: localapi::RouteDescriptor,
+    edit: &RouteEdit,
+) -> Result<localapi::RouteDescriptor> {
+    if edit.agent.is_none()
+        && edit.local.is_none()
+        && edit.remote.is_none()
+        && !edit.socks5
+        && edit.transport.is_none()
+    {
+        bail!(
+            "nothing to change — pass at least one of --agent, --local, --remote, --socks5, --transport"
+        );
+    }
+    if let Some(agent) = &edit.agent {
+        route.node = agent.clone();
+    }
+    if let Some(local) = edit.local {
+        route.local = local;
+    }
+    if edit.socks5 {
+        route.kind = FlowKind::Socks5;
+        route.remote = None;
+    } else if let Some(remote) = &edit.remote {
+        route.kind = FlowKind::Forward;
+        route.remote = Some(remote.clone());
+    }
+    if let Some(transport) = edit.transport {
+        route.transport = transport.to_string();
+    }
+    Ok(route)
+}
+
+/// `roomler route edit <id> …` — replace a declared route in ONE step (the
+/// FR-84 `RouteUpdate` verb). The daemon validates the result exactly like
+/// an add and refuses it without touching the running route.
+pub async fn route_edit(edit: RouteEdit) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let routes = client.route_list().await.map_err(daemon_err)?;
+    let Some(current) = routes.into_iter().find(|r| r.route.id == edit.id) else {
+        bail!("no declared route with id {}", edit.id);
+    };
+    let wanted = apply_route_edit(current.route, &edit)?;
+    let eff = client.route_update(wanted).await.map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("unknown variant") {
+            anyhow!("the roomler daemon predates `route edit` — update it, then retry")
+        } else {
+            anyhow!("{msg}")
+        }
+    })?;
+    println!("route replaced: {}", eff.id);
+    match &eff.remote {
+        Some(r) => println!(
+            "  127.0.0.1:{} → {r}  via node {}",
+            eff.local,
+            short_id(&eff.node)
+        ),
+        None => println!(
+            "  socks5 127.0.0.1:{} → node {} (per-connection target)",
+            eff.local,
+            short_id(&eff.node)
+        ),
+    }
+    if !eff.enabled {
+        println!("  declared DISABLED — `roomler route enable {}`", eff.id);
+    }
+    println!("  roomler route ls            # live state");
     Ok(())
 }
 
@@ -2350,5 +2435,95 @@ mod tests {
         assert_eq!(mesh_label("ž.roomler", None), Some("ž"));
         assert_eq!(mesh_label("a.žroomler", None), None);
         assert_eq!(mesh_label("€€€€", None), None);
+    }
+}
+
+#[cfg(test)]
+mod route_edit_tests {
+    use super::{RouteEdit, apply_route_edit};
+    use tunnel_core::localapi::{FlowKind, RouteDescriptor};
+
+    fn declared() -> RouteDescriptor {
+        RouteDescriptor {
+            id: "pg".into(),
+            kind: FlowKind::Forward,
+            node: "aabbccddeeff001122334455".into(),
+            local: 15432,
+            remote: Some("db:5432".into()),
+            transport: "auto".into(),
+            enabled: false,
+            org: Some("acme".into()),
+        }
+    }
+
+    /// FR-84 — `route edit` sends the WHOLE descriptor back, so everything
+    /// the flags did not name must ride along unchanged: the enabled state
+    /// (a disabled route stays disabled) and the org label in particular.
+    #[test]
+    fn edit_changes_only_what_was_named() {
+        let edited = apply_route_edit(
+            declared(),
+            &RouteEdit {
+                id: "pg".into(),
+                local: Some(25432),
+                ..RouteEdit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(edited.local, 25432);
+        assert_eq!(edited.remote.as_deref(), Some("db:5432"));
+        assert_eq!(edited.node, "aabbccddeeff001122334455");
+        assert!(!edited.enabled, "the enabled state is carried over");
+        assert_eq!(
+            edited.org.as_deref(),
+            Some("acme"),
+            "the org label is carried over"
+        );
+        assert_eq!(edited.id, "pg");
+    }
+
+    #[test]
+    fn socks5_drops_the_remote_and_remote_makes_a_forward() {
+        let socks = apply_route_edit(
+            declared(),
+            &RouteEdit {
+                id: "pg".into(),
+                socks5: true,
+                ..RouteEdit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(socks.kind, FlowKind::Socks5);
+        assert_eq!(socks.remote, None);
+
+        let mut was_socks = declared();
+        was_socks.kind = FlowKind::Socks5;
+        was_socks.remote = None;
+        let fwd = apply_route_edit(
+            was_socks,
+            &RouteEdit {
+                id: "pg".into(),
+                remote: Some("web:80".into()),
+                transport: Some("quic"),
+                ..RouteEdit::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fwd.kind, FlowKind::Forward);
+        assert_eq!(fwd.remote.as_deref(), Some("web:80"));
+        assert_eq!(fwd.transport, "quic");
+    }
+
+    #[test]
+    fn an_edit_that_names_nothing_is_refused() {
+        let err = apply_route_edit(
+            declared(),
+            &RouteEdit {
+                id: "pg".into(),
+                ..RouteEdit::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("nothing to change"), "{err}");
     }
 }
