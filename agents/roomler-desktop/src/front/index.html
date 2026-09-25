@@ -830,9 +830,11 @@
             <h3>Your private network</h3>
             <p>
               Roomler can join this computer to a private network with your
-              other devices. It is a WireGuard mesh: devices talk to each other
-              directly, encrypted end to end. The Roomler server introduces the
-              devices to each other but never sees what they send.
+              other devices. It is a WireGuard mesh: your devices connect to
+              each other with end-to-end encryption, directly when the network
+              allows it and through a relay when it doesn't. The Roomler server
+              introduces them to each other but never sees what they send, and
+              a relay only ever carries encrypted data.
             </p>
             <ul class="wl-points">
               <li>
@@ -841,9 +843,11 @@
               </li>
               <li>
                 <strong>What changes on this computer.</strong> Roomler adds a
-                virtual network adapter and routes for the network's own
-                addresses (100.64.0.0/10) only. Nothing else on this computer is
-                rerouted.
+                virtual network adapter, with routes for the network's own
+                addresses (in the 100.64.0.0/10 range). If your admins have
+                approved a subnet router (an office network reachable through
+                one of your devices, say), its addresses go through the private
+                network too. Your internet traffic is not rerouted.
               </li>
               <li>
                 <strong>Who can reach this computer.</strong> Only devices in your
