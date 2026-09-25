@@ -23,6 +23,7 @@ pub mod peer_relay_audit;
 pub mod push_subscription;
 pub mod reaction;
 pub mod recording;
+pub mod recording_activity;
 pub mod remote_audit;
 pub mod remote_session;
 pub mod role;

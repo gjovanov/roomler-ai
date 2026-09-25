@@ -89,6 +89,16 @@ pub mod permissions {
     /// and an org may well want one reviewer for bounded commands and another
     /// for interactive sessions.
     pub const VIEW_SSH_AUDIT: u64 = 1 << 30;
+    /// FR-85 P3 — record a device's screen from a remote-control session (the
+    /// session bit `Permissions::RECORD` survives the hub only for a holder of
+    /// this, the device's owner, or an ADMINISTRATOR — and never under
+    /// break-glass).
+    ///
+    /// ⚠️ In NO managed row below the ADMINISTRATOR bypass, like
+    /// [`EXEC_DEVICE`] and [`SSH_DEVICE`]: controlling a screen is visible to
+    /// whoever is at it and ends with the session, but a recording is a copy
+    /// that outlives both. An org grants it on purpose or not at all.
+    pub const RECORD_REMOTE_SCREEN: u64 = 1 << 31;
     // ⚠️ Bit 52 is the ceiling, and the reason is the JSON number rather than
     // anything here: a mask crosses the wire as a JSON integer, which is exact
     // only below 2^53. The UI mirror (`ui/src/utils/permissions.ts`) does its
@@ -148,7 +158,7 @@ pub mod permissions {
     /// Owner permissions (everything). Bump the mask whenever a new bit is
     /// added above so `ALL` literally contains every defined permission (owner
     /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
-    pub const ALL: u64 = (1 << 31) - 1;
+    pub const ALL: u64 = (1 << 32) - 1;
 
     /// Every named bit, with its wire name. Lives here rather than in the test
     /// module because two callers need it: `all_contains_every_named_permission`
@@ -187,6 +197,7 @@ pub mod permissions {
         ("VIEW_EXEC_AUDIT", VIEW_EXEC_AUDIT),
         ("SSH_DEVICE", SSH_DEVICE),
         ("VIEW_SSH_AUDIT", VIEW_SSH_AUDIT),
+        ("RECORD_REMOTE_SCREEN", RECORD_REMOTE_SCREEN),
     ];
 
     /// Names of every named bit set in `mask`, for error messages. An
@@ -414,6 +425,14 @@ mod tests {
                 "managed role `{}` seeds SSH_DEVICE without the ADMINISTRATOR bypass",
                 r.name
             );
+            // FR-85 P3 — a recording outlives the session; an org grants it
+            // on purpose or not at all.
+            assert_eq!(
+                r.permissions & RECORD_REMOTE_SCREEN,
+                0,
+                "managed role `{}` seeds RECORD_REMOTE_SCREEN without the ADMINISTRATOR bypass",
+                r.name
+            );
         }
     }
 
@@ -516,6 +535,11 @@ mod tests {
             DEFAULT_ADMIN & SSH_DEVICE,
             0,
             "SSH_DEVICE must stay an explicit grant"
+        );
+        assert_eq!(
+            DEFAULT_ADMIN & RECORD_REMOTE_SCREEN,
+            0,
+            "RECORD_REMOTE_SCREEN must stay an explicit grant"
         );
     }
 

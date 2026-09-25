@@ -713,6 +713,8 @@ the on-host prompt still stands for exactly the announced window.
 
 If recording is enabled for the session, the controlled side gets a persistent banner (cannot be dismissed) and a red dot in the tray icon. Mirrors macOS's screen-recording indicator behavior; users have learned to look for it.
 
+**FR-85 builds this** ([recording.md](recording.md) §10). A remote recording is made and stored **on the controlled device**, and the controller downloads it on demand over the session's P2P channel. The server stores only the facts. `Permissions::RECORD` survives the hub only when the controller may record (the device's owner, an `ADMINISTRATOR`, or the role bit `RECORD_REMOTE_SCREEN`) **and** the device's owner has switched remote recording on. Each refusal is named in `rc:session.created` and in the audit. The indicator above comes with the device side (P3b): it shows **before the first frame**, and on an attended host with no surface to show it the recording is refused.
+
 ### 11.4 The reality of misuse
 
 A remote-control feature is the most-abused capability in any product. Mitigations:
@@ -723,6 +725,7 @@ A remote-control feature is the most-abused capability in any product. Mitigatio
 - **Mandatory audit retention** is configurable per-org but cannot go below 30 d for sessions.
 - **No keystroke logging** in audit — only event counts. The controlled user's passwords typed during a session must not be persisted.
 - **Tray icon cannot be hidden** by config; if you want covert monitoring, this is the wrong product.
+- **Break-glass never records** (FR-85). An `ADMINISTRATOR` who skips consent with an `override_reason` is never granted `RECORD`, whatever their mask says: nobody at the machine agreed to the session, so a recording of it would be covert.
 
 ## 12. Performance targets & budget
 

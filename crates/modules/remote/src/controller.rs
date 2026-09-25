@@ -71,6 +71,7 @@ pub async fn handle_controller_frame(state: &RemoteState, frame: ControllerFrame
         authz.override_reason,
         authz.input_mode,
         authz.tenant_name,
+        authz.may_record,
         frame.dialed_tid,
         frame.conn_established_ms,
         frame.connection_id,
@@ -95,6 +96,8 @@ pub async fn dispatch_controller_rc(
     // Multi-org — the org name the host's consent prompt should name
     // (resolved by the same gate).
     tenant_name: Option<String>,
+    // FR-85 P3 — may this controller record (resolved by the same gate)?
+    may_record: bool,
     // PR-1 rehome direction inputs: the affinity key this conn DIALED
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
@@ -119,6 +122,7 @@ pub async fn dispatch_controller_rc(
         override_reason: override_reason.clone(),
         input_mode,
         tenant_name: tenant_name.clone(),
+        may_record,
     };
     // …and so does the cross-pod relay, for the same reason.
     let relay_tenant_name = tenant_name;
@@ -165,6 +169,7 @@ pub async fn dispatch_controller_rc(
                     &override_reason,
                     input_mode,
                     &relay_tenant_name,
+                    may_record,
                     &frame_val,
                 )
                 .await
@@ -281,6 +286,7 @@ pub async fn dispatch_controller_rc(
                         &override_reason,
                         input_mode,
                         &relay_tenant_name,
+                        may_record,
                         &frame_val,
                     )
                     .await
@@ -334,6 +340,13 @@ pub struct SessionAuthz {
     /// from the agent row the gate already loads. `None` on the early-out
     /// paths (non-session-request, unknown agent) where no prompt follows.
     pub tenant_name: Option<String>,
+    /// FR-85 P3 — may this controller RECORD the device's screen? The
+    /// device's owner, an ADMINISTRATOR, or a holder of
+    /// `RECORD_REMOTE_SCREEN` — and ⚠️ never under break-glass: that path
+    /// forces `ConsentMode::Auto`, and a forced, unconsented session that
+    /// could also record would be covert monitoring (docs §11.4). The hub
+    /// strips `Permissions::RECORD` from the grant when this is false.
+    pub may_record: bool,
 }
 
 impl SessionAuthz {
@@ -343,6 +356,7 @@ impl SessionAuthz {
             override_reason: None,
             input_mode: None,
             tenant_name: None,
+            may_record: false,
         }
     }
     fn allow_with_input(
@@ -355,7 +369,13 @@ impl SessionAuthz {
             override_reason: None,
             input_mode,
             tenant_name,
+            may_record: false,
         }
+    }
+    /// FR-85 P3 — set whether this allowed controller may record.
+    fn recording(mut self, may_record: bool) -> Self {
+        self.may_record = may_record;
+        self
     }
 }
 
@@ -434,11 +454,13 @@ pub async fn resolve_session_authz(
     // an owner opts into being asked (a shared workstation, or field-testing the
     // attended modes without a second account).
     if agent.owner_user_id == controller_user_id {
+        // FR-85 P3 — the owner may record their own device.
         return Ok(SessionAuthz::allow_with_input(
             agent.access_policy.owner_consent_mode(),
             input_mode,
             tenant_name,
-        ));
+        )
+        .recording(true));
     }
 
     // The effective mode for an allowed non-owner controller (attended default).
@@ -459,34 +481,35 @@ pub async fn resolve_session_authz(
                 override_reason: Some(reason),
                 input_mode,
                 tenant_name,
+                // ⚠️ FR-85 P3 — never record under break-glass (§11.4): the
+                // consent was skipped, so recording would be covert.
+                may_record: false,
             });
         }
-        return Ok(SessionAuthz::allow_with_input(
-            mode,
-            input_mode,
-            tenant_name.clone(),
-        ));
+        return Ok(
+            SessionAuthz::allow_with_input(mode, input_mode, tenant_name.clone()).recording(true),
+        );
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
         return Err("you don't have permission to control others' devices".to_string());
     }
+    // FR-85 P3 — past the ADMINISTRATOR branch, recording is its own grant.
+    let may_record = permissions::has(perms, permissions::RECORD_REMOTE_SCREEN);
 
     // Per-agent allowlist. Empty ⇒ no per-device restriction (any operator may
     // request; consent is the real gate). Non-empty ⇒ user or a role must match.
     let policy = &agent.access_policy;
     if policy.allowed_user_ids.is_empty() && policy.allowed_role_ids.is_empty() {
-        return Ok(SessionAuthz::allow_with_input(
-            mode,
-            input_mode,
-            tenant_name.clone(),
-        ));
+        return Ok(
+            SessionAuthz::allow_with_input(mode, input_mode, tenant_name.clone())
+                .recording(may_record),
+        );
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
-        return Ok(SessionAuthz::allow_with_input(
-            mode,
-            input_mode,
-            tenant_name.clone(),
-        ));
+        return Ok(
+            SessionAuthz::allow_with_input(mode, input_mode, tenant_name.clone())
+                .recording(may_record),
+        );
     }
     let role_ids = state
         .tenants
@@ -494,11 +517,10 @@ pub async fn resolve_session_authz(
         .await
         .unwrap_or_default();
     if policy.allowed_role_ids.iter().any(|r| role_ids.contains(r)) {
-        return Ok(SessionAuthz::allow_with_input(
-            mode,
-            input_mode,
-            tenant_name.clone(),
-        ));
+        return Ok(
+            SessionAuthz::allow_with_input(mode, input_mode, tenant_name.clone())
+                .recording(may_record),
+        );
     }
     Err("you're not on this device's control allowlist".to_string())
 }

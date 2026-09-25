@@ -126,6 +126,15 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     group: 'Fleet access',
     description: 'Read the roomler-SSH audit trail — who was granted, or refused, a session.',
   },
+  {
+    key: 'RECORD_REMOTE_SCREEN',
+    // FR-85 P3 — `2 ** 31`, never `1 << 31`: that is NEGATIVE in JS (int32).
+    bit: 2 ** 31,
+    label: 'Record remote screens',
+    group: 'Fleet access',
+    description:
+      'Record a device’s screen during a remote-control session. The device must allow it, and the person there sees it. A recording outlives the session, so no role gets this by default.',
+  },
 ]
 
 /** Group names in display order (insertion order of the flags above). */
@@ -184,11 +193,11 @@ export const DEFAULT_ADMIN = maskUnion(
 )
 
 /**
- * Every defined bit — server `ALL = (1 << 31) - 1` = bits 0–30.
- * Written as `2 ** 31 - 1` because the Rust spelling evaluates to a NEGATIVE
+ * Every defined bit — server `ALL = (1 << 32) - 1` = bits 0–31.
+ * Written as `2 ** 32 - 1` because the Rust spelling evaluates to a NEGATIVE
  * number in JS (see the int32 note at the top of this file).
  */
-export const ALL_PERMISSIONS = 2 ** 31 - 1
+export const ALL_PERMISSIONS = 2 ** 32 - 1
 
 /**
  * Mask arithmetic that is exact to `Number.MAX_SAFE_INTEGER`, i.e. bits 0–52.

@@ -477,6 +477,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/tenant/{tenant_id}/recording-activity/{agent_id}",
+      "methods": "GET,HEAD"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/role",
       "methods": "GET,HEAD,POST"
     },
@@ -1375,6 +1379,30 @@
               "user_id": 1
             },
             "unique": true
+          }
+        ]
+      },
+      {
+        "collection": "recording_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
           }
         ]
       },
@@ -2780,6 +2808,30 @@
         ]
       },
       {
+        "collection": "recording_activity",
+        "indexes": [
+          {
+            "key": {
+              "tenant_id": 1,
+              "agent_id": 1,
+              "at": -1
+            }
+          },
+          {
+            "key": {
+              "session_id": 1,
+              "at": 1
+            }
+          },
+          {
+            "key": {
+              "at": 1
+            },
+            "expireAfterSeconds": 7776000
+          }
+        ]
+      },
+      {
         "collection": "recordings",
         "indexes": [
           {
@@ -3560,6 +3612,7 @@
     "rc:rpc.result",
     "rc:rpc.request",
     "rc:ssh.request",
+    "rc:recording.activity",
     "rc:ssh.activity",
     "rc:ssh.grant_ack",
     "rc:agent.config_status",
@@ -3667,6 +3720,7 @@
     "rc:overlay.srflx": "network",
     "rc:overlay.warm_relay_request": "network",
     "rc:ping": "fleet",
+    "rc:recording.activity": "remote",
     "rc:relay.derp_ticket_request": "network",
     "rc:relay.probe_report": "network",
     "rc:rpc.request": "fleet",

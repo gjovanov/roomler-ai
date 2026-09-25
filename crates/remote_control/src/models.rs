@@ -210,6 +210,21 @@ pub struct AgentCaps {
     /// leaving the caller to hang until its deadline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rpc: Vec<String>,
+    /// FR-85 P3 — what this agent can record for a REMOTE controller, as
+    /// [`RecordCap`] wire words:
+    ///
+    /// * `"remote"` — the device's owner switched remote recording on
+    ///   (`record_remote_enabled`), and the agent serves the `record`
+    ///   DataChannel.
+    /// * `"remote-audio"` — and allows the computer's audio in one
+    ///   (`record_remote_audio`). The microphone is never offered remotely.
+    ///
+    /// Advertised only while the device gate is on, so an old agent, or one
+    /// whose owner never opted in, never receives `Permissions::RECORD`: the
+    /// hub strips it. ⚠️ `remote` is a PREFIX of `remote-audio`; matching is
+    /// equality ([`AgentCaps::has_record`]), never `starts_with`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub record: Vec<String>,
     /// Clipboard-DC protocol-v2 capability list. Extends the coarse
     /// `supports_clipboard` bool (kept for older browsers) with
     /// per-feature flags. Recognised values:
@@ -620,6 +635,37 @@ impl RpcCap {
     }
 }
 
+/// FR-85 P3 — a remote-recording capability word in [`AgentCaps::record`].
+/// The [`RpcCap`] pattern: variant → [`RecordCap::wire`] (the compatibility
+/// surface) → [`RecordCap::ALL`], matched by EQUALITY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecordCap {
+    /// The device serves remote recording (its owner opted in).
+    Remote,
+    /// …and may include what the computer plays.
+    RemoteAudio,
+}
+
+impl RecordCap {
+    /// Exactly what crosses the wire. ⚠️ A compatibility surface: renaming
+    /// one un-advertises the feature on every deployed agent. Locked by test.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::RemoteAudio => "remote-audio",
+        }
+    }
+
+    /// Every word THIS build knows about.
+    pub const ALL: [RecordCap; 2] = [Self::Remote, Self::RemoteAudio];
+
+    /// Parse a wire word; `None` for anything unrecognised (ignored, never
+    /// an error — see [`AgentCaps::has_rpc`]).
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.wire() == s)
+    }
+}
+
 impl AgentCaps {
     /// Does this agent advertise `cap`?
     ///
@@ -630,6 +676,12 @@ impl AgentCaps {
     /// error.
     pub fn has_rpc(&self, cap: RpcCap) -> bool {
         self.rpc.iter().any(|v| v == cap.wire())
+    }
+
+    /// FR-85 P3 — does this agent advertise the recording word `cap`?
+    /// Equality, never a prefix: `remote` is a prefix of `remote-audio`.
+    pub fn has_record(&self, cap: RecordCap) -> bool {
+        self.record.iter().any(|v| v == cap.wire())
     }
 
     /// FR-77 — the cells this reader can name. Entries from a newer agent
@@ -3138,6 +3190,69 @@ pub struct SshActivityEvent {
     pub at: DateTime,
 }
 
+/// FR-85 P3 — what a device reports about a REMOTE recording.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingActivityKind {
+    /// The host allowed the recording at the just-in-time prompt.
+    PromptGranted,
+    /// The host refused it.
+    PromptDenied,
+    /// Nobody answered the prompt.
+    PromptTimedOut,
+    /// The recorder is writing (after the indicator went up).
+    Started,
+    /// The file is final. `reason` is the stop reason, `bytes` and
+    /// `duration_ms` what was recorded.
+    Stopped,
+    /// The device refused to start: `reason` names why (the gate is off, no
+    /// indicator surface, an encoder or disk problem, …).
+    Refused,
+    /// The controller downloaded a recording (`name`, `bytes`).
+    Downloaded,
+}
+
+/// FR-85 P3 — one thing a device reported about a remote recording.
+///
+/// ⚠️ **REPORTED BY THE DEVICE, not observed by the server** — the same split
+/// as [`SshActivityEvent`] vs [`SshAuditEvent`]. The server's own decision (was
+/// `RECORD` granted, and if not why) lives in `remote_audit`'s
+/// `SessionRequested`; this is the host's claim about what then happened.
+/// Never content: no frames, no window titles — only the fact, sizes and
+/// reasons.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RecordingActivityEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    /// From the authenticated WS, never from the frame.
+    pub tenant_id: ObjectId,
+    pub agent_id: ObjectId,
+    pub session_id: ObjectId,
+    /// The controller the live session belongs to — the SERVER's record of
+    /// who was recording, not the device's.
+    pub controller_user_id: ObjectId,
+    pub kind: RecordingActivityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Stamped by the SERVER. A device clock is not evidence.
+    pub at: DateTime,
+}
+
+impl RecordingActivityEvent {
+    pub const COLLECTION: &'static str = "recording_activity";
+
+    /// Longest `name` / `reason` a device may report: both are free text from
+    /// a host that may be compromised, and an unbounded one would let a
+    /// session bloat the collection.
+    pub const MAX_TEXT: usize = 256;
+}
+
 impl SshActivityEvent {
     pub const COLLECTION: &'static str = "ssh_activity";
 
@@ -3249,6 +3364,14 @@ pub enum AuditKind {
         /// this field readable at all (#1630).
         #[serde(default, deserialize_with = "crate::permissions::deserialize_stored")]
         permissions: Permissions,
+        /// FR-85 P3 — why `RECORD` was stripped from the requested grant
+        /// (`controller_not_allowed` / `device_not_opted_in`); `None` = not
+        /// requested, or granted. The server's DECISION, kept here beside the
+        /// grant; what the host then did lives in `recording_activity`. A
+        /// field rather than a new variant, so a pod on an older build can
+        /// still read the row mid-rollout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_stripped: Option<String>,
     },
     ConsentPrompted,
     ConsentGranted,
@@ -4292,6 +4415,43 @@ mod tests {
         assert_eq!(RpcCap::from_wire("no-such-verb"), None);
     }
 
+    /// FR-85 P3 — `remote` is a PREFIX of `remote-audio`: a prefix matcher
+    /// would read every recording-capable device as audio-capable, and the
+    /// hub would hand computer audio to controllers of devices whose owners
+    /// allowed only the picture.
+    #[test]
+    fn remote_recording_does_not_imply_remote_audio() {
+        let video_only = AgentCaps {
+            record: vec!["remote".into()],
+            ..Default::default()
+        };
+        assert!(video_only.has_record(RecordCap::Remote));
+        assert!(!video_only.has_record(RecordCap::RemoteAudio));
+        let both = AgentCaps {
+            record: vec!["remote".into(), "remote-audio".into()],
+            ..Default::default()
+        };
+        assert!(both.has_record(RecordCap::Remote) && both.has_record(RecordCap::RemoteAudio));
+        // An agent that predates the field, or never opted in, sends no
+        // `record` key at all (a round trip, like `absent_rpc_list_…`).
+        let wire = serde_json::to_string(&AgentCaps::default()).unwrap();
+        assert!(!wire.contains("\"record\""), "{wire}");
+        let old: AgentCaps = serde_json::from_str(&wire).unwrap();
+        assert!(old.record.is_empty() && !old.has_record(RecordCap::Remote));
+        // A word from a newer agent is ignored, never an error.
+        let future = AgentCaps {
+            record: vec!["remote-4k".into()],
+            ..Default::default()
+        };
+        assert!(!future.has_record(RecordCap::Remote));
+        // The wire words are a compatibility surface.
+        let words: Vec<&str> = RecordCap::ALL.iter().map(|c| c.wire()).collect();
+        assert_eq!(words, vec!["remote", "remote-audio"]);
+        for c in RecordCap::ALL {
+            assert_eq!(RecordCap::from_wire(c.wire()), Some(c));
+        }
+    }
+
     /// ⚠️ `ssh` is a PREFIX of `ssh-consent`, and the difference between them
     /// is the difference between "runs an SSH server" and "actually honours
     /// `consent_mode`". A matcher using `starts_with`/`contains` instead of
@@ -4989,6 +5149,7 @@ mod tests {
                 controller_user_id: ObjectId::new(),
                 controller_name: "op".into(),
                 permissions: Permissions::default(),
+                record_stripped: None,
             },
             AuditKind::PermissionsChanged {
                 permissions: Permissions::VIEW,
