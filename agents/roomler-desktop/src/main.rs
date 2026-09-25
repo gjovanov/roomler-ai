@@ -35,23 +35,30 @@
 )]
 
 mod commands;
+mod desktop_log;
 mod panels;
 mod tray;
 
 use tauri::Manager;
 
 fn main() {
-    // Lightweight logging (the agent has its own persistent rolling
-    // log; the tray's log is for tray-side issues like a failed
-    // enrollment HTTP call). Stderr only — no file rotation.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init();
+    // Lightweight logging (the agent has its own persistent rolling log;
+    // this one is for companion-side issues — a failed enrollment HTTP call,
+    // a refresh the daemon refused). FR-84 D1: stderr PLUS a small
+    // size-capped file under the per-user data dir, because a tray app's
+    // stderr is read by nobody and the errors it swallowed were invisible.
+    let log_path = desktop_log::init();
+    match &log_path {
+        Some(p) => tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            log = %p.display(),
+            "roomler-desktop starting"
+        ),
+        None => tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            "roomler-desktop starting (no data dir — stderr only)"
+        ),
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -97,11 +104,11 @@ fn main() {
             commands::cmd_get_pending_consents,
             commands::cmd_rc_sessions,
             commands::cmd_rc_disconnect,
-            commands::cmd_route_list,
+            commands::cmd_tunnels_view,
             commands::cmd_route_add,
+            commands::cmd_route_update,
             commands::cmd_route_remove,
             commands::cmd_route_set_enabled,
-            commands::cmd_flows,
             commands::cmd_config_cleanup,
             commands::cmd_config_entries,
             commands::cmd_config_set,

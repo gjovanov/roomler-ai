@@ -13,8 +13,11 @@ use roomler_node_core::config::{self, AgentConfig};
 use roomler_node_core::enrollment::{self, EnrollInputs};
 use roomler_node_core::{logging, notify};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// What the SPA shows on the status page. Returned from
 /// [`cmd_status`]. All fields are JSON-friendly primitives so the
@@ -249,6 +252,7 @@ impl DeviceView {
 /// success it issues `status` then `peers` on ONE connection.
 #[tauri::command]
 pub async fn cmd_device_view() -> DeviceView {
+    const SURFACE: &str = "device_view";
     let mut client = match localapi::connect().await {
         Ok(c) => c,
         Err(e) => {
@@ -257,6 +261,7 @@ pub async fn cmd_device_view() -> DeviceView {
             } else {
                 "connect_error"
             };
+            refresh_failed(SURFACE, describe_io("connect", &e));
             return DeviceView::unavailable(reason);
         }
     };
@@ -264,10 +269,20 @@ pub async fn cmd_device_view() -> DeviceView {
         Ok(s) => s,
         // Reached the endpoint but the exchange failed (daemon shutting down,
         // protocol error) — treat as unreachable for the UI.
-        Err(_) => return DeviceView::unavailable("daemon_unreachable"),
+        Err(e) => {
+            refresh_failed(SURFACE, describe_io("status", &e));
+            return DeviceView::unavailable("daemon_unreachable");
+        }
     };
     // Peers are best-effort: a status-ok / peers-fail shouldn't blank the view.
-    let peers = client.peers().await.unwrap_or_default();
+    let peers = match client.peers().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %describe_io("peers", &e), "device view: peers unavailable");
+            Vec::new()
+        }
+    };
+    refresh_ok(SURFACE);
     DeviceView {
         available: true,
         reason: None,
@@ -1001,15 +1016,92 @@ pub async fn cmd_rc_disconnect(session: String) -> Result<(), String> {
 
 // ─── declared routes (P6 — the Tunnels pane) ───────────────────────
 
-/// Declared routes + live state for the Tunnels pane. NEVER errors —
-/// like [`cmd_get_pending_consents`], the pane shows its own zero-state
-/// when the daemon is down (an empty list is indistinguishable from
-/// "no routes", and the Devices section already surfaces daemon-down).
+/// FR-84 D1 — what the Routes view renders: the declared routes AND the live
+/// flows, read on ONE LocalAPI connection, or `available: false` with a
+/// `reason` the page shows verbatim.
+///
+/// Never rejects. Before FR-84 the view issued `cmd_route_list` and
+/// `cmd_flows` as two parallel calls (two more pipe opens in the same
+/// millisecond as the device-view poll), and each turned ANY error into
+/// `[]` — which the page painted as "no routes yet". A failure is a STATE
+/// here: the page keeps its last good data and says since when and why.
+#[derive(Debug, Serialize)]
+pub struct TunnelsView {
+    /// Both reads succeeded on one connection.
+    pub available: bool,
+    /// Why not, when `available` is false — the stage that failed, the io
+    /// error kind and the raw OS error (231 = `ERROR_PIPE_BUSY`).
+    pub reason: Option<String>,
+    pub routes: Vec<roomler_localapi::RouteInfo>,
+    pub flows: Vec<FlowInfo>,
+}
+
+impl TunnelsView {
+    fn unavailable(reason: String) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason),
+            routes: Vec::new(),
+            flows: Vec::new(),
+        }
+    }
+}
+
 #[tauri::command]
-pub async fn cmd_route_list() -> Vec<roomler_localapi::RouteInfo> {
-    match localapi::connect().await {
-        Ok(mut c) => c.route_list().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+pub async fn cmd_tunnels_view() -> TunnelsView {
+    const SURFACE: &str = "tunnels";
+    let mut client = match localapi::connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            return TunnelsView::unavailable(refresh_failed(SURFACE, describe_io("connect", &e)));
+        }
+    };
+    let routes = match client.route_list().await {
+        Ok(r) => r,
+        Err(e) => {
+            return TunnelsView::unavailable(refresh_failed(
+                SURFACE,
+                describe_io("route_list", &e),
+            ));
+        }
+    };
+    let flows = match client.flows().await {
+        Ok(f) => f,
+        Err(e) => {
+            return TunnelsView::unavailable(refresh_failed(SURFACE, describe_io("flows", &e)));
+        }
+    };
+    refresh_ok(SURFACE);
+    TunnelsView {
+        available: true,
+        reason: None,
+        routes,
+        flows,
+    }
+}
+
+/// FR-84 D1 — replace a declared route in ONE step (`RouteUpdate`). The
+/// daemon validates the replacement exactly like an add and refuses it
+/// without touching the running route; its messages surface verbatim on the
+/// form. A daemon older than the verb answers "unknown variant", which is
+/// rendered as "predates route editing" rather than as a stack of JSON.
+#[tauri::command]
+pub async fn cmd_route_update(
+    route: roomler_localapi::RouteDescriptor,
+) -> Result<roomler_localapi::RouteDescriptor, String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    client
+        .route_update(route)
+        .await
+        .map_err(|e| explain_route_edit_error(&e.to_string()))
+}
+
+/// The one reply an old daemon gives to a verb it has never heard of.
+fn explain_route_edit_error(message: &str) -> String {
+    if message.contains("unknown variant") {
+        "The device service predates route editing — update it, then try again.".to_string()
+    } else {
+        message.to_string()
     }
 }
 
@@ -1044,20 +1136,6 @@ pub async fn cmd_route_set_enabled(id: String, enabled: bool) -> Result<bool, St
         .map_err(|e| e.to_string())
 }
 
-/// Live forwards / SOCKS5 listeners with their per-flow byte counters —
-/// the "watch its live bytes" surface (unification §4.3). Covers BOTH
-/// daemon-supervised routes (each active route is backed by a flow) and
-/// ephemeral CLI-created flows. NEVER errors (mirrors [`cmd_route_list`]):
-/// daemon down ⇒ empty list, and the Devices section already surfaces
-/// daemon-down explicitly.
-#[tauri::command]
-pub async fn cmd_flows() -> Vec<FlowInfo> {
-    match localapi::connect().await {
-        Ok(mut c) => c.flows().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// The shared connect-error mapping for the mutating route commands
 /// (mirrors [`cmd_ping`]'s wording so the two surfaces read the same).
 fn daemon_unreachable(e: std::io::Error) -> String {
@@ -1065,6 +1143,140 @@ fn daemon_unreachable(e: std::io::Error) -> String {
         "device service not running".to_string()
     } else {
         format!("connecting to the device service: {e}")
+    }
+}
+
+// ─── refresh failures: said once, on the page and in the log ───────
+
+/// One line naming WHAT failed (`stage`) and HOW — the io error kind and,
+/// when the OS supplied one, its raw code (`231` = `ERROR_PIPE_BUSY`, the one
+/// FR-84 chased). `NotFound` on connect is the daemon not running, said
+/// plainly.
+fn describe_io(stage: &str, e: &std::io::Error) -> String {
+    if stage == "connect" && e.kind() == std::io::ErrorKind::NotFound {
+        return "device service not running (no LocalAPI endpoint)".to_string();
+    }
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(code) => {
+            // std's Display already ends an OS error with "(os error N)";
+            // keep the code once, after the kind.
+            let suffix = format!(" (os error {code})");
+            let text = text.strip_suffix(suffix.as_str()).unwrap_or(&text);
+            format!("{stage}: {text} [{:?}, os error {code}]", e.kind())
+        }
+        None => format!("{stage}: {text} [{:?}]", e.kind()),
+    }
+}
+
+/// How the refresh-failure ledger wants a failure reported.
+#[derive(Debug, PartialEq, Eq)]
+enum FailureLog {
+    /// Write a warn line: the first failure of a streak, a changed reason,
+    /// or the periodic summary (`suppressed` = lines withheld since the
+    /// last one).
+    Warn { failures: u32, suppressed: u32 },
+    /// Same reason, inside the quiet window — count it, write nothing.
+    Quiet,
+}
+
+struct FailureStreak {
+    failures: u32,
+    last_reason: String,
+    last_logged: Instant,
+    suppressed: u32,
+}
+
+/// FR-84 D1 — the ledger behind the desktop log's refresh lines: one warn
+/// when a surface starts failing, another at once when the reason changes,
+/// a summary at most every [`Self::QUIET`] while it keeps failing, and one
+/// info line with the count when it recovers. Pure (takes `now`), so the
+/// policy is testable; the statics below wrap it.
+///
+/// Without it every swallowed error was invisible — the page blanked and
+/// nothing anywhere said why — and without the rate limit a 2 s poller
+/// failing for a day would write 43 000 identical lines.
+#[derive(Default)]
+struct RefreshLedger {
+    streaks: HashMap<&'static str, FailureStreak>,
+}
+
+impl RefreshLedger {
+    /// Minimum gap between two lines for the same unchanged reason.
+    const QUIET: Duration = Duration::from_secs(30);
+
+    fn failed(&mut self, surface: &'static str, reason: &str, now: Instant) -> FailureLog {
+        match self.streaks.get_mut(surface) {
+            None => {
+                self.streaks.insert(
+                    surface,
+                    FailureStreak {
+                        failures: 1,
+                        last_reason: reason.to_string(),
+                        last_logged: now,
+                        suppressed: 0,
+                    },
+                );
+                FailureLog::Warn {
+                    failures: 1,
+                    suppressed: 0,
+                }
+            }
+            Some(s) => {
+                s.failures += 1;
+                let changed = s.last_reason != reason;
+                if changed || now.duration_since(s.last_logged) >= Self::QUIET {
+                    let suppressed = s.suppressed;
+                    s.suppressed = 0;
+                    s.last_logged = now;
+                    s.last_reason = reason.to_string();
+                    FailureLog::Warn {
+                        failures: s.failures,
+                        suppressed,
+                    }
+                } else {
+                    s.suppressed += 1;
+                    FailureLog::Quiet
+                }
+            }
+        }
+    }
+
+    /// A success ends the streak; returns how many failures it had, if any.
+    fn recovered(&mut self, surface: &'static str) -> Option<u32> {
+        self.streaks.remove(surface).map(|s| s.failures)
+    }
+}
+
+static REFRESH_LEDGER: LazyLock<Mutex<RefreshLedger>> =
+    LazyLock::new(|| Mutex::new(RefreshLedger::default()));
+
+/// Record a failed refresh of `surface` and log it per the ledger's policy.
+/// Returns `reason` so a caller can hand it straight to the page.
+fn refresh_failed(surface: &'static str, reason: String) -> String {
+    let action = REFRESH_LEDGER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .failed(surface, &reason, Instant::now());
+    if let FailureLog::Warn {
+        failures,
+        suppressed,
+    } = action
+    {
+        tracing::warn!(surface, failures, suppressed, %reason, "refresh failed");
+    }
+    reason
+}
+
+/// Record a successful refresh of `surface`; logs the recovery once if it
+/// ends a failure streak.
+fn refresh_ok(surface: &'static str) {
+    let ended = REFRESH_LEDGER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .recovered(surface);
+    if let Some(failures) = ended {
+        tracing::info!(surface, failures, "refresh recovered");
     }
 }
 
@@ -1313,6 +1525,116 @@ mod tests {
         assert!(
             !user.contains("administrator"),
             "per-user failures must not claim elevation is needed: {user}"
+        );
+    }
+
+    /// FR-84 D1 — the refresh-failure ledger: first failure logs, identical
+    /// repeats inside the quiet window do not, a changed reason logs at
+    /// once, the periodic summary carries the suppressed count, and a
+    /// recovery reports the streak length exactly once.
+    #[test]
+    fn refresh_ledger_rate_limits_repeats_and_reports_recovery() {
+        let mut ledger = RefreshLedger::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            ledger.failed("tunnels", "connect: busy", t0),
+            FailureLog::Warn {
+                failures: 1,
+                suppressed: 0
+            },
+            "the first failure of a streak is always logged"
+        );
+        for i in 1..=5 {
+            assert_eq!(
+                ledger.failed("tunnels", "connect: busy", t0 + Duration::from_secs(i * 2)),
+                FailureLog::Quiet,
+                "an identical reason inside the quiet window is counted, not logged"
+            );
+        }
+        assert_eq!(
+            ledger.failed("tunnels", "route_list: eof", t0 + Duration::from_secs(12)),
+            FailureLog::Warn {
+                failures: 7,
+                suppressed: 5
+            },
+            "a changed reason is logged at once, with the lines it superseded"
+        );
+        assert_eq!(
+            ledger.failed("tunnels", "route_list: eof", t0 + Duration::from_secs(14)),
+            FailureLog::Quiet
+        );
+        assert_eq!(
+            ledger.failed(
+                "tunnels",
+                "route_list: eof",
+                t0 + Duration::from_secs(12) + RefreshLedger::QUIET
+            ),
+            FailureLog::Warn {
+                failures: 9,
+                suppressed: 1
+            },
+            "the periodic summary fires once the quiet window has elapsed"
+        );
+        // Surfaces are independent streaks.
+        assert_eq!(
+            ledger.failed("device_view", "connect: busy", t0),
+            FailureLog::Warn {
+                failures: 1,
+                suppressed: 0
+            }
+        );
+        assert_eq!(ledger.recovered("tunnels"), Some(9));
+        assert_eq!(
+            ledger.recovered("tunnels"),
+            None,
+            "a recovery is reported once; steady success is silent"
+        );
+        assert_eq!(
+            ledger.failed("tunnels", "connect: busy", t0 + Duration::from_secs(60)),
+            FailureLog::Warn {
+                failures: 1,
+                suppressed: 0
+            },
+            "after a recovery the next failure starts a new streak"
+        );
+    }
+
+    /// The reason the page shows names the stage, the kind and the raw OS
+    /// code once — and says "not running" plainly for an absent endpoint.
+    #[test]
+    fn describe_io_names_stage_kind_and_os_code_once() {
+        let busy = std::io::Error::from_raw_os_error(231);
+        let s = describe_io("connect", &busy);
+        assert!(s.starts_with("connect: "), "{s}");
+        assert_eq!(
+            s.matches("os error").count(),
+            1,
+            "std's own '(os error N)' suffix is folded into ours: {s}"
+        );
+        assert!(s.ends_with(", os error 231]"), "{s}");
+
+        let gone = std::io::Error::new(std::io::ErrorKind::NotFound, "no pipe");
+        assert_eq!(
+            describe_io("connect", &gone),
+            "device service not running (no LocalAPI endpoint)"
+        );
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed early");
+        assert_eq!(
+            describe_io("route_list", &eof),
+            "route_list: closed early [UnexpectedEof]"
+        );
+    }
+
+    #[test]
+    fn old_daemon_reply_is_explained() {
+        let old = explain_route_edit_error(
+            "localapi: unexpected response: Error { message: \"bad request: unknown variant `route_update`, expected one of …\" }",
+        );
+        assert!(old.contains("predates route editing"), "{old}");
+        assert_eq!(
+            explain_route_edit_error("no declared route with id 'x'"),
+            "no declared route with id 'x'",
+            "a real daemon refusal surfaces verbatim"
         );
     }
 }
