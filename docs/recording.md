@@ -5,15 +5,17 @@
 > its audio on Windows and Linux, and on Windows the identity rule: it runs as
 > the person at the device, §6), P2a (the local verbs), P2b
 > (roomler-desktop's Recordings view and tray), P3a (the server's gates for
-> remote recording), P3b (the device's half of it), P3b-2 (downloading it) and
-> P3c (the viewer's Record and Download, §10).** It sits behind the `recording`
-> cargo feature and is in no release build yet. It is driven by
-> `roomlerd record`, by the daemon for the LocalAPI recording verbs and
-> `roomler record` (§6), by roomler-desktop (§7), and by a remote controller
-> from the viewer's toolbar, over the session's `record` channel (§10). Still
+> remote recording), P3b (the device's half of it), P3b-2 (downloading it),
+> P3c (the viewer's Record and Download, §10) and P5a (the export engine: cut
+> and speed up, §11).** It sits behind the `recording` cargo feature and is in
+> no release build yet. It is driven by `roomlerd record`, by the daemon for
+> the LocalAPI recording verbs and `roomler record` (§6), by roomler-desktop
+> (§7), by a remote controller from the viewer's toolbar, over the session's
+> `record` channel (§10), and by `roomlerd media` for an export (§11). Still
 > to come: the microphone on macOS, delivery out of the recorder's data folder
-> (P2c), re-attaching after a dropped session (P3b-3), and the editor (cut,
-> speed up, background music) in P5.
+> (P2c), re-attaching after a dropped session (P3b-3), and the rest of the
+> editor: audio through an export and background music (P5b), the Edit view
+> (P5c).
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -679,7 +681,76 @@ compromised: join it on `session_id` with `remote_audit` for the decision.
 first and paginated. It is gated by `VIEW_REMOTE_AUDIT`, like the session
 audit. The device is resolved within the tenant, so a foreign id gets a 404.
 
-## 11. Tests
+## 11. The editor (P5)
+
+Editing is **non-destructive**. An edit list is saved beside its recording
+(`<name>.mp4.edit.json`, the sidecar's naming), the recording is never
+written, and an export is a new file beside it: `<name> (edited).mp4`, then
+`(edited 2)`, `(edited 3)` … — an export never replaces anything.
+
+```mermaid
+flowchart LR
+    REC[("recording.mp4")] --> DMX["demux<br/>ProgressiveFile"]
+    DMX --> DEC["decode<br/>openh264 (Baseline)"]
+    EDL[("recording.mp4.edit.json")] --> PLAN["edit::Plan<br/>output frame n → source time"]
+    PLAN --> PICK{{"the frame shown<br/>at that time"}}
+    DEC --> PICK
+    PICK --> ENC["encode<br/>the recording profile"]
+    ENC --> FW["fragmented MP4<br/>.roomler-partial (locked)"]
+    FW --> FIN["finalize<br/>moov first"]
+    FIN --> OUT[("recording (edited).mp4")]
+```
+
+**The edit list** (`recording/edit.rs`):
+
+| Field | Meaning |
+|---|---|
+| `version` | `1`; any other is refused by name |
+| `source` | the recording's file name, bare, in the list's own folder |
+| `segments[]` | `{start_ms, end_ms, action}`, contiguous from 0: `keep`, `cut`, or `speed` with `"speed": 1.25 … 16` in quarter steps. Whatever follows the last segment is kept, so "cut the first ten seconds" is one segment; segments past the recording's end are clipped |
+
+- ⚠️ **The time map is exact integer arithmetic** on the 90 kHz clock.
+  Output frame `n` shows the source frame presented at `Plan::source_time(n)`;
+  a k× speed-up shows every k-th frame with no drift (over an hour at 1.5×, the
+  last frame is exactly the one integer arithmetic says). A float map slips a
+  frame here and there, which the oracle reads as the wrong frame.
+- ⚠️ **openh264 decodes only Constrained Baseline**, which is what the
+  software encoder writes. A hardware encoder's recording (High profile) is
+  refused `decoder_unavailable`, by name and before a frame is decoded, until
+  FR-85 P4 vendors FFmpeg's H.264 decoder. Never a garbled export.
+- **It decodes forward**, jumping to the keyframe before the next frame it
+  needs when that keyframe lies ahead: a cut costs at most one GOP (2 s) of
+  decoding. A speed-up still decodes every frame it passes over (H.264 needs
+  them all since the last keyframe); only the frames it shows are converted and
+  encoded.
+- ⚠️ **The list names its recording, bare, in its own folder.** A `source`
+  with a separator or `..` is refused before anything is read. Without the
+  check, `../elsewhere.mp4` reached the filesystem (the control that proved
+  it).
+- The export's partial holds the same liveness lock as a recording's, so a
+  recorder starting beside a running export never reconciles it. A failed or
+  cancelled export leaves nothing behind.
+- **Video only in P5a.** The export carries no audio yet, and says so
+  (`"audio": "not_carried"`), so a caller never presents a silent file as the
+  whole export.
+
+**`roomlerd media`** is the engine as a process of its own, launched by
+roomler-desktop **as the person** (never by the daemon), speaking the
+recorder's JSON-line protocol:
+
+| Command | Answers |
+|---|---|
+| `media probe <file>` | one `probe`: `duration_ms`, `width`, `height`, `frames`, `profile`, `audio`, `editable`, and the reason when it is not |
+| `media export --edl <file> [--encoder auto\|hardware\|software]` | `started`, `progress {frames, total}`, then `done {path, frames, duration_ms, bytes, encoder, audio}` or `refused {code, detail}`: `bad_edit_list`, `source_unreadable`, `decoder_unavailable`, `encoder_unavailable`, `decode_failed`, `write_failed`, `cancelled` |
+
+`{"cmd":"cancel"}` on stdin stops an export. End of stdin does not: a
+finished file is harmless, and an export started with stdin closed must run.
+
+Not yet: the original audio through cuts and speed-ups, and background music
+(P5b); the Edit view in roomler-desktop (P5c); FFmpeg's decoder for hardware
+recordings (P4).
+
+## 12. Tests
 
 | Where | What | CI |
 |---|---|---|
@@ -687,6 +758,8 @@ audit. The device is resolved within the tenant, so a foreign id gets a 404.
 | `recording::launch` unit tests, Windows (P1e) | every argument comes back whole through Windows's own parser (`CommandLineToArgvW`): a display name full of quotes, backslashes and `--out` stays ONE argument; an added variable replaces its namesake whatever its case; **work done as the recorder gets only the recorder's rights**: an elevated run writes into an Administrators-only folder, and the same write made through `as_identity(RestrictedCopy)` is refused, then the thread is itself again (red without the impersonation) | `ci.yml` "Windows recorder identity (FR-85)", elevated on purpose (`ROOMLERD_TEST_REQUIRE_ELEVATED` fails a runner that is not) |
 | `tests/recorder.rs`, Windows (P1e) | the recorder an elevated daemon launches reports (`record --whoami`) the same user at MEDIUM integrity with the admin group deny-only; red with the integrity left alone, red with no group made deny-only; the positive control, launched as the daemon itself, IS elevated. A whole recording through the rule: the folder asked of the recorder (`record --where`), start, stop, and the list and delete done as it | the same Windows job |
 | `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
+| `recording::edit` unit tests (P5a) | the keep / cut / 4× / keep list maps every output frame to exactly the frame the oracle expects; keeping everything is the identity (the control); an hour at 1.5× lands on the frame integer arithmetic says, no drift; what follows the last segment is kept and a long list is clipped; a bad list is refused by name (version, no segments, not from 0, a gap, an empty segment, nothing kept); speeds are 1.25–16 in quarter steps (NaN, infinity, 1×, 17× refused); the file reads as written | "Test the recorder (FR-85)" (`--lib recording::`) |
+| `tests/export.rs` (P5a) | a recording whose every frame paints its own index, exported keep 0–2 s · cut 2–4 s · 4× 4–8 s · keep 8–10 s, decodes to exactly `0..59, 120, 124 … 236, 240..299` (150 frames, 5 s, moov first, the recording byte-identical); the same comparison against the unedited source fails (the oracle discriminates); keeping everything reproduces the recording frame for frame; a cancelled export and one that keeps nothing leave no file and nothing staged; the real `roomlerd media probe` / `export` process (a cut plus 2× shows frames 30, 32 … 58, the `done` event says `audio: not_carried`), and a list naming `../elsewhere.mp4` is refused `bad_edit_list`. Red, each on its own cell: the map ignoring speed, the frame choice off by one, the cancel check removed, the name check removed | same step, `--test export` |
 | `recording::audio` unit tests (P1c) | 48 kHz passes through exactly (one frame of interpolator latency); mono → both channels; a 44.1 kHz sine resamples to 48 kHz at the same pitch; a positive rate trim consumes faster; the soft clip is linear below the knee, monotonic, never wraps; a silent source still yields one frame per 20 ms; two sources sum; a backlog is cut to the lag keeping the newest; a 0.2 % fast source is held near the lag by the rate correction, never trimmed | "Test the recorder (FR-85)", the `audio` run |
 | `tests/recorder.rs`, audio (P1c) | a 440 Hz tone at 44.1 kHz mono plus a microphone that delivers nothing → an Opus track within 80 ms of the video, decoded back at 440 Hz with the right level; the same recording without audio has no audio track (the negative control); `roomlerd record --system-audio` through the real process; a build without `audio` refuses `--microphone` with `audio_unavailable` | both runs of the same step |
 | `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |
