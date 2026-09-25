@@ -1058,8 +1058,12 @@ pub async fn route_set_enabled(id: &str, enabled: bool) -> Result<()> {
 }
 
 /// `roomler config ls` — the S2 editable config surface: key, current
-/// value, type. The daemon reads its own config file, so
-/// pending not-yet-restarted edits show.
+/// value, type, and whether a change applies live or on restart. The
+/// daemon reads its own config file, so pending not-yet-restarted edits
+/// show. FR-84 D2: the daemon lists the surface grouped, in display order,
+/// and names each entry's group, so the human table prints a header when
+/// the group changes; an older daemon sends no group and the table stays
+/// flat. `--json` is the entries verbatim (fields added, none changed).
 pub async fn config_ls(json: bool) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
     let entries = client.config_entries().await.map_err(daemon_err)?;
@@ -1073,16 +1077,27 @@ pub async fn config_ls(json: bool) -> Result<()> {
         .max()
         .unwrap_or(3)
         .max(3);
-    println!("{:key_w$}  {:9}  VALUE", "KEY", "TYPE");
+    println!("{:key_w$}  {:9}  {:8}  VALUE", "KEY", "TYPE", "APPLIES");
+    let mut last_group: Option<&str> = None;
     for e in &entries {
+        if !e.group_label.is_empty() && last_group != Some(e.group_label.as_str()) {
+            println!("\n[{}]", e.group_label);
+            last_group = Some(e.group_label.as_str());
+        }
         let value = match &e.value {
             Some(v) if !v.is_empty() => v.clone(),
             _ => "(default)".to_string(),
         };
-        println!("{:key_w$}  {:9}  {value}", e.key, e.kind);
+        let applies = if e.restart_required {
+            "restart"
+        } else {
+            "live"
+        };
+        println!("{:key_w$}  {:9}  {:8}  {value}", e.key, e.kind, applies);
     }
     println!(
-        "\nchanges take effect on the next daemon restart — `roomler config set <key> <value>`"
+        "\n`restart` keys take effect on the next daemon restart, `live` keys at once — \
+         `roomler config set <key> <value>`"
     );
     Ok(())
 }
@@ -1100,15 +1115,18 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
         Some(v) if !v.is_empty() => println!("{} = {v}", entry.key),
         _ => println!("{} cleared (built-in default applies)", entry.key),
     }
-    // Two keys are LIVE as of the gate-4 liveness work (docs/remote-config.md
-    // §7b): the daemon re-seeds them from the file it just wrote, so telling an
-    // operator to restart would be wrong in the direction that matters — they
-    // would believe a refusal they just made is not in force yet, and either
-    // restart a healthy daemon for nothing or assume they are still exposed.
-    if matches!(entry.key.as_str(), "exec_enabled" | "remote_config_enabled") {
-        println!("in effect now — no restart needed");
-    } else {
+    // The daemon says per key whether the change is LIVE (the gate-4 flags
+    // it re-seeds from the file it just wrote, docs/remote-config.md §7b) or
+    // waits for a restart — FR-84 D2 moved that truth into the surface, so
+    // this no longer keeps its own list of the live keys. Telling an operator
+    // to restart a live key would be wrong in the direction that matters:
+    // they would believe a refusal they just made is not in force yet, and
+    // either restart a healthy daemon for nothing or assume they are still
+    // exposed.
+    if entry.restart_required {
         println!("takes effect on the next daemon restart");
+    } else {
+        println!("in effect now — no restart needed");
     }
     Ok(())
 }

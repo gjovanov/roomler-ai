@@ -310,6 +310,14 @@
         <div class="view-head"><h2>Settings</h2></div>
         <p class="view-sub">Device identity, service management and file locations.</p>
 
+        <!-- FR-84 D2: keys saved this session that wait for a service restart.
+             Sticky, so it stays in view while scrolling the long configuration
+             card; D3 mounts its "Apply now" control in #cfg-restart-actions. -->
+        <div id="cfg-restart-bar" class="banner banner-warn cfg-restart-bar" hidden>
+          <span id="cfg-restart-text"></span>
+          <span id="cfg-restart-actions" class="cfg-restart-actions"></span>
+        </div>
+
         <div id="st-split-banner" class="banner banner-warn" hidden>
           <div>
             <strong>Two configurations found</strong>
@@ -385,14 +393,27 @@
 
         <!-- S2: the daemon's editable config surface (ConfigGet/ConfigSet).
              Rows are built entirely by settings.js from cmd_config_entries —
-             per-key editors keyed on the entry's `kind`. -->
+             per-key editors keyed on the entry's `kind`. FR-84 D2: an
+             Essentials section first, then one collapsible section per group
+             the daemon names; a daemon without groups gets the flat list. -->
         <div class="card">
           <h3>Device configuration</h3>
           <p class="muted small" style="margin: 0 0 8px">
-            Advanced per-device options (overlay, subnet routes, updates,
-            encoder). Changes are saved to this device's configuration and
-            take effect after the service restarts.
+            Per-device options — the essentials first, the rest grouped.
+            Changes are saved to this device's configuration; each key says
+            whether it takes effect at once or after the service restarts.
           </p>
+          <div id="cfg-search-wrap" class="cfg-search" hidden>
+            <input
+              type="text"
+              id="cfg-search"
+              placeholder="Search keys and descriptions…"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+            />
+            <span id="cfg-search-count" class="muted small"></span>
+          </div>
           <div id="cfg-rows"><p class="muted small">Loading…</p></div>
         </div>
 
