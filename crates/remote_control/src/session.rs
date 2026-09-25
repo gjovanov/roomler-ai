@@ -79,6 +79,13 @@ pub struct LiveSession {
     /// `register_agent` re-pushes this on the agent's fresh connection so
     /// the consent flow completes instead of timing out.
     pub pending_request: Option<ServerMsg>,
+
+    /// FR-85 P3 — why `Permissions::RECORD` was stripped from this grant, when
+    /// it was asked for and refused (`controller_not_allowed`,
+    /// `device_not_opted_in`). Kept so a DUPLICATE request coalesced onto this
+    /// session (#1045) is answered with the same reason: the effective grant
+    /// it repeats lacks RECORD, and a bare `None` would read as "never asked".
+    pub record_refused: Option<&'static str>,
 }
 
 impl LiveSession {
@@ -111,6 +118,7 @@ impl LiveSession {
             relay_region: None,
             offer_seen: false,
             pending_request: None,
+            record_refused: None,
         };
         (s, waiter)
     }

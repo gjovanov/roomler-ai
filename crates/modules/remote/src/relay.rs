@@ -128,6 +128,13 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     .get("tenant_name")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                // FR-85 P3 — resolved by the ORIGIN pod's authz gate. ⚠️ An
+                // absent field (a pod still on an older build) reads as
+                // FALSE: the hub then strips RECORD, which fails closed.
+                let may_record = body
+                    .get("may_record")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let frame: ClientMsg = serde_json::from_value(
                     body.get("frame")
                         .cloned()
@@ -184,6 +191,7 @@ pub fn wire_rc_relay(state: &RemoteState) {
                     override_reason,
                     input_mode,
                     tenant_name,
+                    may_record,
                 };
                 match state.fleet.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
@@ -318,6 +326,9 @@ pub async fn relay_rc_frame(
     override_reason: &Option<String>,
     input_mode: Option<InputMode>,
     tenant_name: &Option<String>,
+    // FR-85 P3 — the origin pod ran the authz gate; the owner pod's hub
+    // strips RECORD without it.
+    may_record: bool,
     raw_frame: &serde_json::Value,
 ) -> Result<Option<(String, String)>, ()> {
     let Some(bus) = state.cluster_bus.clone() else {
@@ -335,6 +346,7 @@ pub async fn relay_rc_frame(
         "override_reason": override_reason,
         "input_mode": input_mode,
         "tenant_name": tenant_name,
+        "may_record": may_record,
         "frame": raw_frame,
     });
     match bus.request(owner_pod, "rc.cmd", body).await {

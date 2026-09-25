@@ -254,3 +254,78 @@ fn to_session_response(s: RemoteSession) -> SessionResponse {
         ended_at: s.ended_at.map(fmt_dt),
     }
 }
+
+/// FR-85 P3 — one remote-recording activity row, as the UI reads it (hex ids,
+/// RFC 3339 time — never a raw BSON `{"$date":…}` object).
+#[derive(Debug, Serialize)]
+pub struct RecordingActivityDto {
+    pub id: String,
+    pub session_id: String,
+    pub controller_user_id: String,
+    pub kind: roomler_ai_remote_control::models::RecordingActivityKind,
+    pub name: Option<String>,
+    pub bytes: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub reason: Option<String>,
+    pub at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordingActivityListResponse {
+    pub items: Vec<RecordingActivityDto>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+/// FR-85 P3 — what a device reported about remote recordings, newest first.
+/// Gated like the audit it is read with (`VIEW_REMOTE_AUDIT`); the device is
+/// resolved WITHIN the tenant, so a foreign id 404s.
+pub async fn recording_activity(
+    State(state): State<RemoteState>,
+    auth: AuthUser,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<RecordingActivityListResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
+
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::VIEW_REMOTE_AUDIT,
+        "VIEW_REMOTE_AUDIT",
+    )
+    .await?;
+    let _ = state.fleet.agents.find_in_tenant(tid, aid).await?;
+
+    let page = state
+        .recording_activity
+        .list_for_agent(tid, aid, &params)
+        .await?;
+    Ok(Json(RecordingActivityListResponse {
+        items: page
+            .items
+            .into_iter()
+            .map(|e| RecordingActivityDto {
+                id: e.id.map(|i| i.to_hex()).unwrap_or_default(),
+                session_id: e.session_id.to_hex(),
+                controller_user_id: e.controller_user_id.to_hex(),
+                kind: e.kind,
+                name: e.name,
+                bytes: e.bytes,
+                duration_ms: e.duration_ms,
+                reason: e.reason,
+                at: fmt_dt(e.at),
+            })
+            .collect(),
+        total: page.total,
+        page: page.page,
+        per_page: page.per_page,
+        total_pages: page.total_pages,
+    }))
+}

@@ -262,6 +262,7 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET | `…/session/{sid}` | Remote-desktop session detail |
 | POST | `…/session/{sid}/terminate` | Force-terminate |
 | GET | `…/session/{sid}/audit` | Session audit trail |
+| GET | `…/recording-activity/{aid}` | What a device reported about remote recordings (FR-85), newest first; `VIEW_REMOTE_AUDIT` — see [recording.md](recording.md) §10 |
 
 Exec body (`POST …/exec`): `{shell?: "pwsh"|"powershell"|"cmd"|"bash"|"sh", command,
 timeout_ms?, max_output_bytes?}` — clamped server-side; output is secret-redacted
