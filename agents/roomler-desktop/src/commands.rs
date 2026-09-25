@@ -456,6 +456,13 @@ pub async fn cmd_config_set(
     if let Ok(mut client) = localapi::connect().await {
         match client.config_set(&key, value.as_deref()).await {
             Ok(entry) => return Ok(entry),
+            // FR-85 — where recordings go is the DAEMON's to accept: its
+            // listener refuses a `record_*` change from anyone but the
+            // console user. When it answered, its answer stands; writing the
+            // file behind its back would report a success it refused.
+            Err(e) if is_daemon_owned_key(&key) => {
+                return Err(explain_recording_error(&e.to_string()));
+            }
             Err(e) => daemon_err = Some(e.to_string()),
         }
     }
@@ -1146,6 +1153,284 @@ fn daemon_unreachable(e: std::io::Error) -> String {
     }
 }
 
+// ─── FR-85 — screen recording (the Recordings view) ────────────────
+
+/// What the Recordings view renders: the recorder's state, the folder with
+/// its recordings, and the configured `record_dir`, read on ONE LocalAPI
+/// connection (the FR-84 D1 lesson), or `available: false` with a reason
+/// the page shows verbatim. Never rejects.
+#[derive(Debug, Serialize)]
+pub struct RecordingsView {
+    pub available: bool,
+    pub reason: Option<String>,
+    /// The device service answers, but has no recorder: it predates the
+    /// recording verbs or was built without them. The view says so instead
+    /// of painting an empty list.
+    pub unsupported: bool,
+    pub state: Option<localapi::RecordingState>,
+    pub listing: Option<localapi::RecordingsListing>,
+    /// `record_dir` as configured; `None` = the default folder.
+    pub record_dir: Option<String>,
+}
+
+impl RecordingsView {
+    fn unavailable(reason: String) -> Self {
+        Self {
+            available: false,
+            reason: Some(reason),
+            unsupported: false,
+            state: None,
+            listing: None,
+            record_dir: None,
+        }
+    }
+
+    fn unsupported() -> Self {
+        Self {
+            available: true,
+            reason: None,
+            unsupported: true,
+            state: None,
+            listing: None,
+            record_dir: None,
+        }
+    }
+}
+
+/// A service without a recorder: one that has never heard of the verb, or
+/// one built without it (the trait default and the daemon both say "not
+/// available").
+fn recording_unsupported(message: &str) -> bool {
+    message.contains("unknown variant") || message.contains("not available")
+}
+
+/// The daemon's words, minus the transport prefix; an old service's
+/// "unknown variant" becomes a sentence a person can act on.
+fn explain_recording_error(message: &str) -> String {
+    if message.contains("unknown variant") {
+        return "The device service predates screen recording — update it, then try again."
+            .to_string();
+    }
+    message
+        .strip_prefix("localapi error: ")
+        .unwrap_or(message)
+        .to_string()
+}
+
+#[tauri::command]
+pub async fn cmd_recordings_view() -> RecordingsView {
+    const SURFACE: &str = "recordings";
+    let mut client = match localapi::connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            return RecordingsView::unavailable(refresh_failed(
+                SURFACE,
+                describe_io("connect", &e),
+            ));
+        }
+    };
+    let state = match client.record_status().await {
+        Ok(s) => s,
+        Err(e) if recording_unsupported(&e.to_string()) => {
+            refresh_ok(SURFACE);
+            return RecordingsView::unsupported();
+        }
+        Err(e) => {
+            return RecordingsView::unavailable(refresh_failed(
+                SURFACE,
+                describe_io("record_status", &e),
+            ));
+        }
+    };
+    let listing = match client.recordings_list().await {
+        Ok(l) => l,
+        Err(e) if recording_unsupported(&e.to_string()) => {
+            refresh_ok(SURFACE);
+            return RecordingsView::unsupported();
+        }
+        Err(e) => {
+            return RecordingsView::unavailable(refresh_failed(
+                SURFACE,
+                describe_io("recordings_list", &e),
+            ));
+        }
+    };
+    // The folder row shows whether a folder was CHOSEN; the listing says
+    // which one is in use (and why, when it is not the chosen one).
+    let record_dir = client
+        .config_entries()
+        .await
+        .ok()
+        .and_then(|entries| entries.into_iter().find(|e| e.key == "record_dir"))
+        .and_then(|e| e.value)
+        .filter(|v| !v.is_empty());
+    refresh_ok(SURFACE);
+    RecordingsView {
+        available: true,
+        reason: None,
+        unsupported: false,
+        state: Some(state),
+        listing: Some(listing),
+        record_dir,
+    }
+}
+
+/// Keys whose change the daemon must accept itself: a refusal it ANSWERED
+/// is final, never retried as a direct file write (`cmd_config_set`).
+fn is_daemon_owned_key(key: &str) -> bool {
+    key.starts_with("record_")
+}
+
+/// Start recording this device's screen. Resolves once the recorder is
+/// encoding, with the file and encoder named; rejects with the daemon's
+/// reason otherwise (not the console user, a SYSTEM/root service, no
+/// encoder, no disk).
+#[tauri::command]
+pub async fn cmd_record_start(
+    fps: Option<u32>,
+    encoder: Option<String>,
+) -> Result<localapi::RecordingState, String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    client
+        .record_start(localapi::RecordStartOpts {
+            fps,
+            encoder,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| explain_recording_error(&e.to_string()))
+}
+
+/// Stop the recording. Resolves once the file is final.
+#[tauri::command]
+pub async fn cmd_record_stop() -> Result<localapi::RecordingState, String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    client
+        .record_stop()
+        .await
+        .map_err(|e| explain_recording_error(&e.to_string()))
+}
+
+/// Delete a recording (and its sidecar) by file name.
+#[tauri::command]
+pub async fn cmd_recording_delete(name: String) -> Result<(), String> {
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    client
+        .recording_delete(&name)
+        .await
+        .map_err(|e| explain_recording_error(&e.to_string()))
+}
+
+/// A recording's file name from the page: a bare `*.mp4` name, nothing
+/// that could leave the folder. The daemon checks the same rule before a
+/// delete; opening a file is the companion's own act, so it checks here.
+fn check_recording_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.contains(['/', '\\', ':'])
+        || name.contains("..")
+        || !name.to_ascii_lowercase().ends_with(".mp4")
+    {
+        return Err(format!("{name:?} is not a recording's file name"));
+    }
+    Ok(())
+}
+
+/// Open the recordings folder (`name` = None), play a recording in the OS's
+/// default player, or (`reveal`) show it selected in the file manager. The
+/// path is always the DAEMON's folder joined with a checked bare name —
+/// never a path the page supplies.
+#[tauri::command]
+pub async fn cmd_recording_open(name: Option<String>, reveal: bool) -> Result<(), String> {
+    if let Some(n) = &name {
+        check_recording_name(n)?;
+    }
+    let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
+    let listing = client
+        .recordings_list()
+        .await
+        .map_err(|e| explain_recording_error(&e.to_string()))?;
+    let dir = PathBuf::from(listing.dir);
+    tokio::task::spawn_blocking(move || {
+        let Some(name) = name else {
+            return open_path_in_explorer(&dir);
+        };
+        let path = dir.join(name);
+        let meta =
+            std::fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if !meta.file_type().is_file() {
+            return Err(format!("{} is not a recording file", path.display()));
+        }
+        if reveal {
+            reveal_in_file_manager(&path)
+        } else {
+            open_path_in_explorer(&path)
+        }
+    })
+    .await
+    .map_err(|e| format!("task join: {e}"))?
+}
+
+/// Show `path` selected in the OS file manager (Linux has no portable
+/// "select": its folder opens instead).
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // Recording names contain spaces, and explorer parses `/select,`
+        // itself: the path must be quoted INSIDE the argument, which the
+        // standard quoting (the whole argument in quotes) breaks.
+        Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", path.display()))
+            .spawn()
+            .map_err(|e| format!("explorer.exe: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("open -R: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let dir = path.parent().unwrap_or(path);
+        open_path_in_explorer(dir)
+    }
+}
+
+/// The native folder picker for `record_dir`. Resolves to the chosen folder,
+/// or `None` when the person cancelled; the page then saves it through
+/// `cmd_config_set`, where the daemon validates it.
+#[tauri::command]
+pub async fn cmd_pick_record_dir(
+    app: tauri::AppHandle,
+    current: Option<String>,
+) -> Result<Option<String>, String> {
+    use tauri::Manager as _;
+    use tauri_plugin_dialog::DialogExt as _;
+    tokio::task::spawn_blocking(move || {
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("Where Roomler saves screen recordings");
+        if let Some(dir) = current.as_deref().filter(|d| Path::new(d).is_dir()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(window) = app.get_webview_window("main") {
+            dialog = dialog.set_parent(&window);
+        }
+        Ok(dialog
+            .blocking_pick_folder()
+            .and_then(|p| p.into_path().ok())
+            .map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| format!("task join: {e}"))?
+}
+
 // ─── refresh failures: said once, on the page and in the log ───────
 
 /// One line naming WHAT failed (`stage`) and HOW — the io error kind and,
@@ -1485,6 +1770,52 @@ fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-85 — the page hands the companion a NAME to open, never a path.
+    #[test]
+    fn only_a_bare_mp4_name_is_opened() {
+        assert!(check_recording_name("Roomler Recording 2026-09-25 14-30-12.mp4").is_ok());
+        assert!(check_recording_name("x.MP4").is_ok());
+        for bad in [
+            "",
+            "../x.mp4",
+            "sub/x.mp4",
+            r"sub\x.mp4",
+            "C:x.mp4",
+            "x.mp4.roomler.json",
+            "notes.txt",
+        ] {
+            assert!(check_recording_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// FR-85 — a service without a recorder is "unsupported" (said on the
+    /// page), not a failure (retried and logged as one).
+    #[test]
+    fn a_service_without_the_recorder_reads_as_unsupported() {
+        assert!(recording_unsupported(
+            "localapi: unexpected response: Error { message: \"bad request: unknown variant `record_status`\" }"
+        ));
+        assert!(recording_unsupported(
+            "localapi error: screen recording is not available in this build"
+        ));
+        assert!(!recording_unsupported(
+            "localapi error: a recording is already running"
+        ));
+        assert_eq!(
+            explain_recording_error("localapi error: a recording is already running"),
+            "a recording is already running"
+        );
+        assert!(explain_recording_error("… unknown variant `record_start` …").contains("predates"));
+    }
+
+    /// FR-85 — a refusal the daemon ANSWERED for a recording key is final.
+    #[test]
+    fn recording_keys_are_the_daemons_to_accept() {
+        assert!(is_daemon_owned_key("record_dir"));
+        assert!(!is_daemon_owned_key("exec_enabled"));
+        assert!(!is_daemon_owned_key("files_dir"));
+    }
 
     /// The split-brain lock: machine-global is read ONLY under an SCM
     /// flavour — a stale `%PROGRAMDATA%` config from an old perMachine
