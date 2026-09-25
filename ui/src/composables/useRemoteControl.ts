@@ -64,6 +64,7 @@ import {
 } from './rcConnectTiming'
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
 import { useSnackbar } from './useSnackbar'
+import { useRemoteRecording, type RecordChannel } from './useRemoteRecording'
 
 /**
  * Backoff ladder for the auto-reconnect path. The first three steps
@@ -303,6 +304,42 @@ export type SessionCreatedAction = 'adopt' | 'ignore' | 'terminate'
  * adopted as before: the guard refuses only what it can prove foreign, so a
  * server that omitted the field could never brick Connect.
  */
+/**
+ * FR-85 P3c — does the session's EFFECTIVE grant (`rc:session.created`'s
+ * `permissions`) hold RECORD? Never assumed: an older server that sends no
+ * grant cannot have checked who may record, so absent means no. Each bit is
+ * matched by equality, never as a prefix.
+ */
+export function grantHoldsRecord(permissions: unknown): boolean {
+  return (
+    typeof permissions === 'string' &&
+    permissions.split('|').some((p) => p.trim() === 'RECORD')
+  )
+}
+
+/**
+ * FR-85 P3c — open the session's `record` channel from its grant: once per
+ * PeerConnection, and only on a grant that holds RECORD (the device answers a
+ * channel without it `not_granted`). Reliable and ordered, because a
+ * download's chunks carry no offsets. Returns the channel it opened, or null.
+ *
+ * ⚠️ Called from `rc:session.created`, never beside `files` in `connect()`.
+ * Those channels are made BEFORE the session request goes out, when no grant
+ * has been seen, so a gate there is always closed and the channel never
+ * exists: the Record button showed and did nothing (P3c's first cut, caught
+ * before merge). The offer is built on `rc:ready`, which follows the create,
+ * so a channel opened here is in it.
+ */
+export function openRecordChannel(
+  pc: Pick<RTCPeerConnection, 'createDataChannel'> | null,
+  channels: Record<string, RTCDataChannel>,
+  permissions: unknown,
+): RTCDataChannel | null {
+  if (!pc || channels.record || !grantHoldsRecord(permissions)) return null
+  channels.record = pc.createDataChannel('record', { ordered: true })
+  return channels.record
+}
+
 export function sessionCreatedAction(
   phase: RcPhase,
   msg: { session_id?: unknown; agent_id?: unknown },
@@ -4472,6 +4509,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   // `rc:session.created.permissions`. `true` until a server says otherwise
   // (pre-P3 servers omit the field = as-requested). Reset on each connect.
   const inputGranted = ref(true)
+  // FR-85 P3c — RECORD survives the hub only when this controller may record
+  // AND the device's owner opted in. `recordRefused` is the server's reason
+  // when it did not (`controller_not_allowed`, `device_not_opted_in`), so the
+  // toolbar can explain instead of only hiding. Reset on each connect.
+  const recordGranted = ref(false)
+  const recordRefused = ref<string | null>(null)
+  const recording = useRemoteRecording()
 
   // Pending clipboard:read requests. Keyed by `req_id` so interleaved
   // reads can resolve independently. The agent echoes the req_id back
@@ -6925,6 +6969,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // we never stream events the agent drops anyway.
       const perms = typeof msg.permissions === 'string' ? msg.permissions : null
       inputGranted.value = perms === null || perms.includes('INPUT')
+      recordGranted.value = grantHoldsRecord(perms)
+      recordRefused.value = typeof msg.record_refused === 'string' ? msg.record_refused : null
+      // FR-85 P3c — the grant is known only now, so the `record` channel is
+      // opened only now (see `openRecordChannel` for why never in connect()).
+      const recordChannel = openRecordChannel(pc, channels, perms)
+      if (recordChannel) recording.attach(recordChannel as unknown as RecordChannel)
       if (!inputGranted.value) {
         console.info(
           '[rc] session is VIEW-EFFECTIVE: another session already holds input on this host',
@@ -7404,7 +7454,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // Multi-user P3: FILES is requested explicitly now that the agent
     // ENFORCES it (it was always implicitly granted under the legacy
     // triple; the server grandfathers exactly that legacy request).
-    permissions = 'VIEW | INPUT | CLIPBOARD | FILES',
+    // FR-85 P3c: RECORD is always asked for. The server strips it, with a
+    // reason, unless this controller may record and the device opted in, so
+    // asking costs nothing and the answer is what enables the Record button.
+    permissions = 'VIEW | INPUT | CLIPBOARD | FILES | RECORD',
     isReconnect = false,
     // The agent's org (tenant hex). Placement-critical: the session
     // request must originate from the pod this org hashes to, and the
@@ -7457,6 +7510,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // one that followed it.
     mediaEverFlowed = false
     inputGranted.value = true // until rc:session.created reports otherwise
+    // FR-85 P3c — a recording is granted per session, never carried over.
+    recordGranted.value = false
+    recordRefused.value = null
     // P6 — fresh session, fresh multi-user state.
     controlState.value = null
     peerCursors.value = {}
@@ -7805,6 +7861,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       stopClipboardSyncTriggers()
     }
     channels.files = pc.createDataChannel('files', { ordered: true })
+    // FR-85 P3c — NOT the `record` channel: no grant has been seen yet (the
+    // session request goes out below). `rc:session.created` opens it
+    // (`openRecordChannel`).
 
     // Persistent listener on the `files` DC. Demuxes every control
     // message by id and dispatches to the registry entry that owns
@@ -10919,6 +10978,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     hasMedia,
     inputChannelOpen,
     inputGranted,
+    recordGranted,
+    recordRefused,
+    recording,
     stats,
     quality,
     setQuality,
