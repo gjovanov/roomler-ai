@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. **P4 (RemoteDesktop input) FIELD-VERIFIED** — injection lands to the exact requested pixel, scroll sign correct, restore round trip clean · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. **P4 (RemoteDesktop input) FIELD-VERIFIED** — injection lands to the exact requested pixel, scroll sign correct, restore round trip clean. **P5 (mutter direct) FIELD-VERIFIED on WSL2, through the daemon's own cascade, encoding with `av1_nvenc` at native 1920×1080 in 11.4 ms — AC2 met** (2026-09-25). **Docs:** [`docs/linux-capture.md`](../linux-capture.md) · **Owner:** agent / capture
 
 ## Goal
 
@@ -63,6 +63,7 @@ on a machine with no scanout. The backend priority stays
 | **P3c-ii** ✅ | Frames to the daemon and the **sixth `ScreenCapture` backend**, picked after DRM and before X11. ⚠️ A pipe and a copy, **not** `SCM_RIGHTS` — see the corrected decision below. Field-verified through `capture-smoke` as root: `backend=portal`, **delivered=5 empty=0**, 1920x1080 Bgra, `mean_ms=27.70`, and the dumped frame is a correct picture. | `ROOMLERD_PORTAL_CAPTURE=1` |
 | **P4** ✅ (2026-09-01, field-verified on Asahi/GNOME) | Input via the portal's **RemoteDesktop** interface, riding the SAME session as capture — `CreateSession`/`Start` move to RemoteDesktop, `SelectDevices` (keyboard+pointer, persist on v2+) slots in before the unchanged `SelectSources`, so ONE consent dialog covers see+touch and one restore token covers both (stored apart from the capture-only token: `portal-restore-token-rd`). The daemon's input arbiter forwards `InputMsg` JSON lines to the helper's stdin; the helper maps them to `Notify*` (evdev keycodes via the shared FR-36 table; typed text as Unicode keysyms, layout-proof; absolute motion in the stream's LOGICAL size). Falls back to capture-only where the portal has no RemoteDesktop (wlr, measured). Motivation measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. | `ROOMLERD_PORTAL_INPUT=0` (config `portal_input`) |
 | **P5** ✅ (2026-09-01, field-verified on BOTH hosts) | **`org.gnome.Mutter.ScreenCast` DIRECT — the unattended sibling, for hosts the portal cannot serve.** Mutter's own API needs no portal backend and shows no consent dialog, which is exactly what blocks WSL2 (where `xdg-desktop-portal-gnome` exits without a GNOME session, while `mutter --headless` runs fine and exposes ScreenCast v4). Same PipeWire consumption, same POD negotiation, same wire format and `ScreenCapture` backend — only the *session broker* changes. ⚠️⚠️ **This is NOT a portal variant and must never be described as one: it does not ask.** Its peer is FR-36's DRM backend (also unattended, also opt-in), not P2b. | `ROOMLERD_MUTTER_CAPTURE` (config `mutter_capture`), default **OFF** |
+| **Docs** ✅ (2026-09-25, added retroactively — see the criterion) | [`docs/linux-capture.md`](../linux-capture.md): the Linux capture cascade and its four arms, the attended-only rule, the logind gate (P5b), the knobs and the probe-trigger they share; the Linux rows of `remote-control.md` §5.1 and §6.1 and the cascade paragraph + probe-cache warning in `encoders.md` brought up to date; a `docs/README.md` row. | n/a |
 
 ### The seam is unchanged
 
@@ -334,26 +335,26 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
       ancient compositor. A
       **nested GNOME Wayland session in WSL2** (per the WSLg + `gnome-shell
       --nested` recipe) is captured and rendered in the browser
-- [~] That session encodes with **`*_nvenc`**, and `avg_encode_ms` is within
-      ~2× the 10.4 ms already measured on that host. **Half-met 2026-09-25 on
-      0.4.101 — `[~]`, not `[x]`.** **Met:** the P5 mutter-direct capture,
-      driven from a signed-in browser controller, produced live remote-desktop
-      sessions that encode with **`av1_nvenc`** (a `*_nvenc`) at **`avg_encode_ms`
-      mean 8.25 ms** (min 5.69, max 12.70; 68 agent-side `DC pump heartbeat`s
-      across 6 sessions) — within ~2× of the 10.4 ms baseline, in fact below it.
-      The encoder verb and the number both pass, and the capture came from
-      `mutter node 44 on Meta-0` with the virtual desktop OFF, so it is the P5
-      path, not the Xvfb fallback. **Missing for a clean tick:** a **like-for-like
-      1080p** read. Those sessions ran at **1280×720**, because the relay pair is
-      remembered slow-link (FR-59) and the pump opens capped there; a smaller
-      frame encodes faster, so 720p/8.25 ms is not the baseline's 1080p
-      condition. Reaching native 1080p needs `ROOMLERD_SLOW_LINK_PROFILE=0`, and
-      on this host that knob forces a fresh caps probe that **hangs under
-      test-rig GPU load** → the pump watchdog restart-loops the daemon
-      (recovered; fresh probes complete in ~5 s once the GPU is idle). So 1080p
-      is blocked here by slow-link rate memory **and** the probe-hang, not by
-      the capture path — the capture path is proven to feed NVENC at a healthy
-      per-frame cost
+- [x] That session encodes with **`*_nvenc`**, and `avg_encode_ms` is within
+      ~2× the 10.4 ms already measured on that host. **MET 2026-09-25 on
+      0.4.102, like for like at 1920×1080.** The P5 mutter-direct capture,
+      driven from a signed-in browser controller through the daemon's **own**
+      cascade (`mutter node 44 on Meta-0` → `capture: backend=portal …
+      1920×1080`, virtual desktop OFF, so not the Xvfb fallback), encoded with
+      **`av1_nvenc`** at **`avg_encode_ms` mean 11.39 ms** (min 6.24, max
+      16.73) over **109 agent-side `DC pump heartbeat`s across 5 sessions, every
+      one at 1920×1080**; the two sustained sessions (~60 s and ~2.2 min)
+      averaged 12.00 and 11.66 ms — **1.1–1.15× the 10.4 ms baseline**, inside
+      the ~2× bound, and
+      the viewer's HUD agreed (`1920×1080`, `AV1 4:2:0 HW (av1_nvenc) · relay ·
+      dec HW`). Condition, stated because it is load-bearing: the FR-59 P5
+      slow-link opening profile OFF (`ROOMLERD_SLOW_LINK_PROFILE=0`) and the
+      pair's remembered rate cleared — the 2026-08-31 baseline predates that
+      profile, so this IS the baseline's condition. The earlier reading of the
+      same day — **8.25 ms at 1280×720** (68 heartbeats / 6 sessions), the
+      size the profile had opened at — stands beside it as the smaller-frame
+      number, and the wrong turn between the two (a knob change that forced a
+      capability probe which hung under the rig's load) is in the field log
 - [x] `roomlerd capture-smoke` reports **whether the portal is available and
       why not**, on a host where it is absent — FR-36 measured a host where
       `xdg-desktop-portal` was running yet exposed **neither ScreenCast nor
@@ -389,6 +390,21 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
       after a full helper restart, came up `input_ok:true` in seconds with **no
       dialog**, restoring from `portal-restore-token-rd` — and injection landed
       again in that restored session
+- [x] **Docs updated/created with diagrams, linked from `docs/README.md`** —
+      [`docs/linux-capture.md`](../linux-capture.md): the Linux capture cascade
+      and why each arm is opt-in, the portal handshake and the mutter broker as
+      `mermaid` sequence diagrams, the helper/`dlopen` dependency rule, input on
+      the same session, the **attended-only rule** and every place the product
+      states it, portal detection and its five verdicts, the logind session
+      gate that keeps P5 off WSL2 and headless hosts (open decision P5b) with
+      the transient-unit recipe, the field table, the configuration keys and
+      the caps-probe trigger they all share; `file:line` anchors verified
+      against master. Indexed in `docs/README.md`, and cross-linked from
+      `remote-control.md` §5.1 / §6.1 and `encoders.md` (capture backends, the
+      probe cache). ⚠️ **Added retroactively (2026-09-25)**: FR-45 opened on
+      2026-08-31, before the docs-before-close rule (#1401, 2026-09-05), and a
+      close after that date binds it. Marked rather than backdated, so the spec
+      does not claim it always complied.
 
 ## Open decisions
 
@@ -510,3 +526,8 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
 | 2026-09-25 | ⏳ **AC2's encode half — NOT read, and why** | The measurement needs a live remote-desktop session: the pump's `DC pump heartbeat` is what carries `encoder=` and `avg_encode_ms`, and nothing offline measures it (`encoder-smoke` proves an open and an IDR, not a per-frame cost). The controller available to the run — the Claude-in-Chrome profile on the dev box — was **signed out** of roomler.ai (`/tenant/…/devices` bounced to `/login`), and a worker may not enter credentials, so the run stopped there rather than fake the half. Left to do, ~10 min: bring the rig above up, sign in, open the device's viewer for ≥2 min while the weston clients animate, and read `journalctl -u roomlerd \| grep 'DC pump heartbeat'` — pass if `encoder="*_nvenc"` and the mean `avg_encode_ms` ≤ ~21 (2× 10.4). The host was restored after the run: drop-in removed, transient units stopped, Xvfb virtual desktop back. |
 | 2026-09-25 | 🏆 **AC2 encode half READ — resumed once the browser was signed in, 0.4.101, WSL2** | Same P5 rig (PAM-registered wayland session + headless mutter + weston motion, daemon drop-in `VD=0`/`PORTAL_CAPTURE=1`/`MUTTER_CAPTURE=1`), a live RC session opened from the signed-in controller. The daemon took the P5 path — `portal capture: using org.gnome.Mutter.ScreenCast DIRECTLY` → `mutter node 44 on Meta-0 (ScreenCast v4)` → `media pump: AV1 over DataChannel` — with the virtual desktop OFF, so no Xvfb fallback. **Encoder = `av1_nvenc`; `avg_encode_ms` mean 8.25 ms** (min 5.69, max 12.70) across **68 `DC pump heartbeat`s / 6 sessions**, `c=true` (relay). Within ~2× of the 10.4 ms baseline — below it, in fact. ⚠️ **All at 1280×720, not the baseline's 1920×1080**: the relay pair is remembered slow-link (FR-59 `remembered_bps≈26592`), so the pump opens capped `max_long_edge=1280 max_fps=15` and does not climb. A smaller frame encodes faster, so this is **not** a like-for-like reproduction of the 1080p number — AC2 is `[~]`, not `[x]`. ⚠️ Sessions were short (~30 s each): the automation tab is `visibilityState:hidden`, so the viewer's decode-progress watchdog (`useRemoteControl.ts` — media-progress ticks drive it) re-creates the session; the agent-side heartbeats are valid regardless, but no single 2-min session accrued. |
 | 2026-09-25 | ⛔ **The 1080p arm is blocked on this host — and the wrong turn is worth recording** | To lift the 720p cap I set `ROOMLERD_SLOW_LINK_PROFILE=0`. That is a `ROOMLERD_*` knob, and the caps cache is keyed on the knob set, so it forced a **fresh caps probe** — which **hung** under the daemon's minimal systemd environment while the test rig loaded the box (`caps probe: the probe child hung`; `env -i roomlerd caps` reproduces a 75 s hang, while an interactive `caps` with the login env completes in ~5 s). The 94 s pump watchdog then `exit(2)`-looped the daemon (`watchdog: pumps stalled … forcing exit(2)`, `crash_count` climbing). 🔑 Pre-warming the single-entry cache with a matching key did **not** hold — the daemon recomputed a miss — so the knob is not safely settable on this host under load. Recovery: stop the transient units (frees the GPU), remove the drop-in, restart on the original config — the **fresh probe then completed in 4.6 s with the GPU idle** and the daemon came up `rc:agent.hello sent`, peers online. So the 1080p read is blocked by **two** independent things — slow-link rate memory forcing 720p, and a fresh-probe hang under load — neither in the P5 capture path itself. (The probe-under-load hang looks like its own latent WSL/NVENC issue, not an FR-45 defect.) |
+| 2026-09-25 | **AC2 1080p arm — the BEFORE, 0.4.102, WSL2** | Two befores stand on record for this arm: the deploy as found (Xvfb virtual desktop, `hevc_nvenc`, 1080p, 9.8–11.9 ms — the row above) and the same day's P5 sessions at **1280×720**. The cap's mechanism, read off the host: `rate_memory.json` held ONE bare-address entry for the relay address at **43 514 bps** (the 720p run had seen ≈26 592), and any remembered rate ≤ 1 Mbps opens a constrained pump at `max_long_edge=1280 max_fps=15` (`rate_profile.rs:413`). ⚠️ That memory reads as **self-inflicted by the test rig** rather than a property of the link: the day's sessions were ~30 s each in a hidden automation tab, and what a session measures is what it writes back, so each short session made the next one open smaller. A hypothesis from the numbers, not an A/B — recorded so the next reader does not treat "this pair is slow" as a fact. |
+| 2026-09-25 | **The knob change, sequenced around the probe landmine** | The box was shared with two other workers' `cargo` jobs (load 15–28 on 32 cores), so a bounded wait fired the change the moment no builder process remained (load 5.5): drop-in `ROOMLERD_VIRTUAL_DESKTOP=0` / `PORTAL_CAPTURE=1` / `MUTTER_CAPTURE=1` / **`SLOW_LINK_PROFILE=0`** as ONE knob change, the rate-memory entry cleared (a backup kept on the host), `daemon-reload`, restart. The fresh probe (`cache miss … reason=a ROOMLERD_* knob changed`) completed in **10.4 s** (4.6 s at idle the same morning; 60 s is the bound), `rc:agent.hello sent` 13 s after `agent starting`, `NRestarts=0`, no Xvfb, peers online — and only then the rig: `systemd-run` mutter with `PAMName=login` + `XDG_SESSION_TYPE=wayland` (logind gained a `Type=wayland Class=user Active=yes` session), `weston-simple-shm` + `weston-simple-egl -f` on its display. 🔑 Both levers were pulled on purpose — the knob AND the cleared memory: the 10.4 ms baseline (0.4.33, 2026-08-31) predates FR-59 P5 (2026-09-01), so "profile off, no memory" IS the baseline's condition, and pulling one alone risked a second knob restart under load if the other still capped the open. |
+| 2026-09-25 | 🏆 **AC2 MET like for like — 1080p on the P5 path, 0.4.102, WSL2** | Viewer opened from the signed-in controller; its `rc:resolution` default is `original` and no preference was stored for this device, so the request does not depend on the viewport and the hidden tab is not a resolution confound (checked in `localStorage` before connecting). Every session took the same path: `portal capture: using org.gnome.Mutter.ScreenCast DIRECTLY` → `portal-helper: mutter node 44 on Meta-0 (ScreenCast v4, 16–60 ms)` → `streaming 1920x1080` → `capture: backend=portal … width=1920 height=1080` → `ffmpeg encoder opened … encoder="av1_nvenc" width=1920 height=1080 fps=30`; no slow-link line. **109 `DC pump heartbeat`s across 5 sessions, all `1920x1080`, `encoder="av1_nvenc"`, `avg_encode_ms` mean 11.39 (min 6.24, max 16.73)**; per session 7.06 (n=3), 8.69 (n=4), 8.86 (n=5), **12.00 (n=30, ~60 s)**, **11.66 (n=67, ~2.2 min, 6 484 frames captured)** — the short sessions' means are dominated by the opening frames, so the sustained figure is ~11.7–12 ms: **1.1–1.15× the 10.4 ms baseline**, `target_fps=30`, `constrained=true` (relay), `target_bps` 2.7–3.2 M. The viewer's HUD agreed: `1920×1080 shown at 1.08× ~45 ms`, `AV1 4:2:0 HW (av1_nvenc) · relay · dec HW`. ⚠️ The hidden tab's decode-progress watchdog still re-created sessions (`Connection lost — reconnecting … Reconnected in 1.8 s after 1 failed`), though two ran a full minute; the agent-side heartbeats are valid regardless. |
+| 2026-09-25 | Two log lines on this path that are noise today and worth a look | (1) `FFmpeg DC pump: encoder ignored forced keyframe — rebuilding to emit a guaranteed IDR (vp9_qsv-class runtime-force bug)` fired once per session ~14 s in, on **`av1_nvenc`** — the handling covers it (a sub-second rebuild and a fresh IDR), but NVENC ignoring a forced keyframe is not the case the message was written for; encoder-side, not FR-45's. (2) `portal capture: frame stream ended error=failed to fill whole buffer` at WARN on **every** normal session teardown — the reader hits EOF mid-frame when the helper is killed with the capture; harmless, but a WARN that fires on every clean stop should become a debug line when the capture is being dropped (`portal/backend.rs`). |
+| 2026-09-25 | ✅ **Host restored and verified** | In the order the landmine dictates: the rig down FIRST (`fr45-*` units stopped, none left), then a bounded wait for the shared host to have no builder running (fired at load 3.9), then the drop-in removed, `daemon-reload`, restart. The second fresh probe of the run (`cache miss … a ROOMLERD_* knob changed` — restoring the old knob set misses the single-entry cache too) completed in **6.6 s**, `rc:agent.hello sent` for both orgs, `NRestarts=0`; Xvfb `:103` back with xfwm4 and the two startup apps; only the three standing drop-ins; no leftover mutter/weston/`portal-helper`; logind back to its two `tty` sessions; peers online. The daemon's own write-back to `rate_memory.json` after the run: **3 187 500 bps** for the relay it nominated — a healthy number where the morning's entry held 43 514 (⚠️ a different relay address was nominated this time, so this is not a same-key A/B; the artefact's key is simply gone, and the pair opens with no memory next time). |
