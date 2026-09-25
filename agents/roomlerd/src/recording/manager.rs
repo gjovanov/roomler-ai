@@ -64,6 +64,38 @@ struct Active {
     ended: watch::Receiver<bool>,
 }
 
+/// FR-85 P3 — who a REMOTE recording is for: the session that asked (the
+/// device side's handle on it) and the controller (what the sidecar keeps,
+/// because a download is owned by the USER — the reconnect ladder mints new
+/// session ids).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteInitiator {
+    pub session_id: bson::oid::ObjectId,
+    pub controller_user_id: bson::oid::ObjectId,
+    pub controller_name: String,
+}
+
+/// FR-85 P3 — why a start did not happen, for a caller that must say so in
+/// a closed set rather than a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartError {
+    /// This daemon cannot record here (SYSTEM/root, until P1e).
+    Unavailable(String),
+    /// A recording is already running (one at a time).
+    Busy,
+    /// The recorder refused, failed, or missed its start deadline.
+    Failed(String),
+}
+
+impl StartError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Unavailable(m) | Self::Failed(m) => m.clone(),
+            Self::Busy => "a recording is already running".into(),
+        }
+    }
+}
+
 /// The recorder's supervisor. Cheap to share (`Arc`).
 pub struct RecordingManager {
     /// The binary to launch — this daemon's own executable in production.
@@ -79,6 +111,9 @@ pub struct RecordingManager {
     child_env: Vec<(String, String)>,
     /// [`START_TIMEOUT`], unless a test shortens it.
     start_timeout: Duration,
+    /// FR-85 P3 — the initiator of the most recent start when it was REMOTE
+    /// (`None` for a local one). Meaningful only while the state is active.
+    remote: StdMutex<Option<RemoteInitiator>>,
 }
 
 impl RecordingManager {
@@ -91,7 +126,23 @@ impl RecordingManager {
             service_identity: super::identity::daemon_is_service_account(),
             child_env: Vec::new(),
             start_timeout: START_TIMEOUT,
+            remote: StdMutex::new(None),
         }
+    }
+
+    /// Can this daemon record at all (FR-85 P3 advertises remote recording
+    /// only where it can)? `false` for a SYSTEM/root service until P1e.
+    pub fn available(&self) -> bool {
+        !self.service_identity
+    }
+
+    /// FR-85 P3 — the session a REMOTE recording in progress belongs to.
+    /// `None` when idle, or when the active recording is local.
+    pub fn active_remote(&self) -> Option<RemoteInitiator> {
+        if !self.snapshot().active {
+            return None;
+        }
+        self.remote.lock().ok().and_then(|r| r.clone())
     }
 
     /// Shorten the start deadline — for the test that proves a recorder
@@ -140,18 +191,47 @@ impl RecordingManager {
     /// Start a recording. Answers once the child has either begun encoding or
     /// refused, so the caller learns the folder, the encoder, or why not.
     pub async fn start(&self, opts: RecordStartOpts) -> Response {
+        match self.start_inner(opts, None).await {
+            Ok(state) => Response::Recording(state),
+            Err(e) => Response::Error {
+                message: e.message(),
+            },
+        }
+    }
+
+    /// FR-85 P3 — start a recording for a REMOTE controller: the sidecar
+    /// names them (what a download is later checked against), and the state
+    /// says who the host is being recorded for.
+    ///
+    /// ⚠️ Never the microphone. It is not a parameter here, so no caller can
+    /// pass it through: a remote controller switching on a host's microphone
+    /// is not a thing this path can express.
+    pub async fn start_remote(
+        &self,
+        initiator: RemoteInitiator,
+        system_audio: bool,
+    ) -> Result<RecordingState, StartError> {
+        let opts = RecordStartOpts {
+            system_audio,
+            microphone: false,
+            ..Default::default()
+        };
+        self.start_inner(opts, Some(initiator)).await
+    }
+
+    async fn start_inner(
+        &self,
+        opts: RecordStartOpts,
+        remote: Option<RemoteInitiator>,
+    ) -> Result<RecordingState, StartError> {
         if self.service_identity {
-            return Response::Error {
-                message: SERVICE_IDENTITY_REFUSAL.into(),
-            };
+            return Err(StartError::Unavailable(SERVICE_IDENTITY_REFUSAL.into()));
         }
         let mut guard = self.active.lock().await;
         if let Some(a) = guard.as_ref()
             && !*a.ended.borrow()
         {
-            return Response::Error {
-                message: "a recording is already running".into(),
-            };
+            return Err(StartError::Busy);
         }
         // A previous child that ended: reap it before starting the next — but
         // never wait on it unboundedly: one that already reported `stopped`
@@ -183,6 +263,15 @@ impl RecordingManager {
         if opts.microphone {
             cmd.arg("--microphone");
         }
+        // FR-85 P3 — the `=` form, so a display name that starts with `-`
+        // is a value, never a flag.
+        if let Some(r) = &remote {
+            cmd.arg(format!(
+                "--remote-user-id={}",
+                r.controller_user_id.to_hex()
+            ))
+            .arg(format!("--remote-user-name={}", r.controller_name));
+        }
         // The config-backed knobs (the encoder denylist, pinned devices) are
         // process-local here; hand them to the child as real env, exactly as
         // the capability probe does, or the gate would be a courtesy.
@@ -200,16 +289,14 @@ impl RecordingManager {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                return Response::Error {
-                    message: format!("could not launch the recorder: {e}"),
-                };
+                return Err(StartError::Failed(format!(
+                    "could not launch the recorder: {e}"
+                )));
             }
         };
         let stdin = child.stdin.take();
         let Some(stdout) = child.stdout.take() else {
-            return Response::Error {
-                message: "the recorder has no stdout".into(),
-            };
+            return Err(StartError::Failed("the recorder has no stdout".into()));
         };
 
         // A fresh state for this recording; the last one's ending stays.
@@ -217,8 +304,12 @@ impl RecordingManager {
             let last = s.last.take();
             *s = RecordingState {
                 last,
+                remote_controller: remote.as_ref().map(|r| r.controller_name.clone()),
                 ..Default::default()
             };
+        }
+        if let Ok(mut r) = self.remote.lock() {
+            *r = remote;
         }
         let (ended_tx, ended_rx) = watch::channel(false);
         let (started_tx, mut started_rx) = watch::channel(false);
@@ -264,6 +355,7 @@ impl RecordingManager {
                     "the recorder exited before it started — see the daemon's log"
                 };
                 s.active = false;
+                s.remote_controller = None;
                 s.last = Some(RecordingEnded {
                     reason: "recorder_exited".into(),
                     path: s.path.clone(),
@@ -292,10 +384,9 @@ impl RecordingManager {
         .await;
         let snap = self.snapshot();
         match outcome {
-            Ok(()) if snap.active => Response::Recording(snap),
-            Ok(()) => Response::Error {
-                message: snap
-                    .last
+            Ok(()) if snap.active => Ok(snap),
+            Ok(()) => Err(StartError::Failed(
+                snap.last
                     .as_ref()
                     .map(|l| {
                         format!(
@@ -305,7 +396,7 @@ impl RecordingManager {
                         )
                     })
                     .unwrap_or_else(|| "the recording did not start".into()),
-            },
+            )),
             Err(_) => {
                 // ⚠️ Never leave running a recorder whose caller was told it
                 // did not start: stuck in an encoder open or a first frame,
@@ -326,6 +417,7 @@ impl RecordingManager {
                 *guard = None;
                 if let Ok(mut s) = self.state.lock() {
                     s.active = false;
+                    s.remote_controller = None;
                     s.last = Some(RecordingEnded {
                         reason: "start_timeout".into(),
                         path: None,
@@ -337,18 +429,27 @@ impl RecordingManager {
                         )),
                     });
                 }
-                Response::Error {
-                    message: format!(
-                        "the recorder did not start within {} s — it was stopped",
-                        self.start_timeout.as_secs_f32()
-                    ),
-                }
+                Err(StartError::Failed(format!(
+                    "the recorder did not start within {} s — it was stopped",
+                    self.start_timeout.as_secs_f32()
+                )))
             }
         }
     }
 
-    /// Stop the active recording and answer once its file is final.
+    /// Stop the active recording and answer once its file is final — the
+    /// person AT the device asking (the LocalAPI, the tray, the banner). A
+    /// REMOTE recording stopped this way ends `host_stopped`, so the
+    /// controller is told the host ended it rather than that they did.
     pub async fn stop(&self) -> Response {
+        let reason = self.active_remote().map(|_| "host_stopped");
+        self.stop_with(reason).await
+    }
+
+    /// Stop with a reason from the closed set the recorder knows
+    /// (`requested`, `host_stopped`, `session_ended`, `gate_revoked`); `None`
+    /// is a plain `requested`.
+    pub async fn stop_with(&self, reason: Option<&str>) -> Response {
         let mut guard = self.active.lock().await;
         let Some(active) = guard.as_mut() else {
             return Response::Recording(self.snapshot());
@@ -356,7 +457,11 @@ impl RecordingManager {
         if !*active.ended.borrow()
             && let Some(stdin) = active.stdin.as_mut()
         {
-            let _ = stdin.write_all(b"{\"cmd\":\"stop\"}\n").await;
+            let line = match reason {
+                Some(r) => serde_json::json!({ "cmd": "stop", "reason": r }).to_string(),
+                None => r#"{"cmd":"stop"}"#.to_string(),
+            };
+            let _ = stdin.write_all(format!("{line}\n").as_bytes()).await;
             let _ = stdin.flush().await;
         }
         let mut ended = active.ended.clone();
@@ -374,6 +479,11 @@ impl RecordingManager {
 
     pub fn status(&self) -> Response {
         Response::Recording(self.snapshot())
+    }
+
+    /// The same as [`Self::status`], unwrapped.
+    pub fn state(&self) -> RecordingState {
+        self.snapshot()
     }
 
     /// The folder recordings go to, and the finished recordings in it.
@@ -468,6 +578,7 @@ fn apply_event(s: &mut RecordingState, ev: &serde_json::Value) -> bool {
         }
         Some("stopped") => {
             s.active = false;
+            s.remote_controller = None;
             s.duration_ms = u64_of("duration_ms");
             s.bytes = u64_of("bytes");
             s.frames = u64_of("frames");
@@ -485,6 +596,7 @@ fn apply_event(s: &mut RecordingState, ev: &serde_json::Value) -> bool {
         }
         Some("refused") | Some("error") => {
             s.active = false;
+            s.remote_controller = None;
             s.last = Some(RecordingEnded {
                 reason: str_of("code").unwrap_or_else(|| "error".into()),
                 path: None,

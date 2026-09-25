@@ -164,6 +164,10 @@ fn consent_deny_rect() -> RECT {
 struct State {
     /// Active sessions: `session_id_hex → controller display name`.
     sessions: HashMap<String, String>,
+    /// FR-85 P3 — the sessions RECORDING the screen. While any is, the badge
+    /// is pinned open and says so: a recording is not something to be told
+    /// about only when the cursor happens to wander to the top edge.
+    recording: std::collections::HashSet<String>,
     /// FR-27 — the consent question currently on screen, if any.
     ///
     /// At most ONE: two overlapping Approve/Deny panels is how someone
@@ -285,8 +289,30 @@ impl Inner {
         {
             let mut s = self.state.lock().unwrap();
             s.sessions.remove(&session_id);
+            s.recording.remove(&session_id);
         }
         self.post_redraw();
+    }
+
+    /// FR-85 P3 — mark a session as recording (or not). `true` when the badge
+    /// will SHOW it: the pump is up and the session is on it. A session the
+    /// badge does not carry is never marked, so nothing claims a notice that
+    /// is not on screen.
+    pub(super) fn set_recording(&self, session_id: &str, recording: bool) -> bool {
+        let shown = {
+            let mut s = self.state.lock().unwrap();
+            if !recording {
+                s.recording.remove(session_id);
+                false
+            } else if s.sessions.contains_key(session_id) {
+                s.recording.insert(session_id.to_string());
+                true
+            } else {
+                false
+            }
+        };
+        self.post_redraw();
+        shown && self.hwnd.lock().unwrap().is_some()
     }
 
     /// FR-27 — raise the native consent panel. `false` when one is already up
@@ -550,6 +576,11 @@ unsafe fn pump_ptr(hwnd: HWND) -> *mut PumpState {
 /// True while ≥1 session is active.
 unsafe fn has_session(p: *mut PumpState) -> bool {
     unsafe { !(*p).shared.lock().unwrap().sessions.is_empty() }
+}
+
+/// FR-85 P3 — true while ≥1 session is recording the screen.
+unsafe fn is_recording(p: *mut PumpState) -> bool {
+    unsafe { !(*p).shared.lock().unwrap().recording.is_empty() }
 }
 
 unsafe fn show_badge(p: *mut PumpState) {
@@ -916,6 +947,14 @@ unsafe extern "system" fn border_wnd_proc(
                     }
                     return LRESULT(0);
                 }
+                // FR-85 P3 — while anything records, the badge stays OPEN:
+                // no hover-to-reveal, no auto-hide.
+                if is_recording(p) {
+                    if !(*p).badge_visible {
+                        show_badge(p);
+                    }
+                    return LRESULT(0);
+                }
                 // Decide inside a short borrow, then run window ops after
                 // it is dropped (they can re-enter the pump).
                 let (do_show, do_hide) = {
@@ -1140,20 +1179,18 @@ unsafe fn paint_badge(hwnd: HWND) {
         let _ = SelectObject(hdc, old_pen);
         let _ = SelectObject(hdc, old_brush);
 
-        // Read the current controller name (first/only session).
-        let name = {
+        // Read the current controller name (first/only session), and whether
+        // anything is recording (FR-85 P3).
+        let (name, recording) = {
             let p = pump_ptr(hwnd);
             if p.is_null() {
-                String::new()
+                (String::new(), false)
             } else {
-                (*p).shared
-                    .lock()
-                    .unwrap()
-                    .sessions
-                    .values()
-                    .next()
-                    .cloned()
-                    .unwrap_or_default()
+                let s = (*p).shared.lock().unwrap();
+                (
+                    s.sessions.values().next().cloned().unwrap_or_default(),
+                    !s.recording.is_empty(),
+                )
             }
         };
         let inits = initials_of(&name);
@@ -1179,7 +1216,11 @@ unsafe fn paint_badge(hwnd: HWND) {
         let text_right = button_rect().left - 8;
         draw_text(
             hdc,
-            "Being viewed by",
+            if recording {
+                "\u{25CF} Recording, viewed by"
+            } else {
+                "Being viewed by"
+            },
             RECT {
                 left: text_left,
                 top: 6,

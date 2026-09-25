@@ -1093,6 +1093,11 @@ impl LocalApiState for DaemonState {
                     rc.adopt_local(&cfg);
                 }
                 // (`files_dir` was re-seeded on the blocking thread above.)
+                // FR-85 P3b — the remote-recording gates are live the same
+                // way, and an OFF stops a remote recording in progress. The
+                // console gate on `record_*` keys has already run.
+                #[cfg(feature = "recording")]
+                crate::recording::remote::adopt(&cfg);
                 // The surface says per key whether that re-seed made the
                 // change live (FR-84 D2) — log the same truth the client
                 // shows, never a blanket "on restart".

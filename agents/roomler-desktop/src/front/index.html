@@ -502,6 +502,23 @@
           <p id="rec-folder-error" class="error small" hidden></p>
         </div>
 
+        <!-- FR-85 P3b — the owner's remote-recording gates (hidden against a
+             device service that predates them). -->
+        <div class="card" id="rec-remote" hidden>
+          <h3>Recording by a remote controller</h3>
+          <p class="muted small" style="margin: 0 0 8px">
+            Off unless you turn it on. When on, someone controlling this device through Roomler
+            may ask to record the screen. The recording is saved on this device, a banner shows
+            while it runs, and you can stop it at any time. Your microphone is never recorded
+            remotely.
+          </p>
+          <div class="actions">
+            <label><input type="checkbox" id="rec-remote-enabled" /> Allow remote recording</label>
+            <label><input type="checkbox" id="rec-remote-audio" /> Include computer audio</label>
+          </div>
+          <p id="rec-remote-error" class="error small" hidden></p>
+        </div>
+
         <div class="card">
           <h3>Saved recordings</h3>
           <p id="rec-empty" class="muted small" style="margin: 0" hidden>No recordings yet.</p>

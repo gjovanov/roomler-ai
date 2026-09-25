@@ -3,13 +3,15 @@
 > **FR-85** ([#1634](https://github.com/gjovanov/roomler-ai/issues/1634),
 > [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core,
 > and its audio on Windows and Linux), P2a (the local verbs), P2b
-> (roomler-desktop's Recordings view and tray) and P3a (the server's gates for
-> remote recording, §10).** It sits behind the `recording` cargo feature and
-> is in no release build yet. It is driven by `roomlerd record`, by the daemon
-> for the LocalAPI recording verbs and `roomler record` (§6), and by
-> roomler-desktop (§7). Still to come: the microphone on macOS, delivery out of
-> the recorder's data folder (P2c), the device and viewer halves of remote
-> recording (P3b, P3c), and the editor (cut, speed up, background music) in P5.
+> (roomler-desktop's Recordings view and tray), P3a (the server's gates for
+> remote recording) and P3b (the device's half of it, §10).** It sits behind
+> the `recording` cargo feature and is in no release build yet. It is driven by
+> `roomlerd record`, by the daemon for the LocalAPI recording verbs and
+> `roomler record` (§6), by roomler-desktop (§7), and by a remote controller
+> over the session's `record` channel (§10). Still to come: the microphone on
+> macOS, delivery out of the recorder's data folder (P2c), downloading a remote
+> recording and re-attaching after a drop (P3b-2), the viewer's Record button
+> (P3c), and the editor (cut, speed up, background music) in P5.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -380,13 +382,15 @@ the bundle targets 12). The microphone needs cpal on macOS, plus
 `NSMicrophoneUsageDescription` and the `audio-input` entitlement in the
 bundle. Both are refused by name until then.
 
-## 10. Remote recording — the server's gates (P3a)
+## 10. Remote recording (P3)
 
-A controller in the browser will be able to record the screen it controls. P3b
-builds the device side and P3c the viewer. The file stays **on the device**, and
+A controller in the browser records the screen it controls. P3a built the
+server's gates, P3b the device side, and P3c builds the viewer. The file stays **on the device**, and
 the controller downloads it on demand over the session's own P2P channel. The
 server never holds a byte of it (`RemoteSession.recording_url` stays `None`). It
 decides who may ask, and it keeps the device's account of what happened.
+
+### The server's gates (P3a)
 
 The session bit is `Permissions::RECORD`. Before P3a nothing read it, and the
 hub passed through every bit a tab asked for except INPUT, so any tab could ask
@@ -435,8 +439,88 @@ locked by `remote_recording_does_not_imply_remote_audio`. It is the same lesson
 as `ssh` and `ssh-consent`. A word this server does not know is ignored, never
 an error. The microphone is not a remote option at all.
 
-Until P3b ships, no agent advertises `record`, so every request for RECORD is
-stripped with `device_not_opted_in`. P3a is inert in the field on its own.
+An agent older than P3b never advertises `record`, so every request for RECORD
+to it is stripped with `device_not_opted_in`.
+
+### The device's half (P3b)
+
+The owner switches it on in roomler-desktop's Recordings view ("Allow remote
+recording", and separately "Include computer audio"), or with
+`roomler config set record_remote_enabled true`. Both keys are device-only: the
+console gate accepts them only from the person at the device, and
+`DesiredConfig` cannot carry them. Both are live. The agent re-announces its caps
+on the next heartbeat, so the hub follows within one beat, and an OFF also stops
+a remote recording in progress (`gate_revoked`). The agent advertises `remote`
+only while the switch is on AND a recorder can run in its process, and
+`remote-audio` only on top of that with the audio switch on and an audio build.
+
+A controller holding RECORD opens a `record` DataChannel on the session
+(`recording/remote.rs`). On a session whose grant lacks RECORD the channel
+answers every request with `not_granted`, the same attach-time gate as `files`
+and `input` (`peer.rs`).
+
+```mermaid
+sequenceDiagram
+    participant V as viewer
+    participant D as device (record DC)
+    participant H as the host's screen
+    participant R as roomlerd record
+
+    V->>D: rc:record.start {id, audio?}
+    D->>D: the owner's switch · a recorder here · audio allowed · not busy
+    alt the session was consented ON THE HOST
+        D-->>V: rc:record.state pending_consent
+        D->>H: "Alice wants to record this screen" (a FRESH prompt id)
+        H-->>D: approve / deny / no answer
+    end
+    D->>H: banner: "Recording your screen for Alice" + Stop recording
+    Note over D,H: nothing can show it ⇒ refused {no_indicator_surface}
+    D->>R: start_remote (never the microphone)
+    D-->>V: rc:record.state recording {name}, then progress each second
+    V->>D: rc:record.stop
+    R-->>D: the file is final
+    D-->>V: rc:record.state stopped {reason, bytes, duration_ms, name}
+```
+
+| Refusal | Why |
+|---|---|
+| `not_granted` | the session's grant lacks RECORD |
+| `disabled_on_device` | the owner's switch is off, read at the moment of asking and again after the prompt |
+| `unavailable` | no recorder can run in this process: a SYSTEM/root service until P1e, or a session delegated to the macOS GUI worker |
+| `audio_not_allowed` | computer audio was asked for and the owner has not allowed it, or the build has no audio |
+| `busy` | a recording is already running, local or remote |
+| `already_starting` | this session is already starting one |
+| `consent_denied` | the host said no. The same session is then refused `rate_limited` for 60 s |
+| `consent_timeout` / `no_prompt_surface` | nobody answered / nobody could be asked |
+| `no_indicator_surface` | nothing on this device could show that it is being recorded |
+| `start_failed` | the recorder refused or failed; `detail` says which |
+
+A recording ends `requested` (the controller's Stop), `host_stopped` (the host's
+Stop: the banner, the tray, the Recordings view, `roomler record stop`),
+`gate_revoked`, `session_ended`, or with the recorder's own reasons (`disk_low`,
+`max_duration`, …). The device reports every outcome as `rc:recording.activity`.
+
+⚠️ **A fresh prompt id, never the session's.** The session already has an
+answered prompt. A decision recorded against its id, or anything derived from
+it, must not be able to answer this one: the `ssh` / `ssh-consent` lesson.
+
+⚠️ **Something on screen says "recording" before the first frame.** On Windows
+the daemon's own badge is pinned open while recording and reads "Recording,
+viewed by …". It is capture-excluded, so it is not in the recording. Everywhere
+else the companion's banner reads "Recording your screen for …" and has a
+**Stop recording** button that keeps the session. On X11 and macOS that banner
+is not capture-excluded and appears in the recording. With no surface at all the
+start is refused. There is no unattended exception yet: an unattended host runs
+the recorder as SYSTEM/root, which P1e must solve first.
+
+⚠️ **An older companion.** A companion that predates `record` renders an
+unknown prompt kind as a remote-control request. So a record prompt carries the
+whole question in its detail line, the one field every companion shows as it
+is.
+
+Not in P3b yet: the download (`rc:record.list` / `rc:record.get`, resumable)
+and the 60 s re-attach after a dropped session (P3b-2), and the viewer's Record
+button (P3c).
 
 ### Decision and claim, like SSH
 
@@ -466,7 +550,10 @@ audit. The device is resolved within the tenant, so a foreign id gets a 404.
 | `recording::audio` unit tests (P1c) | 48 kHz passes through exactly (one frame of interpolator latency); mono → both channels; a 44.1 kHz sine resamples to 48 kHz at the same pitch; a positive rate trim consumes faster; the soft clip is linear below the knee, monotonic, never wraps; a silent source still yields one frame per 20 ms; two sources sum; a backlog is cut to the lag keeping the newest; a 0.2 % fast source is held near the lag by the rate correction, never trimmed | "Test the recorder (FR-85)", the `audio` run |
 | `tests/recorder.rs`, audio (P1c) | a 440 Hz tone at 44.1 kHz mono plus a microphone that delivers nothing → an Opus track within 80 ms of the video, decoded back at 440 Hz with the right level; the same recording without audio has no audio track (the negative control); `roomlerd record --system-audio` through the real process; a build without `audio` refuses `--microphone` with `audio_unavailable` | both runs of the same step |
 | `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |
-| `crates/agent-core` | `record_dir` set/echo/validate/clear; the live set is exactly `exec_enabled`, `remote_config_enabled`, `record_dir`; `recording_dir` validation incl. a real Windows junction | same |
+| `crates/agent-core` | `record_dir` set/echo/validate/clear; the live set is exactly `exec_enabled`, `remote_config_enabled`, `record_dir`, `record_remote_enabled`, `record_remote_audio`; `recording_dir` validation incl. a real Windows junction | same |
+| `recording::remote` unit tests (P3b) | nothing advertised unless the owner opted in AND a recorder can run, `remote-audio` only on top with an audio build; the prechecks refuse in order and by name; the wire parses (audio off unless asked; a `microphone` field is ignored) and speaks the documented state shape; the controller is told a file name, never a path; `adopt` signals only a change | "Test the recorder (FR-85)" (`--lib recording::`) |
+| `tests/control_dc_record.rs` (P3b) | A loopback PeerConnection pair, the PRODUCTION `record` handler and the real recorder child. The owner's switch and the audio gate refuse by name, leave no file and no banner, and are reported to the server; a grant without RECORD gets a refusing channel. No indicator surface means no recording and no running recorder. An auto-granted session records: the banner is up before the file, a second start is `busy`, Stop ends it `requested`, and the sidecar names the controller with no microphone. A host-consented session asks again with a FRESH prompt id (never the session's), the detail line carries the question, a deny holds for a minute (`rate_limited`), and an approval records. The owner's OFF ends it `gate_revoked`, the host's Stop `host_stopped`, the controller going away `session_ended` | same step, `--test control_dc_record` |
+| `rc_sessions` (P3b) | the banner's `recording` follows the session, survives a re-announce, and cannot be set on a session the banner does not show | the default `--lib` step |
 | `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config`; `remote_recording_does_not_imply_remote_audio` (equality, an old agent's hello advertises nothing, a newer word is ignored, the wire words are pinned); `rc:recording.activity` owned by `remote` | same |
 | `crates/db` (P3a) | `RECORD_REMOTE_SCREEN` is named, inside `ALL`, in no managed row below `ADMINISTRATOR`, and outside `DEFAULT_ADMIN` | same |
 | `crates/modules/fleet` (P3a) | `record_grant`'s table: kept only when the controller may AND the device serves it, each refusal with its reason, a grant without RECORD untouched; the hub strips RECORD from the effective grant and names why in `SessionCreated`; a coalesced duplicate repeats the reason | "Run fleet module unit tests" |
@@ -474,7 +561,9 @@ audit. The device is resolved within the tenant, so a foreign id gets a 404.
 | `ui/src/__tests__/utils/permissions.spec.ts` (P3a) | the catalogue lists 32 bits, `RECORD_REMOTE_SCREEN` is `2 ** 31` (positive, not `1 << 31`), and mask arithmetic keeps bit 31 | "Frontend checks" |
 | `agents/roomler-cli` | `record` verbs parse; lengths and endings read plainly | same |
 | `ui/src/__tests__/companion/recordings.spec.ts` | roomler-desktop's REAL `index.html` section and `recordings.js`, in jsdom against a mocked `invoke`: Start greyed out with the reason, the running state, start options, a refusal said, delete only on the second click (red when a single click deletes), the arm expiring, the folder picker saving through `cmd_config_set` and a cancel saving nothing, keyed rows kept in place (red when rows are rebuilt), the last good data kept on a failed refresh, a service with no recorder | "Frontend checks" (`bun run test:unit`) |
-| `agents/roomler-desktop` | the tray's wording and when its item is enabled; only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys are the daemon's to accept | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |
+| `ui/src/__tests__/companion/recordings.spec.ts` (P3b) | the remote-recording card: absent against a service that predates the gates; computer audio offered only once remote recording is allowed; each toggle saved through `cmd_config_set`; a refused toggle said and not faked; a remote recording's status names who it is for | "Frontend checks" |
+| `ui/src/__tests__/companion/viewing.spec.ts` (P3b) | the REAL banner (`panel-viewing.html` / `.js`): who is watching; a RECORDING controller leads, even when another viewer came first (red when the lookup is removed); Stop recording stops the recording and not the session; the notice comes down when the recording ends | "Frontend checks" |
+| `agents/roomler-desktop` | the tray's wording and when its item is enabled; only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys (incl. both remote gates) are the daemon's to accept; the remote gates come from the listing and are absent on an older service | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |
 
 ⚠️ `agents/roomlerd/tests/*.rs` runs only when a step **names** it. Every other
 roomlerd test step is `--lib`, which is why `tests/file_dc.rs` has never run in
