@@ -1,6 +1,6 @@
 # FR-45 — Portal capture: Wayland where there is no scanout
 
-**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. **P4 (RemoteDesktop input) FIELD-VERIFIED** — injection lands to the exact requested pixel, scroll sign correct, restore round trip clean · **Owner:** agent / capture
+**Issue:** [#1041](https://github.com/gjovanov/roomler-ai/issues/1041) · **Status:** P1 → P3c COMPLETE and field-verified — **a Wayland desktop is captured through the portal and delivered to the daemon as a correct picture**. **P4 (RemoteDesktop input) FIELD-VERIFIED** — injection lands to the exact requested pixel, scroll sign correct, restore round trip clean. **P5 (mutter direct) FIELD-VERIFIED on WSL2, through the daemon's own cascade, encoding with `av1_nvenc`** (2026-09-25). **Docs:** [`docs/linux-capture.md`](../linux-capture.md) · **Owner:** agent / capture
 
 ## Goal
 
@@ -63,6 +63,7 @@ on a machine with no scanout. The backend priority stays
 | **P3c-ii** ✅ | Frames to the daemon and the **sixth `ScreenCapture` backend**, picked after DRM and before X11. ⚠️ A pipe and a copy, **not** `SCM_RIGHTS` — see the corrected decision below. Field-verified through `capture-smoke` as root: `backend=portal`, **delivered=5 empty=0**, 1920x1080 Bgra, `mean_ms=27.70`, and the dumped frame is a correct picture. | `ROOMLERD_PORTAL_CAPTURE=1` |
 | **P4** ✅ (2026-09-01, field-verified on Asahi/GNOME) | Input via the portal's **RemoteDesktop** interface, riding the SAME session as capture — `CreateSession`/`Start` move to RemoteDesktop, `SelectDevices` (keyboard+pointer, persist on v2+) slots in before the unchanged `SelectSources`, so ONE consent dialog covers see+touch and one restore token covers both (stored apart from the capture-only token: `portal-restore-token-rd`). The daemon's input arbiter forwards `InputMsg` JSON lines to the helper's stdin; the helper maps them to `Notify*` (evdev keycodes via the shared FR-36 table; typed text as Unicode keysyms, layout-proof; absolute motion in the stream's LOGICAL size). Falls back to capture-only where the portal has no RemoteDesktop (wlr, measured). Motivation measured 2026-08-31: uinput works in WSL2 and libinput even enumerates the device — but a NESTED compositor reads its parent, not evdev, so nothing consumes the events. | `ROOMLERD_PORTAL_INPUT=0` (config `portal_input`) |
 | **P5** ✅ (2026-09-01, field-verified on BOTH hosts) | **`org.gnome.Mutter.ScreenCast` DIRECT — the unattended sibling, for hosts the portal cannot serve.** Mutter's own API needs no portal backend and shows no consent dialog, which is exactly what blocks WSL2 (where `xdg-desktop-portal-gnome` exits without a GNOME session, while `mutter --headless` runs fine and exposes ScreenCast v4). Same PipeWire consumption, same POD negotiation, same wire format and `ScreenCapture` backend — only the *session broker* changes. ⚠️⚠️ **This is NOT a portal variant and must never be described as one: it does not ask.** Its peer is FR-36's DRM backend (also unattended, also opt-in), not P2b. | `ROOMLERD_MUTTER_CAPTURE` (config `mutter_capture`), default **OFF** |
+| **Docs** ✅ (2026-09-25, added retroactively — see the criterion) | [`docs/linux-capture.md`](../linux-capture.md): the Linux capture cascade and its four arms, the attended-only rule, the logind gate (P5b), the knobs and the probe-trigger they share; the Linux rows of `remote-control.md` §5.1 and §6.1 and the cascade paragraph + probe-cache warning in `encoders.md` brought up to date; a `docs/README.md` row. | n/a |
 
 ### The seam is unchanged
 
@@ -389,6 +390,21 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
       after a full helper restart, came up `input_ok:true` in seconds with **no
       dialog**, restoring from `portal-restore-token-rd` — and injection landed
       again in that restored session
+- [x] **Docs updated/created with diagrams, linked from `docs/README.md`** —
+      [`docs/linux-capture.md`](../linux-capture.md): the Linux capture cascade
+      and why each arm is opt-in, the portal handshake and the mutter broker as
+      `mermaid` sequence diagrams, the helper/`dlopen` dependency rule, input on
+      the same session, the **attended-only rule** and every place the product
+      states it, portal detection and its five verdicts, the logind session
+      gate that keeps P5 off WSL2 and headless hosts (open decision P5b) with
+      the transient-unit recipe, the field table, the configuration keys and
+      the caps-probe trigger they all share; `file:line` anchors verified
+      against master. Indexed in `docs/README.md`, and cross-linked from
+      `remote-control.md` §5.1 / §6.1 and `encoders.md` (capture backends, the
+      probe cache). ⚠️ **Added retroactively (2026-09-25)**: FR-45 opened on
+      2026-08-31, before the docs-before-close rule (#1401, 2026-09-05), and a
+      close after that date binds it. Marked rather than backdated, so the spec
+      does not claim it always complied.
 
 ## Open decisions
 
