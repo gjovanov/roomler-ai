@@ -4203,13 +4203,21 @@ mod tests {
             ("vp9_qsv", (C::Vp9, B::Qsv)),
             ("h264_videotoolbox", (C::H264, B::VideoToolbox)),
             ("hevc_vaapi", (C::Hevc, B::Vaapi)),
+            // FR-78 added these two backends. They sat in the `unknown` list
+            // below — written for FR-77, when they were — and the test failed
+            // on master for as long as no CI lane ran this crate.
+            ("h264_vulkan", (C::H264, B::Vulkan)),
+            ("av1_d3d12va", (C::Av1, B::D3d12)),
         ] {
             assert_eq!(B::from_ffmpeg_name(name), Some(want), "{name}");
         }
+        // Real FFmpeg encoder names this build's tables do NOT carry — so a
+        // backend added to a dispatch table without a vocabulary entry still
+        // fails here, which is the point of the test.
         for unknown in [
             "hevc_mf",
-            "h264_vulkan",
-            "av1_d3d12va",
+            "h264_v4l2m2m",
+            "hevc_mediacodec",
             "libx264",
             "hevc",
             "",
@@ -4241,9 +4249,12 @@ mod tests {
                     chroma: vec!["yuv420".into()],
                     hw: true,
                 },
+                // A backend this build does not know. It was `vulkan` until
+                // FR-78 taught the vocabulary that one, which silently turned
+                // "an unknown cell is skipped" into a failing assertion.
                 VideoCell {
                     codec: "av1".into(),
-                    backend: "vulkan".into(),
+                    backend: "mediacodec".into(),
                     chroma: vec!["yuv420".into()],
                     hw: true,
                 },
@@ -4260,7 +4271,7 @@ mod tests {
         assert_eq!(
             typed.len(),
             2,
-            "the vvc and vulkan cells are unknown here: {typed:?}"
+            "the vvc and mediacodec cells are unknown here: {typed:?}"
         );
         assert_eq!(
             typed[1].chroma,
@@ -4269,7 +4280,7 @@ mod tests {
         assert!(caps.has_cell(VideoCodec::Hevc, ChromaFormat::Yuv444));
         assert!(
             !caps.has_cell(VideoCodec::Av1, ChromaFormat::Yuv420),
-            "the vulkan cell is unreadable here"
+            "the mediacodec cell is unreadable here"
         );
         assert!(!caps.has_cell(VideoCodec::H264, ChromaFormat::Yuv420));
 
