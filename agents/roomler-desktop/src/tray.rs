@@ -6,6 +6,9 @@
 //!
 //! Menu items:
 //!   - Open Roomler       — show the main window (Overview view)
+//!   - Start/Stop recording — FR-85: record this screen through the device
+//!                           service; the label and the tray tooltip follow
+//!                           the recorder (a light poll, every 3 s)
 //!   - Onboarding…        — show the main window on the Onboarding view
 //!   - Check for Updates  — invoke `cmd_check_update` and surface
 //!                           the result in the Overview's update panel
@@ -26,6 +29,8 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // S7 — the embedded web-app window (WebView2 on Windows; browser
     // elsewhere). Distinct from the LOCAL status window above.
     let open_web = MenuItem::with_id(app, "open_web", "Open Roomler…", true, None::<&str>)?;
+    // FR-85 — disabled until the service says it has a recorder.
+    let record = MenuItem::with_id(app, RECORD_ITEM_ID, "Start recording", false, None::<&str>)?;
     let onboarding = MenuItem::with_id(app, "onboarding", "Onboarding…", true, None::<&str>)?;
     let check_updates_item = MenuItem::with_id(
         app,
@@ -41,6 +46,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         &[
             &open_status,
             &open_web,
+            &record,
             &onboarding,
             &check_updates_item,
             &open_logs,
@@ -51,6 +57,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let on_menu = |app: &AppHandle<R>, event: tauri::menu::MenuEvent| match event.id.as_ref() {
         "open_status" => show_window(app, "/overview"),
         "open_web" => open_roomler_web(app),
+        RECORD_ITEM_ID => toggle_recording(app),
         "onboarding" => show_window(app, "/onboarding"),
         "check_updates" => check_updates(app),
         "open_logs" => {
@@ -77,6 +84,8 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             show_window(tray.app_handle(), "/overview");
         }
     };
+
+    spawn_recording_watch(app.clone(), record);
 
     // FR-27 — ADOPT the tray Tauri already created from `app.trayIcon` in
     // tauri.conf.json instead of building a second one.
@@ -105,7 +114,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         id = CONFIG_TRAY_ID,
         "no config-declared tray icon found — building one with the embedded fallback image"
     );
-    let mut builder = TrayIconBuilder::with_id("roomler-desktop-tray")
+    let mut builder = TrayIconBuilder::with_id(FALLBACK_TRAY_ID)
         .tooltip("Roomler")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -131,6 +140,93 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 /// The id Tauri gives the tray it creates from `app.trayIcon`. Set explicitly
 /// in `tauri.conf.json` so this lookup does not depend on Tauri's default.
 const CONFIG_TRAY_ID: &str = "roomler";
+/// The fallback tray's id (see `install`).
+const FALLBACK_TRAY_ID: &str = "roomler-desktop-tray";
+
+/// FR-85 — the Start/Stop recording menu item.
+const RECORD_ITEM_ID: &str = "record_toggle";
+
+/// What the tray shows for the recorder's state. Pure, so the wording is
+/// tested: `None` = the service has no recorder (or is down) and the item is
+/// disabled.
+fn record_labels(state: Option<&roomler_localapi::RecordingState>) -> (String, bool, String) {
+    match state {
+        Some(s) if s.active => {
+            let secs = s.duration_ms / 1000;
+            let t = format!("{}:{:02}", secs / 60, secs % 60);
+            (
+                format!("Stop recording ({t})"),
+                true,
+                format!("Roomler — recording {t}"),
+            )
+        }
+        // Start only where the service says a recording can start at all.
+        Some(s) => ("Start recording".into(), s.available, "Roomler".into()),
+        None => ("Start recording".into(), false, "Roomler".into()),
+    }
+}
+
+/// Keep the menu item and the tooltip in step with the recorder, started by
+/// this item, the Recordings view, or `roomler record` alike. One LocalAPI
+/// request every 3 s — the listener keeps a pool of instances (FR-84 D1).
+fn spawn_recording_watch<R: Runtime>(app: AppHandle<R>, item: MenuItem<R>) {
+    tauri::async_runtime::spawn(async move {
+        let mut shown: Option<(String, bool, String)> = None;
+        loop {
+            let state = match roomler_localapi::connect().await {
+                Ok(mut c) => c.record_status().await.ok(),
+                Err(_) => None,
+            };
+            let labels = record_labels(state.as_ref());
+            if shown.as_ref() != Some(&labels) {
+                let _ = item.set_text(&labels.0);
+                let _ = item.set_enabled(labels.1);
+                for id in [CONFIG_TRAY_ID, FALLBACK_TRAY_ID] {
+                    if let Some(tray) = app.tray_by_id(id) {
+                        let _ = tray.set_tooltip(Some(&labels.2));
+                    }
+                }
+                shown = Some(labels);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+}
+
+/// Start or stop a recording from the tray. A refusal (not the console
+/// user, no encoder, a SYSTEM/root service) is shown in the Recordings view,
+/// where it can be read — a tray has nowhere to put a sentence.
+fn toggle_recording<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let outcome: Result<(), String> = async {
+            let mut client = roomler_localapi::connect()
+                .await
+                .map_err(|e| format!("connecting to the device service: {e}"))?;
+            let state = client.record_status().await.map_err(|e| e.to_string())?;
+            if state.active {
+                client.record_stop().await.map(|_| ())
+            } else {
+                client.record_start(Default::default()).await.map(|_| ())
+            }
+            .map_err(|e| {
+                let m = e.to_string();
+                m.strip_prefix("localapi error: ").unwrap_or(&m).to_string()
+            })
+        }
+        .await;
+        if let Err(message) = outcome {
+            tracing::warn!(%message, "tray: recording toggle refused");
+            show_window(&app, "/recordings");
+            if let Some(window) = app.get_webview_window("main") {
+                let text = serde_json::to_string(&message).unwrap_or_else(|_| "\"\"".into());
+                let _ = window.eval(format!(
+                    "window.RoomlerRecordings && window.RoomlerRecordings.showError({text})"
+                ));
+            }
+        }
+    });
+}
 
 /// Show + focus the main window and route the SPA to `path` (a hash-router
 /// path like `/overview`). The router treats an unknown hash as `/overview`,
@@ -179,5 +275,47 @@ fn check_updates<R: Runtime>(app: &AppHandle<R>) {
         Err(e) => {
             tracing::warn!(%e, "check-update failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FR-85 — the tray says what the recorder is doing, and a service
+    /// without a recorder (or none at all) leaves the item disabled rather
+    /// than offering a Start that can only fail.
+    #[test]
+    fn the_record_item_follows_the_recorder() {
+        let idle = roomler_localapi::RecordingState {
+            available: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            record_labels(Some(&idle)),
+            ("Start recording".into(), true, "Roomler".into())
+        );
+        // A service that cannot record here (no recorder, or SYSTEM/root
+        // until P1e) answers idle — and the item stays greyed out.
+        let cannot = roomler_localapi::RecordingState::unavailable(roomler_localapi::NO_RECORDER);
+        assert!(!record_labels(Some(&cannot)).1);
+        let live = roomler_localapi::RecordingState {
+            available: true,
+            active: true,
+            duration_ms: 83_900,
+            ..Default::default()
+        };
+        assert_eq!(
+            record_labels(Some(&live)),
+            (
+                "Stop recording (1:23)".into(),
+                true,
+                "Roomler — recording 1:23".into()
+            )
+        );
+        assert_eq!(
+            record_labels(None),
+            ("Start recording".into(), false, "Roomler".into())
+        );
     }
 }

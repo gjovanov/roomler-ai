@@ -999,7 +999,9 @@ impl LocalApiState for DaemonState {
     async fn record_status(&self) -> Response {
         match &self.recorder {
             Some(r) => r.status(),
-            None => Response::Recording(Default::default()),
+            None => Response::Recording(tunnel_core::localapi::RecordingState::unavailable(
+                tunnel_core::localapi::NO_RECORDER,
+            )),
         }
     }
 
