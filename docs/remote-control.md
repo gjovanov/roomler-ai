@@ -207,10 +207,11 @@ This hybrid is exactly the `WorkerPool + RoomManager` pattern already in roomler
 |---|---|---|---|
 | Windows 10+ | `Windows.Graphics.Capture` (WGC) via `windows` crate | DXGI surface, no permission prompt for own session, handles DPI, supports per-window | DXGI Desktop Duplication |
 | macOS 12.3+ | `ScreenCaptureKit` | Apple's blessed path; handles privacy indicators, multi-display | `CGDisplayStream` (deprecated but works) |
-| Linux Wayland | `xdg-desktop-portal` ScreenCast → PipeWire | The only sanctioned route on Wayland; works on GNOME, KDE, Sway | None — Wayland refuses raw access |
-| Linux X11 | `XShm` + `XCompositeNameWindowPixmap` | Zero-copy via shared memory | Generic XGetImage |
+| Linux, a host with scanout (X11 or Wayland) | **DRM/KMS** — the scanout plane read below the compositor (FR-36, opt-in `ROOMLERD_DRM_CAPTURE=1`) | Compositor-independent, needs no consent, sees the greeter and a locked screen — the unattended path | the portal, then X11 |
+| Linux Wayland, **no** scanout (WSL2, containers, nested compositors) | **`xdg-desktop-portal` ScreenCast → PipeWire**, through a privilege-dropped helper in the user's session (FR-45, opt-in `ROOMLERD_PORTAL_CAPTURE=1`) — or `org.gnome.Mutter.ScreenCast` directly where no portal backend can run (`ROOMLERD_MUTTER_CAPTURE=1`, GNOME only, unattended) | The only route a Wayland compositor sanctions; **attended** — a logged-in user and a consent dialog, never the greeter or a locked screen | X11 |
+| Linux X11 | `XShm` via scrap, with XDamage deciding whether a frame is worth taking (FR-29) | Zero-copy via shared memory; on a headless box the daemon starts its own Xvfb (`ROOMLERD_VIRTUAL_DESKTOP=1`) | `NoopCapture` carrying the reason (§5.1a) |
 
-The portal/SCK paths produce a system permission prompt the *first* time. That's a feature, not a bug — it's the user consent layer.
+The portal/SCK paths produce a system permission prompt the *first* time. That's a feature, not a bug — it's the user consent layer. The Linux arms, their order and their gates are [`linux-capture.md`](linux-capture.md).
 
 ### 5.1a When capture cannot open, the session says why (FR-80)
 
@@ -310,6 +311,8 @@ Key design choices:
 ### 6.1 The Wayland problem
 
 Wayland has no equivalent of XTest. The supported path is `/dev/uinput`, which requires the agent to be in the `input` group (or have `CAP_SYS_ADMIN`). Installer adds the user to `input` group + udev rule. If permission isn't granted, the agent runs in **view-only** mode and the UI clearly says so.
+
+As shipped: uinput is FR-36's arm (`ROOMLERD_UINPUT=1`, paired with DRM capture; host-global, it injects into whatever has focus). Where the compositor is **nested** — WSL2, a compositor inside another — uinput publishes events that nothing reads, so the only input path is the portal's RemoteDesktop interface riding the capture session (FR-45 P4, `ROOMLERD_PORTAL_INPUT=1`), and on GNOME the person at the screen must also flip the dialog's *Allow Remote Interaction* switch. Both are in [`linux-capture.md`](linux-capture.md#43-input-rides-the-same-session-p4).
 
 ### 6.2 Remote cursor
 
