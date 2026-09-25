@@ -245,12 +245,47 @@ one more"), and conflating them would mark every tenant exactly at its limit as 
 ## Acceptance criteria
 
 - [ ] `grep -rn '\.limits()' crates/` shows **no** hand-rolled comparison outside `services::quota`.
+      *One exception, deliberate and reporting-only (2026-09-25): `plan_compliance.rs`
+      reads `max_message_history` itself, `-1` = unlimited — the retention bound this
+      FR chose not to gate, so it has no `Limit` variant. Every other comparison goes
+      through `Limit::describe`. Whether that exception satisfies this line is an
+      operator call.*
 - [ ] Adding a field to `PlanLimits` fails to compile until it is classified in `Limit`.
+      *⚠️ Not true, and never was (2026-09-25). `Limit::describe`'s exhaustive match
+      covers `Limit`'s VARIANTS, not `PlanLimits`' FIELDS: two fields —
+      `overlay_mesh`, `max_message_history` — have never had a variant (deliberately,
+      per this spec) and it compiles; a new field would too. #898 ticked this on
+      08-29, and `quota.rs`'s doc comment still claims it. The fix is an exhaustive
+      destructure of `PlanLimits` (no `..`) mapping every field to a variant or to an
+      explicit "not a gate".*
 - [ ] A Free tenant at 10 members: `add_member` **succeeds** under `Warn` and emits one denial record naming `max_members`, `used=10`, `max=10`; **refuses 403** under `Enforce`; is unaffected under `Off`.
+      *For members specifically only `Enforce` is proven at the route
+      (`the_member_cap_gates_the_admin_add_path`: the 11th seat refused, "10 of 10
+      members"); `Warn` and `Off` are proven on the channel cap and generically in the
+      unit tests. The "denial record" became a log line plus the P1c snapshot, by design.*
 - [ ] The same assertion once per wired limit — 11 tests, each proving the gate fires *and* that `Warn` does not refuse.
-- [ ] P0 changes no observable behaviour: the 3 existing device/tunnel refusals return the same status and the same message before and after the helper lands.
-- [ ] Denial records are queryable per tenant, so "who would break" can be answered before any flip.
-- [ ] No tenant is moved to `Enforce` without its warn data being read first — recorded per tenant in the field log.
+      *Not as written: 13 unit + 9 integration tests exercise the shared mechanism by
+      scenario, not once per limit. The integration suite exists to prove "each gate is
+      wired at its route", and several wired gates have no route-level test.*
+- [x] P0 changes no observable behaviour: the 3 existing device/tunnel refusals return the same status and the same message before and after the helper lands.
+      *#898 Result, field-verified on prod `v20260829-0da90b766dc0`; locked by
+      `an_established_limit_ignores_the_mode` and `a_count_gate_keeps_the_counting_message`.*
+- [x] Denial records are queryable per tenant, so "who would break" can be answered before any flip.
+      *Answered as a SNAPSHOT, not denial records — the redesign this spec records in
+      "P1c: the observe phase wants a snapshot, not an event log":
+      `GET /api/admin/plan-compliance`, field-verified on prod.*
+- [x] No tenant is moved to `Enforce` without its warn data being read first — recorded per tenant in the field log.
+      *P2 was held when the report was found under-reporting (video and AI gates
+      unmeasured, fixed in #945); `Grox` and `Jovanov` were flipped by explicit `_id`
+      after the corrected read; the other 63 — all integration-test debris, the newest
+      183 days old — were flipped as one class after confirming none was live. Field
+      log 2026-08-30.*
+
+Evidence: [#898 — Result](https://github.com/gjovanov/roomler-ai/issues/898#issuecomment-5464381341),
+[integration coverage](https://github.com/gjovanov/roomler-ai/issues/898#issuecomment-5464737453),
+[P2 complete](https://github.com/gjovanov/roomler-ai/issues/898#issuecomment-5467593411).
+*Three ticked 2026-09-25; four left open with their reasons above — the thread ticked
+all seven, and two of those ticks do not survive a check against the code.*
 
 ## Standing decision: the default stays `Warn` during early growth
 
