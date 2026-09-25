@@ -689,7 +689,21 @@ impl LocalApiState for DaemonState {
             // restart knows the relaunched daemon from the one that is leaving.
             pid: Some(std::process::id()),
             started_at_ms: Some(self.started_at_ms),
+            // FR-84 D4 — where a drop would land right now: the configured
+            // folder when it passes for THIS writer and the user logged in
+            // at this moment, else the default ladder. From a cache that is
+            // refreshed off this thread — this is a sync read on the async
+            // dispatch, and the honest answer needs the disk.
+            files_dir: crate::files::effective_files_dir(),
         }
+    }
+
+    fn encoder_caps(&self) -> Option<tunnel_core::localapi::EncoderCapsSummary> {
+        // FR-84 D4 — the probe's CACHED result and nothing else. This answers
+        // every Overview poll; `caps::detect()` here would spawn the probe
+        // children — vendor driver code — from a control-surface read on any
+        // host that has not reached its server yet.
+        Some(crate::encode::caps::summarize_cached())
     }
 
     fn peers(&self) -> Vec<PeerInfo> {
@@ -1038,8 +1052,29 @@ impl LocalApiState for DaemonState {
         let saved = tokio::task::spawn_blocking(move || {
             let mut cfg =
                 crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
+            // FR-84 D4 — `files_dir` names a folder this daemon will WRITE
+            // remote-supplied files into, as the identity it runs under. The
+            // surface's `apply` checks the shape; placement (a SYSTEM/root
+            // writer stays inside the active user's profile — the pipe admits
+            // interactive non-admins) and creatable-and-writable need THIS
+            // process's identity and its disk, so they run here, before
+            // anything is persisted: a refused value is never saved to be
+            // silently ignored at use time, and the reason goes back verbatim.
+            if key == "files_dir"
+                && let Some(v) = value.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            {
+                crate::files::validate_files_dir_setting(v)?;
+            }
             crate::config_surface::apply(&mut cfg, &key, value.as_deref())?;
             crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+            // FR-84 D4 — `files_dir` is LIVE: every transfer reads the
+            // process-global this re-seeds, so the next drop already uses
+            // the new folder. The status answer is recomputed HERE, on the
+            // blocking thread, so the read right after the set shows it.
+            crate::files::set_files_dir(cfg.files_dir.clone());
+            if key == "files_dir" {
+                crate::files::refresh_effective_files_dir();
+            }
             let entry = crate::config_surface::entry_for(&cfg, &key)
                 .ok_or_else(|| format!("unknown config key {key:?}"))?;
             Ok((entry, cfg))
@@ -1057,6 +1092,7 @@ impl LocalApiState for DaemonState {
                 if let Some(rc) = self.remote_config.as_ref() {
                     rc.adopt_local(&cfg);
                 }
+                // (`files_dir` was re-seeded on the blocking thread above.)
                 // The surface says per key whether that re-seed made the
                 // change live (FR-84 D2) — log the same truth the client
                 // shows, never a blanket "on restart".
@@ -1930,6 +1966,98 @@ mod tests {
             wired.devices("ghost", &q).await,
             Response::Upstream { ref code, .. } if code == "unknown_org"
         ));
+    }
+
+    /// FR-84 D4 — `files_dir` is gated in the daemon's `ConfigSet` BEFORE
+    /// the save: a folder this writer would refuse at use time (a system
+    /// root; a path that is a file) never reaches the config, the refusal
+    /// travels verbatim, and nothing is re-seeded. An accepted folder is
+    /// created, persisted, live for the next drop at once — which is why
+    /// the surface reports the key `restart_required = false` — and shown
+    /// on `status()`.
+    #[tokio::test]
+    async fn config_set_files_dir_is_gated_before_the_save_and_live_after_it() {
+        let _lock = crate::files::FILES_DIR_TEST_LOCK.lock().await;
+        crate::files::set_files_dir(None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let (_tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("files-dir"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        )
+        .with_config_persist(path.clone(), Arc::new(tokio::sync::Mutex::new(())));
+
+        // Refused by placement: a system root. The surface would refuse this
+        // too; the daemon refuses it first and persists nothing.
+        let system_dir = if cfg!(windows) {
+            r"C:\Windows\Temp\roomler-drops"
+        } else {
+            "/usr/roomler-drops"
+        };
+        match st.config_set("files_dir", Some(system_dir)).await {
+            Response::Error { message } => {
+                assert!(message.contains("must not be under"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(crate::config::load(&path).unwrap().files_dir, None);
+        assert_eq!(crate::files::configured_files_dir(), None);
+
+        // Refused by reality — something only the daemon's disk can tell:
+        // the path exists and is a FILE.
+        let blocker = dir.path().join("not-a-folder");
+        std::fs::write(&blocker, b"x").unwrap();
+        match st
+            .config_set("files_dir", Some(&blocker.to_string_lossy()))
+            .await
+        {
+            Response::Error { message } => assert!(message.contains("not a folder"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(crate::config::load(&path).unwrap().files_dir, None);
+
+        // Accepted: created, persisted, live, on status.
+        let good = dir.path().join("drops");
+        let spelled = good.to_string_lossy().into_owned();
+        match st.config_set("files_dir", Some(&spelled)).await {
+            Response::ConfigUpdated { entry } => {
+                assert!(!entry.restart_required, "files_dir is live");
+                assert_eq!(entry.value.as_deref(), Some(spelled.as_str()));
+            }
+            other => panic!("expected ConfigUpdated, got {other:?}"),
+        }
+        assert!(good.is_dir(), "created at set time");
+        assert_eq!(
+            crate::config::load(&path).unwrap().files_dir.as_deref(),
+            Some(spelled.as_str())
+        );
+        assert_eq!(
+            crate::files::configured_files_dir().as_deref(),
+            Some(spelled.as_str()),
+            "re-seeded for the next drop without a restart"
+        );
+        assert_eq!(st.status().files_dir.as_deref(), Some(spelled.as_str()));
+
+        // Cleared: back to the ladder, also live, and status still names
+        // a folder.
+        match st.config_set("files_dir", None).await {
+            Response::ConfigUpdated { entry } => assert_eq!(entry.value, None),
+            other => panic!("expected ConfigUpdated, got {other:?}"),
+        }
+        assert_eq!(crate::files::configured_files_dir(), None);
+        let after = st.status().files_dir;
+        assert!(after.is_some(), "the default ladder names a folder");
+        assert_ne!(after.as_deref(), Some(spelled.as_str()));
     }
 
     #[test]

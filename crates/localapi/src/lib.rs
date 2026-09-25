@@ -317,6 +317,14 @@ pub struct NodeStatus {
     /// relaunched daemon itself. `None` from a daemon that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at_ms: Option<u64>,
+    /// FR-84 D4 — where a file dropped onto a remote-control session would
+    /// land RIGHT NOW: the configured `files_dir` (validated for this
+    /// daemon's identity and the active user, `~` expanded) when it passes,
+    /// else the default ladder (the active user's Downloads). `None` from a
+    /// daemon that predates the field. The Overview shows it next to
+    /// "Change…" / "Use default".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files_dir: Option<String>,
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -1211,6 +1219,77 @@ pub enum Request {
         #[serde(default)]
         reason: String,
     },
+    /// FR-84 D4 — what this device can encode: the codec × backend × chroma
+    /// cells the capability probe opened, the denylist, the resolved encoder
+    /// preference. READ-ONLY and cheap by contract: it reports the probe's
+    /// cached result and **never starts a probe** — the probe runs in child
+    /// processes at the first server hello, and a control-surface poll must
+    /// not be what launches vendor driver code. Before that first hello the
+    /// answer is `not_probed`; a build without encoders answers
+    /// `unsupported`. Returns [`Response::EncoderCaps`].
+    EncoderCaps,
+}
+
+/// FR-84 D4 — what this device can encode, as [`Request::EncoderCaps`]
+/// reports it. Plain strings on the wire (the vocabulary lives in
+/// `roomler_ai_remote_control::models`; this leaf crate carries none of it),
+/// every field additive.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct EncoderCapsSummary {
+    /// `ready` (the probe ran; `cells` is the matrix), `not_probed` (the
+    /// daemon has not connected to a server yet — poll again) or
+    /// `unsupported` (this build carries no video encoder at all).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    /// One row per encoder the probe opened, with the chroma formats it
+    /// produced. Empty until `ready`, and on a host with no encoder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<EncoderCell>,
+    /// The legacy descriptive labels (`ffmpeg-hevc_nvenc`, `openh264-sw`, …)
+    /// exactly as the hello advertises them — what `roomlerd caps` prints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hw_encoders: Vec<String>,
+    /// Codecs this device can produce (`h264`, `h265`, `av1`, `vp9`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codecs: Vec<String>,
+    /// How long the probe took, or the cached probe's duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_ms: Option<u32>,
+    /// The matrix came from the on-disk probe cache, not a fresh probe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probe_cached: bool,
+    /// The effective `encoder_cells_deny` list — `name:chroma` entries in
+    /// FFmpeg's spelling (`hevc_qsv:yuv444`) — env, config or the built-in
+    /// default, whichever is in force. A denied cell is never opened by the
+    /// probe or a session, so it appears here and not in `cells`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied: Vec<String>,
+    /// The encoder preference the daemon RESOLVED (CLI > env > config >
+    /// `auto`), as `auto` | `hardware` | `software`. `None` when the daemon
+    /// has not resolved one (a `caps`-only process).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_preference: Option<String>,
+}
+
+/// FR-84 D4 — one encoder the probe opened: a codec × backend pair and the
+/// chroma formats it produced (`yuv420` first).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct EncoderCell {
+    /// `h264` · `hevc` · `av1` · `vp9`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codec: String,
+    /// `nvenc` · `qsv` · `amf` · `videotoolbox` · `vaapi` · `d3d12` ·
+    /// `vulkan` · `mf` · `openh264` · `libvpx`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub backend: String,
+    /// `yuv420` and/or `yuv444`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chroma: Vec<String>,
+    /// Verified hardware encode (the session will not fall back to software
+    /// silently). `false` = a software cell, or a backend whose hardware
+    /// path could not be proven.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hardware: bool,
 }
 
 /// One editable config entry (S2 config surface). Values travel as
@@ -1395,6 +1474,8 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// FR-84 D4 — answer to [`Request::EncoderCaps`].
+    EncoderCaps(EncoderCapsSummary),
     /// FR-85 — the recorder's state, answering [`Request::RecordStart`],
     /// [`Request::RecordStop`] and [`Request::RecordStatus`].
     Recording(RecordingState),
@@ -1957,6 +2038,13 @@ pub trait LocalApiState: Send + Sync {
     /// connection die before it learns the restart was accepted. Default:
     /// no-op.
     fn restart_commit(&self) {}
+    /// FR-84 D4 — what this device can encode, from the probe's CACHED
+    /// result only (never a probe). `None` = this node does not report
+    /// encoder capabilities at all (mocks, non-daemon impls); the daemon
+    /// overrides and answers `not_probed` / `unsupported` / `ready`.
+    fn encoder_caps(&self) -> Option<EncoderCapsSummary> {
+        None
+    }
 }
 
 /// FR-85 — the refusal a non-console caller gets for a recording verb.
@@ -1988,6 +2076,13 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
             ok: state.kill_flow(id),
         },
         Request::RouteList => Response::Routes(state.route_list()),
+        // FR-84 D4 — sync by contract: a cached read, never a probe.
+        Request::EncoderCaps => match state.encoder_caps() {
+            Some(summary) => Response::EncoderCaps(summary),
+            None => Response::Error {
+                message: "encoder capabilities are not reported on this node".into(),
+            },
+        },
         // `Ping` / `Create*` / the mutating `Route*` verbs are async —
         // intercepted in `serve_connection` before this sync dispatch runs.
         // These arms only satisfy match exhaustiveness.
@@ -2088,6 +2183,17 @@ where
                 if key.starts_with("record_") && !peer.is_console_user() =>
             {
                 not_the_console_user()
+            }
+            // FR-84 D4 — and so is where files dropped into the console
+            // user's session land: the pipe admits RDP guests too, and one
+            // must not steer another person's incoming files (say, into
+            // their Startup folder). Equality, not a prefix match.
+            Ok(Request::ConfigSet { key, .. }) if key == "files_dir" && !peer.is_console_user() => {
+                Response::Error {
+                    message: "only the person at this device's console can change where \
+                              incoming files land"
+                        .into(),
+                }
             }
             Ok(Request::ConfigSet { key, value }) => state.config_set(&key, value.as_deref()).await,
             Ok(Request::TailLog { source, max_bytes }) => state.tail_log(&source, max_bytes).await,
@@ -3258,6 +3364,16 @@ impl Client {
             .await?;
         Ok(RestartAnswer::from_response(resp))
     }
+
+    /// FR-84 D4 — what this device can encode, from the probe's cached
+    /// result. An older daemon answers with a bad-request [`Response::Error`]
+    /// (surfaced as `Err`), which a client renders as "update the service".
+    pub async fn encoder_caps(&mut self) -> std::io::Result<EncoderCapsSummary> {
+        match self.request(&Request::EncoderCaps).await? {
+            Response::EncoderCaps(summary) => Ok(summary),
+            other => Err(unexpected_response(other)),
+        }
+    }
 }
 
 /// FR-84 D3 — what a daemon said to [`Request::RestartDaemon`], classified
@@ -3636,6 +3752,7 @@ mod tests {
                 org_relay: None,
                 legacy_env_uses: Some(Vec::new()),
                 retired_env_present: Some(Vec::new()),
+                files_dir: None,
                 derp_inbound_drops: None,
                 netcheck: None,
                 pid: None,
@@ -4471,6 +4588,94 @@ mod tests {
         assert!(json.contains("\"group\":\"network_carriers\""), "{json}");
     }
 
+    /// FR-84 D4 — the encoder-caps verb: wire shape locked (the desktop and
+    /// `roomler` depend on the discriminators), every summary field
+    /// additive (absent when default, so an old reader sees nothing new and
+    /// a new reader of an old daemon fills in defaults), and the trait
+    /// default is a clean Error — a mock is not an encoder host.
+    #[tokio::test]
+    async fn encoder_caps_wire_shape_round_trip_and_default_unsupported() {
+        assert_eq!(
+            serde_json::to_string(&Request::EncoderCaps).unwrap(),
+            r#"{"t":"encoder_caps"}"#
+        );
+        // A `not_probed` answer is exactly one field: nothing else is known
+        // yet, and nothing else is sent.
+        let pending = EncoderCapsSummary {
+            state: "not_probed".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&Response::EncoderCaps(pending.clone())).unwrap(),
+            r#"{"t":"encoder_caps","d":{"state":"not_probed"}}"#
+        );
+        let full = EncoderCapsSummary {
+            state: "ready".into(),
+            cells: vec![
+                EncoderCell {
+                    codec: "hevc".into(),
+                    backend: "nvenc".into(),
+                    chroma: vec!["yuv420".into(), "yuv444".into()],
+                    hardware: true,
+                },
+                EncoderCell {
+                    codec: "h264".into(),
+                    backend: "openh264".into(),
+                    chroma: vec!["yuv420".into()],
+                    hardware: false,
+                },
+            ],
+            hw_encoders: vec!["ffmpeg-hevc_nvenc".into(), "openh264-sw".into()],
+            codecs: vec!["h264".into(), "h265".into()],
+            probe_ms: Some(812),
+            probe_cached: true,
+            denied: vec!["hevc_qsv:yuv444".into()],
+            encoder_preference: Some("auto".into()),
+        };
+        let s = serde_json::to_string(&Response::EncoderCaps(full.clone())).unwrap();
+        assert!(s.starts_with(r#"{"t":"encoder_caps","d":{"state":"ready","cells":[{"codec":"hevc","backend":"nvenc","chroma":["yuv420","yuv444"],"hardware":true},{"codec":"h264","backend":"openh264","chroma":["yuv420"]}]"#), "{s}");
+        assert!(s.contains(r#""probe_ms":812,"probe_cached":true,"denied":["hevc_qsv:yuv444"],"encoder_preference":"auto"}"#), "{s}");
+        // A software cell omits `hardware` (false is the default).
+        assert!(!s.contains(r#""hardware":false"#), "{s}");
+        match serde_json::from_str::<Response>(&s).unwrap() {
+            Response::EncoderCaps(back) => assert_eq!(back, full),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // A newer daemon's extra field is ignored; a missing one defaults.
+        let newer: EncoderCapsSummary =
+            serde_json::from_str(r#"{"state":"ready","future":1}"#).unwrap();
+        assert_eq!(newer.state, "ready");
+        assert!(newer.cells.is_empty() && !newer.probe_cached);
+
+        // Trait default: a mock reports no encoder caps — the sync dispatch
+        // turns that into a clean Error rather than an empty matrix that
+        // would read as "this host has no encoders".
+        let s = Mock;
+        assert!(s.encoder_caps().is_none());
+        assert!(matches!(
+            handle(&Request::EncoderCaps, &s),
+            Response::Error { .. }
+        ));
+    }
+
+    /// FR-84 D4 — `NodeStatus.files_dir` is additive: absent when the
+    /// daemon has none to report, and an old status line without it still
+    /// parses.
+    #[test]
+    fn node_status_files_dir_is_additive() {
+        let mut st = Mock.status();
+        let without = serde_json::to_string(&st).unwrap();
+        assert!(!without.contains("files_dir"));
+        st.files_dir = Some(r"C:\Users\alice\Downloads".into());
+        let with = serde_json::to_string(&st).unwrap();
+        assert!(
+            with.contains(r#""files_dir":"C:\\Users\\alice\\Downloads""#),
+            "{with}"
+        );
+        let back: NodeStatus = serde_json::from_str(&without).unwrap();
+        assert_eq!(back.files_dir, None);
+    }
+
     #[tokio::test]
     async fn route_verbs_dispatch_and_lock_wire_shape() {
         let s = Mock;
@@ -4855,6 +5060,44 @@ mod tests {
         )
         .await;
         assert!(!is_console_refusal(&r), "{r:?}");
+    }
+
+    /// FR-84 D4 — where files dropped into the console user's session land
+    /// is the console user's call, like where recordings go: an unidentified
+    /// (or RDP-guest) peer is refused, set AND clear, while the console user
+    /// reaches the state (the mock's own answer — a different error, so the
+    /// gate demonstrably passed). The match is on the exact key.
+    #[tokio::test]
+    async fn only_the_console_user_moves_incoming_files() {
+        for line in [
+            r#"{"t":"config_set","d":{"key":"files_dir","value":"~\\Desktop"}}"#,
+            r#"{"t":"config_set","d":{"key":"files_dir"}}"#,
+        ] {
+            let r = ask(ClientPeer::UNKNOWN, line).await;
+            assert!(
+                matches!(&r, Response::Error { message } if message.contains("console") && message.contains("incoming files")),
+                "{line} → {r:?}"
+            );
+        }
+        // A key that merely starts with the name is not this gate's business.
+        let r = ask(
+            ClientPeer::UNKNOWN,
+            r#"{"t":"config_set","d":{"key":"files_dir_x","value":"1"}}"#,
+        )
+        .await;
+        assert!(!is_console_refusal(&r), "{r:?}");
+        let me = ClientPeer {
+            session_id: console_session_id(),
+            uid: own_uid(),
+        };
+        if me.is_console_user() {
+            let r = ask(
+                me,
+                r#"{"t":"config_set","d":{"key":"files_dir","value":"~\\Desktop"}}"#,
+            )
+            .await;
+            assert!(!is_console_refusal(&r), "{r:?}");
+        }
     }
 
     /// FR-85 P2b — a state without a recorder says so AHEAD of a start, so a

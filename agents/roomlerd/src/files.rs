@@ -49,11 +49,13 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tunnel_core::env::node_env_os;
+
+use crate::files_dir;
 
 /// 2 GiB. SCTP DCs in webrtc-rs can carry larger payloads in theory
 /// but per-transfer >2 GB is outside the "drop a file" use case and
@@ -81,6 +83,261 @@ pub fn set_remote_browse_enabled(enabled: bool) {
 
 pub fn is_remote_browse_enabled() -> bool {
     REMOTE_BROWSE_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// FR-84 D4 — the configured drop folder (`files_dir`), LIVE: seeded from
+/// the config at startup (`main.rs::run_cmd`) and re-seeded by the daemon's
+/// `ConfigSet` (`localapi_state::config_set`); read by every transfer. The
+/// raw config VALUE is kept, not a resolved path: `~` expands against the
+/// ACTIVE user at the moment of the drop, and the placement rule is judged
+/// against the identity doing the writing then — one machine-global config
+/// stays right for whoever is logged in.
+///
+/// A process-global like `REMOTE_BROWSE_ENABLED` above rather than a
+/// per-transfer config-file read: the daemon already holds the only write
+/// path that matters (the LocalAPI verb — remote configuration cannot carry
+/// this key, `DesiredConfig` has no such field), the value is one string,
+/// and a file read per drop would add a TOML parse plus a torn-read race
+/// with the atomic save for no gain — a hand edit of the file is picked up
+/// at the next start, exactly as every other key.
+static FILES_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Bumped — under `FILES_DIR`'s write lock — every time the configured value
+/// CHANGES, so a status answer computed for an older value can never
+/// overwrite one computed for the current value.
+static FILES_DIR_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Seed / re-seed the configured drop folder. Blank = unset (the ladder).
+/// A change also starts a background refresh of the status answer, so the
+/// Overview has one long before anyone asks.
+pub fn set_files_dir(value: Option<String>) {
+    let value = value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let changed = {
+        let mut g = FILES_DIR.write().unwrap_or_else(|e| e.into_inner());
+        if *g == value {
+            false
+        } else {
+            *g = value;
+            FILES_DIR_GEN.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+    };
+    if changed {
+        spawn_effective_refresh();
+    }
+}
+
+/// The configured drop folder, as spelled in the config (unexpanded).
+pub fn configured_files_dir() -> Option<String> {
+    FILES_DIR.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The value and its generation, read together.
+fn configured_files_dir_and_gen() -> (Option<String>, u64) {
+    let g = FILES_DIR.read().unwrap_or_else(|e| e.into_inner());
+    (g.clone(), FILES_DIR_GEN.load(Ordering::Acquire))
+}
+
+/// Serialises the tests that set the process-global drop folder. A tokio
+/// mutex because one of them (`localapi_state`) holds it across `.await`;
+/// the sync tests take it with `blocking_lock`.
+#[cfg(test)]
+pub(crate) static FILES_DIR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Who this process writes files as, for `files_dir`'s placement rule
+/// (`roomler_node_core::files_dir`).
+///
+/// * Windows, `LocalSystem` — the winlogon-token worker in a user's session
+///   (`system_context`), or any `roomlerd run` started under a SYSTEM token,
+///   feature or no feature. Privileged; the active user is the one signed in
+///   to THIS process's session, and their profile comes from their token
+///   (`win_identity::session_user_profile_dir`), never from their name. No
+///   user in the session (session 0, pre-logon) = no profile = every folder
+///   refused, by design.
+/// * Unix, root — privileged; the "active" profile is the daemon's own home.
+///   A root daemon serves the console through KMS capture / uinput with no
+///   per-user identity to resolve, its default ladder already lands in its
+///   own folders, and the LocalAPI socket is owner-only (0600) — the pipe's
+///   non-admin caller does not exist on Unix, so the rule is belt and braces.
+/// * Everyone else — unprivileged: this process can only write where its own
+///   user can, so the folder rules apply and the profile rule does not.
+pub fn writer_context() -> files_dir::Writer {
+    #[cfg(target_os = "windows")]
+    {
+        if crate::win_identity::process_is_local_system() {
+            return files_dir::Writer {
+                privileged: true,
+                active_home: crate::win_identity::session_user_profile_dir(),
+            };
+        }
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return files_dir::Writer {
+                privileged: true,
+                active_home: process_home(),
+            };
+        }
+    }
+    files_dir::Writer::unprivileged(process_home())
+}
+
+/// This process's own home. Windows asks the token (a registry read — never
+/// the known-folder lookups `UserDirs` makes, which verify every folder and
+/// so can touch a share a folder is redirected to).
+fn process_home() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::win_identity::own_profile_dir()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        directories::BaseDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
+    }
+}
+
+/// FR-84 D4 — the SET-time gate: everything a drop will demand of the value
+/// at use time (shape, placement for THIS writer, creatable and writable),
+/// run now so a `ConfigSet` the daemon would not honour is refused with the
+/// reason instead of saved and silently ignored. The refusal text is what the
+/// desktop shows verbatim.
+pub fn validate_files_dir_setting(raw: &str) -> Result<PathBuf, String> {
+    files_dir::validate(raw, &writer_context(), &files_dir::Rules::from_env())
+}
+
+/// `raw` as it resolves for THIS writer right now — shape, placement, the
+/// on-disk link check and "a folder could be here" — with nothing created
+/// or written: what a drop would use, short of the write probe.
+fn resolve_without_creating(raw: &str) -> Result<PathBuf, String> {
+    let writer = writer_context();
+    let rules = files_dir::Rules::from_env();
+    let p = files_dir::resolve(raw, &writer, &rules)?;
+    files_dir::check_placement_on_disk(&p, &writer, &rules)?;
+    files_dir::check_creatable(&p)?;
+    Ok(p)
+}
+
+/// The configured folder via [`resolve_without_creating`]. `Ok(None)` = no
+/// folder configured.
+fn configured_folder_without_creating() -> Result<Option<PathBuf>, String> {
+    match configured_files_dir() {
+        None => Ok(None),
+        Some(raw) => resolve_without_creating(&raw).map(Some),
+    }
+}
+
+// ── NodeStatus.files_dir: answered from a cache, never from the disk ──────
+
+/// The status answer and what it was computed for.
+struct EffectiveFilesDir {
+    /// The `FILES_DIR_GEN` it was computed for.
+    generation: u64,
+    computed_at: Option<std::time::Instant>,
+    value: Option<String>,
+}
+
+static EFFECTIVE_FILES_DIR: std::sync::Mutex<EffectiveFilesDir> =
+    std::sync::Mutex::new(EffectiveFilesDir {
+        generation: 0,
+        computed_at: None,
+        value: None,
+    });
+static EFFECTIVE_REFRESHING: AtomicBool = AtomicBool::new(false);
+/// How old a status answer may be before a read starts a refresh — long
+/// enough that a 2 s poller does not re-resolve on every tick, short enough
+/// that a folder deleted or a user switched shows up within one glance.
+const EFFECTIVE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// FR-84 D4 — where a drop would land RIGHT NOW, for `NodeStatus.files_dir`:
+/// the configured folder when it passes for this writer (it need not exist
+/// yet — a drop creates it), else the default ladder.
+///
+/// NEVER touches the disk: the status verb is a synchronous read on the
+/// LocalAPI's async dispatch, polled every 2 s by the companion, and the
+/// honest answer needs the disk (a link out of the profile) and, through the
+/// default ladder's known-folder lookups, possibly a Downloads redirected to
+/// a share that is offline right now. So this answers from a cache and, when
+/// the cached answer is older than [`EFFECTIVE_TTL`] or was computed for a
+/// previous value, refreshes it on a background thread. `None` only before
+/// the first refresh has landed (`set_files_dir` at startup starts one).
+pub fn effective_files_dir() -> Option<String> {
+    let current = FILES_DIR_GEN.load(Ordering::Acquire);
+    let (value, fresh) = {
+        let c = EFFECTIVE_FILES_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let fresh =
+            c.generation == current && c.computed_at.is_some_and(|at| at.elapsed() < EFFECTIVE_TTL);
+        (c.value.clone(), fresh)
+    };
+    if !fresh {
+        spawn_effective_refresh();
+    }
+    value
+}
+
+/// Compute the status answer now and cache it. BLOCKING (token, disk,
+/// known-folder lookups): the daemon's `ConfigSet` runs it on its blocking
+/// thread, so the status read right after a change is already the new
+/// answer; everything else reaches it through [`spawn_effective_refresh`].
+pub fn refresh_effective_files_dir() -> Option<String> {
+    let (raw, generation) = configured_files_dir_and_gen();
+    let value = compute_effective_files_dir(raw.as_deref());
+    let mut c = EFFECTIVE_FILES_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // An answer for an OLDER value never replaces one for a newer value.
+    if generation >= c.generation {
+        *c = EffectiveFilesDir {
+            generation,
+            computed_at: Some(std::time::Instant::now()),
+            value: value.clone(),
+        };
+    }
+    value
+}
+
+/// One background refresh at a time; a read that finds one running simply
+/// returns the cached answer.
+fn spawn_effective_refresh() {
+    if EFFECTIVE_REFRESHING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            EFFECTIVE_REFRESHING.store(false, Ordering::Release);
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("files-dir-status".into())
+        .spawn(|| {
+            let _done = Done;
+            refresh_effective_files_dir();
+        });
+    if spawned.is_err() {
+        EFFECTIVE_REFRESHING.store(false, Ordering::Release);
+    }
+}
+
+fn compute_effective_files_dir(raw: Option<&str>) -> Option<String> {
+    if let Some(raw) = raw {
+        match resolve_without_creating(raw) {
+            Ok(p) => return Some(p.to_string_lossy().into_owned()),
+            Err(e) => tracing::debug!(
+                files_dir = %raw,
+                %e,
+                "files: the configured files_dir would be refused right now — reporting the default folder"
+            ),
+        }
+    }
+    default_download_dir(false)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Number of in-flight file transfers (incoming uploads + outgoing
@@ -333,14 +590,31 @@ pub async fn sweep_orphans() -> (usize, usize) {
             return sweep_orphans_root(&root).await;
         }
     }
-    let root = match download_dir() {
-        Ok(d) => d,
-        Err(_) => {
-            tracing::debug!("sweep_orphans: Downloads dir not resolvable; skipping");
-            return (0, 0);
-        }
-    };
-    sweep_orphans_in(&root).await
+    // FR-84 D4 — a partial lives next to the folder its transfer targeted:
+    // walk the default folder AND the configured one (when set, usable and
+    // different), so a `files_dir` change strands no resumable upload.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = default_download_dir(false) {
+        roots.push(d);
+    }
+    // Only a folder that still passes for this writer — the sweep deletes,
+    // so it must never walk a configured value the placement rule refuses.
+    if let Ok(Some(c)) = configured_folder_without_creating()
+        && !roots.contains(&c)
+    {
+        roots.push(c);
+    }
+    if roots.is_empty() {
+        tracing::debug!("sweep_orphans: Downloads dir not resolvable; skipping");
+        return (0, 0);
+    }
+    let (mut kept, mut swept) = (0, 0);
+    for root in &roots {
+        let (k, s) = sweep_orphans_in(root).await;
+        kept += k;
+        swept += s;
+    }
+    (kept, swept)
 }
 
 /// rc.22 — sweep a directory whose CHILDREN are per-id staging dirs.
@@ -1963,7 +2237,37 @@ fn split_stem_ext(name: &str) -> (&str, &str) {
     (name, "")
 }
 
+/// Where an incoming transfer lands: the configured `files_dir` when it
+/// passes for THIS writer at THIS moment, else the default ladder below.
+///
+/// FR-84 D4 — this is the USE-time gate, and the load-bearing one: it holds
+/// even when the value reached the config file behind the daemon's back (a
+/// hand edit, the desktop's direct-file fallback while the daemon was down,
+/// a user switch since it was set). The full check runs per transfer —
+/// shape, placement for the identity doing the writing and the user signed
+/// in now, links followed, created if missing, a write probe — and a
+/// refusal is logged and falls back rather than failing the drop.
 fn download_dir() -> Result<PathBuf> {
+    if let Some(raw) = configured_files_dir() {
+        let writer = writer_context();
+        match files_dir::validate(&raw, &writer, &files_dir::Rules::from_env()) {
+            Ok(dir) => return Ok(dir),
+            Err(e) => tracing::warn!(
+                files_dir = %raw,
+                privileged = writer.privileged,
+                active_home = ?writer.active_home,
+                %e,
+                "files: configured files_dir refused — this transfer lands in the default folder"
+            ),
+        }
+    }
+    default_download_dir(true)
+}
+
+/// The default ladder — what `files_dir` unset has always meant. `log` =
+/// false for the status answer, which is recomputed every few seconds while
+/// the companion is open and must not repeat the fallback's warning each time.
+fn default_download_dir(log: bool) -> Result<PathBuf> {
     // M3 A1 SystemContext fallback: when the worker is spawned by the
     // SCM service via winlogon-token, it runs as LocalSystem
     // (S-1-5-18) but in the user's interactive session.
@@ -2014,10 +2318,12 @@ fn download_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let staging = crate::appdirs::machine_global_dir().join("uploads");
-        tracing::warn!(
-            fallback_path = %staging.display(),
-            "files: no user-accessible Downloads dir (Folder Redirection?); staging in PROGRAMDATA"
-        );
+        if log {
+            tracing::warn!(
+                fallback_path = %staging.display(),
+                "files: no user-accessible Downloads dir (Folder Redirection?); staging in PROGRAMDATA"
+            );
+        }
         Ok(staging)
     }
     // Non-Windows: keep the temp-dir final fallback (headless CI,
@@ -2025,6 +2331,7 @@ fn download_dir() -> Result<PathBuf> {
     // Defender's SystemTemp-scan problem).
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = log;
         Ok(std::env::temp_dir())
     }
 }
@@ -2102,6 +2409,176 @@ mod tests {
     /// parallelism). tokio Mutex, not std: the guard is held across the
     /// tests' awaits by design.
     static HOME_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A folder THIS writer may use: the temp dir for an ordinary test
+    /// runner; inside the active home for a privileged one (a root CI
+    /// container), where the profile rule would refuse the temp dir.
+    fn scratch_drop_dir(tag: &str) -> PathBuf {
+        let w = writer_context();
+        let base = if w.privileged {
+            PathBuf::from(w.active_home.expect("a privileged test runner has a home"))
+        } else {
+            std::env::temp_dir()
+        };
+        base.join(format!("roomler-files-dir-{tag}-{}", std::process::id()))
+    }
+
+    /// FR-84 D4 — the USE-time gate. A configured folder that passes is where
+    /// the drop lands (created on first use); one the validator refuses —
+    /// here a system root, the case a hand-edited config or the desktop's
+    /// direct-file fallback can produce with no daemon to say no — falls back
+    /// to the default ladder, per transfer, and the status answer names the
+    /// folder a drop would really use. Unset = today's ladder.
+    #[test]
+    fn configured_files_dir_is_used_when_valid_and_ignored_when_not() {
+        let _lock = FILES_DIR_TEST_LOCK.blocking_lock();
+        let _home = HOME_ENV_LOCK.blocking_lock();
+        set_files_dir(None);
+        let default = default_download_dir(false).unwrap();
+        let default_s = default.to_string_lossy().into_owned();
+        assert_eq!(download_dir().unwrap(), default, "unset = the ladder");
+        assert_eq!(
+            refresh_effective_files_dir().as_deref(),
+            Some(default_s.as_str())
+        );
+
+        let dir = scratch_drop_dir("use");
+        let _ = std::fs::remove_dir_all(&dir);
+        let spelled = dir.to_string_lossy().into_owned();
+        set_files_dir(Some(format!("  {spelled}  ")));
+        assert_eq!(
+            configured_files_dir().as_deref(),
+            Some(spelled.as_str()),
+            "trimmed"
+        );
+        // Before the first drop the folder does not exist, and the status
+        // still names it: the drop creates it. Looking created nothing.
+        assert_eq!(
+            refresh_effective_files_dir().as_deref(),
+            Some(spelled.as_str())
+        );
+        assert!(!dir.exists(), "the status answer creates nothing");
+        assert_eq!(download_dir().unwrap(), dir);
+        assert!(dir.is_dir(), "created on first use");
+
+        let bad = if cfg!(windows) {
+            r"C:\Windows\Temp\roomler-drops"
+        } else {
+            "/usr/roomler-drops"
+        };
+        set_files_dir(Some(bad.to_string()));
+        assert_eq!(
+            download_dir().unwrap(),
+            default,
+            "a refused value never wins over the ladder"
+        );
+        assert_eq!(
+            refresh_effective_files_dir().as_deref(),
+            Some(default_s.as_str()),
+            "status reports where a drop would really land"
+        );
+        assert!(
+            !std::path::Path::new(bad).exists(),
+            "a refused folder is never created"
+        );
+
+        set_files_dir(Some("   ".into()));
+        assert_eq!(configured_files_dir(), None, "blank = unset");
+        assert_eq!(download_dir().unwrap(), default);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-84 D4 — a value that passed when it was set and fails now (here the
+    /// folder was replaced by a file; a user switch or a new link are the
+    /// field versions). The drop does not fail and does not follow the stale
+    /// value: it lands in the default folder, and the status says so.
+    #[test]
+    fn a_files_dir_that_became_invalid_falls_back_at_use_time() {
+        let _lock = FILES_DIR_TEST_LOCK.blocking_lock();
+        let _home = HOME_ENV_LOCK.blocking_lock();
+        let dir = scratch_drop_dir("stale");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        let spelled = dir.to_string_lossy().into_owned();
+        validate_files_dir_setting(&spelled).expect("accepted at set time");
+        set_files_dir(Some(spelled.clone()));
+        assert_eq!(download_dir().unwrap(), dir);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a folder any more").unwrap();
+        let default = default_download_dir(false).unwrap();
+        assert_eq!(
+            download_dir().unwrap(),
+            default,
+            "the drop falls back instead of failing"
+        );
+        assert_eq!(
+            refresh_effective_files_dir(),
+            Some(default.to_string_lossy().into_owned()),
+            "and the status answer follows"
+        );
+        assert!(
+            validate_files_dir_setting(&spelled).is_err(),
+            "the set-time gate would refuse it now too"
+        );
+        set_files_dir(None);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// FR-84 D4 — the status read never computes: it answers from the cache
+    /// (a disk or share lookup on the LocalAPI's async dispatch would stall
+    /// every client), and an answer for an OLD value never overwrites the
+    /// answer for the current one.
+    #[test]
+    fn effective_files_dir_answers_from_the_cache() {
+        let _lock = FILES_DIR_TEST_LOCK.blocking_lock();
+        let _home = HOME_ENV_LOCK.blocking_lock();
+        let dir = scratch_drop_dir("cache");
+        let spelled = dir.to_string_lossy().into_owned();
+        set_files_dir(Some(spelled.clone()));
+        assert_eq!(
+            refresh_effective_files_dir().as_deref(),
+            Some(spelled.as_str())
+        );
+        // Fresh ⇒ served from the cache, the same answer.
+        assert_eq!(effective_files_dir().as_deref(), Some(spelled.as_str()));
+        // A stale generation's late result is dropped on the floor.
+        {
+            let mut c = EFFECTIVE_FILES_DIR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            c.generation += 1; // as if a newer value's answer had landed
+        }
+        refresh_effective_files_dir(); // computed for the (now older) current generation
+        let c = EFFECTIVE_FILES_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            c.generation,
+            FILES_DIR_GEN.load(Ordering::Acquire) + 1,
+            "an older generation must not replace a newer one"
+        );
+        drop(c);
+        // Put the cache back in step for whoever runs next.
+        {
+            let mut c = EFFECTIVE_FILES_DIR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            c.generation = FILES_DIR_GEN.load(Ordering::Acquire);
+            c.computed_at = None;
+        }
+        set_files_dir(None);
+    }
+
+    #[test]
+    fn writer_context_describes_this_process() {
+        let w = writer_context();
+        assert!(w.active_home.is_some(), "a test runner has a home: {w:?}");
+        #[cfg(target_os = "windows")]
+        assert_eq!(w.privileged, crate::win_identity::process_is_local_system());
+        #[cfg(unix)]
+        assert_eq!(w.privileged, unsafe { libc::geteuid() } == 0);
+    }
 
     #[test]
     fn sanitize_strips_path_components() {

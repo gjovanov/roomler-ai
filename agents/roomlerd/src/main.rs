@@ -2890,6 +2890,9 @@ async fn run_cmd(
     roomlerd::purge_exit_routes();
 
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
+    // FR-84 D4 — publish the RESOLVED preference, so the LocalAPI reports
+    // what is in force (a CLI flag or env var may have overridden the config).
+    encode::set_resolved_preference(encoder_preference);
 
     // Wire the file-DC v2 `files:dir` browse capability. Default
     // tracks `cfg.enable_remote_browse` (true unless the operator
@@ -2903,6 +2906,16 @@ async fn run_cmd(
         );
     roomlerd::files::set_remote_browse_enabled(browse_enabled);
     tracing::info!(browse_enabled, "file-DC remote browse capability");
+
+    // FR-84 D4 — where dropped files land. The raw value is seeded here and
+    // re-seeded by the LocalAPI `ConfigSet`; every transfer validates it for
+    // the identity doing the writing and the user logged in at that moment,
+    // and falls back to the Downloads ladder (with a warning) when it fails.
+    roomlerd::files::set_files_dir(cfg.files_dir.clone());
+    tracing::info!(
+        files_dir = ?cfg.files_dir,
+        "file-DC drop folder (unset = the active user's Downloads)"
+    );
 
     // Remote app selection & launch (virtual-desktop hosts). Same
     // process-global install as the browse flag above; the caps builder's
@@ -5198,6 +5211,30 @@ async fn caps_cmd() -> Result<()> {
     let caps = roomlerd::encode::caps::detect();
     println!("codecs: {:?}", caps.codecs);
     println!("hw_encoders: {:?}", caps.hw_encoders);
+    // FR-84 D4 — the cell matrix the desktop's Overview card draws, one
+    // line per cell, so a field check can compare the two line by line.
+    // `summarize_cached` reads the cache `detect()` just filled, plus the
+    // denylist in force.
+    let summary = roomlerd::encode::caps::summarize_cached();
+    for cell in &summary.cells {
+        println!(
+            "cell: {}_{} chroma={:?} hw={}",
+            cell.codec, cell.backend, cell.chroma, cell.hardware
+        );
+    }
+    println!("denied_cells: {:?}", summary.denied);
+    println!(
+        "probe_ms: {} ({})",
+        summary
+            .probe_ms
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "-".into()),
+        if summary.probe_cached {
+            "cached"
+        } else {
+            "fresh"
+        }
+    );
     println!("transports: {:?}", caps.transports);
     println!("has_input_permission: {}", caps.has_input_permission);
     // macOS has a THIRD state and `has_input_permission` cannot express it.
