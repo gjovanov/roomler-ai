@@ -120,15 +120,33 @@ keys for publicly-trusted code signing since June 2023, so no CA issues a PFX.
   `identifier "com.roomler.agent" + cert root H"b2a06501…"` byte-identical
   rc.479→482; TCC Screen-Recording grant survived updates (operator-confirmed
   on rc.482: "screen worked directly", no re-grant).
-- [ ] Apple Developer ID + notarisation live end-to-end (enrolment 5XS5WN8R99
-  awaiting Apple verification; CI lanes merged and waiting on the six
-  `APPLE_*` secrets from `60-apple-setup.sh`).
+- [x] Apple Developer ID + notarisation live end-to-end — enrolment 5XS5WN8R99
+  completed 2026-09-08 (team G ROX EOOD, `4TG7586MY5`; Developer ID Application
+  + Installer on the G2 Sub-CA). Field-verified on a real Mac against the
+  **published** `.pkg` with quarantine set: `spctl -a -vvv -t install` →
+  `source=Notarized Developer ID`
+  ([result](https://github.com/gjovanov/roomler-ai/issues/778#issuecomment-5589571740),
+  [on the published artifact](https://github.com/gjovanov/roomler-ai/issues/778#issuecomment-5589756486)).
+  The first run with real credentials was refused as `Invalid` (#1521, fixed).
+  *Ticked 2026-09-25: verified on 09-08, left unticked at the close.*
+- [x] Docs, in the house style and linked from `docs/README.md` (the
+  docs-before-close rule, #1401): `docs/code-signing.md` — §2b's live status
+  records all three platforms (it said Apple was "still pending" two weeks
+  after it went live), §4 gains a diagram of the signing chain and both of its
+  verifiers, §7b describes the updater's pinned-key `.asc` gate as built (it
+  described it as unbuilt) and the downgrade that stays open on Linux/macOS,
+  and §9 records the one name no sweep can align (`G ROX EOOD`).
+  *Added 2026-09-25, after the close: the verification-debt guard (#1598) found
+  FR-7 closed with no docs criterion.*
 
 ## Out of scope
 
 - Signed apt repository (`InRelease`) — deferred until an apt channel exists.
 - Signing the manifest itself (version+url+hash attested as a unit) — the
   per-artifact signature + ProductVersion binding closes the practical gap.
+  ⚠️ *(2026-09-25) For the **MSI** only: a `.pkg` or `.deb` is authenticated by
+  its pinned-key `.asc` but has no version binding, so the downgrade stays open
+  on Linux/macOS — `docs/code-signing.md` §7b.*
 - EV/SmartScreen instant reputation — does not exist anymore (removed 2024);
   reputation accrues per publisher across releases.
 
@@ -144,3 +162,5 @@ keys for publicly-trusted code signing since June 2023, so no CA issues a PFX.
 | 2026-08-24 | First signed release `agent-v0.3.0-rc.453`; updater publisher-verify + anti-rollback binding land |
 | 2026-08-25/26 | GPG `.asc` mandatory + pinned-key verify (#724, #727); macOS stable self-signed DR solves the TCC wipe (#729/#737/#740) |
 | 2026-08-26 | Operator confirms on rc.482: TCC survived the update chain; pinned-GPG verify proven twice in the field |
+| 2026-09-08 | Apple enrolment 5XS5WN8R99 completes; Developer ID Application + Installer issued (G2 Sub-CA, to 2031-09-09). First real run refused as `Invalid` (#1521, fixed). **Field-verified on a real Mac**: the published `.pkg`, quarantine set, `spctl` → `source=Notarized Developer ID` ([#778](https://github.com/gjovanov/roomler-ai/issues/778#issuecomment-5589756486)) |
+| 2026-09-25 | Record caught up. The verification-debt guard (#1598) found FR-7 closed with the Apple criterion unticked and no docs criterion. Ticked against the 09-08 evidence; `docs/code-signing.md` brought up to what shipped — it still called Apple "pending" and the updater's pinned-key gate unbuilt |

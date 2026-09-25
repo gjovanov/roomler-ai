@@ -52,6 +52,48 @@ sequenceDiagram
 re-running an installer on a known machine reuses its identity instead of
 duplicating it.
 
+### "The host must be re-enrolled" — when to believe it
+
+Re-enrolling is **destructive**: removal is final, and a re-enrolled device
+never gets its old overlay address back. So the one log line that prescribes it
+has to be true whenever it appears. Since FR-66 it is: `roomlerd` reads its
+`config.toml` two ways, and which one a caller uses states whether a missing
+file is a *normal* answer for that caller.
+
+| Reader | For | When the file is absent or unreadable |
+|---|---|---|
+| `config::load` (`crates/agent-core/src/config.rs:2487`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:2523`) |
+| `config::read_if_present` (`:2553`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+
+```mermaid
+flowchart TD
+    Q["a caller needs config.toml"] --> A{"is 'no file' a normal answer<br/>for THIS caller?"}
+    A -->|"yes — an optional-flag probe,<br/>a first enrollment"| P["read_if_present<br/>→ None · debug at most"]
+    A -->|"no — the config the<br/>process runs on"| L["load"]
+    L --> T{"live file parses?"}
+    T -->|"yes"| OK["the config"]
+    T -->|"no"| V{"config.toml.prev parses?"}
+    V -->|"yes"| R["promoted to live<br/>ERROR 'RECOVERED' — no action needed"]
+    V -->|"no"| E["ERROR 'the host must be re-enrolled'<br/>— believe it"]
+```
+
+Before FR-66, two callers that expect to find nothing went through `load` and
+printed the destructive remedy about perfectly healthy hosts: the Windows
+supervisor's `netd_enabled()` flag probe
+(`agents/roomlerd/src/win_service/supervisor.rs:961`), on **every service
+start** of every user-context install; and enrollment itself, reusing an
+existing `machine_id` — during the very operation that enrolls the machine.
+The noise also buried the genuine case, which prints the identical line.
+
+⚠️ **Pick the reader by the question, not by the mechanism.** A shared helper
+that logs at the severity of its worst caller makes every caller inherit that
+reading. Do not fix a false alarm by softening `load`'s ERROR: for the config a
+process runs on, it is exactly as serious as it was. And never use
+`read_if_present` for *that* config — silently getting `None` there is the
+"running on an older config must never look like a normal boot" failure the
+ERROR exists to prevent. FR-66's P2 audited all 37 `load` call sites on this
+question; two moved to `read_if_present`.
+
 ## Windows
 
 **Recommended: the `roomler-setup` wizard** (signed EXE, downloadable from the
