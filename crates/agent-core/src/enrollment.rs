@@ -246,6 +246,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         d3d12_adapter: None,
         vulkan_device: None,
         record_dir: None,
+        record_remote_enabled: false,
+        record_remote_audio: false,
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,

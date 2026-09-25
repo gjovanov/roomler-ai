@@ -1463,6 +1463,24 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-85 - the folder screen recordings are saved to: an absolute local path (no ~, no network share, no symlink or junction). Empty = Videos\\Roomler on Windows when it is local and writable (else %USERPROFILE%\\Roomler Recordings), ~/Movies/Roomler on macOS, the XDG videos folder + Roomler on Linux. Read when a recording starts. Device-only: never pushable through remote config.",
     },
     KeyMeta {
+        key: "record_remote_enabled",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        // LIVE: read per start request, and OFF stops a remote recording in
+        // progress; the capability follows on the next heartbeat.
+        live: true,
+        kind: "bool",
+        description: "FR-85 - let a remote controller record this screen during a session (default off). The recording is made and kept on this device, with a banner on screen while it runs; the controller downloads it. Off also stops a remote recording in progress. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
+        key: "record_remote_audio",
+        group: Group::RemoteDesktop,
+        tier: Tier::Standard,
+        live: true,
+        kind: "bool",
+        description: "FR-85 - let a remote recording include what this computer plays (default off; needs record_remote_enabled). The microphone is never recorded remotely. Device-only: never pushable through remote config.",
+    },
+    KeyMeta {
         key: "forward_acl",
         group: Group::Tunnels,
         tier: Tier::Standard,
@@ -1714,6 +1732,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "d3d12_adapter" => cfg.d3d12_adapter.clone(),
         "vulkan_device" => cfg.vulkan_device.clone(),
         "record_dir" => cfg.record_dir.clone(),
+        "record_remote_enabled" => Some(fmt_bool(cfg.record_remote_enabled)),
+        "record_remote_audio" => Some(fmt_bool(cfg.record_remote_audio)),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -1758,6 +1778,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // Clearing the key (`value: None`) resets to OFF, not ON — the
         // fail-safe direction for a gate that grants root.
         "exec_enabled" => cfg.exec_enabled = parse_bool_or(value, false)?,
+        "record_remote_enabled" => cfg.record_remote_enabled = parse_bool_or(value, false)?,
+        "record_remote_audio" => cfg.record_remote_audio = parse_bool_or(value, false)?,
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
         }
@@ -2400,9 +2422,11 @@ mod tests {
     /// (FR-85), which the recorder's supervisor reads fresh when a recording
     /// starts (`recording/manager.rs`, `configured_dir`),
     /// `local_restart_enabled` (FR-84 D3), which the restart verb reads fresh
-    /// on every request (`localapi_state.rs`, `restart_daemon`), and
+    /// on every request (`localapi_state.rs`, `restart_daemon`),
     /// `files_dir` (FR-84 D4), which the same `ConfigSet` hands to
-    /// `files::set_files_dir` and every drop re-reads. A key wrongly
+    /// `files::set_files_dir` and every drop re-reads, and the two remote
+    /// recording gates, re-seeded after a `ConfigSet` the same way as the
+    /// gate-4 flags (`recording/remote.rs`, `adopt`). A key wrongly
     /// claiming `live` tells a person their change is in force while the
     /// daemon still runs the old value; a live key claiming `restart` has
     /// them bounce a healthy service — or believe a refusal they just made
@@ -2423,6 +2447,8 @@ mod tests {
             "record_dir",
             "local_restart_enabled",
             "files_dir",
+            "record_remote_enabled",
+            "record_remote_audio",
         ]
         .into_iter()
         .map(String::from)

@@ -36,6 +36,8 @@ struct Entry {
     org: String,
     started_at_ms: u64,
     kill: KillSender,
+    /// FR-85 P3 — this controller is recording the screen.
+    recording: bool,
 }
 
 /// Cheap to clone; every clone sees the same map.
@@ -64,7 +66,11 @@ impl RcSessionRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        self.inner.lock().unwrap().insert(
+        let mut map = self.inner.lock().unwrap();
+        // ⚠️ A re-announce must not clear a recording in progress: the banner
+        // saying "recording" is the host's only notice of it.
+        let recording = map.get(&session).is_some_and(|e| e.recording);
+        map.insert(
             session,
             Entry {
                 controller_name,
@@ -72,12 +78,26 @@ impl RcSessionRegistry {
                 org,
                 started_at_ms,
                 kill,
+                recording,
             },
         );
     }
 
     pub fn remove(&self, session: &ObjectId) {
         self.inner.lock().unwrap().remove(session);
+    }
+
+    /// FR-85 P3 — mark `session` as recording (or not). `false` = no such
+    /// live session, which the caller must treat as "nothing on screen says
+    /// so" — a recording is never started behind a banner that is not there.
+    pub fn set_recording(&self, session: &ObjectId, recording: bool) -> bool {
+        match self.inner.lock().unwrap().get_mut(session) {
+            Some(e) => {
+                e.recording = recording;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Snapshot for the LocalAPI, oldest first — a banner listing several
@@ -97,6 +117,7 @@ impl RcSessionRegistry {
                         permissions: e.permissions.clone(),
                         org: e.org.clone(),
                         started_at_ms: e.started_at_ms,
+                        recording: e.recording,
                     },
                 )
             })
@@ -212,5 +233,31 @@ mod tests {
         let left = reg.list();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].session_id, ids[1].to_hex());
+    }
+
+    /// FR-85 P3 — the banner's "recording" follows the session, survives a
+    /// re-announce (which would otherwise hide a recording in progress), and
+    /// cannot be set on a session the banner does not show.
+    #[test]
+    fn recording_is_marked_per_session_and_survives_a_re_announce() {
+        let (reg, ids, _rx) = reg_with(2);
+        assert!(reg.list().iter().all(|s| !s.recording));
+        assert!(reg.set_recording(&ids[1], true));
+        let listed = reg.list();
+        assert!(!listed[0].recording && listed[1].recording);
+
+        let (tx, _rx2) = tokio::sync::mpsc::channel(1);
+        reg.insert(ids[1], "viewer1".into(), "VIEW".into(), String::new(), tx);
+        assert!(
+            reg.list()[1].recording,
+            "a re-announce cleared a recording the host must still see"
+        );
+
+        assert!(reg.set_recording(&ids[1], false));
+        assert!(reg.list().iter().all(|s| !s.recording));
+        assert!(
+            !reg.set_recording(&ObjectId::new(), true),
+            "no banner, no recording"
+        );
     }
 }

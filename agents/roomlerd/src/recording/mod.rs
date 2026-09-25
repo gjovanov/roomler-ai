@@ -29,4 +29,7 @@ pub mod manager;
 pub mod mp4;
 pub mod pacer;
 pub mod recorder;
+/// FR-85 P3b — the device's half of remote recording: the owner's gates,
+/// what the device advertises, and the `record` DataChannel.
+pub mod remote;
 pub mod sidecar;

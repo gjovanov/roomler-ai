@@ -104,6 +104,28 @@ const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 /// experiences.
 pub(crate) const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
 
+/// What `rc:request` resolves for a session and `rc:sdp.offer` consumes:
+/// P6's controller display name and the device policy's input mode, FR-27's
+/// asking org (the "Being viewed by" banner is raised at peer-build time, not
+/// request time), and FR-85 P3b's record-channel context.
+type SessionMeta = (
+    String,
+    Option<roomler_ai_remote_control::models::InputMode>,
+    Option<String>,
+    Option<RecordMeta>,
+);
+
+/// FR-85 P3b — what a session's `record` channel needs, resolved when the
+/// session is requested and consumed when its peer is built.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "recording"), allow(dead_code))]
+pub(crate) struct RecordMeta {
+    controller_user_id: bson::oid::ObjectId,
+    /// `Some(window)` = the session was consented on the host, so a
+    /// recording asks again; `None` = auto-granted.
+    prompt_window: Option<Duration>,
+}
+
 /// What the agent puts on the wire for a resolved host consent prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConsentReply {
@@ -1066,12 +1088,16 @@ async fn connect_once(
     crate::exec::register_secret(&cfg.agent_token);
 
     // Say hello.
+    let hello_caps = stub_caps(cfg.overlay_multi_org);
+    // FR-85 P3b — what the hello told the server about remote recording, so
+    // the heartbeat re-announces the moment the owner's gate changes it.
+    let mut last_announced_record: Vec<String> = hello_caps.record.clone();
     let hello = ClientMsg::AgentHello {
         machine_name: cfg.machine_name.clone(),
         os: detect_os(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         displays: stub_displays(),
-        caps: Box::new(stub_caps(cfg.overlay_multi_org)),
+        caps: Box::new(hello_caps),
         // Tunnel mesh subnet-router: advertise the CIDRs this host offers to
         // route — explicit `advertise_routes` config unioned with auto-detected
         // local subnets. Admin-gated server-side (untrusted until an admin
@@ -1247,16 +1273,7 @@ async fn connect_once(
     // P6 — (controller display name, device-policy input mode) from
     // `rc:request`, consumed at `rc:sdp.offer` so AgentPeer can register
     // the session with the InputArbiter (participants rail + mode seed).
-    let mut pending_session_meta: HashMap<
-        bson::oid::ObjectId,
-        (
-            String,
-            Option<roomler_ai_remote_control::models::InputMode>,
-            // FR-27 follow-up — the asking org, carried so the "Being viewed
-            // by" banner can be raised at peer-build time (not request time).
-            Option<String>,
-        ),
-    > = HashMap::new();
+    let mut pending_session_meta: HashMap<bson::oid::ObjectId, SessionMeta> = HashMap::new();
     // T2.10d: one `AgentTunnelPeer` per active `roomler`
     // session. Distinct map from `peers` (remote-control sessions)
     // because the namespaces don't overlap and the lifecycles
@@ -1591,20 +1608,32 @@ async fn connect_once(
                 // ⚠️ Sending them every beat would be ~200 bytes of nothing on
                 // a frequent message. `None` means "no news", not "no caps".
                 let caps_now = delegate.as_ref().and_then(|d| d.effective_permissions());
-                let caps = if caps_now == last_announced_permissions {
+                // FR-85 P3b — the owner's remote-recording gate is live, so its
+                // word is news too: an OFF must stop the hub granting RECORD
+                // within a beat, not at the next reconnect.
+                let record_now = record_caps();
+                let caps = if caps_now == last_announced_permissions
+                    && record_now == last_announced_record
+                {
                     None
                 } else {
                     last_announced_permissions = caps_now.clone();
-                    // Our own caps, with the worker's permissions substituted:
-                    // codecs and encoders stay OURS, because we are the half
-                    // that answers `rc:session.request` (the P2b-3 lesson).
-                    let mut c = crate::encode::caps::detect();
+                    last_announced_record = record_now.clone();
+                    // Our own caps AS THE HELLO BUILT THEM — the server replaces
+                    // its stored blob with this, so anything the hello carried
+                    // (`multi_org` `tun`, `record`) must be here too — with the
+                    // worker's permissions substituted: codecs and encoders
+                    // stay OURS, because we are the half that answers
+                    // `rc:session.request` (the P2b-3 lesson).
+                    let mut c = stub_caps(cfg.overlay_multi_org);
+                    c.record = record_now;
                     if let Some((perms, has_input)) = caps_now {
                         c.permissions = Some(perms);
                         c.has_input_permission = has_input;
                     }
                     info!(
                         permissions = ?c.permissions,
+                        record = ?c.record,
                         "announcing changed capabilities on the heartbeat (FR-43 P2c)"
                     );
                     Some(Box::new(c))
@@ -1754,9 +1783,11 @@ async fn connect_once(
                                 pending_chunk_framing.insert(sid, p.chunk_framing);
                                 pending_audio.insert(sid, p.audio);
                                 pending_permissions.insert(sid, p.permissions);
+                                // No record context: a delegated session is
+                                // one whose daemon cannot record (FR-85 P3b).
                                 pending_session_meta.insert(
                                     sid,
-                                    (p.controller_name, p.input_mode, p.asking_org),
+                                    (p.controller_name, p.input_mode, p.asking_org, None),
                                 );
                                 info!(session_id = %sid, "delegation: session params received");
                             }
@@ -2138,16 +2169,7 @@ async fn handle_server_msg(
         bson::oid::ObjectId,
         roomler_ai_remote_control::permissions::Permissions,
     >,
-    pending_session_meta: &mut HashMap<
-        bson::oid::ObjectId,
-        (
-            String,
-            Option<roomler_ai_remote_control::models::InputMode>,
-            // FR-27 follow-up — the asking org, carried so the "Being viewed
-            // by" banner can be raised at peer-build time (not request time).
-            Option<String>,
-        ),
-    >,
+    pending_session_meta: &mut HashMap<bson::oid::ObjectId, SessionMeta>,
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
     tunnel_quic_peers: &mut HashMap<
         bson::oid::ObjectId,
@@ -2313,7 +2335,12 @@ async fn handle_server_msg(
             // the device policy's input arbitration mode.
             pending_session_meta.insert(
                 session_id,
-                (controller_name.clone(), input_mode, asking_org.clone()),
+                (
+                    controller_name.clone(),
+                    input_mode,
+                    asking_org.clone(),
+                    None,
+                ),
             );
             // FR-43 P2b-3 — hand the SAME resolved values to the GUI worker, if
             // one is attached. `Request` is not delegated (consent and the
@@ -2412,6 +2439,19 @@ async fn handle_server_msg(
             // `Auto`, inverting the gate-4 property exec and SSH are built on.
             let effective_mode =
                 crate::consent::strictest_of(directed_mode, consent_broker.mode(), host_window);
+            // FR-85 P3b — a recording's prompt follows the session's own: a
+            // session consented ON THE HOST asks the host again (same window)
+            // before it may record; an auto-granted one does not ask, its
+            // owner having opted into remote recording on the device.
+            if let Some(meta) = pending_session_meta.get_mut(&session_id) {
+                meta.3 = Some(RecordMeta {
+                    controller_user_id,
+                    prompt_window: match effective_mode {
+                        crate::consent::Mode::AutoGrant => None,
+                        crate::consent::Mode::Prompt { timeout } => Some(timeout),
+                    },
+                });
+            }
             let session_hex = session_id.to_hex();
             // Phase 4 — Email/Push are OWNER-side modes: the SERVER obtains
             // consent from the device owner (email link / push), so the agent
@@ -2660,9 +2700,10 @@ async fn handle_server_msg(
             // P6 — controller name + policy input mode for the arbiter
             // registration. Missing (harness skipped rc:request) → an
             // anonymous label + the agent-default (free) mode.
-            let (controller_name, input_mode, asking_org) = pending_session_meta
+            #[cfg_attr(not(feature = "recording"), allow(unused_variables))]
+            let (controller_name, input_mode, asking_org, record_meta) = pending_session_meta
                 .remove(&session_id)
-                .unwrap_or_else(|| ("Controller".to_string(), None, None));
+                .unwrap_or_else(|| ("Controller".to_string(), None, None, None));
             // FR-27 follow-up — capture what the "Being viewed by" banner needs
             // BEFORE `controller_name` is moved into `AgentPeer::new` below.
             // The banner is raised once the peer is established (after
@@ -2712,6 +2753,25 @@ async fn handle_server_msg(
                     return Ok(());
                 }
             };
+
+            // FR-85 P3b — the `record` channel's context, BEFORE the answer:
+            // a channel cannot open until the offer is answered, so it can
+            // never see this unset. A delegated session carries none (its
+            // daemon cannot record) and its channel refuses `unavailable`.
+            #[cfg(feature = "recording")]
+            if let Some(meta) = record_meta {
+                peer.set_record_ctx(crate::recording::remote::SessionCtx {
+                    session_id,
+                    controller_user_id: meta.controller_user_id,
+                    controller_name: banner_name.clone(),
+                    org: banner_org.clone(),
+                    prompt_window: meta.prompt_window,
+                    consent: consent_broker.clone(),
+                    indicator: indicator.clone(),
+                    outbound: delegated.unwrap_or(outbound_tx).clone(),
+                    companion: crate::recording::remote::Companion::System,
+                });
+            }
 
             let answer_sdp = match peer.handle_offer(sdp).await {
                 Ok(s) => s,
@@ -4242,7 +4302,23 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     if multi_org_tun {
         caps.multi_org.push("tun".into());
     }
+    caps.record = record_caps();
     caps
+}
+
+/// FR-85 P3b — `AgentCaps.record` as it stands NOW: the owner's live gate
+/// and whether a recorder can run here. Config-dependent and live, so it is
+/// filled at every announcement (the hello, a heartbeat that re-announces),
+/// never inside the memoized `detect()`.
+fn record_caps() -> Vec<String> {
+    #[cfg(feature = "recording")]
+    {
+        crate::recording::remote::advertised()
+    }
+    #[cfg(not(feature = "recording"))]
+    {
+        Vec::new()
+    }
 }
 
 pub(crate) fn urlencode(s: &str) -> String {

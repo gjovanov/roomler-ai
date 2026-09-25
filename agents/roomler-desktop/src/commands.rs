@@ -1755,6 +1755,32 @@ pub struct RecordingsView {
     pub listing: Option<localapi::RecordingsListing>,
     /// `record_dir` as configured; `None` = the default folder.
     pub record_dir: Option<String>,
+    /// FR-85 P3b — the owner's remote-recording gates, `None` against a
+    /// service that predates them (the view then offers no toggle).
+    pub remote: Option<RemoteRecordingGates>,
+}
+
+/// FR-85 P3b — `record_remote_enabled` / `record_remote_audio`, as the
+/// service reports them.
+#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
+pub struct RemoteRecordingGates {
+    pub enabled: bool,
+    pub audio: bool,
+}
+
+/// The remote gates out of a config listing; `None` unless the service
+/// knows the enabling key.
+fn remote_gates(entries: &[localapi::ConfigEntry]) -> Option<RemoteRecordingGates> {
+    let flag = |key: &str| {
+        entries
+            .iter()
+            .find(|e| e.key == key)
+            .map(|e| e.value.as_deref() == Some("true"))
+    };
+    Some(RemoteRecordingGates {
+        enabled: flag("record_remote_enabled")?,
+        audio: flag("record_remote_audio").unwrap_or(false),
+    })
 }
 
 impl RecordingsView {
@@ -1766,6 +1792,7 @@ impl RecordingsView {
             state: None,
             listing: None,
             record_dir: None,
+            remote: None,
         }
     }
 
@@ -1777,6 +1804,7 @@ impl RecordingsView {
             state: None,
             listing: None,
             record_dir: None,
+            remote: None,
         }
     }
 }
@@ -1841,12 +1869,11 @@ pub async fn cmd_recordings_view() -> RecordingsView {
     };
     // The folder row shows whether a folder was CHOSEN; the listing says
     // which one is in use (and why, when it is not the chosen one).
-    let record_dir = client
-        .config_entries()
-        .await
-        .ok()
-        .and_then(|entries| entries.into_iter().find(|e| e.key == "record_dir"))
-        .and_then(|e| e.value)
+    let entries = client.config_entries().await.unwrap_or_default();
+    let record_dir = entries
+        .iter()
+        .find(|e| e.key == "record_dir")
+        .and_then(|e| e.value.clone())
         .filter(|v| !v.is_empty());
     refresh_ok(SURFACE);
     RecordingsView {
@@ -1856,6 +1883,7 @@ pub async fn cmd_recordings_view() -> RecordingsView {
         state: Some(state),
         listing: Some(listing),
         record_dir,
+        remote: remote_gates(&entries),
     }
 }
 
@@ -2514,11 +2542,45 @@ mod tests {
     #[test]
     fn recording_keys_are_the_daemons_to_accept() {
         assert!(is_daemon_owned_key("record_dir"));
+        assert!(is_daemon_owned_key("record_remote_enabled"));
+        assert!(is_daemon_owned_key("record_remote_audio"));
         assert!(!is_daemon_owned_key("exec_enabled"));
         assert!(!is_daemon_owned_key("enable_remote_browse"));
         // FR-84 D4 made `files_dir` daemon-owned as well (see
         // `a_daemon_refusal_of_files_dir_is_final`).
         assert!(is_daemon_owned_key("files_dir"));
+    }
+
+    /// FR-85 P3b — the remote gates come from the service's own listing, and
+    /// a service that predates them offers no toggle at all (rather than an
+    /// "off" that could never be switched on).
+    #[test]
+    fn remote_gates_come_from_the_listing_and_are_absent_on_an_older_service() {
+        let entry = |key: &str, value: Option<&str>| -> localapi::ConfigEntry {
+            serde_json::from_value(serde_json::json!({
+                "key": key, "value": value, "kind": "bool",
+                "restart_required": false, "description": "",
+            }))
+            .unwrap()
+        };
+        assert_eq!(remote_gates(&[entry("record_dir", None)]), None);
+        assert_eq!(
+            remote_gates(&[
+                entry("record_remote_enabled", Some("true")),
+                entry("record_remote_audio", Some("false")),
+            ]),
+            Some(RemoteRecordingGates {
+                enabled: true,
+                audio: false
+            })
+        );
+        assert_eq!(
+            remote_gates(&[entry("record_remote_enabled", Some("false"))]),
+            Some(RemoteRecordingGates {
+                enabled: false,
+                audio: false
+            })
+        );
     }
 
     /// The split-brain lock: machine-global is read ONLY under an SCM

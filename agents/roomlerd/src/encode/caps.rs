@@ -1447,10 +1447,10 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
         // the device's ExecPolicy, and the agent's own `exec_enabled` config
         // key all still have to say yes before anything runs.
         rpc: rpc_caps(),
-        // FR-85 P3 — nothing yet: the agent advertises `remote` only once it
-        // serves the `record` DataChannel (P3b), and only while its owner's
-        // `record_remote_enabled` gate is on. Until then the hub strips
-        // `Permissions::RECORD` from every grant to this agent.
+        // FR-85 P3b — empty HERE on purpose: `detect()` is memoized and
+        // config-blind, while the record words follow the owner's LIVE gate.
+        // `signaling::stub_caps` fills them at every announcement (the hello,
+        // and a heartbeat that re-announces when they change).
         record: Vec::new(),
     }
 }
