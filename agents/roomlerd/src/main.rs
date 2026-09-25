@@ -3126,8 +3126,15 @@ async fn run_cmd(
         // console user's own non-elevated token where this worker may hold
         // the elevated one. Everywhere else (the per-user Scheduled Task, the
         // Linux systemd unit) the worker is the launcher.
+        // RUNNING, not merely registered: a stopped leftover registration
+        // (a per-user install over a half-removed per-machine one) has no
+        // host to do it, and this worker must.
         #[cfg(target_os = "windows")]
-        let scm_owns_companion = roomlerd::win_service::is_installed();
+        let scm_owns_companion = matches!(
+            roomlerd::win_service::status(),
+            Ok(roomlerd::win_service::InstalledStatus::Running
+                | roomlerd::win_service::InstalledStatus::StartPending)
+        );
         #[cfg(not(target_os = "windows"))]
         let scm_owns_companion = false;
         let companion_autostart = cfg.companion_autostart;
