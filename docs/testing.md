@@ -55,8 +55,9 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
   websocket + connection status, billing, invite, oauth, email flows,
   notifications, observability, profile, responsive, 404 — plus the
   remote-control lane: `remote-session-smoke`, `remote-file-upload-smoke`,
-  `rc-vp9-444` (needs an agent built with the feature), and a field-host upload
-  spec. Chromium runs with fake media devices for WebRTC.
+  `rc-vp9-444` (needs an agent built with the feature),
+  `remote-recording-refused` and `remote-recording-smoke` (FR-85; the second
+  needs an agent that advertises `record`), and a field-host upload spec. Chromium runs with fake media devices for WebRTC.
 
 ## In-crate Rust unit tests
 

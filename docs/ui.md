@@ -47,13 +47,14 @@ collaboration core — plus the fleet set: `agents`, `tunnelClients`,
 `tunnelPolicies`, `overlayRoutes`, `overlayAcl`, `orgBadges` (multi-org
 indicators), `stats` (observability series).
 
-## Composables (13)
+## Composables
 
 | Composable | Purpose |
 |---|---|
 | `useAuth` | Session + token lifecycle |
 | `useWebSocket` | The `/ws` connection + event dispatch into stores |
 | `useRemoteControl` | The entire remote-desktop viewer engine (below) |
+| `useRemoteRecording` | The viewer's half of the session's `record` channel: start/stop, the device's list, a checked, resumable download ([recording.md](recording.md) §10) |
 | `useConferenceLayout` / `useActiveSpeaker` / `useAudioPlayback` / `usePictureInPicture` | Conference UX |
 | `useMarkdown` | markdown-it + DOMPurify rendering |
 | `usePush` | Web-push subscribe/unsubscribe |
@@ -95,6 +96,10 @@ flowchart TB
   bridge for full-fidelity RTF.
 - **File transfer**: chunked uploads/downloads, folder download (streamed zip),
   resumable, cancellable.
+- **Recording** (FR-85): Record, the REC chip and the device's recordings,
+  over a `record` channel opened only when the grant kept `RECORD`; a stripped
+  grant shows a disabled control that says why
+  ([recording.md](recording.md) §10).
 - **Remote apps**: list / focus / launch on the controlled host — and, on a
   host that cannot, the reason ([`remote-apps.md`](remote-apps.md)).
 - **Diagnostics**: stats polling, jank detector, long-task observer, inbound-RTP
