@@ -8,6 +8,8 @@ import { describe, it, expect, beforeEach, afterEach, afterAll } from 'vitest'
 // carry the important invariants.
 import {
   browserButton,
+  grantHoldsRecord,
+  openRecordChannel,
   kbdCodeToHid,
   letterboxedNormalise,
   directVideoNormalise,
@@ -4502,5 +4504,47 @@ describe('codecLabelFromDecoderConfig', () => {
   it('is case-insensitive, because the string comes from a browser API', () => {
     expect(codecLabelFromDecoderConfig('AVC1.640034')).toBe('H.264')
     expect(codecLabelFromDecoderConfig('AV01.0.13M.08')).toBe('AV1')
+  })
+})
+
+describe('the record channel (FR-85 P3c)', () => {
+  /** A PeerConnection that only records which channels were opened on it. */
+  function fakePc() {
+    const opened: string[] = []
+    return {
+      opened,
+      pc: {
+        createDataChannel: (label: string) => {
+          opened.push(label)
+          return { label } as unknown as RTCDataChannel
+        },
+      },
+    }
+  }
+
+  it('reads RECORD out of the effective grant, by equality, and never assumes it', () => {
+    expect(grantHoldsRecord('VIEW | INPUT | CLIPBOARD | FILES | RECORD')).toBe(true)
+    expect(grantHoldsRecord('VIEW|RECORD')).toBe(true)
+    expect(grantHoldsRecord('VIEW | INPUT')).toBe(false)
+    // A newer bit that merely starts with RECORD is not RECORD.
+    expect(grantHoldsRecord('VIEW | RECORDING')).toBe(false)
+    // An older server sends no grant: absent means no.
+    expect(grantHoldsRecord(undefined)).toBe(false)
+    expect(grantHoldsRecord(null)).toBe(false)
+  })
+
+  it('is opened from the grant, once per PeerConnection, and only when it holds RECORD', () => {
+    const { opened, pc } = fakePc()
+    const channels: Record<string, RTCDataChannel> = {}
+    expect(openRecordChannel(pc, channels, 'VIEW | INPUT')).toBeNull()
+    expect(openRecordChannel(pc, channels, null)).toBeNull()
+    const ch = openRecordChannel(pc, channels, 'VIEW | RECORD')
+    expect(ch).not.toBeNull()
+    expect(channels.record).toBe(ch)
+    // A second create for the same session (the coalesce echo) opens nothing.
+    expect(openRecordChannel(pc, channels, 'VIEW | RECORD')).toBeNull()
+    expect(opened).toEqual(['record'])
+    // No PeerConnection (a create racing teardown): nothing to open it on.
+    expect(openRecordChannel(null, {}, 'VIEW | RECORD')).toBeNull()
   })
 })
