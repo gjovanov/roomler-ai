@@ -321,6 +321,14 @@ const KEYS: &[KeyMeta] = &[
         description: "Ask the OS to stay awake so this device stays reachable (FR-55). `on-ac` is the setting a laptop usually wants. A live remote-control or SSH session ALWAYS holds the machine awake regardless of this. ⚠️ macOS clamshell sleep (lid closed, no external display) ignores it — an OS limit, not a setting. Default: never.",
     },
     KeyMeta {
+        key: "companion_autostart",
+        group: Group::Device,
+        tier: Tier::Standard,
+        live: false,
+        kind: "bool",
+        description: "FR-84 - whether the service opens the desktop companion once after installation (the Welcome tour) and keeps it registered to start at login (Windows: the `Roomler Desktop` Run value). Off = neither; the companion still runs when someone opens it. A person's own 'Start at login' choice is separate and needs no admin. Takes effect at the next service start. Default: on.",
+    },
+    KeyMeta {
         key: "remote_config_enabled",
         group: Group::Access,
         tier: Tier::Essential,
@@ -1580,6 +1588,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         } else {
             cfg.power_policy.clone()
         }),
+        "companion_autostart" => Some(fmt_bool(cfg.companion_autostart)),
         "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
         "local_restart_enabled" => Some(fmt_bool(cfg.local_restart_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
@@ -1795,6 +1804,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             }
             cfg.power_policy = v;
         }
+        // FR-84 D6 — clearing returns to ON, the built-in default.
+        "companion_autostart" => cfg.companion_autostart = parse_bool_or(value, true)?,
         // Same fail-safe direction, and note WHERE this is settable from:
         // locally (this surface — CLI, desktop companion), never from a
         // server push. A future config-push handler must reject this field

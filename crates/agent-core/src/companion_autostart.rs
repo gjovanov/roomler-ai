@@ -44,8 +44,7 @@ pub const XDG_SYSTEM_AUTOSTART: &str = "/etc/xdg/autostart/roomler-desktop.deskt
 /// unquoted Run command with a space is parsed by the shell as
 /// `C:\Program` + arguments.
 pub fn windows_run_command(exe: &Path) -> String {
-    // STUB (RED stage).
-    exe.display().to_string()
+    format!("\"{}\" {AUTOSTART_ARG}", exe.display())
 }
 
 /// What the Run value SHOULD be, or `None` for "no value".
@@ -55,13 +54,12 @@ pub fn windows_run_command(exe: &Path) -> String {
 /// (`HKCU`) value — the machine value serves every account, and a person's
 /// opt-out is honoured by the companion at `--autostart` instead.
 pub fn desired_run_value(
-    _device_enabled: bool,
+    device_enabled: bool,
     exe: &Path,
-    _exe_exists: bool,
-    _user_opted_out: bool,
+    exe_exists: bool,
+    user_opted_out: bool,
 ) -> Option<String> {
-    // STUB (RED stage).
-    Some(windows_run_command(exe))
+    (device_enabled && exe_exists && !user_opted_out).then(|| windows_run_command(exe))
 }
 
 /// What to do to the registry to get from `current` to `desired`.
@@ -73,9 +71,13 @@ pub enum RunKeyAction {
 }
 
 /// Plan the change. Pure: the registry is read and written by the caller.
-pub fn plan_run_key(_current: Option<&str>, _desired: Option<&str>) -> RunKeyAction {
-    // STUB (RED stage).
-    RunKeyAction::Keep
+pub fn plan_run_key(current: Option<&str>, desired: Option<&str>) -> RunKeyAction {
+    match (current, desired) {
+        (None, None) => RunKeyAction::Keep,
+        (Some(c), Some(d)) if c == d => RunKeyAction::Keep,
+        (_, Some(d)) => RunKeyAction::Write(d.to_string()),
+        (Some(_), None) => RunKeyAction::Remove,
+    }
 }
 
 /// Which Windows Run key owns an EXE's login start.
@@ -90,9 +92,38 @@ pub enum InstallScope {
 /// Classify `exe` by its location. `program_files` are the candidate
 /// Program Files roots (`%ProgramFiles%`, `%ProgramW6432%`); the comparison
 /// is by whole path components and ignores case and slash direction.
-pub fn windows_scope_for_exe(_exe: &Path, _program_files: &[PathBuf]) -> InstallScope {
-    // STUB (RED stage).
-    InstallScope::User
+pub fn windows_scope_for_exe(exe: &Path, program_files: &[PathBuf]) -> InstallScope {
+    // String form on purpose: this is tested on every platform, and Linux's
+    // `Path` does not split `C:\…` into components.
+    fn norm(p: &Path) -> String {
+        let mut s = p.to_string_lossy().replace('/', "\\").to_lowercase();
+        while s.ends_with('\\') {
+            s.pop();
+        }
+        s
+    }
+    let exe = norm(exe);
+    let inside = program_files.iter().map(|d| norm(d)).any(|root| {
+        !root.is_empty()
+            && exe.len() > root.len()
+            && exe.starts_with(&root)
+            && exe.as_bytes()[root.len()] == b'\\'
+    });
+    if inside {
+        InstallScope::Machine
+    } else {
+        InstallScope::User
+    }
+}
+
+/// The Program Files roots of this machine, for [`windows_scope_for_exe`].
+/// Empty off Windows.
+pub fn program_files_dirs() -> Vec<PathBuf> {
+    ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// The per-user XDG autostart directory: `$XDG_CONFIG_HOME/autostart` when
@@ -102,25 +133,66 @@ pub fn xdg_user_autostart_dir(
     xdg_config_home: Option<&str>,
     home: Option<&Path>,
 ) -> Option<PathBuf> {
-    // STUB (RED stage).
-    let _ = xdg_config_home;
-    home.map(|h| h.join("autostart"))
+    // XDG is a POSIX spec: "absolute" means a leading `/`, whatever the
+    // platform running the test thinks.
+    if let Some(cfg) = xdg_config_home.filter(|c| c.starts_with('/')) {
+        return Some(PathBuf::from(format!(
+            "{}/autostart",
+            cfg.trim_end_matches('/')
+        )));
+    }
+    home.map(|h| PathBuf::from(format!("{}/.config/autostart", h.display())))
 }
 
 /// Does this desktop entry carry `Hidden=true` in its `[Desktop Entry]`
 /// group? That is the XDG way to switch a system autostart entry off for
 /// one user.
-pub fn xdg_entry_hidden(_content: &str) -> bool {
-    // STUB (RED stage).
+pub fn xdg_entry_hidden(content: &str) -> bool {
+    let mut in_entry = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim() == "Hidden"
+        {
+            return v.trim().eq_ignore_ascii_case("true");
+        }
+    }
     false
 }
 
 /// A per-user autostart entry for the companion at `exe`, switched off
 /// (`Hidden=true`) or on. Marked `X-Roomler-Managed=true` so the companion
 /// knows the file is its own to rewrite or delete.
-pub fn xdg_user_entry(_exe: &str, _hidden: bool) -> String {
-    // STUB (RED stage).
-    String::new()
+pub fn xdg_user_entry(exe: &str, hidden: bool) -> String {
+    // The Exec key quotes an argument with a space in double quotes.
+    let exec = if exe.contains(' ') {
+        format!("\"{exe}\"")
+    } else {
+        exe.to_string()
+    };
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Roomler\n\
+         Comment=Start the Roomler companion at login\n\
+         Exec={exec} {AUTOSTART_ARG}\n\
+         Icon=roomler-desktop\n\
+         Terminal=false\n\
+         X-GNOME-Autostart-Phase=Applications\n\
+         X-GNOME-Autostart-Delay=5\n\
+         X-Roomler-Managed=true\n\
+         Hidden={hidden}\n"
+    )
 }
 
 /// Registry access for the Run value. Windows-only; every call takes the
@@ -128,6 +200,11 @@ pub fn xdg_user_entry(_exe: &str, _hidden: bool) -> String {
 #[cfg(windows)]
 pub mod registry {
     use super::RunKeyAction;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW,
+        RegGetValueW, RegSetKeyValueW,
+    };
 
     /// Which hive.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,27 +213,100 @@ pub mod registry {
         CurrentUser,
     }
 
+    impl Hive {
+        fn hkey(self) -> HKEY {
+            match self {
+                Hive::LocalMachine => HKEY_LOCAL_MACHINE,
+                Hive::CurrentUser => HKEY_CURRENT_USER,
+            }
+        }
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn os_err(code: u32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code as i32)
+    }
+
     /// Read a `REG_SZ` value; `Ok(None)` when the key or the value is absent.
-    pub fn read_value(_hive: Hive, _subkey: &str, _name: &str) -> std::io::Result<Option<String>> {
-        // STUB (RED stage).
-        Ok(None)
+    pub fn read_value(hive: Hive, subkey: &str, name: &str) -> std::io::Result<Option<String>> {
+        let (k, n) = (wide(subkey), wide(name));
+        let mut bytes: u32 = 0;
+        // SAFETY: a size query — null data pointer, valid out-param.
+        let rc = unsafe {
+            RegGetValueW(
+                hive.hkey(),
+                k.as_ptr(),
+                n.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bytes,
+            )
+        };
+        if rc == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if rc != ERROR_SUCCESS {
+            return Err(os_err(rc));
+        }
+        let mut buf = vec![0u16; (bytes as usize).div_ceil(2).max(1)];
+        let mut len = (buf.len() * 2) as u32;
+        // SAFETY: `buf` holds `len` bytes; RegGetValueW NUL-terminates.
+        let rc = unsafe {
+            RegGetValueW(
+                hive.hkey(),
+                k.as_ptr(),
+                n.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if rc != ERROR_SUCCESS {
+            return Err(os_err(rc));
+        }
+        let chars = (len as usize / 2).min(buf.len());
+        let end = buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
+        Ok(Some(String::from_utf16_lossy(&buf[..end])))
     }
 
     /// Write a `REG_SZ` value, creating the key when needed.
-    pub fn write_value(
-        _hive: Hive,
-        _subkey: &str,
-        _name: &str,
-        _data: &str,
-    ) -> std::io::Result<()> {
-        // STUB (RED stage).
+    pub fn write_value(hive: Hive, subkey: &str, name: &str, data: &str) -> std::io::Result<()> {
+        let (k, n, d) = (wide(subkey), wide(name), wide(data));
+        // SAFETY: NUL-terminated wide buffers; size in bytes includes the NUL.
+        let rc = unsafe {
+            RegSetKeyValueW(
+                hive.hkey(),
+                k.as_ptr(),
+                n.as_ptr(),
+                REG_SZ,
+                d.as_ptr().cast(),
+                (d.len() * 2) as u32,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(os_err(rc));
+        }
         Ok(())
     }
 
     /// Delete a value; `Ok(false)` when there was nothing to delete.
-    pub fn delete_value(_hive: Hive, _subkey: &str, _name: &str) -> std::io::Result<bool> {
-        // STUB (RED stage).
-        Ok(false)
+    pub fn delete_value(hive: Hive, subkey: &str, name: &str) -> std::io::Result<bool> {
+        let (k, n) = (wide(subkey), wide(name));
+        // SAFETY: NUL-terminated wide buffers.
+        let rc = unsafe { RegDeleteKeyValueW(hive.hkey(), k.as_ptr(), n.as_ptr()) };
+        match rc {
+            ERROR_SUCCESS => Ok(true),
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            other => Err(os_err(other)),
+        }
     }
 
     /// Bring the value at `subkey\name` to `desired` (`None` = absent) and
@@ -181,7 +331,22 @@ pub mod registry {
 
     /// Test-only: remove a scratch key and everything under it.
     #[cfg(test)]
-    pub(crate) fn delete_tree(_hive: Hive, _subkey: &str) {}
+    pub(crate) fn delete_tree(hive: Hive, subkey: &str) {
+        use windows_sys::Win32::System::Registry::RegDeleteTreeW;
+        // Refuse anything that is not a scratch key: this must never be able
+        // to take a real key with it.
+        assert!(subkey.starts_with(r"Software\RoomlerTest\"), "{subkey}");
+        let k = wide(subkey);
+        // SAFETY: NUL-terminated wide buffer; absent key is a no-op error.
+        unsafe { RegDeleteTreeW(hive.hkey(), k.as_ptr()) };
+        // And the (empty) scratch parent — `RegDeleteKeyW` refuses a key that
+        // still has subkeys, so a concurrent test's key is never touched.
+        let parent = wide(r"Software\RoomlerTest");
+        // SAFETY: as above.
+        unsafe {
+            windows_sys::Win32::System::Registry::RegDeleteKeyW(hive.hkey(), parent.as_ptr())
+        };
+    }
 }
 
 #[cfg(test)]

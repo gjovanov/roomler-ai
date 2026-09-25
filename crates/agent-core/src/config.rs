@@ -165,6 +165,23 @@ pub struct AgentConfig {
     #[serde(default)]
     pub power_policy: String,
 
+    /// FR-84 D6 — whether the service opens the desktop companion once after
+    /// installation and keeps it registered to start at login.
+    ///
+    /// Default **on**: the companion is this device's consent prompt and the
+    /// only place that explains what the device can do, and an install that
+    /// ends with nothing on screen leaves a person unsure it worked. OFF is
+    /// the kill switch for the whole of D6's launch behaviour: the one-shot
+    /// post-install launch is skipped, and the Windows Run value
+    /// (`HKLM`/`HKCU\…\Run\Roomler Desktop`) is removed at the next service
+    /// start. The companion itself still runs when someone opens it.
+    ///
+    /// ⚠️ This is the DEVICE's switch. A person's own "Start Roomler at login"
+    /// choice lives in the companion's per-user state
+    /// ([`crate::desktop_state`]) and needs no admin.
+    #[serde(default = "default_true")]
+    pub companion_autostart: bool,
+
     /// Whether this device accepts configuration pushed from its control
     /// plane (see `docs/remote-config.md`).
     ///
@@ -2077,6 +2094,7 @@ pub fn test_fixture() -> AgentConfig {
         exec_enabled: false,
         macos_supervise_gui_worker: false,
         power_policy: String::new(),
+        companion_autostart: true,
         remote_config_enabled: false,
         local_restart_enabled: true,
         ssh_enabled: false,
