@@ -1015,6 +1015,18 @@ pub enum Request {
     /// `Failed` state and re-supervises. Returns
     /// [`Response::RouteUpdated`].
     RouteSetEnabled { id: String, enabled: bool },
+    /// FR-84 D1 — replace a declared route IN ONE STEP, keyed by `route.id`.
+    /// The daemon validates the new descriptor exactly as [`Self::RouteAdd`]
+    /// does (bad node, missing/forbidden `remote`, a local port another
+    /// enabled route already holds — the route being replaced excepted);
+    /// an invalid replacement is refused and the OLD route keeps running and
+    /// stays persisted. A valid one is written to config in ONE save, its
+    /// old flow is stopped and the new descriptor is reconciled. The
+    /// alternative — `RouteRemove` then `RouteAdd` — loses the route
+    /// entirely when the add fails. Unknown id ⇒ [`Response::Error`].
+    /// Mutating — the pipe/socket ACL is the trust boundary. Returns
+    /// [`Response::RouteReplaced`] with the effective descriptor.
+    RouteUpdate { route: RouteDescriptor },
     /// Rename this device: the daemon persists the new `machine_name` to ITS
     /// OWN config file — profile-correct by construction (under a SYSTEM/SCM
     /// install the machine-global config is writable by the daemon but NOT by
@@ -1207,6 +1219,14 @@ pub enum Response {
     /// unknown.
     RouteUpdated {
         ok: bool,
+    },
+    /// FR-84 D1 — a route was replaced + persisted ([`Request::RouteUpdate`])
+    /// — carries the effective descriptor. A daemon that predates the verb
+    /// answers the request with a bad-request [`Response::Error`] instead,
+    /// which a client should render as "this service predates route
+    /// editing", never as a blank page.
+    RouteReplaced {
+        route: RouteDescriptor,
     },
     /// The device was renamed + persisted ([`Request::SetDeviceName`]) —
     /// carries the effective (trimmed) name.
@@ -1427,6 +1447,13 @@ pub trait LocalApiState: Send + Sync {
             message: "declared routes are not supported on this node".into(),
         }
     }
+    /// FR-84 D1 — replace a declared route in one step (async — config
+    /// I/O). Default: unsupported.
+    async fn route_update(&self, _route: RouteDescriptor) -> Response {
+        Response::Error {
+            message: "declared routes are not supported on this node".into(),
+        }
+    }
     /// Rename this device — persist the new name to the daemon's own config
     /// (async — config I/O). Default: unsupported, so existing impls / mocks
     /// and the read-only contract are undisturbed; the agent daemon overrides.
@@ -1517,6 +1544,7 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RouteAdd { .. }
         | Request::RouteRemove { .. }
         | Request::RouteSetEnabled { .. }
+        | Request::RouteUpdate { .. }
         | Request::SetDeviceName { .. }
         | Request::ConfigCleanupStale
         | Request::ConfigGet
@@ -1576,6 +1604,7 @@ where
             Ok(Request::RouteSetEnabled { id, enabled }) => {
                 state.route_set_enabled(&id, enabled).await
             }
+            Ok(Request::RouteUpdate { route }) => state.route_update(route).await,
             Ok(Request::SetDeviceName { name }) => state.set_device_name(&name).await,
             Ok(Request::ConfigCleanupStale) => state.config_cleanup_stale().await,
             Ok(Request::ConfigGet) => state.config_entries().await,
@@ -1634,18 +1663,56 @@ where
 ///
 /// Each accepted connection is served on its own task; a slow or misbehaving
 /// client can't stall the accept loop or another client.
+///
+/// Uses the built-in listening-instance pool ([`DEFAULT_PIPE_POOL`]); the
+/// daemon threads its configured `localapi_pipe_pool` through
+/// [`serve_with_pool`] instead.
 pub async fn serve(
     state: Arc<dyn LocalApiState>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    serve_with_pool(state, shutdown, DEFAULT_PIPE_POOL).await
+}
+
+/// [`serve`] with an explicit named-pipe listener pool size (FR-84 D1).
+///
+/// `pipe_pool` is how many pipe instances stay LISTENING at once on Windows
+/// (clamped to `1..=`[`MAX_PIPE_POOL`]); `1` is the pre-FR-84 single
+/// instance. The unix socket has a kernel accept backlog and ignores it.
+pub async fn serve_with_pool(
+    state: Arc<dyn LocalApiState>,
+    shutdown: watch::Receiver<bool>,
+    pipe_pool: u32,
+) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        serve_windows(state, shutdown).await
+        serve_windows(state, shutdown, pipe_pool).await
     }
     #[cfg(not(windows))]
     {
+        let _ = pipe_pool;
         serve_unix(state, shutdown).await
     }
+}
+
+/// FR-84 D1 — the built-in number of named-pipe instances kept listening
+/// (`localapi_pipe_pool` unset). Four covers the companion's worst measured
+/// burst — device view, routes and flows opening within the same
+/// millisecond — with one to spare for the CLI.
+pub const DEFAULT_PIPE_POOL: u32 = 4;
+
+/// Upper bound on the listener pool. Each instance is a kernel object plus
+/// a parked accept task; beyond this a burst that large is a bug elsewhere.
+pub const MAX_PIPE_POOL: u32 = 16;
+
+/// The pool size the listener actually runs with for a configured value:
+/// `None` ⇒ [`DEFAULT_PIPE_POOL`], anything else clamped to
+/// `1..=`[`MAX_PIPE_POOL`]. `1` is the kill switch (one listening instance,
+/// the pre-FR-84 behaviour).
+pub fn effective_pipe_pool(configured: Option<u32>) -> u32 {
+    configured
+        .unwrap_or(DEFAULT_PIPE_POOL)
+        .clamp(1, MAX_PIPE_POOL)
 }
 
 // ---- Windows: named pipe + SDDL security descriptor ----------------------
@@ -1747,25 +1814,40 @@ impl Drop for PipeSecurity {
 async fn serve_windows(
     state: Arc<dyn LocalApiState>,
     shutdown: watch::Receiver<bool>,
+    pipe_pool: u32,
 ) -> std::io::Result<()> {
-    serve_windows_at(LOCALAPI_PIPE_NAME, state, shutdown).await
+    serve_windows_at(LOCALAPI_PIPE_NAME, state, shutdown, pipe_pool).await
 }
 
-/// The named-pipe accept loop, parameterised on the pipe name so tests can use
-/// a private one. Builds the ACL once, then serves clients: on each connect it
-/// hands the connected instance to a task and pre-creates the next instance so
-/// a second client racing the handoff isn't refused with `ERROR_PIPE_BUSY`.
+/// The named-pipe listener, parameterised on the pipe name so tests can use a
+/// private one. Binds the FIRST instance (retrying while another process
+/// holds the name), then runs a POOL of `pipe_pool` accept tasks, each owning
+/// one listening instance — so there is never a moment with zero listening
+/// instances, which is what a client sees as `ERROR_PIPE_BUSY`.
+///
+/// Before FR-84 there was exactly one listening instance, and its replacement
+/// was created only after `connect()` had returned to this task. A client
+/// opening the pipe in that gap — or while the one instance was already taken
+/// — was refused on the spot (`CreateFileW` does not wait). The desktop
+/// companion opens three connections within the same millisecond every 2 s,
+/// and the raw 3-open probe measured on the reporting host had open #2 fail
+/// 60/60 times. With `pipe_pool = 1` this is exactly the old behaviour (the
+/// kill switch); with N, up to N clients can open back-to-back and each
+/// accept task re-creates its own instance after handing the connected one
+/// off.
 #[cfg(windows)]
 pub(crate) async fn serve_windows_at(
     pipe_name: &str,
     state: Arc<dyn LocalApiState>,
     mut shutdown: watch::Receiver<bool>,
+    pipe_pool: u32,
 ) -> std::io::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     if *shutdown.borrow() {
         return Ok(());
     }
+    let pool = effective_pipe_pool(Some(pipe_pool));
     let mut security = PipeSecurity::new(LOCALAPI_SDDL)?;
     // Retry the FIRST-instance create instead of failing permanently. If another
     // process already holds `\\.\pipe\roomler` (a stale/leftover agent, or a
@@ -1777,7 +1859,7 @@ pub(crate) async fn serve_windows_at(
     //
     // SAFETY: `security.as_ptr()` stays valid for the lifetime of `security`,
     // which outlives every create call below.
-    let mut server = loop {
+    let first = loop {
         match unsafe {
             ServerOptions::new()
                 .first_pipe_instance(true)
@@ -1799,28 +1881,124 @@ pub(crate) async fn serve_windows_at(
             }
         }
     };
+
+    // The spare instances. Only the very first create above may claim
+    // `first_pipe_instance`; these join the name the first one now owns. Each
+    // accept task gets its own `PipeSecurity` (it is `Send`, not `Sync`).
+    // Best-effort: a spare that cannot be created degrades the pool, it does
+    // not take the listener down — slot 0 still serves.
+    let mut spares = Vec::new();
+    for slot in 1..pool {
+        let mut sec = match PipeSecurity::new(LOCALAPI_SDDL) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(slot, error = %e, "localapi: pipe pool slot skipped (security descriptor)");
+                break;
+            }
+        };
+        match create_pipe_instance(pipe_name, &mut sec) {
+            Ok(server) => {
+                spares.push(tokio::spawn(accept_pipe(
+                    pipe_name.to_string(),
+                    slot,
+                    server,
+                    sec,
+                    state.clone(),
+                    shutdown.clone(),
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(slot, error = %e, "localapi: pipe pool slot skipped (create failed)");
+                break;
+            }
+        }
+    }
     tracing::info!(
         pipe = pipe_name,
+        pool = spares.len() + 1,
         "localapi: named-pipe listener up (SYSTEM + Administrators + interactive user)"
     );
 
+    // Slot 0 runs inline; every slot exits on the same shutdown watch, and
+    // the abort below is only a belt for the case where slot 0 returns first.
+    let result = accept_pipe(pipe_name.to_string(), 0, first, security, state, shutdown).await;
+    for task in spares {
+        task.abort();
+    }
+    result
+}
+
+/// One more listening instance of an already-bound pipe.
+///
+/// SAFETY: `security.as_ptr()` is valid for the lifetime of `security`; the OS
+/// copies the descriptor into the new instance.
+#[cfg(windows)]
+fn create_pipe_instance(
+    pipe_name: &str,
+    security: &mut PipeSecurity,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    // SAFETY: see the function doc — the pointer outlives the call and the
+    // kernel copies the descriptor.
+    unsafe {
+        ServerOptions::new().create_with_security_attributes_raw(pipe_name, security.as_ptr())
+    }
+}
+
+/// One pool slot: own a listening instance, and on every client connect hand
+/// the connected instance to its own task and re-create the listener. A
+/// re-create that fails is retried (bounded by `shutdown`) rather than ending
+/// the slot — with one slot that would be today's whole listener dying.
+#[cfg(windows)]
+async fn accept_pipe(
+    pipe_name: String,
+    slot: u32,
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+    mut security: PipeSecurity,
+    state: Arc<dyn LocalApiState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    const RETRY: std::time::Duration = std::time::Duration::from_millis(200);
+    let mut listening = Some(first);
     loop {
+        let Some(server) = listening.as_mut() else {
+            // The replacement create failed after the last handoff; this slot
+            // is dark until it succeeds.
+            match create_pipe_instance(&pipe_name, &mut security) {
+                Ok(s) => listening = Some(s),
+                Err(e) => {
+                    tracing::warn!(slot, error = %e, "localapi: pipe instance create failed; retrying");
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() { return Ok(()); }
+                        }
+                        _ = tokio::time::sleep(RETRY) => {}
+                    }
+                }
+            }
+            continue;
+        };
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    tracing::info!("localapi: shutdown; pipe listener exiting");
+                    tracing::info!(slot, "localapi: shutdown; pipe listener exiting");
                     return Ok(());
                 }
             }
             conn = server.connect() => match conn {
                 Ok(()) => {
-                    let connected = server;
-                    // SAFETY: same invariant as the first create.
-                    server = unsafe {
-                        ServerOptions::new()
-                            .create_with_security_attributes_raw(pipe_name, security.as_ptr())?
-                    };
+                    let connected = listening.take().expect("a connected instance");
+                    // Re-create BEFORE handing off, so with a pool of one the
+                    // gap is no wider than it ever was; a failure here is
+                    // retried at the top of the loop, after the client is served.
+                    match create_pipe_instance(&pipe_name, &mut security) {
+                        Ok(next) => listening = Some(next),
+                        Err(e) => {
+                            tracing::warn!(slot, error = %e, "localapi: pipe instance re-create failed; will retry");
+                        }
+                    }
                     let st = state.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve_connection(connected, &*st).await {
@@ -1829,8 +2007,8 @@ pub(crate) async fn serve_windows_at(
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "localapi: pipe connect failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tracing::warn!(slot, error = %e, "localapi: pipe connect failed; retrying");
+                    tokio::time::sleep(RETRY).await;
                 }
             }
         }
@@ -2083,24 +2261,45 @@ pub fn other_daemon_socket() -> Option<std::path::PathBuf> {
     None
 }
 
+/// FR-84 D1 — how long to wait before the `attempt`-th retry of a pipe open
+/// that was refused with `ERROR_PIPE_BUSY` (every listening instance taken):
+/// `5, 10, 20, 40, 80, 160` ms, then `None` = give up and surface the error.
+/// Bounded at 315 ms in total — this is an interactive path, and a daemon
+/// that keeps every instance busy for longer than that is not "momentarily
+/// between instances", it is wedged, and the caller must hear about it.
+///
+/// Before FR-84 the client retried ONCE after 50 ms. Against a single
+/// listening instance that lost to the companion's own sibling poll every
+/// 2 s: the loser's retry landed while the winner's instance was still being
+/// replaced, and the error became an empty table.
+#[cfg_attr(not(windows), allow(dead_code))] // only the pipe client backs off; the pure test runs everywhere
+pub(crate) fn pipe_busy_backoff(attempt: u32) -> Option<std::time::Duration> {
+    const LADDER_MS: [u64; 6] = [5, 10, 20, 40, 80, 160];
+    LADDER_MS
+        .get(attempt as usize)
+        .map(|ms| std::time::Duration::from_millis(*ms))
+}
+
 /// Named-pipe connect, parameterised on the pipe name so tests can target a
-/// private one. Retries ONCE on `ERROR_PIPE_BUSY` (the server is momentarily
-/// between instances — it pre-creates the next on each accept, but there's a
-/// sub-ms window); any other error (notably `ERROR_FILE_NOT_FOUND` = daemon not
-/// running) propagates immediately. No multi-second wait — this is an
-/// interactive path.
+/// private one. Retries `ERROR_PIPE_BUSY` (every listening instance taken)
+/// on the bounded [`pipe_busy_backoff`] ladder; any other error (notably
+/// `ERROR_FILE_NOT_FOUND` = daemon not running) propagates immediately.
 #[cfg(windows)]
 pub(crate) async fn connect_windows_at(pipe_name: &str) -> std::io::Result<Client> {
     use tokio::net::windows::named_pipe::ClientOptions;
     const ERROR_PIPE_BUSY: i32 = 231;
-    let mut retried = false;
+    let mut attempt = 0u32;
     let pipe = loop {
         match ClientOptions::new().open(pipe_name) {
             Ok(p) => break p,
-            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && !retried => {
-                retried = true;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => match pipe_busy_backoff(attempt)
+            {
+                Some(delay) => {
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                None => return Err(e),
+            },
             Err(e) => return Err(e),
         }
     };
@@ -2325,6 +2524,20 @@ impl Client {
             .await?
         {
             Response::RouteUpdated { ok } => Ok(ok),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-84 D1 — `Request::RouteUpdate` → the effective persisted
+    /// descriptor. A daemon [`Response::Error`] (unknown id, bad node,
+    /// duplicate port, config write failure, or "unknown variant" from a
+    /// daemon older than the verb) surfaces its message verbatim as `Err`.
+    pub async fn route_update(
+        &mut self,
+        route: RouteDescriptor,
+    ) -> std::io::Result<RouteDescriptor> {
+        match self.request(&Request::RouteUpdate { route }).await? {
+            Response::RouteReplaced { route } => Ok(route),
             other => Err(unexpected_response(other)),
         }
     }
@@ -3156,6 +3369,44 @@ mod tests {
             .unwrap(),
             r#"{"t":"route_set_enabled","d":{"id":"pg-buildhost","enabled":false}}"#
         );
+        // FR-84 D1 — the atomic replace, keyed by the descriptor's own id.
+        assert_eq!(
+            serde_json::to_string(&Request::RouteUpdate {
+                route: route.clone()
+            })
+            .unwrap(),
+            r#"{"t":"route_update","d":{"route":{"id":"pg-buildhost","kind":"forward","node":"aabbcc","local":15432,"remote":"db:5432","transport":"auto","enabled":true}}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::RouteReplaced {
+                route: route.clone()
+            })
+            .unwrap(),
+            r#"{"t":"route_replaced","d":{"route":{"id":"pg-buildhost","kind":"forward","node":"aabbcc","local":15432,"remote":"db:5432","transport":"auto","enabled":true}}}"#
+        );
+        assert!(matches!(
+            handle(
+                &Request::RouteUpdate {
+                    route: route.clone()
+                },
+                &s
+            ),
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            s.route_update(route.clone()).await,
+            Response::Error { .. }
+        ));
+        // A daemon older than the verb answers the request line with a
+        // bad-request error — the reply a client must render as "this
+        // service predates route editing", never as an empty page.
+        let old_daemon: Response = serde_json::from_str(
+            r#"{"t":"error","d":{"message":"bad request: unknown variant `route_update`"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(old_daemon, Response::Error { ref message } if message.contains("unknown variant"))
+        );
         assert_eq!(
             serde_json::to_string(&Response::RouteAdded {
                 route: route.clone()
@@ -3352,20 +3603,11 @@ mod tests {
         let (sd_tx, sd_rx) = watch::channel(false);
         let state: Arc<dyn LocalApiState> = Arc::new(Mock);
         let pipe_srv = pipe.clone();
-        let srv = tokio::spawn(async move { serve_windows_at(&pipe_srv, state, sd_rx).await });
+        let srv = tokio::spawn(async move {
+            serve_windows_at(&pipe_srv, state, sd_rx, DEFAULT_PIPE_POOL).await
+        });
 
-        // Retry connect until the first pipe instance exists.
-        let mut client = None;
-        for _ in 0..200 {
-            match connect_windows_at(&pipe).await {
-                Ok(c) => {
-                    client = Some(c);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-            }
-        }
-        let mut client = client.expect("connect to the LocalAPI pipe");
+        let mut client = connect_when_up(&pipe).await;
 
         let status = client.status().await.unwrap();
         assert_eq!(status.name, "devbox");
@@ -3385,6 +3627,131 @@ mod tests {
 
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+    }
+
+    /// Retry the real client connect until the server's first instance exists.
+    #[cfg(windows)]
+    async fn connect_when_up(pipe: &str) -> Client {
+        for _ in 0..200 {
+            match connect_windows_at(pipe).await {
+                Ok(c) => return c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        panic!("connect to the LocalAPI pipe {pipe}");
+    }
+
+    /// FR-84 D1 — the field measurement, as a test. After one round trip the
+    /// server sits in its accept loop; then N raw `CreateFileW` opens with NO
+    /// await between them — exactly what the desktop's three pollers do
+    /// every 2 s — must all succeed. Raw opens, not `connect_windows_at`:
+    /// the client's backoff would hide the gap this test exists to see.
+    ///
+    /// On a current-thread runtime nothing else runs between the opens, so
+    /// the outcome is decided purely by how many instances were LISTENING
+    /// when the burst started. Pre-FR-84 (one instance, replaced only after
+    /// `connect()` returned to the accept task) the second open failed with
+    /// `ERROR_PIPE_BUSY` (231) deterministically — 60/60 on the reporting
+    /// host, and 100% here.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_accepts_back_to_back_opens_without_pipe_busy() {
+        let (opens, _keep) = raw_open_burst(DEFAULT_PIPE_POOL, 4).await;
+        let refused: Vec<String> = opens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.as_ref().err().map(|e| format!("open #{}: {e}", i + 1)))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "every back-to-back open must find a listening instance; refused: {refused:?}"
+        );
+    }
+
+    /// FR-84 D1 — the kill switch is real: `localapi_pipe_pool = 1` is the
+    /// pre-FR-84 listener, and the pre-FR-84 listener refuses the second of
+    /// two back-to-back opens with 231. If this ever passes with `1`, the
+    /// pool parameter has stopped meaning anything.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_pool_of_one_refuses_the_second_back_to_back_open() {
+        let (opens, _keep) = raw_open_burst(1, 2).await;
+        assert!(opens[0].is_ok(), "the one listening instance takes open #1");
+        let second = match &opens[1] {
+            Err(e) => e,
+            Ok(_) => panic!("with one instance the second raw open must be refused"),
+        };
+        assert_eq!(
+            second.raw_os_error(),
+            Some(231),
+            "the refusal is ERROR_PIPE_BUSY, got {second}"
+        );
+    }
+
+    /// Serve a private pipe with `pool` listening instances, do one real
+    /// client round trip (so every accept task has run once and re-created
+    /// its instance), then perform `burst` raw opens back-to-back. Returns
+    /// each open's outcome; the second tuple field keeps the server alive
+    /// until the caller drops it.
+    #[cfg(windows)]
+    async fn raw_open_burst(
+        pool: u32,
+        burst: usize,
+    ) -> (
+        Vec<std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient>>,
+        (
+            watch::Sender<bool>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+        ),
+    ) {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pipe = format!(r"\\.\pipe\roomler-test-pool{pool}-{}", std::process::id());
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let state: Arc<dyn LocalApiState> = Arc::new(Mock);
+        let pipe_srv = pipe.clone();
+        let srv =
+            tokio::spawn(async move { serve_windows_at(&pipe_srv, state, sd_rx, pool).await });
+
+        // One round trip through the real client. Its awaits let every accept
+        // task run: the one whose instance we took re-creates it, the others
+        // park on `connect()`. Dropping the client ends that connection.
+        let mut client = connect_when_up(&pipe).await;
+        assert_eq!(client.status().await.unwrap().name, "devbox");
+        drop(client);
+
+        // The burst: no `.await` between opens, so no accept task can run.
+        let mut opens = Vec::with_capacity(burst);
+        for _ in 0..burst {
+            opens.push(ClientOptions::new().open(&pipe));
+        }
+        (opens, (sd_tx, srv))
+    }
+
+    /// FR-84 D1 — the client's `ERROR_PIPE_BUSY` ladder: six bounded steps
+    /// summing to 315 ms, then give up. Interactive path: a refusal must
+    /// surface within a third of a second, never become a hang.
+    #[test]
+    fn pipe_busy_backoff_is_bounded() {
+        let mut total = std::time::Duration::ZERO;
+        let mut steps = Vec::new();
+        let mut attempt = 0u32;
+        while let Some(d) = pipe_busy_backoff(attempt) {
+            steps.push(d.as_millis() as u64);
+            total += d;
+            attempt += 1;
+            assert!(attempt <= 16, "the ladder must end");
+        }
+        assert_eq!(steps, vec![5, 10, 20, 40, 80, 160]);
+        assert_eq!(total, std::time::Duration::from_millis(315));
+        assert!(pipe_busy_backoff(6).is_none());
+        assert!(
+            pipe_busy_backoff(u32::MAX).is_none(),
+            "no overflow at the top"
+        );
+        assert!(
+            steps.windows(2).all(|w| w[1] == w[0] * 2),
+            "each step doubles the previous one"
+        );
     }
 
     /// The client must look for a per-user daemon FIRST and the system
