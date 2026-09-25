@@ -122,6 +122,39 @@ pub struct ConnectedAgent {
     /// never sends, and every grant to it would wait out the bound and then
     /// be refused.
     pub supports_ssh_grant_ack: bool,
+    /// FR-85 P3 — the agent advertises `AgentCaps.record` containing
+    /// `remote`: it serves the `record` DataChannel AND its owner switched
+    /// remote recording on (the agent advertises it only while that gate is
+    /// on). Kept per CONNECTION, like [`Self::supports_ssh_grant_ack`]: the
+    /// stored row outlives an owner's OFF and a rollback alike. `false` ⇒
+    /// `create_session` strips `Permissions::RECORD`.
+    pub supports_record: bool,
+}
+
+/// FR-85 P3 — the RECORD part of a grant: kept only when the controller may
+/// record AND the agent serves it; otherwise stripped, with the reason (for
+/// the audit and the viewer). A grant without RECORD passes untouched.
+pub fn record_grant(
+    permissions: Permissions,
+    may_record: bool,
+    agent_records: bool,
+) -> (Permissions, Option<&'static str>) {
+    if !permissions.contains(Permissions::RECORD) {
+        return (permissions, None);
+    }
+    if !may_record {
+        return (
+            permissions - Permissions::RECORD,
+            Some("controller_not_allowed"),
+        );
+    }
+    if !agent_records {
+        return (
+            permissions - Permissions::RECORD,
+            Some("device_not_opted_in"),
+        );
+    }
+    (permissions, None)
 }
 
 pub struct ConnectedController {
@@ -323,6 +356,9 @@ impl Hub {
             // Same setter, same reasoning: `false` = answered without waiting,
             // exactly as before FR-83.
             supports_ssh_grant_ack: false,
+            // FR-85 P3 — set by `set_agent_record_support` right after
+            // registration; `false` (RECORD stripped) until it is.
+            supports_record: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -691,9 +727,54 @@ impl Hub {
         override_reason: Option<String>,
         local_relay: Option<LocalRelayDescriptor>,
         input_mode: Option<roomler_ai_remote_control::models::InputMode>,
+        tenant_name: Option<String>,
+    ) -> Result<ObjectId> {
+        // FR-85 P3 — a caller that does not say may NOT record: RECORD is
+        // stripped (the safe default for every path but the authz-gated one).
+        self.create_session_full(
+            agent_id,
+            controller_user_id,
+            controller_name,
+            controller_tx,
+            permissions,
+            browser_caps,
+            preferred_transport,
+            chroma_pref,
+            chunk_framing,
+            audio_enabled,
+            consent_mode,
+            override_reason,
+            local_relay,
+            input_mode,
+            tenant_name,
+            false,
+        )
+    }
+
+    /// [`Self::create_session`], with the authz gate's `may_record` (FR-85
+    /// P3): `Permissions::RECORD` survives only when it is `true` AND the
+    /// agent serves remote recording.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_full(
+        &self,
+        agent_id: ObjectId,
+        controller_user_id: ObjectId,
+        controller_name: String,
+        controller_tx: ClientTx,
+        permissions: Permissions,
+        browser_caps: Vec<String>,
+        preferred_transport: Option<String>,
+        chroma_pref: Option<String>,
+        chunk_framing: Option<bool>,
+        audio_enabled: bool,
+        consent_mode: ConsentMode,
+        override_reason: Option<String>,
+        local_relay: Option<LocalRelayDescriptor>,
+        input_mode: Option<roomler_ai_remote_control::models::InputMode>,
         // Multi-org — display name of the requesting org, for the host's
         // consent prompt. See `ServerMsg::Request::tenant_name`.
         tenant_name: Option<String>,
+        may_record: bool,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -757,9 +838,9 @@ impl Hub {
                     .as_ref()
                     .map(|tx| ptr_eq(tx, &controller_tx) && !tx.is_closed())
                     .unwrap_or(false);
-            is_dup.then(|| (s.id, s.permissions))
+            is_dup.then(|| (s.id, s.permissions, s.record_refused))
         });
-        if let Some((existing_id, existing_perms)) = existing {
+        if let Some((existing_id, existing_perms, existing_record_refused)) = existing {
             info!(
                 "coalescing duplicate rc:session.request from controller {} to agent {} onto live \
                  session {} (same connection; no second consent prompt)",
@@ -777,11 +858,14 @@ impl Hub {
                 session_id: existing_id,
                 agent_id,
                 permissions: Some(existing_perms),
+                // FR-85 P3 — the SAME grant, so the same reason: a retry
+                // must not read as "RECORD was never asked for".
+                record_refused: existing_record_refused.map(str::to_string),
             });
             return Ok(existing_id);
         }
 
-        let (agent_org, agent_arbitrates) = {
+        let (agent_org, agent_arbitrates, agent_records) = {
             let mut agent = self
                 .inner
                 .agents
@@ -791,7 +875,7 @@ impl Hub {
                 return Err(Error::AgentBusy);
             }
             agent.active_sessions += 1;
-            (agent.tenant_id, agent.input_arbiter)
+            (agent.tenant_id, agent.input_arbiter, agent.supports_record)
         };
 
         // Multi-user P3 back-compat — the FILES bit becomes agent-ENFORCED in
@@ -836,6 +920,13 @@ impl Hub {
             permissions
         };
 
+        // FR-85 P3 — RECORD survives only for a controller the authz gate let
+        // record (owner / ADMINISTRATOR / RECORD_REMOTE_SCREEN, never
+        // break-glass) on an agent that serves it (its owner opted in, so it
+        // advertises the `record` cap). Anything else is stripped here, and
+        // the reason travels in the audit and to the viewer — never silently.
+        let (permissions, record_refused) = record_grant(permissions, may_record, agent_records);
+
         let session_id = ObjectId::new();
         let (mut live, waiter) = LiveSession::new(
             session_id,
@@ -852,6 +943,8 @@ impl Hub {
         // FR-27 — `deliver_consent` needs the mode to know whether a host-side
         // timeout ends the session or hands over to the owner's emailed link.
         live.consent_mode = consent_mode;
+        // FR-85 P3 — kept for a duplicate request coalesced onto this session.
+        live.record_refused = record_refused;
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -879,6 +972,7 @@ impl Hub {
             session_id,
             agent_id,
             permissions: Some(permissions),
+            record_refused: record_refused.map(str::to_string),
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -946,6 +1040,7 @@ impl Hub {
                 controller_user_id,
                 controller_name: controller_name.clone(),
                 permissions,
+                record_stripped: record_refused.map(str::to_string),
             },
         );
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
@@ -1437,6 +1532,26 @@ impl Hub {
         }
     }
 
+    /// FR-85 P3 — record whether the agent serves remote recording (its
+    /// hello's `AgentCaps.record` contains `remote`).
+    pub fn set_agent_record_support(&self, agent_id: ObjectId, records: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_record = records;
+        }
+    }
+
+    /// FR-85 P3 — a LIVE session's `(agent_id, controller_user_id,
+    /// effective grant)`, for checking what an agent reports about it.
+    /// `None` once the session has ended (callers fall back to the stored
+    /// `remote_sessions` row: a recording's last report arrives after its
+    /// session is gone).
+    pub fn session_grant(&self, session_id: ObjectId) -> Option<(ObjectId, ObjectId, Permissions)> {
+        self.inner.sessions.get(&session_id).map(|e| {
+            let s = e.value().lock();
+            (s.agent_id, s.controller_user_id, s.permissions)
+        })
+    }
+
     /// Push `rc:rpc.exec` and await the matching `rc:rpc.result`.
     ///
     /// `msg` must be a [`ServerMsg::RpcExec`] carrying `request_id`; the
@@ -1601,6 +1716,11 @@ pub struct DispatchCtx {
     /// say WHICH org is asking. `None` = older caller / lookup failed; the
     /// agent then falls back to its org label.
     pub tenant_name: Option<String>,
+    /// FR-85 P3 — may this controller record? Resolved by the API WS layer's
+    /// authz gate (owner / ADMINISTRATOR / `RECORD_REMOTE_SCREEN`, never
+    /// break-glass). `create_session` strips `Permissions::RECORD` when it is
+    /// `false`. Ignored for non-request messages and agent-role dispatch.
+    pub may_record: bool,
 }
 
 impl Hub {
@@ -1671,7 +1791,7 @@ impl Hub {
                 let user_id = ctx.user_id.ok_or(Error::PermissionDenied("no user"))?;
                 let name = ctx.controller_name.clone().unwrap_or_default();
                 let tx = ctx.controller_tx.clone().ok_or(Error::SendFailed)?;
-                self.create_session(
+                self.create_session_full(
                     agent_id,
                     user_id,
                     name,
@@ -1687,6 +1807,7 @@ impl Hub {
                     local_relay,
                     ctx.input_mode,
                     ctx.tenant_name.clone(),
+                    ctx.may_record,
                 )?;
                 Ok(())
             }
@@ -2179,6 +2300,7 @@ mod tests {
             override_reason: None,
             input_mode: None,
             tenant_name: None,
+            may_record: false,
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -2271,6 +2393,181 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// FR-85 P3 — RECORD is kept only when BOTH gates say yes: the
+    /// controller may record, and the device serves it. Each refusal is named.
+    #[test]
+    fn record_is_granted_only_when_the_controller_may_and_the_device_serves_it() {
+        let want = Permissions::VIEW | Permissions::RECORD;
+        assert_eq!(record_grant(want, true, true), (want, None));
+        assert_eq!(
+            record_grant(want, false, true),
+            (Permissions::VIEW, Some("controller_not_allowed"))
+        );
+        assert_eq!(
+            record_grant(want, true, false),
+            (Permissions::VIEW, Some("device_not_opted_in"))
+        );
+        // Both refusals: the controller's is the one named (it is what the
+        // viewer's user can do something about least).
+        assert_eq!(
+            record_grant(want, false, false),
+            (Permissions::VIEW, Some("controller_not_allowed"))
+        );
+        // A grant that never asked for RECORD passes untouched, with no reason.
+        assert_eq!(
+            record_grant(Permissions::default(), false, false),
+            (Permissions::default(), None)
+        );
+    }
+
+    /// FR-85 P3 — end to end through `create_session_full`: an agent whose
+    /// owner has not opted in gets no RECORD (and the viewer is told why);
+    /// one that serves recording keeps it for an allowed controller; and the
+    /// legacy `create_session` (no authz verdict) never grants it.
+    #[tokio::test]
+    async fn the_hub_strips_record_unless_both_gates_allow_it() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            8,
+            true,
+            false,
+        );
+        let ask = |hub: &Hub, may_record: bool| {
+            let (tx, mut rx) = mpsc::channel(8);
+            hub.create_session_full(
+                agent_id,
+                ObjectId::new(),
+                "ctl".into(),
+                tx,
+                Permissions::VIEW | Permissions::RECORD,
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+                None,
+                may_record,
+            )
+            .unwrap();
+            match rx.try_recv().unwrap() {
+                ServerMsg::SessionCreated {
+                    permissions,
+                    record_refused,
+                    ..
+                } => (permissions.unwrap(), record_refused),
+                other => panic!("expected SessionCreated, got {other:?}"),
+            }
+        };
+
+        // The device has not advertised the cap (its owner never opted in).
+        let (p, why) = ask(&hub, true);
+        assert!(!p.contains(Permissions::RECORD));
+        assert_eq!(why.as_deref(), Some("device_not_opted_in"));
+
+        hub.set_agent_record_support(agent_id, true);
+        let (p, why) = ask(&hub, true);
+        assert!(p.contains(Permissions::RECORD), "both gates allow it");
+        assert_eq!(why, None);
+
+        let (p, why) = ask(&hub, false);
+        assert!(!p.contains(Permissions::RECORD));
+        assert_eq!(why.as_deref(), Some("controller_not_allowed"));
+
+        // The legacy entry point carries no authz verdict: never RECORD.
+        let (tx, mut rx) = mpsc::channel(8);
+        hub.create_session(
+            agent_id,
+            ObjectId::new(),
+            "legacy".into(),
+            tx,
+            Permissions::VIEW | Permissions::RECORD,
+            Vec::new(),
+            None,
+            None,
+            None,
+            false,
+            ConsentMode::Prompt,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        match rx.try_recv().unwrap() {
+            ServerMsg::SessionCreated { permissions, .. } => {
+                assert!(!permissions.unwrap().contains(Permissions::RECORD))
+            }
+            other => panic!("expected SessionCreated, got {other:?}"),
+        }
+    }
+
+    /// FR-85 P3 — a duplicate request on the SAME connection coalesces onto
+    /// the live session (#1045) and is answered with its grant. It must also
+    /// carry that grant's refusal: the repeated permissions lack RECORD, and
+    /// a bare `None` would tell the viewer RECORD was never asked for.
+    #[tokio::test]
+    async fn a_coalesced_duplicate_repeats_the_record_refusal() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            8,
+            true,
+            false,
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        let user = ObjectId::new();
+        let ask = |hub: &Hub| {
+            hub.create_session_full(
+                agent_id,
+                user,
+                "ctl".into(),
+                tx.clone(),
+                Permissions::VIEW | Permissions::RECORD,
+                Vec::new(),
+                None,
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap()
+        };
+        let first = ask(&hub);
+        let second = ask(&hub);
+        assert_eq!(first, second, "the duplicate must coalesce");
+        for _ in 0..2 {
+            match rx.try_recv().unwrap() {
+                ServerMsg::SessionCreated {
+                    permissions,
+                    record_refused,
+                    ..
+                } => {
+                    assert!(!permissions.unwrap().contains(Permissions::RECORD));
+                    assert_eq!(record_refused.as_deref(), Some("device_not_opted_in"));
+                }
+                other => panic!("expected SessionCreated, got {other:?}"),
+            }
+        }
     }
 
     /// Multi-user P3 — ONE INPUT holder per agent: a second concurrent

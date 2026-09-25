@@ -2,14 +2,14 @@
 
 > **FR-85** ([#1634](https://github.com/gjovanov/roomler-ai/issues/1634),
 > [spec](fr/FR-85-hq-screen-recording.md)). **Status: P1 (the recorder core,
-> and its audio on Windows and Linux), P2a (the local verbs) and P2b
-> (roomler-desktop's Recordings view and tray).** It sits behind the
-> `recording` cargo feature and is in no release build yet. It is driven by
-> `roomlerd record`, by the daemon for the LocalAPI recording verbs and
-> `roomler record` (§6), and by roomler-desktop (§7). Still to come: the
-> microphone on macOS, delivery out of the recorder's data folder (P2c),
-> remote recording (P3), and the editor (cut, speed up, background music) in
-> P5.
+> and its audio on Windows and Linux), P2a (the local verbs), P2b
+> (roomler-desktop's Recordings view and tray) and P3a (the server's gates for
+> remote recording, §10).** It sits behind the `recording` cargo feature and
+> is in no release build yet. It is driven by `roomlerd record`, by the daemon
+> for the LocalAPI recording verbs and `roomler record` (§6), and by
+> roomler-desktop (§7). Still to come: the microphone on macOS, delivery out of
+> the recorder's data folder (P2c), the device and viewer halves of remote
+> recording (P3b, P3c), and the editor (cut, speed up, background music) in P5.
 
 A recording is **encoded at the source, in a pipeline of its own, into a
 local file.** It is not a copy of what a viewer receives. The live
@@ -380,7 +380,84 @@ the bundle targets 12). The microphone needs cpal on macOS, plus
 `NSMicrophoneUsageDescription` and the `audio-input` entitlement in the
 bundle. Both are refused by name until then.
 
-## 10. Tests
+## 10. Remote recording — the server's gates (P3a)
+
+A controller in the browser will be able to record the screen it controls. P3b
+builds the device side and P3c the viewer. The file stays **on the device**, and
+the controller downloads it on demand over the session's own P2P channel. The
+server never holds a byte of it (`RemoteSession.recording_url` stays `None`). It
+decides who may ask, and it keeps the device's account of what happened.
+
+The session bit is `Permissions::RECORD`. Before P3a nothing read it, and the
+hub passed through every bit a tab asked for except INPUT, so any tab could ask
+for RECORD. Now the bit survives only when both gates below say yes, and every
+refusal is named.
+
+```mermaid
+sequenceDiagram
+    participant V as viewer (browser)
+    participant C as controller's pod<br/>resolve_session_authz
+    participant H as hub (the agent's pod)<br/>create_session
+    participant A as agent
+    participant DB as MongoDB
+
+    A->>H: rc:agent.hello, or a heartbeat re-announcing caps:<br/>caps.record = ["remote"] only while its owner's gate is on (P3b)
+    V->>C: rc:session.request, permissions "VIEW | … | RECORD"
+    C->>C: may_record = owner ∨ ADMINISTRATOR ∨ RECORD_REMOTE_SCREEN,<br/>and false under break-glass
+    C->>H: dispatch (or the cross-pod relay), carrying may_record
+    H->>H: record_grant(permissions, may_record, supports_record)
+    H-->>V: rc:session.created { permissions, record_refused? }
+    H->>DB: remote_audit: SessionRequested { permissions, record_stripped? }
+    H->>A: rc:request { permissions } — RECORD only if it survived
+    A-->>H: rc:recording.activity { session_id, kind, … } (P3b)
+    H->>DB: recording_activity — only for a session of THIS device whose grant held RECORD
+```
+
+| Gate | Where | Refusal |
+|---|---|---|
+| **1. The controller may record**: the device's owner, an `ADMINISTRATOR`, or a holder of the role bit `RECORD_REMOTE_SCREEN` (bit 31). The bit is in no managed role below `ADMINISTRATOR` ([permissions.md](permissions.md) §2) | `resolve_session_authz` → `SessionAuthz.may_record` (`crates/modules/remote/src/controller.rs`); `relay_rc_frame` carries it to the agent's pod | `controller_not_allowed` |
+| ⚠️ **Never under break-glass.** An `ADMINISTRATOR` with an `override_reason` skips the host's consent, so a recording made that way would be covert ([remote-control.md](remote-control.md) §11.4) | the same function: its break-glass branch sets `may_record: false` | `controller_not_allowed` |
+| **2. The device serves it**: its caps advertise `AgentCaps.record` ∋ `remote`. An agent does that only while its owner's `record_remote_enabled` is on (P3b). The hub keeps it per connection (`ConnectedAgent.supports_record`), set from the hello and refreshed from any heartbeat that re-announces caps (FR-43 P2c), so an owner's ON or OFF reaches the hub within one heartbeat, without a reconnect. It never reads it from the stored row, which outlives both an owner's OFF and a rollback | `record_grant` (`crates/modules/fleet/src/hub.rs`), applied after the INPUT rule | `device_not_opted_in` |
+
+Everything downstream reads the **effective** grant: `SessionCreated.permissions`
+(the viewer), `Request.permissions` (the agent) and the `remote_sessions` row.
+The reason travels in `SessionCreated.record_refused` and in the audit's
+`SessionRequested.record_stripped`, so a strip is never silent. When both gates
+fail, `controller_not_allowed` is the one named. Both fields are additive and
+absent when nothing was refused. ⚠️ A duplicate request on the same connection
+coalesces onto the live session (#1045) and is answered with that session's
+grant, so the session keeps its reason and the duplicate's answer repeats it.
+Without that, a viewer's retry would read "RECORD was never asked for".
+
+⚠️ **`remote` is a prefix of `remote-audio`** (the device also allows computer
+audio in a remote recording). Matching is equality (`AgentCaps::has_record`),
+locked by `remote_recording_does_not_imply_remote_audio`. It is the same lesson
+as `ssh` and `ssh-consent`. A word this server does not know is ignored, never
+an error. The microphone is not a remote option at all.
+
+Until P3b ships, no agent advertises `record`, so every request for RECORD is
+stripped with `device_not_opted_in`. P3a is inert in the field on its own.
+
+### Decision and claim, like SSH
+
+| Collection | Written by | What it is |
+|---|---|---|
+| `remote_audit` | the server | Its **decision**: the grant, with `record_stripped` when RECORD was asked for and refused. Authoritative. |
+| `recording_activity` | the device, through `rc:recording.activity` | Its **claims**: a prompt granted, denied or timed out; a recording started, stopped or refused; a download. Each carries a file name, bytes, duration and reason, with text clipped to 256 characters. Never content. 90-day TTL. |
+
+A claim is kept only for a session **of the sending device** whose effective
+grant held `RECORD`. The server checks the live session in the hub, or its
+stored `remote_sessions` row once it has ended, because a stop can arrive after
+the session. Anything else is dropped and logged. So a device cannot write about
+another device's session, and it cannot invent recording activity for a session
+that was never allowed to record. It is still a claim by a host that may be
+compromised: join it on `session_id` with `remote_audit` for the decision.
+
+`GET /api/tenant/{tenant_id}/recording-activity/{agent_id}` reads it, newest
+first and paginated. It is gated by `VIEW_REMOTE_AUDIT`, like the session
+audit. The device is resolved within the tenant, so a foreign id gets a 404.
+
+## 11. Tests
 
 | Where | What | CI |
 |---|---|---|
@@ -390,7 +467,11 @@ bundle. Both are refused by name until then.
 | `tests/recorder.rs`, audio (P1c) | a 440 Hz tone at 44.1 kHz mono plus a microphone that delivers nothing → an Opus track within 80 ms of the video, decoded back at 440 Hz with the right level; the same recording without audio has no audio track (the negative control); `roomlerd record --system-audio` through the real process; a build without `audio` refuses `--microphone` with `audio_unavailable` | both runs of the same step |
 | `crates/localapi` | the console-user decision table; a recording verb from an unidentified peer is refused before any handler runs; `ConfigSet record_dir` gated the same way; the verbs round-trip | "Run the remaining crates' unit tests" |
 | `crates/agent-core` | `record_dir` set/echo/validate/clear; the live set is exactly `exec_enabled`, `remote_config_enabled`, `record_dir`; `recording_dir` validation incl. a real Windows junction | same |
-| `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config` | same |
+| `crates/remote_control` | `no_record_key_is_server_pushable_via_desired_config`; `remote_recording_does_not_imply_remote_audio` (equality, an old agent's hello advertises nothing, a newer word is ignored, the wire words are pinned); `rc:recording.activity` owned by `remote` | same |
+| `crates/db` (P3a) | `RECORD_REMOTE_SCREEN` is named, inside `ALL`, in no managed row below `ADMINISTRATOR`, and outside `DEFAULT_ADMIN` | same |
+| `crates/modules/fleet` (P3a) | `record_grant`'s table: kept only when the controller may AND the device serves it, each refusal with its reason, a grant without RECORD untouched; the hub strips RECORD from the effective grant and names why in `SessionCreated`; a coalesced duplicate repeats the reason | "Run fleet module unit tests" |
+| `crates/tests/src/remote_recording_tests.rs` (P3a) | Real servers, WebSockets and MongoDB, one controller connection per request (a second request on one socket coalesces). The owner on an opted-in device keeps RECORD, and on a device that never opted in gets `device_not_opted_in`. A member with `REMOTE_CONTROL` gets `controller_not_allowed`; the same member with `RECORD_REMOTE_SCREEN` keeps it (the positive control). A non-owner `ADMINISTRATOR` keeps it; under break-glass it is stripped. A heartbeat re-announcing caps opts the device in and out without a reconnect, and one without caps changes nothing. Activity is kept for a RECORD session of the sending device only (not for a session without RECORD, not from another device). The route answers RFC 3339 times and refuses a caller without `VIEW_REMOTE_AUDIT` | `integration-tests.yml` |
+| `ui/src/__tests__/utils/permissions.spec.ts` (P3a) | the catalogue lists 32 bits, `RECORD_REMOTE_SCREEN` is `2 ** 31` (positive, not `1 << 31`), and mask arithmetic keeps bit 31 | "Frontend checks" |
 | `agents/roomler-cli` | `record` verbs parse; lengths and endings read plainly | same |
 | `ui/src/__tests__/companion/recordings.spec.ts` | roomler-desktop's REAL `index.html` section and `recordings.js`, in jsdom against a mocked `invoke`: Start greyed out with the reason, the running state, start options, a refusal said, delete only on the second click (red when a single click deletes), the arm expiring, the folder picker saving through `cmd_config_set` and a cancel saving nothing, keyed rows kept in place (red when rows are rebuilt), the last good data kept on a failed refresh, a service with no recorder | "Frontend checks" (`bun run test:unit`) |
 | `agents/roomler-desktop` | the tray's wording and when its item is enabled; only a bare `*.mp4` name is opened; a service without the recorder reads as unsupported; recording keys are the daemon's to accept | `ci.yml` "Test the desktop companion (roomler-desktop)", new with P2b. The crate's unit tests ran in NO lane before: the macOS job only `cargo check`s it, and the shared step is `--lib`, which a bin-only crate cannot join |

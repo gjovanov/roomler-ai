@@ -28,12 +28,12 @@ import {
 // composite value changes and this fails loudly.
 
 describe('permission catalog', () => {
-  it('defines all 31 flags with unique bits and keys', () => {
-    expect(PERMISSION_FLAGS).toHaveLength(31)
+  it('defines all 32 flags with unique bits and keys', () => {
+    expect(PERMISSION_FLAGS).toHaveLength(32)
     const bits = PERMISSION_FLAGS.map((f) => f.bit)
-    expect(new Set(bits).size).toBe(31)
+    expect(new Set(bits).size).toBe(32)
     const keys = PERMISSION_FLAGS.map((f) => f.key)
-    expect(new Set(keys).size).toBe(31)
+    expect(new Set(keys).size).toBe(32)
     // Every bit is a single power of two. The ceiling is now bit 52, not 30
     // (#888): the file uses arithmetic rather than bitwise operators, so the
     // limit is the JSON number's exact-integer range, not int32 coercion.
@@ -47,12 +47,14 @@ describe('permission catalog', () => {
   })
 
   it('OR of every flag equals ALL', () => {
-    const all = PERMISSION_FLAGS.reduce((m, f) => m | f.bit, 0)
+    // `maskUnion`, never `|`: bit 31 (RECORD_REMOTE_SCREEN, FR-85) is the
+    // first flag a bitwise OR would coerce to a NEGATIVE int32.
+    const all = PERMISSION_FLAGS.reduce((m, f) => maskUnion(m, f.bit), 0)
     expect(all).toBe(ALL_PERMISSIONS)
-    // `(1 << 31) - 1` — the Rust spelling — is −2147483649 in JS. Assert the
-    // POSITIVE value so a copy-paste of the Rust expression fails here.
-    expect(ALL_PERMISSIONS).toBe(2147483647)
-    expect(ALL_PERMISSIONS).toBe(2 ** 31 - 1)
+    // `(1 << 32) - 1` — the Rust spelling — is 0 in JS. Assert the POSITIVE
+    // value so a copy-paste of the Rust expression fails here.
+    expect(ALL_PERMISSIONS).toBe(4294967295)
+    expect(ALL_PERMISSIONS).toBe(2 ** 32 - 1)
     expect(ALL_PERMISSIONS).toBeGreaterThan(0)
   })
 
@@ -69,6 +71,7 @@ describe('permission catalog', () => {
     expect(bit('VIEW_EXEC_AUDIT')).toBe(1 << 28)
     expect(bit('SSH_DEVICE')).toBe(1 << 29)
     expect(bit('VIEW_SSH_AUDIT')).toBe(1 << 30)
+    expect(bit('RECORD_REMOTE_SCREEN')).toBe(2 ** 31)
   })
 
   it('withholds the fleet-access grants from the admin preset', () => {
@@ -83,6 +86,8 @@ describe('permission catalog', () => {
     // is a different job from being able to serve it.
     expect(DEFAULT_ADMIN & (1 << 28)).not.toBe(0) // VIEW_EXEC_AUDIT
     expect(DEFAULT_ADMIN & (1 << 30)).not.toBe(0) // VIEW_SSH_AUDIT
+    // FR-85 — a recording outlives the session: never in the admin preset.
+    expect(maskHas(DEFAULT_ADMIN, 2 ** 31)).toBe(false) // RECORD_REMOTE_SCREEN
   })
 
   it('a preset round-trip preserves every bit the preset claims to set', () => {
@@ -91,8 +96,10 @@ describe('permission catalog', () => {
     // silently dropped them. Any bit in a preset must survive being described
     // and re-derived from the catalog.
     for (const preset of [DEFAULT_MEMBER, DEFAULT_ADMIN, ALL_PERMISSIONS]) {
+      // Arithmetic masks: ALL_PERMISSIONS spans bit 31, which `&`/`|` coerce
+      // to a negative int32.
       const covered = PERMISSION_FLAGS.reduce(
-        (m, f) => ((preset & f.bit) !== 0 ? m | f.bit : m),
+        (m, f) => (maskHas(preset, f.bit) ? maskUnion(m, f.bit) : m),
         0,
       )
       expect(covered).toBe(preset)
@@ -359,8 +366,9 @@ describe('#888 — the ceiling is bit 52, not bit 30', () => {
       const set = maskSet(base, bit)
       expect(maskHas(set, bit)).toBe(true)
       // every previously-held permission survives — the failure mode here is a
-      // saved role coming back with permissions silently stripped
-      expect(describePermissions(set)).toEqual(describePermissions(base))
+      // saved role coming back with permissions silently stripped. (A superset:
+      // bit 31 is a NAMED flag since FR-85, so it describes itself too.)
+      expect(describePermissions(set)).toEqual(expect.arrayContaining(describePermissions(base)))
       expect(maskClear(set, bit)).toBe(base)
       // idempotent in both directions
       expect(maskSet(set, bit)).toBe(set)
