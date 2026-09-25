@@ -78,14 +78,30 @@ recorded result rather than a silent gap.
 
 ## Acceptance criteria
 
-- [ ] `docker manifest inspect ghcr.io/gjovanov/roomler-ai:<tag>` lists **both**
+- [x] `docker manifest inspect ghcr.io/gjovanov/roomler-ai:<tag>` lists **both**
       `linux/amd64` and `linux/arm64`
-- [ ] the arm64 image is smoke-tested **on an arm64 runner** — `/health` 200 and
+      *Verified anonymously against the registry for `v0.4.45` and `latest`, and
+      re-read 2026-09-25: `:latest` is a manifest list naming both.*
+- [x] the arm64 image is smoke-tested **on an arm64 runner** — `/health` 200 and
       the SPA served, not merely built
+      *Native `ubuntu-24.04-arm`: built + smoke 15m33s, healthy after 20 s, `GET / -> 200`.*
 - [ ] an actual arm64 host pulls and runs it (`fedora-arm` is on the fleet)
-- [ ] the amd64 timings do not regress from FR-42's measured 88 s
-- [ ] `README.md` and `docs/self-hosting.md` no longer say amd64-only
-- [ ] a failing arm64 build does not block the amd64 publish, and says so
+      *Half met, and the Result declined to claim it: the image RAN on a genuine
+      aarch64 runner, but no arm64 host ever PULLED it — `fedora-arm` sits on the
+      demo mesh, unreachable from the workstation. The residual risk is narrow: a
+      manifest that resolves for an anonymous HTTP client resolving differently
+      for a docker daemon on aarch64. One `docker pull` on an arm64 host settles it.*
+- [x] the amd64 timings do not regress from FR-42's measured 88 s
+      *The 88 s clean-box path is unchanged; only the publish workflow moved.*
+- [x] `README.md` and `docs/self-hosting.md` no longer say amd64-only
+      *Re-checked 2026-09-25: no amd64-only wording in either; `self-hosting.md`
+      states "linux/amd64 and linux/arm64".*
+- [x] a failing arm64 build does not block the amd64 publish, and says so
+      *`fail-fast: false`, the merge on `always()`, and a warning naming the missing
+      architecture.*
+
+Evidence: [#1161 — Result, published multi-arch](https://github.com/gjovanov/roomler-ai/issues/1161#issuecomment-5499495658).
+*Five ticked 2026-09-25 — verified 2026-09-01, never ticked in the spec.*
 
 ## Out of scope
 

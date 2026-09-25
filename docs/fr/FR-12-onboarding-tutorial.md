@@ -248,12 +248,26 @@ stripped on arrival so a refresh or a shared link cannot replay the tour.
 
 - [ ] A brand-new user's first login lands on the Tutorial once, never twice;
       dismiss works instantly
+      *Unit-tested (the org-fresh auto-open heuristic), never watched: P1 LIVE handed
+      "one fresh-org account to watch the auto-open fire exactly once" to a human, and
+      no run is recorded.*
 - [ ] Every chapter renders its hero + steps; every step's deep link lands on
       the real page/dialog with the right tenant id
+      *Heroes: 8 of 8 distinct and loaded, in a real browser on prod (P3, 2026-09-01).
+      Deep links: contract-tested to name a route that exists — never clicked through
+      to confirm the page, the dialog and the tenant id.*
 - [ ] The `?` app-bar icon and user-menu entry open the Tutorial for an
       onboarded user at any time
+      *Shipped and deployed (P1 LIVE); no recorded check of either entry point — the
+      2026-09-01 browser run reached the Tutorial by URL.*
 - [ ] Empty states on /devices and the rooms list link to their chapters
-- [ ] `bun run test:unit` + `bun run build` green; no new runtime deps in P1
+      *Implemented in P1; never seen live — it needs an org with no devices or rooms.*
+- [x] `bun run test:unit` + `bun run build` green; no new runtime deps in P1
+      *#797: every check green, including Frontend checks; 823 vitest; it does not touch
+      `ui/package.json`. Ticked 2026-09-25.*
+
+*The four left open are one browser session with a fresh account: first login, the
+`?` and the menu, an empty org, a click through every deep link.*
 
 ## Open decisions
 
